@@ -5,6 +5,7 @@
 - Build Doria as a PHP-shaped compiled language with native machine code and standalone executables as the long-term target.
 - Keep PHP as a compatibility, migration, debugging, and transpilation backend only.
 - Move toward **self-hosting**: `doriac` is initially implemented in Rust, but an early language-development goal is to eventually write significant parts of `doriac` in Doria itself.
+- Support Doria language features that PHP cannot express directly, including executable property initializers and richer attribute/metadata expressions.
 
 ## Current Slice
 
@@ -21,6 +22,9 @@
 - Add native backend experiments behind explicit targets.
 - Add string interpolation AST nodes independent of PHP behavior.
 - Emit precedence-aware backend expressions.
+- Add parser/AST support for attributes using `#[...]`.
+- Add shared call argument representation for positional and named arguments.
+- Preserve property initializer expressions in AST/HIR and later lower non-constant initializers correctly.
 
 ## Self-Hosting Path
 
