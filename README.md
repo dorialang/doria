@@ -2,7 +2,9 @@
 
 Doria is a new PHP-shaped compiled programming language. It uses familiar PHP syntax such as `$variables`, classes, functions, visibility modifiers, constructor property promotion, and C-like blocks, but it is statically checked before it runs.
 
-The compiler is called `doriac` and is implemented in Rust. Doria's long-term primary target is native machine code and standalone executables. PHP is a compatibility, migration, debugging, and transpilation backend; it must not shape the core compiler architecture.
+The compiler is called `doriac` and is initially implemented in Rust. Doria's long-term primary target is native machine code and standalone executables. PHP is a compatibility, migration, debugging, and transpilation backend; it must not shape the core compiler architecture.
+
+A strategic long-term goal is self-hosting: as Doria matures, more of `doriac` should become writable in Doria itself.
 
 ```text
 Doria source
@@ -59,6 +61,14 @@ doriac run <file>
 
 `doriac run` is currently a convenience command for the PHP backend: it compiles to a temporary PHP file and runs it with the local `php` binary.
 
+Future migration tooling may expose a command such as:
+
+```bash
+doriac migrate php src --out migrated
+```
+
+That would be a PHP-to-Doria migration converter, not the Doria parser and not the core compiler identity.
+
 ## Language principles
 
 - Doria is PHP-shaped, not PHP-compatible at the parser level.
@@ -69,6 +79,22 @@ doriac run <file>
 - Intentional mutation uses `writable`.
 - Collection aliases are `List<T>`, `Dictionary<K, V>`, and `Set<T>`.
 - The compiler must reject invalid Doria before lowering to HIR/MIR or emitting backend output.
+- Doria may support features PHP cannot express directly, such as executable instance property initializers and richer attribute expressions.
+
+## Design docs
+
+Important project documents:
+
+```text
+SPEC.md
+ROADMAP.md
+AGENTS.md
+docs/doria-development-plan.md
+docs/self-hosting.md
+docs/executable-initializers-and-attributes.md
+docs/php-interop-and-migration.md
+docs/chatgpt-project-context.md
+```
 
 ## Repository layout
 
@@ -84,7 +110,11 @@ doriac run <file>
 │       ├── src/
 │       └── tests/
 ├── docs/
-│   └── doria-development-plan.md
+│   ├── doria-development-plan.md
+│   ├── executable-initializers-and-attributes.md
+│   ├── php-interop-and-migration.md
+│   ├── self-hosting.md
+│   └── chatgpt-project-context.md
 └── examples/
     ├── hello.doria
     ├── variables.doria
