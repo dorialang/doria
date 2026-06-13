@@ -12,12 +12,15 @@ Last updated: 2026-06-13
 
 The name comes from the creator's two sisters' middle names:
 
-- Dorothy
-- Lucy / Lucia
+```text
+Dorothy + Lucy / Lucia -> Doria
+```
 
 Doria should feel familiar to PHP developers, but it is **not PHP++** and should not be constrained by PHP's parser, runtime, or historical design choices.
 
-The compiler is called **`doriac`** and is implemented in Rust.
+The compiler is called **`doriac`**.
+
+`doriac` is currently a **Rust bootstrap compiler**. Rust is the initial implementation language, not the permanent identity of the compiler. A strategic early goal is for Doria to become capable enough that significant parts of `doriac` can eventually be written in Doria itself.
 
 The long-term target is:
 
@@ -38,7 +41,22 @@ The PHP backend must not shape the core compiler architecture.
 
 ---
 
-## 2. Project goal
+## 2. Product goal
+
+Doria is for places where PHP developers may want a PHP-like development experience, but PHP itself does not completely make sense.
+
+Important target areas include:
+
+```text
+- native command-line tools
+- native desktop applications
+- long-running services
+- game tooling
+- game engines
+- graphics/media applications
+- native bindings to C libraries, eventually including raylib
+- self-hosted compiler/tooling work
+```
 
 Doria should become the language PHP developers might choose if PHP were designed today for:
 
@@ -51,9 +69,14 @@ Doria should become the language PHP developers might choose if PHP were designe
 - async and concurrency
 - native compilation
 - standalone deployment
+- FFI/native library integration
 ```
 
-The first implementation should grow in small, tested compiler slices. Avoid rushing into a full language runtime, async runtime, borrow checker, or native backend before the frontend and semantic model are solid.
+The project should grow in small, tested compiler slices. Avoid rushing into a full language runtime, async runtime, borrow checker, game engine, raylib bindings, or native backend before the frontend and semantic model are solid.
+
+A useful slogan:
+
+> Doria keeps PHP's readability, but adds compiler-enforced safety and native compilation.
 
 ---
 
@@ -71,14 +94,11 @@ Doria should follow these principles:
 7. Types are real compiler-checked types, not comments.
 8. Generics are first-class.
 9. Async/concurrency should be built into the language eventually.
-10. The compiler architecture must be backend-independent.
-11. Native code generation is the primary long-term direction.
-12. PHP output is only one backend.
+10. Native code generation is the primary long-term direction.
+11. PHP output is only one backend.
+12. Native desktop/game/FFI use cases should influence runtime and ABI design.
+13. Self-hosting should influence compiler architecture.
 ```
-
-A useful slogan:
-
-> Doria keeps PHP's readability, but adds compiler-enforced safety and native compilation.
 
 ---
 
@@ -110,7 +130,7 @@ Bare assignment is only assignment to an existing writable variable.
 
 ### 4.2 Readonly by default
 
-Doria uses **Option B** from earlier design discussion:
+Doria uses this rule:
 
 ```text
 Everything is readonly unless explicitly marked writable.
@@ -174,18 +194,63 @@ Assignment requires two permissions:
 2. The property itself must be writable, unless being initialized through constructor init access.
 ```
 
-Example:
+---
+
+### 4.4 Class-level mutability ergonomics
+
+Users may find repeated `writable` tedious for mutable data models. The preferred solution is to preserve readonly-by-default as the language default, but add explicit class-level opt-ins.
+
+Planned direction:
 
 ```php
-let writable $person = new Person("p1", "Andrew");
-
-$person->name = "Lucy"; // ok if name is writable
-$person->id = "p2";     // error if id is readonly
+writable class Person
+{
+    public string $name;
+    public int $age;
+}
 ```
+
+Meaning:
+
+```text
+Properties in this class are writable by default.
+```
+
+`writable class` should affect properties only. It should not make every method a writable method. Mutating methods should still say:
+
+```php
+public writable function rename(string $name): void
+{
+    $this->name = $name;
+}
+```
+
+Allow readonly overrides inside writable classes:
+
+```php
+writable class User
+{
+    public readonly int $id;
+    public string $name;
+    public string $email;
+}
+```
+
+Also support explicit immutable value objects:
+
+```php
+readonly class Money
+{
+    public int $amount;
+    public string $currency;
+}
+```
+
+Do not add `var`, `mut`, `rw`, or other shorter aliases yet. Keep `writable` as the canonical keyword and add class-level/property-group ergonomics first.
 
 ---
 
-### 4.4 Parameters are readonly by default
+### 4.5 Parameters are readonly by default
 
 Readonly parameter:
 
@@ -208,7 +273,7 @@ function rename(writable Person $person, string $name): void
 
 ---
 
-### 4.5 Methods receive readonly `$this` by default
+### 4.6 Methods receive readonly `$this` by default
 
 A normal method cannot mutate `$this`:
 
@@ -252,9 +317,33 @@ $person->rename("Lucy"); // ok
 
 ---
 
-### 4.6 Constructor init access
+### 4.7 References
 
-This is an important pending language rule.
+Doria should support references/borrows, but they should be explicit, typed, and borrow-checker-aware rather than a direct copy of PHP's dynamic reference aliasing.
+
+Possible direction:
+
+```php
+function increment(writable int &$count): void
+{
+    $count += 1;
+}
+
+let writable $count = 0;
+increment(&$count);
+```
+
+Migration hard case wording should be:
+
+```text
+PHP-style dynamic reference aliasing with `&`, especially assignment-by-reference, foreach-by-reference, return-by-reference, and dynamic reference patterns.
+```
+
+Do not describe Doria as dropping references.
+
+---
+
+### 4.8 Constructor init access
 
 Constructors should get **init access**, not full writable `$this` by default.
 
@@ -290,17 +379,9 @@ public function __construct(string $id)
 }
 ```
 
-Outside construction, assigning readonly properties remains invalid:
-
-```php
-$person->id = "other"; // error
-```
-
-This rule is documented but not fully implemented yet.
-
 ---
 
-### 4.7 Collection names
+### 4.9 Collection names
 
 Use clear collection aliases:
 
@@ -312,77 +393,63 @@ Set<string>               // unique strings
 
 Do **not** use `Vec`.
 
-For early PHP output, these may lower to PHP arrays, but the Doria type checker should keep them distinct.
-
 ---
 
-## 5. Example Doria code
+## 5. Executable property initializers and attributes
+
+Doria should support object construction in instance property initializers:
 
 ```php
-class Person
+class Office
 {
-    protected Dictionary<string, int> $items = [
-        "apples" => 5,
-        "oranges" => 10,
-    ];
-
-    public function __construct(
-        public writable string $name,
-        public int $age = 10,
-    ) {
-    }
-
-    public function greet(): void
-    {
-        echo $this->getGreetingMessage();
-    }
-
-    public function displayInventory(): void
-    {
-        foreach ($this->items as string $name => int $quantity) {
-            echo sprintf("%-20s %d\n", "{$name}:", $quantity);
-        }
-    }
-
-    public writable function rename(string $name): void
-    {
-        $this->name = $name;
-    }
-
-    private function getGreetingMessage(): string
-    {
-        return "Hello, my name is {$this->name} and I am {$this->age} years old!";
-    }
+    public Person $manager = new Person();
 }
-
-let writable $person = new Person("Andrew Masiye", 37);
-
-$person->greet();
-echo "\n---\n";
-$person->displayInventory();
-
-$person->rename("Lucy");
-echo "\n---\n";
-$person->greet();
 ```
 
-Expected output:
+Semantics:
 
 ```text
-Hello, my name is Andrew Masiye and I am 37 years old!
----
-apples:              5
-oranges:             10
+- Instance property initializers run once per object construction.
+- Each object gets its own initialized value.
+- A property initializer counts as initialization for readonly properties.
+- PHP backend limitations must not define Doria semantics.
+```
 
----
-Hello, my name is Lucy and I am 37 years old!
+Doria should also support richer attribute/metadata expressions than PHP:
+
+```doria
+#[Module(
+    imports: [
+        ORMModule::forRoot(
+            type: "mysql",
+            host: "localhost",
+            port: 3306,
+            username: "root",
+            password: "root",
+            database: "test",
+            entities: [],
+            synchronize: true,
+        )
+    ]
+)]
+class PostsModule
+{
+}
+```
+
+Attribute expression evaluation policy is not settled yet. Doria should avoid blindly executing arbitrary side-effecting code at compile time.
+
+See:
+
+```text
+docs/executable-initializers-and-attributes.md
 ```
 
 ---
 
 ## 6. Compiler architecture
 
-The target architecture is:
+Target architecture:
 
 ```text
 Doria source
@@ -406,8 +473,6 @@ HIR = checked, backend-neutral, but still relatively source-shaped.
 MIR = future control-flow-oriented representation for borrow/lifetime analysis and native lowering.
 ```
 
-Current HIR is intentionally close to AST. Do not pretend it is the final backend IR.
-
 Long-term backend model:
 
 ```text
@@ -421,7 +486,184 @@ The PHP backend should never decide what the parser, AST, semantic model, HIR, o
 
 ---
 
-## 7. Repository context
+## 7. Self-hosting direction
+
+Self-hosting is an early strategic goal.
+
+Current state:
+
+```text
+doriac is a Rust bootstrap compiler.
+```
+
+Long-term direction:
+
+```text
+Rust doriac
+-> compiles Doria-written doriac
+-> Doria-written doriac compiles itself
+```
+
+Important wording:
+
+```text
+Rust is the bootstrap implementation language.
+Doria should eventually become capable enough to implement significant parts of doriac.
+```
+
+Avoid wording:
+
+```text
+Compiler implementation language: Rust.
+Doria is implemented in Rust forever.
+```
+
+See:
+
+```text
+docs/self-hosting.md
+```
+
+---
+
+## 8. Native desktop, games, and FFI direction
+
+Doria should not be only a server/web language.
+
+Important long-term targets:
+
+```text
+- native desktop apps
+- native GUI tooling
+- game tools
+- game engines
+- graphics programming
+- media applications
+- bindings to C libraries
+- raylib bindings eventually
+```
+
+This means Doria will eventually need serious answers for:
+
+```text
+- FFI to C libraries
+- stable ABI or binding conventions
+- ownership rules across FFI boundaries
+- native string/buffer representation
+- low-level arrays/slices
+- struct layout controls
+- predictable performance
+- explicit allocation strategies
+- cross-platform builds
+- package/build integration for native libraries
+```
+
+Do not implement these immediately, but keep them in mind when designing MIR, runtime, standard library, and native backend.
+
+---
+
+## 9. Performance and benchmarking direction
+
+Doria's long-term performance goal is to be far closer to native compiled languages than to PHP/Python.
+
+Honest expectation for a mature native Doria:
+
+```text
+- usually slower than mature C/C++/Rust on extreme low-level workloads
+- potentially close to Rust/Go/C# NativeAOT territory for many application workloads
+- much faster than PHP/Python for CPU-bound userland code
+- competitive with Java/C#/JavaScript depending on workload, startup, runtime, and JIT effects
+```
+
+Benchmarking should be built into the project culture.
+
+Track:
+
+```text
+- compile time
+- cold startup time
+- hot execution time
+- wall/user/system time
+- peak RSS memory
+- binary size
+- stripped binary size
+- compressed artifact size
+- container image size later
+- correctness hash/output
+```
+
+Likely benchmark cases:
+
+```text
+hello_world
+startup
+fibonacci
+primes
+json_parse
+json_encode
+string_interpolation
+list_dictionary_ops
+object_construction
+method_dispatch
+lexer
+parser
+type_checker
+small_game_loop
+raylib_binding_smoke_test later
+```
+
+Do not make broad performance claims from one benchmark.
+
+---
+
+## 10. PHP interop and migration
+
+Doria should have:
+
+```text
+1. Doria -> PHP backend.
+2. PHP -> Doria migration tooling.
+```
+
+Doria should not promise:
+
+```text
+perfect conversion of all valid PHP into clean, idiomatic Doria.
+```
+
+Recommended framing:
+
+```text
+PHP-to-Doria migration assistant.
+```
+
+Architecture rule:
+
+```text
+Doria parser parses Doria.
+PHP migration tool parses PHP.
+```
+
+Do not make the Doria parser accept all PHP.
+
+Migration tooling should be confidence-based:
+
+```text
+Exact
+Likely
+Partial
+Unsupported
+```
+
+See:
+
+```text
+docs/php-interop-and-migration.md
+```
+
+---
+
+## 11. Current repo context
 
 Repository:
 
@@ -442,31 +684,6 @@ Preferred flow:
 feature/codex-some-task -> PR into develop
 develop -> PR into main
 ```
-
-Recommended branch protection:
-
-```text
-main:
-  - require pull request before merging
-  - require status checks
-  - require branch up to date
-  - require linear history
-  - block force pushes
-  - restrict deletions
-
-
-develop:
-  - require pull request before merging
-  - require status checks
-  - block force pushes
-  - restrict deletions
-```
-
-`develop` can be slightly less strict than `main` while the project is moving quickly.
-
----
-
-## 8. Current repo structure
 
 Current structure is still mostly one compiler crate:
 
@@ -491,26 +708,11 @@ crates/
     tests/
 ```
 
-This is acceptable for early development.
-
-A future split may look like:
-
-```text
-crates/
-  doriac/                 # CLI driver
-  doria_frontend/         # lexer, parser, AST, source, diagnostics
-  doria_semantics/        # symbols, type checker, mutability checker
-  doria_hir/              # high-level checked representation
-  doria_mir/              # control-flow-oriented representation
-  doria_backend_php/      # PHP backend
-  doria_backend_native/   # native backend experiments
-```
-
-Do not force this split too early, but keep code boundaries clean enough that the split remains easy.
+This is acceptable for early development. Keep boundaries clean enough for a future split.
 
 ---
 
-## 9. Current implemented behavior
+## 12. Current implemented behavior
 
 The current compiler vertical slice should support:
 
@@ -538,7 +740,7 @@ The compiler is intentionally incomplete.
 
 ---
 
-## 10. Known limitations and design gaps
+## 13. Known limitations and design gaps
 
 Do not assume these are implemented yet:
 
@@ -554,6 +756,7 @@ Do not assume these are implemented yet:
 - precedence-aware PHP expression emission
 - nullable types
 - union types
+- references/borrows
 - interfaces
 - traits
 - namespaces
@@ -561,6 +764,10 @@ Do not assume these are implemented yet:
 - borrow checker across tasks
 - real MIR
 - native code generation
+- FFI
+- desktop app support
+- game engine support
+- raylib bindings
 - package manager
 ```
 
@@ -573,11 +780,12 @@ Important known technical concerns:
 4. String interpolation currently risks being PHP-backend-dependent.
 5. Constructor init access needs a proper semantic model.
 6. Parameter shadowing policy needs to be decided and tested.
+7. FFI/native runtime goals should be considered before locking memory representation.
 ```
 
 ---
 
-## 11. Near-term roadmap
+## 14. Near-term roadmap
 
 Prioritize these tasks before adding large language features:
 
@@ -593,13 +801,16 @@ Prioritize these tasks before adding large language features:
 9. Design and implement constructor init access.
 10. Add string interpolation AST independent of PHP behavior.
 11. Add precedence-aware backend expression emission.
-12. Begin MIR design with simple functions and returns.
-13. Add a tiny native backend experiment only after MIR has shape.
+12. Add parser/AST support for attributes and named arguments.
+13. Preserve property initializer expressions in AST/HIR.
+14. Begin MIR design with simple functions and returns.
+15. Add benchmarks structure before making performance claims.
+16. Add a tiny native backend experiment only after MIR has shape.
 ```
 
 ---
 
-## 12. CI expectations
+## 15. CI expectations
 
 Expected CI checks:
 
@@ -623,49 +834,27 @@ pull requests targeting develop
 manual workflow_dispatch
 ```
 
-Use read-only GitHub Actions permissions unless a workflow genuinely needs more.
-
 ---
 
-## 13. Repository governance files
-
-Recommended/expected files:
-
-```text
-LICENSE
-README.md
-SPEC.md
-ROADMAP.md
-CONTRIBUTING.md
-SECURITY.md
-AGENTS.md
-.github/CODEOWNERS
-.github/dependabot.yml
-.github/workflows/ci.yml
-rust-toolchain.toml
-```
-
-The project currently uses the MIT license.
-
----
-
-## 14. Guidance for ChatGPT and Codex
+## 16. Guidance for ChatGPT and Codex
 
 When helping with Doria:
 
 ```text
 - Treat Doria as the language, and `doriac` as the compiler.
 - Do not call Doria a Rust language.
-- Rust is only the implementation language of the compiler.
+- Rust is only the bootstrap implementation language for the current doriac.
+- Remember that self-hosting doriac in Doria is a strategic goal.
 - Do not describe Doria as primarily compiling to PHP.
 - Preserve native compilation as the long-term goal.
+- Keep native desktop, game engine, and C-library binding use cases in mind.
 - Treat PHP output as a compatibility/debugging backend.
+- Treat PHP-to-Doria conversion as migration tooling, not core parsing.
 - Keep compiler changes incremental and tested.
 - Prefer explicit diagnostics over permissive parsing.
 - Do not introduce dependencies without explaining the tradeoff.
-- Update SPEC.md when language behavior changes.
+- Update SPEC.md or design docs when language behavior changes.
 - Update tests when compiler behavior changes.
-- Keep examples small and meaningful.
 ```
 
 When reviewing code:
@@ -677,27 +866,19 @@ When reviewing code:
 4. Check whether errors have useful diagnostics.
 5. Check whether new behavior has tests.
 6. Check whether docs/spec need updating.
-```
-
-When creating Codex prompts:
-
-```text
-- Give one focused task at a time.
-- State the branch target.
-- State non-goals explicitly.
-- Ask for tests.
-- Ask Codex not to add unrelated features.
-- Ask Codex to keep architecture terms precise: AST, HIR, MIR, backend.
+7. Check whether the change accidentally treats Rust as permanent rather than bootstrap.
+8. Check whether native/FFI/desktop/game goals are being prematurely blocked.
 ```
 
 ---
 
-## 15. Useful Codex task template
+## 17. Useful Codex task template
 
 ```text
 You are working on Doria, a PHP-shaped compiled programming language.
-The compiler is `doriac`, implemented in Rust.
+The compiler is `doriac`; the current doriac is a Rust bootstrap compiler, and self-hosting doriac in Doria is a strategic goal.
 Doria's long-term primary target is native machine code and standalone executables.
+Doria should eventually be suitable for native desktop apps, game tooling/engines, and C-library bindings such as raylib.
 The PHP backend is only a compatibility/debugging backend and must not shape core architecture.
 
 Branch target: develop
@@ -718,6 +899,7 @@ Language rules to preserve:
 Architecture rules:
 - Keep parser/AST/HIR/semantics backend-independent.
 - Do not let PHP backend needs leak into the core model.
+- Do not let Rust-specific implementation details define Doria's language model.
 - Current HIR may remain source-shaped.
 - MIR is the future control-flow-oriented lowering target.
 
@@ -726,30 +908,34 @@ Definition of done:
 - cargo clippy passes.
 - cargo test passes.
 - Add or update tests for changed compiler behavior.
-- Update SPEC.md or ROADMAP.md if behavior or priorities change.
+- Update SPEC.md, ROADMAP.md, or design docs if behavior or priorities change.
 
 Non-goals:
 - Do not implement unrelated language features.
-- Do not start native backend work unless this task explicitly asks for it.
+- Do not start native backend, FFI, raylib, game engine, or desktop work unless this task explicitly asks for it.
 - Do not add dependencies without justification.
 ```
 
 ---
 
-## 16. Important design decisions already settled
+## 18. Important design decisions already settled
 
 Settled:
 
 ```text
 - Language name: Doria.
 - Compiler name: doriac.
-- Compiler implementation language: Rust.
+- Current bootstrap implementation language: Rust.
+- Self-hosting doriac in Doria is a strategic goal.
 - Long-term goal: native machine code / standalone executables.
+- Native desktop, game tooling/engines, and C-library bindings are important long-term use cases.
 - PHP backend: side feature only.
+- PHP-to-Doria migration: desirable, but separate from the Doria parser.
 - Variable declaration: must use let or explicit type.
 - Bare assignment never declares.
 - Default mutability: readonly.
 - Mutation keyword: writable.
+- Class-level mutability direction: writable class / readonly class.
 - Collection aliases: List, Dictionary, Set.
 - Avoid Vec.
 - Current IR naming: HIR today, MIR later.
@@ -760,9 +946,14 @@ Not settled / still open:
 
 ```text
 - Exact ownership/borrow checker design.
+- Exact reference/borrow syntax and lifetime rules.
 - Exact async runtime model.
 - Native backend choice: Cranelift, LLVM, or another path.
 - Memory model: GC, reference counting, ownership-first, or hybrid.
+- FFI and ABI design.
+- Desktop app packaging strategy.
+- Game engine architecture.
+- Raylib binding design.
 - String interpolation semantics.
 - Nullable and union type syntax details.
 - Package manager strategy.
@@ -772,7 +963,7 @@ Not settled / still open:
 
 ---
 
-## 17. Tone and product direction
+## 19. Tone and product direction
 
 The project should feel ambitious but practical.
 
@@ -780,15 +971,18 @@ Good phrasing:
 
 ```text
 Doria is PHP-shaped, but not PHP++.
+Doria starts with a Rust bootstrap compiler and should grow toward self-hosting.
 Doria borrows safety ideas from Rust without forcing Rust vocabulary onto PHP developers.
 Doria should make mutation visible without making normal code ugly.
 Doria should compile to native executables eventually.
+Doria should support places where PHP-like ergonomics are useful but PHP itself is the wrong runtime.
 ```
 
 Avoid phrasing like:
 
 ```text
 Doria is a Rust compiler.
+Doria is implemented in Rust forever.
 Doria is a PHP transpiler.
 Doria is PHP with generics.
 Doria should be understandable by a PHP interpreter.
@@ -802,7 +996,7 @@ Doria code should be familiar to PHP developers, and existing PHP should be easy
 
 ---
 
-## 18. Review checklist for future branches
+## 20. Review checklist for future branches
 
 Before merging a branch:
 
@@ -811,6 +1005,7 @@ Before merging a branch:
 - Are tests added for new behavior?
 - Does the change preserve readonly-by-default semantics?
 - Does the change avoid PHP-specific assumptions in frontend/semantics/HIR?
+- Does the change avoid treating Rust as the permanent compiler identity?
 - Are diagnostics clear and stable?
 - Does SPEC.md need updating?
 - Does ROADMAP.md need updating?
@@ -824,41 +1019,12 @@ For compiler changes, prefer smaller PRs:
 ```text
 Good: "Add unknown method diagnostics"
 Good: "Add return type checking"
-Bad: "Add native backend, async, generics, and refactor parser"
+Bad: "Add native backend, async, generics, raylib bindings, and refactor parser"
 ```
 
 ---
 
-## 19. Current mental model for borrow checking
-
-The borrow checker is a future feature. The current readonly/writable model is the foundation.
-
-Conceptual model:
-
-```text
-readonly = safe to read/share
-writable = allowed to change, but must not be shared unsafely
-```
-
-Future async example:
-
-```php
-let writable $person = new Person("Andrew", 37);
-
-let $task = spawn sendWelcomeEmail($person);
-
-$person->name = "Lucy"; // future error until task is awaited
-
-await $task;
-```
-
-The compiler should eventually prevent writing to values that are borrowed or in use elsewhere, especially across async/concurrent tasks.
-
-Do not implement this yet unless explicitly requested.
-
----
-
-## 20. Native backend direction
+## 21. Native backend direction
 
 Native code generation is the primary long-term target, but it should wait until MIR and semantic types are better defined.
 
@@ -880,7 +1046,9 @@ Recommended order:
 5. Tiny native function experiment.
 6. Native printing/runtime model.
 7. Objects, strings, collections.
-8. Async/concurrency.
+8. FFI foundations.
+9. Desktop/game/raylib experiments.
+10. Async/concurrency.
 ```
 
 Do not jump directly from source-shaped HIR to a complex native backend.
