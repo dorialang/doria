@@ -1,0 +1,9 @@
+class Person
+{
+    public writable string $name;
+
+    public function rename(string $name): void
+    {
+        $this->name = $name;
+    }
+}

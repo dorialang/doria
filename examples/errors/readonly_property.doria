@@ -1,0 +1,7 @@
+class Person
+{
+    public string $name;
+}
+
+let writable $person = new Person();
+$person->name = "Lucy";

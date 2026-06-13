@@ -1,0 +1,16 @@
+let $name = "Andrew";
+let writable $count = 0;
+
+string $city = "Lusaka";
+writable int $score = 1;
+
+List<int> $numbers = [1, 2, 3];
+Dictionary<string, int> $items = [
+    "apples" => 5,
+    "oranges" => 10,
+];
+
+$count += 1;
+$score = $score + 1;
+
+echo "{$name} in {$city}\n";

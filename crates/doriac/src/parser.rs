@@ -1,0 +1,846 @@
+use crate::ast::*;
+use crate::diagnostics::{Diagnostic, DiagnosticResult};
+use crate::lexer::{Token, TokenKind};
+use crate::source::Span;
+use crate::types::TypeRef;
+
+pub struct Parser {
+    tokens: Vec<Token>,
+    current: usize,
+    diagnostics: Vec<Diagnostic>,
+}
+
+impl Parser {
+    pub fn new(tokens: Vec<Token>) -> Self {
+        Self {
+            tokens,
+            current: 0,
+            diagnostics: Vec::new(),
+        }
+    }
+
+    pub fn parse_program(mut self) -> DiagnosticResult<Program> {
+        let mut items = Vec::new();
+
+        while !self.is_at_end() {
+            match self.parse_item() {
+                Some(item) => items.push(item),
+                None => self.synchronize(),
+            }
+        }
+
+        if self.diagnostics.is_empty() {
+            Ok(Program { items })
+        } else {
+            Err(self.diagnostics)
+        }
+    }
+
+    fn parse_item(&mut self) -> Option<Item> {
+        if self.match_kind(&TokenKind::Class) {
+            self.parse_class().map(Item::Class)
+        } else if self.match_kind(&TokenKind::Function) {
+            self.parse_function(None, false, self.previous().span)
+                .map(Item::Function)
+        } else {
+            self.parse_statement().map(Item::Statement)
+        }
+    }
+
+    fn parse_class(&mut self) -> Option<ClassDecl> {
+        let start = self.previous().span.start;
+        let name = self.expect_identifier("expected class name")?;
+        self.expect(TokenKind::LeftBrace, "expected `{` after class name")?;
+
+        let mut members = Vec::new();
+        while !self.check(&TokenKind::RightBrace) && !self.is_at_end() {
+            if let Some(member) = self.parse_class_member() {
+                members.push(member);
+            } else {
+                self.synchronize();
+            }
+        }
+
+        let end = self
+            .expect(TokenKind::RightBrace, "expected `}` after class body")?
+            .span
+            .end;
+
+        Some(ClassDecl {
+            name,
+            members,
+            span: Span::new(start, end),
+        })
+    }
+
+    fn parse_class_member(&mut self) -> Option<ClassMember> {
+        let visibility = self.parse_visibility().unwrap_or(Visibility::Public);
+        self.match_kind(&TokenKind::Static);
+
+        let writable = self.match_kind(&TokenKind::Writable);
+        if self.match_kind(&TokenKind::Function) {
+            let start = self.previous().span.start;
+            return self
+                .parse_function(Some(visibility), writable, Span::new(start, start))
+                .map(ClassMember::Method);
+        }
+
+        let start = self.previous().span.start;
+        let ty = self.parse_type_ref()?;
+        let (name, name_span) = self.expect_variable("expected property variable name")?;
+        let initializer = if self.match_kind(&TokenKind::Equals) {
+            Some(self.parse_expression()?)
+        } else {
+            None
+        };
+        let end = self
+            .expect(
+                TokenKind::Semicolon,
+                "expected `;` after property declaration",
+            )?
+            .span
+            .end;
+
+        Some(ClassMember::Property(PropertyDecl {
+            visibility,
+            writable,
+            ty,
+            name,
+            initializer,
+            span: Span::new(start.min(name_span.start), end),
+        }))
+    }
+
+    fn parse_function(
+        &mut self,
+        visibility: Option<Visibility>,
+        writable_this: bool,
+        start_span: Span,
+    ) -> Option<FunctionDecl> {
+        let start = start_span.start;
+        let name = self.expect_identifier("expected function name")?;
+        self.expect(TokenKind::LeftParen, "expected `(` after function name")?;
+
+        let mut params = Vec::new();
+        if !self.check(&TokenKind::RightParen) {
+            loop {
+                params.push(self.parse_param()?);
+                if !self.match_kind(&TokenKind::Comma) {
+                    break;
+                }
+                if self.check(&TokenKind::RightParen) {
+                    break;
+                }
+            }
+        }
+
+        self.expect(TokenKind::RightParen, "expected `)` after parameters")?;
+
+        let return_type = if self.match_kind(&TokenKind::Colon) {
+            Some(self.parse_type_ref()?)
+        } else {
+            None
+        };
+
+        let body = self.parse_block()?;
+        let span = Span::new(start, body.span.end);
+        Some(FunctionDecl {
+            visibility,
+            writable_this,
+            name,
+            params,
+            return_type,
+            body,
+            span,
+        })
+    }
+
+    fn parse_param(&mut self) -> Option<Param> {
+        let start = self.peek().span.start;
+        let promoted_visibility = self.parse_visibility();
+        let writable = self.match_kind(&TokenKind::Writable);
+        let ty = self.parse_type_ref()?;
+        let (name, name_span) = self.expect_variable("expected parameter variable name")?;
+        let default = if self.match_kind(&TokenKind::Equals) {
+            Some(self.parse_expression()?)
+        } else {
+            None
+        };
+
+        let end = default.as_ref().map(Expr::span).unwrap_or(name_span).end;
+
+        Some(Param {
+            promoted_visibility,
+            writable,
+            ty,
+            name,
+            default,
+            span: Span::new(start, end),
+        })
+    }
+
+    fn parse_block(&mut self) -> Option<Block> {
+        let start = self
+            .expect(TokenKind::LeftBrace, "expected `{` before block")?
+            .span
+            .start;
+        let mut statements = Vec::new();
+
+        while !self.check(&TokenKind::RightBrace) && !self.is_at_end() {
+            if let Some(statement) = self.parse_statement() {
+                statements.push(statement);
+            } else {
+                self.synchronize();
+            }
+        }
+
+        let end = self
+            .expect(TokenKind::RightBrace, "expected `}` after block")?
+            .span
+            .end;
+
+        Some(Block {
+            statements,
+            span: Span::new(start, end),
+        })
+    }
+
+    fn parse_statement(&mut self) -> Option<Stmt> {
+        if self.match_kind(&TokenKind::Let) {
+            return self.parse_let_decl();
+        }
+
+        if self.match_kind(&TokenKind::Echo) {
+            let start = self.previous().span.start;
+            let expr = self.parse_expression()?;
+            let end = self
+                .expect(TokenKind::Semicolon, "expected `;` after echo statement")?
+                .span
+                .end;
+            return Some(Stmt::Echo {
+                expr,
+                span: Span::new(start, end),
+            });
+        }
+
+        if self.match_kind(&TokenKind::Return) {
+            let start = self.previous().span.start;
+            let expr = if self.check(&TokenKind::Semicolon) {
+                None
+            } else {
+                Some(self.parse_expression()?)
+            };
+            let end = self
+                .expect(TokenKind::Semicolon, "expected `;` after return statement")?
+                .span
+                .end;
+            return Some(Stmt::Return {
+                expr,
+                span: Span::new(start, end),
+            });
+        }
+
+        if self.match_kind(&TokenKind::Foreach) {
+            return self.parse_foreach();
+        }
+
+        if self.can_start_typed_decl() {
+            let checkpoint = self.current;
+            let start = self.peek().span.start;
+            let writable = self.match_kind(&TokenKind::Writable);
+            if let Some(ty) = self.parse_type_ref() {
+                if let Some((name, _name_span)) = self.consume_variable() {
+                    self.expect(TokenKind::Equals, "expected `=` in variable declaration")?;
+                    let initializer = self.parse_expression()?;
+                    let end = self
+                        .expect(
+                            TokenKind::Semicolon,
+                            "expected `;` after variable declaration",
+                        )?
+                        .span
+                        .end;
+                    return Some(Stmt::VarDecl(VarDecl {
+                        writable,
+                        ty: Some(ty),
+                        name,
+                        initializer,
+                        span: Span::new(start, end),
+                    }));
+                }
+            }
+            self.current = checkpoint;
+        }
+
+        let expr = self.parse_expression()?;
+        if let Some(op) = self.parse_assignment_op() {
+            let start = expr.span().start;
+            let value = self.parse_expression()?;
+            let end = self
+                .expect(TokenKind::Semicolon, "expected `;` after assignment")?
+                .span
+                .end;
+            return Some(Stmt::Assignment(Assignment {
+                target: expr,
+                op,
+                value,
+                span: Span::new(start, end),
+            }));
+        }
+
+        let end = self
+            .expect(
+                TokenKind::Semicolon,
+                "expected `;` after expression statement",
+            )?
+            .span
+            .end;
+        Some(Stmt::Expr {
+            span: Span::new(expr.span().start, end),
+            expr,
+        })
+    }
+
+    fn parse_let_decl(&mut self) -> Option<Stmt> {
+        let start = self.previous().span.start;
+        let writable = self.match_kind(&TokenKind::Writable);
+        let (name, _span) = self.expect_variable("expected variable name after `let`")?;
+        self.expect(TokenKind::Equals, "expected `=` in let declaration")?;
+        let initializer = self.parse_expression()?;
+        let end = self
+            .expect(TokenKind::Semicolon, "expected `;` after let declaration")?
+            .span
+            .end;
+
+        Some(Stmt::VarDecl(VarDecl {
+            writable,
+            ty: None,
+            name,
+            initializer,
+            span: Span::new(start, end),
+        }))
+    }
+
+    fn parse_foreach(&mut self) -> Option<Stmt> {
+        let start = self.previous().span.start;
+        self.expect(TokenKind::LeftParen, "expected `(` after foreach")?;
+        let iterable = self.parse_expression()?;
+        self.expect(TokenKind::As, "expected `as` in foreach")?;
+        let first = self.parse_foreach_binding()?;
+        let (key, value) = if self.match_kind(&TokenKind::FatArrow) {
+            let value = self.parse_foreach_binding()?;
+            (Some(first), value)
+        } else {
+            (None, first)
+        };
+        self.expect(TokenKind::RightParen, "expected `)` after foreach bindings")?;
+        let body = self.parse_block()?;
+        let span = Span::new(start, body.span.end);
+        Some(Stmt::Foreach(ForeachStmt {
+            iterable,
+            key,
+            value,
+            body,
+            span,
+        }))
+    }
+
+    fn parse_foreach_binding(&mut self) -> Option<ForeachBinding> {
+        if let Some((name, _span)) = self.consume_variable() {
+            return Some(ForeachBinding { ty: None, name });
+        }
+
+        let ty = self.parse_type_ref()?;
+        let (name, _span) = self.expect_variable("expected foreach binding variable")?;
+        Some(ForeachBinding { ty: Some(ty), name })
+    }
+
+    fn parse_expression(&mut self) -> Option<Expr> {
+        self.parse_binary(1)
+    }
+
+    fn parse_binary(&mut self, min_prec: u8) -> Option<Expr> {
+        let mut left = self.parse_postfix()?;
+
+        while let Some((op, prec)) = self.current_binary_op() {
+            if prec < min_prec {
+                break;
+            }
+            self.advance();
+            let right = self.parse_binary(prec + 1)?;
+            let span = left.span().merge(right.span());
+            left = Expr::Binary {
+                left: Box::new(left),
+                op,
+                right: Box::new(right),
+                span,
+            };
+        }
+
+        Some(left)
+    }
+
+    fn parse_postfix(&mut self) -> Option<Expr> {
+        let mut expr = self.parse_primary()?;
+
+        loop {
+            if self.match_kind(&TokenKind::Arrow) {
+                let property =
+                    self.expect_identifier("expected property or method name after `->`")?;
+                if self.match_kind(&TokenKind::LeftParen) {
+                    let args = self.parse_argument_list_after_open()?;
+                    let span = expr.span().merge(self.previous().span);
+                    expr = Expr::MethodCall {
+                        object: Box::new(expr),
+                        method: property,
+                        args,
+                        span,
+                    };
+                } else {
+                    let span = expr.span().merge(self.previous().span);
+                    expr = Expr::PropertyAccess {
+                        object: Box::new(expr),
+                        property,
+                        span,
+                    };
+                }
+                continue;
+            }
+
+            if self.match_kind(&TokenKind::LeftParen) {
+                let args = self.parse_argument_list_after_open()?;
+                match expr {
+                    Expr::Identifier { name, span } => {
+                        let end = self.previous().span.end;
+                        expr = Expr::FunctionCall {
+                            name,
+                            args,
+                            span: Span::new(span.start, end),
+                        };
+                    }
+                    _ => {
+                        self.error(
+                            "only named function calls are supported in this position",
+                            expr.span(),
+                        );
+                    }
+                }
+                continue;
+            }
+
+            break;
+        }
+
+        Some(expr)
+    }
+
+    fn parse_primary(&mut self) -> Option<Expr> {
+        let token = self.advance().clone();
+        match token.kind {
+            TokenKind::Variable(name) => {
+                if name == "this" {
+                    Some(Expr::This { span: token.span })
+                } else {
+                    Some(Expr::Variable {
+                        name,
+                        span: token.span,
+                    })
+                }
+            }
+            TokenKind::Identifier(name) => {
+                if self.match_kind(&TokenKind::DoubleColon) {
+                    let method = self.expect_identifier("expected method name after `::`")?;
+                    self.expect(
+                        TokenKind::LeftParen,
+                        "expected `(` after static method name",
+                    )?;
+                    let args = self.parse_argument_list_after_open()?;
+                    let span = Span::new(token.span.start, self.previous().span.end);
+                    Some(Expr::StaticCall {
+                        class_name: name,
+                        method,
+                        args,
+                        span,
+                    })
+                } else {
+                    Some(Expr::Identifier {
+                        name,
+                        span: token.span,
+                    })
+                }
+            }
+            TokenKind::StringLiteral(value) => Some(Expr::String {
+                value,
+                span: token.span,
+            }),
+            TokenKind::IntLiteral(value) => Some(Expr::Int {
+                value,
+                span: token.span,
+            }),
+            TokenKind::FloatLiteral(value) => Some(Expr::Float {
+                value,
+                span: token.span,
+            }),
+            TokenKind::True => Some(Expr::Bool {
+                value: true,
+                span: token.span,
+            }),
+            TokenKind::False => Some(Expr::Bool {
+                value: false,
+                span: token.span,
+            }),
+            TokenKind::Null => Some(Expr::Null { span: token.span }),
+            TokenKind::New => self.parse_new(token.span.start),
+            TokenKind::LeftBracket => self.parse_array(token.span.start),
+            TokenKind::LeftParen => {
+                let expr = self.parse_expression()?;
+                self.expect(TokenKind::RightParen, "expected `)` after expression")?;
+                Some(expr)
+            }
+            _ => {
+                self.error("expected expression", token.span);
+                None
+            }
+        }
+    }
+
+    fn parse_new(&mut self, start: usize) -> Option<Expr> {
+        let class_name = self.expect_identifier("expected class name after `new`")?;
+        self.expect(TokenKind::LeftParen, "expected `(` after class name")?;
+        let args = self.parse_argument_list_after_open()?;
+        let span = Span::new(start, self.previous().span.end);
+        Some(Expr::New {
+            class_name,
+            args,
+            span,
+        })
+    }
+
+    fn parse_array(&mut self, start: usize) -> Option<Expr> {
+        let mut elements = Vec::new();
+        if !self.check(&TokenKind::RightBracket) {
+            loop {
+                let first = self.parse_expression()?;
+                if self.match_kind(&TokenKind::FatArrow) {
+                    let value = self.parse_expression()?;
+                    elements.push(ArrayElement {
+                        key: Some(first),
+                        value,
+                    });
+                } else {
+                    elements.push(ArrayElement {
+                        key: None,
+                        value: first,
+                    });
+                }
+
+                if !self.match_kind(&TokenKind::Comma) {
+                    break;
+                }
+                if self.check(&TokenKind::RightBracket) {
+                    break;
+                }
+            }
+        }
+
+        let end = self
+            .expect(TokenKind::RightBracket, "expected `]` after array literal")?
+            .span
+            .end;
+        Some(Expr::Array {
+            elements,
+            span: Span::new(start, end),
+        })
+    }
+
+    fn parse_argument_list_after_open(&mut self) -> Option<Vec<Expr>> {
+        let mut args = Vec::new();
+        if !self.check(&TokenKind::RightParen) {
+            loop {
+                args.push(self.parse_expression()?);
+                if !self.match_kind(&TokenKind::Comma) {
+                    break;
+                }
+                if self.check(&TokenKind::RightParen) {
+                    break;
+                }
+            }
+        }
+        self.expect(TokenKind::RightParen, "expected `)` after arguments")?;
+        Some(args)
+    }
+
+    fn parse_type_ref(&mut self) -> Option<TypeRef> {
+        let name = match self.advance().kind.clone() {
+            TokenKind::Void => "void".to_string(),
+            TokenKind::IntType => "int".to_string(),
+            TokenKind::FloatType => "float".to_string(),
+            TokenKind::StringType => "string".to_string(),
+            TokenKind::BoolType => "bool".to_string(),
+            TokenKind::ArrayType => "array".to_string(),
+            TokenKind::Identifier(name) => name,
+            other => {
+                self.error(
+                    format!("expected type name, found `{}`", token_name(&other)),
+                    self.previous().span,
+                );
+                return None;
+            }
+        };
+
+        let mut args = Vec::new();
+        if self.match_kind(&TokenKind::Less) {
+            loop {
+                args.push(self.parse_type_ref()?);
+                if !self.match_kind(&TokenKind::Comma) {
+                    break;
+                }
+            }
+            self.expect(
+                TokenKind::Greater,
+                "expected `>` after generic type arguments",
+            )?;
+        }
+
+        Some(if args.is_empty() {
+            TypeRef::named(name)
+        } else {
+            TypeRef::generic(name, args)
+        })
+    }
+
+    fn parse_visibility(&mut self) -> Option<Visibility> {
+        if self.match_kind(&TokenKind::Public) {
+            Some(Visibility::Public)
+        } else if self.match_kind(&TokenKind::Protected) {
+            Some(Visibility::Protected)
+        } else if self.match_kind(&TokenKind::Private) {
+            Some(Visibility::Private)
+        } else {
+            None
+        }
+    }
+
+    fn parse_assignment_op(&mut self) -> Option<AssignOp> {
+        if self.match_kind(&TokenKind::Equals) {
+            Some(AssignOp::Assign)
+        } else if self.match_kind(&TokenKind::PlusEquals) {
+            Some(AssignOp::AddAssign)
+        } else if self.match_kind(&TokenKind::MinusEquals) {
+            Some(AssignOp::SubAssign)
+        } else {
+            None
+        }
+    }
+
+    fn current_binary_op(&self) -> Option<(BinaryOp, u8)> {
+        match self.peek().kind {
+            TokenKind::OrOr => Some((BinaryOp::Or, 1)),
+            TokenKind::AndAnd => Some((BinaryOp::And, 2)),
+            TokenKind::QuestionQuestion => Some((BinaryOp::Coalesce, 3)),
+            TokenKind::EqualEqual => Some((BinaryOp::Equal, 4)),
+            TokenKind::EqualEqualEqual => Some((BinaryOp::StrictEqual, 4)),
+            TokenKind::BangEqual => Some((BinaryOp::NotEqual, 4)),
+            TokenKind::BangEqualEqual => Some((BinaryOp::NotStrictEqual, 4)),
+            TokenKind::Less => Some((BinaryOp::Less, 5)),
+            TokenKind::LessEqual => Some((BinaryOp::LessEqual, 5)),
+            TokenKind::Greater => Some((BinaryOp::Greater, 5)),
+            TokenKind::GreaterEqual => Some((BinaryOp::GreaterEqual, 5)),
+            TokenKind::Plus => Some((BinaryOp::Add, 6)),
+            TokenKind::Minus => Some((BinaryOp::Sub, 6)),
+            TokenKind::Dot => Some((BinaryOp::Concat, 6)),
+            TokenKind::Star => Some((BinaryOp::Mul, 7)),
+            TokenKind::Slash => Some((BinaryOp::Div, 7)),
+            TokenKind::Percent => Some((BinaryOp::Mod, 7)),
+            _ => None,
+        }
+    }
+
+    fn can_start_typed_decl(&self) -> bool {
+        matches!(
+            self.peek().kind,
+            TokenKind::Writable
+                | TokenKind::Void
+                | TokenKind::IntType
+                | TokenKind::FloatType
+                | TokenKind::StringType
+                | TokenKind::BoolType
+                | TokenKind::ArrayType
+                | TokenKind::Identifier(_)
+        )
+    }
+
+    fn expect_identifier(&mut self, message: &str) -> Option<String> {
+        let token = self.advance().clone();
+        match token.kind {
+            TokenKind::Identifier(name) => Some(name),
+            _ => {
+                self.error(message, token.span);
+                None
+            }
+        }
+    }
+
+    fn expect_variable(&mut self, message: &str) -> Option<(String, Span)> {
+        self.consume_variable().or_else(|| {
+            self.error(message, self.peek().span);
+            None
+        })
+    }
+
+    fn consume_variable(&mut self) -> Option<(String, Span)> {
+        let token = self.peek().clone();
+        if let TokenKind::Variable(name) = token.kind {
+            self.advance();
+            Some((name, token.span))
+        } else {
+            None
+        }
+    }
+
+    fn expect(&mut self, kind: TokenKind, message: &str) -> Option<Token> {
+        if self.check(&kind) {
+            Some(self.advance().clone())
+        } else {
+            self.error(message, self.peek().span);
+            None
+        }
+    }
+
+    fn match_kind(&mut self, kind: &TokenKind) -> bool {
+        if self.check(kind) {
+            self.advance();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn check(&self, kind: &TokenKind) -> bool {
+        if self.is_at_end() {
+            return matches!(kind, TokenKind::Eof);
+        }
+        std::mem::discriminant(&self.peek().kind) == std::mem::discriminant(kind)
+    }
+
+    fn advance(&mut self) -> &Token {
+        if !self.is_at_end() {
+            self.current += 1;
+        }
+        self.previous()
+    }
+
+    fn is_at_end(&self) -> bool {
+        matches!(self.peek().kind, TokenKind::Eof)
+    }
+
+    fn peek(&self) -> &Token {
+        &self.tokens[self.current]
+    }
+
+    fn previous(&self) -> &Token {
+        &self.tokens[self.current - 1]
+    }
+
+    fn error(&mut self, message: impl Into<String>, span: Span) {
+        self.diagnostics
+            .push(Diagnostic::new("P0001", message, span));
+    }
+
+    fn synchronize(&mut self) {
+        while !self.is_at_end() {
+            if matches!(
+                self.previous().kind,
+                TokenKind::Semicolon | TokenKind::RightBrace
+            ) {
+                return;
+            }
+            match self.peek().kind {
+                TokenKind::Class
+                | TokenKind::Function
+                | TokenKind::Let
+                | TokenKind::Echo
+                | TokenKind::Return
+                | TokenKind::Foreach
+                | TokenKind::Public
+                | TokenKind::Protected
+                | TokenKind::Private => return,
+                _ => {
+                    self.advance();
+                }
+            }
+        }
+    }
+}
+
+fn token_name(kind: &TokenKind) -> &'static str {
+    match kind {
+        TokenKind::Class => "class",
+        TokenKind::Function => "function",
+        TokenKind::Public => "public",
+        TokenKind::Protected => "protected",
+        TokenKind::Private => "private",
+        TokenKind::Static => "static",
+        TokenKind::Let => "let",
+        TokenKind::Writable => "writable",
+        TokenKind::Readonly => "readonly",
+        TokenKind::Return => "return",
+        TokenKind::Echo => "echo",
+        TokenKind::New => "new",
+        TokenKind::Foreach => "foreach",
+        TokenKind::As => "as",
+        TokenKind::If => "if",
+        TokenKind::Else => "else",
+        TokenKind::While => "while",
+        TokenKind::For => "for",
+        TokenKind::True => "true",
+        TokenKind::False => "false",
+        TokenKind::Null => "null",
+        TokenKind::Void => "void",
+        TokenKind::IntType => "int",
+        TokenKind::FloatType => "float",
+        TokenKind::StringType => "string",
+        TokenKind::BoolType => "bool",
+        TokenKind::ArrayType => "array",
+        TokenKind::Reserved(_) => "reserved keyword",
+        TokenKind::Identifier(_) => "identifier",
+        TokenKind::Variable(_) => "variable",
+        TokenKind::IntLiteral(_) => "integer",
+        TokenKind::FloatLiteral(_) => "float",
+        TokenKind::StringLiteral(_) => "string",
+        TokenKind::Equals => "=",
+        TokenKind::Plus => "+",
+        TokenKind::Minus => "-",
+        TokenKind::Star => "*",
+        TokenKind::Slash => "/",
+        TokenKind::Percent => "%",
+        TokenKind::Dot => ".",
+        TokenKind::PlusEquals => "+=",
+        TokenKind::MinusEquals => "-=",
+        TokenKind::EqualEqual => "==",
+        TokenKind::EqualEqualEqual => "===",
+        TokenKind::BangEqual => "!=",
+        TokenKind::BangEqualEqual => "!==",
+        TokenKind::Less => "<",
+        TokenKind::LessEqual => "<=",
+        TokenKind::Greater => ">",
+        TokenKind::GreaterEqual => ">=",
+        TokenKind::AndAnd => "&&",
+        TokenKind::OrOr => "||",
+        TokenKind::Bang => "!",
+        TokenKind::Question => "?",
+        TokenKind::QuestionQuestion => "??",
+        TokenKind::FatArrow => "=>",
+        TokenKind::LeftParen => "(",
+        TokenKind::RightParen => ")",
+        TokenKind::LeftBrace => "{",
+        TokenKind::RightBrace => "}",
+        TokenKind::LeftBracket => "[",
+        TokenKind::RightBracket => "]",
+        TokenKind::Semicolon => ";",
+        TokenKind::Colon => ":",
+        TokenKind::Comma => ",",
+        TokenKind::Arrow => "->",
+        TokenKind::DoubleColon => "::",
+        TokenKind::Eof => "end of file",
+    }
+}

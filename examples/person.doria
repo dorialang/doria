@@ -1,0 +1,45 @@
+class Person
+{
+    protected Dictionary<string, int> $items = [
+        "apples" => 5,
+        "oranges" => 10,
+    ];
+
+    public function __construct(
+        public writable string $name,
+        public int $age = 10,
+    ) {
+    }
+
+    public function greet(): void
+    {
+        echo $this->getGreetingMessage();
+    }
+
+    public function displayInventory(): void
+    {
+        foreach ($this->items as string $name => int $quantity) {
+            echo sprintf("%-20s %d\n", "{$name}:", $quantity);
+        }
+    }
+
+    public writable function rename(string $name): void
+    {
+        $this->name = $name;
+    }
+
+    private function getGreetingMessage(): string
+    {
+        return "Hello, my name is {$this->name} and I am {$this->age} years old!";
+    }
+}
+
+let writable $person = new Person("Andrew Masiye", 37);
+
+$person->greet();
+echo "\n---\n";
+$person->displayInventory();
+
+$person->rename("Lucy");
+echo "\n---\n";
+$person->greet();

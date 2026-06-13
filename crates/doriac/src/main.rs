@@ -1,0 +1,131 @@
+use std::env;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::{Command, ExitCode};
+
+fn main() -> ExitCode {
+    match run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(message) => {
+            eprintln!("{message}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run() -> Result<(), String> {
+    let args = env::args().skip(1).collect::<Vec<_>>();
+    if args.is_empty() || args[0] == "--help" || args[0] == "-h" {
+        print_help();
+        return Ok(());
+    }
+
+    match args[0].as_str() {
+        "check" => {
+            let input = args
+                .get(1)
+                .ok_or_else(|| "missing input file".to_string())?;
+            let (path, text) = read_source(input)?;
+            match doriac::check_source(path.clone(), text.clone()) {
+                Ok(_) => {
+                    println!("OK");
+                    Ok(())
+                }
+                Err(diagnostics) => Err(doriac::render_diagnostics(path, text, &diagnostics)),
+            }
+        }
+        "compile" => compile_command(&args[1..]),
+        "run" => run_command(&args[1..]),
+        command => Err(format!(
+            "unknown command `{command}`\n\nRun `doriac --help`."
+        )),
+    }
+}
+
+fn compile_command(args: &[String]) -> Result<(), String> {
+    let input = args
+        .first()
+        .ok_or_else(|| "missing input file".to_string())?;
+    let mut target = "php".to_string();
+    let mut out = None::<String>;
+    let mut index = 1;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--target" => {
+                target = args
+                    .get(index + 1)
+                    .ok_or_else(|| "missing value for --target".to_string())?
+                    .clone();
+                index += 2;
+            }
+            "--out" => {
+                out = Some(
+                    args.get(index + 1)
+                        .ok_or_else(|| "missing value for --out".to_string())?
+                        .clone(),
+                );
+                index += 2;
+            }
+            flag => return Err(format!("unknown compile option `{flag}`")),
+        }
+    }
+
+    if target != "php" {
+        return Err(format!(
+            "unsupported target `{target}`; only `php` is available"
+        ));
+    }
+
+    let out = out.ok_or_else(|| "missing --out <file>".to_string())?;
+    let (path, text) = read_source(input)?;
+    let php = doriac::compile_source_to_php(path.clone(), text.clone())
+        .map_err(|diagnostics| doriac::render_diagnostics(path, text, &diagnostics))?;
+
+    let out_path = PathBuf::from(out);
+    if let Some(parent) = out_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)
+                .map_err(|error| format!("failed to create output directory: {error}"))?;
+        }
+    }
+    fs::write(&out_path, php).map_err(|error| format!("failed to write output file: {error}"))?;
+    println!("{}", out_path.display());
+    Ok(())
+}
+
+fn run_command(args: &[String]) -> Result<(), String> {
+    let input = args
+        .first()
+        .ok_or_else(|| "missing input file".to_string())?;
+    let (path, text) = read_source(input)?;
+    let php = doriac::compile_source_to_php(path.clone(), text.clone())
+        .map_err(|diagnostics| doriac::render_diagnostics(path, text, &diagnostics))?;
+
+    let temp_path = env::temp_dir().join("doriac-run.php");
+    fs::write(&temp_path, php)
+        .map_err(|error| format!("failed to write temp PHP file: {error}"))?;
+
+    let status = Command::new("php")
+        .arg(&temp_path)
+        .status()
+        .map_err(|error| format!("failed to run `php`: {error}"))?;
+
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("php exited with status {status}"))
+    }
+}
+
+fn read_source(path: impl AsRef<Path>) -> Result<(String, String), String> {
+    let path = path.as_ref();
+    let text = fs::read_to_string(path)
+        .map_err(|error| format!("failed to read `{}`: {error}", path.display()))?;
+    Ok((path.display().to_string(), text))
+}
+
+fn print_help() {
+    println!(
+        "doriac 0.1.0\n\nUSAGE:\n    doriac check <file>\n    doriac compile <file> --target php --out <file>\n    doriac run <file>"
+    );
+}
