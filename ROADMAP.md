@@ -6,12 +6,14 @@
 - Keep PHP as a compatibility, migration, debugging, and transpilation backend only.
 - Move toward **self-hosting**: `doriac` is initially implemented in Rust, but an early language-development goal is to eventually write significant parts of `doriac` in Doria itself.
 - Support Doria language features that PHP cannot express directly, including executable property initializers and richer attribute/metadata expressions.
+- Eventually support PHP-to-Doria migration tooling, while keeping that tooling separate from the Doria parser and core compiler semantics.
 
 ## Current Slice
 
 - Keep the parser and semantic checker small but tested.
 - Treat the current lowered form as HIR, not final IR.
 - Keep PHP as a compatibility backend only.
+- Do not build PHP-to-Doria migration in the current v0.1 slice.
 
 ## Next Compiler Work
 
@@ -25,6 +27,15 @@
 - Add parser/AST support for attributes using `#[...]`.
 - Add shared call argument representation for positional and named arguments.
 - Preserve property initializer expressions in AST/HIR and later lower non-constant initializers correctly.
+
+## PHP Migration Path
+
+- Treat Doria-to-PHP as a backend and PHP-to-Doria as a migration converter. They are separate directions with separate architecture.
+- Do not promise perfect conversion for all valid PHP.
+- Start with simple, typed, modern PHP and produce conservative valid Doria.
+- Prefer diagnostics and TODO comments over unsafe or misleading rewrites for dynamic PHP features.
+- Add a Doria pretty-printer before serious PHP-to-Doria work.
+- Consider a future `doria_migrate_php` crate or `doriac migrate php` command after the Doria AST, semantic types, and formatter are more stable.
 
 ## Self-Hosting Path
 
