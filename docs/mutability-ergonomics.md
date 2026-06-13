@@ -1,0 +1,283 @@
+# Mutability Ergonomics
+
+Doria is readonly by default. This is a core safety feature and should not be abandoned simply because some users find `writable` repetitive.
+
+However, Doria should also be pleasant to write. This document records the planned ergonomic tools for reducing repetition while keeping mutation explicit.
+
+---
+
+## 1. Core rule
+
+The default rule remains:
+
+```text
+Everything is readonly unless explicitly marked writable.
+```
+
+Examples:
+
+```php
+let $x = 5;
+$x = 10; // error
+```
+
+```php
+let writable $x = 5;
+$x = 10; // ok
+```
+
+```php
+class Person
+{
+    public string $id;
+    public writable string $name;
+}
+```
+
+---
+
+## 2. The complaint
+
+Users may say:
+
+```text
+I have to write `writable` too often.
+```
+
+This is especially likely for:
+
+```text
+- DTOs
+- ORM entities
+- form models
+- config objects
+- test fixtures
+- game state objects
+- ECS components
+- editor/tooling data models
+```
+
+The solution is not to make Doria mutable by default. The solution is to provide explicit larger-scope mutability controls.
+
+---
+
+## 3. Planned `writable class`
+
+Doria should support:
+
+```php
+writable class Person
+{
+    public string $name;
+    public int $age;
+}
+```
+
+Meaning:
+
+```text
+Properties in this class are writable by default.
+```
+
+Equivalent to:
+
+```php
+class Person
+{
+    public writable string $name;
+    public writable int $age;
+}
+```
+
+This helps mutable data-heavy classes without making the whole language mutable by default.
+
+---
+
+## 4. `writable class` affects properties only
+
+`writable class` should not make every method a mutating method.
+
+This should still be an error:
+
+```php
+writable class Person
+{
+    public string $name;
+
+    public function rename(string $name): void
+    {
+        $this->name = $name; // error: method is not writable
+    }
+}
+```
+
+The method must still say:
+
+```php
+public writable function rename(string $name): void
+{
+    $this->name = $name;
+}
+```
+
+Reason:
+
+```text
+Property writability answers: can this field be reassigned?
+Method writability answers: can this method mutate `$this`?
+```
+
+Those should remain separate.
+
+---
+
+## 5. Readonly overrides inside writable classes
+
+A writable class should allow readonly exceptions:
+
+```php
+writable class User
+{
+    public readonly int $id;
+    public string $name;
+    public string $email;
+}
+```
+
+Meaning:
+
+```text
+$id is readonly.
+$name and $email are writable by default because the class is writable.
+```
+
+---
+
+## 6. Planned `readonly class`
+
+Doria is already readonly by default, but `readonly class` is still useful as a stronger declaration of intent.
+
+```php
+readonly class Money
+{
+    public int $amount;
+    public string $currency;
+}
+```
+
+Meaning:
+
+```text
+This class is an immutable value object.
+Writable properties should be rejected inside it.
+```
+
+Example error:
+
+```php
+readonly class Money
+{
+    public writable int $amount; // error
+}
+```
+
+---
+
+## 7. Property groups as a later feature
+
+Property groups may later reduce repetition inside a normal class:
+
+```php
+class Person
+{
+    public writable {
+        string $name;
+        int $age;
+        string $email;
+    }
+
+    public string $id;
+}
+```
+
+This is useful, but it should come after simpler class-level mutability.
+
+---
+
+## 8. Shorter keyword alternatives
+
+Possible alternatives were considered:
+
+```text
+mut       too Rust-flavored
+var       possible local-variable sugar later, but not now
+rw        too cryptic
+write     awkward grammar
+mutable   clear, but not shorter than writable in a meaningful way
+```
+
+Decision for now:
+
+```text
+Keep `writable` as the canonical keyword.
+Do not add aliases yet.
+```
+
+The compiler may offer typo help:
+
+```text
+error: unknown keyword `writeable`
+help: did you mean `writable`?
+```
+
+Do not accept both spellings as valid syntax.
+
+---
+
+## 9. Interaction with object bindings
+
+Even if a class is writable, the variable binding still matters.
+
+```php
+writable class Person
+{
+    public string $name;
+}
+
+let $person = new Person();
+$person->name = "Lucy"; // error: binding is readonly
+```
+
+```php
+let writable $person = new Person();
+$person->name = "Lucy"; // ok
+```
+
+This preserves the rule:
+
+```text
+To write through a path, the whole path must permit writing.
+```
+
+---
+
+## 10. Settled direction
+
+Settled:
+
+```text
+- Doria remains readonly by default.
+- `writable` remains the canonical mutation keyword.
+- Add `writable class` to make properties writable by default inside that class.
+- Add `readonly class` to make immutable value-object intent explicit.
+- `writable class` affects properties only, not method `$this` mutability.
+- Do not add `var`, `mut`, `rw`, or other aliases yet.
+```
+
+Open:
+
+```text
+- Exact parser grammar for `writable class` and `readonly class`.
+- Whether property groups are worth adding later.
+- Whether `var` should ever become local-variable sugar.
+```
