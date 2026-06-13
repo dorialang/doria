@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::str::FromStr;
 
-use doriac::backend::BackendTarget;
+use doriac::backend::{BackendOutput, BackendTarget};
 
 fn main() -> ExitCode {
     match run() {
@@ -37,6 +37,8 @@ fn run() -> Result<(), String> {
                 Err(diagnostics) => Err(doriac::render_diagnostics(path, text, &diagnostics)),
             }
         }
+        "ast" => ast_command(&args[1..]),
+        "hir" => hir_command(&args[1..]),
         "compile" => compile_command(&args[1..]),
         "run" => run_command(&args[1..]),
         command => Err(format!(
@@ -49,7 +51,7 @@ fn compile_command(args: &[String]) -> Result<(), String> {
     let input = args
         .first()
         .ok_or_else(|| "missing input file".to_string())?;
-    let mut target = BackendTarget::Php;
+    let mut target = None::<BackendTarget>;
     let mut out = None::<String>;
     let mut index = 1;
     while index < args.len() {
@@ -59,7 +61,7 @@ fn compile_command(args: &[String]) -> Result<(), String> {
                     .get(index + 1)
                     .ok_or_else(|| "missing value for --target".to_string())?
                     .clone();
-                target = BackendTarget::from_str(&target_value)?;
+                target = Some(BackendTarget::from_str(&target_value)?);
                 index += 2;
             }
             "--out" => {
@@ -73,6 +75,11 @@ fn compile_command(args: &[String]) -> Result<(), String> {
             flag => return Err(format!("unknown compile option `{flag}`")),
         }
     }
+
+    let target = target.ok_or_else(|| {
+        "missing --target <target>; use `--target php` for the currently implemented backend"
+            .to_string()
+    })?;
 
     if !target.is_available() {
         return Err(format!(
@@ -88,16 +95,52 @@ fn compile_command(args: &[String]) -> Result<(), String> {
         .map_err(|diagnostics| doriac::render_diagnostics(path, text, &diagnostics))?;
 
     let out_path = PathBuf::from(out);
+    write_backend_output(&out_path, output)?;
+    println!("{}", out_path.display());
+    Ok(())
+}
+
+fn ast_command(args: &[String]) -> Result<(), String> {
+    let input = args
+        .first()
+        .ok_or_else(|| "missing input file".to_string())?;
+    let (path, text) = read_source(input)?;
+    let ast = doriac::parse_source(path.clone(), text.clone())
+        .map_err(|diagnostics| doriac::render_diagnostics(path, text, &diagnostics))?;
+    println!("{ast:#?}");
+    Ok(())
+}
+
+fn hir_command(args: &[String]) -> Result<(), String> {
+    let input = args
+        .first()
+        .ok_or_else(|| "missing input file".to_string())?;
+    let (path, text) = read_source(input)?;
+    let hir = doriac::lower_source(path.clone(), text.clone())
+        .map_err(|diagnostics| doriac::render_diagnostics(path, text, &diagnostics))?;
+    println!("{hir:#?}");
+    Ok(())
+}
+
+fn write_backend_output(out_path: &Path, output: BackendOutput) -> Result<(), String> {
     if let Some(parent) = out_path.parent() {
         if !parent.as_os_str().is_empty() {
             fs::create_dir_all(parent)
                 .map_err(|error| format!("failed to create output directory: {error}"))?;
         }
     }
-    fs::write(&out_path, output)
-        .map_err(|error| format!("failed to write output file: {error}"))?;
-    println!("{}", out_path.display());
-    Ok(())
+
+    match output {
+        BackendOutput::Text { contents, .. } => fs::write(out_path, contents)
+            .map_err(|error| format!("failed to write output file: {error}")),
+        BackendOutput::Binary { bytes, .. } => fs::write(out_path, bytes)
+            .map_err(|error| format!("failed to write output file: {error}")),
+        BackendOutput::Artifact { path } => {
+            fs::copy(&path, out_path)
+                .map_err(|error| format!("failed to copy backend artifact: {error}"))?;
+            Ok(())
+        }
+    }
 }
 
 fn run_command(args: &[String]) -> Result<(), String> {
@@ -133,6 +176,6 @@ fn read_source(path: impl AsRef<Path>) -> Result<(String, String), String> {
 
 fn print_help() {
     println!(
-        "doriac 0.1.0\n\nUSAGE:\n    doriac check <file>\n    doriac compile <file> --target php --out <file>\n    doriac run <file>"
+        "doriac 0.1.0\n\nUSAGE:\n    doriac check <file>\n    doriac ast <file>\n    doriac hir <file>\n    doriac compile <file> --target <target> --out <file>\n    doriac run <file>\n\nTARGETS:\n    php       available compatibility backend\n    native    planned primary backend\n    debug     planned interpreter/debug backend\n    wasm      planned WebAssembly backend"
     );
 }

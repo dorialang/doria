@@ -13,7 +13,8 @@ Doria source
 -> type checker
 -> readonly/writable checker
 -> borrow/lifetime analysis later
--> Doria IR
+-> HIR today
+-> MIR later
 -> backend
 ```
 
@@ -27,7 +28,7 @@ This repository contains the first working vertical slice of `doriac`:
 - Parses a small subset of declarations, classes, functions, statements, and expressions.
 - Builds an AST.
 - Checks undeclared assignment and readonly/writable mutation rules for locals, properties, `$this`, and writable methods.
-- Lowers the checked AST to a small backend-independent Doria IR.
+- Lowers the checked AST to a small backend-neutral HIR. MIR is planned for native-oriented lowering.
 - Emits PHP for supported syntax through the PHP backend.
 - Provides CLI commands and integration tests.
 
@@ -39,6 +40,7 @@ It is intentionally not a complete language yet. The implementation should grow 
 cargo test
 cargo run -p doriac -- --help
 cargo run -p doriac -- check examples/hello.doria
+cargo run -p doriac -- hir examples/hello.doria
 cargo run -p doriac -- compile examples/person.doria --target php --out build/person.php
 php build/person.php
 ```
@@ -47,9 +49,13 @@ php build/person.php
 
 ```bash
 doriac check <file>
-doriac compile <file> --target php --out <file>
+doriac ast <file>
+doriac hir <file>
+doriac compile <file> --target <target> --out <file>
 doriac run <file>
 ```
+
+`compile` requires an explicit target. `php` is currently implemented. `native`, `debug`, and `wasm` are recognized planned targets.
 
 `doriac run` is currently a convenience command for the PHP backend: it compiles to a temporary PHP file and runs it with the local `php` binary.
 
@@ -62,7 +68,7 @@ doriac run <file>
 - Bindings, properties, parameters, and `$this` are readonly by default.
 - Intentional mutation uses `writable`.
 - Collection aliases are `List<T>`, `Dictionary<K, V>`, and `Set<T>`.
-- The compiler must reject invalid Doria before lowering to IR or emitting backend output.
+- The compiler must reject invalid Doria before lowering to HIR/MIR or emitting backend output.
 
 ## Repository layout
 

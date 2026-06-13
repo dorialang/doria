@@ -2,9 +2,10 @@ pub mod ast;
 pub mod backend;
 pub mod codegen_php;
 pub mod diagnostics;
-pub mod ir;
+pub mod hir;
 pub mod lexer;
 pub mod lowering;
+pub mod mir;
 pub mod parser;
 pub mod semantics;
 pub mod source;
@@ -40,13 +41,20 @@ pub fn compile_source_to_php(
     path: impl Into<String>,
     text: impl Into<String>,
 ) -> DiagnosticResult<String> {
-    compile_source(path, text, BackendTarget::Php)
+    match compile_source(path, text, BackendTarget::Php)? {
+        backend::BackendOutput::Text { contents, .. } => Ok(contents),
+        _ => Err(vec![Diagnostic::new(
+            "B0002",
+            "PHP backend did not return text output",
+            crate::source::Span::default(),
+        )]),
+    }
 }
 
 pub fn lower_source(
     path: impl Into<String>,
     text: impl Into<String>,
-) -> DiagnosticResult<ir::Program> {
+) -> DiagnosticResult<hir::Program> {
     let program = check_source(path, text)?;
     Ok(lowering::lower_program(&program))
 }
@@ -55,12 +63,12 @@ pub fn compile_source(
     path: impl Into<String>,
     text: impl Into<String>,
     target: BackendTarget,
-) -> Result<String, Vec<Diagnostic>> {
-    let ir = lower_source(path, text)?;
-    backend::emit(&ir, target).map_err(|error| {
+) -> Result<backend::BackendOutput, Vec<Diagnostic>> {
+    let hir = lower_source(path, text)?;
+    backend::emit(&hir, target).map_err(|error| {
         vec![Diagnostic::new(
             "B0001",
-            error,
+            error.message,
             crate::source::Span::default(),
         )]
     })

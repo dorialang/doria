@@ -56,6 +56,15 @@ impl<'program> Checker<'program> {
                 continue;
             };
 
+            if self.classes.contains_key(&class_decl.name) {
+                self.diagnostics.push(Diagnostic::new(
+                    "E0300",
+                    format!("class `{}` is already declared", class_decl.name),
+                    class_decl.span,
+                ));
+                continue;
+            }
+
             let mut info = ClassInfo {
                 properties: HashMap::new(),
                 methods: HashMap::new(),
@@ -64,31 +73,34 @@ impl<'program> Checker<'program> {
             for member in &class_decl.members {
                 match member {
                     ClassMember::Property(property) => {
-                        info.properties.insert(
-                            property.name.clone(),
-                            PropertyInfo {
-                                writable: property.writable,
-                                ty: property.ty.clone(),
-                            },
-                        );
+                        self.declare_property(&mut info, &class_decl.name, property);
                     }
                     ClassMember::Method(method) => {
-                        info.methods.insert(
-                            method.name.clone(),
-                            MethodInfo {
-                                writable_this: method.writable_this,
-                            },
-                        );
+                        if info.methods.contains_key(&method.name) {
+                            self.diagnostics.push(Diagnostic::new(
+                                "E0302",
+                                format!(
+                                    "class `{}` already has a method `{}`",
+                                    class_decl.name, method.name
+                                ),
+                                method.span,
+                            ));
+                        } else {
+                            info.methods.insert(
+                                method.name.clone(),
+                                MethodInfo {
+                                    writable_this: method.writable_this,
+                                },
+                            );
+                        }
 
                         if method.name == "__construct" {
                             for param in &method.params {
                                 if param.promoted_visibility.is_some() {
-                                    info.properties.insert(
-                                        param.name.clone(),
-                                        PropertyInfo {
-                                            writable: param.writable,
-                                            ty: param.ty.clone(),
-                                        },
+                                    self.declare_promoted_property(
+                                        &mut info,
+                                        &class_decl.name,
+                                        param,
                                     );
                                 }
                             }
@@ -115,15 +127,82 @@ impl<'program> Checker<'program> {
         }
     }
 
+    fn declare_property(
+        &mut self,
+        info: &mut ClassInfo,
+        class_name: &str,
+        property: &PropertyDecl,
+    ) {
+        if info.properties.contains_key(&property.name) {
+            self.diagnostics.push(Diagnostic::new(
+                "E0301",
+                format!(
+                    "class `{class_name}` already has a property `${}`",
+                    property.name
+                ),
+                property.span,
+            ));
+            return;
+        }
+
+        info.properties.insert(
+            property.name.clone(),
+            PropertyInfo {
+                writable: property.writable,
+                ty: property.ty.clone(),
+            },
+        );
+    }
+
+    fn declare_promoted_property(&mut self, info: &mut ClassInfo, class_name: &str, param: &Param) {
+        if info.properties.contains_key(&param.name) {
+            self.diagnostics.push(Diagnostic::new(
+                "E0301",
+                format!(
+                    "class `{class_name}` already has a property `${}`",
+                    param.name
+                ),
+                param.span,
+            ));
+            return;
+        }
+
+        info.properties.insert(
+            param.name.clone(),
+            PropertyInfo {
+                writable: param.writable,
+                ty: param.ty.clone(),
+            },
+        );
+    }
+
+    fn declare_binding(
+        &mut self,
+        scopes: &mut ScopeStack,
+        name: String,
+        binding: Binding,
+        span: Span,
+    ) {
+        if !scopes.declare(name.clone(), binding) {
+            self.diagnostics.push(Diagnostic::new(
+                "E0103",
+                format!("variable `${name}` is already declared in this scope"),
+                span,
+            ));
+        }
+    }
+
     fn check_function(&mut self, function: &FunctionDecl, method_context: Option<MethodContext>) {
         let mut scopes = ScopeStack::new();
         for param in &function.params {
-            scopes.declare(
+            self.declare_binding(
+                &mut scopes,
                 param.name.clone(),
                 Binding {
                     writable: param.writable,
                     ty: param.ty.clone(),
                 },
+                param.span,
             );
         }
         self.check_block(&function.body, &mut scopes, method_context.as_ref());
@@ -154,12 +233,14 @@ impl<'program> Checker<'program> {
                 let ty = decl.ty.clone().unwrap_or_else(|| {
                     self.infer_expr_type(&decl.initializer, scopes, method_context)
                 });
-                scopes.declare(
+                self.declare_binding(
+                    scopes,
                     decl.name.clone(),
                     Binding {
                         writable: decl.writable,
                         ty,
                     },
+                    decl.span,
                 );
             }
             Stmt::Assignment(assignment) => {
@@ -178,20 +259,24 @@ impl<'program> Checker<'program> {
                 self.check_expr(&foreach.iterable, scopes, method_context);
                 scopes.push();
                 if let Some(key) = &foreach.key {
-                    scopes.declare(
+                    self.declare_binding(
+                        scopes,
                         key.name.clone(),
                         Binding {
                             writable: false,
                             ty: key.ty.clone().unwrap_or_else(TypeRef::unknown),
                         },
+                        foreach.span,
                     );
                 }
-                scopes.declare(
+                self.declare_binding(
+                    scopes,
                     foreach.value.name.clone(),
                     Binding {
                         writable: false,
                         ty: foreach.value.ty.clone().unwrap_or_else(TypeRef::unknown),
                     },
+                    foreach.span,
                 );
                 for statement in &foreach.body.statements {
                     self.check_statement(statement, scopes, method_context);
@@ -230,8 +315,13 @@ impl<'program> Checker<'program> {
                     self.check_expr(&element.value, scopes, method_context);
                 }
             }
-            Expr::PropertyAccess { object, .. } => {
+            Expr::PropertyAccess {
+                object,
+                property,
+                span,
+            } => {
                 self.check_expr(object, scopes, method_context);
+                self.lookup_property(object, property, *span, scopes, method_context);
             }
             Expr::MethodCall {
                 object,
@@ -245,9 +335,23 @@ impl<'program> Checker<'program> {
                 }
                 self.check_method_call(object, method, *span, scopes, method_context);
             }
-            Expr::FunctionCall { args, .. }
-            | Expr::StaticCall { args, .. }
-            | Expr::New { args, .. } => {
+            Expr::FunctionCall { args, .. } | Expr::StaticCall { args, .. } => {
+                for arg in args {
+                    self.check_expr(arg, scopes, method_context);
+                }
+            }
+            Expr::New {
+                class_name,
+                args,
+                span,
+            } => {
+                if !self.classes.contains_key(class_name) {
+                    self.diagnostics.push(Diagnostic::new(
+                        "E0305",
+                        format!("unknown class `{class_name}`"),
+                        *span,
+                    ));
+                }
                 for arg in args {
                     self.check_expr(arg, scopes, method_context);
                 }
@@ -306,25 +410,23 @@ impl<'program> Checker<'program> {
                         .push(Diagnostic::new("E0201", message, object.span()));
                 }
 
-                if let Some(class_name) = self.expr_class_name(object, scopes, method_context) {
-                    if let Some(class_info) = self.classes.get(&class_name) {
-                        if let Some(property_info) = class_info.properties.get(property) {
-                            if !property_info.writable {
-                                self.diagnostics.push(
-                                    Diagnostic::new(
-                                        "E0202",
-                                        format!(
-                                            "cannot assign to readonly property `{class_name}::${property}`"
-                                        ),
-                                        *span,
-                                    )
-                                    .with_help(format!(
-                                        "mark the property writable: `public writable {} ${property};`",
-                                        property_info.ty
-                                    )),
-                                );
-                            }
-                        }
+                if let Some((class_name, property_info)) =
+                    self.lookup_property(object, property, *span, scopes, method_context)
+                {
+                    if !property_info.writable {
+                        self.diagnostics.push(
+                            Diagnostic::new(
+                                "E0202",
+                                format!(
+                                    "cannot assign to readonly property `{class_name}::${property}`"
+                                ),
+                                *span,
+                            )
+                            .with_help(format!(
+                                "mark the property writable: `public writable {} ${property};`",
+                                property_info.ty
+                            )),
+                        );
                     }
                 }
             }
@@ -347,10 +449,20 @@ impl<'program> Checker<'program> {
         let Some(class_name) = self.expr_class_name(object, scopes, method_context) else {
             return;
         };
-        let Some(class_info) = self.classes.get(&class_name) else {
+        let Some(class_info) = self.classes.get(&class_name).cloned() else {
+            self.diagnostics.push(Diagnostic::new(
+                "E0305",
+                format!("unknown class `{class_name}`"),
+                span,
+            ));
             return;
         };
         let Some(method_info) = class_info.methods.get(method) else {
+            self.diagnostics.push(Diagnostic::new(
+                "E0304",
+                format!("unknown method `{class_name}::{method}`"),
+                span,
+            ));
             return;
         };
 
@@ -398,6 +510,35 @@ impl<'program> Checker<'program> {
             }
             _ => false,
         }
+    }
+
+    fn lookup_property(
+        &mut self,
+        object: &Expr,
+        property: &str,
+        span: Span,
+        scopes: &ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) -> Option<(String, PropertyInfo)> {
+        let class_name = self.expr_class_name(object, scopes, method_context)?;
+        let Some(class_info) = self.classes.get(&class_name) else {
+            self.diagnostics.push(Diagnostic::new(
+                "E0305",
+                format!("unknown class `{class_name}`"),
+                span,
+            ));
+            return None;
+        };
+        let Some(property_info) = class_info.properties.get(property) else {
+            self.diagnostics.push(Diagnostic::new(
+                "E0303",
+                format!("unknown property `{class_name}::${property}`"),
+                span,
+            ));
+            return None;
+        };
+
+        Some((class_name, property_info.clone()))
     }
 
     fn infer_expr_type(

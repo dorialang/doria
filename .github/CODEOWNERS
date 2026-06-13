@@ -1,0 +1,13 @@
+# Default owner for the whole repository.
+* @amasiye
+
+# Governance and project direction.
+/.github/ @amasiye
+/CODEOWNERS @amasiye
+/AGENTS.md @amasiye
+/SPEC.md @amasiye
+/docs/ @amasiye
+
+# Compiler core.
+/crates/ @amasiye
+/examples/ @amasiye

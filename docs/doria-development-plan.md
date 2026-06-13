@@ -15,7 +15,8 @@ Doria source
 → type checker
 → readonly/writable checker
 → borrow/lifetime analysis later
-→ Doria IR
+→ HIR
+→ MIR later
 → backend
 ```
 
@@ -47,7 +48,7 @@ Doria is a PHP-shaped, C-like, compiled language inspired by PHP syntax but with
 - Future: generics, borrow checker, async/await, native backend
 ```
 
-The first implementation slice may include a PHP backend because it is easy to inspect and run locally, but Doria must be designed as a compiled language with a backend-independent IR and a native backend as the primary long-term target. The compiler should reject invalid Doria code before lowering to IR or emitting any backend output.
+The first implementation slice may include a PHP backend because it is easy to inspect and run locally, but Doria must be designed as a compiled language with backend-independent HIR/MIR boundaries and a native backend as the primary long-term target. The compiler should reject invalid Doria code before lowering to HIR/MIR or emitting any backend output.
 
 ---
 
@@ -332,7 +333,7 @@ It should define:
 7. Class syntax
 8. Function syntax
 9. Collection aliases
-10. IR and backend behavior
+10. HIR, MIR, and backend behavior
 11. Future features
 ```
 
@@ -1011,13 +1012,13 @@ async scope {
 }
 ```
 
-For a PHP backend, this could eventually lower to a Doria runtime built on Fibers. For a native backend, lower async to Doria IR, then to LLVM or another backend later. PHP’s Fiber API gives low-level suspension/resumption, but Doria should offer a cleaner language-level abstraction. ([PHP][3])
+For a PHP backend, this could eventually lower to a Doria runtime built on Fibers. For a native backend, lower async through HIR/MIR, then to LLVM, Cranelift, or another backend later. PHP’s Fiber API gives low-level suspension/resumption, but Doria should offer a cleaner language-level abstraction. ([PHP][3])
 
 ---
 
 # Phase 11: Native backend foundation
 
-Doria IR belongs in the core compiler pipeline before backend emission. As the language matures, evolve the initial IR into explicit HIR/MIR phases that can support the native backend.
+HIR belongs in the core compiler pipeline before backend emission today. As the language matures, evolve the placeholder MIR into the explicit control-flow-oriented phase that can support the native backend.
 
 Possible future pipeline:
 

@@ -5,5 +5,5 @@ resolver = "2"
 [workspace.package]
 edition = "2021"
 license = "MIT"
-repository = "https://example.invalid/doria"
+repository = "https://github.com/amasiye/doria"
 version = "0.1.0"

@@ -45,9 +45,15 @@ impl ScopeStack {
         self.scopes.pop();
     }
 
-    pub fn declare(&mut self, name: String, binding: Binding) {
+    pub fn declare(&mut self, name: String, binding: Binding) -> bool {
         if let Some(scope) = self.scopes.last_mut() {
+            if scope.contains_key(&name) {
+                return false;
+            }
             scope.insert(name, binding);
+            true
+        } else {
+            false
         }
     }
 

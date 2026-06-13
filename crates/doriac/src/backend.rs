@@ -1,9 +1,31 @@
+use std::path::PathBuf;
 use std::str::FromStr;
 
-use crate::{codegen_php, ir};
+use crate::{codegen_php, hir};
 
 pub trait Backend {
-    fn emit(&self, program: &ir::Program) -> String;
+    fn target(&self) -> BackendTarget;
+    fn emit(&self, program: &hir::Program) -> Result<BackendOutput, BackendError>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BackendOutput {
+    Text { extension: String, contents: String },
+    Binary { extension: String, bytes: Vec<u8> },
+    Artifact { path: PathBuf },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackendError {
+    pub message: String,
+}
+
+impl BackendError {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,18 +77,32 @@ impl FromStr for BackendTarget {
 pub struct PhpBackend;
 
 impl Backend for PhpBackend {
-    fn emit(&self, program: &ir::Program) -> String {
-        codegen_php::generate(program)
+    fn target(&self) -> BackendTarget {
+        BackendTarget::Php
+    }
+
+    fn emit(&self, program: &hir::Program) -> Result<BackendOutput, BackendError> {
+        Ok(BackendOutput::Text {
+            extension: "php".to_string(),
+            contents: codegen_php::generate(program),
+        })
     }
 }
 
-pub fn emit(program: &ir::Program, target: BackendTarget) -> Result<String, String> {
+pub fn emit(program: &hir::Program, target: BackendTarget) -> Result<BackendOutput, BackendError> {
     match target {
-        BackendTarget::Php => Ok(PhpBackend.emit(program)),
+        BackendTarget::Php => PhpBackend.emit(program),
         BackendTarget::Native | BackendTarget::Debug | BackendTarget::Wasm => Err(format!(
             "backend `{}` ({}) is planned but not implemented yet",
             target.name(),
             target.description()
-        )),
+        )
+        .into()),
+    }
+}
+
+impl From<String> for BackendError {
+    fn from(message: String) -> Self {
+        BackendError::new(message)
     }
 }

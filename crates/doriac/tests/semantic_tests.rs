@@ -95,3 +95,126 @@ $person->rename("Lucy");
 
     assert!(err.iter().any(|diagnostic| diagnostic.code == "E0203"));
 }
+
+#[test]
+fn rejects_duplicate_local_declaration() {
+    let err = doriac::check_source(
+        "test.doria",
+        r#"
+let $x = 1;
+let $x = 2;
+"#,
+    )
+    .expect_err("semantic check should fail");
+
+    assert!(err.iter().any(|diagnostic| diagnostic.code == "E0103"));
+}
+
+#[test]
+fn rejects_duplicate_class_declaration() {
+    let err = doriac::check_source(
+        "test.doria",
+        r#"
+class Person {}
+class Person {}
+"#,
+    )
+    .expect_err("semantic check should fail");
+
+    assert!(err.iter().any(|diagnostic| diagnostic.code == "E0300"));
+}
+
+#[test]
+fn rejects_duplicate_property_declaration() {
+    let err = doriac::check_source(
+        "test.doria",
+        r#"
+class Person
+{
+    public string $name;
+    public string $name;
+}
+"#,
+    )
+    .expect_err("semantic check should fail");
+
+    assert!(err.iter().any(|diagnostic| diagnostic.code == "E0301"));
+}
+
+#[test]
+fn rejects_duplicate_method_declaration() {
+    let err = doriac::check_source(
+        "test.doria",
+        r#"
+class Person
+{
+    public function rename(string $name): void {}
+    public function rename(string $name): void {}
+}
+"#,
+    )
+    .expect_err("semantic check should fail");
+
+    assert!(err.iter().any(|diagnostic| diagnostic.code == "E0302"));
+}
+
+#[test]
+fn rejects_unknown_property_read() {
+    let err = doriac::check_source(
+        "test.doria",
+        r#"
+class Person {}
+
+let $person = new Person();
+echo $person->name;
+"#,
+    )
+    .expect_err("semantic check should fail");
+
+    assert!(err.iter().any(|diagnostic| diagnostic.code == "E0303"));
+}
+
+#[test]
+fn rejects_unknown_property_write() {
+    let err = doriac::check_source(
+        "test.doria",
+        r#"
+class Person {}
+
+let writable $person = new Person();
+$person->name = "Lucy";
+"#,
+    )
+    .expect_err("semantic check should fail");
+
+    assert!(err.iter().any(|diagnostic| diagnostic.code == "E0303"));
+}
+
+#[test]
+fn rejects_unknown_method_call() {
+    let err = doriac::check_source(
+        "test.doria",
+        r#"
+class Person {}
+
+let $person = new Person();
+$person->rename("Lucy");
+"#,
+    )
+    .expect_err("semantic check should fail");
+
+    assert!(err.iter().any(|diagnostic| diagnostic.code == "E0304"));
+}
+
+#[test]
+fn rejects_unknown_class_construction() {
+    let err = doriac::check_source(
+        "test.doria",
+        r#"
+let $person = new Person();
+"#,
+    )
+    .expect_err("semantic check should fail");
+
+    assert!(err.iter().any(|diagnostic| diagnostic.code == "E0305"));
+}

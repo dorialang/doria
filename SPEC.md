@@ -21,7 +21,8 @@ Doria source
 -> type checker
 -> readonly/writable checker
 -> borrow/lifetime analysis later
--> Doria IR
+-> HIR
+-> MIR later
 -> backend
 ```
 
@@ -149,13 +150,10 @@ let $person = new Person("Andrew"); // Person
 ```php
 class Person
 {
-    public writable string $name;
-    public int $age;
-
-    public function __construct(string $name, int $age)
-    {
-        $this->name = $name;
-        $this->age = $age;
+    public function __construct(
+        public writable string $name,
+        public int $age,
+    ) {
     }
 }
 ```
@@ -169,6 +167,8 @@ public function __construct(
 ) {
 }
 ```
+
+Constructor init access for assigning readonly properties inside constructor bodies is a required language rule, but it is not implemented in the current vertical slice. The intended rule is narrower than writable `$this`: a constructor may initialize each uninitialized readonly property exactly once.
 
 ## 8. Function syntax
 
@@ -202,18 +202,20 @@ Do not use `Vec`.
 
 The PHP backend lowers these aliases to PHP arrays, while the Doria type checker keeps them distinct.
 
-## 10. IR and backend behavior
+## 10. HIR, MIR, and backend behavior
 
-After semantic analysis, type checking, and readonly/writable checking, the compiler lowers the checked AST to Doria IR. Backends consume Doria IR rather than parser structures.
+After semantic analysis, type checking, and readonly/writable checking, the compiler currently lowers the checked AST to HIR. HIR is still close to source structure and is not the final backend IR.
 
-The native backend is the primary long-term target. It should eventually lower Doria IR toward native machine code and standalone executables.
+MIR is planned as the simpler, control-flow-oriented representation for borrow/lifetime analysis and native-oriented backend lowering.
+
+The native backend is the primary long-term target. It should eventually lower MIR toward native machine code and standalone executables.
 
 The PHP backend is currently the first implemented backend. It emits `<?php` and lowers Doria-only syntax away:
 
 - `let` is removed.
 - `writable` is removed.
 - Collection aliases are emitted as `array`.
-- Doria readonly/writable rules are enforced before IR lowering and backend emission, not at PHP runtime.
+- Doria readonly/writable rules are enforced before HIR/MIR lowering and backend emission, not at PHP runtime.
 
 ## 11. Future features
 
@@ -225,6 +227,6 @@ Future work includes:
 - Interfaces, traits, and namespaces.
 - Async/await and structured concurrency.
 - Native backend design and implementation.
-- More explicit Doria IR phases.
+- MIR implementation.
 - Native code generation.
 - Package management.

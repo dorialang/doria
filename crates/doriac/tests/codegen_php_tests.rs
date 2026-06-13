@@ -1,5 +1,5 @@
 use doriac::backend::BackendTarget;
-use doriac::ir;
+use doriac::hir;
 
 #[test]
 fn emits_php_for_simple_program() {
@@ -20,7 +20,7 @@ echo $count;
 }
 
 #[test]
-fn lowers_checked_program_to_backend_independent_ir() {
+fn lowers_checked_program_to_hir() {
     let lowered = doriac::lower_source(
         "test.doria",
         r#"
@@ -32,7 +32,7 @@ echo $name;
 
     assert!(matches!(
         &lowered.items[0],
-        ir::Item::Statement(ir::Stmt::VarDecl(decl)) if decl.name == "name"
+        hir::Item::Statement(hir::Stmt::VarDecl(decl)) if decl.name == "name"
     ));
 }
 
@@ -50,6 +50,24 @@ echo $name;
 
     assert_eq!(err[0].code, "B0001");
     assert!(err[0].message.contains("backend `native`"));
+}
+
+#[test]
+fn php_backend_uses_text_output_shape() {
+    let output = doriac::compile_source(
+        "test.doria",
+        r#"
+let $name = "Doria";
+echo $name;
+"#,
+        BackendTarget::Php,
+    )
+    .expect("php backend should emit output");
+
+    assert!(matches!(
+        output,
+        doriac::backend::BackendOutput::Text { .. }
+    ));
 }
 
 #[test]

@@ -3,6 +3,12 @@ use crate::types::TypeRef;
 
 pub use crate::ast::{AssignOp, BinaryOp, Visibility};
 
+/// High-level IR.
+///
+/// HIR is intentionally still close to checked source structure. It is the
+/// resolved, backend-neutral form we can emit from today while the future MIR
+/// becomes the simpler control-flow-oriented representation for native code.
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Program {
     pub items: Vec<Item>,
