@@ -2,7 +2,9 @@
 
 Doria is a new PHP-shaped compiled programming language. It uses familiar PHP syntax such as `$variables`, classes, functions, visibility modifiers, constructor property promotion, and C-like blocks, but it is statically checked before it runs.
 
-The compiler is called `doriac` and is implemented in Rust. Doria's long-term primary target is native machine code and standalone executables. PHP is a compatibility, migration, debugging, and transpilation backend; it must not shape the core compiler architecture.
+The compiler is called `doriac`. The current bootstrap implementation of `doriac` is written in Rust, but an early strategic goal is to make `doriac` increasingly self-hosted in Doria. Doria's long-term primary target is native machine code and standalone executables. PHP is a compatibility, migration, debugging, and transpilation backend; it must not shape the core compiler architecture.
+
+Doria is also intended for areas where PHP developers may want a PHP-like experience but where PHP itself is unsuitable, including native desktop applications, CLI tools, game development, game engines, graphics/multimedia tooling, native library bindings, and future raylib bindings.
 
 ```text
 Doria source
@@ -59,6 +61,28 @@ doriac run <file>
 
 `doriac run` is currently a convenience command for the PHP backend: it compiles to a temporary PHP file and runs it with the local `php` binary.
 
+## Editor support
+
+Doria has first-pass editor tooling for `.doria` files:
+
+- `doria-lsp` is a stdio Language Server Protocol binary that reuses the compiler pipeline for diagnostics.
+- `editors/vscode/doria` contains a VS Code extension with TextMate syntax highlighting, bracket/comment configuration, and a small built-in LSP client.
+
+Build the server before starting the extension:
+
+```bash
+cargo build -p doriac --bin doria-lsp
+```
+
+The VS Code extension looks for the server in this order:
+
+```text
+1. doria.languageServer.path setting
+2. DORIA_LSP_PATH environment variable
+3. target/debug/doria-lsp in the open workspace
+4. doria-lsp on PATH
+```
+
 ## Language principles
 
 - Doria is PHP-shaped, not PHP-compatible at the parser level.
@@ -69,6 +93,7 @@ doriac run <file>
 - Intentional mutation uses `writable`.
 - Collection aliases are `List<T>`, `Dictionary<K, V>`, and `Set<T>`.
 - The compiler must reject invalid Doria before lowering to HIR/MIR or emitting backend output.
+- Rust is the current bootstrap implementation language for `doriac`; Doria self-hosting is an early strategic goal.
 
 ## Repository layout
 
@@ -85,6 +110,9 @@ doriac run <file>
 │       └── tests/
 ├── docs/
 │   └── doria-development-plan.md
+├── editors/
+│   └── vscode/
+│       └── doria/
 └── examples/
     ├── hello.doria
     ├── variables.doria

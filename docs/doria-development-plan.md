@@ -250,7 +250,7 @@ MVP may support only `List<T>` and `Dictionary<K, V>`. `Set<T>` can be added aft
 
 # Recommended implementation approach
 
-Use **Rust** for the compiler.
+Use **Rust** for the bootstrap implementation of the compiler. Rust is not the permanent identity of `doriac`; Doria self-hosting is an early strategic goal.
 
 The first compiler should be called:
 
@@ -1049,7 +1049,7 @@ You are helping build a new programming language called Doria.
 
 Doria is PHP-shaped but not PHP++. It uses PHP-like syntax, `$variables`, classes, functions, visibility modifiers, constructor property promotion, and C-like blocks. However, it is strongly typed, compiled, readonly by default, and uses `writable` for intentional mutation.
 
-Build the first MVP compiler in Rust.
+Build the first MVP compiler with Rust as the bootstrap implementation language.
 
 Goal for v0.1:
 - Parse a small Doria subset.

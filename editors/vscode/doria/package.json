@@ -1,0 +1,49 @@
+{
+  "name": "doria-language-support",
+  "displayName": "Doria Language Support",
+  "description": "Syntax highlighting and language server diagnostics for .doria files.",
+  "version": "0.1.0",
+  "publisher": "doria",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "activationEvents": [
+    "onLanguage:doria"
+  ],
+  "main": "./extension.js",
+  "contributes": {
+    "languages": [
+      {
+        "id": "doria",
+        "aliases": [
+          "Doria",
+          "doria"
+        ],
+        "extensions": [
+          ".doria"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "doria",
+        "scopeName": "source.doria",
+        "path": "./syntaxes/doria.tmLanguage.json"
+      }
+    ],
+    "configuration": {
+      "title": "Doria",
+      "properties": {
+        "doria.languageServer.path": {
+          "type": "string",
+          "default": "",
+          "description": "Path to the doria-lsp executable. Leave empty to use DORIA_LSP_PATH, workspace target/debug/doria-lsp, or doria-lsp from PATH."
+        }
+      }
+    }
+  }
+}

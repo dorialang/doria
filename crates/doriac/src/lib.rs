@@ -5,6 +5,7 @@ pub mod diagnostics;
 pub mod hir;
 pub mod lexer;
 pub mod lowering;
+pub mod lsp;
 pub mod mir;
 pub mod parser;
 pub mod semantics;

@@ -1,0 +1,241 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "Doria",
+  "scopeName": "source.doria",
+  "patterns": [
+    {
+      "include": "#comments"
+    },
+    {
+      "include": "#strings"
+    },
+    {
+      "include": "#declarations"
+    },
+    {
+      "include": "#variables"
+    },
+    {
+      "include": "#numbers"
+    },
+    {
+      "include": "#keywords"
+    },
+    {
+      "include": "#types"
+    },
+    {
+      "include": "#calls"
+    },
+    {
+      "include": "#operators"
+    },
+    {
+      "include": "#punctuation"
+    }
+  ],
+  "repository": {
+    "comments": {
+      "patterns": [
+        {
+          "name": "comment.line.double-slash.doria",
+          "match": "//.*$"
+        },
+        {
+          "name": "comment.line.number-sign.doria",
+          "match": "#.*$"
+        },
+        {
+          "name": "comment.block.doria",
+          "begin": "/\\*",
+          "end": "\\*/"
+        }
+      ]
+    },
+    "strings": {
+      "patterns": [
+        {
+          "name": "string.quoted.double.doria",
+          "begin": "\"",
+          "end": "\"",
+          "patterns": [
+            {
+              "name": "constant.character.escape.doria",
+              "match": "\\\\."
+            },
+            {
+              "name": "variable.other.doria",
+              "match": "\\$[A-Za-z_][A-Za-z0-9_]*"
+            }
+          ]
+        },
+        {
+          "name": "string.quoted.single.doria",
+          "begin": "'",
+          "end": "'",
+          "patterns": [
+            {
+              "name": "constant.character.escape.doria",
+              "match": "\\\\."
+            }
+          ]
+        }
+      ]
+    },
+    "declarations": {
+      "patterns": [
+        {
+          "match": "\\b(class)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+          "captures": {
+            "1": {
+              "name": "keyword.declaration.class.doria"
+            },
+            "2": {
+              "name": "entity.name.type.class.doria"
+            }
+          }
+        },
+        {
+          "match": "\\b(function)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+          "captures": {
+            "1": {
+              "name": "keyword.declaration.function.doria"
+            },
+            "2": {
+              "name": "entity.name.function.doria"
+            }
+          }
+        },
+        {
+          "match": "\\b(new)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+          "captures": {
+            "1": {
+              "name": "keyword.operator.new.doria"
+            },
+            "2": {
+              "name": "entity.name.type.class.doria"
+            }
+          }
+        }
+      ]
+    },
+    "variables": {
+      "patterns": [
+        {
+          "name": "variable.language.this.doria",
+          "match": "\\$this\\b"
+        },
+        {
+          "name": "variable.other.doria",
+          "match": "\\$[A-Za-z_][A-Za-z0-9_]*"
+        },
+        {
+          "match": "(->)\\s*([A-Za-z_][A-Za-z0-9_]*)",
+          "captures": {
+            "1": {
+              "name": "keyword.operator.access.doria"
+            },
+            "2": {
+              "name": "variable.other.property.doria"
+            }
+          }
+        }
+      ]
+    },
+    "numbers": {
+      "patterns": [
+        {
+          "name": "constant.numeric.float.doria",
+          "match": "\\b[0-9]+\\.[0-9]+\\b"
+        },
+        {
+          "name": "constant.numeric.integer.doria",
+          "match": "\\b[0-9]+\\b"
+        }
+      ]
+    },
+    "keywords": {
+      "patterns": [
+        {
+          "name": "constant.language.boolean.doria",
+          "match": "\\b(?:true|false)\\b"
+        },
+        {
+          "name": "constant.language.null.doria",
+          "match": "\\bnull\\b"
+        },
+        {
+          "name": "keyword.control.doria",
+          "match": "\\b(?:return|foreach|as|if|else|while|for)\\b"
+        },
+        {
+          "name": "keyword.other.doria",
+          "match": "\\b(?:let|writable|readonly|echo|public|protected|private|static)\\b"
+        },
+        {
+          "name": "invalid.deprecated.reserved.doria",
+          "match": "\\b(?:async|await|spawn|scope|interface|trait|enum|match|try|catch|throw|Result|Option)\\b"
+        }
+      ]
+    },
+    "types": {
+      "patterns": [
+        {
+          "name": "storage.type.primitive.doria",
+          "match": "\\b(?:void|int|float|string|bool|mixed|array|Unknown)\\b"
+        },
+        {
+          "name": "support.type.collection.doria",
+          "match": "\\b(?:List|Dictionary|Set)\\b"
+        }
+      ]
+    },
+    "calls": {
+      "patterns": [
+        {
+          "match": "\\b([A-Za-z_][A-Za-z0-9_]*)\\s*(?=\\()",
+          "captures": {
+            "1": {
+              "name": "entity.name.function.call.doria"
+            }
+          }
+        },
+        {
+          "match": "(::)\\s*([A-Za-z_][A-Za-z0-9_]*)",
+          "captures": {
+            "1": {
+              "name": "keyword.operator.access.doria"
+            },
+            "2": {
+              "name": "entity.name.function.static.doria"
+            }
+          }
+        }
+      ]
+    },
+    "operators": {
+      "patterns": [
+        {
+          "name": "keyword.operator.doria",
+          "match": "===|!==|==|!=|<=|>=|&&|\\|\\||\\?\\?|=>|->|::|\\+=|-=|[=+\\-*/%.<>!?:]"
+        }
+      ]
+    },
+    "punctuation": {
+      "patterns": [
+        {
+          "name": "punctuation.terminator.statement.doria",
+          "match": ";"
+        },
+        {
+          "name": "punctuation.separator.comma.doria",
+          "match": ","
+        },
+        {
+          "name": "punctuation.section.doria",
+          "match": "[\\[\\]{}()]"
+        }
+      ]
+    }
+  }
+}
