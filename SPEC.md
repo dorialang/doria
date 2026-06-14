@@ -8,9 +8,7 @@ Doria is a PHP-shaped, statically checked, compiled programming language. It kee
 
 Doria source files use the `.doria` extension and do not require `<?php` tags.
 
-The compiler is `doriac`. Its current bootstrap implementation is written in Rust, but Doria self-hosting is an early strategic goal. Doria's long-term primary target is native machine code and standalone executables.
-
-Doria is also intended for areas where PHP developers may want a PHP-like experience but where PHP itself is unsuitable, including native desktop applications, CLI tools, game development, game engines, graphics/multimedia tooling, native library bindings, and future raylib bindings.
+The compiler is `doriac`, implemented initially in Rust. Doria's long-term primary target is native machine code and standalone executables. A strategic goal is for `doriac` to become increasingly self-hosted in Doria over time.
 
 The compiler architecture is backend-independent:
 
@@ -45,7 +43,7 @@ Doria is PHP-shaped, not PHP-compatible at the parser level.
 
 Valid PHP should be easy to migrate to Doria, but Doria-specific syntax does not need to run directly in PHP.
 
-The v0.1 compiler does not yet produce native executables, and it is not yet a package manager, reflection system, macro system, async runtime, or full standard library.
+The v0.1 compiler does not yet produce native executables, and it is not yet a package manager, reflection system, macro system, async runtime, PHP migration converter, or full standard library.
 
 Doria is not a Rust language. Rust is the current bootstrap implementation language for `doriac`, not the permanent identity of the compiler.
 
@@ -65,6 +63,12 @@ The MVP supports:
 - Assignments.
 - Function calls, method calls, property access, object construction, and literals.
 - List and dictionary literals using PHP-like array syntax.
+
+Planned near-term syntax includes:
+
+- Attribute lists using `#[...]`.
+- Named arguments using `name: expression`.
+- Richer property initializer expressions, including object construction.
 
 ## 4. Declaration rules
 
@@ -116,7 +120,7 @@ class Person
 }
 ```
 
-To assign to a property, both the object path and the property must be writable.
+To assign to a property, both the object path and the property must be writable, unless a constructor is initializing an uninitialized readonly property through constructor init access.
 
 Function parameters are readonly by default and become writable only with `writable`.
 
@@ -174,6 +178,17 @@ public function __construct(
 
 Constructor init access for assigning readonly properties inside constructor bodies is a required language rule, but it is not implemented in the current vertical slice. The intended rule is narrower than writable `$this`: a constructor may initialize each uninitialized readonly property exactly once.
 
+Doria should support richer instance property initializers than PHP:
+
+```php
+class Office
+{
+    public Person $manager = new Person();
+}
+```
+
+Instance property initializer expressions run once per object construction. Each object gets its own initialized value. A property initializer counts as initialization for readonly properties.
+
 ## 8. Function syntax
 
 ```php
@@ -206,7 +221,72 @@ Do not use `Vec`.
 
 The PHP backend lowers these aliases to PHP arrays, while the Doria type checker keeps them distinct.
 
-## 10. HIR, MIR, and backend behavior
+## 10. Attributes and metadata expressions
+
+Doria should support attribute syntax using `#[...]`.
+
+Unlike PHP attributes, Doria attributes should eventually allow richer typed expressions, including static factory calls and named arguments.
+
+Example:
+
+```doria
+#[Module(
+    imports: [
+        ORMModule::forRoot(
+            type: "mysql",
+            host: "localhost",
+            port: 3306,
+            username: "root",
+            password: "root",
+            database: "test",
+            entities: [],
+            synchronize: true,
+        )
+    ]
+)]
+class PostsModule
+{
+}
+```
+
+The intended direction is:
+
+```text
+- Attribute expressions are parsed and type-checked by Doria.
+- Attribute arguments may use named arguments.
+- Attribute expressions may include literals, lists, dictionaries, class/static references, object construction, and static factory calls.
+- The exact compile-time vs runtime evaluation policy is not settled yet.
+- Doria should avoid blindly executing arbitrary side-effecting code at compile time.
+```
+
+See `docs/executable-initializers-and-attributes.md` for the detailed design notes.
+
+## 11. PHP interop and migration
+
+Doria supports two separate PHP-related directions:
+
+```text
+1. Doria -> PHP backend.
+2. PHP -> Doria migration converter.
+```
+
+The PHP backend is a planned compatibility/debugging backend.
+
+A PHP-to-Doria converter may eventually help migrate existing PHP codebases into Doria, but it must remain architecturally separate from the Doria parser and core compiler semantics.
+
+Recommended future shape:
+
+```bash
+doriac migrate php src --out migrated
+```
+
+The converter should initially produce conservative valid Doria, not perfect idiomatic Doria. It should use diagnostics for unsupported dynamic PHP features rather than pretending every valid PHP program can be automatically converted safely.
+
+Doria should avoid promising full bidirectional PHP/Doria compatibility.
+
+See `docs/php-interop-and-migration.md` for the detailed design notes.
+
+## 12. HIR, MIR, and backend behavior
 
 After semantic analysis, type checking, and readonly/writable checking, the compiler currently lowers the checked AST to HIR. HIR is still close to source structure and is not the final backend IR.
 
@@ -221,7 +301,9 @@ The PHP backend is currently the first implemented backend. It emits `<?php` and
 - Collection aliases are emitted as `array`.
 - Doria readonly/writable rules are enforced before HIR/MIR lowering and backend emission, not at PHP runtime.
 
-## 11. Future features
+For Doria features that PHP cannot express directly, such as object construction in property initializers or richer attribute expressions, the PHP backend should lower to equivalent generated PHP where practical or produce a clear unsupported-feature diagnostic temporarily. PHP limitations must not define Doria semantics.
+
+## 13. Future features
 
 Future work includes:
 
@@ -229,8 +311,13 @@ Future work includes:
 - Nullable types.
 - Full type inference for lists and dictionaries.
 - Interfaces, traits, and namespaces.
+- Attribute syntax and metadata representation.
+- Richer instance property initializers.
+- Named arguments.
 - Async/await and structured concurrency.
 - Native backend design and implementation.
 - MIR implementation.
 - Native code generation.
+- Self-hosting path for writing more of `doriac` in Doria.
+- PHP-to-Doria migration tooling.
 - Package management.
