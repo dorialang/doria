@@ -1,11 +1,10 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="title desc">
-  <title id="title">Doria programming language app icon</title>
+  <title id="title">Doria app icon</title>
   <desc id="desc">Doria D mark on a dark rounded square.</desc>
-  <rect x="32" y="32" width="448" height="448" rx="112" fill="#0F172A"/>
+  <rect x="32" y="32" width="448" height="448" rx="112" fill="#0B1215"/>
+  <circle cx="390" cy="118" r="46" fill="#F7B538" opacity="0.16"/>
   <g transform="translate(96 96) scale(1.25)">
-    
-<g id="doria-mark">
-  <path fill="#6D5DF6" fill-rule="evenodd" d="
+    <path fill="#0F6B4A" fill-rule="evenodd" d="
     M44 24
     H112
     C180 24 230 72 230 128
@@ -22,7 +21,6 @@
     C184 95 151 70 110 70
     H80
     Z"/>
-  <path fill="#19D3C5" d="M118 91 L168 128 L118 165 V141 L139 128 L118 115 Z"/>
-</g>
+    <path fill="#F7B538" d="M118 91 L168 128 L118 165 V141 L139 128 L118 115 Z"/>
   </g>
 </svg>

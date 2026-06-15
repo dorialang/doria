@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="res/images/doria-app-icon.svg" alt="Doria Logo" width="200" height="200">
+  <img src="res/images/doria-app-icon-warm.svg" alt="Doria Logo" width="200" height="200">
 </div>
 
 # Doria
