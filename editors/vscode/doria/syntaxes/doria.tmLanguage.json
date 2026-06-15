@@ -169,8 +169,24 @@
           "match": "\\b(?:return|foreach|as|if|else|while|for)\\b"
         },
         {
-          "name": "keyword.other.doria",
-          "match": "\\b(?:let|writable|readonly|echo|public|protected|private|static)\\b"
+          "name": "storage.modifier.mutability.doria",
+          "match": "\\b(?:writable|readonly)\\b"
+        },
+        {
+          "name": "storage.modifier.visibility.doria",
+          "match": "\\b(?:public|protected|private)\\b"
+        },
+        {
+          "name": "keyword.declaration.variable.doria",
+          "match": "\\b(?:let)\\b"
+        },
+        {
+          "name": "keyword.other.echo.doria",
+          "match": "\\b(?:echo)\\b"
+        },
+        {
+          "name": "storage.modifier.static.doria",
+          "match": "\\b(?:static)\\b"
         },
         {
           "name": "invalid.deprecated.reserved.doria",
