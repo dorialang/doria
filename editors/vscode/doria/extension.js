@@ -60,21 +60,25 @@ class DoriaLanguageClient {
     this.started = true;
 
     const serverPath = resolveServerPath(this.context);
-    this.process = cp.spawn(serverPath, [], {
+    const child = cp.spawn(serverPath, [], {
       cwd: workspaceRoot(),
       stdio: ["pipe", "pipe", "pipe"]
     });
+    this.process = child;
 
-    this.process.on("error", (error) => {
+    child.on("error", (error) => {
       vscode.window.showWarningMessage(`Doria language server failed to start: ${error.message}`);
+      this.resetServer(child, error);
     });
-    this.process.stderr.on("data", (chunk) => {
+    child.stderr.on("data", (chunk) => {
       console.error(`[doria-lsp] ${chunk.toString()}`);
     });
-    this.process.stdout.on("data", (chunk) => this.onData(chunk));
-    this.process.on("exit", () => {
-      this.process = undefined;
-      this.diagnostics.clear();
+    child.stdout.on("data", (chunk) => this.onData(chunk));
+    child.on("close", (code, signal) => {
+      this.resetServer(
+        child,
+        new Error(`Doria language server stopped (code ${code ?? "none"}, signal ${signal ?? "none"})`)
+      );
     });
 
     this.sendRequest("initialize", {
@@ -86,6 +90,8 @@ class DoriaLanguageClient {
       for (const document of vscode.workspace.textDocuments) {
         this.didOpen(document);
       }
+    }).catch(() => {
+      // The spawn error path rejects the initialize request after surfacing a warning.
     });
   }
 
@@ -194,6 +200,25 @@ class DoriaLanguageClient {
     const body = Buffer.from(JSON.stringify(message), "utf8");
     const header = Buffer.from(`Content-Length: ${body.length}\r\n\r\n`, "ascii");
     this.process.stdin.write(Buffer.concat([header, body]));
+  }
+
+  resetServer(child, error) {
+    if (child !== this.process) {
+      return;
+    }
+
+    this.process = undefined;
+    this.started = false;
+    this.buffer = Buffer.alloc(0);
+    this.diagnostics.clear();
+    this.rejectPending(error);
+  }
+
+  rejectPending(error) {
+    for (const pending of this.pending.values()) {
+      pending.reject(error);
+    }
+    this.pending.clear();
   }
 
   onData(chunk) {
