@@ -4,9 +4,9 @@
 
 # Doria
 
-Doria is a new PHP-shaped compiled programming language. It uses familiar PHP syntax such as `$variables`, classes, functions, visibility modifiers, constructor property promotion, and C-like blocks, but it is statically checked before it runs.
+Doria is a compiled programming language for building native applications, command-line tools, services, games, and systems software with expressive syntax, strong static typing, safe defaults, and modern concurrency.
 
-The compiler is called `doriac` and is initially implemented in Rust. Doria's long-term primary target is native machine code and standalone executables. PHP is a compatibility, migration, debugging, and transpilation backend; it must not shape the core compiler architecture.
+The compiler is called `doriac`. The current bootstrap implementation is written in Rust, but Rust is not the permanent identity of the compiler. Doria's long-term primary target is native machine code and standalone executables.
 
 A strategic long-term goal is self-hosting: as Doria matures, more of `doriac` should become writable in Doria itself.
 
@@ -25,6 +25,18 @@ Doria source
 ```
 
 Planned backends include native, PHP, debug/interpreter, and WebAssembly. The current working backend is PHP.
+
+## Influence and migration
+
+Doria's surface syntax is intentionally familiar to developers coming from PHP-like and C-like languages, but Doria is its own language. PHP does not define Doria's semantics, and PHP output must not shape the core compiler architecture.
+
+PHP support belongs in compatibility, migration, debugging, and transpilation contexts. Future migration tooling may expose a command such as:
+
+```bash
+doriac migrate php src --out migrated
+```
+
+That would be a PHP-to-Doria migration converter, not the Doria parser and not the core compiler identity.
 
 ## Current status
 
@@ -63,7 +75,7 @@ doriac run <file>
 
 `compile` requires an explicit target. `php` is currently implemented. `native`, `debug`, and `wasm` are recognized planned targets.
 
-`doriac run` is currently a convenience command for the PHP backend: it compiles to a temporary PHP file and runs it with the local `php` binary.
+`doriac run` is currently a convenience command for the PHP compatibility backend: it compiles to a temporary PHP file and runs it with the local `php` binary.
 
 ## Editor Support
 
@@ -87,17 +99,9 @@ The VS Code extension looks for the server in this order:
 4. doria-lsp on PATH
 ```
 
-Future migration tooling may expose a command such as:
-
-```bash
-doriac migrate php src --out migrated
-```
-
-That would be a PHP-to-Doria migration converter, not the Doria parser and not the core compiler identity.
-
 ## Language principles
 
-- Doria is PHP-shaped, not PHP-compatible at the parser level.
+- Doria is its own language; PHP is syntax influence, migration context, and compatibility backend.
 - Valid PHP should be easy to migrate to Doria, but Doria-specific syntax does not need to run directly in PHP.
 - Variables must be declared with `let` or an explicit type.
 - Bare assignment never declares a variable.
@@ -116,10 +120,10 @@ SPEC.md
 ROADMAP.md
 AGENTS.md
 docs/doria-development-plan.md
+docs/brand-positioning.md
 docs/self-hosting.md
 docs/executable-initializers-and-attributes.md
 docs/php-interop-and-migration.md
-docs/chatgpt-project-context.md
 ```
 
 ## Repository layout
@@ -136,11 +140,11 @@ docs/chatgpt-project-context.md
 │       ├── src/
 │       └── tests/
 ├── docs/
+│   ├── brand-positioning.md
 │   ├── doria-development-plan.md
 │   ├── executable-initializers-and-attributes.md
 │   ├── php-interop-and-migration.md
-│   ├── self-hosting.md
-│   └── chatgpt-project-context.md
+│   └── self-hosting.md
 ├── editors/
 │   └── vscode/
 │       └── doria/

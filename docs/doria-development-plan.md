@@ -35,7 +35,7 @@ The native backend is the primary long-term target. A PHP backend may exist as a
 
 **Doria**
 
-Doria is a PHP-shaped, C-like, compiled language inspired by PHP syntax but with stronger safety guarantees:
+Doria is a compiled programming language for native applications, command-line tools, services, games, and systems software. It has syntax familiar to PHP developers, but this is migration and development context rather than brand identity:
 
 ```text
 - Strong static typing
@@ -340,7 +340,7 @@ It should define:
 Important wording:
 
 ```text
-Doria is PHP-shaped, not PHP-compatible at the parser level.
+Doria is its own language. Its syntax is familiar to developers coming from PHP-like and C-like languages, but it is not PHP-compatible at the parser level.
 
 Valid PHP should be easy to migrate to Doria, but Doria-specific syntax does not need to run directly in PHP.
 ```
@@ -1047,7 +1047,7 @@ Copy this into Codex:
 ```text
 You are helping build a new programming language called Doria.
 
-Doria is PHP-shaped but not PHP++. It uses PHP-like syntax, `$variables`, classes, functions, visibility modifiers, constructor property promotion, and C-like blocks. However, it is strongly typed, compiled, readonly by default, and uses `writable` for intentional mutation.
+Doria is a compiled programming language for native applications, command-line tools, services, games, and systems software. It has syntax familiar to PHP-like and C-like language users, including `$variables`, classes, functions, visibility modifiers, constructor property promotion, and C-like blocks. However, it is strongly typed, compiled, readonly by default, and uses `writable` for intentional mutation.
 
 Build the first MVP compiler with Rust as the bootstrap implementation language.
 

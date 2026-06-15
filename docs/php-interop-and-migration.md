@@ -1,6 +1,6 @@
 # PHP Interop and Migration Strategy
 
-Doria is PHP-shaped, but it is not PHP++ and it is not primarily a PHP transpiler.
+Doria is its own compiled programming language. PHP interop is an adoption strategy, not Doria's identity.
 
 Still, PHP interoperability is important. A major adoption advantage would be letting existing PHP teams move toward Doria gradually instead of rewriting whole applications at once.
 

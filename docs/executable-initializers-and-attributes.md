@@ -1,6 +1,6 @@
 # Executable Initializers and Attribute Expressions
 
-Doria is PHP-shaped, but it should not inherit PHP's restrictions around property default values or attribute arguments.
+Doria has syntax familiar to developers coming from PHP-like and C-like languages, but it should not inherit PHP's restrictions around property default values or attribute arguments.
 
 In PHP, property initializers and attribute arguments are limited to constant values or constant expressions. Doria should allow richer, typed, compiler-checked expressions in both places.
 

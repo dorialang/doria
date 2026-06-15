@@ -2,11 +2,11 @@
 
 ## Project
 
-Doria is a new PHP-shaped compiled programming language. The compiler is `doriac`, and the current `doriac` is a Rust bootstrap compiler. The native backend is the primary long-term target; PHP is only a compatibility, migration, debugging, and transpilation backend.
+Doria is a compiled programming language for native applications, command-line tools, services, games, and systems software. The compiler is `doriac`, and the current `doriac` is a Rust bootstrap compiler. The native backend is the primary long-term target; PHP is only a compatibility, migration, debugging, and transpilation backend.
 
 A strategic early goal is **self-hosting**: as Doria matures, more of `doriac` should be written in Doria itself. Rust is the bootstrap implementation language, not the permanent identity of the compiler.
 
-Doria is intended for places where PHP developers may want a PHP-like experience but PHP itself is not the right runtime, including native CLI tools, native desktop applications, game tooling, game engines, graphics/media work, and C-library bindings such as raylib.
+Doria is intended for native CLI tools, native desktop applications, game tooling, game engines, graphics/media work, C-library bindings, and future raylib bindings.
 
 Doria may intentionally support features PHP cannot express directly, including executable instance property initializers and richer attribute/metadata expressions. PHP backend limitations must not define Doria semantics.
 
@@ -14,8 +14,9 @@ Doria may eventually include a PHP-to-Doria migration converter, but that conver
 
 ## Working rules
 
-- Treat `docs/doria-development-plan.md`, `docs/self-hosting.md`, `docs/executable-initializers-and-attributes.md`, `docs/php-interop-and-migration.md`, `docs/performance-and-benchmarking.md`, `docs/mutability-ergonomics.md`, and `SPEC.md` as the product direction.
+- Treat `docs/brand-positioning.md`, `docs/doria-development-plan.md`, `docs/self-hosting.md`, `docs/executable-initializers-and-attributes.md`, `docs/php-interop-and-migration.md`, `docs/performance-and-benchmarking.md`, `docs/mutability-ergonomics.md`, and `SPEC.md` as the product direction.
 - Keep compiler work incremental and tested.
+- Do not make PHP the public identity of Doria. PHP is development context, migration context, and one compatibility backend; Doria should be described as its own language.
 - Do not describe Doria as a Rust language. Rust is only the bootstrap implementation language for the current `doriac`.
 - Preserve the backend-independent pipeline: lexer -> parser -> AST -> semantic analysis -> type checker -> readonly/writable checker -> borrow/lifetime analysis later -> HIR -> MIR later -> backend.
 - Do not let PHP backend needs leak into the parser, AST, semantic model, HIR, or MIR design.

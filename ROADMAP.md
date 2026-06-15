@@ -2,8 +2,8 @@
 
 ## Strategic Goals
 
-- Build Doria as a PHP-shaped compiled language with native machine code and standalone executables as the long-term target.
-- Support areas where PHP developers may want a PHP-like experience but PHP itself does not make complete sense, including native desktop applications, game tooling, game engines, graphics/media work, and C-library bindings such as raylib.
+- Build Doria as a compiled language with native machine code and standalone executables as the long-term target.
+- Support command-line tools, services, systems software, native desktop applications, game development, game tooling, game engines, graphics/media work, C-library bindings, and future raylib bindings.
 - Keep PHP as a compatibility, migration, debugging, and transpilation backend only.
 - Move toward **self-hosting**: `doriac` is initially implemented in Rust, but an early language-development goal is to eventually write significant parts of `doriac` in Doria itself.
 - Support Doria language features that PHP cannot express directly, including executable property initializers and richer attribute/metadata expressions.

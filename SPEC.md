@@ -4,11 +4,13 @@ This document describes the v0.1 direction for Doria.
 
 ## 1. What Doria is
 
-Doria is a PHP-shaped, statically checked, compiled programming language. It keeps familiar PHP surface syntax where that helps migration, including `$variables`, classes, functions, visibility modifiers, constructor property promotion, arrays, and C-like blocks.
+Doria is a statically checked compiled programming language designed for native executables, tooling, services, desktop software, games, and future self-hosting.
+
+Doria's surface syntax is intentionally familiar to developers coming from PHP-like and C-like languages, but Doria is not PHP++ and PHP does not define Doria's semantics.
 
 Doria source files use the `.doria` extension and do not require `<?php` tags.
 
-The compiler is `doriac`, implemented initially in Rust. Doria's long-term primary target is native machine code and standalone executables. A strategic goal is for `doriac` to become increasingly self-hosted in Doria over time.
+The compiler is `doriac`. The current bootstrap implementation is written in Rust. Doria's long-term primary target is native machine code and standalone executables. A strategic goal is for `doriac` to become increasingly self-hosted in Doria over time.
 
 The compiler architecture is backend-independent:
 
@@ -39,7 +41,7 @@ The PHP backend is a compatibility, migration, debugging, and transpilation targ
 
 Doria is not PHP++ and is not required to parse every valid PHP program.
 
-Doria is PHP-shaped, not PHP-compatible at the parser level.
+Doria syntax is familiar to developers coming from PHP-like and C-like languages, but it is not PHP-compatible at the parser level.
 
 Valid PHP should be easy to migrate to Doria, but Doria-specific syntax does not need to run directly in PHP.
 

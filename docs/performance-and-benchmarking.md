@@ -1,6 +1,6 @@
 # Performance and Benchmarking Plan
 
-Doria's long-term goal is native machine code and standalone executables. Performance should be measured honestly from early development onward, especially because Doria is intended for areas where PHP-like ergonomics are useful but PHP itself is not the right runtime: native CLI tools, desktop applications, game tooling, game engines, graphics/media work, and C-library bindings such as raylib.
+Doria's long-term goal is native machine code and standalone executables. Performance should be measured honestly from early development onward, especially because Doria is intended for native CLI tools, desktop applications, game tooling, game engines, graphics/media work, C-library bindings, and future raylib bindings.
 
 This document records the benchmark direction. It is not a performance claim.
 
