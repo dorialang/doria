@@ -1,3 +1,7 @@
+<div align="center">
+  <img src="res/images/doria-app-icon.svg" alt="Doria Logo" width="200" height="200">
+</div>
+
 # Doria
 
 Doria is a new PHP-shaped compiled programming language. It uses familiar PHP syntax such as `$variables`, classes, functions, visibility modifiers, constructor property promotion, and C-like blocks, but it is statically checked before it runs.
@@ -61,6 +65,28 @@ doriac run <file>
 
 `doriac run` is currently a convenience command for the PHP backend: it compiles to a temporary PHP file and runs it with the local `php` binary.
 
+## Editor Support
+
+Doria has first-pass editor tooling for `.doria` files:
+
+- `doria-lsp` is a stdio Language Server Protocol binary that reuses the compiler pipeline for diagnostics, hover, and completion.
+- `editors/vscode/doria` contains a VS Code extension with TextMate syntax highlighting, bracket/comment configuration, and a small built-in LSP client.
+
+Build the server before starting the extension:
+
+```bash
+cargo build -p doriac --bin doria-lsp
+```
+
+The VS Code extension looks for the server in this order:
+
+```text
+1. doria.languageServer.path setting
+2. DORIA_LSP_PATH environment variable
+3. target/debug/doria-lsp in the open workspace
+4. doria-lsp on PATH
+```
+
 Future migration tooling may expose a command such as:
 
 ```bash
@@ -115,6 +141,9 @@ docs/chatgpt-project-context.md
 │   ├── php-interop-and-migration.md
 │   ├── self-hosting.md
 │   └── chatgpt-project-context.md
+├── editors/
+│   └── vscode/
+│       └── doria/
 └── examples/
     ├── hello.doria
     ├── variables.doria

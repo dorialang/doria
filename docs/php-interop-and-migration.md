@@ -7,7 +7,7 @@ Still, PHP interoperability is important. A major adoption advantage would be le
 This document distinguishes three related but different ideas:
 
 ```text
-1. Doria -> PHP backend
+1. Doria -> PHP compatibility backend
 2. PHP -> Doria migration converter
 3. Full bidirectional PHP/Doria compatibility
 ```
@@ -24,7 +24,7 @@ The long-term compiler direction remains:
 Doria source -> doriac -> HIR -> MIR -> native backend -> standalone executable
 ```
 
-The PHP backend is a compatibility/debugging/migration backend.
+The PHP backend is a compatibility, debugging, migration, and transpilation backend. It is not Doria's reference implementation, and generated PHP is not the definition of Doria semantics.
 
 A PHP-to-Doria converter may also be useful, but it should be treated as a migration tool, not as the core compiler pipeline.
 
@@ -62,11 +62,11 @@ Doria should aim for a migration bridge, not semantic equivalence.
 
 ---
 
-## 3. Doria -> PHP backend
+## 3. Doria -> PHP compatibility backend
 
 This is the easier direction.
 
-Doria source can lower into PHP for supported features:
+Doria source can lower into PHP for supported features. This output is useful for compatibility and inspection, but it is non-normative:
 
 ```text
 Doria source -> parser -> AST -> semantic checks -> HIR -> PHP backend
@@ -75,11 +75,11 @@ Doria source -> parser -> AST -> semantic checks -> HIR -> PHP backend
 Use cases:
 
 ```text
-- early executable backend
+- early runnable compatibility backend
 - debugging output
 - migration aid
 - ability to run some Doria code in PHP environments
-- comparison target while native backend matures
+- inspection target while native backend matures
 ```
 
 Important rule:
@@ -447,10 +447,11 @@ The converter should begin with simple, typed, modern PHP.
 Settled:
 
 ```text
-- Doria should support Doria -> PHP as a backend.
+- Doria should support Doria -> PHP as a compatibility backend.
 - Doria may support PHP -> Doria as a migration converter.
 - PHP -> Doria should not be part of the Doria parser.
 - PHP -> Doria should not define Doria semantics.
+- Generated PHP should not be treated as Doria's semantic reference output.
 - The converter should be honest and diagnostic-heavy.
 - The converter should produce conservative valid Doria first, idiomatic Doria later.
 ```

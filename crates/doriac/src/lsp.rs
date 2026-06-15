@@ -22,7 +22,6 @@ struct Document {
 #[derive(Default)]
 struct Server {
     documents: HashMap<String, Document>,
-    shutdown_requested: bool,
 }
 
 pub fn run_stdio() -> Result<(), String> {
@@ -122,7 +121,6 @@ impl Server {
             }
             "initialized" => {}
             "shutdown" => {
-                self.shutdown_requested = true;
                 if let Some(id) = id {
                     send_response(writer, id, Value::Null)?;
                 }
