@@ -273,7 +273,7 @@ Open questions:
 - How should PHP backend output represent Doria attributes that PHP cannot express directly?
 ```
 
-Until these questions are settled, implement parsing and AST/HIR representation first, not full evaluation.
+Until these questions are settled, implement parsing and AST/Doria IR representation first, not full evaluation.
 
 ---
 
@@ -413,10 +413,10 @@ Implement in this order:
 1. Add parser support for attributes without semantic evaluation.
 2. Add AST support for attributes and named arguments.
 3. Add parser support for named call arguments generally.
-4. Keep property initializers in AST/HIR as expressions.
+4. Keep property initializers in AST/Doria IR as expressions.
 5. Add semantic checks that property initializer type matches property type once TypeId/TypeKind exists.
 6. Add PHP backend lowering for simple `new` property initializers into constructors.
-7. Add a metadata representation for attributes in HIR.
+7. Add a metadata representation for attributes in Doria IR.
 8. Decide attribute evaluation policy before executing attribute expressions.
 ```
 

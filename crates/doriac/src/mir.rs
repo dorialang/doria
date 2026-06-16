@@ -1,11 +1,11 @@
-//! Mid-level IR design note.
+//! Native-oriented IR design note.
 //!
-//! MIR is intentionally a placeholder today. The current compiler lowers the
-//! checked AST into HIR, which is still source-shaped. MIR should become the
-//! simpler, control-flow-oriented representation used by native, WebAssembly,
-//! and interpreter/debug backends.
+//! This module is intentionally a placeholder today. The current compiler
+//! lowers the checked AST into Doria IR. A later native-oriented IR should
+//! become the simpler, control-flow-oriented representation used by native,
+//! WebAssembly, and interpreter/debug backends.
 //!
-//! Expected MIR responsibilities:
+//! Expected native-oriented IR responsibilities:
 //!
 //! - Explicit basic blocks and terminators.
 //! - Local slots and temporaries instead of source variables.

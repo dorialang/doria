@@ -302,6 +302,51 @@ echo $person->message();
 }
 
 #[test]
+fn rejects_free_function_access_to_internal_property() {
+    let err = doriac::check_source(
+        "test.doria",
+        r#"
+class Person
+{
+    internal string $secret;
+}
+
+function reveal(Person $person): void
+{
+    echo $person->secret;
+}
+"#,
+    )
+    .expect_err("semantic check should fail");
+
+    assert!(err.iter().any(|diagnostic| diagnostic.code == "E0306"));
+}
+
+#[test]
+fn rejects_free_function_call_to_internal_method() {
+    let err = doriac::check_source(
+        "test.doria",
+        r#"
+class Person
+{
+    internal function message(): string
+    {
+        return "Hello";
+    }
+}
+
+function reveal(Person $person): void
+{
+    echo $person->message();
+}
+"#,
+    )
+    .expect_err("semantic check should fail");
+
+    assert!(err.iter().any(|diagnostic| diagnostic.code == "E0307"));
+}
+
+#[test]
 fn rejects_other_class_access_to_internal_property() {
     let err = doriac::check_source(
         "test.doria",
@@ -350,6 +395,31 @@ class Inspector
     .expect_err("semantic check should fail");
 
     assert!(err.iter().any(|diagnostic| diagnostic.code == "E0307"));
+}
+
+#[test]
+fn allows_constructor_accessing_own_internal_members() {
+    doriac::check_source(
+        "test.doria",
+        r#"
+class Person
+{
+    internal string $cacheKey = "person";
+
+    function __construct(string $name)
+    {
+        echo $this->cacheKey;
+        echo $this->buildCacheKey($name);
+    }
+
+    internal function buildCacheKey(string $name): string
+    {
+        return $name;
+    }
+}
+"#,
+    )
+    .expect("semantic check should succeed");
 }
 
 #[test]

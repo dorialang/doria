@@ -24,7 +24,8 @@ For Doria specifically, self-hosting should help validate:
 - diagnostics
 - file I/O
 - string handling
-- HIR/MIR design
+- Doria IR design
+- future native-oriented IR design
 - backend independence
 - native compilation strategy
 ```
@@ -50,7 +51,7 @@ This means:
 - Avoid unnecessary clever Rust-specific abstractions in core compiler logic.
 - Keep data structures explicit and easy to represent in Doria later.
 - Keep diagnostics and source handling language-agnostic.
-- Design HIR and MIR as Doria concepts, not Rust concepts.
+- Design Doria IR and any future native-oriented IR as Doria concepts, not Rust concepts.
 - Let Doria's eventual standard library grow toward compiler needs.
 ```
 
@@ -73,7 +74,7 @@ Do not attempt full self-hosting before Doria has:
 - enough string support
 - file I/O
 - a usable testing story
-- a stable HIR or MIR boundary
+- a stable Doria IR boundary
 ```
 
 Avoid creating a huge Doria compiler rewrite too early. That would slow the project down and hide design problems instead of exposing them.
@@ -96,8 +97,8 @@ Main goals:
 - AST
 - semantic checker
 - readonly/writable checker
-- HIR
-- early MIR design
+- Doria IR
+- future native-oriented IR design
 - PHP compatibility backend
 - native backend experiments later
 ```
@@ -160,7 +161,7 @@ Good candidates:
 - diagnostic message formatting
 - source file abstraction
 - simple AST pretty-printer
-- HIR debug printer
+- Doria IR debug printer
 - small parser helper utilities
 ```
 
@@ -225,7 +226,7 @@ The exact binary output may not be byte-for-byte identical at first. The importa
 
 ```text
 - same diagnostics for the same invalid programs
-- same HIR/MIR for the same valid programs, where practical
+- same Doria IR for the same valid programs, where practical
 - same backend output for stable test cases
 - same test suite results
 ```
@@ -274,10 +275,12 @@ TypeRef
 TypeId
 Diagnostic
 SymbolTable
-HIR
-MIR
+Doria IR
+Native-oriented IR
 BackendOutput
 ```
+
+For public architecture, describe the checked compiler-owned representation as Doria IR. A lower native-oriented IR may be introduced later if native codegen needs a simpler representation.
 
 Avoid designs that only make sense because Rust has a specific feature. For example, Rust traits and lifetimes are useful for implementing the bootstrap compiler, but the core compiler model should still be expressible in Doria later.
 
@@ -313,8 +316,8 @@ Do these before attempting Doria-written compiler modules:
 5. Design modules/namespaces.
 6. Design Doria-owned string interpolation.
 7. Design error handling for compiler-style code.
-8. Stabilize HIR enough to print and compare it in tests.
-9. Begin MIR with simple functions and returns.
+8. Stabilize Doria IR enough to print and compare it in tests.
+9. Sketch native-oriented IR needs with simple functions and returns.
 10. Add a tiny native backend experiment.
 ```
 
@@ -342,7 +345,7 @@ Until then, self-hosting should influence design, not dominate implementation.
 
 ---
 
-## 10. Guidance for future ChatGPT/Codex work
+## 10. Guidance for future compiler work
 
 When creating or reviewing Doria work, remember:
 

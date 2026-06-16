@@ -14,11 +14,11 @@ Doria source
 → semantic analysis
 → type checker
 → readonly/writable checker
-→ borrow/lifetime analysis later
-→ HIR
-→ MIR later
+→ Doria IR
 → backend
 ```
+
+As native code generation matures, Doria IR may lower into a simpler native-oriented IR for control flow, memory layout, runtime calls, and backend code generation.
 
 Backends may include:
 
@@ -29,7 +29,7 @@ Backends may include:
 4. WebAssembly backend
 ```
 
-The native backend is the primary long-term target. A PHP backend may exist as a compatibility feature, migration tool, debugging aid, or transpilation target, but it must not shape the core compiler architecture.
+The native backend is the primary long-term target. A PHP backend may exist as a compatibility feature, migration tool, debugging aid, or inspection target, but it must not shape the core compiler architecture.
 
 ## Project name
 
@@ -48,7 +48,7 @@ Doria is a compiled programming language for native applications, command-line t
 - Future: generics, borrow checker, async/await, native backend
 ```
 
-The first implementation slice may include a PHP backend because it is easy to inspect and run locally, but Doria must be designed as a compiled language with backend-independent HIR/MIR boundaries and a native backend as the primary long-term target. The compiler should reject invalid Doria code before lowering to HIR/MIR or emitting any backend output.
+The first implementation slice may include a PHP backend because it is easy to inspect and run locally, but Doria must be designed as a compiled language with a backend-independent Doria IR boundary and a native backend as the primary long-term target. The compiler should reject invalid Doria code before lowering to Doria IR or emitting any backend output.
 
 ---
 
@@ -304,7 +304,7 @@ doriac run examples/person.doria
 
 For MVP, `doriac run` can compile to temporary PHP and execute it using the local `php` binary.
 
-Codex should work in small, testable increments. OpenAI’s Codex docs describe Codex as an AI agent for writing, reviewing, and shipping code, so this plan is written as a sequence of scoped engineering tasks rather than one giant “build a language” task. ([OpenAI Help Center][4])
+Codex should work in small, testable increments. This plan is written as a sequence of scoped engineering tasks rather than one giant “build a language” task.
 
 ---
 
@@ -349,7 +349,7 @@ doria/
     └── codegen_php_tests.rs
 ```
 
-Create `AGENTS.md` with project-specific instructions for Codex. Codex supports generating an `AGENTS.md` scaffold through `/init`, but for this project, it should be explicit from the start. ([OpenAI Help Center][4])
+Create `AGENTS.md` with project-specific instructions for Codex.
 
 ---
 
@@ -370,7 +370,7 @@ It should define:
 8. Class syntax
 9. Function syntax
 10. Collection aliases
-11. HIR, MIR, and backend behavior
+11. Doria IR and backend behavior
 12. Future features
 ```
 
@@ -863,30 +863,15 @@ The PHP output does not need to preserve `readonly`, `writable`, or `internal` s
 
 This file should compile and run:
 
-```php
+```doria
 class Person
 {
-    internal Dictionary<string, int> $items = [
-        'apples' => 5,
-        'oranges' => 10,
-    ];
-
-    function __construct(
-        writable string $name,
-        int $age = 10,
-    ) {
-    }
+    writable string $name = "Andrew Masiye";
+    int $age = 37;
 
     function greet(): void
     {
         echo $this->getGreetingMessage();
-    }
-
-    function displayInventory(): void
-    {
-        foreach ($this->items as string $name => int $quantity) {
-            echo sprintf("%-20s %d\n", "{$name}:", $quantity);
-        }
     }
 
     writable function rename(string $name): void
@@ -900,12 +885,9 @@ class Person
     }
 }
 
-let writable $person = new Person("Andrew Masiye", 37);
+let writable $person = new Person();
 
 $person->greet();
-echo "\n---\n";
-$person->displayInventory();
-
 $person->rename("Lucy");
 echo "\n---\n";
 $person->greet();
@@ -915,10 +897,6 @@ Expected output:
 
 ```text
 Hello, my name is Andrew Masiye and I am 37 years old!
----
-apples:              5
-oranges:             10
-
 ---
 Hello, my name is Lucy and I am 37 years old!
 ```
@@ -1048,13 +1026,13 @@ async scope {
 }
 ```
 
-For a PHP backend, this could eventually lower to a Doria runtime built on Fibers. For a native backend, lower async through HIR/MIR, then to LLVM, Cranelift, or another backend later. PHP’s Fiber API gives low-level suspension/resumption, but Doria should offer a cleaner language-level abstraction. ([PHP][3])
+For a PHP backend, this could eventually lower to a Doria runtime built on Fibers. For a native backend, lower async through Doria IR and a future native-oriented IR, then to LLVM, Cranelift, or another backend later. PHP’s Fiber API gives low-level suspension/resumption, but Doria should offer a cleaner language-level abstraction. ([PHP][3])
 
 ---
 
 # Phase 11: Native backend foundation
 
-HIR belongs in the core compiler pipeline before backend emission today. As the language matures, evolve the placeholder MIR into the explicit control-flow-oriented phase that can support the native backend.
+Doria IR belongs in the core compiler pipeline before backend emission. As native code generation matures, Doria IR may lower into a simpler native-oriented IR for control flow, memory layout, runtime calls, and backend code generation.
 
 Possible future pipeline:
 
@@ -1064,8 +1042,8 @@ Doria source
 → Parser
 → AST
 → Semantic analysis
-→ Doria HIR
-→ Doria MIR
+→ Doria IR
+→ native-oriented IR
 → LLVM IR or MLIR
 → Native executable
 ```
@@ -1371,10 +1349,6 @@ Expected output:
 ```text
 Hello, my name is Andrew Masiye and I am 37 years old!
 ---
-apples:              5
-oranges:             10
-
----
 Hello, my name is Lucy and I am 37 years old!
 ```
 
@@ -1418,7 +1392,6 @@ That is enough for v0.1. Generics, async, borrow checking, and native compilatio
 [1]: https://llvm.org/docs/tutorial/index.html "LLVM Tutorial: Table of Contents — LLVM 23.0.0git documentation"
 [2]: https://www.php.net/manual/en/language.oop5.properties.php "PHP: Properties - Manual"
 [3]: https://www.php.net/manual/en/language.fibers.php "PHP: Fibers - Manual"
-[4]: https://help.openai.com/en/articles/11369540-getting-started-with-codex "Using Codex with your ChatGPT plan | OpenAI Help Center"
 [5]: https://tree-sitter.github.io/tree-sitter/creating-parsers/2-the-grammar-dsl.html "The Grammar DSL - Tree-sitter"
 [6]: https://www.antlr.org/about.html "About The ANTLR Parser Generator"
 [7]: https://mlir.llvm.org/docs/LangRef/ "MLIR Language Reference - MLIR"

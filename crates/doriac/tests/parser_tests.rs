@@ -128,15 +128,38 @@ class Parser
 
 #[test]
 fn rejects_legacy_visibility_member_modifiers() {
-    for source in [
-        "class Person { public string $name; }",
-        "class Person { public function greet(): void {} }",
-        "class Person { private string $name; }",
-        "class Person { private function greet(): void {} }",
-        "class Person { protected string $name; }",
-        "class Person { protected function greet(): void {} }",
+    for (source, message) in [
+        (
+            "class Person { public string $name; }",
+            "Doria members are public by default; remove `public`.",
+        ),
+        (
+            "class Person { public function greet(): void {} }",
+            "Doria members are public by default; remove `public`.",
+        ),
+        (
+            "class Person { private string $name; }",
+            "Use `internal` for implementation details.",
+        ),
+        (
+            "class Person { private function greet(): void {} }",
+            "Use `internal` for implementation details.",
+        ),
+        (
+            "class Person { protected string $name; }",
+            "Doria does not support `protected`; use `internal` or redesign the API.",
+        ),
+        (
+            "class Person { protected function greet(): void {} }",
+            "Doria does not support `protected`; use `internal` or redesign the API.",
+        ),
     ] {
-        doriac::parse_source("test.doria", source)
+        let err = doriac::parse_source("test.doria", source)
             .expect_err("legacy visibility modifier should be rejected");
+
+        assert!(
+            err.iter().any(|diagnostic| diagnostic.message == message),
+            "expected diagnostic message `{message}` for source `{source}`"
+        );
     }
 }

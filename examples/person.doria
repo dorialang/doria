@@ -1,26 +1,11 @@
 class Person
 {
-    internal Dictionary<string, int> $items = [
-        "apples" => 5,
-        "oranges" => 10,
-    ];
-
-    function __construct(
-        writable string $name,
-        int $age = 10,
-    ) {
-    }
+    writable string $name = "Andrew Masiye";
+    int $age = 37;
 
     function greet(): void
     {
         echo $this->getGreetingMessage();
-    }
-
-    function displayInventory(): void
-    {
-        foreach ($this->items as string $name => int $quantity) {
-            echo sprintf("%-20s %d\n", "{$name}:", $quantity);
-        }
     }
 
     writable function rename(string $name): void
@@ -34,12 +19,9 @@ class Person
     }
 }
 
-let writable $person = new Person("Andrew Masiye", 37);
+let writable $person = new Person();
 
 $person->greet();
-echo "\n---\n";
-$person->displayInventory();
-
 $person->rename("Lucy");
 echo "\n---\n";
 $person->greet();

@@ -22,9 +22,7 @@ Doria source
 -> semantic analysis
 -> type checker
 -> readonly/writable checker
--> borrow/lifetime analysis later
--> HIR
--> MIR later
+-> Doria IR
 -> backend
 ```
 
@@ -35,7 +33,7 @@ Backends may include:
 - Debug/interpreter backend.
 - WebAssembly backend.
 
-The PHP backend is a compatibility, migration, debugging, and transpilation target. It must not shape the core compiler architecture.
+The PHP backend is a compatibility, migration, debugging, and inspection target. It must not shape the core compiler architecture.
 
 ## 2. What Doria is not
 
@@ -333,13 +331,13 @@ Doria should avoid promising full bidirectional PHP/Doria compatibility.
 
 See `docs/php-interop-and-migration.md` for the detailed design notes.
 
-## 13. HIR, MIR, and backend behavior
+## 13. Doria IR and backend behavior
 
-After semantic analysis, type checking, and readonly/writable checking, the compiler currently lowers the checked AST to HIR. HIR is still close to source structure and is not the final backend IR.
+Doria IR is the checked compiler-owned representation of a Doria program. After semantic analysis, type checking, and readonly/writable checking, the compiler lowers the checked AST into Doria IR before backend output.
 
-MIR is planned as the simpler, control-flow-oriented representation for borrow/lifetime analysis and native-oriented backend lowering.
+As native code generation matures, Doria IR may lower into a simpler native-oriented IR for control flow, memory layout, runtime calls, and backend code generation.
 
-The native backend is the primary long-term target. It should eventually lower MIR toward native machine code and standalone executables.
+The native backend is the primary long-term target. It should eventually lower Doria IR, and any later native-oriented IR, toward native machine code and standalone executables.
 
 The PHP backend is currently the first implemented backend. It emits `<?php` and lowers Doria-only syntax away:
 
@@ -347,7 +345,7 @@ The PHP backend is currently the first implemented backend. It emits `<?php` and
 - `writable` is removed.
 - `internal` is enforced by Doria before backend emission and may lower to PHP `private` or another backend-specific representation.
 - Collection aliases are emitted as `array`.
-- Doria readonly/writable rules are enforced before HIR/MIR lowering and backend emission, not at PHP runtime.
+- Doria readonly/writable rules are enforced before Doria IR lowering and backend emission, not at PHP runtime.
 
 For Doria features that PHP cannot express directly, such as object construction in property initializers or richer attribute expressions, the PHP backend should lower to equivalent generated PHP where practical or produce a clear unsupported-feature diagnostic temporarily. PHP limitations must not define Doria semantics.
 
@@ -364,7 +362,7 @@ Future work includes:
 - Named arguments.
 - Async/await and structured concurrency.
 - Native backend design and implementation.
-- MIR implementation.
+- Native-oriented IR implementation when native code generation needs it.
 - Native code generation.
 - Self-hosting path for writing more of `doriac` in Doria.
 - PHP-to-Doria migration tooling.
