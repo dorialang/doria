@@ -170,6 +170,49 @@ Internal members are accessible only from methods and constructors of the declar
 
 Property hooks are planned later for validation and computed properties, but they are not part of the current implementation.
 
+### API surface naming
+
+Doria APIs should make intent obvious at the call site.
+
+The preferred rule is:
+
+```text
+Nouns are properties.
+Verbs are methods.
+```
+
+Use properties for values, state, identifiers, configuration, and computed data:
+
+```php
+let $body = $message->body;
+let $headers = $message->headers;
+let $status = $message->status;
+```
+
+Avoid vague zero-argument noun methods when the member is conceptually data:
+
+```php
+let $body = $message->body(); // avoid
+let $headers = $message->headers(); // avoid
+let $status = $message->status(); // avoid
+```
+
+A noun method such as `body()` can be misread as an action, preparation step, mutation, or builder-style operation. If the member represents data, expose it as a property.
+
+Property hooks are the planned escape hatch when a property-shaped API needs validation, computed behavior, lazy decoding, caching, normalization, or guarded access. The public member should remain property-shaped when it is conceptually a value.
+
+Use methods for actions, commands, mutation, I/O, async work, fallible operations, and behavior with meaningful work:
+
+```php
+await $message->acknowledge();
+await $message->retryAfter(seconds: 30);
+$report->renderPdf();
+```
+
+If a data-returning operation must be a method because it performs I/O, expensive work, decoding, or another explicit operation, use an unmistakable verb such as `loadBody()`, `decodeBody()`, `findById()`, or `fetchProfile()`.
+
+See `docs/api-design-guidelines.md` for the detailed design notes.
+
 ## 7. Basic type system
 
 The MVP type names are:

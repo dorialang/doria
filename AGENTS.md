@@ -14,7 +14,7 @@ Doria may eventually include a PHP-to-Doria migration converter, but that conver
 
 ## Working rules
 
-- Treat `docs/brand-positioning.md`, `docs/doria-development-plan.md`, `docs/self-hosting.md`, `docs/executable-initializers-and-attributes.md`, `docs/php-interop-and-migration.md`, `docs/performance-and-benchmarking.md`, `docs/mutability-ergonomics.md`, and `SPEC.md` as the product direction.
+- Treat `docs/brand-positioning.md`, `docs/doria-development-plan.md`, `docs/self-hosting.md`, `docs/executable-initializers-and-attributes.md`, `docs/php-interop-and-migration.md`, `docs/performance-and-benchmarking.md`, `docs/mutability-ergonomics.md`, `docs/api-design-guidelines.md`, and `SPEC.md` as the product direction.
 - Keep compiler work incremental and tested.
 - Do not make PHP the public identity of Doria. PHP is development context, migration context, and one compatibility backend; Doria should be described as its own language.
 - Do not describe Doria as a Rust language. Rust is only the bootstrap implementation language for the current `doriac`.
@@ -28,6 +28,7 @@ Doria may eventually include a PHP-to-Doria migration converter, but that conver
 - Keep executable initializers and attribute expressions represented as Doria concepts, not PHP workarounds.
 - Keep PHP-to-Doria migration architecturally separate from the Doria parser. The migration tool may parse PHP, but Doria itself should parse Doria.
 - Preserve readonly-by-default as the language default. Use class-level ergonomics such as `writable class`/`readonly class` before adding shorter aliases for `writable`.
+- Prefer nouns as properties and verbs as methods in Doria APIs and examples. Use property hooks for computed, validated, lazy, or guarded values instead of vague zero-argument noun methods such as `body()`.
 - Favor clear diagnostics over permissive parsing.
 - Do not introduce external Rust crates unless they remove real complexity and the repository is ready to manage that dependency.
 
