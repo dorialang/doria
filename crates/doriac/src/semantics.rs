@@ -885,6 +885,7 @@ impl<'program> Checker<'program> {
         let target_kind = self.types.kind(target).clone();
         let value_kind = self.types.kind(value).clone();
         match (target_kind, value_kind) {
+            (TypeKind::Heterogeneous, _) | (_, TypeKind::Heterogeneous) => false,
             // TODO: tighten mixed later with narrowing or runtime checks.
             (TypeKind::Mixed, _) | (_, TypeKind::Mixed) => true,
             (TypeKind::Unknown, _) | (_, TypeKind::Unknown) => true,
@@ -980,15 +981,27 @@ impl<'program> Checker<'program> {
     }
 
     fn common_clear_type(&mut self, types: Vec<TypeId>) -> TypeId {
-        let Some(first) = types.first().copied() else {
-            return self.types.unknown();
-        };
+        let mut common = None;
 
-        if !self.is_clear_inferred_type(first) || types.iter().any(|ty| *ty != first) {
-            return self.types.unknown();
+        for ty in types {
+            if !self.is_clear_inferred_type(ty) {
+                return self.types.unknown();
+            }
+
+            if let Some(common_ty) = common {
+                if common_ty != ty {
+                    return self.types.intern(TypeKind::Heterogeneous);
+                }
+            } else {
+                common = Some(ty);
+            }
         }
 
-        first
+        if let Some(common) = common {
+            common
+        } else {
+            self.types.unknown()
+        }
     }
 
     fn is_clear_inferred_type(&self, ty: TypeId) -> bool {

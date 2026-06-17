@@ -716,9 +716,17 @@ Dictionary<string, int> $counts = [
 
     for source in [
         r#"List<string> $numbers = [1, 2, 3];"#,
+        r#"List<int> $numbers = [1, "two"];"#,
+        r#"List<mixed> $numbers = [1, "two"];"#,
         r#"
 Dictionary<string, string> $counts = [
     "apples" => 5,
+];
+"#,
+        r#"
+Dictionary<string, int> $counts = [
+    "apples" => 5,
+    "oranges" => "ten",
 ];
 "#,
     ] {

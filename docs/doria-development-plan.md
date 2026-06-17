@@ -654,7 +654,7 @@ Should infer:
 List<int>
 ```
 
-For mixed list values in MVP, either reject or infer `List<mixed>`. Prefer rejecting until the type system is stable.
+For mixed list values in MVP, reject clear heterogeneous collection literals until the type system is stable. Do not erase cleanly differing element/value types to `Unknown`, because that would let narrow collection annotations accept invalid literals.
 
 ---
 
