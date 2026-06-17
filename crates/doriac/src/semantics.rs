@@ -962,7 +962,93 @@ impl<'program> Checker<'program> {
                     .map(|property| property.ty)
                     .unwrap_or_else(|| self.types.unknown())
             }
+            Expr::Binary {
+                left, op, right, ..
+            } => self.infer_binary_type(left, op, right, scopes, method_context),
             _ => self.types.unknown(),
+        }
+    }
+
+    fn infer_binary_type(
+        &mut self,
+        left: &Expr,
+        op: &BinaryOp,
+        right: &Expr,
+        scopes: &ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) -> TypeId {
+        let left_ty = self.infer_expr_type(left, scopes, method_context);
+        let right_ty = self.infer_expr_type(right, scopes, method_context);
+
+        match op {
+            BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Mod => {
+                self.infer_numeric_binary_type(left_ty, right_ty)
+            }
+            BinaryOp::Concat => self.infer_concat_binary_type(left_ty, right_ty),
+            BinaryOp::Equal
+            | BinaryOp::StrictEqual
+            | BinaryOp::NotEqual
+            | BinaryOp::NotStrictEqual
+            | BinaryOp::Less
+            | BinaryOp::LessEqual
+            | BinaryOp::Greater
+            | BinaryOp::GreaterEqual
+            | BinaryOp::And
+            | BinaryOp::Or => self.types.intern(TypeKind::Bool),
+            BinaryOp::Coalesce => self.infer_coalesce_binary_type(left_ty, right_ty),
+        }
+    }
+
+    fn infer_numeric_binary_type(&mut self, left: TypeId, right: TypeId) -> TypeId {
+        if let Some(recovery) = self.recovery_binary_type(left, right) {
+            return recovery;
+        }
+
+        let left_kind = self.types.kind(left).clone();
+        let right_kind = self.types.kind(right).clone();
+        match (left_kind, right_kind) {
+            (TypeKind::Int, TypeKind::Int) => self.types.intern(TypeKind::Int),
+            (TypeKind::Float, TypeKind::Float) => self.types.intern(TypeKind::Float),
+            _ => self.types.intern(TypeKind::Heterogeneous),
+        }
+    }
+
+    fn infer_concat_binary_type(&mut self, left: TypeId, right: TypeId) -> TypeId {
+        if let Some(recovery) = self.recovery_binary_type(left, right) {
+            return recovery;
+        }
+
+        let left_kind = self.types.kind(left).clone();
+        let right_kind = self.types.kind(right).clone();
+        match (left_kind, right_kind) {
+            (TypeKind::String, TypeKind::String) => self.types.intern(TypeKind::String),
+            _ => self.types.intern(TypeKind::Heterogeneous),
+        }
+    }
+
+    fn infer_coalesce_binary_type(&mut self, left: TypeId, right: TypeId) -> TypeId {
+        if let Some(recovery) = self.recovery_binary_type(left, right) {
+            return recovery;
+        }
+
+        let left_kind = self.types.kind(left).clone();
+        let right_kind = self.types.kind(right).clone();
+        match (left_kind, right_kind) {
+            (TypeKind::Null, _) => right,
+            (_, TypeKind::Null) => left,
+            _ if left == right => left,
+            _ => self.types.intern(TypeKind::Heterogeneous),
+        }
+    }
+
+    fn recovery_binary_type(&mut self, left: TypeId, right: TypeId) -> Option<TypeId> {
+        let left_kind = self.types.kind(left).clone();
+        let right_kind = self.types.kind(right).clone();
+
+        match (left_kind, right_kind) {
+            (TypeKind::Unknown, _) | (_, TypeKind::Unknown) => Some(self.types.unknown()),
+            (TypeKind::Mixed, _) | (_, TypeKind::Mixed) => Some(self.types.intern(TypeKind::Mixed)),
+            _ => None,
         }
     }
 

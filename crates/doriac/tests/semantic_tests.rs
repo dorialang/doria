@@ -94,6 +94,41 @@ $age = "old";
 }
 
 #[test]
+fn infers_binary_expression_types_for_assignment_compatibility() {
+    doriac::check_source(
+        "test.doria",
+        r#"
+int $sum = 1 + 2;
+float $total = 1.5 + 2.5;
+string $message = "hello" . " world";
+bool $less = 1 < 2;
+bool $same = "a" == "b";
+bool $logic = true && false;
+string $name = null ?? "Andrew";
+"#,
+    )
+    .expect("semantic check should succeed");
+
+    for source in [
+        r#"string $value = 1 + 2;"#,
+        r#"int $value = "x" . "y";"#,
+        r#"
+writable int $value = 0;
+$value = "x" . "y";
+"#,
+        r#"
+class Person
+{
+    string $name = 1 + 2;
+}
+"#,
+        r#"function greet(string $name = 1 + 2): void {}"#,
+    ] {
+        assert_type_mismatch(source);
+    }
+}
+
+#[test]
 fn rejects_readonly_property_assignment() {
     let err = doriac::check_source(
         "test.doria",
