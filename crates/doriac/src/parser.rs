@@ -698,6 +698,7 @@ impl Parser {
                 | TokenKind::StringType
                 | TokenKind::BoolType
                 | TokenKind::ArrayType
+                | TokenKind::Null
                 | TokenKind::Identifier(_)
         )
     }

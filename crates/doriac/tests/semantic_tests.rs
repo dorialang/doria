@@ -487,6 +487,22 @@ function accept(
 }
 
 #[test]
+fn resolves_null_typed_declarations() {
+    doriac::check_source(
+        "test.doria",
+        r#"
+null $empty = null;
+
+function clear(): void
+{
+    null $value = null;
+}
+"#,
+    )
+    .expect("semantic check should succeed");
+}
+
+#[test]
 fn resolves_declared_class_types() {
     doriac::check_source(
         "test.doria",

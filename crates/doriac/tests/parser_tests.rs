@@ -8,11 +8,12 @@ fn parses_variable_declarations() {
 let $x = 5;
 let writable $name = "Doria";
 writable int $score = 1;
+null $empty = null;
 "#,
     )
     .expect("parse should succeed");
 
-    assert_eq!(program.items.len(), 3);
+    assert_eq!(program.items.len(), 4);
     assert!(matches!(
         &program.items[0],
         Item::Statement(Stmt::VarDecl(decl)) if !decl.writable && decl.name == "x"
@@ -24,6 +25,13 @@ writable int $score = 1;
     assert!(matches!(
         &program.items[2],
         Item::Statement(Stmt::VarDecl(decl)) if decl.writable && decl.ty.is_some()
+    ));
+    assert!(matches!(
+        &program.items[3],
+        Item::Statement(Stmt::VarDecl(decl))
+            if !decl.writable
+                && decl.name == "empty"
+                && matches!(decl.ty.as_ref(), Some(ty) if ty.name == "null")
     ));
 }
 
