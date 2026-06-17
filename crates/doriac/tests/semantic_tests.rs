@@ -837,6 +837,22 @@ Dictionary<string, int> $counts = [
     10,
 ];
 "#,
+        r#"
+function collect(mixed $payload): void
+{
+    List<int> $numbers = [1, $payload, "two"];
+}
+"#,
+        r#"
+function collect(mixed $payload): void
+{
+    Dictionary<string, int> $counts = [
+        "apples" => 5,
+        "oranges" => $payload,
+        "pears" => "ten",
+    ];
+}
+"#,
     ] {
         assert_type_mismatch(source);
     }

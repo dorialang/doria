@@ -1089,23 +1089,31 @@ impl<'program> Checker<'program> {
     fn common_clear_type(&mut self, types: Vec<TypeId>) -> TypeId {
         let mut common = None;
         let mut saw_empty_collection = false;
+        let mut saw_mixed = false;
 
         for ty in types {
-            if !self.is_clear_inferred_type(ty) {
-                return self.types.unknown();
-            }
-
-            if matches!(self.types.kind(ty), TypeKind::EmptyCollection) {
-                saw_empty_collection = true;
-                continue;
-            }
-
-            if let Some(common_ty) = common {
-                if common_ty != ty {
-                    return self.types.intern(TypeKind::Heterogeneous);
+            let kind = self.types.kind(ty).clone();
+            match kind {
+                TypeKind::Mixed => {
+                    saw_mixed = true;
+                    continue;
                 }
-            } else {
-                common = Some(ty);
+                TypeKind::Unknown => {
+                    continue;
+                }
+                TypeKind::EmptyCollection => {
+                    saw_empty_collection = true;
+                    continue;
+                }
+                _ => {
+                    if let Some(common_ty) = common {
+                        if common_ty != ty {
+                            return self.types.intern(TypeKind::Heterogeneous);
+                        }
+                    } else {
+                        common = Some(ty);
+                    }
+                }
             }
         }
 
@@ -1116,13 +1124,11 @@ impl<'program> Checker<'program> {
             common
         } else if saw_empty_collection {
             self.types.intern(TypeKind::EmptyCollection)
+        } else if saw_mixed {
+            self.types.intern(TypeKind::Mixed)
         } else {
             self.types.unknown()
         }
-    }
-
-    fn is_clear_inferred_type(&self, ty: TypeId) -> bool {
-        !matches!(self.types.kind(ty), TypeKind::Mixed | TypeKind::Unknown)
     }
 
     fn is_collection_like_type(&self, ty: TypeId) -> bool {
