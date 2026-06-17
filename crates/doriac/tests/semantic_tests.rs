@@ -81,16 +81,35 @@ fn checks_writable_local_assignment_compatibility() {
         r#"
 writable int $age = 37;
 $age = 38;
+$age += 1;
+$age -= 2;
+
+writable float $total = 1.5;
+$total += 2.5;
 "#,
     )
     .expect("semantic check should succeed");
 
-    assert_type_mismatch(
+    for source in [
         r#"
 writable int $age = 37;
 $age = "old";
 "#,
-    );
+        r#"
+writable string $name = "a";
+$name += "b";
+"#,
+        r#"
+writable string $name = "a";
+$name -= "b";
+"#,
+        r#"
+writable int $count = 1;
+$count += "two";
+"#,
+    ] {
+        assert_type_mismatch(source);
+    }
 }
 
 #[test]

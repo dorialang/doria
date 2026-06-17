@@ -377,13 +377,30 @@ impl<'program> Checker<'program> {
                 if let Some(target) =
                     self.check_assignment_target(&assignment.target, scopes, method_context)
                 {
-                    self.check_expr_assignable(
-                        target.ty,
-                        &assignment.value,
-                        scopes,
-                        method_context,
-                        target.destination,
-                    );
+                    match assignment.op {
+                        AssignOp::Assign => {
+                            self.check_expr_assignable(
+                                target.ty,
+                                &assignment.value,
+                                scopes,
+                                method_context,
+                                target.destination,
+                            );
+                        }
+                        AssignOp::AddAssign | AssignOp::SubAssign => {
+                            let value_ty =
+                                self.infer_expr_type(&assignment.value, scopes, method_context);
+                            let result_ty = self.infer_numeric_binary_type(target.ty, value_ty);
+                            if !self.is_assignable(target.ty, result_ty) {
+                                self.check_assignable(
+                                    target.ty,
+                                    result_ty,
+                                    assignment.value.span(),
+                                    target.destination,
+                                );
+                            }
+                        }
+                    }
                 }
             }
             Stmt::Echo { expr, .. } | Stmt::Expr { expr, .. } => {
