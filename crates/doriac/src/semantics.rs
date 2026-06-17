@@ -20,6 +20,7 @@ struct Checker<'program> {
     program: &'program Program,
     classes: HashMap<String, ClassInfo>,
     functions: HashMap<String, TypeId>,
+    function_return_types: HashMap<usize, TypeId>,
     types: TypeRegistry,
     diagnostics: Vec<Diagnostic>,
 }
@@ -105,6 +106,7 @@ impl<'program> Checker<'program> {
             program,
             classes: HashMap::new(),
             functions: HashMap::new(),
+            function_return_types: HashMap::new(),
             types: TypeRegistry::new(),
             diagnostics: Vec::new(),
         }
@@ -165,6 +167,10 @@ impl<'program> Checker<'program> {
                         self.declare_property(&mut info, &class_decl.name, property);
                     }
                     ClassMember::Method(method) => {
+                        let return_ty = self.resolve_function_return_type(method);
+                        self.function_return_types
+                            .insert(method.span.start, return_ty);
+
                         if info.methods.contains_key(&method.name) {
                             self.diagnostics.push(Diagnostic::new(
                                 "E0302",
@@ -175,7 +181,6 @@ impl<'program> Checker<'program> {
                                 method.span,
                             ));
                         } else {
-                            let return_ty = self.resolve_function_return_type(method);
                             info.methods.insert(
                                 method.name.clone(),
                                 MethodInfo {
@@ -212,6 +217,17 @@ impl<'program> Checker<'program> {
             };
 
             let return_ty = self.resolve_function_return_type(function);
+            self.function_return_types
+                .insert(function.span.start, return_ty);
+            if self.functions.contains_key(&function.name) {
+                self.diagnostics.push(Diagnostic::new(
+                    "E0308",
+                    format!("function `{}` is already declared", function.name),
+                    function.span,
+                ));
+                continue;
+            }
+
             self.functions.insert(function.name.clone(), return_ty);
         }
     }
@@ -403,21 +419,13 @@ impl<'program> Checker<'program> {
             .unwrap_or_else(|| function.name.clone());
 
         if let Some(lifecycle) = lifecycle {
-            self.check_lifecycle_return_type(function, method_context, lifecycle);
+            self.check_lifecycle_return_type(function, lifecycle);
         }
 
         let expected = if lifecycle.is_some() {
             None
         } else if function.return_type.is_some() {
-            method_context
-                .and_then(|context| {
-                    self.classes
-                        .get(&context.class_name)
-                        .and_then(|class_info| class_info.methods.get(&function.name))
-                        .map(|method| method.return_ty)
-                })
-                .or_else(|| self.functions.get(&function.name).copied())
-                .or_else(|| Some(self.types.unknown()))
+            Some(self.current_function_return_type(function))
         } else {
             None
         };
@@ -430,24 +438,12 @@ impl<'program> Checker<'program> {
         }
     }
 
-    fn check_lifecycle_return_type(
-        &mut self,
-        function: &FunctionDecl,
-        method_context: Option<&MethodContext>,
-        lifecycle: LifecycleMethod,
-    ) {
+    fn check_lifecycle_return_type(&mut self, function: &FunctionDecl, lifecycle: LifecycleMethod) {
         if function.return_type.is_none() {
             return;
         }
 
-        let return_ty = method_context
-            .and_then(|context| {
-                self.classes
-                    .get(&context.class_name)
-                    .and_then(|class_info| class_info.methods.get(&function.name))
-                    .map(|method| method.return_ty)
-            })
-            .unwrap_or_else(|| self.types.unknown());
+        let return_ty = self.current_function_return_type(function);
 
         if self.is_void_type(return_ty) {
             return;
@@ -468,6 +464,13 @@ impl<'program> Checker<'program> {
                 lifecycle.doria_name()
             )),
         );
+    }
+
+    fn current_function_return_type(&mut self, function: &FunctionDecl) -> TypeId {
+        self.function_return_types
+            .get(&function.span.start)
+            .copied()
+            .unwrap_or_else(|| self.resolve_function_return_type(function))
     }
 
     fn check_block(

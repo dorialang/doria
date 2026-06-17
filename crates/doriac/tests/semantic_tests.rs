@@ -781,6 +781,42 @@ class Person {}
 }
 
 #[test]
+fn rejects_duplicate_function_declaration() {
+    let err = doriac::check_source(
+        "test.doria",
+        r#"
+function greet(): void {}
+function greet(): void {}
+"#,
+    )
+    .expect_err("semantic check should fail");
+
+    assert!(err.iter().any(|diagnostic| diagnostic.code == "E0308"));
+}
+
+#[test]
+fn checks_duplicate_global_functions_against_their_own_return_annotations() {
+    let err = doriac::check_source(
+        "test.doria",
+        r#"
+function f(): string
+{
+    return 1;
+}
+
+function f(): int
+{
+    return 1;
+}
+"#,
+    )
+    .expect_err("semantic check should fail");
+
+    assert!(err.iter().any(|diagnostic| diagnostic.code == "E0308"));
+    assert!(err.iter().any(|diagnostic| diagnostic.code == "E0404"));
+}
+
+#[test]
 fn rejects_duplicate_property_declaration() {
     let err = doriac::check_source(
         "test.doria",
