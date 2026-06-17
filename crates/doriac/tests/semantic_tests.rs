@@ -342,6 +342,50 @@ class Person
     {
         return;
     }
+
+    function __destruct()
+    {
+        return;
+    }
+}
+"#,
+    )
+    .expect("semantic check should succeed");
+}
+
+#[test]
+fn allows_lifecycle_methods_with_omitted_or_void_return_types() {
+    doriac::check_source(
+        "test.doria",
+        r#"
+class Person
+{
+    function __construct()
+    {
+    }
+
+    function __destruct()
+    {
+    }
+}
+"#,
+    )
+    .expect("semantic check should succeed");
+
+    doriac::check_source(
+        "test.doria",
+        r#"
+class Person
+{
+    function __construct(): void
+    {
+        return;
+    }
+
+    function __destruct(): void
+    {
+        return;
+    }
 }
 "#,
     )
@@ -457,10 +501,41 @@ class Person
     {
         return 1;
     }
+
+    function __destruct()
+    {
+        return "done";
+    }
 }
 "#,
     ] {
         assert_diagnostic_code(source, "E0405");
+    }
+}
+
+#[test]
+fn rejects_non_void_lifecycle_return_annotations() {
+    for source in [
+        r#"
+class Person
+{
+    function __construct(): int
+    {
+        return 1;
+    }
+}
+"#,
+        r#"
+class Person
+{
+    function __destruct(): string
+    {
+        return "done";
+    }
+}
+"#,
+    ] {
+        assert_diagnostic_code(source, "E0407");
     }
 }
 

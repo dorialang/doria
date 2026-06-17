@@ -35,7 +35,7 @@ struct MethodContext {
 struct ReturnContext {
     name: String,
     expected: Option<TypeId>,
-    is_constructor: bool,
+    lifecycle: Option<LifecycleMethod>,
     is_method: bool,
 }
 
@@ -45,6 +45,43 @@ impl ReturnContext {
             "method"
         } else {
             "function"
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LifecycleMethod {
+    Constructor,
+    Destructor,
+}
+
+impl LifecycleMethod {
+    fn from_method_name(name: &str) -> Option<Self> {
+        match name {
+            "__construct" => Some(Self::Constructor),
+            "__destruct" => Some(Self::Destructor),
+            _ => None,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Constructor => "constructor",
+            Self::Destructor => "destructor",
+        }
+    }
+
+    fn doria_name(self) -> &'static str {
+        match self {
+            Self::Constructor => "__construct",
+            Self::Destructor => "__destruct",
+        }
+    }
+
+    fn return_value_message(self) -> &'static str {
+        match self {
+            Self::Constructor => "constructors cannot return a value",
+            Self::Destructor => "destructors cannot return a value",
         }
     }
 }
@@ -358,12 +395,18 @@ impl<'program> Checker<'program> {
         method_context: Option<&MethodContext>,
     ) -> ReturnContext {
         let is_method = method_context.is_some();
-        let is_constructor = is_method && function.name == "__construct";
+        let lifecycle = is_method
+            .then(|| LifecycleMethod::from_method_name(&function.name))
+            .flatten();
         let name = method_context
             .map(|context| format!("{}::{}", context.class_name, function.name))
             .unwrap_or_else(|| function.name.clone());
 
-        let expected = if is_constructor {
+        if let Some(lifecycle) = lifecycle {
+            self.check_lifecycle_return_type(function, method_context, lifecycle);
+        }
+
+        let expected = if lifecycle.is_some() {
             None
         } else if function.return_type.is_some() {
             method_context
@@ -382,9 +425,49 @@ impl<'program> Checker<'program> {
         ReturnContext {
             name,
             expected,
-            is_constructor,
+            lifecycle,
             is_method,
         }
+    }
+
+    fn check_lifecycle_return_type(
+        &mut self,
+        function: &FunctionDecl,
+        method_context: Option<&MethodContext>,
+        lifecycle: LifecycleMethod,
+    ) {
+        if function.return_type.is_none() {
+            return;
+        }
+
+        let return_ty = method_context
+            .and_then(|context| {
+                self.classes
+                    .get(&context.class_name)
+                    .and_then(|class_info| class_info.methods.get(&function.name))
+                    .map(|method| method.return_ty)
+            })
+            .unwrap_or_else(|| self.types.unknown());
+
+        if self.is_void_type(return_ty) {
+            return;
+        }
+
+        self.diagnostics.push(
+            Diagnostic::new(
+                "E0407",
+                format!(
+                    "{} `{}` cannot declare non-void return type",
+                    lifecycle.label(),
+                    lifecycle.doria_name()
+                ),
+                function.span,
+            )
+            .with_help(format!(
+                "remove the return type annotation or use `{}(): void`",
+                lifecycle.doria_name()
+            )),
+        );
     }
 
     fn check_block(
@@ -551,11 +634,11 @@ impl<'program> Checker<'program> {
             self.check_expr(expr, scopes, method_context);
         }
 
-        if context.is_constructor {
+        if let Some(lifecycle) = context.lifecycle {
             if expr.is_some() {
                 self.diagnostics.push(Diagnostic::new(
                     "E0405",
-                    "constructors cannot return a value",
+                    lifecycle.return_value_message(),
                     span,
                 ));
             }
@@ -597,7 +680,7 @@ impl<'program> Checker<'program> {
     }
 
     fn check_missing_final_return(&mut self, function: &FunctionDecl, context: &ReturnContext) {
-        if context.is_constructor {
+        if context.lifecycle.is_some() {
             return;
         }
 
