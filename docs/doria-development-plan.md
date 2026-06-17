@@ -607,7 +607,7 @@ Dictionary<K, V>
 Set<T>
 ```
 
-Assignment compatibility, return type checking, and constructor argument checking should come after this foundation.
+Assignment compatibility is checked for typed declarations, property initializers, property writes, and parameter defaults. Doria does not perform PHP-style scalar coercion, and numeric widening is not implemented yet. Return type checking, function call argument checking, and constructor argument checking should come after this foundation.
 
 Support nullable types later:
 
@@ -654,7 +654,7 @@ Should infer:
 List<int>
 ```
 
-For mixed list values in MVP, either reject or infer `List<mixed>`. Prefer rejecting until the type system is stable.
+For mixed list values in MVP, reject clear heterogeneous collection literals for narrow collection aliases until the type system is stable. Do not erase cleanly differing element/value types to `Unknown`, because that would let `List<T>` and `Dictionary<K, V>` annotations accept invalid literals. Keep `[]` ambiguous so typed contexts can use it for empty lists or dictionaries. The PHP-compatible `array` annotation remains broad enough to accept list-shaped and dictionary-shaped literals.
 
 ---
 

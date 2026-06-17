@@ -19,6 +19,7 @@ pub fn check_program(program: &Program) -> DiagnosticResult<()> {
 struct Checker<'program> {
     program: &'program Program,
     classes: HashMap<String, ClassInfo>,
+    functions: HashMap<String, TypeId>,
     types: TypeRegistry,
     diagnostics: Vec<Diagnostic>,
 }
@@ -27,6 +28,20 @@ struct Checker<'program> {
 struct MethodContext {
     class_name: String,
     writable_this: bool,
+    this_available: bool,
+}
+
+#[derive(Debug, Clone)]
+struct AssignmentTarget {
+    ty: TypeId,
+    destination: AssignmentDestination,
+}
+
+#[derive(Debug, Clone)]
+enum AssignmentDestination {
+    Type,
+    Parameter { name: String },
+    Property { class_name: String, name: String },
 }
 
 impl<'program> Checker<'program> {
@@ -34,6 +49,7 @@ impl<'program> Checker<'program> {
         Self {
             program,
             classes: HashMap::new(),
+            functions: HashMap::new(),
             types: TypeRegistry::new(),
             diagnostics: Vec::new(),
         }
@@ -41,6 +57,7 @@ impl<'program> Checker<'program> {
 
     fn check(&mut self) {
         self.collect_classes();
+        self.collect_functions();
 
         let mut scopes = ScopeStack::new();
         for item in &self.program.items {
@@ -101,11 +118,13 @@ impl<'program> Checker<'program> {
                                 method.span,
                             ));
                         } else {
+                            let return_ty = self.resolve_function_return_type(method);
                             info.methods.insert(
                                 method.name.clone(),
                                 MethodInfo {
                                     access: method.access.clone(),
                                     writable_this: method.writable_this,
+                                    return_ty,
                                 },
                             );
                         }
@@ -129,18 +148,73 @@ impl<'program> Checker<'program> {
         }
     }
 
+    fn collect_functions(&mut self) {
+        for item in &self.program.items {
+            let Item::Function(function) = item else {
+                continue;
+            };
+
+            let return_ty = self.resolve_function_return_type(function);
+            self.functions.insert(function.name.clone(), return_ty);
+        }
+    }
+
+    fn resolve_function_return_type(&mut self, function: &FunctionDecl) -> TypeId {
+        function
+            .return_type
+            .as_ref()
+            .map(|return_type| self.resolve_type_ref(return_type, function.span))
+            .unwrap_or_else(|| self.types.unknown())
+    }
+
     fn check_class(&mut self, class_decl: &ClassDecl) {
         for member in &class_decl.members {
-            if let ClassMember::Method(method) = member {
-                self.check_function(
-                    method,
-                    Some(MethodContext {
-                        class_name: class_decl.name.clone(),
-                        writable_this: method.writable_this,
-                    }),
-                );
+            match member {
+                ClassMember::Property(property) => {
+                    self.check_property_initializer(&class_decl.name, property);
+                }
+                ClassMember::Method(method) => {
+                    self.check_function(
+                        method,
+                        Some(MethodContext {
+                            class_name: class_decl.name.clone(),
+                            writable_this: method.writable_this,
+                            this_available: true,
+                        }),
+                    );
+                }
             }
         }
+    }
+
+    fn check_property_initializer(&mut self, class_name: &str, property: &PropertyDecl) {
+        let Some(initializer) = &property.initializer else {
+            return;
+        };
+
+        let scopes = ScopeStack::new();
+        let initializer_context = MethodContext {
+            class_name: class_name.to_string(),
+            writable_this: false,
+            this_available: false,
+        };
+        self.check_expr(initializer, &scopes, Some(&initializer_context));
+        let target_ty = self
+            .classes
+            .get(class_name)
+            .and_then(|class_info| class_info.properties.get(&property.name))
+            .map(|property| property.ty)
+            .unwrap_or_else(|| self.resolve_type_ref(&property.ty, property.span));
+        self.check_expr_assignable(
+            target_ty,
+            initializer,
+            &scopes,
+            Some(&initializer_context),
+            AssignmentDestination::Property {
+                class_name: class_name.to_string(),
+                name: property.name.clone(),
+            },
+        );
     }
 
     fn declare_property(
@@ -217,11 +291,27 @@ impl<'program> Checker<'program> {
 
     fn check_function(&mut self, function: &FunctionDecl, method_context: Option<MethodContext>) {
         let mut scopes = ScopeStack::new();
-        if let Some(return_type) = &function.return_type {
-            self.resolve_type_ref(return_type, function.span);
-        }
         for param in &function.params {
             let ty = self.resolve_type_ref(&param.ty, param.span);
+            if let Some(default) = &param.default {
+                let default_context = method_context.as_ref().map(|context| MethodContext {
+                    class_name: context.class_name.clone(),
+                    writable_this: context.writable_this,
+                    this_available: false,
+                });
+                let default_context = default_context.as_ref();
+
+                self.check_expr(default, &scopes, default_context);
+                self.check_expr_assignable(
+                    ty,
+                    default,
+                    &scopes,
+                    default_context,
+                    AssignmentDestination::Parameter {
+                        name: param.name.clone(),
+                    },
+                );
+            }
             self.declare_binding(
                 &mut scopes,
                 param.name.clone(),
@@ -257,9 +347,20 @@ impl<'program> Checker<'program> {
         match statement {
             Stmt::VarDecl(decl) => {
                 self.check_expr(&decl.initializer, scopes, method_context);
+                let value_ty = self.infer_expr_type(&decl.initializer, scopes, method_context);
                 let ty = match &decl.ty {
-                    Some(ty) => self.resolve_type_ref(ty, decl.span),
-                    None => self.infer_expr_type(&decl.initializer, scopes, method_context),
+                    Some(ty) => {
+                        let target_ty = self.resolve_type_ref(ty, decl.span);
+                        self.check_expr_assignable(
+                            target_ty,
+                            &decl.initializer,
+                            scopes,
+                            method_context,
+                            AssignmentDestination::Type,
+                        );
+                        target_ty
+                    }
+                    None => value_ty,
                 };
                 self.declare_binding(
                     scopes,
@@ -273,7 +374,45 @@ impl<'program> Checker<'program> {
             }
             Stmt::Assignment(assignment) => {
                 self.check_expr(&assignment.value, scopes, method_context);
-                self.check_assignment_target(&assignment.target, scopes, method_context);
+                if let Some(target) =
+                    self.check_assignment_target(&assignment.target, scopes, method_context)
+                {
+                    match assignment.op {
+                        AssignOp::Assign => {
+                            let target_ty = target.ty;
+                            let assignment_ok = self.check_expr_assignable(
+                                target.ty,
+                                &assignment.value,
+                                scopes,
+                                method_context,
+                                target.destination,
+                            );
+                            if assignment_ok {
+                                let value_ty =
+                                    self.infer_expr_type(&assignment.value, scopes, method_context);
+                                self.narrow_empty_collection_assignment(
+                                    &assignment.target,
+                                    target_ty,
+                                    value_ty,
+                                    scopes,
+                                );
+                            }
+                        }
+                        AssignOp::AddAssign | AssignOp::SubAssign => {
+                            let value_ty =
+                                self.infer_expr_type(&assignment.value, scopes, method_context);
+                            let result_ty = self.infer_numeric_binary_type(target.ty, value_ty);
+                            if !self.is_assignable(target.ty, result_ty) {
+                                self.check_assignable(
+                                    target.ty,
+                                    result_ty,
+                                    assignment.value.span(),
+                                    target.destination,
+                                );
+                            }
+                        }
+                    }
+                }
             }
             Stmt::Echo { expr, .. } | Stmt::Expr { expr, .. } => {
                 self.check_expr(expr, scopes, method_context);
@@ -338,7 +477,10 @@ impl<'program> Checker<'program> {
                 }
             }
             Expr::This { span } => {
-                if method_context.is_none() {
+                if !method_context
+                    .map(|context| context.this_available)
+                    .unwrap_or(false)
+                {
                     self.diagnostics.push(Diagnostic::new(
                         "E0102",
                         "`$this` is only available inside methods",
@@ -424,21 +566,31 @@ impl<'program> Checker<'program> {
         target: &Expr,
         scopes: &ScopeStack,
         method_context: Option<&MethodContext>,
-    ) {
+    ) -> Option<AssignmentTarget> {
         match target {
             Expr::Variable { name, span } => match scopes.lookup(name) {
-                Some(binding) if binding.writable => {}
-                Some(_) => self.diagnostics.push(
-                    Diagnostic::new(
-                        "E0201",
-                        format!("cannot assign to readonly variable `${name}`"),
-                        *span,
-                    )
-                    .with_help(format!(
-                        "declare it as `let writable ${name} = ...` if mutation is intended"
-                    )),
-                ),
-                None => self.undeclared_variable(name, *span),
+                Some(binding) => {
+                    if !binding.writable {
+                        self.diagnostics.push(
+                            Diagnostic::new(
+                                "E0201",
+                                format!("cannot assign to readonly variable `${name}`"),
+                                *span,
+                            )
+                            .with_help(format!(
+                                "declare it as `let writable ${name} = ...` if mutation is intended"
+                            )),
+                        );
+                    }
+                    Some(AssignmentTarget {
+                        ty: binding.ty,
+                        destination: AssignmentDestination::Type,
+                    })
+                }
+                None => {
+                    self.undeclared_variable(name, *span);
+                    None
+                }
             },
             Expr::PropertyAccess {
                 object,
@@ -479,13 +631,25 @@ impl<'program> Checker<'program> {
                             )),
                         );
                     }
+                    Some(AssignmentTarget {
+                        ty: property_info.ty,
+                        destination: AssignmentDestination::Property {
+                            class_name,
+                            name: property.clone(),
+                        },
+                    })
+                } else {
+                    None
                 }
             }
-            _ => self.diagnostics.push(Diagnostic::new(
-                "E0204",
-                "unsupported assignment target",
-                target.span(),
-            )),
+            _ => {
+                self.diagnostics.push(Diagnostic::new(
+                    "E0204",
+                    "unsupported assignment target",
+                    target.span(),
+                ));
+                None
+            }
         }
     }
 
@@ -587,7 +751,7 @@ impl<'program> Checker<'program> {
                 .map(|binding| binding.writable)
                 .unwrap_or(false),
             Expr::This { .. } => method_context
-                .map(|context| context.writable_this)
+                .map(|context| context.this_available && context.writable_this)
                 .unwrap_or(false),
             Expr::PropertyAccess {
                 object, property, ..
@@ -751,6 +915,195 @@ impl<'program> Checker<'program> {
         false
     }
 
+    fn check_assignable(
+        &mut self,
+        target: TypeId,
+        value: TypeId,
+        span: Span,
+        destination: AssignmentDestination,
+    ) {
+        let target_name = self.types.display(target);
+        let value_name = self.types.display(value);
+        let message = match destination {
+            AssignmentDestination::Type => {
+                format!("cannot assign value of type `{value_name}` to `{target_name}`")
+            }
+            AssignmentDestination::Parameter { name } => format!(
+                "cannot assign default value of type `{value_name}` to parameter `${name}` of type `{target_name}`"
+            ),
+            AssignmentDestination::Property { class_name, name } => format!(
+                "cannot assign value of type `{value_name}` to property `{class_name}::${name}` of type `{target_name}`"
+            ),
+        };
+
+        self.diagnostics
+            .push(Diagnostic::new("E0403", message, span));
+    }
+
+    fn check_expr_assignable(
+        &mut self,
+        target: TypeId,
+        value_expr: &Expr,
+        scopes: &ScopeStack,
+        method_context: Option<&MethodContext>,
+        destination: AssignmentDestination,
+    ) -> bool {
+        let value = self.infer_expr_type(value_expr, scopes, method_context);
+        if self.is_expr_assignable(target, value_expr, scopes, method_context)
+            || self.is_assignable(target, value)
+        {
+            return true;
+        }
+
+        self.check_assignable(target, value, value_expr.span(), destination);
+        false
+    }
+
+    fn narrow_empty_collection_assignment(
+        &self,
+        target: &Expr,
+        target_ty: TypeId,
+        value_ty: TypeId,
+        scopes: &mut ScopeStack,
+    ) {
+        if !matches!(self.types.kind(target_ty), TypeKind::EmptyCollection)
+            || !self.is_non_empty_collection_like_type(value_ty)
+        {
+            return;
+        }
+
+        let Expr::Variable { name, .. } = target else {
+            return;
+        };
+
+        let Some(binding) = scopes.lookup_mut(name) else {
+            return;
+        };
+
+        if matches!(self.types.kind(binding.ty), TypeKind::EmptyCollection) {
+            binding.ty = value_ty;
+        }
+    }
+
+    fn is_expr_assignable(
+        &mut self,
+        target: TypeId,
+        value_expr: &Expr,
+        scopes: &ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) -> bool {
+        match value_expr {
+            Expr::Array { elements, .. } => {
+                self.is_array_literal_assignable(target, elements, scopes, method_context)
+            }
+            _ => {
+                let value = self.infer_expr_type(value_expr, scopes, method_context);
+                self.is_assignable(target, value)
+            }
+        }
+    }
+
+    fn is_array_literal_assignable(
+        &mut self,
+        target: TypeId,
+        elements: &[ArrayElement],
+        scopes: &ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) -> bool {
+        let target_kind = self.types.kind(target).clone();
+
+        match target_kind {
+            TypeKind::Mixed | TypeKind::Unknown | TypeKind::Array => true,
+            TypeKind::List(element) => {
+                if self.is_mixed_or_unknown_type(element)
+                    || elements.iter().any(|element| element.key.is_some())
+                {
+                    return false;
+                }
+
+                elements.iter().all(|array_element| {
+                    self.is_expr_assignable(element, &array_element.value, scopes, method_context)
+                })
+            }
+            TypeKind::Dictionary(key, value) => {
+                if self.is_mixed_or_unknown_type(key) || self.is_mixed_or_unknown_type(value) {
+                    return false;
+                }
+
+                if elements.is_empty() {
+                    return true;
+                }
+
+                if !elements.iter().any(|element| element.key.is_some()) {
+                    return false;
+                }
+
+                elements.iter().all(|array_element| {
+                    let key_ok = if let Some(key_expr) = &array_element.key {
+                        self.is_expr_assignable(key, key_expr, scopes, method_context)
+                    } else {
+                        let implicit_key = self.types.intern(TypeKind::Int);
+                        self.is_assignable(key, implicit_key)
+                    };
+                    let value_ok = self.is_expr_assignable(
+                        value,
+                        &array_element.value,
+                        scopes,
+                        method_context,
+                    );
+                    key_ok && value_ok
+                })
+            }
+            _ => {
+                let value = self.infer_array_type(elements, scopes, method_context);
+                self.is_assignable(target, value)
+            }
+        }
+    }
+
+    fn is_mixed_or_unknown_type(&self, ty: TypeId) -> bool {
+        matches!(self.types.kind(ty), TypeKind::Mixed | TypeKind::Unknown)
+    }
+
+    fn is_assignable(&self, target: TypeId, value: TypeId) -> bool {
+        if target == value {
+            return true;
+        }
+
+        let target_kind = self.types.kind(target).clone();
+        let value_kind = self.types.kind(value).clone();
+        match (target_kind, value_kind) {
+            (TypeKind::Heterogeneous, _) | (_, TypeKind::Heterogeneous) => false,
+            // TODO: tighten mixed later with narrowing or runtime checks.
+            (TypeKind::Mixed, _) | (_, TypeKind::Mixed) => true,
+            (TypeKind::Unknown, _) | (_, TypeKind::Unknown) => true,
+            (TypeKind::Object, TypeKind::Class(_)) => true,
+            (
+                TypeKind::Array,
+                TypeKind::List(_) | TypeKind::Dictionary(_, _) | TypeKind::Set(_),
+            ) => true,
+            (
+                TypeKind::Array | TypeKind::List(_) | TypeKind::Dictionary(_, _) | TypeKind::Set(_),
+                TypeKind::EmptyCollection,
+            ) => true,
+            (
+                TypeKind::EmptyCollection,
+                TypeKind::Array | TypeKind::List(_) | TypeKind::Dictionary(_, _) | TypeKind::Set(_),
+            ) => true,
+            (TypeKind::Class(target), TypeKind::Class(value)) => target == value,
+            (TypeKind::List(target), TypeKind::List(value)) => self.is_assignable(target, value),
+            (
+                TypeKind::Dictionary(target_key, target_value),
+                TypeKind::Dictionary(value_key, value_value),
+            ) => {
+                self.is_assignable(target_key, value_key)
+                    && self.is_assignable(target_value, value_value)
+            }
+            (TypeKind::Set(target), TypeKind::Set(value)) => self.is_assignable(target, value),
+            _ => false,
+        }
+    }
+
     fn infer_expr_type(
         &mut self,
         expr: &Expr,
@@ -763,23 +1116,20 @@ impl<'program> Checker<'program> {
             Expr::Float { .. } => self.types.intern(TypeKind::Float),
             Expr::Bool { .. } => self.types.intern(TypeKind::Bool),
             Expr::Null { .. } => self.types.intern(TypeKind::Null),
-            Expr::New { class_name, .. } => self.types.intern(TypeKind::Class(class_name.clone())),
-            Expr::Array { elements, .. } => {
-                if elements.iter().any(|element| element.key.is_some()) {
-                    let unknown_key = self.types.unknown();
-                    let unknown_value = self.types.unknown();
-                    self.types
-                        .intern(TypeKind::Dictionary(unknown_key, unknown_value))
+            Expr::New { class_name, .. } => {
+                if self.classes.contains_key(class_name) {
+                    self.types.intern(TypeKind::Class(class_name.clone()))
                 } else {
-                    let unknown = self.types.unknown();
-                    self.types.intern(TypeKind::List(unknown))
+                    self.types.unknown()
                 }
             }
+            Expr::Array { elements, .. } => self.infer_array_type(elements, scopes, method_context),
             Expr::Variable { name, .. } => scopes
                 .lookup(name)
                 .map(|binding| binding.ty)
                 .unwrap_or_else(|| self.types.unknown()),
             Expr::This { .. } => method_context
+                .filter(|context| context.this_available)
                 .map(|context| {
                     self.types
                         .intern(TypeKind::Class(context.class_name.clone()))
@@ -797,8 +1147,240 @@ impl<'program> Checker<'program> {
                     .map(|property| property.ty)
                     .unwrap_or_else(|| self.types.unknown())
             }
+            Expr::MethodCall { object, method, .. } => {
+                let Some(class_name) = self.expr_class_name(object, scopes, method_context) else {
+                    return self.types.unknown();
+                };
+                self.classes
+                    .get(&class_name)
+                    .and_then(|class_info| class_info.methods.get(method))
+                    .map(|method| method.return_ty)
+                    .unwrap_or_else(|| self.types.unknown())
+            }
+            Expr::FunctionCall { name, .. } => self
+                .functions
+                .get(name)
+                .copied()
+                .unwrap_or_else(|| self.types.unknown()),
+            Expr::StaticCall {
+                class_name, method, ..
+            } => self
+                .classes
+                .get(class_name)
+                .and_then(|class_info| class_info.methods.get(method))
+                .map(|method| method.return_ty)
+                .unwrap_or_else(|| self.types.unknown()),
+            Expr::Binary {
+                left, op, right, ..
+            } => self.infer_binary_type(left, op, right, scopes, method_context),
             _ => self.types.unknown(),
         }
+    }
+
+    fn infer_binary_type(
+        &mut self,
+        left: &Expr,
+        op: &BinaryOp,
+        right: &Expr,
+        scopes: &ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) -> TypeId {
+        let left_ty = self.infer_expr_type(left, scopes, method_context);
+        let right_ty = self.infer_expr_type(right, scopes, method_context);
+
+        match op {
+            BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Mod => {
+                self.infer_numeric_binary_type(left_ty, right_ty)
+            }
+            BinaryOp::Concat => self.infer_concat_binary_type(left_ty, right_ty),
+            BinaryOp::Equal
+            | BinaryOp::StrictEqual
+            | BinaryOp::NotEqual
+            | BinaryOp::NotStrictEqual => self.types.intern(TypeKind::Bool),
+            BinaryOp::Less | BinaryOp::LessEqual | BinaryOp::Greater | BinaryOp::GreaterEqual => {
+                self.infer_relational_binary_type(left_ty, right_ty)
+            }
+            BinaryOp::And | BinaryOp::Or => self.infer_logical_binary_type(left_ty, right_ty),
+            BinaryOp::Coalesce => self.infer_coalesce_binary_type(left_ty, right_ty),
+        }
+    }
+
+    fn infer_numeric_binary_type(&mut self, left: TypeId, right: TypeId) -> TypeId {
+        if let Some(recovery) = self.recovery_binary_type(left, right) {
+            return recovery;
+        }
+
+        let left_kind = self.types.kind(left).clone();
+        let right_kind = self.types.kind(right).clone();
+        match (left_kind, right_kind) {
+            (TypeKind::Int, TypeKind::Int) => self.types.intern(TypeKind::Int),
+            (TypeKind::Float, TypeKind::Float) => self.types.intern(TypeKind::Float),
+            _ => self.types.intern(TypeKind::Heterogeneous),
+        }
+    }
+
+    fn infer_concat_binary_type(&mut self, left: TypeId, right: TypeId) -> TypeId {
+        if let Some(recovery) = self.recovery_binary_type(left, right) {
+            return recovery;
+        }
+
+        let left_kind = self.types.kind(left).clone();
+        let right_kind = self.types.kind(right).clone();
+        match (left_kind, right_kind) {
+            (TypeKind::String, TypeKind::String) => self.types.intern(TypeKind::String),
+            _ => self.types.intern(TypeKind::Heterogeneous),
+        }
+    }
+
+    fn infer_logical_binary_type(&mut self, left: TypeId, right: TypeId) -> TypeId {
+        if let Some(recovery) = self.recovery_binary_type(left, right) {
+            return recovery;
+        }
+
+        let left_kind = self.types.kind(left).clone();
+        let right_kind = self.types.kind(right).clone();
+        match (left_kind, right_kind) {
+            (TypeKind::Bool, TypeKind::Bool) => self.types.intern(TypeKind::Bool),
+            _ => self.types.intern(TypeKind::Heterogeneous),
+        }
+    }
+
+    fn infer_relational_binary_type(&mut self, left: TypeId, right: TypeId) -> TypeId {
+        if let Some(recovery) = self.recovery_binary_type(left, right) {
+            return recovery;
+        }
+
+        let left_kind = self.types.kind(left).clone();
+        let right_kind = self.types.kind(right).clone();
+        match (left_kind, right_kind) {
+            (TypeKind::Int, TypeKind::Int)
+            | (TypeKind::Float, TypeKind::Float)
+            | (TypeKind::String, TypeKind::String) => self.types.intern(TypeKind::Bool),
+            _ => self.types.intern(TypeKind::Heterogeneous),
+        }
+    }
+
+    fn infer_coalesce_binary_type(&mut self, left: TypeId, right: TypeId) -> TypeId {
+        if let Some(recovery) = self.recovery_binary_type(left, right) {
+            return recovery;
+        }
+
+        let left_kind = self.types.kind(left).clone();
+        let right_kind = self.types.kind(right).clone();
+        match (left_kind, right_kind) {
+            (TypeKind::Null, _) => right,
+            (_, TypeKind::Null) => left,
+            _ if left == right => left,
+            _ => self.types.intern(TypeKind::Heterogeneous),
+        }
+    }
+
+    fn recovery_binary_type(&mut self, left: TypeId, right: TypeId) -> Option<TypeId> {
+        let left_kind = self.types.kind(left).clone();
+        let right_kind = self.types.kind(right).clone();
+
+        match (left_kind, right_kind) {
+            (TypeKind::Unknown, _) | (_, TypeKind::Unknown) => Some(self.types.unknown()),
+            (TypeKind::Mixed, _) | (_, TypeKind::Mixed) => Some(self.types.intern(TypeKind::Mixed)),
+            _ => None,
+        }
+    }
+
+    fn infer_array_type(
+        &mut self,
+        elements: &[ArrayElement],
+        scopes: &ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) -> TypeId {
+        if elements.is_empty() {
+            return self.types.intern(TypeKind::EmptyCollection);
+        }
+
+        if elements.iter().any(|element| element.key.is_some()) {
+            let mut key_types = Vec::new();
+            let mut value_types = Vec::new();
+            for element in elements {
+                if let Some(key) = &element.key {
+                    key_types.push(self.infer_expr_type(key, scopes, method_context));
+                } else {
+                    key_types.push(self.types.intern(TypeKind::Int));
+                }
+                value_types.push(self.infer_expr_type(&element.value, scopes, method_context));
+            }
+            let key = self.common_clear_type(key_types);
+            let value = self.common_clear_type(value_types);
+            self.types.intern(TypeKind::Dictionary(key, value))
+        } else {
+            let mut element_types = Vec::new();
+            for element in elements {
+                element_types.push(self.infer_expr_type(&element.value, scopes, method_context));
+            }
+            let element = self.common_clear_type(element_types);
+            self.types.intern(TypeKind::List(element))
+        }
+    }
+
+    fn common_clear_type(&mut self, types: Vec<TypeId>) -> TypeId {
+        let mut common = None;
+        let mut saw_empty_collection = false;
+        let mut saw_mixed = false;
+
+        for ty in types {
+            let kind = self.types.kind(ty).clone();
+            match kind {
+                TypeKind::Mixed => {
+                    saw_mixed = true;
+                    continue;
+                }
+                TypeKind::Unknown => {
+                    continue;
+                }
+                TypeKind::EmptyCollection => {
+                    saw_empty_collection = true;
+                    continue;
+                }
+                _ => {
+                    if let Some(common_ty) = common {
+                        if common_ty != ty {
+                            return self.types.intern(TypeKind::Heterogeneous);
+                        }
+                    } else {
+                        common = Some(ty);
+                    }
+                }
+            }
+        }
+
+        if let Some(common) = common {
+            if saw_empty_collection && !self.is_collection_like_type(common) {
+                return self.types.intern(TypeKind::Heterogeneous);
+            }
+            common
+        } else if saw_empty_collection {
+            self.types.intern(TypeKind::EmptyCollection)
+        } else if saw_mixed {
+            self.types.intern(TypeKind::Mixed)
+        } else {
+            self.types.unknown()
+        }
+    }
+
+    fn is_collection_like_type(&self, ty: TypeId) -> bool {
+        matches!(
+            self.types.kind(ty),
+            TypeKind::Array
+                | TypeKind::List(_)
+                | TypeKind::Dictionary(_, _)
+                | TypeKind::Set(_)
+                | TypeKind::EmptyCollection
+        )
+    }
+
+    fn is_non_empty_collection_like_type(&self, ty: TypeId) -> bool {
+        matches!(
+            self.types.kind(ty),
+            TypeKind::Array | TypeKind::List(_) | TypeKind::Dictionary(_, _) | TypeKind::Set(_)
+        )
     }
 
     fn expr_class_name(

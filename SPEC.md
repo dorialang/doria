@@ -273,6 +273,12 @@ let $name = "Doria"; // string
 let $person = new Person("Andrew"); // Person
 ```
 
+The semantic checker resolves parsed type syntax into semantic types before checking assignment compatibility. Doria checks typed declarations, property initializers, property writes, and parameter defaults. It does not perform PHP-style scalar coercion: `int` is not assignable from `string`, `string` is not assignable from `int`, and `bool` is not assignable from `int`.
+
+Numeric widening is not implemented yet; for now `float` is not assignable from `int`, and `int` is not assignable from `float`. Any future safe numeric widening should be a separate design decision. Return type checking, function call argument checking, and constructor argument checking are separate future slices.
+
+Simple collection literals infer collection element/key/value types when all clear parts match. Clear heterogeneous collection literals, such as `[1, "two"]`, are rejected by narrow collection alias assignment checks rather than being erased to `Unknown`. The empty literal `[]` stays ambiguous so typed contexts may use it as an empty `List<T>` or `Dictionary<K, V>`. The PHP-compatible `array` annotation remains broad enough to accept list-shaped and dictionary-shaped literals.
+
 ## 8. Class syntax
 
 ```php
@@ -342,7 +348,7 @@ Do not use `Vec`.
 
 The PHP backend lowers these aliases to PHP arrays, while the Doria type checker keeps them distinct.
 
-The current type foundation resolves explicit annotations and reports unknown type names and invalid collection alias arity. Assignment compatibility, return type checking, and constructor argument checking come later.
+The current type foundation resolves explicit annotations, reports unknown type names and invalid collection alias arity, and checks assignment compatibility for typed declarations, property initializers, property writes, and parameter defaults. Return type checking and constructor argument checking come later.
 
 ## 11. Attributes and metadata expressions
 
