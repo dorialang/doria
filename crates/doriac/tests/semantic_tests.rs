@@ -86,6 +86,10 @@ $age -= 2;
 
 writable float $total = 1.5;
 $total += 2.5;
+
+let writable $items = [];
+$items = [1];
+$items = ["apples" => 5];
 "#,
     )
     .expect("semantic check should succeed");
@@ -106,6 +110,10 @@ $name -= "b";
         r#"
 writable int $count = 1;
 $count += "two";
+"#,
+        r#"
+let writable $items = [];
+$items = 1;
 "#,
     ] {
         assert_type_mismatch(source);
