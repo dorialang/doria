@@ -430,7 +430,7 @@ Recommended order:
 ```text
 1. Stabilize Doria parser and AST.
 2. Add real semantic types.
-3. Add assignment and return type checking.
+3. Stabilize assignment compatibility and basic return type checking.
 4. Add Doria IR stability and pretty/debug output.
 5. Add a Doria pretty-printer.
 6. Build a small PHP-to-Doria prototype for simple PHP files.

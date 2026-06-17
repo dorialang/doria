@@ -14,14 +14,16 @@
 
 - Keep the parser and semantic checker small but tested.
 - Treat the checked compiler-owned representation as Doria IR.
+- Check assignment compatibility and declared function/method return values in the current semantic slice.
 - Keep PHP as a compatibility backend only.
 - Do not build PHP-to-Doria migration in the current v0.1 slice.
 - Do not start desktop, game engine, raylib, or FFI implementation work in the current v0.1 slice.
 
 ## Next Compiler Work
 
-- Implement real semantic type IDs and assignment compatibility.
-- Add return type checking.
+- Expand return checking from the current final-statement rule into full path-sensitive control-flow analysis.
+- Add function call argument checking.
+- Add constructor argument checking.
 - Add constructor init access for readonly properties.
 - Plan a lowered/native IR when native code generation needs a simpler representation for control flow, memory layout, runtime calls, and backend emission.
 - Add native backend experiments behind explicit targets.

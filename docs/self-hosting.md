@@ -68,7 +68,8 @@ Do not attempt full self-hosting before Doria has:
 - reliable diagnostics
 - real semantic TypeId / TypeKind support
 - assignment compatibility checking
-- return type checking
+- basic return type checking
+- path-sensitive control-flow checks for required returns
 - modules or namespaces
 - enough collection support
 - enough string support
@@ -312,7 +313,7 @@ Do these before attempting Doria-written compiler modules:
 1. Keep Rust doriac modular and well tested.
 2. Implement real semantic TypeId / TypeKind support.
 3. Implement assignment compatibility checking.
-4. Implement return type checking.
+4. Expand basic return checking into path-sensitive control-flow checks.
 5. Design modules/namespaces.
 6. Design Doria-owned string interpolation.
 7. Design error handling for compiler-style code.

@@ -1,9 +1,13 @@
 fn assert_type_mismatch(source: &str) {
+    assert_diagnostic_code(source, "E0403");
+}
+
+fn assert_diagnostic_code(source: &str, code: &str) {
     let err = doriac::check_source("test.doria", source).expect_err("semantic check should fail");
 
     assert!(
-        err.iter().any(|diagnostic| diagnostic.code == "E0403"),
-        "expected E0403, got {err:?}"
+        err.iter().any(|diagnostic| diagnostic.code == code),
+        "expected {code}, got {err:?}"
     );
 }
 
@@ -261,6 +265,259 @@ function greet(string $name = Person::age()): void
     ] {
         assert_type_mismatch(source);
     }
+}
+
+#[test]
+fn checks_declared_function_return_types() {
+    doriac::check_source(
+        "test.doria",
+        r#"
+function age(): int
+{
+    return 37;
+}
+
+function name(): string
+{
+    return "Andrew";
+}
+
+function active(): bool
+{
+    return true;
+}
+
+function total(): float
+{
+    return 1.5 + 2.5;
+}
+
+function message(): string
+{
+    return "Hello" . " Doria";
+}
+
+function copyAge(): int
+{
+    return age();
+}
+
+function log(): void
+{
+    return;
+}
+
+function noop(): void
+{
+    echo "ok";
+}
+"#,
+    )
+    .expect("semantic check should succeed");
+}
+
+#[test]
+fn checks_declared_method_return_types() {
+    doriac::check_source(
+        "test.doria",
+        r#"
+class Person
+{
+    function name(): string
+    {
+        return "Andrew";
+    }
+
+    function age(): int
+    {
+        return 37;
+    }
+
+    function copyAge(): int
+    {
+        return $this->age();
+    }
+
+    function __construct()
+    {
+        return;
+    }
+}
+"#,
+    )
+    .expect("semantic check should succeed");
+}
+
+#[test]
+fn rejects_declared_function_return_type_mismatches() {
+    for source in [
+        r#"
+function age(): int
+{
+    return "37";
+}
+"#,
+        r#"
+function name(): string
+{
+    return 123;
+}
+"#,
+        r#"
+function active(): bool
+{
+    return 1;
+}
+"#,
+        r#"
+function ratio(): float
+{
+    return 1;
+}
+"#,
+        r#"
+function total(): string
+{
+    return 1 + 2;
+}
+"#,
+        r#"
+function name(): string
+{
+    return age();
+}
+
+function age(): int
+{
+    return 37;
+}
+"#,
+        r#"
+class Person
+{
+    function age(): int
+    {
+        return 37;
+    }
+}
+
+function name(): string
+{
+    let $person = new Person();
+    return $person->age();
+}
+"#,
+        r#"
+class Person
+{
+    function age(): int
+    {
+        return 37;
+    }
+}
+
+function name(): string
+{
+    return Person::age();
+}
+"#,
+        r#"
+function numbers(): List<int>
+{
+    return [1, "two"];
+}
+"#,
+    ] {
+        assert_diagnostic_code(source, "E0404");
+    }
+}
+
+#[test]
+fn rejects_values_returned_from_void_functions_and_constructors() {
+    for source in [
+        r#"
+function log(): void
+{
+    return "done";
+}
+"#,
+        r#"
+class Person
+{
+    function clear(): void
+    {
+        return 1;
+    }
+}
+"#,
+        r#"
+class Person
+{
+    function __construct()
+    {
+        return 1;
+    }
+}
+"#,
+    ] {
+        assert_diagnostic_code(source, "E0405");
+    }
+}
+
+#[test]
+fn rejects_missing_values_from_non_void_returns() {
+    for source in [
+        r#"
+function age(): int
+{
+    return;
+}
+"#,
+        r#"
+function age(): int
+{
+    echo "missing";
+}
+"#,
+        r#"
+function first(List<int> $items): int
+{
+    foreach ($items as int $item) {
+        return $item;
+    }
+}
+"#,
+        r#"
+class Person
+{
+    function age(): int
+    {
+        echo "missing";
+    }
+}
+"#,
+    ] {
+        assert_diagnostic_code(source, "E0406");
+    }
+}
+
+#[test]
+fn keeps_unannotated_returns_unchecked() {
+    doriac::check_source(
+        "test.doria",
+        r#"
+function value()
+{
+    return "anything";
+}
+
+function empty()
+{
+    return;
+}
+"#,
+    )
+    .expect("semantic check should succeed");
 }
 
 #[test]
