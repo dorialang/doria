@@ -33,6 +33,7 @@
 - Preserve property initializer expressions in AST/Doria IR and later lower non-constant initializers correctly.
 - Add property hooks later for validation and computed properties without changing the default-public plus `internal` member model.
 - Add language/design support for `writable class` and `readonly class` as mutability ergonomics before considering shorter mutation keywords.
+- Specify the planned control-flow direction before implementation: `while`, `do ... while ... finally`, `given ... when ... finally`, `given ... while ... finally`, `if` / `else if` / `else` / `finally`, `when`, and `match`.
 
 ## Performance and Native Application Path
 

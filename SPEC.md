@@ -72,6 +72,18 @@ Planned near-term syntax includes:
 - Named arguments using `name: expression`.
 - Richer property initializer expressions, including object construction.
 
+Planned future control-flow design includes:
+
+- `while`.
+- `do ... while ... finally`.
+- `given ... when ... finally`.
+- `given ... while ... finally`.
+- `if` / `else if` / `else` / `finally`.
+- `when` as a value-returning conditional form.
+- `match` as a pattern/value selection construct.
+
+These control-flow forms are not MVP syntax unless listed in the MVP support list above. See `docs/decisions/0009-control-flow-direction.md`.
+
 ## 4. Declaration rules
 
 Variables must be declared before use.
@@ -403,6 +415,7 @@ Future work includes:
 - Attribute syntax and metadata representation.
 - Richer instance property initializers.
 - Named arguments.
+- Full control-flow design for `while`, `do ... while ... finally`, `given ... when`, `given ... while`, `if` chains with possible `finally`, value-returning `when`, and `match`.
 - Async/await and structured concurrency.
 - Native backend design and implementation.
 - Native-oriented IR implementation when native code generation needs it.

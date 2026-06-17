@@ -302,6 +302,27 @@ echo $person->message();
 }
 
 #[test]
+fn rejects_external_static_call_to_internal_method() {
+    let err = doriac::check_source(
+        "test.doria",
+        r#"
+class Person
+{
+    internal function message(): string
+    {
+        return "Hello";
+    }
+}
+
+echo Person::message();
+"#,
+    )
+    .expect_err("semantic check should fail");
+
+    assert!(err.iter().any(|diagnostic| diagnostic.code == "E0307"));
+}
+
+#[test]
 fn rejects_free_function_access_to_internal_property() {
     let err = doriac::check_source(
         "test.doria",

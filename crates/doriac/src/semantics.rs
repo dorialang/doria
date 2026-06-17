@@ -341,10 +341,21 @@ impl<'program> Checker<'program> {
                 }
                 self.check_method_call(object, method, *span, scopes, method_context);
             }
-            Expr::FunctionCall { args, .. } | Expr::StaticCall { args, .. } => {
+            Expr::FunctionCall { args, .. } => {
                 for arg in args {
                     self.check_expr(arg, scopes, method_context);
                 }
+            }
+            Expr::StaticCall {
+                class_name,
+                method,
+                args,
+                span,
+            } => {
+                for arg in args {
+                    self.check_expr(arg, scopes, method_context);
+                }
+                self.check_static_call(class_name, method, *span, method_context);
             }
             Expr::New {
                 class_name,
@@ -491,6 +502,41 @@ impl<'program> Checker<'program> {
                 format!(
                     "cannot call writable method `{class_name}::{method}` through readonly value"
                 ),
+                span,
+            ));
+        }
+    }
+
+    fn check_static_call(
+        &mut self,
+        class_name: &str,
+        method: &str,
+        span: Span,
+        method_context: Option<&MethodContext>,
+    ) {
+        let Some(class_info) = self.classes.get(class_name).cloned() else {
+            self.diagnostics.push(Diagnostic::new(
+                "E0305",
+                format!("unknown class `{class_name}`"),
+                span,
+            ));
+            return;
+        };
+        let Some(method_info) = class_info.methods.get(method) else {
+            self.diagnostics.push(Diagnostic::new(
+                "E0304",
+                format!("unknown method `{class_name}::{method}`"),
+                span,
+            ));
+            return;
+        };
+
+        if matches!(method_info.access, MemberAccess::Internal)
+            && !self.can_access_internal_member(class_name, method_context)
+        {
+            self.diagnostics.push(Diagnostic::new(
+                "E0307",
+                format!("method `{class_name}::{method}` is internal"),
                 span,
             ));
         }
