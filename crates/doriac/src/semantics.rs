@@ -1157,6 +1157,16 @@ impl<'program> Checker<'program> {
             return;
         };
 
+        if matches!(constructor.access, MemberAccess::Internal)
+            && !self.can_access_internal_member(class_name, method_context)
+        {
+            self.diagnostics.push(Diagnostic::new(
+                "E0307",
+                format!("method `{class_name}::__construct` is internal"),
+                span,
+            ));
+        }
+
         self.check_call_arguments(
             &format!("constructor `{class_name}::__construct`"),
             &constructor.params,

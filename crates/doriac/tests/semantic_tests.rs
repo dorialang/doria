@@ -501,6 +501,55 @@ let $bad = new Person("Andrew");
 }
 
 #[test]
+fn checks_internal_constructor_access() {
+    doriac::check_source(
+        "test.doria",
+        r#"
+class Person
+{
+    internal function __construct(string $name)
+    {
+    }
+
+    function create(): Person
+    {
+        return new Person("Andrew");
+    }
+}
+"#,
+    )
+    .expect("semantic check should succeed");
+
+    for source in [
+        r#"
+class Person
+{
+    internal function __construct(string $name)
+    {
+    }
+}
+
+let $person = new Person("Andrew");
+"#,
+        r#"
+class Person
+{
+    internal function __construct(string $name)
+    {
+    }
+}
+
+function create(): Person
+{
+    return new Person("Andrew");
+}
+"#,
+    ] {
+        assert_diagnostic_code(source, "E0307");
+    }
+}
+
+#[test]
 fn rejects_invalid_lifecycle_signatures() {
     assert_diagnostic_code(
         r#"
