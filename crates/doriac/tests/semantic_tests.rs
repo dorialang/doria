@@ -39,7 +39,7 @@ fn rejects_readonly_property_assignment() {
         r#"
 class Person
 {
-    public string $name;
+    string $name;
 }
 
 let writable $person = new Person();
@@ -58,9 +58,9 @@ fn rejects_this_mutation_in_readonly_method() {
         r#"
 class Person
 {
-    public writable string $name;
+    writable string $name;
 
-    public function rename(string $name): void
+    function rename(string $name): void
     {
         $this->name = $name;
     }
@@ -79,9 +79,9 @@ fn rejects_writable_method_call_through_readonly_variable() {
         r#"
 class Person
 {
-    public writable string $name;
+    writable string $name;
 
-    public writable function rename(string $name): void
+    writable function rename(string $name): void
     {
         $this->name = $name;
     }
@@ -131,8 +131,8 @@ fn rejects_duplicate_property_declaration() {
         r#"
 class Person
 {
-    public string $name;
-    public string $name;
+    string $name;
+    string $name;
 }
 "#,
     )
@@ -148,8 +148,8 @@ fn rejects_duplicate_method_declaration() {
         r#"
 class Person
 {
-    public function rename(string $name): void {}
-    public function rename(string $name): void {}
+    function rename(string $name): void {}
+    function rename(string $name): void {}
 }
 "#,
     )
@@ -217,4 +217,249 @@ let $person = new Person();
     .expect_err("semantic check should fail");
 
     assert!(err.iter().any(|diagnostic| diagnostic.code == "E0305"));
+}
+
+#[test]
+fn allows_method_accessing_own_internal_method() {
+    doriac::check_source(
+        "test.doria",
+        r#"
+class Person
+{
+    internal function message(): string
+    {
+        return "Hello";
+    }
+
+    function greet(): void
+    {
+        echo $this->message();
+    }
+}
+"#,
+    )
+    .expect("semantic check should succeed");
+}
+
+#[test]
+fn allows_method_accessing_own_internal_property() {
+    doriac::check_source(
+        "test.doria",
+        r#"
+class Parser
+{
+    internal int $position;
+
+    function parse(): void
+    {
+        echo $this->position;
+    }
+}
+"#,
+    )
+    .expect("semantic check should succeed");
+}
+
+#[test]
+fn rejects_external_access_to_internal_property() {
+    let err = doriac::check_source(
+        "test.doria",
+        r#"
+class Person
+{
+    internal string $secret;
+}
+
+let $person = new Person();
+echo $person->secret;
+"#,
+    )
+    .expect_err("semantic check should fail");
+
+    assert!(err.iter().any(|diagnostic| diagnostic.code == "E0306"));
+}
+
+#[test]
+fn rejects_external_call_to_internal_method() {
+    let err = doriac::check_source(
+        "test.doria",
+        r#"
+class Person
+{
+    internal function message(): string
+    {
+        return "Hello";
+    }
+}
+
+let $person = new Person();
+echo $person->message();
+"#,
+    )
+    .expect_err("semantic check should fail");
+
+    assert!(err.iter().any(|diagnostic| diagnostic.code == "E0307"));
+}
+
+#[test]
+fn rejects_external_static_call_to_internal_method() {
+    let err = doriac::check_source(
+        "test.doria",
+        r#"
+class Person
+{
+    internal function message(): string
+    {
+        return "Hello";
+    }
+}
+
+echo Person::message();
+"#,
+    )
+    .expect_err("semantic check should fail");
+
+    assert!(err.iter().any(|diagnostic| diagnostic.code == "E0307"));
+}
+
+#[test]
+fn rejects_free_function_access_to_internal_property() {
+    let err = doriac::check_source(
+        "test.doria",
+        r#"
+class Person
+{
+    internal string $secret;
+}
+
+function reveal(Person $person): void
+{
+    echo $person->secret;
+}
+"#,
+    )
+    .expect_err("semantic check should fail");
+
+    assert!(err.iter().any(|diagnostic| diagnostic.code == "E0306"));
+}
+
+#[test]
+fn rejects_free_function_call_to_internal_method() {
+    let err = doriac::check_source(
+        "test.doria",
+        r#"
+class Person
+{
+    internal function message(): string
+    {
+        return "Hello";
+    }
+}
+
+function reveal(Person $person): void
+{
+    echo $person->message();
+}
+"#,
+    )
+    .expect_err("semantic check should fail");
+
+    assert!(err.iter().any(|diagnostic| diagnostic.code == "E0307"));
+}
+
+#[test]
+fn rejects_other_class_access_to_internal_property() {
+    let err = doriac::check_source(
+        "test.doria",
+        r#"
+class Person
+{
+    internal string $secret;
+}
+
+class Inspector
+{
+    function reveal(Person $person): void
+    {
+        echo $person->secret;
+    }
+}
+"#,
+    )
+    .expect_err("semantic check should fail");
+
+    assert!(err.iter().any(|diagnostic| diagnostic.code == "E0306"));
+}
+
+#[test]
+fn rejects_other_class_call_to_internal_method() {
+    let err = doriac::check_source(
+        "test.doria",
+        r#"
+class Person
+{
+    internal function message(): string
+    {
+        return "Hello";
+    }
+}
+
+class Inspector
+{
+    function reveal(Person $person): void
+    {
+        echo $person->message();
+    }
+}
+"#,
+    )
+    .expect_err("semantic check should fail");
+
+    assert!(err.iter().any(|diagnostic| diagnostic.code == "E0307"));
+}
+
+#[test]
+fn allows_constructor_accessing_own_internal_members() {
+    doriac::check_source(
+        "test.doria",
+        r#"
+class Person
+{
+    internal string $cacheKey = "person";
+
+    function __construct(string $name)
+    {
+        echo $this->cacheKey;
+        echo $this->buildCacheKey($name);
+    }
+
+    internal function buildCacheKey(string $name): string
+    {
+        return $name;
+    }
+}
+"#,
+    )
+    .expect("semantic check should succeed");
+}
+
+#[test]
+fn internal_does_not_imply_writable() {
+    let err = doriac::check_source(
+        "test.doria",
+        r#"
+class Parser
+{
+    internal int $position;
+
+    writable function advance(): void
+    {
+        $this->position = 1;
+    }
+}
+"#,
+    )
+    .expect_err("semantic check should fail");
+
+    assert!(err.iter().any(|diagnostic| diagnostic.code == "E0202"));
 }

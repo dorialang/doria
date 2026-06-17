@@ -2,11 +2,20 @@ name: ci
 
 on:
   pull_request:
+    branches: [main, develop]
   push:
-    branches: [main]
+    branches: [main, develop]
+  workflow_dispatch:
 
 permissions:
   contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
 
 jobs:
   rust:
@@ -16,6 +25,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v6
+        with:
+          persist-credentials: false
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -26,7 +37,19 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Build
+        run: cargo build --workspace --all-targets --locked --verbose
 
       - name: Test
-        run: cargo test --workspace --all-targets
+        run: cargo test --workspace --all-targets --locked --verbose
+
+      - name: Smoke check Doria example
+        run: cargo run -p doriac -- check examples/person.doria
+
+      - name: Smoke dump Doria example IR
+        run: cargo run -p doriac -- hir examples/person.doria
+
+      - name: Smoke compile Doria example to PHP
+        run: cargo run -p doriac -- compile examples/person.doria --target php --out build/person.php

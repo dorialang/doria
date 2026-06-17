@@ -22,7 +22,6 @@ struct Document {
 #[derive(Default)]
 struct Server {
     documents: HashMap<String, Document>,
-    shutdown_requested: bool,
 }
 
 pub fn run_stdio() -> Result<(), String> {
@@ -122,7 +121,6 @@ impl Server {
             }
             "initialized" => {}
             "shutdown" => {
-                self.shutdown_requested = true;
                 if let Some(id) = id {
                     send_response(writer, id, Value::Null)?;
                 }
@@ -328,23 +326,8 @@ fn initialize_result() -> Value {
 
 fn completion_items() -> Value {
     let keywords = [
-        "class",
-        "function",
-        "let",
-        "writable",
-        "readonly",
-        "return",
-        "echo",
-        "new",
-        "foreach",
-        "as",
-        "public",
-        "protected",
-        "private",
-        "static",
-        "true",
-        "false",
-        "null",
+        "class", "function", "let", "writable", "internal", "readonly", "return", "echo", "new",
+        "foreach", "as", "static", "true", "false", "null",
     ];
     let types = [
         "void",
@@ -406,15 +389,16 @@ fn hover_description(kind: &TokenKind) -> Option<&'static str> {
         TokenKind::Function => Some("Declares a function or method."),
         TokenKind::Let => Some("Declares a local binding with an inferred type."),
         TokenKind::Writable => Some("Marks a binding, property, parameter, or method receiver as mutable."),
+        TokenKind::Internal => Some("Marks a class member as hidden from the external object surface."),
         TokenKind::Readonly => Some("Reserved for explicit readonly syntax."),
         TokenKind::Return => Some("Returns a value from the current function."),
         TokenKind::Echo => Some("Emits a value through the current backend."),
         TokenKind::New => Some("Constructs an instance of a class."),
         TokenKind::Foreach => Some("Iterates over a list or dictionary value."),
         TokenKind::As => Some("Separates a `foreach` iterable from its binding."),
-        TokenKind::Public => Some("Public class member visibility."),
-        TokenKind::Protected => Some("Protected class member visibility."),
-        TokenKind::Private => Some("Private class member visibility."),
+        TokenKind::Public => Some("Deprecated: Doria members are public by default; remove `public`."),
+        TokenKind::Protected => Some("Unsupported: Doria does not have `protected`; use `internal` or redesign the API."),
+        TokenKind::Private => Some("Unsupported: use `internal` for implementation details."),
         TokenKind::Static => Some("Reserved for static members and calls."),
         TokenKind::Void => Some("The `void` return type."),
         TokenKind::IntType => Some("The `int` primitive type."),

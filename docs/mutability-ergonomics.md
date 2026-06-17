@@ -14,6 +14,8 @@ The default rule remains:
 Everything is readonly unless explicitly marked writable.
 ```
 
+Member access is separate from mutability. Doria class members are externally accessible by default, and `internal` marks implementation details. `writable` controls mutation; `internal` controls API surface.
+
 Examples:
 
 ```php
@@ -29,8 +31,8 @@ $x = 10; // ok
 ```php
 class Person
 {
-    public string $id;
-    public writable string $name;
+    string $id;
+    writable string $name;
 }
 ```
 
@@ -68,8 +70,8 @@ Doria should support:
 ```php
 writable class Person
 {
-    public string $name;
-    public int $age;
+    string $name;
+    int $age;
 }
 ```
 
@@ -84,8 +86,8 @@ Equivalent to:
 ```php
 class Person
 {
-    public writable string $name;
-    public writable int $age;
+    writable string $name;
+    writable int $age;
 }
 ```
 
@@ -102,9 +104,9 @@ This should still be an error:
 ```php
 writable class Person
 {
-    public string $name;
+    string $name;
 
-    public function rename(string $name): void
+    function rename(string $name): void
     {
         $this->name = $name; // error: method is not writable
     }
@@ -114,7 +116,7 @@ writable class Person
 The method must still say:
 
 ```php
-public writable function rename(string $name): void
+writable function rename(string $name): void
 {
     $this->name = $name;
 }
@@ -138,9 +140,9 @@ A writable class should allow readonly exceptions:
 ```php
 writable class User
 {
-    public readonly int $id;
-    public string $name;
-    public string $email;
+    readonly int $id;
+    string $name;
+    string $email;
 }
 ```
 
@@ -160,8 +162,8 @@ Doria is already readonly by default, but `readonly class` is still useful as a 
 ```php
 readonly class Money
 {
-    public int $amount;
-    public string $currency;
+    int $amount;
+    string $currency;
 }
 ```
 
@@ -177,7 +179,7 @@ Example error:
 ```php
 readonly class Money
 {
-    public writable int $amount; // error
+    writable int $amount; // error
 }
 ```
 
@@ -190,13 +192,13 @@ Property groups may later reduce repetition inside a normal class:
 ```php
 class Person
 {
-    public writable {
+    writable {
         string $name;
         int $age;
         string $email;
     }
 
-    public string $id;
+    string $id;
 }
 ```
 
@@ -241,7 +243,7 @@ Even if a class is writable, the variable binding still matters.
 ```php
 writable class Person
 {
-    public string $name;
+    string $name;
 }
 
 let $person = new Person();

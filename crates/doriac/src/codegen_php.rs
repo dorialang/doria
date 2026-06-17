@@ -35,7 +35,7 @@ fn emit_class(class_decl: &ClassDecl, output: &mut String, indent: usize) {
 }
 
 fn emit_property(property: &PropertyDecl, output: &mut String, indent: usize) {
-    let visibility = emit_visibility(&property.visibility);
+    let visibility = emit_member_access(&property.access);
     let ty = php_type(&property.ty);
     write_indent(output, indent);
     output.push_str(visibility);
@@ -53,10 +53,8 @@ fn emit_property(property: &PropertyDecl, output: &mut String, indent: usize) {
 fn emit_function(function: &FunctionDecl, output: &mut String, indent: usize, is_method: bool) {
     write_indent(output, indent);
     if is_method {
-        if let Some(visibility) = &function.visibility {
-            output.push_str(emit_visibility(visibility));
-            output.push(' ');
-        }
+        output.push_str(emit_member_access(&function.access));
+        output.push(' ');
     }
     output.push_str("function ");
     output.push_str(&function.name);
@@ -80,8 +78,8 @@ fn emit_function(function: &FunctionDecl, output: &mut String, indent: usize, is
 
 fn emit_param(param: &Param) -> String {
     let mut output = String::new();
-    if let Some(visibility) = &param.promoted_visibility {
-        output.push_str(emit_visibility(visibility));
+    if let Some(access) = &param.promoted_access {
+        output.push_str(emit_member_access(access));
         output.push(' ');
     }
     output.push_str(&php_type(&param.ty));
@@ -253,11 +251,10 @@ fn emit_binary_op(op: &BinaryOp) -> &'static str {
     }
 }
 
-fn emit_visibility(visibility: &Visibility) -> &'static str {
-    match visibility {
-        Visibility::Public => "public",
-        Visibility::Protected => "protected",
-        Visibility::Private => "private",
+fn emit_member_access(access: &MemberAccess) -> &'static str {
+    match access {
+        MemberAccess::External => "public",
+        MemberAccess::Internal => "private",
     }
 }
 

@@ -1,8 +1,8 @@
 class Person
 {
-    public writable string $name;
+    writable string $name;
 
-    public function rename(string $name): void
+    function rename(string $name): void
     {
         $this->name = $name;
     }

@@ -77,9 +77,9 @@ fn strips_doria_writable_from_php_output() {
         r#"
 class Person
 {
-    public writable string $name;
+    writable string $name;
 
-    public writable function rename(string $name): void
+    writable function rename(string $name): void
     {
         $this->name = $name;
     }
@@ -91,4 +91,32 @@ class Person
     assert!(php.contains("public string $name;"));
     assert!(php.contains("public function rename(string $name): void"));
     assert!(!php.contains("writable"));
+}
+
+#[test]
+fn emits_internal_members_as_private_php_members() {
+    let php = doriac::compile_source_to_php(
+        "test.doria",
+        r#"
+class Person
+{
+    internal string $secret;
+
+    function reveal(): string
+    {
+        return $this->secret;
+    }
+
+    internal function message(): string
+    {
+        return "Hello";
+    }
+}
+"#,
+    )
+    .expect("compilation should succeed");
+
+    assert!(php.contains("private string $secret;"));
+    assert!(php.contains("public function reveal(): string"));
+    assert!(php.contains("private function message(): string"));
 }

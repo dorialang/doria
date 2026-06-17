@@ -1,6 +1,6 @@
 class Person
 {
-    public string $name;
+    string $name;
 }
 
 let writable $person = new Person();

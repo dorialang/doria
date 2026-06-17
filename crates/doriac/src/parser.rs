@@ -40,7 +40,7 @@ impl Parser {
         if self.match_kind(&TokenKind::Class) {
             self.parse_class().map(Item::Class)
         } else if self.match_kind(&TokenKind::Function) {
-            self.parse_function(None, false, self.previous().span)
+            self.parse_function(MemberAccess::External, false, self.previous().span)
                 .map(Item::Function)
         } else {
             self.parse_statement().map(Item::Statement)
@@ -74,18 +74,22 @@ impl Parser {
     }
 
     fn parse_class_member(&mut self) -> Option<ClassMember> {
-        let visibility = self.parse_visibility().unwrap_or(Visibility::Public);
+        if self.reject_legacy_visibility_modifier() {
+            return None;
+        }
+
+        let access = self.parse_member_access();
         self.match_kind(&TokenKind::Static);
 
         let writable = self.match_kind(&TokenKind::Writable);
         if self.match_kind(&TokenKind::Function) {
             let start = self.previous().span.start;
             return self
-                .parse_function(Some(visibility), writable, Span::new(start, start))
+                .parse_function(access, writable, Span::new(start, start))
                 .map(ClassMember::Method);
         }
 
-        let start = self.previous().span.start;
+        let start = self.peek().span.start;
         let ty = self.parse_type_ref()?;
         let (name, name_span) = self.expect_variable("expected property variable name")?;
         let initializer = if self.match_kind(&TokenKind::Equals) {
@@ -102,7 +106,7 @@ impl Parser {
             .end;
 
         Some(ClassMember::Property(PropertyDecl {
-            visibility,
+            access,
             writable,
             ty,
             name,
@@ -113,7 +117,7 @@ impl Parser {
 
     fn parse_function(
         &mut self,
-        visibility: Option<Visibility>,
+        access: MemberAccess,
         writable_this: bool,
         start_span: Span,
     ) -> Option<FunctionDecl> {
@@ -124,7 +128,7 @@ impl Parser {
         let mut params = Vec::new();
         if !self.check(&TokenKind::RightParen) {
             loop {
-                params.push(self.parse_param()?);
+                params.push(self.parse_param(name == "__construct")?);
                 if !self.match_kind(&TokenKind::Comma) {
                     break;
                 }
@@ -145,7 +149,7 @@ impl Parser {
         let body = self.parse_block()?;
         let span = Span::new(start, body.span.end);
         Some(FunctionDecl {
-            visibility,
+            access,
             writable_this,
             name,
             params,
@@ -155,9 +159,22 @@ impl Parser {
         })
     }
 
-    fn parse_param(&mut self) -> Option<Param> {
+    fn parse_param(&mut self, is_constructor: bool) -> Option<Param> {
         let start = self.peek().span.start;
-        let promoted_visibility = self.parse_visibility();
+        if self.reject_legacy_visibility_modifier() {
+            return None;
+        }
+
+        if !is_constructor && self.check(&TokenKind::Internal) {
+            let span = self.advance().span;
+            self.error(
+                "`internal` is only valid on class members and constructor-promoted properties",
+                span,
+            );
+            return None;
+        }
+
+        let access = self.parse_member_access();
         let writable = self.match_kind(&TokenKind::Writable);
         let ty = self.parse_type_ref()?;
         let (name, name_span) = self.expect_variable("expected parameter variable name")?;
@@ -170,7 +187,7 @@ impl Parser {
         let end = default.as_ref().map(Expr::span).unwrap_or(name_span).end;
 
         Some(Param {
-            promoted_visibility,
+            promoted_access: is_constructor.then_some(access),
             writable,
             ty,
             name,
@@ -608,15 +625,30 @@ impl Parser {
         })
     }
 
-    fn parse_visibility(&mut self) -> Option<Visibility> {
-        if self.match_kind(&TokenKind::Public) {
-            Some(Visibility::Public)
-        } else if self.match_kind(&TokenKind::Protected) {
-            Some(Visibility::Protected)
-        } else if self.match_kind(&TokenKind::Private) {
-            Some(Visibility::Private)
+    fn parse_member_access(&mut self) -> MemberAccess {
+        if self.match_kind(&TokenKind::Internal) {
+            MemberAccess::Internal
         } else {
-            None
+            MemberAccess::External
+        }
+    }
+
+    fn reject_legacy_visibility_modifier(&mut self) -> bool {
+        let message = match &self.peek().kind {
+            TokenKind::Public => Some("Doria members are public by default; remove `public`."),
+            TokenKind::Private => Some("Use `internal` for implementation details."),
+            TokenKind::Protected => {
+                Some("Doria does not support `protected`; use `internal` or redesign the API.")
+            }
+            _ => None,
+        };
+
+        if let Some(message) = message {
+            let span = self.advance().span;
+            self.error(message, span);
+            true
+        } else {
+            false
         }
     }
 
@@ -761,6 +793,7 @@ impl Parser {
                 | TokenKind::Echo
                 | TokenKind::Return
                 | TokenKind::Foreach
+                | TokenKind::Internal
                 | TokenKind::Public
                 | TokenKind::Protected
                 | TokenKind::Private => return,
@@ -779,6 +812,7 @@ fn token_name(kind: &TokenKind) -> &'static str {
         TokenKind::Public => "public",
         TokenKind::Protected => "protected",
         TokenKind::Private => "private",
+        TokenKind::Internal => "internal",
         TokenKind::Static => "static",
         TokenKind::Let => "let",
         TokenKind::Writable => "writable",

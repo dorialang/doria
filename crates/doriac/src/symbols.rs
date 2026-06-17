@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use crate::ast::MemberAccess;
 use crate::types::TypeRef;
 
 #[derive(Debug, Clone)]
@@ -16,12 +17,14 @@ pub struct ClassInfo {
 
 #[derive(Debug, Clone)]
 pub struct PropertyInfo {
+    pub access: MemberAccess,
     pub writable: bool,
     pub ty: TypeRef,
 }
 
 #[derive(Debug, Clone)]
 pub struct MethodInfo {
+    pub access: MemberAccess,
     pub writable_this: bool,
 }
 

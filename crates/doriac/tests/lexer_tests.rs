@@ -33,3 +33,10 @@ fn lexes_future_reserved_words() {
     assert!(matches!(kinds[2], TokenKind::Reserved(ref word) if word == "spawn"));
     assert!(matches!(kinds[3], TokenKind::Reserved(ref word) if word == "scope"));
 }
+
+#[test]
+fn lexes_internal_keyword() {
+    let kinds = token_kinds("internal writable string $name;");
+    assert!(matches!(kinds[0], TokenKind::Internal));
+    assert!(matches!(kinds[1], TokenKind::Writable));
+}

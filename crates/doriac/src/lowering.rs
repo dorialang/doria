@@ -33,7 +33,7 @@ fn lower_class_member(member: &ast::ClassMember) -> hir::ClassMember {
 
 fn lower_property(property: &ast::PropertyDecl) -> hir::PropertyDecl {
     hir::PropertyDecl {
-        visibility: property.visibility.clone(),
+        access: property.access.clone(),
         writable: property.writable,
         ty: property.ty.clone(),
         name: property.name.clone(),
@@ -44,7 +44,7 @@ fn lower_property(property: &ast::PropertyDecl) -> hir::PropertyDecl {
 
 fn lower_function(function: &ast::FunctionDecl) -> hir::FunctionDecl {
     hir::FunctionDecl {
-        visibility: function.visibility.clone(),
+        access: function.access.clone(),
         writable_this: function.writable_this,
         name: function.name.clone(),
         params: function.params.iter().map(lower_param).collect(),
@@ -56,7 +56,7 @@ fn lower_function(function: &ast::FunctionDecl) -> hir::FunctionDecl {
 
 fn lower_param(param: &ast::Param) -> hir::Param {
     hir::Param {
-        promoted_visibility: param.promoted_visibility.clone(),
+        promoted_access: param.promoted_access.clone(),
         writable: param.writable,
         ty: param.ty.clone(),
         name: param.name.clone(),

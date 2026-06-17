@@ -53,7 +53,7 @@ impl BackendTarget {
     pub fn description(self) -> &'static str {
         match self {
             BackendTarget::Native => "native machine code",
-            BackendTarget::Php => "PHP compatibility/transpilation",
+            BackendTarget::Php => "PHP compatibility/inspection",
             BackendTarget::Debug => "debug interpreter",
             BackendTarget::Wasm => "WebAssembly",
         }

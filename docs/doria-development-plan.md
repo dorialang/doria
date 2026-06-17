@@ -14,11 +14,11 @@ Doria source
 → semantic analysis
 → type checker
 → readonly/writable checker
-→ borrow/lifetime analysis later
-→ HIR
-→ MIR later
+→ Doria IR
 → backend
 ```
+
+As native code generation matures, Doria IR may lower into a simpler native-oriented IR for control flow, memory layout, runtime calls, and backend code generation.
 
 Backends may include:
 
@@ -29,13 +29,13 @@ Backends may include:
 4. WebAssembly backend
 ```
 
-The native backend is the primary long-term target. A PHP backend may exist as a compatibility feature, migration tool, debugging aid, or transpilation target, but it must not shape the core compiler architecture.
+The native backend is the primary long-term target. A PHP backend may exist as a compatibility feature, migration tool, debugging aid, or inspection target, but it must not shape the core compiler architecture.
 
 ## Project name
 
 **Doria**
 
-Doria is a PHP-shaped, C-like, compiled language inspired by PHP syntax but with stronger safety guarantees:
+Doria is a compiled programming language for native applications, command-line tools, services, games, and systems software. It has syntax familiar to PHP developers, but this is migration and development context rather than brand identity:
 
 ```text
 - Strong static typing
@@ -43,12 +43,12 @@ Doria is a PHP-shaped, C-like, compiled language inspired by PHP syntax but with
 - Variables declared only with let or explicit types
 - Everything readonly by default
 - writable keyword for intentional mutation
-- Classes, functions, methods, visibility, constructor promotion
+- Classes, functions, methods, default-public members, internal members, constructor promotion
 - Collection aliases: List<T>, Dictionary<K, V>, Set<T>
 - Future: generics, borrow checker, async/await, native backend
 ```
 
-The first implementation slice may include a PHP backend because it is easy to inspect and run locally, but Doria must be designed as a compiled language with backend-independent HIR/MIR boundaries and a native backend as the primary long-term target. The compiler should reject invalid Doria code before lowering to HIR/MIR or emitting any backend output.
+The first implementation slice may include a PHP backend because it is easy to inspect and run locally, but Doria must be designed as a compiled language with a backend-independent Doria IR boundary and a native backend as the primary long-term target. The compiler should reject invalid Doria code before lowering to Doria IR or emitting any backend output.
 
 ---
 
@@ -129,9 +129,9 @@ $x = 10; // Okay
 ```php
 class Person
 {
-    public string $id;
-    public writable string $name;
-    public writable int $age;
+    string $id;
+    writable string $name;
+    writable int $age;
 }
 ```
 
@@ -173,14 +173,14 @@ function rename(writable Person $person, string $name): void
 ```php
 class Person
 {
-    public writable string $name;
+    writable string $name;
 
-    public function getName(): string
+    function getName(): string
     {
         return $this->name;
     }
 
-    public function rename(string $name): void
+    function rename(string $name): void
     {
         $this->name = $name; // Error
     }
@@ -192,9 +192,9 @@ To mutate `$this`, the method must be marked `writable`:
 ```php
 class Person
 {
-    public writable string $name;
+    writable string $name;
 
-    public writable function rename(string $name): void
+    writable function rename(string $name): void
     {
         $this->name = $name;
     }
@@ -217,7 +217,43 @@ $person->rename("Lucy"); // Okay
 
 ---
 
-## 7. Collection aliases
+## 7. Member access uses default-public plus `internal`
+
+Doria class members are externally accessible by default. There is no need to write `public`.
+
+Use `internal` for implementation details that should not be accessed from outside the declaring class:
+
+```php
+class Person
+{
+    string $name;
+
+    function greet(): void
+    {
+        echo $this->message();
+    }
+
+    internal function message(): string
+    {
+        return "Hello";
+    }
+}
+```
+
+`writable` and `internal` solve different problems:
+
+```text
+writable answers: can this value/member be reassigned or can this method mutate `$this`?
+internal answers: can code outside the declaring class access this member?
+```
+
+Do not use `public`, `protected`, or `private` as Doria member modifiers. Doria does not include `protected` behavior in the early language.
+
+Property hooks are planned later for validation and computed properties, but they are not implemented in this slice.
+
+---
+
+## 8. Collection aliases
 
 Use these names:
 
@@ -268,7 +304,7 @@ doriac run examples/person.doria
 
 For MVP, `doriac run` can compile to temporary PHP and execute it using the local `php` binary.
 
-Codex should work in small, testable increments. OpenAI’s Codex docs describe Codex as an AI agent for writing, reviewing, and shipping code, so this plan is written as a sequence of scoped engineering tasks rather than one giant “build a language” task. ([OpenAI Help Center][4])
+Codex should work in small, testable increments. This plan is written as a sequence of scoped engineering tasks rather than one giant “build a language” task.
 
 ---
 
@@ -313,7 +349,7 @@ doria/
     └── codegen_php_tests.rs
 ```
 
-Create `AGENTS.md` with project-specific instructions for Codex. Codex supports generating an `AGENTS.md` scaffold through `/init`, but for this project, it should be explicit from the start. ([OpenAI Help Center][4])
+Create `AGENTS.md` with project-specific instructions for Codex.
 
 ---
 
@@ -329,18 +365,19 @@ It should define:
 3. MVP syntax
 4. Declaration rules
 5. Readonly/writable rules
-6. Basic type system
-7. Class syntax
-8. Function syntax
-9. Collection aliases
-10. HIR, MIR, and backend behavior
-11. Future features
+6. Member access
+7. Basic type system
+8. Class syntax
+9. Function syntax
+10. Collection aliases
+11. Doria IR and backend behavior
+12. Future features
 ```
 
 Important wording:
 
 ```text
-Doria is PHP-shaped, not PHP-compatible at the parser level.
+Doria is its own language. Its syntax is familiar to developers coming from PHP-like and C-like languages, but it is not PHP-compatible at the parser level.
 
 Valid PHP should be easy to migrate to Doria, but Doria-specific syntax does not need to run directly in PHP.
 ```
@@ -355,9 +392,7 @@ Implement a lexer that recognizes:
 Keywords:
 class
 function
-public
-protected
-private
+internal
 static
 let
 writable
@@ -380,6 +415,11 @@ float
 string
 bool
 array
+
+Deprecated/reserved member modifiers:
+public
+protected
+private
 
 Future reserved:
 async
@@ -684,7 +724,7 @@ Okay.
 ```php
 class Person
 {
-    public string $name;
+    string $name;
 }
 
 let writable $person = new Person("Andrew");
@@ -696,7 +736,7 @@ Error because `name` is readonly.
 ```php
 class Person
 {
-    public writable string $name;
+    writable string $name;
 }
 
 let $person = new Person("Andrew");
@@ -708,7 +748,7 @@ Error because `$person` is readonly.
 ```php
 class Person
 {
-    public writable string $name;
+    writable string $name;
 }
 
 let writable $person = new Person("Andrew");
@@ -722,9 +762,9 @@ Okay.
 ```php
 class Person
 {
-    public writable string $name;
+    writable string $name;
 
-    public function rename(string $name): void
+    function rename(string $name): void
     {
         $this->name = $name;
     }
@@ -738,9 +778,9 @@ Correct:
 ```php
 class Person
 {
-    public writable string $name;
+    writable string $name;
 
-    public writable function rename(string $name): void
+    writable function rename(string $name): void
     {
         $this->name = $name;
     }
@@ -790,13 +830,11 @@ Doria class:
 ```php
 class Person
 {
-    public writable string $name;
-    public int $age;
-
-    public function __construct(string $name, int $age)
+    function __construct(
+        writable string $name,
+        int $age,
+    )
     {
-        $this->name = $name;
-        $this->age = $age;
     }
 }
 ```
@@ -808,18 +846,16 @@ PHP output:
 
 class Person
 {
-    public string $name;
-    public int $age;
-
-    public function __construct(string $name, int $age)
+    public function __construct(
+        public string $name,
+        public int $age,
+    )
     {
-        $this->name = $name;
-        $this->age = $age;
     }
 }
 ```
 
-The PHP output does not need to preserve `readonly` or `writable` semantics at runtime for v0.1. The Doria compiler enforces those rules before output.
+The PHP output does not need to preserve `readonly`, `writable`, or `internal` semantics at runtime for v0.1. The Doria compiler enforces those rules before output.
 
 ---
 
@@ -827,49 +863,31 @@ The PHP output does not need to preserve `readonly` or `writable` semantics at r
 
 This file should compile and run:
 
-```php
+```doria
 class Person
 {
-    protected Dictionary<string, int> $items = [
-        'apples' => 5,
-        'oranges' => 10,
-    ];
+    writable string $name = "Andrew Masiye";
+    int $age = 37;
 
-    public function __construct(
-        public writable string $name,
-        public int $age = 10,
-    ) {
-    }
-
-    public function greet(): void
+    function greet(): void
     {
         echo $this->getGreetingMessage();
     }
 
-    public function displayInventory(): void
-    {
-        foreach ($this->items as string $name => int $quantity) {
-            echo sprintf("%-20s %d\n", "{$name}:", $quantity);
-        }
-    }
-
-    public writable function rename(string $name): void
+    writable function rename(string $name): void
     {
         $this->name = $name;
     }
 
-    private function getGreetingMessage(): string
+    internal function getGreetingMessage(): string
     {
         return "Hello, my name is {$this->name} and I am {$this->age} years old!";
     }
 }
 
-let writable $person = new Person("Andrew Masiye", 37);
+let writable $person = new Person();
 
 $person->greet();
-echo "\n---\n";
-$person->displayInventory();
-
 $person->rename("Lucy");
 echo "\n---\n";
 $person->greet();
@@ -879,10 +897,6 @@ Expected output:
 
 ```text
 Hello, my name is Andrew Masiye and I am 37 years old!
----
-apples:              5
-oranges:             10
-
 ---
 Hello, my name is Lucy and I am 37 years old!
 ```
@@ -921,7 +935,7 @@ Bad code:
 ```php
 class Person
 {
-    public string $name;
+    string $name;
 }
 
 let writable $person = new Person("Andrew");
@@ -934,7 +948,7 @@ Diagnostic:
 error[E0202]: cannot assign to readonly property `Person::$name`
 
 help: mark the property writable:
-  public writable string $name;
+  writable string $name;
 ```
 
 ---
@@ -1012,13 +1026,13 @@ async scope {
 }
 ```
 
-For a PHP backend, this could eventually lower to a Doria runtime built on Fibers. For a native backend, lower async through HIR/MIR, then to LLVM, Cranelift, or another backend later. PHP’s Fiber API gives low-level suspension/resumption, but Doria should offer a cleaner language-level abstraction. ([PHP][3])
+For a PHP backend, this could eventually lower to a Doria runtime built on Fibers. For a native backend, lower async through Doria IR and a future native-oriented IR, then to LLVM, Cranelift, or another backend later. PHP’s Fiber API gives low-level suspension/resumption, but Doria should offer a cleaner language-level abstraction. ([PHP][3])
 
 ---
 
 # Phase 11: Native backend foundation
 
-HIR belongs in the core compiler pipeline before backend emission today. As the language matures, evolve the placeholder MIR into the explicit control-flow-oriented phase that can support the native backend.
+Doria IR belongs in the core compiler pipeline before backend emission. As native code generation matures, Doria IR may lower into a simpler native-oriented IR for control flow, memory layout, runtime calls, and backend code generation.
 
 Possible future pipeline:
 
@@ -1028,8 +1042,8 @@ Doria source
 → Parser
 → AST
 → Semantic analysis
-→ Doria HIR
-→ Doria MIR
+→ Doria IR
+→ native-oriented IR
 → LLVM IR or MLIR
 → Native executable
 ```
@@ -1047,7 +1061,7 @@ Copy this into Codex:
 ```text
 You are helping build a new programming language called Doria.
 
-Doria is PHP-shaped but not PHP++. It uses PHP-like syntax, `$variables`, classes, functions, visibility modifiers, constructor property promotion, and C-like blocks. However, it is strongly typed, compiled, readonly by default, and uses `writable` for intentional mutation.
+Doria is a compiled programming language for native applications, command-line tools, services, games, and systems software. It has syntax familiar to PHP-like and C-like language users, including `$variables`, classes, functions, default-public members, `internal` implementation details, constructor property promotion, and C-like blocks. However, it is strongly typed, compiled, readonly by default, and uses `writable` for intentional mutation.
 
 Build the first MVP compiler with Rust as the bootstrap implementation language.
 
@@ -1250,9 +1264,9 @@ Support:
 ```php
 class Person
 {
-    public writable string $name;
+    writable string $name;
 
-    public function greet(): void
+    function greet(): void
     {
         echo $this->name;
     }
@@ -1281,7 +1295,7 @@ Catch:
 ```php
 class Person
 {
-    public string $name;
+    string $name;
 }
 
 let writable $person = new Person("Andrew");
@@ -1293,9 +1307,9 @@ Catch:
 ```php
 class Person
 {
-    public writable string $name;
+    writable string $name;
 
-    public function rename(string $name): void
+    function rename(string $name): void
     {
         $this->name = $name;
     }
@@ -1334,10 +1348,6 @@ Expected output:
 
 ```text
 Hello, my name is Andrew Masiye and I am 37 years old!
----
-apples:              5
-oranges:             10
-
 ---
 Hello, my name is Lucy and I am 37 years old!
 ```
@@ -1382,7 +1392,6 @@ That is enough for v0.1. Generics, async, borrow checking, and native compilatio
 [1]: https://llvm.org/docs/tutorial/index.html "LLVM Tutorial: Table of Contents — LLVM 23.0.0git documentation"
 [2]: https://www.php.net/manual/en/language.oop5.properties.php "PHP: Properties - Manual"
 [3]: https://www.php.net/manual/en/language.fibers.php "PHP: Fibers - Manual"
-[4]: https://help.openai.com/en/articles/11369540-getting-started-with-codex "Using Codex with your ChatGPT plan | OpenAI Help Center"
 [5]: https://tree-sitter.github.io/tree-sitter/creating-parsers/2-the-grammar-dsl.html "The Grammar DSL - Tree-sitter"
 [6]: https://www.antlr.org/about.html "About The ANTLR Parser Generator"
 [7]: https://mlir.llvm.org/docs/LangRef/ "MLIR Language Reference - MLIR"

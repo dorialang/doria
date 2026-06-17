@@ -1,6 +1,6 @@
 # Executable Initializers and Attribute Expressions
 
-Doria is PHP-shaped, but it should not inherit PHP's restrictions around property default values or attribute arguments.
+Doria has syntax familiar to developers coming from PHP-like and C-like languages, but it should not inherit PHP's restrictions around property default values or attribute arguments.
 
 In PHP, property initializers and attribute arguments are limited to constant values or constant expressions. Doria should allow richer, typed, compiler-checked expressions in both places.
 
@@ -15,15 +15,15 @@ Doria should allow code like this:
 ```doria
 class Person
 {
-    public function __construct(
-        public string $name = "Unknown",
+    function __construct(
+        string $name = "Unknown",
     ) {
     }
 }
 
 class Office
 {
-    public Person $manager = new Person();
+    Person $manager = new Person();
 }
 ```
 
@@ -85,9 +85,9 @@ Doria should allow instance properties to be initialized with non-constant expre
 ```doria
 class Office
 {
-    public Person $manager = new Person();
-    public List<Person> $staff = [];
-    public Dictionary<string, string> $labels = Dictionary::new();
+    Person $manager = new Person();
+    List<Person> $staff = [];
+    Dictionary<string, string> $labels = Dictionary::new();
 }
 ```
 
@@ -123,7 +123,7 @@ A property initializer counts as initialization.
 ```doria
 class Office
 {
-    public Person $manager = new Person();
+    Person $manager = new Person();
 }
 ```
 
@@ -140,7 +140,7 @@ If a property is marked `writable`, the property can be reassigned later:
 ```doria
 class Office
 {
-    public writable Person $manager = new Person();
+    writable Person $manager = new Person();
 }
 
 let writable $office = new Office();
@@ -166,7 +166,7 @@ Possible future syntax:
 ```doria
 class Registry
 {
-    public static Dictionary<string, Handler> $handlers = Dictionary::new();
+    internal static Dictionary<string, Handler> $handlers = Dictionary::new();
 }
 ```
 
@@ -273,7 +273,7 @@ Open questions:
 - How should PHP backend output represent Doria attributes that PHP cannot express directly?
 ```
 
-Until these questions are settled, implement parsing and AST/HIR representation first, not full evaluation.
+Until these questions are settled, implement parsing and AST/Doria IR representation first, not full evaluation.
 
 ---
 
@@ -286,7 +286,7 @@ For property initializers like:
 ```doria
 class Office
 {
-    public Person $manager = new Person();
+    Person $manager = new Person();
 }
 ```
 
@@ -388,7 +388,7 @@ Example:
 ```doria
 class Office
 {
-    public Person $manager = "Andrew"; // error: string is not Person
+    Person $manager = "Andrew"; // error: string is not Person
 }
 ```
 
@@ -413,10 +413,10 @@ Implement in this order:
 1. Add parser support for attributes without semantic evaluation.
 2. Add AST support for attributes and named arguments.
 3. Add parser support for named call arguments generally.
-4. Keep property initializers in AST/HIR as expressions.
+4. Keep property initializers in AST/Doria IR as expressions.
 5. Add semantic checks that property initializer type matches property type once TypeId/TypeKind exists.
 6. Add PHP backend lowering for simple `new` property initializers into constructors.
-7. Add a metadata representation for attributes in HIR.
+7. Add a metadata representation for attributes in Doria IR.
 8. Decide attribute evaluation policy before executing attribute expressions.
 ```
 
