@@ -175,17 +175,17 @@ impl<'program> Checker<'program> {
             this_available: false,
         };
         self.check_expr(initializer, &scopes, Some(&initializer_context));
-        let value_ty = self.infer_expr_type(initializer, &scopes, Some(&initializer_context));
         let target_ty = self
             .classes
             .get(class_name)
             .and_then(|class_info| class_info.properties.get(&property.name))
             .map(|property| property.ty)
             .unwrap_or_else(|| self.resolve_type_ref(&property.ty, property.span));
-        self.check_assignable(
+        self.check_expr_assignable(
             target_ty,
-            value_ty,
-            initializer.span(),
+            initializer,
+            &scopes,
+            Some(&initializer_context),
             AssignmentDestination::Property {
                 class_name: class_name.to_string(),
                 name: property.name.clone(),
@@ -274,11 +274,11 @@ impl<'program> Checker<'program> {
             let ty = self.resolve_type_ref(&param.ty, param.span);
             if let Some(default) = &param.default {
                 self.check_expr(default, &scopes, method_context.as_ref());
-                let value_ty = self.infer_expr_type(default, &scopes, method_context.as_ref());
-                self.check_assignable(
+                self.check_expr_assignable(
                     ty,
-                    value_ty,
-                    default.span(),
+                    default,
+                    &scopes,
+                    method_context.as_ref(),
                     AssignmentDestination::Parameter {
                         name: param.name.clone(),
                     },
@@ -323,10 +323,11 @@ impl<'program> Checker<'program> {
                 let ty = match &decl.ty {
                     Some(ty) => {
                         let target_ty = self.resolve_type_ref(ty, decl.span);
-                        self.check_assignable(
+                        self.check_expr_assignable(
                             target_ty,
-                            value_ty,
-                            decl.initializer.span(),
+                            &decl.initializer,
+                            scopes,
+                            method_context,
                             AssignmentDestination::Type,
                         );
                         target_ty
@@ -345,14 +346,14 @@ impl<'program> Checker<'program> {
             }
             Stmt::Assignment(assignment) => {
                 self.check_expr(&assignment.value, scopes, method_context);
-                let value_ty = self.infer_expr_type(&assignment.value, scopes, method_context);
                 if let Some(target) =
                     self.check_assignment_target(&assignment.target, scopes, method_context)
                 {
-                    self.check_assignable(
+                    self.check_expr_assignable(
                         target.ty,
-                        value_ty,
-                        assignment.value.span(),
+                        &assignment.value,
+                        scopes,
+                        method_context,
                         target.destination,
                     );
                 }
@@ -865,10 +866,6 @@ impl<'program> Checker<'program> {
         span: Span,
         destination: AssignmentDestination,
     ) {
-        if self.is_assignable(target, value) {
-            return;
-        }
-
         let target_name = self.types.display(target);
         let value_name = self.types.display(value);
         let message = match destination {
@@ -885,6 +882,104 @@ impl<'program> Checker<'program> {
 
         self.diagnostics
             .push(Diagnostic::new("E0403", message, span));
+    }
+
+    fn check_expr_assignable(
+        &mut self,
+        target: TypeId,
+        value_expr: &Expr,
+        scopes: &ScopeStack,
+        method_context: Option<&MethodContext>,
+        destination: AssignmentDestination,
+    ) {
+        let value = self.infer_expr_type(value_expr, scopes, method_context);
+        if self.is_expr_assignable(target, value_expr, scopes, method_context)
+            || self.is_assignable(target, value)
+        {
+            return;
+        }
+
+        self.check_assignable(target, value, value_expr.span(), destination);
+    }
+
+    fn is_expr_assignable(
+        &mut self,
+        target: TypeId,
+        value_expr: &Expr,
+        scopes: &ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) -> bool {
+        match value_expr {
+            Expr::Array { elements, .. } => {
+                self.is_array_literal_assignable(target, elements, scopes, method_context)
+            }
+            _ => {
+                let value = self.infer_expr_type(value_expr, scopes, method_context);
+                self.is_assignable(target, value)
+            }
+        }
+    }
+
+    fn is_array_literal_assignable(
+        &mut self,
+        target: TypeId,
+        elements: &[ArrayElement],
+        scopes: &ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) -> bool {
+        let target_kind = self.types.kind(target).clone();
+
+        match target_kind {
+            TypeKind::Mixed | TypeKind::Unknown | TypeKind::Array => true,
+            TypeKind::List(element) => {
+                if self.is_mixed_or_unknown_type(element)
+                    || elements.iter().any(|element| element.key.is_some())
+                {
+                    return false;
+                }
+
+                elements.iter().all(|array_element| {
+                    self.is_expr_assignable(element, &array_element.value, scopes, method_context)
+                })
+            }
+            TypeKind::Dictionary(key, value) => {
+                if self.is_mixed_or_unknown_type(key) || self.is_mixed_or_unknown_type(value) {
+                    return false;
+                }
+
+                if elements.is_empty() {
+                    return true;
+                }
+
+                if !elements.iter().any(|element| element.key.is_some()) {
+                    return false;
+                }
+
+                elements.iter().all(|array_element| {
+                    let key_ok = if let Some(key_expr) = &array_element.key {
+                        self.is_expr_assignable(key, key_expr, scopes, method_context)
+                    } else {
+                        let implicit_key = self.types.intern(TypeKind::Int);
+                        self.is_assignable(key, implicit_key)
+                    };
+                    let value_ok = self.is_expr_assignable(
+                        value,
+                        &array_element.value,
+                        scopes,
+                        method_context,
+                    );
+                    key_ok && value_ok
+                })
+            }
+            _ => {
+                let value = self.infer_array_type(elements, scopes, method_context);
+                self.is_assignable(target, value)
+            }
+        }
+    }
+
+    fn is_mixed_or_unknown_type(&self, ty: TypeId) -> bool {
+        matches!(self.types.kind(ty), TypeKind::Mixed | TypeKind::Unknown)
     }
 
     fn is_assignable(&self, target: TypeId, value: TypeId) -> bool {

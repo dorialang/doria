@@ -781,11 +781,20 @@ fn checks_collection_assignment_compatibility() {
     doriac::check_source(
         "test.doria",
         r#"
+class A {}
+class B {}
+
 List<int> $numbers = [1, 2, 3];
 List<int> $emptyNumbers = [];
 List<List<int>> $rows = [[1], []];
+List<object> $objects = [new A(), new B()];
+List<array> $arrays = [[1], ["k" => 2]];
 Dictionary<string, int> $counts = [
     "apples" => 5,
+];
+Dictionary<string, object> $objectsByName = [
+    "a" => new A(),
+    "b" => new B(),
 ];
 Dictionary<string, List<int>> $nestedCounts = [
     "apples" => [5],
@@ -806,9 +815,14 @@ array $mixed = [1, "two"];
 class Inventory
 {
     Dictionary<string, int> $counts = [];
+    List<object> $objects = [new A(), new B()];
 }
 
 function readCounts(Dictionary<string, int> $counts = []): void
+{
+}
+
+function readObjects(List<object> $objects = [new A(), new B()]): void
 {
 }
 "#,
@@ -835,6 +849,20 @@ Dictionary<string, int> $counts = [
 Dictionary<string, int> $counts = [
     "apples" => 5,
     10,
+];
+"#,
+        r#"
+class A {}
+List<object> $objects = [new A(), 1];
+"#,
+        r#"
+List<array> $arrays = [[1], 2];
+"#,
+        r#"
+class A {}
+Dictionary<string, object> $objectsByName = [
+    "a" => new A(),
+    "b" => 1,
 ];
 "#,
         r#"
