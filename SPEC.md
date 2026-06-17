@@ -277,7 +277,7 @@ The semantic checker resolves parsed type syntax into semantic types before chec
 
 Numeric widening is not implemented yet; for now `float` is not assignable from `int`, and `int` is not assignable from `float`. Any future safe numeric widening should be a separate design decision. Return type checking, function call argument checking, and constructor argument checking are separate future slices.
 
-Simple collection literals infer collection element/key/value types when all clear parts match. Clear heterogeneous collection literals, such as `[1, "two"]`, are rejected by narrow collection alias assignment checks rather than being erased to `Unknown`. The PHP-compatible `array` annotation remains broad enough to accept list-shaped and dictionary-shaped literals.
+Simple collection literals infer collection element/key/value types when all clear parts match. Clear heterogeneous collection literals, such as `[1, "two"]`, are rejected by narrow collection alias assignment checks rather than being erased to `Unknown`. The empty literal `[]` stays ambiguous so typed contexts may use it as an empty `List<T>` or `Dictionary<K, V>`. The PHP-compatible `array` annotation remains broad enough to accept list-shaped and dictionary-shaped literals.
 
 ## 8. Class syntax
 

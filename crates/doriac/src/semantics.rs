@@ -891,6 +891,10 @@ impl<'program> Checker<'program> {
             (TypeKind::Unknown, _) | (_, TypeKind::Unknown) => true,
             (TypeKind::Object, TypeKind::Class(_)) => true,
             (TypeKind::Array, TypeKind::List(_) | TypeKind::Dictionary(_, _)) => true,
+            (
+                TypeKind::Array | TypeKind::List(_) | TypeKind::Dictionary(_, _) | TypeKind::Set(_),
+                TypeKind::EmptyCollection,
+            ) => true,
             (TypeKind::Class(target), TypeKind::Class(value)) => target == value,
             (TypeKind::List(target), TypeKind::List(value)) => self.is_assignable(target, value),
             (
@@ -957,6 +961,10 @@ impl<'program> Checker<'program> {
         scopes: &ScopeStack,
         method_context: Option<&MethodContext>,
     ) -> TypeId {
+        if elements.is_empty() {
+            return self.types.intern(TypeKind::EmptyCollection);
+        }
+
         if elements.iter().any(|element| element.key.is_some()) {
             let mut key_types = Vec::new();
             let mut value_types = Vec::new();

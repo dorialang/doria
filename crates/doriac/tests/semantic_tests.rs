@@ -707,15 +707,26 @@ fn checks_collection_assignment_compatibility() {
         "test.doria",
         r#"
 List<int> $numbers = [1, 2, 3];
+List<int> $emptyNumbers = [];
 Dictionary<string, int> $counts = [
     "apples" => 5,
 ];
+Dictionary<string, int> $emptyCounts = [];
 array $empty = [];
 array $items = [1, 2, 3];
 array $inventory = [
     "apples" => 5,
 ];
 array $mixed = [1, "two"];
+
+class Inventory
+{
+    Dictionary<string, int> $counts = [];
+}
+
+function readCounts(Dictionary<string, int> $counts = []): void
+{
+}
 "#,
     )
     .expect("semantic check should succeed");

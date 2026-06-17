@@ -68,6 +68,7 @@ pub enum TypeKind {
     Array,
     Unknown,
     Heterogeneous,
+    EmptyCollection,
     Class(String),
     List(TypeId),
     Dictionary(TypeId, TypeId),
@@ -125,6 +126,7 @@ impl TypeRegistry {
             TypeKind::Array => "array".to_string(),
             TypeKind::Unknown => "Unknown".to_string(),
             TypeKind::Heterogeneous => "heterogeneous".to_string(),
+            TypeKind::EmptyCollection => "[]".to_string(),
             TypeKind::Class(name) => name.clone(),
             TypeKind::List(element) => format!("List<{}>", self.display(*element)),
             TypeKind::Dictionary(key, value) => {

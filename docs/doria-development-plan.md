@@ -654,7 +654,7 @@ Should infer:
 List<int>
 ```
 
-For mixed list values in MVP, reject clear heterogeneous collection literals for narrow collection aliases until the type system is stable. Do not erase cleanly differing element/value types to `Unknown`, because that would let `List<T>` and `Dictionary<K, V>` annotations accept invalid literals. The PHP-compatible `array` annotation remains broad enough to accept list-shaped and dictionary-shaped literals.
+For mixed list values in MVP, reject clear heterogeneous collection literals for narrow collection aliases until the type system is stable. Do not erase cleanly differing element/value types to `Unknown`, because that would let `List<T>` and `Dictionary<K, V>` annotations accept invalid literals. Keep `[]` ambiguous so typed contexts can use it for empty lists or dictionaries. The PHP-compatible `array` annotation remains broad enough to accept list-shaped and dictionary-shaped literals.
 
 ---
 
