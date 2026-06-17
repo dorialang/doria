@@ -20,6 +20,7 @@ struct Checker<'program> {
     program: &'program Program,
     classes: HashMap<String, ClassInfo>,
     functions: HashMap<String, TypeId>,
+    function_return_types: HashMap<usize, TypeId>,
     types: TypeRegistry,
     diagnostics: Vec<Diagnostic>,
 }
@@ -29,6 +30,61 @@ struct MethodContext {
     class_name: String,
     writable_this: bool,
     this_available: bool,
+}
+
+#[derive(Debug, Clone)]
+struct ReturnContext {
+    name: String,
+    expected: Option<TypeId>,
+    lifecycle: Option<LifecycleMethod>,
+    is_method: bool,
+}
+
+impl ReturnContext {
+    fn kind_name(&self) -> &'static str {
+        if self.is_method {
+            "method"
+        } else {
+            "function"
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LifecycleMethod {
+    Constructor,
+    Destructor,
+}
+
+impl LifecycleMethod {
+    fn from_method_name(name: &str) -> Option<Self> {
+        match name {
+            "__construct" => Some(Self::Constructor),
+            "__destruct" => Some(Self::Destructor),
+            _ => None,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Constructor => "constructor",
+            Self::Destructor => "destructor",
+        }
+    }
+
+    fn doria_name(self) -> &'static str {
+        match self {
+            Self::Constructor => "__construct",
+            Self::Destructor => "__destruct",
+        }
+    }
+
+    fn return_value_message(self) -> &'static str {
+        match self {
+            Self::Constructor => "constructors cannot return a value",
+            Self::Destructor => "destructors cannot return a value",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -50,6 +106,7 @@ impl<'program> Checker<'program> {
             program,
             classes: HashMap::new(),
             functions: HashMap::new(),
+            function_return_types: HashMap::new(),
             types: TypeRegistry::new(),
             diagnostics: Vec::new(),
         }
@@ -62,7 +119,9 @@ impl<'program> Checker<'program> {
         let mut scopes = ScopeStack::new();
         for item in &self.program.items {
             match item {
-                Item::Statement(statement) => self.check_statement(statement, &mut scopes, None),
+                Item::Statement(statement) => {
+                    self.check_statement(statement, &mut scopes, None, None);
+                }
                 Item::Function(function) => self.check_function(function, None),
                 Item::Class(class_decl) => self.check_class(class_decl),
             }
@@ -108,6 +167,10 @@ impl<'program> Checker<'program> {
                         self.declare_property(&mut info, &class_decl.name, property);
                     }
                     ClassMember::Method(method) => {
+                        let return_ty = self.resolve_function_return_type(method);
+                        self.function_return_types
+                            .insert(method.span.start, return_ty);
+
                         if info.methods.contains_key(&method.name) {
                             self.diagnostics.push(Diagnostic::new(
                                 "E0302",
@@ -118,7 +181,6 @@ impl<'program> Checker<'program> {
                                 method.span,
                             ));
                         } else {
-                            let return_ty = self.resolve_function_return_type(method);
                             info.methods.insert(
                                 method.name.clone(),
                                 MethodInfo {
@@ -155,6 +217,17 @@ impl<'program> Checker<'program> {
             };
 
             let return_ty = self.resolve_function_return_type(function);
+            self.function_return_types
+                .insert(function.span.start, return_ty);
+            if self.functions.contains_key(&function.name) {
+                self.diagnostics.push(Diagnostic::new(
+                    "E0308",
+                    format!("function `{}` is already declared", function.name),
+                    function.span,
+                ));
+                continue;
+            }
+
             self.functions.insert(function.name.clone(), return_ty);
         }
     }
@@ -291,6 +364,7 @@ impl<'program> Checker<'program> {
 
     fn check_function(&mut self, function: &FunctionDecl, method_context: Option<MethodContext>) {
         let mut scopes = ScopeStack::new();
+        let return_context = self.return_context_for_function(function, method_context.as_ref());
         for param in &function.params {
             let ty = self.resolve_type_ref(&param.ty, param.span);
             if let Some(default) = &param.default {
@@ -322,7 +396,81 @@ impl<'program> Checker<'program> {
                 param.span,
             );
         }
-        self.check_block(&function.body, &mut scopes, method_context.as_ref());
+        self.check_block(
+            &function.body,
+            &mut scopes,
+            method_context.as_ref(),
+            Some(&return_context),
+        );
+        self.check_missing_final_return(function, &return_context);
+    }
+
+    fn return_context_for_function(
+        &mut self,
+        function: &FunctionDecl,
+        method_context: Option<&MethodContext>,
+    ) -> ReturnContext {
+        let is_method = method_context.is_some();
+        let lifecycle = is_method
+            .then(|| LifecycleMethod::from_method_name(&function.name))
+            .flatten();
+        let name = method_context
+            .map(|context| format!("{}::{}", context.class_name, function.name))
+            .unwrap_or_else(|| function.name.clone());
+
+        if let Some(lifecycle) = lifecycle {
+            self.check_lifecycle_return_type(function, lifecycle);
+        }
+
+        let expected = if lifecycle.is_some() {
+            None
+        } else if function.return_type.is_some() {
+            Some(self.current_function_return_type(function))
+        } else {
+            None
+        };
+
+        ReturnContext {
+            name,
+            expected,
+            lifecycle,
+            is_method,
+        }
+    }
+
+    fn check_lifecycle_return_type(&mut self, function: &FunctionDecl, lifecycle: LifecycleMethod) {
+        if function.return_type.is_none() {
+            return;
+        }
+
+        let return_ty = self.current_function_return_type(function);
+
+        if self.is_void_type(return_ty) {
+            return;
+        }
+
+        self.diagnostics.push(
+            Diagnostic::new(
+                "E0407",
+                format!(
+                    "{} `{}` cannot declare non-void return type",
+                    lifecycle.label(),
+                    lifecycle.doria_name()
+                ),
+                function.span,
+            )
+            .with_help(format!(
+                "remove the return type annotation or use `{}(): void`",
+                lifecycle.doria_name()
+            )),
+        );
+    }
+
+    fn current_function_return_type(&mut self, function: &FunctionDecl) -> TypeId {
+        self.function_return_types
+            .get(&function.span.start)
+            .copied()
+            .unwrap_or_else(|| self.resolve_function_return_type(function))
     }
 
     fn check_block(
@@ -330,10 +478,11 @@ impl<'program> Checker<'program> {
         block: &Block,
         scopes: &mut ScopeStack,
         method_context: Option<&MethodContext>,
+        return_context: Option<&ReturnContext>,
     ) {
         scopes.push();
         for statement in &block.statements {
-            self.check_statement(statement, scopes, method_context);
+            self.check_statement(statement, scopes, method_context, return_context);
         }
         scopes.pop();
     }
@@ -343,6 +492,7 @@ impl<'program> Checker<'program> {
         statement: &Stmt,
         scopes: &mut ScopeStack,
         method_context: Option<&MethodContext>,
+        return_context: Option<&ReturnContext>,
     ) {
         match statement {
             Stmt::VarDecl(decl) => {
@@ -417,10 +567,14 @@ impl<'program> Checker<'program> {
             Stmt::Echo { expr, .. } | Stmt::Expr { expr, .. } => {
                 self.check_expr(expr, scopes, method_context);
             }
-            Stmt::Return { expr, .. } => {
-                if let Some(expr) = expr {
-                    self.check_expr(expr, scopes, method_context);
-                }
+            Stmt::Return { expr, span } => {
+                self.check_return_statement(
+                    expr.as_ref(),
+                    *span,
+                    scopes,
+                    method_context,
+                    return_context,
+                );
             }
             Stmt::Foreach(foreach) => {
                 self.check_expr(&foreach.iterable, scopes, method_context);
@@ -457,11 +611,141 @@ impl<'program> Checker<'program> {
                     foreach.span,
                 );
                 for statement in &foreach.body.statements {
-                    self.check_statement(statement, scopes, method_context);
+                    self.check_statement(statement, scopes, method_context, return_context);
                 }
                 scopes.pop();
             }
         }
+    }
+
+    fn check_return_statement(
+        &mut self,
+        expr: Option<&Expr>,
+        span: Span,
+        scopes: &ScopeStack,
+        method_context: Option<&MethodContext>,
+        return_context: Option<&ReturnContext>,
+    ) {
+        let Some(context) = return_context else {
+            if let Some(expr) = expr {
+                self.check_expr(expr, scopes, method_context);
+            }
+            return;
+        };
+
+        if let Some(expr) = expr {
+            self.check_expr(expr, scopes, method_context);
+        }
+
+        if let Some(lifecycle) = context.lifecycle {
+            if expr.is_some() {
+                self.diagnostics.push(Diagnostic::new(
+                    "E0405",
+                    lifecycle.return_value_message(),
+                    span,
+                ));
+            }
+            return;
+        }
+
+        let Some(expected) = context.expected else {
+            return;
+        };
+
+        if self.is_void_type(expected) {
+            if expr.is_some() {
+                self.diagnostics.push(Diagnostic::new(
+                    "E0405",
+                    format!(
+                        "cannot return a value from void {} `{}`",
+                        context.kind_name(),
+                        context.name
+                    ),
+                    span,
+                ));
+            }
+            return;
+        }
+
+        let Some(expr) = expr else {
+            self.report_missing_return_value(context, expected, span);
+            return;
+        };
+
+        let value = self.infer_expr_type(expr, scopes, method_context);
+        if self.is_expr_assignable(expected, expr, scopes, method_context)
+            || self.is_assignable(expected, value)
+        {
+            return;
+        }
+
+        self.report_return_type_mismatch(context, expected, value, expr.span());
+    }
+
+    fn check_missing_final_return(&mut self, function: &FunctionDecl, context: &ReturnContext) {
+        if context.lifecycle.is_some() {
+            return;
+        }
+
+        let Some(expected) = context.expected else {
+            return;
+        };
+
+        if !self.requires_return_value(expected) {
+            return;
+        }
+
+        match function.body.statements.last() {
+            Some(Stmt::Return { expr: Some(_), .. }) => {}
+            Some(Stmt::Return { expr: None, .. }) => {}
+            _ => self.report_missing_return_value(context, expected, function.span),
+        }
+    }
+
+    fn report_return_type_mismatch(
+        &mut self,
+        context: &ReturnContext,
+        expected: TypeId,
+        value: TypeId,
+        span: Span,
+    ) {
+        self.diagnostics.push(Diagnostic::new(
+            "E0404",
+            format!(
+                "cannot return value of type `{}` from {} `{}` with return type `{}`",
+                self.types.display(value),
+                context.kind_name(),
+                context.name,
+                self.types.display(expected)
+            ),
+            span,
+        ));
+    }
+
+    fn report_missing_return_value(
+        &mut self,
+        context: &ReturnContext,
+        expected: TypeId,
+        span: Span,
+    ) {
+        self.diagnostics.push(Diagnostic::new(
+            "E0406",
+            format!(
+                "{} `{}` must return a value of type `{}`",
+                context.kind_name(),
+                context.name,
+                self.types.display(expected)
+            ),
+            span,
+        ));
+    }
+
+    fn is_void_type(&self, ty: TypeId) -> bool {
+        matches!(self.types.kind(ty), TypeKind::Void)
+    }
+
+    fn requires_return_value(&self, ty: TypeId) -> bool {
+        !matches!(self.types.kind(ty), TypeKind::Void | TypeKind::Unknown)
     }
 
     fn check_expr(

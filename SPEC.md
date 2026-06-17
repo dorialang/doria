@@ -273,9 +273,9 @@ let $name = "Doria"; // string
 let $person = new Person("Andrew"); // Person
 ```
 
-The semantic checker resolves parsed type syntax into semantic types before checking assignment compatibility. Doria checks typed declarations, property initializers, property writes, and parameter defaults. It does not perform PHP-style scalar coercion: `int` is not assignable from `string`, `string` is not assignable from `int`, and `bool` is not assignable from `int`.
+The semantic checker resolves parsed type syntax into semantic types before checking assignment and return compatibility. Doria checks typed declarations, property initializers, property writes, parameter defaults, and declared function/method return values. It does not perform PHP-style scalar coercion: `int` is not assignable from `string`, `string` is not assignable from `int`, and `bool` is not assignable from `int`.
 
-Numeric widening is not implemented yet; for now `float` is not assignable from `int`, and `int` is not assignable from `float`. Any future safe numeric widening should be a separate design decision. Return type checking, function call argument checking, and constructor argument checking are separate future slices.
+Numeric widening is not implemented yet; for now `float` is not assignable from `int`, and `int` is not assignable from `float`. Any future safe numeric widening should be a separate design decision. Function call argument checking and constructor argument checking are separate future slices.
 
 Simple collection literals infer collection element/key/value types when all clear parts match. Clear heterogeneous collection literals, such as `[1, "two"]`, are rejected by narrow collection alias assignment checks rather than being erased to `Unknown`. The empty literal `[]` stays ambiguous so typed contexts may use it as an empty `List<T>` or `Dictionary<K, V>`. The PHP-compatible `array` annotation remains broad enough to accept list-shaped and dictionary-shaped literals.
 
@@ -334,6 +334,17 @@ function rename(writable Person $person, string $name): void
 }
 ```
 
+Declared return types are checked against returned expressions:
+
+```php
+function age(): int
+{
+    return 37;
+}
+```
+
+`void` functions and methods may use `return;` or fall through. Lifecycle methods, currently `__construct` and `__destruct`, are void-like: they may omit a return type or explicitly declare `: void`, may use bare `return;`, and may fall through. A non-`void` lifecycle return annotation is an error, and returning a value from a `void` function or lifecycle method is an error. For declared non-`void` return types, the current checker requires the final top-level statement of the function or method body to be `return expr;`. This is a deliberate early rule, not full path-sensitive control-flow analysis.
+
 ## 10. Collection aliases
 
 Doria uses:
@@ -348,7 +359,7 @@ Do not use `Vec`.
 
 The PHP backend lowers these aliases to PHP arrays, while the Doria type checker keeps them distinct.
 
-The current type foundation resolves explicit annotations, reports unknown type names and invalid collection alias arity, and checks assignment compatibility for typed declarations, property initializers, property writes, and parameter defaults. Return type checking and constructor argument checking come later.
+The current type foundation resolves explicit annotations, reports unknown type names and invalid collection alias arity, and checks assignment compatibility for typed declarations, property initializers, property writes, parameter defaults, and declared return values. Constructor argument checking comes later.
 
 ## 11. Attributes and metadata expressions
 
