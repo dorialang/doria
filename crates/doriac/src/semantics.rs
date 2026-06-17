@@ -1016,7 +1016,10 @@ impl<'program> Checker<'program> {
             (TypeKind::Mixed, _) | (_, TypeKind::Mixed) => true,
             (TypeKind::Unknown, _) | (_, TypeKind::Unknown) => true,
             (TypeKind::Object, TypeKind::Class(_)) => true,
-            (TypeKind::Array, TypeKind::List(_) | TypeKind::Dictionary(_, _)) => true,
+            (
+                TypeKind::Array,
+                TypeKind::List(_) | TypeKind::Dictionary(_, _) | TypeKind::Set(_),
+            ) => true,
             (
                 TypeKind::Array | TypeKind::List(_) | TypeKind::Dictionary(_, _) | TypeKind::Set(_),
                 TypeKind::EmptyCollection,

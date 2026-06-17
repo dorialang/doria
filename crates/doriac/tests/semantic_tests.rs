@@ -898,6 +898,8 @@ array $inventory = [
     "apples" => 5,
 ];
 array $mixed = [1, "two"];
+Set<string> $names = [];
+array $itemsFromSet = $names;
 
 class Inventory
 {
