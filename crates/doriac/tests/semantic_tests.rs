@@ -748,8 +748,13 @@ fn checks_collection_assignment_compatibility() {
         r#"
 List<int> $numbers = [1, 2, 3];
 List<int> $emptyNumbers = [];
+List<List<int>> $rows = [[1], []];
 Dictionary<string, int> $counts = [
     "apples" => 5,
+];
+Dictionary<string, List<int>> $nestedCounts = [
+    "apples" => [5],
+    "oranges" => [],
 ];
 Dictionary<int, int> $indexedCounts = [
     10,
@@ -778,6 +783,7 @@ function readCounts(Dictionary<string, int> $counts = []): void
     for source in [
         r#"List<string> $numbers = [1, 2, 3];"#,
         r#"List<int> $numbers = [1, "two"];"#,
+        r#"List<int> $numbers = [1, []];"#,
         r#"List<mixed> $numbers = [1, "two"];"#,
         r#"
 Dictionary<string, string> $counts = [

@@ -1002,10 +1002,16 @@ impl<'program> Checker<'program> {
 
     fn common_clear_type(&mut self, types: Vec<TypeId>) -> TypeId {
         let mut common = None;
+        let mut saw_empty_collection = false;
 
         for ty in types {
             if !self.is_clear_inferred_type(ty) {
                 return self.types.unknown();
+            }
+
+            if matches!(self.types.kind(ty), TypeKind::EmptyCollection) {
+                saw_empty_collection = true;
+                continue;
             }
 
             if let Some(common_ty) = common {
@@ -1018,7 +1024,12 @@ impl<'program> Checker<'program> {
         }
 
         if let Some(common) = common {
+            if saw_empty_collection && !self.is_collection_like_type(common) {
+                return self.types.intern(TypeKind::Heterogeneous);
+            }
             common
+        } else if saw_empty_collection {
+            self.types.intern(TypeKind::EmptyCollection)
         } else {
             self.types.unknown()
         }
@@ -1026,6 +1037,17 @@ impl<'program> Checker<'program> {
 
     fn is_clear_inferred_type(&self, ty: TypeId) -> bool {
         !matches!(self.types.kind(ty), TypeKind::Mixed | TypeKind::Unknown)
+    }
+
+    fn is_collection_like_type(&self, ty: TypeId) -> bool {
+        matches!(
+            self.types.kind(ty),
+            TypeKind::Array
+                | TypeKind::List(_)
+                | TypeKind::Dictionary(_, _)
+                | TypeKind::Set(_)
+                | TypeKind::EmptyCollection
+        )
     }
 
     fn expr_class_name(
