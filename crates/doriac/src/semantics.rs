@@ -29,6 +29,19 @@ struct MethodContext {
     writable_this: bool,
 }
 
+#[derive(Debug, Clone)]
+struct AssignmentTarget {
+    ty: TypeId,
+    destination: AssignmentDestination,
+}
+
+#[derive(Debug, Clone)]
+enum AssignmentDestination {
+    Type,
+    Parameter { name: String },
+    Property { class_name: String, name: String },
+}
+
 impl<'program> Checker<'program> {
     fn new(program: &'program Program) -> Self {
         Self {
@@ -131,16 +144,46 @@ impl<'program> Checker<'program> {
 
     fn check_class(&mut self, class_decl: &ClassDecl) {
         for member in &class_decl.members {
-            if let ClassMember::Method(method) = member {
-                self.check_function(
-                    method,
-                    Some(MethodContext {
-                        class_name: class_decl.name.clone(),
-                        writable_this: method.writable_this,
-                    }),
-                );
+            match member {
+                ClassMember::Property(property) => {
+                    self.check_property_initializer(&class_decl.name, property);
+                }
+                ClassMember::Method(method) => {
+                    self.check_function(
+                        method,
+                        Some(MethodContext {
+                            class_name: class_decl.name.clone(),
+                            writable_this: method.writable_this,
+                        }),
+                    );
+                }
             }
         }
+    }
+
+    fn check_property_initializer(&mut self, class_name: &str, property: &PropertyDecl) {
+        let Some(initializer) = &property.initializer else {
+            return;
+        };
+
+        let scopes = ScopeStack::new();
+        self.check_expr(initializer, &scopes, None);
+        let value_ty = self.infer_expr_type(initializer, &scopes, None);
+        let target_ty = self
+            .classes
+            .get(class_name)
+            .and_then(|class_info| class_info.properties.get(&property.name))
+            .map(|property| property.ty)
+            .unwrap_or_else(|| self.resolve_type_ref(&property.ty, property.span));
+        self.check_assignable(
+            target_ty,
+            value_ty,
+            initializer.span(),
+            AssignmentDestination::Property {
+                class_name: class_name.to_string(),
+                name: property.name.clone(),
+            },
+        );
     }
 
     fn declare_property(
@@ -222,6 +265,18 @@ impl<'program> Checker<'program> {
         }
         for param in &function.params {
             let ty = self.resolve_type_ref(&param.ty, param.span);
+            if let Some(default) = &param.default {
+                self.check_expr(default, &scopes, method_context.as_ref());
+                let value_ty = self.infer_expr_type(default, &scopes, method_context.as_ref());
+                self.check_assignable(
+                    ty,
+                    value_ty,
+                    default.span(),
+                    AssignmentDestination::Parameter {
+                        name: param.name.clone(),
+                    },
+                );
+            }
             self.declare_binding(
                 &mut scopes,
                 param.name.clone(),
@@ -257,9 +312,19 @@ impl<'program> Checker<'program> {
         match statement {
             Stmt::VarDecl(decl) => {
                 self.check_expr(&decl.initializer, scopes, method_context);
+                let value_ty = self.infer_expr_type(&decl.initializer, scopes, method_context);
                 let ty = match &decl.ty {
-                    Some(ty) => self.resolve_type_ref(ty, decl.span),
-                    None => self.infer_expr_type(&decl.initializer, scopes, method_context),
+                    Some(ty) => {
+                        let target_ty = self.resolve_type_ref(ty, decl.span);
+                        self.check_assignable(
+                            target_ty,
+                            value_ty,
+                            decl.initializer.span(),
+                            AssignmentDestination::Type,
+                        );
+                        target_ty
+                    }
+                    None => value_ty,
                 };
                 self.declare_binding(
                     scopes,
@@ -273,7 +338,17 @@ impl<'program> Checker<'program> {
             }
             Stmt::Assignment(assignment) => {
                 self.check_expr(&assignment.value, scopes, method_context);
-                self.check_assignment_target(&assignment.target, scopes, method_context);
+                let value_ty = self.infer_expr_type(&assignment.value, scopes, method_context);
+                if let Some(target) =
+                    self.check_assignment_target(&assignment.target, scopes, method_context)
+                {
+                    self.check_assignable(
+                        target.ty,
+                        value_ty,
+                        assignment.value.span(),
+                        target.destination,
+                    );
+                }
             }
             Stmt::Echo { expr, .. } | Stmt::Expr { expr, .. } => {
                 self.check_expr(expr, scopes, method_context);
@@ -424,21 +499,31 @@ impl<'program> Checker<'program> {
         target: &Expr,
         scopes: &ScopeStack,
         method_context: Option<&MethodContext>,
-    ) {
+    ) -> Option<AssignmentTarget> {
         match target {
             Expr::Variable { name, span } => match scopes.lookup(name) {
-                Some(binding) if binding.writable => {}
-                Some(_) => self.diagnostics.push(
-                    Diagnostic::new(
-                        "E0201",
-                        format!("cannot assign to readonly variable `${name}`"),
-                        *span,
-                    )
-                    .with_help(format!(
-                        "declare it as `let writable ${name} = ...` if mutation is intended"
-                    )),
-                ),
-                None => self.undeclared_variable(name, *span),
+                Some(binding) => {
+                    if !binding.writable {
+                        self.diagnostics.push(
+                            Diagnostic::new(
+                                "E0201",
+                                format!("cannot assign to readonly variable `${name}`"),
+                                *span,
+                            )
+                            .with_help(format!(
+                                "declare it as `let writable ${name} = ...` if mutation is intended"
+                            )),
+                        );
+                    }
+                    Some(AssignmentTarget {
+                        ty: binding.ty,
+                        destination: AssignmentDestination::Type,
+                    })
+                }
+                None => {
+                    self.undeclared_variable(name, *span);
+                    None
+                }
             },
             Expr::PropertyAccess {
                 object,
@@ -479,13 +564,25 @@ impl<'program> Checker<'program> {
                             )),
                         );
                     }
+                    Some(AssignmentTarget {
+                        ty: property_info.ty,
+                        destination: AssignmentDestination::Property {
+                            class_name,
+                            name: property.clone(),
+                        },
+                    })
+                } else {
+                    None
                 }
             }
-            _ => self.diagnostics.push(Diagnostic::new(
-                "E0204",
-                "unsupported assignment target",
-                target.span(),
-            )),
+            _ => {
+                self.diagnostics.push(Diagnostic::new(
+                    "E0204",
+                    "unsupported assignment target",
+                    target.span(),
+                ));
+                None
+            }
         }
     }
 
@@ -751,6 +848,61 @@ impl<'program> Checker<'program> {
         false
     }
 
+    fn check_assignable(
+        &mut self,
+        target: TypeId,
+        value: TypeId,
+        span: Span,
+        destination: AssignmentDestination,
+    ) {
+        if self.is_assignable(target, value) {
+            return;
+        }
+
+        let target_name = self.types.display(target);
+        let value_name = self.types.display(value);
+        let message = match destination {
+            AssignmentDestination::Type => {
+                format!("cannot assign value of type `{value_name}` to `{target_name}`")
+            }
+            AssignmentDestination::Parameter { name } => format!(
+                "cannot assign default value of type `{value_name}` to parameter `${name}` of type `{target_name}`"
+            ),
+            AssignmentDestination::Property { class_name, name } => format!(
+                "cannot assign value of type `{value_name}` to property `{class_name}::${name}` of type `{target_name}`"
+            ),
+        };
+
+        self.diagnostics
+            .push(Diagnostic::new("E0403", message, span));
+    }
+
+    fn is_assignable(&self, target: TypeId, value: TypeId) -> bool {
+        if target == value {
+            return true;
+        }
+
+        let target_kind = self.types.kind(target).clone();
+        let value_kind = self.types.kind(value).clone();
+        match (target_kind, value_kind) {
+            // TODO: tighten mixed later with narrowing or runtime checks.
+            (TypeKind::Mixed, _) | (_, TypeKind::Mixed) => true,
+            (TypeKind::Unknown, _) | (_, TypeKind::Unknown) => true,
+            (TypeKind::Object, TypeKind::Class(_)) => true,
+            (TypeKind::Class(target), TypeKind::Class(value)) => target == value,
+            (TypeKind::List(target), TypeKind::List(value)) => self.is_assignable(target, value),
+            (
+                TypeKind::Dictionary(target_key, target_value),
+                TypeKind::Dictionary(value_key, value_value),
+            ) => {
+                self.is_assignable(target_key, value_key)
+                    && self.is_assignable(target_value, value_value)
+            }
+            (TypeKind::Set(target), TypeKind::Set(value)) => self.is_assignable(target, value),
+            _ => false,
+        }
+    }
+
     fn infer_expr_type(
         &mut self,
         expr: &Expr,
@@ -763,18 +915,14 @@ impl<'program> Checker<'program> {
             Expr::Float { .. } => self.types.intern(TypeKind::Float),
             Expr::Bool { .. } => self.types.intern(TypeKind::Bool),
             Expr::Null { .. } => self.types.intern(TypeKind::Null),
-            Expr::New { class_name, .. } => self.types.intern(TypeKind::Class(class_name.clone())),
-            Expr::Array { elements, .. } => {
-                if elements.iter().any(|element| element.key.is_some()) {
-                    let unknown_key = self.types.unknown();
-                    let unknown_value = self.types.unknown();
-                    self.types
-                        .intern(TypeKind::Dictionary(unknown_key, unknown_value))
+            Expr::New { class_name, .. } => {
+                if self.classes.contains_key(class_name) {
+                    self.types.intern(TypeKind::Class(class_name.clone()))
                 } else {
-                    let unknown = self.types.unknown();
-                    self.types.intern(TypeKind::List(unknown))
+                    self.types.unknown()
                 }
             }
+            Expr::Array { elements, .. } => self.infer_array_type(elements, scopes, method_context),
             Expr::Variable { name, .. } => scopes
                 .lookup(name)
                 .map(|binding| binding.ty)
@@ -799,6 +947,52 @@ impl<'program> Checker<'program> {
             }
             _ => self.types.unknown(),
         }
+    }
+
+    fn infer_array_type(
+        &mut self,
+        elements: &[ArrayElement],
+        scopes: &ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) -> TypeId {
+        if elements.iter().any(|element| element.key.is_some()) {
+            let mut key_types = Vec::new();
+            let mut value_types = Vec::new();
+            for element in elements {
+                if let Some(key) = &element.key {
+                    key_types.push(self.infer_expr_type(key, scopes, method_context));
+                } else {
+                    key_types.push(self.types.unknown());
+                }
+                value_types.push(self.infer_expr_type(&element.value, scopes, method_context));
+            }
+            let key = self.common_clear_type(key_types);
+            let value = self.common_clear_type(value_types);
+            self.types.intern(TypeKind::Dictionary(key, value))
+        } else {
+            let mut element_types = Vec::new();
+            for element in elements {
+                element_types.push(self.infer_expr_type(&element.value, scopes, method_context));
+            }
+            let element = self.common_clear_type(element_types);
+            self.types.intern(TypeKind::List(element))
+        }
+    }
+
+    fn common_clear_type(&mut self, types: Vec<TypeId>) -> TypeId {
+        let Some(first) = types.first().copied() else {
+            return self.types.unknown();
+        };
+
+        if !self.is_clear_inferred_type(first) || types.iter().any(|ty| *ty != first) {
+            return self.types.unknown();
+        }
+
+        first
+    }
+
+    fn is_clear_inferred_type(&self, ty: TypeId) -> bool {
+        !matches!(self.types.kind(ty), TypeKind::Mixed | TypeKind::Unknown)
     }
 
     fn expr_class_name(

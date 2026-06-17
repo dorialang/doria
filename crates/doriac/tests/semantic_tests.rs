@@ -1,3 +1,12 @@
+fn assert_type_mismatch(source: &str) {
+    let err = doriac::check_source("test.doria", source).expect_err("semantic check should fail");
+
+    assert!(
+        err.iter().any(|diagnostic| diagnostic.code == "E0403"),
+        "expected E0403, got {err:?}"
+    );
+}
+
 #[test]
 fn rejects_undeclared_assignment() {
     let err = doriac::check_source("test.doria", r#"$name = "Andrew";"#)
@@ -33,6 +42,58 @@ $count = 1;
 }
 
 #[test]
+fn allows_compatible_scalar_typed_declarations() {
+    doriac::check_source(
+        "test.doria",
+        r#"
+int $age = 37;
+float $ratio = 1.5;
+string $name = "Andrew";
+bool $active = true;
+null $empty = null;
+
+function copy(resource $handle): void
+{
+    resource $same = $handle;
+}
+"#,
+    )
+    .expect("semantic check should succeed");
+}
+
+#[test]
+fn rejects_incompatible_scalar_typed_declarations() {
+    for source in [
+        r#"int $age = "37";"#,
+        r#"string $name = 123;"#,
+        r#"bool $active = 1;"#,
+        r#"int $count = 1.5;"#,
+        r#"float $ratio = 1;"#,
+    ] {
+        assert_type_mismatch(source);
+    }
+}
+
+#[test]
+fn checks_writable_local_assignment_compatibility() {
+    doriac::check_source(
+        "test.doria",
+        r#"
+writable int $age = 37;
+$age = 38;
+"#,
+    )
+    .expect("semantic check should succeed");
+
+    assert_type_mismatch(
+        r#"
+writable int $age = 37;
+$age = "old";
+"#,
+    );
+}
+
+#[test]
 fn rejects_readonly_property_assignment() {
     let err = doriac::check_source(
         "test.doria",
@@ -49,6 +110,59 @@ $person->name = "Lucy";
     .expect_err("semantic check should fail");
 
     assert!(err.iter().any(|diagnostic| diagnostic.code == "E0202"));
+}
+
+#[test]
+fn checks_property_initializer_compatibility() {
+    doriac::check_source(
+        "test.doria",
+        r#"
+class Person
+{
+    string $name = "Andrew";
+    int $age = 37;
+}
+"#,
+    )
+    .expect("semantic check should succeed");
+
+    assert_type_mismatch(
+        r#"
+class Person
+{
+    string $name = 123;
+}
+"#,
+    );
+}
+
+#[test]
+fn checks_property_assignment_compatibility() {
+    doriac::check_source(
+        "test.doria",
+        r#"
+class Person
+{
+    writable string $name;
+}
+
+let writable $person = new Person();
+$person->name = "Lucy";
+"#,
+    )
+    .expect("semantic check should succeed");
+
+    assert_type_mismatch(
+        r#"
+class Person
+{
+    writable string $name;
+}
+
+let writable $person = new Person();
+$person->name = 123;
+"#,
+    );
 }
 
 #[test]
@@ -518,6 +632,43 @@ function greet(Person $person): void
 }
 
 #[test]
+fn checks_class_assignment_compatibility() {
+    doriac::check_source(
+        "test.doria",
+        r#"
+class Person {}
+
+Person $person = new Person();
+"#,
+    )
+    .expect("semantic check should succeed");
+
+    assert_type_mismatch(
+        r#"
+class Person {}
+class Office {}
+
+Person $person = new Office();
+"#,
+    );
+}
+
+#[test]
+fn checks_object_assignment_compatibility() {
+    doriac::check_source(
+        "test.doria",
+        r#"
+class Person {}
+
+object $person = new Person();
+"#,
+    )
+    .expect("semantic check should succeed");
+
+    assert_type_mismatch("object $value = 1;");
+}
+
+#[test]
 fn reports_unknown_explicit_type_names() {
     let err = doriac::check_source(
         "test.doria",
@@ -548,6 +699,77 @@ function accept(
 "#,
     )
     .expect("semantic check should succeed");
+}
+
+#[test]
+fn checks_collection_assignment_compatibility() {
+    doriac::check_source(
+        "test.doria",
+        r#"
+List<int> $numbers = [1, 2, 3];
+Dictionary<string, int> $counts = [
+    "apples" => 5,
+];
+"#,
+    )
+    .expect("semantic check should succeed");
+
+    for source in [
+        r#"List<string> $numbers = [1, 2, 3];"#,
+        r#"
+Dictionary<string, string> $counts = [
+    "apples" => 5,
+];
+"#,
+    ] {
+        assert_type_mismatch(source);
+    }
+}
+
+#[test]
+fn checks_parameter_default_compatibility() {
+    doriac::check_source(
+        "test.doria",
+        r#"
+function greet(string $name = "Andrew"): void
+{
+}
+
+class Person
+{
+    function __construct(string $name = "Andrew")
+    {
+    }
+
+    function rename(string $name = "Lucy"): void
+    {
+    }
+}
+"#,
+    )
+    .expect("semantic check should succeed");
+
+    for source in [
+        r#"function greet(string $name = 123): void {}"#,
+        r#"
+class Person
+{
+    function rename(string $name = 123): void
+    {
+    }
+}
+"#,
+        r#"
+class Person
+{
+    function __construct(string $name = 123)
+    {
+    }
+}
+"#,
+    ] {
+        assert_type_mismatch(source);
+    }
 }
 
 #[test]

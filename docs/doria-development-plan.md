@@ -607,7 +607,7 @@ Dictionary<K, V>
 Set<T>
 ```
 
-Assignment compatibility, return type checking, and constructor argument checking should come after this foundation.
+Assignment compatibility is checked for typed declarations, property initializers, property writes, and parameter defaults. Doria does not perform PHP-style scalar coercion, and numeric widening is not implemented yet. Return type checking, function call argument checking, and constructor argument checking should come after this foundation.
 
 Support nullable types later:
 
