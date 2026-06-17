@@ -137,6 +137,46 @@ class Person
 }
 
 #[test]
+fn allows_property_initializer_accessing_own_internal_static_method() {
+    doriac::check_source(
+        "test.doria",
+        r#"
+class Person
+{
+    string $name = Person::defaultName();
+
+    internal function defaultName(): string
+    {
+        return "Andrew";
+    }
+}
+"#,
+    )
+    .expect("semantic check should succeed");
+}
+
+#[test]
+fn rejects_this_in_property_initializer() {
+    let err = doriac::check_source(
+        "test.doria",
+        r#"
+class Person
+{
+    string $name = $this->defaultName();
+
+    internal function defaultName(): string
+    {
+        return "Andrew";
+    }
+}
+"#,
+    )
+    .expect_err("semantic check should fail");
+
+    assert!(err.iter().any(|diagnostic| diagnostic.code == "E0102"));
+}
+
+#[test]
 fn checks_property_assignment_compatibility() {
     doriac::check_source(
         "test.doria",
@@ -711,6 +751,10 @@ List<int> $emptyNumbers = [];
 Dictionary<string, int> $counts = [
     "apples" => 5,
 ];
+Dictionary<int, int> $indexedCounts = [
+    10,
+    1 => 20,
+];
 Dictionary<string, int> $emptyCounts = [];
 array $empty = [];
 array $items = [1, 2, 3];
@@ -744,6 +788,12 @@ Dictionary<string, string> $counts = [
 Dictionary<string, int> $counts = [
     "apples" => 5,
     "oranges" => "ten",
+];
+"#,
+        r#"
+Dictionary<string, int> $counts = [
+    "apples" => 5,
+    10,
 ];
 "#,
     ] {

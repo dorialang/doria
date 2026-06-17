@@ -27,6 +27,7 @@ struct Checker<'program> {
 struct MethodContext {
     class_name: String,
     writable_this: bool,
+    this_available: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -154,6 +155,7 @@ impl<'program> Checker<'program> {
                         Some(MethodContext {
                             class_name: class_decl.name.clone(),
                             writable_this: method.writable_this,
+                            this_available: true,
                         }),
                     );
                 }
@@ -167,8 +169,13 @@ impl<'program> Checker<'program> {
         };
 
         let scopes = ScopeStack::new();
-        self.check_expr(initializer, &scopes, None);
-        let value_ty = self.infer_expr_type(initializer, &scopes, None);
+        let initializer_context = MethodContext {
+            class_name: class_name.to_string(),
+            writable_this: false,
+            this_available: false,
+        };
+        self.check_expr(initializer, &scopes, Some(&initializer_context));
+        let value_ty = self.infer_expr_type(initializer, &scopes, Some(&initializer_context));
         let target_ty = self
             .classes
             .get(class_name)
@@ -413,7 +420,10 @@ impl<'program> Checker<'program> {
                 }
             }
             Expr::This { span } => {
-                if method_context.is_none() {
+                if !method_context
+                    .map(|context| context.this_available)
+                    .unwrap_or(false)
+                {
                     self.diagnostics.push(Diagnostic::new(
                         "E0102",
                         "`$this` is only available inside methods",
@@ -684,7 +694,7 @@ impl<'program> Checker<'program> {
                 .map(|binding| binding.writable)
                 .unwrap_or(false),
             Expr::This { .. } => method_context
-                .map(|context| context.writable_this)
+                .map(|context| context.this_available && context.writable_this)
                 .unwrap_or(false),
             Expr::PropertyAccess {
                 object, property, ..
@@ -934,6 +944,7 @@ impl<'program> Checker<'program> {
                 .map(|binding| binding.ty)
                 .unwrap_or_else(|| self.types.unknown()),
             Expr::This { .. } => method_context
+                .filter(|context| context.this_available)
                 .map(|context| {
                     self.types
                         .intern(TypeKind::Class(context.class_name.clone()))
@@ -972,7 +983,7 @@ impl<'program> Checker<'program> {
                 if let Some(key) = &element.key {
                     key_types.push(self.infer_expr_type(key, scopes, method_context));
                 } else {
-                    key_types.push(self.types.unknown());
+                    key_types.push(self.types.intern(TypeKind::Int));
                 }
                 value_types.push(self.infer_expr_type(&element.value, scopes, method_context));
             }
