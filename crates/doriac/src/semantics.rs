@@ -890,6 +890,7 @@ impl<'program> Checker<'program> {
             (TypeKind::Mixed, _) | (_, TypeKind::Mixed) => true,
             (TypeKind::Unknown, _) | (_, TypeKind::Unknown) => true,
             (TypeKind::Object, TypeKind::Class(_)) => true,
+            (TypeKind::Array, TypeKind::List(_) | TypeKind::Dictionary(_, _)) => true,
             (TypeKind::Class(target), TypeKind::Class(value)) => target == value,
             (TypeKind::List(target), TypeKind::List(value)) => self.is_assignable(target, value),
             (

@@ -710,6 +710,12 @@ List<int> $numbers = [1, 2, 3];
 Dictionary<string, int> $counts = [
     "apples" => 5,
 ];
+array $empty = [];
+array $items = [1, 2, 3];
+array $inventory = [
+    "apples" => 5,
+];
+array $mixed = [1, "two"];
 "#,
     )
     .expect("semantic check should succeed");
