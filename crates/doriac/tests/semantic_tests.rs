@@ -990,8 +990,17 @@ class Person
     {
     }
 
+    function greet(string $name = Person::defaultName()): void
+    {
+    }
+
     function rename(string $name = "Lucy"): void
     {
+    }
+
+    internal function defaultName(): string
+    {
+        return "Andrew";
     }
 }
 "#,
@@ -1019,6 +1028,29 @@ class Person
     ] {
         assert_type_mismatch(source);
     }
+}
+
+#[test]
+fn rejects_this_in_parameter_defaults() {
+    let err = doriac::check_source(
+        "test.doria",
+        r#"
+class Person
+{
+    string $name = "Andrew";
+
+    function rename(string $name = $this->name): void
+    {
+    }
+}
+"#,
+    )
+    .expect_err("semantic check should fail");
+
+    assert!(
+        err.iter().any(|diagnostic| diagnostic.code == "E0102"),
+        "expected E0102, got {err:?}"
+    );
 }
 
 #[test]

@@ -294,12 +294,19 @@ impl<'program> Checker<'program> {
         for param in &function.params {
             let ty = self.resolve_type_ref(&param.ty, param.span);
             if let Some(default) = &param.default {
-                self.check_expr(default, &scopes, method_context.as_ref());
+                let default_context = method_context.as_ref().map(|context| MethodContext {
+                    class_name: context.class_name.clone(),
+                    writable_this: context.writable_this,
+                    this_available: false,
+                });
+                let default_context = default_context.as_ref();
+
+                self.check_expr(default, &scopes, default_context);
                 self.check_expr_assignable(
                     ty,
                     default,
                     &scopes,
-                    method_context.as_ref(),
+                    default_context,
                     AssignmentDestination::Parameter {
                         name: param.name.clone(),
                     },
