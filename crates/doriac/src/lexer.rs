@@ -11,9 +11,6 @@ pub struct Token {
 pub enum TokenKind {
     Class,
     Function,
-    Public,
-    Protected,
-    Private,
     Internal,
     Static,
     Let,
@@ -264,9 +261,6 @@ impl<'source> Lexer<'source> {
         let kind = match text {
             "class" => TokenKind::Class,
             "function" => TokenKind::Function,
-            "public" => TokenKind::Public,
-            "protected" => TokenKind::Protected,
-            "private" => TokenKind::Private,
             "internal" => TokenKind::Internal,
             "static" => TokenKind::Static,
             "let" => TokenKind::Let,

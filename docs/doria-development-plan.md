@@ -416,11 +416,6 @@ string
 bool
 array
 
-Deprecated/reserved member modifiers:
-public
-protected
-private
-
 Future reserved:
 async
 await

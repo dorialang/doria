@@ -40,3 +40,11 @@ fn lexes_internal_keyword() {
     assert!(matches!(kinds[0], TokenKind::Internal));
     assert!(matches!(kinds[1], TokenKind::Writable));
 }
+
+#[test]
+fn lexes_non_doria_visibility_words_as_identifiers() {
+    let kinds = token_kinds("public protected private");
+    assert!(matches!(kinds[0], TokenKind::Identifier(ref word) if word == "public"));
+    assert!(matches!(kinds[1], TokenKind::Identifier(ref word) if word == "protected"));
+    assert!(matches!(kinds[2], TokenKind::Identifier(ref word) if word == "private"));
+}
