@@ -1039,6 +1039,294 @@ $person->name = 123;
 }
 
 #[test]
+fn allows_constructor_init_access_for_readonly_properties() {
+    doriac::check_source(
+        "test.doria",
+        r#"
+class Person
+{
+    string $id;
+
+    function __construct(string $givenId)
+    {
+        $this->id = $givenId;
+    }
+}
+
+class Token
+{
+    internal string $value;
+
+    function __construct(string $raw)
+    {
+        $this->value = $raw;
+    }
+}
+
+class Counter
+{
+    writable int $count;
+
+    function __construct(int $initial)
+    {
+        $this->count = $initial;
+        $this->count = $initial + 1;
+        $this->count += 1;
+    }
+}
+
+class Accumulator
+{
+    writable int $count = 0;
+
+    function __construct(List<int> $items)
+    {
+        foreach ($items as int $item) {
+            $this->count += $item;
+        }
+    }
+}
+
+class Renamer
+{
+    writable string $name;
+
+    writable function __construct(string $newName)
+    {
+        $this->rename($newName);
+    }
+
+    writable function rename(string $name): void
+    {
+        $this->name = $name;
+    }
+}
+
+class Child
+{
+    writable string $name;
+}
+
+class Parent
+{
+    writable Child $child;
+
+    writable function __construct()
+    {
+        $this->child->name = "Lucy";
+    }
+}
+"#,
+    )
+    .expect("semantic check should succeed");
+}
+
+#[test]
+fn rejects_invalid_constructor_init_access() {
+    for (source, code) in [
+        (
+            r#"
+class Person
+{
+    string $id;
+
+    function __construct(string $givenId)
+    {
+        $this->id = $givenId;
+        $this->id = "other";
+    }
+}
+"#,
+            "E0412",
+        ),
+        (
+            r#"
+class Person
+{
+    string $id = "default";
+
+    function __construct(string $givenId)
+    {
+        $this->id = $givenId;
+    }
+}
+"#,
+            "E0412",
+        ),
+        (
+            r#"
+class Person
+{
+    function __construct(string $id)
+    {
+        $this->id = "other";
+    }
+}
+"#,
+            "E0412",
+        ),
+        (
+            r#"
+class Person
+{
+    int $id;
+
+    function __construct(int $givenId)
+    {
+        $this->id += $givenId;
+    }
+}
+"#,
+            "E0413",
+        ),
+        (
+            r#"
+class Person
+{
+    string $id;
+
+    function rename(string $id): void
+    {
+        $this->id = $id;
+    }
+}
+"#,
+            "E0202",
+        ),
+        (
+            r#"
+class Person
+{
+    string $id;
+
+    function __destruct()
+    {
+        $this->id = "late";
+    }
+}
+"#,
+            "E0202",
+        ),
+        (
+            r#"
+class Child
+{
+    writable string $name;
+}
+
+class Person
+{
+    Child $child;
+
+    function __construct(Child $newChild)
+    {
+        $this->child->name = "Lucy";
+    }
+}
+"#,
+            "E0201",
+        ),
+        (
+            r#"
+class Person
+{
+    writable string $name;
+
+    function __construct(string $newName)
+    {
+        $this->rename($newName);
+    }
+
+    writable function rename(string $name): void
+    {
+        $this->name = $name;
+    }
+}
+"#,
+            "E0203",
+        ),
+        (
+            r#"
+class Person
+{
+    string $id;
+
+    function __construct(List<string> $ids)
+    {
+        foreach ($ids as string $id) {
+            $this->id = $id;
+        }
+    }
+}
+"#,
+            "E0202",
+        ),
+    ] {
+        assert_diagnostic_code(source, code);
+    }
+}
+
+#[test]
+fn rejects_direct_lifecycle_method_calls() {
+    for source in [
+        r#"
+class Person
+{
+    string $id;
+
+    function __construct(string $givenId)
+    {
+        $this->id = $givenId;
+    }
+}
+
+let writable $person = new Person("a");
+$person->__construct("b");
+"#,
+        r#"
+class Person
+{
+    function __destruct()
+    {
+    }
+}
+
+let writable $person = new Person();
+$person->__destruct();
+"#,
+        r#"
+class Person
+{
+    function __construct()
+    {
+    }
+}
+
+Person::__construct();
+"#,
+    ] {
+        assert_diagnostic_code(source, "E0414");
+    }
+}
+
+#[test]
+fn checks_constructor_init_assignment_compatibility() {
+    assert_type_mismatch(
+        r#"
+class Person
+{
+    int $age;
+
+    function __construct(string $value)
+    {
+        $this->age = $value;
+    }
+}
+"#,
+    );
+}
+
+#[test]
 fn rejects_this_mutation_in_readonly_method() {
     let err = doriac::check_source(
         "test.doria",

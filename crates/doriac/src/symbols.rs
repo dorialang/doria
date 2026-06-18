@@ -20,6 +20,14 @@ pub struct PropertyInfo {
     pub access: MemberAccess,
     pub writable: bool,
     pub ty: TypeId,
+    pub init_state: PropertyInitState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PropertyInitState {
+    Uninitialized,
+    HasInitializer,
+    PromotedParameter,
 }
 
 #[derive(Debug, Clone)]

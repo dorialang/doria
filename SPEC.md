@@ -136,6 +136,8 @@ class Person
 
 To assign to a property, both the object path and the property must be writable, unless a constructor is initializing an uninitialized readonly property through constructor init access.
 
+Constructor init access is narrower than writable `$this`. Inside `__construct`, a direct simple assignment such as `$this->id = $id;` may initialize an uninitialized readonly property of the declaring class exactly once. Property initializers and constructor-promoted parameters count as already initialized. Readonly init access does not permit compound assignments, nested writes such as `$this->child->name = "Lucy";`, calls to writable methods through `$this`, or initialization from repeatable bodies such as `foreach`. Writable properties keep normal mutation rules inside constructors, including inside repeatable bodies, subject to type checking. An explicitly declared `writable function __construct` also follows normal writable `$this` method rules. Full definite property initialization is future work; the current checker does not yet require every readonly property to be initialized by every constructor path.
+
 Function parameters are readonly by default and become writable only with `writable`.
 
 Methods receive readonly `$this` by default. A method that mutates `$this` must be declared with `writable function`.
@@ -303,7 +305,21 @@ function __construct(
 }
 ```
 
-Constructor init access for assigning readonly properties inside constructor bodies is a required language rule, but it is not implemented in the current vertical slice. The intended rule is narrower than writable `$this`: a constructor may initialize each uninitialized readonly property exactly once.
+Constructor init access is supported for direct initialization of uninitialized readonly properties inside constructor bodies:
+
+```php
+class Person
+{
+    string $id;
+
+    function __construct(string $givenId)
+    {
+        $this->id = $givenId;
+    }
+}
+```
+
+This does not make `$this` writable. The constructor cannot assign the same readonly property twice, cannot reassign a readonly property that already has an initializer or is promoted from a constructor parameter, cannot use compound assignment for init access, and cannot use init access for nested object paths.
 
 Doria should support richer instance property initializers than PHP:
 
@@ -343,7 +359,7 @@ function age(): int
 }
 ```
 
-`void` functions and methods may use `return;` or fall through. Lifecycle methods, currently `__construct` and `__destruct`, are void-like: they may omit a return type or explicitly declare `: void`, may use bare `return;`, and may fall through. A non-`void` lifecycle return annotation is an error, and returning a value from a `void` function or lifecycle method is an error. `__construct` may declare parameters and constructor calls are checked against them. `__destruct` must not declare parameters. For declared non-`void` return types, the current checker requires the final top-level statement of the function or method body to be `return expr;`. This is a deliberate early rule, not full path-sensitive control-flow analysis.
+`void` functions and methods may use `return;` or fall through. Lifecycle methods, currently `__construct` and `__destruct`, are void-like: they may omit a return type or explicitly declare `: void`, may use bare `return;`, and may fall through. A non-`void` lifecycle return annotation is an error, returning a value from a `void` function or lifecycle method is an error, and lifecycle methods cannot be called directly as ordinary methods. `__construct` may declare parameters and constructor calls are checked against them through `new Class(...)`. `__destruct` must not declare parameters. For declared non-`void` return types, the current checker requires the final top-level statement of the function or method body to be `return expr;`. This is a deliberate early rule, not full path-sensitive control-flow analysis.
 
 Calls are checked against declared parameter lists:
 

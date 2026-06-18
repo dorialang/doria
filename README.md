@@ -36,6 +36,18 @@ doriac migrate php src --out migrated
 
 That would be a PHP-to-Doria migration converter, not the Doria parser and not the core compiler identity.
 
+## Influence and migration
+
+Doria's surface syntax is intentionally familiar to developers coming from PHP-like and C-like languages, but Doria is its own language. PHP does not define Doria's semantics, and PHP output must not shape the core compiler architecture.
+
+PHP support belongs in compatibility, migration, debugging, and transpilation contexts. Future migration tooling may expose a command such as:
+
+```bash
+doriac migrate php src --out migrated
+```
+
+That would be a PHP-to-Doria migration converter, not the Doria parser and not the core compiler identity.
+
 ## Current status
 
 This repository contains the first working vertical slice of `doriac`:
@@ -81,21 +93,24 @@ Doria has first-pass editor tooling for `.doria` files:
 
 - `doria-lsp` is a stdio Language Server Protocol binary that reuses the compiler pipeline for diagnostics, hover, and completion.
 - `editors/vscode/doria` contains a VS Code extension with TextMate syntax highlighting, bracket/comment configuration, and a small built-in LSP client.
+- `editors/intellij/doria` contains an IntelliJ Platform plugin with `.doria` file recognition, syntax highlighting, editor settings, and `doria-lsp` integration.
 
-Build the server before starting the extension:
+Build the server before starting either editor extension:
 
 ```bash
 cargo build -p doriac --bin doria-lsp
 ```
 
-The VS Code extension looks for the server in this order:
+The editor integrations look for the server in this order:
 
 ```text
-1. doria.languageServer.path setting
+1. Editor setting for the Doria language server path
 2. DORIA_LSP_PATH environment variable
-3. target/debug/doria-lsp in the open workspace
+3. target/debug/doria-lsp in the open workspace/project
 4. doria-lsp on PATH
 ```
+
+For VS Code, the setting is `doria.languageServer.path`. For IntelliJ IDEs, use the Doria settings page.
 
 ## Language principles
 
@@ -146,6 +161,8 @@ docs/php-interop-and-migration.md
 │   ├── php-interop-and-migration.md
 │   └── self-hosting.md
 ├── editors/
+│   ├── intellij/
+│   │   └── doria/
 │   └── vscode/
 │       └── doria/
 └── examples/

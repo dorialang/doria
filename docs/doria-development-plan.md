@@ -416,11 +416,6 @@ string
 bool
 array
 
-Deprecated/reserved member modifiers:
-public
-protected
-private
-
 Future reserved:
 async
 await
@@ -809,6 +804,26 @@ class Person
     }
 }
 ```
+
+## Constructor init access
+
+Constructors have narrow init access for readonly properties. This is not the same as writable `$this`.
+
+```php
+class Person
+{
+    string $id;
+
+    function __construct(string $givenId)
+    {
+        $this->id = $givenId;
+    }
+}
+```
+
+This is valid because `$this->id = $givenId;` is a direct simple assignment to an uninitialized readonly property of the declaring class. The property may be initialized this way at most once.
+
+Property initializers and constructor-promoted parameters count as already initialized, so constructor bodies cannot assign those readonly properties again. Init access does not allow compound assignment, nested writes such as `$this->child->name = "Lucy";`, or calls to writable methods through `$this`. Full definite property initialization, where every constructor path must initialize required readonly properties, is future work.
 
 ---
 

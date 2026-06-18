@@ -327,7 +327,7 @@ fn initialize_result() -> Value {
 fn completion_items() -> Value {
     let keywords = [
         "class", "function", "let", "writable", "internal", "readonly", "return", "echo", "new",
-        "foreach", "as", "static", "true", "false", "null",
+        "foreach", "as", "if", "else", "while", "for", "static", "true", "false", "null",
     ];
     let types = [
         "void",
@@ -397,9 +397,6 @@ fn hover_description(kind: &TokenKind) -> Option<&'static str> {
         TokenKind::New => Some("Constructs an instance of a class."),
         TokenKind::Foreach => Some("Iterates over a list or dictionary value."),
         TokenKind::As => Some("Separates a `foreach` iterable from its binding."),
-        TokenKind::Public => Some("Deprecated: Doria members are public by default; remove `public`."),
-        TokenKind::Protected => Some("Unsupported: Doria does not have `protected`; use `internal` or redesign the API."),
-        TokenKind::Private => Some("Unsupported: use `internal` for implementation details."),
         TokenKind::Static => Some("Reserved for static members and calls."),
         TokenKind::Void => Some("The `void` return type."),
         TokenKind::IntType => Some("The `int` primitive type."),

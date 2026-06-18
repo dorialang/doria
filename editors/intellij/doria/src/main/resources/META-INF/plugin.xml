@@ -1,0 +1,49 @@
+<idea-plugin>
+  <id>dev.doria.intellij</id>
+  <name>Doria Language Support</name>
+  <vendor>Doria</vendor>
+
+  <description><![CDATA[
+    Adds Doria language support for IntelliJ-based IDEs, including .doria file recognition,
+    syntax highlighting, editor configuration, and doria-lsp integration.
+  ]]></description>
+
+  <depends>com.intellij.modules.platform</depends>
+  <depends optional="true" config-file="doria-lsp.xml">com.intellij.modules.lsp</depends>
+
+  <extensions defaultExtensionNs="com.intellij">
+    <applicationService serviceImplementation="dev.doria.intellij.settings.DoriaSettings" />
+
+    <fileType
+      name="Doria"
+      language="Doria"
+      implementationClass="dev.doria.intellij.DoriaFileType"
+      fieldName="INSTANCE"
+      extensions="doria" />
+
+    <lang.syntaxHighlighterFactory
+      language="Doria"
+      implementationClass="dev.doria.intellij.highlighting.DoriaSyntaxHighlighterFactory" />
+
+    <colorSettingsPage implementation="dev.doria.intellij.highlighting.DoriaColorSettingsPage" />
+
+    <lang.parserDefinition
+      language="Doria"
+      implementationClass="dev.doria.intellij.psi.DoriaParserDefinition" />
+
+    <lang.commenter
+      language="Doria"
+      implementationClass="dev.doria.intellij.DoriaCommenter" />
+
+    <annotator
+      language="Doria"
+      implementationClass="dev.doria.intellij.highlighting.DoriaVariableUsageAnnotator" />
+
+    <applicationConfigurable
+      parentId="language"
+      instance="dev.doria.intellij.settings.DoriaConfigurable"
+      id="dev.doria.intellij.settings"
+      displayName="Doria" />
+
+  </extensions>
+</idea-plugin>

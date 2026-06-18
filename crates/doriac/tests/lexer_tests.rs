@@ -35,8 +35,30 @@ fn lexes_future_reserved_words() {
 }
 
 #[test]
+fn lexes_planned_control_flow_words_as_identifiers() {
+    let kinds = token_kinds("when finally");
+    assert!(matches!(kinds[0], TokenKind::Identifier(ref word) if word == "when"));
+    assert!(matches!(kinds[1], TokenKind::Identifier(ref word) if word == "finally"));
+}
+
+#[test]
+fn lexes_result_and_option_as_identifiers() {
+    let kinds = token_kinds("Result Option");
+    assert!(matches!(kinds[0], TokenKind::Identifier(ref word) if word == "Result"));
+    assert!(matches!(kinds[1], TokenKind::Identifier(ref word) if word == "Option"));
+}
+
+#[test]
 fn lexes_internal_keyword() {
     let kinds = token_kinds("internal writable string $name;");
     assert!(matches!(kinds[0], TokenKind::Internal));
     assert!(matches!(kinds[1], TokenKind::Writable));
+}
+
+#[test]
+fn lexes_non_doria_visibility_words_as_identifiers() {
+    let kinds = token_kinds("public protected private");
+    assert!(matches!(kinds[0], TokenKind::Identifier(ref word) if word == "public"));
+    assert!(matches!(kinds[1], TokenKind::Identifier(ref word) if word == "protected"));
+    assert!(matches!(kinds[2], TokenKind::Identifier(ref word) if word == "private"));
 }

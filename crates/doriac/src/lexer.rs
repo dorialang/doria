@@ -11,9 +11,6 @@ pub struct Token {
 pub enum TokenKind {
     Class,
     Function,
-    Public,
-    Protected,
-    Private,
     Internal,
     Static,
     Let,
@@ -264,9 +261,6 @@ impl<'source> Lexer<'source> {
         let kind = match text {
             "class" => TokenKind::Class,
             "function" => TokenKind::Function,
-            "public" => TokenKind::Public,
-            "protected" => TokenKind::Protected,
-            "private" => TokenKind::Private,
             "internal" => TokenKind::Internal,
             "static" => TokenKind::Static,
             "let" => TokenKind::Let,
@@ -291,9 +285,7 @@ impl<'source> Lexer<'source> {
             "bool" => TokenKind::BoolType,
             "array" => TokenKind::ArrayType,
             "async" | "await" | "spawn" | "scope" | "interface" | "trait" | "enum" | "match"
-            | "try" | "catch" | "throw" | "Result" | "Option" => {
-                TokenKind::Reserved(text.to_string())
-            }
+            | "try" | "catch" | "throw" => TokenKind::Reserved(text.to_string()),
             _ => TokenKind::Identifier(text.to_string()),
         };
 
