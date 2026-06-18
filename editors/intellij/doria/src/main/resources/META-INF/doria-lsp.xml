@@ -1,5 +1,5 @@
 <idea-plugin>
   <extensions defaultExtensionNs="com.intellij">
-    <lsp.serverSupportProvider implementation="dev.doria.intellij.lsp.DoriaLspServerSupportProvider" />
+    <platform.lsp.serverSupportProvider implementation="dev.doria.intellij.lsp.DoriaLspServerSupportProvider" />
   </extensions>
 </idea-plugin>

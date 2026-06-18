@@ -27,11 +27,20 @@ Dictionary<string, int> $items = ["apples" => 5];"#,
 
 #[test]
 fn lexes_future_reserved_words() {
-    let kinds = token_kinds("async await spawn scope");
+    let kinds = token_kinds("async await spawn scope when finally");
     assert!(matches!(kinds[0], TokenKind::Reserved(ref word) if word == "async"));
     assert!(matches!(kinds[1], TokenKind::Reserved(ref word) if word == "await"));
     assert!(matches!(kinds[2], TokenKind::Reserved(ref word) if word == "spawn"));
     assert!(matches!(kinds[3], TokenKind::Reserved(ref word) if word == "scope"));
+    assert!(matches!(kinds[4], TokenKind::Reserved(ref word) if word == "when"));
+    assert!(matches!(kinds[5], TokenKind::Reserved(ref word) if word == "finally"));
+}
+
+#[test]
+fn lexes_result_and_option_as_identifiers() {
+    let kinds = token_kinds("Result Option");
+    assert!(matches!(kinds[0], TokenKind::Identifier(ref word) if word == "Result"));
+    assert!(matches!(kinds[1], TokenKind::Identifier(ref word) if word == "Option"));
 }
 
 #[test]

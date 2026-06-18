@@ -11,9 +11,9 @@
   <depends>com.intellij.modules.platform</depends>
   <depends optional="true" config-file="doria-lsp.xml">com.intellij.modules.lsp</depends>
 
-  <applicationService serviceImplementation="dev.doria.intellij.settings.DoriaSettings" />
-
   <extensions defaultExtensionNs="com.intellij">
+    <applicationService serviceImplementation="dev.doria.intellij.settings.DoriaSettings" />
+
     <fileType
       name="Doria"
       language="Doria"

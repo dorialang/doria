@@ -281,7 +281,7 @@
         },
         {
           "name": "keyword.control.doria",
-          "match": "\\b(?:return|foreach|as|if|else|while|for)\\b"
+          "match": "\\b(?:return|foreach|as|if|else|while|for|when|finally)\\b"
         },
         {
           "name": "storage.modifier.mutability.doria",
@@ -305,7 +305,7 @@
         },
         {
           "name": "keyword.other.reserved.doria",
-          "match": "\\b(?:async|await|spawn|scope|interface|trait|enum|match|try|catch|throw|Result|Option)\\b"
+          "match": "\\b(?:async|await|spawn|scope|interface|trait|enum|match|try|catch|throw)\\b"
         }
       ]
     },

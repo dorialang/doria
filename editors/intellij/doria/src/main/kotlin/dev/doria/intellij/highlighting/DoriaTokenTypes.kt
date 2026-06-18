@@ -15,6 +15,7 @@ object DoriaTokenTypes {
     val PRIMITIVE_TYPE = DoriaTokenType("DORIA_PRIMITIVE_TYPE")
     val COLLECTION_TYPE = DoriaTokenType("DORIA_COLLECTION_TYPE")
     val TYPE_NAME = DoriaTokenType("DORIA_TYPE_NAME")
+    val METHOD_NAME = DoriaTokenType("DORIA_METHOD_NAME")
     val IDENTIFIER = DoriaTokenType("DORIA_IDENTIFIER")
     val VARIABLE = DoriaTokenType("DORIA_VARIABLE")
     val THIS = DoriaTokenType("DORIA_THIS")

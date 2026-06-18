@@ -225,19 +225,24 @@ class DoriaLexer : LexerBase() {
         tokenType = when (text) {
             "class", "function", "let", "return", "echo", "new", "foreach", "as",
             "if", "else", "while", "for", "static", "async", "await", "spawn", "scope",
-            "interface", "trait", "enum", "match", "try", "catch", "throw" -> DoriaTokenTypes.KEYWORD
+            "interface", "trait", "enum", "match", "try", "catch", "throw", "when", "finally" -> DoriaTokenTypes.KEYWORD
 
-            "writable", "readonly", "internal", "public", "protected", "private" -> DoriaTokenTypes.MODIFIER
+            "writable", "readonly", "internal" -> DoriaTokenTypes.MODIFIER
 
             "void", "int", "float", "string", "bool", "mixed", "object", "resource", "array" -> DoriaTokenTypes.PRIMITIVE_TYPE
 
-            "List", "Dictionary", "Set", "Result", "Option" -> DoriaTokenTypes.COLLECTION_TYPE
+            "List", "Dictionary", "Set" -> DoriaTokenTypes.COLLECTION_TYPE
 
             "true", "false" -> DoriaTokenTypes.BOOLEAN_LITERAL
 
             "null" -> DoriaTokenTypes.NULL_LITERAL
 
-            else -> if (text.first().isUpperCase()) DoriaTokenTypes.TYPE_NAME else DoriaTokenTypes.IDENTIFIER
+            else -> when {
+                isFunctionDeclarationName() -> DoriaTokenTypes.METHOD_NAME
+                text.first().isUpperCase() -> DoriaTokenTypes.TYPE_NAME
+                nextNonWhitespace(tokenEnd) == '(' -> DoriaTokenTypes.METHOD_NAME
+                else -> DoriaTokenTypes.IDENTIFIER
+            }
         }
     }
 
@@ -273,6 +278,38 @@ class DoriaLexer : LexerBase() {
     private fun sliceEquals(value: String): Boolean {
         val length = tokenEnd - tokenStart
         return length == value.length && buffer.subSequence(tokenStart, tokenEnd).toString() == value
+    }
+
+    private fun isFunctionDeclarationName(): Boolean =
+        nextNonWhitespace(tokenEnd) == '(' && previousIdentifier() == "function"
+
+    private fun nextNonWhitespace(index: Int): Char? {
+        var cursor = index
+        while (cursor < endOffset && buffer[cursor].isWhitespace()) {
+            cursor++
+        }
+        return if (cursor < endOffset) buffer[cursor] else null
+    }
+
+    private fun previousIdentifier(): String? {
+        var cursor = tokenStart - 1
+        while (cursor >= startOffset && buffer[cursor].isWhitespace()) {
+            cursor--
+        }
+        if (cursor < startOffset || !isIdentifierPart(buffer[cursor])) {
+            return null
+        }
+
+        val end = cursor + 1
+        while (cursor >= startOffset && isIdentifierPart(buffer[cursor])) {
+            cursor--
+        }
+
+        val start = cursor + 1
+        if (start >= end || !isIdentifierStart(buffer[start])) {
+            return null
+        }
+        return buffer.subSequence(start, end).toString()
     }
 
     private fun isIdentifierStart(char: Char): Boolean = char == '_' || char.isLetter()

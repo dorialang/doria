@@ -327,7 +327,8 @@ fn initialize_result() -> Value {
 fn completion_items() -> Value {
     let keywords = [
         "class", "function", "let", "writable", "internal", "readonly", "return", "echo", "new",
-        "foreach", "as", "static", "true", "false", "null",
+        "foreach", "as", "if", "else", "while", "for", "when", "finally", "static", "true",
+        "false", "null",
     ];
     let types = [
         "void",

@@ -3,6 +3,10 @@ class Person
     writable string $name = "Andrew Masiye";
     int $age = 37;
 
+    function __construct()
+    {
+    }
+
     function greet(): void
     {
         echo $this->getGreetingMessage();
