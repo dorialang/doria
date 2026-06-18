@@ -2,8 +2,15 @@
 /build/
 **/build/
 **/.gradle/
+**/.kotlin/
 **/out/
 /.DS_Store
 **/.DS_Store
 *.php
 !examples/**/*.php
+node_modules/
+vendor/
+*.log
+*.vsix
+.idea
+.intellijPlatform
