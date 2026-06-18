@@ -12,15 +12,13 @@ repositories {
 }
 
 intellij {
-    version.set("2024.2.5")
-    type.set("IC")
-    plugins.set(listOf("com.intellij.platform.lsp"))
+    version.set("2025.2.1")
+    type.set("IU")
 }
 
 tasks {
     patchPluginXml {
-        sinceBuild.set("242")
-        untilBuild.set("252.*")
+        sinceBuild.set("252")
     }
 
     buildSearchableOptions {
