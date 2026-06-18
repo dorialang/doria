@@ -25,6 +25,10 @@
       language="Doria"
       implementationClass="dev.doria.intellij.highlighting.DoriaSyntaxHighlighterFactory" />
 
+    <lang.commenter
+      language="Doria"
+      implementationClass="dev.doria.intellij.DoriaCommenter" />
+
     <applicationConfigurable
       parentId="language"
       instance="dev.doria.intellij.settings.DoriaConfigurable"
