@@ -285,10 +285,15 @@ function collect(List<int> $items): void
 {
 }
 
+function collectMixed(List<mixed> $items): void
+{
+}
+
 greet("Andrew");
 greet("Andrew", "!");
 int $total = sum(1, 2);
 collect([1, 2, 3]);
+collectMixed([1, 2]);
 "#,
     )
     .expect("semantic check should succeed");

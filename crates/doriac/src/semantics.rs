@@ -1195,11 +1195,14 @@ impl<'program> Checker<'program> {
         }
 
         for (index, (arg, param)) in args.iter().zip(params.iter()).enumerate() {
-            if self.is_expr_assignable(param.ty, arg, scopes, method_context) {
+            let got = self.infer_expr_type(arg, scopes, method_context);
+
+            if self.is_expr_assignable(param.ty, arg, scopes, method_context)
+                || self.is_assignable(param.ty, got)
+            {
                 continue;
             }
 
-            let got = self.infer_expr_type(arg, scopes, method_context);
             self.diagnostics.push(Diagnostic::new(
                 "E0408",
                 format!(
