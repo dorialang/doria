@@ -17,7 +17,10 @@ class DoriaSyntaxHighlighter : SyntaxHighlighter {
         DoriaTokenTypes.PRIMITIVE_TYPE -> PRIMITIVE_TYPE_KEYS
         DoriaTokenTypes.COLLECTION_TYPE -> COLLECTION_TYPE_KEYS
         DoriaTokenTypes.TYPE_NAME -> TYPE_NAME_KEYS
-        DoriaTokenTypes.METHOD_NAME -> METHOD_NAME_KEYS
+        DoriaTokenTypes.FUNCTION_DECLARATION -> FUNCTION_DECLARATION_KEYS
+        DoriaTokenTypes.FUNCTION_CALL -> FUNCTION_CALL_KEYS
+        DoriaTokenTypes.METHOD_CALL -> METHOD_CALL_KEYS
+        DoriaTokenTypes.STATIC_METHOD_CALL -> STATIC_METHOD_CALL_KEYS
         DoriaTokenTypes.IDENTIFIER -> IDENTIFIER_KEYS
         DoriaTokenTypes.VARIABLE -> VARIABLE_KEYS
         DoriaTokenTypes.THIS -> THIS_KEYS
@@ -56,9 +59,21 @@ class DoriaSyntaxHighlighter : SyntaxHighlighter {
             "DORIA_TYPE_NAME",
             DefaultLanguageHighlighterColors.CLASS_NAME,
         )
-        val METHOD_NAME: TextAttributesKey = TextAttributesKey.createTextAttributesKey(
-            "DORIA_METHOD_NAME",
+        val FUNCTION_DECLARATION: TextAttributesKey = TextAttributesKey.createTextAttributesKey(
+            "DORIA_FUNCTION_DECLARATION",
+            DefaultLanguageHighlighterColors.FUNCTION_DECLARATION,
+        )
+        val FUNCTION_CALL: TextAttributesKey = TextAttributesKey.createTextAttributesKey(
+            "DORIA_FUNCTION_CALL",
             DefaultLanguageHighlighterColors.FUNCTION_CALL,
+        )
+        val METHOD_CALL: TextAttributesKey = TextAttributesKey.createTextAttributesKey(
+            "DORIA_METHOD_CALL",
+            DefaultLanguageHighlighterColors.INSTANCE_METHOD,
+        )
+        val STATIC_METHOD_CALL: TextAttributesKey = TextAttributesKey.createTextAttributesKey(
+            "DORIA_STATIC_METHOD_CALL",
+            DefaultLanguageHighlighterColors.STATIC_METHOD,
         )
         val IDENTIFIER: TextAttributesKey = TextAttributesKey.createTextAttributesKey(
             "DORIA_IDENTIFIER",
@@ -123,7 +138,10 @@ class DoriaSyntaxHighlighter : SyntaxHighlighter {
         private val PRIMITIVE_TYPE_KEYS = arrayOf(PRIMITIVE_TYPE)
         private val COLLECTION_TYPE_KEYS = arrayOf(COLLECTION_TYPE)
         private val TYPE_NAME_KEYS = arrayOf(TYPE_NAME)
-        private val METHOD_NAME_KEYS = arrayOf(METHOD_NAME)
+        private val FUNCTION_DECLARATION_KEYS = arrayOf(FUNCTION_DECLARATION)
+        private val FUNCTION_CALL_KEYS = arrayOf(FUNCTION_CALL)
+        private val METHOD_CALL_KEYS = arrayOf(METHOD_CALL)
+        private val STATIC_METHOD_CALL_KEYS = arrayOf(STATIC_METHOD_CALL)
         private val IDENTIFIER_KEYS = arrayOf(IDENTIFIER)
         private val VARIABLE_KEYS = arrayOf(VARIABLE)
         private val THIS_KEYS = arrayOf(THIS)

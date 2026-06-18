@@ -238,9 +238,9 @@ class DoriaLexer : LexerBase() {
             "null" -> DoriaTokenTypes.NULL_LITERAL
 
             else -> when {
-                isFunctionDeclarationName() -> DoriaTokenTypes.METHOD_NAME
+                isFunctionDeclarationName() -> DoriaTokenTypes.FUNCTION_DECLARATION
                 text.first().isUpperCase() -> DoriaTokenTypes.TYPE_NAME
-                nextNonWhitespace(tokenEnd) == '(' -> DoriaTokenTypes.METHOD_NAME
+                nextNonWhitespace(tokenEnd) == '(' -> callableTokenType()
                 else -> DoriaTokenTypes.IDENTIFIER
             }
         }
@@ -282,6 +282,25 @@ class DoriaLexer : LexerBase() {
 
     private fun isFunctionDeclarationName(): Boolean =
         nextNonWhitespace(tokenEnd) == '(' && previousIdentifier() == "function"
+
+    private fun callableTokenType(): IElementType = when (previousAccessor()) {
+        "->" -> DoriaTokenTypes.METHOD_CALL
+        "::" -> DoriaTokenTypes.STATIC_METHOD_CALL
+        else -> DoriaTokenTypes.FUNCTION_CALL
+    }
+
+    private fun previousAccessor(): String? {
+        var cursor = tokenStart - 1
+        while (cursor >= startOffset && buffer[cursor].isWhitespace()) {
+            cursor--
+        }
+        if (cursor <= startOffset) {
+            return null
+        }
+
+        val twoChars = buffer.subSequence(cursor - 1, cursor + 1).toString()
+        return twoChars.takeIf { it == "->" || it == "::" }
+    }
 
     private fun nextNonWhitespace(index: Int): Char? {
         var cursor = index

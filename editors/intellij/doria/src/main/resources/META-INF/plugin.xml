@@ -25,6 +25,8 @@
       language="Doria"
       implementationClass="dev.doria.intellij.highlighting.DoriaSyntaxHighlighterFactory" />
 
+    <colorSettingsPage implementation="dev.doria.intellij.highlighting.DoriaColorSettingsPage" />
+
     <lang.parserDefinition
       language="Doria"
       implementationClass="dev.doria.intellij.psi.DoriaParserDefinition" />
