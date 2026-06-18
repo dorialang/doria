@@ -9,7 +9,7 @@
   ]]></description>
 
   <depends>com.intellij.modules.platform</depends>
-  <depends>com.intellij.platform.lsp</depends>
+  <depends>com.intellij.modules.lsp</depends>
 
   <applicationService serviceImplementation="dev.doria.intellij.settings.DoriaSettings" />
 
