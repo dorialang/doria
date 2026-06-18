@@ -136,7 +136,7 @@ class Person
 
 To assign to a property, both the object path and the property must be writable, unless a constructor is initializing an uninitialized readonly property through constructor init access.
 
-Constructor init access is narrower than writable `$this`. Inside `__construct`, a direct simple assignment such as `$this->id = $id;` may initialize an uninitialized readonly property of the declaring class exactly once. Property initializers and constructor-promoted parameters count as already initialized. Init access does not permit compound assignments, nested writes such as `$this->child->name = "Lucy";`, calls to writable methods through `$this`, or initialization from repeatable bodies such as `foreach`. Full definite property initialization is future work; the current checker does not yet require every readonly property to be initialized by every constructor path.
+Constructor init access is narrower than writable `$this`. Inside `__construct`, a direct simple assignment such as `$this->id = $id;` may initialize an uninitialized readonly property of the declaring class exactly once. Property initializers and constructor-promoted parameters count as already initialized. Readonly init access does not permit compound assignments, nested writes such as `$this->child->name = "Lucy";`, calls to writable methods through `$this`, or initialization from repeatable bodies such as `foreach`. Writable properties keep normal mutation rules inside constructors, subject to type checking. Full definite property initialization is future work; the current checker does not yet require every readonly property to be initialized by every constructor path.
 
 Function parameters are readonly by default and become writable only with `writable`.
 

@@ -1082,6 +1082,10 @@ impl<'program> Checker<'program> {
             return ConstructorInitDecision::NotApplicable;
         }
 
+        if property_info.writable {
+            return ConstructorInitDecision::Allowed;
+        }
+
         if !matches!(op, AssignOp::Assign) {
             self.diagnostics.push(Diagnostic::new(
                 "E0413",
@@ -1089,10 +1093,6 @@ impl<'program> Checker<'program> {
                 span,
             ));
             return ConstructorInitDecision::Rejected;
-        }
-
-        if property_info.writable {
-            return ConstructorInitDecision::Allowed;
         }
 
         match property_info.init_state {

@@ -1071,6 +1071,7 @@ class Counter
     {
         $this->count = $initial;
         $this->count = $initial + 1;
+        $this->count += 1;
     }
 }
 "#,
