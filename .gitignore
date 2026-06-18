@@ -1,5 +1,8 @@
 /target/
 /build/
+**/build/
+**/.gradle/
+**/out/
 /.DS_Store
 **/.DS_Store
 *.php
