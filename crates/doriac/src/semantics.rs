@@ -38,7 +38,18 @@ struct MethodContext {
 #[derive(Debug, Clone)]
 struct ConstructorInitContext {
     class_name: String,
+    readonly_init_allowed: bool,
     initialized: HashSet<String>,
+}
+
+impl ConstructorInitContext {
+    fn without_readonly_init(&self) -> Self {
+        Self {
+            class_name: self.class_name.clone(),
+            readonly_init_allowed: false,
+            initialized: HashSet::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -312,16 +323,11 @@ impl<'program> Checker<'program> {
                     self.check_property_initializer(&class_decl.name, property);
                 }
                 ClassMember::Method(method) => {
-                    let writable_this = if method.name == "__construct" {
-                        false
-                    } else {
-                        method.writable_this
-                    };
                     self.check_function(
                         method,
                         Some(MethodContext {
                             class_name: class_decl.name.clone(),
-                            writable_this,
+                            writable_this: method.writable_this,
                             this_available: true,
                         }),
                     );
@@ -476,6 +482,7 @@ impl<'program> Checker<'program> {
         let mut constructor_init_context = method_context.as_ref().and_then(|context| {
             (function.name == "__construct").then(|| ConstructorInitContext {
                 class_name: context.class_name.clone(),
+                readonly_init_allowed: true,
                 initialized: HashSet::new(),
             })
         });
@@ -711,8 +718,17 @@ impl<'program> Checker<'program> {
                     },
                     foreach.span,
                 );
+                let mut loop_constructor_init_context = constructor_init_context
+                    .as_deref()
+                    .map(ConstructorInitContext::without_readonly_init);
                 for statement in &foreach.body.statements {
-                    self.check_statement(statement, scopes, method_context, None, return_context);
+                    self.check_statement(
+                        statement,
+                        scopes,
+                        method_context,
+                        loop_constructor_init_context.as_mut(),
+                        return_context,
+                    );
                 }
                 scopes.pop();
             }
@@ -1084,6 +1100,10 @@ impl<'program> Checker<'program> {
 
         if property_info.writable {
             return ConstructorInitDecision::Allowed;
+        }
+
+        if !context.readonly_init_allowed {
+            return ConstructorInitDecision::NotApplicable;
         }
 
         if !matches!(op, AssignOp::Assign) {

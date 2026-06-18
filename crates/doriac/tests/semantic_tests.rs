@@ -1074,6 +1074,48 @@ class Counter
         $this->count += 1;
     }
 }
+
+class Accumulator
+{
+    writable int $count = 0;
+
+    function __construct(List<int> $items)
+    {
+        foreach ($items as int $item) {
+            $this->count += $item;
+        }
+    }
+}
+
+class Renamer
+{
+    writable string $name;
+
+    writable function __construct(string $newName)
+    {
+        $this->rename($newName);
+    }
+
+    writable function rename(string $name): void
+    {
+        $this->name = $name;
+    }
+}
+
+class Child
+{
+    writable string $name;
+}
+
+class Parent
+{
+    writable Child $child;
+
+    writable function __construct()
+    {
+        $this->child->name = "Lucy";
+    }
+}
 "#,
     )
     .expect("semantic check should succeed");
