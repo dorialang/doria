@@ -1,4 +1,20 @@
-<svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
-  <rect x="1" y="1" width="14" height="14" rx="3" fill="#4B2E83"/>
-  <path d="M4 3.5h4.1c2.4 0 4 1.6 4 4.5s-1.6 4.5-4 4.5H4v-9Zm2 1.8v5.4h1.9c1.3 0 2.1-.9 2.1-2.7s-.8-2.7-2.1-2.7H6Z" fill="#F7E7B6"/>
+<svg width="16" height="16" viewBox="0 0 256 256" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <path fill="#0F6B4A" fill-rule="evenodd" d="
+    M44 24
+    H112
+    C180 24 230 72 230 128
+    C230 184 180 232 112 232
+    H44
+    C34 232 26 224 26 214
+    V42
+    C26 32 34 24 44 24
+    Z
+    M80 70
+    V186
+    H110
+    C151 186 184 161 184 128
+    C184 95 151 70 110 70
+    H80
+    Z"/>
+  <path fill="#F7B538" d="M118 91 L168 128 L118 165 V141 L139 128 L118 115 Z"/>
 </svg>
