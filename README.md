@@ -18,13 +18,23 @@ Doria source
 -> semantic analysis
 -> type checker
 -> readonly/writable checker
--> borrow/lifetime analysis later
--> HIR today
--> MIR later
+-> Doria IR
 -> backend
 ```
 
-Planned backends include native, PHP, debug/interpreter, and WebAssembly. The current working backend is PHP.
+Native machine code and standalone executables are the primary long-term target. PHP is currently the implemented compatibility, migration, debugging, and inspection backend.
+
+## Influence and migration
+
+Doria's surface syntax is intentionally familiar to developers coming from PHP-like and C-like languages, but Doria is its own language. PHP does not define Doria's semantics, and PHP output must not shape the core compiler architecture.
+
+PHP support belongs in compatibility, migration, debugging, and inspection contexts. Future migration tooling may expose a command such as:
+
+```bash
+doriac migrate php src --out migrated
+```
+
+That would be a PHP-to-Doria migration converter, not the Doria parser and not the core compiler identity.
 
 ## Influence and migration
 
@@ -46,7 +56,7 @@ This repository contains the first working vertical slice of `doriac`:
 - Parses a small subset of declarations, classes, functions, statements, and expressions.
 - Builds an AST.
 - Checks undeclared assignment and readonly/writable mutation rules for locals, properties, `$this`, and writable methods.
-- Lowers the checked AST to a small backend-neutral HIR. MIR is planned for native-oriented lowering.
+- Lowers the checked AST to Doria IR, the compiler-owned representation used before backend output.
 - Emits PHP for supported syntax through the PHP backend.
 - Provides CLI commands and integration tests.
 
@@ -110,7 +120,7 @@ The VS Code extension looks for the server in this order:
 - Class members are externally accessible by default; use `internal` for implementation details that should not be accessed from outside the declaring class.
 - `writable` controls mutation. `internal` controls API surface.
 - Collection aliases are `List<T>`, `Dictionary<K, V>`, and `Set<T>`.
-- The compiler must reject invalid Doria before lowering to HIR/MIR or emitting backend output.
+- The compiler must reject invalid Doria before lowering to Doria IR or emitting backend output.
 - Doria may support features PHP cannot express directly, such as executable instance property initializers and richer attribute expressions.
 
 ## Design docs

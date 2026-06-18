@@ -74,10 +74,6 @@ impl Parser {
     }
 
     fn parse_class_member(&mut self) -> Option<ClassMember> {
-        if self.reject_legacy_visibility_modifier() {
-            return None;
-        }
-
         let access = self.parse_member_access();
         self.match_kind(&TokenKind::Static);
 
@@ -161,10 +157,6 @@ impl Parser {
 
     fn parse_param(&mut self, is_constructor: bool) -> Option<Param> {
         let start = self.peek().span.start;
-        if self.reject_legacy_visibility_modifier() {
-            return None;
-        }
-
         if !is_constructor && self.check(&TokenKind::Internal) {
             let span = self.advance().span;
             self.error(
@@ -594,6 +586,7 @@ impl Parser {
             TokenKind::StringType => "string".to_string(),
             TokenKind::BoolType => "bool".to_string(),
             TokenKind::ArrayType => "array".to_string(),
+            TokenKind::Null => "null".to_string(),
             TokenKind::Identifier(name) => name,
             other => {
                 self.error(
@@ -630,25 +623,6 @@ impl Parser {
             MemberAccess::Internal
         } else {
             MemberAccess::External
-        }
-    }
-
-    fn reject_legacy_visibility_modifier(&mut self) -> bool {
-        let message = match &self.peek().kind {
-            TokenKind::Public => Some("Doria members are public by default; remove `public`."),
-            TokenKind::Private => Some("Use `internal` for implementation details."),
-            TokenKind::Protected => {
-                Some("Doria does not support `protected`; use `internal` or redesign the API.")
-            }
-            _ => None,
-        };
-
-        if let Some(message) = message {
-            let span = self.advance().span;
-            self.error(message, span);
-            true
-        } else {
-            false
         }
     }
 
@@ -697,6 +671,7 @@ impl Parser {
                 | TokenKind::StringType
                 | TokenKind::BoolType
                 | TokenKind::ArrayType
+                | TokenKind::Null
                 | TokenKind::Identifier(_)
         )
     }
@@ -793,10 +768,7 @@ impl Parser {
                 | TokenKind::Echo
                 | TokenKind::Return
                 | TokenKind::Foreach
-                | TokenKind::Internal
-                | TokenKind::Public
-                | TokenKind::Protected
-                | TokenKind::Private => return,
+                | TokenKind::Internal => return,
                 _ => {
                     self.advance();
                 }
@@ -809,9 +781,6 @@ fn token_name(kind: &TokenKind) -> &'static str {
     match kind {
         TokenKind::Class => "class",
         TokenKind::Function => "function",
-        TokenKind::Public => "public",
-        TokenKind::Protected => "protected",
-        TokenKind::Private => "private",
         TokenKind::Internal => "internal",
         TokenKind::Static => "static",
         TokenKind::Let => "let",

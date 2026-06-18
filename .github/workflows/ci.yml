@@ -46,7 +46,10 @@ jobs:
         run: cargo test --workspace --all-targets --locked --verbose
 
       - name: Smoke check Doria example
-        run: cargo run --locked -p doriac -- check examples/person.doria
+        run: cargo run -p doriac -- check examples/person.doria
+
+      - name: Smoke dump Doria example IR
+        run: cargo run -p doriac -- hir examples/person.doria
 
       - name: Smoke compile Doria example to PHP
-        run: cargo run --locked -p doriac -- compile examples/person.doria --target php --out build/person.php
+        run: cargo run -p doriac -- compile examples/person.doria --target php --out build/person.php

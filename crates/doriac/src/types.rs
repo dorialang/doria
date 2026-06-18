@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fmt;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -27,8 +28,8 @@ impl TypeRef {
 
     pub fn as_class_name(&self) -> Option<&str> {
         match self.name.as_str() {
-            "void" | "int" | "float" | "string" | "bool" | "array" | "mixed" | "null" | "List"
-            | "Dictionary" | "Set" | "Unknown" => None,
+            "void" | "int" | "float" | "string" | "bool" | "array" | "mixed" | "null"
+            | "object" | "resource" | "List" | "Dictionary" | "Set" | "Unknown" => None,
             _ => Some(&self.name),
         }
     }
@@ -46,6 +47,96 @@ impl fmt::Display for TypeRef {
                 .collect::<Vec<_>>()
                 .join(", ");
             write!(formatter, "{}<{}>", self.name, args)
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TypeId(usize);
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum TypeKind {
+    Void,
+    Int,
+    Float,
+    String,
+    Bool,
+    Null,
+    Mixed,
+    Object,
+    Resource,
+    Array,
+    Unknown,
+    Heterogeneous,
+    EmptyCollection,
+    Class(String),
+    List(TypeId),
+    Dictionary(TypeId, TypeId),
+    Set(TypeId),
+}
+
+#[derive(Debug, Default)]
+pub struct TypeRegistry {
+    ids: HashMap<TypeKind, TypeId>,
+    kinds: Vec<TypeKind>,
+}
+
+impl TypeRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn intern(&mut self, kind: TypeKind) -> TypeId {
+        if let Some(id) = self.ids.get(&kind) {
+            return *id;
+        }
+
+        let id = TypeId(self.kinds.len());
+        self.kinds.push(kind.clone());
+        self.ids.insert(kind, id);
+        id
+    }
+
+    pub fn kind(&self, id: TypeId) -> &TypeKind {
+        &self.kinds[id.0]
+    }
+
+    pub fn unknown(&mut self) -> TypeId {
+        self.intern(TypeKind::Unknown)
+    }
+
+    pub fn class_name(&self, id: TypeId) -> Option<&str> {
+        match self.kind(id) {
+            TypeKind::Class(name) => Some(name),
+            _ => None,
+        }
+    }
+
+    pub fn display(&self, id: TypeId) -> String {
+        match self.kind(id) {
+            TypeKind::Void => "void".to_string(),
+            TypeKind::Int => "int".to_string(),
+            TypeKind::Float => "float".to_string(),
+            TypeKind::String => "string".to_string(),
+            TypeKind::Bool => "bool".to_string(),
+            TypeKind::Null => "null".to_string(),
+            TypeKind::Mixed => "mixed".to_string(),
+            TypeKind::Object => "object".to_string(),
+            TypeKind::Resource => "resource".to_string(),
+            TypeKind::Array => "array".to_string(),
+            TypeKind::Unknown => "Unknown".to_string(),
+            TypeKind::Heterogeneous => "heterogeneous".to_string(),
+            TypeKind::EmptyCollection => "[]".to_string(),
+            TypeKind::Class(name) => name.clone(),
+            TypeKind::List(element) => format!("List<{}>", self.display(*element)),
+            TypeKind::Dictionary(key, value) => {
+                format!(
+                    "Dictionary<{}, {}>",
+                    self.display(*key),
+                    self.display(*value)
+                )
+            }
+            TypeKind::Set(element) => format!("Set<{}>", self.display(*element)),
         }
     }
 }

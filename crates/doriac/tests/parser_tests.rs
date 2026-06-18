@@ -8,11 +8,12 @@ fn parses_variable_declarations() {
 let $x = 5;
 let writable $name = "Doria";
 writable int $score = 1;
+null $empty = null;
 "#,
     )
     .expect("parse should succeed");
 
-    assert_eq!(program.items.len(), 3);
+    assert_eq!(program.items.len(), 4);
     assert!(matches!(
         &program.items[0],
         Item::Statement(Stmt::VarDecl(decl)) if !decl.writable && decl.name == "x"
@@ -24,6 +25,13 @@ writable int $score = 1;
     assert!(matches!(
         &program.items[2],
         Item::Statement(Stmt::VarDecl(decl)) if decl.writable && decl.ty.is_some()
+    ));
+    assert!(matches!(
+        &program.items[3],
+        Item::Statement(Stmt::VarDecl(decl))
+            if !decl.writable
+                && decl.name == "empty"
+                && matches!(decl.ty.as_ref(), Some(ty) if ty.name == "null")
     ));
 }
 
@@ -127,7 +135,7 @@ class Parser
 }
 
 #[test]
-fn rejects_legacy_visibility_member_modifiers() {
+fn rejects_unsupported_visibility_member_syntax() {
     for source in [
         "class Person { public string $name; }",
         "class Person { public function greet(): void {} }",
@@ -136,7 +144,12 @@ fn rejects_legacy_visibility_member_modifiers() {
         "class Person { protected string $name; }",
         "class Person { protected function greet(): void {} }",
     ] {
-        doriac::parse_source("test.doria", source)
-            .expect_err("legacy visibility modifier should be rejected");
+        let err = doriac::parse_source("test.doria", source)
+            .expect_err("unsupported visibility syntax should be rejected");
+
+        assert!(
+            err.iter().any(|diagnostic| diagnostic.code == "P0001"),
+            "expected parse diagnostic for source `{source}`"
+        );
     }
 }

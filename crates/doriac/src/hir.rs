@@ -3,12 +3,11 @@ use crate::types::TypeRef;
 
 pub use crate::ast::{AssignOp, BinaryOp, MemberAccess};
 
-/// High-level IR.
+/// Current Doria IR implementation.
 ///
-/// HIR is intentionally still close to checked source structure. It is the
-/// resolved, backend-neutral form we can emit from today while the future MIR
-/// becomes the simpler control-flow-oriented representation for native code.
-
+/// The module name is historical and may change later. Public architecture
+/// should describe this as Doria IR: the resolved, backend-neutral form emitted
+/// before backend output. A lower native-oriented IR may come later.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Program {
     pub items: Vec<Item>,

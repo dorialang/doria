@@ -21,10 +21,11 @@ Doria should support the first two over time. It should avoid promising the thir
 The long-term compiler direction remains:
 
 ```text
-Doria source -> doriac -> HIR -> MIR -> native backend -> standalone executable
+Doria source -> lexer -> parser -> AST -> semantic/type checking -> Doria IR -> backend
 ```
 
-The PHP backend is a compatibility, debugging, migration, and transpilation backend. It is not Doria's reference implementation, and generated PHP is not the definition of Doria semantics.
+The PHP backend is a compatibility, debugging, migration, and inspection backend. It is not Doria's reference implementation, and generated PHP is not the definition of Doria semantics.
+Native executables are the primary long-term target. As native code generation matures, Doria IR may lower into a simpler native-oriented IR for control flow, memory layout, runtime calls, and backend code generation.
 
 A PHP-to-Doria converter may also be useful, but it should be treated as a migration tool, not as the core compiler pipeline.
 
@@ -69,7 +70,7 @@ This is the easier direction.
 Doria source can lower into PHP for supported features. This output is useful for compatibility and inspection, but it is non-normative:
 
 ```text
-Doria source -> parser -> AST -> semantic checks -> HIR -> PHP backend
+Doria source -> parser -> AST -> semantic checks -> Doria IR -> PHP backend
 ```
 
 Use cases:
@@ -345,7 +346,7 @@ PHP migration parser:
   parses PHP for conversion purposes only
 
 Doria backend_php:
-  emits PHP from Doria HIR/MIR
+  emits PHP from Doria IR
 ```
 
 Do not mix these into one parser.
@@ -380,8 +381,7 @@ crates/
   doriac/
   doria_frontend/
   doria_semantics/
-  doria_hir/
-  doria_mir/
+  doria_ir/
   doria_backend_php/
   doria_backend_native/
   doria_migrate_php/
@@ -430,8 +430,8 @@ Recommended order:
 ```text
 1. Stabilize Doria parser and AST.
 2. Add real semantic types.
-3. Add assignment and return type checking.
-4. Add HIR stability and pretty/debug output.
+3. Stabilize assignment compatibility and basic return type checking.
+4. Add Doria IR stability and pretty/debug output.
 5. Add a Doria pretty-printer.
 6. Build a small PHP-to-Doria prototype for simple PHP files.
 7. Use the prototype to inform Doria syntax and diagnostics.

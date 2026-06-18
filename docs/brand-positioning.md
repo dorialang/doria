@@ -21,7 +21,7 @@ Doria is a compiled programming language for building native applications, comma
 
 - Doria is PHP but compiled.
 - Doria is PHP++.
-- Doria is a PHP transpiler.
+- Doria is just a PHP output tool.
 - Doria is primarily PHP-like.
 - Doria should be understandable by a PHP interpreter.
 

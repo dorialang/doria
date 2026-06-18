@@ -120,3 +120,54 @@ class Person
     assert!(php.contains("public function reveal(): string"));
     assert!(php.contains("private function message(): string"));
 }
+
+#[test]
+fn omits_lifecycle_method_return_types_for_php() {
+    let php = doriac::compile_source_to_php(
+        "test.doria",
+        r#"
+class Person
+{
+    function __construct(): void
+    {
+        return;
+    }
+
+    function __destruct(): void
+    {
+        return;
+    }
+}
+"#,
+    )
+    .expect("compilation should succeed");
+
+    assert!(php.contains("public function __construct()"));
+    assert!(php.contains("public function __destruct()"));
+    assert!(!php.contains("__construct(): void"));
+    assert!(!php.contains("__destruct(): void"));
+}
+
+#[test]
+fn lowers_resource_type_to_php_mixed() {
+    let php = doriac::compile_source_to_php(
+        "test.doria",
+        r#"
+class StreamBox
+{
+    resource $handle;
+
+    function read(resource $handle): resource
+    {
+        return $handle;
+    }
+}
+"#,
+    )
+    .expect("compilation should succeed");
+
+    assert!(php.contains("public mixed $handle;"));
+    assert!(php.contains("public function read(mixed $handle): mixed"));
+    assert!(!php.contains("resource $handle"));
+    assert!(!php.contains("): resource"));
+}

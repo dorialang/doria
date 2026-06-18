@@ -68,7 +68,13 @@ fn emit_function(function: &FunctionDecl, output: &mut String, indent: usize, is
             .join(", "),
     );
     output.push(')');
-    if let Some(return_type) = &function.return_type {
+    let is_lifecycle_method =
+        is_method && matches!(function.name.as_str(), "__construct" | "__destruct");
+    if let Some(return_type) = function
+        .return_type
+        .as_ref()
+        .filter(|_| !is_lifecycle_method)
+    {
         output.push_str(": ");
         output.push_str(&php_type(return_type));
     }
@@ -261,6 +267,7 @@ fn emit_member_access(access: &MemberAccess) -> &'static str {
 fn php_type(ty: &TypeRef) -> String {
     match ty.name.as_str() {
         "List" | "Dictionary" | "Set" => "array".to_string(),
+        "resource" => "mixed".to_string(),
         name => name.to_string(),
     }
 }

@@ -1,12 +1,12 @@
 use std::collections::HashMap;
 
 use crate::ast::MemberAccess;
-use crate::types::TypeRef;
+use crate::types::TypeId;
 
 #[derive(Debug, Clone)]
 pub struct Binding {
     pub writable: bool,
-    pub ty: TypeRef,
+    pub ty: TypeId,
 }
 
 #[derive(Debug, Clone)]
@@ -19,13 +19,36 @@ pub struct ClassInfo {
 pub struct PropertyInfo {
     pub access: MemberAccess,
     pub writable: bool,
-    pub ty: TypeRef,
+    pub ty: TypeId,
+    pub init_state: PropertyInitState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PropertyInitState {
+    Uninitialized,
+    HasInitializer,
+    PromotedParameter,
+}
+
+#[derive(Debug, Clone)]
+pub struct ParamInfo {
+    pub name: String,
+    pub ty: TypeId,
+    pub has_default: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct FunctionInfo {
+    pub params: Vec<ParamInfo>,
+    pub return_ty: TypeId,
 }
 
 #[derive(Debug, Clone)]
 pub struct MethodInfo {
     pub access: MemberAccess,
     pub writable_this: bool,
+    pub params: Vec<ParamInfo>,
+    pub return_ty: TypeId,
 }
 
 #[derive(Debug, Default)]
@@ -62,5 +85,12 @@ impl ScopeStack {
 
     pub fn lookup(&self, name: &str) -> Option<&Binding> {
         self.scopes.iter().rev().find_map(|scope| scope.get(name))
+    }
+
+    pub fn lookup_mut(&mut self, name: &str) -> Option<&mut Binding> {
+        self.scopes
+            .iter_mut()
+            .rev()
+            .find_map(|scope| scope.get_mut(name))
     }
 }

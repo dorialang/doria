@@ -308,7 +308,7 @@
         },
         {
           "name": "keyword.other.reserved.doria",
-          "match": "\\b(?:public|protected|private|async|await|spawn|scope|interface|trait|enum|match|try|catch|throw|Result|Option)\\b"
+          "match": "\\b(?:async|await|spawn|scope|interface|trait|enum|match|try|catch|throw|Result|Option)\\b"
         }
       ]
     },
@@ -342,7 +342,7 @@
         },
         {
           "name": "storage.type.primitive.doria",
-          "match": "\\b(?:void|int|float|string|bool|mixed|array|Unknown)\\b"
+          "match": "\\b(?:void|int|float|string|bool|mixed|object|resource|array)\\b"
         },
         {
           "name": "support.type.collection.doria",

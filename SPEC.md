@@ -22,9 +22,7 @@ Doria source
 -> semantic analysis
 -> type checker
 -> readonly/writable checker
--> borrow/lifetime analysis later
--> HIR
--> MIR later
+-> Doria IR
 -> backend
 ```
 
@@ -35,7 +33,7 @@ Backends may include:
 - Debug/interpreter backend.
 - WebAssembly backend.
 
-The PHP backend is a compatibility, migration, debugging, and transpilation target. It must not shape the core compiler architecture.
+The PHP backend is a compatibility, migration, debugging, and inspection target. It must not shape the core compiler architecture.
 
 ## 2. What Doria is not
 
@@ -73,6 +71,18 @@ Planned near-term syntax includes:
 - Attribute lists using `#[...]`.
 - Named arguments using `name: expression`.
 - Richer property initializer expressions, including object construction.
+
+Planned future control-flow design includes:
+
+- `while`.
+- `do ... while ... finally`.
+- `given ... when ... finally`.
+- `given ... while ... finally`.
+- `if` / `else if` / `else` / `finally`.
+- `when` as a value-returning conditional form.
+- `match` as a pattern/value selection construct.
+
+These control-flow forms are not MVP syntax unless listed in the MVP support list above. See `docs/decisions/0009-control-flow-direction.md`.
 
 ## 4. Declaration rules
 
@@ -126,6 +136,8 @@ class Person
 
 To assign to a property, both the object path and the property must be writable, unless a constructor is initializing an uninitialized readonly property through constructor init access.
 
+Constructor init access is narrower than writable `$this`. Inside `__construct`, a direct simple assignment such as `$this->id = $id;` may initialize an uninitialized readonly property of the declaring class exactly once. Property initializers and constructor-promoted parameters count as already initialized. Readonly init access does not permit compound assignments, nested writes such as `$this->child->name = "Lucy";`, calls to writable methods through `$this`, or initialization from repeatable bodies such as `foreach`. Writable properties keep normal mutation rules inside constructors, subject to type checking. Full definite property initialization is future work; the current checker does not yet require every readonly property to be initialized by every constructor path.
+
 Function parameters are readonly by default and become writable only with `writable`.
 
 Methods receive readonly `$this` by default. A method that mutates `$this` must be declared with `writable function`.
@@ -172,6 +184,49 @@ Internal members are accessible only from methods and constructors of the declar
 
 Property hooks are planned later for validation and computed properties, but they are not part of the current implementation.
 
+### API surface naming
+
+Doria APIs should make intent obvious at the call site.
+
+The preferred rule is:
+
+```text
+Nouns are properties.
+Verbs are methods.
+```
+
+Use properties for values, state, identifiers, configuration, and computed data:
+
+```php
+let $body = $message->body;
+let $headers = $message->headers;
+let $status = $message->status;
+```
+
+Avoid vague zero-argument noun methods when the member is conceptually data:
+
+```php
+let $body = $message->body(); // avoid
+let $headers = $message->headers(); // avoid
+let $status = $message->status(); // avoid
+```
+
+A noun method such as `body()` can be misread as an action, preparation step, mutation, or builder-style operation. If the member represents data, expose it as a property.
+
+Property hooks are the planned escape hatch when a property-shaped API needs validation, computed behavior, lazy decoding, caching, normalization, or guarded access. The public member should remain property-shaped when it is conceptually a value.
+
+Use methods for actions, commands, mutation, I/O, async work, fallible operations, and behavior with meaningful work:
+
+```php
+await $message->acknowledge();
+await $message->retryAfter(seconds: 30);
+$report->renderPdf();
+```
+
+If a data-returning operation must be a method because it performs I/O, expensive work, decoding, or another explicit operation, use an unmistakable verb such as `loadBody()`, `decodeBody()`, `findById()`, or `fetchProfile()`.
+
+See `docs/api-design-guidelines.md` for the detailed design notes.
+
 ## 7. Basic type system
 
 The MVP type names are:
@@ -184,11 +239,32 @@ string
 bool
 null
 mixed
+object
+resource
 List<T>
 Dictionary<K, V>
 Set<T>
 ClassType
-Unknown
+```
+
+The compiler keeps parsed type syntax and semantic types separate:
+
+```text
+TypeRef      parsed source spelling, such as `List<int>` or `Person`
+TypeId       resolved semantic type identity
+TypeKind     resolved semantic type shape
+```
+
+The semantic model also has an internal `Unknown` recovery type for diagnostics and error recovery; it is not the normal spelling for user-authored type declarations.
+
+Lowercase primitive names are type-position names: `int`, `float`, `string`, `bool`, `object`, and `resource`. PascalCase names such as `Int`, `Float`, `String`, `Bool`, `Object`, and `Resource` are reserved for future expression-level standard-library/helper APIs. They are not primitive type spellings, and primitive type names are not namespaces. Future code should prefer APIs such as `Int::parse(...)`, but companion semantics are not part of the current implementation.
+
+Collection aliases have fixed arity:
+
+```text
+List<T>
+Dictionary<K, V>
+Set<T>
 ```
 
 `let` declarations infer simple literal and constructor types:
@@ -198,6 +274,12 @@ let $x = 5;        // int
 let $name = "Doria"; // string
 let $person = new Person("Andrew"); // Person
 ```
+
+The semantic checker resolves parsed type syntax into semantic types before checking assignment, return, and positional call compatibility. Doria checks typed declarations, property initializers, property writes, parameter defaults, declared function/method return values, and call arguments for functions, methods, static calls, and constructors. It does not perform PHP-style scalar coercion: `int` is not assignable from `string`, `string` is not assignable from `int`, and `bool` is not assignable from `int`.
+
+Numeric widening is not implemented yet; for now `float` is not assignable from `int`, and `int` is not assignable from `float`. Any future safe numeric widening should be a separate design decision. Named arguments and richer call argument representation are separate future slices.
+
+Simple collection literals infer collection element/key/value types when all clear parts match. Clear heterogeneous collection literals, such as `[1, "two"]`, are rejected by narrow collection alias assignment checks rather than being erased to `Unknown`. The empty literal `[]` stays ambiguous so typed contexts may use it as an empty `List<T>` or `Dictionary<K, V>`. The PHP-compatible `array` annotation remains broad enough to accept list-shaped and dictionary-shaped literals.
 
 ## 8. Class syntax
 
@@ -223,7 +305,21 @@ function __construct(
 }
 ```
 
-Constructor init access for assigning readonly properties inside constructor bodies is a required language rule, but it is not implemented in the current vertical slice. The intended rule is narrower than writable `$this`: a constructor may initialize each uninitialized readonly property exactly once.
+Constructor init access is supported for direct initialization of uninitialized readonly properties inside constructor bodies:
+
+```php
+class Person
+{
+    string $id;
+
+    function __construct(string $givenId)
+    {
+        $this->id = $givenId;
+    }
+}
+```
+
+This does not make `$this` writable. The constructor cannot assign the same readonly property twice, cannot reassign a readonly property that already has an initializer or is promoted from a constructor parameter, cannot use compound assignment for init access, and cannot use init access for nested object paths.
 
 Doria should support richer instance property initializers than PHP:
 
@@ -254,6 +350,32 @@ function rename(writable Person $person, string $name): void
 }
 ```
 
+Declared return types are checked against returned expressions:
+
+```php
+function age(): int
+{
+    return 37;
+}
+```
+
+`void` functions and methods may use `return;` or fall through. Lifecycle methods, currently `__construct` and `__destruct`, are void-like: they may omit a return type or explicitly declare `: void`, may use bare `return;`, and may fall through. A non-`void` lifecycle return annotation is an error, returning a value from a `void` function or lifecycle method is an error, and lifecycle methods cannot be called directly as ordinary methods. `__construct` may declare parameters and constructor calls are checked against them through `new Class(...)`. `__destruct` must not declare parameters. For declared non-`void` return types, the current checker requires the final top-level statement of the function or method body to be `return expr;`. This is a deliberate early rule, not full path-sensitive control-flow analysis.
+
+Calls are checked against declared parameter lists:
+
+```php
+function greet(string $name, string $suffix = "!"): void
+{
+}
+
+greet("Andrew");      // ok
+greet("Andrew", "!"); // ok
+greet();              // error
+greet(123);           // error
+```
+
+Only positional arguments are supported in the current slice. Required parameters cannot follow optional parameters until named arguments exist.
+
 ## 10. Collection aliases
 
 Doria uses:
@@ -267,6 +389,8 @@ Set<string>
 Do not use `Vec`.
 
 The PHP backend lowers these aliases to PHP arrays, while the Doria type checker keeps them distinct.
+
+The current type foundation resolves explicit annotations, reports unknown type names and invalid collection alias arity, and checks assignment compatibility for typed declarations, property initializers, property writes, parameter defaults, declared return values, and positional call arguments. Classes without constructors cannot be constructed with arguments.
 
 ## 11. Attributes and metadata expressions
 
@@ -333,13 +457,13 @@ Doria should avoid promising full bidirectional PHP/Doria compatibility.
 
 See `docs/php-interop-and-migration.md` for the detailed design notes.
 
-## 13. HIR, MIR, and backend behavior
+## 13. Doria IR and backend behavior
 
-After semantic analysis, type checking, and readonly/writable checking, the compiler currently lowers the checked AST to HIR. HIR is still close to source structure and is not the final backend IR.
+Doria IR is the checked compiler-owned representation of a Doria program. After semantic analysis, type checking, and readonly/writable checking, the compiler lowers the checked AST into Doria IR before backend output.
 
-MIR is planned as the simpler, control-flow-oriented representation for borrow/lifetime analysis and native-oriented backend lowering.
+As native code generation matures, Doria IR may lower into a simpler native-oriented IR for control flow, memory layout, runtime calls, and backend code generation.
 
-The native backend is the primary long-term target. It should eventually lower MIR toward native machine code and standalone executables.
+The native backend is the primary long-term target. It should eventually lower Doria IR, and any later native-oriented IR, toward native machine code and standalone executables.
 
 The PHP backend is currently the first implemented backend. It emits `<?php` and lowers Doria-only syntax away:
 
@@ -347,7 +471,8 @@ The PHP backend is currently the first implemented backend. It emits `<?php` and
 - `writable` is removed.
 - `internal` is enforced by Doria before backend emission and may lower to PHP `private` or another backend-specific representation.
 - Collection aliases are emitted as `array`.
-- Doria readonly/writable rules are enforced before HIR/MIR lowering and backend emission, not at PHP runtime.
+- `resource` is emitted as `mixed` because PHP cannot declare `resource` type hints.
+- Doria readonly/writable rules are enforced before Doria IR lowering and backend emission, not at PHP runtime.
 
 For Doria features that PHP cannot express directly, such as object construction in property initializers or richer attribute expressions, the PHP backend should lower to equivalent generated PHP where practical or produce a clear unsupported-feature diagnostic temporarily. PHP limitations must not define Doria semantics.
 
@@ -362,9 +487,10 @@ Future work includes:
 - Attribute syntax and metadata representation.
 - Richer instance property initializers.
 - Named arguments.
+- Full control-flow design for `while`, `do ... while ... finally`, `given ... when`, `given ... while`, `if` chains with possible `finally`, value-returning `when`, and `match`.
 - Async/await and structured concurrency.
 - Native backend design and implementation.
-- MIR implementation.
+- Native-oriented IR implementation when native code generation needs it.
 - Native code generation.
 - Self-hosting path for writing more of `doriac` in Doria.
 - PHP-to-Doria migration tooling.
