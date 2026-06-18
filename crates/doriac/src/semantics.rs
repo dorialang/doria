@@ -3,7 +3,9 @@ use std::collections::HashMap;
 use crate::ast::*;
 use crate::diagnostics::{Diagnostic, DiagnosticResult};
 use crate::source::Span;
-use crate::symbols::{Binding, ClassInfo, MethodInfo, PropertyInfo, ScopeStack};
+use crate::symbols::{
+    Binding, ClassInfo, FunctionInfo, MethodInfo, ParamInfo, PropertyInfo, ScopeStack,
+};
 use crate::types::{TypeId, TypeKind, TypeRef, TypeRegistry};
 
 pub fn check_program(program: &Program) -> DiagnosticResult<()> {
@@ -19,8 +21,8 @@ pub fn check_program(program: &Program) -> DiagnosticResult<()> {
 struct Checker<'program> {
     program: &'program Program,
     classes: HashMap<String, ClassInfo>,
-    functions: HashMap<String, TypeId>,
-    function_return_types: HashMap<usize, TypeId>,
+    functions: HashMap<String, FunctionInfo>,
+    function_signatures: HashMap<usize, FunctionInfo>,
     types: TypeRegistry,
     diagnostics: Vec<Diagnostic>,
 }
@@ -106,7 +108,7 @@ impl<'program> Checker<'program> {
             program,
             classes: HashMap::new(),
             functions: HashMap::new(),
-            function_return_types: HashMap::new(),
+            function_signatures: HashMap::new(),
             types: TypeRegistry::new(),
             diagnostics: Vec::new(),
         }
@@ -167,9 +169,17 @@ impl<'program> Checker<'program> {
                         self.declare_property(&mut info, &class_decl.name, property);
                     }
                     ClassMember::Method(method) => {
-                        let return_ty = self.resolve_function_return_type(method);
-                        self.function_return_types
-                            .insert(method.span.start, return_ty);
+                        let signature = self.resolve_function_signature(method);
+                        self.function_signatures
+                            .insert(method.span.start, signature.clone());
+
+                        if method.name == "__destruct" && !method.params.is_empty() {
+                            self.diagnostics.push(Diagnostic::new(
+                                "E0411",
+                                "destructor `__destruct` cannot declare parameters",
+                                method.span,
+                            ));
+                        }
 
                         if info.methods.contains_key(&method.name) {
                             self.diagnostics.push(Diagnostic::new(
@@ -186,7 +196,8 @@ impl<'program> Checker<'program> {
                                 MethodInfo {
                                     access: method.access.clone(),
                                     writable_this: method.writable_this,
-                                    return_ty,
+                                    params: signature.params,
+                                    return_ty: signature.return_ty,
                                 },
                             );
                         }
@@ -216,9 +227,9 @@ impl<'program> Checker<'program> {
                 continue;
             };
 
-            let return_ty = self.resolve_function_return_type(function);
-            self.function_return_types
-                .insert(function.span.start, return_ty);
+            let signature = self.resolve_function_signature(function);
+            self.function_signatures
+                .insert(function.span.start, signature.clone());
             if self.functions.contains_key(&function.name) {
                 self.diagnostics.push(Diagnostic::new(
                     "E0308",
@@ -228,8 +239,48 @@ impl<'program> Checker<'program> {
                 continue;
             }
 
-            self.functions.insert(function.name.clone(), return_ty);
+            self.functions.insert(function.name.clone(), signature);
         }
+    }
+
+    fn resolve_function_signature(&mut self, function: &FunctionDecl) -> FunctionInfo {
+        FunctionInfo {
+            params: self.resolve_param_infos(function),
+            return_ty: self.resolve_function_return_type(function),
+        }
+    }
+
+    fn resolve_param_infos(&mut self, function: &FunctionDecl) -> Vec<ParamInfo> {
+        let mut params = Vec::new();
+        let mut saw_optional = false;
+
+        for param in &function.params {
+            let ty = self.resolve_type_ref(&param.ty, param.span);
+            let has_default = param.default.is_some();
+
+            if !has_default && saw_optional {
+                self.diagnostics.push(Diagnostic::new(
+                    "E0410",
+                    format!(
+                        "required parameter `${}` cannot follow an optional parameter",
+                        param.name
+                    ),
+                    param.span,
+                ));
+            }
+
+            if has_default {
+                saw_optional = true;
+            }
+
+            params.push(ParamInfo {
+                name: param.name.clone(),
+                ty,
+                has_default,
+            });
+        }
+
+        params
     }
 
     fn resolve_function_return_type(&mut self, function: &FunctionDecl) -> TypeId {
@@ -364,9 +415,10 @@ impl<'program> Checker<'program> {
 
     fn check_function(&mut self, function: &FunctionDecl, method_context: Option<MethodContext>) {
         let mut scopes = ScopeStack::new();
+        let signature = self.current_function_signature(function);
         let return_context = self.return_context_for_function(function, method_context.as_ref());
-        for param in &function.params {
-            let ty = self.resolve_type_ref(&param.ty, param.span);
+        for (param, param_info) in function.params.iter().zip(signature.params.iter()) {
+            let ty = param_info.ty;
             if let Some(default) = &param.default {
                 let default_context = method_context.as_ref().map(|context| MethodContext {
                     class_name: context.class_name.clone(),
@@ -467,10 +519,14 @@ impl<'program> Checker<'program> {
     }
 
     fn current_function_return_type(&mut self, function: &FunctionDecl) -> TypeId {
-        self.function_return_types
+        self.current_function_signature(function).return_ty
+    }
+
+    fn current_function_signature(&mut self, function: &FunctionDecl) -> FunctionInfo {
+        self.function_signatures
             .get(&function.span.start)
-            .copied()
-            .unwrap_or_else(|| self.resolve_function_return_type(function))
+            .cloned()
+            .unwrap_or_else(|| self.resolve_function_signature(function))
     }
 
     fn check_block(
@@ -798,12 +854,13 @@ impl<'program> Checker<'program> {
                 for arg in args {
                     self.check_expr(arg, scopes, method_context);
                 }
-                self.check_method_call(object, method, *span, scopes, method_context);
+                self.check_method_call(object, method, args, *span, scopes, method_context);
             }
-            Expr::FunctionCall { args, .. } => {
+            Expr::FunctionCall { name, args, span } => {
                 for arg in args {
                     self.check_expr(arg, scopes, method_context);
                 }
+                self.check_function_call(name, args, *span, scopes, method_context);
             }
             Expr::StaticCall {
                 class_name,
@@ -814,14 +871,15 @@ impl<'program> Checker<'program> {
                 for arg in args {
                     self.check_expr(arg, scopes, method_context);
                 }
-                self.check_static_call(class_name, method, *span, method_context);
+                self.check_static_call(class_name, method, args, *span, scopes, method_context);
             }
             Expr::New {
                 class_name,
                 args,
                 span,
             } => {
-                if !self.classes.contains_key(class_name) {
+                let class_exists = self.classes.contains_key(class_name);
+                if !class_exists {
                     self.diagnostics.push(Diagnostic::new(
                         "E0305",
                         format!("unknown class `{class_name}`"),
@@ -830,6 +888,9 @@ impl<'program> Checker<'program> {
                 }
                 for arg in args {
                     self.check_expr(arg, scopes, method_context);
+                }
+                if class_exists {
+                    self.check_constructor_call(class_name, args, *span, scopes, method_context);
                 }
             }
             Expr::Binary { left, right, .. } => {
@@ -937,10 +998,38 @@ impl<'program> Checker<'program> {
         }
     }
 
+    fn check_function_call(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        span: Span,
+        scopes: &ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) {
+        let Some(function_info) = self.functions.get(name).cloned() else {
+            self.diagnostics.push(Diagnostic::new(
+                "E0309",
+                format!("unknown function `{name}`"),
+                span,
+            ));
+            return;
+        };
+
+        self.check_call_arguments(
+            &format!("function `{name}`"),
+            &function_info.params,
+            args,
+            span,
+            scopes,
+            method_context,
+        );
+    }
+
     fn check_method_call(
         &mut self,
         object: &Expr,
         method: &str,
+        args: &[Expr],
         span: Span,
         scopes: &ScopeStack,
         method_context: Option<&MethodContext>,
@@ -986,13 +1075,24 @@ impl<'program> Checker<'program> {
                 span,
             ));
         }
+
+        self.check_call_arguments(
+            &format!("method `{class_name}::{method}`"),
+            &method_info.params,
+            args,
+            span,
+            scopes,
+            method_context,
+        );
     }
 
     fn check_static_call(
         &mut self,
         class_name: &str,
         method: &str,
+        args: &[Expr],
         span: Span,
+        scopes: &ScopeStack,
         method_context: Option<&MethodContext>,
     ) {
         let Some(class_info) = self.classes.get(class_name).cloned() else {
@@ -1020,6 +1120,128 @@ impl<'program> Checker<'program> {
                 format!("method `{class_name}::{method}` is internal"),
                 span,
             ));
+        }
+
+        self.check_call_arguments(
+            &format!("method `{class_name}::{method}`"),
+            &method_info.params,
+            args,
+            span,
+            scopes,
+            method_context,
+        );
+    }
+
+    fn check_constructor_call(
+        &mut self,
+        class_name: &str,
+        args: &[Expr],
+        span: Span,
+        scopes: &ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) {
+        let Some(class_info) = self.classes.get(class_name).cloned() else {
+            return;
+        };
+
+        let Some(constructor) = class_info.methods.get("__construct") else {
+            if !args.is_empty() {
+                self.report_argument_count_mismatch(
+                    &format!("constructor `{class_name}::__construct`"),
+                    0,
+                    0,
+                    args.len(),
+                    span,
+                );
+            }
+            return;
+        };
+
+        if matches!(constructor.access, MemberAccess::Internal)
+            && !self.can_access_internal_member(class_name, method_context)
+        {
+            self.diagnostics.push(Diagnostic::new(
+                "E0307",
+                format!("method `{class_name}::__construct` is internal"),
+                span,
+            ));
+        }
+
+        self.check_call_arguments(
+            &format!("constructor `{class_name}::__construct`"),
+            &constructor.params,
+            args,
+            span,
+            scopes,
+            method_context,
+        );
+    }
+
+    fn check_call_arguments(
+        &mut self,
+        callee: &str,
+        params: &[ParamInfo],
+        args: &[Expr],
+        span: Span,
+        scopes: &ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) {
+        let required = params.iter().filter(|param| !param.has_default).count();
+        let total = params.len();
+
+        if args.len() < required || args.len() > total {
+            self.report_argument_count_mismatch(callee, required, total, args.len(), span);
+            return;
+        }
+
+        for (index, (arg, param)) in args.iter().zip(params.iter()).enumerate() {
+            let got = self.infer_expr_type(arg, scopes, method_context);
+
+            if self.is_expr_assignable(param.ty, arg, scopes, method_context)
+                || self.is_assignable(param.ty, got)
+            {
+                continue;
+            }
+
+            self.diagnostics.push(Diagnostic::new(
+                "E0408",
+                format!(
+                    "argument {} of {callee} expects `{}`, got `{}`",
+                    index + 1,
+                    self.types.display(param.ty),
+                    self.types.display(got)
+                ),
+                arg.span(),
+            ));
+        }
+    }
+
+    fn report_argument_count_mismatch(
+        &mut self,
+        callee: &str,
+        required: usize,
+        total: usize,
+        got: usize,
+        span: Span,
+    ) {
+        let expectation = if required == total {
+            format!("{} {}", required, Self::argument_word(required))
+        } else {
+            format!("between {} and {} arguments", required, total)
+        };
+
+        self.diagnostics.push(Diagnostic::new(
+            "E0409",
+            format!("{callee} expects {expectation}, got {got}"),
+            span,
+        ));
+    }
+
+    fn argument_word(count: usize) -> &'static str {
+        if count == 1 {
+            "argument"
+        } else {
+            "arguments"
         }
     }
 
@@ -1444,7 +1666,7 @@ impl<'program> Checker<'program> {
             Expr::FunctionCall { name, .. } => self
                 .functions
                 .get(name)
-                .copied()
+                .map(|function| function.return_ty)
                 .unwrap_or_else(|| self.types.unknown()),
             Expr::StaticCall {
                 class_name, method, ..

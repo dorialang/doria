@@ -268,6 +268,337 @@ function greet(string $name = Person::age()): void
 }
 
 #[test]
+fn checks_function_call_arguments() {
+    doriac::check_source(
+        "test.doria",
+        r#"
+function greet(string $name, string $suffix = "!"): void
+{
+}
+
+function sum(int $left, int $right): int
+{
+    return $left + $right;
+}
+
+function collect(List<int> $items): void
+{
+}
+
+function collectMixed(List<mixed> $items): void
+{
+}
+
+greet("Andrew");
+greet("Andrew", "!");
+int $total = sum(1, 2);
+collect([1, 2, 3]);
+collectMixed([1, 2]);
+"#,
+    )
+    .expect("semantic check should succeed");
+}
+
+#[test]
+fn rejects_invalid_function_call_arguments() {
+    for (source, code) in [
+        (
+            r#"
+function greet(string $name): void
+{
+}
+
+greet(123);
+"#,
+            "E0408",
+        ),
+        (
+            r#"
+function greet(string $name): void
+{
+}
+
+greet();
+"#,
+            "E0409",
+        ),
+        (
+            r#"
+function greet(string $name): void
+{
+}
+
+greet("A", "B");
+"#,
+            "E0409",
+        ),
+        (r#"unknown();"#, "E0309"),
+    ] {
+        assert_diagnostic_code(source, code);
+    }
+}
+
+#[test]
+fn checks_method_call_arguments() {
+    doriac::check_source(
+        "test.doria",
+        r#"
+class Person
+{
+    function greet(string $name): void
+    {
+    }
+}
+
+let $person = new Person();
+$person->greet("Andrew");
+"#,
+    )
+    .expect("semantic check should succeed");
+
+    for (source, code) in [
+        (
+            r#"
+class Person
+{
+    function greet(string $name): void
+    {
+    }
+}
+
+let $person = new Person();
+$person->greet(123);
+"#,
+            "E0408",
+        ),
+        (
+            r#"
+class Person
+{
+    function greet(string $name): void
+    {
+    }
+}
+
+let $person = new Person();
+$person->greet();
+"#,
+            "E0409",
+        ),
+    ] {
+        assert_diagnostic_code(source, code);
+    }
+}
+
+#[test]
+fn checks_static_call_arguments() {
+    doriac::check_source(
+        "test.doria",
+        r#"
+class Person
+{
+    function makeName(string $name): string
+    {
+        return $name;
+    }
+}
+
+string $name = Person::makeName("Andrew");
+"#,
+    )
+    .expect("semantic check should succeed");
+
+    assert_diagnostic_code(
+        r#"
+class Person
+{
+    function makeName(string $name): string
+    {
+        return $name;
+    }
+}
+
+string $bad = Person::makeName(123);
+"#,
+        "E0408",
+    );
+}
+
+#[test]
+fn checks_constructor_call_arguments() {
+    doriac::check_source(
+        "test.doria",
+        r#"
+class Person
+{
+    function __construct(string $name, int $age = 37)
+    {
+    }
+}
+
+let $a = new Person("Andrew");
+let $b = new Person("Andrew", 37);
+"#,
+    )
+    .expect("semantic check should succeed");
+
+    doriac::check_source(
+        "test.doria",
+        r#"
+class Person {}
+
+let $person = new Person();
+"#,
+    )
+    .expect("semantic check should succeed");
+
+    for (source, code) in [
+        (
+            r#"
+class Person
+{
+    function __construct(string $name, int $age = 37)
+    {
+    }
+}
+
+let $bad = new Person();
+"#,
+            "E0409",
+        ),
+        (
+            r#"
+class Person
+{
+    function __construct(string $name, int $age = 37)
+    {
+    }
+}
+
+let $bad = new Person("Andrew", "37");
+"#,
+            "E0408",
+        ),
+        (
+            r#"
+class Person
+{
+    function __construct(string $name, int $age = 37)
+    {
+    }
+}
+
+let $bad = new Person("Andrew", 37, true);
+"#,
+            "E0409",
+        ),
+        (
+            r#"
+class Person {}
+
+let $bad = new Person("Andrew");
+"#,
+            "E0409",
+        ),
+    ] {
+        assert_diagnostic_code(source, code);
+    }
+}
+
+#[test]
+fn checks_internal_constructor_access() {
+    doriac::check_source(
+        "test.doria",
+        r#"
+class Person
+{
+    internal function __construct(string $name)
+    {
+    }
+
+    function create(): Person
+    {
+        return new Person("Andrew");
+    }
+}
+"#,
+    )
+    .expect("semantic check should succeed");
+
+    for source in [
+        r#"
+class Person
+{
+    internal function __construct(string $name)
+    {
+    }
+}
+
+let $person = new Person("Andrew");
+"#,
+        r#"
+class Person
+{
+    internal function __construct(string $name)
+    {
+    }
+}
+
+function create(): Person
+{
+    return new Person("Andrew");
+}
+"#,
+    ] {
+        assert_diagnostic_code(source, "E0307");
+    }
+}
+
+#[test]
+fn rejects_invalid_lifecycle_signatures() {
+    assert_diagnostic_code(
+        r#"
+class Person
+{
+    function __destruct(string $reason)
+    {
+    }
+}
+"#,
+        "E0411",
+    );
+}
+
+#[test]
+fn rejects_required_parameters_after_optional_parameters() {
+    for source in [
+        r#"
+function greet(string $prefix = "Hi", string $name): void
+{
+}
+"#,
+        r#"
+class Person
+{
+    function greet(string $prefix = "Hi", string $name): void
+    {
+    }
+}
+"#,
+        r#"
+class Person
+{
+    function __construct(string $prefix = "Hi", string $name)
+    {
+    }
+}
+"#,
+    ] {
+        assert_diagnostic_code(source, "E0410");
+    }
+}
+
+#[test]
 fn checks_declared_function_return_types() {
     doriac::check_source(
         "test.doria",

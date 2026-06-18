@@ -23,9 +23,23 @@ pub struct PropertyInfo {
 }
 
 #[derive(Debug, Clone)]
+pub struct ParamInfo {
+    pub name: String,
+    pub ty: TypeId,
+    pub has_default: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct FunctionInfo {
+    pub params: Vec<ParamInfo>,
+    pub return_ty: TypeId,
+}
+
+#[derive(Debug, Clone)]
 pub struct MethodInfo {
     pub access: MemberAccess,
     pub writable_this: bool,
+    pub params: Vec<ParamInfo>,
     pub return_ty: TypeId,
 }
 

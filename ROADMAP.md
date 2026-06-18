@@ -14,7 +14,7 @@
 
 - Keep the parser and semantic checker small but tested.
 - Treat the checked compiler-owned representation as Doria IR.
-- Check assignment compatibility and declared function/method return values in the current semantic slice.
+- Check assignment compatibility, declared function/method return values, and positional call arguments in the current semantic slice.
 - Keep PHP as a compatibility backend only.
 - Do not build PHP-to-Doria migration in the current v0.1 slice.
 - Do not start desktop, game engine, raylib, or FFI implementation work in the current v0.1 slice.
@@ -22,8 +22,6 @@
 ## Next Compiler Work
 
 - Expand return checking from the current final-statement rule into full path-sensitive control-flow analysis.
-- Add function call argument checking.
-- Add constructor argument checking.
 - Add constructor init access for readonly properties.
 - Plan a lowered/native IR when native code generation needs a simpler representation for control flow, memory layout, runtime calls, and backend emission.
 - Add native backend experiments behind explicit targets.
@@ -31,7 +29,7 @@
 - Add string interpolation AST nodes independent of PHP behavior.
 - Emit precedence-aware backend expressions.
 - Add parser/AST support for attributes using `#[...]`.
-- Add shared call argument representation for positional and named arguments.
+- Add named arguments and shared call argument representation for calls and attributes.
 - Preserve property initializer expressions in AST/Doria IR and later lower non-constant initializers correctly.
 - Add property hooks later for validation and computed properties without changing the default-public plus `internal` member model.
 - Add language/design support for `writable class` and `readonly class` as mutability ergonomics before considering shorter mutation keywords.
