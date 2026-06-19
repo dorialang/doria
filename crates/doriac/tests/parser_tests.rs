@@ -53,6 +53,10 @@ fn parses_plain_and_interpolated_strings() {
         parse_echo_expr("echo \"Hello\";"),
         Expr::String { value, .. } if value == "Hello"
     ));
+    assert!(matches!(
+        parse_echo_expr("echo \"{}\";"),
+        Expr::String { value, .. } if value == "{}"
+    ));
 
     let Expr::InterpolatedString { parts, .. } = parse_echo_expr("echo \"Hello, {$name}\";") else {
         panic!("expected interpolated string");
@@ -96,7 +100,7 @@ fn rejects_malformed_or_unsupported_string_interpolation() {
             "echo \"Hello, {$name\";",
             "unterminated string interpolation",
         ),
-        ("echo \"Hello, {}\";", "empty string interpolation"),
+        ("echo \"Hello, {$}\";", "empty string interpolation"),
         (
             "echo \"Total: {$a + $b}\";",
             "unsupported string interpolation expression",

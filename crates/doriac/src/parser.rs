@@ -529,11 +529,6 @@ impl Parser {
 
         while let Some(open_offset) = value[cursor..].find('{') {
             let open = cursor + open_offset;
-            if open + 1 < value.len() && bytes[open + 1] == b'}' {
-                self.error("empty string interpolation", span);
-                return None;
-            }
-
             if open + 1 >= value.len() || bytes[open + 1] != b'$' {
                 cursor = open + 1;
                 continue;
