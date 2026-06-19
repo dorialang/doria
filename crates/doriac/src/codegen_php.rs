@@ -168,7 +168,8 @@ fn emit_expr(expr: &Expr) -> String {
         Expr::Variable { name, .. } => format!("${name}"),
         Expr::This { .. } => "$this".to_string(),
         Expr::Identifier { name, .. } => name.clone(),
-        Expr::String { value, .. } => format!("\"{}\"", escape_php_string(value)),
+        Expr::String { value, .. } => emit_php_string_literal(value),
+        Expr::InterpolatedString { parts, .. } => emit_interpolated_string(parts),
         Expr::Int { value, .. } | Expr::Float { value, .. } => value.clone(),
         Expr::Bool { value, .. } => {
             if *value {
@@ -233,6 +234,35 @@ fn emit_expr(expr: &Expr) -> String {
             emit_expr(right)
         ),
     }
+}
+
+fn emit_interpolated_string(parts: &[InterpolatedStringPart]) -> String {
+    let mut emitted = Vec::new();
+    let mut has_expr = false;
+
+    for part in parts {
+        match part {
+            InterpolatedStringPart::Text(text) => {
+                if !text.is_empty() {
+                    emitted.push(emit_php_string_literal(text));
+                }
+            }
+            InterpolatedStringPart::Expr(expr) => {
+                has_expr = true;
+                emitted.push(emit_expr(expr));
+            }
+        }
+    }
+
+    match emitted.len() {
+        0 => emit_php_string_literal(""),
+        1 if has_expr => format!("{} . {}", emit_php_string_literal(""), emitted[0]),
+        _ => emitted.join(" . "),
+    }
+}
+
+fn emit_php_string_literal(value: &str) -> String {
+    format!("\"{}\"", escape_php_string(value))
 }
 
 fn emit_binary_op(op: &BinaryOp) -> &'static str {

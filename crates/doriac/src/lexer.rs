@@ -7,6 +7,12 @@ pub struct Token {
     pub span: Span,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StringQuoteKind {
+    Single,
+    Double,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum TokenKind {
     Class,
@@ -39,7 +45,10 @@ pub enum TokenKind {
     Variable(String),
     IntLiteral(String),
     FloatLiteral(String),
-    StringLiteral(String),
+    StringLiteral {
+        value: String,
+        quote: StringQuoteKind,
+    },
     Equals,
     Plus,
     Minus,
@@ -322,13 +331,21 @@ impl<'source> Lexer<'source> {
 
     fn lex_string(&mut self, start: usize) -> Token {
         let quote = self.bytes[start];
+        let quote_kind = if quote == 34 {
+            StringQuoteKind::Double
+        } else {
+            StringQuoteKind::Single
+        };
         let mut value = String::new();
 
         while let Some(byte) = self.peek() {
             if byte == quote {
                 self.advance();
                 return Token {
-                    kind: TokenKind::StringLiteral(value),
+                    kind: TokenKind::StringLiteral {
+                        value,
+                        quote: quote_kind,
+                    },
                     span: Span::new(start, self.index),
                 };
             }
@@ -354,7 +371,10 @@ impl<'source> Lexer<'source> {
 
         self.error("unterminated string literal", start, self.index);
         Token {
-            kind: TokenKind::StringLiteral(value),
+            kind: TokenKind::StringLiteral {
+                value,
+                quote: quote_kind,
+            },
             span: Span::new(start, self.index),
         }
     }
