@@ -40,7 +40,10 @@ class DoriaParserDefinition : ParserDefinition {
         DoriaTokenTypes.DOC_COMMENT_TAG,
     )
 
-    override fun getStringLiteralElements(): TokenSet = TokenSet.create(DoriaTokenTypes.STRING)
+    override fun getStringLiteralElements(): TokenSet = TokenSet.create(
+        DoriaTokenTypes.STRING,
+        DoriaTokenTypes.ESCAPE_SEQUENCE,
+    )
 
     override fun createElement(node: ASTNode): PsiElement = ASTWrapperPsiElement(node)
 

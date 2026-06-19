@@ -26,6 +26,7 @@ object DoriaTokenTypes {
     val NULL_LITERAL = DoriaTokenType("DORIA_NULL_LITERAL")
     val NUMBER = DoriaTokenType("DORIA_NUMBER")
     val STRING = DoriaTokenType("DORIA_STRING")
+    val ESCAPE_SEQUENCE = DoriaTokenType("DORIA_ESCAPE_SEQUENCE")
     val COMMENT = DoriaTokenType("DORIA_COMMENT")
     val DOC_COMMENT = DoriaTokenType("DORIA_DOC_COMMENT")
     val DOC_COMMENT_TAG = DoriaTokenType("DORIA_DOC_COMMENT_TAG")
