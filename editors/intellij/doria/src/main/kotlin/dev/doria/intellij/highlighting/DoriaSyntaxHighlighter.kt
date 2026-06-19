@@ -83,7 +83,7 @@ class DoriaSyntaxHighlighter : SyntaxHighlighter {
         )
         val VARIABLE: TextAttributesKey = TextAttributesKey.createTextAttributesKey(
             "DORIA_VARIABLE",
-            DefaultLanguageHighlighterColors.LOCAL_VARIABLE,
+            DefaultLanguageHighlighterColors.INSTANCE_FIELD,
         )
         val THIS: TextAttributesKey = TextAttributesKey.createTextAttributesKey(
             "DORIA_THIS",

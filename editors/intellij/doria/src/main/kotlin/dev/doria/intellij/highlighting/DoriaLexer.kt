@@ -242,23 +242,24 @@ class DoriaLexer : LexerBase() {
     }
 
     private fun scanInterpolationToken() {
-        if (buffer[tokenStart] == '}') {
-            tokenEnd = tokenStart + 1
-            tokenType = DoriaTokenTypes.STRING
-            mode = MODE_DOUBLE_STRING
-            return
+        when {
+            buffer[tokenStart] == '}' -> {
+                tokenEnd = tokenStart + 1
+                tokenType = DoriaTokenTypes.STRING
+                mode = MODE_DOUBLE_STRING
+            }
+            buffer[tokenStart] == '$' -> scanVariable()
+            buffer[tokenStart] == '-' && peek(1) == '>' -> {
+                tokenEnd = tokenStart + 2
+                tokenType = DoriaTokenTypes.OPERATOR
+            }
+            isIdentifierStart(buffer[tokenStart]) -> scanIdentifierLike()
+            buffer[tokenStart].isWhitespace() -> scanWhitespace()
+            else -> {
+                tokenEnd = tokenStart + 1
+                tokenType = DoriaTokenTypes.OPERATOR
+            }
         }
-
-        if (buffer[tokenStart] == '$') {
-            scanVariable()
-            return
-        }
-
-        tokenEnd = tokenStart + 1
-        while (tokenEnd < endOffset && buffer[tokenEnd] != '$' && buffer[tokenEnd] != '}') {
-            tokenEnd++
-        }
-        tokenType = DoriaTokenTypes.STRING
     }
 
     private fun scanVariable() {

@@ -27,7 +27,16 @@ class DoriaColorSettingsPage : ColorSettingsPage {
              * Rename the person.
              *
              * @param string ${'$'}name The new name.
-             * @return Person
+             */
+            writable function rename(string ${'$'}name): void
+            {
+                ${'$'}this->name = ${'$'}name;
+            }
+
+            /**
+             * Get the greeting message.
+             *
+             * @return string The greeting message.
              */
             internal function getGreetingMessage(): string
             {
