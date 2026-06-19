@@ -95,6 +95,12 @@ fn lower_stmt(statement: &ast::Stmt) -> hir::Stmt {
             expr: expr.as_ref().map(lower_expr),
             span: *span,
         },
+        ast::Stmt::If(if_stmt) => hir::Stmt::If(lower_if_stmt(if_stmt)),
+        ast::Stmt::While(while_stmt) => hir::Stmt::While(hir::WhileStmt {
+            condition: lower_expr(&while_stmt.condition),
+            body: lower_block(&while_stmt.body),
+            span: while_stmt.span,
+        }),
         ast::Stmt::Foreach(foreach) => hir::Stmt::Foreach(hir::ForeachStmt {
             iterable: lower_expr(&foreach.iterable),
             key: foreach.key.as_ref().map(lower_foreach_binding),
@@ -106,6 +112,22 @@ fn lower_stmt(statement: &ast::Stmt) -> hir::Stmt {
             expr: lower_expr(expr),
             span: *span,
         },
+    }
+}
+
+fn lower_if_stmt(if_stmt: &ast::IfStmt) -> hir::IfStmt {
+    hir::IfStmt {
+        condition: lower_expr(&if_stmt.condition),
+        then_block: lower_block(&if_stmt.then_block),
+        else_branch: if_stmt.else_branch.as_ref().map(lower_else_branch),
+        span: if_stmt.span,
+    }
+}
+
+fn lower_else_branch(branch: &ast::ElseBranch) -> hir::ElseBranch {
+    match branch {
+        ast::ElseBranch::If(if_stmt) => hir::ElseBranch::If(Box::new(lower_if_stmt(if_stmt))),
+        ast::ElseBranch::Block(block) => hir::ElseBranch::Block(lower_block(block)),
     }
 }
 

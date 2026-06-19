@@ -75,6 +75,8 @@ pub enum Stmt {
     Assignment(Assignment),
     Echo { expr: Expr, span: Span },
     Return { expr: Option<Expr>, span: Span },
+    If(IfStmt),
+    While(WhileStmt),
     Foreach(ForeachStmt),
     Expr { expr: Expr, span: Span },
 }
@@ -93,6 +95,36 @@ pub struct Assignment {
     pub target: Expr,
     pub op: AssignOp,
     pub value: Expr,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct IfStmt {
+    pub condition: Expr,
+    pub then_block: Block,
+    pub else_branch: Option<ElseBranch>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ElseBranch {
+    If(Box<IfStmt>),
+    Block(Block),
+}
+
+impl ElseBranch {
+    pub fn span(&self) -> Span {
+        match self {
+            ElseBranch::If(if_stmt) => if_stmt.span,
+            ElseBranch::Block(block) => block.span,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct WhileStmt {
+    pub condition: Expr,
+    pub body: Block,
     pub span: Span,
 }
 

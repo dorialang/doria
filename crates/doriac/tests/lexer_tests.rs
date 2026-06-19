@@ -45,6 +45,13 @@ fn lexes_string_quote_kinds() {
 }
 
 #[test]
+fn lexes_basic_control_flow_keywords() {
+    let kinds = token_kinds("if else while");
+    assert!(matches!(kinds[0], TokenKind::If));
+    assert!(matches!(kinds[1], TokenKind::Else));
+    assert!(matches!(kinds[2], TokenKind::While));
+}
+#[test]
 fn lexes_future_reserved_words() {
     let kinds = token_kinds("async await spawn scope");
     assert!(matches!(kinds[0], TokenKind::Reserved(ref word) if word == "async"));

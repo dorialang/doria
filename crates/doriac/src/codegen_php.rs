@@ -142,6 +142,14 @@ fn emit_statement(statement: &Stmt, output: &mut String, indent: usize) {
                 writeln(output, indent, "return;");
             }
         }
+        Stmt::If(if_stmt) => emit_if(if_stmt, output, indent, "if"),
+        Stmt::While(while_stmt) => {
+            write_indent(output, indent);
+            output.push_str("while (");
+            output.push_str(&emit_expr(&while_stmt.condition));
+            output.push_str(")\n");
+            emit_block(&while_stmt.body, output, indent);
+        }
         Stmt::Foreach(foreach) => {
             write_indent(output, indent);
             output.push_str("foreach (");
@@ -159,6 +167,26 @@ fn emit_statement(statement: &Stmt, output: &mut String, indent: usize) {
         }
         Stmt::Expr { expr, .. } => {
             writeln(output, indent, &format!("{};", emit_expr(expr)));
+        }
+    }
+}
+
+fn emit_if(if_stmt: &IfStmt, output: &mut String, indent: usize, keyword: &str) {
+    write_indent(output, indent);
+    output.push_str(keyword);
+    output.push_str(" (");
+    output.push_str(&emit_expr(&if_stmt.condition));
+    output.push_str(")\n");
+    emit_block(&if_stmt.then_block, output, indent);
+
+    if let Some(else_branch) = &if_stmt.else_branch {
+        match else_branch {
+            ElseBranch::If(else_if) => emit_if(else_if, output, indent, "else if"),
+            ElseBranch::Block(block) => {
+                write_indent(output, indent);
+                output.push_str("else\n");
+                emit_block(block, output, indent);
+            }
         }
     }
 }

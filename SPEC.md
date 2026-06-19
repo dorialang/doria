@@ -61,7 +61,7 @@ The MVP supports:
 - Properties.
 - Methods.
 - Constructor parameters and constructor property promotion.
-- `echo`, `return`, and `foreach`.
+- `echo`, `return`, `foreach`, `if` / `else if` / `else`, and `while`.
 - Assignments.
 - Function calls, method calls, property access, object construction, and literals.
 - List and dictionary literals using PHP-like array syntax.
@@ -74,15 +74,14 @@ Planned near-term syntax includes:
 
 Planned future control-flow design includes:
 
-- `while`.
 - `do ... while ... finally`.
 - `given ... when ... finally`.
 - `given ... while ... finally`.
-- `if` / `else if` / `else` / `finally`.
+- `finally` attached to `if` / `else if` / `else` chains.
 - `when` as a value-returning conditional form.
 - `match` as a pattern/value selection construct.
 
-These control-flow forms are not MVP syntax unless listed in the MVP support list above. See `docs/decisions/0009-control-flow-direction.md`.
+These advanced control-flow forms are not MVP syntax. See `docs/decisions/0009-control-flow-direction.md`.
 
 ## 4. Declaration rules
 
@@ -296,6 +295,12 @@ Interpolated values may currently be `string`, `int`, `float`, `bool`, `null`, `
 Numeric widening is not implemented yet; for now `float` is not assignable from `int`, and `int` is not assignable from `float`. Any future safe numeric widening should be a separate design decision. Named arguments and richer call argument representation are separate future slices.
 
 Simple collection literals infer collection element/key/value types when all clear parts match. Clear heterogeneous collection literals, such as `[1, "two"]`, are rejected by narrow collection alias assignment checks rather than being erased to `Unknown`. The empty literal `[]` stays ambiguous so typed contexts may use it as an empty `List<T>` or `Dictionary<K, V>`. The PHP-compatible `array` annotation remains broad enough to accept list-shaped and dictionary-shaped literals.
+
+### Control-flow conditions
+
+Basic `if` / `else if` / `else` and `while` are MVP syntax. Conditions must be `bool`; Doria does not use PHP-style truthiness for integers, strings, null, objects, resources, or collections. The checker currently allows `mixed` and the internal `Unknown` recovery type so one diagnostic does not cascade into unrelated follow-up errors.
+
+Each `if`, `else if`, `else`, and `while` body has its own block scope. Variables declared inside those bodies are not visible after the block. Until Doria has path-sensitive definite initialization analysis, constructor readonly init access is available only for direct constructor-body assignments and not inside `if`, `else if`, `else`, or `while` bodies.
 
 ## 8. Class syntax
 

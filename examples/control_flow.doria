@@ -1,0 +1,14 @@
+let writable $count = 0;
+
+while ($count < 3) {
+    if ($count == 0) {
+        echo "zero";
+    } else if ($count == 1) {
+        echo "one";
+    } else {
+        echo "many";
+    }
+
+    echo "\n";
+    $count += 1;
+}
