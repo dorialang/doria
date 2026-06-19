@@ -28,7 +28,7 @@ Doria may eventually include a PHP-to-Doria migration converter, but that conver
 - Keep executable initializers and attribute expressions represented as Doria concepts, not PHP workarounds.
 - Keep PHP-to-Doria migration architecturally separate from the Doria parser. The migration tool may parse PHP, but Doria itself should parse Doria.
 - Preserve readonly-by-default as the language default. Use class-level ergonomics such as `writable class`/`readonly class` before adding shorter aliases for `writable`.
-- Treat `while`, `do ... while ... finally`, `given ... when`, `given ... while`, `if`/`else if`/`else`/`finally`, value-returning `when`, and `match` as planned control-flow ideas only. Do not add lexer, parser, semantic, Doria IR, or backend behavior for them until their grammar and semantics are specified.
+- Treat basic `if` / `else if` / `else` and `while` as MVP control flow. Keep `finally`, `do ... while`, `given`, value-returning `when`, `match`, `break`, and `continue` as planned control-flow ideas only until their grammar and semantics are specified.
 - Prefer nouns as properties and verbs as methods in Doria APIs and examples. Use property hooks for computed, validated, lazy, or guarded values instead of vague zero-argument noun methods such as `body()`.
 - Favor clear diagnostics over permissive parsing.
 - Do not introduce external Rust crates unless they remove real complexity and the repository is ready to manage that dependency.

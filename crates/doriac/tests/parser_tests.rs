@@ -1,4 +1,6 @@
-use doriac::ast::{ClassMember, Expr, InterpolatedStringPart, Item, MemberAccess, Stmt};
+use doriac::ast::{
+    ClassMember, ElseBranch, Expr, InterpolatedStringPart, Item, MemberAccess, Stmt,
+};
 
 #[test]
 fn parses_variable_declarations() {
@@ -118,6 +120,55 @@ fn rejects_malformed_or_unsupported_string_interpolation() {
             "expected diagnostic containing {message}, got {err:?}"
         );
     }
+}
+#[test]
+fn parses_if_else_and_while_control_flow() {
+    let program = doriac::parse_source(
+        "test.doria",
+        r#"
+if (true) {
+    echo "yes";
+}
+
+if ($age < 13) {
+    echo "child";
+} else if ($age < 20) {
+    echo "teen";
+} else {
+    echo "adult";
+}
+
+while ($count < 10) {
+    $count += 1;
+}
+"#,
+    )
+    .expect("parse should succeed");
+
+    let Item::Statement(Stmt::If(simple_if)) = &program.items[0] else {
+        panic!("expected if statement");
+    };
+    assert!(matches!(
+        simple_if.condition,
+        Expr::Bool { value: true, .. }
+    ));
+    assert_eq!(simple_if.then_block.statements.len(), 1);
+    assert!(simple_if.else_branch.is_none());
+
+    let Item::Statement(Stmt::If(if_stmt)) = &program.items[1] else {
+        panic!("expected if statement");
+    };
+    let Some(ElseBranch::If(else_if)) = &if_stmt.else_branch else {
+        panic!("expected else-if branch");
+    };
+    assert!(matches!(else_if.condition, Expr::Binary { .. }));
+    assert!(matches!(else_if.else_branch, Some(ElseBranch::Block(_))));
+
+    let Item::Statement(Stmt::While(while_stmt)) = &program.items[2] else {
+        panic!("expected while statement");
+    };
+    assert!(matches!(while_stmt.condition, Expr::Binary { .. }));
+    assert_eq!(while_stmt.body.statements.len(), 1);
 }
 #[test]
 fn parses_class_with_writable_method() {

@@ -684,6 +684,41 @@ impl<'program> Checker<'program> {
                     return_context,
                 );
             }
+            Stmt::If(if_stmt) => {
+                self.check_condition(&if_stmt.condition, scopes, method_context);
+                let mut then_constructor_init_context = constructor_init_context
+                    .as_deref()
+                    .map(ConstructorInitContext::without_readonly_init);
+                self.check_block(
+                    &if_stmt.then_block,
+                    scopes,
+                    method_context,
+                    then_constructor_init_context.as_mut(),
+                    return_context,
+                );
+                if let Some(else_branch) = &if_stmt.else_branch {
+                    self.check_else_branch(
+                        else_branch,
+                        scopes,
+                        method_context,
+                        constructor_init_context.as_deref(),
+                        return_context,
+                    );
+                }
+            }
+            Stmt::While(while_stmt) => {
+                self.check_condition(&while_stmt.condition, scopes, method_context);
+                let mut loop_constructor_init_context = constructor_init_context
+                    .as_deref()
+                    .map(ConstructorInitContext::without_readonly_init);
+                self.check_block(
+                    &while_stmt.body,
+                    scopes,
+                    method_context,
+                    loop_constructor_init_context.as_mut(),
+                    return_context,
+                );
+            }
             Stmt::Foreach(foreach) => {
                 self.check_expr(&foreach.iterable, scopes, method_context);
                 scopes.push();
@@ -733,6 +768,72 @@ impl<'program> Checker<'program> {
                 scopes.pop();
             }
         }
+    }
+
+    fn check_else_branch(
+        &mut self,
+        branch: &ElseBranch,
+        scopes: &mut ScopeStack,
+        method_context: Option<&MethodContext>,
+        constructor_init_context: Option<&ConstructorInitContext>,
+        return_context: Option<&ReturnContext>,
+    ) {
+        match branch {
+            ElseBranch::If(if_stmt) => {
+                self.check_condition(&if_stmt.condition, scopes, method_context);
+                let mut then_constructor_init_context =
+                    constructor_init_context.map(ConstructorInitContext::without_readonly_init);
+                self.check_block(
+                    &if_stmt.then_block,
+                    scopes,
+                    method_context,
+                    then_constructor_init_context.as_mut(),
+                    return_context,
+                );
+                if let Some(else_branch) = &if_stmt.else_branch {
+                    self.check_else_branch(
+                        else_branch,
+                        scopes,
+                        method_context,
+                        constructor_init_context,
+                        return_context,
+                    );
+                }
+            }
+            ElseBranch::Block(block) => {
+                let mut block_constructor_init_context =
+                    constructor_init_context.map(ConstructorInitContext::without_readonly_init);
+                self.check_block(
+                    block,
+                    scopes,
+                    method_context,
+                    block_constructor_init_context.as_mut(),
+                    return_context,
+                );
+            }
+        }
+    }
+
+    fn check_condition(
+        &mut self,
+        condition: &Expr,
+        scopes: &ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) {
+        self.check_expr(condition, scopes, method_context);
+        let ty = self.infer_expr_type(condition, scopes, method_context);
+        if matches!(
+            self.types.kind(ty),
+            TypeKind::Bool | TypeKind::Mixed | TypeKind::Unknown
+        ) {
+            return;
+        }
+
+        self.diagnostics.push(Diagnostic::new(
+            "E0416",
+            format!("condition must be `bool`, got `{}`", self.types.display(ty)),
+            condition.span(),
+        ));
     }
 
     fn check_return_statement(
@@ -813,9 +914,38 @@ impl<'program> Checker<'program> {
         }
 
         match function.body.statements.last() {
-            Some(Stmt::Return { expr: Some(_), .. }) => {}
-            Some(Stmt::Return { expr: None, .. }) => {}
+            Some(statement) if Self::statement_is_terminal(statement) => {}
             _ => self.report_missing_return_value(context, expected, function.span),
+        }
+    }
+
+    fn statement_is_terminal(statement: &Stmt) -> bool {
+        match statement {
+            Stmt::Return { .. } => true,
+            Stmt::If(if_stmt) => Self::if_statement_is_terminal(if_stmt),
+            _ => false,
+        }
+    }
+
+    fn if_statement_is_terminal(if_stmt: &IfStmt) -> bool {
+        Self::block_is_terminal(&if_stmt.then_block)
+            && if_stmt
+                .else_branch
+                .as_ref()
+                .is_some_and(Self::else_branch_is_terminal)
+    }
+
+    fn block_is_terminal(block: &Block) -> bool {
+        block
+            .statements
+            .last()
+            .is_some_and(Self::statement_is_terminal)
+    }
+
+    fn else_branch_is_terminal(branch: &ElseBranch) -> bool {
+        match branch {
+            ElseBranch::If(if_stmt) => Self::if_statement_is_terminal(if_stmt),
+            ElseBranch::Block(block) => Self::block_is_terminal(block),
         }
     }
 

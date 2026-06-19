@@ -37,6 +37,102 @@ echo $name;
 }
 
 #[test]
+fn lowers_control_flow_to_hir() {
+    let lowered = doriac::lower_source(
+        "test.doria",
+        r#"
+let writable $count = 0;
+if ($count < 10) {
+    echo "small";
+} else {
+    echo "large";
+}
+
+while ($count < 10) {
+    $count += 1;
+}
+"#,
+    )
+    .expect("lowering should succeed");
+
+    assert!(matches!(
+        &lowered.items[1],
+        hir::Item::Statement(hir::Stmt::If(if_stmt))
+            if matches!(if_stmt.condition, hir::Expr::Binary { .. })
+                && if_stmt.else_branch.is_some()
+    ));
+    assert!(matches!(
+        &lowered.items[2],
+        hir::Item::Statement(hir::Stmt::While(while_stmt))
+            if matches!(while_stmt.condition, hir::Expr::Binary { .. })
+    ));
+}
+
+#[test]
+fn emits_php_for_basic_control_flow() {
+    let php = doriac::compile_source_to_php(
+        "test.doria",
+        r#"
+let writable $count = 0;
+if ($count < 10) {
+    echo "small";
+} else if ($count < 20) {
+    echo "medium";
+} else {
+    echo "large";
+}
+
+while ($count < 10) {
+    echo $count;
+    $count += 1;
+}
+"#,
+    )
+    .expect("compilation should succeed");
+
+    assert!(php.contains("if ($count < 10)\n{\n    echo \"small\";\n}"));
+    assert!(php.contains("else if ($count < 20)\n{\n    echo \"medium\";\n}"));
+    assert!(php.contains("else\n{\n    echo \"large\";\n}"));
+    assert!(php.contains("while ($count < 10)\n{\n    echo $count;\n    $count += 1;\n}"));
+}
+
+#[test]
+fn preserves_block_local_bindings_in_php_output() {
+    let php = doriac::compile_source_to_php(
+        "test.doria",
+        r#"
+let $name = "outer";
+if (true) {
+    let $name = $name . " inner";
+    echo "block {$name}";
+}
+echo $name;
+
+function greet(string $name): string
+{
+    if (true) {
+        let $name = "inner";
+        return $name;
+    }
+
+    return $name;
+}
+"#,
+    )
+    .expect("compilation should succeed");
+
+    assert!(php.contains("$name = \"outer\";"));
+    assert!(php.contains("$name__doria1 = $name . \" inner\";"));
+    assert!(php.contains("echo \"block \" . $name__doria1;"));
+    assert!(php.contains("echo $name;"));
+    assert!(php.contains("function greet(string $name): string"));
+    assert!(php.contains("$name__doria1 = \"inner\";"));
+    assert!(php.contains("return $name__doria1;"));
+    assert!(php.contains("return $name;"));
+    assert!(!php.contains("$name = $name . \" inner\";"));
+}
+
+#[test]
 fn recognizes_native_as_planned_backend() {
     let err = doriac::compile_source(
         "test.doria",
@@ -251,6 +347,7 @@ echo "Total: {$amount} ($currency)";
     assert!(php.contains("echo \"Literal \\$name\";"));
     assert!(php.contains("echo \"Total: \" . $amount . \" (\\$currency)\";"));
 }
+
 #[test]
 fn compiles_person_example_with_explicit_interpolation() {
     let example_path =

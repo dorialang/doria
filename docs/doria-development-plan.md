@@ -1188,7 +1188,7 @@ Initial CLI:
 Start by implementing:
 1. SPEC.md
 2. Lexer
-3. Parser for variable declarations, functions, classes, properties, methods, constructor params, echo, return, foreach, assignments, function calls, method calls, property access, literals, arrays/dictionaries.
+3. Parser for variable declarations, functions, classes, properties, methods, constructor params, echo, return, foreach, `if` / `else if` / `else`, `while`, assignments, function calls, method calls, property access, literals, arrays/dictionaries.
 4. AST structs/enums.
 5. Semantic checker for symbol declarations and readonly/writable rules.
 6. Backend abstraction and PHP backend.

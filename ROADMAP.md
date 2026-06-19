@@ -17,6 +17,7 @@
 - Check assignment compatibility, declared function/method return values, and positional call arguments in the current semantic slice.
 - Allow constructors to initialize uninitialized readonly properties through narrow direct init access.
 - Keep PHP as a compatibility backend only.
+- Support MVP `if` / `else if` / `else` and `while` in the AST, semantic checker, Doria IR, and PHP backend.
 - Represent braced string interpolation in the Doria AST and Doria IR, with PHP lowering emitted as explicit concatenation.
 - Do not build PHP-to-Doria migration in the current v0.1 slice.
 - Do not start desktop, game engine, raylib, or FFI implementation work in the current v0.1 slice.
@@ -35,7 +36,7 @@
 - Preserve property initializer expressions in AST/Doria IR and later lower non-constant initializers correctly.
 - Add property hooks later for validation and computed properties without changing the default-public plus `internal` member model.
 - Add language/design support for `writable class` and `readonly class` as mutability ergonomics before considering shorter mutation keywords.
-- Specify the planned control-flow direction before implementation: `while`, `do ... while ... finally`, `given ... when ... finally`, `given ... while ... finally`, `if` / `else if` / `else` / `finally`, `when`, and `match`.
+- Keep advanced control-flow constructs as future design work: `finally`, `do ... while`, `given`, value-returning `when`, `match`, `break`, and `continue`.
 
 ## Performance and Native Application Path
 

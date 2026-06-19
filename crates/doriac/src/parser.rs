@@ -249,6 +249,14 @@ impl Parser {
             });
         }
 
+        if self.match_kind(&TokenKind::If) {
+            return self.parse_if_statement().map(Stmt::If);
+        }
+
+        if self.match_kind(&TokenKind::While) {
+            return self.parse_while().map(Stmt::While);
+        }
+
         if self.match_kind(&TokenKind::Foreach) {
             return self.parse_foreach();
         }
@@ -327,6 +335,49 @@ impl Parser {
             initializer,
             span: Span::new(start, end),
         }))
+    }
+
+    fn parse_if_statement(&mut self) -> Option<IfStmt> {
+        let start = self.previous().span.start;
+        self.expect(TokenKind::LeftParen, "expected `(` after if")?;
+        let condition = self.parse_expression()?;
+        self.expect(TokenKind::RightParen, "expected `)` after if condition")?;
+        let then_block = self.parse_block()?;
+        let else_branch = if self.match_kind(&TokenKind::Else) {
+            if self.match_kind(&TokenKind::If) {
+                Some(ElseBranch::If(Box::new(self.parse_if_statement()?)))
+            } else {
+                Some(ElseBranch::Block(self.parse_block()?))
+            }
+        } else {
+            None
+        };
+        let end = else_branch
+            .as_ref()
+            .map(ElseBranch::span)
+            .unwrap_or(then_block.span)
+            .end;
+
+        Some(IfStmt {
+            condition,
+            then_block,
+            else_branch,
+            span: Span::new(start, end),
+        })
+    }
+
+    fn parse_while(&mut self) -> Option<WhileStmt> {
+        let start = self.previous().span.start;
+        self.expect(TokenKind::LeftParen, "expected `(` after while")?;
+        let condition = self.parse_expression()?;
+        self.expect(TokenKind::RightParen, "expected `)` after while condition")?;
+        let body = self.parse_block()?;
+        let span = Span::new(start, body.span.end);
+        Some(WhileStmt {
+            condition,
+            body,
+            span,
+        })
     }
 
     fn parse_foreach(&mut self) -> Option<Stmt> {
@@ -890,6 +941,8 @@ impl Parser {
                 | TokenKind::Let
                 | TokenKind::Echo
                 | TokenKind::Return
+                | TokenKind::If
+                | TokenKind::While
                 | TokenKind::Foreach
                 | TokenKind::Internal => return,
                 _ => {

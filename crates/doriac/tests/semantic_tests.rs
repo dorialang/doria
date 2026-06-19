@@ -894,6 +894,34 @@ function first(List<int> $items): int
 }
 "#,
         r#"
+function value(bool $flag): int
+{
+    if ($flag) {
+        return 1;
+    }
+}
+"#,
+        r#"
+function value(bool $left, bool $right): int
+{
+    if ($left) {
+        return 1;
+    } else if ($right) {
+        return 2;
+    }
+}
+"#,
+        r#"
+function value(bool $flag): int
+{
+    if ($flag) {
+        echo "missing";
+    } else {
+        return 2;
+    }
+}
+"#,
+        r#"
 class Person
 {
     function age(): int
@@ -905,6 +933,40 @@ class Person
     ] {
         assert_diagnostic_code(source, "E0406");
     }
+}
+
+#[test]
+fn counts_exhaustive_if_returns_for_non_void_functions() {
+    doriac::check_source(
+        "test.doria",
+        r#"
+function value(bool $flag): int
+{
+    if ($flag) {
+        return 1;
+    } else {
+        return 2;
+    }
+}
+
+function chained(bool $left, bool $right): int
+{
+    if ($left) {
+        echo "left";
+        return 1;
+    } else if ($right) {
+        return 2;
+    } else {
+        if ($left == $right) {
+            return 3;
+        } else {
+            return 4;
+        }
+    }
+}
+"#,
+    )
+    .expect("semantic check should succeed");
 }
 
 #[test]
@@ -1199,6 +1261,180 @@ $person->name = 123;
     );
 }
 
+#[test]
+fn checks_basic_control_flow_semantics() {
+    doriac::check_source(
+        "test.doria",
+        r#"
+bool $flag = true;
+if ($flag) {
+    echo "yes";
+}
+
+writable int $age = 12;
+if ($age < 13) {
+    echo "child";
+} else if ($age < 20) {
+    echo "teen";
+} else {
+    echo "adult";
+}
+
+while ($age < 20) {
+    $age += 1;
+}
+"#,
+    )
+    .expect("semantic check should succeed");
+}
+
+#[test]
+fn rejects_non_bool_control_flow_conditions() {
+    for source in [
+        r#"
+if (1) {
+    echo "bad";
+}
+"#,
+        r#"
+while ("yes") {
+    echo "bad";
+}
+"#,
+    ] {
+        assert_diagnostic_code(source, "E0416");
+    }
+}
+
+#[test]
+fn keeps_control_flow_block_scopes_local() {
+    assert_diagnostic_code(
+        r#"
+if (true) {
+    let $name = "Andrew";
+}
+
+echo $name;
+"#,
+        "E0101",
+    );
+
+    assert_diagnostic_code(
+        r#"
+while (true) {
+    let $name = "Andrew";
+}
+
+echo $name;
+"#,
+        "E0101",
+    );
+}
+
+#[test]
+fn checks_mutation_rules_inside_control_flow() {
+    doriac::check_source(
+        "test.doria",
+        r#"
+let writable $count = 0;
+while ($count < 10) {
+    $count += 1;
+}
+"#,
+    )
+    .expect("semantic check should succeed");
+
+    assert_diagnostic_code(
+        r#"
+let $count = 0;
+while ($count < 10) {
+    $count += 1;
+}
+"#,
+        "E0201",
+    );
+}
+
+#[test]
+fn checks_property_mutation_rules_inside_control_flow() {
+    doriac::check_source(
+        "test.doria",
+        r#"
+class Counter
+{
+    writable int $count;
+
+    function __construct(int $start)
+    {
+        if ($start > 0) {
+            $this->count = $start;
+        }
+
+        while ($this->count < 10) {
+            $this->count += 1;
+        }
+    }
+}
+"#,
+    )
+    .expect("semantic check should succeed");
+
+    assert_diagnostic_code(
+        r#"
+class Counter
+{
+    int $count;
+
+    function update(int $start): void
+    {
+        if ($start > 0) {
+            $this->count = $start;
+        }
+    }
+}
+"#,
+        "E0202",
+    );
+}
+
+#[test]
+fn rejects_constructor_readonly_init_inside_control_flow() {
+    assert_diagnostic_code(
+        r#"
+class Person
+{
+    string $id;
+
+    function __construct(string $id)
+    {
+        if ($id == "") {
+            $this->id = "unknown";
+        } else {
+            $this->id = $id;
+        }
+    }
+}
+"#,
+        "E0202",
+    );
+
+    assert_diagnostic_code(
+        r#"
+class Person
+{
+    string $id;
+
+    function __construct(string $id)
+    {
+        while ($id == "") {
+            $this->id = "unknown";
+        }
+    }
+}
+"#,
+        "E0202",
+    );
+}
 #[test]
 fn allows_constructor_init_access_for_readonly_properties() {
     doriac::check_source(
