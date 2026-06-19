@@ -6,7 +6,7 @@
 
 Doria is a compiled programming language for building native applications, command-line tools, services, games, and systems software with expressive syntax, strong static typing, safe defaults, and modern concurrency.
 
-The compiler is called `doriac`. The current bootstrap implementation is written in Rust, but Rust is not the permanent identity of the compiler. Doria's long-term primary target is native machine code and standalone executables.
+The compiler is called `doriac`. The current bootstrap implementation is written in Rust, but Rust is not the permanent identity of the compiler. Doria's primary target is native machine code and standalone executables.
 
 A strategic long-term goal is self-hosting: as Doria matures, more of `doriac` should become writable in Doria itself.
 
@@ -22,7 +22,19 @@ Doria source
 -> backend
 ```
 
-Native machine code and standalone executables are the primary long-term target. PHP is currently the implemented compatibility, migration, debugging, and inspection backend.
+Native machine code and standalone executables are the authoritative product direction. PHP is currently an implemented compatibility, migration, debugging, and inspection backend, but PHP output is not Doria's semantic reference and is not required to be perfect for Doria to succeed.
+
+## Native-first correctness policy
+
+Doria must be designed from its own semantics outward:
+
+```text
+Doria semantics -> Doria IR -> backend-specific lowering
+```
+
+The project must not choose language behavior because it is convenient for PHP transpilation, Rust implementation details, or any future native backend library. Correctness, safety, and clear semantics outrank quick runnable demos.
+
+When an implementation task exposes a language-design fork, the correct behavior is to stop and ask the language designer. Do not silently choose behavior for syntax, types, runtime semantics, memory behavior, object layout, error handling, string conversion, collections, or standard-library APIs.
 
 ## Influence and migration
 
@@ -36,31 +48,20 @@ doriac migrate php src --out migrated
 
 That would be a PHP-to-Doria migration converter, not the Doria parser and not the core compiler identity.
 
-## Influence and migration
-
-Doria's surface syntax is intentionally familiar to developers coming from PHP-like and C-like languages, but Doria is its own language. PHP does not define Doria's semantics, and PHP output must not shape the core compiler architecture.
-
-PHP support belongs in compatibility, migration, debugging, and transpilation contexts. Future migration tooling may expose a command such as:
-
-```bash
-doriac migrate php src --out migrated
-```
-
-That would be a PHP-to-Doria migration converter, not the Doria parser and not the core compiler identity.
-
 ## Current status
 
-This repository contains the first working vertical slice of `doriac`:
+This repository contains the first working vertical slices of `doriac`:
 
 - Lexes a useful Doria token set.
 - Parses a small subset of declarations, classes, functions, statements, and expressions.
 - Builds an AST.
 - Checks undeclared assignment and readonly/writable mutation rules for locals, properties, `$this`, and writable methods.
+- Checks assignment compatibility, declared returns, positional call arguments, constructor init access, control-flow conditions, and string interpolation constraints for the supported subset.
 - Lowers the checked AST to Doria IR, the compiler-owned representation used before backend output.
-- Emits PHP for supported syntax through the PHP backend.
+- Emits PHP for supported syntax through the optional PHP compatibility backend.
 - Provides CLI commands and integration tests.
 
-It is intentionally not a complete language yet. The implementation should grow in small, tested compiler increments.
+It is intentionally not a complete language yet. The implementation should grow in small, tested compiler increments without compromising Doria's native-first semantics.
 
 ## Quick start
 
@@ -69,6 +70,11 @@ cargo test
 cargo run -p doriac -- --help
 cargo run -p doriac -- check examples/hello.doria
 cargo run -p doriac -- hir examples/hello.doria
+```
+
+The currently implemented compatibility backend can also emit PHP for supported syntax:
+
+```bash
 cargo run -p doriac -- compile examples/person.doria --target php --out build/person.php
 php build/person.php
 ```
@@ -85,7 +91,7 @@ doriac run <file>
 
 `compile` requires an explicit target. `php` is currently implemented. `native`, `debug`, and `wasm` are recognized planned targets.
 
-`doriac run` is currently a convenience command for the PHP compatibility backend: it compiles to a temporary PHP file and runs it with the local `php` binary.
+`doriac run` is currently a convenience command for the PHP compatibility backend: it compiles to a temporary PHP file and runs it with the local `php` binary. This is a temporary execution convenience, not the language's strategic execution model.
 
 ## Editor Support
 
@@ -114,7 +120,7 @@ For VS Code, the setting is `doria.languageServer.path`. For IntelliJ IDEs, use 
 
 ## Language principles
 
-- Doria is its own language; PHP is syntax influence, migration context, and compatibility backend.
+- Doria is its own native-first language; PHP is syntax influence, migration context, and optional compatibility backend.
 - Valid PHP should be easy to migrate to Doria, but Doria-specific syntax does not need to run directly in PHP.
 - Variables must be declared with `let` or an explicit type.
 - Bare assignment never declares a variable.
@@ -125,6 +131,7 @@ For VS Code, the setting is `doria.languageServer.path`. For IntelliJ IDEs, use 
 - Collection aliases are `List<T>`, `Dictionary<K, V>`, and `Set<T>`.
 - The compiler must reject invalid Doria before lowering to Doria IR or emitting backend output.
 - Doria may support features PHP cannot express directly, such as executable instance property initializers and richer attribute expressions.
+- If a language behavior is not specified, implementation work should pause for an explicit design decision rather than inventing behavior silently.
 
 ## Design docs
 
@@ -139,6 +146,7 @@ docs/brand-positioning.md
 docs/self-hosting.md
 docs/executable-initializers-and-attributes.md
 docs/php-interop-and-migration.md
+docs/decisions/0010-native-first-correctness.md
 ```
 
 ## Repository layout
@@ -156,6 +164,7 @@ docs/php-interop-and-migration.md
 │       └── tests/
 ├── docs/
 │   ├── brand-positioning.md
+│   ├── decisions/
 │   ├── doria-development-plan.md
 │   ├── executable-initializers-and-attributes.md
 │   ├── php-interop-and-migration.md
