@@ -308,6 +308,7 @@ fn escape_php_string(value: &str) -> String {
         match character {
             '\\' => output.push_str("\\\\"),
             '"' => output.push_str("\\\""),
+            '$' => output.push_str("\\$"),
             '\n' => output.push_str("\\n"),
             '\r' => output.push_str("\\r"),
             '\t' => output.push_str("\\t"),

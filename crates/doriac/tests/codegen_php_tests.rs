@@ -234,6 +234,24 @@ class Person
 }
 
 #[test]
+fn escapes_php_interpolation_markers_in_string_text() {
+    let php = doriac::compile_source_to_php(
+        "test.doria",
+        r#"
+let $name = "Andrew";
+let $amount = 10;
+echo "Hello, $name";
+echo 'Literal $name';
+echo "Total: {$amount} ($currency)";
+"#,
+    )
+    .expect("compilation should succeed");
+
+    assert!(php.contains("echo \"Hello, \\$name\";"));
+    assert!(php.contains("echo \"Literal \\$name\";"));
+    assert!(php.contains("echo \"Total: \" . $amount . \" (\\$currency)\";"));
+}
+#[test]
 fn compiles_person_example_with_explicit_interpolation() {
     let example_path =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/person.doria");
