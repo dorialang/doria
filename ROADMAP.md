@@ -26,7 +26,7 @@
 ## Next Compiler Work
 
 - Treat `docs/decisions/0011-native-execution-path.md` as the accepted Stage 1 native execution path.
-- Keep backend technology selection as a separate decision; Stage 1 acceptance does not choose Cranelift, LLVM, C, or an interpreter as the final route.
+- Follow the accepted staged Cranelift/LLVM native backend direction: Cranelift first for the smallest native smoke/backend route, LLVM later as the longer-term optimizing backend path.
 - Plan a lowered/native IR when native code generation needs a simpler representation for control flow, memory layout, runtime calls, and backend emission.
 - Implement the smallest native smoke target: a standalone executable requiring exactly one top-level `function main(): int`, with the returned `int` becoming the process exit code.
 - Expand return checking from the current final-statement rule into full path-sensitive control-flow analysis.
