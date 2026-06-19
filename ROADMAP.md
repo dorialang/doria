@@ -27,9 +27,7 @@
 ## Next Compiler Work
 
 - Treat `docs/decisions/0011-native-execution-path.md` as the accepted Stage 1 native execution path.
-- Treat `docs/decisions/0012-dual-native-backend-strategy.md` as the accepted dual native backend strategy.
-- Implement the smallest Stage 1 native smoke target through the Cranelift-backed fast native profile: a standalone executable requiring exactly one top-level `function main(): int`, with the returned `int` becoming the process exit code.
-- Keep LLVM implementation for the optimized native profile until the native-oriented IR and conformance tests are ready enough to prevent LLVM from shaping Doria semantics.
+- Follow the accepted staged Cranelift/LLVM native backend direction: Cranelift first for the smallest native smoke/backend route, LLVM later as the longer-term optimizing backend path.
 - Plan a lowered/native IR when native code generation needs a simpler representation for control flow, memory layout, runtime calls, and backend emission.
 - Expand return checking from the current final-statement rule into full path-sensitive control-flow analysis.
 - Add full definite property initialization analysis for constructor paths.

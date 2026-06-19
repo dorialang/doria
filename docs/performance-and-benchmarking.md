@@ -244,12 +244,13 @@ Settled:
 - Benchmarks should include runtime speed, memory, compile time, and artifact size.
 - Doria should avoid unsupported performance marketing.
 - Native desktop/game/FFI use cases should influence future benchmark design.
+- The native backend direction is a staged Cranelift/LLVM route: Cranelift first for native smoke/backend iteration, LLVM later as the longer-term optimizing backend path.
 ```
 
 Open:
 
 ```text
-- Exact native backend.
+- Exact Cranelift object/linking integration and LLVM adoption milestone.
 - Exact runtime and memory model.
 - Exact benchmark runner implementation.
 - Whether benchmark results are published per release.

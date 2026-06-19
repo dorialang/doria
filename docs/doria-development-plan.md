@@ -1098,11 +1098,11 @@ Doria source
 → Semantic analysis
 → Doria IR
 → native-oriented IR
-→ selected native backend (for example Cranelift, LLVM, C, or another accepted route)
+→ Cranelift native backend first, with LLVM as the longer-term optimizing backend path
 → Native executable
 ```
 
-LLVM is a strong long-term backend candidate because its tutorial path covers implementing a language frontend, generating LLVM IR, JIT support, object-code compilation, and debug info. MLIR is another possible future option if Doria needs multiple levels of IR and more advanced lowering. Cranelift, a C backend bridge, and a debug/interpreter route should also be evaluated in Doria terms instead of choosing a backend silently. Backend technology selection remains a separate decision; see `docs/decisions/0011-native-execution-path.md` for the accepted Stage 1 boundary. ([LLVM][1]) ([mlir.llvm.org][7])
+Doria's native backend direction is a staged Cranelift/LLVM route; see `docs/decisions/0011-native-execution-path.md`. Cranelift is the first native smoke/backend route because it keeps the initial standalone-executable path small. LLVM is the accepted longer-term optimizing backend path once Doria's native-oriented IR, runtime, object layout, and debug-info needs are clearer. MLIR remains a possible future LLVM-ecosystem tool if Doria needs multiple levels of IR and more advanced lowering. A C backend bridge or debug/interpreter route may still be useful as auxiliary tooling, but they are not competing product-direction backend choices. ([LLVM][1]) ([mlir.llvm.org][7])
 
 Do not begin here.
 
