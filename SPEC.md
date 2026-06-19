@@ -6,11 +6,11 @@ This document describes the v0.1 direction for Doria.
 
 Doria is a statically checked compiled programming language designed for native executables, tooling, services, desktop software, games, and future self-hosting.
 
-Doria's surface syntax is intentionally familiar to developers coming from PHP-like and C-like languages, but Doria is not PHP++ and PHP does not define Doria's semantics.
+Doria's surface syntax is intentionally familiar to developers coming from PHP-like and C-like languages, but Doria is not PHP++, PHP does not define Doria's semantics, and generated PHP is not Doria's reference behavior.
 
 Doria source files use the `.doria` extension and do not require `<?php` tags.
 
-The compiler is `doriac`. The current bootstrap implementation is written in Rust. Doria's long-term primary target is native machine code and standalone executables. A strategic goal is for `doriac` to become increasingly self-hosted in Doria over time.
+The compiler is `doriac`. The current bootstrap implementation is written in Rust. Doria's primary target is native machine code and standalone executables. A strategic goal is for `doriac` to become increasingly self-hosted in Doria over time.
 
 The compiler architecture is backend-independent:
 
@@ -28,12 +28,29 @@ Doria source
 
 Backends may include:
 
-- Native backend.
-- PHP backend.
-- Debug/interpreter backend.
+- Native backend, the primary product target.
+- Debug/interpreter backend, for validating Doria semantics without relying on another language runtime.
+- PHP backend, as an optional compatibility, migration, debugging, and inspection target.
 - WebAssembly backend.
 
-The PHP backend is a compatibility, migration, debugging, and inspection target. It must not shape the core compiler architecture.
+The PHP backend must not shape the parser, AST, semantic model, Doria IR, native-oriented IR, runtime model, memory model, object model, error model, or standard library.
+
+### 1.1 Design authority and correctness policy
+
+Doria semantics are defined by Doria's specification, accepted design decisions, and explicit language-designer decisions. Backend output is an implementation of those semantics, not the authority for those semantics.
+
+The project follows these rules:
+
+```text
+Correctness over speed.
+Native-first over convenient transpilation.
+Safety over quick demos.
+Explicit design decisions over silent implementation assumptions.
+```
+
+If an implementation task reaches a design fork not answered by this specification or `docs/decisions/`, the implementation must stop and ask for a decision. It should report the question, options, tradeoffs, affected files, and a recommendation. It must not silently choose behavior because PHP, Rust, JavaScript, C, C++, or a backend library makes that behavior easy.
+
+Temporary backend limitations may produce unsupported-feature diagnostics. They must not redefine Doria.
 
 ## 2. What Doria is not
 
@@ -45,7 +62,7 @@ Valid PHP should be easy to migrate to Doria, but Doria-specific syntax does not
 
 Doria does not use `public`, `protected`, or `private` as member visibility modifiers. Class members are externally accessible by default, and `internal` marks implementation details.
 
-The v0.1 compiler does not yet produce native executables, and it is not yet a package manager, reflection system, macro system, async runtime, PHP migration converter, or full standard library.
+The current compiler implementation does not yet produce native executables, and it is not yet a package manager, reflection system, macro system, async runtime, PHP migration converter, or full standard library. That implementation status does not make PHP transpilation the language goal.
 
 Doria is not a Rust language. Rust is the current bootstrap implementation language for `doriac`, not the permanent identity of the compiler.
 
@@ -87,7 +104,7 @@ These advanced control-flow forms are not MVP syntax. See `docs/decisions/0009-c
 
 Variables must be declared before use.
 
-```php
+```doria
 let $name = "Andrew";
 let writable $count = 0;
 
@@ -97,7 +114,7 @@ writable int $score = 0;
 
 Bare assignment never declares a variable:
 
-```php
+```doria
 $name = "Andrew"; // error
 ```
 
@@ -105,7 +122,7 @@ $name = "Andrew"; // error
 
 Everything is readonly unless explicitly marked `writable`.
 
-```php
+```doria
 let $x = 5;
 $x = 10; // error
 
@@ -115,7 +132,7 @@ $y = 10; // ok
 
 Explicit typed declarations follow the same rule:
 
-```php
+```doria
 int $x = 5;
 $x = 10; // error
 
@@ -125,7 +142,7 @@ $y = 10; // ok
 
 Properties are readonly by default:
 
-```php
+```doria
 class Person
 {
     string $id;
@@ -154,7 +171,7 @@ internal controls API surface.
 
 Valid member declarations:
 
-```php
+```doria
 class Parser
 {
     string $name;
@@ -196,7 +213,7 @@ Verbs are methods.
 
 Use properties for values, state, identifiers, configuration, and computed data:
 
-```php
+```doria
 let $body = $message->body;
 let $headers = $message->headers;
 let $status = $message->status;
@@ -204,7 +221,7 @@ let $status = $message->status;
 
 Avoid vague zero-argument noun methods when the member is conceptually data:
 
-```php
+```doria
 let $body = $message->body(); // avoid
 let $headers = $message->headers(); // avoid
 let $status = $message->status(); // avoid
@@ -216,7 +233,7 @@ Property hooks are the planned escape hatch when a property-shaped API needs val
 
 Use methods for actions, commands, mutation, I/O, async work, fallible operations, and behavior with meaningful work:
 
-```php
+```doria
 await $message->acknowledge();
 await $message->retryAfter(seconds: 30);
 $report->renderPdf();
@@ -268,7 +285,7 @@ Set<T>
 
 `let` declarations infer simple literal and constructor types:
 
-```php
+```doria
 let $x = 5;        // int
 let $name = "Doria"; // string
 let $person = new Person("Andrew"); // Person
@@ -294,7 +311,7 @@ Interpolated values may currently be `string`, `int`, `float`, `bool`, `null`, `
 
 Numeric widening is not implemented yet; for now `float` is not assignable from `int`, and `int` is not assignable from `float`. Any future safe numeric widening should be a separate design decision. Named arguments and richer call argument representation are separate future slices.
 
-Simple collection literals infer collection element/key/value types when all clear parts match. Clear heterogeneous collection literals, such as `[1, "two"]`, are rejected by narrow collection alias assignment checks rather than being erased to `Unknown`. The empty literal `[]` stays ambiguous so typed contexts may use it as an empty `List<T>` or `Dictionary<K, V>`. The PHP-compatible `array` annotation remains broad enough to accept list-shaped and dictionary-shaped literals.
+Simple collection literals infer collection element/key/value types when all clear parts match. Clear heterogeneous collection literals, such as `[1, "two"]`, are rejected by narrow collection alias assignment checks rather than being erased to `Unknown`. The empty literal `[]` stays ambiguous so typed contexts may use it as an empty `List<T>` or `Dictionary<K, V>`. The PHP-compatible `array` annotation remains broad enough to accept list-shaped and dictionary-shaped literals for now, but `array` is not the desired long-term collection model.
 
 ### Control-flow conditions
 
@@ -304,7 +321,7 @@ Each `if`, `else if`, `else`, and `while` body has its own block scope. Variable
 
 ## 8. Class syntax
 
-```php
+```doria
 class Person
 {
     function __construct(
@@ -317,7 +334,7 @@ class Person
 
 Constructor property promotion is supported in the current vertical slice. Constructor parameters are promoted to externally accessible properties by default unless marked `internal`:
 
-```php
+```doria
 function __construct(
     writable string $name,
     int $age = 10,
@@ -328,7 +345,7 @@ function __construct(
 
 Constructor init access is supported for direct initialization of uninitialized readonly properties inside constructor bodies:
 
-```php
+```doria
 class Person
 {
     string $id;
@@ -344,7 +361,7 @@ This does not make `$this` writable. The constructor cannot assign the same read
 
 Doria should support richer instance property initializers than PHP:
 
-```php
+```doria
 class Office
 {
     Person $manager = new Person();
@@ -355,7 +372,7 @@ Instance property initializer expressions run once per object construction. Each
 
 ## 9. Function syntax
 
-```php
+```doria
 function greet(string $name): void
 {
     echo "Hello, {$name}";
@@ -364,7 +381,7 @@ function greet(string $name): void
 
 Parameters are readonly unless marked `writable`:
 
-```php
+```doria
 function rename(writable Person $person, string $name): void
 {
     $person->name = $name;
@@ -373,7 +390,7 @@ function rename(writable Person $person, string $name): void
 
 Declared return types are checked against returned expressions:
 
-```php
+```doria
 function age(): int
 {
     return 37;
@@ -384,7 +401,7 @@ function age(): int
 
 Calls are checked against declared parameter lists:
 
-```php
+```doria
 function greet(string $name, string $suffix = "!"): void
 {
 }
@@ -401,7 +418,7 @@ Only positional arguments are supported in the current slice. Required parameter
 
 Doria uses:
 
-```php
+```doria
 List<int>
 Dictionary<string, int>
 Set<string>
@@ -409,7 +426,7 @@ Set<string>
 
 Do not use `Vec`.
 
-The PHP backend lowers these aliases to PHP arrays, while the Doria type checker keeps them distinct.
+The current PHP compatibility backend may lower these aliases to PHP arrays, while the Doria type checker keeps them distinct. The native backend must make deliberate representation choices for each collection family rather than inheriting PHP array behavior.
 
 The current type foundation resolves explicit annotations, reports unknown type names and invalid collection alias arity, and checks assignment compatibility for typed declarations, property initializers, property writes, parameter defaults, declared return values, and positional call arguments. Classes without constructors cannot be constructed with arguments.
 
@@ -455,14 +472,14 @@ See `docs/executable-initializers-and-attributes.md` for the detailed design not
 
 ## 12. PHP interop and migration
 
-Doria supports two separate PHP-related directions:
+Doria may support two separate PHP-related directions:
 
 ```text
-1. Doria -> PHP backend.
+1. Doria -> PHP compatibility/debugging backend.
 2. PHP -> Doria migration converter.
 ```
 
-The PHP backend is a planned compatibility/debugging backend.
+Both are optional adoption and tooling aids. Neither is the core correctness target for the language.
 
 A PHP-to-Doria converter may eventually help migrate existing PHP codebases into Doria, but it must remain architecturally separate from the Doria parser and core compiler semantics.
 
@@ -484,18 +501,20 @@ Doria IR is the checked compiler-owned representation of a Doria program. After 
 
 As native code generation matures, Doria IR may lower into a simpler native-oriented IR for control flow, memory layout, runtime calls, and backend code generation.
 
-The native backend is the primary long-term target. It should eventually lower Doria IR, and any later native-oriented IR, toward native machine code and standalone executables.
+The native backend is the primary target. It should lower Doria IR, and any later native-oriented IR, toward native machine code and standalone executables.
 
-The PHP backend is currently the first implemented backend. It emits `<?php` and lowers Doria-only syntax away:
+The PHP backend is currently implemented as a compatibility/debugging backend. It emits `<?php` and lowers Doria-only syntax away:
 
 - `let` is removed.
 - `writable` is removed.
 - `internal` is enforced by Doria before backend emission and may lower to PHP `private` or another backend-specific representation.
-- Collection aliases are emitted as `array`.
+- Collection aliases are emitted as `array` for the current PHP backend only.
 - `resource` is emitted as `mixed` because PHP cannot declare `resource` type hints.
 - Doria readonly/writable rules are enforced before Doria IR lowering and backend emission, not at PHP runtime.
 
 For Doria features that PHP cannot express directly, such as object construction in property initializers or richer attribute expressions, the PHP backend should lower to equivalent generated PHP where practical or produce a clear unsupported-feature diagnostic temporarily. PHP limitations must not define Doria semantics.
+
+Backend-specific tests are useful, but the PHP backend must not be the required proof that a language feature is correct. Correctness belongs to the parser, semantic checker, Doria IR, and eventually the native/backend-independent execution path.
 
 ## 14. Future features
 
@@ -508,11 +527,12 @@ Future work includes:
 - Attribute syntax and metadata representation.
 - Richer instance property initializers.
 - Named arguments.
-- Full control-flow design for `while`, `do ... while ... finally`, `given ... when`, `given ... while`, `if` chains with possible `finally`, value-returning `when`, and `match`.
+- Full path-sensitive control-flow analysis for returns and constructor initialization.
+- Advanced control-flow design for `do ... while ... finally`, `given ... when`, `given ... while`, `if` chains with possible `finally`, value-returning `when`, and `match`.
 - Async/await and structured concurrency.
 - Native backend design and implementation.
 - Native-oriented IR implementation when native code generation needs it.
-- Native code generation.
+- Native code generation and standalone executable production.
 - Self-hosting path for writing more of `doriac` in Doria.
 - PHP-to-Doria migration tooling.
 - Package management.
