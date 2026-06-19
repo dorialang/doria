@@ -77,13 +77,12 @@ fn compile_command(args: &[String]) -> Result<(), String> {
     }
 
     let target = target.ok_or_else(|| {
-        "missing --target <target>; use `--target php` for the currently implemented backend"
-            .to_string()
+        "missing --target <target>; available targets are `native` and `php`".to_string()
     })?;
 
     if !target.is_available() {
         return Err(format!(
-            "target `{}` ({}) is planned but not implemented yet; only `php` is currently available",
+            "target `{}` ({}) is planned but not implemented yet; available targets are `native` and `php`",
             target.name(),
             target.description()
         ));
@@ -135,6 +134,11 @@ fn write_backend_output(out_path: &Path, output: BackendOutput) -> Result<(), St
             .map_err(|error| format!("failed to write output file: {error}")),
         BackendOutput::Binary { bytes, .. } => fs::write(out_path, bytes)
             .map_err(|error| format!("failed to write output file: {error}")),
+        BackendOutput::Executable { bytes, .. } => {
+            fs::write(out_path, bytes)
+                .map_err(|error| format!("failed to write output file: {error}"))?;
+            make_executable(out_path)
+        }
         BackendOutput::Artifact { path } => {
             fs::copy(&path, out_path)
                 .map_err(|error| format!("failed to copy backend artifact: {error}"))?;
@@ -176,6 +180,23 @@ fn read_source(path: impl AsRef<Path>) -> Result<(String, String), String> {
 
 fn print_help() {
     println!(
-        "doriac 0.1.0\n\nUSAGE:\n    doriac check <file>\n    doriac ast <file>\n    doriac hir <file>\n    doriac compile <file> --target <target> --out <file>\n    doriac run <file>\n\nTARGETS:\n    php       available compatibility backend\n    native    planned primary backend\n    debug     planned interpreter/debug backend\n    wasm      planned WebAssembly backend"
+        "doriac 0.1.0\n\nUSAGE:\n    doriac check <file>\n    doriac ast <file>\n    doriac hir <file>\n    doriac compile <file> --target <target> --out <file>\n    doriac run <file>\n\nTARGETS:\n    native    available Stage 1 Cranelift-backed fast native smoke backend\n    php       available compatibility backend\n    debug     planned interpreter/debug backend\n    wasm      planned WebAssembly backend"
     );
+}
+
+#[cfg(unix)]
+fn make_executable(path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut permissions = fs::metadata(path)
+        .map_err(|error| format!("failed to read output permissions: {error}"))?
+        .permissions();
+    permissions.set_mode(permissions.mode() | 0o111);
+    fs::set_permissions(path, permissions)
+        .map_err(|error| format!("failed to mark output executable: {error}"))
+}
+
+#[cfg(not(unix))]
+fn make_executable(_path: &Path) -> Result<(), String> {
+    Ok(())
 }

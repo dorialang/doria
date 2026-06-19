@@ -133,19 +133,19 @@ function greet(string $name): string
 }
 
 #[test]
-fn recognizes_native_as_planned_backend() {
+fn recognizes_debug_as_planned_backend() {
     let err = doriac::compile_source(
         "test.doria",
         r#"
 let $name = "Doria";
 echo $name;
 "#,
-        BackendTarget::Native,
+        BackendTarget::Debug,
     )
-    .expect_err("native backend is planned but not implemented yet");
+    .expect_err("debug backend is planned but not implemented yet");
 
     assert_eq!(err[0].code, "B0001");
-    assert!(err[0].message.contains("backend `native`"));
+    assert!(err[0].message.contains("backend `debug`"));
 }
 
 #[test]

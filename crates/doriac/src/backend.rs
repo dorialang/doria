@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::str::FromStr;
 
-use crate::{codegen_php, hir};
+use crate::{codegen_native, codegen_php, hir};
 
 pub trait Backend {
     fn target(&self) -> BackendTarget;
@@ -12,6 +12,7 @@ pub trait Backend {
 pub enum BackendOutput {
     Text { extension: String, contents: String },
     Binary { extension: String, bytes: Vec<u8> },
+    Executable { extension: String, bytes: Vec<u8> },
     Artifact { path: PathBuf },
 }
 
@@ -47,7 +48,7 @@ impl BackendTarget {
     }
 
     pub fn is_available(self) -> bool {
-        matches!(self, BackendTarget::Php)
+        matches!(self, BackendTarget::Native | BackendTarget::Php)
     }
 
     pub fn description(self) -> &'static str {
@@ -89,10 +90,26 @@ impl Backend for PhpBackend {
     }
 }
 
+pub struct NativeBackend;
+
+impl Backend for NativeBackend {
+    fn target(&self) -> BackendTarget {
+        BackendTarget::Native
+    }
+
+    fn emit(&self, program: &hir::Program) -> Result<BackendOutput, BackendError> {
+        Ok(BackendOutput::Executable {
+            extension: native_executable_extension().to_string(),
+            bytes: codegen_native::generate_executable(program)?,
+        })
+    }
+}
+
 pub fn emit(program: &hir::Program, target: BackendTarget) -> Result<BackendOutput, BackendError> {
     match target {
+        BackendTarget::Native => NativeBackend.emit(program),
         BackendTarget::Php => PhpBackend.emit(program),
-        BackendTarget::Native | BackendTarget::Debug | BackendTarget::Wasm => Err(format!(
+        BackendTarget::Debug | BackendTarget::Wasm => Err(format!(
             "backend `{}` ({}) is planned but not implemented yet",
             target.name(),
             target.description()
@@ -104,5 +121,13 @@ pub fn emit(program: &hir::Program, target: BackendTarget) -> Result<BackendOutp
 impl From<String> for BackendError {
     fn from(message: String) -> Self {
         BackendError::new(message)
+    }
+}
+
+fn native_executable_extension() -> &'static str {
+    if cfg!(windows) {
+        "exe"
+    } else {
+        ""
     }
 }

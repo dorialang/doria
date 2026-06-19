@@ -60,6 +60,7 @@ This repository contains the first working vertical slices of `doriac`:
 - Checks undeclared assignment and readonly/writable mutation rules for locals, properties, `$this`, and writable methods.
 - Checks assignment compatibility, declared returns, positional call arguments, constructor init access, control-flow conditions, and string interpolation constraints for the supported subset.
 - Lowers the checked AST to Doria IR, the compiler-owned representation used before backend output.
+- Emits a Stage 1 Cranelift-backed native smoke executable only for the accepted `function main(): int { return 0; }` shape.
 - Emits PHP for supported syntax through the optional PHP compatibility backend.
 - Provides CLI commands and integration tests.
 
@@ -81,6 +82,15 @@ cargo run -p doriac -- compile examples/person.doria --target php --out build/pe
 php build/person.php
 ```
 
+The native backend currently supports only the accepted Stage 1 smoke shape:
+
+```bash
+cargo run -p doriac -- compile examples/native/main_return_zero.doria --target native --out build/native/main_return_zero
+./build/native/main_return_zero
+```
+
+For this first slice, `--target native` emits a Cranelift object and links it through the host platform toolchain so the platform startup path can call `main`. This is not a C backend and does not use PHP output.
+
 ## CLI
 
 ```bash
@@ -91,7 +101,7 @@ doriac compile <file> --target <target> --out <file>
 doriac run <file>
 ```
 
-`compile` requires an explicit target. `php` is currently implemented. `native`, `debug`, and `wasm` are recognized planned targets.
+`compile` requires an explicit target. `native` is currently implemented only for the Stage 1 Cranelift-backed smoke shape. `php` is implemented as a compatibility backend. `debug` and `wasm` are recognized planned targets.
 
 `doriac run` is currently a convenience command for the PHP compatibility backend: it compiles to a temporary PHP file and runs it with the local `php` binary. This is a temporary execution convenience, not the language's strategic execution model.
 
@@ -132,6 +142,7 @@ For VS Code, the setting is `doria.languageServer.path`. For IntelliJ IDEs, use 
 - `writable` controls mutation. `internal` controls API surface.
 - Collection aliases are `List<T>`, `Dictionary<K, V>`, and `Set<T>`.
 - The compiler must reject invalid Doria before lowering to Doria IR or emitting backend output.
+- The native backend currently accepts only the Stage 1 smoke entrypoint and rejects broader valid Doria with unsupported-feature diagnostics.
 - Doria may support features PHP cannot express directly, such as executable instance property initializers and richer attribute expressions.
 - If a language behavior is not specified, implementation work should pause for an explicit design decision rather than inventing behavior silently.
 
@@ -179,6 +190,7 @@ docs/decisions/0012-dual-native-backend-strategy.md
 │   └── vscode/
 │       └── doria/
 └── examples/
+    ├── native/
     ├── hello.doria
     ├── variables.doria
     ├── person.doria
