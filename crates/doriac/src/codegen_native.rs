@@ -187,8 +187,8 @@ fn link_object(object_bytes: &[u8]) -> Result<Vec<u8>, BackendError> {
 
 fn invoke_linker(object_path: &Path, executable_path: &Path) -> Result<(), BackendError> {
     // Stage 1 emits a Cranelift object file and asks the host toolchain to link
-    // it with the platform startup/runtime path. This is not a C backend:
-    // Doria never generates C source or uses C semantics as an oracle here.
+    // it. This is not a C backend: Doria never generates C source or uses C
+    // semantics as an oracle here.
     let cc_is_set = env::var_os("CC").is_some();
     let linker = env::var("CC").unwrap_or_else(|_| default_linker().to_string());
     let mut command = Command::new(&linker);
@@ -276,10 +276,16 @@ fn linker_arguments(
     executable_path: &Path,
 ) -> Vec<OsString> {
     if windows && (!cc_is_set || is_msvc_style_compiler_driver(linker)) {
+        // Cranelift-generated objects do not carry MSVC /DEFAULTLIB directives.
+        // For Stage 1's tiny main, make Doria's main the executable entrypoint
+        // instead of relying on CRT startup to discover and call it.
         return vec![
             OsString::from("/nologo"),
             object_path.as_os_str().to_os_string(),
             OsString::from(format!("/Fe:{}", executable_path.display())),
+            OsString::from("/link"),
+            OsString::from("/ENTRY:main"),
+            OsString::from("/SUBSYSTEM:CONSOLE"),
         ];
     }
 
@@ -354,6 +360,9 @@ mod tests {
                 OsString::from("/nologo"),
                 OsString::from("main.obj"),
                 OsString::from("/Fe:main.exe"),
+                OsString::from("/link"),
+                OsString::from("/ENTRY:main"),
+                OsString::from("/SUBSYSTEM:CONSOLE"),
             ]
         );
     }
@@ -374,6 +383,9 @@ mod tests {
                 OsString::from("/nologo"),
                 OsString::from("main.obj"),
                 OsString::from("/Fe:main.exe"),
+                OsString::from("/link"),
+                OsString::from("/ENTRY:main"),
+                OsString::from("/SUBSYSTEM:CONSOLE"),
             ]
         );
     }
