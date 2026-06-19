@@ -8,6 +8,15 @@ A strategic early goal is **self-hosting**: as Doria matures, more of `doriac` s
 
 Doria is intended for native CLI tools, native desktop applications, game tooling, game engines, graphics/media work, C-library bindings, and future raylib bindings.
 
+The accepted native backend strategy is dual-profile:
+
+```text
+Fast native profile       -> Cranelift
+Optimized native profile  -> LLVM
+```
+
+The fast profile is for local development feedback and smoke builds. The optimized profile is for release/shipping builds. Both profiles must preserve the same Doria-visible semantics for supported code.
+
 Doria may intentionally support features PHP cannot express directly, including executable instance property initializers and richer attribute/metadata expressions. PHP backend limitations must not define Doria semantics.
 
 Doria may eventually include a PHP-to-Doria migration converter, but that converter is a migration tool, not the Doria parser and not the core compiler identity.
@@ -34,6 +43,8 @@ Doria may eventually include a PHP-to-Doria migration converter, but that conver
 - Preserve the public compiler pipeline: lexer -> parser -> AST -> semantic/type checking -> Doria IR -> backend.
 - Treat Doria IR as the checked compiler-owned representation. A lowered/native IR may come later for control flow, memory layout, runtime calls, and native backend code generation.
 - Do not let PHP backend needs leak into the parser, AST, semantic model, Doria IR, or native-oriented IR design.
+- For native work, keep the fast Cranelift profile and optimized LLVM profile semantically equivalent for supported code. Differences may be in compile time, optimization, debug information, and binary quality, not Doria behavior.
+- Do not let Cranelift or LLVM semantics decide Doria semantics. Backend-specific assumptions must remain behind Doria IR or native-oriented IR lowering.
 - Do not reintroduce `public`, `protected`, or `private` as Doria member visibility modifiers. Doria class members are externally accessible by default; use `internal` for implementation details.
 - Keep `writable` and `internal` separate: `writable` controls mutation, while `internal` controls API surface.
 - Keep self-hosting in mind when designing compiler APIs, diagnostics, source management, Doria IR, and the standard library.

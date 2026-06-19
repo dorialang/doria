@@ -5,6 +5,7 @@
 - Build Doria as a compiled language with native machine code and standalone executables as the primary product target.
 - Support command-line tools, services, systems software, native desktop applications, game development, game tooling, game engines, graphics/media work, C-library bindings, and future raylib bindings.
 - Prioritize correctness, safety, and explicit language semantics over quick runnable demos or backend-specific shortcuts.
+- Pursue a dual native backend strategy: Cranelift for fast local development/profile builds and LLVM for optimized release/profile builds.
 - Keep PHP as an optional compatibility, migration, debugging, and inspection backend only.
 - Move toward **self-hosting**: `doriac` is initially implemented in Rust, but an early language-development goal is to eventually write significant parts of `doriac` in Doria itself.
 - Support Doria language features that PHP cannot express directly, including executable property initializers and richer attribute/metadata expressions.
@@ -26,9 +27,8 @@
 ## Next Compiler Work
 
 - Treat `docs/decisions/0011-native-execution-path.md` as the accepted Stage 1 native execution path.
-- Keep backend technology selection as a separate decision; Stage 1 acceptance does not choose Cranelift, LLVM, C, or an interpreter as the final route.
+- Follow the accepted staged Cranelift/LLVM native backend direction: Cranelift first for the smallest native smoke/backend route, LLVM later as the longer-term optimizing backend path.
 - Plan a lowered/native IR when native code generation needs a simpler representation for control flow, memory layout, runtime calls, and backend emission.
-- Implement the smallest native smoke target: a standalone executable requiring exactly one top-level `function main(): int`, with the returned `int` becoming the process exit code.
 - Expand return checking from the current final-statement rule into full path-sensitive control-flow analysis.
 - Add full definite property initialization analysis for constructor paths.
 - Plan the path toward writing more of `doriac` in Doria itself.
@@ -47,6 +47,7 @@
 - Track runtime speed, compile time, startup time, memory, binary size, stripped binary size, compressed artifact size, and correctness output.
 - Include Doria-relevant benchmarks such as lexing, parsing, type checking, object construction, string operations, collections, and eventually small game-loop/FFI smoke tests.
 - Keep native desktop, game engine, and raylib goals visible when designing Doria IR, runtime, memory representation, and FFI.
+- Require conformance tests once Cranelift and LLVM both support the same native feature: same Doria source, same semantic checks, same Doria-visible behavior.
 - Do not begin raylib bindings until native backend, FFI model, and basic runtime are ready.
 
 ## PHP Migration Path

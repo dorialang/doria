@@ -29,7 +29,7 @@ For Stage 1:
 - Any future fallible/recoverable-error entrypoint form is deferred until Doria's error model is designed.
 ```
 
-This decision accepts only the smallest Stage 1 native execution path. It does not settle strings, objects, collections, heap allocation, FFI, standard library, recoverable errors, broad numeric semantics, or final backend technology.
+This decision accepts only the smallest Stage 1 native execution path and a staged Cranelift/LLVM native backend direction. Cranelift is the first native smoke/backend route because it keeps early native iteration small. LLVM is the accepted longer-term optimizing backend path once Doria's native-oriented IR, runtime, object layout, and debug-info needs are clearer. This decision does not settle strings, objects, collections, heap allocation, FFI, standard library, recoverable errors, broad numeric semantics, or every backend integration detail.
 
 ## Context
 
@@ -210,20 +210,22 @@ String representation is deferred until a string-native stage. Strings affect li
 
 Accepted: Doria will begin with the smallest standalone native executable smoke target.
 
-Deferred: final backend technology selection.
+Accepted: the native backend direction is a staged Cranelift/LLVM route. Start with Cranelift for the smallest native executable smoke work and early backend iteration. Preserve the Doria IR and native-oriented IR boundary so LLVM can become the longer-term optimizing backend without letting either backend define Doria semantics.
 
-This note does not accept Cranelift, LLVM, C, a debug interpreter, or any other route as the final backend choice.
+Deferred: exact object/linker integration, runtime packaging, debug-info strategy, and the milestone where LLVM first becomes useful.
 
-Backend options to evaluate separately:
+This note does not accept a C backend, debug interpreter, PHP backend, or any other route as the native product direction. Those may still be useful auxiliary tools, but they are not competing final backend choices.
+
+Backend route roles:
 
 | Route | Strengths | Risks |
 | --- | --- | --- |
-| Cranelift backend | Rust-friendly, practical path to a small native executable, lower integration burden than LLVM, good for fast compiler iteration. | Smaller ecosystem than LLVM, long-term optimization/debug-info story may need revisiting, still a meaningful dependency. |
-| LLVM backend | Mature optimization pipeline, broad platform support, object generation, debug-info ecosystem, strong long-term potential. | Heavy dependency burden, larger integration surface, easy to spend time on backend plumbing before Doria semantics are settled. |
-| C backend as bootstrap/native portability bridge | Can produce native executables through existing C compilers, useful for portability experiments and simple inspection. | C semantics can leak into Doria if not guarded; object/layout/runtime details still need explicit design; generated C is another backend output, not an oracle. |
-| Interpreter/debug backend | Excellent for correctness testing, simple expected-output checks, and backend-independent semantic validation. | Not a standalone native executable by itself; cannot satisfy Stage 1 unless paired with a native wrapper/runtime; may delay first binary if treated as a prerequisite. |
+| Cranelift backend | Accepted first native smoke/backend route. Rust-friendly, practical path to a small native executable, lower integration burden than LLVM, good for fast compiler iteration. | Smaller ecosystem than LLVM, long-term optimization/debug-info story may need revisiting, still a meaningful dependency. |
+| LLVM backend | Accepted longer-term optimizing backend path. Mature optimization pipeline, broad platform support, object generation, debug-info ecosystem, strong long-term potential. | Heavy dependency burden, larger integration surface, easy to spend time on backend plumbing before Doria semantics are settled. |
+| C backend as bootstrap/native portability bridge | Possible auxiliary inspection or portability experiment. | C semantics can leak into Doria if not guarded; object/layout/runtime details still need explicit design; generated C is another backend output, not an oracle. |
+| Interpreter/debug backend | Possible auxiliary correctness tool for expected-output checks and backend-independent semantic validation. | Not a standalone native executable by itself; cannot satisfy the native product target and should not delay the first binary. |
 
-Recommendation, not accepted decision: evaluate a small Cranelift smoke backend first if its object/linking path is acceptable, and consider a tiny debug interpreter as a correctness aid. Revisit LLVM and C backend tradeoffs after the native-oriented IR shape is clearer.
+Implementation direction: build the smallest Cranelift smoke backend first. Keep the IR boundaries backend-independent so LLVM can be introduced later as the optimizing backend. Treat a C backend or debug interpreter as optional support tools, not as product-direction alternatives.
 
 ## Doria IR and native-oriented IR boundary
 
@@ -379,11 +381,12 @@ These remain open beyond Stage 1:
 3. Should Doria define process exit-code range/truncation explicitly?
 4. Should early arithmetic `int` semantics be fixed signed 64-bit?
 5. What should integer overflow do once arithmetic lands?
-6. Which backend route should implement the first and longer-term native paths?
-7. Should a debug interpreter be built before, alongside, or after the first native executable smoke target?
-8. What diagnostics should distinguish general semantic errors from backend-unsupported native features?
-9. What future argument-passing form should `main` use after strings and collections are designed?
-10. What future fallible/recoverable-error entrypoint form should exist after Doria's error model is designed?
+6. What exact Cranelift object/linking path should implement the first native smoke backend?
+7. At what milestone should LLVM become part of the native backend implementation?
+8. Should a debug interpreter be built before, alongside, or after the first native executable smoke target?
+9. What diagnostics should distinguish general semantic errors from backend-unsupported native features?
+10. What future argument-passing form should `main` use after strings and collections are designed?
+11. What future fallible/recoverable-error entrypoint form should exist after Doria's error model is designed?
 ```
 
 ## Non-goals of this decision
@@ -400,7 +403,7 @@ This decision does not:
 - change Cargo dependencies
 - add native tests
 - change PHP backend behavior
-- settle final backend technology
+- settle every backend integration detail
 - settle strings
 - settle objects/classes/constructors
 - settle heap allocation
