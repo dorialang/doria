@@ -2,9 +2,10 @@
 
 ## Strategic Goals
 
-- Build Doria as a compiled language with native machine code and standalone executables as the long-term target.
+- Build Doria as a compiled language with native machine code and standalone executables as the primary product target.
 - Support command-line tools, services, systems software, native desktop applications, game development, game tooling, game engines, graphics/media work, C-library bindings, and future raylib bindings.
-- Keep PHP as a compatibility, migration, debugging, and inspection backend only.
+- Prioritize correctness, safety, and explicit language semantics over quick runnable demos or backend-specific shortcuts.
+- Keep PHP as an optional compatibility, migration, debugging, and inspection backend only.
 - Move toward **self-hosting**: `doriac` is initially implemented in Rust, but an early language-development goal is to eventually write significant parts of `doriac` in Doria itself.
 - Support Doria language features that PHP cannot express directly, including executable property initializers and richer attribute/metadata expressions.
 - Eventually support PHP-to-Doria migration tooling, while keeping that tooling separate from the Doria parser and core compiler semantics.
@@ -16,18 +17,19 @@
 - Treat the checked compiler-owned representation as Doria IR.
 - Check assignment compatibility, declared function/method return values, and positional call arguments in the current semantic slice.
 - Allow constructors to initialize uninitialized readonly properties through narrow direct init access.
-- Keep PHP as a compatibility backend only.
 - Support MVP `if` / `else if` / `else` and `while` in the AST, semantic checker, Doria IR, and PHP backend.
 - Represent braced string interpolation in the Doria AST and Doria IR, with PHP lowering emitted as explicit concatenation.
+- Keep PHP as a compatibility backend only; do not treat PHP output as the proof that Doria semantics are correct.
 - Do not build PHP-to-Doria migration in the current v0.1 slice.
 - Do not start desktop, game engine, raylib, or FFI implementation work in the current v0.1 slice.
 
 ## Next Compiler Work
 
+- Define the native execution path: entrypoint rules, primitive representation assumptions, minimal runtime boundaries, and first native smoke target.
+- Plan a lowered/native IR when native code generation needs a simpler representation for control flow, memory layout, runtime calls, and backend emission.
+- Add a tiny native backend smoke slice once the native execution note is accepted, starting with a minimal `main(): int` program that returns an exit code.
 - Expand return checking from the current final-statement rule into full path-sensitive control-flow analysis.
 - Add full definite property initialization analysis for constructor paths.
-- Plan a lowered/native IR when native code generation needs a simpler representation for control flow, memory layout, runtime calls, and backend emission.
-- Add native backend experiments behind explicit targets.
 - Plan the path toward writing more of `doriac` in Doria itself.
 - Expand string interpolation beyond variable/property paths after Doria has a deliberate display/string-conversion design.
 - Emit precedence-aware backend expressions.
@@ -48,12 +50,13 @@
 
 ## PHP Migration Path
 
-- Treat Doria-to-PHP as a backend and PHP-to-Doria as a migration converter. They are separate directions with separate architecture.
+- Treat Doria-to-PHP as an optional backend and PHP-to-Doria as a migration converter. They are separate directions with separate architecture.
 - Do not promise perfect conversion for all valid PHP.
+- Do not prioritize PHP migration ahead of the native execution path.
 - Start with simple, typed, modern PHP and produce conservative valid Doria.
 - Prefer diagnostics and TODO comments over unsafe or misleading rewrites for dynamic PHP features.
 - Add a Doria pretty-printer before serious PHP-to-Doria work.
-- Consider a future `doria_migrate_php` crate or `doriac migrate php` command after the Doria AST, semantic types, and formatter are more stable.
+- Consider a future `doria_migrate_php` crate or `doriac migrate php` command after the Doria AST, semantic types, formatter, and native execution path are more stable.
 
 ## Self-Hosting Path
 
