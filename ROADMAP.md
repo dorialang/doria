@@ -29,8 +29,9 @@
 
 - Treat `docs/decisions/0011-native-execution-path.md` as the accepted Stage 1 native execution path.
 - Follow the accepted staged Cranelift/LLVM native backend direction: Cranelift first for the smallest native smoke/backend route, LLVM later as the longer-term optimizing backend path.
-- Review `docs/decisions/0013-stage-2-native-integers.md`, which proposes Stage 2 native integer execution semantics.
-- After Stage 2 integer semantics are accepted, implement the chosen integer sub-stage before broadening native support further.
+- Treat `docs/decisions/0013-stage-2-native-integers.md` as the accepted Stage 2 native integer execution decision.
+- Implement Stage 2a native integer literal exit-code support next: `return <literal>;` from `main` for portable exit-code literals `0..125`.
+- Keep Stage 2b readonly integer locals, Stage 2c simple integer arithmetic, and Stage 2d returned integer expressions as separate future implementation slices.
 - Plan a lowered/native IR when native code generation needs a simpler representation for control flow, memory layout, runtime calls, and backend emission.
 - Expand native support beyond Stage 1 only after the next accepted native slice specifies the language semantics and expected behavior.
 - Keep future LLVM optimized-profile work conformant with accepted Doria integer semantics and Cranelift fast-profile behavior for the same supported programs.

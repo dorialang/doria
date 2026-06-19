@@ -1,6 +1,6 @@
 # 0013 Stage 2 native integer execution
 
-Status: Proposed
+Status: Accepted
 
 ## Question
 
@@ -40,29 +40,31 @@ Those features require answers for:
 - how Cranelift fast profile and future LLVM optimized profile remain semantically identical
 ```
 
-This note is proposed only. It does not implement Stage 2 and does not change Doria semantics until accepted.
+This decision accepts the Stage 2 native integer direction and the narrow Stage 2a implementation path. It does not implement Stage 2 native code generation.
 
-## Recommendation summary
+## Decision summary
 
-Recommendation:
+Accepted decisions:
 
 ```text
 - Split Stage 2 into small sub-stages instead of one large integer slice.
+- Implement Stage 2a first: `return <portable integer exit-code literal>;` from `main`.
 - Use fixed-width signed 64-bit `int` for early native integer semantics.
-- Require `int` literals to fit the accepted Doria `int` range.
-- Reject compile-time constant overflow before native lowering.
+- Require decimal integer literals in `int` contexts to fit the signed 64-bit Doria `int` range.
+- Support Stage 2a native exit-code literals only in the portable `0..125` range.
+- Reject out-of-range integer literals before Doria IR/native lowering.
+- Reject compile-time constant overflow before native lowering when arithmetic lands.
 - Defer non-constant runtime overflow until Doria has an accepted panic/error/runtime policy.
-- For native smoke exit-code tests, support only a narrow portable exit-code literal range at first.
 - Require future LLVM support to match Cranelift/Doria behavior exactly for accepted Stage 2 programs.
 ```
 
-These are recommendations, not accepted decisions.
+Cranelift and LLVM are backend profiles. They implement Doria; they do not define Doria integer semantics.
 
-## Proposed sub-stages
+## Accepted staged rollout
 
 Stage 2 does not need to be one implementation jump.
 
-Recommended sequence:
+Accepted sequence:
 
 ```text
 Stage 2a:
@@ -77,6 +79,8 @@ Stage 2c:
 Stage 2d:
   Support returning simple integer expressions from `main`.
 ```
+
+Stage 2a is the next accepted implementation slice. Stage 2b, Stage 2c, and Stage 2d remain separate future implementation slices and should not be treated as implemented or ready to implement by this decision alone.
 
 Rationale:
 
@@ -157,28 +161,30 @@ Cons:
 - Requires naming, conversion, overflow, and literal inference design.
 ```
 
-Recommendation:
+Decision:
 
 ```text
 Use fixed-width signed 64-bit `int` for early native semantics.
 ```
 
-This should be accepted explicitly before implementation. Cranelift and LLVM should lower Doria `int` according to this Doria decision, not according to backend defaults.
+Doria `int` is a fixed-width signed 64-bit integer for early native integer semantics. Cranelift and LLVM should lower Doria `int` according to this Doria decision, not according to backend defaults.
+
+Explicit sized integer families may be designed later for FFI, binary formats, graphics, game engines, and systems APIs. They are not part of Stage 2a.
 
 ## Integer literal rules
 
-Questions to settle:
+This decision answers:
 
 ```text
-- What decimal literal range is accepted for `int`?
-- Are negative integers parsed as negative literals or unary expressions?
-- What diagnostic is reported when an integer literal does not fit Doria `int`?
-- Is compile-time literal overflow a semantic error?
+- Decimal integer literals in `int` contexts must fit the signed 64-bit Doria `int` range.
+- Negative integers are not parsed as special negative literals in Stage 2a.
+- Out-of-range integer literals must be diagnosed before Doria IR/native lowering.
+- Compile-time literal overflow is a semantic error.
 ```
 
 Current syntax already parses integer literals as unsigned digit text. A spelling such as `-1` should be treated as a unary expression only after unary syntax is specified; Stage 2 should not smuggle unary operators into the native backend by treating `-1` as a special case.
 
-Recommendation:
+Decision:
 
 ```text
 - Decimal integer literals in `int` contexts must fit the accepted Doria `int` range.
@@ -187,7 +193,7 @@ Recommendation:
 - Compile-time literal overflow is a semantic error.
 ```
 
-For an accepted signed 64-bit `int`, the positive literal range for Stage 2 would be:
+For the accepted signed 64-bit Doria `int`, the positive literal range for Stage 2 is:
 
 ```text
 0 through 9223372036854775807
@@ -209,14 +215,18 @@ Options:
 | Debug checked / release unchecked | Common in some ecosystems. | Creates profile-dependent Doria behavior, conflicting with the Cranelift/LLVM conformance rule. |
 | Arbitrary precision promotion | Avoids fixed-width overflow. | Requires runtime representation and allocation decisions outside Stage 2. |
 
-Recommendation:
+Decision:
 
 ```text
 Doria must not inherit LLVM undefined behavior or Cranelift wrapping behavior by accident.
 
-For early native integer arithmetic:
-- reject compile-time constant overflow before native lowering
-- defer non-constant runtime overflow until Doria has an accepted panic/error/runtime policy
+For Stage 2a:
+- arithmetic is not supported, so arithmetic overflow is not yet applicable
+- out-of-range integer literals are rejected before native lowering
+
+For future Stage 2c:
+- compile-time constant overflow should be rejected before native lowering
+- non-constant runtime overflow remains deferred until Doria has an accepted panic/error/runtime policy
 ```
 
 If Stage 2c needs arithmetic before runtime overflow policy exists, it should initially accept only expressions whose overflow can be decided at compile time. For example, arithmetic over integer literals and readonly locals initialized from integer literals can be constant-folded and checked before lowering.
@@ -227,7 +237,7 @@ Do not introduce debug-checked/release-unchecked behavior. The fast Cranelift pr
 
 Stage 1 only returns `0`, so it avoids platform exit-code differences.
 
-Stage 2a may want:
+Stage 2a accepts:
 
 ```doria
 function main(): int
@@ -236,22 +246,22 @@ function main(): int
 }
 ```
 
-Questions to settle:
+This decision answers:
 
 ```text
-- What range is portable for native smoke tests?
-- Should Doria reject out-of-range exit-code literals for now?
-- Should Doria map or truncate according to platform convention?
-- Is the full `int` return value semantic while the observed process status is platform-specific?
+- The portable Stage 2a native smoke-test range is `0..125`.
+- Doria must reject out-of-range Stage 2a exit-code literals before native lowering.
+- Doria must not map or truncate Stage 2a return values according to platform convention.
+- Full `int` return-value process-exit behavior remains a later decision.
 ```
 
-Recommendation:
+Decision:
 
 ```text
-For Stage 2 native smoke tests, support portable non-negative exit-code literals in a narrow range first.
+For Stage 2a native executable output, support portable non-negative exit-code literals in the `0..125` range.
 ```
 
-Possible accepted range:
+Accepted range:
 
 ```text
 0..125
@@ -272,19 +282,22 @@ Alternative possible range:
 0..255
 ```
 
-This is familiar on Unix-like systems, but still risks platform-specific interpretation and shell conventions. If this range is chosen, the decision should explicitly state that the observed process status is constrained to the platform process-exit mechanism.
+This is familiar on Unix-like systems, but still risks platform-specific interpretation and shell conventions. Stage 2a does not choose this range.
 
-Recommendation:
+Decision:
 
 ```text
-- Stage 2a should reject out-of-range exit-code literals before native lowering.
-- Stage 2 should not silently allow platform truncation.
+- `return 0;` through `return 125;` are accepted for native Stage 2a.
+- `return 126;` and above are rejected for native Stage 2a.
+- Negative return values are out of scope because unary expressions are out of scope.
+- Stage 2a must reject out-of-range exit-code literals before native lowering.
+- Stage 2a must not silently allow platform truncation.
 - A later process-exit decision can specify how full Doria `int` return values map to platform exit status.
 ```
 
-## Proposed Stage 2 implementation scope
+## Accepted Stage 2a implementation scope
 
-Possible Stage 2a accepted shape:
+Stage 2a may compile only this shape:
 
 ```doria
 function main(): int
@@ -293,28 +306,9 @@ function main(): int
 }
 ```
 
-Possible Stage 2b accepted shape:
+The returned integer literal must be in the accepted `0..125` Stage 2a exit-code range.
 
-```doria
-function main(): int
-{
-    let $code = 42;
-    return $code;
-}
-```
-
-Possible Stage 2c/2d accepted shape:
-
-```doria
-function main(): int
-{
-    let $x = 20;
-    let $y = 22;
-    return $x + $y;
-}
-```
-
-The implementation should still require:
+Stage 2a must still require:
 
 ```text
 - exactly one top-level `function main(): int`
@@ -322,13 +316,15 @@ The implementation should still require:
 - no top-level executable statements
 - no extra top-level functions
 - no classes
-- no unsupported statements inside `main`
+- one `return <portable integer literal>;` statement in `main`
 - parser and semantic checks before native lowering
 ```
 
-Out of scope for Stage 2:
+Stage 2a must not compile:
 
 ```text
+- locals
+- arithmetic
 - strings
 - echo/stdout
 - bools and comparisons
@@ -345,7 +341,7 @@ Out of scope for Stage 2:
 - standard library runtime
 ```
 
-Those belong to later accepted native slices.
+Those belong to later accepted native slices. Stage 2b, Stage 2c, and Stage 2d remain future work.
 
 ## Conformance expectations
 
@@ -354,6 +350,7 @@ When LLVM later supports Stage 2 integer execution, it must match Cranelift/Dori
 Conformance checks should include:
 
 ```text
+- accepted/rejected behavior
 - process exit code for supported values
 - diagnostics for out-of-range integer literals
 - diagnostics for unsupported native expressions
@@ -374,9 +371,9 @@ Stage 1 native tests should mirror the backend linker selection behavior, includ
 
 This note does not implement that change. It records a hardening issue for the implementation follow-up.
 
-## Non-goals of this proposal
+## Non-goals of this decision
 
-This proposal does not:
+This decision does not:
 
 ```text
 - implement Stage 2 native code generation
@@ -393,16 +390,16 @@ This proposal does not:
 - define final process-exit behavior for all Doria `int` values
 ```
 
-## Open questions for review
+## Resolved questions
 
-Andrew should explicitly decide:
+This decision resolves:
 
 ```text
-1. Should early Doria `int` be signed 64-bit?
-2. Should Stage 2a use exit-code range `0..125`, `0..255`, or another range?
-3. Should negative integer expressions remain out of scope until unary operators are specified?
-4. Should Stage 2c accept only compile-time-checkable arithmetic until runtime overflow policy exists?
-5. What diagnostic wording should Doria use for out-of-range literals and constant overflow?
+1. Early Doria `int` is signed 64-bit.
+2. Stage 2a uses exit-code range `0..125`.
+3. Negative integer expressions remain out of scope until unary operators are specified.
+4. Future Stage 2c should reject compile-time constant overflow before native lowering.
+5. Non-constant runtime overflow remains deferred until Doria has an accepted panic/error/runtime policy.
 ```
 
-Until those questions are accepted, Stage 2 implementation should not begin.
+Diagnostic wording for out-of-range literals and constant overflow can be finalized during implementation, as long as diagnostics are clear and occur before Doria IR/native lowering.
