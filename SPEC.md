@@ -277,6 +277,22 @@ let $person = new Person("Andrew"); // Person
 
 The semantic checker resolves parsed type syntax into semantic types before checking assignment, return, and positional call compatibility. Doria checks typed declarations, property initializers, property writes, parameter defaults, declared function/method return values, and call arguments for functions, methods, static calls, and constructors. It does not perform PHP-style scalar coercion: `int` is not assignable from `string`, `string` is not assignable from `int`, and `bool` is not assignable from `int`.
 
+### String literals and interpolation
+
+Single-quoted string literals are plain string literals. Double-quoted string literals support braced interpolation using Doria-owned syntax, not PHP backend behavior:
+
+```doria
+let $name = "Andrew";
+echo "Hello, {$name}";
+echo "Hello, {$this->profile->displayName}";
+```
+
+This slice supports only variable/property-path interpolation: `$name`, `$this`, `$user->name`, and repeated property access. Unbraced interpolation, method calls, function calls, arithmetic, comparisons, custom formatting, and full expressions inside interpolation are future work.
+
+Interpolated strings are represented in the AST and Doria IR as string parts before any backend runs. The PHP backend lowers them explicitly, for example `"Hello, {$name}!"` becomes PHP equivalent to `"Hello, " . $name . "!"`.
+
+Interpolated values may currently be `string`, `int`, `float`, `bool`, `null`, `mixed`, or the internal `Unknown` recovery type. Class values, `object`, `resource`, `List<T>`, `Dictionary<K, V>`, and `Set<T>` are rejected until Doria has a deliberate display/string-conversion design.
+
 Numeric widening is not implemented yet; for now `float` is not assignable from `int`, and `int` is not assignable from `float`. Any future safe numeric widening should be a separate design decision. Named arguments and richer call argument representation are separate future slices.
 
 Simple collection literals infer collection element/key/value types when all clear parts match. Clear heterogeneous collection literals, such as `[1, "two"]`, are rejected by narrow collection alias assignment checks rather than being erased to `Unknown`. The empty literal `[]` stays ambiguous so typed contexts may use it as an empty `List<T>` or `Dictionary<K, V>`. The PHP-compatible `array` annotation remains broad enough to accept list-shaped and dictionary-shaped literals.

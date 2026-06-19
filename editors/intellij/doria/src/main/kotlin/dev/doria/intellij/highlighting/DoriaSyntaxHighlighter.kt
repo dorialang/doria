@@ -28,6 +28,7 @@ class DoriaSyntaxHighlighter : SyntaxHighlighter {
         DoriaTokenTypes.NULL_LITERAL -> CONSTANT_KEYS
         DoriaTokenTypes.NUMBER -> NUMBER_KEYS
         DoriaTokenTypes.STRING -> STRING_KEYS
+        DoriaTokenTypes.ESCAPE_SEQUENCE -> ESCAPE_SEQUENCE_KEYS
         DoriaTokenTypes.COMMENT -> COMMENT_KEYS
         DoriaTokenTypes.DOC_COMMENT -> DOC_COMMENT_KEYS
         DoriaTokenTypes.DOC_COMMENT_TAG -> DOC_COMMENT_TAG_KEYS
@@ -83,7 +84,7 @@ class DoriaSyntaxHighlighter : SyntaxHighlighter {
         )
         val VARIABLE: TextAttributesKey = TextAttributesKey.createTextAttributesKey(
             "DORIA_VARIABLE",
-            DefaultLanguageHighlighterColors.LOCAL_VARIABLE,
+            DefaultLanguageHighlighterColors.INSTANCE_FIELD,
         )
         val THIS: TextAttributesKey = TextAttributesKey.createTextAttributesKey(
             "DORIA_THIS",
@@ -104,6 +105,10 @@ class DoriaSyntaxHighlighter : SyntaxHighlighter {
         val STRING: TextAttributesKey = TextAttributesKey.createTextAttributesKey(
             "DORIA_STRING",
             DefaultLanguageHighlighterColors.STRING,
+        )
+        val ESCAPE_SEQUENCE: TextAttributesKey = TextAttributesKey.createTextAttributesKey(
+            "DORIA_ESCAPE_SEQUENCE",
+            DefaultLanguageHighlighterColors.VALID_STRING_ESCAPE,
         )
         val COMMENT: TextAttributesKey = TextAttributesKey.createTextAttributesKey(
             "DORIA_COMMENT",
@@ -158,6 +163,7 @@ class DoriaSyntaxHighlighter : SyntaxHighlighter {
         private val CONSTANT_KEYS = arrayOf(CONSTANT)
         private val NUMBER_KEYS = arrayOf(NUMBER)
         private val STRING_KEYS = arrayOf(STRING)
+        private val ESCAPE_SEQUENCE_KEYS = arrayOf(ESCAPE_SEQUENCE)
         private val COMMENT_KEYS = arrayOf(COMMENT)
         private val DOC_COMMENT_KEYS = arrayOf(DOC_COMMENT)
         private val DOC_COMMENT_TAG_KEYS = arrayOf(DOC_COMMENT_TAG)

@@ -970,6 +970,167 @@ class Person
 }
 
 #[test]
+fn checks_string_interpolation_semantics() {
+    doriac::check_source(
+        "test.doria",
+        r#"
+function render(mixed $value): void
+{
+    string $name = "Andrew";
+    int $age = 37;
+    float $ratio = 1.5;
+    bool $active = true;
+    null $nothing = null;
+
+    echo "{$name}{$age}{$ratio}{$active}{$nothing}{$value}";
+}
+"#,
+    )
+    .expect("semantic check should succeed");
+
+    doriac::check_source(
+        "test.doria",
+        r#"
+class Profile
+{
+    string $displayName = "Andrew";
+}
+
+class Person
+{
+    function __construct(Profile $profile)
+    {
+    }
+
+    function greet(): void
+    {
+        echo "Hello, {$this->profile->displayName}";
+    }
+}
+
+let $person = new Person(new Profile());
+"#,
+    )
+    .expect("semantic check should succeed");
+
+    doriac::check_source(
+        "test.doria",
+        r#"
+class Person
+{
+    string $message;
+
+    function __construct(string $name)
+    {
+        $this->message = "Hello, {$name}";
+    }
+}
+
+let $person = new Person("Andrew");
+"#,
+    )
+    .expect("semantic check should succeed");
+
+    assert_type_mismatch(
+        r#"
+class Person
+{
+    int $message;
+
+    function __construct(string $name)
+    {
+        $this->message = "Hello, {$name}";
+    }
+}
+"#,
+    );
+}
+
+#[test]
+fn rejects_invalid_string_interpolation_semantics() {
+    for (source, code) in [
+        (r#"echo "Hello, {$name}";"#, "E0101"),
+        (
+            r#"
+class Person {}
+
+let $person = new Person();
+echo "Hello, {$person->name}";
+"#,
+            "E0303",
+        ),
+        (
+            r#"
+class Secret
+{
+    internal string $value = "hidden";
+}
+
+let $secret = new Secret();
+echo "Secret: {$secret->value}";
+"#,
+            "E0306",
+        ),
+        (
+            r#"
+class Person {}
+
+let $person = new Person();
+echo "{$person}";
+"#,
+            "E0415",
+        ),
+        (
+            r#"
+class Person {}
+
+object $value = new Person();
+echo "{$value}";
+"#,
+            "E0415",
+        ),
+        (
+            r#"
+function show(resource $handle): void
+{
+    echo "{$handle}";
+}
+"#,
+            "E0415",
+        ),
+        (
+            r#"
+function show(List<int> $items): void
+{
+    echo "{$items}";
+}
+"#,
+            "E0415",
+        ),
+        (
+            r#"
+function show(Dictionary<string, int> $items): void
+{
+    echo "{$items}";
+}
+"#,
+            "E0415",
+        ),
+        (
+            r#"
+function show(Set<int> $items): void
+{
+    echo "{$items}";
+}
+"#,
+            "E0415",
+        ),
+    ] {
+        assert_diagnostic_code(source, code);
+    }
+}
+
+#[test]
 fn allows_property_initializer_accessing_own_internal_static_method() {
     doriac::check_source(
         "test.doria",

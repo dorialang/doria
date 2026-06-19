@@ -27,7 +27,16 @@ class DoriaColorSettingsPage : ColorSettingsPage {
              * Rename the person.
              *
              * @param string ${'$'}name The new name.
-             * @return Person
+             */
+            writable function rename(string ${'$'}name): void
+            {
+                ${'$'}this->name = ${'$'}name;
+            }
+
+            /**
+             * Get the greeting message.
+             *
+             * @return string The greeting message.
              */
             internal function getGreetingMessage(): string
             {
@@ -36,6 +45,7 @@ class DoriaColorSettingsPage : ColorSettingsPage {
         }
 
         let writable ${'$'}person = new Person();
+        echo "\\n---\\t---\\r---\\s";
         ${'$'}person->greet();
         Person::fromName("Lucy");
     """.trimIndent()
@@ -66,6 +76,7 @@ class DoriaColorSettingsPage : ColorSettingsPage {
             AttributesDescriptor("Constant", DoriaSyntaxHighlighter.CONSTANT),
             AttributesDescriptor("Number", DoriaSyntaxHighlighter.NUMBER),
             AttributesDescriptor("String", DoriaSyntaxHighlighter.STRING),
+            AttributesDescriptor("Escape sequence", DoriaSyntaxHighlighter.ESCAPE_SEQUENCE),
             AttributesDescriptor("Comment", DoriaSyntaxHighlighter.COMMENT),
             AttributesDescriptor("Doc comment", DoriaSyntaxHighlighter.DOC_COMMENT),
             AttributesDescriptor("Doc comment tag", DoriaSyntaxHighlighter.DOC_COMMENT_TAG),

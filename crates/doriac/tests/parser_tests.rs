@@ -1,4 +1,4 @@
-use doriac::ast::{ClassMember, Item, MemberAccess, Stmt};
+use doriac::ast::{ClassMember, Expr, InterpolatedStringPart, Item, MemberAccess, Stmt};
 
 #[test]
 fn parses_variable_declarations() {
@@ -35,6 +35,90 @@ null $empty = null;
     ));
 }
 
+fn parse_echo_expr(source: &str) -> Expr {
+    let program = doriac::parse_source("test.doria", source).expect("parse should succeed");
+    let Item::Statement(Stmt::Echo { expr, .. }) = &program.items[0] else {
+        panic!("expected echo statement");
+    };
+    expr.clone()
+}
+
+#[test]
+fn parses_plain_and_interpolated_strings() {
+    assert!(matches!(
+        parse_echo_expr("echo '{$name}';"),
+        Expr::String { value, .. } if value == "{$name}"
+    ));
+    assert!(matches!(
+        parse_echo_expr("echo \"Hello\";"),
+        Expr::String { value, .. } if value == "Hello"
+    ));
+    assert!(matches!(
+        parse_echo_expr("echo \"{}\";"),
+        Expr::String { value, .. } if value == "{}"
+    ));
+
+    let Expr::InterpolatedString { parts, .. } = parse_echo_expr("echo \"Hello, {$name}\";") else {
+        panic!("expected interpolated string");
+    };
+    assert!(matches!(&parts[0], InterpolatedStringPart::Text(text) if text == "Hello, "));
+    assert!(matches!(
+        &parts[1],
+        InterpolatedStringPart::Expr(Expr::Variable { name, .. }) if name == "name"
+    ));
+
+    let Expr::InterpolatedString { parts, .. } = parse_echo_expr("echo \"Hello, {$this->name}\";")
+    else {
+        panic!("expected interpolated string");
+    };
+    assert!(matches!(
+        &parts[1],
+        InterpolatedStringPart::Expr(Expr::PropertyAccess { object, property, .. })
+            if matches!(object.as_ref(), Expr::This { .. }) && property == "name"
+    ));
+
+    let Expr::InterpolatedString { parts, .. } = parse_echo_expr("echo \"{$first} {$last}\";")
+    else {
+        panic!("expected interpolated string");
+    };
+    assert_eq!(parts.len(), 3);
+    assert!(matches!(
+        &parts[0],
+        InterpolatedStringPart::Expr(Expr::Variable { name, .. }) if name == "first"
+    ));
+    assert!(matches!(&parts[1], InterpolatedStringPart::Text(text) if text == " "));
+    assert!(matches!(
+        &parts[2],
+        InterpolatedStringPart::Expr(Expr::Variable { name, .. }) if name == "last"
+    ));
+}
+
+#[test]
+fn rejects_malformed_or_unsupported_string_interpolation() {
+    for (source, message) in [
+        (
+            "echo \"Hello, {$name\";",
+            "unterminated string interpolation",
+        ),
+        ("echo \"Hello, {$}\";", "empty string interpolation"),
+        (
+            "echo \"Total: {$a + $b}\";",
+            "unsupported string interpolation expression",
+        ),
+        (
+            "echo \"Name: {$user->name()}\";",
+            "unsupported string interpolation expression",
+        ),
+    ] {
+        let err = doriac::parse_source("test.doria", source)
+            .expect_err("parse should reject unsupported interpolation");
+        assert!(
+            err.iter()
+                .any(|diagnostic| diagnostic.message.contains(message)),
+            "expected diagnostic containing {message}, got {err:?}"
+        );
+    }
+}
 #[test]
 fn parses_class_with_writable_method() {
     let program = doriac::parse_source(

@@ -1,4 +1,4 @@
-use doriac::lexer::{Lexer, TokenKind};
+use doriac::lexer::{Lexer, StringQuoteKind, TokenKind};
 use doriac::source::SourceFile;
 
 fn token_kinds(source: &str) -> Vec<TokenKind> {
@@ -23,6 +23,25 @@ Dictionary<string, int> $items = ["apples" => 5];"#,
     assert!(matches!(kinds[2], TokenKind::Variable(ref name) if name == "name"));
     assert!(matches!(kinds[6], TokenKind::Identifier(ref name) if name == "Dictionary"));
     assert!(kinds.iter().any(|kind| matches!(kind, TokenKind::FatArrow)));
+}
+
+#[test]
+fn lexes_string_quote_kinds() {
+    let kinds = token_kinds(r#"'{}' "{}""#);
+    assert!(matches!(
+        &kinds[0],
+        TokenKind::StringLiteral {
+            value,
+            quote: StringQuoteKind::Single,
+        } if value == "{}"
+    ));
+    assert!(matches!(
+        &kinds[1],
+        TokenKind::StringLiteral {
+            value,
+            quote: StringQuoteKind::Double,
+        } if value == "{}"
+    ));
 }
 
 #[test]

@@ -889,6 +889,9 @@ impl<'program> Checker<'program> {
                     ));
                 }
             }
+            Expr::InterpolatedString { parts, .. } => {
+                self.check_interpolated_string(parts, scopes, method_context);
+            }
             Expr::Array { elements, .. } => {
                 for element in elements {
                     if let Some(key) = &element.key {
@@ -965,6 +968,43 @@ impl<'program> Checker<'program> {
             | Expr::Bool { .. }
             | Expr::Null { .. } => {}
         }
+    }
+
+    fn check_interpolated_string(
+        &mut self,
+        parts: &[InterpolatedStringPart],
+        scopes: &ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) {
+        for part in parts {
+            let InterpolatedStringPart::Expr(expr) = part else {
+                continue;
+            };
+
+            self.check_expr(expr, scopes, method_context);
+            let ty = self.infer_expr_type(expr, scopes, method_context);
+            if !self.is_interpolatable_type(ty) {
+                let ty_name = self.types.display(ty);
+                self.diagnostics.push(Diagnostic::new(
+                    "E0415",
+                    format!("value of type {ty_name} cannot be interpolated into a string"),
+                    expr.span(),
+                ));
+            }
+        }
+    }
+
+    fn is_interpolatable_type(&self, ty: TypeId) -> bool {
+        matches!(
+            self.types.kind(ty),
+            TypeKind::String
+                | TypeKind::Int
+                | TypeKind::Float
+                | TypeKind::Bool
+                | TypeKind::Null
+                | TypeKind::Mixed
+                | TypeKind::Unknown
+        )
     }
 
     fn check_assignment_target(
@@ -1824,7 +1864,9 @@ impl<'program> Checker<'program> {
         method_context: Option<&MethodContext>,
     ) -> TypeId {
         match expr {
-            Expr::String { .. } => self.types.intern(TypeKind::String),
+            Expr::String { .. } | Expr::InterpolatedString { .. } => {
+                self.types.intern(TypeKind::String)
+            }
             Expr::Int { .. } => self.types.intern(TypeKind::Int),
             Expr::Float { .. } => self.types.intern(TypeKind::Float),
             Expr::Bool { .. } => self.types.intern(TypeKind::Bool),

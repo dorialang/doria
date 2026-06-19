@@ -135,6 +135,10 @@ pub enum Expr {
         value: String,
         span: Span,
     },
+    InterpolatedString {
+        parts: Vec<InterpolatedStringPart>,
+        span: Span,
+    },
     Int {
         value: String,
         span: Span,
@@ -190,6 +194,12 @@ pub enum Expr {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub enum InterpolatedStringPart {
+    Text(String),
+    Expr(Expr),
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct ArrayElement {
     pub key: Option<Expr>,
     pub value: Expr,
@@ -223,6 +233,7 @@ impl Expr {
             | Expr::This { span }
             | Expr::Identifier { span, .. }
             | Expr::String { span, .. }
+            | Expr::InterpolatedString { span, .. }
             | Expr::Int { span, .. }
             | Expr::Float { span, .. }
             | Expr::Bool { span, .. }

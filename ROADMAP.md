@@ -17,6 +17,7 @@
 - Check assignment compatibility, declared function/method return values, and positional call arguments in the current semantic slice.
 - Allow constructors to initialize uninitialized readonly properties through narrow direct init access.
 - Keep PHP as a compatibility backend only.
+- Represent braced string interpolation in the Doria AST and Doria IR, with PHP lowering emitted as explicit concatenation.
 - Do not build PHP-to-Doria migration in the current v0.1 slice.
 - Do not start desktop, game engine, raylib, or FFI implementation work in the current v0.1 slice.
 
@@ -27,7 +28,7 @@
 - Plan a lowered/native IR when native code generation needs a simpler representation for control flow, memory layout, runtime calls, and backend emission.
 - Add native backend experiments behind explicit targets.
 - Plan the path toward writing more of `doriac` in Doria itself.
-- Add string interpolation AST nodes independent of PHP behavior.
+- Expand string interpolation beyond variable/property paths after Doria has a deliberate display/string-conversion design.
 - Emit precedence-aware backend expressions.
 - Add parser/AST support for attributes using `#[...]`.
 - Add named arguments and shared call argument representation for calls and attributes.

@@ -171,3 +171,97 @@ class StreamBox
     assert!(!php.contains("resource $handle"));
     assert!(!php.contains("): resource"));
 }
+
+#[test]
+fn lowers_interpolated_string_to_hir() {
+    let lowered = doriac::lower_source(
+        "test.doria",
+        r#"
+let $name = "Doria";
+echo "Hello, {$name}";
+"#,
+    )
+    .expect("lowering should succeed");
+
+    let hir::Item::Statement(hir::Stmt::Echo { expr, .. }) = &lowered.items[1] else {
+        panic!("expected echo statement");
+    };
+    let hir::Expr::InterpolatedString { parts, .. } = expr else {
+        panic!("expected interpolated string in HIR");
+    };
+
+    assert!(matches!(&parts[0], hir::InterpolatedStringPart::Text(text) if text == "Hello, "));
+    assert!(matches!(
+        &parts[1],
+        hir::InterpolatedStringPart::Expr(hir::Expr::Variable { name, .. }) if name == "name"
+    ));
+}
+
+#[test]
+fn emits_explicit_php_concat_for_interpolated_strings() {
+    let php = doriac::compile_source_to_php(
+        "test.doria",
+        r#"
+let $name = "Andrew";
+echo "Hello, {$name}!";
+"#,
+    )
+    .expect("compilation should succeed");
+
+    assert!(php.contains("echo \"Hello, \" . $name . \"!\";"));
+    assert!(!php.contains("{$name}"));
+
+    let php = doriac::compile_source_to_php(
+        "test.doria",
+        r#"
+class Person
+{
+    function __construct(string $name)
+    {
+    }
+
+    function greet(): void
+    {
+        echo "Hello, {$this->name}";
+    }
+}
+"#,
+    )
+    .expect("compilation should succeed");
+
+    assert!(php.contains("echo \"Hello, \" . $this->name;"));
+    assert!(!php.contains("{$this->name}"));
+}
+
+#[test]
+fn escapes_php_interpolation_markers_in_string_text() {
+    let php = doriac::compile_source_to_php(
+        "test.doria",
+        r#"
+let $name = "Andrew";
+let $amount = 10;
+echo "Hello, $name";
+echo 'Literal $name';
+echo "Total: {$amount} ($currency)";
+"#,
+    )
+    .expect("compilation should succeed");
+
+    assert!(php.contains("echo \"Hello, \\$name\";"));
+    assert!(php.contains("echo \"Literal \\$name\";"));
+    assert!(php.contains("echo \"Total: \" . $amount . \" (\\$currency)\";"));
+}
+#[test]
+fn compiles_person_example_with_explicit_interpolation() {
+    let example_path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/person.doria");
+    let source = std::fs::read_to_string(&example_path).expect("read person example");
+    let php = doriac::compile_source_to_php("examples/person.doria", &source)
+        .expect("person example should compile");
+
+    assert!(php.contains(
+        "return \"Hello, my name is \" . $this->name . \" and I am \" . $this->age . \" years old!\";"
+    ));
+    assert!(!php.contains("{$this->name}"));
+    assert!(!php.contains("{$this->age}"));
+}

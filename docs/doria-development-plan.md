@@ -825,6 +825,20 @@ This is valid because `$this->id = $givenId;` is a direct simple assignment to a
 
 Property initializers and constructor-promoted parameters count as already initialized, so constructor bodies cannot assign those readonly properties again. Init access does not allow compound assignment, nested writes such as `$this->child->name = "Lucy";`, or calls to writable methods through `$this`. Full definite property initialization, where every constructor path must initialize required readonly properties, is future work.
 
+## String interpolation
+
+Doria supports braced interpolation in double-quoted strings:
+
+```doria
+let $name = "Andrew";
+echo "Hello, {$name}";
+echo "Hello, {$this->profile->displayName}";
+```
+
+Single-quoted strings are plain strings and never interpolate. Interpolation is represented in the Doria AST and Doria IR before backend emission; the PHP backend lowers it to explicit concatenation instead of relying on PHP double-quoted interpolation.
+
+The first slice supports only variable/property paths: `$name`, `$this`, `$user->name`, and repeated `->property` chains. It allows `string`, `int`, `float`, `bool`, `null`, and `mixed` values. Class values, `object`, `resource`, and collection values are rejected until Doria has a deliberate string conversion/display design. Method calls, function calls, arithmetic, comparisons, custom formatting, and full expressions inside interpolation are future work.
+
 ---
 
 # Phase 6: Backend emission and PHP backend

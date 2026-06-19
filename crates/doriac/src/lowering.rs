@@ -131,6 +131,10 @@ fn lower_expr(expr: &ast::Expr) -> hir::Expr {
             value: value.clone(),
             span: *span,
         },
+        ast::Expr::InterpolatedString { parts, span } => hir::Expr::InterpolatedString {
+            parts: parts.iter().map(lower_interpolated_string_part).collect(),
+            span: *span,
+        },
         ast::Expr::Int { value, span } => hir::Expr::Int {
             value: value.clone(),
             span: *span,
@@ -204,6 +208,17 @@ fn lower_expr(expr: &ast::Expr) -> hir::Expr {
             right: Box::new(lower_expr(right)),
             span: *span,
         },
+    }
+}
+
+fn lower_interpolated_string_part(
+    part: &ast::InterpolatedStringPart,
+) -> hir::InterpolatedStringPart {
+    match part {
+        ast::InterpolatedStringPart::Text(text) => hir::InterpolatedStringPart::Text(text.clone()),
+        ast::InterpolatedStringPart::Expr(expr) => {
+            hir::InterpolatedStringPart::Expr(lower_expr(expr))
+        }
     }
 }
 

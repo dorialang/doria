@@ -1,6 +1,6 @@
 use crate::ast::*;
 use crate::diagnostics::{Diagnostic, DiagnosticResult};
-use crate::lexer::{Token, TokenKind};
+use crate::lexer::{StringQuoteKind, Token, TokenKind};
 use crate::source::Span;
 use crate::types::TypeRef;
 
@@ -477,10 +477,9 @@ impl Parser {
                     })
                 }
             }
-            TokenKind::StringLiteral(value) => Some(Expr::String {
-                value,
-                span: token.span,
-            }),
+            TokenKind::StringLiteral { value, quote } => {
+                self.parse_string_literal(value, quote, token.span)
+            }
             TokenKind::IntLiteral(value) => Some(Expr::Int {
                 value,
                 span: token.span,
@@ -510,6 +509,130 @@ impl Parser {
                 None
             }
         }
+    }
+
+    fn parse_string_literal(
+        &mut self,
+        value: String,
+        quote: StringQuoteKind,
+        span: Span,
+    ) -> Option<Expr> {
+        if matches!(quote, StringQuoteKind::Single) || !value.contains('{') {
+            return Some(Expr::String { value, span });
+        }
+
+        let bytes = value.as_bytes();
+        let mut parts = Vec::new();
+        let mut cursor = 0;
+        let mut text_start = 0;
+        let mut has_interpolation = false;
+
+        while let Some(open_offset) = value[cursor..].find('{') {
+            let open = cursor + open_offset;
+            if open + 1 >= value.len() || bytes[open + 1] != b'$' {
+                cursor = open + 1;
+                continue;
+            }
+
+            let inner_start = open + 1;
+            let Some(close_offset) = value[inner_start..].find('}') else {
+                self.error("unterminated string interpolation", span);
+                return None;
+            };
+            let close = inner_start + close_offset;
+            let inner = &value[inner_start..close];
+            if inner == "$" {
+                self.error("empty string interpolation", span);
+                return None;
+            }
+
+            if open > text_start {
+                parts.push(InterpolatedStringPart::Text(
+                    value[text_start..open].to_string(),
+                ));
+            }
+
+            let expr = self.parse_interpolation_expr(inner, span)?;
+            parts.push(InterpolatedStringPart::Expr(expr));
+            has_interpolation = true;
+            cursor = close + 1;
+            text_start = cursor;
+        }
+
+        if !has_interpolation {
+            return Some(Expr::String { value, span });
+        }
+
+        if text_start < value.len() {
+            parts.push(InterpolatedStringPart::Text(
+                value[text_start..].to_string(),
+            ));
+        }
+
+        Some(Expr::InterpolatedString { parts, span })
+    }
+
+    fn parse_interpolation_expr(&mut self, inner: &str, span: Span) -> Option<Expr> {
+        if !inner.starts_with('$') {
+            self.error("unsupported string interpolation expression", span);
+            return None;
+        }
+
+        let mut cursor = 1;
+        let Some(name) = Self::consume_interpolation_identifier(inner, &mut cursor) else {
+            self.error("unsupported string interpolation expression", span);
+            return None;
+        };
+
+        let mut expr = if name == "this" {
+            Expr::This { span }
+        } else {
+            Expr::Variable { name, span }
+        };
+
+        while cursor < inner.len() {
+            if !inner[cursor..].starts_with("->") {
+                self.error("unsupported string interpolation expression", span);
+                return None;
+            }
+            cursor += 2;
+
+            let Some(property) = Self::consume_interpolation_identifier(inner, &mut cursor) else {
+                self.error("unsupported string interpolation expression", span);
+                return None;
+            };
+
+            expr = Expr::PropertyAccess {
+                object: Box::new(expr),
+                property,
+                span,
+            };
+        }
+
+        Some(expr)
+    }
+
+    fn consume_interpolation_identifier(input: &str, cursor: &mut usize) -> Option<String> {
+        let bytes = input.as_bytes();
+        if *cursor >= bytes.len() || !Self::is_identifier_start_byte(bytes[*cursor]) {
+            return None;
+        }
+
+        let start = *cursor;
+        *cursor += 1;
+        while *cursor < bytes.len() && Self::is_identifier_part_byte(bytes[*cursor]) {
+            *cursor += 1;
+        }
+
+        Some(input[start..*cursor].to_string())
+    }
+
+    fn is_identifier_start_byte(byte: u8) -> bool {
+        byte == b'_' || byte.is_ascii_alphabetic()
+    }
+
+    fn is_identifier_part_byte(byte: u8) -> bool {
+        byte == b'_' || byte.is_ascii_alphanumeric()
     }
 
     fn parse_new(&mut self, start: usize) -> Option<Expr> {
@@ -809,7 +932,7 @@ fn token_name(kind: &TokenKind) -> &'static str {
         TokenKind::Variable(_) => "variable",
         TokenKind::IntLiteral(_) => "integer",
         TokenKind::FloatLiteral(_) => "float",
-        TokenKind::StringLiteral(_) => "string",
+        TokenKind::StringLiteral { .. } => "string",
         TokenKind::Equals => "=",
         TokenKind::Plus => "+",
         TokenKind::Minus => "-",
