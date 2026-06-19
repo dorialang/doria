@@ -914,9 +914,38 @@ impl<'program> Checker<'program> {
         }
 
         match function.body.statements.last() {
-            Some(Stmt::Return { expr: Some(_), .. }) => {}
-            Some(Stmt::Return { expr: None, .. }) => {}
+            Some(statement) if Self::statement_is_terminal(statement) => {}
             _ => self.report_missing_return_value(context, expected, function.span),
+        }
+    }
+
+    fn statement_is_terminal(statement: &Stmt) -> bool {
+        match statement {
+            Stmt::Return { .. } => true,
+            Stmt::If(if_stmt) => Self::if_statement_is_terminal(if_stmt),
+            _ => false,
+        }
+    }
+
+    fn if_statement_is_terminal(if_stmt: &IfStmt) -> bool {
+        Self::block_is_terminal(&if_stmt.then_block)
+            && if_stmt
+                .else_branch
+                .as_ref()
+                .is_some_and(Self::else_branch_is_terminal)
+    }
+
+    fn block_is_terminal(block: &Block) -> bool {
+        block
+            .statements
+            .last()
+            .is_some_and(Self::statement_is_terminal)
+    }
+
+    fn else_branch_is_terminal(branch: &ElseBranch) -> bool {
+        match branch {
+            ElseBranch::If(if_stmt) => Self::if_statement_is_terminal(if_stmt),
+            ElseBranch::Block(block) => Self::block_is_terminal(block),
         }
     }
 

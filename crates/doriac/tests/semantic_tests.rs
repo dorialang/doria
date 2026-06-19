@@ -894,6 +894,34 @@ function first(List<int> $items): int
 }
 "#,
         r#"
+function value(bool $flag): int
+{
+    if ($flag) {
+        return 1;
+    }
+}
+"#,
+        r#"
+function value(bool $left, bool $right): int
+{
+    if ($left) {
+        return 1;
+    } else if ($right) {
+        return 2;
+    }
+}
+"#,
+        r#"
+function value(bool $flag): int
+{
+    if ($flag) {
+        echo "missing";
+    } else {
+        return 2;
+    }
+}
+"#,
+        r#"
 class Person
 {
     function age(): int
@@ -905,6 +933,40 @@ class Person
     ] {
         assert_diagnostic_code(source, "E0406");
     }
+}
+
+#[test]
+fn counts_exhaustive_if_returns_for_non_void_functions() {
+    doriac::check_source(
+        "test.doria",
+        r#"
+function value(bool $flag): int
+{
+    if ($flag) {
+        return 1;
+    } else {
+        return 2;
+    }
+}
+
+function chained(bool $left, bool $right): int
+{
+    if ($left) {
+        echo "left";
+        return 1;
+    } else if ($right) {
+        return 2;
+    } else {
+        if ($left == $right) {
+            return 3;
+        } else {
+            return 4;
+        }
+    }
+}
+"#,
+    )
+    .expect("semantic check should succeed");
 }
 
 #[test]
