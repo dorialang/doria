@@ -224,7 +224,7 @@ fn host_linker_is_available() -> bool {
 
 fn default_linker() -> &'static str {
     if cfg!(windows) {
-        "link.exe"
+        "cl.exe"
     } else {
         "cc"
     }

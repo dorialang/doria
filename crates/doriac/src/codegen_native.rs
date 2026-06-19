@@ -1,4 +1,5 @@
 use std::env;
+use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -188,16 +189,16 @@ fn invoke_linker(object_path: &Path, executable_path: &Path) -> Result<(), Backe
     // Stage 1 emits a Cranelift object file and asks the host toolchain to link
     // it with the platform startup/runtime path. This is not a C backend:
     // Doria never generates C source or uses C semantics as an oracle here.
+    let cc_is_set = env::var_os("CC").is_some();
     let linker = env::var("CC").unwrap_or_else(|_| default_linker().to_string());
     let mut command = Command::new(&linker);
-
-    if cfg!(windows) && env::var("CC").is_err() {
-        command
-            .arg(object_path)
-            .arg(format!("/OUT:{}", executable_path.display()));
-    } else {
-        command.arg(object_path).arg("-o").arg(executable_path);
-    }
+    command.args(linker_arguments(
+        &linker,
+        cc_is_set,
+        cfg!(windows),
+        object_path,
+        executable_path,
+    ));
 
     let output = command.output().map_err(|error| {
         BackendError::new(format!(
@@ -261,10 +262,42 @@ fn executable_extension() -> &'static str {
 
 fn default_linker() -> &'static str {
     if cfg!(windows) {
-        "link.exe"
+        "cl.exe"
     } else {
         "cc"
     }
+}
+
+fn linker_arguments(
+    linker: &str,
+    cc_is_set: bool,
+    windows: bool,
+    object_path: &Path,
+    executable_path: &Path,
+) -> Vec<OsString> {
+    if windows && (!cc_is_set || is_msvc_style_compiler_driver(linker)) {
+        return vec![
+            OsString::from("/nologo"),
+            object_path.as_os_str().to_os_string(),
+            OsString::from(format!("/Fe:{}", executable_path.display())),
+        ];
+    }
+
+    vec![
+        object_path.as_os_str().to_os_string(),
+        OsString::from("-o"),
+        executable_path.as_os_str().to_os_string(),
+    ]
+}
+
+fn is_msvc_style_compiler_driver(linker: &str) -> bool {
+    let Some(name) = Path::new(linker).file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "cl" | "cl.exe" | "clang-cl" | "clang-cl.exe"
+    )
 }
 
 fn describe_statement(statement: &Stmt) -> &'static str {
@@ -298,5 +331,70 @@ fn describe_expression(expr: &Expr) -> &'static str {
         Expr::StaticCall { .. } => "static call",
         Expr::New { .. } => "object construction",
         Expr::Binary { .. } => "binary expression",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn windows_default_uses_msvc_compiler_driver_arguments() {
+        let args = linker_arguments(
+            "cl.exe",
+            false,
+            true,
+            Path::new("main.obj"),
+            Path::new("main.exe"),
+        );
+
+        assert_eq!(
+            args,
+            vec![
+                OsString::from("/nologo"),
+                OsString::from("main.obj"),
+                OsString::from("/Fe:main.exe"),
+            ]
+        );
+    }
+
+    #[test]
+    fn windows_clang_cl_uses_msvc_compiler_driver_arguments() {
+        let args = linker_arguments(
+            "clang-cl.exe",
+            true,
+            true,
+            Path::new("main.obj"),
+            Path::new("main.exe"),
+        );
+
+        assert_eq!(
+            args,
+            vec![
+                OsString::from("/nologo"),
+                OsString::from("main.obj"),
+                OsString::from("/Fe:main.exe"),
+            ]
+        );
+    }
+
+    #[test]
+    fn unix_style_compiler_driver_uses_dash_o() {
+        let args = linker_arguments(
+            "clang",
+            true,
+            true,
+            Path::new("main.obj"),
+            Path::new("main.exe"),
+        );
+
+        assert_eq!(
+            args,
+            vec![
+                OsString::from("main.obj"),
+                OsString::from("-o"),
+                OsString::from("main.exe"),
+            ]
+        );
     }
 }

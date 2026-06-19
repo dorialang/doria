@@ -53,3 +53,27 @@ $count = 1;
         .expect("message should be string")
         .contains("readonly variable"));
 }
+
+#[test]
+fn accepts_control_flow_without_lsp_diagnostics() {
+    let diagnostics = diagnostics_for_document(
+        "file:///control_flow.doria",
+        r#"let writable $count = 0;
+
+while ($count < 3) {
+    if ($count == 0) {
+        echo "zero";
+    } else if ($count == 1) {
+        echo "one";
+    } else {
+        echo "many";
+    }
+
+    echo "\n";
+    $count += 1;
+}
+"#,
+    );
+
+    assert_eq!(diagnostics, Vec::<Value>::new());
+}
