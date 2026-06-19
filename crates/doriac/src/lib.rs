@@ -1,5 +1,6 @@
 pub mod ast;
 pub mod backend;
+pub mod codegen_native;
 pub mod codegen_php;
 pub mod diagnostics;
 pub mod hir;
