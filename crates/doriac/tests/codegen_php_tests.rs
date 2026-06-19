@@ -95,6 +95,43 @@ while ($count < 10) {
     assert!(php.contains("else\n{\n    echo \"large\";\n}"));
     assert!(php.contains("while ($count < 10)\n{\n    echo $count;\n    $count += 1;\n}"));
 }
+
+#[test]
+fn preserves_block_local_bindings_in_php_output() {
+    let php = doriac::compile_source_to_php(
+        "test.doria",
+        r#"
+let $name = "outer";
+if (true) {
+    let $name = $name . " inner";
+    echo "block {$name}";
+}
+echo $name;
+
+function greet(string $name): string
+{
+    if (true) {
+        let $name = "inner";
+        return $name;
+    }
+
+    return $name;
+}
+"#,
+    )
+    .expect("compilation should succeed");
+
+    assert!(php.contains("$name = \"outer\";"));
+    assert!(php.contains("$name__doria1 = $name . \" inner\";"));
+    assert!(php.contains("echo \"block \" . $name__doria1;"));
+    assert!(php.contains("echo $name;"));
+    assert!(php.contains("function greet(string $name): string"));
+    assert!(php.contains("$name__doria1 = \"inner\";"));
+    assert!(php.contains("return $name__doria1;"));
+    assert!(php.contains("return $name;"));
+    assert!(!php.contains("$name = $name . \" inner\";"));
+}
+
 #[test]
 fn recognizes_native_as_planned_backend() {
     let err = doriac::compile_source(
@@ -310,6 +347,7 @@ echo "Total: {$amount} ($currency)";
     assert!(php.contains("echo \"Literal \\$name\";"));
     assert!(php.contains("echo \"Total: \" . $amount . \" (\\$currency)\";"));
 }
+
 #[test]
 fn compiles_person_example_with_explicit_interpolation() {
     let example_path =

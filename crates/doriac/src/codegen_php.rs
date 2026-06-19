@@ -1,10 +1,13 @@
+use std::collections::{HashMap, HashSet};
+
 use crate::hir::*;
 use crate::types::TypeRef;
 
 pub fn generate(program: &Program) -> String {
     let mut output = String::from("<?php\n\n");
+    let mut scopes = PhpNameScopes::new();
     for item in &program.items {
-        emit_item(item, &mut output, 0);
+        emit_item(item, &mut output, 0, &mut scopes);
         if !output.ends_with("\n\n") {
             output.push('\n');
         }
@@ -13,11 +16,82 @@ pub fn generate(program: &Program) -> String {
     output
 }
 
-fn emit_item(item: &Item, output: &mut String, indent: usize) {
+#[derive(Debug, Default)]
+struct PhpNameScopes {
+    scopes: Vec<HashMap<String, String>>,
+    used_php_names: HashSet<String>,
+    next_mangled_id: usize,
+}
+
+impl PhpNameScopes {
+    fn new() -> Self {
+        Self {
+            scopes: vec![HashMap::new()],
+            used_php_names: HashSet::new(),
+            next_mangled_id: 0,
+        }
+    }
+
+    fn push(&mut self) {
+        self.scopes.push(HashMap::new());
+    }
+
+    fn pop(&mut self) {
+        self.scopes.pop();
+    }
+
+    fn declare(&mut self, name: &str) -> String {
+        let shadows_outer = self.lookup(name).is_some();
+        let php_name = if shadows_outer || self.used_php_names.contains(name) {
+            self.next_mangled_name(name)
+        } else {
+            name.to_string()
+        };
+        self.insert_current(name, php_name.clone());
+        php_name
+    }
+
+    fn declare_unmangled(&mut self, name: &str) -> String {
+        let php_name = name.to_string();
+        self.insert_current(name, php_name.clone());
+        php_name
+    }
+
+    fn lookup(&self, name: &str) -> Option<&str> {
+        self.scopes
+            .iter()
+            .rev()
+            .find_map(|scope| scope.get(name))
+            .map(String::as_str)
+    }
+
+    fn php_name(&self, name: &str) -> String {
+        self.lookup(name).unwrap_or(name).to_string()
+    }
+
+    fn insert_current(&mut self, name: &str, php_name: String) {
+        self.used_php_names.insert(php_name.clone());
+        if let Some(scope) = self.scopes.last_mut() {
+            scope.insert(name.to_string(), php_name);
+        }
+    }
+
+    fn next_mangled_name(&mut self, name: &str) -> String {
+        loop {
+            self.next_mangled_id += 1;
+            let candidate = format!("{name}__doria{}", self.next_mangled_id);
+            if !self.used_php_names.contains(&candidate) {
+                return candidate;
+            }
+        }
+    }
+}
+
+fn emit_item(item: &Item, output: &mut String, indent: usize, scopes: &mut PhpNameScopes) {
     match item {
         Item::Class(class_decl) => emit_class(class_decl, output, indent),
         Item::Function(function) => emit_function(function, output, indent, false),
-        Item::Statement(statement) => emit_statement(statement, output, indent),
+        Item::Statement(statement) => emit_statement(statement, output, indent, scopes),
     }
 }
 
@@ -44,13 +118,19 @@ fn emit_property(property: &PropertyDecl, output: &mut String, indent: usize) {
     output.push_str(" $");
     output.push_str(&property.name);
     if let Some(initializer) = &property.initializer {
+        let scopes = PhpNameScopes::new();
         output.push_str(" = ");
-        output.push_str(&emit_expr(initializer));
+        output.push_str(&emit_expr(initializer, &scopes));
     }
     output.push_str(";\n");
 }
 
 fn emit_function(function: &FunctionDecl, output: &mut String, indent: usize, is_method: bool) {
+    let mut scopes = PhpNameScopes::new();
+    for param in &function.params {
+        scopes.declare_unmangled(&param.name);
+    }
+
     write_indent(output, indent);
     if is_method {
         output.push_str(emit_member_access(&function.access));
@@ -63,7 +143,7 @@ fn emit_function(function: &FunctionDecl, output: &mut String, indent: usize, is
         &function
             .params
             .iter()
-            .map(emit_param)
+            .map(|param| emit_param(param, &scopes))
             .collect::<Vec<_>>()
             .join(", "),
     );
@@ -79,10 +159,10 @@ fn emit_function(function: &FunctionDecl, output: &mut String, indent: usize, is
         output.push_str(&php_type(return_type));
     }
     output.push('\n');
-    emit_block(&function.body, output, indent);
+    emit_block(&function.body, output, indent, &mut scopes);
 }
 
-fn emit_param(param: &Param) -> String {
+fn emit_param(param: &Param, scopes: &PhpNameScopes) -> String {
     let mut output = String::new();
     if let Some(access) = &param.promoted_access {
         output.push_str(emit_member_access(access));
@@ -90,30 +170,35 @@ fn emit_param(param: &Param) -> String {
     }
     output.push_str(&php_type(&param.ty));
     output.push_str(" $");
-    output.push_str(&param.name);
+    output.push_str(&scopes.php_name(&param.name));
     if let Some(default) = &param.default {
         output.push_str(" = ");
-        output.push_str(&emit_expr(default));
+        output.push_str(&emit_expr(default, scopes));
     }
     output
 }
 
-fn emit_block(block: &Block, output: &mut String, indent: usize) {
+fn emit_block(block: &Block, output: &mut String, indent: usize, scopes: &mut PhpNameScopes) {
     writeln(output, indent, "{");
+    scopes.push();
     for statement in &block.statements {
-        emit_statement(statement, output, indent + 1);
+        emit_statement(statement, output, indent + 1, scopes);
     }
+    scopes.pop();
     writeln(output, indent, "}");
 }
 
-fn emit_statement(statement: &Stmt, output: &mut String, indent: usize) {
+fn emit_statement(
+    statement: &Stmt,
+    output: &mut String,
+    indent: usize,
+    scopes: &mut PhpNameScopes,
+) {
     match statement {
         Stmt::VarDecl(decl) => {
-            writeln(
-                output,
-                indent,
-                &format!("${} = {};", decl.name, emit_expr(&decl.initializer)),
-            );
+            let initializer = emit_expr(&decl.initializer, scopes);
+            let php_name = scopes.declare(&decl.name);
+            writeln(output, indent, &format!("${php_name} = {initializer};"));
         }
         Stmt::Assignment(assignment) => {
             let op = match assignment.op {
@@ -126,78 +211,109 @@ fn emit_statement(statement: &Stmt, output: &mut String, indent: usize) {
                 indent,
                 &format!(
                     "{} {} {};",
-                    emit_expr(&assignment.target),
+                    emit_expr(&assignment.target, scopes),
                     op,
-                    emit_expr(&assignment.value)
+                    emit_expr(&assignment.value, scopes)
                 ),
             );
         }
         Stmt::Echo { expr, .. } => {
-            writeln(output, indent, &format!("echo {};", emit_expr(expr)));
+            writeln(
+                output,
+                indent,
+                &format!("echo {};", emit_expr(expr, scopes)),
+            );
         }
         Stmt::Return { expr, .. } => {
             if let Some(expr) = expr {
-                writeln(output, indent, &format!("return {};", emit_expr(expr)));
+                writeln(
+                    output,
+                    indent,
+                    &format!("return {};", emit_expr(expr, scopes)),
+                );
             } else {
                 writeln(output, indent, "return;");
             }
         }
-        Stmt::If(if_stmt) => emit_if(if_stmt, output, indent, "if"),
+        Stmt::If(if_stmt) => emit_if(if_stmt, output, indent, "if", scopes),
         Stmt::While(while_stmt) => {
             write_indent(output, indent);
             output.push_str("while (");
-            output.push_str(&emit_expr(&while_stmt.condition));
+            output.push_str(&emit_expr(&while_stmt.condition, scopes));
             output.push_str(")\n");
-            emit_block(&while_stmt.body, output, indent);
+            emit_block(&while_stmt.body, output, indent, scopes);
         }
-        Stmt::Foreach(foreach) => {
-            write_indent(output, indent);
-            output.push_str("foreach (");
-            output.push_str(&emit_expr(&foreach.iterable));
-            output.push_str(" as ");
-            if let Some(key) = &foreach.key {
-                output.push('$');
-                output.push_str(&key.name);
-                output.push_str(" => ");
-            }
-            output.push('$');
-            output.push_str(&foreach.value.name);
-            output.push_str(")\n");
-            emit_block(&foreach.body, output, indent);
-        }
+        Stmt::Foreach(foreach) => emit_foreach(foreach, output, indent, scopes),
         Stmt::Expr { expr, .. } => {
-            writeln(output, indent, &format!("{};", emit_expr(expr)));
+            writeln(output, indent, &format!("{};", emit_expr(expr, scopes)));
         }
     }
 }
 
-fn emit_if(if_stmt: &IfStmt, output: &mut String, indent: usize, keyword: &str) {
+fn emit_if(
+    if_stmt: &IfStmt,
+    output: &mut String,
+    indent: usize,
+    keyword: &str,
+    scopes: &mut PhpNameScopes,
+) {
     write_indent(output, indent);
     output.push_str(keyword);
     output.push_str(" (");
-    output.push_str(&emit_expr(&if_stmt.condition));
+    output.push_str(&emit_expr(&if_stmt.condition, scopes));
     output.push_str(")\n");
-    emit_block(&if_stmt.then_block, output, indent);
+    emit_block(&if_stmt.then_block, output, indent, scopes);
 
     if let Some(else_branch) = &if_stmt.else_branch {
         match else_branch {
-            ElseBranch::If(else_if) => emit_if(else_if, output, indent, "else if"),
+            ElseBranch::If(else_if) => emit_if(else_if, output, indent, "else if", scopes),
             ElseBranch::Block(block) => {
                 write_indent(output, indent);
                 output.push_str("else\n");
-                emit_block(block, output, indent);
+                emit_block(block, output, indent, scopes);
             }
         }
     }
 }
 
-fn emit_expr(expr: &Expr) -> String {
+fn emit_foreach(
+    foreach: &ForeachStmt,
+    output: &mut String,
+    indent: usize,
+    scopes: &mut PhpNameScopes,
+) {
+    let iterable = emit_expr(&foreach.iterable, scopes);
+    scopes.push();
+    let key_name = foreach.key.as_ref().map(|key| scopes.declare(&key.name));
+    let value_name = scopes.declare(&foreach.value.name);
+
+    write_indent(output, indent);
+    output.push_str("foreach (");
+    output.push_str(&iterable);
+    output.push_str(" as ");
+    if let Some(key_name) = key_name {
+        output.push('$');
+        output.push_str(&key_name);
+        output.push_str(" => ");
+    }
+    output.push('$');
+    output.push_str(&value_name);
+    output.push_str(")\n");
+    writeln(output, indent, "{");
+    for statement in &foreach.body.statements {
+        emit_statement(statement, output, indent + 1, scopes);
+    }
+    scopes.pop();
+    writeln(output, indent, "}");
+}
+
+fn emit_expr(expr: &Expr, scopes: &PhpNameScopes) -> String {
     match expr {
-        Expr::Variable { name, .. } => format!("${name}"),
+        Expr::Variable { name, .. } => format!("${}", scopes.php_name(name)),
         Expr::This { .. } => "$this".to_string(),
         Expr::Identifier { name, .. } => name.clone(),
         Expr::String { value, .. } => emit_php_string_literal(value),
-        Expr::InterpolatedString { parts, .. } => emit_interpolated_string(parts),
+        Expr::InterpolatedString { parts, .. } => emit_interpolated_string(parts, scopes),
         Expr::Int { value, .. } | Expr::Float { value, .. } => value.clone(),
         Expr::Bool { value, .. } => {
             if *value {
@@ -212,9 +328,13 @@ fn emit_expr(expr: &Expr) -> String {
                 .iter()
                 .map(|element| {
                     if let Some(key) = &element.key {
-                        format!("{} => {}", emit_expr(key), emit_expr(&element.value))
+                        format!(
+                            "{} => {}",
+                            emit_expr(key, scopes),
+                            emit_expr(&element.value, scopes)
+                        )
                     } else {
-                        emit_expr(&element.value)
+                        emit_expr(&element.value, scopes)
                     }
                 })
                 .collect::<Vec<_>>()
@@ -223,7 +343,7 @@ fn emit_expr(expr: &Expr) -> String {
         }
         Expr::PropertyAccess {
             object, property, ..
-        } => format!("{}->{property}", emit_expr(object)),
+        } => format!("{}->{property}", emit_expr(object, scopes)),
         Expr::MethodCall {
             object,
             method,
@@ -231,12 +351,18 @@ fn emit_expr(expr: &Expr) -> String {
             ..
         } => format!(
             "{}->{method}({})",
-            emit_expr(object),
-            args.iter().map(emit_expr).collect::<Vec<_>>().join(", ")
+            emit_expr(object, scopes),
+            args.iter()
+                .map(|arg| emit_expr(arg, scopes))
+                .collect::<Vec<_>>()
+                .join(", ")
         ),
         Expr::FunctionCall { name, args, .. } => format!(
             "{name}({})",
-            args.iter().map(emit_expr).collect::<Vec<_>>().join(", ")
+            args.iter()
+                .map(|arg| emit_expr(arg, scopes))
+                .collect::<Vec<_>>()
+                .join(", ")
         ),
         Expr::StaticCall {
             class_name,
@@ -245,26 +371,32 @@ fn emit_expr(expr: &Expr) -> String {
             ..
         } => format!(
             "{class_name}::{method}({})",
-            args.iter().map(emit_expr).collect::<Vec<_>>().join(", ")
+            args.iter()
+                .map(|arg| emit_expr(arg, scopes))
+                .collect::<Vec<_>>()
+                .join(", ")
         ),
         Expr::New {
             class_name, args, ..
         } => format!(
             "new {class_name}({})",
-            args.iter().map(emit_expr).collect::<Vec<_>>().join(", ")
+            args.iter()
+                .map(|arg| emit_expr(arg, scopes))
+                .collect::<Vec<_>>()
+                .join(", ")
         ),
         Expr::Binary {
             left, op, right, ..
         } => format!(
             "{} {} {}",
-            emit_expr(left),
+            emit_expr(left, scopes),
             emit_binary_op(op),
-            emit_expr(right)
+            emit_expr(right, scopes)
         ),
     }
 }
 
-fn emit_interpolated_string(parts: &[InterpolatedStringPart]) -> String {
+fn emit_interpolated_string(parts: &[InterpolatedStringPart], scopes: &PhpNameScopes) -> String {
     let mut emitted = Vec::new();
     let mut has_expr = false;
 
@@ -277,7 +409,7 @@ fn emit_interpolated_string(parts: &[InterpolatedStringPart]) -> String {
             }
             InterpolatedStringPart::Expr(expr) => {
                 has_expr = true;
-                emitted.push(emit_expr(expr));
+                emitted.push(emit_expr(expr, scopes));
             }
         }
     }
