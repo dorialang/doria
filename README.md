@@ -22,7 +22,9 @@ Doria source
 -> backend
 ```
 
-Native machine code and standalone executables are the authoritative product direction. PHP is currently an implemented compatibility, migration, debugging, and inspection backend, but PHP output is not Doria's semantic reference and is not required to be perfect for Doria to succeed.
+Native machine code and standalone executables are the authoritative product direction. The accepted native strategy is a dual-backend path: a Cranelift-backed fast native profile for local development feedback and an LLVM-backed optimized native profile for release builds, with identical Doria-visible semantics across both profiles.
+
+PHP is currently an implemented compatibility, migration, debugging, and inspection backend, but PHP output is not Doria's semantic reference and is not required to be perfect for Doria to succeed.
 
 ## Native-first correctness policy
 
@@ -147,6 +149,8 @@ docs/self-hosting.md
 docs/executable-initializers-and-attributes.md
 docs/php-interop-and-migration.md
 docs/decisions/0010-native-first-correctness.md
+docs/decisions/0011-native-execution-path.md
+docs/decisions/0012-dual-native-backend-strategy.md
 ```
 
 ## Repository layout
