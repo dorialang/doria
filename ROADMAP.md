@@ -25,9 +25,9 @@
 
 ## Next Compiler Work
 
-- Define the native execution path: entrypoint rules, primitive representation assumptions, minimal runtime boundaries, and first native smoke target.
+- Review and accept or revise the proposed native execution path in `docs/decisions/0011-native-execution-path.md`.
 - Plan a lowered/native IR when native code generation needs a simpler representation for control flow, memory layout, runtime calls, and backend emission.
-- Add a tiny native backend smoke slice once the native execution note is accepted, starting with a minimal `main(): int` program that returns an exit code.
+- After the native execution note is accepted, add the smallest native smoke target: a standalone executable for a minimal `function main(): int` program that returns an exit code.
 - Expand return checking from the current final-statement rule into full path-sensitive control-flow analysis.
 - Add full definite property initialization analysis for constructor paths.
 - Plan the path toward writing more of `doriac` in Doria itself.

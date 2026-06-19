@@ -302,7 +302,7 @@ doriac compile examples/person.doria --target php --out build/person.php
 doriac run examples/person.doria
 ```
 
-For MVP, `doriac run` can compile to temporary PHP and execute it using the local `php` binary.
+Before native execution exists, `doriac run` may temporarily use a compatibility backend such as PHP for local inspection. That behavior must remain non-authoritative: generated PHP is not Doria's semantic proof and must not shape native execution.
 
 Codex should work in small, testable increments. This plan is written as a sequence of scoped engineering tasks rather than one giant “build a language” task.
 
@@ -843,7 +843,7 @@ The first slice supports only variable/property paths: `$name`, `$this`, `$user-
 
 # Phase 6: Backend emission and PHP backend
 
-The first backend should emit PHP.
+The first implemented compatibility backend may emit PHP because it is easy to inspect. This phase is a backend smoke slice, not Doria's central correctness proof; native execution is tracked separately in `docs/decisions/0011-native-execution-path.md`.
 
 Doria:
 
@@ -913,7 +913,7 @@ The PHP output does not need to preserve `readonly`, `writable`, or `internal` s
 
 # Phase 7: MVP example to compile
 
-This file should compile and run:
+For the PHP compatibility slice, this file should compile and run:
 
 ```doria
 class Person
@@ -1084,6 +1084,8 @@ For a PHP backend, this could eventually lower to a Doria runtime built on Fiber
 
 # Phase 11: Native backend foundation
 
+Before implementation, review and accept or revise the proposed native execution path in `docs/decisions/0011-native-execution-path.md`.
+
 Doria IR belongs in the core compiler pipeline before backend emission. As native code generation matures, Doria IR may lower into a simpler native-oriented IR for control flow, memory layout, runtime calls, and backend code generation.
 
 Possible future pipeline:
@@ -1096,11 +1098,11 @@ Doria source
 → Semantic analysis
 → Doria IR
 → native-oriented IR
-→ LLVM IR or MLIR
+→ selected native backend (for example Cranelift, LLVM, C, or another accepted route)
 → Native executable
 ```
 
-LLVM is the obvious long-term backend candidate because its tutorial path covers implementing a language frontend, generating LLVM IR, JIT support, object-code compilation, and debug info. MLIR is another possible future option if Doria needs multiple levels of IR and more advanced lowering, because MLIR is built around a textual/in-memory/serialized IR suitable for transformations and compiler development. ([LLVM][1]) ([mlir.llvm.org][7])
+LLVM is a strong long-term backend candidate because its tutorial path covers implementing a language frontend, generating LLVM IR, JIT support, object-code compilation, and debug info. MLIR is another possible future option if Doria needs multiple levels of IR and more advanced lowering. Cranelift, a C backend bridge, and a debug/interpreter route should also be evaluated in Doria terms instead of choosing a backend silently. See `docs/decisions/0011-native-execution-path.md` for the proposed decision note. ([LLVM][1]) ([mlir.llvm.org][7])
 
 Do not begin here.
 
@@ -1198,7 +1200,7 @@ Definition of done:
 - `cargo test` passes.
 - `doriac check examples/person.doria` succeeds.
 - `doriac compile examples/person.doria --target php --out build/person.php` emits runnable PHP.
-- Running the emitted PHP produces the expected output.
+- For the PHP compatibility backend slice, running emitted PHP produces expected output without treating PHP as Doria's semantic authority.
 - Invalid examples produce clear compiler errors.
 ```
 
@@ -1412,7 +1414,7 @@ Do not implement these yet:
 
 ```text
 - Full PHP compatibility
-- Native code generation
+- Broad native code generation beyond an accepted tiny smoke slice
 - LLVM
 - MLIR
 - Full borrow checker
