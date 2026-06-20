@@ -15,12 +15,12 @@ use crate::backend::BackendError;
 use crate::hir::{self, Expr, Item, Stmt};
 
 pub fn generate_executable(program: &hir::Program) -> Result<Vec<u8>, BackendError> {
-    validate_stage_1(program)?;
-    let object_bytes = generate_object()?;
+    let exit_code = validate_stage_2a(program)?;
+    let object_bytes = generate_object(exit_code)?;
     link_object(&object_bytes)
 }
 
-pub fn validate_stage_1(program: &hir::Program) -> Result<(), BackendError> {
+pub fn validate_stage_2a(program: &hir::Program) -> Result<i32, BackendError> {
     let mut main_functions = Vec::new();
 
     for item in &program.items {
@@ -30,19 +30,19 @@ pub fn validate_stage_1(program: &hir::Program) -> Result<(), BackendError> {
             }
             Item::Function(function) => {
                 return Err(BackendError::new(format!(
-                    "unsupported top-level item for native Stage 1: extra top-level function `{}`",
+                    "unsupported top-level item for native Stage 2a: extra top-level function `{}`",
                     function.name
                 )));
             }
             Item::Class(class_decl) => {
                 return Err(BackendError::new(format!(
-                    "unsupported top-level item for native Stage 1: class `{}`",
+                    "unsupported top-level item for native Stage 2a: class `{}`",
                     class_decl.name
                 )));
             }
             Item::Statement(statement) => {
                 return Err(BackendError::new(format!(
-                    "unsupported top-level item for native Stage 1: {}",
+                    "unsupported top-level item for native Stage 2a: {}",
                     describe_statement(statement)
                 )));
             }
@@ -52,17 +52,17 @@ pub fn validate_stage_1(program: &hir::Program) -> Result<(), BackendError> {
     let [main] = main_functions.as_slice() else {
         return Err(match main_functions.len() {
             0 => BackendError::new(
-                "no native entrypoint found; Stage 1 native output requires exactly one top-level `function main(): int`",
+                "no native entrypoint found; Stage 2a native output requires exactly one top-level `function main(): int`",
             ),
             _ => BackendError::new(
-                "multiple native entrypoints found; Stage 1 native output requires exactly one top-level `function main(): int`",
+                "multiple native entrypoints found; Stage 2a native output requires exactly one top-level `function main(): int`",
             ),
         });
     };
 
     if !main.params.is_empty() {
         return Err(BackendError::new(
-            "wrong main signature for native Stage 1: `main` must not declare parameters",
+            "wrong main signature for native Stage 2a: `main` must not declare parameters",
         ));
     }
 
@@ -71,21 +71,21 @@ pub fn validate_stage_1(program: &hir::Program) -> Result<(), BackendError> {
         Some(return_type) if return_type.name == "int" && return_type.args.is_empty()
     ) {
         return Err(BackendError::new(
-            "wrong main signature for native Stage 1: expected `function main(): int`",
+            "wrong main signature for native Stage 2a: expected `function main(): int`",
         ));
     }
 
     let [statement] = main.body.statements.as_slice() else {
         return Err(match main.body.statements.as_slice() {
             [] => BackendError::new(
-                "unsupported native statement for Stage 1: `main` must contain exactly `return 0;`",
+                "unsupported native statement for Stage 2a: `main` must contain exactly `return <portable integer literal>;`",
             ),
-            [first, ..] if !is_return_zero(first) => BackendError::new(format!(
-                "unsupported native statement for Stage 1: expected `return 0;`, found {}",
+            [first, ..] if !is_return_integer_literal(first) => BackendError::new(format!(
+                "unsupported native statement for Stage 2a: expected `return <portable integer literal>;`, found {}",
                 describe_statement(first)
             )),
             _ => BackendError::new(
-                "unsupported native statement for Stage 1: no statements may follow `return 0;`",
+                "unsupported native statement for Stage 2a: no statements may follow `return <portable integer literal>;`",
             ),
         });
     };
@@ -94,41 +94,55 @@ pub fn validate_stage_1(program: &hir::Program) -> Result<(), BackendError> {
         Stmt::Return {
             expr: Some(Expr::Int { value, .. }),
             ..
-        } if value == "0" => Ok(()),
+        } => parse_stage_2a_exit_code(value),
         Stmt::Return {
             expr: Some(expr), ..
         } => Err(BackendError::new(format!(
-            "unsupported native expression for Stage 1: expected `return 0;`, found `{}`",
+            "unsupported native expression for Stage 2a: expected integer literal exit code, found `{}`",
             describe_expression(expr)
         ))),
         Stmt::Return { expr: None, .. } => Err(BackendError::new(
-            "unsupported native statement for Stage 1: expected `return 0;`, found bare `return;`",
+            "unsupported native statement for Stage 2a: expected `return <portable integer literal>;`, found bare `return;`",
         )),
         other => Err(BackendError::new(format!(
-            "unsupported native statement for Stage 1: expected `return 0;`, found {}",
+            "unsupported native statement for Stage 2a: expected `return <portable integer literal>;`, found {}",
             describe_statement(other)
         ))),
     }
 }
 
-fn is_return_zero(statement: &Stmt) -> bool {
+fn is_return_integer_literal(statement: &Stmt) -> bool {
     matches!(
         statement,
         Stmt::Return {
-            expr: Some(Expr::Int { value, .. }),
+            expr: Some(Expr::Int { .. }),
             ..
-        } if value == "0"
+        }
     )
 }
 
-fn generate_object() -> Result<Vec<u8>, BackendError> {
+fn parse_stage_2a_exit_code(value: &str) -> Result<i32, BackendError> {
+    let parsed = value
+        .parse::<i64>()
+        .map_err(|_| BackendError::new("integer literal is outside the Doria `int` range"))?;
+
+    if !(0..=125).contains(&parsed) {
+        return Err(BackendError::new(
+            "native Stage 2a exit code must be in the range 0..125",
+        ));
+    }
+
+    Ok(parsed as i32)
+}
+
+fn generate_object(exit_code: i32) -> Result<Vec<u8>, BackendError> {
     let isa_builder = cranelift_native::builder()
         .map_err(|error| BackendError::new(format!("backend emission failure: {error}")))?;
     let isa = isa_builder
         .finish(settings::Flags::new(settings::builder()))
         .map_err(|error| BackendError::new(format!("backend emission failure: {error}")))?;
     let mut module = ObjectModule::new(
-        ObjectBuilder::new(isa, "doria_stage_1", default_libcall_names())
+        ObjectBuilder::new(isa, "doria_stage_2a", default_libcall_names())
             .map_err(|error| BackendError::new(format!("backend emission failure: {error}")))?,
     );
 
@@ -147,8 +161,8 @@ fn generate_object() -> Result<Vec<u8>, BackendError> {
         let entry_block = builder.create_block();
         builder.switch_to_block(entry_block);
         builder.seal_block(entry_block);
-        let exit_code = builder.ins().iconst(types::I32, 0);
-        builder.ins().return_(&[exit_code]);
+        let exit_value = builder.ins().iconst(types::I32, i64::from(exit_code));
+        builder.ins().return_(&[exit_value]);
         builder.finalize();
     }
 
@@ -186,7 +200,7 @@ fn link_object(object_bytes: &[u8]) -> Result<Vec<u8>, BackendError> {
 }
 
 fn invoke_linker(object_path: &Path, executable_path: &Path) -> Result<(), BackendError> {
-    // Stage 1 emits a Cranelift object file and asks the host toolchain to link
+    // Stage 2a emits a Cranelift object file and asks the host toolchain to link
     // it. This is not a C backend: Doria never generates C source or uses C
     // semantics as an oracle here.
     let cc_is_set = env::var_os("CC").is_some();
@@ -277,7 +291,7 @@ fn linker_arguments(
 ) -> Vec<OsString> {
     if windows && (!cc_is_set || is_msvc_style_compiler_driver(linker)) {
         // Cranelift-generated objects do not carry MSVC /DEFAULTLIB directives.
-        // For Stage 1's tiny main, make Doria's main the executable entrypoint
+        // For Stage 2a's tiny main, make Doria's main the executable entrypoint
         // instead of relying on CRT startup to discover and call it.
         return vec![
             OsString::from("/nologo"),

@@ -180,7 +180,7 @@ fn read_source(path: impl AsRef<Path>) -> Result<(String, String), String> {
 
 fn print_help() {
     println!(
-        "doriac 0.1.0\n\nUSAGE:\n    doriac check <file>\n    doriac ast <file>\n    doriac hir <file>\n    doriac compile <file> --target <target> --out <file>\n    doriac run <file>\n\nTARGETS:\n    native    available Stage 1 Cranelift-backed fast native smoke backend\n    php       available compatibility backend\n    debug     planned interpreter/debug backend\n    wasm      planned WebAssembly backend"
+        "doriac 0.1.0\n\nUSAGE:\n    doriac check <file>\n    doriac ast <file>\n    doriac hir <file>\n    doriac compile <file> --target <target> --out <file>\n    doriac run <file>\n\nTARGETS:\n    native    available Stage 2a Cranelift-backed fast native smoke backend\n    php       available compatibility backend\n    debug     planned interpreter/debug backend\n    wasm      planned WebAssembly backend"
     );
 }
 

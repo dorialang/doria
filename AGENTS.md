@@ -88,6 +88,7 @@ cargo test --workspace --all-targets --locked --verbose
 cargo run -p doriac -- check examples/person.doria
 cargo run -p doriac -- hir examples/person.doria
 cargo run -p doriac -- compile examples/native/main_return_zero.doria --target native --out build/native/main_return_zero
+cargo run -p doriac -- compile examples/native/main_return_42.doria --target native --out build/native/main_return_42
 ```
 
 Run backend-specific checks only when the touched task depends on that backend. For the current PHP compatibility backend:
@@ -96,4 +97,4 @@ Run backend-specific checks only when the touched task depends on that backend. 
 cargo run -p doriac -- compile examples/person.doria --target php --out build/person.php
 ```
 
-When a native backend target exists, native smoke tests must be part of the relevant definition of done. The current native target is the Stage 1 Cranelift-backed smoke backend only; do not treat it as full native code generation.
+When a native backend target exists, native smoke tests must be part of the relevant definition of done. The current native target is the Stage 2a Cranelift-backed smoke backend only; do not treat it as full native code generation.

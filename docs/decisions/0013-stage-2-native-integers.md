@@ -40,7 +40,7 @@ Those features require answers for:
 - how Cranelift fast profile and future LLVM optimized profile remain semantically identical
 ```
 
-This decision accepts the Stage 2 native integer direction and the narrow Stage 2a implementation path. It does not implement Stage 2 native code generation.
+This decision accepts the Stage 2 native integer direction and the narrow Stage 2a implementation path. The current implementation supports Stage 2a only; Stage 2b, Stage 2c, and Stage 2d remain future implementation slices.
 
 ## Decision summary
 
@@ -80,7 +80,7 @@ Stage 2d:
   Support returning simple integer expressions from `main`.
 ```
 
-Stage 2a is the next accepted implementation slice. Stage 2b, Stage 2c, and Stage 2d remain separate future implementation slices and should not be treated as implemented or ready to implement by this decision alone.
+Stage 2a is the current accepted and implemented native integer slice. Stage 2b, Stage 2c, and Stage 2d remain separate future implementation slices and should not be treated as implemented or ready to implement by this decision alone.
 
 Rationale:
 
@@ -361,23 +361,23 @@ Conformance checks should include:
 
 Expected tests should compare Doria-visible behavior and diagnostics, not backend IR or backend-specific instruction choices.
 
-## Stage 1 hardening note
+## Linker test hardening note
 
-Implementation note for the next code task:
+Implementation note:
 
 ```text
 Stage 1 native tests should mirror the backend linker selection behavior, including `CC` if set, so tests do not skip or fail differently from the backend.
 ```
 
-This note does not implement that change. It records a hardening issue for the implementation follow-up.
+The Stage 2a implementation keeps this behavior hardened: native tests check the same `CC`-selected linker that the backend uses.
 
 ## Non-goals of this decision
 
 This decision does not:
 
 ```text
-- implement Stage 2 native code generation
-- change the Stage 1 native backend
+- implement native code generation beyond Stage 2a
+- change the native backend beyond Stage 2a
 - change CLI behavior
 - add Cranelift features
 - add LLVM
