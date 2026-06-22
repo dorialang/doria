@@ -79,6 +79,34 @@ fn rejects_incompatible_scalar_typed_declarations() {
 }
 
 #[test]
+fn rejects_integer_literals_outside_doria_int_range_before_lowering() {
+    let source = r#"
+function main(): int
+{
+    return 9223372036854775808;
+}
+"#;
+
+    let check_err = doriac::check_source("test.doria", source)
+        .expect_err("semantic check should reject out-of-range integer literals");
+    assert!(
+        check_err
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E0417"),
+        "expected E0417, got {check_err:?}"
+    );
+
+    let lower_err = doriac::lower_source("test.doria", source)
+        .expect_err("lowering should not run after semantic integer range failure");
+    assert!(
+        lower_err
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E0417"),
+        "expected E0417, got {lower_err:?}"
+    );
+}
+
+#[test]
 fn checks_writable_local_assignment_compatibility() {
     doriac::check_source(
         "test.doria",

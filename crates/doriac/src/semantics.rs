@@ -1093,10 +1093,20 @@ impl<'program> Checker<'program> {
             }
             Expr::Identifier { .. }
             | Expr::String { .. }
-            | Expr::Int { .. }
             | Expr::Float { .. }
             | Expr::Bool { .. }
             | Expr::Null { .. } => {}
+            Expr::Int { value, span } => self.check_int_literal_range(value, *span),
+        }
+    }
+
+    fn check_int_literal_range(&mut self, value: &str, span: Span) {
+        if value.parse::<i64>().is_err() {
+            self.diagnostics.push(Diagnostic::new(
+                "E0417",
+                "integer literal is outside the Doria `int` range",
+                span,
+            ));
         }
     }
 

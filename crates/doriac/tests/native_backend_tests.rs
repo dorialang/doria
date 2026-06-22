@@ -108,7 +108,7 @@ function main(): int
     return 9223372036854775808;
 }
 "#,
-            "B0001",
+            "E0417",
             "integer literal is outside the Doria `int` range",
         ),
         (
