@@ -192,15 +192,15 @@ This decision does not settle final CLI spelling.
 Possible future shapes include:
 
 ```bash
-doriac compile app.doria --target native --profile fast
-doriac compile app.doria --target native --profile release
+doriac compile app.doria --profile fast
+doriac compile app.doria --profile release
 ```
 
 or:
 
 ```bash
-doriac compile app.doria --target native --backend cranelift
-doriac compile app.doria --target native --backend llvm
+doriac compile app.doria --backend cranelift
+doriac compile app.doria --backend llvm
 ```
 
 Recommendation: prefer user-facing build profiles such as `fast` and `release` over exposing backend names as the main user workflow. Backend names may still be useful for diagnostics, internal tests, and advanced users.

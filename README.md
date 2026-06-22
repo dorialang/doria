@@ -78,21 +78,21 @@ cargo run -p doriac -- hir examples/hello.doria
 The currently implemented compatibility backend can also emit PHP for supported syntax:
 
 ```bash
-cargo run -p doriac -- compile examples/person.doria --target php --out build/person.php
-php build/person.php
+cargo run -p doriac -- compile examples/person.doria --target php
+php person.php
 ```
 
 The native backend currently supports only the accepted Stage 2a smoke shape: exactly one top-level `function main(): int` returning an integer literal in the portable `0..125` exit-code range.
 
 ```bash
-cargo run -p doriac -- compile examples/native/main_return_zero.doria --target native --out build/native/main_return_zero
-./build/native/main_return_zero
+cargo run -p doriac -- compile examples/native/main_return_zero.doria
+./main_return_zero
 
-cargo run -p doriac -- compile examples/native/main_return_42.doria --target native --out build/native/main_return_42
-./build/native/main_return_42
+cargo run -p doriac -- compile examples/native/main_return_42.doria
+./main_return_42
 ```
 
-For this slice, `--target native` emits a Cranelift object and links it through the host platform toolchain. This is not a C backend and does not use PHP output. Locals, arithmetic, strings, `if` / `while`, classes, collections, broader runtime features, and LLVM output remain future work.
+For this slice, native compilation emits an object and links it through the host platform toolchain. This is not a C backend and does not use PHP output. Locals, arithmetic, strings, `if` / `while`, classes, collections, broader runtime features, and LLVM output remain future work.
 
 ## CLI
 
@@ -100,11 +100,12 @@ For this slice, `--target native` emits a Cranelift object and links it through 
 doriac check <file>
 doriac ast <file>
 doriac hir <file>
-doriac compile <file> --target <target> --out <file>
+doriac compile <file> [--out <file>]
+doriac compile <file> --target php [--out <file>]
 doriac run <file>
 ```
 
-`compile` requires an explicit target. `native` is currently implemented only for the Stage 2a Cranelift-backed smoke shape. `php` is implemented as a compatibility backend. `debug` and `wasm` are recognized planned targets.
+`compile` defaults to native output and infers an output file name from the input file. `php` is implemented as an explicit compatibility backend. `debug` and `wasm` are recognized planned targets.
 
 `doriac run` is currently a convenience command for the PHP compatibility backend: it compiles to a temporary PHP file and runs it with the local `php` binary. This is a temporary execution convenience, not the language's strategic execution model.
 

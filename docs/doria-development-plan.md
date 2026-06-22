@@ -298,7 +298,8 @@ Initial commands:
 
 ```bash
 doriac check examples/person.doria
-doriac compile examples/person.doria --target php --out build/person.php
+doriac compile examples/native/main_return_zero.doria
+doriac compile examples/person.doria --target php
 doriac run examples/person.doria
 ```
 
@@ -1184,7 +1185,8 @@ Language rules:
 
 Initial CLI:
 - `doriac check <file>`
-- `doriac compile <file> --target php --out <file>`
+- `doriac compile <file>`
+- `doriac compile <file> --target php` for compatibility output
 - `doriac run <file>`
 
 Start by implementing:
@@ -1199,7 +1201,8 @@ Start by implementing:
 Definition of done:
 - `cargo test` passes.
 - `doriac check examples/person.doria` succeeds.
-- `doriac compile examples/person.doria --target php --out build/person.php` emits runnable PHP.
+- `doriac compile examples/native/main_return_zero.doria` emits a native executable for the currently supported native slice.
+- `doriac compile examples/person.doria --target php` emits runnable PHP for the compatibility backend slice.
 - For the PHP compatibility backend slice, running emitted PHP produces expected output without treating PHP as Doria's semantic authority.
 - Invalid examples produce clear compiler errors.
 ```

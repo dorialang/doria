@@ -51,7 +51,7 @@ fn compile_command(args: &[String]) -> Result<(), String> {
     let input = args
         .first()
         .ok_or_else(|| "missing input file".to_string())?;
-    let mut target = None::<BackendTarget>;
+    let mut target = BackendTarget::Native;
     let mut out = None::<String>;
     let mut index = 1;
     while index < args.len() {
@@ -61,7 +61,7 @@ fn compile_command(args: &[String]) -> Result<(), String> {
                     .get(index + 1)
                     .ok_or_else(|| "missing value for --target".to_string())?
                     .clone();
-                target = Some(BackendTarget::from_str(&target_value)?);
+                target = BackendTarget::from_str(&target_value)?;
                 index += 2;
             }
             "--out" => {
@@ -76,10 +76,6 @@ fn compile_command(args: &[String]) -> Result<(), String> {
         }
     }
 
-    let target = target.ok_or_else(|| {
-        "missing --target <target>; available targets are `native` and `php`".to_string()
-    })?;
-
     if !target.is_available() {
         return Err(format!(
             "target `{}` ({}) is planned but not implemented yet; available targets are `native` and `php`",
@@ -88,12 +84,14 @@ fn compile_command(args: &[String]) -> Result<(), String> {
         ));
     }
 
-    let out = out.ok_or_else(|| "missing --out <file>".to_string())?;
     let (path, text) = read_source(input)?;
     let output = doriac::compile_source(path.clone(), text.clone(), target)
         .map_err(|diagnostics| doriac::render_diagnostics(path, text, &diagnostics))?;
 
-    let out_path = PathBuf::from(out);
+    let out_path = match out {
+        Some(out) => PathBuf::from(out),
+        None => default_output_path(input, &output)?,
+    };
     write_backend_output(&out_path, output)?;
     println!("{}", out_path.display());
     Ok(())
@@ -147,6 +145,32 @@ fn write_backend_output(out_path: &Path, output: BackendOutput) -> Result<(), St
     }
 }
 
+fn default_output_path(input: &str, output: &BackendOutput) -> Result<PathBuf, String> {
+    let stem = Path::new(input)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .filter(|stem| !stem.is_empty())
+        .ok_or_else(|| format!("cannot infer output file name from `{input}`"))?;
+
+    let extension = output_extension(output);
+    let mut file_name = stem.to_string();
+    if !extension.is_empty() {
+        file_name.push('.');
+        file_name.push_str(extension);
+    }
+
+    Ok(PathBuf::from(file_name))
+}
+
+fn output_extension(output: &BackendOutput) -> &str {
+    match output {
+        BackendOutput::Text { extension, .. }
+        | BackendOutput::Binary { extension, .. }
+        | BackendOutput::Executable { extension, .. } => extension,
+        BackendOutput::Artifact { .. } => "",
+    }
+}
+
 fn run_command(args: &[String]) -> Result<(), String> {
     let input = args
         .first()
@@ -180,7 +204,7 @@ fn read_source(path: impl AsRef<Path>) -> Result<(String, String), String> {
 
 fn print_help() {
     println!(
-        "doriac 0.1.0\n\nUSAGE:\n    doriac check <file>\n    doriac ast <file>\n    doriac hir <file>\n    doriac compile <file> --target <target> --out <file>\n    doriac run <file>\n\nTARGETS:\n    native    available Stage 2a Cranelift-backed fast native smoke backend\n    php       available compatibility backend\n    debug     planned interpreter/debug backend\n    wasm      planned WebAssembly backend"
+        "doriac 0.1.0\n\nUSAGE:\n    doriac check <file>\n    doriac ast <file>\n    doriac hir <file>\n    doriac compile <file> [--out <file>]\n    doriac compile <file> --target php [--out <file>]\n    doriac run <file>\n\nTARGETS:\n    native    default target for standalone executables\n    php       compatibility and inspection backend\n    debug     planned interpreter/debug backend\n    wasm      planned WebAssembly backend"
     );
 }
 
