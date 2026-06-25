@@ -10,6 +10,7 @@
 - Move toward **self-hosting**: `doriac` is initially implemented in Rust, but an early language-development goal is to eventually write significant parts of `doriac` in Doria itself.
 - Support Doria language features that PHP cannot express directly, including executable property initializers and richer attribute/metadata expressions.
 - Eventually support PHP-to-Doria migration tooling, while keeping that tooling separate from the Doria parser and core compiler semantics.
+- Establish Baton as Doria's planned project, package, build, and application orchestration tool while keeping `doriac` as the compiler.
 - Build a benchmark culture early: measure speed, memory, compile time, startup time, and artifact size before making performance claims.
 
 ## Current Slice
@@ -54,6 +55,33 @@
 - Keep native desktop, game engine, and raylib goals visible when designing Doria IR, runtime, memory representation, and FFI.
 - Require conformance tests once Cranelift and LLVM both support the same native feature: same Doria source, same semantic checks, same Doria-visible behavior.
 - Do not begin raylib bindings until native backend, FFI model, and basic runtime are ready.
+
+## Baton Project Tool Path
+
+Baton is planned project tooling. It should not move ahead of current compiler correctness work unless explicitly directed later.
+
+Future Baton work should proceed in stages:
+
+1. Accepted product identity and responsibility boundary: Baton is the project/package/build tool; `doriac` is the compiler; Doria semantics remain owned by the language specification and compiler.
+2. Manifest and lockfile design: decide file names, package metadata, dependency syntax, lockfile guarantees, and reproducibility rules in separate decisions.
+3. Project creation: design project initialization, default layout, examples, and starter application shape.
+4. Build orchestration: define the public write/build/run path without exposing compiler internals as the primary workflow.
+5. Compiler invocation: decide how Baton invokes `doriac`, passes profiles/options, receives diagnostics, and preserves compiler-owned semantics.
+6. Dependency resolution: design version constraints, source kinds, conflict resolution, and diagnostics.
+7. Local/package cache: define where packages and build artifacts live and how cache invalidation works.
+8. Workspaces: design multi-package repositories and shared dependency resolution.
+9. Testing integration: define how Baton discovers and runs tests without becoming a separate language runtime.
+10. Package registry and publication: design registry interaction, publication checks, package metadata, and yanking/deprecation policy.
+11. Security, integrity, and reproducibility: design checksums, signing or trust model, supply-chain protections, offline behavior, and deterministic build inputs.
+
+Throughout this path, Baton may orchestrate the accepted native profiles:
+
+```text
+Fast native profile       -> Cranelift
+Optimized native profile  -> LLVM
+```
+
+Baton must not change Doria-visible semantics between profiles.
 
 ## PHP Migration Path
 

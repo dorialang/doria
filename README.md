@@ -10,6 +10,12 @@ The compiler is called `doriac`. The current bootstrap implementation is written
 
 A strategic long-term goal is self-hosting: as Doria matures, more of `doriac` should become writable in Doria itself.
 
+## Toolchain Direction
+
+`doriac` is the compiler. Baton is the planned user-facing project, package, build, and application orchestration tool.
+
+The eventual public workflow is write/build/run. Baton is not implemented yet, so direct `doriac` commands remain appropriate for current compiler development and backend smoke testing.
+
 ```text
 Doria source
 -> lexer
@@ -166,6 +172,8 @@ docs/php-interop-and-migration.md
 docs/decisions/0010-native-first-correctness.md
 docs/decisions/0011-native-execution-path.md
 docs/decisions/0012-dual-native-backend-strategy.md
+docs/decisions/0014-baton-project-tool.md
+docs/website-content-guidelines.md
 ```
 
 ## Repository layout

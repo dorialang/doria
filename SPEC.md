@@ -12,6 +12,8 @@ Doria source files use the `.doria` extension and do not require `<?php` tags.
 
 The compiler is `doriac`. The current bootstrap implementation is written in Rust. Doria's primary target is native machine code and standalone executables. A strategic goal is for `doriac` to become increasingly self-hosted in Doria over time.
 
+Baton is planned external project tooling for project, package, build, and application orchestration. Baton does not define Doria semantics and is not part of the compiler pipeline.
+
 The compiler architecture is backend-independent:
 
 ```text
