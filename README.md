@@ -66,7 +66,7 @@ This repository contains the first working vertical slices of `doriac`:
 - Checks undeclared assignment and readonly/writable mutation rules for locals, properties, `$this`, and writable methods.
 - Checks assignment compatibility, declared returns, positional call arguments, constructor init access, control-flow conditions, and string interpolation constraints for the supported subset.
 - Lowers the checked AST to Doria IR, the compiler-owned representation used before backend output.
-- Emits Stage 2d Cranelift-backed native smoke executables for `function main(): int` using supported readonly integer locals and `+`/`-`/`*` arithmetic, with a final supported returned integer expression in the accepted `0..125` portable exit-code range.
+- Emits Stage 3a Cranelift-backed native smoke executables for the accepted Stage 2d source subset: `function main(): int` using supported readonly integer locals and `+`/`-`/`*` arithmetic, with a final supported returned integer expression in the accepted `0..125` portable exit-code range.
 - Emits PHP for supported syntax through the optional PHP compatibility backend.
 - Provides CLI commands and integration tests.
 
@@ -88,7 +88,7 @@ cargo run -p doriac -- compile examples/person.doria --target php
 php person.php
 ```
 
-The native backend currently supports only the accepted Stage 2d smoke shape: exactly one top-level `function main(): int` with readonly integer locals initialized from integer literals, prior supported readonly integer locals, or `+`/`-`/`*` arithmetic, and a final return of a supported integer expression in the portable `0..125` exit-code range.
+The native backend currently preserves the accepted Stage 2d smoke source shape: exactly one top-level `function main(): int` with readonly integer locals initialized from integer literals, prior supported readonly integer locals, or `+`/`-`/`*` arithmetic, and a final return of a supported integer expression in the portable `0..125` exit-code range. The Stage 3a implementation lowers those supported integer expressions into Cranelift instead of reducing the whole program to a precomputed exit-code constant before code generation.
 
 ```bash
 cargo run -p doriac -- compile examples/native/main_return_zero.doria
@@ -159,7 +159,7 @@ For VS Code, the setting is `doria.languageServer.path`. For IntelliJ IDEs, use 
 - Collection aliases are `List<T>`, `Dictionary<K, V>`, and `Set<T>`.
 - `int` means `int64`, `float` means `float64`, and the accepted fixed-width numeric family is documented in `docs/decisions/0016-fixed-width-numeric-types.md`; compiler support for those explicit spellings is future work.
 - The compiler must reject invalid Doria before lowering to Doria IR or emitting backend output.
-- The native backend currently accepts only the Stage 2d smoke entrypoint, `function main(): int` with supported readonly integer locals and `+`/`-`/`*` arithmetic, followed by a final return of a supported integer expression in `0..125`; it rejects broader valid Doria with unsupported-feature diagnostics. That range is a process-exit boundary, not the range of Doria `int`.
+- The native backend currently accepts only the Stage 2d smoke source subset, `function main(): int` with supported readonly integer locals and `+`/`-`/`*` arithmetic, followed by a final return of a supported integer expression in `0..125`; the Stage 3a backend lowers supported integer expressions through Cranelift and rejects broader valid Doria with unsupported-feature diagnostics. That range is a process-exit boundary, not the range of Doria `int`.
 - Doria may support features PHP cannot express directly, such as executable instance property initializers and richer attribute expressions.
 - If a language behavior is not specified, implementation work should pause for an explicit design decision rather than inventing behavior silently.
 

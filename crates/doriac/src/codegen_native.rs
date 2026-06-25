@@ -7,7 +7,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use cranelift_codegen::ir::{types, AbiParam, InstBuilder};
+use cranelift_codegen::ir::{types, AbiParam, InstBuilder, Value};
 use cranelift_codegen::settings;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_module::{default_libcall_names, Linkage, Module};
@@ -17,12 +17,54 @@ use crate::backend::BackendError;
 use crate::hir::{self, BinaryOp, Expr, Item, Stmt};
 
 pub fn generate_executable(program: &hir::Program) -> Result<Vec<u8>, BackendError> {
-    let exit_code = validate_stage_2d(program)?;
-    let object_bytes = generate_object(exit_code)?;
+    let native_main = validate_stage_3a(program)?;
+    let object_bytes = generate_object(&native_main)?;
     link_object(&object_bytes)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NativeMain {
+    locals: Vec<NativeLocal>,
+    return_expr: NativeExpr,
+    evaluated_exit_code: i32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NativeLocal {
+    name: String,
+    expr: NativeExpr,
+    evaluated_value: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum NativeExpr {
+    Int(i64),
+    Local(String),
+    Binary {
+        op: NativeBinaryOp,
+        left: Box<NativeExpr>,
+        right: Box<NativeExpr>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NativeBinaryOp {
+    Add,
+    Subtract,
+    Multiply,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ValidatedNativeExpr {
+    expr: NativeExpr,
+    value: i64,
+}
+
 pub fn validate_stage_2d(program: &hir::Program) -> Result<i32, BackendError> {
+    Ok(validate_stage_3a(program)?.evaluated_exit_code)
+}
+
+fn validate_stage_3a(program: &hir::Program) -> Result<NativeMain, BackendError> {
     let mut main_functions = Vec::new();
 
     for item in &program.items {
@@ -84,9 +126,14 @@ pub fn validate_stage_2d(program: &hir::Program) -> Result<i32, BackendError> {
     };
 
     let mut local_values = HashMap::new();
+    let mut locals = Vec::new();
     for statement in local_statements {
         match statement {
-            Stmt::VarDecl(decl) => validate_stage_2d_local(decl, &mut local_values)?,
+            Stmt::VarDecl(decl) => {
+                let local = validate_stage_3a_local(decl, &local_values)?;
+                local_values.insert(local.name.clone(), local.evaluated_value);
+                locals.push(local);
+            }
             Stmt::Return { .. } => {
                 return Err(BackendError::new(
                     "unsupported native statement for Stage 2d: no statements may follow `return <portable integer expression>;`",
@@ -103,7 +150,13 @@ pub fn validate_stage_2d(program: &hir::Program) -> Result<i32, BackendError> {
 
     match return_statement {
         Stmt::Return { expr: Some(expr), .. } => {
-            validate_stage_2d_return_expr(expr, &local_values)
+            let return_expr = validate_stage_3a_int_expr(expr, &local_values)?;
+            let evaluated_exit_code = parse_stage_2d_exit_code(return_expr.value)?;
+            Ok(NativeMain {
+                locals,
+                return_expr: return_expr.expr,
+                evaluated_exit_code,
+            })
         }
         Stmt::Return { expr: None, .. } => Err(BackendError::new(
             "unsupported native statement for Stage 2d: expected `return <portable integer expression>;`, found bare `return;`",
@@ -115,10 +168,10 @@ pub fn validate_stage_2d(program: &hir::Program) -> Result<i32, BackendError> {
     }
 }
 
-fn validate_stage_2d_local(
+fn validate_stage_3a_local(
     decl: &hir::VarDecl,
-    local_values: &mut HashMap<String, i64>,
-) -> Result<(), BackendError> {
+    local_values: &HashMap<String, i64>,
+) -> Result<NativeLocal, BackendError> {
     if decl.writable {
         return Err(unsupported_stage_2d_local());
     }
@@ -129,9 +182,12 @@ fn validate_stage_2d_local(
         }
     }
 
-    let value = eval_stage_2d_int_expr(&decl.initializer, local_values)?;
-    local_values.insert(decl.name.clone(), value);
-    Ok(())
+    let initializer = validate_stage_3a_int_expr(&decl.initializer, local_values)?;
+    Ok(NativeLocal {
+        name: decl.name.clone(),
+        expr: initializer.expr,
+        evaluated_value: initializer.value,
+    })
 }
 
 fn unsupported_stage_2d_local() -> BackendError {
@@ -140,32 +196,45 @@ fn unsupported_stage_2d_local() -> BackendError {
     )
 }
 
-fn validate_stage_2d_return_expr(
+fn validate_stage_3a_int_expr(
     expr: &Expr,
     local_values: &HashMap<String, i64>,
-) -> Result<i32, BackendError> {
-    let value = eval_stage_2d_int_expr(expr, local_values)?;
-    parse_stage_2d_exit_code(value)
-}
-
-fn eval_stage_2d_int_expr(
-    expr: &Expr,
-    local_values: &HashMap<String, i64>,
-) -> Result<i64, BackendError> {
+) -> Result<ValidatedNativeExpr, BackendError> {
     match expr {
-        Expr::Int { value, .. } => parse_doria_int_literal(value),
-        Expr::Variable { name, .. } => local_values.get(name).copied().ok_or_else(|| {
-            BackendError::new(
-                "unsupported native expression for Stage 2d: expected integer literal, readonly integer local, or supported integer arithmetic",
-            )
-        }),
+        Expr::Int { value, .. } => {
+            let value = parse_doria_int_literal(value)?;
+            Ok(ValidatedNativeExpr {
+                expr: NativeExpr::Int(value),
+                value,
+            })
+        }
+        Expr::Variable { name, .. } => {
+            let value = local_values.get(name).copied().ok_or_else(|| {
+                BackendError::new(
+                    "unsupported native expression for Stage 2d: expected integer literal, readonly integer local, or supported integer arithmetic",
+                )
+            })?;
+            Ok(ValidatedNativeExpr {
+                expr: NativeExpr::Local(name.clone()),
+                value,
+            })
+        }
         Expr::Binary {
             left, op, right, ..
-        } if is_stage_2d_arithmetic_op(op) => {
-            let left = eval_stage_2d_int_expr(left, local_values)?;
-            let right = eval_stage_2d_int_expr(right, local_values)?;
-            checked_stage_2d_arithmetic(left, op, right).ok_or_else(|| {
+        } if native_binary_op(op).is_some() => {
+            let native_op = native_binary_op(op).expect("checked by guard");
+            let left = validate_stage_3a_int_expr(left, local_values)?;
+            let right = validate_stage_3a_int_expr(right, local_values)?;
+            let value = checked_native_arithmetic(left.value, native_op, right.value).ok_or_else(|| {
                 BackendError::new("integer arithmetic overflows the Doria `int` range")
+            })?;
+            Ok(ValidatedNativeExpr {
+                expr: NativeExpr::Binary {
+                    op: native_op,
+                    left: Box::new(left.expr),
+                    right: Box::new(right.expr),
+                },
+                value,
             })
         }
         Expr::Binary {
@@ -183,16 +252,20 @@ fn eval_stage_2d_int_expr(
     }
 }
 
-fn is_stage_2d_arithmetic_op(op: &BinaryOp) -> bool {
-    matches!(op, BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul)
+fn native_binary_op(op: &BinaryOp) -> Option<NativeBinaryOp> {
+    match op {
+        BinaryOp::Add => Some(NativeBinaryOp::Add),
+        BinaryOp::Sub => Some(NativeBinaryOp::Subtract),
+        BinaryOp::Mul => Some(NativeBinaryOp::Multiply),
+        _ => None,
+    }
 }
 
-fn checked_stage_2d_arithmetic(left: i64, op: &BinaryOp, right: i64) -> Option<i64> {
+fn checked_native_arithmetic(left: i64, op: NativeBinaryOp, right: i64) -> Option<i64> {
     match op {
-        BinaryOp::Add => left.checked_add(right),
-        BinaryOp::Sub => left.checked_sub(right),
-        BinaryOp::Mul => left.checked_mul(right),
-        _ => None,
+        NativeBinaryOp::Add => left.checked_add(right),
+        NativeBinaryOp::Subtract => left.checked_sub(right),
+        NativeBinaryOp::Multiply => left.checked_mul(right),
     }
 }
 
@@ -212,14 +285,14 @@ fn parse_stage_2d_exit_code(value: i64) -> Result<i32, BackendError> {
     Ok(value as i32)
 }
 
-fn generate_object(exit_code: i32) -> Result<Vec<u8>, BackendError> {
+fn generate_object(native_main: &NativeMain) -> Result<Vec<u8>, BackendError> {
     let isa_builder = cranelift_native::builder()
         .map_err(|error| BackendError::new(format!("backend emission failure: {error}")))?;
     let isa = isa_builder
         .finish(settings::Flags::new(settings::builder()))
         .map_err(|error| BackendError::new(format!("backend emission failure: {error}")))?;
     let mut module = ObjectModule::new(
-        ObjectBuilder::new(isa, "doria_stage_2d", default_libcall_names())
+        ObjectBuilder::new(isa, "doria_stage_3a", default_libcall_names())
             .map_err(|error| BackendError::new(format!("backend emission failure: {error}")))?,
     );
 
@@ -238,7 +311,29 @@ fn generate_object(exit_code: i32) -> Result<Vec<u8>, BackendError> {
         let entry_block = builder.create_block();
         builder.switch_to_block(entry_block);
         builder.seal_block(entry_block);
-        let exit_value = builder.ins().iconst(types::I32, i64::from(exit_code));
+        let mut lowered_local_values = HashMap::new();
+        let mut evaluated_local_values = HashMap::new();
+        for local in &native_main.locals {
+            let value = lower_native_expr(&mut builder, &local.expr, &lowered_local_values)?;
+            lowered_local_values.insert(local.name.clone(), value);
+            evaluated_local_values.insert(local.name.clone(), local.evaluated_value);
+        }
+
+        let return_value = lower_native_expr(
+            &mut builder,
+            &native_main.return_expr,
+            &lowered_local_values,
+        )?;
+        let Some(evaluated_return) =
+            evaluate_native_expr(&native_main.return_expr, &evaluated_local_values)
+        else {
+            return Err(BackendError::new(
+                "backend emission failure: validated native expression could not be re-evaluated",
+            ));
+        };
+        debug_assert_eq!(evaluated_return, i64::from(native_main.evaluated_exit_code));
+
+        let exit_value = builder.ins().ireduce(types::I32, return_value);
         builder.ins().return_(&[exit_value]);
         builder.finalize();
     }
@@ -252,6 +347,42 @@ fn generate_object(exit_code: i32) -> Result<Vec<u8>, BackendError> {
         .finish()
         .emit()
         .map_err(|error| BackendError::new(format!("backend emission failure: {error}")))
+}
+
+fn lower_native_expr(
+    builder: &mut FunctionBuilder,
+    expr: &NativeExpr,
+    local_values: &HashMap<String, Value>,
+) -> Result<Value, BackendError> {
+    match expr {
+        NativeExpr::Int(value) => Ok(builder.ins().iconst(types::I64, *value)),
+        NativeExpr::Local(name) => local_values.get(name).copied().ok_or_else(|| {
+            BackendError::new(format!(
+                "backend emission failure: validated native local `{name}` was not lowered"
+            ))
+        }),
+        NativeExpr::Binary { op, left, right } => {
+            let left = lower_native_expr(builder, left, local_values)?;
+            let right = lower_native_expr(builder, right, local_values)?;
+            Ok(match op {
+                NativeBinaryOp::Add => builder.ins().iadd(left, right),
+                NativeBinaryOp::Subtract => builder.ins().isub(left, right),
+                NativeBinaryOp::Multiply => builder.ins().imul(left, right),
+            })
+        }
+    }
+}
+
+fn evaluate_native_expr(expr: &NativeExpr, local_values: &HashMap<String, i64>) -> Option<i64> {
+    match expr {
+        NativeExpr::Int(value) => Some(*value),
+        NativeExpr::Local(name) => local_values.get(name).copied(),
+        NativeExpr::Binary { op, left, right } => checked_native_arithmetic(
+            evaluate_native_expr(left, local_values)?,
+            *op,
+            evaluate_native_expr(right, local_values)?,
+        ),
+    }
 }
 
 fn link_object(object_bytes: &[u8]) -> Result<Vec<u8>, BackendError> {
@@ -277,9 +408,9 @@ fn link_object(object_bytes: &[u8]) -> Result<Vec<u8>, BackendError> {
 }
 
 fn invoke_linker(object_path: &Path, executable_path: &Path) -> Result<(), BackendError> {
-    // Stage 2d emits a Cranelift object file and asks the host toolchain to link
-    // it. This is not a C backend: Doria never generates C source or uses C
-    // semantics as an oracle here.
+    // Stage 3a emits a Cranelift object file and asks the host toolchain to
+    // link it. This is not a C backend: Doria never generates C source or uses
+    // C semantics as an oracle here.
     let cc_is_set = env::var_os("CC").is_some();
     let linker = env::var("CC").unwrap_or_else(|_| default_linker().to_string());
     let mut command = Command::new(&linker);
@@ -374,7 +505,7 @@ fn linker_arguments(
 ) -> Vec<OsString> {
     if windows && (!cc_is_set || is_msvc_style_compiler_driver(linker)) {
         // Cranelift-generated objects do not carry MSVC /DEFAULTLIB directives.
-        // For Stage 2d's tiny main, make Doria's main the executable entrypoint
+        // For Stage 3a's tiny main, make Doria's main the executable entrypoint
         // instead of relying on CRT startup to discover and call it.
         return vec![
             OsString::from("/nologo"),
@@ -440,6 +571,42 @@ fn describe_expression(expr: &Expr) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stage_3a_validation_preserves_expression_structure_for_codegen() {
+        let program = crate::lower_source(
+            "stage3a.doria",
+            r#"
+function main(): int
+{
+    let $left = 20;
+    let $right = 22;
+    return $left + $right;
+}
+"#,
+        )
+        .expect("source should lower to HIR");
+
+        let native_main = validate_stage_3a(&program).expect("source should validate for Stage 3a");
+
+        assert_eq!(native_main.evaluated_exit_code, 42);
+        assert_eq!(native_main.locals.len(), 2);
+        assert_eq!(native_main.locals[0].name, "left");
+        assert_eq!(native_main.locals[0].expr, NativeExpr::Int(20));
+        assert_eq!(native_main.locals[0].evaluated_value, 20);
+        assert_eq!(native_main.locals[1].name, "right");
+        assert_eq!(native_main.locals[1].expr, NativeExpr::Int(22));
+        assert_eq!(native_main.locals[1].evaluated_value, 22);
+
+        assert_eq!(
+            native_main.return_expr,
+            NativeExpr::Binary {
+                op: NativeBinaryOp::Add,
+                left: Box::new(NativeExpr::Local("left".to_string())),
+                right: Box::new(NativeExpr::Local("right".to_string())),
+            }
+        );
+    }
 
     #[test]
     fn windows_default_uses_msvc_compiler_driver_arguments() {

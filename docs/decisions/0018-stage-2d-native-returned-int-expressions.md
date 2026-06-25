@@ -48,7 +48,9 @@ function main(): int
 
 Stage 2d proves returned integer expressions without widening native output into general expression lowering, control flow, assignments, calls, strings, or runtime support.
 
-The implementation may evaluate supported integer expressions at compile time for this native slice. That is a validation and lowering technique for the Stage 2d smoke backend, not a general Doria `const` feature, not a compile-time execution engine, and not permission to evaluate arbitrary calls or side effects.
+The Stage 2d implementation was allowed to evaluate supported integer expressions at compile time for validation and smoke output. That was not a general Doria `const` feature, not a compile-time execution engine, and not permission to evaluate arbitrary calls or side effects.
+
+Stage 3a preserves this accepted source subset while changing the backend architecture: the native backend validates into a small implementation-private native expression model, evaluates supported expressions only for checked arithmetic and process-exit range validation, then lowers the retained integer expression tree into Cranelift `i64` values before reducing the final validated result to the platform `main` return type. This is still not a public native IR, full native arithmetic support, or broader runtime support.
 
 ## Overflow and range
 
