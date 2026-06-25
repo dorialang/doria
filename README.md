@@ -151,8 +151,9 @@ For VS Code, the setting is `doria.languageServer.path`. For IntelliJ IDEs, use 
 - Class members are externally accessible by default; use `internal` for implementation details that should not be accessed from outside the declaring class.
 - `writable` controls mutation. `internal` controls API surface.
 - Collection aliases are `List<T>`, `Dictionary<K, V>`, and `Set<T>`.
+- `int` means `int64`, `float` means `float64`, and the accepted fixed-width numeric family is documented in `docs/decisions/0016-fixed-width-numeric-types.md`; compiler support for those explicit spellings is future work.
 - The compiler must reject invalid Doria before lowering to Doria IR or emitting backend output.
-- The native backend currently accepts only the Stage 2a smoke entrypoint, `function main(): int` returning an integer literal in `0..125`, and rejects broader valid Doria with unsupported-feature diagnostics.
+- The native backend currently accepts only the Stage 2a smoke entrypoint, `function main(): int` returning an integer literal in `0..125`, and rejects broader valid Doria with unsupported-feature diagnostics. That range is a process-exit boundary, not the range of Doria `int`.
 - Doria may support features PHP cannot express directly, such as executable instance property initializers and richer attribute expressions.
 - If a language behavior is not specified, implementation work should pause for an explicit design decision rather than inventing behavior silently.
 
@@ -172,7 +173,9 @@ docs/php-interop-and-migration.md
 docs/decisions/0010-native-first-correctness.md
 docs/decisions/0011-native-execution-path.md
 docs/decisions/0012-dual-native-backend-strategy.md
+docs/decisions/0013-stage-2-native-integers.md
 docs/decisions/0014-baton-project-tool.md
+docs/decisions/0016-fixed-width-numeric-types.md
 docs/website-content-guidelines.md
 ```
 

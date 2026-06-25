@@ -24,6 +24,7 @@ Accepted decisions already establish:
 - Doria is native-first and backend output does not define Doria semantics.
 - Cranelift and LLVM are backend profiles; they implement Doria, not separate languages.
 - Doria `int` is a fixed-width signed 64-bit integer for early native integer semantics.
+- `0016-fixed-width-numeric-types.md` accepts the fixed-width numeric family and clarifies that `int` means `int64`.
 - Decimal integer literals in `int` contexts must fit the Doria `int` range before Doria IR/native lowering.
 - The current `0..125` range is a portable native smoke-test process exit-code range. It is not the range of Doria `int`.
 

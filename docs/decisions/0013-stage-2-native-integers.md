@@ -169,7 +169,7 @@ Use fixed-width signed 64-bit `int` for early native semantics.
 
 Doria `int` is a fixed-width signed 64-bit integer for early native integer semantics. Cranelift and LLVM should lower Doria `int` according to this Doria decision, not according to backend defaults.
 
-Explicit sized integer families may be designed later for FFI, binary formats, graphics, game engines, and systems APIs. They are not part of Stage 2a.
+Explicit fixed-width numeric spellings are accepted separately in `0016-fixed-width-numeric-types.md` for FFI, binary formats, graphics, game engines, and systems APIs. They are not implemented by Stage 2a.
 
 ## Integer literal rules
 
