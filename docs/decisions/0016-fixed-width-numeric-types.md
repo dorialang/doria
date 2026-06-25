@@ -152,7 +152,7 @@ Any future safe widening, narrowing, checked conversion, wrapping conversion, or
 
 ## Stage 2 native exit-code boundary
 
-The current native Stage 2a process-exit restriction is:
+The Stage 2 native process-exit restriction that began in Stage 2a is:
 
 ```text
 0..125

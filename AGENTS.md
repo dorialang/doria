@@ -43,6 +43,26 @@ The accepted project-tool name is Baton. Baton is the planned user-facing projec
 - Compiler-oriented documentation may still document direct `doriac` commands.
 - If Baton design encounters an unresolved product or language fork, stop and ask Andrew.
 
+## Decision triage
+
+Stop and ask Andrew only when a decision affects one or more of:
+
+- Doria-visible language semantics
+- safety or memory guarantees
+- ABI or externally observable data layout
+- Cranelift/LLVM conformance
+- public APIs that would be costly to reverse
+- syntax, type conversions, ownership, destruction, or runtime behavior
+
+For reversible implementation details:
+
+- choose the simplest correct backend-independent option
+- explicitly record the assumption
+- test it
+- proceed without blocking
+
+At completion, report assumptions made and critical decisions encountered. If no critical decision requires Andrew's input, say so directly.
+
 ## Working rules
 
 - Treat `docs/brand-positioning.md`, `docs/doria-development-plan.md`, `docs/self-hosting.md`, `docs/executable-initializers-and-attributes.md`, `docs/php-interop-and-migration.md`, `docs/performance-and-benchmarking.md`, `docs/mutability-ergonomics.md`, `docs/api-design-guidelines.md`, `docs/decisions/`, and `SPEC.md` as the product direction.
@@ -109,4 +129,4 @@ Run backend-specific checks only when the touched task depends on that backend. 
 cargo run -p doriac -- compile examples/person.doria --target php --out build/person.php
 ```
 
-When a native backend target exists, native smoke tests must be part of the relevant definition of done. The current native target is the Stage 2a Cranelift-backed smoke backend only; do not treat it as full native code generation.
+When a native backend target exists, native smoke tests must be part of the relevant definition of done. The current native target is the Stage 2b Cranelift-backed smoke backend only; do not treat it as full native code generation.

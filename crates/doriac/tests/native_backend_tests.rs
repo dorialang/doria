@@ -6,7 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use doriac::backend::BackendTarget;
 
 #[test]
-fn compiles_and_runs_stage_2a_native_smoke_examples() {
+fn compiles_and_runs_stage_2b_native_smoke_examples() {
     if !host_linker_is_available() {
         eprintln!(
             "native smoke test unavailable: host linker `{}` was not found",
@@ -24,6 +24,21 @@ fn compiles_and_runs_stage_2a_native_smoke_examples() {
         ),
         ("main_return_42", "examples/native/main_return_42.doria", 42),
         ("main_return_125", "inline_main_return_125.doria", 125),
+        (
+            "main_readonly_local",
+            "examples/native/main_readonly_local.doria",
+            42,
+        ),
+        (
+            "main_typed_readonly_local",
+            "inline_main_typed_readonly_local.doria",
+            42,
+        ),
+        (
+            "main_unused_large_local",
+            "inline_main_unused_large_local.doria",
+            0,
+        ),
     ];
 
     for (stem, source, expected_code) in cases {
@@ -32,15 +47,7 @@ fn compiles_and_runs_stage_2a_native_smoke_examples() {
         if source.ends_with(".doria") && source.starts_with("examples/") {
             compile_native_file(&workspace.join(source), &output);
         } else {
-            compile_native_source(
-                r#"
-function main(): int
-{
-    return 125;
-}
-"#,
-                &output,
-            );
+            compile_native_source(native_smoke_source(stem), &output);
         }
 
         let run = Command::new(&output)
@@ -52,8 +59,40 @@ function main(): int
     }
 }
 
+fn native_smoke_source(stem: &str) -> &'static str {
+    match stem {
+        "main_return_125" => {
+            r#"
+function main(): int
+{
+    return 125;
+}
+"#
+        }
+        "main_typed_readonly_local" => {
+            r#"
+function main(): int
+{
+    int $code = 42;
+    return $code;
+}
+"#
+        }
+        "main_unused_large_local" => {
+            r#"
+function main(): int
+{
+    let $value = 9223372036854775807;
+    return 0;
+}
+"#
+        }
+        _ => unreachable!("unexpected inline native smoke source `{stem}`"),
+    }
+}
+
 #[test]
-fn rejects_unsupported_stage_2a_native_shapes() {
+fn rejects_unsupported_stage_2b_native_shapes() {
     let cases = [
         ("no main", "", "B0001", "no native entrypoint found"),
         (
@@ -87,7 +126,7 @@ function main(): int
 }
 "#,
             "B0001",
-            "native Stage 2a exit code must be in the range 0..125",
+            "native Stage 2b exit code must be in the range 0..125",
         ),
         (
             "return 255",
@@ -98,7 +137,7 @@ function main(): int
 }
 "#,
             "B0001",
-            "native Stage 2a exit code must be in the range 0..125",
+            "native Stage 2b exit code must be in the range 0..125",
         ),
         (
             "return out of Doria int range",
@@ -145,16 +184,16 @@ function main(): int
             "undeclared variable `$code`",
         ),
         (
-            "local then return variable",
+            "returned local outside exit-code range",
             r#"
 function main(): int
 {
-    let $code = 42;
+    let $code = 126;
     return $code;
 }
 "#,
             "B0001",
-            "local variable declaration",
+            "native Stage 2b exit code must be in the range 0..125",
         ),
         (
             "return binary expression",
@@ -165,19 +204,68 @@ function main(): int
 }
 "#,
             "B0001",
-            "expected integer literal exit code",
+            "expected integer literal or readonly integer local",
         ),
         (
-            "local variable",
+            "writable local",
             r#"
 function main(): int
 {
-    let $value = 0;
+    let writable $code = 42;
+    return $code;
+}
+"#,
+            "B0001",
+            "unsupported native local for Stage 2b",
+        ),
+        (
+            "non-int local",
+            r#"
+function main(): int
+{
+    string $message = "hello";
     return 0;
 }
 "#,
             "B0001",
-            "local variable declaration",
+            "unsupported native local for Stage 2b",
+        ),
+        (
+            "local initialized from binary expression",
+            r#"
+function main(): int
+{
+    let $code = 20 + 22;
+    return $code;
+}
+"#,
+            "B0001",
+            "unsupported native local for Stage 2b",
+        ),
+        (
+            "local initialized from another local",
+            r#"
+function main(): int
+{
+    let $first = 42;
+    let $second = $first;
+    return $second;
+}
+"#,
+            "B0001",
+            "unsupported native local for Stage 2b",
+        ),
+        (
+            "local outside Doria int range",
+            r#"
+function main(): int
+{
+    let $value = 9223372036854775808;
+    return 0;
+}
+"#,
+            "E0417",
+            "integer literal is outside the Doria `int` range",
         ),
         (
             "echo",
@@ -240,7 +328,7 @@ function main(): int
     for (name, source, expected_code, expected_message) in cases {
         let diagnostics =
             doriac::compile_source(format!("{name}.doria"), source, BackendTarget::Native)
-                .expect_err("unsupported native Stage 2a source should fail");
+                .expect_err("unsupported native Stage 2b source should fail");
 
         assert_eq!(diagnostics[0].code, expected_code, "{name}");
         assert!(
@@ -252,7 +340,7 @@ function main(): int
 }
 
 #[test]
-fn native_backend_returns_executable_output_for_stage_2a_shape() {
+fn native_backend_returns_executable_output_for_stage_2b_literal_shape() {
     if !host_linker_is_available() {
         eprintln!(
             "native executable output test unavailable: host linker `{}` was not found",
@@ -271,7 +359,38 @@ function main(): int
 "#,
         BackendTarget::Native,
     )
-    .expect("Stage 2a source should compile");
+    .expect("Stage 2b source should compile");
+
+    match output {
+        doriac::backend::BackendOutput::Executable { bytes, .. } => {
+            assert!(!bytes.is_empty());
+        }
+        other => panic!("native backend should return executable output, got {other:?}"),
+    }
+}
+
+#[test]
+fn native_backend_returns_executable_output_for_stage_2b_local_shape() {
+    if !host_linker_is_available() {
+        eprintln!(
+            "native executable output test unavailable: host linker `{}` was not found",
+            host_linker()
+        );
+        return;
+    }
+
+    let output = doriac::compile_source(
+        "test.doria",
+        r#"
+function main(): int
+{
+    let $code = 42;
+    return $code;
+}
+"#,
+        BackendTarget::Native,
+    )
+    .expect("Stage 2b local source should compile");
 
     match output {
         doriac::backend::BackendOutput::Executable { bytes, .. } => {
@@ -299,7 +418,7 @@ fn compile_native_file(input: &Path, output: &Path) {
 
 fn compile_native_source(source: &str, output: &Path) {
     let native = doriac::compile_source("test.doria", source, BackendTarget::Native)
-        .expect("Stage 2a source should compile");
+        .expect("Stage 2b source should compile");
     let doriac::backend::BackendOutput::Executable { bytes, .. } = native else {
         panic!("native backend should return executable output, got {native:?}");
     };

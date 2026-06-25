@@ -21,7 +21,7 @@
 - Allow constructors to initialize uninitialized readonly properties through narrow direct init access.
 - Support MVP `if` / `else if` / `else` and `while` in the AST, semantic checker, Doria IR, and PHP backend.
 - Represent braced string interpolation in the Doria AST and Doria IR, with PHP lowering emitted as explicit concatenation.
-- Stage 2a Cranelift native smoke backend is implemented for exactly one top-level `function main(): int` returning an integer literal in the portable `0..125` exit-code range.
+- Stage 2b Cranelift native smoke backend is implemented for exactly one top-level `function main(): int` with readonly integer locals initialized from integer literals and a final return of an integer literal or supported readonly local in the portable `0..125` exit-code range.
 - Keep PHP as a compatibility backend only; do not treat PHP output as the proof that Doria semantics are correct.
 - Do not build PHP-to-Doria migration in the current v0.1 slice.
 - Do not start desktop, game engine, raylib, or FFI implementation work in the current v0.1 slice.
@@ -31,11 +31,12 @@
 - Treat `docs/decisions/0011-native-execution-path.md` as the accepted Stage 1 native execution path.
 - Follow the accepted staged Cranelift/LLVM native backend direction: Cranelift first for the smallest native smoke/backend route, LLVM later as the longer-term optimizing backend path.
 - Treat `docs/decisions/0013-stage-2-native-integers.md` as the accepted Stage 2 native integer execution decision.
+- Treat `docs/decisions/0015-stage-2b-native-readonly-integer-locals.md` as the accepted Stage 2b native readonly integer locals decision.
 - Treat `docs/decisions/0016-fixed-width-numeric-types.md` as the accepted fixed-width numeric family and default numeric spelling decision.
-- Keep Stage 2b readonly integer locals, Stage 2c simple integer arithmetic, and Stage 2d returned integer expressions as separate future implementation slices after Stage 2a.
+- Keep Stage 2c simple integer arithmetic and Stage 2d returned integer expressions as separate future implementation slices after Stage 2b.
 - Add compiler support for `int8`/`int16`/`int32`/`int64`, `uint8`/`uint16`/`uint32`/`uint64`, and `float32`/`float64` in a dedicated typed semantic model slice before claiming those spellings are implemented.
 - Plan a lowered/native IR when native code generation needs a simpler representation for control flow, memory layout, runtime calls, and backend emission.
-- Expand native support beyond Stage 2a only after the next accepted native slice specifies the language semantics and expected behavior.
+- Expand native support beyond Stage 2b only after the next accepted native slice specifies the language semantics and expected behavior.
 - Keep future LLVM optimized-profile work conformant with accepted Doria integer semantics and Cranelift fast-profile behavior for the same supported programs.
 - Expand return checking from the current final-statement rule into full path-sensitive control-flow analysis.
 - Add full definite property initialization analysis for constructor paths.

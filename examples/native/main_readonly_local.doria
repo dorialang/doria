@@ -1,0 +1,5 @@
+function main(): int
+{
+    let $code = 42;
+    return $code;
+}

@@ -1,8 +1,8 @@
 # 0015 Stage 2b native readonly integer locals
 
-Status: Proposed
+Status: Accepted
 
-Andrew must review this decision before implementation. Do not implement Stage 2b native code generation from this document until it is accepted.
+Accepted by the Stage 2b implementation task. Keep this slice narrow; later native stages must still be accepted separately.
 
 ## Question
 
@@ -32,7 +32,7 @@ The current AST and Doria IR already represent local declarations with mutabilit
 
 The current semantic checker already handles declaration rules, readonly/writable bindings, duplicate locals, undeclared variables, type resolution, assignment compatibility, return types, and integer literal range diagnostics.
 
-## Proposed Stage 2b objective
+## Stage 2b objective
 
 Stage 2b should add native support for readonly local integer bindings initialized from integer literals inside the accepted `main(): int` entrypoint.
 
@@ -72,7 +72,7 @@ return $code;
 
 No statement may follow the return.
 
-## Proposed accepted source forms
+## Accepted source forms
 
 Stage 2b native output should accept:
 
@@ -111,7 +111,7 @@ function main(): int
 
 The third example is important: a local may hold any accepted Doria `int` literal value. The `0..125` restriction applies only when a value is used as the observable Stage 2 native process exit code.
 
-## Proposed unsupported native forms
+## Unsupported native forms
 
 These forms may remain valid Doria but should be rejected by the native Stage 2b backend with unsupported-feature diagnostics until later stages:
 
@@ -309,9 +309,9 @@ same process exit behavior
 
 Cranelift and LLVM may use different internal storage strategies. They must preserve the same Doria-visible behavior.
 
-## Proposed implementation boundary
+## Implementation boundary
 
-If this decision is accepted, the implementation should remain narrow:
+The implementation should remain narrow:
 
 - Do not add arithmetic.
 - Do not add assignment support.
@@ -324,13 +324,11 @@ If this decision is accepted, the implementation should remain narrow:
 - Do not change the public process exit-code rule beyond tracking returned readonly local values.
 - Do not reshape Doria IR around Cranelift storage needs.
 
-## Open review questions
+## Accepted answers
 
-Andrew should review these proposed boundaries before implementation:
+The implementation task accepts these boundaries:
 
-1. Should Stage 2b include only integer-literal local initializers, or also allow `let $b = $a;` when `$a` is a supported readonly integer local?
-2. Should Stage 2b support both `let $code = 42;` and `int $code = 42;`, as proposed here?
-3. Should a returned local outside `0..125` reuse the Stage 2a exit-code diagnostic wording or use Stage 2b-specific wording?
-4. Should unused readonly locals be accepted in Stage 2b native output, as proposed here, or rejected until native code generation can prove they are harmless?
-
-Until these are accepted, this document remains Proposed.
+1. Stage 2b includes only integer-literal local initializers. Local-to-local initializers remain future work.
+2. Stage 2b supports both `let $code = 42;` and `int $code = 42;`.
+3. A returned local outside `0..125` uses Stage 2b-specific exit-code diagnostic wording.
+4. Unused readonly integer locals initialized from integer literals are accepted in Stage 2b native output.
