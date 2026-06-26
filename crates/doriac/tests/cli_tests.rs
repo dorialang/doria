@@ -79,6 +79,64 @@ echo "Hello from Doria\n";
 }
 
 #[test]
+fn run_compiles_source_to_native_and_returns_program_status() {
+    if !host_linker_is_available() {
+        eprintln!(
+            "native CLI run test unavailable: host linker `{}` was not found",
+            host_linker()
+        );
+        return;
+    }
+
+    let temp_dir = temp_dir_path("native-run");
+    fs::create_dir_all(&temp_dir).expect("temp directory should be created");
+    fs::write(
+        temp_dir.join("main.doria"),
+        r#"
+function main(): int
+{
+    return 42;
+}
+"#,
+    )
+    .expect("source file should be writable");
+
+    let run = Command::new(doriac_bin())
+        .current_dir(&temp_dir)
+        .arg("run")
+        .arg("main.doria")
+        .output()
+        .expect("doriac binary should run");
+
+    assert_eq!(
+        run.status.code(),
+        Some(42),
+        "doriac run should return the native program status"
+    );
+
+    let _ = fs::remove_dir_all(temp_dir);
+}
+
+#[test]
+fn run_rejects_binary_input_with_source_hint() {
+    let temp_dir = temp_dir_path("run-binary-input");
+    fs::create_dir_all(&temp_dir).expect("temp directory should be created");
+    fs::write(temp_dir.join("main"), [0, 159, 146, 150])
+        .expect("binary-like file should be writable");
+
+    let run = Command::new(doriac_bin())
+        .current_dir(&temp_dir)
+        .arg("run")
+        .arg("main")
+        .output()
+        .expect("doriac binary should run");
+
+    assert_failure_contains("binary run input", run, "expects a `.doria` source file");
+
+    let _ = fs::remove_dir_all(temp_dir);
+}
+
+#[test]
 fn compile_rejects_inferred_native_output_that_would_overwrite_input() {
     let temp_dir = temp_dir_path("native-overwrite-guard");
     fs::create_dir_all(&temp_dir).expect("temp directory should be created");

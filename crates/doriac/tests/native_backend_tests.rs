@@ -89,6 +89,23 @@ fn compiles_and_runs_stage_2d_native_smoke_examples() {
             "inline_main_unused_arithmetic_126.doria",
             0,
         ),
+        (
+            "main_if_else_42",
+            "examples/native/main_if_else_42.doria",
+            42,
+        ),
+        ("main_if_true_42", "inline_main_if_true_42.doria", 42),
+        ("main_if_false_42", "inline_main_if_false_42.doria", 42),
+        (
+            "main_if_less_than_local",
+            "inline_main_if_less_than_local.doria",
+            42,
+        ),
+        (
+            "main_if_large_local",
+            "inline_main_if_large_local.doria",
+            42,
+        ),
     ];
 
     for (stem, source, expected_code) in cases {
@@ -214,6 +231,58 @@ function main(): int
 }
 "#
         }
+        "main_if_true_42" => {
+            r#"
+function main(): int
+{
+    if (true) {
+        return 42;
+    } else {
+        return 0;
+    }
+}
+"#
+        }
+        "main_if_false_42" => {
+            r#"
+function main(): int
+{
+    if (false) {
+        return 0;
+    } else {
+        return 42;
+    }
+}
+"#
+        }
+        "main_if_less_than_local" => {
+            r#"
+function main(): int
+{
+    let $x = 10;
+
+    if ($x < 20) {
+        return $x + 32;
+    } else {
+        return 0;
+    }
+}
+"#
+        }
+        "main_if_large_local" => {
+            r#"
+function main(): int
+{
+    let $value = 126;
+
+    if ($value > 100) {
+        return 42;
+    } else {
+        return 0;
+    }
+}
+"#
+        }
         _ => unreachable!("unexpected inline native smoke source `{stem}`"),
     }
 }
@@ -253,7 +322,7 @@ function main(): int
 }
 "#,
             "B0001",
-            "native Stage 2d exit code must be in the range 0..125",
+            "native Stage 4a exit code must be in the range 0..125",
         ),
         (
             "return 255",
@@ -264,7 +333,7 @@ function main(): int
 }
 "#,
             "B0001",
-            "native Stage 2d exit code must be in the range 0..125",
+            "native Stage 4a exit code must be in the range 0..125",
         ),
         (
             "return out of Doria int range",
@@ -320,7 +389,7 @@ function main(): int
 }
 "#,
             "B0001",
-            "native Stage 2d exit code must be in the range 0..125",
+            "native Stage 4a exit code must be in the range 0..125",
         ),
         (
             "return arithmetic outside exit-code range",
@@ -331,7 +400,7 @@ function main(): int
 }
 "#,
             "B0001",
-            "native Stage 2d exit code must be in the range 0..125",
+            "native Stage 4a exit code must be in the range 0..125",
         ),
         (
             "returned arithmetic local outside exit-code range",
@@ -343,7 +412,7 @@ function main(): int
 }
 "#,
             "B0001",
-            "native Stage 2d exit code must be in the range 0..125",
+            "native Stage 4a exit code must be in the range 0..125",
         ),
         (
             "writable local",
@@ -494,7 +563,130 @@ function main(): int
 }
 "#,
             "B0001",
-            "native Stage 2d exit code must be in the range 0..125",
+            "native Stage 4a exit code must be in the range 0..125",
+        ),
+        (
+            "if else branch outside exit-code range",
+            r#"
+function main(): int
+{
+    if (true) {
+        return 0;
+    } else {
+        return 126;
+    }
+}
+"#,
+            "B0001",
+            "native Stage 4a exit code must be in the range 0..125",
+        ),
+        (
+            "if integer condition",
+            r#"
+function main(): int
+{
+    if (1) {
+        return 42;
+    } else {
+        return 0;
+    }
+}
+"#,
+            "E0416",
+            "condition must be `bool`",
+        ),
+        (
+            "if arithmetic integer condition",
+            r#"
+function main(): int
+{
+    if (20 + 22) {
+        return 42;
+    } else {
+        return 0;
+    }
+}
+"#,
+            "E0416",
+            "condition must be `bool`",
+        ),
+        (
+            "if condition division",
+            r#"
+function main(): int
+{
+    if (42 / 1 == 42) {
+        return 42;
+    } else {
+        return 0;
+    }
+}
+"#,
+            "B0001",
+            "unsupported native arithmetic operator for Stage 2d",
+        ),
+        (
+            "if branch local declaration",
+            r#"
+function main(): int
+{
+    if (true) {
+        let $code = 42;
+        return $code;
+    } else {
+        return 0;
+    }
+}
+"#,
+            "B0001",
+            "unsupported native branch for Stage 4a",
+        ),
+        (
+            "if without else",
+            r#"
+function main(): int
+{
+    if (true) {
+        return 42;
+    }
+}
+"#,
+            "E0406",
+            "must return a value",
+        ),
+        (
+            "else if",
+            r#"
+function main(): int
+{
+    if (true) {
+        return 42;
+    } else if (false) {
+        return 1;
+    } else {
+        return 0;
+    }
+}
+"#,
+            "B0001",
+            "else-if is not supported",
+        ),
+        (
+            "statement after terminal if else",
+            r#"
+function main(): int
+{
+    if (true) {
+        return 42;
+    } else {
+        return 0;
+    }
+
+    return 1;
+}
+"#,
+            "B0001",
+            "unsupported native statement for Stage 2d",
         ),
         (
             "echo",

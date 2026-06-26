@@ -300,10 +300,10 @@ Initial commands:
 doriac check examples/person.doria
 doriac compile examples/native/main_return_zero.doria
 doriac compile examples/person.doria --target php
-doriac run examples/person.doria
+doriac run examples/native/main_return_zero.doria
 ```
 
-Before native execution exists, `doriac run` may temporarily use a compatibility backend such as PHP for local inspection. That behavior must remain non-authoritative: generated PHP is not Doria's semantic proof and must not shape native execution.
+`doriac run` should compile Doria source through the native backend and run the resulting temporary executable. Compatibility backends such as PHP remain explicit targets and must not be treated as Doria's semantic proof.
 
 Codex should work in small, testable increments. This plan is written as a sequence of scoped engineering tasks rather than one giant “build a language” task.
 
@@ -1184,10 +1184,10 @@ Language rules:
 14. Do not use `Vec`.
 
 Initial CLI:
-- `doriac check <file>`
-- `doriac compile <file>`
-- `doriac compile <file> --target php` for compatibility output
-- `doriac run <file>`
+- `doriac check <source.doria>`
+- `doriac compile <source.doria>`
+- `doriac compile <source.doria> --target php` for compatibility output
+- `doriac run <source.doria>`
 
 Start by implementing:
 1. SPEC.md
@@ -1398,7 +1398,8 @@ Generated PHP passes `php -l`.
 Acceptance:
 
 ```bash
-doriac run examples/person.doria
+doriac compile examples/person.doria --target php --out build/person.php
+php build/person.php
 ```
 
 Expected output:

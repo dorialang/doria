@@ -66,7 +66,7 @@ This repository contains the first working vertical slices of `doriac`:
 - Checks undeclared assignment and readonly/writable mutation rules for locals, properties, `$this`, and writable methods.
 - Checks assignment compatibility, declared returns, positional call arguments, constructor init access, control-flow conditions, and string interpolation constraints for the supported subset.
 - Lowers the checked AST to Doria IR, the compiler-owned representation used before backend output.
-- Emits Stage 3a Cranelift-backed native smoke executables for the accepted Stage 2d source subset: `function main(): int` using supported readonly integer locals and `+`/`-`/`*` arithmetic, with a final supported returned integer expression in the accepted `0..125` portable exit-code range.
+- Emits Stage 4a Cranelift-backed native smoke executables for `function main(): int` using supported readonly integer locals, `+`/`-`/`*` arithmetic, and a narrow terminal `if` / `else` whose branches each contain exactly one supported return in the accepted `0..125` portable exit-code range.
 - Emits PHP for supported syntax through the optional PHP compatibility backend.
 - Provides CLI commands and integration tests.
 
@@ -88,7 +88,7 @@ cargo run -p doriac -- compile examples/person.doria --target php
 php person.php
 ```
 
-The native backend currently preserves the accepted Stage 2d smoke source shape: exactly one top-level `function main(): int` with readonly integer locals initialized from integer literals, prior supported readonly integer locals, or `+`/`-`/`*` arithmetic, and a final return of a supported integer expression in the portable `0..125` exit-code range. The Stage 3a implementation lowers those supported integer expressions into Cranelift instead of reducing the whole program to a precomputed exit-code constant before code generation.
+The native backend currently supports a narrow Stage 4a smoke shape: exactly one top-level `function main(): int` with readonly integer locals initialized from integer literals, prior supported readonly integer locals, or `+`/`-`/`*` arithmetic, followed by either a final supported return or a terminal `if` / `else` whose branches each contain exactly one supported return. Conditions are limited to bool literals and integer comparisons over supported integer expressions. Returned process status values must be in the portable `0..125` exit-code range.
 
 ```bash
 cargo run -p doriac -- compile examples/native/main_return_zero.doria
@@ -102,24 +102,27 @@ cargo run -p doriac -- compile examples/native/main_readonly_local.doria
 
 cargo run -p doriac -- compile examples/native/main_return_arithmetic_42.doria
 ./main_return_arithmetic_42
+
+cargo run -p doriac -- compile examples/native/main_if_else_42.doria
+./main_if_else_42
 ```
 
-For this slice, native compilation emits an object and links it through the host platform toolchain. This is not a C backend and does not use PHP output. Writable locals, division/modulo, strings, `if` / `while`, classes, collections, broader runtime features, and LLVM output remain future work.
+For this slice, native compilation emits an object and links it through the host platform toolchain. This is not a C backend and does not use PHP output. Writable locals, division/modulo, strings, broader control flow beyond terminal `if` / `else` returns, classes, collections, broader runtime features, and LLVM output remain future work.
 
 ## CLI
 
 ```bash
-doriac check <file>
-doriac ast <file>
-doriac hir <file>
-doriac compile <file> [--out <file>]
-doriac compile <file> --target php [--out <file>]
-doriac run <file>
+doriac check <source.doria>
+doriac ast <source.doria>
+doriac hir <source.doria>
+doriac compile <source.doria> [--out <file>]
+doriac compile <source.doria> --target php [--out <file>]
+doriac run <source.doria>
 ```
 
 `compile` defaults to native output and infers an output file name from the input file. `php` is implemented as an explicit compatibility backend. `debug` and `wasm` are recognized planned targets.
 
-`doriac run` is currently a convenience command for the PHP compatibility backend: it compiles to a temporary PHP file and runs it with the local `php` binary. This is a temporary execution convenience, not the language's strategic execution model.
+`doriac run` expects a Doria source file, compiles it through the native backend, and runs a temporary executable. To run an executable you already built, run that executable directly, for example `./build/native/main_if_else_42`.
 
 ## Editor Support
 
@@ -159,7 +162,7 @@ For VS Code, the setting is `doria.languageServer.path`. For IntelliJ IDEs, use 
 - Collection aliases are `List<T>`, `Dictionary<K, V>`, and `Set<T>`.
 - `int` means `int64`, `float` means `float64`, and the accepted fixed-width numeric family is documented in `docs/decisions/0016-fixed-width-numeric-types.md`; compiler support for those explicit spellings is future work.
 - The compiler must reject invalid Doria before lowering to Doria IR or emitting backend output.
-- The native backend currently accepts only the Stage 2d smoke source subset, `function main(): int` with supported readonly integer locals and `+`/`-`/`*` arithmetic, followed by a final return of a supported integer expression in `0..125`; the Stage 3a backend lowers supported integer expressions through Cranelift and rejects broader valid Doria with unsupported-feature diagnostics. That range is a process-exit boundary, not the range of Doria `int`.
+- The native backend currently accepts only the Stage 4a smoke subset, `function main(): int` with supported readonly integer locals, `+`/`-`/`*` arithmetic, and a final return or terminal `if` / `else` with exactly one supported return per branch. It rejects broader valid Doria with unsupported-feature diagnostics. The `0..125` range is a process-exit boundary, not the range of Doria `int`.
 - Doria may support features PHP cannot express directly, such as executable instance property initializers and richer attribute expressions.
 - If a language behavior is not specified, implementation work should pause for an explicit design decision rather than inventing behavior silently.
 
@@ -185,6 +188,7 @@ docs/decisions/0015-stage-2b-native-readonly-integer-locals.md
 docs/decisions/0016-fixed-width-numeric-types.md
 docs/decisions/0017-stage-2c-native-int-arithmetic.md
 docs/decisions/0018-stage-2d-native-returned-int-expressions.md
+docs/decisions/0019-stage-4a-native-if-else-returns.md
 docs/website-content-guidelines.md
 ```
 

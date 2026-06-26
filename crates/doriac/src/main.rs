@@ -1,14 +1,15 @@
 use std::env;
 use std::fs;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode};
+use std::process::{Command, ExitCode, ExitStatus};
 use std::str::FromStr;
 
 use doriac::backend::{BackendOutput, BackendTarget};
 
 fn main() -> ExitCode {
     match run() {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(exit_code) => exit_code,
         Err(message) => {
             eprintln!("{message}");
             ExitCode::FAILURE
@@ -16,11 +17,11 @@ fn main() -> ExitCode {
     }
 }
 
-fn run() -> Result<(), String> {
+fn run() -> Result<ExitCode, String> {
     let args = env::args().skip(1).collect::<Vec<_>>();
     if args.is_empty() || args[0] == "--help" || args[0] == "-h" {
         print_help();
-        return Ok(());
+        return Ok(ExitCode::SUCCESS);
     }
 
     match args[0].as_str() {
@@ -32,14 +33,14 @@ fn run() -> Result<(), String> {
             match doriac::check_source(path.clone(), text.clone()) {
                 Ok(_) => {
                     println!("OK");
-                    Ok(())
+                    Ok(ExitCode::SUCCESS)
                 }
                 Err(diagnostics) => Err(doriac::render_diagnostics(path, text, &diagnostics)),
             }
         }
-        "ast" => ast_command(&args[1..]),
-        "hir" => hir_command(&args[1..]),
-        "compile" => compile_command(&args[1..]),
+        "ast" => ast_command(&args[1..]).map(|()| ExitCode::SUCCESS),
+        "hir" => hir_command(&args[1..]).map(|()| ExitCode::SUCCESS),
+        "compile" => compile_command(&args[1..]).map(|()| ExitCode::SUCCESS),
         "run" => run_command(&args[1..]),
         command => Err(format!(
             "unknown command `{command}`\n\nRun `doriac --help`."
@@ -206,40 +207,89 @@ fn default_output_extension(target: BackendTarget) -> &'static str {
     }
 }
 
-fn run_command(args: &[String]) -> Result<(), String> {
+fn run_command(args: &[String]) -> Result<ExitCode, String> {
     let input = args
         .first()
         .ok_or_else(|| "missing input file".to_string())?;
+    if args.len() > 1 {
+        return Err(format!("unknown run option `{}`", args[1]));
+    }
+
     let (path, text) = read_source(input)?;
-    let php = doriac::compile_source_to_php(path.clone(), text.clone())
+    let output = doriac::compile_source(path.clone(), text.clone(), BackendTarget::Native)
         .map_err(|diagnostics| doriac::render_diagnostics(path, text, &diagnostics))?;
 
-    let temp_path = env::temp_dir().join("doriac-run.php");
-    fs::write(&temp_path, php)
-        .map_err(|error| format!("failed to write temp PHP file: {error}"))?;
+    let temp_path = temp_run_executable_path(input);
+    write_backend_output(&temp_path, output)
+        .map_err(|error| format!("failed to write temp native executable: {error}"))?;
 
-    let status = Command::new("php")
-        .arg(&temp_path)
-        .status()
-        .map_err(|error| format!("failed to run `php`: {error}"))?;
+    let status = Command::new(&temp_path).status().map_err(|error| {
+        format!(
+            "failed to run native executable `{}`: {error}",
+            temp_path.display()
+        )
+    })?;
 
-    if status.success() {
-        Ok(())
+    let _ = fs::remove_file(&temp_path);
+    exit_code_from_status(status)
+}
+
+fn temp_run_executable_path(input: &str) -> PathBuf {
+    let stem = Path::new(input)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .filter(|stem| !stem.is_empty())
+        .unwrap_or("doriac-run");
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let extension = if cfg!(windows) { ".exe" } else { "" };
+    env::temp_dir().join(format!(
+        "doriac-run-{stem}-{}-{nanos}{extension}",
+        std::process::id()
+    ))
+}
+
+fn exit_code_from_status(status: ExitStatus) -> Result<ExitCode, String> {
+    if let Some(code) = status.code() {
+        let code = u8::try_from(code).unwrap_or(1);
+        Ok(ExitCode::from(code))
     } else {
-        Err(format!("php exited with status {status}"))
+        Err(format!(
+            "native executable terminated without an exit code: {status}"
+        ))
     }
 }
 
 fn read_source(path: impl AsRef<Path>) -> Result<(String, String), String> {
     let path = path.as_ref();
-    let text = fs::read_to_string(path)
-        .map_err(|error| format!("failed to read `{}`: {error}", path.display()))?;
+    let text = fs::read_to_string(path).map_err(|error| {
+        if error.kind() == ErrorKind::InvalidData {
+            format!(
+                "failed to read `{}` as Doria source: Doria source files must be valid UTF-8.\n`doriac run` expects a `.doria` source file. To run a compiled executable, run it directly: `{}`",
+                path.display(),
+                direct_executable_hint(path)
+            )
+        } else {
+            format!("failed to read `{}`: {error}", path.display())
+        }
+    })?;
     Ok((path.display().to_string(), text))
+}
+
+fn direct_executable_hint(path: &Path) -> String {
+    let display = path.display().to_string();
+    if !path.is_absolute() && path.components().count() == 1 {
+        format!(".{}{display}", std::path::MAIN_SEPARATOR)
+    } else {
+        display
+    }
 }
 
 fn print_help() {
     println!(
-        "doriac 0.1.0\n\nUSAGE:\n    doriac check <file>\n    doriac ast <file>\n    doriac hir <file>\n    doriac compile <file> [--out <file>]\n    doriac compile <file> --target php [--out <file>]\n    doriac run <file>\n\nTARGETS:\n    native    default target for standalone executables\n    php       compatibility and inspection backend\n    debug     planned interpreter/debug backend\n    wasm      planned WebAssembly backend"
+        "doriac 0.1.0\n\nUSAGE:\n    doriac check <source.doria>\n    doriac ast <source.doria>\n    doriac hir <source.doria>\n    doriac compile <source.doria> [--out <file>]\n    doriac compile <source.doria> --target php [--out <file>]\n    doriac run <source.doria>\n\nTARGETS:\n    native    default target for standalone executables\n    php       compatibility and inspection backend\n    debug     planned interpreter/debug backend\n    wasm      planned WebAssembly backend"
     );
 }
 

@@ -1,0 +1,11 @@
+function main(): int
+{
+    let $left = 20;
+    let $right = 22;
+
+    if ($left + $right == 42) {
+        return 42;
+    }
+
+    return 0;
+}
