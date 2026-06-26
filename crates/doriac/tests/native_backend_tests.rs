@@ -686,7 +686,7 @@ function main(): int
 }
 "#,
             "B0001",
-            "unsupported native statement for Stage 2d",
+            "unsupported native statement for Stage 4a",
         ),
         (
             "echo",

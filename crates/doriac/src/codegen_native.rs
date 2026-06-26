@@ -179,12 +179,12 @@ fn validate_stage_4a(program: &hir::Program) -> Result<NativeMain, BackendError>
             }
             Stmt::Return { .. } => {
                 return Err(BackendError::new(
-                    "unsupported native statement for Stage 2d: no statements may follow `return <portable integer expression>;`",
+                    "unsupported native statement for Stage 4a: no statements may follow a final return or terminal if/else",
                 ));
             }
             other => {
                 return Err(BackendError::new(format!(
-                    "unsupported native statement for Stage 2d: expected readonly `int` local declaration or final return, found {}",
+                    "unsupported native statement for Stage 4a: expected readonly `int` local declaration before the final return or terminal if/else, found {}",
                     describe_statement(other)
                 )));
             }
