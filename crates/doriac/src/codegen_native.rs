@@ -162,41 +162,79 @@ fn validate_stage_4a(program: &hir::Program) -> Result<NativeMain, BackendError>
         ));
     }
 
-    let Some((terminal_statement, local_statements)) = main.body.statements.split_last() else {
-        return Err(BackendError::new(
-            "unsupported native terminal statement for Stage 4a: expected final return or terminal if/else",
-        ));
-    };
-
     let mut local_values = HashMap::new();
     let mut locals = Vec::new();
-    for statement in local_statements {
-        match statement {
-            Stmt::VarDecl(decl) => {
-                let local = validate_stage_3a_local(decl, &local_values)?;
-                local_values.insert(local.name.clone(), local.evaluated_value);
-                locals.push(local);
-            }
-            Stmt::Return { .. } => {
-                return Err(BackendError::new(
-                    "unsupported native statement for Stage 4a: no statements may follow a final return or terminal if/else",
-                ));
-            }
-            other => {
-                return Err(BackendError::new(format!(
-                    "unsupported native statement for Stage 4a: expected readonly `int` local declaration before the final return or terminal if/else, found {}",
-                    describe_statement(other)
-                )));
-            }
-        }
+
+    let mut terminal_index = 0;
+    while let Some(Stmt::VarDecl(decl)) = main.body.statements.get(terminal_index) {
+        let local = validate_stage_3a_local(decl, &local_values)?;
+        local_values.insert(local.name.clone(), local.evaluated_value);
+        locals.push(local);
+        terminal_index += 1;
     }
 
-    let terminator = validate_stage_4a_terminator(terminal_statement, &local_values)?;
+    let terminator = validate_stage_4a_statement_sequence(
+        &main.body.statements[terminal_index..],
+        &local_values,
+    )?;
     let evaluated_exit_code = evaluate_native_terminator_exit_code(&terminator);
     Ok(NativeMain {
         locals,
         terminator,
         evaluated_exit_code,
+    })
+}
+
+fn validate_stage_4a_statement_sequence(
+    statements: &[Stmt],
+    local_values: &HashMap<String, i64>,
+) -> Result<NativeTerminator, BackendError> {
+    match statements {
+        [] => Err(BackendError::new(
+            "unsupported native terminal statement for Stage 4a: expected final return, terminal if/else, or guard if followed by fallback return",
+        )),
+        [statement] => validate_stage_4a_terminator(statement, local_values),
+        [
+            Stmt::If(if_stmt),
+            Stmt::Return {
+                expr: Some(fallback_expr),
+                ..
+            },
+        ] if if_stmt.else_branch.is_none() => {
+            validate_stage_4a_guard_return(if_stmt, fallback_expr, local_values)
+        }
+        [Stmt::If(if_stmt), _] if if_stmt.else_branch.is_some() => {
+            Err(BackendError::new(
+                "unsupported native statement for Stage 4a: no statements may follow a terminal if/else",
+            ))
+        }
+        [Stmt::Return { .. }, ..] => Err(BackendError::new(
+            "unsupported native statement for Stage 4a: no statements may follow a final return",
+        )),
+        [first, ..] => Err(BackendError::new(format!(
+            "unsupported native statement for Stage 4a: expected readonly `int` local declaration, final return, terminal if/else, or guard if followed by fallback return, found {}",
+            describe_statement(first)
+        ))),
+    }
+}
+
+fn validate_stage_4a_guard_return(
+    if_stmt: &hir::IfStmt,
+    fallback_expr: &Expr,
+    local_values: &HashMap<String, i64>,
+) -> Result<NativeTerminator, BackendError> {
+    let condition = validate_stage_4a_condition(&if_stmt.condition, local_values)?;
+    let (then_expr, then_exit_code) =
+        validate_stage_4a_branch(&if_stmt.then_block.statements, local_values)?;
+    let (else_expr, else_exit_code) = validate_stage_4a_return_expr(fallback_expr, local_values)?;
+
+    Ok(NativeTerminator::IfElse {
+        condition: condition.condition,
+        evaluated_condition: condition.value,
+        then_expr,
+        then_exit_code,
+        else_expr,
+        else_exit_code,
     })
 }
 
@@ -249,7 +287,9 @@ fn validate_stage_4a_terminator(
                 validate_stage_4a_branch(&if_stmt.then_block.statements, local_values)?;
 
             let Some(else_branch) = &if_stmt.else_branch else {
-                return Err(BackendError::new("missing native else branch for Stage 4a"));
+                return Err(BackendError::new(
+                    "unsupported native terminal if for Stage 4a: terminal if requires else; guard if without else is supported only when followed by a fallback return",
+                ));
             };
 
             let ElseBranch::Block(else_block) = else_branch else {
@@ -947,6 +987,51 @@ function main(): int
     } else {
         return 0;
     }
+}
+"#,
+        )
+        .expect("source should lower to HIR");
+
+        let native_main = validate_stage_4a(&program).expect("source should validate for Stage 4a");
+
+        assert_eq!(native_main.evaluated_exit_code, 42);
+        assert_eq!(native_main.locals.len(), 2);
+        assert_eq!(
+            native_main.terminator,
+            NativeTerminator::IfElse {
+                condition: NativeCondition::Compare {
+                    op: NativeCompareOp::Equal,
+                    left: NativeExpr::Binary {
+                        op: NativeBinaryOp::Add,
+                        left: Box::new(NativeExpr::Local("left".to_string())),
+                        right: Box::new(NativeExpr::Local("right".to_string())),
+                    },
+                    right: NativeExpr::Int(42),
+                },
+                evaluated_condition: true,
+                then_expr: NativeExpr::Int(42),
+                then_exit_code: 42,
+                else_expr: NativeExpr::Int(0),
+                else_exit_code: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn stage_4a_validation_preserves_guard_if_structure_for_codegen() {
+        let program = crate::lower_source(
+            "stage4a_guard.doria",
+            r#"
+function main(): int
+{
+    let $left = 20;
+    let $right = 22;
+
+    if ($left + $right == 42) {
+        return 42;
+    }
+
+    return 0;
 }
 "#,
         )

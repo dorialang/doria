@@ -94,8 +94,14 @@ fn compiles_and_runs_stage_2d_native_smoke_examples() {
             "examples/native/main_if_else_42.doria",
             42,
         ),
+        ("main_if_42", "examples/native/main_if_42.doria", 42),
         ("main_if_true_42", "inline_main_if_true_42.doria", 42),
         ("main_if_false_42", "inline_main_if_false_42.doria", 42),
+        (
+            "main_guard_if_false_fallback_42",
+            "inline_main_guard_if_false_fallback_42.doria",
+            42,
+        ),
         (
             "main_if_less_than_local",
             "inline_main_if_less_than_local.doria",
@@ -252,6 +258,18 @@ function main(): int
     } else {
         return 42;
     }
+}
+"#
+        }
+        "main_guard_if_false_fallback_42" => {
+            r#"
+function main(): int
+{
+    if (false) {
+        return 0;
+    }
+
+    return 42;
 }
 "#
         }
@@ -581,6 +599,21 @@ function main(): int
             "native Stage 4a exit code must be in the range 0..125",
         ),
         (
+            "guard if branch outside exit-code range",
+            r#"
+function main(): int
+{
+    if (true) {
+        return 126;
+    }
+
+    return 0;
+}
+"#,
+            "B0001",
+            "native Stage 4a exit code must be in the range 0..125",
+        ),
+        (
             "if integer condition",
             r#"
 function main(): int
@@ -642,7 +675,7 @@ function main(): int
             "unsupported native branch for Stage 4a",
         ),
         (
-            "if without else",
+            "if without fallback return",
             r#"
 function main(): int
 {

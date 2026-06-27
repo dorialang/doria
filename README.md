@@ -66,7 +66,7 @@ This repository contains the first working vertical slices of `doriac`:
 - Checks undeclared assignment and readonly/writable mutation rules for locals, properties, `$this`, and writable methods.
 - Checks assignment compatibility, declared returns, positional call arguments, constructor init access, control-flow conditions, and string interpolation constraints for the supported subset.
 - Lowers the checked AST to Doria IR, the compiler-owned representation used before backend output.
-- Emits Stage 4a Cranelift-backed native smoke executables for `function main(): int` using supported readonly integer locals, `+`/`-`/`*` arithmetic, and a narrow terminal `if` / `else` whose branches each contain exactly one supported return in the accepted `0..125` portable exit-code range.
+- Emits Stage 4a Cranelift-backed native smoke executables for `function main(): int` using supported readonly integer locals, `+`/`-`/`*` arithmetic, final returns, terminal `if` / `else` returns, and guard-style `if` returns with a fallback return in the accepted `0..125` portable exit-code range.
 - Emits PHP for supported syntax through the optional PHP compatibility backend.
 - Provides CLI commands and integration tests.
 
@@ -88,7 +88,7 @@ cargo run -p doriac -- compile examples/person.doria --target php
 php person.php
 ```
 
-The native backend currently supports a narrow Stage 4a smoke shape: exactly one top-level `function main(): int` with readonly integer locals initialized from integer literals, prior supported readonly integer locals, or `+`/`-`/`*` arithmetic, followed by either a final supported return or a terminal `if` / `else` whose branches each contain exactly one supported return. Conditions are limited to bool literals and integer comparisons over supported integer expressions. Returned process status values must be in the portable `0..125` exit-code range.
+The native backend currently supports a narrow Stage 4a smoke shape: exactly one top-level `function main(): int` with readonly integer locals initialized from integer literals, prior supported readonly integer locals, or `+`/`-`/`*` arithmetic, followed by a final supported return, a terminal `if` / `else` return, or a guard-style `if` return with a fallback return. Conditions are limited to bool literals and integer comparisons over supported integer expressions. Returned process status values must be in the portable `0..125` exit-code range.
 
 ```bash
 cargo run -p doriac -- compile examples/native/main_return_zero.doria
@@ -103,11 +103,14 @@ cargo run -p doriac -- compile examples/native/main_readonly_local.doria
 cargo run -p doriac -- compile examples/native/main_return_arithmetic_42.doria
 ./main_return_arithmetic_42
 
+cargo run -p doriac -- compile examples/native/main_if_42.doria
+./main_if_42
+
 cargo run -p doriac -- compile examples/native/main_if_else_42.doria
 ./main_if_else_42
 ```
 
-For this slice, native compilation emits an object and links it through the host platform toolchain. This is not a C backend and does not use PHP output. Writable locals, division/modulo, strings, broader control flow beyond terminal `if` / `else` returns, classes, collections, broader runtime features, and LLVM output remain future work.
+For this slice, native compilation emits an object and links it through the host platform toolchain. This is not a C backend and does not use PHP output. Writable locals, division/modulo, strings, broader control flow beyond the accepted final return, terminal `if` / `else`, and guard-return shapes, classes, collections, broader runtime features, and LLVM output remain future work.
 
 ## CLI
 
@@ -162,7 +165,7 @@ For VS Code, the setting is `doria.languageServer.path`. For IntelliJ IDEs, use 
 - Collection aliases are `List<T>`, `Dictionary<K, V>`, and `Set<T>`.
 - `int` means `int64`, `float` means `float64`, and the accepted fixed-width numeric family is documented in `docs/decisions/0016-fixed-width-numeric-types.md`; compiler support for those explicit spellings is future work.
 - The compiler must reject invalid Doria before lowering to Doria IR or emitting backend output.
-- The native backend currently accepts only the Stage 4a smoke subset, `function main(): int` with supported readonly integer locals, `+`/`-`/`*` arithmetic, and a final return or terminal `if` / `else` with exactly one supported return per branch. It rejects broader valid Doria with unsupported-feature diagnostics. The `0..125` range is a process-exit boundary, not the range of Doria `int`.
+- The native backend currently accepts only the Stage 4a smoke subset, `function main(): int` with supported readonly integer locals, `+`/`-`/`*` arithmetic, and final return, terminal `if` / `else`, or guard-return shapes. It rejects broader valid Doria with unsupported-feature diagnostics. The `0..125` range is a process-exit boundary, not the range of Doria `int`.
 - Doria may support features PHP cannot express directly, such as executable instance property initializers and richer attribute expressions.
 - If a language behavior is not specified, implementation work should pause for an explicit design decision rather than inventing behavior silently.
 

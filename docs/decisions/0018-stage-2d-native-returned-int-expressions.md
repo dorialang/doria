@@ -52,7 +52,7 @@ The Stage 2d implementation was allowed to evaluate supported integer expression
 
 Stage 3a preserves this accepted source subset while changing the backend architecture: the native backend validates into a small implementation-private native expression model, evaluates supported expressions only for checked arithmetic and process-exit range validation, then lowers the retained integer expression tree into Cranelift `i64` values before reducing the final validated result to the platform `main` return type. This is still not a public native IR, full native arithmetic support, or broader runtime support.
 
-Stage 4a is accepted separately in `0019-stage-4a-native-if-else-returns.md`. It preserves this expression subset and adds only a narrow terminal `if` / `else` return form.
+Stage 4a is accepted separately in `0019-stage-4a-native-if-else-returns.md`. It preserves this expression subset and adds narrow terminal `if` / `else` and guard-style `if` return forms.
 
 ## Overflow and range
 
