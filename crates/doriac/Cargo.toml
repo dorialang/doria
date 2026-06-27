@@ -14,7 +14,7 @@ path = "src/lib.rs"
 cranelift-codegen = "0.127.4"
 cranelift-frontend = "0.127.4"
 cranelift-module = "0.127.4"
-cranelift-native = "0.127.4"
+cranelift-native = "0.133.1"
 cranelift-object = "0.127.4"
 serde_json = "1"
 
