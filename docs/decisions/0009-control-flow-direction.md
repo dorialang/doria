@@ -6,7 +6,7 @@ Status: Accepted
 
 Doria should support familiar control flow while also exploring a Gherkin-inspired setup/condition/action style for stateful conditional and looping code.
 
-This note records language direction only. It does not specify final grammar, lowering, borrow-checking behavior, or implementation requirements for the current compiler slice.
+This note records broad control-flow direction only. `docs/decisions/0020-boolean-operators-and-given-predicates.md` later accepts the `given { ... }` predicate-block direction and the `if` / `when` distinction. Neither note implements grammar, lowering, borrow-checking behavior, or compiler work by itself.
 
 Planned control-flow families:
 
@@ -49,15 +49,17 @@ If a return type is declared, all successful paths should return that type. Whet
 
 ### given ... when
 
-`given` establishes a precondition/setup scope. Variables declared in the `given` block are available to the following `when` block.
+`given` establishes a precondition/setup scope. Variables declared in the `given` block are available to the attached control construct.
 
 Non-normative sketch:
 
 ```doria
-given ($count % 2 == 0) {
+given {
     let writable $message = "say something";
     let $timeInterval = 50;
     let writable $nextTime = get_time() + $timeInterval;
+
+    $count % 2 == 0;
 } when (get_time() > $nextTime): void {
     echo $message;
 } finally {
@@ -72,10 +74,12 @@ given ($count % 2 == 0) {
 Non-normative sketch:
 
 ```doria
-given ($count % 2 == 0) {
+given {
     let writable $message = "say something";
     let $timeInterval = 50;
     let writable $nextTime = get_time() + $timeInterval;
+
+    $count % 2 == 0;
 } while (get_time() > $nextTime): void {
     echo $message;
 } finally {
@@ -87,7 +91,7 @@ given ($count % 2 == 0) {
 
 ### if / else if / else / finally
 
-Doria should support normal `if` / `else if` / `else` control flow. Doria may also support a `finally` block attached to an `if` chain.
+Doria should support normal `if` / `else if` / `else` statement control flow. `if` does not return a value. Doria may also support a `finally` block attached to an `if` chain.
 
 Use `else if` as the spelling for now.
 
@@ -104,7 +108,7 @@ Doria should eventually support `match` as a pattern/value selection construct. 
 - Does `finally` run after zero `while` iterations?
 - Is `when` an expression, a statement, or both?
 - Does `when` require an `else` or default branch when used as an expression?
-- What is the exact scope relationship between `given`, `when`/`while`, and `finally`?
+- What borrow/lifetime rules apply across `given`, the attached control construct, and `finally`?
 - Are variables declared in `given` mutable across `while` iterations?
 - Does `finally` have access to variables declared in `given`?
 - Does `finally` have access to variables declared inside `when`/`while`?

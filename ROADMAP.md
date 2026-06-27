@@ -36,7 +36,9 @@
 - Treat `docs/decisions/0017-stage-2c-native-int-arithmetic.md` as the accepted Stage 2c native integer arithmetic decision.
 - Treat `docs/decisions/0018-stage-2d-native-returned-int-expressions.md` as the accepted Stage 2d native returned integer expression decision.
 - Treat `docs/decisions/0019-stage-4a-native-if-else-returns.md` as the accepted Stage 4a native terminal `if` / `else` and guard-return decision.
+- Treat `docs/decisions/0020-boolean-operators-and-given-predicates.md` as the accepted typed equality, boolean operator, bitwise operator, `xor`, and `given` predicate block decision.
 - Keep broader native expression and control-flow support beyond the Stage 4a smoke subset as separate future implementation slices.
+- Add compiler support for accepted boolean/equality/bitwise operator spellings in a dedicated parser and semantic checking slice; do not import PHP loose comparison or PHP `and` / `or` precedence.
 - Add compiler support for `int8`/`int16`/`int32`/`int64`, `uint8`/`uint16`/`uint32`/`uint64`, and `float32`/`float64` in a dedicated typed semantic model slice before claiming those spellings are implemented.
 - Plan a lowered/native IR when native code generation needs a simpler representation for control flow, memory layout, runtime calls, and backend emission.
 - Expand native source support beyond Stage 4a only after the next accepted native slice specifies the language semantics and expected behavior.
@@ -51,7 +53,7 @@
 - Preserve property initializer expressions in AST/Doria IR and later lower non-constant initializers correctly.
 - Add property hooks later for validation and computed properties without changing the default-public plus `internal` member model.
 - Add language/design support for `writable class` and `readonly class` as mutability ergonomics before considering shorter mutation keywords.
-- Keep advanced control-flow constructs as future design work: `finally`, `do ... while`, `given`, value-returning `when`, `match`, `break`, and `continue`.
+- Keep implementation of advanced control-flow constructs as future work: `finally`, `do ... while`, `given`, value-returning `when`, `match`, `break`, and `continue`.
 
 ## Performance and Native Application Path
 

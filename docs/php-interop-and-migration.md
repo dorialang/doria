@@ -59,7 +59,6 @@ Implementation work must not choose Doria behavior because it is easy to emit as
 Examples of questions that must not be answered silently:
 
 ```text
-- Does Doria allow truthiness for non-bool conditions?
 - How are Doria strings represented in a native runtime?
 - What types may be interpolated into strings?
 - Does object interpolation call a conversion hook?
@@ -67,6 +66,8 @@ Examples of questions that must not be answered silently:
 - What is the order of property initializers, constructor promotion, and constructor body execution?
 - What errors are recoverable, and how are they represented?
 ```
+
+Truthiness is no longer an open question: Doria conditions must be `bool`, and Doria does not use PHP-style truthiness.
 
 Temporary PHP-backend limitations may produce diagnostics. They must not change the language.
 

@@ -327,11 +327,80 @@ Numeric widening is not implemented yet; for now `float` is not assignable from 
 
 Simple collection literals infer collection element/key/value types when all clear parts match. Clear heterogeneous collection literals, such as `[1, "two"]`, are rejected by narrow collection alias assignment checks rather than being erased to `Unknown`. The empty literal `[]` stays ambiguous so typed contexts may use it as an empty `List<T>` or `Dictionary<K, V>`. The PHP-compatible `array` annotation remains broad enough to accept list-shaped and dictionary-shaped literals for now, but `array` is not the desired long-term collection model.
 
+### Equality and boolean operators
+
+Doria equality is typed:
+
+```doria
+==
+!=
+```
+
+`==` is typed equality. `!=` is typed inequality. Doria does not use PHP-style loose comparison, so expressions such as `1 == "1"` and `false == 0` are type errors rather than truthy comparisons. Doria does not use PHP strict-comparison operators; `===` and `!==` are not part of Doria syntax.
+
+Accepted boolean operators are:
+
+```doria
+!
+not
+
+&&
+and
+
+||
+or
+
+xor
+```
+
+`not` is an exact synonym for `!`, `and` is an exact synonym for `&&`, and `or` is an exact synonym for `||`. Doria does not copy PHP's lower-precedence `and` / `or` behavior. Boolean operators require `bool` operands, and conditions must be `bool`; Doria does not use PHP-style truthiness.
+
+`xor` is bool-only boolean exclusive OR. It evaluates both operands and does not short-circuit. It is not bitwise XOR. Unparenthesized chained `xor` and `xor` mixed with `and`, `or`, `&&`, or `||` should require parentheses or produce a diagnostic/lint when implemented.
+
+Accepted bitwise operators are:
+
+```doria
+&
+|
+^
+~
+```
+
+`&`, `|`, `^`, and `~` are integer bitwise operators. They are not boolean operators, and `&` / `|` are not aliases for boolean AND/OR. Doria does not add `^^`.
+
+Do not add `nand`, `nor`, `implies`, `iff`, `unless`, `^^`, `===`, or `!==` as core syntax without a new accepted decision. Future helper APIs such as `Bool::all(...)`, `Bool::any(...)`, `Bool::none(...)`, or `Bool::one(...)` may be considered separately.
+
+The accepted boolean/equality/bitwise operator direction is recorded in `docs/decisions/0020-boolean-operators-and-given-predicates.md`. Current compiler support may lag that accepted direction until the lexer, parser, semantic checker, Doria IR, and backends are updated.
+
 ### Control-flow conditions
 
 Basic `if` / `else if` / `else` and `while` are MVP syntax. Conditions must be `bool`; Doria does not use PHP-style truthiness for integers, strings, null, objects, resources, or collections. The checker currently allows `mixed` and the internal `Unknown` recovery type so one diagnostic does not cascade into unrelated follow-up errors.
 
 Each `if`, `else if`, `else`, and `while` body has its own block scope. Variables declared inside those bodies are not visible after the block. Until Doria has path-sensitive definite initialization analysis, constructor readonly init access is available only for direct constructor-body assignments and not inside `if`, `else if`, `else`, or `while` bodies.
+
+`if` is statement control flow and does not return a value. `if` without `else` is valid Doria. `else`, `else if`, `given`, and `finally` are optional. A base `if`, `while`, `foreach`, or future control construct does not require `given` or `finally`.
+
+`when` is the planned value-returning conditional/control construct. `when`, `given`, and `finally` are accepted design direction but are not implemented in the current compiler slice.
+
+### given predicate blocks
+
+A `given` block attached to a control construct may contain variable declarations, void expression statements, and bool expression statements. Bool expression statements are predicates. Void expression statements are setup actions. Variable declarations introduce scoped names available to the attached control construct. Non-bool, non-void discarded expressions should be rejected.
+
+```doria
+given {
+    let $user = $session->user;
+    let $permission = Permission::EditPost;
+
+    $user->isActivated;
+    $this->isOrgMember($user) || $this->isAdmin($user);
+} if ($user->can($permission)) {
+    $post->publish();
+}
+```
+
+Separate bool predicate lines are implicitly AND-ed in source order with the attached control condition. Bool predicates short-circuit the attached condition and body when false. Inside a predicate, normal boolean short-circuiting applies for `&&` / `and` and `||` / `or`; `xor` does not short-circuit.
+
+The scoped declarations remain scoped to the whole `given` plus attached control construct. The exact lowering, borrow/lifetime interaction, cleanup behavior, and `finally` execution guarantees remain future decisions.
 
 ## 8. Class syntax
 

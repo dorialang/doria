@@ -75,6 +75,11 @@ At completion, report assumptions made and critical decisions encountered. If no
 - For native work, keep the fast Cranelift profile and optimized LLVM profile semantically equivalent for supported code. Differences may be in compile time, optimization, debug information, and binary quality, not Doria behavior.
 - Do not let Cranelift or LLVM semantics decide Doria semantics. Backend-specific assumptions must remain behind Doria IR or native-oriented IR lowering.
 - Preserve the accepted fixed-width numeric direction: `int` means `int64`, `float` means `float64`, and the accepted explicit numeric spellings are `int8`/`int16`/`int32`/`int64`, `uint8`/`uint16`/`uint32`/`uint64`, and `float32`/`float64`.
+- Preserve the accepted typed equality and boolean operator direction: `==` and `!=` are typed equality/inequality; `===` and `!==` are not Doria syntax; Doria does not use PHP loose comparison.
+- Treat `not` as an exact synonym for `!`, `and` as an exact synonym for `&&`, and `or` as an exact synonym for `||`. Do not import PHP `and` / `or` precedence.
+- Treat `xor` as a bool-only, non-short-circuiting boolean exclusive OR. It is not bitwise XOR.
+- Treat `&`, `|`, `^`, and `~` as integer bitwise operators. Do not make `&` or `|` boolean aliases, and do not add `^^`.
+- Do not add `nand`, `nor`, `implies`, `iff`, or `unless` without a new accepted decision.
 - Do not treat the native Stage 2a `0..125` process-exit range as the range of Doria integer values.
 - Do not reintroduce `public`, `protected`, or `private` as Doria member visibility modifiers. Doria class members are externally accessible by default; use `internal` for implementation details.
 - Keep `writable` and `internal` separate: `writable` controls mutation, while `internal` controls API surface.
@@ -84,7 +89,8 @@ At completion, report assumptions made and critical decisions encountered. If no
 - Keep executable initializers and attribute expressions represented as Doria concepts, not PHP workarounds.
 - Keep PHP-to-Doria migration architecturally separate from the Doria parser. The migration tool may parse PHP, but Doria itself should parse Doria.
 - Preserve readonly-by-default as the language default. Use class-level ergonomics such as `writable class`/`readonly class` before adding shorter aliases for `writable`.
-- Treat basic `if` / `else if` / `else` and `while` as MVP control flow. Keep `finally`, `do ... while`, `given`, value-returning `when`, `match`, `break`, and `continue` as planned control-flow ideas only until their grammar and semantics are specified.
+- Treat basic `if` / `else if` / `else` and `while` as MVP control flow. `if` is statement control flow and does not return a value; `when` is the planned value-returning conditional/control construct. Keep `finally`, `do ... while`, `given`, value-returning `when`, `match`, `break`, and `continue` as planned control-flow implementation work until their remaining grammar and semantics are specified.
+- Do not confuse unsupported native backend coverage with invalid Doria. If a construct is valid Doria but unsupported by the current native slice, call it unsupported native backend coverage, especially for `if` without `else`, `else if`, `given`, `finally`, `when`, wider boolean expressions, and broader control-flow shapes.
 - Prefer nouns as properties and verbs as methods in Doria APIs and examples. Use property hooks for computed, validated, lazy, or guarded values instead of vague zero-argument noun methods such as `body()`.
 - Do not introduce external Rust crates unless they remove real complexity and the repository is ready to manage that dependency.
 

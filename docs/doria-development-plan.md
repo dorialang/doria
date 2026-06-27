@@ -467,16 +467,22 @@ Operators:
 +=
 -=
 ==
-===
 !=
-!==
 <
 <=
 >
 >=
 &&
+and
 ||
+or
 !
+not
+xor
+&
+|
+^
+~
 ?
 ??
 =>
@@ -496,6 +502,8 @@ Punctuation:
 <
 >
 ```
+
+Do not add `===` or `!==`; Doria uses typed `==` and `!=` instead of PHP loose/strict comparison pairs.
 
 Important: generic type syntax uses `<` and `>`, so the parser must distinguish type context from comparison expressions.
 
