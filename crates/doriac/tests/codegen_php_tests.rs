@@ -153,6 +153,36 @@ while ($count < 10) {
 }
 
 #[test]
+fn omits_grouping_around_assignment_targets_for_php() {
+    let php = doriac::compile_source_to_php(
+        "test.doria",
+        r#"
+let writable $count = 0;
+($count) = 1;
+
+class Person
+{
+    writable string $name;
+
+    function __construct(string $initial)
+    {
+        $this->name = $initial;
+    }
+}
+
+let writable $person = new Person("Ada");
+($person->name) = "Lucy";
+"#,
+    )
+    .expect("compilation should succeed");
+
+    assert!(php.contains("$count = 1;"));
+    assert!(php.contains("$person->name = \"Lucy\";"));
+    assert!(!php.contains("($count) = 1;"));
+    assert!(!php.contains("($person->name) = \"Lucy\";"));
+}
+
+#[test]
 fn emits_php_for_basic_control_flow() {
     let php = doriac::compile_source_to_php(
         "test.doria",
