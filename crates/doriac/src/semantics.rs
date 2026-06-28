@@ -1435,8 +1435,7 @@ impl<'program> Checker<'program> {
                 if let Some((class_name, property_info)) =
                     self.lookup_property(object, property, *span, scopes, method_context)
                 {
-                    let constructor_init_decision = if matches!(object.as_ref(), Expr::This { .. })
-                    {
+                    let constructor_init_decision = if Self::is_direct_this(object) {
                         self.check_constructor_init_assignment(
                             &class_name,
                             property,
@@ -1456,14 +1455,15 @@ impl<'program> Checker<'program> {
                         let writable_path =
                             self.is_writable_object_path(object, scopes, method_context);
                         if !writable_path {
-                            let message = match object.as_ref() {
-                                Expr::This { .. } => {
-                                    "cannot mutate `$this` in a readonly method".to_string()
+                            let message = if Self::is_direct_this(object) {
+                                "cannot mutate `$this` in a readonly method".to_string()
+                            } else {
+                                match object.as_ref() {
+                                    Expr::Variable { name, .. } => {
+                                        format!("cannot write through readonly variable `${name}`")
+                                    }
+                                    _ => "cannot write through readonly object path".to_string(),
                                 }
-                                Expr::Variable { name, .. } => {
-                                    format!("cannot write through readonly variable `${name}`")
-                                }
-                                _ => "cannot write through readonly object path".to_string(),
                             };
                             self.diagnostics
                                 .push(Diagnostic::new("E0201", message, object.span()));
@@ -1910,6 +1910,14 @@ impl<'program> Checker<'program> {
                     .map(|property| property.writable)
                     .unwrap_or(false)
             }
+            _ => false,
+        }
+    }
+
+    fn is_direct_this(expr: &Expr) -> bool {
+        match expr {
+            Expr::Grouped { expr, .. } => Self::is_direct_this(expr),
+            Expr::This { .. } => true,
             _ => false,
         }
     }
