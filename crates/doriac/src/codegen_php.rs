@@ -211,7 +211,7 @@ fn emit_statement(
                 indent,
                 &format!(
                     "{} {} {};",
-                    emit_expr(&assignment.target, scopes),
+                    emit_assignment_target(&assignment.target, scopes),
                     op,
                     emit_expr(&assignment.value, scopes)
                 ),
@@ -247,6 +247,13 @@ fn emit_statement(
         Stmt::Expr { expr, .. } => {
             writeln(output, indent, &format!("{};", emit_expr(expr, scopes)));
         }
+    }
+}
+
+fn emit_assignment_target(expr: &Expr, scopes: &PhpNameScopes) -> String {
+    match expr {
+        Expr::Grouped { expr, .. } => emit_assignment_target(expr, scopes),
+        _ => emit_expr(expr, scopes),
     }
 }
 
@@ -385,14 +392,35 @@ fn emit_expr(expr: &Expr, scopes: &PhpNameScopes) -> String {
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
+        Expr::Grouped { expr, .. } => format!("({})", emit_expr(expr, scopes)),
+        Expr::Unary { op, expr, .. } => match op {
+            UnaryOp::Not => format!("!({})", emit_expr(expr, scopes)),
+        },
         Expr::Binary {
             left, op, right, ..
-        } => format!(
-            "{} {} {}",
-            emit_expr(left, scopes),
-            emit_binary_op(op),
-            emit_expr(right, scopes)
-        ),
+        } => match op {
+            BinaryOp::And => format!(
+                "(({}) && ({}))",
+                emit_expr(left, scopes),
+                emit_expr(right, scopes)
+            ),
+            BinaryOp::Or => format!(
+                "(({}) || ({}))",
+                emit_expr(left, scopes),
+                emit_expr(right, scopes)
+            ),
+            BinaryOp::Xor => format!(
+                "(({}) !== ({}))",
+                emit_expr(left, scopes),
+                emit_expr(right, scopes)
+            ),
+            _ => format!(
+                "{} {} {}",
+                emit_expr(left, scopes),
+                emit_binary_op(op),
+                emit_expr(right, scopes)
+            ),
+        },
     }
 }
 
@@ -433,16 +461,15 @@ fn emit_binary_op(op: &BinaryOp) -> &'static str {
         BinaryOp::Div => "/",
         BinaryOp::Mod => "%",
         BinaryOp::Concat => ".",
-        BinaryOp::Equal => "==",
-        BinaryOp::StrictEqual => "===",
-        BinaryOp::NotEqual => "!=",
-        BinaryOp::NotStrictEqual => "!==",
+        BinaryOp::Equal => "===",
+        BinaryOp::NotEqual => "!==",
         BinaryOp::Less => "<",
         BinaryOp::LessEqual => "<=",
         BinaryOp::Greater => ">",
         BinaryOp::GreaterEqual => ">=",
         BinaryOp::And => "&&",
         BinaryOp::Or => "||",
+        BinaryOp::Xor => unreachable!("xor is emitted by the boolean-specialized binary branch"),
         BinaryOp::Coalesce => "??",
     }
 }

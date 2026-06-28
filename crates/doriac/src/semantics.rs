@@ -1103,6 +1103,11 @@ impl<'program> Checker<'program> {
                     self.check_constructor_call(class_name, args, *span, scopes, method_context);
                 }
             }
+            Expr::Grouped { expr, .. } => self.check_expr(expr, scopes, method_context),
+            Expr::Unary { op, expr, .. } => {
+                self.check_expr(expr, scopes, method_context);
+                self.check_unary_operand(op, expr, scopes, method_context);
+            }
             Expr::Binary {
                 left,
                 op,
@@ -1112,6 +1117,7 @@ impl<'program> Checker<'program> {
                 self.check_expr(left, scopes, method_context);
                 self.check_expr(right, scopes, method_context);
                 self.check_int_constant_arithmetic(left, op, right, *span, scopes);
+                self.check_binary_operands(left, op, right, *span, scopes, method_context);
             }
             Expr::Identifier { .. }
             | Expr::String { .. }
@@ -1129,6 +1135,124 @@ impl<'program> Checker<'program> {
                 "integer literal is outside the Doria `int` range",
                 span,
             ));
+        }
+    }
+
+    fn check_unary_operand(
+        &mut self,
+        op: &UnaryOp,
+        expr: &Expr,
+        scopes: &ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) {
+        match op {
+            UnaryOp::Not => {
+                let ty = self.infer_expr_type(expr, scopes, method_context);
+                if self.is_bool_or_recovery_type(ty) {
+                    return;
+                }
+
+                self.diagnostics.push(Diagnostic::new(
+                    "E0419",
+                    format!(
+                        "boolean operator `not`/`!` requires a `bool` operand, got `{}`",
+                        self.types.display(ty)
+                    ),
+                    expr.span(),
+                ));
+            }
+        }
+    }
+
+    fn check_binary_operands(
+        &mut self,
+        left: &Expr,
+        op: &BinaryOp,
+        right: &Expr,
+        span: Span,
+        scopes: &ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) {
+        match op {
+            BinaryOp::And | BinaryOp::Or | BinaryOp::Xor => {
+                self.check_logical_binary_operands(left, op, right, span, scopes, method_context);
+            }
+            BinaryOp::Equal | BinaryOp::NotEqual => {
+                self.check_equality_operands(left, right, span, scopes, method_context);
+            }
+            _ => {}
+        }
+    }
+
+    fn check_logical_binary_operands(
+        &mut self,
+        left: &Expr,
+        op: &BinaryOp,
+        right: &Expr,
+        span: Span,
+        scopes: &ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) {
+        let left_ty = self.infer_expr_type(left, scopes, method_context);
+        let right_ty = self.infer_expr_type(right, scopes, method_context);
+        if self.is_bool_or_recovery_type(left_ty) && self.is_bool_or_recovery_type(right_ty) {
+            return;
+        }
+
+        self.diagnostics.push(Diagnostic::new(
+            "E0419",
+            format!(
+                "boolean operator {} requires `bool` operands, got `{}` and `{}`",
+                Self::logical_operator_name(op),
+                self.types.display(left_ty),
+                self.types.display(right_ty)
+            ),
+            span,
+        ));
+    }
+
+    fn check_equality_operands(
+        &mut self,
+        left: &Expr,
+        right: &Expr,
+        span: Span,
+        scopes: &ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) {
+        let left_ty = self.infer_expr_type(left, scopes, method_context);
+        let right_ty = self.infer_expr_type(right, scopes, method_context);
+        if self.is_equality_compatible(left_ty, right_ty) {
+            return;
+        }
+
+        self.diagnostics.push(Diagnostic::new(
+            "E0420",
+            format!(
+                "equality operands must have compatible types, got `{}` and `{}`",
+                self.types.display(left_ty),
+                self.types.display(right_ty)
+            ),
+            span,
+        ));
+    }
+
+    fn is_bool_or_recovery_type(&self, ty: TypeId) -> bool {
+        matches!(
+            self.types.kind(ty),
+            TypeKind::Bool | TypeKind::Mixed | TypeKind::Unknown
+        )
+    }
+
+    fn is_equality_compatible(&self, left: TypeId, right: TypeId) -> bool {
+        self.is_assignable(left, right) || self.is_assignable(right, left)
+    }
+
+    fn logical_operator_name(op: &BinaryOp) -> &'static str {
+        match op {
+            BinaryOp::And => "`and`/`&&`",
+            BinaryOp::Or => "`or`/`||`",
+            BinaryOp::Xor => "`xor`",
+            _ => "logical operator",
         }
     }
 
@@ -1190,6 +1314,7 @@ impl<'program> Checker<'program> {
                 .and_then(|binding| binding.int_constant)
                 .map(IntConstantEval::Known)
                 .unwrap_or(IntConstantEval::Unknown),
+            Expr::Grouped { expr, .. } => Self::eval_int_constant(expr, scopes),
             Expr::Binary {
                 left, op, right, ..
             } if Self::is_checked_int_arithmetic_op(op) => {
@@ -1270,6 +1395,13 @@ impl<'program> Checker<'program> {
         constructor_init_context: Option<&mut ConstructorInitContext>,
     ) -> Option<AssignmentTarget> {
         match target {
+            Expr::Grouped { expr, .. } => self.check_assignment_target(
+                expr,
+                op,
+                scopes,
+                method_context,
+                constructor_init_context,
+            ),
             Expr::Variable { name, span } => match scopes.lookup(name) {
                 Some(binding) => {
                     if !binding.writable {
@@ -1303,8 +1435,7 @@ impl<'program> Checker<'program> {
                 if let Some((class_name, property_info)) =
                     self.lookup_property(object, property, *span, scopes, method_context)
                 {
-                    let constructor_init_decision = if matches!(object.as_ref(), Expr::This { .. })
-                    {
+                    let constructor_init_decision = if Self::is_direct_this(object) {
                         self.check_constructor_init_assignment(
                             &class_name,
                             property,
@@ -1324,14 +1455,15 @@ impl<'program> Checker<'program> {
                         let writable_path =
                             self.is_writable_object_path(object, scopes, method_context);
                         if !writable_path {
-                            let message = match object.as_ref() {
-                                Expr::This { .. } => {
-                                    "cannot mutate `$this` in a readonly method".to_string()
+                            let message = if Self::is_direct_this(object) {
+                                "cannot mutate `$this` in a readonly method".to_string()
+                            } else {
+                                match object.as_ref() {
+                                    Expr::Variable { name, .. } => {
+                                        format!("cannot write through readonly variable `${name}`")
+                                    }
+                                    _ => "cannot write through readonly object path".to_string(),
                                 }
-                                Expr::Variable { name, .. } => {
-                                    format!("cannot write through readonly variable `${name}`")
-                                }
-                                _ => "cannot write through readonly object path".to_string(),
                             };
                             self.diagnostics
                                 .push(Diagnostic::new("E0201", message, object.span()));
@@ -1753,6 +1885,9 @@ impl<'program> Checker<'program> {
         method_context: Option<&MethodContext>,
     ) -> bool {
         match expr {
+            Expr::Grouped { expr, .. } => {
+                self.is_writable_object_path(expr, scopes, method_context)
+            }
             Expr::Variable { name, .. } => scopes
                 .lookup(name)
                 .map(|binding| binding.writable)
@@ -1775,6 +1910,14 @@ impl<'program> Checker<'program> {
                     .map(|property| property.writable)
                     .unwrap_or(false)
             }
+            _ => false,
+        }
+    }
+
+    fn is_direct_this(expr: &Expr) -> bool {
+        match expr {
+            Expr::Grouped { expr, .. } => Self::is_direct_this(expr),
+            Expr::This { .. } => true,
             _ => false,
         }
     }
@@ -2000,6 +2143,9 @@ impl<'program> Checker<'program> {
         method_context: Option<&MethodContext>,
     ) -> bool {
         match value_expr {
+            Expr::Grouped { expr, .. } => {
+                self.is_expr_assignable(target, expr, scopes, method_context)
+            }
             Expr::Array { elements, .. } => {
                 self.is_array_literal_assignable(target, elements, scopes, method_context)
             }
@@ -2179,10 +2325,30 @@ impl<'program> Checker<'program> {
                 .and_then(|class_info| class_info.methods.get(method))
                 .map(|method| method.return_ty)
                 .unwrap_or_else(|| self.types.unknown()),
+            Expr::Grouped { expr, .. } => self.infer_expr_type(expr, scopes, method_context),
+            Expr::Unary { op, expr, .. } => self.infer_unary_type(op, expr, scopes, method_context),
             Expr::Binary {
                 left, op, right, ..
             } => self.infer_binary_type(left, op, right, scopes, method_context),
             _ => self.types.unknown(),
+        }
+    }
+
+    fn infer_unary_type(
+        &mut self,
+        op: &UnaryOp,
+        expr: &Expr,
+        scopes: &ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) -> TypeId {
+        let ty = self.infer_expr_type(expr, scopes, method_context);
+        match op {
+            UnaryOp::Not => match self.types.kind(ty) {
+                TypeKind::Bool => self.types.intern(TypeKind::Bool),
+                TypeKind::Mixed => self.types.intern(TypeKind::Mixed),
+                TypeKind::Unknown => self.types.unknown(),
+                _ => self.types.intern(TypeKind::Heterogeneous),
+            },
         }
     }
 
@@ -2202,14 +2368,13 @@ impl<'program> Checker<'program> {
                 self.infer_numeric_binary_type(left_ty, right_ty)
             }
             BinaryOp::Concat => self.infer_concat_binary_type(left_ty, right_ty),
-            BinaryOp::Equal
-            | BinaryOp::StrictEqual
-            | BinaryOp::NotEqual
-            | BinaryOp::NotStrictEqual => self.types.intern(TypeKind::Bool),
+            BinaryOp::Equal | BinaryOp::NotEqual => self.types.intern(TypeKind::Bool),
             BinaryOp::Less | BinaryOp::LessEqual | BinaryOp::Greater | BinaryOp::GreaterEqual => {
                 self.infer_relational_binary_type(left_ty, right_ty)
             }
-            BinaryOp::And | BinaryOp::Or => self.infer_logical_binary_type(left_ty, right_ty),
+            BinaryOp::And | BinaryOp::Or | BinaryOp::Xor => {
+                self.infer_logical_binary_type(left_ty, right_ty)
+            }
             BinaryOp::Coalesce => self.infer_coalesce_binary_type(left_ty, right_ty),
         }
     }

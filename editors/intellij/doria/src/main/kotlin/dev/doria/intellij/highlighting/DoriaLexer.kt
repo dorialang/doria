@@ -317,6 +317,8 @@ class DoriaLexer : LexerBase() {
             "if", "else", "while", "for", "static", "async", "await", "spawn", "scope",
             "interface", "trait", "enum", "match", "try", "catch", "throw" -> DoriaTokenTypes.KEYWORD
 
+            "not", "and", "or", "xor" -> DoriaTokenTypes.OPERATOR
+
             "writable", "readonly", "internal" -> DoriaTokenTypes.MODIFIER
 
             "void", "int", "float", "string", "bool", "mixed", "object", "resource", "array" -> DoriaTokenTypes.PRIMITIVE_TYPE

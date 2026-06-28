@@ -20,6 +20,90 @@ echo $count;
 }
 
 #[test]
+fn emits_php_for_boolean_word_operators() {
+    let php = doriac::compile_source_to_php(
+        "test.doria",
+        r#"
+echo true and false;
+echo false or true;
+echo not false;
+echo true xor false;
+"#,
+    )
+    .expect("compilation should succeed");
+
+    assert!(php.contains("echo ((true) && (false));"));
+    assert!(php.contains("echo ((false) || (true));"));
+    assert!(php.contains("echo !(false);"));
+    assert!(php.contains("echo ((true) !== (false));"));
+}
+
+#[test]
+fn parenthesizes_logical_operands_for_php() {
+    let php = doriac::compile_source_to_php(
+        "test.doria",
+        r#"
+echo true and null ?? true;
+echo false or null ?? true;
+"#,
+    )
+    .expect("compilation should succeed");
+
+    assert!(php.contains("echo ((true) && (null ?? true));"));
+    assert!(php.contains("echo ((false) || (null ?? true));"));
+    assert!(!php.contains("true && null ?? true"));
+    assert!(!php.contains("false || null ?? true"));
+}
+
+#[test]
+fn parenthesizes_xor_operands_for_php() {
+    let php = doriac::compile_source_to_php(
+        "test.doria",
+        r#"
+echo true == true xor false;
+echo false xor true != false;
+"#,
+    )
+    .expect("compilation should succeed");
+
+    assert!(php.contains("echo ((true === true) !== (false));"));
+    assert!(php.contains("echo ((false) !== (true !== false));"));
+    assert!(!php.contains("true === true !== false"));
+    assert!(!php.contains("false !== true !== false"));
+}
+
+#[test]
+fn emits_typed_php_comparisons() {
+    let php = doriac::compile_source_to_php(
+        "test.doria",
+        r#"
+echo "01" == "1";
+echo "01" != "1";
+"#,
+    )
+    .expect("compilation should succeed");
+
+    assert!(php.contains("echo \"01\" === \"1\";"));
+    assert!(php.contains("echo \"01\" !== \"1\";"));
+    assert!(!php.contains("echo \"01\" == \"1\";"));
+    assert!(!php.contains("echo \"01\" != \"1\";"));
+}
+
+#[test]
+fn parenthesizes_unary_not_operands_for_php() {
+    let php = doriac::compile_source_to_php(
+        "test.doria",
+        r#"
+echo not (1 < 2);
+"#,
+    )
+    .expect("compilation should succeed");
+
+    assert!(php.contains("echo !((1 < 2));"));
+    assert!(!php.contains("echo !1 < 2;"));
+}
+
+#[test]
 fn lowers_checked_program_to_hir() {
     let lowered = doriac::lower_source(
         "test.doria",
@@ -66,6 +150,36 @@ while ($count < 10) {
         hir::Item::Statement(hir::Stmt::While(while_stmt))
             if matches!(while_stmt.condition, hir::Expr::Binary { .. })
     ));
+}
+
+#[test]
+fn omits_grouping_around_assignment_targets_for_php() {
+    let php = doriac::compile_source_to_php(
+        "test.doria",
+        r#"
+let writable $count = 0;
+($count) = 1;
+
+class Person
+{
+    writable string $name;
+
+    function __construct(string $initial)
+    {
+        $this->name = $initial;
+    }
+}
+
+let writable $person = new Person("Ada");
+($person->name) = "Lucy";
+"#,
+    )
+    .expect("compilation should succeed");
+
+    assert!(php.contains("$count = 1;"));
+    assert!(php.contains("$person->name = \"Lucy\";"));
+    assert!(!php.contains("($count) = 1;"));
+    assert!(!php.contains("($person->name) = \"Lucy\";"));
 }
 
 #[test]
@@ -351,9 +465,9 @@ echo "Total: {$amount} ($currency)";
 #[test]
 fn compiles_person_example_with_explicit_interpolation() {
     let example_path =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/person.doria");
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/php/person.doria");
     let source = std::fs::read_to_string(&example_path).expect("read person example");
-    let php = doriac::compile_source_to_php("examples/person.doria", &source)
+    let php = doriac::compile_source_to_php("examples/php/person.doria", &source)
         .expect("person example should compile");
 
     assert!(php.contains(

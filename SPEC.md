@@ -370,7 +370,7 @@ Accepted bitwise operators are:
 
 Do not add `nand`, `nor`, `implies`, `iff`, `unless`, `^^`, `===`, or `!==` as core syntax without a new accepted decision. Future helper APIs such as `Bool::all(...)`, `Bool::any(...)`, `Bool::none(...)`, or `Bool::one(...)` may be considered separately.
 
-The accepted boolean/equality/bitwise operator direction is recorded in `docs/decisions/0020-boolean-operators-and-given-predicates.md`. Current compiler support may lag that accepted direction until the lexer, parser, semantic checker, Doria IR, and backends are updated.
+The accepted boolean/equality/bitwise operator direction is recorded in `docs/decisions/0020-boolean-operators-and-given-predicates.md`. Current compiler support includes typed `==` / `!=` checking, rejection of `===` / `!==`, `not` / `and` / `or` / `xor` parsing, bool-only semantic checking, Doria IR lowering, and PHP backend lowering for the supported subset. Bitwise operators and broader native lowering remain future implementation work.
 
 ### Control-flow conditions
 

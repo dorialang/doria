@@ -64,10 +64,10 @@ This repository contains the first working vertical slices of `doriac`:
 - Parses a small subset of declarations, classes, functions, statements, and expressions.
 - Builds an AST.
 - Checks undeclared assignment and readonly/writable mutation rules for locals, properties, `$this`, and writable methods.
-- Checks assignment compatibility, declared returns, positional call arguments, constructor init access, control-flow conditions, and string interpolation constraints for the supported subset.
+- Checks assignment compatibility, declared returns, typed equality/inequality, bool-only boolean operators, positional call arguments, constructor init access, control-flow conditions, and string interpolation constraints for the supported subset.
 - Lowers the checked AST to Doria IR, the compiler-owned representation used before backend output.
 - Emits Stage 4a Cranelift-backed native smoke executables for `function main(): int` using supported readonly integer locals, `+`/`-`/`*` arithmetic, final returns, terminal `if` / `else` returns, and guard-style `if` returns with a fallback return in the accepted `0..125` portable exit-code range.
-- Emits PHP for supported syntax through the optional PHP compatibility backend.
+- Emits PHP for supported syntax through the optional PHP compatibility backend, including `not`, `and`, `or`, and `xor` lowering that preserves Doria boolean semantics.
 - Provides CLI commands and integration tests.
 
 It is intentionally not a complete language yet. The implementation should grow in small, tested compiler increments without compromising Doria's native-first semantics.
@@ -77,15 +77,17 @@ It is intentionally not a complete language yet. The implementation should grow 
 ```bash
 cargo test
 cargo run -p doriac -- --help
-cargo run -p doriac -- check examples/hello.doria
-cargo run -p doriac -- hir examples/hello.doria
+cargo run -p doriac -- check examples/native/main_if_42.doria
+cargo run -p doriac -- hir examples/native/main_if_42.doria
+cargo run -p doriac -- compile examples/native/main_if_42.doria --out build/native/main_if_42
+./build/native/main_if_42
 ```
 
 The currently implemented compatibility backend can also emit PHP for supported syntax:
 
 ```bash
-cargo run -p doriac -- compile examples/person.doria --target php
-php person.php
+cargo run -p doriac -- compile examples/php/person.doria --target php --out build/php/person.php
+php build/php/person.php
 ```
 
 The native backend currently supports a narrow Stage 4a smoke shape: exactly one top-level `function main(): int` with readonly integer locals initialized from integer literals, prior supported readonly integer locals, or `+`/`-`/`*` arithmetic, followed by a final supported return, a terminal `if` / `else` return, or a guard-style `if` return with a fallback return. Conditions are limited to bool literals and integer comparisons over supported integer expressions. Returned process status values must be in the portable `0..125` exit-code range.

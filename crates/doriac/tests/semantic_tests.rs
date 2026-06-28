@@ -224,7 +224,12 @@ bool $less = 1 < 2;
 bool $floatLess = 1.5 <= 2.5;
 bool $stringLess = "a" < "b";
 bool $same = "a" == "b";
+bool $different = "a" != "b";
 bool $logic = true && false;
+bool $wordAnd = true and false;
+bool $wordOr = false or true;
+bool $wordNot = not false;
+bool $wordXor = true xor false;
 string $name = null ?? "Andrew";
 "#,
     )
@@ -238,6 +243,9 @@ string $name = null ?? "Andrew";
         r#"bool $value = true <= false;"#,
         r#"bool $value = 1 && 2;"#,
         r#"bool $value = "x" || "y";"#,
+        r#"bool $value = not 1;"#,
+        r#"bool $value = 1 and true;"#,
+        r#"bool $value = "x" xor false;"#,
         r#"
 writable int $value = 0;
 $value = "x" . "y";
@@ -251,6 +259,24 @@ class Person
         r#"function greet(string $name = 1 + 2): void {}"#,
     ] {
         assert_type_mismatch(source);
+    }
+}
+
+#[test]
+fn rejects_incompatible_typed_equality_operands() {
+    for source in [r#"bool $value = 1 == "1";"#, r#"bool $value = true != 1;"#] {
+        assert_diagnostic_code(source, "E0420");
+    }
+}
+
+#[test]
+fn reports_boolean_operator_operand_errors() {
+    for source in [
+        r#"bool $value = not 1;"#,
+        r#"bool $value = 1 and true;"#,
+        r#"bool $value = "x" xor false;"#,
+    ] {
+        assert_diagnostic_code(source, "E0419");
     }
 }
 
@@ -1520,7 +1546,7 @@ class Person
 
     function __construct(string $givenId)
     {
-        $this->id = $givenId;
+        ($this)->id = $givenId;
     }
 }
 

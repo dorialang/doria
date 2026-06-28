@@ -51,6 +51,37 @@ fn lexes_basic_control_flow_keywords() {
     assert!(matches!(kinds[1], TokenKind::Else));
     assert!(matches!(kinds[2], TokenKind::While));
 }
+
+#[test]
+fn lexes_boolean_word_operators() {
+    let kinds = token_kinds("not and or xor");
+    assert!(matches!(kinds[0], TokenKind::Not));
+    assert!(matches!(kinds[1], TokenKind::And));
+    assert!(matches!(kinds[2], TokenKind::Or));
+    assert!(matches!(kinds[3], TokenKind::Xor));
+}
+
+#[test]
+fn rejects_php_strict_equality_tokens() {
+    for (source, message) in [
+        (
+            "echo 1 === 1;",
+            "Doria uses typed `==`; `===` is not supported",
+        ),
+        (
+            "echo 1 !== 1;",
+            "Doria uses typed `!=`; `!==` is not supported",
+        ),
+    ] {
+        let err = doriac::lex_source("test.doria", source)
+            .expect_err("strict equality token should be rejected");
+        assert!(
+            err.iter()
+                .any(|diagnostic| diagnostic.message.contains(message)),
+            "expected diagnostic containing {message}, got {err:?}"
+        );
+    }
+}
 #[test]
 fn lexes_future_reserved_words() {
     let kinds = token_kinds("async await spawn scope");

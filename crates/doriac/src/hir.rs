@@ -1,7 +1,7 @@
 use crate::source::Span;
 use crate::types::TypeRef;
 
-pub use crate::ast::{AssignOp, BinaryOp, MemberAccess};
+pub use crate::ast::{AssignOp, BinaryOp, MemberAccess, UnaryOp};
 
 /// Current Doria IR implementation.
 ///
@@ -202,6 +202,15 @@ pub enum Expr {
         args: Vec<Expr>,
         span: Span,
     },
+    Grouped {
+        expr: Box<Expr>,
+        span: Span,
+    },
+    Unary {
+        op: UnaryOp,
+        expr: Box<Expr>,
+        span: Span,
+    },
     Binary {
         left: Box<Expr>,
         op: BinaryOp,
@@ -240,6 +249,8 @@ impl Expr {
             | Expr::FunctionCall { span, .. }
             | Expr::StaticCall { span, .. }
             | Expr::New { span, .. }
+            | Expr::Grouped { span, .. }
+            | Expr::Unary { span, .. }
             | Expr::Binary { span, .. } => *span,
         }
     }

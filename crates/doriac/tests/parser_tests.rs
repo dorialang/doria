@@ -1,5 +1,6 @@
 use doriac::ast::{
-    ClassMember, ElseBranch, Expr, InterpolatedStringPart, Item, MemberAccess, Stmt,
+    BinaryOp, ClassMember, ElseBranch, Expr, InterpolatedStringPart, Item, MemberAccess, Stmt,
+    UnaryOp,
 };
 
 #[test]
@@ -43,6 +44,67 @@ fn parse_echo_expr(source: &str) -> Expr {
         panic!("expected echo statement");
     };
     expr.clone()
+}
+
+#[test]
+fn parses_boolean_word_operators() {
+    assert!(matches!(
+        parse_echo_expr("echo true and false;"),
+        Expr::Binary {
+            op: BinaryOp::And,
+            ..
+        }
+    ));
+    assert!(matches!(
+        parse_echo_expr("echo false or true;"),
+        Expr::Binary {
+            op: BinaryOp::Or,
+            ..
+        }
+    ));
+    assert!(matches!(
+        parse_echo_expr("echo true xor false;"),
+        Expr::Binary {
+            op: BinaryOp::Xor,
+            ..
+        }
+    ));
+    assert!(matches!(
+        parse_echo_expr("echo not false;"),
+        Expr::Unary {
+            op: UnaryOp::Not,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn rejects_ambiguous_xor_expressions() {
+    for source in [
+        "echo true xor false xor true;",
+        "echo true and false xor true;",
+        "echo true xor false or true;",
+    ] {
+        let err = doriac::parse_source("test.doria", source)
+            .expect_err("ambiguous xor expression should be rejected");
+        assert!(
+            err.iter()
+                .any(|diagnostic| diagnostic.message.contains("ambiguous `xor`")),
+            "expected ambiguous xor diagnostic, got {err:?}"
+        );
+    }
+}
+
+#[test]
+fn accepts_parenthesized_xor_expressions() {
+    for source in [
+        "echo (true xor false) xor true;",
+        "echo (true and false) xor true;",
+        "echo true xor (false or true);",
+    ] {
+        doriac::parse_source("test.doria", source)
+            .unwrap_or_else(|err| panic!("parenthesized xor expression should parse: {err:?}"));
+    }
 }
 
 #[test]

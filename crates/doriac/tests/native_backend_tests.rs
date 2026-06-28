@@ -644,6 +644,36 @@ function main(): int
             "condition must be `bool`",
         ),
         (
+            "if unary not condition unsupported by native",
+            r#"
+function main(): int
+{
+    if (not true) {
+        return 42;
+    } else {
+        return 0;
+    }
+}
+"#,
+            "B0001",
+            "unsupported native condition",
+        ),
+        (
+            "if logical word condition unsupported by native",
+            r#"
+function main(): int
+{
+    if (true and false) {
+        return 42;
+    } else {
+        return 0;
+    }
+}
+"#,
+            "B0001",
+            "unsupported native condition",
+        ),
+        (
             "if condition division",
             r#"
 function main(): int

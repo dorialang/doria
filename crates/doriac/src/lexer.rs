@@ -69,6 +69,10 @@ pub enum TokenKind {
     AndAnd,
     OrOr,
     Bang,
+    Not,
+    And,
+    Or,
+    Xor,
     Question,
     QuestionQuestion,
     FatArrow,
@@ -121,7 +125,12 @@ impl<'source> Lexer<'source> {
                 b'=' => {
                     if self.match_byte(b'=') {
                         if self.match_byte(b'=') {
-                            self.token(TokenKind::EqualEqualEqual, start)
+                            self.error(
+                                "Doria uses typed `==`; `===` is not supported",
+                                start,
+                                self.index,
+                            );
+                            continue;
                         } else {
                             self.token(TokenKind::EqualEqual, start)
                         }
@@ -154,7 +163,12 @@ impl<'source> Lexer<'source> {
                 b'!' => {
                     if self.match_byte(b'=') {
                         if self.match_byte(b'=') {
-                            self.token(TokenKind::BangEqualEqual, start)
+                            self.error(
+                                "Doria uses typed `!=`; `!==` is not supported",
+                                start,
+                                self.index,
+                            );
+                            continue;
                         } else {
                             self.token(TokenKind::BangEqual, start)
                         }
@@ -293,6 +307,10 @@ impl<'source> Lexer<'source> {
             "string" => TokenKind::StringType,
             "bool" => TokenKind::BoolType,
             "array" => TokenKind::ArrayType,
+            "not" => TokenKind::Not,
+            "and" => TokenKind::And,
+            "or" => TokenKind::Or,
+            "xor" => TokenKind::Xor,
             "async" | "await" | "spawn" | "scope" | "interface" | "trait" | "enum" | "match"
             | "try" | "catch" | "throw" => TokenKind::Reserved(text.to_string()),
             _ => TokenKind::Identifier(text.to_string()),

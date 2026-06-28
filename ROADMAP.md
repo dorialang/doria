@@ -21,6 +21,7 @@
 - Allow constructors to initialize uninitialized readonly properties through narrow direct init access.
 - Support MVP `if` / `else if` / `else` and `while` in the AST, semantic checker, Doria IR, and PHP backend.
 - Represent braced string interpolation in the Doria AST and Doria IR, with PHP lowering emitted as explicit concatenation.
+- Support the first accepted boolean/equality compiler slice: typed `==` / `!=`, rejection of `===` / `!==`, bool-only `!` / `not`, `&&` / `and`, `||` / `or`, and `xor` in the parser, semantic checker, Doria IR, and PHP backend.
 - Stage 4a Cranelift native smoke backend is implemented for exactly one top-level `function main(): int` with supported readonly integer locals, `+`/`-`/`*` arithmetic, and either a final supported return, a terminal `if` / `else` whose branches each contain exactly one supported return, or a guard-style `if` followed by a fallback return in the portable `0..125` exit-code range. Conditions support bool literals and integer comparisons over supported integer expressions.
 - Keep PHP as a compatibility backend only; do not treat PHP output as the proof that Doria semantics are correct.
 - Do not build PHP-to-Doria migration in the current v0.1 slice.
@@ -38,7 +39,7 @@
 - Treat `docs/decisions/0019-stage-4a-native-if-else-returns.md` as the accepted Stage 4a native terminal `if` / `else` and guard-return decision.
 - Treat `docs/decisions/0020-boolean-operators-and-given-predicates.md` as the accepted typed equality, boolean operator, bitwise operator, `xor`, and `given` predicate block decision.
 - Keep broader native expression and control-flow support beyond the Stage 4a smoke subset as separate future implementation slices.
-- Add compiler support for accepted boolean/equality/bitwise operator spellings in a dedicated parser and semantic checking slice; do not import PHP loose comparison or PHP `and` / `or` precedence.
+- Extend accepted operator support with integer bitwise spellings in a dedicated parser and semantic checking slice; do not import PHP loose comparison or PHP `and` / `or` precedence.
 - Add compiler support for `int8`/`int16`/`int32`/`int64`, `uint8`/`uint16`/`uint32`/`uint64`, and `float32`/`float64` in a dedicated typed semantic model slice before claiming those spellings are implemented.
 - Plan a lowered/native IR when native code generation needs a simpler representation for control flow, memory layout, runtime calls, and backend emission.
 - Expand native source support beyond Stage 4a only after the next accepted native slice specifies the language semantics and expected behavior.

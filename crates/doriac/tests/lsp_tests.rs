@@ -55,6 +55,20 @@ $count = 1;
 }
 
 #[test]
+fn accepts_boolean_word_operators_without_lsp_diagnostics() {
+    let diagnostics = diagnostics_for_document(
+        "file:///operators.doria",
+        r#"let $a = true and false;
+let $b = false or true;
+let $c = not false;
+let $d = true xor false;
+"#,
+    );
+
+    assert_eq!(diagnostics, Vec::<Value>::new());
+}
+
+#[test]
 fn accepts_control_flow_without_lsp_diagnostics() {
     let diagnostics = diagnostics_for_document(
         "file:///control_flow.doria",

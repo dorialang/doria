@@ -327,7 +327,8 @@ fn initialize_result() -> Value {
 fn completion_items() -> Value {
     let keywords = [
         "class", "function", "let", "writable", "internal", "readonly", "return", "echo", "new",
-        "foreach", "as", "if", "else", "while", "for", "static", "true", "false", "null",
+        "foreach", "as", "if", "else", "while", "for", "static", "not", "and", "or", "xor", "true",
+        "false", "null",
     ];
     let types = [
         "void",
@@ -398,6 +399,10 @@ fn hover_description(kind: &TokenKind) -> Option<&'static str> {
         TokenKind::Foreach => Some("Iterates over a list or dictionary value."),
         TokenKind::As => Some("Separates a `foreach` iterable from its binding."),
         TokenKind::Static => Some("Reserved for static members and calls."),
+        TokenKind::Not => Some("Boolean NOT operator; exact synonym for `!`."),
+        TokenKind::And => Some("Boolean AND operator; exact synonym for `&&`."),
+        TokenKind::Or => Some("Boolean OR operator; exact synonym for `||`."),
+        TokenKind::Xor => Some("Bool-only exclusive OR operator."),
         TokenKind::Void => Some("The `void` return type."),
         TokenKind::IntType => Some("The `int` primitive type."),
         TokenKind::FloatType => Some("The `float` primitive type."),
