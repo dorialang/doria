@@ -35,7 +35,24 @@ echo true xor false;
     assert!(php.contains("echo (true && false);"));
     assert!(php.contains("echo (false || true);"));
     assert!(php.contains("echo !(false);"));
-    assert!(php.contains("echo (true !== false);"));
+    assert!(php.contains("echo ((true) !== (false));"));
+}
+
+#[test]
+fn parenthesizes_xor_operands_for_php() {
+    let php = doriac::compile_source_to_php(
+        "test.doria",
+        r#"
+echo true == true xor false;
+echo false xor true != false;
+"#,
+    )
+    .expect("compilation should succeed");
+
+    assert!(php.contains("echo ((true === true) !== (false));"));
+    assert!(php.contains("echo ((false) !== (true !== false));"));
+    assert!(!php.contains("true === true !== false"));
+    assert!(!php.contains("false !== true !== false"));
 }
 
 #[test]
@@ -65,7 +82,7 @@ echo not (1 < 2);
     )
     .expect("compilation should succeed");
 
-    assert!(php.contains("echo !(1 < 2);"));
+    assert!(php.contains("echo !((1 < 2));"));
     assert!(!php.contains("echo !1 < 2;"));
 }
 

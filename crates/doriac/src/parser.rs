@@ -462,38 +462,44 @@ impl Parser {
 
     fn xor_mix_is_ambiguous(op: &BinaryOp, left: &Expr, right: &Expr) -> bool {
         match op {
-            BinaryOp::Xor => Self::has_logical_binary(left) || Self::has_logical_binary(right),
+            BinaryOp::Xor => {
+                Self::has_unparenthesized_logical_binary(left)
+                    || Self::has_unparenthesized_logical_binary(right)
+            }
             BinaryOp::And | BinaryOp::Or => {
-                Self::has_xor_binary(left) || Self::has_xor_binary(right)
+                Self::has_unparenthesized_xor_binary(left)
+                    || Self::has_unparenthesized_xor_binary(right)
             }
             _ => false,
         }
     }
 
-    fn has_logical_binary(expr: &Expr) -> bool {
+    fn has_unparenthesized_logical_binary(expr: &Expr) -> bool {
         match expr {
             Expr::Binary {
                 op, left, right, ..
             } => {
                 matches!(op, BinaryOp::And | BinaryOp::Or | BinaryOp::Xor)
-                    || Self::has_logical_binary(left)
-                    || Self::has_logical_binary(right)
+                    || Self::has_unparenthesized_logical_binary(left)
+                    || Self::has_unparenthesized_logical_binary(right)
             }
-            Expr::Unary { expr, .. } => Self::has_logical_binary(expr),
+            Expr::Grouped { .. } => false,
+            Expr::Unary { expr, .. } => Self::has_unparenthesized_logical_binary(expr),
             _ => false,
         }
     }
 
-    fn has_xor_binary(expr: &Expr) -> bool {
+    fn has_unparenthesized_xor_binary(expr: &Expr) -> bool {
         match expr {
             Expr::Binary {
                 op, left, right, ..
             } => {
                 matches!(op, BinaryOp::Xor)
-                    || Self::has_xor_binary(left)
-                    || Self::has_xor_binary(right)
+                    || Self::has_unparenthesized_xor_binary(left)
+                    || Self::has_unparenthesized_xor_binary(right)
             }
-            Expr::Unary { expr, .. } => Self::has_xor_binary(expr),
+            Expr::Grouped { .. } => false,
+            Expr::Unary { expr, .. } => Self::has_unparenthesized_xor_binary(expr),
             _ => false,
         }
     }
@@ -610,9 +616,16 @@ impl Parser {
             TokenKind::New => self.parse_new(token.span.start),
             TokenKind::LeftBracket => self.parse_array(token.span.start),
             TokenKind::LeftParen => {
+                let start = token.span.start;
                 let expr = self.parse_expression()?;
-                self.expect(TokenKind::RightParen, "expected `)` after expression")?;
-                Some(expr)
+                let end = self
+                    .expect(TokenKind::RightParen, "expected `)` after expression")?
+                    .span
+                    .end;
+                Some(Expr::Grouped {
+                    expr: Box::new(expr),
+                    span: Span::new(start, end),
+                })
             }
             _ => {
                 self.error("expected expression", token.span);

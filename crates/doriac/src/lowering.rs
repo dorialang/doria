@@ -219,6 +219,10 @@ fn lower_expr(expr: &ast::Expr) -> hir::Expr {
             args: args.iter().map(lower_expr).collect(),
             span: *span,
         },
+        ast::Expr::Grouped { expr, span } => hir::Expr::Grouped {
+            expr: Box::new(lower_expr(expr)),
+            span: *span,
+        },
         ast::Expr::Unary { op, expr, span } => hir::Expr::Unary {
             op: op.clone(),
             expr: Box::new(lower_expr(expr)),

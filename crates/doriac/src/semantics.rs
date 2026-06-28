@@ -1103,6 +1103,7 @@ impl<'program> Checker<'program> {
                     self.check_constructor_call(class_name, args, *span, scopes, method_context);
                 }
             }
+            Expr::Grouped { expr, .. } => self.check_expr(expr, scopes, method_context),
             Expr::Unary { op, expr, .. } => {
                 self.check_expr(expr, scopes, method_context);
                 self.check_unary_operand(op, expr, scopes, method_context);
@@ -1313,6 +1314,7 @@ impl<'program> Checker<'program> {
                 .and_then(|binding| binding.int_constant)
                 .map(IntConstantEval::Known)
                 .unwrap_or(IntConstantEval::Unknown),
+            Expr::Grouped { expr, .. } => Self::eval_int_constant(expr, scopes),
             Expr::Binary {
                 left, op, right, ..
             } if Self::is_checked_int_arithmetic_op(op) => {
@@ -1393,6 +1395,13 @@ impl<'program> Checker<'program> {
         constructor_init_context: Option<&mut ConstructorInitContext>,
     ) -> Option<AssignmentTarget> {
         match target {
+            Expr::Grouped { expr, .. } => self.check_assignment_target(
+                expr,
+                op,
+                scopes,
+                method_context,
+                constructor_init_context,
+            ),
             Expr::Variable { name, span } => match scopes.lookup(name) {
                 Some(binding) => {
                     if !binding.writable {
@@ -1876,6 +1885,9 @@ impl<'program> Checker<'program> {
         method_context: Option<&MethodContext>,
     ) -> bool {
         match expr {
+            Expr::Grouped { expr, .. } => {
+                self.is_writable_object_path(expr, scopes, method_context)
+            }
             Expr::Variable { name, .. } => scopes
                 .lookup(name)
                 .map(|binding| binding.writable)
@@ -2123,6 +2135,9 @@ impl<'program> Checker<'program> {
         method_context: Option<&MethodContext>,
     ) -> bool {
         match value_expr {
+            Expr::Grouped { expr, .. } => {
+                self.is_expr_assignable(target, expr, scopes, method_context)
+            }
             Expr::Array { elements, .. } => {
                 self.is_array_literal_assignable(target, elements, scopes, method_context)
             }
@@ -2302,6 +2317,7 @@ impl<'program> Checker<'program> {
                 .and_then(|class_info| class_info.methods.get(method))
                 .map(|method| method.return_ty)
                 .unwrap_or_else(|| self.types.unknown()),
+            Expr::Grouped { expr, .. } => self.infer_expr_type(expr, scopes, method_context),
             Expr::Unary { op, expr, .. } => self.infer_unary_type(op, expr, scopes, method_context),
             Expr::Binary {
                 left, op, right, ..

@@ -202,6 +202,10 @@ pub enum Expr {
         args: Vec<Expr>,
         span: Span,
     },
+    Grouped {
+        expr: Box<Expr>,
+        span: Span,
+    },
     Unary {
         op: UnaryOp,
         expr: Box<Expr>,
@@ -245,6 +249,7 @@ impl Expr {
             | Expr::FunctionCall { span, .. }
             | Expr::StaticCall { span, .. }
             | Expr::New { span, .. }
+            | Expr::Grouped { span, .. }
             | Expr::Unary { span, .. }
             | Expr::Binary { span, .. } => *span,
         }

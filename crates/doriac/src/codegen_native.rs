@@ -365,6 +365,7 @@ fn validate_stage_3a_int_expr(
                 value,
             })
         }
+        Expr::Grouped { expr, .. } => validate_stage_3a_int_expr(expr, local_values),
         Expr::Binary {
             left, op, right, ..
         } if native_binary_op(op).is_some() => {
@@ -407,6 +408,7 @@ fn validate_stage_4a_condition(
             condition: NativeCondition::Bool(*value),
             value: *value,
         }),
+        Expr::Grouped { expr, .. } => validate_stage_4a_condition(expr, local_values),
         Expr::Binary {
             left, op, right, ..
         } if native_compare_op(op).is_some() => {
@@ -920,6 +922,7 @@ fn describe_expression(expr: &Expr) -> &'static str {
         Expr::FunctionCall { .. } => "function call",
         Expr::StaticCall { .. } => "static call",
         Expr::New { .. } => "object construction",
+        Expr::Grouped { .. } => "grouped expression",
         Expr::Unary { .. } => "unary expression",
         Expr::Binary { .. } => "binary expression",
     }

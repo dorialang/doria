@@ -96,6 +96,18 @@ fn rejects_ambiguous_xor_expressions() {
 }
 
 #[test]
+fn accepts_parenthesized_xor_expressions() {
+    for source in [
+        "echo (true xor false) xor true;",
+        "echo (true and false) xor true;",
+        "echo true xor (false or true);",
+    ] {
+        doriac::parse_source("test.doria", source)
+            .unwrap_or_else(|err| panic!("parenthesized xor expression should parse: {err:?}"));
+    }
+}
+
+#[test]
 fn parses_plain_and_interpolated_strings() {
     assert!(matches!(
         parse_echo_expr("echo '{$name}';"),

@@ -385,6 +385,7 @@ fn emit_expr(expr: &Expr, scopes: &PhpNameScopes) -> String {
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
+        Expr::Grouped { expr, .. } => format!("({})", emit_expr(expr, scopes)),
         Expr::Unary { op, expr, .. } => match op {
             UnaryOp::Not => format!("!({})", emit_expr(expr, scopes)),
         },
@@ -402,7 +403,7 @@ fn emit_expr(expr: &Expr, scopes: &PhpNameScopes) -> String {
                 emit_expr(right, scopes)
             ),
             BinaryOp::Xor => format!(
-                "({} !== {})",
+                "(({}) !== ({}))",
                 emit_expr(left, scopes),
                 emit_expr(right, scopes)
             ),
