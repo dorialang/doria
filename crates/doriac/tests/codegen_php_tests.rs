@@ -400,17 +400,10 @@ echo "Total: {$amount} ($currency)";
 
 #[test]
 fn compiles_person_example_with_explicit_interpolation() {
-    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let example_path = [
-        "../../examples/php/person.doria",
-        "../../examples/person.doria",
-    ]
-    .into_iter()
-    .map(|relative| manifest_dir.join(relative))
-    .find(|path| path.exists())
-    .expect("person example should exist");
+    let example_path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/php/person.doria");
     let source = std::fs::read_to_string(&example_path).expect("read person example");
-    let php = doriac::compile_source_to_php("examples/person.doria", &source)
+    let php = doriac::compile_source_to_php("examples/php/person.doria", &source)
         .expect("person example should compile");
 
     assert!(php.contains(

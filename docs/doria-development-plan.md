@@ -297,9 +297,9 @@ doriac
 Initial commands:
 
 ```bash
-doriac check examples/person.doria
+doriac check examples/native/main_return_zero.doria
 doriac compile examples/native/main_return_zero.doria
-doriac compile examples/person.doria --target php
+doriac compile examples/php/person.doria --target php
 doriac run examples/native/main_return_zero.doria
 ```
 
@@ -980,7 +980,7 @@ Possible diagnostic:
 ```text
 error[E0201]: cannot write through readonly variable `$person`
 
-  examples/person.doria:2:1
+  examples/php/person.doria:2:1
   |
 2 | $person->name = "Lucy";
   | ^^^^^^^ `$person` was declared readonly here
@@ -1208,9 +1208,9 @@ Start by implementing:
 
 Definition of done:
 - `cargo test` passes.
-- `doriac check examples/person.doria` succeeds.
+- `doriac check examples/native/main_return_zero.doria` succeeds.
 - `doriac compile examples/native/main_return_zero.doria` emits a native executable for the currently supported native slice.
-- `doriac compile examples/person.doria --target php` emits runnable PHP for the compatibility backend slice.
+- `doriac compile examples/php/person.doria --target php` emits runnable PHP for the compatibility backend slice.
 - For the PHP compatibility backend slice, running emitted PHP produces expected output without treating PHP as Doria's semantic authority.
 - Invalid examples produce clear compiler errors.
 ```
@@ -1406,8 +1406,8 @@ Generated PHP passes `php -l`.
 Acceptance:
 
 ```bash
-doriac compile examples/person.doria --target php --out build/person.php
-php build/person.php
+doriac compile examples/php/person.doria --target php --out build/php/person.php
+php build/php/person.php
 ```
 
 Expected output:

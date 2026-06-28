@@ -45,11 +45,26 @@ jobs:
       - name: Test
         run: cargo test --workspace --all-targets --locked --verbose
 
-      - name: Smoke check Doria example
-        run: cargo run -p doriac -- check examples/person.doria
+      - name: Smoke check native Doria example
+        run: cargo run -p doriac -- check examples/native/main_if_42.doria
 
-      - name: Smoke dump Doria example IR
-        run: cargo run -p doriac -- hir examples/person.doria
+      - name: Smoke dump native Doria example IR
+        run: cargo run -p doriac -- hir examples/native/main_if_42.doria
 
-      - name: Smoke compile Doria example to PHP
-        run: cargo run -p doriac -- compile examples/person.doria --target php --out build/person.php
+      - name: Smoke compile native Doria example with default target
+        run: cargo run -p doriac -- compile examples/native/main_if_42.doria --out build/native/main_if_42
+
+      - name: Smoke run native Doria executable
+        run: |
+          set +e
+          build/native/main_if_42
+          status=$?
+          set -e
+          echo "native smoke exit code: ${status}"
+          test "${status}" -eq 42
+
+      - name: Smoke check PHP compatibility example
+        run: cargo run -p doriac -- check examples/php/person.doria
+
+      - name: Smoke compile PHP compatibility example
+        run: cargo run -p doriac -- compile examples/php/person.doria --target php --out build/php/person.php

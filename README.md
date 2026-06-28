@@ -77,15 +77,17 @@ It is intentionally not a complete language yet. The implementation should grow 
 ```bash
 cargo test
 cargo run -p doriac -- --help
-cargo run -p doriac -- check examples/hello.doria
-cargo run -p doriac -- hir examples/hello.doria
+cargo run -p doriac -- check examples/native/main_if_42.doria
+cargo run -p doriac -- hir examples/native/main_if_42.doria
+cargo run -p doriac -- compile examples/native/main_if_42.doria --out build/native/main_if_42
+./build/native/main_if_42
 ```
 
 The currently implemented compatibility backend can also emit PHP for supported syntax:
 
 ```bash
-cargo run -p doriac -- compile examples/person.doria --target php
-php person.php
+cargo run -p doriac -- compile examples/php/person.doria --target php --out build/php/person.php
+php build/php/person.php
 ```
 
 The native backend currently supports a narrow Stage 4a smoke shape: exactly one top-level `function main(): int` with readonly integer locals initialized from integer literals, prior supported readonly integer locals, or `+`/`-`/`*` arithmetic, followed by a final supported return, a terminal `if` / `else` return, or a guard-style `if` return with a fallback return. Conditions are limited to bool literals and integer comparisons over supported integer expressions. Returned process status values must be in the portable `0..125` exit-code range.
