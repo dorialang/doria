@@ -386,7 +386,7 @@ fn emit_expr(expr: &Expr, scopes: &PhpNameScopes) -> String {
                 .join(", ")
         ),
         Expr::Unary { op, expr, .. } => match op {
-            UnaryOp::Not => format!("(!{})", emit_expr(expr, scopes)),
+            UnaryOp::Not => format!("!({})", emit_expr(expr, scopes)),
         },
         Expr::Binary {
             left, op, right, ..
@@ -453,8 +453,8 @@ fn emit_binary_op(op: &BinaryOp) -> &'static str {
         BinaryOp::Div => "/",
         BinaryOp::Mod => "%",
         BinaryOp::Concat => ".",
-        BinaryOp::Equal => "==",
-        BinaryOp::NotEqual => "!=",
+        BinaryOp::Equal => "===",
+        BinaryOp::NotEqual => "!==",
         BinaryOp::Less => "<",
         BinaryOp::LessEqual => "<=",
         BinaryOp::Greater => ">",
