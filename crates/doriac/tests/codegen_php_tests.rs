@@ -32,10 +32,27 @@ echo true xor false;
     )
     .expect("compilation should succeed");
 
-    assert!(php.contains("echo (true && false);"));
-    assert!(php.contains("echo (false || true);"));
+    assert!(php.contains("echo ((true) && (false));"));
+    assert!(php.contains("echo ((false) || (true));"));
     assert!(php.contains("echo !(false);"));
     assert!(php.contains("echo ((true) !== (false));"));
+}
+
+#[test]
+fn parenthesizes_logical_operands_for_php() {
+    let php = doriac::compile_source_to_php(
+        "test.doria",
+        r#"
+echo true and null ?? true;
+echo false or null ?? true;
+"#,
+    )
+    .expect("compilation should succeed");
+
+    assert!(php.contains("echo ((true) && (null ?? true));"));
+    assert!(php.contains("echo ((false) || (null ?? true));"));
+    assert!(!php.contains("true && null ?? true"));
+    assert!(!php.contains("false || null ?? true"));
 }
 
 #[test]

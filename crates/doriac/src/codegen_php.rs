@@ -393,12 +393,12 @@ fn emit_expr(expr: &Expr, scopes: &PhpNameScopes) -> String {
             left, op, right, ..
         } => match op {
             BinaryOp::And => format!(
-                "({} && {})",
+                "(({}) && ({}))",
                 emit_expr(left, scopes),
                 emit_expr(right, scopes)
             ),
             BinaryOp::Or => format!(
-                "({} || {})",
+                "(({}) || ({}))",
                 emit_expr(left, scopes),
                 emit_expr(right, scopes)
             ),
