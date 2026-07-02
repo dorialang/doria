@@ -4,7 +4,7 @@ Status: Accepted
 
 ## Decision
 
-Doria accepts typed equality, bool-only boolean operators, integer bitwise operators, and `given` predicate block rules as language design direction. The compiler now has an initial implementation slice for typed equality, bool-only boolean operators, Doria IR lowering, and PHP backend lowering. This decision still does not implement integer bitwise operators, broader native lowering, `Bool` helper APIs, `given`, `finally`, or `when`.
+Doria accepts typed equality, bool-only boolean operators, integer bitwise operators, and `given` predicate block rules as language design direction. The compiler now has an initial implementation slice for typed equality, bool-only boolean operators, Doria IR lowering, PHP backend lowering, and Stage 4b native lowering for supported `if` conditions. This decision still does not implement integer bitwise operators, broad native expression lowering, `Bool` helper APIs, `given`, `finally`, or `when`.
 
 Backend support may lag this decision. Unsupported backend coverage must be described as unsupported backend coverage, not invalid Doria syntax.
 

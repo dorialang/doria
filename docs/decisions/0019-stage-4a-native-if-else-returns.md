@@ -4,6 +4,8 @@ Status: Accepted
 
 Accepted by the Stage 4a implementation task. Keep this slice narrow; later native control-flow stages must still be accepted separately.
 
+Decision 0021 extends this native condition subset for Stage 4b. This decision remains the accepted record for the Stage 4a statement shapes.
+
 ## Decision
 
 Stage 4a adds native support for two statement-control-flow shapes inside the accepted native entrypoint:

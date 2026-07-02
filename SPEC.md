@@ -64,7 +64,7 @@ Valid PHP should be easy to migrate to Doria, but Doria-specific syntax does not
 
 Doria does not use `public`, `protected`, or `private` as member visibility modifiers. Class members are externally accessible by default, and `internal` marks implementation details.
 
-The current compiler implementation produces only Stage 4a native smoke executables for exactly one top-level `function main(): int` with supported readonly integer locals, `+`/`-`/`*` arithmetic, and either a final supported return, a terminal `if` / `else` whose branches each contain exactly one supported return, or a guard-style `if` followed by a fallback return in the accepted `0..125` portable exit-code range. It is not yet full native code generation, a package manager, reflection system, macro system, async runtime, PHP migration converter, or full standard library. That implementation status does not make PHP transpilation the language goal.
+The current compiler implementation produces only Stage 4b native smoke executables for exactly one top-level `function main(): int` with supported readonly integer locals, `+`/`-`/`*` arithmetic, and either a final supported return, a terminal `if` / `else` whose branches each contain exactly one supported return, or a guard-style `if` followed by a fallback return in the accepted `0..125` portable exit-code range. Supported native conditions include bool literals, grouped conditions, integer comparisons, and bool-only `not` / `and` / `or` / `xor`. It is not yet full native code generation, a package manager, reflection system, macro system, async runtime, PHP migration converter, or full standard library. That implementation status does not make PHP transpilation the language goal.
 
 Doria is not a Rust language. Rust is the current bootstrap implementation language for `doriac`, not the permanent identity of the compiler.
 
@@ -370,7 +370,7 @@ Accepted bitwise operators are:
 
 Do not add `nand`, `nor`, `implies`, `iff`, `unless`, `^^`, `===`, or `!==` as core syntax without a new accepted decision. Future helper APIs such as `Bool::all(...)`, `Bool::any(...)`, `Bool::none(...)`, or `Bool::one(...)` may be considered separately.
 
-The accepted boolean/equality/bitwise operator direction is recorded in `docs/decisions/0020-boolean-operators-and-given-predicates.md`. Current compiler support includes typed `==` / `!=` checking, rejection of `===` / `!==`, `not` / `and` / `or` / `xor` parsing, bool-only semantic checking, Doria IR lowering, and PHP backend lowering for the supported subset. Bitwise operators and broader native lowering remain future implementation work.
+The accepted boolean/equality/bitwise operator direction is recorded in `docs/decisions/0020-boolean-operators-and-given-predicates.md`. Current compiler support includes typed `==` / `!=` checking, rejection of `===` / `!==`, `not` / `and` / `or` / `xor` parsing, bool-only semantic checking, Doria IR lowering, PHP backend lowering for the supported subset, and Stage 4b native lowering for supported `if` conditions. Bitwise operators and broader native expression lowering remain future implementation work.
 
 ### Control-flow conditions
 
@@ -584,7 +584,7 @@ Doria IR is the checked compiler-owned representation of a Doria program. After 
 
 As native code generation matures, Doria IR may lower into a simpler native-oriented IR for control flow, memory layout, runtime calls, and backend code generation.
 
-The native backend is the primary target. It should lower Doria IR, and any later native-oriented IR, toward native machine code and standalone executables. The current Cranelift-backed Stage 4a native backend is deliberately limited to exactly one top-level `function main(): int` with supported readonly integer locals, `+`/`-`/`*` arithmetic, and either a final supported return, a terminal `if` / `else` whose branches each contain exactly one supported return, or a guard-style `if` followed by a fallback return in `0..125`. Stage 4a conditions support bool literals and integer comparisons over supported integer expressions. It emits unsupported-feature diagnostics for branch-local declarations, nested `if`, `else if`, general `if` statement lowering beyond the accepted return shapes, writable locals, non-integer locals, division/modulo, logical operators, strings, `while`, classes, collections, and broader valid Doria until later native slices are designed.
+The native backend is the primary target. It should lower Doria IR, and any later native-oriented IR, toward native machine code and standalone executables. The current Cranelift-backed Stage 4b native backend is deliberately limited to exactly one top-level `function main(): int` with supported readonly integer locals, `+`/`-`/`*` arithmetic, and either a final supported return, a terminal `if` / `else` whose branches each contain exactly one supported return, or a guard-style `if` followed by a fallback return in `0..125`. Stage 4b conditions support bool literals, grouped conditions, integer comparisons over supported integer expressions, `!` / `not`, `&&` / `and`, `||` / `or`, and `xor`. It emits unsupported-feature diagnostics for branch-local declarations, nested `if`, `else if`, general `if` statement lowering beyond the accepted return shapes, writable locals, non-integer locals, division/modulo, strings, `while`, classes, collections, and broader valid Doria until later native slices are designed.
 
 The PHP backend is currently implemented as a compatibility/debugging backend. It emits `<?php` and lowers Doria-only syntax away:
 
@@ -613,9 +613,9 @@ Future work includes:
 - Full path-sensitive control-flow analysis for returns and constructor initialization.
 - Advanced control-flow design for `do ... while ... finally`, `given ... when`, `given ... while`, `if` chains with possible `finally`, value-returning `when`, and `match`.
 - Async/await and structured concurrency.
-- Broader native backend design and implementation beyond the Stage 4a smoke target.
+- Broader native backend design and implementation beyond the Stage 4b smoke target.
 - Native-oriented IR implementation when native code generation needs it.
-- Broader native code generation and standalone executable production beyond the Stage 4a smoke target.
+- Broader native code generation and standalone executable production beyond the Stage 4b smoke target.
 - Self-hosting path for writing more of `doriac` in Doria.
 - PHP-to-Doria migration tooling.
 - Package management.
