@@ -135,4 +135,4 @@ Run backend-specific checks only when the touched task depends on that backend. 
 cargo run -p doriac -- compile examples/person.doria --target php --out build/person.php
 ```
 
-When a native backend target exists, native smoke tests must be part of the relevant definition of done. The current native target is the Stage 4a Cranelift-backed smoke backend for final returns, narrow terminal `if` / `else` returns, and guard-style `if` returns with fallback returns only; do not treat it as full native code generation or full native control-flow support.
+When a native backend target exists, native smoke tests must be part of the relevant definition of done. The current native target is the Stage 4b Cranelift-backed smoke backend for final returns, narrow terminal `if` / `else` returns, guard-style `if` returns with fallback returns, and accepted boolean conditions only; do not treat it as full native code generation or full native control-flow support.

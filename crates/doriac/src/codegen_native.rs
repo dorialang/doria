@@ -8,17 +8,17 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use cranelift_codegen::ir::condcodes::IntCC;
-use cranelift_codegen::ir::{types, AbiParam, InstBuilder, Value};
+use cranelift_codegen::ir::{types, AbiParam, Block, BlockArg, InstBuilder, Value};
 use cranelift_codegen::settings;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_module::{default_libcall_names, Linkage, Module};
 use cranelift_object::{ObjectBuilder, ObjectModule};
 
 use crate::backend::BackendError;
-use crate::hir::{self, BinaryOp, ElseBranch, Expr, Item, Stmt};
+use crate::hir::{self, BinaryOp, ElseBranch, Expr, Item, Stmt, UnaryOp};
 
 pub fn generate_executable(program: &hir::Program) -> Result<Vec<u8>, BackendError> {
-    let native_main = validate_stage_4a(program)?;
+    let native_main = validate_stage_4b(program)?;
     let object_bytes = generate_object(&native_main)?;
     link_object(&object_bytes)
 }
@@ -79,6 +79,19 @@ enum NativeCondition {
         left: NativeExpr,
         right: NativeExpr,
     },
+    Not(Box<NativeCondition>),
+    And {
+        left: Box<NativeCondition>,
+        right: Box<NativeCondition>,
+    },
+    Or {
+        left: Box<NativeCondition>,
+        right: Box<NativeCondition>,
+    },
+    Xor {
+        left: Box<NativeCondition>,
+        right: Box<NativeCondition>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -104,10 +117,10 @@ struct ValidatedNativeCondition {
 }
 
 pub fn validate_stage_2d(program: &hir::Program) -> Result<i32, BackendError> {
-    Ok(validate_stage_4a(program)?.evaluated_exit_code)
+    Ok(validate_stage_4b(program)?.evaluated_exit_code)
 }
 
-fn validate_stage_4a(program: &hir::Program) -> Result<NativeMain, BackendError> {
+fn validate_stage_4b(program: &hir::Program) -> Result<NativeMain, BackendError> {
     let mut main_functions = Vec::new();
 
     for item in &program.items {
@@ -173,7 +186,7 @@ fn validate_stage_4a(program: &hir::Program) -> Result<NativeMain, BackendError>
         terminal_index += 1;
     }
 
-    let terminator = validate_stage_4a_statement_sequence(
+    let terminator = validate_stage_4b_statement_sequence(
         &main.body.statements[terminal_index..],
         &local_values,
     )?;
@@ -185,15 +198,15 @@ fn validate_stage_4a(program: &hir::Program) -> Result<NativeMain, BackendError>
     })
 }
 
-fn validate_stage_4a_statement_sequence(
+fn validate_stage_4b_statement_sequence(
     statements: &[Stmt],
     local_values: &HashMap<String, i64>,
 ) -> Result<NativeTerminator, BackendError> {
     match statements {
         [] => Err(BackendError::new(
-            "unsupported native terminal statement for Stage 4a: expected final return, terminal if/else, or guard if followed by fallback return",
+            "unsupported native terminal statement for Stage 4b: expected final return, terminal if/else, or guard if followed by fallback return",
         )),
-        [statement] => validate_stage_4a_terminator(statement, local_values),
+        [statement] => validate_stage_4b_terminator(statement, local_values),
         [
             Stmt::If(if_stmt),
             Stmt::Return {
@@ -201,32 +214,32 @@ fn validate_stage_4a_statement_sequence(
                 ..
             },
         ] if if_stmt.else_branch.is_none() => {
-            validate_stage_4a_guard_return(if_stmt, fallback_expr, local_values)
+            validate_stage_4b_guard_return(if_stmt, fallback_expr, local_values)
         }
         [Stmt::If(if_stmt), _] if if_stmt.else_branch.is_some() => {
             Err(BackendError::new(
-                "unsupported native statement for Stage 4a: no statements may follow a terminal if/else",
+                "unsupported native statement for Stage 4b: no statements may follow a terminal if/else",
             ))
         }
         [Stmt::Return { .. }, ..] => Err(BackendError::new(
-            "unsupported native statement for Stage 4a: no statements may follow a final return",
+            "unsupported native statement for Stage 4b: no statements may follow a final return",
         )),
         [first, ..] => Err(BackendError::new(format!(
-            "unsupported native statement for Stage 4a: expected readonly `int` local declaration, final return, terminal if/else, or guard if followed by fallback return, found {}",
+            "unsupported native statement for Stage 4b: expected readonly `int` local declaration, final return, terminal if/else, or guard if followed by fallback return, found {}",
             describe_statement(first)
         ))),
     }
 }
 
-fn validate_stage_4a_guard_return(
+fn validate_stage_4b_guard_return(
     if_stmt: &hir::IfStmt,
     fallback_expr: &Expr,
     local_values: &HashMap<String, i64>,
 ) -> Result<NativeTerminator, BackendError> {
-    let condition = validate_stage_4a_condition(&if_stmt.condition, local_values)?;
+    let condition = validate_stage_4b_condition(&if_stmt.condition, local_values)?;
     let (then_expr, then_exit_code) =
-        validate_stage_4a_branch(&if_stmt.then_block.statements, local_values)?;
-    let (else_expr, else_exit_code) = validate_stage_4a_return_expr(fallback_expr, local_values)?;
+        validate_stage_4b_branch(&if_stmt.then_block.statements, local_values)?;
+    let (else_expr, else_exit_code) = validate_stage_4b_return_expr(fallback_expr, local_values)?;
 
     Ok(NativeTerminator::IfElse {
         condition: condition.condition,
@@ -266,40 +279,40 @@ fn unsupported_stage_2d_local() -> BackendError {
     )
 }
 
-fn validate_stage_4a_terminator(
+fn validate_stage_4b_terminator(
     statement: &Stmt,
     local_values: &HashMap<String, i64>,
 ) -> Result<NativeTerminator, BackendError> {
     match statement {
         Stmt::Return { expr: Some(expr), .. } => {
-            let (expr, evaluated_exit_code) = validate_stage_4a_return_expr(expr, local_values)?;
+            let (expr, evaluated_exit_code) = validate_stage_4b_return_expr(expr, local_values)?;
             Ok(NativeTerminator::Return {
                 expr,
                 evaluated_exit_code,
             })
         }
         Stmt::Return { expr: None, .. } => Err(BackendError::new(
-            "unsupported native terminal statement for Stage 4a: expected `return <portable integer expression>;`, found bare `return;`",
+            "unsupported native terminal statement for Stage 4b: expected `return <portable integer expression>;`, found bare `return;`",
         )),
         Stmt::If(if_stmt) => {
-            let condition = validate_stage_4a_condition(&if_stmt.condition, local_values)?;
+            let condition = validate_stage_4b_condition(&if_stmt.condition, local_values)?;
             let (then_expr, then_exit_code) =
-                validate_stage_4a_branch(&if_stmt.then_block.statements, local_values)?;
+                validate_stage_4b_branch(&if_stmt.then_block.statements, local_values)?;
 
             let Some(else_branch) = &if_stmt.else_branch else {
                 return Err(BackendError::new(
-                    "unsupported native terminal if for Stage 4a: terminal if requires else; guard if without else is supported only when followed by a fallback return",
+                    "unsupported native terminal if for Stage 4b: terminal if requires else; guard if without else is supported only when followed by a fallback return",
                 ));
             };
 
             let ElseBranch::Block(else_block) = else_branch else {
                 return Err(BackendError::new(
-                    "unsupported native terminal statement for Stage 4a: else-if is not supported",
+                    "unsupported native terminal statement for Stage 4b: else-if is not supported",
                 ));
             };
 
             let (else_expr, else_exit_code) =
-                validate_stage_4a_branch(&else_block.statements, local_values)?;
+                validate_stage_4b_branch(&else_block.statements, local_values)?;
 
             Ok(NativeTerminator::IfElse {
                 condition: condition.condition,
@@ -311,13 +324,13 @@ fn validate_stage_4a_terminator(
             })
         }
         other => Err(BackendError::new(format!(
-            "unsupported native terminal statement for Stage 4a: expected final return or terminal if/else, found {}",
+            "unsupported native terminal statement for Stage 4b: expected final return or terminal if/else, found {}",
             describe_statement(other)
         ))),
     }
 }
 
-fn validate_stage_4a_branch(
+fn validate_stage_4b_branch(
     statements: &[Stmt],
     local_values: &HashMap<String, i64>,
 ) -> Result<(NativeExpr, i32), BackendError> {
@@ -326,19 +339,19 @@ fn validate_stage_4a_branch(
     }] = statements
     else {
         return Err(BackendError::new(
-            "unsupported native branch for Stage 4a: expected exactly one return statement",
+            "unsupported native branch for Stage 4b: expected exactly one return statement",
         ));
     };
 
-    validate_stage_4a_return_expr(expr, local_values)
+    validate_stage_4b_return_expr(expr, local_values)
 }
 
-fn validate_stage_4a_return_expr(
+fn validate_stage_4b_return_expr(
     expr: &Expr,
     local_values: &HashMap<String, i64>,
 ) -> Result<(NativeExpr, i32), BackendError> {
     let return_expr = validate_stage_3a_int_expr(expr, local_values)?;
-    let evaluated_exit_code = parse_stage_4a_exit_code(return_expr.value)?;
+    let evaluated_exit_code = parse_stage_4b_exit_code(return_expr.value)?;
     Ok((return_expr.expr, evaluated_exit_code))
 }
 
@@ -399,7 +412,7 @@ fn validate_stage_3a_int_expr(
     }
 }
 
-fn validate_stage_4a_condition(
+fn validate_stage_4b_condition(
     expr: &Expr,
     local_values: &HashMap<String, i64>,
 ) -> Result<ValidatedNativeCondition, BackendError> {
@@ -408,13 +421,24 @@ fn validate_stage_4a_condition(
             condition: NativeCondition::Bool(*value),
             value: *value,
         }),
-        Expr::Grouped { expr, .. } => validate_stage_4a_condition(expr, local_values),
+        Expr::Grouped { expr, .. } => validate_stage_4b_condition(expr, local_values),
+        Expr::Unary {
+            op: UnaryOp::Not,
+            expr,
+            ..
+        } => {
+            let condition = validate_stage_4b_condition(expr, local_values)?;
+            Ok(ValidatedNativeCondition {
+                condition: NativeCondition::Not(Box::new(condition.condition)),
+                value: !condition.value,
+            })
+        }
         Expr::Binary {
             left, op, right, ..
         } if native_compare_op(op).is_some() => {
             let native_op = native_compare_op(op).expect("checked by guard");
-            let left = validate_stage_4a_comparison_operand(left, local_values)?;
-            let right = validate_stage_4a_comparison_operand(right, local_values)?;
+            let left = validate_stage_4b_comparison_operand(left, local_values)?;
+            let right = validate_stage_4b_comparison_operand(right, local_values)?;
             Ok(ValidatedNativeCondition {
                 condition: NativeCondition::Compare {
                     op: native_op,
@@ -424,14 +448,65 @@ fn validate_stage_4a_condition(
                 value: evaluate_native_compare(left.value, native_op, right.value),
             })
         }
+        Expr::Binary {
+            left,
+            op: BinaryOp::And,
+            right,
+            ..
+        } => {
+            let left = validate_stage_4b_condition(left, local_values)?;
+            let right = validate_stage_4b_condition(right, local_values)?;
+            let value = left.value && right.value;
+            Ok(ValidatedNativeCondition {
+                condition: NativeCondition::And {
+                    left: Box::new(left.condition),
+                    right: Box::new(right.condition),
+                },
+                value,
+            })
+        }
+        Expr::Binary {
+            left,
+            op: BinaryOp::Or,
+            right,
+            ..
+        } => {
+            let left = validate_stage_4b_condition(left, local_values)?;
+            let right = validate_stage_4b_condition(right, local_values)?;
+            let value = left.value || right.value;
+            Ok(ValidatedNativeCondition {
+                condition: NativeCondition::Or {
+                    left: Box::new(left.condition),
+                    right: Box::new(right.condition),
+                },
+                value,
+            })
+        }
+        Expr::Binary {
+            left,
+            op: BinaryOp::Xor,
+            right,
+            ..
+        } => {
+            let left = validate_stage_4b_condition(left, local_values)?;
+            let right = validate_stage_4b_condition(right, local_values)?;
+            let value = left.value ^ right.value;
+            Ok(ValidatedNativeCondition {
+                condition: NativeCondition::Xor {
+                    left: Box::new(left.condition),
+                    right: Box::new(right.condition),
+                },
+                value,
+            })
+        }
 
         _ => Err(BackendError::new(
-            "unsupported native condition for Stage 4a: expected bool literal or supported integer comparison",
+            "unsupported native condition for Stage 4b: expected bool literal, supported integer comparison, or supported boolean condition",
         )),
     }
 }
 
-fn validate_stage_4a_comparison_operand(
+fn validate_stage_4b_comparison_operand(
     expr: &Expr,
     local_values: &HashMap<String, i64>,
 ) -> Result<ValidatedNativeExpr, BackendError> {
@@ -440,7 +515,7 @@ fn validate_stage_4a_comparison_operand(
             error
         } else {
             BackendError::new(
-                "unsupported native comparison for Stage 4a: expected supported integer expressions",
+                "unsupported native comparison for Stage 4b: expected supported integer expressions",
             )
         }
     })
@@ -519,10 +594,10 @@ fn parse_doria_int_literal(value: &str) -> Result<i64, BackendError> {
         .map_err(|_| BackendError::new("integer literal is outside the Doria `int` range"))
 }
 
-fn parse_stage_4a_exit_code(value: i64) -> Result<i32, BackendError> {
+fn parse_stage_4b_exit_code(value: i64) -> Result<i32, BackendError> {
     if !(0..=125).contains(&value) {
         return Err(BackendError::new(
-            "native Stage 4a exit code must be in the range 0..125",
+            "native Stage 4b exit code must be in the range 0..125",
         ));
     }
 
@@ -536,7 +611,7 @@ fn generate_object(native_main: &NativeMain) -> Result<Vec<u8>, BackendError> {
         .finish(settings::Flags::new(settings::builder()))
         .map_err(|error| BackendError::new(format!("backend emission failure: {error}")))?;
     let mut module = ObjectModule::new(
-        ObjectBuilder::new(isa, "doria_stage_4a", default_libcall_names())
+        ObjectBuilder::new(isa, "doria_stage_4b", default_libcall_names())
             .map_err(|error| BackendError::new(format!("backend emission failure: {error}")))?,
     );
 
@@ -608,7 +683,6 @@ fn lower_native_terminator(
             else_expr,
             else_exit_code,
         } => {
-            let condition_value = lower_native_condition(builder, condition, lowered_local_values)?;
             let Some(evaluated_condition_value) =
                 evaluate_native_condition(condition, evaluated_local_values)
             else {
@@ -620,9 +694,13 @@ fn lower_native_terminator(
 
             let then_block = builder.create_block();
             let else_block = builder.create_block();
-            builder
-                .ins()
-                .brif(condition_value, then_block, &[], else_block, &[]);
+            lower_native_condition_branch(
+                builder,
+                condition,
+                then_block,
+                else_block,
+                lowered_local_values,
+            )?;
 
             builder.switch_to_block(then_block);
             builder.seal_block(then_block);
@@ -691,19 +769,88 @@ fn lower_native_expr(
     }
 }
 
-fn lower_native_condition(
+fn lower_native_condition_branch(
+    builder: &mut FunctionBuilder,
+    condition: &NativeCondition,
+    then_block: Block,
+    else_block: Block,
+    local_values: &HashMap<String, Value>,
+) -> Result<(), BackendError> {
+    match condition {
+        NativeCondition::Bool(value) => {
+            let value = builder.ins().iconst(types::I8, i64::from(*value));
+            builder.ins().brif(value, then_block, &[], else_block, &[]);
+            Ok(())
+        }
+        NativeCondition::Compare { op, left, right } => {
+            let left = lower_native_expr(builder, left, local_values)?;
+            let right = lower_native_expr(builder, right, local_values)?;
+            let condition = builder.ins().icmp(native_compare_intcc(*op), left, right);
+            builder
+                .ins()
+                .brif(condition, then_block, &[], else_block, &[]);
+            Ok(())
+        }
+        NativeCondition::Not(condition) => {
+            lower_native_condition_branch(builder, condition, else_block, then_block, local_values)
+        }
+        NativeCondition::And { left, right } => {
+            let right_block = builder.create_block();
+            lower_native_condition_branch(builder, left, right_block, else_block, local_values)?;
+
+            builder.switch_to_block(right_block);
+            builder.seal_block(right_block);
+            lower_native_condition_branch(builder, right, then_block, else_block, local_values)
+        }
+        NativeCondition::Or { left, right } => {
+            let right_block = builder.create_block();
+            lower_native_condition_branch(builder, left, then_block, right_block, local_values)?;
+
+            builder.switch_to_block(right_block);
+            builder.seal_block(right_block);
+            lower_native_condition_branch(builder, right, then_block, else_block, local_values)
+        }
+        NativeCondition::Xor { left, right } => {
+            let left = lower_native_condition_value(builder, left, local_values)?;
+            let right = lower_native_condition_value(builder, right, local_values)?;
+            let condition = builder.ins().icmp(IntCC::NotEqual, left, right);
+            builder
+                .ins()
+                .brif(condition, then_block, &[], else_block, &[]);
+            Ok(())
+        }
+    }
+}
+
+fn lower_native_condition_value(
     builder: &mut FunctionBuilder,
     condition: &NativeCondition,
     local_values: &HashMap<String, Value>,
 ) -> Result<Value, BackendError> {
-    match condition {
-        NativeCondition::Bool(value) => Ok(builder.ins().iconst(types::I8, i64::from(*value))),
-        NativeCondition::Compare { op, left, right } => {
-            let left = lower_native_expr(builder, left, local_values)?;
-            let right = lower_native_expr(builder, right, local_values)?;
-            Ok(builder.ins().icmp(native_compare_intcc(*op), left, right))
-        }
-    }
+    let true_block = builder.create_block();
+    let false_block = builder.create_block();
+    let done_block = builder.create_block();
+    builder.append_block_param(done_block, types::I8);
+
+    lower_native_condition_branch(builder, condition, true_block, false_block, local_values)?;
+
+    builder.switch_to_block(true_block);
+    builder.seal_block(true_block);
+    let true_value = builder.ins().iconst(types::I8, 1);
+    builder
+        .ins()
+        .jump(done_block, &[BlockArg::Value(true_value)]);
+
+    builder.switch_to_block(false_block);
+    builder.seal_block(false_block);
+    let false_value = builder.ins().iconst(types::I8, 0);
+    builder
+        .ins()
+        .jump(done_block, &[BlockArg::Value(false_value)]);
+
+    builder.switch_to_block(done_block);
+    builder.seal_block(done_block);
+    Ok(builder.block_params(done_block)[0])
 }
 
 fn native_compare_intcc(op: NativeCompareOp) -> IntCC {
@@ -740,6 +887,27 @@ fn evaluate_native_condition(
             *op,
             evaluate_native_expr(right, local_values)?,
         )),
+        NativeCondition::Not(condition) => {
+            Some(!evaluate_native_condition(condition, local_values)?)
+        }
+        NativeCondition::And { left, right } => {
+            if !evaluate_native_condition(left, local_values)? {
+                Some(false)
+            } else {
+                evaluate_native_condition(right, local_values)
+            }
+        }
+        NativeCondition::Or { left, right } => {
+            if evaluate_native_condition(left, local_values)? {
+                Some(true)
+            } else {
+                evaluate_native_condition(right, local_values)
+            }
+        }
+        NativeCondition::Xor { left, right } => Some(
+            evaluate_native_condition(left, local_values)?
+                ^ evaluate_native_condition(right, local_values)?,
+        ),
     }
 }
 
@@ -766,7 +934,7 @@ fn link_object(object_bytes: &[u8]) -> Result<Vec<u8>, BackendError> {
 }
 
 fn invoke_linker(object_path: &Path, executable_path: &Path) -> Result<(), BackendError> {
-    // Stage 4a emits a Cranelift object file and asks the host toolchain to
+    // Stage 4b emits a Cranelift object file and asks the host toolchain to
     // link it. This is not a C backend: Doria never generates C source or uses
     // C semantics as an oracle here.
     let cc_is_set = env::var_os("CC").is_some();
@@ -863,7 +1031,7 @@ fn linker_arguments(
 ) -> Vec<OsString> {
     if windows && (!cc_is_set || is_msvc_style_compiler_driver(linker)) {
         // Cranelift-generated objects do not carry MSVC /DEFAULTLIB directives.
-        // For Stage 4a's tiny main, make Doria's main the executable entrypoint
+        // For Stage 4b's tiny main, make Doria's main the executable entrypoint
         // instead of relying on CRT startup to discover and call it.
         return vec![
             OsString::from("/nologo"),
@@ -933,7 +1101,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn stage_4a_validation_preserves_return_expression_structure_for_codegen() {
+    fn stage_4b_validation_preserves_return_expression_structure_for_codegen() {
         let program = crate::lower_source(
             "stage3a.doria",
             r#"
@@ -947,7 +1115,7 @@ function main(): int
         )
         .expect("source should lower to HIR");
 
-        let native_main = validate_stage_4a(&program).expect("source should validate for Stage 4a");
+        let native_main = validate_stage_4b(&program).expect("source should validate for Stage 4b");
 
         assert_eq!(native_main.evaluated_exit_code, 42);
         assert_eq!(native_main.locals.len(), 2);
@@ -972,7 +1140,7 @@ function main(): int
     }
 
     #[test]
-    fn stage_4a_validation_preserves_if_else_structure_for_codegen() {
+    fn stage_4b_validation_preserves_if_else_structure_for_codegen() {
         let program = crate::lower_source(
             "stage4a.doria",
             r#"
@@ -991,7 +1159,7 @@ function main(): int
         )
         .expect("source should lower to HIR");
 
-        let native_main = validate_stage_4a(&program).expect("source should validate for Stage 4a");
+        let native_main = validate_stage_4b(&program).expect("source should validate for Stage 4b");
 
         assert_eq!(native_main.evaluated_exit_code, 42);
         assert_eq!(native_main.locals.len(), 2);
@@ -1017,7 +1185,7 @@ function main(): int
     }
 
     #[test]
-    fn stage_4a_validation_preserves_guard_if_structure_for_codegen() {
+    fn stage_4b_validation_preserves_guard_if_structure_for_codegen() {
         let program = crate::lower_source(
             "stage4a_guard.doria",
             r#"
@@ -1036,7 +1204,7 @@ function main(): int
         )
         .expect("source should lower to HIR");
 
-        let native_main = validate_stage_4a(&program).expect("source should validate for Stage 4a");
+        let native_main = validate_stage_4b(&program).expect("source should validate for Stage 4b");
 
         assert_eq!(native_main.evaluated_exit_code, 42);
         assert_eq!(native_main.locals.len(), 2);
@@ -1051,6 +1219,53 @@ function main(): int
                         right: Box::new(NativeExpr::Local("right".to_string())),
                     },
                     right: NativeExpr::Int(42),
+                },
+                evaluated_condition: true,
+                then_expr: NativeExpr::Int(42),
+                then_exit_code: 42,
+                else_expr: NativeExpr::Int(0),
+                else_exit_code: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn stage_4b_validation_preserves_boolean_condition_structure_for_codegen() {
+        let program = crate::lower_source(
+            "stage4b_boolean_condition.doria",
+            r#"
+function main(): int
+{
+    let $left = 20;
+    let $right = 22;
+
+    if (($left + $right == 42) and not false) {
+        return 42;
+    }
+
+    return 0;
+}
+"#,
+        )
+        .expect("source should lower to HIR");
+
+        let native_main = validate_stage_4b(&program).expect("source should validate for Stage 4b");
+
+        assert_eq!(native_main.evaluated_exit_code, 42);
+        assert_eq!(
+            native_main.terminator,
+            NativeTerminator::IfElse {
+                condition: NativeCondition::And {
+                    left: Box::new(NativeCondition::Compare {
+                        op: NativeCompareOp::Equal,
+                        left: NativeExpr::Binary {
+                            op: NativeBinaryOp::Add,
+                            left: Box::new(NativeExpr::Local("left".to_string())),
+                            right: Box::new(NativeExpr::Local("right".to_string())),
+                        },
+                        right: NativeExpr::Int(42),
+                    }),
+                    right: Box::new(NativeCondition::Not(Box::new(NativeCondition::Bool(false)))),
                 },
                 evaluated_condition: true,
                 then_expr: NativeExpr::Int(42),

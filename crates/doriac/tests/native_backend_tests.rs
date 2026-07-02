@@ -112,6 +112,58 @@ fn compiles_and_runs_stage_2d_native_smoke_examples() {
             "inline_main_if_large_local.doria",
             42,
         ),
+        (
+            "main_boolean_condition_42",
+            "examples/native/main_boolean_condition_42.doria",
+            42,
+        ),
+        ("main_if_not_false", "inline_main_if_not_false.doria", 42),
+        ("main_if_bang_false", "inline_main_if_bang_false.doria", 42),
+        (
+            "main_if_true_and_true",
+            "inline_main_if_true_and_true.doria",
+            42,
+        ),
+        (
+            "main_if_true_symbol_and_true",
+            "inline_main_if_true_symbol_and_true.doria",
+            42,
+        ),
+        (
+            "main_if_false_or_true",
+            "inline_main_if_false_or_true.doria",
+            42,
+        ),
+        (
+            "main_if_false_symbol_or_true",
+            "inline_main_if_false_symbol_or_true.doria",
+            42,
+        ),
+        (
+            "main_if_true_xor_false",
+            "inline_main_if_true_xor_false.doria",
+            42,
+        ),
+        (
+            "main_if_comparison_and_comparison",
+            "inline_main_if_comparison_and_comparison.doria",
+            42,
+        ),
+        (
+            "main_if_comparison_or_false",
+            "inline_main_if_comparison_or_false.doria",
+            42,
+        ),
+        (
+            "main_if_comparison_xor_comparison",
+            "inline_main_if_comparison_xor_comparison.doria",
+            42,
+        ),
+        (
+            "main_terminal_if_else_false_or_true",
+            "inline_main_terminal_if_else_false_or_true.doria",
+            42,
+        ),
     ];
 
     for (stem, source, expected_code) in cases {
@@ -301,6 +353,147 @@ function main(): int
 }
 "#
         }
+        "main_if_not_false" => {
+            r#"
+function main(): int
+{
+    if (not false) {
+        return 42;
+    }
+
+    return 0;
+}
+"#
+        }
+        "main_if_bang_false" => {
+            r#"
+function main(): int
+{
+    if (!false) {
+        return 42;
+    }
+
+    return 0;
+}
+"#
+        }
+        "main_if_true_and_true" => {
+            r#"
+function main(): int
+{
+    if (true and true) {
+        return 42;
+    }
+
+    return 0;
+}
+"#
+        }
+        "main_if_true_symbol_and_true" => {
+            r#"
+function main(): int
+{
+    if (true && true) {
+        return 42;
+    }
+
+    return 0;
+}
+"#
+        }
+        "main_if_false_or_true" => {
+            r#"
+function main(): int
+{
+    if (false or true) {
+        return 42;
+    }
+
+    return 0;
+}
+"#
+        }
+        "main_if_false_symbol_or_true" => {
+            r#"
+function main(): int
+{
+    if (false || true) {
+        return 42;
+    }
+
+    return 0;
+}
+"#
+        }
+        "main_if_true_xor_false" => {
+            r#"
+function main(): int
+{
+    if (true xor false) {
+        return 42;
+    }
+
+    return 0;
+}
+"#
+        }
+        "main_if_comparison_and_comparison" => {
+            r#"
+function main(): int
+{
+    let $left = 20;
+    let $right = 22;
+
+    if (($left == 20) and ($right == 22)) {
+        return 42;
+    }
+
+    return 0;
+}
+"#
+        }
+        "main_if_comparison_or_false" => {
+            r#"
+function main(): int
+{
+    let $left = 20;
+    let $right = 22;
+
+    if (($left + $right == 42) or false) {
+        return 42;
+    }
+
+    return 0;
+}
+"#
+        }
+        "main_if_comparison_xor_comparison" => {
+            r#"
+function main(): int
+{
+    let $left = 20;
+    let $right = 22;
+
+    if (($left == 20) xor ($right == 20)) {
+        return 42;
+    }
+
+    return 0;
+}
+"#
+        }
+        "main_terminal_if_else_false_or_true" => {
+            r#"
+function main(): int
+{
+    if (false or true) {
+        return 42;
+    } else {
+        return 0;
+    }
+}
+"#
+        }
         _ => unreachable!("unexpected inline native smoke source `{stem}`"),
     }
 }
@@ -340,7 +533,7 @@ function main(): int
 }
 "#,
             "B0001",
-            "native Stage 4a exit code must be in the range 0..125",
+            "native Stage 4b exit code must be in the range 0..125",
         ),
         (
             "return 255",
@@ -351,7 +544,7 @@ function main(): int
 }
 "#,
             "B0001",
-            "native Stage 4a exit code must be in the range 0..125",
+            "native Stage 4b exit code must be in the range 0..125",
         ),
         (
             "return out of Doria int range",
@@ -407,7 +600,7 @@ function main(): int
 }
 "#,
             "B0001",
-            "native Stage 4a exit code must be in the range 0..125",
+            "native Stage 4b exit code must be in the range 0..125",
         ),
         (
             "return arithmetic outside exit-code range",
@@ -418,7 +611,7 @@ function main(): int
 }
 "#,
             "B0001",
-            "native Stage 4a exit code must be in the range 0..125",
+            "native Stage 4b exit code must be in the range 0..125",
         ),
         (
             "returned arithmetic local outside exit-code range",
@@ -430,7 +623,7 @@ function main(): int
 }
 "#,
             "B0001",
-            "native Stage 4a exit code must be in the range 0..125",
+            "native Stage 4b exit code must be in the range 0..125",
         ),
         (
             "writable local",
@@ -581,7 +774,7 @@ function main(): int
 }
 "#,
             "B0001",
-            "native Stage 4a exit code must be in the range 0..125",
+            "native Stage 4b exit code must be in the range 0..125",
         ),
         (
             "if else branch outside exit-code range",
@@ -596,7 +789,7 @@ function main(): int
 }
 "#,
             "B0001",
-            "native Stage 4a exit code must be in the range 0..125",
+            "native Stage 4b exit code must be in the range 0..125",
         ),
         (
             "guard if branch outside exit-code range",
@@ -611,7 +804,22 @@ function main(): int
 }
 "#,
             "B0001",
-            "native Stage 4a exit code must be in the range 0..125",
+            "native Stage 4b exit code must be in the range 0..125",
+        ),
+        (
+            "logical if branch outside exit-code range",
+            r#"
+function main(): int
+{
+    if (true and true) {
+        return 126;
+    }
+
+    return 0;
+}
+"#,
+            "B0001",
+            "native Stage 4b exit code must be in the range 0..125",
         ),
         (
             "if integer condition",
@@ -644,34 +852,34 @@ function main(): int
             "condition must be `bool`",
         ),
         (
-            "if unary not condition unsupported by native",
+            "if logical condition has non-bool operand",
             r#"
 function main(): int
 {
-    if (not true) {
+    if (1 and true) {
         return 42;
-    } else {
-        return 0;
     }
+
+    return 0;
 }
 "#,
-            "B0001",
-            "unsupported native condition",
+            "E0419",
+            "requires `bool` operands",
         ),
         (
-            "if logical word condition unsupported by native",
+            "if ambiguous xor condition",
             r#"
 function main(): int
 {
-    if (true and false) {
+    if (true xor false or true) {
         return 42;
-    } else {
-        return 0;
     }
+
+    return 0;
 }
 "#,
-            "B0001",
-            "unsupported native condition",
+            "P0001",
+            "ambiguous `xor`",
         ),
         (
             "if condition division",
@@ -689,6 +897,21 @@ function main(): int
             "unsupported native arithmetic operator for Stage 2d",
         ),
         (
+            "if call condition",
+            r#"
+function main(): int
+{
+    if (isReady()) {
+        return 42;
+    }
+
+    return 0;
+}
+"#,
+            "E0309",
+            "unknown function `isReady`",
+        ),
+        (
             "if branch local declaration",
             r#"
 function main(): int
@@ -702,7 +925,7 @@ function main(): int
 }
 "#,
             "B0001",
-            "unsupported native branch for Stage 4a",
+            "unsupported native branch for Stage 4b",
         ),
         (
             "if without fallback return",
@@ -749,7 +972,7 @@ function main(): int
 }
 "#,
             "B0001",
-            "unsupported native statement for Stage 4a",
+            "unsupported native statement for Stage 4b",
         ),
         (
             "echo",
