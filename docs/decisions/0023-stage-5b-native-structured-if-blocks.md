@@ -2,6 +2,8 @@
 
 Status: Accepted
 
+Decision 0024 extends this native smoke subset with Stage 6a bounded `while` loops whose assignment-only bodies are proven to terminate within the current native smoke verification cap. This decision remains the accepted record for Stage 5b structured `if` blocks.
+
 ## Decision
 
 Stage 5b extends the current Cranelift native smoke backend from single-return branch bodies to structured native blocks.
