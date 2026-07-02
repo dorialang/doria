@@ -1546,7 +1546,7 @@ class Person
 
     function __construct(string $givenId)
     {
-        $this->id = $givenId;
+        ($this)->id = $givenId;
     }
 }
 

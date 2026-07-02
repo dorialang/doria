@@ -32,10 +32,27 @@ echo true xor false;
     )
     .expect("compilation should succeed");
 
-    assert!(php.contains("echo (true && false);"));
-    assert!(php.contains("echo (false || true);"));
+    assert!(php.contains("echo ((true) && (false));"));
+    assert!(php.contains("echo ((false) || (true));"));
     assert!(php.contains("echo !(false);"));
     assert!(php.contains("echo ((true) !== (false));"));
+}
+
+#[test]
+fn parenthesizes_logical_operands_for_php() {
+    let php = doriac::compile_source_to_php(
+        "test.doria",
+        r#"
+echo true and null ?? true;
+echo false or null ?? true;
+"#,
+    )
+    .expect("compilation should succeed");
+
+    assert!(php.contains("echo ((true) && (null ?? true));"));
+    assert!(php.contains("echo ((false) || (null ?? true));"));
+    assert!(!php.contains("true && null ?? true"));
+    assert!(!php.contains("false || null ?? true"));
 }
 
 #[test]
@@ -133,6 +150,36 @@ while ($count < 10) {
         hir::Item::Statement(hir::Stmt::While(while_stmt))
             if matches!(while_stmt.condition, hir::Expr::Binary { .. })
     ));
+}
+
+#[test]
+fn omits_grouping_around_assignment_targets_for_php() {
+    let php = doriac::compile_source_to_php(
+        "test.doria",
+        r#"
+let writable $count = 0;
+($count) = 1;
+
+class Person
+{
+    writable string $name;
+
+    function __construct(string $initial)
+    {
+        $this->name = $initial;
+    }
+}
+
+let writable $person = new Person("Ada");
+($person->name) = "Lucy";
+"#,
+    )
+    .expect("compilation should succeed");
+
+    assert!(php.contains("$count = 1;"));
+    assert!(php.contains("$person->name = \"Lucy\";"));
+    assert!(!php.contains("($count) = 1;"));
+    assert!(!php.contains("($person->name) = \"Lucy\";"));
 }
 
 #[test]

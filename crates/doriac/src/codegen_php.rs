@@ -211,7 +211,7 @@ fn emit_statement(
                 indent,
                 &format!(
                     "{} {} {};",
-                    emit_expr(&assignment.target, scopes),
+                    emit_assignment_target(&assignment.target, scopes),
                     op,
                     emit_expr(&assignment.value, scopes)
                 ),
@@ -247,6 +247,13 @@ fn emit_statement(
         Stmt::Expr { expr, .. } => {
             writeln(output, indent, &format!("{};", emit_expr(expr, scopes)));
         }
+    }
+}
+
+fn emit_assignment_target(expr: &Expr, scopes: &PhpNameScopes) -> String {
+    match expr {
+        Expr::Grouped { expr, .. } => emit_assignment_target(expr, scopes),
+        _ => emit_expr(expr, scopes),
     }
 }
 
@@ -393,12 +400,12 @@ fn emit_expr(expr: &Expr, scopes: &PhpNameScopes) -> String {
             left, op, right, ..
         } => match op {
             BinaryOp::And => format!(
-                "({} && {})",
+                "(({}) && ({}))",
                 emit_expr(left, scopes),
                 emit_expr(right, scopes)
             ),
             BinaryOp::Or => format!(
-                "({} || {})",
+                "(({}) || ({}))",
                 emit_expr(left, scopes),
                 emit_expr(right, scopes)
             ),
