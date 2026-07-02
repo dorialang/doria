@@ -260,6 +260,11 @@ fn compiles_and_runs_current_native_smoke_examples() {
             "inline_main_while_local_above_exit_boundary_returns_zero.doria",
             0,
         ),
+        (
+            "main_while_rhs_uses_ordered_body_state",
+            "inline_main_while_rhs_uses_ordered_body_state.doria",
+            42,
+        ),
     ];
 
     for (stem, source, expected_code) in cases {
@@ -829,6 +834,24 @@ function main(): int
 
     while ($code > 0) {
         $code -= 42;
+    }
+
+    return $code;
+}
+"#
+        }
+        "main_while_rhs_uses_ordered_body_state" => {
+            r#"
+function main(): int
+{
+    let writable $code = 0;
+    let writable $x = 3037000500;
+
+    while ($code == 0) {
+        $x -= 1;
+        $x = $x * $x;
+        $x = 0;
+        $code = 42;
     }
 
     return $code;

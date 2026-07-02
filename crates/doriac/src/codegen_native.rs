@@ -568,7 +568,7 @@ fn validate_stage_6a_loop_assignment(
         )));
     }
 
-    let value = validate_stage_6a_int_expr(&assignment.value, local_states)?;
+    let value = validate_stage_6a_loop_int_expr(&assignment.value, local_states)?;
     Ok(NativeLoopAssign {
         target: name.clone(),
         op: match assignment.op {
@@ -576,8 +576,47 @@ fn validate_stage_6a_loop_assignment(
             AssignOp::AddAssign => NativeAssignOp::AddAssign,
             AssignOp::SubAssign => NativeAssignOp::SubAssign,
         },
-        expr: value.expr,
+        expr: value,
     })
+}
+
+fn validate_stage_6a_loop_int_expr(
+    expr: &Expr,
+    local_states: &HashMap<String, NativeLocalState>,
+) -> Result<NativeExpr, BackendError> {
+    match expr {
+        Expr::Int { value, .. } => Ok(NativeExpr::Int(parse_doria_int_literal(value)?)),
+        Expr::Variable { name, .. } => {
+            if !local_states.contains_key(name) {
+                return Err(BackendError::new(
+                    "unsupported native expression for Stage 6a: expected integer literal, supported integer local, or supported integer arithmetic",
+                ));
+            }
+
+            Ok(NativeExpr::Local(name.clone()))
+        }
+        Expr::Grouped { expr, .. } => validate_stage_6a_loop_int_expr(expr, local_states),
+        Expr::Binary {
+            left, op, right, ..
+        } if native_binary_op(op).is_some() => {
+            let native_op = native_binary_op(op).expect("checked by guard");
+            Ok(NativeExpr::Binary {
+                op: native_op,
+                left: Box::new(validate_stage_6a_loop_int_expr(left, local_states)?),
+                right: Box::new(validate_stage_6a_loop_int_expr(right, local_states)?),
+            })
+        }
+        Expr::Binary {
+            op: BinaryOp::Div | BinaryOp::Mod,
+            ..
+        } => Err(BackendError::new(
+            "unsupported native arithmetic operator for Stage 6a",
+        )),
+        other => Err(BackendError::new(format!(
+            "unsupported native expression for Stage 6a: expected integer literal, supported integer local, or supported integer arithmetic, found `{}`",
+            describe_expression(other)
+        ))),
+    }
 }
 
 fn native_state_values(local_states: &HashMap<String, NativeLocalState>) -> HashMap<String, i64> {
