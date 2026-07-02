@@ -2,7 +2,7 @@
 
 Status: Accepted
 
-Decision 0022 extends the current native smoke subset with Stage 5a direct-body writable integer locals and direct-body integer assignments. This decision remains the accepted record for Stage 4b boolean condition support.
+Decisions 0022 and 0023 extend the native smoke subset with writable integer locals, writable integer assignments, and structured returning `if` blocks. This decision remains the accepted record for Stage 4b boolean condition support.
 
 ## Decision
 

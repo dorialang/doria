@@ -18,16 +18,21 @@ use crate::backend::BackendError;
 use crate::hir::{self, AssignOp, BinaryOp, ElseBranch, Expr, Item, Stmt, UnaryOp};
 
 pub fn generate_executable(program: &hir::Program) -> Result<Vec<u8>, BackendError> {
-    let native_main = validate_stage_5a(program)?;
+    let native_main = validate_stage_5b(program)?;
     let object_bytes = generate_object(&native_main)?;
     link_object(&object_bytes)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct NativeMain {
-    prelude: Vec<NativeStmt>,
-    terminator: NativeTerminator,
+    body: NativeBlock,
     evaluated_exit_code: i32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NativeBlock {
+    statements: Vec<NativeStmt>,
+    terminator: NativeTerminator,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -86,10 +91,14 @@ enum NativeTerminator {
     IfElse {
         condition: NativeCondition,
         evaluated_condition: bool,
-        then_expr: NativeExpr,
-        then_exit_code: i32,
-        else_expr: NativeExpr,
-        else_exit_code: i32,
+        then_block: Box<NativeBlock>,
+        else_block: Box<NativeBlock>,
+    },
+    Guard {
+        condition: NativeCondition,
+        evaluated_condition: bool,
+        then_block: Box<NativeBlock>,
+        fallback: Box<NativeBlock>,
     },
 }
 
@@ -147,10 +156,10 @@ struct NativeLocalState {
 // Historical helper retained for existing callers; it validates against the
 // current native smoke backend.
 pub fn validate_stage_2d(program: &hir::Program) -> Result<i32, BackendError> {
-    Ok(validate_stage_5a(program)?.evaluated_exit_code)
+    Ok(validate_stage_5b(program)?.evaluated_exit_code)
 }
 
-fn validate_stage_5a(program: &hir::Program) -> Result<NativeMain, BackendError> {
+fn validate_stage_5b(program: &hir::Program) -> Result<NativeMain, BackendError> {
     let mut main_functions = Vec::new();
 
     for item in &program.items {
@@ -182,17 +191,17 @@ fn validate_stage_5a(program: &hir::Program) -> Result<NativeMain, BackendError>
     let [main] = main_functions.as_slice() else {
         return Err(match main_functions.len() {
             0 => BackendError::new(
-                "no native entrypoint found; native Stage 5a output requires exactly one top-level `function main(): int`",
+                "no native entrypoint found; native Stage 5b output requires exactly one top-level `function main(): int`",
             ),
             _ => BackendError::new(
-                "multiple native entrypoints found; native Stage 5a output requires exactly one top-level `function main(): int`",
+                "multiple native entrypoints found; native Stage 5b output requires exactly one top-level `function main(): int`",
             ),
         });
     };
 
     if !main.params.is_empty() {
         return Err(BackendError::new(
-            "wrong main signature for native Stage 5a: `main` must not declare parameters",
+            "wrong main signature for native Stage 5b: `main` must not declare parameters",
         ));
     }
 
@@ -201,109 +210,115 @@ fn validate_stage_5a(program: &hir::Program) -> Result<NativeMain, BackendError>
         Some(return_type) if return_type.name == "int" && return_type.args.is_empty()
     ) {
         return Err(BackendError::new(
-            "wrong main signature for native Stage 5a: expected `function main(): int`",
+            "wrong main signature for native Stage 5b: expected `function main(): int`",
         ));
     }
 
-    let mut local_states = HashMap::new();
-    let mut prelude = Vec::new();
+    let body = validate_stage_5b_block(&main.body.statements, &HashMap::new())?;
+    let evaluated_exit_code = evaluate_native_block_exit_code(&body);
+    Ok(NativeMain {
+        body,
+        evaluated_exit_code,
+    })
+}
 
+fn validate_stage_5b_block(
+    statements: &[Stmt],
+    local_states: &HashMap<String, NativeLocalState>,
+) -> Result<NativeBlock, BackendError> {
+    let mut block_states = local_states.clone();
+    let mut native_statements = Vec::new();
     let mut terminal_index = 0;
-    while let Some(statement) = main.body.statements.get(terminal_index) {
+
+    while let Some(statement) = statements.get(terminal_index) {
         match statement {
             Stmt::VarDecl(decl) => {
-                let local = validate_stage_5a_local(decl, &local_states)?;
-                local_states.insert(
+                let local = validate_stage_5b_local(decl, &block_states)?;
+                block_states.insert(
                     local.name.clone(),
                     NativeLocalState {
                         writable: local.writable,
                         value: local.evaluated_value,
                     },
                 );
-                prelude.push(NativeStmt::Local(local));
+                native_statements.push(NativeStmt::Local(local));
                 terminal_index += 1;
             }
             Stmt::Assignment(assignment) => {
-                let assignment = validate_stage_5a_assignment(assignment, &local_states)?;
-                let Some(state) = local_states.get_mut(&assignment.target) else {
+                let assignment = validate_stage_5b_assignment(assignment, &block_states)?;
+                let Some(state) = block_states.get_mut(&assignment.target) else {
                     return Err(BackendError::new(
                         "backend validation failure: validated native assignment target was not declared",
                     ));
                 };
                 state.value = assignment.evaluated_value;
-                prelude.push(NativeStmt::Assign(assignment));
+                native_statements.push(NativeStmt::Assign(assignment));
                 terminal_index += 1;
             }
             _ => break,
         }
     }
 
-    let terminator = validate_stage_5a_statement_sequence(
-        &main.body.statements[terminal_index..],
-        &local_states,
-    )?;
-    let evaluated_exit_code = evaluate_native_terminator_exit_code(&terminator);
-    Ok(NativeMain {
-        prelude,
+    let terminator =
+        validate_stage_5b_statement_sequence(&statements[terminal_index..], &block_states)?;
+
+    Ok(NativeBlock {
+        statements: native_statements,
         terminator,
-        evaluated_exit_code,
     })
 }
 
-fn validate_stage_5a_statement_sequence(
+fn validate_stage_5b_statement_sequence(
     statements: &[Stmt],
     local_states: &HashMap<String, NativeLocalState>,
 ) -> Result<NativeTerminator, BackendError> {
     match statements {
         [] => Err(BackendError::new(
-            "unsupported native terminal statement for Stage 5a: expected final return, terminal if/else, or guard if followed by fallback return",
+            "unsupported native block for Stage 5b: expected supported local declarations or assignments followed by a return, terminal if/else, or guard if with fallback",
         )),
-        [statement] => validate_stage_5a_terminator(statement, local_states),
-        [
-            Stmt::If(if_stmt),
-            Stmt::Return {
-                expr: Some(fallback_expr),
-                ..
-            },
-        ] if if_stmt.else_branch.is_none() => {
-            validate_stage_5a_guard_return(if_stmt, fallback_expr, local_states)
+        [statement] => validate_stage_5b_terminator(statement, local_states),
+        [Stmt::If(if_stmt), rest @ ..] if if_stmt.else_branch.is_none() => {
+            validate_stage_5b_guard(if_stmt, rest, local_states)
         }
         [Stmt::If(if_stmt), _] if if_stmt.else_branch.is_some() => {
             Err(BackendError::new(
-                "unsupported statement after native terminator for Stage 5a: no statements may follow a terminal if/else",
+                "unsupported statement after native terminator for Stage 5b: no statements may follow a terminal if/else",
             ))
         }
         [Stmt::Return { .. }, ..] => Err(BackendError::new(
-            "unsupported statement after native terminator for Stage 5a: no statements may follow a final return",
+            "unsupported statement after native terminator for Stage 5b: no statements may follow a final return",
         )),
         [first, ..] => Err(BackendError::new(format!(
-            "unsupported native statement for Stage 5a: expected supported direct-body local declaration, direct-body assignment, final return, terminal if/else, or guard if followed by fallback return, found {}",
+            "unsupported native statement for Stage 5b: expected supported block local declaration, block assignment, final return, terminal if/else, or guard if followed by fallback block, found {}",
             describe_statement(first)
         ))),
     }
 }
 
-fn validate_stage_5a_guard_return(
+fn validate_stage_5b_guard(
     if_stmt: &hir::IfStmt,
-    fallback_expr: &Expr,
+    fallback_statements: &[Stmt],
     local_states: &HashMap<String, NativeLocalState>,
 ) -> Result<NativeTerminator, BackendError> {
-    let condition = validate_stage_5a_condition(&if_stmt.condition, local_states)?;
-    let (then_expr, then_exit_code) =
-        validate_stage_5a_branch(&if_stmt.then_block.statements, local_states)?;
-    let (else_expr, else_exit_code) = validate_stage_5a_return_expr(fallback_expr, local_states)?;
+    if fallback_statements.is_empty() {
+        return Err(BackendError::new(
+            "unsupported native branch fallthrough for Stage 5b: guard `if` without `else` requires a supported fallback block",
+        ));
+    }
 
-    Ok(NativeTerminator::IfElse {
+    let condition = validate_stage_5b_condition(&if_stmt.condition, local_states)?;
+    let then_block = validate_stage_5b_branch(&if_stmt.then_block.statements, local_states)?;
+    let fallback = validate_stage_5b_block(fallback_statements, local_states)?;
+
+    Ok(NativeTerminator::Guard {
         condition: condition.condition,
         evaluated_condition: condition.value,
-        then_expr,
-        then_exit_code,
-        else_expr,
-        else_exit_code,
+        then_block: Box::new(then_block),
+        fallback: Box::new(fallback),
     })
 }
 
-fn validate_stage_5a_local(
+fn validate_stage_5b_local(
     decl: &hir::VarDecl,
     local_states: &HashMap<String, NativeLocalState>,
 ) -> Result<NativeLocal, BackendError> {
@@ -314,7 +329,7 @@ fn validate_stage_5a_local(
     }
 
     let initializer =
-        validate_stage_5a_int_expr(&decl.initializer, local_states).map_err(|error| {
+        validate_stage_5b_int_expr(&decl.initializer, local_states).map_err(|error| {
             if should_preserve_native_expression_error(&error.message) {
                 error
             } else {
@@ -335,29 +350,29 @@ fn unsupported_current_native_local() -> BackendError {
     )
 }
 
-fn validate_stage_5a_assignment(
+fn validate_stage_5b_assignment(
     assignment: &hir::Assignment,
     local_states: &HashMap<String, NativeLocalState>,
 ) -> Result<NativeAssign, BackendError> {
     let Expr::Variable { name, .. } = &assignment.target else {
         return Err(BackendError::new(
-            "unsupported native assignment target for Stage 5a: expected writable `int` local",
+            "unsupported native assignment target for Stage 5b: expected writable `int` local",
         ));
     };
 
     let Some(target) = local_states.get(name) else {
         return Err(BackendError::new(format!(
-            "unsupported native assignment target for Stage 5a: undeclared local `${name}`"
+            "unsupported native assignment target for Stage 5b: undeclared local `${name}`"
         )));
     };
 
     if !target.writable {
         return Err(BackendError::new(format!(
-            "unsupported native assignment to readonly local for Stage 5a: `${name}`"
+            "unsupported native assignment to readonly local for Stage 5b: `${name}`"
         )));
     }
 
-    let value = validate_stage_5a_int_expr(&assignment.value, local_states)?;
+    let value = validate_stage_5b_int_expr(&assignment.value, local_states)?;
     let (op, evaluated_value) = match assignment.op {
         AssignOp::Assign => (NativeAssignOp::Assign, value.value),
         AssignOp::AddAssign => (
@@ -383,83 +398,98 @@ fn validate_stage_5a_assignment(
     })
 }
 
-fn validate_stage_5a_terminator(
+fn validate_stage_5b_terminator(
     statement: &Stmt,
     local_states: &HashMap<String, NativeLocalState>,
 ) -> Result<NativeTerminator, BackendError> {
     match statement {
         Stmt::Return { expr: Some(expr), .. } => {
-            let (expr, evaluated_exit_code) = validate_stage_5a_return_expr(expr, local_states)?;
+            let (expr, evaluated_exit_code) = validate_stage_5b_return_expr(expr, local_states)?;
             Ok(NativeTerminator::Return {
                 expr,
                 evaluated_exit_code,
             })
         }
         Stmt::Return { expr: None, .. } => Err(BackendError::new(
-            "unsupported native terminal statement for Stage 5a: expected `return <portable integer expression>;`, found bare `return;`",
+            "unsupported native terminal statement for Stage 5b: expected `return <portable integer expression>;`, found bare `return;`",
         )),
         Stmt::If(if_stmt) => {
-            let condition = validate_stage_5a_condition(&if_stmt.condition, local_states)?;
-            let (then_expr, then_exit_code) =
-                validate_stage_5a_branch(&if_stmt.then_block.statements, local_states)?;
+            let condition = validate_stage_5b_condition(&if_stmt.condition, local_states)?;
+            let then_block = validate_stage_5b_branch(&if_stmt.then_block.statements, local_states)?;
 
             let Some(else_branch) = &if_stmt.else_branch else {
                 return Err(BackendError::new(
-                    "unsupported native terminal if for Stage 5a: terminal if requires else; guard if without else is supported only when followed by a fallback return",
+                    "unsupported native terminal if for Stage 5b: terminal if requires else; guard if without else is supported only when followed by a fallback return",
                 ));
             };
 
-            let ElseBranch::Block(else_block) = else_branch else {
-                return Err(BackendError::new(
-                    "unsupported native terminal statement for Stage 5a: else-if is not supported",
-                ));
+            let else_block = match else_branch {
+                ElseBranch::Block(else_block) => {
+                    validate_stage_5b_branch(&else_block.statements, local_states)?
+                }
+                ElseBranch::If(else_if) => validate_stage_5b_if_as_block(else_if, local_states)?,
             };
-
-            let (else_expr, else_exit_code) =
-                validate_stage_5a_branch(&else_block.statements, local_states)?;
 
             Ok(NativeTerminator::IfElse {
                 condition: condition.condition,
                 evaluated_condition: condition.value,
-                then_expr,
-                then_exit_code,
-                else_expr,
-                else_exit_code,
+                then_block: Box::new(then_block),
+                else_block: Box::new(else_block),
             })
         }
         other => Err(BackendError::new(format!(
-            "unsupported native terminal statement for Stage 5a: expected final return or terminal if/else, found {}",
+            "unsupported native terminal statement for Stage 5b: expected final return or terminal if/else, found {}",
             describe_statement(other)
         ))),
     }
 }
 
-fn validate_stage_5a_branch(
+fn validate_stage_5b_branch(
     statements: &[Stmt],
     local_states: &HashMap<String, NativeLocalState>,
-) -> Result<(NativeExpr, i32), BackendError> {
-    let [Stmt::Return {
-        expr: Some(expr), ..
-    }] = statements
-    else {
-        return Err(BackendError::new(
-            "unsupported native branch body shape for Stage 5a: expected exactly one return statement",
-        ));
-    };
-
-    validate_stage_5a_return_expr(expr, local_states)
+) -> Result<NativeBlock, BackendError> {
+    validate_stage_5b_block(statements, local_states).map_err(|error| {
+        if should_preserve_native_block_error(&error.message) {
+            error
+        } else {
+            BackendError::new(
+                "unsupported native branch body shape for Stage 5b: expected supported local declarations or assignments followed by a supported native terminator",
+            )
+        }
+    })
 }
 
-fn validate_stage_5a_return_expr(
+fn validate_stage_5b_if_as_block(
+    if_stmt: &hir::IfStmt,
+    local_states: &HashMap<String, NativeLocalState>,
+) -> Result<NativeBlock, BackendError> {
+    let statement = Stmt::If(if_stmt.clone());
+    let terminator = validate_stage_5b_terminator(&statement, local_states)?;
+    Ok(NativeBlock {
+        statements: Vec::new(),
+        terminator,
+    })
+}
+
+fn should_preserve_native_block_error(message: &str) -> bool {
+    should_preserve_native_expression_error(message)
+        || message.contains("exit code")
+        || message.contains("unsupported native assignment")
+        || message.contains("readonly local")
+        || message.contains("branch fallthrough")
+        || message.contains("unsupported native branch body shape")
+}
+
+fn validate_stage_5b_return_expr(
     expr: &Expr,
     local_states: &HashMap<String, NativeLocalState>,
 ) -> Result<(NativeExpr, i32), BackendError> {
-    let return_expr = validate_stage_5a_int_expr(expr, local_states)?;
-    let evaluated_exit_code = parse_stage_5a_exit_code(return_expr.value)?;
+    let return_expr = validate_stage_5b_int_expr(expr, local_states)?;
+    let evaluated_exit_code = parse_stage_5b_exit_code(return_expr.value)?;
     Ok((return_expr.expr, evaluated_exit_code))
 }
 
-fn validate_stage_5a_int_expr(
+fn validate_stage_5b_int_expr(
     expr: &Expr,
     local_states: &HashMap<String, NativeLocalState>,
 ) -> Result<ValidatedNativeExpr, BackendError> {
@@ -474,7 +504,7 @@ fn validate_stage_5a_int_expr(
         Expr::Variable { name, .. } => {
             let value = local_states.get(name).map(|state| state.value).ok_or_else(|| {
                 BackendError::new(
-                    "unsupported native expression for Stage 5a: expected integer literal, supported integer local, or supported integer arithmetic",
+                    "unsupported native expression for Stage 5b: expected integer literal, supported integer local, or supported integer arithmetic",
                 )
             })?;
             Ok(ValidatedNativeExpr {
@@ -482,13 +512,13 @@ fn validate_stage_5a_int_expr(
                 value,
             })
         }
-        Expr::Grouped { expr, .. } => validate_stage_5a_int_expr(expr, local_states),
+        Expr::Grouped { expr, .. } => validate_stage_5b_int_expr(expr, local_states),
         Expr::Binary {
             left, op, right, ..
         } if native_binary_op(op).is_some() => {
             let native_op = native_binary_op(op).expect("checked by guard");
-            let left = validate_stage_5a_int_expr(left, local_states)?;
-            let right = validate_stage_5a_int_expr(right, local_states)?;
+            let left = validate_stage_5b_int_expr(left, local_states)?;
+            let right = validate_stage_5b_int_expr(right, local_states)?;
             let value = checked_native_arithmetic(left.value, native_op, right.value).ok_or_else(|| {
                 BackendError::new("integer arithmetic overflows the Doria `int` range")
             })?;
@@ -506,17 +536,17 @@ fn validate_stage_5a_int_expr(
             ..
         } => {
             Err(BackendError::new(
-                "unsupported native arithmetic operator for Stage 5a",
+                "unsupported native arithmetic operator for Stage 5b",
             ))
         }
         other => Err(BackendError::new(format!(
-            "unsupported native expression for Stage 5a: expected integer literal, supported integer local, or supported integer arithmetic, found `{}`",
+            "unsupported native expression for Stage 5b: expected integer literal, supported integer local, or supported integer arithmetic, found `{}`",
             describe_expression(other)
         ))),
     }
 }
 
-fn validate_stage_5a_condition(
+fn validate_stage_5b_condition(
     expr: &Expr,
     local_states: &HashMap<String, NativeLocalState>,
 ) -> Result<ValidatedNativeCondition, BackendError> {
@@ -525,13 +555,13 @@ fn validate_stage_5a_condition(
             condition: NativeCondition::Bool(*value),
             value: *value,
         }),
-        Expr::Grouped { expr, .. } => validate_stage_5a_condition(expr, local_states),
+        Expr::Grouped { expr, .. } => validate_stage_5b_condition(expr, local_states),
         Expr::Unary {
             op: UnaryOp::Not,
             expr,
             ..
         } => {
-            let condition = validate_stage_5a_condition(expr, local_states)?;
+            let condition = validate_stage_5b_condition(expr, local_states)?;
             Ok(ValidatedNativeCondition {
                 condition: NativeCondition::Not(Box::new(condition.condition)),
                 value: !condition.value,
@@ -541,8 +571,8 @@ fn validate_stage_5a_condition(
             left, op, right, ..
         } if native_compare_op(op).is_some() => {
             let native_op = native_compare_op(op).expect("checked by guard");
-            let left = validate_stage_5a_comparison_operand(left, local_states)?;
-            let right = validate_stage_5a_comparison_operand(right, local_states)?;
+            let left = validate_stage_5b_comparison_operand(left, local_states)?;
+            let right = validate_stage_5b_comparison_operand(right, local_states)?;
             Ok(ValidatedNativeCondition {
                 condition: NativeCondition::Compare {
                     op: native_op,
@@ -558,8 +588,8 @@ fn validate_stage_5a_condition(
             right,
             ..
         } => {
-            let left = validate_stage_5a_condition(left, local_states)?;
-            let right = validate_stage_5a_condition(right, local_states)?;
+            let left = validate_stage_5b_condition(left, local_states)?;
+            let right = validate_stage_5b_condition(right, local_states)?;
             let value = left.value && right.value;
             Ok(ValidatedNativeCondition {
                 condition: NativeCondition::And {
@@ -575,8 +605,8 @@ fn validate_stage_5a_condition(
             right,
             ..
         } => {
-            let left = validate_stage_5a_condition(left, local_states)?;
-            let right = validate_stage_5a_condition(right, local_states)?;
+            let left = validate_stage_5b_condition(left, local_states)?;
+            let right = validate_stage_5b_condition(right, local_states)?;
             let value = left.value || right.value;
             Ok(ValidatedNativeCondition {
                 condition: NativeCondition::Or {
@@ -592,8 +622,8 @@ fn validate_stage_5a_condition(
             right,
             ..
         } => {
-            let left = validate_stage_5a_condition(left, local_states)?;
-            let right = validate_stage_5a_condition(right, local_states)?;
+            let left = validate_stage_5b_condition(left, local_states)?;
+            let right = validate_stage_5b_condition(right, local_states)?;
             let value = left.value ^ right.value;
             Ok(ValidatedNativeCondition {
                 condition: NativeCondition::Xor {
@@ -605,21 +635,21 @@ fn validate_stage_5a_condition(
         }
 
         _ => Err(BackendError::new(
-            "unsupported native condition for Stage 5a: expected bool literal, supported integer comparison, or supported boolean condition",
+            "unsupported native condition for Stage 5b: expected bool literal, supported integer comparison, or supported boolean condition",
         )),
     }
 }
 
-fn validate_stage_5a_comparison_operand(
+fn validate_stage_5b_comparison_operand(
     expr: &Expr,
     local_states: &HashMap<String, NativeLocalState>,
 ) -> Result<ValidatedNativeExpr, BackendError> {
-    validate_stage_5a_int_expr(expr, local_states).map_err(|error| {
+    validate_stage_5b_int_expr(expr, local_states).map_err(|error| {
         if should_preserve_native_expression_error(&error.message) {
             error
         } else {
             BackendError::new(
-                "unsupported native comparison for Stage 5a: expected supported integer expressions",
+                "unsupported native comparison for Stage 5b: expected supported integer expressions",
             )
         }
     })
@@ -671,6 +701,10 @@ fn evaluate_native_compare(left: i64, op: NativeCompareOp, right: i64) -> bool {
     }
 }
 
+fn evaluate_native_block_exit_code(block: &NativeBlock) -> i32 {
+    evaluate_native_terminator_exit_code(&block.terminator)
+}
+
 fn evaluate_native_terminator_exit_code(terminator: &NativeTerminator) -> i32 {
     match terminator {
         NativeTerminator::Return {
@@ -679,14 +713,26 @@ fn evaluate_native_terminator_exit_code(terminator: &NativeTerminator) -> i32 {
         } => *evaluated_exit_code,
         NativeTerminator::IfElse {
             evaluated_condition,
-            then_exit_code,
-            else_exit_code,
+            then_block,
+            else_block,
             ..
         } => {
             if *evaluated_condition {
-                *then_exit_code
+                evaluate_native_block_exit_code(then_block)
             } else {
-                *else_exit_code
+                evaluate_native_block_exit_code(else_block)
+            }
+        }
+        NativeTerminator::Guard {
+            evaluated_condition,
+            then_block,
+            fallback,
+            ..
+        } => {
+            if *evaluated_condition {
+                evaluate_native_block_exit_code(then_block)
+            } else {
+                evaluate_native_block_exit_code(fallback)
             }
         }
     }
@@ -698,10 +744,10 @@ fn parse_doria_int_literal(value: &str) -> Result<i64, BackendError> {
         .map_err(|_| BackendError::new("integer literal is outside the Doria `int` range"))
 }
 
-fn parse_stage_5a_exit_code(value: i64) -> Result<i32, BackendError> {
+fn parse_stage_5b_exit_code(value: i64) -> Result<i32, BackendError> {
     if !(0..=125).contains(&value) {
         return Err(BackendError::new(
-            "native Stage 5a exit code must be in the range 0..125",
+            "native Stage 5b exit code must be in the range 0..125",
         ));
     }
 
@@ -715,7 +761,7 @@ fn generate_object(native_main: &NativeMain) -> Result<Vec<u8>, BackendError> {
         .finish(settings::Flags::new(settings::builder()))
         .map_err(|error| BackendError::new(format!("backend emission failure: {error}")))?;
     let mut module = ObjectModule::new(
-        ObjectBuilder::new(isa, "doria_stage_5a", default_libcall_names())
+        ObjectBuilder::new(isa, "doria_stage_5b", default_libcall_names())
             .map_err(|error| BackendError::new(format!("backend emission failure: {error}")))?,
     );
 
@@ -736,20 +782,11 @@ fn generate_object(native_main: &NativeMain) -> Result<Vec<u8>, BackendError> {
         builder.seal_block(entry_block);
         let mut lowered_local_values = HashMap::new();
         let mut evaluated_local_values = HashMap::new();
-        for statement in &native_main.prelude {
-            lower_native_statement(
-                &mut builder,
-                statement,
-                &mut lowered_local_values,
-                &mut evaluated_local_values,
-            )?;
-        }
-
-        lower_native_terminator(
+        lower_native_block(
             &mut builder,
-            &native_main.terminator,
-            &lowered_local_values,
-            &evaluated_local_values,
+            &native_main.body,
+            &mut lowered_local_values,
+            &mut evaluated_local_values,
         )?;
         builder.finalize();
     }
@@ -763,6 +800,29 @@ fn generate_object(native_main: &NativeMain) -> Result<Vec<u8>, BackendError> {
         .finish()
         .emit()
         .map_err(|error| BackendError::new(format!("backend emission failure: {error}")))
+}
+
+fn lower_native_block(
+    builder: &mut FunctionBuilder,
+    block: &NativeBlock,
+    lowered_local_values: &mut HashMap<String, Value>,
+    evaluated_local_values: &mut HashMap<String, i64>,
+) -> Result<(), BackendError> {
+    for statement in &block.statements {
+        lower_native_statement(
+            builder,
+            statement,
+            lowered_local_values,
+            evaluated_local_values,
+        )?;
+    }
+
+    lower_native_terminator(
+        builder,
+        &block.terminator,
+        lowered_local_values,
+        evaluated_local_values,
+    )
 }
 
 fn lower_native_terminator(
@@ -785,10 +845,8 @@ fn lower_native_terminator(
         NativeTerminator::IfElse {
             condition,
             evaluated_condition,
-            then_expr,
-            then_exit_code,
-            else_expr,
-            else_exit_code,
+            then_block,
+            else_block,
         } => {
             let Some(evaluated_condition_value) =
                 evaluate_native_condition(condition, evaluated_local_values)
@@ -799,34 +857,83 @@ fn lower_native_terminator(
             };
             debug_assert_eq!(evaluated_condition_value, *evaluated_condition);
 
-            let then_block = builder.create_block();
-            let else_block = builder.create_block();
+            let then_ir_block = builder.create_block();
+            let else_ir_block = builder.create_block();
             lower_native_condition_branch(
                 builder,
                 condition,
+                then_ir_block,
+                else_ir_block,
+                lowered_local_values,
+            )?;
+
+            builder.switch_to_block(then_ir_block);
+            builder.seal_block(then_ir_block);
+            let mut then_lowered_local_values = lowered_local_values.clone();
+            let mut then_evaluated_local_values = evaluated_local_values.clone();
+            lower_native_block(
+                builder,
                 then_block,
+                &mut then_lowered_local_values,
+                &mut then_evaluated_local_values,
+            )?;
+
+            builder.switch_to_block(else_ir_block);
+            builder.seal_block(else_ir_block);
+            let mut else_lowered_local_values = lowered_local_values.clone();
+            let mut else_evaluated_local_values = evaluated_local_values.clone();
+            lower_native_block(
+                builder,
                 else_block,
+                &mut else_lowered_local_values,
+                &mut else_evaluated_local_values,
+            )
+        }
+        NativeTerminator::Guard {
+            condition,
+            evaluated_condition,
+            then_block,
+            fallback,
+        } => {
+            let Some(evaluated_condition_value) =
+                evaluate_native_condition(condition, evaluated_local_values)
+            else {
+                return Err(BackendError::new(
+                    "backend emission failure: validated native condition could not be re-evaluated",
+                ));
+            };
+            debug_assert_eq!(evaluated_condition_value, *evaluated_condition);
+
+            let then_ir_block = builder.create_block();
+            let fallback_ir_block = builder.create_block();
+            lower_native_condition_branch(
+                builder,
+                condition,
+                then_ir_block,
+                fallback_ir_block,
                 lowered_local_values,
             )?;
 
-            builder.switch_to_block(then_block);
-            builder.seal_block(then_block);
-            lower_native_return(
+            builder.switch_to_block(then_ir_block);
+            builder.seal_block(then_ir_block);
+            let mut then_lowered_local_values = lowered_local_values.clone();
+            let mut then_evaluated_local_values = evaluated_local_values.clone();
+            lower_native_block(
                 builder,
-                then_expr,
-                *then_exit_code,
-                lowered_local_values,
-                evaluated_local_values,
+                then_block,
+                &mut then_lowered_local_values,
+                &mut then_evaluated_local_values,
             )?;
 
-            builder.switch_to_block(else_block);
-            builder.seal_block(else_block);
-            lower_native_return(
+            builder.switch_to_block(fallback_ir_block);
+            builder.seal_block(fallback_ir_block);
+            let mut fallback_lowered_local_values = lowered_local_values.clone();
+            let mut fallback_evaluated_local_values = evaluated_local_values.clone();
+            lower_native_block(
                 builder,
-                else_expr,
-                *else_exit_code,
-                lowered_local_values,
-                evaluated_local_values,
+                fallback,
+                &mut fallback_lowered_local_values,
+                &mut fallback_evaluated_local_values,
             )
         }
     }
@@ -1087,7 +1194,7 @@ fn link_object(object_bytes: &[u8]) -> Result<Vec<u8>, BackendError> {
 }
 
 fn invoke_linker(object_path: &Path, executable_path: &Path) -> Result<(), BackendError> {
-    // Stage 5a emits a Cranelift object file and asks the host toolchain to
+    // Stage 5b emits a Cranelift object file and asks the host toolchain to
     // link it. This is not a C backend: Doria never generates C source or uses
     // C semantics as an oracle here.
     let cc_is_set = env::var_os("CC").is_some();
@@ -1184,7 +1291,7 @@ fn linker_arguments(
 ) -> Vec<OsString> {
     if windows && (!cc_is_set || is_msvc_style_compiler_driver(linker)) {
         // Cranelift-generated objects do not carry MSVC /DEFAULTLIB directives.
-        // For Stage 5a's tiny main, make Doria's main the executable entrypoint
+        // For Stage 5b's tiny main, make Doria's main the executable entrypoint
         // instead of relying on CRT startup to discover and call it.
         return vec![
             OsString::from("/nologo"),
@@ -1254,7 +1361,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn stage_5a_validation_preserves_return_expression_structure_for_codegen() {
+    fn stage_5b_validation_preserves_return_expression_structure_for_codegen() {
         let program = crate::lower_source(
             "stage3a.doria",
             r#"
@@ -1268,11 +1375,11 @@ function main(): int
         )
         .expect("source should lower to HIR");
 
-        let native_main = validate_stage_5a(&program).expect("source should validate for Stage 5a");
+        let native_main = validate_stage_5b(&program).expect("source should validate for Stage 5b");
 
         assert_eq!(native_main.evaluated_exit_code, 42);
         assert_eq!(
-            native_main.prelude,
+            native_main.body.statements,
             vec![
                 NativeStmt::Local(NativeLocal {
                     name: "left".to_string(),
@@ -1290,7 +1397,7 @@ function main(): int
         );
 
         assert_eq!(
-            native_main.terminator,
+            native_main.body.terminator,
             NativeTerminator::Return {
                 expr: NativeExpr::Binary {
                     op: NativeBinaryOp::Add,
@@ -1303,7 +1410,7 @@ function main(): int
     }
 
     #[test]
-    fn stage_5a_validation_preserves_if_else_structure_for_codegen() {
+    fn stage_5b_validation_preserves_if_else_structure_for_codegen() {
         let program = crate::lower_source(
             "stage4a.doria",
             r#"
@@ -1322,12 +1429,12 @@ function main(): int
         )
         .expect("source should lower to HIR");
 
-        let native_main = validate_stage_5a(&program).expect("source should validate for Stage 5a");
+        let native_main = validate_stage_5b(&program).expect("source should validate for Stage 5b");
 
         assert_eq!(native_main.evaluated_exit_code, 42);
-        assert_eq!(native_main.prelude.len(), 2);
+        assert_eq!(native_main.body.statements.len(), 2);
         assert_eq!(
-            native_main.terminator,
+            native_main.body.terminator,
             NativeTerminator::IfElse {
                 condition: NativeCondition::Compare {
                     op: NativeCompareOp::Equal,
@@ -1339,16 +1446,26 @@ function main(): int
                     right: NativeExpr::Int(42),
                 },
                 evaluated_condition: true,
-                then_expr: NativeExpr::Int(42),
-                then_exit_code: 42,
-                else_expr: NativeExpr::Int(0),
-                else_exit_code: 0,
+                then_block: Box::new(NativeBlock {
+                    statements: Vec::new(),
+                    terminator: NativeTerminator::Return {
+                        expr: NativeExpr::Int(42),
+                        evaluated_exit_code: 42,
+                    },
+                }),
+                else_block: Box::new(NativeBlock {
+                    statements: Vec::new(),
+                    terminator: NativeTerminator::Return {
+                        expr: NativeExpr::Int(0),
+                        evaluated_exit_code: 0,
+                    },
+                }),
             }
         );
     }
 
     #[test]
-    fn stage_5a_validation_preserves_guard_if_structure_for_codegen() {
+    fn stage_5b_validation_preserves_guard_if_structure_for_codegen() {
         let program = crate::lower_source(
             "stage4a_guard.doria",
             r#"
@@ -1367,13 +1484,13 @@ function main(): int
         )
         .expect("source should lower to HIR");
 
-        let native_main = validate_stage_5a(&program).expect("source should validate for Stage 5a");
+        let native_main = validate_stage_5b(&program).expect("source should validate for Stage 5b");
 
         assert_eq!(native_main.evaluated_exit_code, 42);
-        assert_eq!(native_main.prelude.len(), 2);
+        assert_eq!(native_main.body.statements.len(), 2);
         assert_eq!(
-            native_main.terminator,
-            NativeTerminator::IfElse {
+            native_main.body.terminator,
+            NativeTerminator::Guard {
                 condition: NativeCondition::Compare {
                     op: NativeCompareOp::Equal,
                     left: NativeExpr::Binary {
@@ -1384,16 +1501,26 @@ function main(): int
                     right: NativeExpr::Int(42),
                 },
                 evaluated_condition: true,
-                then_expr: NativeExpr::Int(42),
-                then_exit_code: 42,
-                else_expr: NativeExpr::Int(0),
-                else_exit_code: 0,
+                then_block: Box::new(NativeBlock {
+                    statements: Vec::new(),
+                    terminator: NativeTerminator::Return {
+                        expr: NativeExpr::Int(42),
+                        evaluated_exit_code: 42,
+                    },
+                }),
+                fallback: Box::new(NativeBlock {
+                    statements: Vec::new(),
+                    terminator: NativeTerminator::Return {
+                        expr: NativeExpr::Int(0),
+                        evaluated_exit_code: 0,
+                    },
+                }),
             }
         );
     }
 
     #[test]
-    fn stage_5a_validation_preserves_boolean_condition_structure_for_codegen() {
+    fn stage_5b_validation_preserves_boolean_condition_structure_for_codegen() {
         let program = crate::lower_source(
             "stage4b_boolean_condition.doria",
             r#"
@@ -1412,12 +1539,12 @@ function main(): int
         )
         .expect("source should lower to HIR");
 
-        let native_main = validate_stage_5a(&program).expect("source should validate for Stage 5a");
+        let native_main = validate_stage_5b(&program).expect("source should validate for Stage 5b");
 
         assert_eq!(native_main.evaluated_exit_code, 42);
         assert_eq!(
-            native_main.terminator,
-            NativeTerminator::IfElse {
+            native_main.body.terminator,
+            NativeTerminator::Guard {
                 condition: NativeCondition::And {
                     left: Box::new(NativeCondition::Compare {
                         op: NativeCompareOp::Equal,
@@ -1431,16 +1558,26 @@ function main(): int
                     right: Box::new(NativeCondition::Not(Box::new(NativeCondition::Bool(false)))),
                 },
                 evaluated_condition: true,
-                then_expr: NativeExpr::Int(42),
-                then_exit_code: 42,
-                else_expr: NativeExpr::Int(0),
-                else_exit_code: 0,
+                then_block: Box::new(NativeBlock {
+                    statements: Vec::new(),
+                    terminator: NativeTerminator::Return {
+                        expr: NativeExpr::Int(42),
+                        evaluated_exit_code: 42,
+                    },
+                }),
+                fallback: Box::new(NativeBlock {
+                    statements: Vec::new(),
+                    terminator: NativeTerminator::Return {
+                        expr: NativeExpr::Int(0),
+                        evaluated_exit_code: 0,
+                    },
+                }),
             }
         );
     }
 
     #[test]
-    fn stage_5a_validation_preserves_writable_assignment_order_for_codegen() {
+    fn stage_5b_validation_preserves_writable_assignment_order_for_codegen() {
         let program = crate::lower_source(
             "stage5a_writable_assignment.doria",
             r#"
@@ -1455,11 +1592,11 @@ function main(): int
         )
         .expect("source should lower to HIR");
 
-        let native_main = validate_stage_5a(&program).expect("source should validate for Stage 5a");
+        let native_main = validate_stage_5b(&program).expect("source should validate for Stage 5b");
 
         assert_eq!(native_main.evaluated_exit_code, 42);
         assert_eq!(
-            native_main.prelude,
+            native_main.body.statements,
             vec![
                 NativeStmt::Local(NativeLocal {
                     name: "code".to_string(),
@@ -1476,7 +1613,7 @@ function main(): int
             ]
         );
         assert_eq!(
-            native_main.terminator,
+            native_main.body.terminator,
             NativeTerminator::Return {
                 expr: NativeExpr::Local("code".to_string()),
                 evaluated_exit_code: 42,

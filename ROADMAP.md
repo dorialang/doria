@@ -22,7 +22,7 @@
 - Support MVP `if` / `else if` / `else` and `while` in the AST, semantic checker, Doria IR, and PHP backend.
 - Represent braced string interpolation in the Doria AST and Doria IR, with PHP lowering emitted as explicit concatenation.
 - Support the first accepted boolean/equality compiler slice: typed `==` / `!=`, rejection of `===` / `!==`, bool-only `!` / `not`, `&&` / `and`, `||` / `or`, and `xor` in the parser, semantic checker, Doria IR, and PHP backend.
-- Stage 5a Cranelift native smoke backend is implemented for exactly one top-level `function main(): int` with supported readonly and writable integer locals, direct-body `=`, `+=`, and `-=` assignments to writable integer locals, `+`/`-`/`*` arithmetic, and either a final supported return, a terminal `if` / `else` whose branches each contain exactly one supported return, or a guard-style `if` followed by a fallback return in the portable `0..125` exit-code range. Conditions support bool literals, grouped conditions, integer comparisons over supported integer expressions, `!` / `not`, `&&` / `and`, `||` / `or`, and `xor`.
+- Stage 5b Cranelift native smoke backend is implemented for exactly one top-level `function main(): int` with supported readonly and writable integer locals, `=`, `+=`, and `-=` assignments to writable integer locals, `+`/`-`/`*` arithmetic, and structured returning `if` blocks. Supported native blocks may contain local declarations and writable integer assignments before a return, terminal `if` / `else`, terminal `else if` chain, or guard-style `if` with a supported fallback block. Conditions support bool literals, grouped conditions, integer comparisons over supported integer expressions, `!` / `not`, `&&` / `and`, `||` / `or`, and `xor`.
 - Keep PHP as a compatibility backend only; do not treat PHP output as the proof that Doria semantics are correct.
 - Do not build PHP-to-Doria migration in the current v0.1 slice.
 - Do not start desktop, game engine, raylib, or FFI implementation work in the current v0.1 slice.
@@ -40,11 +40,12 @@
 - Treat `docs/decisions/0020-boolean-operators-and-given-predicates.md` as the accepted typed equality, boolean operator, bitwise operator, `xor`, and `given` predicate block decision.
 - Treat `docs/decisions/0021-stage-4b-native-boolean-conditions.md` as the accepted Stage 4b native boolean-condition implementation decision.
 - Treat `docs/decisions/0022-stage-5a-native-writable-int-locals.md` as the accepted Stage 5a native writable integer local and direct-body assignment implementation decision.
-- Keep broader native expression, assignment, and control-flow support beyond the Stage 5a smoke subset as separate future implementation slices.
+- Treat `docs/decisions/0023-stage-5b-native-structured-if-blocks.md` as the accepted Stage 5b native structured `if` block implementation decision.
+- Keep broader native expression, assignment, and control-flow support beyond the Stage 5b smoke subset as separate future implementation slices.
 - Extend accepted operator support with integer bitwise spellings in a dedicated parser and semantic checking slice; do not import PHP loose comparison or PHP `and` / `or` precedence.
 - Add compiler support for `int8`/`int16`/`int32`/`int64`, `uint8`/`uint16`/`uint32`/`uint64`, and `float32`/`float64` in a dedicated typed semantic model slice before claiming those spellings are implemented.
 - Plan a lowered/native IR when native code generation needs a simpler representation for control flow, memory layout, runtime calls, and backend emission.
-- Expand native source support beyond Stage 5a only after the next accepted native slice specifies the language semantics and expected behavior.
+- Expand native source support beyond Stage 5b only after the next accepted native slice specifies the language semantics and expected behavior.
 - Keep future LLVM optimized-profile work conformant with accepted Doria integer semantics and Cranelift fast-profile behavior for the same supported programs.
 - Expand return checking from the current final-statement rule into full path-sensitive control-flow analysis.
 - Add full definite property initialization analysis for constructor paths.

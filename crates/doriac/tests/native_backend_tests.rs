@@ -199,6 +199,41 @@ fn compiles_and_runs_current_native_smoke_examples() {
             "inline_main_exit_boundary_reassigned_zero.doria",
             0,
         ),
+        (
+            "main_structured_if_42",
+            "examples/native/main_structured_if_42.doria",
+            42,
+        ),
+        (
+            "main_branch_local_declaration_return",
+            "inline_main_branch_local_declaration_return.doria",
+            42,
+        ),
+        (
+            "main_branch_assignment_return",
+            "inline_main_branch_assignment_return.doria",
+            42,
+        ),
+        (
+            "main_else_if_structured_branch",
+            "inline_main_else_if_structured_branch.doria",
+            42,
+        ),
+        (
+            "main_nested_if_structured_branch",
+            "inline_main_nested_if_structured_branch.doria",
+            42,
+        ),
+        (
+            "main_multiple_guard_if_returns",
+            "inline_main_multiple_guard_if_returns.doria",
+            42,
+        ),
+        (
+            "main_branch_large_reassigned_42",
+            "inline_main_branch_large_reassigned_42.doria",
+            42,
+        ),
     ];
 
     for (stem, source, expected_code) in cases {
@@ -600,6 +635,105 @@ function main(): int
 }
 "#
         }
+        "main_branch_local_declaration_return" => {
+            r#"
+function main(): int
+{
+    if (true) {
+        let $code = 42;
+
+        return $code;
+    }
+
+    return 0;
+}
+"#
+        }
+        "main_branch_assignment_return" => {
+            r#"
+function main(): int
+{
+    let writable $code = 0;
+
+    if (true) {
+        $code = 42;
+
+        return $code;
+    }
+
+    return 0;
+}
+"#
+        }
+        "main_else_if_structured_branch" => {
+            r#"
+function main(): int
+{
+    let writable $code = 0;
+
+    if (false) {
+        return 1;
+    } else if (true) {
+        $code = 42;
+
+        return $code;
+    } else {
+        return 0;
+    }
+}
+"#
+        }
+        "main_nested_if_structured_branch" => {
+            r#"
+function main(): int
+{
+    if (true) {
+        if (true) {
+            let $code = 42;
+
+            return $code;
+        } else {
+            return 0;
+        }
+    } else {
+        return 0;
+    }
+}
+"#
+        }
+        "main_multiple_guard_if_returns" => {
+            r#"
+function main(): int
+{
+    if (false) {
+        return 1;
+    }
+
+    if (true) {
+        let $code = 42;
+
+        return $code;
+    }
+
+    return 0;
+}
+"#
+        }
+        "main_branch_large_reassigned_42" => {
+            r#"
+function main(): int
+{
+    if (true) {
+        let writable $code = 9223372036854775807;
+        $code = 42;
+
+        return $code;
+    }
+
+    return 0;
+}
+"#
+        }
         _ => unreachable!("unexpected inline native smoke source `{stem}`"),
     }
 }
@@ -639,7 +773,7 @@ function main(): int
 }
 "#,
             "B0001",
-            "native Stage 5a exit code must be in the range 0..125",
+            "native Stage 5b exit code must be in the range 0..125",
         ),
         (
             "return 255",
@@ -650,7 +784,7 @@ function main(): int
 }
 "#,
             "B0001",
-            "native Stage 5a exit code must be in the range 0..125",
+            "native Stage 5b exit code must be in the range 0..125",
         ),
         (
             "return out of Doria int range",
@@ -706,7 +840,7 @@ function main(): int
 }
 "#,
             "B0001",
-            "native Stage 5a exit code must be in the range 0..125",
+            "native Stage 5b exit code must be in the range 0..125",
         ),
         (
             "return arithmetic outside exit-code range",
@@ -717,7 +851,7 @@ function main(): int
 }
 "#,
             "B0001",
-            "native Stage 5a exit code must be in the range 0..125",
+            "native Stage 5b exit code must be in the range 0..125",
         ),
         (
             "returned arithmetic local outside exit-code range",
@@ -729,7 +863,7 @@ function main(): int
 }
 "#,
             "B0001",
-            "native Stage 5a exit code must be in the range 0..125",
+            "native Stage 5b exit code must be in the range 0..125",
         ),
         (
             "non-int local",
@@ -808,7 +942,7 @@ function main(): int
 }
 "#,
             "B0001",
-            "native Stage 5a exit code must be in the range 0..125",
+            "native Stage 5b exit code must be in the range 0..125",
         ),
         (
             "assignment overflow",
@@ -836,7 +970,7 @@ function main(): int
 }
 "#,
             "B0001",
-            "unsupported native arithmetic operator for Stage 5a",
+            "unsupported native arithmetic operator for Stage 5b",
         ),
         (
             "assignment after final return",
@@ -853,25 +987,7 @@ function main(): int
 }
 "#,
             "B0001",
-            "unsupported statement after native terminator for Stage 5a",
-        ),
-        (
-            "assignment inside branch",
-            r#"
-function main(): int
-{
-    let writable $code = 0;
-
-    if (true) {
-        $code = 42;
-        return $code;
-    }
-
-    return 0;
-}
-"#,
-            "B0001",
-            "unsupported native branch body shape for Stage 5a",
+            "unsupported statement after native terminator for Stage 5b",
         ),
         (
             "return division",
@@ -882,7 +998,7 @@ function main(): int
 }
 "#,
             "B0001",
-            "unsupported native arithmetic operator for Stage 5a",
+            "unsupported native arithmetic operator for Stage 5b",
         ),
         (
             "return modulo",
@@ -893,7 +1009,7 @@ function main(): int
 }
 "#,
             "B0001",
-            "unsupported native arithmetic operator for Stage 5a",
+            "unsupported native arithmetic operator for Stage 5b",
         ),
         (
             "local initialized from division",
@@ -905,7 +1021,7 @@ function main(): int
 }
 "#,
             "B0001",
-            "unsupported native arithmetic operator for Stage 5a",
+            "unsupported native arithmetic operator for Stage 5b",
         ),
         (
             "local initialized from function call",
@@ -998,7 +1114,7 @@ function main(): int
 }
 "#,
             "B0001",
-            "native Stage 5a exit code must be in the range 0..125",
+            "native Stage 5b exit code must be in the range 0..125",
         ),
         (
             "if else branch outside exit-code range",
@@ -1013,7 +1129,7 @@ function main(): int
 }
 "#,
             "B0001",
-            "native Stage 5a exit code must be in the range 0..125",
+            "native Stage 5b exit code must be in the range 0..125",
         ),
         (
             "guard if branch outside exit-code range",
@@ -1028,7 +1144,7 @@ function main(): int
 }
 "#,
             "B0001",
-            "native Stage 5a exit code must be in the range 0..125",
+            "native Stage 5b exit code must be in the range 0..125",
         ),
         (
             "logical if branch outside exit-code range",
@@ -1043,7 +1159,7 @@ function main(): int
 }
 "#,
             "B0001",
-            "native Stage 5a exit code must be in the range 0..125",
+            "native Stage 5b exit code must be in the range 0..125",
         ),
         (
             "if integer condition",
@@ -1118,7 +1234,7 @@ function main(): int
 }
 "#,
             "B0001",
-            "unsupported native arithmetic operator for Stage 5a",
+            "unsupported native arithmetic operator for Stage 5b",
         ),
         (
             "if call condition",
@@ -1136,22 +1252,6 @@ function main(): int
             "unknown function `isReady`",
         ),
         (
-            "if branch local declaration",
-            r#"
-function main(): int
-{
-    if (true) {
-        let $code = 42;
-        return $code;
-    } else {
-        return 0;
-    }
-}
-"#,
-            "B0001",
-            "unsupported native branch body shape for Stage 5a",
-        ),
-        (
             "if without fallback return",
             r#"
 function main(): int
@@ -1165,21 +1265,104 @@ function main(): int
             "must return a value",
         ),
         (
-            "else if",
+            "branch-local variable leak",
             r#"
 function main(): int
 {
     if (true) {
-        return 42;
-    } else if (false) {
-        return 1;
-    } else {
-        return 0;
+        let $code = 42;
+
+        return $code;
     }
+
+    return $code;
+}
+"#,
+            "E0101",
+            "undeclared variable `$code`",
+        ),
+        (
+            "non-terminating branch",
+            r#"
+function main(): int
+{
+    let writable $code = 0;
+
+    if (true) {
+        $code = 42;
+    }
+
+    return $code;
 }
 "#,
             "B0001",
-            "else-if is not supported",
+            "unsupported native branch body shape for Stage 5b",
+        ),
+        (
+            "assignment overflow inside branch",
+            r#"
+function main(): int
+{
+    let writable $code = 9223372036854775807;
+
+    if (true) {
+        $code += 1;
+
+        return 0;
+    }
+
+    return 0;
+}
+"#,
+            "B0001",
+            "integer arithmetic overflows the Doria `int` range",
+        ),
+        (
+            "branch return outside exit-code range",
+            r#"
+function main(): int
+{
+    if (true) {
+        return 126;
+    }
+
+    return 0;
+}
+"#,
+            "B0001",
+            "native Stage 5b exit code must be in the range 0..125",
+        ),
+        (
+            "division inside branch",
+            r#"
+function main(): int
+{
+    if (true) {
+        return 42 / 1;
+    }
+
+    return 0;
+}
+"#,
+            "B0001",
+            "unsupported native arithmetic operator for Stage 5b",
+        ),
+        (
+            "while unsupported",
+            r#"
+function main(): int
+{
+    let writable $code = 0;
+
+    while (false) {
+        $code = 42;
+    }
+
+    return $code;
+}
+"#,
+            "B0001",
+            "while statement",
         ),
         (
             "statement after terminal if else",
@@ -1196,7 +1379,7 @@ function main(): int
 }
 "#,
             "B0001",
-            "unsupported statement after native terminator for Stage 5a",
+            "unsupported statement after native terminator for Stage 5b",
         ),
         (
             "echo",

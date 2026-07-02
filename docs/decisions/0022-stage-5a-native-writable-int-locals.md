@@ -2,6 +2,8 @@
 
 Status: Accepted
 
+Decision 0023 extends this native smoke subset with Stage 5b structured `if` blocks that can contain supported local declarations and writable integer assignments before returning. This decision remains the accepted record for Stage 5a writable integer locals.
+
 ## Decision
 
 Stage 5a extends the current Cranelift native smoke backend with direct-body writable `int` locals and direct-body integer assignments before the existing native terminator shapes.
