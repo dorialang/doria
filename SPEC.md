@@ -64,7 +64,7 @@ Valid PHP should be easy to migrate to Doria, but Doria-specific syntax does not
 
 Doria does not use `public`, `protected`, or `private` as member visibility modifiers. Class members are externally accessible by default, and `internal` marks implementation details.
 
-The current compiler implementation produces only Stage 6a native smoke executables for exactly one top-level `function main(): int` with supported readonly and writable integer locals, `=`, `+=`, and `-=` assignments to writable integer locals, `+`/`-`/`*` arithmetic, structured returning `if` blocks, and bounded assignment-only `while` loops in the accepted `0..125` portable exit-code range. Native validation proves accepted loops terminate within the current smoke verification cap before lowering them to real Cranelift control flow. Supported native conditions include bool literals, grouped conditions, integer comparisons, and bool-only `not` / `and` / `or` / `xor`. It is not yet full native code generation, a package manager, reflection system, macro system, async runtime, PHP migration converter, or full standard library. That implementation status does not make PHP transpilation the language goal.
+The current compiler implementation produces only Stage 6b native smoke executables for exactly one top-level `function main(): int` with supported readonly and writable integer locals, `=`, `+=`, and `-=` assignments to writable integer locals, `+`/`-`/`*` arithmetic, structured returning `if` blocks, fallthrough `if` statements with visible-local merges, and bounded assignment-only `while` loops in the accepted `0..125` portable exit-code range. Native validation proves accepted loops terminate within the current smoke verification cap before lowering them to real Cranelift control flow. Supported native conditions include bool literals, grouped conditions, integer comparisons, and bool-only `not` / `and` / `or` / `xor`. It is not yet full native code generation, a package manager, reflection system, macro system, async runtime, PHP migration converter, or full standard library. That implementation status does not make PHP transpilation the language goal.
 
 Doria is not a Rust language. Rust is the current bootstrap implementation language for `doriac`, not the permanent identity of the compiler.
 
@@ -370,7 +370,7 @@ Accepted bitwise operators are:
 
 Do not add `nand`, `nor`, `implies`, `iff`, `unless`, `^^`, `===`, or `!==` as core syntax without a new accepted decision. Future helper APIs such as `Bool::all(...)`, `Bool::any(...)`, `Bool::none(...)`, or `Bool::one(...)` may be considered separately.
 
-The accepted boolean/equality/bitwise operator direction is recorded in `docs/decisions/0020-boolean-operators-and-given-predicates.md`. Current compiler support includes typed `==` / `!=` checking, rejection of `===` / `!==`, `not` / `and` / `or` / `xor` parsing, bool-only semantic checking, Doria IR lowering, PHP backend lowering for the supported subset, and Stage 6a native lowering for supported `if` / `while` conditions and writable integer assignment in supported native blocks. Bitwise operators and broader native expression lowering remain future implementation work.
+The accepted boolean/equality/bitwise operator direction is recorded in `docs/decisions/0020-boolean-operators-and-given-predicates.md`. Current compiler support includes typed `==` / `!=` checking, rejection of `===` / `!==`, `not` / `and` / `or` / `xor` parsing, bool-only semantic checking, Doria IR lowering, PHP backend lowering for the supported subset, and Stage 6b native lowering for supported `if` / `while` conditions and writable integer assignment in supported native blocks. Bitwise operators and broader native expression lowering remain future implementation work.
 
 ### Control-flow conditions
 
@@ -584,7 +584,7 @@ Doria IR is the checked compiler-owned representation of a Doria program. After 
 
 As native code generation matures, Doria IR may lower into a simpler native-oriented IR for control flow, memory layout, runtime calls, and backend code generation.
 
-The native backend is the primary target. It should lower Doria IR, and any later native-oriented IR, toward native machine code and standalone executables. The current Cranelift-backed Stage 6a native backend is deliberately limited to exactly one top-level `function main(): int` with supported readonly and writable integer locals, `=`, `+=`, and `-=` assignments to writable integer locals, `+`/`-`/`*` arithmetic, structured returning `if` blocks, and bounded assignment-only `while` loops in `0..125`. Stage 6a validates loop termination and checked integer arithmetic before native lowering, then emits real Cranelift loop control flow. The native loop verification cap is a backend support limit, not Doria language semantics. Stage 6a conditions support bool literals, grouped conditions, integer comparisons over supported integer expressions, `!` / `not`, `&&` / `and`, `||` / `or`, and `xor`. It emits unsupported-feature diagnostics for general loop bodies, declarations/nested control flow/returns inside `while`, `break`, `continue`, non-terminating branch merging, non-integer locals, division/modulo, strings, classes, collections, and broader valid Doria until later native slices are designed.
+The native backend is the primary target. It should lower Doria IR, and any later native-oriented IR, toward native machine code and standalone executables. The current Cranelift-backed Stage 6b native backend is deliberately limited to exactly one top-level `function main(): int` with supported readonly and writable integer locals, `=`, `+=`, and `-=` assignments to writable integer locals, `+`/`-`/`*` arithmetic, structured returning `if` blocks, fallthrough `if` statements with visible-local merges, and bounded assignment-only `while` loops in `0..125`. Stage 6b validates loop termination, fallthrough branch state merging, and checked integer arithmetic before native lowering, then emits real Cranelift control flow. The native loop verification cap is a backend support limit, not Doria language semantics. Stage 6b conditions support bool literals, grouped conditions, integer comparisons over supported integer expressions, `!` / `not`, `&&` / `and`, `||` / `or`, and `xor`. It emits unsupported-feature diagnostics for general loop bodies, declarations/nested control flow/returns inside `while`, `if` inside `while`, `return` inside fallthrough branch bodies, `break`, `continue`, non-integer locals, division/modulo, strings, classes, collections, and broader valid Doria until later native slices are designed.
 
 The PHP backend is currently implemented as a compatibility/debugging backend. It emits `<?php` and lowers Doria-only syntax away:
 
@@ -613,9 +613,9 @@ Future work includes:
 - Full path-sensitive control-flow analysis for returns and constructor initialization.
 - Advanced control-flow design for `do ... while ... finally`, `given ... when`, `given ... while`, `if` chains with possible `finally`, value-returning `when`, and `match`.
 - Async/await and structured concurrency.
-- Broader native backend design and implementation beyond the Stage 6a smoke target.
+- Broader native backend design and implementation beyond the Stage 6b smoke target.
 - Native-oriented IR implementation when native code generation needs it.
-- Broader native code generation and standalone executable production beyond the Stage 6a smoke target.
+- Broader native code generation and standalone executable production beyond the Stage 6b smoke target.
 - Self-hosting path for writing more of `doriac` in Doria.
 - PHP-to-Doria migration tooling.
 - Package management.

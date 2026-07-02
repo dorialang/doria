@@ -234,6 +234,36 @@ fn compiles_and_runs_current_native_smoke_examples() {
             "inline_main_branch_large_reassigned_42.doria",
             42,
         ),
+        (
+            "main_if_fallthrough_42",
+            "examples/native/main_if_fallthrough_42.doria",
+            42,
+        ),
+        (
+            "main_if_fallthrough_else_42",
+            "inline_main_if_fallthrough_else_42.doria",
+            42,
+        ),
+        (
+            "main_if_fallthrough_else_if_42",
+            "inline_main_if_fallthrough_else_if_42.doria",
+            42,
+        ),
+        (
+            "main_nested_if_fallthrough_42",
+            "inline_main_nested_if_fallthrough_42.doria",
+            42,
+        ),
+        (
+            "main_while_then_if_fallthrough_42",
+            "inline_main_while_then_if_fallthrough_42.doria",
+            42,
+        ),
+        (
+            "main_if_fallthrough_large_reassigned_42",
+            "inline_main_if_fallthrough_large_reassigned_42.doria",
+            42,
+        ),
         ("main_while_42", "examples/native/main_while_42.doria", 42),
         (
             "main_while_decrement_42",
@@ -765,6 +795,88 @@ function main(): int
 }
 "#
         }
+        "main_if_fallthrough_else_42" => {
+            r#"
+function main(): int
+{
+    let writable $code = 0;
+
+    if (true) {
+        $code = 42;
+    } else {
+        $code = 1;
+    }
+
+    return $code;
+}
+"#
+        }
+        "main_if_fallthrough_else_if_42" => {
+            r#"
+function main(): int
+{
+    let writable $code = 0;
+
+    if (false) {
+        $code = 1;
+    } else if (true) {
+        $code = 42;
+    } else {
+        $code = 2;
+    }
+
+    return $code;
+}
+"#
+        }
+        "main_nested_if_fallthrough_42" => {
+            r#"
+function main(): int
+{
+    let writable $code = 40;
+
+    if ($code == 40) {
+        if (true) {
+            $code += 2;
+        }
+    }
+
+    return $code;
+}
+"#
+        }
+        "main_while_then_if_fallthrough_42" => {
+            r#"
+function main(): int
+{
+    let writable $code = 0;
+
+    while ($code < 40) {
+        $code += 1;
+    }
+
+    if ($code == 40) {
+        $code += 2;
+    }
+
+    return $code;
+}
+"#
+        }
+        "main_if_fallthrough_large_reassigned_42" => {
+            r#"
+function main(): int
+{
+    let writable $code = 126;
+
+    if (true) {
+        $code = 42;
+    }
+
+    return $code;
+}
+"#
+        }
         "main_while_decrement_42" => {
             r#"
 function main(): int
@@ -897,7 +1009,7 @@ function main(): int
 }
 "#,
             "B0001",
-            "native Stage 6a exit code must be in the range 0..125",
+            "native Stage 6b exit code must be in the range 0..125",
         ),
         (
             "return 255",
@@ -908,7 +1020,7 @@ function main(): int
 }
 "#,
             "B0001",
-            "native Stage 6a exit code must be in the range 0..125",
+            "native Stage 6b exit code must be in the range 0..125",
         ),
         (
             "return out of Doria int range",
@@ -964,7 +1076,7 @@ function main(): int
 }
 "#,
             "B0001",
-            "native Stage 6a exit code must be in the range 0..125",
+            "native Stage 6b exit code must be in the range 0..125",
         ),
         (
             "return arithmetic outside exit-code range",
@@ -975,7 +1087,7 @@ function main(): int
 }
 "#,
             "B0001",
-            "native Stage 6a exit code must be in the range 0..125",
+            "native Stage 6b exit code must be in the range 0..125",
         ),
         (
             "returned arithmetic local outside exit-code range",
@@ -987,7 +1099,7 @@ function main(): int
 }
 "#,
             "B0001",
-            "native Stage 6a exit code must be in the range 0..125",
+            "native Stage 6b exit code must be in the range 0..125",
         ),
         (
             "non-int local",
@@ -1066,7 +1178,7 @@ function main(): int
 }
 "#,
             "B0001",
-            "native Stage 6a exit code must be in the range 0..125",
+            "native Stage 6b exit code must be in the range 0..125",
         ),
         (
             "assignment overflow",
@@ -1094,7 +1206,7 @@ function main(): int
 }
 "#,
             "B0001",
-            "unsupported native arithmetic operator for Stage 6a",
+            "unsupported native arithmetic operator for Stage 6b",
         ),
         (
             "assignment after final return",
@@ -1111,7 +1223,7 @@ function main(): int
 }
 "#,
             "B0001",
-            "unsupported statement after native terminator for Stage 6a",
+            "unsupported statement after native terminator for Stage 6b",
         ),
         (
             "return division",
@@ -1122,7 +1234,7 @@ function main(): int
 }
 "#,
             "B0001",
-            "unsupported native arithmetic operator for Stage 6a",
+            "unsupported native arithmetic operator for Stage 6b",
         ),
         (
             "return modulo",
@@ -1133,7 +1245,7 @@ function main(): int
 }
 "#,
             "B0001",
-            "unsupported native arithmetic operator for Stage 6a",
+            "unsupported native arithmetic operator for Stage 6b",
         ),
         (
             "local initialized from division",
@@ -1145,7 +1257,7 @@ function main(): int
 }
 "#,
             "B0001",
-            "unsupported native arithmetic operator for Stage 6a",
+            "unsupported native arithmetic operator for Stage 6b",
         ),
         (
             "local initialized from function call",
@@ -1238,7 +1350,7 @@ function main(): int
 }
 "#,
             "B0001",
-            "native Stage 6a exit code must be in the range 0..125",
+            "native Stage 6b exit code must be in the range 0..125",
         ),
         (
             "if else branch outside exit-code range",
@@ -1253,7 +1365,7 @@ function main(): int
 }
 "#,
             "B0001",
-            "native Stage 6a exit code must be in the range 0..125",
+            "native Stage 6b exit code must be in the range 0..125",
         ),
         (
             "guard if branch outside exit-code range",
@@ -1268,7 +1380,7 @@ function main(): int
 }
 "#,
             "B0001",
-            "native Stage 6a exit code must be in the range 0..125",
+            "native Stage 6b exit code must be in the range 0..125",
         ),
         (
             "logical if branch outside exit-code range",
@@ -1283,7 +1395,7 @@ function main(): int
 }
 "#,
             "B0001",
-            "native Stage 6a exit code must be in the range 0..125",
+            "native Stage 6b exit code must be in the range 0..125",
         ),
         (
             "if integer condition",
@@ -1358,7 +1470,7 @@ function main(): int
 }
 "#,
             "B0001",
-            "unsupported native arithmetic operator for Stage 6a",
+            "unsupported native arithmetic operator for Stage 6b",
         ),
         (
             "if call condition",
@@ -1395,8 +1507,6 @@ function main(): int
 {
     if (true) {
         let $code = 42;
-
-        return $code;
     }
 
     return $code;
@@ -1406,24 +1516,24 @@ function main(): int
             "undeclared variable `$code`",
         ),
         (
-            "non-terminating branch",
+            "readonly assignment in fallthrough branch",
             r#"
 function main(): int
 {
-    let writable $code = 0;
+    let $code = 40;
 
     if (true) {
-        $code = 42;
+        $code += 2;
     }
 
     return $code;
 }
 "#,
-            "B0001",
-            "unsupported native branch body shape for Stage 6a",
+            "E0201",
+            "cannot assign to readonly variable `$code`",
         ),
         (
-            "assignment overflow inside branch",
+            "assignment overflow inside fallthrough branch",
             r#"
 function main(): int
 {
@@ -1431,8 +1541,6 @@ function main(): int
 
     if (true) {
         $code += 1;
-
-        return 0;
     }
 
     return 0;
@@ -1440,6 +1548,23 @@ function main(): int
 "#,
             "B0001",
             "integer arithmetic overflows the Doria `int` range",
+        ),
+        (
+            "returned value outside exit-code range after fallthrough branch",
+            r#"
+function main(): int
+{
+    let writable $code = 100;
+
+    if (true) {
+        $code += 26;
+    }
+
+    return $code;
+}
+"#,
+            "B0001",
+            "native Stage 6b exit code must be in the range 0..125",
         ),
         (
             "branch return outside exit-code range",
@@ -1454,7 +1579,24 @@ function main(): int
 }
 "#,
             "B0001",
-            "native Stage 6a exit code must be in the range 0..125",
+            "native Stage 6b exit code must be in the range 0..125",
+        ),
+        (
+            "division inside fallthrough branch",
+            r#"
+function main(): int
+{
+    let writable $code = 0;
+
+    if (true) {
+        $code = 84 / 2;
+    }
+
+    return $code;
+}
+"#,
+            "B0001",
+            "unsupported native arithmetic operator for Stage 6b",
         ),
         (
             "division inside branch",
@@ -1469,7 +1611,7 @@ function main(): int
 }
 "#,
             "B0001",
-            "unsupported native arithmetic operator for Stage 6a",
+            "unsupported native arithmetic operator for Stage 6b",
         ),
         (
             "readonly assignment in while",
@@ -1521,7 +1663,7 @@ function main(): int
 }
 "#,
             "B0001",
-            "unsupported native while body for Stage 6a",
+            "unsupported native while body for Stage 6b",
         ),
         (
             "if inside while",
@@ -1540,7 +1682,7 @@ function main(): int
 }
 "#,
             "B0001",
-            "unsupported native while body statement for Stage 6a",
+            "unsupported native while body statement for Stage 6b",
         ),
         (
             "return inside while",
@@ -1557,7 +1699,7 @@ function main(): int
 }
 "#,
             "B0001",
-            "unsupported native while body statement for Stage 6a",
+            "unsupported native while body statement for Stage 6b",
         ),
         (
             "nonterminating while",
@@ -1625,7 +1767,7 @@ function main(): int
 }
 "#,
             "B0001",
-            "native Stage 6a exit code must be in the range 0..125",
+            "native Stage 6b exit code must be in the range 0..125",
         ),
         (
             "statement after terminal if else",
@@ -1642,7 +1784,7 @@ function main(): int
 }
 "#,
             "B0001",
-            "unsupported statement after native terminator for Stage 6a",
+            "unsupported statement after native terminator for Stage 6b",
         ),
         (
             "echo",

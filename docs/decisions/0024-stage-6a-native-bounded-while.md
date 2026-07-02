@@ -2,6 +2,8 @@
 
 Status: Accepted
 
+Decision 0025 extends this native smoke subset with Stage 6b fallthrough `if` statements that merge visible local values after supported branches. This decision remains the accepted record for Stage 6a bounded `while` loops.
+
 ## Decision
 
 Stage 6a extends the Cranelift native smoke backend with bounded, compile-time-verifiable `while` loops before an existing native terminator.

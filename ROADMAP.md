@@ -22,7 +22,7 @@
 - Support MVP `if` / `else if` / `else` and `while` in the AST, semantic checker, Doria IR, and PHP backend.
 - Represent braced string interpolation in the Doria AST and Doria IR, with PHP lowering emitted as explicit concatenation.
 - Support the first accepted boolean/equality compiler slice: typed `==` / `!=`, rejection of `===` / `!==`, bool-only `!` / `not`, `&&` / `and`, `||` / `or`, and `xor` in the parser, semantic checker, Doria IR, and PHP backend.
-- Stage 6a Cranelift native smoke backend is implemented for exactly one top-level `function main(): int` with supported readonly and writable integer locals, `=`, `+=`, and `-=` assignments to writable integer locals, `+`/`-`/`*` arithmetic, structured returning `if` blocks, and bounded assignment-only `while` loops. Native validation proves accepted loops terminate within the current smoke verification cap before lowering them to real Cranelift control flow. Conditions support bool literals, grouped conditions, integer comparisons over supported integer expressions, `!` / `not`, `&&` / `and`, `||` / `or`, and `xor`.
+- Stage 6b Cranelift native smoke backend is implemented for exactly one top-level `function main(): int` with supported readonly and writable integer locals, `=`, `+=`, and `-=` assignments to writable integer locals, `+`/`-`/`*` arithmetic, structured returning `if` blocks, fallthrough `if` statements with visible-local merges, and bounded assignment-only `while` loops. Native validation proves accepted loops terminate within the current smoke verification cap before lowering them to real Cranelift control flow. Conditions support bool literals, grouped conditions, integer comparisons over supported integer expressions, `!` / `not`, `&&` / `and`, `||` / `or`, and `xor`.
 - Keep PHP as a compatibility backend only; do not treat PHP output as the proof that Doria semantics are correct.
 - Do not build PHP-to-Doria migration in the current v0.1 slice.
 - Do not start desktop, game engine, raylib, or FFI implementation work in the current v0.1 slice.
@@ -42,11 +42,12 @@
 - Treat `docs/decisions/0022-stage-5a-native-writable-int-locals.md` as the accepted Stage 5a native writable integer local and direct-body assignment implementation decision.
 - Treat `docs/decisions/0023-stage-5b-native-structured-if-blocks.md` as the accepted Stage 5b native structured `if` block implementation decision.
 - Treat `docs/decisions/0024-stage-6a-native-bounded-while.md` as the accepted Stage 6a native bounded `while` implementation decision.
-- Keep broader native expression, assignment, and control-flow support beyond the Stage 6a smoke subset as separate future implementation slices.
+- Treat `docs/decisions/0025-stage-6b-native-if-fallthrough-merges.md` as the accepted Stage 6b native fallthrough `if` merge implementation decision.
+- Keep broader native expression, assignment, and control-flow support beyond the Stage 6b smoke subset as separate future implementation slices.
 - Extend accepted operator support with integer bitwise spellings in a dedicated parser and semantic checking slice; do not import PHP loose comparison or PHP `and` / `or` precedence.
 - Add compiler support for `int8`/`int16`/`int32`/`int64`, `uint8`/`uint16`/`uint32`/`uint64`, and `float32`/`float64` in a dedicated typed semantic model slice before claiming those spellings are implemented.
 - Plan a lowered/native IR when native code generation needs a simpler representation for control flow, memory layout, runtime calls, and backend emission.
-- Expand native source support beyond Stage 6a only after the next accepted native slice specifies the language semantics and expected behavior.
+- Expand native source support beyond Stage 6b only after the next accepted native slice specifies the language semantics and expected behavior.
 - Keep future LLVM optimized-profile work conformant with accepted Doria integer semantics and Cranelift fast-profile behavior for the same supported programs.
 - Expand return checking from the current final-statement rule into full path-sensitive control-flow analysis.
 - Add full definite property initialization analysis for constructor paths.
