@@ -1,0 +1,19 @@
+function main(): int
+{
+    let writable $total = 0;
+    let writable $index = 0;
+
+    while ($index < 6) {
+        let $step = 7;
+
+        if ($index < 3) {
+            $total += $step;
+        } else {
+            $total += 7;
+        }
+
+        $index += 1;
+    }
+
+    return $total;
+}

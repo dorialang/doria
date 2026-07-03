@@ -2,6 +2,8 @@
 
 Status: Accepted
 
+Decision 0026 extends this native smoke subset with Stage 6c structured `while` bodies that support loop-body local declarations and fallthrough `if` statements. This decision remains the accepted record for Stage 6b fallthrough `if` merges.
+
 ## Decision
 
 Stage 6b extends the Cranelift native smoke backend with supported fallthrough `if` statements before later native statements.

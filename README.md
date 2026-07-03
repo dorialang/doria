@@ -66,7 +66,7 @@ This repository contains the first working vertical slices of `doriac`:
 - Checks undeclared assignment and readonly/writable mutation rules for locals, properties, `$this`, and writable methods.
 - Checks assignment compatibility, declared returns, typed equality/inequality, bool-only boolean operators, positional call arguments, constructor init access, control-flow conditions, and string interpolation constraints for the supported subset.
 - Lowers the checked AST to Doria IR, the compiler-owned representation used before backend output.
-- Emits Stage 6b Cranelift-backed native smoke executables for `function main(): int` using supported readonly and writable integer locals, `=`, `+=`, and `-=` assignments, `+`/`-`/`*` arithmetic, structured returning `if` blocks, fallthrough `if` statements with visible-local merges, and bounded assignment-only `while` loops in the accepted `0..125` portable exit-code range. Supported native conditions include bool literals, grouped conditions, integer comparisons, `!` / `not`, `&&` / `and`, `||` / `or`, and `xor`.
+- Emits Stage 6c Cranelift-backed native smoke executables for `function main(): int` using supported readonly and writable integer locals, `=`, `+=`, and `-=` assignments, `+`/`-`/`*` arithmetic, structured returning `if` blocks, fallthrough `if` statements with visible-local merges, and bounded structured `while` loops in the accepted `0..125` portable exit-code range. Supported native `while` bodies may contain integer local declarations, writable integer assignments, and fallthrough `if` statements. Supported native conditions include bool literals, grouped conditions, integer comparisons, `!` / `not`, `&&` / `and`, `||` / `or`, and `xor`.
 - Emits PHP for supported syntax through the optional PHP compatibility backend, including `not`, `and`, `or`, and `xor` lowering that preserves Doria boolean semantics.
 - Provides CLI commands and integration tests.
 
@@ -90,7 +90,7 @@ cargo run -p doriac -- compile examples/php/person.doria --target php --out buil
 php build/php/person.php
 ```
 
-The native backend currently supports a narrow Stage 6b smoke shape: exactly one top-level `function main(): int` with supported readonly and writable integer locals, `=`, `+=`, and `-=` assignments to writable integer locals, `+`/`-`/`*` arithmetic, structured returning `if` blocks, fallthrough `if` statements that merge visible integer locals, and bounded assignment-only `while` loops. Native validation proves accepted loops terminate within the current smoke verification cap before lowering them to real Cranelift control flow. Conditions support bool literals, grouped conditions, integer comparisons over supported integer expressions, `!` / `not`, `&&` / `and`, `||` / `or`, and `xor`. Returned process status values must be in the portable `0..125` exit-code range.
+The native backend currently supports a narrow Stage 6c smoke shape: exactly one top-level `function main(): int` with supported readonly and writable integer locals, `=`, `+=`, and `-=` assignments to writable integer locals, `+`/`-`/`*` arithmetic, structured returning `if` blocks, fallthrough `if` statements that merge visible integer locals, and bounded structured `while` loops. Supported native `while` bodies may contain integer local declarations, writable integer assignments, and fallthrough `if` statements. Native validation proves accepted loops terminate within the current smoke verification cap before lowering them to real Cranelift control flow. Conditions support bool literals, grouped conditions, integer comparisons over supported integer expressions, `!` / `not`, `&&` / `and`, `||` / `or`, and `xor`. Returned process status values must be in the portable `0..125` exit-code range.
 
 ```bash
 cargo run -p doriac -- compile examples/native/main_return_zero.doria
@@ -125,9 +125,12 @@ cargo run -p doriac -- compile examples/native/main_if_fallthrough_42.doria
 
 cargo run -p doriac -- compile examples/native/main_while_42.doria
 ./main_while_42
+
+cargo run -p doriac -- compile examples/native/main_structured_while_42.doria
+./main_structured_while_42
 ```
 
-For this slice, native compilation emits an object and links it through the host platform toolchain. This is not a C backend and does not use PHP output. General loops, declarations/nested control flow/returns inside `while` bodies, `if` inside `while`, `return` inside fallthrough branch bodies, `break`, `continue`, division/modulo, strings, classes, collections, broader runtime features, and LLVM output remain future work.
+For this slice, native compilation emits an object and links it through the host platform toolchain. This is not a C backend and does not use PHP output. General loops beyond the bounded Stage 6c shape, nested `while`, returns inside `while` bodies, `return` inside fallthrough branch bodies, `break`, `continue`, division/modulo, strings, classes, collections, broader runtime features, and LLVM output remain future work.
 
 ## CLI
 
@@ -182,7 +185,7 @@ For VS Code, the setting is `doria.languageServer.path`. For IntelliJ IDEs, use 
 - Collection aliases are `List<T>`, `Dictionary<K, V>`, and `Set<T>`.
 - `int` means `int64`, `float` means `float64`, and the accepted fixed-width numeric family is documented in `docs/decisions/0016-fixed-width-numeric-types.md`; compiler support for those explicit spellings is future work.
 - The compiler must reject invalid Doria before lowering to Doria IR or emitting backend output.
-- The native backend currently accepts only the Stage 6b smoke subset, `function main(): int` with supported readonly and writable integer locals, writable integer assignments, `+`/`-`/`*` arithmetic, structured returning `if` blocks, fallthrough `if` statements with visible-local merges, and bounded assignment-only `while` loops. Supported native conditions include bool literals, grouped conditions, integer comparisons, and bool-only `not` / `and` / `or` / `xor`. It rejects broader valid Doria with unsupported-feature diagnostics. The `0..125` range is a process-exit boundary, not the range of Doria `int`.
+- The native backend currently accepts only the Stage 6c smoke subset, `function main(): int` with supported readonly and writable integer locals, writable integer assignments, `+`/`-`/`*` arithmetic, structured returning `if` blocks, fallthrough `if` statements with visible-local merges, and bounded structured `while` loops whose bodies contain supported integer locals, assignments, and fallthrough `if` statements. Supported native conditions include bool literals, grouped conditions, integer comparisons, and bool-only `not` / `and` / `or` / `xor`. It rejects broader valid Doria with unsupported-feature diagnostics. The `0..125` range is a process-exit boundary, not the range of Doria `int`.
 - Doria may support features PHP cannot express directly, such as executable instance property initializers and richer attribute expressions.
 - If a language behavior is not specified, implementation work should pause for an explicit design decision rather than inventing behavior silently.
 

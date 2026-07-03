@@ -276,6 +276,11 @@ fn compiles_and_runs_current_native_smoke_examples() {
         ),
         ("main_while_42", "examples/native/main_while_42.doria", 42),
         (
+            "main_structured_while_42",
+            "examples/native/main_structured_while_42.doria",
+            42,
+        ),
+        (
             "main_while_decrement_42",
             "inline_main_while_decrement_42.doria",
             42,
@@ -304,6 +309,41 @@ fn compiles_and_runs_current_native_smoke_examples() {
             "main_while_rhs_uses_ordered_body_state",
             "inline_main_while_rhs_uses_ordered_body_state.doria",
             42,
+        ),
+        (
+            "main_while_body_local_42",
+            "inline_main_while_body_local_42.doria",
+            42,
+        ),
+        (
+            "main_while_body_writable_local_42",
+            "inline_main_while_body_writable_local_42.doria",
+            42,
+        ),
+        (
+            "main_while_body_if_42",
+            "inline_main_while_body_if_42.doria",
+            42,
+        ),
+        (
+            "main_while_body_if_empty_then_branch_42",
+            "inline_main_while_body_if_empty_then_branch_42.doria",
+            42,
+        ),
+        (
+            "main_while_body_if_empty_else_branch_42",
+            "inline_main_while_body_if_empty_else_branch_42.doria",
+            42,
+        ),
+        (
+            "main_while_body_shadow_preserves_outer",
+            "inline_main_while_body_shadow_preserves_outer.doria",
+            0,
+        ),
+        (
+            "main_while_body_shadow_preserves_pre_shadow_assignment",
+            "inline_main_while_body_shadow_preserves_pre_shadow_assignment.doria",
+            2,
         ),
     ];
 
@@ -1009,6 +1049,122 @@ function main(): int
 }
 "#
         }
+        "main_while_body_local_42" => {
+            r#"
+function main(): int
+{
+    let writable $code = 0;
+
+    while ($code < 42) {
+        let $step = 2;
+        $code += $step;
+    }
+
+    return $code;
+}
+"#
+        }
+        "main_while_body_writable_local_42" => {
+            r#"
+function main(): int
+{
+    let writable $code = 0;
+
+    while ($code < 42) {
+        let writable $step = 1;
+        $step += 1;
+        $code += $step;
+    }
+
+    return $code;
+}
+"#
+        }
+        "main_while_body_if_42" => {
+            r#"
+function main(): int
+{
+    let writable $code = 0;
+
+    while ($code < 42) {
+        if ($code < 40) {
+            $code += 2;
+        } else {
+            $code += 1;
+        }
+    }
+
+    return $code;
+}
+"#
+        }
+        "main_while_body_if_empty_then_branch_42" => {
+            r#"
+function main(): int
+{
+    let writable $i = 0;
+
+    while ($i < 1) {
+        if ($i == 1) {
+        } else {
+            $i += 1;
+        }
+    }
+
+    return $i + 41;
+}
+"#
+        }
+        "main_while_body_if_empty_else_branch_42" => {
+            r#"
+function main(): int
+{
+    let writable $i = 0;
+
+    while ($i < 1) {
+        if ($i == 0) {
+            $i += 1;
+        } else {
+        }
+    }
+
+    return $i + 41;
+}
+"#
+        }
+        "main_while_body_shadow_preserves_outer" => {
+            r#"
+function main(): int
+{
+    let writable $code = 0;
+    let writable $count = 0;
+
+    while ($count < 1) {
+        let $code = 42;
+        $count += 1;
+    }
+
+    return $code;
+}
+"#
+        }
+        "main_while_body_shadow_preserves_pre_shadow_assignment" => {
+            r#"
+function main(): int
+{
+    let writable $code = 1;
+    let writable $count = 0;
+
+    while ($count < 1) {
+        $code = 2;
+        let $code = 42;
+        $count += 1;
+    }
+
+    return $code;
+}
+"#
+        }
         _ => unreachable!("unexpected inline native smoke source `{stem}`"),
     }
 }
@@ -1048,7 +1204,7 @@ function main(): int
 }
 "#,
             "B0001",
-            "native Stage 6b exit code must be in the range 0..125",
+            "native Stage 6c exit code must be in the range 0..125",
         ),
         (
             "return 255",
@@ -1059,7 +1215,7 @@ function main(): int
 }
 "#,
             "B0001",
-            "native Stage 6b exit code must be in the range 0..125",
+            "native Stage 6c exit code must be in the range 0..125",
         ),
         (
             "return out of Doria int range",
@@ -1115,7 +1271,7 @@ function main(): int
 }
 "#,
             "B0001",
-            "native Stage 6b exit code must be in the range 0..125",
+            "native Stage 6c exit code must be in the range 0..125",
         ),
         (
             "return arithmetic outside exit-code range",
@@ -1126,7 +1282,7 @@ function main(): int
 }
 "#,
             "B0001",
-            "native Stage 6b exit code must be in the range 0..125",
+            "native Stage 6c exit code must be in the range 0..125",
         ),
         (
             "returned arithmetic local outside exit-code range",
@@ -1138,7 +1294,7 @@ function main(): int
 }
 "#,
             "B0001",
-            "native Stage 6b exit code must be in the range 0..125",
+            "native Stage 6c exit code must be in the range 0..125",
         ),
         (
             "non-int local",
@@ -1217,7 +1373,7 @@ function main(): int
 }
 "#,
             "B0001",
-            "native Stage 6b exit code must be in the range 0..125",
+            "native Stage 6c exit code must be in the range 0..125",
         ),
         (
             "assignment overflow",
@@ -1245,7 +1401,7 @@ function main(): int
 }
 "#,
             "B0001",
-            "unsupported native arithmetic operator for Stage 6b",
+            "unsupported native arithmetic operator for Stage 6c",
         ),
         (
             "assignment after final return",
@@ -1262,7 +1418,7 @@ function main(): int
 }
 "#,
             "B0001",
-            "unsupported statement after native terminator for Stage 6b",
+            "unsupported statement after native terminator for Stage 6c",
         ),
         (
             "return division",
@@ -1273,7 +1429,7 @@ function main(): int
 }
 "#,
             "B0001",
-            "unsupported native arithmetic operator for Stage 6b",
+            "unsupported native arithmetic operator for Stage 6c",
         ),
         (
             "return modulo",
@@ -1284,7 +1440,7 @@ function main(): int
 }
 "#,
             "B0001",
-            "unsupported native arithmetic operator for Stage 6b",
+            "unsupported native arithmetic operator for Stage 6c",
         ),
         (
             "local initialized from division",
@@ -1296,7 +1452,7 @@ function main(): int
 }
 "#,
             "B0001",
-            "unsupported native arithmetic operator for Stage 6b",
+            "unsupported native arithmetic operator for Stage 6c",
         ),
         (
             "local initialized from function call",
@@ -1389,7 +1545,7 @@ function main(): int
 }
 "#,
             "B0001",
-            "native Stage 6b exit code must be in the range 0..125",
+            "native Stage 6c exit code must be in the range 0..125",
         ),
         (
             "if else branch outside exit-code range",
@@ -1404,7 +1560,7 @@ function main(): int
 }
 "#,
             "B0001",
-            "native Stage 6b exit code must be in the range 0..125",
+            "native Stage 6c exit code must be in the range 0..125",
         ),
         (
             "guard if branch outside exit-code range",
@@ -1419,7 +1575,7 @@ function main(): int
 }
 "#,
             "B0001",
-            "native Stage 6b exit code must be in the range 0..125",
+            "native Stage 6c exit code must be in the range 0..125",
         ),
         (
             "logical if branch outside exit-code range",
@@ -1434,7 +1590,7 @@ function main(): int
 }
 "#,
             "B0001",
-            "native Stage 6b exit code must be in the range 0..125",
+            "native Stage 6c exit code must be in the range 0..125",
         ),
         (
             "if integer condition",
@@ -1509,7 +1665,7 @@ function main(): int
 }
 "#,
             "B0001",
-            "unsupported native arithmetic operator for Stage 6b",
+            "unsupported native arithmetic operator for Stage 6c",
         ),
         (
             "if call condition",
@@ -1603,7 +1759,7 @@ function main(): int
 }
 "#,
             "B0001",
-            "native Stage 6b exit code must be in the range 0..125",
+            "native Stage 6c exit code must be in the range 0..125",
         ),
         (
             "branch return outside exit-code range",
@@ -1618,7 +1774,7 @@ function main(): int
 }
 "#,
             "B0001",
-            "native Stage 6b exit code must be in the range 0..125",
+            "native Stage 6c exit code must be in the range 0..125",
         ),
         (
             "division inside fallthrough branch",
@@ -1635,7 +1791,7 @@ function main(): int
 }
 "#,
             "B0001",
-            "unsupported native arithmetic operator for Stage 6b",
+            "unsupported native arithmetic operator for Stage 6c",
         ),
         (
             "division inside branch",
@@ -1650,7 +1806,7 @@ function main(): int
 }
 "#,
             "B0001",
-            "unsupported native arithmetic operator for Stage 6b",
+            "unsupported native arithmetic operator for Stage 6c",
         ),
         (
             "readonly assignment in while",
@@ -1687,32 +1843,14 @@ function main(): int
             "condition must be `bool`",
         ),
         (
-            "declaration inside while",
+            "nested while",
             r#"
 function main(): int
 {
     let writable $code = 0;
 
     while ($code < 42) {
-        let $step = 1;
-        $code += $step;
-    }
-
-    return $code;
-}
-"#,
-            "B0001",
-            "unsupported native while body for Stage 6b",
-        ),
-        (
-            "if inside while",
-            r#"
-function main(): int
-{
-    let writable $code = 0;
-
-    while ($code < 42) {
-        if ($code == 10) {
+        while ($code < 10) {
             $code += 1;
         }
     }
@@ -1721,7 +1859,7 @@ function main(): int
 }
 "#,
             "B0001",
-            "unsupported native while body statement for Stage 6b",
+            "unsupported native while body statement for Stage 6c",
         ),
         (
             "return inside while",
@@ -1738,7 +1876,7 @@ function main(): int
 }
 "#,
             "B0001",
-            "unsupported native while body statement for Stage 6b",
+            "unsupported native while body statement for Stage 6c",
         ),
         (
             "nonterminating while",
@@ -1806,7 +1944,7 @@ function main(): int
 }
 "#,
             "B0001",
-            "native Stage 6b exit code must be in the range 0..125",
+            "native Stage 6c exit code must be in the range 0..125",
         ),
         (
             "statement after terminal if else",
@@ -1823,7 +1961,7 @@ function main(): int
 }
 "#,
             "B0001",
-            "unsupported statement after native terminator for Stage 6b",
+            "unsupported statement after native terminator for Stage 6c",
         ),
         (
             "echo",
