@@ -64,7 +64,7 @@ Valid PHP should be easy to migrate to Doria, but Doria-specific syntax does not
 
 Doria does not use `public`, `protected`, or `private` as member visibility modifiers. Class members are externally accessible by default, and `internal` marks implementation details.
 
-The current compiler implementation produces only Stage 6c native smoke executables for exactly one top-level `function main(): int` with supported readonly and writable integer locals, `=`, `+=`, and `-=` assignments to writable integer locals, `+`/`-`/`*` arithmetic, structured returning `if` blocks, fallthrough `if` statements with visible-local merges, and bounded structured `while` loops in the accepted `0..125` portable exit-code range. Supported native `while` bodies may contain integer local declarations, writable integer assignments, and fallthrough `if` statements. Native validation proves accepted loops terminate within the current smoke verification cap before lowering them to real Cranelift control flow. Supported native conditions include bool literals, grouped conditions, integer comparisons, and bool-only `not` / `and` / `or` / `xor`. It is not yet full native code generation, a package manager, reflection system, macro system, async runtime, PHP migration converter, or full standard library. That implementation status does not make PHP transpilation the language goal.
+The current compiler implementation produces only Stage 6c native smoke executables for exactly one top-level `function main(): int` with supported readonly and writable integer locals, `=`, `+=`, and `-=` assignments to writable integer locals, `+`/`-`/`*` arithmetic, structured returning `if` blocks, fallthrough `if` statements with visible-local merges, and bounded structured `while` loops in the accepted `0..125` portable exit-code range. Supported native `while` bodies may contain integer local declarations, writable integer assignments, and fallthrough `if` statements. Native validation proves accepted loops terminate within the current smoke verification cap before lowering them through a private native smoke module to real Cranelift control flow. Supported native conditions include bool literals, grouped conditions, integer comparisons, and bool-only `not` / `and` / `or` / `xor`. It is not yet full native code generation, a package manager, reflection system, macro system, async runtime, PHP migration converter, or full standard library. That implementation status does not make PHP transpilation the language goal.
 
 Doria is not a Rust language. Rust is the current bootstrap implementation language for `doriac`, not the permanent identity of the compiler.
 
@@ -99,8 +99,67 @@ Planned future control-flow design includes:
 - `finally` attached to `if` / `else if` / `else` chains.
 - `when` as a value-returning conditional form.
 - `match` as a pattern/value selection construct.
+- `break` and `continue` for nearest-loop control flow.
 
 These advanced control-flow forms are not MVP syntax. See `docs/decisions/0009-control-flow-direction.md`.
+
+### Source organization and compiler directives
+
+The accepted namespace, import, include, and directive direction is recorded in `docs/decisions/0028-namespaces-use-include-and-directives.md`. Current compiler support may lag this accepted direction until lexer, parser, semantic name resolution, source management, Doria IR, backends, and LSP support are updated.
+
+Namespaces define logical symbol ownership and declaration scope. They are part of semantic name resolution, not source inclusion, package resolution, build orchestration, or runtime loading.
+
+Accepted conceptual syntax:
+
+```doria
+namespace App\Services;
+
+class UserService
+{
+}
+```
+
+Nested namespace paths such as `namespace App\Domain\Users;` are accepted as the likely/default direction. The backslash separator matches Doria's PHP-shaped readability, but exact grammar details remain future implementation work.
+
+`use` statements import names from namespaces into the current file or declaration context. `use` is semantic name resolution and aliasing. It is not textual inclusion, PHP runtime include, package dependency resolution, or code execution.
+
+Accepted conceptual syntax:
+
+```doria
+use App\Models\User;
+use App\Security\Permission;
+use App\Repositories\PostRepository as Posts;
+```
+
+`use` may import fully qualified symbols and may alias symbols. Duplicate or conflicting imports should be diagnosed. Unused import warnings may be added later. `use` does not load packages by itself; package resolution belongs to Baton later.
+
+`include` is compile-time source inclusion with required include-once behavior. It is lower-level source composition, not the normal import mechanism. If an included file cannot be found, compilation fails. If the same canonical file is included more than once, it is included once. Include resolution must be deterministic, include diagnostics must preserve source file and span information, and included source participates in the same compiler pipeline as normal Doria source.
+
+Accepted conceptual syntax:
+
+```doria
+include "src/generated/routes.doria";
+```
+
+Only string-literal local source paths are accepted in the intended direction. Computed paths and remote includes are rejected:
+
+```doria
+include $path;                         // rejected direction
+include getPath();                     // rejected direction
+include "https://example.com/file.doria"; // rejected direction
+```
+
+Doria does not add separate PHP-style `require`, `require_once`, or `include_once` forms. Doria `include` already means required include-once source inclusion.
+
+`break` exits the nearest enclosing loop. PHP-style numeric break levels such as `break 2;` are not accepted by the namespace/directive decision. Labeled break may be evaluated later if needed.
+
+`continue` jumps to the next iteration of the nearest enclosing loop. PHP-style numeric continue levels such as `continue 2;` are not accepted by the namespace/directive decision. Labeled continue may be evaluated later if needed.
+
+`declare` is a structured compiler/source directive. It is not a macro system and not textual substitution. Exact grammar and allowed declaration keys require future decisions. Unknown declare keys should be rejected when `declare` is implemented. Possible future uses include warning policy, unsafe/FFI boundary policy, backend/profile constraints, platform configuration, optimization intent, feature gates, and compile-time diagnostics.
+
+`goto` is evaluation-only and is not accepted for implementation yet. If it is ever accepted, it should be constrained so it cannot jump into deeper scopes, bypass visible initialization, bypass cleanup or `finally` obligations, cross protected resource regions, or cross future borrow/lifetime boundaries.
+
+Doria should not adopt a C/C++ textual macro preprocessor by default. `#define` and `#undef` textual macro substitution are not accepted. Future conditional compilation and compile-time diagnostics should use structured compiler semantics rather than arbitrary token substitution. Doria source should remain parseable, typed, and semantically checked by `doriac`.
 
 ## 4. Declaration rules
 
@@ -584,7 +643,7 @@ Doria IR is the checked compiler-owned representation of a Doria program. After 
 
 As native code generation matures, Doria IR may lower into a simpler native-oriented IR for control flow, memory layout, runtime calls, and backend code generation.
 
-The native backend is the primary target. It should lower Doria IR, and any later native-oriented IR, toward native machine code and standalone executables. The current Cranelift-backed Stage 6c native backend is deliberately limited to exactly one top-level `function main(): int` with supported readonly and writable integer locals, `=`, `+=`, and `-=` assignments to writable integer locals, `+`/`-`/`*` arithmetic, structured returning `if` blocks, fallthrough `if` statements with visible-local merges, and bounded structured `while` loops in `0..125`. Supported native `while` bodies may contain integer local declarations, writable integer assignments, and fallthrough `if` statements. Stage 6c validates loop termination, loop-body scoping, fallthrough branch state merging, and checked integer arithmetic before native lowering, then emits real Cranelift control flow. The native loop verification cap is a backend support limit, not Doria language semantics. Stage 6c conditions support bool literals, grouped conditions, integer comparisons over supported integer expressions, `!` / `not`, `&&` / `and`, `||` / `or`, and `xor`. It emits unsupported-feature diagnostics for general loops beyond the bounded Stage 6c shape, nested `while`, returns inside `while`, `return` inside fallthrough branch bodies, `break`, `continue`, non-integer locals, division/modulo, strings, classes, collections, and broader valid Doria until later native slices are designed.
+The native backend is the primary target. It should lower Doria IR, and any later native-oriented IR, toward native machine code and standalone executables. The current Cranelift-backed Stage 6c native backend is deliberately limited to exactly one top-level `function main(): int` with supported readonly and writable integer locals, `=`, `+=`, and `-=` assignments to writable integer locals, `+`/`-`/`*` arithmetic, structured returning `if` blocks, fallthrough `if` statements with visible-local merges, and bounded structured `while` loops in `0..125`. Supported native `while` bodies may contain integer local declarations, writable integer assignments, and fallthrough `if` statements. Stage 6c validates loop termination, loop-body scoping, fallthrough branch state merging, and checked integer arithmetic before native lowering, then emits real Cranelift control flow. Stage 7a keeps that source support unchanged while separating native smoke validation, compile-time smoke evaluation/proof, and Cranelift lowering behind a private `NativeSmokeModule` boundary. That module is not public Doria IR, final MIR, or a permanent local storage model. The native loop verification cap is a backend support limit, not Doria language semantics. Stage 6c conditions support bool literals, grouped conditions, integer comparisons over supported integer expressions, `!` / `not`, `&&` / `and`, `||` / `or`, and `xor`. It emits unsupported-feature diagnostics for general loops beyond the bounded Stage 6c shape, nested `while`, returns inside `while`, `return` inside fallthrough branch bodies, `break`, `continue`, non-integer locals, division/modulo, strings, classes, collections, and broader valid Doria until later native slices are designed.
 
 The PHP backend is currently implemented as a compatibility/debugging backend. It emits `<?php` and lowers Doria-only syntax away:
 
@@ -607,11 +666,15 @@ Future work includes:
 - Nullable types.
 - Full type inference for lists and dictionaries.
 - Interfaces, traits, and namespaces.
+- `use` statements for semantic imports and aliases.
+- `include` as required include-once compile-time source inclusion.
+- `declare` as structured compiler/source directives.
 - Attribute syntax and metadata representation.
 - Richer instance property initializers.
 - Named arguments.
 - Full path-sensitive control-flow analysis for returns and constructor initialization.
-- Advanced control-flow design for `do ... while ... finally`, `given ... when`, `given ... while`, `if` chains with possible `finally`, value-returning `when`, and `match`.
+- Advanced control-flow design for `do ... while ... finally`, `given ... when`, `given ... while`, `if` chains with possible `finally`, value-returning `when`, `match`, `break`, and `continue`.
+- Careful evaluation of `goto`, labeled loop control, and structured conditional compilation without adopting C/C++ textual macros.
 - Async/await and structured concurrency.
 - Broader native backend design and implementation beyond the Stage 6c smoke target.
 - Native-oriented IR implementation when native code generation needs it.

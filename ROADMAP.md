@@ -23,6 +23,7 @@
 - Represent braced string interpolation in the Doria AST and Doria IR, with PHP lowering emitted as explicit concatenation.
 - Support the first accepted boolean/equality compiler slice: typed `==` / `!=`, rejection of `===` / `!==`, bool-only `!` / `not`, `&&` / `and`, `||` / `or`, and `xor` in the parser, semantic checker, Doria IR, and PHP backend.
 - Stage 6c Cranelift native smoke backend is implemented for exactly one top-level `function main(): int` with supported readonly and writable integer locals, `=`, `+=`, and `-=` assignments to writable integer locals, `+`/`-`/`*` arithmetic, structured returning `if` blocks, fallthrough `if` statements with visible-local merges, and bounded structured `while` loops. Supported native `while` bodies may contain integer local declarations, writable integer assignments, and fallthrough `if` statements. Native validation proves accepted loops terminate within the current smoke verification cap before lowering them to real Cranelift control flow. Conditions support bool literals, grouped conditions, integer comparisons over supported integer expressions, `!` / `not`, `&&` / `and`, `||` / `or`, and `xor`.
+- Stage 7a preserves the Stage 6c native source subset while routing current native smoke validation, compile-time smoke evaluation/proof, and Cranelift lowering through a private native smoke module boundary.
 - Keep PHP as a compatibility backend only; do not treat PHP output as the proof that Doria semantics are correct.
 - Do not build PHP-to-Doria migration in the current v0.1 slice.
 - Do not start desktop, game engine, raylib, or FFI implementation work in the current v0.1 slice.
@@ -44,15 +45,24 @@
 - Treat `docs/decisions/0024-stage-6a-native-bounded-while.md` as the accepted Stage 6a native bounded `while` implementation decision.
 - Treat `docs/decisions/0025-stage-6b-native-if-fallthrough-merges.md` as the accepted Stage 6b native fallthrough `if` merge implementation decision.
 - Treat `docs/decisions/0026-stage-6c-native-structured-while-bodies.md` as the accepted Stage 6c native structured `while` body implementation decision.
+- Treat `docs/decisions/0027-stage-7a-native-smoke-ir-boundary.md` as the accepted Stage 7a native smoke IR boundary implementation decision.
+- Treat `docs/decisions/0028-namespaces-use-include-and-directives.md` as the accepted namespace, `use`, `include`, `declare`, `break`, and `continue` direction.
 - Keep broader native expression, assignment, and control-flow support beyond the Stage 6c smoke subset as separate future implementation slices.
 - Extend accepted operator support with integer bitwise spellings in a dedicated parser and semantic checking slice; do not import PHP loose comparison or PHP `and` / `or` precedence.
 - Add compiler support for `int8`/`int16`/`int32`/`int64`, `uint8`/`uint16`/`uint32`/`uint64`, and `float32`/`float64` in a dedicated typed semantic model slice before claiming those spellings are implemented.
-- Plan a lowered/native IR when native code generation needs a simpler representation for control flow, memory layout, runtime calls, and backend emission.
+- Plan a broader lowered/native IR when native code generation needs a simpler representation for control flow, memory layout, runtime calls, and backend emission; do not confuse the private Stage 7a native smoke module with final Doria MIR.
 - Expand native source support beyond Stage 6c only after the next accepted native slice specifies the language semantics and expected behavior.
 - Keep future LLVM optimized-profile work conformant with accepted Doria integer semantics and Cranelift fast-profile behavior for the same supported programs.
 - Expand return checking from the current final-statement rule into full path-sensitive control-flow analysis.
 - Add full definite property initialization analysis for constructor paths.
 - Plan the path toward writing more of `doriac` in Doria itself.
+- Design and implement namespaces as semantic symbol ownership.
+- Design and implement `use` statements for semantic imports and aliases.
+- Design and implement `include` as required include-once source inclusion.
+- Design and implement `declare` as structured compiler/source directives.
+- Implement `break` and `continue` after the native/control-flow model can support them correctly.
+- Evaluate `goto` carefully before acceptance.
+- Evaluate structured conditional compilation and compile-time diagnostics without adopting C/C++ textual macros.
 - Expand string interpolation beyond variable/property paths after Doria has a deliberate display/string-conversion design.
 - Emit precedence-aware backend expressions.
 - Add parser/AST support for attributes using `#[...]`.

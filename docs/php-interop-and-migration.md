@@ -272,7 +272,7 @@ Hard cases include:
 - dynamic properties
 - magic methods: __get, __set, __call
 - eval
-- include/require with computed paths
+- PHP include/require with computed paths
 - runtime symbol table tricks
 - weak typing and coercion
 - by-reference behavior

@@ -8,6 +8,7 @@ pub mod lexer;
 pub mod lowering;
 pub mod lsp;
 pub mod mir;
+mod native_smoke;
 pub mod parser;
 pub mod semantics;
 pub mod source;
