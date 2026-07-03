@@ -326,6 +326,16 @@ fn compiles_and_runs_current_native_smoke_examples() {
             42,
         ),
         (
+            "main_while_body_if_empty_then_branch_42",
+            "inline_main_while_body_if_empty_then_branch_42.doria",
+            42,
+        ),
+        (
+            "main_while_body_if_empty_else_branch_42",
+            "inline_main_while_body_if_empty_else_branch_42.doria",
+            42,
+        ),
+        (
             "main_while_body_shadow_preserves_outer",
             "inline_main_while_body_shadow_preserves_outer.doria",
             0,
@@ -1085,6 +1095,40 @@ function main(): int
     }
 
     return $code;
+}
+"#
+        }
+        "main_while_body_if_empty_then_branch_42" => {
+            r#"
+function main(): int
+{
+    let writable $i = 0;
+
+    while ($i < 1) {
+        if ($i == 1) {
+        } else {
+            $i += 1;
+        }
+    }
+
+    return $i + 41;
+}
+"#
+        }
+        "main_while_body_if_empty_else_branch_42" => {
+            r#"
+function main(): int
+{
+    let writable $i = 0;
+
+    while ($i < 1) {
+        if ($i == 0) {
+            $i += 1;
+        } else {
+        }
+    }
+
+    return $i + 41;
 }
 "#
         }

@@ -49,6 +49,8 @@ Supported `while` bodies may contain:
 - supported assignments to loop-body writable `int` locals
 - supported fallthrough `if` statements
 
+Empty branches in loop-body fallthrough `if` statements are supported and preserve the incoming visible local state for that branch.
+
 `while` body locals are scoped to the loop body and are recreated for each iteration. They do not leak outside the loop body or overwrite outer locals with the same name.
 
 ## Verification

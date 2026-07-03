@@ -707,6 +707,20 @@ fn validate_stage_6c_while_body(
         ));
     }
 
+    validate_stage_6c_while_scoped_body(statements, local_states)
+}
+
+fn validate_stage_6c_while_branch_body(
+    statements: &[Stmt],
+    local_states: &HashMap<String, NativeLocalState>,
+) -> Result<NativeFallthroughBlock, BackendError> {
+    validate_stage_6c_while_scoped_body(statements, local_states)
+}
+
+fn validate_stage_6c_while_scoped_body(
+    statements: &[Stmt],
+    local_states: &HashMap<String, NativeLocalState>,
+) -> Result<NativeFallthroughBlock, BackendError> {
     let mut block_states = local_states.clone();
     let mut visible_states = local_states.clone();
     let mut shadowed_locals = HashSet::new();
@@ -860,15 +874,16 @@ fn validate_stage_6c_loop_fallthrough_if(
             }
         })?;
 
-    let then_block = validate_stage_6c_while_body(&if_stmt.then_block.statements, local_states)?;
+    let then_block =
+        validate_stage_6c_while_branch_body(&if_stmt.then_block.statements, local_states)?;
     let else_block = match &if_stmt.else_branch {
-        Some(ElseBranch::Block(block)) => Some(validate_stage_6c_while_body(
+        Some(ElseBranch::Block(block)) => Some(validate_stage_6c_while_branch_body(
             &block.statements,
             local_states,
         )?),
         Some(ElseBranch::If(else_if)) => {
             let else_if_statement = Stmt::If((**else_if).clone());
-            Some(validate_stage_6c_while_body(
+            Some(validate_stage_6c_while_branch_body(
                 &[else_if_statement],
                 local_states,
             )?)
