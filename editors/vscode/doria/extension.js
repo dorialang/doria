@@ -115,7 +115,7 @@ class DoriaLanguageClient {
   }
 
   didOpen(document) {
-    if (!isDoria(document) || !this.process) {
+    if (!isDoriaSource(document) || !this.process) {
       return;
     }
 
@@ -130,7 +130,7 @@ class DoriaLanguageClient {
   }
 
   didChange(event) {
-    if (!isDoria(event.document) || !this.process) {
+    if (!isDoriaSource(event.document) || !this.process) {
       return;
     }
 
@@ -148,7 +148,7 @@ class DoriaLanguageClient {
   }
 
   didSave(document) {
-    if (!isDoria(document) || !this.process) {
+    if (!isDoriaSource(document) || !this.process) {
       return;
     }
 
@@ -160,15 +160,17 @@ class DoriaLanguageClient {
   }
 
   didClose(document) {
-    if (!isDoria(document) || !this.process) {
+    if (!isDoria(document)) {
       return;
     }
 
-    this.sendNotification("textDocument/didClose", {
-      textDocument: {
-        uri: document.uri.toString()
-      }
-    });
+    if (isDoriaSource(document) && this.process) {
+      this.sendNotification("textDocument/didClose", {
+        textDocument: {
+          uri: document.uri.toString()
+        }
+      });
+    }
     this.diagnostics.delete(document.uri);
   }
 
@@ -270,6 +272,11 @@ class DoriaLanguageClient {
 
   publishDiagnostics(params) {
     const uri = vscode.Uri.parse(params.uri);
+    if (isEditorFixturePath(uri.fsPath)) {
+      this.diagnostics.delete(uri);
+      return;
+    }
+
     const diagnostics = (params.diagnostics ?? []).map((diagnostic) => {
       const range = new vscode.Range(
         diagnostic.range.start.line,
@@ -290,7 +297,7 @@ class DoriaLanguageClient {
   }
 
   provideHover(document, position) {
-    if (!isDoria(document) || !this.process) {
+    if (!isDoriaSource(document) || !this.process) {
       return undefined;
     }
 
@@ -310,7 +317,7 @@ class DoriaLanguageClient {
   }
 
   provideCompletionItems(document, position) {
-    if (!isDoria(document) || !this.process) {
+    if (!isDoriaSource(document) || !this.process) {
       return undefined;
     }
 
@@ -370,6 +377,14 @@ function workspaceRoot() {
 
 function isDoria(document) {
   return document.languageId === "doria" || document.fileName.endsWith(".doria");
+}
+
+function isDoriaSource(document) {
+  return isDoria(document) && !isEditorFixturePath(document.fileName);
+}
+
+function isEditorFixturePath(fileName) {
+  return fileName.replace(/\\/g, "/").includes("/editors/fixtures/");
 }
 
 function toSeverity(severity) {

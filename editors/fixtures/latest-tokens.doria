@@ -1,0 +1,74 @@
+namespace App\Services;
+
+use App\Models\User;
+use App\Security\Permission;
+use App\Repositories\PostRepository as Posts;
+
+include "src/generated/routes.doria";
+
+declare warnings: strict;
+
+interface Renderable
+{
+    function render(): string;
+}
+
+trait HasSlug
+{
+    string $slug;
+}
+
+class Post extends Model implements Renderable, JsonSerializable
+{
+    use HasSlug;
+
+    function render(): string
+    {
+        return "post";
+    }
+}
+
+function main(): int
+{
+    let writable $code = 0;
+    int8 $tiny = 1;
+    int16 $small = 2;
+    int32 $medium = 3;
+    int64 $large = 9223372036854775807;
+    uint8 $mask = 1;
+    uint16 $port = 8080;
+    uint32 $flags = 0;
+    uint64 $id = 18446744073709551615;
+    float32 $ratio = 1.5;
+    float64 $distance = 10.5;
+
+    while ($code < 42) {
+        $code += 1;
+
+        if ($code == 10) {
+            continue;
+        }
+
+        if ($code == 42) {
+            break;
+        }
+    }
+
+    given {
+        let $user = $session->user;
+
+        not $user->isSuspended;
+        $user->isActivated;
+        $this->isOrgMember($user) and ($this->isOrgMember($user) or $this->isAdmin($user));
+        $user->hasEmail xor $user->hasPhone;
+    } if ($user->can(Permission::EditPost)) {
+        $post->publish();
+    } finally {
+        $audit->record();
+    }
+
+    return when ($code) {
+        42 => 42,
+        default => 0,
+    };
+}

@@ -30,3 +30,5 @@ Keep this TextMate grammar aligned with the IntelliJ / JetBrains highlighter und
 ```bash
 python3 scripts/check_editor_highlighting.py
 ```
+
+Files under `editors/fixtures/` are syntax-highlighting smoke fixtures. The VS Code client keeps them out of `doria-lsp` diagnostics so accepted/planned editor vocabulary can be exercised before compiler implementation lands.
