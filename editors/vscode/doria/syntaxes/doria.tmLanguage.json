@@ -287,21 +287,65 @@
           }
         },
         {
-          "match": "\\b(use)\\s+([A-Za-z_][A-Za-z0-9_]*(?:\\\\[A-Za-z_][A-Za-z0-9_]*)*)(?:\\s+(as)\\s+([A-Za-z_][A-Za-z0-9_]*))?",
-          "captures": {
+          "name": "meta.trait-composition.doria",
+          "begin": "^\\s+(use)\\b(?=\\s+[A-Z][A-Za-z0-9_]*(?:\\s*(?:,|;)))",
+          "beginCaptures": {
             "1": {
-              "name": "keyword.import.doria"
-            },
-            "2": {
-              "name": "entity.name.type.import.doria"
-            },
-            "3": {
-              "name": "keyword.control.as.doria"
-            },
-            "4": {
-              "name": "entity.name.type.alias.doria"
+              "name": "keyword.other.trait-use.doria"
             }
-          }
+          },
+          "end": "(;)",
+          "endCaptures": {
+            "1": {
+              "name": "punctuation.terminator.statement.doria"
+            }
+          },
+          "patterns": [
+            {
+              "name": "entity.name.type.trait.doria",
+              "match": "\\b[A-Z][A-Za-z0-9_]*\\b"
+            },
+            {
+              "name": "punctuation.separator.comma.doria",
+              "match": ","
+            }
+          ]
+        },
+        {
+          "name": "meta.import.doria",
+          "begin": "^(use)\\b(?=\\s+[A-Za-z_][A-Za-z0-9_]*(?:\\\\[A-Za-z_][A-Za-z0-9_]*)+)",
+          "beginCaptures": {
+            "1": {
+              "name": "keyword.control.import.doria"
+            }
+          },
+          "end": "(;)",
+          "endCaptures": {
+            "1": {
+              "name": "punctuation.terminator.statement.doria"
+            }
+          },
+          "patterns": [
+            {
+              "match": "(\\bas\\b)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+              "captures": {
+                "1": {
+                  "name": "keyword.operator.alias.doria"
+                },
+                "2": {
+                  "name": "entity.name.type.alias.doria"
+                }
+              }
+            },
+            {
+              "name": "punctuation.separator.namespace.doria",
+              "match": "\\\\"
+            },
+            {
+              "name": "entity.name.namespace.doria",
+              "match": "\\b[A-Za-z_][A-Za-z0-9_]*\\b"
+            }
+          ]
         },
         {
           "match": "\\b(class)\\s+([A-Za-z_][A-Za-z0-9_]*)",

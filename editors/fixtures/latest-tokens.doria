@@ -1,6 +1,7 @@
-namespace App\Services;
+namespace App\Posts;
 
-use App\Models\User;
+// Namespace import use imports names from namespaces.
+use App\Models\Post;
 use App\Security\Permission;
 use App\Repositories\PostRepository as Posts;
 
@@ -18,9 +19,15 @@ trait HasSlug
     string $slug;
 }
 
-class Post extends Model implements Renderable, JsonSerializable
+trait TracksChanges
 {
-    use HasSlug;
+    int64 $lastChangedAt;
+}
+
+class Article extends Model implements Renderable, JsonSerializable
+{
+    // Class-body use composes traits into the class.
+    use HasSlug, TracksChanges;
 
     function render(): string
     {

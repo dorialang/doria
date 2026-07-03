@@ -324,6 +324,26 @@ class DoriaLexer : LexerBase() {
         tokenType = when (text) {
             in INVALID_KEYWORDS -> DoriaTokenTypes.INVALID
 
+            "use" -> useTokenType()
+
+            "as" -> if (isImportUseLine()) DoriaTokenTypes.IMPORT_ALIAS_KEYWORD else DoriaTokenTypes.KEYWORD
+
+            else -> contextualIdentifierTokenType(text)
+        }
+    }
+
+    private fun contextualIdentifierTokenType(text: String): IElementType = when {
+        isTraitUseLine() && text.first().isUpperCase() -> DoriaTokenTypes.TRAIT_NAME
+
+        isImportAliasName() -> DoriaTokenTypes.IMPORT_ALIAS
+
+        isImportUseLine() && text !in KEYWORDS -> DoriaTokenTypes.IMPORT_PATH
+
+        else -> baseIdentifierTokenType(text)
+    }
+
+    private fun baseIdentifierTokenType(text: String): IElementType =
+        when (text) {
             in KEYWORDS -> DoriaTokenTypes.KEYWORD
 
             in WORD_OPERATORS -> DoriaTokenTypes.OPERATOR
@@ -345,6 +365,11 @@ class DoriaLexer : LexerBase() {
                 else -> DoriaTokenTypes.IDENTIFIER
             }
         }
+
+    private fun useTokenType(): IElementType = when {
+        isTraitUseLine() -> DoriaTokenTypes.TRAIT_USE_KEYWORD
+        isImportUseLine() -> DoriaTokenTypes.IMPORT_USE_KEYWORD
+        else -> DoriaTokenTypes.KEYWORD
     }
 
     private fun scanSymbol() {
@@ -393,6 +418,18 @@ class DoriaLexer : LexerBase() {
 
         return cursor >= endOffset || !isIdentifierPart(buffer[cursor])
     }
+
+    private fun isTraitUseLine(): Boolean =
+        TRAIT_USE_LINE.matches(currentLine())
+
+    private fun isImportUseLine(): Boolean =
+        IMPORT_USE_LINE.matches(currentLine())
+
+    private fun isImportAliasName(): Boolean =
+        isImportUseLine() && previousIdentifier() == "as"
+
+    private fun currentLine(): String =
+        buffer.subSequence(lineStart(tokenStart), lineEnd(tokenStart)).toString()
 
     private fun peek(delta: Int): Char? {
         val index = tokenStart + delta
@@ -682,6 +719,12 @@ class DoriaLexer : LexerBase() {
         )
 
         private val COLLECTION_TYPES = setOf("List", "Dictionary", "Set")
+
+        private val TRAIT_USE_LINE =
+            Regex("^\\s+use\\s+[A-Z][A-Za-z0-9_]*(?:\\s*,\\s*[A-Z][A-Za-z0-9_]*)*\\s*;?\\s*(?://.*)?$")
+
+        private val IMPORT_USE_LINE =
+            Regex("^use\\s+[A-Za-z_][A-Za-z0-9_]*(?:\\\\[A-Za-z_][A-Za-z0-9_]*)+(?:\\s+as\\s+[A-Za-z_][A-Za-z0-9_]*)?\\s*;?\\s*(?://.*)?$")
 
         private val PREPROCESSOR_DIRECTIVES = setOf(
             "include",

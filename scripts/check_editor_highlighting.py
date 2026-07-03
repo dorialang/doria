@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import pathlib
+import re
 import sys
 from collections.abc import Iterator
 from typing import Any
@@ -15,6 +16,8 @@ VSCODE_PACKAGE = ROOT / "editors/vscode/doria/package.json"
 VSCODE_GRAMMAR = ROOT / "editors/vscode/doria/syntaxes/doria.tmLanguage.json"
 VSCODE_EXTENSION = ROOT / "editors/vscode/doria/extension.js"
 INTELLIJ_LEXER = ROOT / "editors/intellij/doria/src/main/kotlin/dev/doria/intellij/highlighting/DoriaLexer.kt"
+INTELLIJ_TOKEN_TYPES = ROOT / "editors/intellij/doria/src/main/kotlin/dev/doria/intellij/highlighting/DoriaTokenTypes.kt"
+INTELLIJ_SYNTAX_HIGHLIGHTER = ROOT / "editors/intellij/doria/src/main/kotlin/dev/doria/intellij/highlighting/DoriaSyntaxHighlighter.kt"
 INTELLIJ_LSP_FILES = ROOT / "editors/intellij/doria/src/main/kotlin/dev/doria/intellij/lsp/DoriaLspFiles.kt"
 FIXTURE = ROOT / "editors/fixtures/latest-tokens.doria"
 
@@ -168,9 +171,42 @@ def check_vscode_grammar() -> None:
         "VS Code grammar must mark goto invalid or unsupported",
     )
 
+    import_patterns = [pattern for pattern in patterns if pattern.get("name") == "meta.import.doria"]
+    trait_patterns = [pattern for pattern in patterns if pattern.get("name") == "meta.trait-composition.doria"]
+    require(import_patterns, "VS Code grammar must define a distinct import-use scope")
+    require(trait_patterns, "VS Code grammar must define a distinct trait-composition scope")
+
+    import_begin = import_patterns[0].get("begin", "")
+    trait_begin = trait_patterns[0].get("begin", "")
+    require(re.search(import_begin, r"use App\Models\User;"), "VS Code import pattern must match namespace imports")
+    require(
+        not re.search(import_begin, "    use HasSlug;"),
+        "VS Code import pattern must not match class-body trait use",
+    )
+    require(re.search(trait_begin, "    use HasSlug;"), "VS Code trait-use pattern must match class-body trait use")
+    require(
+        not re.search(trait_begin, r"use App\Models\User;"),
+        "VS Code trait-use pattern must not match namespace imports",
+    )
+
+    for scope in [
+        "keyword.control.import.doria",
+        "keyword.operator.alias.doria",
+        "keyword.other.trait-use.doria",
+        "entity.name.type.trait.doria",
+    ]:
+        require(scope in grammar_text, f"VS Code grammar is missing {scope!r}")
+
 
 def check_intellij_lexer() -> None:
     lexer_text = INTELLIJ_LEXER.read_text(encoding="utf-8")
+    intellij_highlighting_text = "\n".join(
+        [
+            lexer_text,
+            INTELLIJ_TOKEN_TYPES.read_text(encoding="utf-8"),
+            INTELLIJ_SYNTAX_HIGHLIGHTER.read_text(encoding="utf-8"),
+        ]
+    )
 
     for token in sorted(ACCEPTED_KEYWORDS | PRIMITIVE_TYPES | WORD_OPERATORS):
         require(f'"{token}"' in lexer_text, f"IntelliJ lexer is missing {token!r}")
@@ -188,6 +224,16 @@ def check_intellij_lexer() -> None:
     require('"goto"' in lexer_text and "INVALID_KEYWORDS" in lexer_text, "IntelliJ lexer must mark goto invalid")
     for directive in sorted(REJECTED_PREPROCESSOR):
         require(f'"{directive}"' in lexer_text, f"IntelliJ lexer must recognize #{directive} as unsupported")
+
+    for token_type in [
+        "DORIA_IMPORT_USE_KEYWORD",
+        "DORIA_IMPORT_PATH",
+        "DORIA_IMPORT_ALIAS_KEYWORD",
+        "DORIA_IMPORT_ALIAS",
+        "DORIA_TRAIT_USE_KEYWORD",
+        "DORIA_TRAIT_NAME",
+    ]:
+        require(token_type in intellij_highlighting_text, f"IntelliJ highlighting is missing {token_type}")
 
 
 def check_editor_fixture_diagnostics_are_skipped() -> None:
@@ -210,6 +256,10 @@ def check_fixture() -> None:
         require(token in fixture_text, f"shared editor fixture is missing {token!r}")
     for token in sorted({"int8", "int16", "int32", "int64", "uint8", "uint16", "uint32", "uint64", "float32", "float64"}):
         require(token in fixture_text, f"shared editor fixture is missing {token!r}")
+    require(
+        "use App\\Models\\Post;" in fixture_text and "use HasSlug, TracksChanges;" in fixture_text,
+        "shared editor fixture must include both import-use and trait-use examples",
+    )
 
 
 def main() -> int:
