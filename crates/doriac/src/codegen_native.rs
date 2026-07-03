@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::ffi::OsString;
 use std::fs;
@@ -455,6 +455,8 @@ fn validate_stage_6b_fallthrough_block(
     local_states: &HashMap<String, NativeLocalState>,
 ) -> Result<NativeFallthroughBlock, BackendError> {
     let mut block_states = local_states.clone();
+    let mut visible_states = local_states.clone();
+    let mut shadowed_locals = HashSet::new();
     let mut native_statements = Vec::new();
 
     for statement in statements {
@@ -468,6 +470,9 @@ fn validate_stage_6b_fallthrough_block(
                         value: local.evaluated_value,
                     },
                 );
+                if visible_states.contains_key(&local.name) {
+                    shadowed_locals.insert(local.name.clone());
+                }
                 native_statements.push(NativeStmt::Local(local));
             }
             Stmt::Assignment(assignment) => {
@@ -478,16 +483,36 @@ fn validate_stage_6b_fallthrough_block(
                     ));
                 };
                 state.value = assignment.evaluated_value;
+                if visible_states.contains_key(&assignment.target)
+                    && !shadowed_locals.contains(&assignment.target)
+                {
+                    let Some(visible_state) = visible_states.get_mut(&assignment.target) else {
+                        return Err(BackendError::new(
+                            "backend validation failure: validated native visible fallthrough assignment target was not declared",
+                        ));
+                    };
+                    visible_state.value = assignment.evaluated_value;
+                }
                 native_statements.push(NativeStmt::Assign(assignment));
             }
             Stmt::While(while_stmt) => {
                 let native_while = validate_stage_6b_while(while_stmt, &block_states)?;
                 merge_native_values(&mut block_states, &native_while.final_values)?;
+                merge_visible_native_values(
+                    &mut visible_states,
+                    &shadowed_locals,
+                    &native_while.final_values,
+                )?;
                 native_statements.push(NativeStmt::While(native_while));
             }
             Stmt::If(if_stmt) => {
                 let native_if = validate_stage_6b_fallthrough_if(if_stmt, &block_states)?;
                 merge_native_values(&mut block_states, &native_if.merged_values)?;
+                merge_visible_native_values(
+                    &mut visible_states,
+                    &shadowed_locals,
+                    &native_if.merged_values,
+                )?;
                 native_statements.push(NativeStmt::If(native_if));
             }
             Stmt::Return { .. } => {
@@ -506,8 +531,29 @@ fn validate_stage_6b_fallthrough_block(
 
     Ok(NativeFallthroughBlock {
         statements: native_statements,
-        final_states: block_states,
+        final_states: visible_states,
     })
+}
+
+fn merge_visible_native_values(
+    visible_states: &mut HashMap<String, NativeLocalState>,
+    shadowed_locals: &HashSet<String>,
+    values: &[(String, i64)],
+) -> Result<(), BackendError> {
+    for (name, value) in values {
+        if !visible_states.contains_key(name) || shadowed_locals.contains(name) {
+            continue;
+        }
+
+        let Some(state) = visible_states.get_mut(name) else {
+            return Err(BackendError::new(format!(
+                "backend validation failure: validated native visible local `{name}` was not declared",
+            )));
+        };
+        state.value = *value;
+    }
+
+    Ok(())
 }
 
 fn should_defer_if_to_native_terminator(message: &str) -> bool {
@@ -1441,7 +1487,7 @@ fn lower_native_fallthrough_if(
     builder.seal_block(then_ir_block);
     let mut then_lowered_local_values = lowered_local_values.clone();
     let mut then_evaluated_local_values = evaluated_local_values.clone();
-    lower_native_fallthrough_block(
+    let then_visible_local_values = lower_native_fallthrough_block(
         builder,
         &native_if.then_block,
         &mut then_lowered_local_values,
@@ -1451,26 +1497,28 @@ fn lower_native_fallthrough_if(
         builder,
         merge_ir_block,
         &native_if.merged_values,
-        &then_lowered_local_values,
+        &then_visible_local_values,
     )?;
 
     builder.switch_to_block(else_ir_block);
     builder.seal_block(else_ir_block);
     let mut else_lowered_local_values = lowered_local_values.clone();
     let mut else_evaluated_local_values = evaluated_local_values.clone();
-    if let Some(else_block) = &native_if.else_block {
+    let else_visible_local_values = if let Some(else_block) = &native_if.else_block {
         lower_native_fallthrough_block(
             builder,
             else_block,
             &mut else_lowered_local_values,
             &mut else_evaluated_local_values,
-        )?;
-    }
+        )?
+    } else {
+        lowered_local_values.clone()
+    };
     jump_to_native_merge(
         builder,
         merge_ir_block,
         &native_if.merged_values,
-        &else_lowered_local_values,
+        &else_visible_local_values,
     )?;
 
     builder.switch_to_block(merge_ir_block);
@@ -1488,16 +1536,91 @@ fn lower_native_fallthrough_block(
     block: &NativeFallthroughBlock,
     lowered_local_values: &mut HashMap<String, Value>,
     evaluated_local_values: &mut HashMap<String, i64>,
-) -> Result<(), BackendError> {
+) -> Result<HashMap<String, Value>, BackendError> {
+    let mut visible_lowered_local_values = lowered_local_values.clone();
+    let mut shadowed_locals = HashSet::new();
+
     for statement in &block.statements {
-        lower_native_statement(
-            builder,
-            statement,
-            lowered_local_values,
-            evaluated_local_values,
-        )?;
+        match statement {
+            NativeStmt::Local(local) => {
+                lower_native_statement(
+                    builder,
+                    statement,
+                    lowered_local_values,
+                    evaluated_local_values,
+                )?;
+                if visible_lowered_local_values.contains_key(&local.name) {
+                    shadowed_locals.insert(local.name.clone());
+                }
+            }
+            NativeStmt::Assign(assignment) => {
+                lower_native_statement(
+                    builder,
+                    statement,
+                    lowered_local_values,
+                    evaluated_local_values,
+                )?;
+                update_visible_lowered_value(
+                    &mut visible_lowered_local_values,
+                    &shadowed_locals,
+                    &assignment.target,
+                    lowered_local_values,
+                )?;
+            }
+            NativeStmt::While(native_while) => {
+                lower_native_statement(
+                    builder,
+                    statement,
+                    lowered_local_values,
+                    evaluated_local_values,
+                )?;
+                for (name, _) in &native_while.final_values {
+                    update_visible_lowered_value(
+                        &mut visible_lowered_local_values,
+                        &shadowed_locals,
+                        name,
+                        lowered_local_values,
+                    )?;
+                }
+            }
+            NativeStmt::If(native_if) => {
+                lower_native_statement(
+                    builder,
+                    statement,
+                    lowered_local_values,
+                    evaluated_local_values,
+                )?;
+                for (name, _) in &native_if.merged_values {
+                    update_visible_lowered_value(
+                        &mut visible_lowered_local_values,
+                        &shadowed_locals,
+                        name,
+                        lowered_local_values,
+                    )?;
+                }
+            }
+        }
     }
 
+    Ok(visible_lowered_local_values)
+}
+
+fn update_visible_lowered_value(
+    visible_lowered_local_values: &mut HashMap<String, Value>,
+    shadowed_locals: &HashSet<String>,
+    name: &str,
+    lowered_local_values: &HashMap<String, Value>,
+) -> Result<(), BackendError> {
+    if !visible_lowered_local_values.contains_key(name) || shadowed_locals.contains(name) {
+        return Ok(());
+    }
+
+    let Some(value) = lowered_local_values.get(name).copied() else {
+        return Err(BackendError::new(format!(
+            "backend emission failure: validated native visible local `{name}` was not lowered",
+        )));
+    };
+    visible_lowered_local_values.insert(name.to_string(), value);
     Ok(())
 }
 

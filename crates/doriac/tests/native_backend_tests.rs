@@ -264,6 +264,16 @@ fn compiles_and_runs_current_native_smoke_examples() {
             "inline_main_if_fallthrough_large_reassigned_42.doria",
             42,
         ),
+        (
+            "main_if_fallthrough_shadow_preserves_outer",
+            "inline_main_if_fallthrough_shadow_preserves_outer.doria",
+            1,
+        ),
+        (
+            "main_if_fallthrough_shadow_preserves_pre_shadow_assignment",
+            "inline_main_if_fallthrough_shadow_preserves_pre_shadow_assignment.doria",
+            2,
+        ),
         ("main_while_42", "examples/native/main_while_42.doria", 42),
         (
             "main_while_decrement_42",
@@ -871,6 +881,35 @@ function main(): int
 
     if (true) {
         $code = 42;
+    }
+
+    return $code;
+}
+"#
+        }
+        "main_if_fallthrough_shadow_preserves_outer" => {
+            r#"
+function main(): int
+{
+    let $code = 1;
+
+    if (true) {
+        let $code = 42;
+    }
+
+    return $code;
+}
+"#
+        }
+        "main_if_fallthrough_shadow_preserves_pre_shadow_assignment" => {
+            r#"
+function main(): int
+{
+    let writable $code = 1;
+
+    if (true) {
+        $code = 2;
+        let $code = 42;
     }
 
     return $code;
