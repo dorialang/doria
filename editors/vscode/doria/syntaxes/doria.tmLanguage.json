@@ -94,6 +94,9 @@
               "include": "#keywords"
             },
             {
+              "include": "#invalid"
+            },
+            {
               "include": "#operators"
             },
             {

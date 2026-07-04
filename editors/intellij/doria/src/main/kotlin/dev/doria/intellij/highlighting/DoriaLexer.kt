@@ -402,6 +402,14 @@ class DoriaLexer : LexerBase() {
             return false
         }
 
+        var firstNonWhitespace = lineStart(tokenStart)
+        while (firstNonWhitespace < tokenStart && buffer[firstNonWhitespace].isWhitespace()) {
+            firstNonWhitespace++
+        }
+        if (firstNonWhitespace != tokenStart) {
+            return false
+        }
+
         var cursor = tokenStart + 1
         while (cursor < endOffset && buffer[cursor].isLetter()) {
             cursor++

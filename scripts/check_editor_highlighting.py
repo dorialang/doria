@@ -197,6 +197,20 @@ def check_vscode_grammar() -> None:
     ]:
         require(scope in grammar_text, f"VS Code grammar is missing {scope!r}")
 
+    attribute_patterns = grammar.get("repository", {}).get("attributes", {}).get("patterns", [])
+    require(attribute_patterns, "VS Code grammar must define attribute highlighting")
+    attribute_includes = [
+        pattern.get("include")
+        for attribute_pattern in attribute_patterns
+        for pattern in attribute_pattern.get("patterns", [])
+        if isinstance(pattern, dict)
+    ]
+    require("#invalid" in attribute_includes, "VS Code attribute context must include invalid syntax patterns")
+    require(
+        attribute_includes.index("#invalid") < attribute_includes.index("#operators"),
+        "VS Code attribute context must check invalid syntax before normal operators",
+    )
+
 
 def check_intellij_lexer() -> None:
     lexer_text = INTELLIJ_LEXER.read_text(encoding="utf-8")
@@ -224,6 +238,10 @@ def check_intellij_lexer() -> None:
     require('"goto"' in lexer_text and "INVALID_KEYWORDS" in lexer_text, "IntelliJ lexer must mark goto invalid")
     for directive in sorted(REJECTED_PREPROCESSOR):
         require(f'"{directive}"' in lexer_text, f"IntelliJ lexer must recognize #{directive} as unsupported")
+    require(
+        "firstNonWhitespace != tokenStart" in lexer_text,
+        "IntelliJ preprocessor check must require # to be the first non-whitespace character on the line",
+    )
 
     for token_type in [
         "DORIA_IMPORT_USE_KEYWORD",
