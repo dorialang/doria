@@ -184,6 +184,7 @@ For VS Code, the setting is `doria.languageServer.path`. For IntelliJ IDEs, use 
 - Intentional mutation uses `writable`.
 - Class members are externally accessible by default; use `internal` for implementation details that should not be accessed from outside the declaring class.
 - `writable` controls mutation. `internal` controls API surface.
+- Namespace/file-scope `use` is for semantic imports and aliases; class-body or trait-body `uses` is for trait composition.
 - Collection aliases are `List<T>`, `Dictionary<K, V>`, and `Set<T>`.
 - `int` means `int64`, `float` means `float64`, and the accepted fixed-width numeric family is documented in `docs/decisions/0016-fixed-width-numeric-types.md`; compiler support for those explicit spellings is future work.
 - The compiler must reject invalid Doria before lowering to Doria IR or emitting backend output.

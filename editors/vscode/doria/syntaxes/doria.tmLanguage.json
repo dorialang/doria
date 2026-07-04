@@ -290,11 +290,36 @@
           }
         },
         {
-          "name": "meta.trait-composition.doria",
+          "name": "meta.trait-composition.legacy-use.doria",
           "begin": "^\\s+(use)\\b(?=\\s+[A-Z][A-Za-z0-9_]*(?:\\s*(?:,|;)))",
           "beginCaptures": {
             "1": {
-              "name": "keyword.other.trait-use.doria"
+              "name": "invalid.illegal.keyword.trait-use-old-spelling.doria"
+            }
+          },
+          "end": "(;)",
+          "endCaptures": {
+            "1": {
+              "name": "punctuation.terminator.statement.doria"
+            }
+          },
+          "patterns": [
+            {
+              "name": "entity.name.type.trait.doria",
+              "match": "\\b[A-Z][A-Za-z0-9_]*\\b"
+            },
+            {
+              "name": "punctuation.separator.comma.doria",
+              "match": ","
+            }
+          ]
+        },
+        {
+          "name": "meta.trait-composition.doria",
+          "begin": "^\\s+(uses)\\b(?=\\s+[A-Z][A-Za-z0-9_]*(?:\\s*(?:,|;)))",
+          "beginCaptures": {
+            "1": {
+              "name": "keyword.other.trait-uses.doria"
             }
           },
           "end": "(;)",
@@ -484,7 +509,7 @@
         },
         {
           "name": "keyword.control.doria",
-          "match": "\\b(?:return|foreach|as|if|else|while|for|break|continue|when|given|finally|extends|implements)\\b"
+          "match": "\\b(?:return|foreach|as|if|else|while|for|break|continue|when|given|finally|extends|implements|uses)\\b"
         },
         {
           "name": "storage.modifier.mutability.doria",

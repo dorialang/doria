@@ -29,6 +29,7 @@ ACCEPTED_KEYWORDS = {
     "implements",
     "namespace",
     "use",
+    "uses",
     "as",
     "include",
     "declare",
@@ -180,19 +181,24 @@ def check_vscode_grammar() -> None:
     trait_begin = trait_patterns[0].get("begin", "")
     require(re.search(import_begin, r"use App\Models\User;"), "VS Code import pattern must match namespace imports")
     require(
-        not re.search(import_begin, "    use HasSlug;"),
-        "VS Code import pattern must not match class-body trait use",
+        not re.search(import_begin, "    uses HasSlug;"),
+        "VS Code import pattern must not match class-body trait composition",
     )
-    require(re.search(trait_begin, "    use HasSlug;"), "VS Code trait-use pattern must match class-body trait use")
+    require(re.search(trait_begin, "    uses HasSlug;"), "VS Code trait-composition pattern must match class-body uses")
     require(
         not re.search(trait_begin, r"use App\Models\User;"),
-        "VS Code trait-use pattern must not match namespace imports",
+        "VS Code trait-composition pattern must not match namespace imports",
+    )
+    require(
+        not re.search(trait_begin, "    use HasSlug;"),
+        "VS Code trait-composition pattern must not accept legacy class-body use",
     )
 
     for scope in [
         "keyword.control.import.doria",
         "keyword.operator.alias.doria",
-        "keyword.other.trait-use.doria",
+        "keyword.other.trait-uses.doria",
+        "invalid.illegal.keyword.trait-use-old-spelling.doria",
         "entity.name.type.trait.doria",
     ]:
         require(scope in grammar_text, f"VS Code grammar is missing {scope!r}")
@@ -242,13 +248,21 @@ def check_intellij_lexer() -> None:
         "firstNonWhitespace != tokenStart" in lexer_text,
         "IntelliJ preprocessor check must require # to be the first non-whitespace character on the line",
     )
+    require(
+        "TRAIT_USES_LINE" in lexer_text and "DoriaTokenTypes.TRAIT_USES_KEYWORD" in lexer_text,
+        "IntelliJ lexer must recognize trait-composition uses",
+    )
+    require(
+        "LEGACY_TRAIT_USE_LINE" in lexer_text and "isLegacyTraitUseLine() -> DoriaTokenTypes.INVALID" in lexer_text,
+        "IntelliJ lexer must mark legacy class-body trait use invalid",
+    )
 
     for token_type in [
         "DORIA_IMPORT_USE_KEYWORD",
         "DORIA_IMPORT_PATH",
         "DORIA_IMPORT_ALIAS_KEYWORD",
         "DORIA_IMPORT_ALIAS",
-        "DORIA_TRAIT_USE_KEYWORD",
+        "DORIA_TRAIT_USES_KEYWORD",
         "DORIA_TRAIT_NAME",
     ]:
         require(token_type in intellij_highlighting_text, f"IntelliJ highlighting is missing {token_type}")
@@ -275,8 +289,8 @@ def check_fixture() -> None:
     for token in sorted({"int8", "int16", "int32", "int64", "uint8", "uint16", "uint32", "uint64", "float32", "float64"}):
         require(token in fixture_text, f"shared editor fixture is missing {token!r}")
     require(
-        "use App\\Models\\Post;" in fixture_text and "use HasSlug, TracksChanges;" in fixture_text,
-        "shared editor fixture must include both import-use and trait-use examples",
+        "use App\\Models\\Post;" in fixture_text and "uses HasSlug, TracksChanges;" in fixture_text,
+        "shared editor fixture must include both import-use and trait-composition uses examples",
     )
 
 

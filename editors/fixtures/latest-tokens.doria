@@ -26,8 +26,8 @@ trait TracksChanges
 
 class Article extends Model implements Renderable, JsonSerializable
 {
-    // Class-body use composes traits into the class.
-    use HasSlug, TracksChanges;
+    // Class-body uses declarations compose traits into the class.
+    uses HasSlug, TracksChanges;
 
     function render(): string
     {

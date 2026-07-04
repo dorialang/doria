@@ -86,6 +86,9 @@ At completion, report assumptions made and critical decisions encountered. If no
 - Preserve the accepted namespace/import/include/directive direction: namespaces are semantic symbol ownership, `use` is semantic import/name aliasing, `include` is required include-once compile-time source inclusion, and `declare` is a structured compiler/source directive.
 - Do not describe `include` as PHP runtime include, and do not treat `include` as the normal import mechanism.
 - Do not confuse `use` with `include`, and do not confuse `use` with Baton package resolution.
+- Use `use` only for namespace/file-scope semantic imports and aliases.
+- Use `uses` for class-body or trait-body trait composition.
+- Do not document or implement class-body `use TraitName;` as accepted Doria; PHP migration should rewrite it to `uses TraitName;`.
 - Do not add `require`, `require_once`, or `include_once`; Doria `include` already means required include-once.
 - Do not import C/C++ textual macro behavior without an accepted decision. Do not add `#define` or `#undef` macro substitution.
 - Do not implement `goto` without a separate accepted decision.
@@ -93,7 +96,7 @@ At completion, report assumptions made and critical decisions encountered. If no
 - Treat `class`, `interface`, `trait`, `extends`, and `implements` as accepted Doria OOP declaration vocabulary.
 - Do not treat accepted PHP-shaped OOP syntax as permission to import all PHP runtime behavior.
 - Do not assume PHP magic methods, autoloading, reflection, dynamic properties, or trait conflict rules without accepted decisions.
-- Do not confuse namespace/file-scope import `use` with class-body trait-composition `use`.
+- Do not confuse namespace/file-scope import `use` with trait-composition `uses`.
 - Do not make PHP output the semantic oracle for Doria OOP behavior.
 - Do not make Doria editor support VS Code-only. Keep VS Code and IntelliJ / JetBrains syntax highlighting aligned.
 - Treat TextMate/editor highlighting as editor UX only, not lexer, parser, compiler, or LSP semantic-token support.

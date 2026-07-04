@@ -79,7 +79,7 @@ python3 scripts/check_editor_highlighting.py
 
 Files under `editors/fixtures/` are syntax-highlighting smoke fixtures. The IntelliJ LSP adapter keeps them out of `doria-lsp` diagnostics so accepted/planned editor vocabulary can be exercised before compiler implementation lands.
 
-Doria has two distinct `use` contexts: file/namespace-scope `use` imports names from namespaces, while class-body `use` composes traits into a class or trait. The IntelliJ highlighter keeps these scopes separate as import use and trait-composition use.
+Doria uses distinct spellings for imports and trait composition: file/namespace-scope `use` imports names from namespaces, while class-body or trait-body `uses` composes traits. The IntelliJ highlighter keeps these scopes separate as import use and trait-composition uses.
 
 ## Run in a sandbox IDE
 

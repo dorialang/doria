@@ -121,7 +121,7 @@ class UserService
 
 Nested namespace paths such as `namespace App\Domain\Users;` are accepted as the likely/default direction. The backslash separator matches Doria's PHP-shaped readability, but exact grammar details remain future implementation work.
 
-`use` statements import names from namespaces into the current file or declaration context. `use` is semantic name resolution and aliasing. It is not textual inclusion, PHP runtime include, package dependency resolution, or code execution.
+`use` statements import names from namespaces at namespace/file-scope only. `use` is semantic name resolution and aliasing. It is not textual inclusion, PHP runtime include, package dependency resolution, trait composition, or code execution. `use` is not valid inside class, trait, interface, function, or method bodies.
 
 Accepted conceptual syntax:
 
@@ -132,6 +132,8 @@ use App\Repositories\PostRepository as Posts;
 ```
 
 `use` may import fully qualified symbols and may alias symbols. Duplicate or conflicting imports should be diagnosed. Unused import warnings may be added later. `use` does not load packages by itself; package resolution belongs to Baton later.
+
+Class-body and trait-body trait composition uses `uses`, not namespace import `use`.
 
 `include` is compile-time source inclusion with required include-once behavior. It is lower-level source composition, not the normal import mechanism. If an included file cannot be found, compilation fails. If the same canonical file is included more than once, it is included once. Include resolution must be deterministic, include diagnostics must preserve source file and span information, and included source participates in the same compiler pipeline as normal Doria source.
 
@@ -508,7 +510,7 @@ trait HasSlug
 }
 ```
 
-Traits may be composed into classes or other traits. Trait conflict-resolution rules, aliasing, visibility changes through trait use, trait property rules, trait static member rules, trait abstract method requirements, and whether PHP-style `insteadof` / `as` are accepted exactly remain future design work.
+Traits may be composed into classes or other traits with `uses`. Trait conflict-resolution rules, aliasing, visibility changes through trait composition, trait property rules, trait static member rules, trait abstract method requirements, and whether PHP-style `insteadof` / `as` are accepted exactly remain future design work.
 
 Doria will support `extends` for inheritance:
 
@@ -534,11 +536,11 @@ class Post extends Model implements Renderable, JsonSerializable
 
 Likely direction: a class may implement one or more interfaces, and Doria's PHP-shaped direction points toward nominal interface conformance. Exact conformance checking details remain future implementation work.
 
-`use` has distinct meanings by context:
+`use` and `uses` have distinct meanings:
 
 ```text
-namespace/file-scope use -> semantic import / alias
-class-body use           -> trait composition
+namespace/file-scope use  -> semantic import / alias
+class-body/trait-body uses -> trait composition
 ```
 
 ```doria
@@ -549,11 +551,11 @@ use App\Security\Permission;
 
 class Article
 {
-    use HasSlug;
+    uses HasSlug;
 }
 ```
 
-The parser can distinguish namespace/file-scope import `use` from class-body trait-composition `use` by context. Neither form is implemented by the current compiler slice.
+The parser can distinguish namespace/file-scope import `use` from class-body or trait-body trait-composition `uses` by spelling and context. Neither form is implemented by the current compiler slice.
 
 Doria is PHP-shaped, not PHP++. Accepting PHP-shaped OOP declaration syntax does not import PHP dynamic object semantics, magic methods as core behavior, autoloading behavior, reflection behavior, loose typing, PHP visibility rules beyond what Doria has separately accepted, PHP trait conflict-resolution rules without review, or PHP runtime initialization behavior.
 
@@ -751,7 +753,7 @@ Future work includes:
 - Nullable types.
 - Full type inference for lists and dictionaries.
 - Interfaces, traits, and namespaces.
-- Class inheritance through `extends`, interface conformance through `implements`, and class-body trait composition.
+- Class inheritance through `extends`, interface conformance through `implements`, and class-body/trait-body `uses` trait composition.
 - `use` statements for semantic imports and aliases.
 - `include` as required include-once compile-time source inclusion.
 - `declare` as structured compiler/source directives.

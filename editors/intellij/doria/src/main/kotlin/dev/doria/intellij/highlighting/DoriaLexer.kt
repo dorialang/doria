@@ -326,6 +326,8 @@ class DoriaLexer : LexerBase() {
 
             "use" -> useTokenType()
 
+            "uses" -> usesTokenType()
+
             "as" -> if (isImportUseLine()) DoriaTokenTypes.IMPORT_ALIAS_KEYWORD else DoriaTokenTypes.KEYWORD
 
             else -> contextualIdentifierTokenType(text)
@@ -333,7 +335,7 @@ class DoriaLexer : LexerBase() {
     }
 
     private fun contextualIdentifierTokenType(text: String): IElementType = when {
-        isTraitUseLine() && text.first().isUpperCase() -> DoriaTokenTypes.TRAIT_NAME
+        isTraitUsesLine() && text.first().isUpperCase() -> DoriaTokenTypes.TRAIT_NAME
 
         isImportAliasName() -> DoriaTokenTypes.IMPORT_ALIAS
 
@@ -367,8 +369,13 @@ class DoriaLexer : LexerBase() {
         }
 
     private fun useTokenType(): IElementType = when {
-        isTraitUseLine() -> DoriaTokenTypes.TRAIT_USE_KEYWORD
+        isLegacyTraitUseLine() -> DoriaTokenTypes.INVALID
         isImportUseLine() -> DoriaTokenTypes.IMPORT_USE_KEYWORD
+        else -> DoriaTokenTypes.KEYWORD
+    }
+
+    private fun usesTokenType(): IElementType = when {
+        isTraitUsesLine() -> DoriaTokenTypes.TRAIT_USES_KEYWORD
         else -> DoriaTokenTypes.KEYWORD
     }
 
@@ -427,8 +434,11 @@ class DoriaLexer : LexerBase() {
         return cursor >= endOffset || !isIdentifierPart(buffer[cursor])
     }
 
-    private fun isTraitUseLine(): Boolean =
-        TRAIT_USE_LINE.matches(currentLine())
+    private fun isTraitUsesLine(): Boolean =
+        TRAIT_USES_LINE.matches(currentLine())
+
+    private fun isLegacyTraitUseLine(): Boolean =
+        LEGACY_TRAIT_USE_LINE.matches(currentLine())
 
     private fun isImportUseLine(): Boolean =
         IMPORT_USE_LINE.matches(currentLine())
@@ -684,6 +694,7 @@ class DoriaLexer : LexerBase() {
             "finally",
             "namespace",
             "use",
+            "uses",
             "include",
             "declare",
             "static",
@@ -728,7 +739,10 @@ class DoriaLexer : LexerBase() {
 
         private val COLLECTION_TYPES = setOf("List", "Dictionary", "Set")
 
-        private val TRAIT_USE_LINE =
+        private val TRAIT_USES_LINE =
+            Regex("^\\s+uses\\s+[A-Z][A-Za-z0-9_]*(?:\\s*,\\s*[A-Z][A-Za-z0-9_]*)*\\s*;?\\s*(?://.*)?$")
+
+        private val LEGACY_TRAIT_USE_LINE =
             Regex("^\\s+use\\s+[A-Z][A-Za-z0-9_]*(?:\\s*,\\s*[A-Z][A-Za-z0-9_]*)*\\s*;?\\s*(?://.*)?$")
 
         private val IMPORT_USE_LINE =

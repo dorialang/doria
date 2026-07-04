@@ -69,7 +69,7 @@ class DoriaColorSettingsPage : ColorSettingsPage {
             AttributesDescriptor("Import path", DoriaSyntaxHighlighter.IMPORT_PATH),
             AttributesDescriptor("Import alias keyword", DoriaSyntaxHighlighter.IMPORT_ALIAS_KEYWORD),
             AttributesDescriptor("Import alias", DoriaSyntaxHighlighter.IMPORT_ALIAS),
-            AttributesDescriptor("Trait use keyword", DoriaSyntaxHighlighter.TRAIT_USE_KEYWORD),
+            AttributesDescriptor("Trait uses keyword", DoriaSyntaxHighlighter.TRAIT_USES_KEYWORD),
             AttributesDescriptor("Trait name", DoriaSyntaxHighlighter.TRAIT_NAME),
             AttributesDescriptor("Function declaration", DoriaSyntaxHighlighter.FUNCTION_DECLARATION),
             AttributesDescriptor("Function call", DoriaSyntaxHighlighter.FUNCTION_CALL),

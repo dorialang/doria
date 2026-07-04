@@ -48,6 +48,7 @@
 - Treat `docs/decisions/0027-stage-7a-native-smoke-ir-boundary.md` as the accepted Stage 7a native smoke IR boundary implementation decision.
 - Treat `docs/decisions/0028-namespaces-use-include-and-directives.md` as the accepted namespace, `use`, `include`, `declare`, `break`, and `continue` direction.
 - Treat `docs/decisions/0029-oop-declaration-vocabulary.md` as the accepted `class` / `interface` / `trait` / `extends` / `implements` OOP declaration vocabulary direction.
+- Treat `docs/decisions/0030-trait-composition-uses-keyword.md` as the accepted split between namespace/file-scope `use` imports and class-body/trait-body `uses` trait composition.
 - Keep broader native expression, assignment, and control-flow support beyond the Stage 6c smoke subset as separate future implementation slices.
 - Extend accepted operator support with integer bitwise spellings in a dedicated parser and semantic checking slice; do not import PHP loose comparison or PHP `and` / `or` precedence.
 - Add compiler support for `int8`/`int16`/`int32`/`int64`, `uint8`/`uint16`/`uint32`/`uint64`, and `float32`/`float64` in a dedicated typed semantic model slice before claiming those spellings are implemented.
@@ -64,7 +65,8 @@
 - Design and implement interfaces.
 - Design and implement class inheritance through `extends`.
 - Design and implement interface conformance through `implements`.
-- Design and implement traits and class-body trait composition.
+- Design and implement traits and class-body/trait-body `uses` trait composition.
+- Keep namespace/file-scope `use` imports separate from trait-composition `uses`, and plan PHP migration rewrites from class-body `use TraitName;` to `uses TraitName;`.
 - Define trait conflict-resolution rules before implementing advanced trait behavior.
 - Keep OOP runtime, layout, dispatch, and ABI behavior backend-independent and native-first.
 - Implement `break` and `continue` after the native/control-flow model can support them correctly.

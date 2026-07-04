@@ -21,7 +21,7 @@ class DoriaSyntaxHighlighter : SyntaxHighlighter {
         DoriaTokenTypes.IMPORT_PATH -> IMPORT_PATH_KEYS
         DoriaTokenTypes.IMPORT_ALIAS_KEYWORD -> IMPORT_ALIAS_KEYWORD_KEYS
         DoriaTokenTypes.IMPORT_ALIAS -> IMPORT_ALIAS_KEYS
-        DoriaTokenTypes.TRAIT_USE_KEYWORD -> TRAIT_USE_KEYWORD_KEYS
+        DoriaTokenTypes.TRAIT_USES_KEYWORD -> TRAIT_USES_KEYWORD_KEYS
         DoriaTokenTypes.TRAIT_NAME -> TRAIT_NAME_KEYS
         DoriaTokenTypes.FUNCTION_DECLARATION -> FUNCTION_DECLARATION_KEYS
         DoriaTokenTypes.FUNCTION_CALL -> FUNCTION_CALL_KEYS
@@ -85,8 +85,8 @@ class DoriaSyntaxHighlighter : SyntaxHighlighter {
             "DORIA_IMPORT_ALIAS",
             DefaultLanguageHighlighterColors.CLASS_NAME,
         )
-        val TRAIT_USE_KEYWORD: TextAttributesKey = TextAttributesKey.createTextAttributesKey(
-            "DORIA_TRAIT_USE_KEYWORD",
+        val TRAIT_USES_KEYWORD: TextAttributesKey = TextAttributesKey.createTextAttributesKey(
+            "DORIA_TRAIT_USES_KEYWORD",
             DefaultLanguageHighlighterColors.KEYWORD,
         )
         val TRAIT_NAME: TextAttributesKey = TextAttributesKey.createTextAttributesKey(
@@ -192,7 +192,7 @@ class DoriaSyntaxHighlighter : SyntaxHighlighter {
         private val IMPORT_PATH_KEYS = arrayOf(IMPORT_PATH)
         private val IMPORT_ALIAS_KEYWORD_KEYS = arrayOf(IMPORT_ALIAS_KEYWORD)
         private val IMPORT_ALIAS_KEYS = arrayOf(IMPORT_ALIAS)
-        private val TRAIT_USE_KEYWORD_KEYS = arrayOf(TRAIT_USE_KEYWORD)
+        private val TRAIT_USES_KEYWORD_KEYS = arrayOf(TRAIT_USES_KEYWORD)
         private val TRAIT_NAME_KEYS = arrayOf(TRAIT_NAME)
         private val FUNCTION_DECLARATION_KEYS = arrayOf(FUNCTION_DECLARATION)
         private val FUNCTION_CALL_KEYS = arrayOf(FUNCTION_CALL)

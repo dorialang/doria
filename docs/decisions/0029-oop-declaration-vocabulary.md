@@ -2,6 +2,8 @@
 
 Status: Accepted
 
+Updated by: `docs/decisions/0030-trait-composition-uses-keyword.md` for trait-composition spelling.
+
 ## Decision
 
 Doria accepts the PHP-shaped OOP declaration vocabulary where it fits Doria's native-first, statically checked goals:
@@ -74,7 +76,7 @@ This decision does not fully specify:
 
 - method conflict resolution
 - aliasing
-- visibility changes through trait use
+- visibility changes through trait composition
 - trait property rules
 - trait static member rules
 - trait abstract method requirements
@@ -127,13 +129,13 @@ Likely direction:
 
 Exact conformance checking details remain future implementation work.
 
-## Trait Composition and use
+## Trait Composition and uses
 
-Doria also has accepted `use` statements for namespace imports. `use` has distinct meanings by context:
+Doria has accepted `use` statements for namespace imports and accepted `uses` declarations for trait composition. The spellings are distinct:
 
 ```text
-namespace/file-scope use -> semantic import / alias
-class-body use           -> trait composition
+namespace/file-scope use  -> semantic import / alias
+class-body/trait-body uses -> trait composition
 ```
 
 Conceptual example:
@@ -146,13 +148,13 @@ use App\Security\Permission;
 
 class Article
 {
-    use HasSlug;
+    uses HasSlug;
 }
 ```
 
-The parser can distinguish namespace/file-scope import `use` from class-body trait-composition `use` by context.
+The parser can distinguish namespace/file-scope import `use` from class-body or trait-body trait-composition `uses` by spelling and context.
 
-This decision does not implement either form of `use`.
+This decision does not implement either `use` imports or `uses` trait composition.
 
 ## Doria Guardrails
 
@@ -179,7 +181,7 @@ This decision does not implement:
 - `trait`
 - `extends`
 - `implements`
-- class-body trait `use`
+- class-body or trait-body trait `uses`
 - namespace/file-scope `use`
 - visibility changes
 - trait conflict resolution
