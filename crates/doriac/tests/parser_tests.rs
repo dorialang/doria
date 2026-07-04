@@ -232,6 +232,69 @@ while ($count < 10) {
     assert!(matches!(while_stmt.condition, Expr::Binary { .. }));
     assert_eq!(while_stmt.body.statements.len(), 1);
 }
+
+#[test]
+fn parses_break_and_continue_statements() {
+    let program = doriac::parse_source(
+        "test.doria",
+        r#"
+while (true) {
+    break;
+}
+
+while (true) {
+    continue;
+}
+"#,
+    )
+    .expect("parse should succeed");
+
+    let Item::Statement(Stmt::While(break_loop)) = &program.items[0] else {
+        panic!("expected break loop");
+    };
+    assert!(matches!(
+        break_loop.body.statements.as_slice(),
+        [Stmt::Break { .. }]
+    ));
+
+    let Item::Statement(Stmt::While(continue_loop)) = &program.items[1] else {
+        panic!("expected continue loop");
+    };
+    assert!(matches!(
+        continue_loop.body.statements.as_slice(),
+        [Stmt::Continue { .. }]
+    ));
+}
+
+#[test]
+fn rejects_numeric_or_labeled_loop_control() {
+    for (source, message) in [
+        (
+            "while (true) { break 2; }",
+            "`break` does not accept a value or label in this Doria slice",
+        ),
+        (
+            "while (true) { continue 2; }",
+            "`continue` does not accept a value or label in this Doria slice",
+        ),
+        (
+            "while (true) { break outer; }",
+            "`break` does not accept a value or label in this Doria slice",
+        ),
+        (
+            "while (true) { continue outer; }",
+            "`continue` does not accept a value or label in this Doria slice",
+        ),
+    ] {
+        let err = doriac::parse_source("test.doria", source)
+            .expect_err("numeric or labeled loop control should be rejected");
+        assert!(
+            err.iter()
+                .any(|diagnostic| diagnostic.message.contains(message)),
+            "expected diagnostic containing {message}, got {err:?}"
+        );
+    }
+}
 #[test]
 fn parses_class_with_writable_method() {
     let program = doriac::parse_source(

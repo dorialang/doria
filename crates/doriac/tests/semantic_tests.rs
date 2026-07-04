@@ -1389,6 +1389,71 @@ while ($age < 20) {
 }
 
 #[test]
+fn checks_loop_control_semantics() {
+    doriac::check_source(
+        "test.doria",
+        r#"
+function main(): int
+{
+    let writable $code = 0;
+
+    while ($code < 42) {
+        $code += 1;
+
+        if ($code == 10) {
+            continue;
+        }
+
+        if ($code == 42) {
+            break;
+        }
+    }
+
+    return $code;
+}
+"#,
+    )
+    .expect("semantic check should accept loop control inside loops");
+}
+
+#[test]
+fn rejects_loop_control_outside_loop() {
+    for (source, code, message) in [
+        (
+            r#"
+function main(): int
+{
+    break;
+
+    return 0;
+}
+"#,
+            "E0421",
+            "`break` may only be used inside a loop",
+        ),
+        (
+            r#"
+function main(): int
+{
+    continue;
+
+    return 0;
+}
+"#,
+            "E0422",
+            "`continue` may only be used inside a loop",
+        ),
+    ] {
+        let err = doriac::check_source("test.doria", source).expect_err("loop control should fail");
+        assert!(
+            err.iter()
+                .any(|diagnostic| diagnostic.code == code && diagnostic.message.contains(message)),
+            "expected {code} containing {message}, got {err:?}"
+        );
+    }
+}
+
+#[test]
 fn rejects_non_bool_control_flow_conditions() {
     for source in [
         r#"

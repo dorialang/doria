@@ -1,0 +1,16 @@
+function main(): int
+{
+    let writable $code = 0;
+
+    while (true) {
+        $code += 1;
+
+        if ($code < 42) {
+            continue;
+        }
+
+        break;
+    }
+
+    return $code;
+}

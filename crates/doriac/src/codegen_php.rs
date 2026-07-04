@@ -243,6 +243,12 @@ fn emit_statement(
             output.push_str(")\n");
             emit_block(&while_stmt.body, output, indent, scopes);
         }
+        Stmt::Break { .. } => {
+            writeln(output, indent, "break;");
+        }
+        Stmt::Continue { .. } => {
+            writeln(output, indent, "continue;");
+        }
         Stmt::Foreach(foreach) => emit_foreach(foreach, output, indent, scopes),
         Stmt::Expr { expr, .. } => {
             writeln(output, indent, &format!("{};", emit_expr(expr, scopes)));

@@ -53,6 +53,13 @@ fn lexes_basic_control_flow_keywords() {
 }
 
 #[test]
+fn lexes_loop_control_keywords() {
+    let kinds = token_kinds("break continue");
+    assert!(matches!(kinds[0], TokenKind::Break));
+    assert!(matches!(kinds[1], TokenKind::Continue));
+}
+
+#[test]
 fn lexes_boolean_word_operators() {
     let kinds = token_kinds("not and or xor");
     assert!(matches!(kinds[0], TokenKind::Not));

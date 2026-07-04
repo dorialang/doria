@@ -211,6 +211,35 @@ while ($count < 10) {
 }
 
 #[test]
+fn emits_php_for_loop_control() {
+    let php = doriac::compile_source_to_php(
+        "test.doria",
+        r#"
+function main(): void
+{
+    let writable $code = 0;
+
+    while ($code < 10) {
+        $code += 1;
+
+        if ($code == 5) {
+            continue;
+        }
+
+        if ($code == 8) {
+            break;
+        }
+    }
+}
+"#,
+    )
+    .expect("compilation should succeed");
+
+    assert!(php.contains("continue;"));
+    assert!(php.contains("break;"));
+}
+
+#[test]
 fn preserves_block_local_bindings_in_php_output() {
     let php = doriac::compile_source_to_php(
         "test.doria",

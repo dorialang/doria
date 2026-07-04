@@ -101,6 +101,8 @@ fn lower_stmt(statement: &ast::Stmt) -> hir::Stmt {
             body: lower_block(&while_stmt.body),
             span: while_stmt.span,
         }),
+        ast::Stmt::Break { span } => hir::Stmt::Break { span: *span },
+        ast::Stmt::Continue { span } => hir::Stmt::Continue { span: *span },
         ast::Stmt::Foreach(foreach) => hir::Stmt::Foreach(hir::ForeachStmt {
             iterable: lower_expr(&foreach.iterable),
             key: foreach.key.as_ref().map(lower_foreach_binding),

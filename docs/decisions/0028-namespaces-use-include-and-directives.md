@@ -2,6 +2,8 @@
 
 Status: Accepted
 
+Implementation note: `docs/decisions/0031-stage-7b-break-continue.md` implements the first compiler and native smoke slice for `break;` and `continue;`. Namespace, `use`, `include`, and `declare` compiler support still remain future work.
+
 ## Decision
 
 Doria accepts the following language directions:
@@ -264,12 +266,10 @@ Doria source should remain parseable, typed, and semantically checked by `doriac
 
 ## Non-goals
 
-This decision does not implement:
+This decision itself did not implement:
 
 - namespaces
 - `use`
-- `break`
-- `continue`
 - `include`
 - `declare`
 - `goto`

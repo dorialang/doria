@@ -78,6 +78,8 @@ pub enum Stmt {
     Return { expr: Option<Expr>, span: Span },
     If(IfStmt),
     While(WhileStmt),
+    Break { span: Span },
+    Continue { span: Span },
     Foreach(ForeachStmt),
     Expr { expr: Expr, span: Span },
 }

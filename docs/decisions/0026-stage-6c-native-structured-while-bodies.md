@@ -2,6 +2,8 @@
 
 Status: Accepted
 
+Decision 0031 extends this native smoke subset with Stage 7b `break` and `continue` inside supported bounded/proven `while` loops. This decision remains the accepted record for Stage 6c structured `while` bodies.
+
 ## Decision
 
 Stage 6c extends the Cranelift native smoke backend from assignment-only `while` bodies to structured, scoped `while` bodies.

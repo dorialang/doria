@@ -249,6 +249,22 @@ impl Parser {
             });
         }
 
+        if self.match_kind(&TokenKind::Break) {
+            return self.parse_loop_control_statement(
+                TokenKind::Break,
+                "`break` does not accept a value or label in this Doria slice",
+                "expected `;` after break statement",
+            );
+        }
+
+        if self.match_kind(&TokenKind::Continue) {
+            return self.parse_loop_control_statement(
+                TokenKind::Continue,
+                "`continue` does not accept a value or label in this Doria slice",
+                "expected `;` after continue statement",
+            );
+        }
+
         if self.match_kind(&TokenKind::If) {
             return self.parse_if_statement().map(Stmt::If);
         }
@@ -335,6 +351,33 @@ impl Parser {
             initializer,
             span: Span::new(start, end),
         }))
+    }
+
+    fn parse_loop_control_statement(
+        &mut self,
+        kind: TokenKind,
+        unsupported_message: &'static str,
+        missing_semicolon_message: &'static str,
+    ) -> Option<Stmt> {
+        let start = self.previous().span.start;
+        if !self.check(&TokenKind::Semicolon) {
+            self.error(unsupported_message, self.peek().span);
+            return None;
+        }
+
+        let end = self
+            .expect(TokenKind::Semicolon, missing_semicolon_message)?
+            .span
+            .end;
+        match kind {
+            TokenKind::Break => Some(Stmt::Break {
+                span: Span::new(start, end),
+            }),
+            TokenKind::Continue => Some(Stmt::Continue {
+                span: Span::new(start, end),
+            }),
+            _ => unreachable!("loop-control parser called for non-loop-control token"),
+        }
     }
 
     fn parse_if_statement(&mut self) -> Option<IfStmt> {
@@ -1012,6 +1055,8 @@ impl Parser {
                 | TokenKind::Let
                 | TokenKind::Echo
                 | TokenKind::Return
+                | TokenKind::Break
+                | TokenKind::Continue
                 | TokenKind::If
                 | TokenKind::While
                 | TokenKind::Foreach
@@ -1042,6 +1087,8 @@ fn token_name(kind: &TokenKind) -> &'static str {
         TokenKind::Else => "else",
         TokenKind::While => "while",
         TokenKind::For => "for",
+        TokenKind::Break => "break",
+        TokenKind::Continue => "continue",
         TokenKind::True => "true",
         TokenKind::False => "false",
         TokenKind::Null => "null",

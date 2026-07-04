@@ -154,7 +154,7 @@ impl<'program> Checker<'program> {
         for item in &self.program.items {
             match item {
                 Item::Statement(statement) => {
-                    self.check_statement(statement, &mut scopes, None, None, None);
+                    self.check_statement(statement, &mut scopes, None, None, None, 0);
                 }
                 Item::Function(function) => self.check_function(function, None),
                 Item::Class(class_decl) => self.check_class(class_decl),
@@ -501,6 +501,7 @@ impl<'program> Checker<'program> {
             method_context.as_ref(),
             constructor_init_context.as_mut(),
             Some(&return_context),
+            0,
         );
         self.check_missing_final_return(function, &return_context);
     }
@@ -584,6 +585,7 @@ impl<'program> Checker<'program> {
         method_context: Option<&MethodContext>,
         mut constructor_init_context: Option<&mut ConstructorInitContext>,
         return_context: Option<&ReturnContext>,
+        loop_depth: usize,
     ) {
         scopes.push();
         for statement in &block.statements {
@@ -593,6 +595,7 @@ impl<'program> Checker<'program> {
                 method_context,
                 constructor_init_context.as_deref_mut(),
                 return_context,
+                loop_depth,
             );
         }
         scopes.pop();
@@ -605,6 +608,7 @@ impl<'program> Checker<'program> {
         method_context: Option<&MethodContext>,
         constructor_init_context: Option<&mut ConstructorInitContext>,
         return_context: Option<&ReturnContext>,
+        loop_depth: usize,
     ) {
         match statement {
             Stmt::VarDecl(decl) => {
@@ -709,6 +713,7 @@ impl<'program> Checker<'program> {
                     method_context,
                     then_constructor_init_context.as_mut(),
                     return_context,
+                    loop_depth,
                 );
                 if let Some(else_branch) = &if_stmt.else_branch {
                     self.check_else_branch(
@@ -717,6 +722,7 @@ impl<'program> Checker<'program> {
                         method_context,
                         constructor_init_context.as_deref(),
                         return_context,
+                        loop_depth,
                     );
                 }
             }
@@ -731,7 +737,26 @@ impl<'program> Checker<'program> {
                     method_context,
                     loop_constructor_init_context.as_mut(),
                     return_context,
+                    loop_depth + 1,
                 );
+            }
+            Stmt::Break { span } => {
+                if loop_depth == 0 {
+                    self.diagnostics.push(Diagnostic::new(
+                        "E0421",
+                        "`break` may only be used inside a loop",
+                        *span,
+                    ));
+                }
+            }
+            Stmt::Continue { span } => {
+                if loop_depth == 0 {
+                    self.diagnostics.push(Diagnostic::new(
+                        "E0422",
+                        "`continue` may only be used inside a loop",
+                        *span,
+                    ));
+                }
             }
             Stmt::Foreach(foreach) => {
                 self.check_expr(&foreach.iterable, scopes, method_context);
@@ -779,6 +804,7 @@ impl<'program> Checker<'program> {
                         method_context,
                         loop_constructor_init_context.as_mut(),
                         return_context,
+                        loop_depth + 1,
                     );
                 }
                 scopes.pop();
@@ -793,6 +819,7 @@ impl<'program> Checker<'program> {
         method_context: Option<&MethodContext>,
         constructor_init_context: Option<&ConstructorInitContext>,
         return_context: Option<&ReturnContext>,
+        loop_depth: usize,
     ) {
         match branch {
             ElseBranch::If(if_stmt) => {
@@ -805,6 +832,7 @@ impl<'program> Checker<'program> {
                     method_context,
                     then_constructor_init_context.as_mut(),
                     return_context,
+                    loop_depth,
                 );
                 if let Some(else_branch) = &if_stmt.else_branch {
                     self.check_else_branch(
@@ -813,6 +841,7 @@ impl<'program> Checker<'program> {
                         method_context,
                         constructor_init_context,
                         return_context,
+                        loop_depth,
                     );
                 }
             }
@@ -825,6 +854,7 @@ impl<'program> Checker<'program> {
                     method_context,
                     block_constructor_init_context.as_mut(),
                     return_context,
+                    loop_depth,
                 );
             }
         }

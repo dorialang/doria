@@ -22,7 +22,7 @@
 - Support MVP `if` / `else if` / `else` and `while` in the AST, semantic checker, Doria IR, and PHP backend.
 - Represent braced string interpolation in the Doria AST and Doria IR, with PHP lowering emitted as explicit concatenation.
 - Support the first accepted boolean/equality compiler slice: typed `==` / `!=`, rejection of `===` / `!==`, bool-only `!` / `not`, `&&` / `and`, `||` / `or`, and `xor` in the parser, semantic checker, Doria IR, and PHP backend.
-- Stage 6c Cranelift native smoke backend is implemented for exactly one top-level `function main(): int` with supported readonly and writable integer locals, `=`, `+=`, and `-=` assignments to writable integer locals, `+`/`-`/`*` arithmetic, structured returning `if` blocks, fallthrough `if` statements with visible-local merges, and bounded structured `while` loops. Supported native `while` bodies may contain integer local declarations, writable integer assignments, and fallthrough `if` statements. Native validation proves accepted loops terminate within the current smoke verification cap before lowering them to real Cranelift control flow. Conditions support bool literals, grouped conditions, integer comparisons over supported integer expressions, `!` / `not`, `&&` / `and`, `||` / `or`, and `xor`.
+- Stage 7b Cranelift native smoke backend is implemented for exactly one top-level `function main(): int` with supported readonly and writable integer locals, `=`, `+=`, and `-=` assignments to writable integer locals, `+`/`-`/`*` arithmetic, structured returning `if` blocks, fallthrough `if` statements with visible-local merges, and bounded/proven structured `while` loops. Supported native `while` bodies may contain integer local declarations, writable integer assignments, fallthrough `if` statements, `break`, and `continue`. Native validation proves accepted loops terminate within the current smoke verification cap before lowering them to real Cranelift control flow. Conditions support bool literals, grouped conditions, integer comparisons over supported integer expressions, `!` / `not`, `&&` / `and`, `||` / `or`, and `xor`.
 - Stage 7a preserves the Stage 6c native source subset while routing current native smoke validation, compile-time smoke evaluation/proof, and Cranelift lowering through a private native smoke module boundary.
 - Keep PHP as a compatibility backend only; do not treat PHP output as the proof that Doria semantics are correct.
 - Do not build PHP-to-Doria migration in the current v0.1 slice.
@@ -49,11 +49,12 @@
 - Treat `docs/decisions/0028-namespaces-use-include-and-directives.md` as the accepted namespace, `use`, `include`, `declare`, `break`, and `continue` direction.
 - Treat `docs/decisions/0029-oop-declaration-vocabulary.md` as the accepted `class` / `interface` / `trait` / `extends` / `implements` OOP declaration vocabulary direction.
 - Treat `docs/decisions/0030-trait-composition-uses-keyword.md` as the accepted split between namespace/file-scope `use` imports and class-body/trait-body `uses` trait composition.
-- Keep broader native expression, assignment, and control-flow support beyond the Stage 6c smoke subset as separate future implementation slices.
+- Treat `docs/decisions/0031-stage-7b-break-continue.md` as the accepted initial compiler and native smoke implementation for unlabeled `break;` and `continue;`.
+- Keep broader native expression, assignment, and control-flow support beyond the Stage 7b smoke subset as separate future implementation slices.
 - Extend accepted operator support with integer bitwise spellings in a dedicated parser and semantic checking slice; do not import PHP loose comparison or PHP `and` / `or` precedence.
 - Add compiler support for `int8`/`int16`/`int32`/`int64`, `uint8`/`uint16`/`uint32`/`uint64`, and `float32`/`float64` in a dedicated typed semantic model slice before claiming those spellings are implemented.
 - Plan a broader lowered/native IR when native code generation needs a simpler representation for control flow, memory layout, runtime calls, and backend emission; do not confuse the private Stage 7a native smoke module with final Doria MIR.
-- Expand native source support beyond Stage 6c only after the next accepted native slice specifies the language semantics and expected behavior.
+- Expand native source support beyond Stage 7b only after the next accepted native slice specifies the language semantics and expected behavior.
 - Keep future LLVM optimized-profile work conformant with accepted Doria integer semantics and Cranelift fast-profile behavior for the same supported programs.
 - Expand return checking from the current final-statement rule into full path-sensitive control-flow analysis.
 - Add full definite property initialization analysis for constructor paths.
@@ -69,7 +70,7 @@
 - Keep namespace/file-scope `use` imports separate from trait-composition `uses`, and plan PHP migration rewrites from class-body `use TraitName;` to `uses TraitName;`.
 - Define trait conflict-resolution rules before implementing advanced trait behavior.
 - Keep OOP runtime, layout, dispatch, and ABI behavior backend-independent and native-first.
-- Implement `break` and `continue` after the native/control-flow model can support them correctly.
+- Design labeled and numeric `break` / `continue` only with a separate accepted decision.
 - Evaluate `goto` carefully before acceptance.
 - Evaluate structured conditional compilation and compile-time diagnostics without adopting C/C++ textual macros.
 - Expand string interpolation beyond variable/property paths after Doria has a deliberate display/string-conversion design.
@@ -79,7 +80,7 @@
 - Preserve property initializer expressions in AST/Doria IR and later lower non-constant initializers correctly.
 - Add property hooks later for validation and computed properties without changing the default-public plus `internal` member model.
 - Add language/design support for `writable class` and `readonly class` as mutability ergonomics before considering shorter mutation keywords.
-- Keep implementation of advanced control-flow constructs as future work: `finally`, `do ... while`, `given`, value-returning `when`, `match`, `break`, and `continue`.
+- Keep implementation of advanced control-flow constructs as future work: `finally`, `do ... while`, `given`, value-returning `when`, `match`, and labeled or numeric loop control.
 
 ## Performance and Native Application Path
 

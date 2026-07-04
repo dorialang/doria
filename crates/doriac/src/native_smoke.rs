@@ -10,7 +10,7 @@ use cranelift_object::{ObjectBuilder, ObjectModule};
 use crate::backend::BackendError;
 use crate::hir::{self, AssignOp, BinaryOp, ElseBranch, Expr, Item, Stmt, UnaryOp};
 
-const STAGE_6C_LOOP_VERIFICATION_CAP: u64 = 10_000;
+const STAGE_7B_LOOP_VERIFICATION_CAP: u64 = 10_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct NativeSmokeModule {
@@ -29,6 +29,8 @@ enum NativeSmokeStmt {
     Assign(NativeSmokeAssign),
     While(NativeSmokeWhile),
     If(NativeSmokeIf),
+    Break,
+    Continue,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,6 +70,32 @@ struct NativeSmokeIf {
 struct NativeSmokeFallthroughBlock {
     statements: Vec<NativeSmokeStmt>,
     final_states: HashMap<String, NativeSmokeLocalState>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NativeSmokeLoopControl {
+    Fallthrough,
+    Break,
+    Continue,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NativeSmokeLoopEvaluation {
+    visible_states: HashMap<String, NativeSmokeLocalState>,
+    control: NativeSmokeLoopControl,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NativeSmokeLoweringFlow {
+    Fallthrough,
+    Diverged,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct NativeSmokeLoopLoweringContext<'a> {
+    header_block: Block,
+    after_block: Block,
+    carried_locals: &'a [(String, i64)],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -202,17 +230,17 @@ fn validate_stage_6c(program: &hir::Program) -> Result<NativeSmokeModule, Backen
     let [main] = main_functions.as_slice() else {
         return Err(match main_functions.len() {
             0 => BackendError::new(
-                "no native entrypoint found; native Stage 6c output requires exactly one top-level `function main(): int`",
+                "no native entrypoint found; native Stage 7b output requires exactly one top-level `function main(): int`",
             ),
             _ => BackendError::new(
-                "multiple native entrypoints found; native Stage 6c output requires exactly one top-level `function main(): int`",
+                "multiple native entrypoints found; native Stage 7b output requires exactly one top-level `function main(): int`",
             ),
         });
     };
 
     if !main.params.is_empty() {
         return Err(BackendError::new(
-            "wrong main signature for native Stage 6c: `main` must not declare parameters",
+            "wrong main signature for native Stage 7b: `main` must not declare parameters",
         ));
     }
 
@@ -221,7 +249,7 @@ fn validate_stage_6c(program: &hir::Program) -> Result<NativeSmokeModule, Backen
         Some(return_type) if return_type.name == "int" && return_type.args.is_empty()
     ) {
         return Err(BackendError::new(
-            "wrong main signature for native Stage 6c: expected `function main(): int`",
+            "wrong main signature for native Stage 7b: expected `function main(): int`",
         ));
     }
 
@@ -319,7 +347,7 @@ fn validate_stage_6c_statement_sequence(
 ) -> Result<NativeSmokeTerminator, BackendError> {
     match statements {
         [] => Err(BackendError::new(
-            "unsupported native block for Stage 6c: expected supported local declarations, assignments, bounded while statements, or fallthrough if statements followed by a return, terminal if/else, or guard if with fallback",
+            "unsupported native block for Stage 7b: expected supported local declarations, assignments, bounded while statements, or fallthrough if statements followed by a return, terminal if/else, or guard if with fallback",
         )),
         [statement] => validate_stage_6c_terminator(statement, local_states),
         [Stmt::If(if_stmt), rest @ ..] if if_stmt.else_branch.is_none() => {
@@ -327,14 +355,14 @@ fn validate_stage_6c_statement_sequence(
         }
         [Stmt::If(if_stmt), _] if if_stmt.else_branch.is_some() => {
             Err(BackendError::new(
-                "unsupported statement after native terminator for Stage 6c: no statements may follow a terminal if/else",
+                "unsupported statement after native terminator for Stage 7b: no statements may follow a terminal if/else",
             ))
         }
         [Stmt::Return { .. }, ..] => Err(BackendError::new(
-            "unsupported statement after native terminator for Stage 6c: no statements may follow a final return",
+            "unsupported statement after native terminator for Stage 7b: no statements may follow a final return",
         )),
         [first, ..] => Err(BackendError::new(format!(
-            "unsupported native statement for Stage 6c: expected supported block local declaration, block assignment, bounded while statement, fallthrough if statement, final return, terminal if/else, or guard if followed by fallback block, found {}",
+            "unsupported native statement for Stage 7b: expected supported block local declaration, block assignment, bounded while statement, fallthrough if statement, final return, terminal if/else, or guard if followed by fallback block, found {}",
             describe_statement(first)
         ))),
     }
@@ -347,7 +375,7 @@ fn validate_stage_6c_guard(
 ) -> Result<NativeSmokeTerminator, BackendError> {
     if fallback_statements.is_empty() {
         return Err(BackendError::new(
-            "unsupported native branch fallthrough for Stage 6c: guard `if` without `else` requires a supported fallback block",
+            "unsupported native branch fallthrough for Stage 7b: guard `if` without `else` requires a supported fallback block",
         ));
     }
 
@@ -373,7 +401,7 @@ fn validate_stage_6c_fallthrough_if(
                 error
             } else {
                 BackendError::new(
-                    "unsupported native fallthrough if for Stage 6c: expected supported boolean condition",
+                    "unsupported native fallthrough if for Stage 7b: expected supported boolean condition",
                 )
             }
         })?;
@@ -490,12 +518,12 @@ fn validate_stage_6c_fallthrough_block(
             }
             Stmt::Return { .. } => {
                 return Err(BackendError::new(
-                    "unsupported native fallthrough branch for Stage 6c: return inside a fallthrough branch is future native work",
+                    "unsupported native fallthrough branch for Stage 7b: return inside a fallthrough branch is future native work",
                 ));
             }
             other => {
                 return Err(BackendError::new(format!(
-                    "unsupported native fallthrough branch for Stage 6c: expected supported local declaration, assignment, bounded structured while, or nested fallthrough if, found {}",
+                    "unsupported native fallthrough branch for Stage 7b: expected supported local declaration, assignment, bounded structured while, or nested fallthrough if, found {}",
                     describe_statement(other)
                 )));
             }
@@ -577,19 +605,19 @@ fn validate_stage_6c_assignment(
 ) -> Result<NativeSmokeAssign, BackendError> {
     let Expr::Variable { name, .. } = &assignment.target else {
         return Err(BackendError::new(
-            "unsupported native assignment target for Stage 6c: expected writable `int` local",
+            "unsupported native assignment target for Stage 7b: expected writable `int` local",
         ));
     };
 
     let Some(target) = local_states.get(name) else {
         return Err(BackendError::new(format!(
-            "unsupported native assignment target for Stage 6c: undeclared local `${name}`"
+            "unsupported native assignment target for Stage 7b: undeclared local `${name}`"
         )));
     };
 
     if !target.writable {
         return Err(BackendError::new(format!(
-            "unsupported native assignment to readonly local for Stage 6c: `${name}`"
+            "unsupported native assignment to readonly local for Stage 7b: `${name}`"
         )));
     }
 
@@ -630,7 +658,7 @@ fn validate_stage_6c_while(
                 error
             } else {
                 BackendError::new(
-                    "unsupported native while condition for Stage 6c: expected supported boolean condition",
+                    "unsupported native while condition for Stage 7b: expected supported boolean condition",
                 )
             }
         })?;
@@ -651,13 +679,19 @@ fn validate_stage_6c_while(
             break;
         }
 
-        if iterations == STAGE_6C_LOOP_VERIFICATION_CAP {
+        if iterations == STAGE_7B_LOOP_VERIFICATION_CAP {
             return Err(stage_6c_loop_cap_error());
         }
 
-        simulated_states = evaluate_native_scoped_statements(&body.statements, &simulated_states)?;
+        let body_evaluation =
+            evaluate_native_scoped_statements(&body.statements, &simulated_states)?;
+        simulated_states = body_evaluation.visible_states;
 
         iterations += 1;
+
+        if body_evaluation.control == NativeSmokeLoopControl::Break {
+            break;
+        }
     }
 
     let mut final_values = Vec::new();
@@ -684,7 +718,7 @@ fn validate_stage_6c_while_body(
 ) -> Result<NativeSmokeFallthroughBlock, BackendError> {
     if statements.is_empty() {
         return Err(BackendError::new(
-            "unsupported native while body for Stage 6c: expected one or more supported local declarations, assignments, or fallthrough if statements",
+            "unsupported native while body for Stage 7b: expected one or more supported local declarations, assignments, or fallthrough if statements",
         ));
     }
 
@@ -753,19 +787,25 @@ fn validate_stage_6c_while_scoped_body(
                 )?;
                 native_statements.push(NativeSmokeStmt::If(native_if));
             }
+            Stmt::Break { .. } => {
+                native_statements.push(NativeSmokeStmt::Break);
+            }
+            Stmt::Continue { .. } => {
+                native_statements.push(NativeSmokeStmt::Continue);
+            }
             Stmt::While(_) => {
                 return Err(BackendError::new(
-                    "unsupported native while body statement for Stage 6c: nested while loops are future native work",
+                    "unsupported native while body statement for Stage 7b: nested while loops are future native work",
                 ));
             }
             Stmt::Return { .. } => {
                 return Err(BackendError::new(
-                    "unsupported native while body statement for Stage 6c: return inside while bodies is future native work",
+                    "unsupported native while body statement for Stage 7b: return inside while bodies is future native work",
                 ));
             }
             other => {
                 return Err(BackendError::new(format!(
-                    "unsupported native while body statement for Stage 6c: expected local declaration, assignment, or fallthrough if, found {}",
+                    "unsupported native while body statement for Stage 7b: expected local declaration, assignment, or fallthrough if, found {}",
                     describe_statement(other)
                 )));
             }
@@ -811,19 +851,19 @@ fn validate_stage_6c_loop_assignment(
 ) -> Result<NativeSmokeAssign, BackendError> {
     let Expr::Variable { name, .. } = &assignment.target else {
         return Err(BackendError::new(
-            "unsupported native while assignment target for Stage 6c: expected writable `int` local",
+            "unsupported native while assignment target for Stage 7b: expected writable `int` local",
         ));
     };
 
     let Some(target) = local_states.get(name) else {
         return Err(BackendError::new(format!(
-            "unsupported native while assignment target for Stage 6c: undeclared local `${name}`"
+            "unsupported native while assignment target for Stage 7b: undeclared local `${name}`"
         )));
     };
 
     if !target.writable {
         return Err(BackendError::new(format!(
-            "unsupported native while assignment target for Stage 6c: readonly local `${name}`"
+            "unsupported native while assignment target for Stage 7b: readonly local `${name}`"
         )));
     }
 
@@ -850,7 +890,7 @@ fn validate_stage_6c_loop_fallthrough_if(
                 error
             } else {
                 BackendError::new(
-                    "unsupported native while body statement for Stage 6c: expected supported fallthrough if condition",
+                    "unsupported native while body statement for Stage 7b: expected supported fallthrough if condition",
                 )
             }
         })?;
@@ -945,7 +985,7 @@ fn validate_stage_6c_loop_condition(
             right: Box::new(validate_stage_6c_loop_condition(right, local_states)?),
         }),
         _ => Err(BackendError::new(
-            "unsupported native condition for Stage 6c: expected bool literal, supported integer comparison, or supported boolean condition",
+            "unsupported native condition for Stage 7b: expected bool literal, supported integer comparison, or supported boolean condition",
         )),
     }
 }
@@ -959,7 +999,7 @@ fn validate_stage_6c_loop_int_expr(
         Expr::Variable { name, .. } => {
             if !local_states.contains_key(name) {
                 return Err(BackendError::new(
-                    "unsupported native expression for Stage 6c: expected integer literal, supported integer local, or supported integer arithmetic",
+                    "unsupported native expression for Stage 7b: expected integer literal, supported integer local, or supported integer arithmetic",
                 ));
             }
 
@@ -980,10 +1020,10 @@ fn validate_stage_6c_loop_int_expr(
             op: BinaryOp::Div | BinaryOp::Mod,
             ..
         } => Err(BackendError::new(
-            "unsupported native arithmetic operator for Stage 6c",
+            "unsupported native arithmetic operator for Stage 7b",
         )),
         other => Err(BackendError::new(format!(
-            "unsupported native expression for Stage 6c: expected integer literal, supported integer local, or supported integer arithmetic, found `{}`",
+            "unsupported native expression for Stage 7b: expected integer literal, supported integer local, or supported integer arithmetic, found `{}`",
             describe_expression(other)
         ))),
     }
@@ -1029,7 +1069,7 @@ fn evaluate_native_assignment_value(
 fn evaluate_native_scoped_statements(
     statements: &[NativeSmokeStmt],
     visible_states: &HashMap<String, NativeSmokeLocalState>,
-) -> Result<HashMap<String, NativeSmokeLocalState>, BackendError> {
+) -> Result<NativeSmokeLoopEvaluation, BackendError> {
     let mut block_states = visible_states.clone();
     let mut next_visible_states = visible_states.clone();
     let mut shadowed_locals = HashSet::new();
@@ -1089,7 +1129,7 @@ fn evaluate_native_scoped_statements(
             NativeSmokeStmt::If(native_if) => {
                 let updated_states = evaluate_native_scoped_if(native_if, &block_states)?;
                 for name in sorted_native_local_names(&block_states) {
-                    if let Some(updated_state) = updated_states.get(&name) {
+                    if let Some(updated_state) = updated_states.visible_states.get(&name) {
                         block_states.insert(name, updated_state.clone());
                     }
                 }
@@ -1097,26 +1137,47 @@ fn evaluate_native_scoped_statements(
                     if shadowed_locals.contains(&name) {
                         continue;
                     }
-                    if let Some(updated_state) = updated_states.get(&name) {
+                    if let Some(updated_state) = updated_states.visible_states.get(&name) {
                         next_visible_states.insert(name, updated_state.clone());
                     }
+                }
+                if updated_states.control != NativeSmokeLoopControl::Fallthrough {
+                    return Ok(NativeSmokeLoopEvaluation {
+                        visible_states: next_visible_states,
+                        control: updated_states.control,
+                    });
                 }
             }
             NativeSmokeStmt::While(_) => {
                 return Err(BackendError::new(
-                    "unsupported native while body statement for Stage 6c: nested while loops are future native work",
+                    "unsupported native while body statement for Stage 7b: nested while loops are future native work",
                 ));
+            }
+            NativeSmokeStmt::Break => {
+                return Ok(NativeSmokeLoopEvaluation {
+                    visible_states: next_visible_states,
+                    control: NativeSmokeLoopControl::Break,
+                });
+            }
+            NativeSmokeStmt::Continue => {
+                return Ok(NativeSmokeLoopEvaluation {
+                    visible_states: next_visible_states,
+                    control: NativeSmokeLoopControl::Continue,
+                });
             }
         }
     }
 
-    Ok(next_visible_states)
+    Ok(NativeSmokeLoopEvaluation {
+        visible_states: next_visible_states,
+        control: NativeSmokeLoopControl::Fallthrough,
+    })
 }
 
 fn evaluate_native_scoped_if(
     native_if: &NativeSmokeIf,
     local_states: &HashMap<String, NativeSmokeLocalState>,
-) -> Result<HashMap<String, NativeSmokeLocalState>, BackendError> {
+) -> Result<NativeSmokeLoopEvaluation, BackendError> {
     let values = native_state_values(local_states);
     let Some(condition_value) = evaluate_native_condition(&native_if.condition, &values) else {
         return Err(BackendError::new(
@@ -1129,13 +1190,16 @@ fn evaluate_native_scoped_if(
     } else if let Some(else_block) = &native_if.else_block {
         evaluate_native_scoped_statements(&else_block.statements, local_states)
     } else {
-        Ok(local_states.clone())
+        Ok(NativeSmokeLoopEvaluation {
+            visible_states: local_states.clone(),
+            control: NativeSmokeLoopControl::Fallthrough,
+        })
     }
 }
 
 fn stage_6c_loop_cap_error() -> BackendError {
     BackendError::new(
-        "unsupported native while loop for Stage 6c: loop could not be proven to terminate within the current native smoke verification cap",
+        "unsupported native while loop for Stage 7b: loop could not be proven to terminate within the current native smoke verification cap",
     )
 }
 
@@ -1152,7 +1216,7 @@ fn validate_stage_6c_terminator(
             })
         }
         Stmt::Return { expr: None, .. } => Err(BackendError::new(
-            "unsupported native terminal statement for Stage 6c: expected `return <portable integer expression>;`, found bare `return;`",
+            "unsupported native terminal statement for Stage 7b: expected `return <portable integer expression>;`, found bare `return;`",
         )),
         Stmt::If(if_stmt) => {
             let condition = validate_stage_6c_condition(&if_stmt.condition, local_states)?;
@@ -1160,7 +1224,7 @@ fn validate_stage_6c_terminator(
 
             let Some(else_branch) = &if_stmt.else_branch else {
                 return Err(BackendError::new(
-                    "unsupported native terminal if for Stage 6c: terminal if requires else; guard if without else is supported only when followed by a fallback return",
+                    "unsupported native terminal if for Stage 7b: terminal if requires else; guard if without else is supported only when followed by a fallback return",
                 ));
             };
 
@@ -1179,7 +1243,7 @@ fn validate_stage_6c_terminator(
             })
         }
         other => Err(BackendError::new(format!(
-            "unsupported native terminal statement for Stage 6c: expected final return or terminal if/else, found {}",
+            "unsupported native terminal statement for Stage 7b: expected final return or terminal if/else, found {}",
             describe_statement(other)
         ))),
     }
@@ -1194,7 +1258,7 @@ fn validate_stage_6c_branch(
             error
         } else {
             BackendError::new(
-                "unsupported native branch body shape for Stage 6c: expected supported local declarations, assignments, bounded while statements, or fallthrough if statements followed by a supported native terminator",
+                "unsupported native branch body shape for Stage 7b: expected supported local declarations, assignments, bounded while statements, or fallthrough if statements followed by a supported native terminator",
             )
         }
     })
@@ -1246,7 +1310,7 @@ fn validate_stage_6c_int_expr(
         Expr::Variable { name, .. } => {
             let value = local_states.get(name).map(|state| state.value).ok_or_else(|| {
                 BackendError::new(
-                    "unsupported native expression for Stage 6c: expected integer literal, supported integer local, or supported integer arithmetic",
+                    "unsupported native expression for Stage 7b: expected integer literal, supported integer local, or supported integer arithmetic",
                 )
             })?;
             Ok(ValidatedNativeSmokeExpr {
@@ -1278,11 +1342,11 @@ fn validate_stage_6c_int_expr(
             ..
         } => {
             Err(BackendError::new(
-                "unsupported native arithmetic operator for Stage 6c",
+                "unsupported native arithmetic operator for Stage 7b",
             ))
         }
         other => Err(BackendError::new(format!(
-            "unsupported native expression for Stage 6c: expected integer literal, supported integer local, or supported integer arithmetic, found `{}`",
+            "unsupported native expression for Stage 7b: expected integer literal, supported integer local, or supported integer arithmetic, found `{}`",
             describe_expression(other)
         ))),
     }
@@ -1377,7 +1441,7 @@ fn validate_stage_6c_condition(
         }
 
         _ => Err(BackendError::new(
-            "unsupported native condition for Stage 6c: expected bool literal, supported integer comparison, or supported boolean condition",
+            "unsupported native condition for Stage 7b: expected bool literal, supported integer comparison, or supported boolean condition",
         )),
     }
 }
@@ -1391,7 +1455,7 @@ fn validate_stage_6c_comparison_operand(
             error
         } else {
             BackendError::new(
-                "unsupported native comparison for Stage 6c: expected supported integer expressions",
+                "unsupported native comparison for Stage 7b: expected supported integer expressions",
             )
         }
     })
@@ -1493,7 +1557,7 @@ fn parse_doria_int_literal(value: &str) -> Result<i64, BackendError> {
 fn parse_stage_6c_exit_code(value: i64) -> Result<i32, BackendError> {
     if !(0..=125).contains(&value) {
         return Err(BackendError::new(
-            "native Stage 6c exit code must be in the range 0..125",
+            "native Stage 7b exit code must be in the range 0..125",
         ));
     }
 
@@ -1507,7 +1571,7 @@ pub(crate) fn lower_to_object(native_module: &NativeSmokeModule) -> Result<Vec<u
         .finish(settings::Flags::new(settings::builder()))
         .map_err(|error| BackendError::new(format!("backend emission failure: {error}")))?;
     let mut module = ObjectModule::new(
-        ObjectBuilder::new(isa, "doria_stage_6c", default_libcall_names())
+        ObjectBuilder::new(isa, "doria_stage_7b", default_libcall_names())
             .map_err(|error| BackendError::new(format!("backend emission failure: {error}")))?,
     );
 
@@ -1560,6 +1624,8 @@ fn lower_native_block(
             statement,
             lowered_local_values,
             evaluated_local_values,
+            None,
+            None,
         )?;
     }
 
@@ -1690,32 +1756,72 @@ fn lower_native_statement(
     statement: &NativeSmokeStmt,
     lowered_local_values: &mut HashMap<String, Value>,
     evaluated_local_values: &mut HashMap<String, i64>,
-) -> Result<(), BackendError> {
+    visible_local_values: Option<&HashMap<String, Value>>,
+    loop_context: Option<&NativeSmokeLoopLoweringContext<'_>>,
+) -> Result<NativeSmokeLoweringFlow, BackendError> {
     match statement {
         NativeSmokeStmt::Local(local) => {
             let value = lower_native_expr(builder, &local.expr, lowered_local_values)?;
             lowered_local_values.insert(local.name.clone(), value);
             evaluated_local_values.insert(local.name.clone(), local.evaluated_value);
-            Ok(())
+            Ok(NativeSmokeLoweringFlow::Fallthrough)
         }
         NativeSmokeStmt::Assign(assignment) => {
             let value = lower_native_assignment(builder, assignment, lowered_local_values)?;
             lowered_local_values.insert(assignment.target.clone(), value);
             evaluated_local_values.insert(assignment.target.clone(), assignment.evaluated_value);
-            Ok(())
+            Ok(NativeSmokeLoweringFlow::Fallthrough)
         }
         NativeSmokeStmt::While(native_while) => lower_native_while(
             builder,
             native_while,
             lowered_local_values,
             evaluated_local_values,
-        ),
+        )
+        .map(|()| NativeSmokeLoweringFlow::Fallthrough),
         NativeSmokeStmt::If(native_if) => lower_native_fallthrough_if(
             builder,
             native_if,
             lowered_local_values,
             evaluated_local_values,
-        ),
+            visible_local_values,
+            loop_context,
+        )
+        .map(|visible_values| {
+            if visible_values.is_some() {
+                NativeSmokeLoweringFlow::Fallthrough
+            } else {
+                NativeSmokeLoweringFlow::Diverged
+            }
+        }),
+        NativeSmokeStmt::Break => {
+            let Some(loop_context) = loop_context else {
+                return Err(BackendError::new(
+                    "unsupported native break for Stage 7b: expected enclosing while loop",
+                ));
+            };
+            jump_to_native_carried_block(
+                builder,
+                loop_context.after_block,
+                loop_context.carried_locals,
+                visible_local_values.unwrap_or(lowered_local_values),
+            )?;
+            Ok(NativeSmokeLoweringFlow::Diverged)
+        }
+        NativeSmokeStmt::Continue => {
+            let Some(loop_context) = loop_context else {
+                return Err(BackendError::new(
+                    "unsupported native continue for Stage 7b: expected enclosing while loop",
+                ));
+            };
+            jump_to_native_carried_block(
+                builder,
+                loop_context.header_block,
+                loop_context.carried_locals,
+                visible_local_values.unwrap_or(lowered_local_values),
+            )?;
+            Ok(NativeSmokeLoweringFlow::Diverged)
+        }
     }
 }
 
@@ -1724,15 +1830,14 @@ fn lower_native_fallthrough_if(
     native_if: &NativeSmokeIf,
     lowered_local_values: &mut HashMap<String, Value>,
     evaluated_local_values: &mut HashMap<String, i64>,
-) -> Result<(), BackendError> {
+    visible_local_values: Option<&HashMap<String, Value>>,
+    loop_context: Option<&NativeSmokeLoopLoweringContext<'_>>,
+) -> Result<Option<HashMap<String, Value>>, BackendError> {
     let _validated_condition = native_if.evaluated_condition;
     let then_ir_block = builder.create_block();
     let else_ir_block = builder.create_block();
-    let merge_ir_block = builder.create_block();
-
-    for _ in &native_if.merged_values {
-        builder.append_block_param(merge_ir_block, types::I64);
-    }
+    let base_visible_local_values =
+        scoped_native_visible_values(lowered_local_values, visible_local_values);
 
     lower_native_condition_branch(
         builder,
@@ -1751,13 +1856,19 @@ fn lower_native_fallthrough_if(
         &native_if.then_block,
         &mut then_lowered_local_values,
         &mut then_evaluated_local_values,
+        &base_visible_local_values,
+        loop_context,
     )?;
-    jump_to_native_merge(
-        builder,
-        merge_ir_block,
-        &native_if.merged_values,
-        &then_visible_local_values,
-    )?;
+    let mut merge_ir_block = None;
+    if let Some(then_visible_local_values) = &then_visible_local_values {
+        let merge_block = ensure_native_merge_block(builder, &mut merge_ir_block, native_if);
+        jump_to_native_merge(
+            builder,
+            merge_block,
+            &native_if.merged_values,
+            then_visible_local_values,
+        )?;
+    }
 
     builder.switch_to_block(else_ir_block);
     builder.seal_block(else_ir_block);
@@ -1769,16 +1880,25 @@ fn lower_native_fallthrough_if(
             else_block,
             &mut else_lowered_local_values,
             &mut else_evaluated_local_values,
+            &base_visible_local_values,
+            loop_context,
         )?
     } else {
-        lowered_local_values.clone()
+        Some(base_visible_local_values.clone())
     };
-    jump_to_native_merge(
-        builder,
-        merge_ir_block,
-        &native_if.merged_values,
-        &else_visible_local_values,
-    )?;
+    if let Some(else_visible_local_values) = &else_visible_local_values {
+        let merge_block = ensure_native_merge_block(builder, &mut merge_ir_block, native_if);
+        jump_to_native_merge(
+            builder,
+            merge_block,
+            &native_if.merged_values,
+            else_visible_local_values,
+        )?;
+    }
+
+    let Some(merge_ir_block) = merge_ir_block else {
+        return Ok(None);
+    };
 
     builder.switch_to_block(merge_ir_block);
     builder.seal_block(merge_ir_block);
@@ -1787,7 +1907,24 @@ fn lower_native_fallthrough_if(
         evaluated_local_values.insert(name.clone(), *value);
     }
 
-    Ok(())
+    Ok(Some(lowered_local_values.clone()))
+}
+
+fn ensure_native_merge_block(
+    builder: &mut FunctionBuilder,
+    merge_ir_block: &mut Option<Block>,
+    native_if: &NativeSmokeIf,
+) -> Block {
+    if let Some(block) = *merge_ir_block {
+        return block;
+    }
+
+    let block = builder.create_block();
+    for _ in &native_if.merged_values {
+        builder.append_block_param(block, types::I64);
+    }
+    *merge_ir_block = Some(block);
+    block
 }
 
 fn lower_native_fallthrough_block(
@@ -1795,8 +1932,11 @@ fn lower_native_fallthrough_block(
     block: &NativeSmokeFallthroughBlock,
     lowered_local_values: &mut HashMap<String, Value>,
     evaluated_local_values: &mut HashMap<String, i64>,
-) -> Result<HashMap<String, Value>, BackendError> {
-    let mut visible_lowered_local_values = lowered_local_values.clone();
+    visible_local_values: &HashMap<String, Value>,
+    loop_context: Option<&NativeSmokeLoopLoweringContext<'_>>,
+) -> Result<Option<HashMap<String, Value>>, BackendError> {
+    let mut visible_lowered_local_values =
+        scoped_native_visible_values(lowered_local_values, Some(visible_local_values));
     let mut shadowed_locals = HashSet::new();
 
     for statement in &block.statements {
@@ -1807,6 +1947,8 @@ fn lower_native_fallthrough_block(
                     statement,
                     lowered_local_values,
                     evaluated_local_values,
+                    Some(&visible_lowered_local_values),
+                    loop_context,
                 )?;
                 if visible_lowered_local_values.contains_key(&local.name) {
                     shadowed_locals.insert(local.name.clone());
@@ -1818,6 +1960,8 @@ fn lower_native_fallthrough_block(
                     statement,
                     lowered_local_values,
                     evaluated_local_values,
+                    Some(&visible_lowered_local_values),
+                    loop_context,
                 )?;
                 update_visible_lowered_value(
                     &mut visible_lowered_local_values,
@@ -1832,6 +1976,8 @@ fn lower_native_fallthrough_block(
                     statement,
                     lowered_local_values,
                     evaluated_local_values,
+                    Some(&visible_lowered_local_values),
+                    loop_context,
                 )?;
                 for (name, _) in &native_while.final_values {
                     update_visible_lowered_value(
@@ -1843,12 +1989,17 @@ fn lower_native_fallthrough_block(
                 }
             }
             NativeSmokeStmt::If(native_if) => {
-                lower_native_statement(
+                if lower_native_statement(
                     builder,
                     statement,
                     lowered_local_values,
                     evaluated_local_values,
-                )?;
+                    Some(&visible_lowered_local_values),
+                    loop_context,
+                )? == NativeSmokeLoweringFlow::Diverged
+                {
+                    return Ok(None);
+                }
                 for (name, _) in &native_if.merged_values {
                     update_visible_lowered_value(
                         &mut visible_lowered_local_values,
@@ -1858,10 +2009,21 @@ fn lower_native_fallthrough_block(
                     )?;
                 }
             }
+            NativeSmokeStmt::Break | NativeSmokeStmt::Continue => {
+                lower_native_statement(
+                    builder,
+                    statement,
+                    lowered_local_values,
+                    evaluated_local_values,
+                    Some(&visible_lowered_local_values),
+                    loop_context,
+                )?;
+                return Ok(None);
+            }
         }
     }
 
-    Ok(visible_lowered_local_values)
+    Ok(Some(visible_lowered_local_values))
 }
 
 fn update_visible_lowered_value(
@@ -1881,6 +2043,21 @@ fn update_visible_lowered_value(
     };
     visible_lowered_local_values.insert(name.to_string(), value);
     Ok(())
+}
+
+fn scoped_native_visible_values(
+    scoped_local_values: &HashMap<String, Value>,
+    visible_local_values: Option<&HashMap<String, Value>>,
+) -> HashMap<String, Value> {
+    let mut values = scoped_local_values.clone();
+    if let Some(visible_local_values) = visible_local_values {
+        values.extend(
+            visible_local_values
+                .iter()
+                .map(|(name, value)| (name.clone(), *value)),
+        );
+    }
+    values
 }
 
 fn jump_to_native_merge(
@@ -1907,13 +2084,37 @@ fn jump_to_native_merge(
     Ok(())
 }
 
+fn jump_to_native_carried_block(
+    builder: &mut FunctionBuilder,
+    target_block: Block,
+    carried_values: &[(String, i64)],
+    local_values: &HashMap<String, Value>,
+) -> Result<(), BackendError> {
+    let args = carried_values
+        .iter()
+        .map(|(name, _)| {
+            local_values
+                .get(name)
+                .copied()
+                .map(BlockArg::Value)
+                .ok_or_else(|| {
+                    BackendError::new(format!(
+                        "backend emission failure: validated native loop-carried local `{name}` was not lowered"
+                    ))
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    builder.ins().jump(target_block, &args);
+    Ok(())
+}
+
 fn lower_native_while(
     builder: &mut FunctionBuilder,
     native_while: &NativeSmokeWhile,
     lowered_local_values: &mut HashMap<String, Value>,
     evaluated_local_values: &mut HashMap<String, i64>,
 ) -> Result<(), BackendError> {
-    debug_assert!(native_while.evaluated_iterations <= STAGE_6C_LOOP_VERIFICATION_CAP);
+    debug_assert!(native_while.evaluated_iterations <= STAGE_7B_LOOP_VERIFICATION_CAP);
 
     let loop_header = builder.create_block();
     let loop_body = builder.create_block();
@@ -1921,6 +2122,7 @@ fn lower_native_while(
 
     for _ in &native_while.final_values {
         builder.append_block_param(loop_header, types::I64);
+        builder.append_block_param(loop_after, types::I64);
     }
 
     let initial_args = native_while
@@ -1945,29 +2147,11 @@ fn lower_native_while(
     for (index, (name, _)) in native_while.final_values.iter().enumerate() {
         header_local_values.insert(name.clone(), builder.block_params(loop_header)[index]);
     }
-    lower_native_condition_branch(
-        builder,
-        &native_while.condition,
-        loop_body,
-        loop_after,
-        &header_local_values,
-    )?;
-
-    builder.switch_to_block(loop_body);
-    builder.seal_block(loop_body);
-    let mut body_local_values = header_local_values.clone();
-    let mut body_evaluated_values = evaluated_local_values.clone();
-    let visible_body_values = lower_native_fallthrough_block(
-        builder,
-        &native_while.body,
-        &mut body_local_values,
-        &mut body_evaluated_values,
-    )?;
-    let next_args = native_while
+    let after_args = native_while
         .final_values
         .iter()
         .map(|(name, _)| {
-            visible_body_values
+            header_local_values
                 .get(name)
                 .copied()
                 .map(BlockArg::Value)
@@ -1978,18 +2162,57 @@ fn lower_native_while(
                 })
         })
         .collect::<Result<Vec<_>, _>>()?;
-    builder.ins().jump(loop_header, &next_args);
+    lower_native_condition_branch_with_args(
+        builder,
+        &native_while.condition,
+        loop_body,
+        &[],
+        loop_after,
+        &after_args,
+        &header_local_values,
+    )?;
+
+    builder.switch_to_block(loop_body);
+    builder.seal_block(loop_body);
+    let mut body_local_values = header_local_values.clone();
+    let mut body_evaluated_values = evaluated_local_values.clone();
+    let loop_context = NativeSmokeLoopLoweringContext {
+        header_block: loop_header,
+        after_block: loop_after,
+        carried_locals: &native_while.final_values,
+    };
+    let visible_body_values = lower_native_fallthrough_block(
+        builder,
+        &native_while.body,
+        &mut body_local_values,
+        &mut body_evaluated_values,
+        &header_local_values,
+        Some(&loop_context),
+    )?;
+    if let Some(visible_body_values) = visible_body_values {
+        let next_args = native_while
+            .final_values
+            .iter()
+            .map(|(name, _)| {
+                visible_body_values
+                    .get(name)
+                    .copied()
+                    .map(BlockArg::Value)
+                    .ok_or_else(|| {
+                        BackendError::new(format!(
+                            "backend emission failure: validated native while target `{name}` was not lowered"
+                        ))
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        builder.ins().jump(loop_header, &next_args);
+    }
     builder.seal_block(loop_header);
 
     builder.switch_to_block(loop_after);
     builder.seal_block(loop_after);
-    for (name, value) in &native_while.final_values {
-        let Some(lowered_value) = header_local_values.get(name).copied() else {
-            return Err(BackendError::new(format!(
-                "backend emission failure: validated native while target `{name}` was not lowered"
-            )));
-        };
-        lowered_local_values.insert(name.clone(), lowered_value);
+    for (index, (name, value)) in native_while.final_values.iter().enumerate() {
+        lowered_local_values.insert(name.clone(), builder.block_params(loop_after)[index]);
         evaluated_local_values.insert(name.clone(), *value);
     }
 
@@ -2071,10 +2294,32 @@ fn lower_native_condition_branch(
     else_block: Block,
     local_values: &HashMap<String, Value>,
 ) -> Result<(), BackendError> {
+    lower_native_condition_branch_with_args(
+        builder,
+        condition,
+        then_block,
+        &[],
+        else_block,
+        &[],
+        local_values,
+    )
+}
+
+fn lower_native_condition_branch_with_args(
+    builder: &mut FunctionBuilder,
+    condition: &NativeSmokeCondition,
+    then_block: Block,
+    then_args: &[BlockArg],
+    else_block: Block,
+    else_args: &[BlockArg],
+    local_values: &HashMap<String, Value>,
+) -> Result<(), BackendError> {
     match condition {
         NativeSmokeCondition::Bool(value) => {
             let value = builder.ins().iconst(types::I8, i64::from(*value));
-            builder.ins().brif(value, then_block, &[], else_block, &[]);
+            builder
+                .ins()
+                .brif(value, then_block, then_args, else_block, else_args);
             Ok(())
         }
         NativeSmokeCondition::Compare { op, left, right } => {
@@ -2083,27 +2328,65 @@ fn lower_native_condition_branch(
             let condition = builder.ins().icmp(native_compare_intcc(*op), left, right);
             builder
                 .ins()
-                .brif(condition, then_block, &[], else_block, &[]);
+                .brif(condition, then_block, then_args, else_block, else_args);
             Ok(())
         }
-        NativeSmokeCondition::Not(condition) => {
-            lower_native_condition_branch(builder, condition, else_block, then_block, local_values)
-        }
+        NativeSmokeCondition::Not(condition) => lower_native_condition_branch_with_args(
+            builder,
+            condition,
+            else_block,
+            else_args,
+            then_block,
+            then_args,
+            local_values,
+        ),
         NativeSmokeCondition::And { left, right } => {
             let right_block = builder.create_block();
-            lower_native_condition_branch(builder, left, right_block, else_block, local_values)?;
+            lower_native_condition_branch_with_args(
+                builder,
+                left,
+                right_block,
+                &[],
+                else_block,
+                else_args,
+                local_values,
+            )?;
 
             builder.switch_to_block(right_block);
             builder.seal_block(right_block);
-            lower_native_condition_branch(builder, right, then_block, else_block, local_values)
+            lower_native_condition_branch_with_args(
+                builder,
+                right,
+                then_block,
+                then_args,
+                else_block,
+                else_args,
+                local_values,
+            )
         }
         NativeSmokeCondition::Or { left, right } => {
             let right_block = builder.create_block();
-            lower_native_condition_branch(builder, left, then_block, right_block, local_values)?;
+            lower_native_condition_branch_with_args(
+                builder,
+                left,
+                then_block,
+                then_args,
+                right_block,
+                &[],
+                local_values,
+            )?;
 
             builder.switch_to_block(right_block);
             builder.seal_block(right_block);
-            lower_native_condition_branch(builder, right, then_block, else_block, local_values)
+            lower_native_condition_branch_with_args(
+                builder,
+                right,
+                then_block,
+                then_args,
+                else_block,
+                else_args,
+                local_values,
+            )
         }
         NativeSmokeCondition::Xor { left, right } => {
             let left = lower_native_condition_value(builder, left, local_values)?;
@@ -2111,7 +2394,7 @@ fn lower_native_condition_branch(
             let condition = builder.ins().icmp(IntCC::NotEqual, left, right);
             builder
                 .ins()
-                .brif(condition, then_block, &[], else_block, &[]);
+                .brif(condition, then_block, then_args, else_block, else_args);
             Ok(())
         }
     }
@@ -2217,6 +2500,8 @@ fn describe_statement(statement: &Stmt) -> &'static str {
         Stmt::Return { .. } => "return statement",
         Stmt::If(_) => "if statement",
         Stmt::While(_) => "while statement",
+        Stmt::Break { .. } => "break statement",
+        Stmt::Continue { .. } => "continue statement",
         Stmt::Foreach(_) => "foreach statement",
         Stmt::Expr { .. } => "expression statement",
     }
@@ -2375,7 +2660,7 @@ function main(): int
         let error = validate(&program).expect_err("expected loop proof to fail at the cap");
         assert!(
             error.message.contains(
-                "unsupported native while loop for Stage 6c: loop could not be proven to terminate within the current native smoke verification cap"
+                "unsupported native while loop for Stage 7b: loop could not be proven to terminate within the current native smoke verification cap"
             ),
             "unexpected error: {}",
             error.message
