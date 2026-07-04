@@ -1625,6 +1625,7 @@ fn lower_native_block(
             lowered_local_values,
             evaluated_local_values,
             None,
+            None,
         )?;
     }
 
@@ -1755,6 +1756,7 @@ fn lower_native_statement(
     statement: &NativeSmokeStmt,
     lowered_local_values: &mut HashMap<String, Value>,
     evaluated_local_values: &mut HashMap<String, i64>,
+    visible_local_values: Option<&HashMap<String, Value>>,
     loop_context: Option<&NativeSmokeLoopLoweringContext<'_>>,
 ) -> Result<NativeSmokeLoweringFlow, BackendError> {
     match statement {
@@ -1782,6 +1784,7 @@ fn lower_native_statement(
             native_if,
             lowered_local_values,
             evaluated_local_values,
+            visible_local_values,
             loop_context,
         )
         .map(|visible_values| {
@@ -1801,7 +1804,7 @@ fn lower_native_statement(
                 builder,
                 loop_context.after_block,
                 loop_context.carried_locals,
-                lowered_local_values,
+                visible_local_values.unwrap_or(lowered_local_values),
             )?;
             Ok(NativeSmokeLoweringFlow::Diverged)
         }
@@ -1815,7 +1818,7 @@ fn lower_native_statement(
                 builder,
                 loop_context.header_block,
                 loop_context.carried_locals,
-                lowered_local_values,
+                visible_local_values.unwrap_or(lowered_local_values),
             )?;
             Ok(NativeSmokeLoweringFlow::Diverged)
         }
@@ -1827,11 +1830,14 @@ fn lower_native_fallthrough_if(
     native_if: &NativeSmokeIf,
     lowered_local_values: &mut HashMap<String, Value>,
     evaluated_local_values: &mut HashMap<String, i64>,
+    visible_local_values: Option<&HashMap<String, Value>>,
     loop_context: Option<&NativeSmokeLoopLoweringContext<'_>>,
 ) -> Result<Option<HashMap<String, Value>>, BackendError> {
     let _validated_condition = native_if.evaluated_condition;
     let then_ir_block = builder.create_block();
     let else_ir_block = builder.create_block();
+    let base_visible_local_values =
+        scoped_native_visible_values(lowered_local_values, visible_local_values);
 
     lower_native_condition_branch(
         builder,
@@ -1850,6 +1856,7 @@ fn lower_native_fallthrough_if(
         &native_if.then_block,
         &mut then_lowered_local_values,
         &mut then_evaluated_local_values,
+        &base_visible_local_values,
         loop_context,
     )?;
     let mut merge_ir_block = None;
@@ -1873,10 +1880,11 @@ fn lower_native_fallthrough_if(
             else_block,
             &mut else_lowered_local_values,
             &mut else_evaluated_local_values,
+            &base_visible_local_values,
             loop_context,
         )?
     } else {
-        Some(lowered_local_values.clone())
+        Some(base_visible_local_values.clone())
     };
     if let Some(else_visible_local_values) = &else_visible_local_values {
         let merge_block = ensure_native_merge_block(builder, &mut merge_ir_block, native_if);
@@ -1924,9 +1932,11 @@ fn lower_native_fallthrough_block(
     block: &NativeSmokeFallthroughBlock,
     lowered_local_values: &mut HashMap<String, Value>,
     evaluated_local_values: &mut HashMap<String, i64>,
+    visible_local_values: &HashMap<String, Value>,
     loop_context: Option<&NativeSmokeLoopLoweringContext<'_>>,
 ) -> Result<Option<HashMap<String, Value>>, BackendError> {
-    let mut visible_lowered_local_values = lowered_local_values.clone();
+    let mut visible_lowered_local_values =
+        scoped_native_visible_values(lowered_local_values, Some(visible_local_values));
     let mut shadowed_locals = HashSet::new();
 
     for statement in &block.statements {
@@ -1937,6 +1947,7 @@ fn lower_native_fallthrough_block(
                     statement,
                     lowered_local_values,
                     evaluated_local_values,
+                    Some(&visible_lowered_local_values),
                     loop_context,
                 )?;
                 if visible_lowered_local_values.contains_key(&local.name) {
@@ -1949,6 +1960,7 @@ fn lower_native_fallthrough_block(
                     statement,
                     lowered_local_values,
                     evaluated_local_values,
+                    Some(&visible_lowered_local_values),
                     loop_context,
                 )?;
                 update_visible_lowered_value(
@@ -1964,6 +1976,7 @@ fn lower_native_fallthrough_block(
                     statement,
                     lowered_local_values,
                     evaluated_local_values,
+                    Some(&visible_lowered_local_values),
                     loop_context,
                 )?;
                 for (name, _) in &native_while.final_values {
@@ -1981,6 +1994,7 @@ fn lower_native_fallthrough_block(
                     statement,
                     lowered_local_values,
                     evaluated_local_values,
+                    Some(&visible_lowered_local_values),
                     loop_context,
                 )? == NativeSmokeLoweringFlow::Diverged
                 {
@@ -2001,6 +2015,7 @@ fn lower_native_fallthrough_block(
                     statement,
                     lowered_local_values,
                     evaluated_local_values,
+                    Some(&visible_lowered_local_values),
                     loop_context,
                 )?;
                 return Ok(None);
@@ -2028,6 +2043,21 @@ fn update_visible_lowered_value(
     };
     visible_lowered_local_values.insert(name.to_string(), value);
     Ok(())
+}
+
+fn scoped_native_visible_values(
+    scoped_local_values: &HashMap<String, Value>,
+    visible_local_values: Option<&HashMap<String, Value>>,
+) -> HashMap<String, Value> {
+    let mut values = scoped_local_values.clone();
+    if let Some(visible_local_values) = visible_local_values {
+        values.extend(
+            visible_local_values
+                .iter()
+                .map(|(name, value)| (name.clone(), *value)),
+        );
+    }
+    values
 }
 
 fn jump_to_native_merge(
@@ -2156,6 +2186,7 @@ fn lower_native_while(
         &native_while.body,
         &mut body_local_values,
         &mut body_evaluated_values,
+        &header_local_values,
         Some(&loop_context),
     )?;
     if let Some(visible_body_values) = visible_body_values {

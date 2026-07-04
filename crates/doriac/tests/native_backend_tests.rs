@@ -346,6 +346,26 @@ fn compiles_and_runs_current_native_smoke_examples() {
             2,
         ),
         (
+            "main_while_break_shadow_preserves_outer",
+            "inline_main_while_break_shadow_preserves_outer.doria",
+            0,
+        ),
+        (
+            "main_while_continue_shadow_preserves_outer",
+            "inline_main_while_continue_shadow_preserves_outer.doria",
+            0,
+        ),
+        (
+            "main_while_if_break_shadow_preserves_outer",
+            "inline_main_while_if_break_shadow_preserves_outer.doria",
+            0,
+        ),
+        (
+            "main_while_if_continue_shadow_preserves_outer",
+            "inline_main_while_if_continue_shadow_preserves_outer.doria",
+            0,
+        ),
+        (
             "main_break_continue_42",
             "examples/native/main_break_continue_42.doria",
             42,
@@ -1194,6 +1214,76 @@ function main(): int
         $code = 2;
         let $code = 42;
         $count += 1;
+    }
+
+    return $code;
+}
+"#
+        }
+        "main_while_break_shadow_preserves_outer" => {
+            r#"
+function main(): int
+{
+    let writable $code = 0;
+
+    while (true) {
+        let $code = 42;
+        break;
+    }
+
+    return $code;
+}
+"#
+        }
+        "main_while_continue_shadow_preserves_outer" => {
+            r#"
+function main(): int
+{
+    let writable $code = 0;
+    let writable $guard = 0;
+
+    while ($guard < 1) {
+        let $code = 42;
+        $guard += 1;
+        continue;
+    }
+
+    return $code;
+}
+"#
+        }
+        "main_while_if_break_shadow_preserves_outer" => {
+            r#"
+function main(): int
+{
+    let writable $code = 0;
+
+    while (true) {
+        let $code = 42;
+
+        if (true) {
+            break;
+        }
+    }
+
+    return $code;
+}
+"#
+        }
+        "main_while_if_continue_shadow_preserves_outer" => {
+            r#"
+function main(): int
+{
+    let writable $code = 0;
+    let writable $guard = 0;
+
+    while ($guard < 1) {
+        let $code = 42;
+        $guard += 1;
+
+        if (true) {
+            continue;
+        }
     }
 
     return $code;
