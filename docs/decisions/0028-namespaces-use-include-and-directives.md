@@ -67,6 +67,8 @@ Namespaces are required for serious multi-file programs, libraries, package ecos
 
 `use` is not textual inclusion, PHP runtime include, package dependency resolution, or code execution.
 
+Class-body `use` for trait composition is a separate context documented in `docs/decisions/0029-oop-declaration-vocabulary.md`.
+
 Accepted conceptual syntax:
 
 ```doria

@@ -69,6 +69,7 @@ class DoriaLexer : LexerBase() {
         when {
             current.isWhitespace() -> scanWhitespace()
             current == '/' && peek(1) == '/' -> scanLineComment()
+            current == '#' && isPreprocessorDirective() -> scanPreprocessorDirective()
             current == '#' && peek(1) != '[' -> scanLineComment()
             current == '/' && peek(1) == '*' && peek(2) == '*' && peek(3) != '/' -> scanDocCommentStart()
             current == '/' && peek(1) == '*' -> scanBlockComment()
@@ -105,6 +106,14 @@ class DoriaLexer : LexerBase() {
             tokenEnd++
         }
         tokenType = DoriaTokenTypes.COMMENT
+    }
+
+    private fun scanPreprocessorDirective() {
+        tokenEnd = tokenStart + 1
+        while (tokenEnd < endOffset && buffer[tokenEnd] != '\n' && buffer[tokenEnd] != '\r') {
+            tokenEnd++
+        }
+        tokenType = DoriaTokenTypes.INVALID
     }
 
     private fun scanBlockComment() {
@@ -181,8 +190,8 @@ class DoriaLexer : LexerBase() {
         val text = buffer.subSequence(tokenStart, tokenEnd).toString()
         tokenType = if (isDocTypePosition()) {
             when (text) {
-                "void", "int", "float", "string", "bool", "mixed", "object", "resource", "array" -> DoriaTokenTypes.PRIMITIVE_TYPE
-                "List", "Dictionary", "Set" -> DoriaTokenTypes.COLLECTION_TYPE
+                in PRIMITIVE_TYPES -> DoriaTokenTypes.PRIMITIVE_TYPE
+                in COLLECTION_TYPES -> DoriaTokenTypes.COLLECTION_TYPE
                 else -> if (text.first().isUpperCase()) DoriaTokenTypes.TYPE_NAME else DoriaTokenTypes.DOC_COMMENT
             }
         } else if (text == "static" && isDocMethodStaticModifierPosition()) {
@@ -313,17 +322,37 @@ class DoriaLexer : LexerBase() {
 
         val text = buffer.subSequence(tokenStart, tokenEnd).toString()
         tokenType = when (text) {
-            "class", "function", "let", "return", "echo", "new", "foreach", "as",
-            "if", "else", "while", "for", "static", "async", "await", "spawn", "scope",
-            "interface", "trait", "enum", "match", "try", "catch", "throw" -> DoriaTokenTypes.KEYWORD
+            in INVALID_KEYWORDS -> DoriaTokenTypes.INVALID
 
-            "not", "and", "or", "xor" -> DoriaTokenTypes.OPERATOR
+            "use" -> useTokenType()
 
-            "writable", "readonly", "internal" -> DoriaTokenTypes.MODIFIER
+            "as" -> if (isImportUseLine()) DoriaTokenTypes.IMPORT_ALIAS_KEYWORD else DoriaTokenTypes.KEYWORD
 
-            "void", "int", "float", "string", "bool", "mixed", "object", "resource", "array" -> DoriaTokenTypes.PRIMITIVE_TYPE
+            else -> contextualIdentifierTokenType(text)
+        }
+    }
 
-            "List", "Dictionary", "Set" -> DoriaTokenTypes.COLLECTION_TYPE
+    private fun contextualIdentifierTokenType(text: String): IElementType = when {
+        isTraitUseLine() && text.first().isUpperCase() -> DoriaTokenTypes.TRAIT_NAME
+
+        isImportAliasName() -> DoriaTokenTypes.IMPORT_ALIAS
+
+        isImportUseLine() && text !in KEYWORDS -> DoriaTokenTypes.IMPORT_PATH
+
+        else -> baseIdentifierTokenType(text)
+    }
+
+    private fun baseIdentifierTokenType(text: String): IElementType =
+        when (text) {
+            in KEYWORDS -> DoriaTokenTypes.KEYWORD
+
+            in WORD_OPERATORS -> DoriaTokenTypes.OPERATOR
+
+            in MODIFIERS -> DoriaTokenTypes.MODIFIER
+
+            in PRIMITIVE_TYPES -> DoriaTokenTypes.PRIMITIVE_TYPE
+
+            in COLLECTION_TYPES -> DoriaTokenTypes.COLLECTION_TYPE
 
             "true", "false" -> DoriaTokenTypes.BOOLEAN_LITERAL
 
@@ -336,11 +365,21 @@ class DoriaLexer : LexerBase() {
                 else -> DoriaTokenTypes.IDENTIFIER
             }
         }
+
+    private fun useTokenType(): IElementType = when {
+        isTraitUseLine() -> DoriaTokenTypes.TRAIT_USE_KEYWORD
+        isImportUseLine() -> DoriaTokenTypes.IMPORT_USE_KEYWORD
+        else -> DoriaTokenTypes.KEYWORD
     }
 
     private fun scanSymbol() {
         val two = take(2)
         val three = take(3)
+        val symbolText = when {
+            three in THREE_CHAR_OPERATORS -> three
+            two in TWO_CHAR_OPERATORS -> two
+            else -> take(1)
+        }
 
         tokenEnd = when {
             three in THREE_CHAR_OPERATORS -> tokenStart + 3
@@ -348,14 +387,57 @@ class DoriaLexer : LexerBase() {
             else -> tokenStart + 1
         }
 
-        tokenType = when (buffer[tokenStart]) {
-            '{', '}' -> DoriaTokenTypes.BRACE
-            '[', ']' -> DoriaTokenTypes.BRACKET
-            '(', ')' -> DoriaTokenTypes.PAREN
-            ';', ',', ':' -> DoriaTokenTypes.PUNCTUATION
+        tokenType = when {
+            symbolText in STRICT_COMPARISON_OPERATORS -> DoriaTokenTypes.INVALID
+            buffer[tokenStart] == '{' || buffer[tokenStart] == '}' -> DoriaTokenTypes.BRACE
+            buffer[tokenStart] == '[' || buffer[tokenStart] == ']' -> DoriaTokenTypes.BRACKET
+            buffer[tokenStart] == '(' || buffer[tokenStart] == ')' -> DoriaTokenTypes.PAREN
+            buffer[tokenStart] == ';' || buffer[tokenStart] == ',' || buffer[tokenStart] == ':' -> DoriaTokenTypes.PUNCTUATION
             else -> DoriaTokenTypes.OPERATOR
         }
     }
+
+    private fun isPreprocessorDirective(): Boolean {
+        if (peek(1) == '[') {
+            return false
+        }
+
+        var firstNonWhitespace = lineStart(tokenStart)
+        while (firstNonWhitespace < tokenStart && buffer[firstNonWhitespace].isWhitespace()) {
+            firstNonWhitespace++
+        }
+        if (firstNonWhitespace != tokenStart) {
+            return false
+        }
+
+        var cursor = tokenStart + 1
+        while (cursor < endOffset && buffer[cursor].isLetter()) {
+            cursor++
+        }
+
+        if (cursor == tokenStart + 1) {
+            return false
+        }
+
+        val name = buffer.subSequence(tokenStart + 1, cursor).toString()
+        if (name !in PREPROCESSOR_DIRECTIVES) {
+            return false
+        }
+
+        return cursor >= endOffset || !isIdentifierPart(buffer[cursor])
+    }
+
+    private fun isTraitUseLine(): Boolean =
+        TRAIT_USE_LINE.matches(currentLine())
+
+    private fun isImportUseLine(): Boolean =
+        IMPORT_USE_LINE.matches(currentLine())
+
+    private fun isImportAliasName(): Boolean =
+        isImportUseLine() && previousIdentifier() == "as"
+
+    private fun currentLine(): String =
+        buffer.subSequence(lineStart(tokenStart), lineEnd(tokenStart)).toString()
 
     private fun peek(delta: Int): Char? {
         val index = tokenStart + delta
@@ -578,6 +660,94 @@ class DoriaLexer : LexerBase() {
         const val MODE_DOC_COMMENT = 3
         private const val MODE_SINGLE_STRING = 4
 
+        private val KEYWORDS = setOf(
+            "class",
+            "interface",
+            "trait",
+            "extends",
+            "implements",
+            "function",
+            "let",
+            "return",
+            "echo",
+            "new",
+            "foreach",
+            "as",
+            "if",
+            "else",
+            "while",
+            "for",
+            "break",
+            "continue",
+            "when",
+            "given",
+            "finally",
+            "namespace",
+            "use",
+            "include",
+            "declare",
+            "static",
+            "async",
+            "await",
+            "spawn",
+            "scope",
+            "enum",
+            "match",
+            "try",
+            "catch",
+            "throw",
+        )
+
+        private val WORD_OPERATORS = setOf("not", "and", "or", "xor")
+
+        private val INVALID_KEYWORDS = setOf("goto")
+
+        private val MODIFIERS = setOf("writable", "readonly", "internal")
+
+        private val PRIMITIVE_TYPES = setOf(
+            "void",
+            "int",
+            "int8",
+            "int16",
+            "int32",
+            "int64",
+            "uint8",
+            "uint16",
+            "uint32",
+            "uint64",
+            "float",
+            "float32",
+            "float64",
+            "string",
+            "bool",
+            "mixed",
+            "object",
+            "resource",
+            "array",
+        )
+
+        private val COLLECTION_TYPES = setOf("List", "Dictionary", "Set")
+
+        private val TRAIT_USE_LINE =
+            Regex("^\\s+use\\s+[A-Z][A-Za-z0-9_]*(?:\\s*,\\s*[A-Z][A-Za-z0-9_]*)*\\s*;?\\s*(?://.*)?$")
+
+        private val IMPORT_USE_LINE =
+            Regex("^use\\s+[A-Za-z_][A-Za-z0-9_]*(?:\\\\[A-Za-z_][A-Za-z0-9_]*)+(?:\\s+as\\s+[A-Za-z_][A-Za-z0-9_]*)?\\s*;?\\s*(?://.*)?$")
+
+        private val PREPROCESSOR_DIRECTIVES = setOf(
+            "include",
+            "define",
+            "undef",
+            "if",
+            "ifdef",
+            "ifndef",
+            "elif",
+            "else",
+            "endif",
+            "warning",
+            "error",
+        )
+
         private val DOC_TYPE_TAGS = setOf(
             "param",
             "return",
@@ -592,7 +762,8 @@ class DoriaLexer : LexerBase() {
             "implements",
         )
 
-        private val THREE_CHAR_OPERATORS = setOf("===", "!==")
+        private val STRICT_COMPARISON_OPERATORS = setOf("===", "!==")
+        private val THREE_CHAR_OPERATORS = STRICT_COMPARISON_OPERATORS
         private val TWO_CHAR_OPERATORS = setOf("==", "!=", "<=", ">=", "&&", "||", "??", "=>", "+=", "-=", "->", "::")
     }
 }

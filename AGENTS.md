@@ -90,6 +90,14 @@ At completion, report assumptions made and critical decisions encountered. If no
 - Do not import C/C++ textual macro behavior without an accepted decision. Do not add `#define` or `#undef` macro substitution.
 - Do not implement `goto` without a separate accepted decision.
 - Do not confuse source/compiler directives with runtime control flow.
+- Treat `class`, `interface`, `trait`, `extends`, and `implements` as accepted Doria OOP declaration vocabulary.
+- Do not treat accepted PHP-shaped OOP syntax as permission to import all PHP runtime behavior.
+- Do not assume PHP magic methods, autoloading, reflection, dynamic properties, or trait conflict rules without accepted decisions.
+- Do not confuse namespace/file-scope import `use` with class-body trait-composition `use`.
+- Do not make PHP output the semantic oracle for Doria OOP behavior.
+- Do not make Doria editor support VS Code-only. Keep VS Code and IntelliJ / JetBrains syntax highlighting aligned.
+- Treat TextMate/editor highlighting as editor UX only, not lexer, parser, compiler, or LSP semantic-token support.
+- Do not mark rejected Doria syntax such as `===`, `!==`, `#define`, or `#include` as accepted language syntax in editor tooling.
 - Keep self-hosting in mind when designing compiler APIs, diagnostics, source management, Doria IR, and the standard library.
 - Keep native desktop, game engine, C-library binding, and raylib goals visible when designing Doria IR, future native-oriented IR, runtime, memory representation, FFI, and performance benchmarks.
 - Keep Baton architecturally outside the compiler pipeline. Baton may orchestrate projects and invoke `doriac`; it must not duplicate parsing, semantic analysis, type checking, Doria IR lowering, or code generation.

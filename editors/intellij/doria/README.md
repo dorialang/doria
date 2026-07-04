@@ -5,11 +5,13 @@ This directory contains first-pass Doria support for IntelliJ-based IDEs.
 It provides:
 
 - `.doria` file recognition.
-- Basic syntax highlighting for Doria keywords, variables, types, strings, string interpolation, comments, numbers, operators, and punctuation.
+- Basic syntax highlighting for Doria keywords, variables, types, strings, string interpolation, comments, numbers, operators, punctuation, accepted OOP declaration vocabulary, namespace/import/include/directive vocabulary, and rejected strict-comparison/preprocessor spellings.
 - A Doria settings page for configuring the language server path.
 - `doria-lsp` integration through the IntelliJ Platform LSP API.
 
 The initial plugin targets IntelliJ Platform `2025.2.1+`, where JetBrains exposes the LSP module as `com.intellij.modules.lsp`.
+
+This is first-pass Doria support for IntelliJ / JetBrains IDEs. The local IntelliJ highlighter is syntax highlighting only: it does not provide a semantic PSI tree, formatter, inspections, refactors, or compiler diagnostics. Compiler-backed diagnostics, completion, and hover remain separate and come from `doria-lsp` when the language server is configured and available.
 
 ## Build the language server
 
@@ -62,6 +64,22 @@ Make sure `*.doria` is listed under `Doria`, and remove it from `Text` or `Plain
 The syntax highlighter, file type registration, comments, and settings page only require the IntelliJ Platform module. `doria-lsp` integration is enabled when the IDE also provides JetBrains' LSP module.
 
 Double-quoted string interpolation such as `{$this->name}` keeps the string text green while colorizing the variable reference. Single-quoted strings are treated as literal strings.
+
+VS Code and IntelliJ / JetBrains highlighting should stay aligned. The shared smoke fixture is:
+
+```text
+editors/fixtures/latest-tokens.doria
+```
+
+After changing editor highlighting, run this from the repository root:
+
+```bash
+python3 scripts/check_editor_highlighting.py
+```
+
+Files under `editors/fixtures/` are syntax-highlighting smoke fixtures. The IntelliJ LSP adapter keeps them out of `doria-lsp` diagnostics so accepted/planned editor vocabulary can be exercised before compiler implementation lands.
+
+Doria has two distinct `use` contexts: file/namespace-scope `use` imports names from namespaces, while class-body `use` composes traits into a class or trait. The IntelliJ highlighter keeps these scopes separate as import use and trait-composition use.
 
 ## Run in a sandbox IDE
 

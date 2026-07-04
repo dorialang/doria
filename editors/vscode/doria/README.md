@@ -24,3 +24,13 @@ The extension resolves the server from:
 No npm dependencies are required for the development extension.
 
 After changing the TextMate grammar, reload the VS Code window or restart the Extension Development Host so VS Code reads the updated grammar.
+
+Keep this TextMate grammar aligned with the IntelliJ / JetBrains highlighter under `editors/intellij/doria`. From the repository root, run:
+
+```bash
+python3 scripts/check_editor_highlighting.py
+```
+
+Files under `editors/fixtures/` are syntax-highlighting smoke fixtures. The VS Code client keeps them out of `doria-lsp` diagnostics so accepted/planned editor vocabulary can be exercised before compiler implementation lands.
+
+Doria has two distinct `use` contexts: file/namespace-scope `use` imports names from namespaces, while class-body `use` composes traits into a class or trait. The TextMate grammar keeps these scopes separate as import use and trait-composition use.

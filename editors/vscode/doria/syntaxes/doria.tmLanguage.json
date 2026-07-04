@@ -7,6 +7,9 @@
       "include": "#attributes"
     },
     {
+      "include": "#invalid"
+    },
+    {
       "include": "#comments"
     },
     {
@@ -91,12 +94,31 @@
               "include": "#keywords"
             },
             {
+              "include": "#invalid"
+            },
+            {
               "include": "#operators"
             },
             {
               "include": "#punctuation"
             }
           ]
+        }
+      ]
+    },
+    "invalid": {
+      "patterns": [
+        {
+          "name": "invalid.illegal.preprocessor.doria",
+          "match": "^\\s*#(?:include|define|undef|if|ifdef|ifndef|elif|else|endif|warning|error)\\b.*$"
+        },
+        {
+          "name": "invalid.illegal.operator.strict-comparison.doria",
+          "match": "===|!=="
+        },
+        {
+          "name": "invalid.illegal.keyword.goto.doria",
+          "match": "\\bgoto\\b"
         }
       ]
     },
@@ -257,6 +279,78 @@
     "declarations": {
       "patterns": [
         {
+          "match": "\\b(namespace)\\s+([A-Za-z_][A-Za-z0-9_]*(?:\\\\[A-Za-z_][A-Za-z0-9_]*)*)",
+          "captures": {
+            "1": {
+              "name": "keyword.declaration.namespace.doria"
+            },
+            "2": {
+              "name": "entity.name.namespace.doria"
+            }
+          }
+        },
+        {
+          "name": "meta.trait-composition.doria",
+          "begin": "^\\s+(use)\\b(?=\\s+[A-Z][A-Za-z0-9_]*(?:\\s*(?:,|;)))",
+          "beginCaptures": {
+            "1": {
+              "name": "keyword.other.trait-use.doria"
+            }
+          },
+          "end": "(;)",
+          "endCaptures": {
+            "1": {
+              "name": "punctuation.terminator.statement.doria"
+            }
+          },
+          "patterns": [
+            {
+              "name": "entity.name.type.trait.doria",
+              "match": "\\b[A-Z][A-Za-z0-9_]*\\b"
+            },
+            {
+              "name": "punctuation.separator.comma.doria",
+              "match": ","
+            }
+          ]
+        },
+        {
+          "name": "meta.import.doria",
+          "begin": "^(use)\\b(?=\\s+[A-Za-z_][A-Za-z0-9_]*(?:\\\\[A-Za-z_][A-Za-z0-9_]*)+)",
+          "beginCaptures": {
+            "1": {
+              "name": "keyword.control.import.doria"
+            }
+          },
+          "end": "(;)",
+          "endCaptures": {
+            "1": {
+              "name": "punctuation.terminator.statement.doria"
+            }
+          },
+          "patterns": [
+            {
+              "match": "(\\bas\\b)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+              "captures": {
+                "1": {
+                  "name": "keyword.operator.alias.doria"
+                },
+                "2": {
+                  "name": "entity.name.type.alias.doria"
+                }
+              }
+            },
+            {
+              "name": "punctuation.separator.namespace.doria",
+              "match": "\\\\"
+            },
+            {
+              "name": "entity.name.namespace.doria",
+              "match": "\\b[A-Za-z_][A-Za-z0-9_]*\\b"
+            }
+          ]
+        },
+        {
           "match": "\\b(class)\\s+([A-Za-z_][A-Za-z0-9_]*)",
           "captures": {
             "1": {
@@ -264,6 +358,28 @@
             },
             "2": {
               "name": "entity.name.type.class.doria"
+            }
+          }
+        },
+        {
+          "match": "\\b(interface)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+          "captures": {
+            "1": {
+              "name": "keyword.declaration.interface.doria"
+            },
+            "2": {
+              "name": "entity.name.type.interface.doria"
+            }
+          }
+        },
+        {
+          "match": "\\b(trait)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+          "captures": {
+            "1": {
+              "name": "keyword.declaration.trait.doria"
+            },
+            "2": {
+              "name": "entity.name.type.trait.doria"
             }
           }
         },
@@ -288,6 +404,10 @@
               "name": "entity.name.type.doria"
             }
           }
+        },
+        {
+          "name": "keyword.directive.doria",
+          "match": "\\b(?:include|declare)\\b"
         }
       ]
     },
@@ -364,7 +484,7 @@
         },
         {
           "name": "keyword.control.doria",
-          "match": "\\b(?:return|foreach|as|if|else|while|for)\\b"
+          "match": "\\b(?:return|foreach|as|if|else|while|for|break|continue|when|given|finally|extends|implements)\\b"
         },
         {
           "name": "storage.modifier.mutability.doria",
@@ -388,7 +508,7 @@
         },
         {
           "name": "keyword.other.reserved.doria",
-          "match": "\\b(?:async|await|spawn|scope|interface|trait|enum|match|try|catch|throw)\\b"
+          "match": "\\b(?:async|await|spawn|scope|enum|match|try|catch|throw)\\b"
         }
       ]
     },
@@ -422,7 +542,7 @@
         },
         {
           "name": "storage.type.primitive.doria",
-          "match": "\\b(?:void|int|float|string|bool|mixed|object|resource|array)\\b"
+          "match": "\\b(?:void|int|int8|int16|int32|int64|uint8|uint16|uint32|uint64|float|float32|float64|string|bool|mixed|object|resource|array)\\b"
         },
         {
           "name": "support.type.collection.doria",
@@ -473,7 +593,7 @@
         },
         {
           "name": "keyword.operator.doria",
-          "match": "===|!==|==|!=|<=|>=|&&|\\|\\||\\?\\?|=>|->|::|\\+=|-=|[=+\\-*/%.<>!?:]"
+          "match": "==|!=|<=|>=|&&|\\|\\||\\?\\?|=>|->|::|\\+=|-=|[=+\\-*/%.<>!?:]"
         }
       ]
     },

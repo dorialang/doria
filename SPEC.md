@@ -463,6 +463,20 @@ The scoped declarations remain scoped to the whole `given` plus attached control
 
 ## 8. Class syntax
 
+Doria's accepted OOP declaration vocabulary is recorded in `docs/decisions/0029-oop-declaration-vocabulary.md`. Current compiler support may lag this accepted direction until lexer, parser, semantic checking, Doria IR, backend, and LSP support are updated.
+
+Accepted OOP declaration vocabulary:
+
+```text
+class
+interface
+trait
+extends
+implements
+```
+
+`class` declares an object type. Doria already has class syntax in the current compiler surface:
+
 ```doria
 class Person
 {
@@ -473,6 +487,77 @@ class Person
     }
 }
 ```
+
+Doria will support `interface` for contracts that classes can implement:
+
+```doria
+interface Renderable
+{
+    function render(): string;
+}
+```
+
+Interfaces may declare method requirements and may extend one or more interfaces. Interface members do not define instance storage. Default methods, static interface methods, constants, generic interfaces, variance, and interface property requirements remain future design work.
+
+Doria will support `trait` for reusable class-body members:
+
+```doria
+trait HasSlug
+{
+    string $slug;
+}
+```
+
+Traits may be composed into classes or other traits. Trait conflict-resolution rules, aliasing, visibility changes through trait use, trait property rules, trait static member rules, trait abstract method requirements, and whether PHP-style `insteadof` / `as` are accepted exactly remain future design work.
+
+Doria will support `extends` for inheritance:
+
+```doria
+class Post extends Model
+{
+}
+
+interface JsonRenderable extends Renderable
+{
+}
+```
+
+Likely direction: a class may extend at most one class, and an interface may extend one or more interfaces. Constructor inheritance, initialization order, override rules, virtual dispatch layout, final/sealed behavior, runtime layout, and ABI remain future design work.
+
+Doria will support `implements` for compiler-checked interface conformance:
+
+```doria
+class Post extends Model implements Renderable, JsonSerializable
+{
+}
+```
+
+Likely direction: a class may implement one or more interfaces, and Doria's PHP-shaped direction points toward nominal interface conformance. Exact conformance checking details remain future implementation work.
+
+`use` has distinct meanings by context:
+
+```text
+namespace/file-scope use -> semantic import / alias
+class-body use           -> trait composition
+```
+
+```doria
+namespace App\Posts;
+
+use App\Models\Post;
+use App\Security\Permission;
+
+class Article
+{
+    use HasSlug;
+}
+```
+
+The parser can distinguish namespace/file-scope import `use` from class-body trait-composition `use` by context. Neither form is implemented by the current compiler slice.
+
+Doria is PHP-shaped, not PHP++. Accepting PHP-shaped OOP declaration syntax does not import PHP dynamic object semantics, magic methods as core behavior, autoloading behavior, reflection behavior, loose typing, PHP visibility rules beyond what Doria has separately accepted, PHP trait conflict-resolution rules without review, or PHP runtime initialization behavior.
+
+OOP declaration vocabulary is accepted separately from final visibility semantics. Doria's accepted early member model remains default-public plus `internal`: class members are accessible by default, `internal` controls API surface, and `writable` controls mutation.
 
 Constructor property promotion is supported in the current vertical slice. Constructor parameters are promoted to externally accessible properties by default unless marked `internal`:
 
@@ -666,6 +751,7 @@ Future work includes:
 - Nullable types.
 - Full type inference for lists and dictionaries.
 - Interfaces, traits, and namespaces.
+- Class inheritance through `extends`, interface conformance through `implements`, and class-body trait composition.
 - `use` statements for semantic imports and aliases.
 - `include` as required include-once compile-time source inclusion.
 - `declare` as structured compiler/source directives.
