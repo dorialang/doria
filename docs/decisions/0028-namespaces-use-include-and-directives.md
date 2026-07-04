@@ -63,7 +63,9 @@ Namespaces are required for serious multi-file programs, libraries, package ecos
 
 ## use Statements
 
-`use` imports names from namespaces into the current file or declaration context. `use` is semantic name resolution.
+`use` imports names from namespaces at namespace/file-scope only. `use` is semantic name resolution.
+
+`use` is not valid inside class, trait, interface, function, or method bodies.
 
 `use` is not textual inclusion, PHP runtime include, package dependency resolution, or code execution.
 
