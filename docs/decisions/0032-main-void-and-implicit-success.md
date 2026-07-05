@@ -93,3 +93,5 @@ This decision does not add:
 - Baton work
 
 Unsupported backend coverage must continue to produce clear unsupported-feature diagnostics rather than pretending valid Doria is invalid.
+
+Stage 8a later extends this Stage 7b boundary with readonly string locals initialized from string literals and supported string `echo` expressions. See `docs/decisions/0033-stage-8a-native-readonly-string-locals-and-echo.md` for the current native string-local slice.

@@ -66,7 +66,7 @@ This repository contains the first working vertical slices of `doriac`:
 - Checks undeclared assignment and readonly/writable mutation rules for locals, properties, `$this`, and writable methods.
 - Checks assignment compatibility, declared returns, typed equality/inequality, bool-only boolean operators, positional call arguments, constructor init access, control-flow conditions, and string interpolation constraints for the supported subset.
 - Lowers the checked AST to Doria IR, the compiler-owned representation used before backend output.
-- Emits Stage 7b Cranelift-backed native smoke executables for `function main(): int` and `function main(): void`. `main(): int` returns an explicit process status in the accepted `0..125` portable exit-code range, while `main(): void` may fall through or use `return;` for successful status `0`. The native smoke backend supports readonly and writable integer locals, `=`, `+=`, and `-=` assignments, `+`/`-`/`*` arithmetic, structured returning `if` blocks, fallthrough `if` statements with visible-local merges, bounded/proven structured `while` loops, unlabeled `break` and `continue`, accepted boolean conditions, and exact string-literal `echo` stdout. Internally, this smoke subset lowers through a private native smoke module before Cranelift lowering; that module is not public Doria IR or final MIR.
+- Emits Stage 8a Cranelift-backed native smoke executables for `function main(): int` and `function main(): void`. `main(): int` returns an explicit process status in the accepted `0..125` portable exit-code range, while `main(): void` may fall through or use `return;` for successful status `0`. The native smoke backend supports readonly and writable integer locals, `=`, `+=`, and `-=` assignments, `+`/`-`/`*` arithmetic, structured returning `if` blocks, fallthrough `if` statements with visible-local merges, bounded/proven structured `while` loops, unlabeled `break` and `continue`, accepted boolean conditions, exact string-literal `echo` stdout, and Stage 8a readonly string locals initialized from string literals that can be echoed through supported string expressions. Internally, this smoke subset lowers through a private native smoke module before Cranelift lowering; that module is not public Doria IR or final MIR.
 - Emits PHP for supported syntax through the optional PHP compatibility backend, including `not`, `and`, `or`, and `xor` lowering that preserves Doria boolean semantics.
 - Provides CLI commands and integration tests.
 
@@ -90,7 +90,7 @@ cargo run -p doriac -- compile examples/php/person.doria --target php --out buil
 php build/php/person.php
 ```
 
-The native backend currently supports a narrow Stage 7b smoke shape: exactly one top-level `function main(): int` or `function main(): void`. `main(): int` returns an explicit process status in the portable `0..125` exit-code range. `main(): void` may fall through or use `return;` and exits successfully with status `0`. The supported source subset includes readonly and writable integer locals, `=`, `+=`, and `-=` assignments to writable integer locals, `+`/`-`/`*` arithmetic, structured returning `if` blocks, fallthrough `if` statements that merge visible integer locals, and bounded/proven structured `while` loops. Supported native `while` bodies may contain integer local declarations, writable integer assignments, fallthrough `if` statements, `break`, and `continue`. Native validation proves accepted loops terminate within the current smoke verification cap before lowering them through a private native smoke module to real Cranelift control flow. Conditions support bool literals, grouped conditions, integer comparisons over supported integer expressions, `!` / `not`, `&&` / `and`, `||` / `or`, and `xor`. String-literal `echo` writes exact bytes to stdout with no implicit newline; broader native strings and runtime I/O remain future work.
+The native backend currently supports a narrow Stage 8a smoke shape: exactly one top-level `function main(): int` or `function main(): void`. `main(): int` returns an explicit process status in the portable `0..125` exit-code range. `main(): void` may fall through or use `return;` and exits successfully with status `0`. The supported source subset includes readonly and writable integer locals, `=`, `+=`, and `-=` assignments to writable integer locals, `+`/`-`/`*` arithmetic, structured returning `if` blocks, fallthrough `if` statements that merge visible integer locals, and bounded/proven structured `while` loops. Supported native `while` bodies may contain integer local declarations, readonly string locals initialized from string literals, writable integer assignments, fallthrough `if` statements, `break`, `continue`, and supported string `echo` expressions. Native validation proves accepted loops terminate within the current smoke verification cap before lowering them through a private native smoke module to real Cranelift control flow. Conditions support bool literals, grouped conditions, integer comparisons over supported integer expressions, `!` / `not`, `&&` / `and`, `||` / `or`, and `xor`. String-literal `echo` and supported readonly string-local `echo` write exact bytes to stdout with no implicit newline; heap strings, writable string locals, interpolation, concatenation, formatting, and broader runtime I/O remain future work.
 
 ```bash
 cargo run -p doriac -- compile examples/native/main_return_zero.doria
@@ -98,6 +98,9 @@ cargo run -p doriac -- compile examples/native/main_return_zero.doria
 
 cargo run -p doriac -- compile examples/native/main_void_hello.doria
 ./main_void_hello
+
+cargo run -p doriac -- compile examples/native/main_string_local_hello.doria
+./main_string_local_hello
 
 cargo run -p doriac -- compile examples/native/main_return_42.doria
 ./main_return_42
@@ -133,7 +136,7 @@ cargo run -p doriac -- compile examples/native/main_structured_while_42.doria
 ./main_structured_while_42
 ```
 
-For this slice, native compilation emits an object and links it through the host platform toolchain. This is not a C backend and does not use PHP output. General loops beyond the bounded/proven Stage 7b shape, nested `while`, returns inside `while` bodies, `return` inside fallthrough branch bodies, labeled or numeric loop control, division/modulo, native string values beyond string-literal `echo`, classes, collections, broader runtime features, and LLVM output remain future work.
+For this slice, native compilation emits an object and links it through the host platform toolchain. This is not a C backend and does not use PHP output. General loops beyond the bounded/proven Stage 8a shape, nested `while`, returns inside `while` bodies, `return` inside fallthrough branch bodies, labeled or numeric loop control, division/modulo, native string values beyond literal-backed readonly string locals and supported `echo`, writable string locals, interpolation, concatenation, classes, collections, broader runtime features, and LLVM output remain future work.
 
 ## CLI
 
@@ -158,7 +161,7 @@ Doria has first-pass editor tooling for `.doria` files:
 - `editors/vscode/doria` contains a VS Code extension with TextMate syntax highlighting, bracket/comment configuration, and a small built-in LSP client.
 - `editors/intellij/doria` contains an IntelliJ Platform plugin with `.doria` file recognition, syntax highlighting, editor settings, and `doria-lsp` integration.
 
-VS Code and IntelliJ / JetBrains highlighting should stay aligned as accepted Doria vocabulary evolves. The shared smoke fixture is `editors/fixtures/latest-tokens.doria`, and `scripts/check_editor_highlighting.py` checks the current editor token guardrails.
+VS Code and IntelliJ / JetBrains highlighting should stay aligned as accepted Doria vocabulary evolves. The shared smoke fixture is `editors/fixtures/latest-tokens.doria`, and `scripts/check_editor_highlighting.php` checks the current editor token guardrails.
 
 Build the server before starting either editor extension:
 
@@ -191,7 +194,7 @@ For VS Code, the setting is `doria.languageServer.path`. For IntelliJ IDEs, use 
 - Collection aliases are `List<T>`, `Dictionary<K, V>`, and `Set<T>`.
 - `int` means `int64`, `float` means `float64`, and the accepted fixed-width numeric family is documented in `docs/decisions/0016-fixed-width-numeric-types.md`; compiler support for those explicit spellings is future work.
 - The compiler must reject invalid Doria before lowering to Doria IR or emitting backend output.
-- The native backend currently accepts only the Stage 7b smoke subset, `function main(): int` or `function main(): void`, supported readonly and writable integer locals, writable integer assignments, `+`/`-`/`*` arithmetic, structured returning `if` blocks, fallthrough `if` statements with visible-local merges, bounded/proven structured `while` loops whose bodies contain supported integer locals, assignments, fallthrough `if` statements, `break`, and `continue`, accepted boolean conditions, and exact string-literal `echo` stdout. It rejects broader valid Doria with unsupported-feature diagnostics. The `0..125` range is a process-exit boundary for explicit `main(): int` status values, not the range of Doria `int`.
+- The native backend currently accepts only the Stage 8a smoke subset, `function main(): int` or `function main(): void`, supported readonly and writable integer locals, writable integer assignments, `+`/`-`/`*` arithmetic, structured returning `if` blocks, fallthrough `if` statements with visible-local merges, bounded/proven structured `while` loops whose bodies contain supported integer locals, readonly string locals initialized from string literals, assignments, fallthrough `if` statements, `break`, `continue`, accepted boolean conditions, exact string-literal `echo` stdout, and supported readonly string-local `echo`. It rejects broader valid Doria with unsupported-feature diagnostics. The `0..125` range is a process-exit boundary for explicit `main(): int` status values, not the range of Doria `int`.
 - Doria may support features PHP cannot express directly, such as executable instance property initializers and richer attribute expressions.
 - If a language behavior is not specified, implementation work should pause for an explicit design decision rather than inventing behavior silently.
 
@@ -219,6 +222,7 @@ docs/decisions/0017-stage-2c-native-int-arithmetic.md
 docs/decisions/0018-stage-2d-native-returned-int-expressions.md
 docs/decisions/0019-stage-4a-native-if-else-returns.md
 docs/decisions/0032-main-void-and-implicit-success.md
+docs/decisions/0033-stage-8a-native-readonly-string-locals-and-echo.md
 docs/website-content-guidelines.md
 ```
 

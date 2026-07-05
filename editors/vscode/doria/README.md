@@ -28,7 +28,7 @@ After changing the TextMate grammar, reload the VS Code window or restart the Ex
 Keep this TextMate grammar aligned with the IntelliJ / JetBrains highlighter under `editors/intellij/doria`. From the repository root, run:
 
 ```bash
-python3 scripts/check_editor_highlighting.py
+php scripts/check_editor_highlighting.php
 ```
 
 Files under `editors/fixtures/` are syntax-highlighting smoke fixtures. The VS Code client keeps them out of `doria-lsp` diagnostics so accepted/planned editor vocabulary can be exercised before compiler implementation lands.

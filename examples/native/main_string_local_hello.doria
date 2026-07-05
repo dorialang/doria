@@ -1,0 +1,5 @@
+function main(): void
+{
+    let $message = "Hello Doria!";
+    echo $message;
+}

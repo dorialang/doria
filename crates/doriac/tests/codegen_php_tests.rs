@@ -104,6 +104,24 @@ echo not (1 < 2);
 }
 
 #[test]
+fn php_backend_preserves_main_string_local_echo() {
+    let php = doriac::compile_source_to_php(
+        "test.doria",
+        r#"
+function main(): void
+{
+    let $message = "Hello Doria!";
+    echo $message;
+}
+"#,
+    )
+    .expect("compilation should succeed");
+
+    assert!(php.contains("$message = \"Hello Doria!\";"));
+    assert!(php.contains("echo $message;"));
+}
+
+#[test]
 fn lowers_checked_program_to_hir() {
     let lowered = doriac::lower_source(
         "test.doria",

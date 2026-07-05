@@ -1,7 +1,9 @@
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::process::{Command, Output};
+use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use doriac::backend::BackendTarget;
 
@@ -445,9 +447,43 @@ fn compiles_and_runs_void_main_string_literal_echo() {
     assert_native_run_output(&hello_output, "main_void_hello", b"Hello Doria!");
     let _ = fs::remove_file(hello_output);
 
+    let string_local_output = temp_executable_path("main_string_local_hello");
+    compile_native_file(
+        &workspace.join("examples/native/main_string_local_hello.doria"),
+        &string_local_output,
+    );
+    assert_native_run_output(
+        &string_local_output,
+        "main_string_local_hello",
+        b"Hello Doria!",
+    );
+    let _ = fs::remove_file(string_local_output);
+
     for (stem, expected_stdout) in [
         ("main_void_multiple_echo", b"Hello Doria!".as_slice()),
         ("main_void_empty_echo", b"".as_slice()),
+        (
+            "main_void_typed_string_local_echo",
+            b"Hello Doria!".as_slice(),
+        ),
+        (
+            "main_void_multiple_string_locals_echo",
+            b"Hello Doria!".as_slice(),
+        ),
+        (
+            "main_void_string_local_plus_literal_echo",
+            b"Hello Doria!".as_slice(),
+        ),
+        (
+            "main_void_grouped_string_local_echo",
+            b"Hello Doria!".as_slice(),
+        ),
+        ("main_void_string_local_guard_skip", b"".as_slice()),
+        (
+            "main_void_branch_string_shadowing_echo",
+            b"innerouter".as_slice(),
+        ),
+        ("main_void_loop_body_string_local_echo", b"HiHi".as_slice()),
         ("main_void_guard_true_return", b"".as_slice()),
         ("main_void_guard_false_return", b"".as_slice()),
         ("main_void_guard_true_skips_echo", b"".as_slice()),
@@ -517,6 +553,90 @@ function main(): void
 function main(): void
 {
     echo "";
+}
+"#
+        }
+        "main_void_typed_string_local_echo" => {
+            r#"
+function main(): void
+{
+    string $message = "Hello Doria!";
+    echo $message;
+}
+"#
+        }
+        "main_void_multiple_string_locals_echo" => {
+            r#"
+function main(): void
+{
+    let $hello = "Hello";
+    string $space = " ";
+    let $name = "Doria!";
+    echo $hello;
+    echo $space;
+    echo $name;
+}
+"#
+        }
+        "main_void_string_local_plus_literal_echo" => {
+            r#"
+function main(): void
+{
+    let $message = "Doria!";
+    echo "Hello ";
+    echo $message;
+}
+"#
+        }
+        "main_void_grouped_string_local_echo" => {
+            r#"
+function main(): void
+{
+    let $message = ("Hello Doria!");
+    echo ($message);
+}
+"#
+        }
+        "main_void_string_local_guard_skip" => {
+            r#"
+function main(): void
+{
+    let $message = "should not print";
+
+    if (true) {
+        return;
+    }
+
+    echo $message;
+}
+"#
+        }
+        "main_void_branch_string_shadowing_echo" => {
+            r#"
+function main(): void
+{
+    let $message = "outer";
+
+    if (true) {
+        let $message = "inner";
+        echo $message;
+    }
+
+    echo $message;
+}
+"#
+        }
+        "main_void_loop_body_string_local_echo" => {
+            r#"
+function main(): void
+{
+    let writable $count = 0;
+
+    while ($count < 2) {
+        let $message = "Hi";
+        echo $message;
+        $count += 1;
+    }
 }
 "#
         }
@@ -1694,7 +1814,7 @@ function main(): int
             r#"
 function main(): int
 {
-    string $message = "hello";
+    let $ok = true;
     return 0;
 }
 "#,
@@ -2478,19 +2598,57 @@ function main(): int
 }
 "#,
             "B0001",
-            "unsupported native echo expression for Stage 7b",
+            "unsupported native echo expression for Stage 8a",
         ),
         (
-            "string local echo",
+            "int local echo",
+            r#"
+function main(): int
+{
+    let $code = 42;
+    echo $code;
+    return 0;
+}
+"#,
+            "B0001",
+            "unsupported native echo expression for Stage 8a",
+        ),
+        (
+            "writable string local",
             r#"
 function main(): void
 {
-    let $message = "Hello Doria!";
+    let writable $message = "Hello Doria!";
     echo $message;
 }
 "#,
             "B0001",
-            "unsupported native local for current native smoke backend",
+            "unsupported native string local for Stage 8a",
+        ),
+        (
+            "explicit writable string local",
+            r#"
+function main(): void
+{
+    writable string $message = "Hello Doria!";
+    echo $message;
+}
+"#,
+            "B0001",
+            "unsupported native string local for Stage 8a",
+        ),
+        (
+            "string assignment",
+            r#"
+function main(): void
+{
+    string $message = "Hello";
+    $message = "Doria!";
+    echo $message;
+}
+"#,
+            "E0201",
+            "cannot assign to readonly variable `$message`",
         ),
         (
             "interpolated echo",
@@ -2502,7 +2660,7 @@ function main(): void
 }
 "#,
             "B0001",
-            "unsupported native echo expression for Stage 7b",
+            "unsupported native string interpolation for Stage 8a",
         ),
         (
             "top-level statement",
@@ -2627,9 +2785,7 @@ function main(): int
 }
 
 fn assert_native_run_output(output: &Path, stem: &str, expected_stdout: &[u8]) {
-    let run = Command::new(output)
-        .output()
-        .expect("native executable should run");
+    let run = run_native_executable(output).expect("native executable should run");
     assert_eq!(run.status.code(), Some(0), "{stem}");
     assert_eq!(run.stdout, expected_stdout, "{stem}");
     assert!(
@@ -2637,6 +2793,26 @@ fn assert_native_run_output(output: &Path, stem: &str, expected_stdout: &[u8]) {
         "{stem}: expected empty stderr, got {}",
         String::from_utf8_lossy(&run.stderr)
     );
+}
+
+fn run_native_executable(output: &Path) -> io::Result<Output> {
+    const MAX_ATTEMPTS: usize = 20;
+
+    for attempt in 0..MAX_ATTEMPTS {
+        match Command::new(output).output() {
+            Ok(output) => return Ok(output),
+            Err(error) if is_transient_executable_busy(&error) && attempt + 1 < MAX_ATTEMPTS => {
+                thread::sleep(Duration::from_millis(25));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    unreachable!("retry loop returns on final attempt")
+}
+
+fn is_transient_executable_busy(error: &io::Error) -> bool {
+    cfg!(unix) && error.raw_os_error() == Some(26)
 }
 
 fn compile_native_file(input: &Path, output: &Path) {
