@@ -115,6 +115,7 @@ At completion, report assumptions made and critical decisions encountered. If no
 - Do not confuse unsupported native backend coverage with invalid Doria. If a construct is valid Doria but unsupported by the current native slice, call it unsupported native backend coverage, especially for `if` without `else`, `else if`, `given`, `finally`, `when`, wider boolean expressions, and broader control-flow shapes.
 - Prefer nouns as properties and verbs as methods in Doria APIs and examples. Use property hooks for computed, validated, lazy, or guarded values instead of vague zero-argument noun methods such as `body()`.
 - Do not introduce external Rust crates unless they remove real complexity and the repository is ready to manage that dependency.
+- Do not add repository utility scripts in Python, JavaScript, shell, or another scripting language out of habit. Prefer Rust for compiler/project tooling and PHP for small repository text/JSON/regex helpers unless a different tool has an explicit, documented advantage for that specific task.
 
 ## MVP non-goals
 

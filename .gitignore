@@ -9,6 +9,7 @@ editors/intellij/doria/bin/
 **/.DS_Store
 *.php
 !examples/**/*.php
+!scripts/*.php
 node_modules/
 vendor/
 *.log

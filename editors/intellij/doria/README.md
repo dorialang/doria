@@ -74,7 +74,7 @@ editors/fixtures/latest-tokens.doria
 After changing editor highlighting, run this from the repository root:
 
 ```bash
-python3 scripts/check_editor_highlighting.py
+php scripts/check_editor_highlighting.php
 ```
 
 Files under `editors/fixtures/` are syntax-highlighting smoke fixtures. The IntelliJ LSP adapter keeps them out of `doria-lsp` diagnostics so accepted/planned editor vocabulary can be exercised before compiler implementation lands.

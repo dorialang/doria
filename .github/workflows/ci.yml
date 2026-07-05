@@ -45,6 +45,17 @@ jobs:
       - name: Test
         run: cargo test --workspace --all-targets --locked --verbose
 
+      - name: Check repository script guardrails
+        run: |
+          if find scripts -type f -name '*.py' -print -quit | grep -q .; then
+            echo "Do not add Python scripts under scripts/; use Rust/PHP or update this guardrail with the explicit reason."
+            find scripts -type f -name '*.py' -print
+            exit 1
+          fi
+
+      - name: Check editor highlighting
+        run: php scripts/check_editor_highlighting.php
+
       - name: Smoke check native Doria example
         run: cargo run -p doriac -- check examples/native/main_if_42.doria
 
