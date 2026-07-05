@@ -785,6 +785,45 @@ class Person
 }
 
 #[test]
+fn allows_void_main_to_fall_through_or_return_bare() {
+    for source in [
+        r#"
+function main(): void
+{
+}
+"#,
+        r#"
+function main(): void
+{
+    return;
+}
+"#,
+        r#"
+function main(): void
+{
+    echo "Hello Doria!";
+}
+"#,
+    ] {
+        doriac::check_source("test.doria", source).expect("semantic check should succeed");
+    }
+}
+
+#[test]
+fn keeps_int_main_as_explicit_status() {
+    doriac::check_source(
+        "test.doria",
+        r#"
+function main(): int
+{
+    return 42;
+}
+"#,
+    )
+    .expect("semantic check should succeed");
+}
+
+#[test]
 fn allows_lifecycle_methods_with_omitted_or_void_return_types() {
     doriac::check_source(
         "test.doria",
@@ -914,6 +953,12 @@ fn rejects_values_returned_from_void_functions_and_constructors() {
 function log(): void
 {
     return "done";
+}
+"#,
+        r#"
+function main(): void
+{
+    return 0;
 }
 "#,
         r#"

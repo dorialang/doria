@@ -81,6 +81,10 @@ At completion, report assumptions made and critical decisions encountered. If no
 - Treat `&`, `|`, `^`, and `~` as integer bitwise operators. Do not make `&` or `|` boolean aliases, and do not add `^^`.
 - Do not add `nand`, `nor`, `implies`, `iff`, or `unless` without a new accepted decision.
 - Do not treat the native Stage 2a `0..125` process-exit range as the range of Doria integer values.
+- Do not require `main` to return `int`. `main(): void` is valid; falling through or using bare `return;` means successful process status `0`.
+- Do not allow `return <expr>;` in `main(): void`; it is a void-return semantic error.
+- Treat native string-literal `echo` as a narrow smoke path only. It writes exact literal bytes with no implicit newline; do not lower it through newline-adding helpers such as `puts`.
+- Do not claim native strings, string locals, interpolation, stdout formatting, `Console`, runtime I/O, or nonzero runtime error statuses are implemented because string-literal native `echo` works.
 - Do not reintroduce `public`, `protected`, or `private` as Doria member visibility modifiers. Doria class members are externally accessible by default; use `internal` for implementation details.
 - Keep `writable` and `internal` separate: `writable` controls mutation, while `internal` controls API surface.
 - Preserve the accepted namespace/import/include/directive direction: namespaces are semantic symbol ownership, `use` is semantic import/name aliasing, `include` is required include-once compile-time source inclusion, and `declare` is a structured compiler/source directive.
@@ -145,6 +149,7 @@ cargo run -p doriac -- check examples/person.doria
 cargo run -p doriac -- hir examples/person.doria
 cargo run -p doriac -- compile examples/native/main_return_zero.doria --target native --out build/native/main_return_zero
 cargo run -p doriac -- compile examples/native/main_return_42.doria --target native --out build/native/main_return_42
+cargo run -p doriac -- compile examples/native/main_void_hello.doria --target native --out build/native/main_void_hello
 ```
 
 Run backend-specific checks only when the touched task depends on that backend. For the current PHP compatibility backend:
@@ -153,4 +158,4 @@ Run backend-specific checks only when the touched task depends on that backend. 
 cargo run -p doriac -- compile examples/person.doria --target php --out build/person.php
 ```
 
-When a native backend target exists, native smoke tests must be part of the relevant definition of done. The current native target is the Stage 7b Cranelift-backed smoke backend for final returns, structured returning `if` / `else` and `else if` blocks, guard-style `if` returns with supported fallback blocks, fallthrough `if` statements with visible-local merges, bounded/proven structured `while` loops with supported integer locals, writable integer assignments, fallthrough `if` statements in loop bodies, unlabeled `break` and `continue` inside supported while loops, accepted boolean conditions, and supported writable integer local assignments only; do not treat it as full native code generation, full native mutable-variable support, general native loop support, nested `while`, return-bearing loop or fallthrough branch bodies, labeled/numeric loop control, or full native control-flow support. Stage 7a routes that smoke backend through a private native smoke module boundary; do not treat that private module as public Doria IR, final MIR, or a permanent native storage model.
+When a native backend target exists, native smoke tests must be part of the relevant definition of done. The current native target is the Stage 7b Cranelift-backed smoke backend for `main(): int` explicit status, `main(): void` implicit success, final returns, structured returning `if` / `else` and `else if` blocks, guard-style `if` returns with supported fallback blocks, fallthrough `if` statements with visible-local merges, bounded/proven structured `while` loops with supported integer locals, writable integer assignments, fallthrough `if` statements in loop bodies, unlabeled `break` and `continue` inside supported while loops, accepted boolean conditions, supported writable integer local assignments, and exact string-literal `echo` stdout only; do not treat it as full native code generation, full native mutable-variable support, general native loop support, nested `while`, return-bearing loop or fallthrough branch bodies, labeled/numeric loop control, general native strings, interpolation, stdout formatting, runtime I/O, runtime error handling, or full native control-flow support. Stage 7a routes that smoke backend through a private native smoke module boundary; do not treat that private module as public Doria IR, final MIR, or a permanent native storage model.

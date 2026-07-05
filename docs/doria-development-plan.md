@@ -1093,7 +1093,7 @@ For a PHP backend, this could eventually lower to a Doria runtime built on Fiber
 
 # Phase 11: Native backend foundation
 
-Before implementation, follow the accepted Stage 1 native execution path in `docs/decisions/0011-native-execution-path.md`: exactly one top-level `function main(): int` returning a process exit code.
+Before implementation, follow the accepted native execution path in `docs/decisions/0011-native-execution-path.md` and the entrypoint update in `docs/decisions/0032-main-void-and-implicit-success.md`: exactly one top-level `main` entrypoint, either `function main(): int` for an explicit process status or `function main(): void` for implicit successful status `0`.
 
 Doria IR belongs in the core compiler pipeline before backend emission. As native code generation matures, Doria IR may lower into a simpler native-oriented IR for control flow, memory layout, runtime calls, and backend code generation.
 

@@ -240,6 +240,29 @@ function main(): void
 }
 
 #[test]
+fn emits_void_main_without_exit_wrapper_for_php() {
+    let php = doriac::compile_source_to_php(
+        "test.doria",
+        r#"
+function main(): void
+{
+    echo "Hello Doria!";
+    return;
+}
+
+main();
+"#,
+    )
+    .expect("compilation should succeed");
+
+    assert!(php.contains("function main(): void"));
+    assert!(php.contains("echo \"Hello Doria!\";"));
+    assert!(php.contains("return;"));
+    assert!(php.contains("main();"));
+    assert!(!php.contains("exit(main())"));
+}
+
+#[test]
 fn preserves_block_local_bindings_in_php_output() {
     let php = doriac::compile_source_to_php(
         "test.doria",
