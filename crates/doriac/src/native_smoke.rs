@@ -1,10 +1,11 @@
 use std::collections::{HashMap, HashSet};
 
 use cranelift_codegen::ir::condcodes::IntCC;
-use cranelift_codegen::ir::{types, AbiParam, Block, BlockArg, InstBuilder, Value};
+use cranelift_codegen::ir::{
+    types, AbiParam, Block, BlockArg, InstBuilder, StackSlotData, StackSlotKind, Value,
+};
 use cranelift_codegen::settings::{self, Configurable};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
-#[cfg(unix)]
 use cranelift_module::DataDescription;
 use cranelift_module::{default_libcall_names, FuncId, Linkage, Module};
 use cranelift_object::{ObjectBuilder, ObjectModule};
@@ -104,6 +105,8 @@ struct NativeSmokeLoopLoweringContext<'a> {
 struct NativeSmokeLoweringResources<'module> {
     module: &'module mut ObjectModule,
     write_func_id: Option<FuncId>,
+    get_std_handle_func_id: Option<FuncId>,
+    write_file_func_id: Option<FuncId>,
     next_string_literal_id: usize,
 }
 
@@ -112,11 +115,12 @@ impl<'module> NativeSmokeLoweringResources<'module> {
         Self {
             module,
             write_func_id: None,
+            get_std_handle_func_id: None,
+            write_file_func_id: None,
             next_string_literal_id: 0,
         }
     }
 
-    #[cfg(unix)]
     fn declare_write_function(&mut self) -> Result<FuncId, BackendError> {
         if let Some(function_id) = self.write_func_id {
             return Ok(function_id);
@@ -136,6 +140,67 @@ impl<'module> NativeSmokeLoweringResources<'module> {
         self.write_func_id = Some(function_id);
         Ok(function_id)
     }
+
+    fn declare_get_std_handle_function(&mut self) -> Result<FuncId, BackendError> {
+        if let Some(function_id) = self.get_std_handle_func_id {
+            return Ok(function_id);
+        }
+
+        let pointer_type = self.module.target_config().pointer_type();
+        let mut signature = self.module.make_signature();
+        signature.params.push(AbiParam::new(types::I32));
+        signature.returns.push(AbiParam::new(pointer_type));
+
+        let function_id = self
+            .module
+            .declare_function("GetStdHandle", Linkage::Import, &signature)
+            .map_err(|error| BackendError::new(format!("backend emission failure: {error}")))?;
+        self.get_std_handle_func_id = Some(function_id);
+        Ok(function_id)
+    }
+
+    fn declare_write_file_function(&mut self) -> Result<FuncId, BackendError> {
+        if let Some(function_id) = self.write_file_func_id {
+            return Ok(function_id);
+        }
+
+        let pointer_type = self.module.target_config().pointer_type();
+        let mut signature = self.module.make_signature();
+        signature.params.push(AbiParam::new(pointer_type));
+        signature.params.push(AbiParam::new(pointer_type));
+        signature.params.push(AbiParam::new(types::I32));
+        signature.params.push(AbiParam::new(pointer_type));
+        signature.params.push(AbiParam::new(pointer_type));
+        signature.returns.push(AbiParam::new(types::I32));
+
+        let function_id = self
+            .module
+            .declare_function("WriteFile", Linkage::Import, &signature)
+            .map_err(|error| BackendError::new(format!("backend emission failure: {error}")))?;
+        self.write_file_func_id = Some(function_id);
+        Ok(function_id)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NativeSmokeStdoutPlatform {
+    Unix,
+    Windows,
+    Unsupported,
+}
+
+fn native_smoke_stdout_platform(windows: bool, unix: bool) -> NativeSmokeStdoutPlatform {
+    if windows {
+        NativeSmokeStdoutPlatform::Windows
+    } else if unix {
+        NativeSmokeStdoutPlatform::Unix
+    } else {
+        NativeSmokeStdoutPlatform::Unsupported
+    }
+}
+
+fn host_native_smoke_stdout_platform() -> NativeSmokeStdoutPlatform {
+    native_smoke_stdout_platform(cfg!(windows), cfg!(unix))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -415,10 +480,10 @@ fn validate_stage_6c_statement_sequence(
         [] => Err(BackendError::new(
             "unsupported native block for Stage 7b: expected supported local declarations, assignments, string-literal echo statements, bounded while statements, or fallthrough if statements followed by a return, terminal if/else, or guard if with fallback",
         )),
-        [statement] => validate_stage_6c_terminator(statement, local_states, main_return),
         [Stmt::If(if_stmt), rest @ ..] if if_stmt.else_branch.is_none() => {
             validate_stage_6c_guard(if_stmt, rest, local_states, main_return)
         }
+        [statement] => validate_stage_6c_terminator(statement, local_states, main_return),
         [Stmt::If(if_stmt), _] if if_stmt.else_branch.is_some() => {
             Err(BackendError::new(
                 "unsupported statement after native terminator for Stage 7b: no statements may follow a terminal if/else",
@@ -440,7 +505,7 @@ fn validate_stage_6c_guard(
     local_states: &HashMap<String, NativeSmokeLocalState>,
     main_return: NativeSmokeMainReturn,
 ) -> Result<NativeSmokeTerminator, BackendError> {
-    if fallback_statements.is_empty() {
+    if fallback_statements.is_empty() && main_return != NativeSmokeMainReturn::Void {
         return Err(BackendError::new(
             "unsupported native branch fallthrough for Stage 7b: guard `if` without `else` requires a supported fallback block",
         ));
@@ -672,20 +737,9 @@ fn validate_stage_6c_echo(expr: &Expr) -> Result<NativeSmokeStmt, BackendError> 
         )));
     };
 
-    #[cfg(not(unix))]
-    {
-        let _ = value;
-        Err(BackendError::new(
-            "unsupported native echo statement for Stage 7b: string-literal stdout smoke path is currently available only on Unix-like targets",
-        ))
-    }
-
-    #[cfg(unix)]
-    {
-        Ok(NativeSmokeStmt::EchoStringLiteral {
-            value: value.clone(),
-        })
-    }
+    Ok(NativeSmokeStmt::EchoStringLiteral {
+        value: value.clone(),
+    })
 }
 
 fn unsupported_current_native_local() -> BackendError {
@@ -2404,7 +2458,6 @@ fn lower_native_success_return(builder: &mut FunctionBuilder) {
     builder.ins().return_(&[exit_value]);
 }
 
-#[cfg(unix)]
 fn lower_native_echo_string_literal(
     builder: &mut FunctionBuilder,
     value: &str,
@@ -2414,6 +2467,26 @@ fn lower_native_echo_string_literal(
         return Ok(());
     }
 
+    let data_pointer = define_native_echo_string_literal(builder, value, resources)?;
+
+    match host_native_smoke_stdout_platform() {
+        NativeSmokeStdoutPlatform::Unix => {
+            lower_native_unix_echo_string_literal(builder, value, data_pointer, resources)
+        }
+        NativeSmokeStdoutPlatform::Windows => {
+            lower_native_windows_echo_string_literal(builder, value, data_pointer, resources)
+        }
+        NativeSmokeStdoutPlatform::Unsupported => Err(BackendError::new(
+            "unsupported native echo statement for Stage 7b: string-literal stdout smoke path is currently available only on Unix-like and Windows targets",
+        )),
+    }
+}
+
+fn define_native_echo_string_literal(
+    builder: &mut FunctionBuilder,
+    value: &str,
+    resources: &mut NativeSmokeLoweringResources<'_>,
+) -> Result<Value, BackendError> {
     let data_name = format!("__doria_stage_7b_echo_{}", resources.next_string_literal_id);
     resources.next_string_literal_id += 1;
 
@@ -2430,12 +2503,22 @@ fn lower_native_echo_string_literal(
 
     let pointer_type = resources.module.target_config().pointer_type();
     let global_value = resources.module.declare_data_in_func(data_id, builder.func);
-    let data_pointer = builder.ins().global_value(pointer_type, global_value);
+    Ok(builder.ins().global_value(pointer_type, global_value))
+}
 
+fn lower_native_unix_echo_string_literal(
+    builder: &mut FunctionBuilder,
+    value: &str,
+    data_pointer: Value,
+    resources: &mut NativeSmokeLoweringResources<'_>,
+) -> Result<(), BackendError> {
+    // Stage 7b's stdout smoke path is intentionally narrow: string literals go
+    // straight to stdout, with no native string/runtime model implied.
     let write_function_id = resources.declare_write_function()?;
     let write_function = resources
         .module
         .declare_func_in_func(write_function_id, builder.func);
+    let pointer_type = resources.module.target_config().pointer_type();
     let fd = builder.ins().iconst(types::I32, 1);
     let byte_count = builder.ins().iconst(pointer_type, value.len() as i64);
     builder
@@ -2445,15 +2528,47 @@ fn lower_native_echo_string_literal(
     Ok(())
 }
 
-#[cfg(not(unix))]
-fn lower_native_echo_string_literal(
-    _builder: &mut FunctionBuilder,
-    _value: &str,
-    _resources: &mut NativeSmokeLoweringResources<'_>,
+fn lower_native_windows_echo_string_literal(
+    builder: &mut FunctionBuilder,
+    value: &str,
+    data_pointer: Value,
+    resources: &mut NativeSmokeLoweringResources<'_>,
 ) -> Result<(), BackendError> {
-    Err(BackendError::new(
-        "unsupported native echo statement for Stage 7b: string-literal stdout smoke path is currently available only on Unix-like targets",
-    ))
+    // Stage 7b's stdout smoke path uses Kernel32 directly on Windows so it can
+    // work with Doria's generated `main` entrypoint without CRT startup.
+    let pointer_type = resources.module.target_config().pointer_type();
+    let get_std_handle_id = resources.declare_get_std_handle_function()?;
+    let get_std_handle = resources
+        .module
+        .declare_func_in_func(get_std_handle_id, builder.func);
+    let std_output_handle = builder.ins().iconst(types::I32, -11);
+    let handle_call = builder.ins().call(get_std_handle, &[std_output_handle]);
+    let handle = builder.inst_results(handle_call)[0];
+
+    let written_slot =
+        builder.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 4, 2));
+    let zero = builder.ins().iconst(types::I32, 0);
+    builder.ins().stack_store(zero, written_slot, 0);
+    let written_pointer = builder.ins().stack_addr(pointer_type, written_slot, 0);
+    let overlapped_pointer = builder.ins().iconst(pointer_type, 0);
+
+    let write_file_id = resources.declare_write_file_function()?;
+    let write_file = resources
+        .module
+        .declare_func_in_func(write_file_id, builder.func);
+    let byte_count = builder.ins().iconst(types::I32, value.len() as i64);
+    builder.ins().call(
+        write_file,
+        &[
+            handle,
+            data_pointer,
+            byte_count,
+            written_pointer,
+            overlapped_pointer,
+        ],
+    );
+
+    Ok(())
 }
 
 fn lower_native_return(
@@ -2756,6 +2871,60 @@ mod tests {
     fn validate_test_source(source: &str) -> NativeSmokeModule {
         let program = lower_test_source(source);
         validate(&program).expect("expected native smoke validation to pass")
+    }
+
+    #[test]
+    fn stdout_platform_selection_supports_unix_and_windows() {
+        assert_eq!(
+            native_smoke_stdout_platform(false, true),
+            NativeSmokeStdoutPlatform::Unix
+        );
+        assert_eq!(
+            native_smoke_stdout_platform(true, false),
+            NativeSmokeStdoutPlatform::Windows
+        );
+        assert_eq!(
+            native_smoke_stdout_platform(false, false),
+            NativeSmokeStdoutPlatform::Unsupported
+        );
+    }
+
+    #[test]
+    fn validation_accepts_string_literal_echo_without_platform_gate() {
+        let module = validate_test_source(
+            r#"
+function main(): void
+{
+    echo "Hello Doria!";
+}
+"#,
+        );
+
+        assert!(matches!(
+            module.body.statements.as_slice(),
+            [NativeSmokeStmt::EchoStringLiteral { value }] if value == "Hello Doria!"
+        ));
+        assert_eq!(module.body.terminator, NativeSmokeTerminator::ExitSuccess);
+    }
+
+    #[test]
+    fn validation_accepts_void_guard_if_with_implicit_success_fallback() {
+        let module = validate_test_source(
+            r#"
+function main(): void
+{
+    if (true) {
+        return;
+    }
+}
+"#,
+        );
+
+        assert!(matches!(
+            module.body.terminator,
+            NativeSmokeTerminator::Guard { .. }
+        ));
+        assert_eq!(evaluate_exit_code(&module), 0);
     }
 
     #[test]

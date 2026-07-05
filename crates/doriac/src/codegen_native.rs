@@ -151,6 +151,7 @@ fn linker_arguments(
             OsString::from("/link"),
             OsString::from("/ENTRY:main"),
             OsString::from("/SUBSYSTEM:CONSOLE"),
+            OsString::from("kernel32.lib"),
         ];
     }
 
@@ -194,6 +195,7 @@ mod tests {
                 OsString::from("/link"),
                 OsString::from("/ENTRY:main"),
                 OsString::from("/SUBSYSTEM:CONSOLE"),
+                OsString::from("kernel32.lib"),
             ]
         );
     }
@@ -217,6 +219,7 @@ mod tests {
                 OsString::from("/link"),
                 OsString::from("/ENTRY:main"),
                 OsString::from("/SUBSYSTEM:CONSOLE"),
+                OsString::from("kernel32.lib"),
             ]
         );
     }

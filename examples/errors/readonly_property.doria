@@ -4,4 +4,4 @@ class Person
 }
 
 let writable $person = new Person();
-$person->name = "Lucy";
+$person->name = "Dorothy";

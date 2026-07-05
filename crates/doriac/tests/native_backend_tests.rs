@@ -448,6 +448,13 @@ fn compiles_and_runs_void_main_string_literal_echo() {
     for (stem, expected_stdout) in [
         ("main_void_multiple_echo", b"Hello Doria!".as_slice()),
         ("main_void_empty_echo", b"".as_slice()),
+        ("main_void_guard_true_return", b"".as_slice()),
+        ("main_void_guard_false_return", b"".as_slice()),
+        ("main_void_guard_true_skips_echo", b"".as_slice()),
+        (
+            "main_void_guard_false_reaches_echo",
+            b"Hello Doria!".as_slice(),
+        ),
     ] {
         let output = temp_executable_path(stem);
         compile_native_source(native_smoke_source(stem), &output);
@@ -480,6 +487,50 @@ function main(): void
 function main(): void
 {
     echo "";
+}
+"#
+        }
+        "main_void_guard_true_return" => {
+            r#"
+function main(): void
+{
+    if (true) {
+        return;
+    }
+}
+"#
+        }
+        "main_void_guard_false_return" => {
+            r#"
+function main(): void
+{
+    if (false) {
+        return;
+    }
+}
+"#
+        }
+        "main_void_guard_true_skips_echo" => {
+            r#"
+function main(): void
+{
+    if (true) {
+        return;
+    }
+
+    echo "should not print";
+}
+"#
+        }
+        "main_void_guard_false_reaches_echo" => {
+            r#"
+function main(): void
+{
+    if (false) {
+        return;
+    }
+
+    echo "Hello Doria!";
 }
 "#
         }
