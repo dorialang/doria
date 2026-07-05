@@ -468,6 +468,31 @@ fn compiles_and_runs_void_main_string_literal_echo() {
     }
 }
 
+#[test]
+fn compiles_and_runs_large_void_main_string_literal_echo() {
+    if !host_linker_is_available() {
+        eprintln!(
+            "native stdout smoke test unavailable: host linker `{}` was not found",
+            host_linker()
+        );
+        return;
+    }
+
+    let message = "Doria".repeat(64 * 1024);
+    let source = format!(
+        r#"
+function main(): void
+{{
+    echo "{message}";
+}}
+"#
+    );
+    let output = temp_executable_path("main_void_large_echo");
+    compile_native_source(&source, &output);
+    assert_native_run_output(&output, "main_void_large_echo", message.as_bytes());
+    let _ = fs::remove_file(output);
+}
+
 fn native_smoke_source(stem: &str) -> &'static str {
     match stem {
         "main_void_return" => {

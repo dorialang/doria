@@ -2454,6 +2454,11 @@ fn lower_native_success_return(builder: &mut FunctionBuilder) {
     builder.ins().return_(&[exit_value]);
 }
 
+fn lower_native_error_return(builder: &mut FunctionBuilder) {
+    let exit_value = builder.ins().iconst(types::I32, 1);
+    builder.ins().return_(&[exit_value]);
+}
+
 fn lower_native_echo_string_literal(
     builder: &mut FunctionBuilder,
     value: &str,
@@ -2516,10 +2521,61 @@ fn lower_native_unix_echo_string_literal(
         .declare_func_in_func(write_function_id, builder.func);
     let pointer_type = resources.module.target_config().pointer_type();
     let fd = builder.ins().iconst(types::I32, 1);
+
+    let loop_block = builder.create_block();
+    let write_block = builder.create_block();
+    let advance_block = builder.create_block();
+    let error_block = builder.create_block();
+    let done_block = builder.create_block();
+    builder.append_block_param(loop_block, pointer_type);
+    builder.append_block_param(loop_block, pointer_type);
+
+    let zero = builder.ins().iconst(pointer_type, 0);
     let byte_count = builder.ins().iconst(pointer_type, value.len() as i64);
+    builder.ins().jump(
+        loop_block,
+        &[BlockArg::Value(zero), BlockArg::Value(byte_count)],
+    );
+
+    builder.switch_to_block(loop_block);
+    let offset = builder.block_params(loop_block)[0];
+    let remaining = builder.block_params(loop_block)[1];
+    let is_done = builder.ins().icmp_imm(IntCC::Equal, remaining, 0);
     builder
         .ins()
-        .call(write_function, &[fd, data_pointer, byte_count]);
+        .brif(is_done, done_block, &[], write_block, &[]);
+
+    builder.switch_to_block(write_block);
+    builder.seal_block(write_block);
+    let current_pointer = builder.ins().iadd(data_pointer, offset);
+    let write_call = builder
+        .ins()
+        .call(write_function, &[fd, current_pointer, remaining]);
+    let written = builder.inst_results(write_call)[0];
+    let made_progress = builder.ins().icmp_imm(IntCC::SignedGreaterThan, written, 0);
+    builder
+        .ins()
+        .brif(made_progress, advance_block, &[], error_block, &[]);
+
+    builder.switch_to_block(advance_block);
+    builder.seal_block(advance_block);
+    let next_offset = builder.ins().iadd(offset, written);
+    let next_remaining = builder.ins().isub(remaining, written);
+    builder.ins().jump(
+        loop_block,
+        &[
+            BlockArg::Value(next_offset),
+            BlockArg::Value(next_remaining),
+        ],
+    );
+    builder.seal_block(loop_block);
+
+    builder.switch_to_block(error_block);
+    builder.seal_block(error_block);
+    lower_native_error_return(builder);
+
+    builder.switch_to_block(done_block);
+    builder.seal_block(done_block);
 
     Ok(())
 }
@@ -2532,6 +2588,14 @@ fn lower_native_windows_echo_string_literal(
 ) -> Result<(), BackendError> {
     // Stage 7b's stdout smoke path uses Kernel32 directly on Windows so it can
     // work with Doria's generated `main` entrypoint without CRT startup.
+    let byte_count = i64::try_from(value.len())
+        .ok()
+        .and_then(|len| i32::try_from(len).ok())
+        .ok_or_else(|| {
+            BackendError::new(
+                "unsupported native echo statement for Stage 7b: Windows string-literal stdout smoke path supports literals up to 2147483647 bytes",
+            )
+        })?;
     let pointer_type = resources.module.target_config().pointer_type();
     let get_std_handle_id = resources.declare_get_std_handle_function()?;
     let get_std_handle = resources
@@ -2552,17 +2616,82 @@ fn lower_native_windows_echo_string_literal(
     let write_file = resources
         .module
         .declare_func_in_func(write_file_id, builder.func);
-    let byte_count = builder.ins().iconst(types::I32, value.len() as i64);
-    builder.ins().call(
+
+    let loop_block = builder.create_block();
+    let write_block = builder.create_block();
+    let check_written_block = builder.create_block();
+    let advance_block = builder.create_block();
+    let error_block = builder.create_block();
+    let done_block = builder.create_block();
+    builder.append_block_param(loop_block, pointer_type);
+    builder.append_block_param(loop_block, types::I32);
+
+    let offset_zero = builder.ins().iconst(pointer_type, 0);
+    let remaining_count = builder.ins().iconst(types::I32, i64::from(byte_count));
+    builder.ins().jump(
+        loop_block,
+        &[
+            BlockArg::Value(offset_zero),
+            BlockArg::Value(remaining_count),
+        ],
+    );
+
+    builder.switch_to_block(loop_block);
+    let offset = builder.block_params(loop_block)[0];
+    let remaining = builder.block_params(loop_block)[1];
+    let is_done = builder.ins().icmp_imm(IntCC::Equal, remaining, 0);
+    builder
+        .ins()
+        .brif(is_done, done_block, &[], write_block, &[]);
+
+    builder.switch_to_block(write_block);
+    builder.seal_block(write_block);
+    builder.ins().stack_store(zero, written_slot, 0);
+    let current_pointer = builder.ins().iadd(data_pointer, offset);
+    let write_call = builder.ins().call(
         write_file,
         &[
             handle,
-            data_pointer,
-            byte_count,
+            current_pointer,
+            remaining,
             written_pointer,
             overlapped_pointer,
         ],
     );
+    let write_ok = builder.inst_results(write_call)[0];
+    let succeeded = builder.ins().icmp_imm(IntCC::NotEqual, write_ok, 0);
+    builder
+        .ins()
+        .brif(succeeded, check_written_block, &[], error_block, &[]);
+
+    builder.switch_to_block(check_written_block);
+    builder.seal_block(check_written_block);
+    let written = builder.ins().stack_load(types::I32, written_slot, 0);
+    let made_progress = builder.ins().icmp_imm(IntCC::NotEqual, written, 0);
+    builder
+        .ins()
+        .brif(made_progress, advance_block, &[], error_block, &[]);
+
+    builder.switch_to_block(advance_block);
+    builder.seal_block(advance_block);
+    let written_offset = builder.ins().uextend(pointer_type, written);
+    let next_offset = builder.ins().iadd(offset, written_offset);
+    let next_remaining = builder.ins().isub(remaining, written);
+    builder.ins().jump(
+        loop_block,
+        &[
+            BlockArg::Value(next_offset),
+            BlockArg::Value(next_remaining),
+        ],
+    );
+    builder.seal_block(loop_block);
+
+    builder.switch_to_block(error_block);
+    builder.seal_block(error_block);
+    lower_native_error_return(builder);
+
+    builder.switch_to_block(done_block);
+    builder.seal_block(done_block);
 
     Ok(())
 }
