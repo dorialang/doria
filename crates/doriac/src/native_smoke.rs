@@ -1431,11 +1431,7 @@ fn validate_stage_6c_if_as_block(
     main_return: NativeSmokeMainReturn,
 ) -> Result<NativeSmokeBlock, BackendError> {
     let statement = Stmt::If(if_stmt.clone());
-    let terminator = validate_stage_6c_terminator(&statement, local_states, main_return)?;
-    Ok(NativeSmokeBlock {
-        statements: Vec::new(),
-        terminator,
-    })
+    validate_stage_6c_block(&[statement], local_states, main_return)
 }
 
 fn should_preserve_native_block_error(message: &str) -> bool {

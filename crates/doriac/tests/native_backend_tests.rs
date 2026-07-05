@@ -455,6 +455,11 @@ fn compiles_and_runs_void_main_string_literal_echo() {
             "main_void_guard_false_reaches_echo",
             b"Hello Doria!".as_slice(),
         ),
+        ("main_void_else_if_final_true_returns", b"".as_slice()),
+        (
+            "main_void_else_if_final_false_falls_through",
+            b"".as_slice(),
+        ),
     ] {
         let output = temp_executable_path(stem);
         compile_native_source(native_smoke_source(stem), &output);
@@ -531,6 +536,30 @@ function main(): void
     }
 
     echo "Hello Doria!";
+}
+"#
+        }
+        "main_void_else_if_final_true_returns" => {
+            r#"
+function main(): void
+{
+    if (false) {
+        return;
+    } else if (true) {
+        return;
+    }
+}
+"#
+        }
+        "main_void_else_if_final_false_falls_through" => {
+            r#"
+function main(): void
+{
+    if (false) {
+        return;
+    } else if (false) {
+        return;
+    }
 }
 "#
         }
@@ -2027,6 +2056,21 @@ function main(): int
 function main(): int
 {
     if (true) {
+        return 42;
+    }
+}
+"#,
+            "E0406",
+            "must return a value",
+        ),
+        (
+            "int else if without final fallback return",
+            r#"
+function main(): int
+{
+    if (false) {
+        return 0;
+    } else if (true) {
         return 42;
     }
 }
