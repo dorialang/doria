@@ -101,6 +101,13 @@ fn lower_stmt(statement: &ast::Stmt) -> hir::Stmt {
             body: lower_block(&while_stmt.body),
             span: while_stmt.span,
         }),
+        ast::Stmt::For(for_stmt) => hir::Stmt::For(Box::new(hir::ForStmt {
+            initializer: for_stmt.initializer.as_ref().map(lower_for_initializer),
+            condition: for_stmt.condition.as_ref().map(lower_expr),
+            increment: for_stmt.increment.as_ref().map(lower_for_increment),
+            body: lower_block(&for_stmt.body),
+            span: for_stmt.span,
+        })),
         ast::Stmt::Break { span } => hir::Stmt::Break { span: *span },
         ast::Stmt::Continue { span } => hir::Stmt::Continue { span: *span },
         ast::Stmt::Foreach(foreach) => hir::Stmt::Foreach(hir::ForeachStmt {
@@ -110,10 +117,57 @@ fn lower_stmt(statement: &ast::Stmt) -> hir::Stmt {
             body: lower_block(&foreach.body),
             span: foreach.span,
         }),
+        ast::Stmt::Increment(increment) => hir::Stmt::Increment(hir::IncrementStmt {
+            target: lower_expr(&increment.target),
+            op: increment.op.clone(),
+            position: increment.position.clone(),
+            span: increment.span,
+        }),
         ast::Stmt::Expr { expr, span } => hir::Stmt::Expr {
             expr: lower_expr(expr),
             span: *span,
         },
+    }
+}
+
+fn lower_for_initializer(initializer: &ast::ForInitializer) -> hir::ForInitializer {
+    match initializer {
+        ast::ForInitializer::VarDecl(decl) => hir::ForInitializer::VarDecl(hir::VarDecl {
+            writable: decl.writable,
+            ty: decl.ty.clone(),
+            name: decl.name.clone(),
+            initializer: lower_expr(&decl.initializer),
+            span: decl.span,
+        }),
+        ast::ForInitializer::Assignment(assignment) => {
+            hir::ForInitializer::Assignment(hir::Assignment {
+                target: lower_expr(&assignment.target),
+                op: assignment.op.clone(),
+                value: lower_expr(&assignment.value),
+                span: assignment.span,
+            })
+        }
+    }
+}
+
+fn lower_for_increment(increment: &ast::ForIncrement) -> hir::ForIncrement {
+    match increment {
+        ast::ForIncrement::Increment(increment) => {
+            hir::ForIncrement::Increment(hir::IncrementStmt {
+                target: lower_expr(&increment.target),
+                op: increment.op.clone(),
+                position: increment.position.clone(),
+                span: increment.span,
+            })
+        }
+        ast::ForIncrement::Assignment(assignment) => {
+            hir::ForIncrement::Assignment(hir::Assignment {
+                target: lower_expr(&assignment.target),
+                op: assignment.op.clone(),
+                value: lower_expr(&assignment.value),
+                span: assignment.span,
+            })
+        }
     }
 }
 
@@ -239,6 +293,17 @@ fn lower_expr(expr: &ast::Expr) -> hir::Expr {
             left: Box::new(lower_expr(left)),
             op: op.clone(),
             right: Box::new(lower_expr(right)),
+            span: *span,
+        },
+        ast::Expr::Range {
+            start,
+            end,
+            inclusive,
+            span,
+        } => hir::Expr::Range {
+            start: Box::new(lower_expr(start)),
+            end: Box::new(lower_expr(end)),
+            inclusive: *inclusive,
             span: *span,
         },
     }

@@ -1,0 +1,10 @@
+function main(): int
+{
+    let writable $sum = 0;
+
+    for (let writable $i = 0; $i < 42; $i++) {
+        $sum += 1;
+    }
+
+    return $sum;
+}

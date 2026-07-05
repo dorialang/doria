@@ -512,6 +512,10 @@
           "match": "\\b(?:return|foreach|as|if|else|while|for|break|continue|when|given|finally|extends|implements|uses)\\b"
         },
         {
+          "name": "keyword.control.exception.doria",
+          "match": "\\b(?:throw|throws)\\b"
+        },
+        {
           "name": "storage.modifier.mutability.doria",
           "match": "\\b(?:writable|readonly)\\b"
         },
@@ -533,7 +537,7 @@
         },
         {
           "name": "keyword.other.reserved.doria",
-          "match": "\\b(?:async|await|spawn|scope|enum|match|try|catch|throw)\\b"
+          "match": "\\b(?:async|await|spawn|scope|enum|match|try|catch)\\b"
         }
       ]
     },
@@ -618,7 +622,7 @@
         },
         {
           "name": "keyword.operator.doria",
-          "match": "==|!=|<=|>=|&&|\\|\\||\\?\\?|=>|->|::|\\+=|-=|[=+\\-*/%.<>!?:]"
+          "match": "\\.\\.<|\\.\\.|\\+\\+|--|==|!=|<=|>=|&&|\\|\\||\\?\\?|=>|->|::|\\+=|-=|[=+\\-*/%.<>!?:]"
         }
       ]
     },

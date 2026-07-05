@@ -408,6 +408,37 @@ fn compiles_and_runs_current_native_smoke_examples() {
             "inline_main_while_continue_then_unreachable_assignment_42.doria",
             42,
         ),
+        ("main_for_42", "examples/native/main_for_42.doria", 42),
+        (
+            "main_for_pre_increment_42",
+            "inline_main_for_pre_increment_42.doria",
+            42,
+        ),
+        (
+            "main_for_decrement_42",
+            "inline_main_for_decrement_42.doria",
+            42,
+        ),
+        (
+            "main_foreach_range_45",
+            "examples/native/main_foreach_range_45.doria",
+            45,
+        ),
+        (
+            "main_foreach_range_55",
+            "examples/native/main_foreach_range_55.doria",
+            55,
+        ),
+        (
+            "main_foreach_range_break_42",
+            "inline_main_foreach_range_break_42.doria",
+            42,
+        ),
+        (
+            "main_foreach_range_continue_42",
+            "inline_main_foreach_range_continue_42.doria",
+            42,
+        ),
     ];
 
     for (stem, source, expected_code) in cases {
@@ -1689,6 +1720,70 @@ function main(): int
 }
 "#
         }
+        "main_for_pre_increment_42" => {
+            r#"
+function main(): int
+{
+    let writable $sum = 0;
+
+    for (let writable $i = 0; $i < 42; ++$i) {
+        $sum += 1;
+    }
+
+    return $sum;
+}
+"#
+        }
+        "main_for_decrement_42" => {
+            r#"
+function main(): int
+{
+    let writable $sum = 0;
+
+    for (let writable $i = 42; $i > 0; $i--) {
+        $sum += 1;
+    }
+
+    return $sum;
+}
+"#
+        }
+        "main_foreach_range_break_42" => {
+            r#"
+function main(): int
+{
+    let writable $sum = 0;
+
+    foreach (0..100 as $i) {
+        if ($i == 42) {
+            break;
+        }
+
+        $sum += 1;
+    }
+
+    return $sum;
+}
+"#
+        }
+        "main_foreach_range_continue_42" => {
+            r#"
+function main(): int
+{
+    let writable $sum = 0;
+
+    foreach (0..10 as $i) {
+        if ($i < 10) {
+            continue;
+        }
+
+        $sum = 42;
+    }
+
+    return $sum;
+}
+"#
+        }
         _ => unreachable!("unexpected inline native smoke source `{stem}`"),
     }
 }
@@ -1762,6 +1857,40 @@ function main(): int
 "#,
             "E0404",
             "cannot return value of type `bool`",
+        ),
+        (
+            "unproven for loop",
+            r#"
+function main(): int
+{
+    let writable $sum = 0;
+
+    for (let writable $i = 0; true; $i++) {
+        $sum += 1;
+    }
+
+    return $sum;
+}
+"#,
+            "B0001",
+            "loop could not be proven to terminate",
+        ),
+        (
+            "foreach range exceeds smoke cap",
+            r#"
+function main(): int
+{
+    let writable $sum = 0;
+
+    foreach (0..10001 as $i) {
+        $sum += 0;
+    }
+
+    return 0;
+}
+"#,
+            "B0001",
+            "loop could not be proven to terminate",
         ),
         (
             "return undeclared variable",

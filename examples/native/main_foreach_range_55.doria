@@ -1,0 +1,10 @@
+function main(): int
+{
+    let writable $sum = 0;
+
+    foreach (0..10 as $i) {
+        $sum += $i;
+    }
+
+    return $sum;
+}

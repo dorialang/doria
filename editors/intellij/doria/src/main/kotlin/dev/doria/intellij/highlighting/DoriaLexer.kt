@@ -707,6 +707,7 @@ class DoriaLexer : LexerBase() {
             "try",
             "catch",
             "throw",
+            "throws",
         )
 
         private val WORD_OPERATORS = setOf("not", "and", "or", "xor")
@@ -777,7 +778,7 @@ class DoriaLexer : LexerBase() {
         )
 
         private val STRICT_COMPARISON_OPERATORS = setOf("===", "!==")
-        private val THREE_CHAR_OPERATORS = STRICT_COMPARISON_OPERATORS
-        private val TWO_CHAR_OPERATORS = setOf("==", "!=", "<=", ">=", "&&", "||", "??", "=>", "+=", "-=", "->", "::")
+        private val THREE_CHAR_OPERATORS = STRICT_COMPARISON_OPERATORS + setOf("..<")
+        private val TWO_CHAR_OPERATORS = setOf("==", "!=", "<=", ">=", "&&", "||", "??", "=>", "+=", "-=", "++", "--", "..", "->", "::")
     }
 }

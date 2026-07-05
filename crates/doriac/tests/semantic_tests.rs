@@ -1462,6 +1462,137 @@ function main(): int
 }
 
 #[test]
+fn checks_stage_9_increment_and_for_semantics() {
+    doriac::check_source(
+        "test.doria",
+        r#"
+function main(): void
+{
+    let writable $i = 0;
+    $i++;
+    ++$i;
+    $i--;
+    --$i;
+
+    for (let writable $j = 0; $j < 10; $j++) {
+    }
+
+    for (; $i < 10; ++$i) {
+        continue;
+    }
+}
+"#,
+    )
+    .expect("semantic check should succeed");
+}
+
+#[test]
+fn rejects_invalid_stage_9_increment_targets() {
+    assert_diagnostic_code(
+        r#"
+function main(): void
+{
+    let $i = 0;
+    $i++;
+}
+"#,
+        "E0201",
+    );
+
+    assert_diagnostic_code(
+        r#"
+function main(): void
+{
+    $i++;
+}
+"#,
+        "E0101",
+    );
+
+    assert_diagnostic_code(
+        r#"
+function main(): void
+{
+    let writable $name = "Doria";
+    $name++;
+}
+"#,
+        "E0423",
+    );
+}
+
+#[test]
+fn keeps_for_initializer_bindings_loop_local() {
+    assert_diagnostic_code(
+        r#"
+function main(): int
+{
+    for (let writable $i = 0; $i < 10; $i++) {
+    }
+
+    return $i;
+}
+"#,
+        "E0101",
+    );
+}
+
+#[test]
+fn checks_stage_9_foreach_range_semantics() {
+    doriac::check_source(
+        "test.doria",
+        r#"
+function main(): void
+{
+    foreach (0..<10 as $i) {
+        let $copy = $i;
+    }
+}
+"#,
+    )
+    .expect("semantic check should succeed");
+}
+
+#[test]
+fn rejects_invalid_stage_9_foreach_ranges() {
+    assert_diagnostic_code(
+        r#"
+function main(): void
+{
+    foreach (0..10 as $i) {
+        $i++;
+    }
+}
+"#,
+        "E0201",
+    );
+
+    assert_diagnostic_code(
+        r#"
+function main(): int
+{
+    foreach (0..10 as $i) {
+    }
+
+    return $i;
+}
+"#,
+        "E0101",
+    );
+
+    assert_diagnostic_code(
+        r#"
+function main(): void
+{
+    foreach ("0"..10 as $i) {
+    }
+}
+"#,
+        "E0424",
+    );
+}
+
+#[test]
 fn rejects_loop_control_outside_loop() {
     for (source, code, message) in [
         (

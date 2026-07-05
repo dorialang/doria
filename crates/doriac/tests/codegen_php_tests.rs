@@ -258,6 +258,42 @@ function main(): void
 }
 
 #[test]
+fn emits_php_for_stage_9_iteration() {
+    let php = doriac::compile_source_to_php(
+        "test.doria",
+        r#"
+function main(): void
+{
+    for (let writable $i = 0; $i < 10; $i++) {
+        echo "x";
+    }
+
+    foreach (0..<10 as $i) {
+        echo "x";
+    }
+
+    foreach (0..10 as $i) {
+        echo "x";
+    }
+
+    let writable $j = 0;
+    ++$j;
+    $j--;
+}
+"#,
+    )
+    .expect("compilation should succeed");
+
+    assert!(php.contains("for ($i = 0; $i < 10; $i++)"));
+    assert!(php.contains("__doria_range_start"));
+    assert!(php.contains("; $i__doria"));
+    assert!(php.contains(" < $__doria_range_end"));
+    assert!(php.contains(" <= $__doria_range_end"));
+    assert!(php.contains("++$j;"));
+    assert!(php.contains("$j--;"));
+}
+
+#[test]
 fn emits_void_main_without_exit_wrapper_for_php() {
     let php = doriac::compile_source_to_php(
         "test.doria",

@@ -61,6 +61,14 @@ function main(): int
         }
     }
 
+    for (let writable $i = 0; $i < 10; $i++) {
+        echo "x";
+    }
+
+    foreach (0..<10 as $i) {
+        echo "x";
+    }
+
     given {
         let $user = $session->user;
 
@@ -78,4 +86,9 @@ function main(): int
         42 => 42,
         default => 0,
     };
+}
+
+function loadUser(int $id): User throws UserNotFound
+{
+    throw new UserNotFound($id);
 }

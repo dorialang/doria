@@ -60,6 +60,46 @@ fn lexes_loop_control_keywords() {
 }
 
 #[test]
+fn lexes_stage_9_iteration_tokens() {
+    let kinds = token_kinds(
+        r#"
+for (let writable $i = 0; $i < 10; $i++) {
+}
+
+++$i;
+--$i;
+$i++;
+$i--;
+
+foreach (0..10 as $i) {
+}
+
+foreach (0..<10 as $i) {
+}
+"#,
+    );
+
+    assert!(kinds.iter().any(|kind| matches!(kind, TokenKind::For)));
+    assert!(kinds.iter().any(|kind| matches!(kind, TokenKind::Foreach)));
+    assert!(kinds.iter().any(|kind| matches!(kind, TokenKind::As)));
+    assert!(kinds.iter().any(|kind| matches!(kind, TokenKind::PlusPlus)));
+    assert!(kinds
+        .iter()
+        .any(|kind| matches!(kind, TokenKind::MinusMinus)));
+    assert!(kinds.iter().any(|kind| matches!(kind, TokenKind::DotDot)));
+    assert!(kinds
+        .iter()
+        .any(|kind| matches!(kind, TokenKind::DotDotLess)));
+}
+
+#[test]
+fn lexes_checked_error_direction_keywords() {
+    let kinds = token_kinds("throw throws");
+    assert!(matches!(kinds[0], TokenKind::Throw));
+    assert!(matches!(kinds[1], TokenKind::Throws));
+}
+
+#[test]
 fn lexes_boolean_word_operators() {
     let kinds = token_kinds("not and or xor");
     assert!(matches!(kinds[0], TokenKind::Not));
