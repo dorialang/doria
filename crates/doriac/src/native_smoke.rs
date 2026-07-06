@@ -457,6 +457,17 @@ fn validate_stage_6c_block(
                 native_statements.push(NativeSmokeStmt::Assign(assignment));
                 terminal_index += 1;
             }
+            Stmt::Increment(increment) => {
+                let assignment = validate_stage_6c_increment(increment, &block_states)?;
+                let Some(state) = block_states.get_mut(&assignment.target) else {
+                    return Err(BackendError::new(
+                        "backend validation failure: validated native increment target was not declared",
+                    ));
+                };
+                state.value = NativeSmokeValue::Int(assignment.evaluated_value);
+                native_statements.push(NativeSmokeStmt::Assign(assignment));
+                terminal_index += 1;
+            }
             Stmt::Echo { expr, .. } => {
                 native_statements.push(validate_stage_6c_echo(expr, &block_states)?);
                 terminal_index += 1;
@@ -680,6 +691,26 @@ fn validate_stage_6c_fallthrough_block(
                     let Some(visible_state) = visible_states.get_mut(&assignment.target) else {
                         return Err(BackendError::new(
                             "backend validation failure: validated native visible fallthrough assignment target was not declared",
+                        ));
+                    };
+                    visible_state.value = NativeSmokeValue::Int(assignment.evaluated_value);
+                }
+                native_statements.push(NativeSmokeStmt::Assign(assignment));
+            }
+            Stmt::Increment(increment) => {
+                let assignment = validate_stage_6c_increment(increment, &block_states)?;
+                let Some(state) = block_states.get_mut(&assignment.target) else {
+                    return Err(BackendError::new(
+                        "backend validation failure: validated native fallthrough increment target was not declared",
+                    ));
+                };
+                state.value = NativeSmokeValue::Int(assignment.evaluated_value);
+                if visible_states.contains_key(&assignment.target)
+                    && !shadowed_locals.contains(&assignment.target)
+                {
+                    let Some(visible_state) = visible_states.get_mut(&assignment.target) else {
+                        return Err(BackendError::new(
+                            "backend validation failure: validated native visible fallthrough increment target was not declared",
                         ));
                     };
                     visible_state.value = NativeSmokeValue::Int(assignment.evaluated_value);
@@ -972,6 +1003,79 @@ fn validate_stage_6c_assignment(
         expr: value.expr,
         evaluated_value,
     })
+}
+
+fn validate_stage_6c_increment(
+    increment: &hir::IncrementStmt,
+    local_states: &HashMap<String, NativeSmokeLocalState>,
+) -> Result<NativeSmokeAssign, BackendError> {
+    let (name, op, target_value) = validate_native_increment_target(increment, local_states)?;
+    let evaluated_value = checked_native_increment_value(op, target_value)?;
+
+    Ok(NativeSmokeAssign {
+        target: name,
+        op,
+        expr: NativeSmokeExpr::Int(1),
+        evaluated_value,
+    })
+}
+
+fn validate_stage_6c_loop_increment(
+    increment: &hir::IncrementStmt,
+    local_states: &HashMap<String, NativeSmokeLocalState>,
+) -> Result<NativeSmokeAssign, BackendError> {
+    let (name, op, _) = validate_native_increment_target(increment, local_states)?;
+
+    Ok(NativeSmokeAssign {
+        target: name,
+        op,
+        expr: NativeSmokeExpr::Int(1),
+        evaluated_value: 0,
+    })
+}
+
+fn validate_native_increment_target(
+    increment: &hir::IncrementStmt,
+    local_states: &HashMap<String, NativeSmokeLocalState>,
+) -> Result<(String, NativeSmokeAssignOp, i64), BackendError> {
+    let Expr::Variable { name, .. } = &increment.target else {
+        return Err(BackendError::new(
+            "unsupported native increment for Stage 9: expected writable `int` local",
+        ));
+    };
+    let Some(target) = local_states.get(name) else {
+        return Err(BackendError::new(format!(
+            "unsupported native increment for Stage 9: undeclared local `${name}`"
+        )));
+    };
+    if !target.writable {
+        return Err(BackendError::new(format!(
+            "unsupported native increment for Stage 9: readonly local `${name}`"
+        )));
+    }
+    let Some(target_value) = target.value.as_int() else {
+        return Err(BackendError::new(
+            "unsupported native increment for Stage 9: expected integer local",
+        ));
+    };
+    let op = match increment.op {
+        IncrementOp::Increment => NativeSmokeAssignOp::AddAssign,
+        IncrementOp::Decrement => NativeSmokeAssignOp::SubAssign,
+    };
+    Ok((name.clone(), op, target_value))
+}
+
+fn checked_native_increment_value(
+    op: NativeSmokeAssignOp,
+    target_value: i64,
+) -> Result<i64, BackendError> {
+    let native_op = match op {
+        NativeSmokeAssignOp::AddAssign => NativeSmokeBinaryOp::Add,
+        NativeSmokeAssignOp::SubAssign => NativeSmokeBinaryOp::Subtract,
+        NativeSmokeAssignOp::Assign => unreachable!("increments cannot lower to plain assignment"),
+    };
+    checked_native_arithmetic(target_value, native_op, 1)
+        .ok_or_else(|| BackendError::new("integer arithmetic overflows the Doria `int` range"))
 }
 
 fn validate_stage_6c_while(
@@ -1467,35 +1571,7 @@ fn validate_stage_9_for_increment(
 ) -> Result<NativeSmokeAssign, BackendError> {
     match increment {
         ForIncrement::Increment(increment) => {
-            let Expr::Variable { name, .. } = &increment.target else {
-                return Err(BackendError::new(
-                    "unsupported native for increment for Stage 9: expected writable `int` local",
-                ));
-            };
-            let Some(target) = local_states.get(name) else {
-                return Err(BackendError::new(format!(
-                    "unsupported native for increment for Stage 9: undeclared local `${name}`"
-                )));
-            };
-            if !target.writable {
-                return Err(BackendError::new(format!(
-                    "unsupported native for increment for Stage 9: readonly local `${name}`"
-                )));
-            }
-            if target.value.as_int().is_none() {
-                return Err(BackendError::new(
-                    "unsupported native for increment for Stage 9: expected integer local",
-                ));
-            }
-            Ok(NativeSmokeAssign {
-                target: name.clone(),
-                op: match increment.op {
-                    IncrementOp::Increment => NativeSmokeAssignOp::AddAssign,
-                    IncrementOp::Decrement => NativeSmokeAssignOp::SubAssign,
-                },
-                expr: NativeSmokeExpr::Int(1),
-                evaluated_value: 0,
-            })
+            validate_stage_6c_loop_increment(increment, local_states)
         }
         ForIncrement::Assignment(assignment) => {
             validate_stage_6c_loop_assignment(assignment, local_states)
@@ -1675,6 +1751,26 @@ fn validate_stage_6c_while_scoped_body(
                     let Some(visible_state) = visible_states.get_mut(&assignment.target) else {
                         return Err(BackendError::new(
                             "backend validation failure: validated native visible while assignment target was not declared",
+                        ));
+                    };
+                    visible_state.value = NativeSmokeValue::Int(assignment.evaluated_value);
+                }
+                native_statements.push(NativeSmokeStmt::Assign(assignment));
+            }
+            Stmt::Increment(increment) => {
+                let assignment = validate_stage_6c_loop_increment(increment, &block_states)?;
+                let Some(state) = block_states.get_mut(&assignment.target) else {
+                    return Err(BackendError::new(
+                        "backend validation failure: validated native while increment target was not declared",
+                    ));
+                };
+                state.value = NativeSmokeValue::Int(assignment.evaluated_value);
+                if visible_states.contains_key(&assignment.target)
+                    && !shadowed_locals.contains(&assignment.target)
+                {
+                    let Some(visible_state) = visible_states.get_mut(&assignment.target) else {
+                        return Err(BackendError::new(
+                            "backend validation failure: validated native visible while increment target was not declared",
                         ));
                     };
                     visible_state.value = NativeSmokeValue::Int(assignment.evaluated_value);

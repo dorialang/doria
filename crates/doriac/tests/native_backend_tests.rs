@@ -420,6 +420,21 @@ fn compiles_and_runs_current_native_smoke_examples() {
             42,
         ),
         (
+            "main_increment_statement_1",
+            "inline_main_increment_statement_1.doria",
+            1,
+        ),
+        (
+            "main_decrement_statement_1",
+            "inline_main_decrement_statement_1.doria",
+            1,
+        ),
+        (
+            "main_for_body_increment_3",
+            "inline_main_for_body_increment_3.doria",
+            3,
+        ),
+        (
             "main_for_initializer_shadow_preserves_outer_5",
             "inline_main_for_initializer_shadow_preserves_outer_5.doria",
             5,
@@ -1849,6 +1864,42 @@ function main(): int
         }
 
         $sum += 1;
+    }
+
+    return $sum;
+}
+"#
+        }
+        "main_increment_statement_1" => {
+            r#"
+function main(): int
+{
+    let writable $i = 0;
+    $i++;
+
+    return $i;
+}
+"#
+        }
+        "main_decrement_statement_1" => {
+            r#"
+function main(): int
+{
+    let writable $i = 2;
+    --$i;
+
+    return $i;
+}
+"#
+        }
+        "main_for_body_increment_3" => {
+            r#"
+function main(): int
+{
+    let writable $sum = 0;
+
+    for (let writable $i = 0; $i < 3; $i++) {
+        $sum++;
     }
 
     return $sum;
