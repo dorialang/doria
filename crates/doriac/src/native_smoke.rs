@@ -11,7 +11,10 @@ use cranelift_module::{default_libcall_names, FuncId, Linkage, Module};
 use cranelift_object::{ObjectBuilder, ObjectModule};
 
 use crate::backend::BackendError;
-use crate::hir::{self, AssignOp, BinaryOp, ElseBranch, Expr, Item, Stmt, UnaryOp};
+use crate::hir::{
+    self, AssignOp, BinaryOp, ElseBranch, Expr, ForIncrement, ForInitializer, IncrementOp, Item,
+    Stmt, UnaryOp,
+};
 
 const STAGE_7B_LOOP_VERIFICATION_CAP: u64 = 10_000;
 
@@ -32,6 +35,7 @@ enum NativeSmokeStmt {
     Assign(NativeSmokeAssign),
     Echo(NativeSmokeExpr),
     While(NativeSmokeWhile),
+    For(NativeSmokeFor),
     If(NativeSmokeIf),
     Break,
     Continue,
@@ -59,6 +63,24 @@ struct NativeSmokeWhile {
     body: NativeSmokeFallthroughBlock,
     final_values: Vec<(String, NativeSmokeValue)>,
     evaluated_iterations: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NativeSmokeFor {
+    initializer: Option<NativeSmokeForInitializer>,
+    condition: NativeSmokeCondition,
+    increment: Option<NativeSmokeAssign>,
+    increment_exit_condition: Option<NativeSmokeCondition>,
+    body: NativeSmokeFallthroughBlock,
+    carried_values: Vec<(String, NativeSmokeValue)>,
+    final_values: Vec<(String, NativeSmokeValue)>,
+    evaluated_iterations: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum NativeSmokeForInitializer {
+    Local(NativeSmokeLocal),
+    Assign(NativeSmokeAssign),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -97,7 +119,7 @@ enum NativeSmokeLoweringFlow {
 
 #[derive(Debug, Clone, Copy)]
 struct NativeSmokeLoopLoweringContext<'a> {
-    header_block: Block,
+    continue_block: Block,
     after_block: Block,
     carried_locals: &'a [(String, NativeSmokeValue)],
 }
@@ -435,6 +457,17 @@ fn validate_stage_6c_block(
                 native_statements.push(NativeSmokeStmt::Assign(assignment));
                 terminal_index += 1;
             }
+            Stmt::Increment(increment) => {
+                let assignment = validate_stage_6c_increment(increment, &block_states)?;
+                let Some(state) = block_states.get_mut(&assignment.target) else {
+                    return Err(BackendError::new(
+                        "backend validation failure: validated native increment target was not declared",
+                    ));
+                };
+                state.value = NativeSmokeValue::Int(assignment.evaluated_value);
+                native_statements.push(NativeSmokeStmt::Assign(assignment));
+                terminal_index += 1;
+            }
             Stmt::Echo { expr, .. } => {
                 native_statements.push(validate_stage_6c_echo(expr, &block_states)?);
                 terminal_index += 1;
@@ -450,6 +483,18 @@ fn validate_stage_6c_block(
                     state.value = value.clone();
                 }
                 native_statements.push(NativeSmokeStmt::While(native_while));
+                terminal_index += 1;
+            }
+            Stmt::For(for_stmt) => {
+                let native_for = validate_stage_9_for(for_stmt, &block_states)?;
+                merge_native_values(&mut block_states, &native_for.final_values)?;
+                native_statements.push(NativeSmokeStmt::For(native_for));
+                terminal_index += 1;
+            }
+            Stmt::Foreach(foreach) if grouped_range_expr(&foreach.iterable).is_some() => {
+                let native_for = validate_stage_9_range_foreach(foreach, &block_states)?;
+                merge_native_values(&mut block_states, &native_for.final_values)?;
+                native_statements.push(NativeSmokeStmt::For(native_for));
                 terminal_index += 1;
             }
             Stmt::If(if_stmt) => match validate_stage_6c_fallthrough_if(if_stmt, &block_states) {
@@ -652,6 +697,26 @@ fn validate_stage_6c_fallthrough_block(
                 }
                 native_statements.push(NativeSmokeStmt::Assign(assignment));
             }
+            Stmt::Increment(increment) => {
+                let assignment = validate_stage_6c_increment(increment, &block_states)?;
+                let Some(state) = block_states.get_mut(&assignment.target) else {
+                    return Err(BackendError::new(
+                        "backend validation failure: validated native fallthrough increment target was not declared",
+                    ));
+                };
+                state.value = NativeSmokeValue::Int(assignment.evaluated_value);
+                if visible_states.contains_key(&assignment.target)
+                    && !shadowed_locals.contains(&assignment.target)
+                {
+                    let Some(visible_state) = visible_states.get_mut(&assignment.target) else {
+                        return Err(BackendError::new(
+                            "backend validation failure: validated native visible fallthrough increment target was not declared",
+                        ));
+                    };
+                    visible_state.value = NativeSmokeValue::Int(assignment.evaluated_value);
+                }
+                native_statements.push(NativeSmokeStmt::Assign(assignment));
+            }
             Stmt::Echo { expr, .. } => {
                 native_statements.push(validate_stage_6c_echo(expr, &block_states)?);
             }
@@ -730,7 +795,7 @@ fn validate_stage_6c_local(
     decl: &hir::VarDecl,
     local_states: &HashMap<String, NativeSmokeLocalState>,
 ) -> Result<NativeSmokeLocal, BackendError> {
-    if let Some(local) = validate_stage_8a_string_local(decl)? {
+    if let Some(local) = validate_stage_8_string_local(decl, local_states)? {
         return Ok(local);
     }
 
@@ -756,10 +821,11 @@ fn validate_stage_6c_local(
     })
 }
 
-fn validate_stage_8a_string_local(
+fn validate_stage_8_string_local(
     decl: &hir::VarDecl,
+    local_states: &HashMap<String, NativeSmokeLocalState>,
 ) -> Result<Option<NativeSmokeLocal>, BackendError> {
-    let Some((expr, value)) = validate_stage_8a_string_local_initializer(&decl.initializer)? else {
+    let Some(expr) = try_validate_stage_8_string_expr(&decl.initializer, local_states)? else {
         return Ok(None);
     };
 
@@ -770,84 +836,117 @@ fn validate_stage_8a_string_local(
     }
 
     if decl.writable {
-        return Err(unsupported_stage_8a_writable_string_local());
+        return Err(unsupported_stage_8_writable_string_local());
     }
+
+    let NativeSmokeExpr::StringLiteral(value) = &expr else {
+        return Err(BackendError::new(
+            "backend validation failure: validated native string local was not compile-time-known",
+        ));
+    };
+    let evaluated_value = NativeSmokeValue::StringLiteral(value.clone());
 
     Ok(Some(NativeSmokeLocal {
         name: decl.name.clone(),
         writable: false,
         expr,
-        evaluated_value: NativeSmokeValue::StringLiteral(value),
+        evaluated_value,
     }))
 }
 
-fn validate_stage_8a_string_local_initializer(
+fn try_validate_stage_8_string_expr(
     expr: &Expr,
-) -> Result<Option<(NativeSmokeExpr, String)>, BackendError> {
+    local_states: &HashMap<String, NativeSmokeLocalState>,
+) -> Result<Option<NativeSmokeExpr>, BackendError> {
     match expr {
-        Expr::String { value, .. } => Ok(Some((
-            NativeSmokeExpr::StringLiteral(value.clone()),
-            value.clone(),
-        ))),
-        Expr::Grouped { expr, .. } => validate_stage_8a_string_local_initializer(expr),
-        Expr::InterpolatedString { .. } => Err(unsupported_stage_8a_string_interpolation()),
+        Expr::String { value, .. } => Ok(Some(NativeSmokeExpr::StringLiteral(value.clone()))),
+        Expr::Grouped { expr, .. } => try_validate_stage_8_string_expr(expr, local_states),
+        Expr::Variable { name, .. } => Ok(local_states
+            .get(name)
+            .and_then(|state| state.value.as_string_literal())
+            .map(|value| NativeSmokeExpr::StringLiteral(value.to_string()))),
+        Expr::Binary {
+            left,
+            op: BinaryOp::Concat,
+            right,
+            ..
+        } => {
+            let left = validate_stage_8_string_expr(left, local_states)?;
+            let right = validate_stage_8_string_expr(right, local_states)?;
+            let NativeSmokeExpr::StringLiteral(left_value) = left else {
+                return Err(BackendError::new(
+                    "backend validation failure: validated native string concat left operand was not compile-time-known",
+                ));
+            };
+            let NativeSmokeExpr::StringLiteral(right_value) = right else {
+                return Err(BackendError::new(
+                    "backend validation failure: validated native string concat right operand was not compile-time-known",
+                ));
+            };
+            Ok(Some(NativeSmokeExpr::StringLiteral(format!(
+                "{left_value}{right_value}"
+            ))))
+        }
+        Expr::InterpolatedString { .. } => Err(unsupported_stage_8_string_interpolation()),
         _ => Ok(None),
     }
+}
+
+fn validate_stage_8_string_expr(
+    expr: &Expr,
+    local_states: &HashMap<String, NativeSmokeLocalState>,
+) -> Result<NativeSmokeExpr, BackendError> {
+    try_validate_stage_8_string_expr(expr, local_states)?
+        .ok_or_else(|| unsupported_stage_8_string_expression(expr))
+}
+
+fn validate_stage_8_echo_expr(
+    expr: &Expr,
+    local_states: &HashMap<String, NativeSmokeLocalState>,
+) -> Result<NativeSmokeExpr, BackendError> {
+    try_validate_stage_8_string_expr(expr, local_states)?
+        .ok_or_else(|| unsupported_stage_8_echo_expression(expr))
 }
 
 fn validate_stage_6c_echo(
     expr: &Expr,
     local_states: &HashMap<String, NativeSmokeLocalState>,
 ) -> Result<NativeSmokeStmt, BackendError> {
-    Ok(NativeSmokeStmt::Echo(validate_stage_8a_echo_expr(
+    Ok(NativeSmokeStmt::Echo(validate_stage_8_echo_expr(
         expr,
         local_states,
     )?))
 }
 
-fn validate_stage_8a_echo_expr(
-    expr: &Expr,
-    local_states: &HashMap<String, NativeSmokeLocalState>,
-) -> Result<NativeSmokeExpr, BackendError> {
-    match expr {
-        Expr::String { value, .. } => Ok(NativeSmokeExpr::StringLiteral(value.clone())),
-        Expr::Grouped { expr, .. } => validate_stage_8a_echo_expr(expr, local_states),
-        Expr::Variable { name, .. } => {
-            let Some(value) = local_states
-                .get(name)
-                .and_then(|state| state.value.as_string_literal())
-            else {
-                return Err(unsupported_stage_8a_echo_expression(expr));
-            };
-            Ok(NativeSmokeExpr::StringLiteral(value.to_string()))
-        }
-        Expr::InterpolatedString { .. } => Err(unsupported_stage_8a_string_interpolation()),
-        _ => Err(unsupported_stage_8a_echo_expression(expr)),
-    }
-}
-
 fn unsupported_current_native_local() -> BackendError {
     BackendError::new(
-        "unsupported native local for current native smoke backend: expected readonly or writable `int` local initialized from integer literals, supported integer locals, or supported integer arithmetic, or readonly `string` local initialized from a string literal",
+        "unsupported native local for current native smoke backend: expected readonly or writable `int` local initialized from integer literals, supported integer locals, or supported integer arithmetic, or readonly `string` local initialized from a supported string expression",
     )
 }
 
-fn unsupported_stage_8a_writable_string_local() -> BackendError {
+fn unsupported_stage_8_writable_string_local() -> BackendError {
     BackendError::new(
-        "unsupported native string local for Stage 8a: writable string locals are future work",
+        "unsupported native string local for Stage 8: writable string locals are future work",
     )
 }
 
-fn unsupported_stage_8a_echo_expression(expr: &Expr) -> BackendError {
+fn unsupported_stage_8_string_expression(expr: &Expr) -> BackendError {
     BackendError::new(format!(
-        "unsupported native echo expression for Stage 8a: expected string literal or supported readonly string local, found `{}`",
+        "unsupported native string expression for Stage 8: expected supported string expression, found `{}`",
         describe_expression(expr)
     ))
 }
 
-fn unsupported_stage_8a_string_interpolation() -> BackendError {
+fn unsupported_stage_8_echo_expression(expr: &Expr) -> BackendError {
+    BackendError::new(format!(
+        "unsupported native echo expression for Stage 8: expected supported string expression, found `{}`",
+        describe_expression(expr)
+    ))
+}
+
+fn unsupported_stage_8_string_interpolation() -> BackendError {
     BackendError::new(
-        "unsupported native string interpolation for Stage 8a: interpolation is future native string work",
+        "unsupported native string interpolation for Stage 8: interpolation is future native string work",
     )
 }
 
@@ -875,7 +974,7 @@ fn validate_stage_6c_assignment(
 
     let Some(target_value) = target.value.as_int() else {
         return Err(BackendError::new(
-            "unsupported native string assignment for Stage 8a: string assignments are future work",
+            "unsupported native string assignment for Stage 8: string assignments are future work",
         ));
     };
 
@@ -904,6 +1003,79 @@ fn validate_stage_6c_assignment(
         expr: value.expr,
         evaluated_value,
     })
+}
+
+fn validate_stage_6c_increment(
+    increment: &hir::IncrementStmt,
+    local_states: &HashMap<String, NativeSmokeLocalState>,
+) -> Result<NativeSmokeAssign, BackendError> {
+    let (name, op, target_value) = validate_native_increment_target(increment, local_states)?;
+    let evaluated_value = checked_native_increment_value(op, target_value)?;
+
+    Ok(NativeSmokeAssign {
+        target: name,
+        op,
+        expr: NativeSmokeExpr::Int(1),
+        evaluated_value,
+    })
+}
+
+fn validate_stage_6c_loop_increment(
+    increment: &hir::IncrementStmt,
+    local_states: &HashMap<String, NativeSmokeLocalState>,
+) -> Result<NativeSmokeAssign, BackendError> {
+    let (name, op, _) = validate_native_increment_target(increment, local_states)?;
+
+    Ok(NativeSmokeAssign {
+        target: name,
+        op,
+        expr: NativeSmokeExpr::Int(1),
+        evaluated_value: 0,
+    })
+}
+
+fn validate_native_increment_target(
+    increment: &hir::IncrementStmt,
+    local_states: &HashMap<String, NativeSmokeLocalState>,
+) -> Result<(String, NativeSmokeAssignOp, i64), BackendError> {
+    let Expr::Variable { name, .. } = &increment.target else {
+        return Err(BackendError::new(
+            "unsupported native increment for Stage 9: expected writable `int` local",
+        ));
+    };
+    let Some(target) = local_states.get(name) else {
+        return Err(BackendError::new(format!(
+            "unsupported native increment for Stage 9: undeclared local `${name}`"
+        )));
+    };
+    if !target.writable {
+        return Err(BackendError::new(format!(
+            "unsupported native increment for Stage 9: readonly local `${name}`"
+        )));
+    }
+    let Some(target_value) = target.value.as_int() else {
+        return Err(BackendError::new(
+            "unsupported native increment for Stage 9: expected integer local",
+        ));
+    };
+    let op = match increment.op {
+        IncrementOp::Increment => NativeSmokeAssignOp::AddAssign,
+        IncrementOp::Decrement => NativeSmokeAssignOp::SubAssign,
+    };
+    Ok((name.clone(), op, target_value))
+}
+
+fn checked_native_increment_value(
+    op: NativeSmokeAssignOp,
+    target_value: i64,
+) -> Result<i64, BackendError> {
+    let native_op = match op {
+        NativeSmokeAssignOp::AddAssign => NativeSmokeBinaryOp::Add,
+        NativeSmokeAssignOp::SubAssign => NativeSmokeBinaryOp::Subtract,
+        NativeSmokeAssignOp::Assign => unreachable!("increments cannot lower to plain assignment"),
+    };
+    checked_native_arithmetic(target_value, native_op, 1)
+        .ok_or_else(|| BackendError::new("integer arithmetic overflows the Doria `int` range"))
 }
 
 fn validate_stage_6c_while(
@@ -968,6 +1140,563 @@ fn validate_stage_6c_while(
         final_values,
         evaluated_iterations: iterations,
     })
+}
+
+fn validate_stage_9_for(
+    for_stmt: &hir::ForStmt,
+    local_states: &HashMap<String, NativeSmokeLocalState>,
+) -> Result<NativeSmokeFor, BackendError> {
+    let mut loop_states = local_states.clone();
+    let mut shadowed_initializer_binding = None;
+    let initializer = match &for_stmt.initializer {
+        Some(ForInitializer::VarDecl(decl)) => {
+            let mut local = validate_stage_6c_local(decl, &loop_states)?;
+            let source_binding_name = local.name.clone();
+            if local_states.contains_key(&source_binding_name) {
+                let native_binding_name = native_for_initializer_shadow_name(&source_binding_name);
+                local.name = native_binding_name.clone();
+                shadowed_initializer_binding = Some((source_binding_name, native_binding_name));
+            }
+            loop_states.insert(
+                local.name.clone(),
+                NativeSmokeLocalState {
+                    writable: local.writable,
+                    value: local.evaluated_value.clone(),
+                },
+            );
+            Some(NativeSmokeForInitializer::Local(local))
+        }
+        Some(ForInitializer::Assignment(assignment)) => {
+            let assignment = validate_stage_6c_assignment(assignment, &loop_states)?;
+            let Some(state) = loop_states.get_mut(&assignment.target) else {
+                return Err(BackendError::new(
+                    "backend validation failure: validated native for assignment target was not declared",
+                ));
+            };
+            state.value = NativeSmokeValue::Int(assignment.evaluated_value);
+            Some(NativeSmokeForInitializer::Assign(assignment))
+        }
+        None => None,
+    };
+
+    let mut validation_loop_states = loop_states.clone();
+    if let Some((source_binding_name, native_binding_name)) = &shadowed_initializer_binding {
+        let Some(binding_state) = loop_states.get(native_binding_name).cloned() else {
+            return Err(BackendError::new(
+                "backend validation failure: validated native for initializer shadow binding was not declared",
+            ));
+        };
+        validation_loop_states.insert(source_binding_name.clone(), binding_state);
+    }
+
+    let condition = if let Some(condition) = &for_stmt.condition {
+        validate_stage_6c_loop_condition(condition, &validation_loop_states).map_err(|error| {
+            if should_preserve_native_expression_error(&error.message) {
+                error
+            } else {
+                BackendError::new(
+                    "unsupported native for condition for Stage 9: expected supported boolean condition",
+                )
+            }
+        })?
+    } else {
+        NativeSmokeCondition::Bool(true)
+    };
+    let condition =
+        rename_native_shadowed_for_condition(condition, shadowed_initializer_binding.as_ref());
+
+    let body =
+        validate_stage_6c_while_branch_body(&for_stmt.body.statements, &validation_loop_states)?;
+    let body =
+        if let Some((source_binding_name, native_binding_name)) = &shadowed_initializer_binding {
+            rename_native_fallthrough_binding(body, source_binding_name, native_binding_name)
+        } else {
+            body
+        };
+    let increment = for_stmt
+        .increment
+        .as_ref()
+        .map(|increment| validate_stage_9_for_increment(increment, &validation_loop_states))
+        .transpose()?
+        .map(|increment| {
+            rename_native_shadowed_for_increment(increment, shadowed_initializer_binding.as_ref())
+        });
+
+    validate_stage_9_for_like(
+        initializer,
+        condition,
+        increment,
+        None,
+        body,
+        &loop_states,
+        local_states,
+    )
+}
+
+fn native_for_initializer_shadow_name(source_name: &str) -> String {
+    format!("<for_initializer:{source_name}>")
+}
+
+fn grouped_range_expr(expr: &Expr) -> Option<(&Expr, &Expr, bool)> {
+    match expr {
+        Expr::Grouped { expr, .. } => grouped_range_expr(expr),
+        Expr::Range {
+            start,
+            end,
+            inclusive,
+            ..
+        } => Some((start, end, *inclusive)),
+        _ => None,
+    }
+}
+
+fn validate_stage_9_range_foreach(
+    foreach: &hir::ForeachStmt,
+    local_states: &HashMap<String, NativeSmokeLocalState>,
+) -> Result<NativeSmokeFor, BackendError> {
+    if foreach.key.is_some() {
+        return Err(BackendError::new(
+            "unsupported native foreach range for Stage 9: key bindings are future work",
+        ));
+    }
+
+    let Some((start, end, inclusive)) = grouped_range_expr(&foreach.iterable) else {
+        return Err(BackendError::new(
+            "backend validation failure: Stage 9 range foreach validator received non-range iterable",
+        ));
+    };
+
+    let start = validate_stage_6c_int_expr(start, local_states)?;
+    let end = validate_stage_6c_int_expr(end, local_states)?;
+    let source_binding_name = foreach.value.name.clone();
+    let native_binding_name = if local_states.contains_key(&source_binding_name) {
+        native_range_foreach_shadow_name(&source_binding_name)
+    } else {
+        source_binding_name.clone()
+    };
+    let binding_state = NativeSmokeLocalState {
+        writable: false,
+        value: NativeSmokeValue::Int(start.value),
+    };
+    let initializer = NativeSmokeForInitializer::Local(NativeSmokeLocal {
+        name: native_binding_name.clone(),
+        writable: false,
+        expr: NativeSmokeExpr::Int(start.value),
+        evaluated_value: NativeSmokeValue::Int(start.value),
+    });
+
+    let mut loop_states = local_states.clone();
+    loop_states.insert(native_binding_name.clone(), binding_state.clone());
+
+    let mut body_validation_states = loop_states.clone();
+    if native_binding_name != source_binding_name {
+        body_validation_states.insert(source_binding_name.clone(), binding_state);
+    }
+
+    let condition = NativeSmokeCondition::Compare {
+        op: if inclusive {
+            NativeSmokeCompareOp::LessThanOrEqual
+        } else {
+            NativeSmokeCompareOp::LessThan
+        },
+        left: NativeSmokeExpr::Local(native_binding_name.clone()),
+        right: NativeSmokeExpr::Int(end.value),
+    };
+    let increment = NativeSmokeAssign {
+        target: native_binding_name.clone(),
+        op: NativeSmokeAssignOp::AddAssign,
+        expr: NativeSmokeExpr::Int(1),
+        evaluated_value: 0,
+    };
+    let increment_exit_condition = inclusive.then(|| NativeSmokeCondition::Compare {
+        op: NativeSmokeCompareOp::Equal,
+        left: NativeSmokeExpr::Local(native_binding_name.clone()),
+        right: NativeSmokeExpr::Int(end.value),
+    });
+    let body =
+        validate_stage_6c_while_branch_body(&foreach.body.statements, &body_validation_states)?;
+    let body = if native_binding_name != source_binding_name {
+        rename_native_fallthrough_binding(body, &source_binding_name, &native_binding_name)
+    } else {
+        body
+    };
+
+    validate_stage_9_for_like(
+        Some(initializer),
+        condition,
+        Some(increment),
+        increment_exit_condition,
+        body,
+        &loop_states,
+        local_states,
+    )
+}
+
+fn native_range_foreach_shadow_name(source_name: &str) -> String {
+    format!("<range_foreach:{source_name}>")
+}
+
+fn rename_native_shadowed_for_condition(
+    mut condition: NativeSmokeCondition,
+    binding: Option<&(String, String)>,
+) -> NativeSmokeCondition {
+    if let Some((source_name, native_name)) = binding {
+        rename_native_condition_binding(&mut condition, source_name, native_name);
+    }
+    condition
+}
+
+fn rename_native_shadowed_for_increment(
+    mut increment: NativeSmokeAssign,
+    binding: Option<&(String, String)>,
+) -> NativeSmokeAssign {
+    if let Some((source_name, native_name)) = binding {
+        rename_native_assignment_binding(&mut increment, source_name, native_name);
+    }
+    increment
+}
+
+fn rename_native_fallthrough_binding(
+    mut block: NativeSmokeFallthroughBlock,
+    source_name: &str,
+    native_name: &str,
+) -> NativeSmokeFallthroughBlock {
+    rename_native_fallthrough_binding_in_scope(&mut block, source_name, native_name, true);
+    block
+}
+
+fn rename_native_fallthrough_binding_in_scope(
+    block: &mut NativeSmokeFallthroughBlock,
+    source_name: &str,
+    native_name: &str,
+    rename_active: bool,
+) {
+    let mut active = rename_active;
+    for statement in &mut block.statements {
+        active = rename_native_statement_binding(statement, source_name, native_name, active);
+    }
+    if rename_active {
+        rename_native_state_binding(&mut block.final_states, source_name, native_name);
+    }
+}
+
+fn rename_native_statement_binding(
+    statement: &mut NativeSmokeStmt,
+    source_name: &str,
+    native_name: &str,
+    rename_active: bool,
+) -> bool {
+    match statement {
+        NativeSmokeStmt::Local(local) => {
+            if rename_active {
+                rename_native_expr_binding(&mut local.expr, source_name, native_name);
+            }
+            rename_active && local.name != source_name
+        }
+        NativeSmokeStmt::Assign(assignment) => {
+            if rename_active {
+                rename_native_assignment_binding(assignment, source_name, native_name);
+            }
+            rename_active
+        }
+        NativeSmokeStmt::Echo(expr) => {
+            if rename_active {
+                rename_native_expr_binding(expr, source_name, native_name);
+            }
+            rename_active
+        }
+        NativeSmokeStmt::While(native_while) => {
+            if rename_active {
+                rename_native_condition_binding(
+                    &mut native_while.condition,
+                    source_name,
+                    native_name,
+                );
+                rename_native_fallthrough_binding_in_scope(
+                    &mut native_while.body,
+                    source_name,
+                    native_name,
+                    true,
+                );
+                rename_native_value_entries(
+                    &mut native_while.final_values,
+                    source_name,
+                    native_name,
+                );
+            }
+            rename_active
+        }
+        NativeSmokeStmt::For(native_for) => {
+            if rename_active {
+                if let Some(initializer) = &mut native_for.initializer {
+                    rename_native_for_initializer_binding(initializer, source_name, native_name);
+                }
+                rename_native_condition_binding(
+                    &mut native_for.condition,
+                    source_name,
+                    native_name,
+                );
+                if let Some(increment) = &mut native_for.increment {
+                    rename_native_assignment_binding(increment, source_name, native_name);
+                }
+                if let Some(condition) = &mut native_for.increment_exit_condition {
+                    rename_native_condition_binding(condition, source_name, native_name);
+                }
+                rename_native_fallthrough_binding_in_scope(
+                    &mut native_for.body,
+                    source_name,
+                    native_name,
+                    true,
+                );
+                rename_native_value_entries(
+                    &mut native_for.carried_values,
+                    source_name,
+                    native_name,
+                );
+                rename_native_value_entries(&mut native_for.final_values, source_name, native_name);
+            }
+            rename_active
+        }
+        NativeSmokeStmt::If(native_if) => {
+            if rename_active {
+                rename_native_condition_binding(&mut native_if.condition, source_name, native_name);
+                rename_native_fallthrough_binding_in_scope(
+                    &mut native_if.then_block,
+                    source_name,
+                    native_name,
+                    true,
+                );
+                if let Some(else_block) = &mut native_if.else_block {
+                    rename_native_fallthrough_binding_in_scope(
+                        else_block,
+                        source_name,
+                        native_name,
+                        true,
+                    );
+                }
+                rename_native_value_entries(&mut native_if.merged_values, source_name, native_name);
+            }
+            rename_active
+        }
+        NativeSmokeStmt::Break | NativeSmokeStmt::Continue => rename_active,
+    }
+}
+
+fn rename_native_for_initializer_binding(
+    initializer: &mut NativeSmokeForInitializer,
+    source_name: &str,
+    native_name: &str,
+) {
+    match initializer {
+        NativeSmokeForInitializer::Local(local) => {
+            rename_native_expr_binding(&mut local.expr, source_name, native_name);
+        }
+        NativeSmokeForInitializer::Assign(assignment) => {
+            rename_native_assignment_binding(assignment, source_name, native_name);
+        }
+    }
+}
+
+fn rename_native_assignment_binding(
+    assignment: &mut NativeSmokeAssign,
+    source_name: &str,
+    native_name: &str,
+) {
+    if assignment.target == source_name {
+        assignment.target = native_name.to_string();
+    }
+    rename_native_expr_binding(&mut assignment.expr, source_name, native_name);
+}
+
+fn rename_native_expr_binding(expr: &mut NativeSmokeExpr, source_name: &str, native_name: &str) {
+    match expr {
+        NativeSmokeExpr::Local(name) if name == source_name => {
+            *name = native_name.to_string();
+        }
+        NativeSmokeExpr::Binary { left, right, .. } => {
+            rename_native_expr_binding(left, source_name, native_name);
+            rename_native_expr_binding(right, source_name, native_name);
+        }
+        NativeSmokeExpr::Int(_) | NativeSmokeExpr::Local(_) | NativeSmokeExpr::StringLiteral(_) => {
+        }
+    }
+}
+
+fn rename_native_condition_binding(
+    condition: &mut NativeSmokeCondition,
+    source_name: &str,
+    native_name: &str,
+) {
+    match condition {
+        NativeSmokeCondition::Compare { left, right, .. } => {
+            rename_native_expr_binding(left, source_name, native_name);
+            rename_native_expr_binding(right, source_name, native_name);
+        }
+        NativeSmokeCondition::Not(condition) => {
+            rename_native_condition_binding(condition, source_name, native_name);
+        }
+        NativeSmokeCondition::And { left, right }
+        | NativeSmokeCondition::Or { left, right }
+        | NativeSmokeCondition::Xor { left, right } => {
+            rename_native_condition_binding(left, source_name, native_name);
+            rename_native_condition_binding(right, source_name, native_name);
+        }
+        NativeSmokeCondition::Bool(_) => {}
+    }
+}
+
+fn rename_native_state_binding(
+    states: &mut HashMap<String, NativeSmokeLocalState>,
+    source_name: &str,
+    native_name: &str,
+) {
+    if let Some(state) = states.remove(source_name) {
+        states.insert(native_name.to_string(), state);
+    }
+}
+
+fn rename_native_value_entries(
+    entries: &mut Vec<(String, NativeSmokeValue)>,
+    source_name: &str,
+    native_name: &str,
+) {
+    let mut renamed = HashMap::new();
+    for (name, value) in entries.drain(..) {
+        let name = if name == source_name {
+            native_name.to_string()
+        } else {
+            name
+        };
+        renamed.insert(name, value);
+    }
+    *entries = renamed.into_iter().collect();
+    entries.sort_by(|left, right| left.0.cmp(&right.0));
+}
+fn validate_stage_9_for_increment(
+    increment: &ForIncrement,
+    local_states: &HashMap<String, NativeSmokeLocalState>,
+) -> Result<NativeSmokeAssign, BackendError> {
+    match increment {
+        ForIncrement::Increment(increment) => {
+            validate_stage_6c_loop_increment(increment, local_states)
+        }
+        ForIncrement::Assignment(assignment) => {
+            validate_stage_6c_loop_assignment(assignment, local_states)
+        }
+    }
+}
+
+fn validate_stage_9_for_like(
+    initializer: Option<NativeSmokeForInitializer>,
+    condition: NativeSmokeCondition,
+    increment: Option<NativeSmokeAssign>,
+    increment_exit_condition: Option<NativeSmokeCondition>,
+    body: NativeSmokeFallthroughBlock,
+    initial_loop_states: &HashMap<String, NativeSmokeLocalState>,
+    outer_states: &HashMap<String, NativeSmokeLocalState>,
+) -> Result<NativeSmokeFor, BackendError> {
+    let mut simulated_states = initial_loop_states.clone();
+    let mut iterations = 0;
+
+    loop {
+        let values = native_state_values(&simulated_states);
+        let Some(condition_value) = evaluate_native_condition(&condition, &values) else {
+            return Err(BackendError::new(
+                "backend validation failure: validated native for condition could not be re-evaluated",
+            ));
+        };
+
+        if !condition_value {
+            break;
+        }
+
+        if iterations == STAGE_7B_LOOP_VERIFICATION_CAP {
+            return Err(stage_9_loop_cap_error());
+        }
+
+        let body_evaluation =
+            evaluate_native_scoped_statements(&body.statements, &simulated_states)?;
+        simulated_states = body_evaluation.visible_states;
+
+        if body_evaluation.control == NativeSmokeLoopControl::Break {
+            break;
+        }
+
+        if let Some(condition) = &increment_exit_condition {
+            let values = native_state_values(&simulated_states);
+            let Some(exit_before_increment) = evaluate_native_condition(condition, &values) else {
+                return Err(BackendError::new(
+                    "backend validation failure: validated native for increment exit condition could not be re-evaluated",
+                ));
+            };
+            if exit_before_increment {
+                break;
+            }
+        }
+
+        if let Some(increment) = &increment {
+            evaluate_native_for_increment(increment, &mut simulated_states)?;
+        }
+
+        iterations += 1;
+    }
+
+    let mut carried_values = Vec::new();
+    for name in sorted_native_local_names(initial_loop_states) {
+        let Some(state) = simulated_states.get(&name) else {
+            return Err(BackendError::new(
+                "backend validation failure: validated native for carried local was not declared",
+            ));
+        };
+        carried_values.push((name, state.value.clone()));
+    }
+
+    let mut final_values = Vec::new();
+    for name in sorted_native_local_names(outer_states) {
+        let Some(state) = simulated_states.get(&name) else {
+            return Err(BackendError::new(
+                "backend validation failure: validated native for target was not declared",
+            ));
+        };
+        final_values.push((name, state.value.clone()));
+    }
+
+    Ok(NativeSmokeFor {
+        initializer,
+        condition,
+        increment,
+        increment_exit_condition,
+        body,
+        carried_values,
+        final_values,
+        evaluated_iterations: iterations,
+    })
+}
+
+fn evaluate_native_for_increment(
+    increment: &NativeSmokeAssign,
+    local_states: &mut HashMap<String, NativeSmokeLocalState>,
+) -> Result<(), BackendError> {
+    let values = native_state_values(local_states);
+    let Some(target) = local_states.get(&increment.target) else {
+        return Err(BackendError::new(
+            "backend validation failure: validated native for increment target was not declared",
+        ));
+    };
+    let Some(target_value) = target.value.as_int() else {
+        return Err(BackendError::new(
+            "backend validation failure: validated native for increment target was not an integer local",
+        ));
+    };
+    let evaluated_value =
+        evaluate_native_assignment_value(increment.op, target_value, &increment.expr, &values)?;
+    let Some(target) = local_states.get_mut(&increment.target) else {
+        return Err(BackendError::new(
+            "backend validation failure: validated native for increment target was not declared",
+        ));
+    };
+    target.value = NativeSmokeValue::Int(evaluated_value);
+    Ok(())
 }
 
 fn validate_stage_6c_while_body(
@@ -1035,6 +1764,26 @@ fn validate_stage_6c_while_scoped_body(
                 }
                 native_statements.push(NativeSmokeStmt::Assign(assignment));
             }
+            Stmt::Increment(increment) => {
+                let assignment = validate_stage_6c_loop_increment(increment, &block_states)?;
+                let Some(state) = block_states.get_mut(&assignment.target) else {
+                    return Err(BackendError::new(
+                        "backend validation failure: validated native while increment target was not declared",
+                    ));
+                };
+                state.value = NativeSmokeValue::Int(assignment.evaluated_value);
+                if visible_states.contains_key(&assignment.target)
+                    && !shadowed_locals.contains(&assignment.target)
+                {
+                    let Some(visible_state) = visible_states.get_mut(&assignment.target) else {
+                        return Err(BackendError::new(
+                            "backend validation failure: validated native visible while increment target was not declared",
+                        ));
+                    };
+                    visible_state.value = NativeSmokeValue::Int(assignment.evaluated_value);
+                }
+                native_statements.push(NativeSmokeStmt::Assign(assignment));
+            }
             Stmt::Echo { expr, .. } => {
                 native_statements.push(validate_stage_6c_echo(expr, &block_states)?);
             }
@@ -1083,7 +1832,7 @@ fn validate_stage_6c_loop_local(
     decl: &hir::VarDecl,
     local_states: &HashMap<String, NativeSmokeLocalState>,
 ) -> Result<NativeSmokeLocal, BackendError> {
-    if let Some(local) = validate_stage_8a_string_local(decl)? {
+    if let Some(local) = validate_stage_8_string_local(decl, local_states)? {
         return Ok(local);
     }
 
@@ -1134,7 +1883,7 @@ fn validate_stage_6c_loop_assignment(
 
     if target.value.as_int().is_none() {
         return Err(BackendError::new(
-            "unsupported native string assignment for Stage 8a: string assignments are future work",
+            "unsupported native string assignment for Stage 8: string assignments are future work",
         ));
     }
 
@@ -1442,6 +2191,11 @@ fn evaluate_native_scoped_statements(
                     "unsupported native while body statement for Stage 7b: nested while loops are future native work",
                 ));
             }
+            NativeSmokeStmt::For(_) => {
+                return Err(BackendError::new(
+                    "unsupported native loop body statement for Stage 9: nested for/range loops are future native work",
+                ));
+            }
             NativeSmokeStmt::Break => {
                 return Ok(NativeSmokeLoopEvaluation {
                     visible_states: next_visible_states,
@@ -1489,6 +2243,12 @@ fn evaluate_native_scoped_if(
 fn stage_6c_loop_cap_error() -> BackendError {
     BackendError::new(
         "unsupported native while loop for Stage 7b: loop could not be proven to terminate within the current native smoke verification cap",
+    )
+}
+
+fn stage_9_loop_cap_error() -> BackendError {
+    BackendError::new(
+        "unsupported native Stage 9 loop: loop could not be proven to terminate within the current native smoke verification cap",
     )
 }
 
@@ -2110,6 +2870,14 @@ fn lower_native_statement(
             evaluated_local_values,
         )
         .map(|()| NativeSmokeLoweringFlow::Fallthrough),
+        NativeSmokeStmt::For(native_for) => lower_native_for(
+            builder,
+            native_for,
+            resources,
+            lowered_local_values,
+            evaluated_local_values,
+        )
+        .map(|()| NativeSmokeLoweringFlow::Fallthrough),
         NativeSmokeStmt::If(native_if) => lower_native_fallthrough_if(
             builder,
             native_if,
@@ -2143,12 +2911,12 @@ fn lower_native_statement(
         NativeSmokeStmt::Continue => {
             let Some(loop_context) = loop_context else {
                 return Err(BackendError::new(
-                    "unsupported native continue for Stage 7b: expected enclosing while loop",
+                    "unsupported native continue for Stage 7b: expected enclosing loop",
                 ));
             };
             jump_to_native_carried_block(
                 builder,
-                loop_context.header_block,
+                loop_context.continue_block,
                 loop_context.carried_locals,
                 visible_local_values.unwrap_or(lowered_local_values),
             )?;
@@ -2338,6 +3106,11 @@ fn lower_native_fallthrough_block(
                         lowered_local_values,
                     )?;
                 }
+            }
+            NativeSmokeStmt::For(_) => {
+                return Err(BackendError::new(
+                    "unsupported native loop body statement for Stage 9: nested for/range loops are future native work",
+                ));
             }
             NativeSmokeStmt::Echo(_) => {
                 lower_native_statement(
@@ -2553,7 +3326,7 @@ fn lower_native_while(
     let mut body_local_values = header_local_values.clone();
     let mut body_evaluated_values = evaluated_local_values.clone();
     let loop_context = NativeSmokeLoopLoweringContext {
-        header_block: loop_header,
+        continue_block: loop_header,
         after_block: loop_after,
         carried_locals: &native_while.final_values,
     };
@@ -2602,6 +3375,243 @@ fn lower_native_while(
         }
     }
 
+    Ok(())
+}
+
+fn lower_native_for(
+    builder: &mut FunctionBuilder,
+    native_for: &NativeSmokeFor,
+    resources: &mut NativeSmokeLoweringResources<'_>,
+    lowered_local_values: &mut HashMap<String, Value>,
+    evaluated_local_values: &mut HashMap<String, i64>,
+) -> Result<(), BackendError> {
+    debug_assert!(native_for.evaluated_iterations <= STAGE_7B_LOOP_VERIFICATION_CAP);
+
+    if let Some(initializer) = &native_for.initializer {
+        lower_native_for_initializer(
+            builder,
+            initializer,
+            resources,
+            lowered_local_values,
+            evaluated_local_values,
+        )?;
+    }
+
+    let loop_header = builder.create_block();
+    let loop_body = builder.create_block();
+    let loop_increment = builder.create_block();
+    let loop_increment_apply = native_for
+        .increment_exit_condition
+        .as_ref()
+        .map(|_| builder.create_block());
+    let loop_after = builder.create_block();
+
+    for (_, value) in &native_for.carried_values {
+        if value.as_int().is_some() {
+            builder.append_block_param(loop_header, types::I64);
+            builder.append_block_param(loop_increment, types::I64);
+            builder.append_block_param(loop_after, types::I64);
+        }
+    }
+
+    let initial_args = native_for
+        .carried_values
+        .iter()
+        .filter(|(_, value)| value.as_int().is_some())
+        .map(|(name, _)| {
+            lowered_local_values
+                .get(name)
+                .copied()
+                .map(BlockArg::Value)
+                .ok_or_else(|| {
+                    BackendError::new(format!(
+                        "backend emission failure: validated native for carried local `{name}` was not lowered"
+                    ))
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    builder.ins().jump(loop_header, &initial_args);
+
+    builder.switch_to_block(loop_header);
+    let mut header_local_values = lowered_local_values.clone();
+    let mut param_index = 0;
+    for (name, value) in &native_for.carried_values {
+        if value.as_int().is_some() {
+            header_local_values
+                .insert(name.clone(), builder.block_params(loop_header)[param_index]);
+            param_index += 1;
+        }
+    }
+    let after_args = native_for
+        .carried_values
+        .iter()
+        .filter(|(_, value)| value.as_int().is_some())
+        .map(|(name, _)| {
+            header_local_values
+                .get(name)
+                .copied()
+                .map(BlockArg::Value)
+                .ok_or_else(|| {
+                    BackendError::new(format!(
+                        "backend emission failure: validated native for carried local `{name}` was not lowered"
+                    ))
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    lower_native_condition_branch_with_args(
+        builder,
+        &native_for.condition,
+        loop_body,
+        &[],
+        loop_after,
+        &after_args,
+        &header_local_values,
+    )?;
+
+    builder.switch_to_block(loop_body);
+    builder.seal_block(loop_body);
+    let mut body_local_values = header_local_values.clone();
+    let mut body_evaluated_values = evaluated_local_values.clone();
+    let loop_context = NativeSmokeLoopLoweringContext {
+        continue_block: loop_increment,
+        after_block: loop_after,
+        carried_locals: &native_for.carried_values,
+    };
+    let visible_body_values = lower_native_fallthrough_block(
+        builder,
+        &native_for.body,
+        resources,
+        &mut body_local_values,
+        &mut body_evaluated_values,
+        &header_local_values,
+        Some(&loop_context),
+    )?;
+    if let Some(visible_body_values) = visible_body_values {
+        jump_to_native_carried_block(
+            builder,
+            loop_increment,
+            &native_for.carried_values,
+            &visible_body_values,
+        )?;
+    }
+
+    builder.switch_to_block(loop_increment);
+    builder.seal_block(loop_increment);
+    let mut increment_local_values = lowered_local_values.clone();
+    let mut param_index = 0;
+    for (name, value) in &native_for.carried_values {
+        if value.as_int().is_some() {
+            increment_local_values.insert(
+                name.clone(),
+                builder.block_params(loop_increment)[param_index],
+            );
+            param_index += 1;
+        }
+    }
+    if let Some(condition) = &native_for.increment_exit_condition {
+        let Some(loop_increment_apply) = loop_increment_apply else {
+            return Err(BackendError::new(
+                "backend emission failure: validated native for increment guard block was not created",
+            ));
+        };
+        let after_args = native_for
+            .carried_values
+            .iter()
+            .filter(|(_, value)| value.as_int().is_some())
+            .map(|(name, _)| {
+                increment_local_values
+                    .get(name)
+                    .copied()
+                    .map(BlockArg::Value)
+                    .ok_or_else(|| {
+                        BackendError::new(format!(
+                            "backend emission failure: validated native for carried local `{name}` was not lowered"
+                        ))
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        lower_native_condition_branch_with_args(
+            builder,
+            condition,
+            loop_after,
+            &after_args,
+            loop_increment_apply,
+            &[],
+            &increment_local_values,
+        )?;
+        builder.switch_to_block(loop_increment_apply);
+        builder.seal_block(loop_increment_apply);
+    }
+    if let Some(increment) = &native_for.increment {
+        let value = lower_native_assignment(builder, increment, &increment_local_values)?;
+        increment_local_values.insert(increment.target.clone(), value);
+    }
+    jump_to_native_carried_block(
+        builder,
+        loop_header,
+        &native_for.carried_values,
+        &increment_local_values,
+    )?;
+    builder.seal_block(loop_header);
+
+    builder.switch_to_block(loop_after);
+    builder.seal_block(loop_after);
+    let mut param_index = 0;
+    let final_names = native_for
+        .final_values
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .collect::<HashSet<_>>();
+    for (name, value) in &native_for.carried_values {
+        if value.as_int().is_some() {
+            if final_names.contains(name.as_str()) {
+                lowered_local_values
+                    .insert(name.clone(), builder.block_params(loop_after)[param_index]);
+            } else {
+                lowered_local_values.remove(name);
+            }
+            param_index += 1;
+        } else {
+            lowered_local_values.remove(name);
+        }
+    }
+    for (name, value) in &native_for.final_values {
+        if let Some(value) = value.as_int() {
+            evaluated_local_values.insert(name.clone(), value);
+        } else {
+            lowered_local_values.remove(name);
+            evaluated_local_values.remove(name);
+        }
+    }
+
+    Ok(())
+}
+
+fn lower_native_for_initializer(
+    builder: &mut FunctionBuilder,
+    initializer: &NativeSmokeForInitializer,
+    resources: &mut NativeSmokeLoweringResources<'_>,
+    lowered_local_values: &mut HashMap<String, Value>,
+    evaluated_local_values: &mut HashMap<String, i64>,
+) -> Result<(), BackendError> {
+    match initializer {
+        NativeSmokeForInitializer::Local(local) => {
+            lower_native_statement(
+                builder,
+                &NativeSmokeStmt::Local(local.clone()),
+                resources,
+                lowered_local_values,
+                evaluated_local_values,
+                None,
+                None,
+            )?;
+        }
+        NativeSmokeForInitializer::Assign(assignment) => {
+            let value = lower_native_assignment(builder, assignment, lowered_local_values)?;
+            lowered_local_values.insert(assignment.target.clone(), value);
+            evaluated_local_values.insert(assignment.target.clone(), assignment.evaluated_value);
+        }
+    }
     Ok(())
 }
 
@@ -3150,9 +4160,11 @@ fn describe_statement(statement: &Stmt) -> &'static str {
         Stmt::Return { .. } => "return statement",
         Stmt::If(_) => "if statement",
         Stmt::While(_) => "while statement",
+        Stmt::For(_) => "for statement",
         Stmt::Break { .. } => "break statement",
         Stmt::Continue { .. } => "continue statement",
         Stmt::Foreach(_) => "foreach statement",
+        Stmt::Increment(_) => "increment statement",
         Stmt::Expr { .. } => "expression statement",
     }
 }
@@ -3177,6 +4189,7 @@ fn describe_expression(expr: &Expr) -> &'static str {
         Expr::Grouped { .. } => "grouped expression",
         Expr::Unary { .. } => "unary expression",
         Expr::Binary { .. } => "binary expression",
+        Expr::Range { .. } => "range expression",
     }
 }
 

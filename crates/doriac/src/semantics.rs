@@ -653,41 +653,7 @@ impl<'program> Checker<'program> {
                     method_context,
                     constructor_init_context,
                 ) {
-                    match assignment.op {
-                        AssignOp::Assign => {
-                            let target_ty = target.ty;
-                            let assignment_ok = self.check_expr_assignable(
-                                target.ty,
-                                &assignment.value,
-                                scopes,
-                                method_context,
-                                target.destination,
-                            );
-                            if assignment_ok {
-                                let value_ty =
-                                    self.infer_expr_type(&assignment.value, scopes, method_context);
-                                self.narrow_empty_collection_assignment(
-                                    &assignment.target,
-                                    target_ty,
-                                    value_ty,
-                                    scopes,
-                                );
-                            }
-                        }
-                        AssignOp::AddAssign | AssignOp::SubAssign => {
-                            let value_ty =
-                                self.infer_expr_type(&assignment.value, scopes, method_context);
-                            let result_ty = self.infer_numeric_binary_type(target.ty, value_ty);
-                            if !self.is_assignable(target.ty, result_ty) {
-                                self.check_assignable(
-                                    target.ty,
-                                    result_ty,
-                                    assignment.value.span(),
-                                    target.destination,
-                                );
-                            }
-                        }
-                    }
+                    self.check_assignment_value(assignment, target, scopes, method_context);
                 }
             }
             Stmt::Echo { expr, .. } | Stmt::Expr { expr, .. } => {
@@ -740,6 +706,30 @@ impl<'program> Checker<'program> {
                     loop_depth + 1,
                 );
             }
+            Stmt::For(for_stmt) => {
+                scopes.push();
+                if let Some(initializer) = &for_stmt.initializer {
+                    self.check_for_initializer(initializer, scopes, method_context, None);
+                }
+                if let Some(condition) = &for_stmt.condition {
+                    self.check_condition(condition, scopes, method_context);
+                }
+                let mut loop_constructor_init_context = constructor_init_context
+                    .as_deref()
+                    .map(ConstructorInitContext::without_readonly_init);
+                self.check_block(
+                    &for_stmt.body,
+                    scopes,
+                    method_context,
+                    loop_constructor_init_context.as_mut(),
+                    return_context,
+                    loop_depth + 1,
+                );
+                if let Some(increment) = &for_stmt.increment {
+                    self.check_for_increment(increment, scopes, method_context);
+                }
+                scopes.pop();
+            }
             Stmt::Break { span } => {
                 if loop_depth == 0 {
                     self.diagnostics.push(Diagnostic::new(
@@ -759,14 +749,32 @@ impl<'program> Checker<'program> {
                 }
             }
             Stmt::Foreach(foreach) => {
-                self.check_expr(&foreach.iterable, scopes, method_context);
+                let range_iterable = Self::is_grouped_range_expr(&foreach.iterable);
+                if range_iterable {
+                    self.check_expr_with_range_context(
+                        &foreach.iterable,
+                        scopes,
+                        method_context,
+                        true,
+                    );
+                } else {
+                    self.check_expr(&foreach.iterable, scopes, method_context);
+                }
                 scopes.push();
                 if let Some(key) = &foreach.key {
-                    let ty = key
-                        .ty
-                        .as_ref()
-                        .map(|ty| self.resolve_type_ref(ty, foreach.span))
-                        .unwrap_or_else(|| self.types.unknown());
+                    let ty = if range_iterable {
+                        self.diagnostics.push(Diagnostic::new(
+                            "E0425",
+                            "foreach over integer ranges does not support key bindings",
+                            foreach.span,
+                        ));
+                        self.types.unknown()
+                    } else {
+                        key.ty
+                            .as_ref()
+                            .map(|ty| self.resolve_type_ref(ty, foreach.span))
+                            .unwrap_or_else(|| self.types.unknown())
+                    };
                     self.declare_binding(
                         scopes,
                         key.name.clone(),
@@ -778,12 +786,28 @@ impl<'program> Checker<'program> {
                         foreach.span,
                     );
                 }
-                let value_ty = foreach
-                    .value
-                    .ty
-                    .as_ref()
-                    .map(|ty| self.resolve_type_ref(ty, foreach.span))
-                    .unwrap_or_else(|| self.types.unknown());
+                let value_ty = if range_iterable {
+                    let int_ty = self.types.intern(TypeKind::Int);
+                    if let Some(annotation) = &foreach.value.ty {
+                        let annotated_ty = self.resolve_type_ref(annotation, foreach.span);
+                        if !self.is_assignable(annotated_ty, int_ty) {
+                            self.check_assignable(
+                                annotated_ty,
+                                int_ty,
+                                foreach.span,
+                                AssignmentDestination::Type,
+                            );
+                        }
+                    }
+                    int_ty
+                } else {
+                    foreach
+                        .value
+                        .ty
+                        .as_ref()
+                        .map(|ty| self.resolve_type_ref(ty, foreach.span))
+                        .unwrap_or_else(|| self.types.unknown())
+                };
                 self.declare_binding(
                     scopes,
                     foreach.value.name.clone(),
@@ -809,6 +833,206 @@ impl<'program> Checker<'program> {
                 }
                 scopes.pop();
             }
+            Stmt::Increment(increment) => {
+                self.check_increment_statement(increment, scopes, method_context);
+            }
+        }
+    }
+
+    fn check_for_initializer(
+        &mut self,
+        initializer: &ForInitializer,
+        scopes: &mut ScopeStack,
+        method_context: Option<&MethodContext>,
+        constructor_init_context: Option<&mut ConstructorInitContext>,
+    ) {
+        match initializer {
+            ForInitializer::VarDecl(decl) => {
+                self.check_expr(&decl.initializer, scopes, method_context);
+                let value_ty = self.infer_expr_type(&decl.initializer, scopes, method_context);
+                let ty = match &decl.ty {
+                    Some(ty) => {
+                        let target_ty = self.resolve_type_ref(ty, decl.span);
+                        self.check_expr_assignable(
+                            target_ty,
+                            &decl.initializer,
+                            scopes,
+                            method_context,
+                            AssignmentDestination::Type,
+                        );
+                        target_ty
+                    }
+                    None => value_ty,
+                };
+                self.declare_binding(
+                    scopes,
+                    decl.name.clone(),
+                    Binding {
+                        writable: decl.writable,
+                        ty,
+                        int_constant: self.readonly_int_constant(
+                            decl.writable,
+                            ty,
+                            &decl.initializer,
+                            scopes,
+                        ),
+                    },
+                    decl.span,
+                );
+            }
+            ForInitializer::Assignment(assignment) => {
+                self.check_expr(&assignment.value, scopes, method_context);
+                if let Some(target) = self.check_assignment_target(
+                    &assignment.target,
+                    &assignment.op,
+                    scopes,
+                    method_context,
+                    constructor_init_context,
+                ) {
+                    self.check_assignment_value(assignment, target, scopes, method_context);
+                }
+            }
+        }
+    }
+
+    fn check_for_increment(
+        &mut self,
+        increment: &ForIncrement,
+        scopes: &mut ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) {
+        match increment {
+            ForIncrement::Increment(increment) => {
+                self.check_increment_statement(increment, scopes, method_context);
+            }
+            ForIncrement::Assignment(assignment) => {
+                self.check_expr(&assignment.value, scopes, method_context);
+                if let Some(target) = self.check_assignment_target(
+                    &assignment.target,
+                    &assignment.op,
+                    scopes,
+                    method_context,
+                    None,
+                ) {
+                    self.check_assignment_value(assignment, target, scopes, method_context);
+                }
+            }
+        }
+    }
+    fn check_assignment_value(
+        &mut self,
+        assignment: &Assignment,
+        target: AssignmentTarget,
+        scopes: &mut ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) {
+        match assignment.op {
+            AssignOp::Assign => {
+                let target_ty = target.ty;
+                let assignment_ok = self.check_expr_assignable(
+                    target.ty,
+                    &assignment.value,
+                    scopes,
+                    method_context,
+                    target.destination,
+                );
+                if assignment_ok {
+                    let value_ty = self.infer_expr_type(&assignment.value, scopes, method_context);
+                    self.narrow_empty_collection_assignment(
+                        &assignment.target,
+                        target_ty,
+                        value_ty,
+                        scopes,
+                    );
+                }
+            }
+            AssignOp::AddAssign | AssignOp::SubAssign => {
+                let value_ty = self.infer_expr_type(&assignment.value, scopes, method_context);
+                let result_ty = self.infer_numeric_binary_type(target.ty, value_ty);
+                if !self.is_assignable(target.ty, result_ty) {
+                    self.check_assignable(
+                        target.ty,
+                        result_ty,
+                        assignment.value.span(),
+                        target.destination,
+                    );
+                }
+            }
+        }
+    }
+
+    fn check_increment_statement(
+        &mut self,
+        increment: &IncrementStmt,
+        scopes: &ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) {
+        self.check_increment_target(
+            &increment.target,
+            Self::increment_operator_name(&increment.op),
+            scopes,
+            method_context,
+        );
+    }
+
+    fn check_increment_target(
+        &mut self,
+        target: &Expr,
+        op_name: &'static str,
+        scopes: &ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) {
+        match target {
+            Expr::Grouped { expr, .. } => {
+                self.check_increment_target(expr, op_name, scopes, method_context);
+            }
+            Expr::Variable { name, span } => {
+                let Some(binding) = scopes.lookup(name) else {
+                    self.undeclared_variable(name, *span);
+                    return;
+                };
+
+                if !binding.writable {
+                    self.diagnostics.push(
+                        Diagnostic::new(
+                            "E0201",
+                            format!("cannot increment readonly local `${name}`"),
+                            *span,
+                        )
+                        .with_help(format!(
+                            "declare it as `let writable ${name} = ...` if mutation is intended"
+                        )),
+                    );
+                }
+
+                if matches!(
+                    self.types.kind(binding.ty),
+                    TypeKind::Int | TypeKind::Mixed | TypeKind::Unknown
+                ) {
+                    return;
+                }
+
+                self.diagnostics.push(Diagnostic::new(
+                    "E0423",
+                    format!("{op_name} requires writable int target"),
+                    *span,
+                ));
+            }
+            _ => {
+                self.check_expr(target, scopes, method_context);
+                self.diagnostics.push(Diagnostic::new(
+                    "E0204",
+                    "unsupported increment target",
+                    target.span(),
+                ));
+            }
+        }
+    }
+
+    fn increment_operator_name(op: &IncrementOp) -> &'static str {
+        match op {
+            IncrementOp::Increment => "++",
+            IncrementOp::Decrement => "--",
         }
     }
 
@@ -1047,6 +1271,16 @@ impl<'program> Checker<'program> {
         scopes: &ScopeStack,
         method_context: Option<&MethodContext>,
     ) {
+        self.check_expr_with_range_context(expr, scopes, method_context, false);
+    }
+
+    fn check_expr_with_range_context(
+        &mut self,
+        expr: &Expr,
+        scopes: &ScopeStack,
+        method_context: Option<&MethodContext>,
+        allow_range_expr: bool,
+    ) {
         match expr {
             Expr::Variable { name, span } => {
                 if scopes.lookup(name).is_none() {
@@ -1133,7 +1367,9 @@ impl<'program> Checker<'program> {
                     self.check_constructor_call(class_name, args, *span, scopes, method_context);
                 }
             }
-            Expr::Grouped { expr, .. } => self.check_expr(expr, scopes, method_context),
+            Expr::Grouped { expr, .. } => {
+                self.check_expr_with_range_context(expr, scopes, method_context, allow_range_expr)
+            }
             Expr::Unary { op, expr, .. } => {
                 self.check_expr(expr, scopes, method_context);
                 self.check_unary_operand(op, expr, scopes, method_context);
@@ -1149,6 +1385,21 @@ impl<'program> Checker<'program> {
                 self.check_int_constant_arithmetic(left, op, right, *span, scopes);
                 self.check_binary_operands(left, op, right, *span, scopes, method_context);
             }
+            Expr::Range {
+                start, end, span, ..
+            } => {
+                self.check_expr(start, scopes, method_context);
+                self.check_expr(end, scopes, method_context);
+                self.check_range_endpoint_type(start, scopes, method_context);
+                self.check_range_endpoint_type(end, scopes, method_context);
+                if !allow_range_expr {
+                    self.diagnostics.push(Diagnostic::new(
+                        "E0426",
+                        "range expressions are only supported as foreach iterables",
+                        *span,
+                    ));
+                }
+            }
             Expr::Identifier { .. }
             | Expr::String { .. }
             | Expr::Float { .. }
@@ -1156,6 +1407,35 @@ impl<'program> Checker<'program> {
             | Expr::Null { .. } => {}
             Expr::Int { value, span } => self.check_int_literal_range(value, *span),
         }
+    }
+
+    fn is_grouped_range_expr(expr: &Expr) -> bool {
+        match expr {
+            Expr::Grouped { expr, .. } => Self::is_grouped_range_expr(expr),
+            Expr::Range { .. } => true,
+            _ => false,
+        }
+    }
+
+    fn check_range_endpoint_type(
+        &mut self,
+        expr: &Expr,
+        scopes: &ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) {
+        let ty = self.infer_expr_type(expr, scopes, method_context);
+        if matches!(
+            self.types.kind(ty),
+            TypeKind::Int | TypeKind::Mixed | TypeKind::Unknown
+        ) {
+            return;
+        }
+
+        self.diagnostics.push(Diagnostic::new(
+            "E0424",
+            "range endpoints must be int",
+            expr.span(),
+        ));
     }
 
     fn check_int_literal_range(&mut self, value: &str, span: Span) {
@@ -1209,6 +1489,9 @@ impl<'program> Checker<'program> {
             }
             BinaryOp::Equal | BinaryOp::NotEqual => {
                 self.check_equality_operands(left, right, span, scopes, method_context);
+            }
+            BinaryOp::Concat => {
+                self.check_concat_operands(left, right, span, scopes, method_context);
             }
             _ => {}
         }
@@ -1266,10 +1549,42 @@ impl<'program> Checker<'program> {
         ));
     }
 
+    fn check_concat_operands(
+        &mut self,
+        left: &Expr,
+        right: &Expr,
+        span: Span,
+        scopes: &ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) {
+        let left_ty = self.infer_expr_type(left, scopes, method_context);
+        let right_ty = self.infer_expr_type(right, scopes, method_context);
+        if self.is_string_or_recovery_type(left_ty) && self.is_string_or_recovery_type(right_ty) {
+            return;
+        }
+
+        self.diagnostics.push(Diagnostic::new(
+            "E0425",
+            format!(
+                "string concatenation operator `.` requires `string` operands, got `{}` and `{}`",
+                self.types.display(left_ty),
+                self.types.display(right_ty)
+            ),
+            span,
+        ));
+    }
+
     fn is_bool_or_recovery_type(&self, ty: TypeId) -> bool {
         matches!(
             self.types.kind(ty),
             TypeKind::Bool | TypeKind::Mixed | TypeKind::Unknown
+        )
+    }
+
+    fn is_string_or_recovery_type(&self, ty: TypeId) -> bool {
+        matches!(
+            self.types.kind(ty),
+            TypeKind::String | TypeKind::Mixed | TypeKind::Unknown
         )
     }
 
@@ -2360,6 +2675,7 @@ impl<'program> Checker<'program> {
             Expr::Binary {
                 left, op, right, ..
             } => self.infer_binary_type(left, op, right, scopes, method_context),
+            Expr::Range { .. } => self.types.unknown(),
             _ => self.types.unknown(),
         }
     }

@@ -94,4 +94,4 @@ This decision does not add:
 
 Unsupported backend coverage must continue to produce clear unsupported-feature diagnostics rather than pretending valid Doria is invalid.
 
-Stage 8a later extends this Stage 7b boundary with readonly string locals initialized from string literals and supported string `echo` expressions. See `docs/decisions/0033-stage-8a-native-readonly-string-locals-and-echo.md` for the current native string-local slice.
+Stage 8a later extends this Stage 7b boundary with readonly string locals initialized from string literals and supported string `echo` expressions. Stage 8 completes that MVP path with compile-time-known `.` concatenation in supported readonly string locals and `echo` expressions. See `docs/decisions/0033-stage-8a-native-readonly-string-locals-and-echo.md` and `docs/decisions/0036-stage-8-mvp-string-echo-path.md`.

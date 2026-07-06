@@ -408,6 +408,77 @@ fn compiles_and_runs_current_native_smoke_examples() {
             "inline_main_while_continue_then_unreachable_assignment_42.doria",
             42,
         ),
+        ("main_for_42", "examples/native/main_for_42.doria", 42),
+        (
+            "main_for_pre_increment_42",
+            "inline_main_for_pre_increment_42.doria",
+            42,
+        ),
+        (
+            "main_for_decrement_42",
+            "inline_main_for_decrement_42.doria",
+            42,
+        ),
+        (
+            "main_increment_statement_1",
+            "inline_main_increment_statement_1.doria",
+            1,
+        ),
+        (
+            "main_decrement_statement_1",
+            "inline_main_decrement_statement_1.doria",
+            1,
+        ),
+        (
+            "main_for_body_increment_3",
+            "inline_main_for_body_increment_3.doria",
+            3,
+        ),
+        (
+            "main_for_initializer_shadow_preserves_outer_5",
+            "inline_main_for_initializer_shadow_preserves_outer_5.doria",
+            5,
+        ),
+        (
+            "main_foreach_range_45",
+            "examples/native/main_foreach_range_45.doria",
+            45,
+        ),
+        (
+            "main_foreach_range_55",
+            "examples/native/main_foreach_range_55.doria",
+            55,
+        ),
+        (
+            "main_foreach_grouped_range_3",
+            "inline_main_foreach_grouped_range_3.doria",
+            3,
+        ),
+        (
+            "main_foreach_range_break_42",
+            "inline_main_foreach_range_break_42.doria",
+            42,
+        ),
+        (
+            "main_foreach_range_continue_42",
+            "inline_main_foreach_range_continue_42.doria",
+            42,
+        ),
+        (
+            "main_foreach_range_i64_max_single_42",
+            "inline_main_foreach_range_i64_max_single_42.doria",
+            42,
+        ),
+        (
+            "main_foreach_range_i64_max_continue_42",
+            "inline_main_foreach_range_i64_max_continue_42.doria",
+            42,
+        ),
+        (
+            "main_foreach_range_shadow_preserves_outer_5",
+            "inline_main_foreach_range_shadow_preserves_outer_5.doria",
+            5,
+        ),
     ];
 
     for (stem, source, expected_code) in cases {
@@ -419,10 +490,8 @@ fn compiles_and_runs_current_native_smoke_examples() {
             compile_native_source(native_smoke_source(stem), &output);
         }
 
-        let run = Command::new(&output)
-            .status()
-            .expect("native executable should run");
-        assert_eq!(run.code(), Some(expected_code), "{stem}");
+        let run = run_native_executable(&output).expect("native executable should run");
+        assert_eq!(run.status.code(), Some(expected_code), "{stem}");
 
         let _ = fs::remove_file(output);
     }
@@ -459,6 +528,18 @@ fn compiles_and_runs_void_main_string_literal_echo() {
     );
     let _ = fs::remove_file(string_local_output);
 
+    let string_concat_output = temp_executable_path("main_string_concat_hello");
+    compile_native_file(
+        &workspace.join("examples/native/main_string_concat_hello.doria"),
+        &string_concat_output,
+    );
+    assert_native_run_output(
+        &string_concat_output,
+        "main_string_concat_hello",
+        b"Hello Doria!",
+    );
+    let _ = fs::remove_file(string_concat_output);
+
     for (stem, expected_stdout) in [
         ("main_void_multiple_echo", b"Hello Doria!".as_slice()),
         ("main_void_empty_echo", b"".as_slice()),
@@ -476,6 +557,22 @@ fn compiles_and_runs_void_main_string_literal_echo() {
         ),
         (
             "main_void_grouped_string_local_echo",
+            b"Hello Doria!".as_slice(),
+        ),
+        (
+            "main_void_direct_string_concat_echo",
+            b"Hello Doria!".as_slice(),
+        ),
+        (
+            "main_void_string_local_concat_initializer_echo",
+            b"Hello Doria!".as_slice(),
+        ),
+        (
+            "main_void_string_concat_locals_echo",
+            b"Hello Doria!".as_slice(),
+        ),
+        (
+            "main_void_string_local_after_guard_echo",
             b"Hello Doria!".as_slice(),
         ),
         ("main_void_string_local_guard_skip", b"".as_slice()),
@@ -594,6 +691,49 @@ function main(): void
 {
     let $message = ("Hello Doria!");
     echo ($message);
+}
+"#
+        }
+        "main_void_direct_string_concat_echo" => {
+            r#"
+function main(): void
+{
+    let $name = "Doria";
+    echo "Hello " . $name . "!";
+}
+"#
+        }
+        "main_void_string_local_concat_initializer_echo" => {
+            r#"
+function main(): void
+{
+    let $name = "Doria";
+    let $message = "Hello " . $name . "!";
+    echo $message;
+}
+"#
+        }
+        "main_void_string_concat_locals_echo" => {
+            r#"
+function main(): void
+{
+    let $hello = "Hello ";
+    let $name = "Doria";
+    let $punctuation = "!";
+    echo $hello . $name . $punctuation;
+}
+"#
+        }
+        "main_void_string_local_after_guard_echo" => {
+            r#"
+function main(): void
+{
+    if (false) {
+        return;
+    }
+
+    let $message = "Hello Doria!";
+    echo $message;
 }
 "#
         }
@@ -1689,6 +1829,178 @@ function main(): int
 }
 "#
         }
+        "main_for_pre_increment_42" => {
+            r#"
+function main(): int
+{
+    let writable $sum = 0;
+
+    for (let writable $i = 0; $i < 42; ++$i) {
+        $sum += 1;
+    }
+
+    return $sum;
+}
+"#
+        }
+        "main_for_decrement_42" => {
+            r#"
+function main(): int
+{
+    let writable $sum = 0;
+
+    for (let writable $i = 42; $i > 0; $i--) {
+        $sum += 1;
+    }
+
+    return $sum;
+}
+"#
+        }
+        "main_foreach_range_break_42" => {
+            r#"
+function main(): int
+{
+    let writable $sum = 0;
+
+    foreach (0..100 as $i) {
+        if ($i == 42) {
+            break;
+        }
+
+        $sum += 1;
+    }
+
+    return $sum;
+}
+"#
+        }
+        "main_foreach_grouped_range_3" => {
+            r#"
+function main(): int
+{
+    let writable $sum = 0;
+
+    foreach ((0..2) as $i) {
+        $sum += 1;
+    }
+
+    return $sum;
+}
+"#
+        }
+        "main_increment_statement_1" => {
+            r#"
+function main(): int
+{
+    let writable $i = 0;
+    $i++;
+
+    return $i;
+}
+"#
+        }
+        "main_decrement_statement_1" => {
+            r#"
+function main(): int
+{
+    let writable $i = 2;
+    --$i;
+
+    return $i;
+}
+"#
+        }
+        "main_for_body_increment_3" => {
+            r#"
+function main(): int
+{
+    let writable $sum = 0;
+
+    for (let writable $i = 0; $i < 3; $i++) {
+        $sum++;
+    }
+
+    return $sum;
+}
+"#
+        }
+        "main_foreach_range_continue_42" => {
+            r#"
+function main(): int
+{
+    let writable $sum = 0;
+
+    foreach (0..10 as $i) {
+        if ($i < 10) {
+            continue;
+        }
+
+        $sum = 42;
+    }
+
+    return $sum;
+}
+"#
+        }
+        "main_foreach_range_shadow_preserves_outer_5" => {
+            r#"
+function main(): int
+{
+    let writable $i = 5;
+
+    foreach (0..1 as $i) {
+    }
+
+    return $i;
+}
+"#
+        }
+        "main_foreach_range_i64_max_single_42" => {
+            r#"
+function main(): int
+{
+    let writable $sum = 0;
+
+    foreach (9223372036854775807..9223372036854775807 as $i) {
+        $sum = 42;
+    }
+
+    return $sum;
+}
+"#
+        }
+        "main_foreach_range_i64_max_continue_42" => {
+            r#"
+function main(): int
+{
+    let writable $sum = 42;
+
+    foreach (9223372036854775807..9223372036854775807 as $i) {
+        if ($i == 9223372036854775807) {
+            continue;
+        }
+
+        $sum = 0;
+    }
+
+    return $sum;
+}
+"#
+        }
+        "main_for_initializer_shadow_preserves_outer_5" => {
+            r#"
+function main(): int
+{
+    let writable $i = 5;
+
+    for (let writable $i = 0; $i < 2; $i++) {
+    }
+
+    return $i;
+}
+"#
+        }
         _ => unreachable!("unexpected inline native smoke source `{stem}`"),
     }
 }
@@ -1762,6 +2074,40 @@ function main(): int
 "#,
             "E0404",
             "cannot return value of type `bool`",
+        ),
+        (
+            "unproven for loop",
+            r#"
+function main(): int
+{
+    let writable $sum = 0;
+
+    for (let writable $i = 0; true; $i++) {
+        $sum += 1;
+    }
+
+    return $sum;
+}
+"#,
+            "B0001",
+            "loop could not be proven to terminate",
+        ),
+        (
+            "foreach range exceeds smoke cap",
+            r#"
+function main(): int
+{
+    let writable $sum = 0;
+
+    foreach (0..10001 as $i) {
+        $sum += 0;
+    }
+
+    return 0;
+}
+"#,
+            "B0001",
+            "loop could not be proven to terminate",
         ),
         (
             "return undeclared variable",
@@ -2598,7 +2944,7 @@ function main(): int
 }
 "#,
             "B0001",
-            "unsupported native echo expression for Stage 8a",
+            "unsupported native echo expression for Stage 8",
         ),
         (
             "int local echo",
@@ -2611,7 +2957,19 @@ function main(): int
 }
 "#,
             "B0001",
-            "unsupported native echo expression for Stage 8a",
+            "unsupported native echo expression for Stage 8",
+        ),
+        (
+            "string concat int operand",
+            r#"
+function main(): void
+{
+    let $message = "Count: " . 42;
+    echo $message;
+}
+"#,
+            "E0425",
+            "string concatenation operator `.` requires `string` operands",
         ),
         (
             "writable string local",
@@ -2623,7 +2981,7 @@ function main(): void
 }
 "#,
             "B0001",
-            "unsupported native string local for Stage 8a",
+            "unsupported native string local for Stage 8",
         ),
         (
             "explicit writable string local",
@@ -2635,7 +2993,7 @@ function main(): void
 }
 "#,
             "B0001",
-            "unsupported native string local for Stage 8a",
+            "unsupported native string local for Stage 8",
         ),
         (
             "string assignment",
@@ -2660,7 +3018,7 @@ function main(): void
 }
 "#,
             "B0001",
-            "unsupported native string interpolation for Stage 8a",
+            "unsupported native string interpolation for Stage 8",
         ),
         (
             "top-level statement",

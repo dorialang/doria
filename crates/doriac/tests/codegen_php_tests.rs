@@ -122,6 +122,43 @@ function main(): void
 }
 
 #[test]
+fn php_backend_preserves_main_string_concat_echo() {
+    let php = doriac::compile_source_to_php(
+        "test.doria",
+        r#"
+function main(): void
+{
+    let $name = "Doria";
+    echo "Hello " . $name . "!";
+}
+"#,
+    )
+    .expect("compilation should succeed");
+
+    assert!(php.contains("$name = \"Doria\";"));
+    assert!(php.contains("echo \"Hello \" . $name . \"!\";"));
+}
+
+#[test]
+fn php_backend_preserves_main_string_concat_local_initializer() {
+    let php = doriac::compile_source_to_php(
+        "test.doria",
+        r#"
+function main(): void
+{
+    let $name = "Doria";
+    let $message = "Hello " . $name . "!";
+    echo $message;
+}
+"#,
+    )
+    .expect("compilation should succeed");
+
+    assert!(php.contains("$message = \"Hello \" . $name . \"!\";"));
+    assert!(php.contains("echo $message;"));
+}
+
+#[test]
 fn lowers_checked_program_to_hir() {
     let lowered = doriac::lower_source(
         "test.doria",
@@ -255,6 +292,92 @@ function main(): void
 
     assert!(php.contains("continue;"));
     assert!(php.contains("break;"));
+}
+
+#[test]
+fn emits_php_for_stage_9_iteration() {
+    let php = doriac::compile_source_to_php(
+        "test.doria",
+        r#"
+function main(): void
+{
+    for (let writable $i = 0; $i < 10; $i++) {
+        echo "x";
+    }
+
+    foreach (0..<10 as $i) {
+        echo "x";
+    }
+
+    foreach (0..10 as $i) {
+        echo "x";
+    }
+
+    foreach ((0..2) as $k) {
+        echo "x";
+    }
+
+    let writable $j = 0;
+    ++$j;
+    $j--;
+}
+"#,
+    )
+    .expect("compilation should succeed");
+
+    assert!(php.contains("for ($i = 0; $i < 10; $i++)"));
+    assert!(php.contains("__doria_range_start"));
+    assert!(php.contains("; $i__doria"));
+    assert!(php.contains(" < $__doria_range_end"));
+    assert!(php.contains(" <= $__doria_range_end"));
+    assert!(php.matches("__doria_range_start").count() >= 3);
+    assert!(!php.contains("unsupported range expression"));
+    assert!(php.contains("++$j;"));
+    assert!(php.contains("$j--;"));
+}
+
+#[test]
+fn guards_inclusive_php_ranges_before_terminal_increment() {
+    let php = doriac::compile_source_to_php(
+        "test.doria",
+        r#"
+function main(): void
+{
+    foreach (9223372036854775807..9223372036854775807 as $i) {
+        echo "x";
+    }
+}
+"#,
+    )
+    .expect("compilation should succeed");
+
+    assert!(php.contains("$__doria_range_done"));
+    assert!(php.contains("= false;"));
+    assert!(php.contains("!$__doria_range_done"));
+    assert!(php.contains("&& $i <= $__doria_range_end"));
+    assert!(php.contains("$i < $__doria_range_end"));
+    assert!(php.contains("? $i++ : ($__doria_range_done"));
+    assert!(php.contains("= true)"));
+    assert!(!php.contains("; $i++)"));
+}
+
+#[test]
+fn rejects_standalone_range_before_php_codegen() {
+    let err = doriac::compile_source_to_php(
+        "test.doria",
+        r#"
+function main(): void
+{
+    let $range = 0..10;
+}
+"#,
+    )
+    .expect_err("semantic checking should reject standalone ranges before PHP codegen");
+
+    assert!(
+        err.iter().any(|diagnostic| diagnostic.code == "E0426"),
+        "expected E0426, got {err:?}"
+    );
 }
 
 #[test]

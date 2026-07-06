@@ -220,6 +220,8 @@ fn infers_binary_expression_types_for_assignment_compatibility() {
 int $sum = 1 + 2;
 float $total = 1.5 + 2.5;
 string $message = "hello" . " world";
+let $concatName = "Doria";
+let $greeting = "Hello " . $concatName . "!";
 bool $less = 1 < 2;
 bool $floatLess = 1.5 <= 2.5;
 bool $stringLess = "a" < "b";
@@ -234,6 +236,8 @@ string $name = null ?? "Andrew";
 "#,
     )
     .expect("semantic check should succeed");
+
+    assert_diagnostic_code(r#"let $message = "Count: " . 42;"#, "E0425");
 
     for source in [
         r#"string $value = 1 + 2;"#,
@@ -1459,6 +1463,180 @@ function main(): int
 "#,
     )
     .expect("semantic check should accept loop control inside loops");
+}
+
+#[test]
+fn checks_stage_9_increment_and_for_semantics() {
+    doriac::check_source(
+        "test.doria",
+        r#"
+function main(): void
+{
+    let writable $i = 0;
+    $i++;
+    ++$i;
+    $i--;
+    --$i;
+
+    for (let writable $j = 0; $j < 10; $j++) {
+    }
+
+    for (; $i < 10; ++$i) {
+        continue;
+    }
+}
+"#,
+    )
+    .expect("semantic check should succeed");
+}
+
+#[test]
+fn rejects_invalid_stage_9_increment_targets() {
+    assert_diagnostic_code(
+        r#"
+function main(): void
+{
+    let $i = 0;
+    $i++;
+}
+"#,
+        "E0201",
+    );
+
+    assert_diagnostic_code(
+        r#"
+function main(): void
+{
+    $i++;
+}
+"#,
+        "E0101",
+    );
+
+    assert_diagnostic_code(
+        r#"
+function main(): void
+{
+    let writable $name = "Doria";
+    $name++;
+}
+"#,
+        "E0423",
+    );
+
+    assert_diagnostic_code(
+        r#"
+function main(): void
+{
+    let writable $name = "a";
+
+    for ($name += "b"; false;) {
+    }
+}
+"#,
+        "E0403",
+    );
+}
+
+#[test]
+fn keeps_for_initializer_bindings_loop_local() {
+    assert_diagnostic_code(
+        r#"
+function main(): int
+{
+    for (let writable $i = 0; $i < 10; $i++) {
+    }
+
+    return $i;
+}
+"#,
+        "E0101",
+    );
+}
+
+#[test]
+fn checks_stage_9_foreach_range_semantics() {
+    doriac::check_source(
+        "test.doria",
+        r#"
+function main(): void
+{
+    foreach (0..<10 as $i) {
+        let $copy = $i;
+    }
+
+    foreach ((0..10) as $j) {
+        let $copy = $j;
+    }
+}
+"#,
+    )
+    .expect("semantic check should succeed");
+}
+
+#[test]
+fn rejects_standalone_range_expressions() {
+    for source in [
+        r#"
+function main(): void
+{
+    let $range = 0..10;
+}
+"#,
+        r#"
+function main(): void
+{
+    echo 0..<10;
+}
+"#,
+        r#"
+function main(): void
+{
+    let $range = (0..10);
+}
+"#,
+    ] {
+        assert_diagnostic_code(source, "E0426");
+    }
+}
+
+#[test]
+fn rejects_invalid_stage_9_foreach_ranges() {
+    assert_diagnostic_code(
+        r#"
+function main(): void
+{
+    foreach (0..10 as $i) {
+        $i++;
+    }
+}
+"#,
+        "E0201",
+    );
+
+    assert_diagnostic_code(
+        r#"
+function main(): int
+{
+    foreach (0..10 as $i) {
+    }
+
+    return $i;
+}
+"#,
+        "E0101",
+    );
+
+    assert_diagnostic_code(
+        r#"
+function main(): void
+{
+    foreach ("0"..10 as $i) {
+    }
+}
+"#,
+        "E0424",
+    );
 }
 
 #[test]

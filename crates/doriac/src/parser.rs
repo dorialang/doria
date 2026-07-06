@@ -273,8 +273,18 @@ impl Parser {
             return self.parse_while().map(Stmt::While);
         }
 
+        if self.match_kind(&TokenKind::For) {
+            return self
+                .parse_for()
+                .map(|for_stmt| Stmt::For(Box::new(for_stmt)));
+        }
+
         if self.match_kind(&TokenKind::Foreach) {
             return self.parse_foreach();
+        }
+
+        if self.check(&TokenKind::PlusPlus) || self.check(&TokenKind::MinusMinus) {
+            return self.parse_pre_increment_statement();
         }
 
         if self.can_start_typed_decl() {
@@ -305,6 +315,10 @@ impl Parser {
         }
 
         let expr = self.parse_expression()?;
+        if self.check(&TokenKind::PlusPlus) || self.check(&TokenKind::MinusMinus) {
+            return self.parse_post_increment_statement(expr);
+        }
+
         if let Some(op) = self.parse_assignment_op() {
             let start = expr.span().start;
             let value = self.parse_expression()?;
@@ -335,22 +349,31 @@ impl Parser {
 
     fn parse_let_decl(&mut self) -> Option<Stmt> {
         let start = self.previous().span.start;
+        self.parse_let_var_decl_after_let(start, "expected `;` after let declaration")
+            .map(Stmt::VarDecl)
+    }
+
+    fn parse_let_var_decl_after_let(
+        &mut self,
+        start: usize,
+        semicolon_message: &str,
+    ) -> Option<VarDecl> {
         let writable = self.match_kind(&TokenKind::Writable);
         let (name, _span) = self.expect_variable("expected variable name after `let`")?;
         self.expect(TokenKind::Equals, "expected `=` in let declaration")?;
         let initializer = self.parse_expression()?;
         let end = self
-            .expect(TokenKind::Semicolon, "expected `;` after let declaration")?
+            .expect(TokenKind::Semicolon, semicolon_message)?
             .span
             .end;
 
-        Some(Stmt::VarDecl(VarDecl {
+        Some(VarDecl {
             writable,
             ty: None,
             name,
             initializer,
             span: Span::new(start, end),
-        }))
+        })
     }
 
     fn parse_loop_control_statement(
@@ -423,6 +446,160 @@ impl Parser {
         })
     }
 
+    fn parse_for(&mut self) -> Option<ForStmt> {
+        let start = self.previous().span.start;
+        self.expect(TokenKind::LeftParen, "expected `(` after for")?;
+
+        let initializer = if self.match_kind(&TokenKind::Semicolon) {
+            None
+        } else if self.match_kind(&TokenKind::Let) {
+            let start = self.previous().span.start;
+            Some(ForInitializer::VarDecl(self.parse_let_var_decl_after_let(
+                start,
+                "expected `;` after for initializer",
+            )?))
+        } else {
+            let target = self.parse_expression()?;
+            let Some(op) = self.parse_assignment_op() else {
+                self.error(
+                    "expected assignment or `let` declaration in for initializer",
+                    target.span(),
+                );
+                return None;
+            };
+            let value = self.parse_expression()?;
+            let end = self
+                .expect(TokenKind::Semicolon, "expected `;` after for initializer")?
+                .span
+                .end;
+            Some(ForInitializer::Assignment(Assignment {
+                span: Span::new(target.span().start, end),
+                target,
+                op,
+                value,
+            }))
+        };
+
+        let condition = if self.match_kind(&TokenKind::Semicolon) {
+            None
+        } else {
+            let condition = self.parse_expression()?;
+            self.expect(TokenKind::Semicolon, "expected `;` after for condition")?;
+            Some(condition)
+        };
+
+        let increment = if self.check(&TokenKind::RightParen) {
+            None
+        } else {
+            Some(self.parse_for_increment()?)
+        };
+
+        self.expect(TokenKind::RightParen, "expected `)` after for clauses")?;
+        let body = self.parse_block()?;
+        let span = Span::new(start, body.span.end);
+        Some(ForStmt {
+            initializer,
+            condition,
+            increment,
+            body,
+            span,
+        })
+    }
+
+    fn parse_for_increment(&mut self) -> Option<ForIncrement> {
+        if self.check(&TokenKind::PlusPlus) || self.check(&TokenKind::MinusMinus) {
+            return self.parse_pre_increment(false).map(ForIncrement::Increment);
+        }
+
+        let target = self.parse_expression()?;
+        if self.check(&TokenKind::PlusPlus) || self.check(&TokenKind::MinusMinus) {
+            return self
+                .parse_post_increment(target, false)
+                .map(ForIncrement::Increment);
+        }
+
+        if let Some(op) = self.parse_assignment_op() {
+            let start = target.span().start;
+            let value = self.parse_expression()?;
+            let span = Span::new(start, value.span().end);
+            return Some(ForIncrement::Assignment(Assignment {
+                target,
+                op,
+                value,
+                span,
+            }));
+        }
+
+        self.error(
+            "expected increment, decrement, or assignment in for increment",
+            target.span(),
+        );
+        None
+    }
+
+    fn parse_pre_increment_statement(&mut self) -> Option<Stmt> {
+        self.parse_pre_increment(true).map(Stmt::Increment)
+    }
+
+    fn parse_post_increment_statement(&mut self, target: Expr) -> Option<Stmt> {
+        self.parse_post_increment(target, true).map(Stmt::Increment)
+    }
+
+    fn parse_pre_increment(&mut self, expect_semicolon: bool) -> Option<IncrementStmt> {
+        let token = self.advance().clone();
+        let (op, op_name) = match token.kind {
+            TokenKind::PlusPlus => (IncrementOp::Increment, "++"),
+            TokenKind::MinusMinus => (IncrementOp::Decrement, "--"),
+            _ => unreachable!("pre-increment parser called without increment token"),
+        };
+        let target = self.parse_postfix()?;
+        let end = if expect_semicolon {
+            self.expect(
+                TokenKind::Semicolon,
+                &format!("expected `;` after `{op_name}` statement"),
+            )?
+            .span
+            .end
+        } else {
+            target.span().end
+        };
+        Some(IncrementStmt {
+            target,
+            op,
+            position: IncrementPosition::Pre,
+            span: Span::new(token.span.start, end),
+        })
+    }
+
+    fn parse_post_increment(
+        &mut self,
+        target: Expr,
+        expect_semicolon: bool,
+    ) -> Option<IncrementStmt> {
+        let token = self.advance().clone();
+        let (op, op_name) = match token.kind {
+            TokenKind::PlusPlus => (IncrementOp::Increment, "++"),
+            TokenKind::MinusMinus => (IncrementOp::Decrement, "--"),
+            _ => unreachable!("post-increment parser called without increment token"),
+        };
+        let end = if expect_semicolon {
+            self.expect(
+                TokenKind::Semicolon,
+                &format!("expected `;` after `{op_name}` statement"),
+            )?
+            .span
+            .end
+        } else {
+            token.span.end
+        };
+        Some(IncrementStmt {
+            span: Span::new(target.span().start, end),
+            target,
+            op,
+            position: IncrementPosition::Post,
+        })
+    }
+
     fn parse_foreach(&mut self) -> Option<Stmt> {
         let start = self.previous().span.start;
         self.expect(TokenKind::LeftParen, "expected `(` after foreach")?;
@@ -458,7 +635,27 @@ impl Parser {
     }
 
     fn parse_expression(&mut self) -> Option<Expr> {
-        self.parse_binary(1)
+        self.parse_range()
+    }
+
+    fn parse_range(&mut self) -> Option<Expr> {
+        let start = self.parse_binary(1)?;
+        let inclusive = if self.match_kind(&TokenKind::DotDot) {
+            true
+        } else if self.match_kind(&TokenKind::DotDotLess) {
+            false
+        } else {
+            return Some(start);
+        };
+
+        let end = self.parse_binary(1)?;
+        let span = start.span().merge(end.span());
+        Some(Expr::Range {
+            start: Box::new(start),
+            end: Box::new(end),
+            inclusive,
+            span,
+        })
     }
 
     fn parse_binary(&mut self, min_prec: u8) -> Option<Expr> {
@@ -1059,6 +1256,7 @@ impl Parser {
                 | TokenKind::Continue
                 | TokenKind::If
                 | TokenKind::While
+                | TokenKind::For
                 | TokenKind::Foreach
                 | TokenKind::Internal => return,
                 _ => {
@@ -1089,6 +1287,8 @@ fn token_name(kind: &TokenKind) -> &'static str {
         TokenKind::For => "for",
         TokenKind::Break => "break",
         TokenKind::Continue => "continue",
+        TokenKind::Throw => "throw",
+        TokenKind::Throws => "throws",
         TokenKind::True => "true",
         TokenKind::False => "false",
         TokenKind::Null => "null",
@@ -1111,6 +1311,10 @@ fn token_name(kind: &TokenKind) -> &'static str {
         TokenKind::Slash => "/",
         TokenKind::Percent => "%",
         TokenKind::Dot => ".",
+        TokenKind::DotDot => "..",
+        TokenKind::DotDotLess => "..<",
+        TokenKind::PlusPlus => "++",
+        TokenKind::MinusMinus => "--",
         TokenKind::PlusEquals => "+=",
         TokenKind::MinusEquals => "-=",
         TokenKind::EqualEqual => "==",

@@ -2,6 +2,8 @@
 
 Status: Accepted
 
+Note: `docs/decisions/0036-stage-8-mvp-string-echo-path.md` completes the Stage 8 MVP string and echo path by adding compile-time-known `.` concatenation. This decision remains the historical Stage 8a subset record.
+
 ## Decision
 
 Native Stage 8a extends the current native smoke backend with readonly string locals initialized directly from string literals and with `echo` support for the supported string-expression subset.

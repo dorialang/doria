@@ -77,9 +77,11 @@ pub enum Stmt {
     Return { expr: Option<Expr>, span: Span },
     If(IfStmt),
     While(WhileStmt),
+    For(Box<ForStmt>),
     Break { span: Span },
     Continue { span: Span },
     Foreach(ForeachStmt),
+    Increment(IncrementStmt),
     Expr { expr: Expr, span: Span },
 }
 
@@ -130,11 +132,52 @@ pub struct WhileStmt {
     pub span: Span,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct ForStmt {
+    pub initializer: Option<ForInitializer>,
+    pub condition: Option<Expr>,
+    pub increment: Option<ForIncrement>,
+    pub body: Block,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ForInitializer {
+    VarDecl(VarDecl),
+    Assignment(Assignment),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ForIncrement {
+    Increment(IncrementStmt),
+    Assignment(Assignment),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AssignOp {
     Assign,
     AddAssign,
     SubAssign,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct IncrementStmt {
+    pub target: Expr,
+    pub op: IncrementOp,
+    pub position: IncrementPosition,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IncrementOp {
+    Increment,
+    Decrement,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IncrementPosition {
+    Pre,
+    Post,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -234,6 +277,12 @@ pub enum Expr {
         right: Box<Expr>,
         span: Span,
     },
+    Range {
+        start: Box<Expr>,
+        end: Box<Expr>,
+        inclusive: bool,
+        span: Span,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -293,7 +342,8 @@ impl Expr {
             | Expr::New { span, .. }
             | Expr::Grouped { span, .. }
             | Expr::Unary { span, .. }
-            | Expr::Binary { span, .. } => *span,
+            | Expr::Binary { span, .. }
+            | Expr::Range { span, .. } => *span,
         }
     }
 }

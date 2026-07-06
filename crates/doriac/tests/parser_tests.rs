@@ -1,6 +1,6 @@
 use doriac::ast::{
-    BinaryOp, ClassMember, ElseBranch, Expr, InterpolatedStringPart, Item, MemberAccess, Stmt,
-    UnaryOp,
+    BinaryOp, ClassMember, ElseBranch, Expr, ForIncrement, ForInitializer, IncrementOp,
+    IncrementPosition, InterpolatedStringPart, Item, MemberAccess, Stmt, UnaryOp,
 };
 
 #[test]
@@ -76,6 +76,33 @@ fn parses_boolean_word_operators() {
             ..
         }
     ));
+}
+
+#[test]
+fn parses_string_concat_operator() {
+    let expr = parse_echo_expr(r#"echo "Hello " . $name . "!";"#);
+    let Expr::Binary {
+        left,
+        op: BinaryOp::Concat,
+        right,
+        ..
+    } = expr
+    else {
+        panic!("expected outer concat expression");
+    };
+
+    assert!(matches!(right.as_ref(), Expr::String { value, .. } if value == "!"));
+    let Expr::Binary {
+        left: inner_left,
+        op: BinaryOp::Concat,
+        right: inner_right,
+        ..
+    } = left.as_ref()
+    else {
+        panic!("expected left-associative inner concat expression");
+    };
+    assert!(matches!(inner_left.as_ref(), Expr::String { value, .. } if value == "Hello "));
+    assert!(matches!(inner_right.as_ref(), Expr::Variable { name, .. } if name == "name"));
 }
 
 #[test]
@@ -295,6 +322,136 @@ fn rejects_numeric_or_labeled_loop_control() {
         );
     }
 }
+
+#[test]
+fn parses_stage_9_for_loops_and_mutation_statements() {
+    let program = doriac::parse_source(
+        "test.doria",
+        r#"
+for (let writable $i = 0; $i < 10; $i++) {
+    echo $i;
+}
+
+for (let writable $i = 0; $i < 10; ++$i) {
+}
+
+for (let writable $i = 10; $i > 0; $i--) {
+}
+
+$i++;
+++$i;
+$i--;
+--$i;
+"#,
+    )
+    .expect("parse should succeed");
+
+    let Item::Statement(Stmt::For(first_for)) = &program.items[0] else {
+        panic!("expected for loop");
+    };
+    assert!(matches!(
+        &first_for.initializer,
+        Some(ForInitializer::VarDecl(decl)) if decl.writable && decl.name == "i"
+    ));
+    assert!(matches!(first_for.condition, Some(Expr::Binary { .. })));
+    assert!(matches!(
+        &first_for.increment,
+        Some(ForIncrement::Increment(increment))
+            if increment.op == IncrementOp::Increment
+                && increment.position == IncrementPosition::Post
+    ));
+
+    let Item::Statement(Stmt::For(second_for)) = &program.items[1] else {
+        panic!("expected for loop");
+    };
+    assert!(matches!(
+        &second_for.increment,
+        Some(ForIncrement::Increment(increment))
+            if increment.op == IncrementOp::Increment
+                && increment.position == IncrementPosition::Pre
+    ));
+
+    let Item::Statement(Stmt::For(third_for)) = &program.items[2] else {
+        panic!("expected for loop");
+    };
+    assert!(matches!(
+        &third_for.increment,
+        Some(ForIncrement::Increment(increment))
+            if increment.op == IncrementOp::Decrement
+                && increment.position == IncrementPosition::Post
+    ));
+
+    assert!(matches!(
+        &program.items[3],
+        Item::Statement(Stmt::Increment(increment))
+            if increment.op == IncrementOp::Increment
+                && increment.position == IncrementPosition::Post
+    ));
+    assert!(matches!(
+        &program.items[4],
+        Item::Statement(Stmt::Increment(increment))
+            if increment.op == IncrementOp::Increment
+                && increment.position == IncrementPosition::Pre
+    ));
+    assert!(matches!(
+        &program.items[5],
+        Item::Statement(Stmt::Increment(increment))
+            if increment.op == IncrementOp::Decrement
+                && increment.position == IncrementPosition::Post
+    ));
+    assert!(matches!(
+        &program.items[6],
+        Item::Statement(Stmt::Increment(increment))
+            if increment.op == IncrementOp::Decrement
+                && increment.position == IncrementPosition::Pre
+    ));
+}
+
+#[test]
+fn parses_stage_9_foreach_ranges() {
+    let program = doriac::parse_source(
+        "test.doria",
+        r#"
+foreach (0..10 as $i) {
+}
+
+foreach (0..<10 as $i) {
+}
+"#,
+    )
+    .expect("parse should succeed");
+
+    let Item::Statement(Stmt::Foreach(inclusive)) = &program.items[0] else {
+        panic!("expected foreach");
+    };
+    assert!(matches!(
+        inclusive.iterable,
+        Expr::Range {
+            inclusive: true,
+            ..
+        }
+    ));
+
+    let Item::Statement(Stmt::Foreach(exclusive)) = &program.items[1] else {
+        panic!("expected foreach");
+    };
+    assert!(matches!(
+        exclusive.iterable,
+        Expr::Range {
+            inclusive: false,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn rejects_value_producing_increment_expressions() {
+    for source in ["let $x = $i++;", "let $x = ++$i;"] {
+        doriac::parse_source("test.doria", source)
+            .expect_err("value-producing increment should not parse in Stage 9");
+    }
+}
+
 #[test]
 fn parses_class_with_writable_method() {
     let program = doriac::parse_source(

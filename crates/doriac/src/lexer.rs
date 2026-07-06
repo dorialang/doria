@@ -33,6 +33,8 @@ pub enum TokenKind {
     For,
     Break,
     Continue,
+    Throw,
+    Throws,
     True,
     False,
     Null,
@@ -58,6 +60,10 @@ pub enum TokenKind {
     Slash,
     Percent,
     Dot,
+    DotDot,
+    DotDotLess,
+    PlusPlus,
+    MinusMinus,
     PlusEquals,
     MinusEquals,
     EqualEqual,
@@ -143,14 +149,18 @@ impl<'source> Lexer<'source> {
                     }
                 }
                 b'+' => {
-                    if self.match_byte(b'=') {
+                    if self.match_byte(b'+') {
+                        self.token(TokenKind::PlusPlus, start)
+                    } else if self.match_byte(b'=') {
                         self.token(TokenKind::PlusEquals, start)
                     } else {
                         self.token(TokenKind::Plus, start)
                     }
                 }
                 b'-' => {
-                    if self.match_byte(b'>') {
+                    if self.match_byte(b'-') {
+                        self.token(TokenKind::MinusMinus, start)
+                    } else if self.match_byte(b'>') {
                         self.token(TokenKind::Arrow, start)
                     } else if self.match_byte(b'=') {
                         self.token(TokenKind::MinusEquals, start)
@@ -161,7 +171,17 @@ impl<'source> Lexer<'source> {
                 b'*' => self.token(TokenKind::Star, start),
                 b'/' => self.token(TokenKind::Slash, start),
                 b'%' => self.token(TokenKind::Percent, start),
-                b'.' => self.token(TokenKind::Dot, start),
+                b'.' => {
+                    if self.match_byte(b'.') {
+                        if self.match_byte(b'<') {
+                            self.token(TokenKind::DotDotLess, start)
+                        } else {
+                            self.token(TokenKind::DotDot, start)
+                        }
+                    } else {
+                        self.token(TokenKind::Dot, start)
+                    }
+                }
                 b'!' => {
                     if self.match_byte(b'=') {
                         if self.match_byte(b'=') {
@@ -302,6 +322,8 @@ impl<'source> Lexer<'source> {
             "for" => TokenKind::For,
             "break" => TokenKind::Break,
             "continue" => TokenKind::Continue,
+            "throw" => TokenKind::Throw,
+            "throws" => TokenKind::Throws,
             "true" => TokenKind::True,
             "false" => TokenKind::False,
             "null" => TokenKind::Null,
@@ -316,7 +338,7 @@ impl<'source> Lexer<'source> {
             "or" => TokenKind::Or,
             "xor" => TokenKind::Xor,
             "async" | "await" | "spawn" | "scope" | "interface" | "trait" | "enum" | "match"
-            | "try" | "catch" | "throw" => TokenKind::Reserved(text.to_string()),
+            | "try" | "catch" => TokenKind::Reserved(text.to_string()),
             _ => TokenKind::Identifier(text.to_string()),
         };
 

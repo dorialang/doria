@@ -64,7 +64,7 @@ Valid PHP should be easy to migrate to Doria, but Doria-specific syntax does not
 
 Doria does not use `public`, `protected`, or `private` as member visibility modifiers. Class members are externally accessible by default, and `internal` marks implementation details.
 
-The current compiler implementation produces only Stage 8a native smoke executables for exactly one top-level `function main(): int` or `function main(): void`. `main(): int` returns an explicit process status in the accepted `0..125` portable exit-code range. `main(): void` may fall through or use `return;` and exits successfully with status `0`. The supported native source subset includes readonly and writable integer locals, `=`, `+=`, and `-=` assignments to writable integer locals, `+`/`-`/`*` arithmetic, structured returning `if` blocks, fallthrough `if` statements with visible-local merges, bounded/proven structured `while` loops, unlabeled `break` and `continue`, accepted boolean conditions, exact string-literal `echo` stdout, and readonly string locals initialized from string literals that can be echoed through supported string expressions. Native validation proves accepted loops terminate within the current smoke verification cap before lowering them through a private native smoke module to real Cranelift control flow. It is not yet full native code generation, a package manager, reflection system, macro system, async runtime, PHP migration converter, or full standard library. That implementation status does not make PHP transpilation the language goal.
+The current compiler implementation produces only Stage 9 native smoke executables for exactly one top-level `function main(): int` or `function main(): void`. `main(): int` returns an explicit process status in the accepted `0..125` portable exit-code range. `main(): void` may fall through or use `return;` and exits successfully with status `0`. The supported native source subset includes readonly and writable integer locals, `=`, `+=`, and `-=` assignments to writable integer locals, standalone integer `++` / `--`, `+`/`-`/`*` arithmetic, structured returning `if` blocks, fallthrough `if` statements with visible-local merges, bounded/proven structured `while` loops, bounded/proven traditional `for` loops, bounded/proven integer range `foreach`, unlabeled `break` and `continue`, accepted boolean conditions, exact string-literal `echo` stdout, and readonly string locals initialized from supported compile-time-known string expressions, including string literals and `.` concatenation, plus supported string `echo` expressions. Native validation proves accepted loops terminate within the current smoke verification cap before lowering them through a private native smoke module to real Cranelift control flow. It is not yet full native code generation, a package manager, reflection system, macro system, async runtime, PHP migration converter, or full standard library. That implementation status does not make PHP transpilation the language goal.
 
 Doria is not a Rust language. Rust is the current bootstrap implementation language for `doriac`, not the permanent identity of the compiler.
 
@@ -80,7 +80,7 @@ The MVP supports:
 - Properties.
 - Methods.
 - Constructor parameters and constructor property promotion.
-- `echo`, `return`, `foreach`, `if` / `else if` / `else`, and `while`.
+- `echo`, `return`, `foreach`, `for`, `if` / `else if` / `else`, and `while`.
 - Assignments.
 - Function calls, method calls, property access, object construction, and literals.
 - List and dictionary literals using PHP-like array syntax.
@@ -99,7 +99,7 @@ Planned future control-flow design includes:
 - `finally` attached to `if` / `else if` / `else` chains.
 - `when` as a value-returning conditional form.
 - `match` as a pattern/value selection construct.
-- `break` and `continue` for nearest-loop control flow.
+- checked `throw` / `throws` error handling.
 
 These advanced control-flow forms are not MVP syntax. See `docs/decisions/0009-control-flow-direction.md`.
 
@@ -156,6 +156,39 @@ Doria does not add separate PHP-style `require`, `require_once`, or `include_onc
 `break` exits the nearest enclosing loop. PHP-style numeric break levels such as `break 2;` are not accepted by the namespace/directive decision. Labeled break may be evaluated later if needed.
 
 `continue` jumps to the next iteration of the nearest enclosing loop. PHP-style numeric continue levels such as `continue 2;` are not accepted by the namespace/directive decision. Labeled continue may be evaluated later if needed.
+
+Traditional `for` loops are accepted for explicit counter/index iteration:
+
+```doria
+for (let writable $i = 0; $i < 10; $i++) {
+    echo $i;
+}
+```
+
+`foreach` is preferred for collections and ranges. Integer ranges use `..` for inclusive ranges and `..<` for exclusive-end ranges:
+
+```doria
+foreach (0..10 as $i) {
+    echo $i;
+}
+
+foreach (0..<10 as $i) {
+    echo $i;
+}
+```
+
+`0..10` produces `0` through `10`. `0..<10` produces `0` through `9`. Range endpoints must be `int` expressions. The variable after `as` is a readonly loop-local binding for each iteration and does not leak outside the `foreach` body.
+
+Standalone `++` and `--` mutation statements require a declared writable `int` target:
+
+```doria
+$i++;
+++$i;
+$i--;
+--$i;
+```
+
+Value-producing `++` / `--` expression semantics are future work.
 
 `declare` is a structured compiler/source directive. It is not a macro system and not textual substitution. Exact grammar and allowed declaration keys require future decisions. Unknown declare keys should be rejected when `declare` is implemented. Possible future uses include warning policy, unsafe/FFI boundary policy, backend/profile constraints, platform configuration, optimization intent, feature gates, and compile-time diagnostics.
 
@@ -384,6 +417,8 @@ Interpolated strings are represented in the AST and Doria IR as string parts bef
 
 Interpolated values may currently be `string`, `int`, `float`, `bool`, `null`, `mixed`, or the internal `Unknown` recovery type. Class values, `object`, `resource`, `List<T>`, `Dictionary<K, V>`, and `Set<T>` are rejected until Doria has a deliberate display/string-conversion design.
 
+The `.` operator is string concatenation. Both operands must be `string` values or recovery types; Doria does not implicitly convert `int`, `bool`, objects, or other values to `string` for concatenation. The current native Stage 8 smoke backend supports `.` only when the resulting string value is compile-time-known through supported string literals and readonly string locals.
+
 Numeric widening is not implemented yet; for now `float` is not assignable from `int`, and `int` is not assignable from `float`. The accepted fixed-width numeric family also does not imply implicit widening, narrowing, or scalar coercion. Any future safe numeric widening should be a separate design decision. Named arguments and richer call argument representation are separate future slices.
 
 Simple collection literals infer collection element/key/value types when all clear parts match. Clear heterogeneous collection literals, such as `[1, "two"]`, are rejected by narrow collection alias assignment checks rather than being erased to `Unknown`. The empty literal `[]` stays ambiguous so typed contexts may use it as an empty `List<T>` or `Dictionary<K, V>`. The PHP-compatible `array` annotation remains broad enough to accept list-shaped and dictionary-shaped literals for now, but `array` is not the desired long-term collection model.
@@ -431,7 +466,7 @@ Accepted bitwise operators are:
 
 Do not add `nand`, `nor`, `implies`, `iff`, `unless`, `^^`, `===`, or `!==` as core syntax without a new accepted decision. Future helper APIs such as `Bool::all(...)`, `Bool::any(...)`, `Bool::none(...)`, or `Bool::one(...)` may be considered separately.
 
-The accepted boolean/equality/bitwise operator direction is recorded in `docs/decisions/0020-boolean-operators-and-given-predicates.md`. Current compiler support includes typed `==` / `!=` checking, rejection of `===` / `!==`, `not` / `and` / `or` / `xor` parsing, bool-only semantic checking, Doria IR lowering, PHP backend lowering for the supported subset, and Stage 8a native lowering for supported `if` / `while` conditions, writable integer assignment in supported native blocks, unlabeled `break` / `continue` inside supported native while loops, and supported string `echo` expressions. Bitwise operators and broader native expression lowering remain future implementation work.
+The accepted boolean/equality/bitwise operator direction is recorded in `docs/decisions/0020-boolean-operators-and-given-predicates.md`. Current compiler support includes typed `==` / `!=` checking, rejection of `===` / `!==`, `not` / `and` / `or` / `xor` parsing, bool-only semantic checking, Doria IR lowering, PHP backend lowering for the supported subset, and Stage 9 native lowering for supported `if`, `while`, `for`, and integer range `foreach` conditions, writable integer assignment in supported native blocks, unlabeled `break` / `continue` inside supported native loops, and supported string `echo` expressions, including compile-time-known `.` string concatenation. Bitwise operators and broader native expression lowering remain future implementation work.
 
 ### Control-flow conditions
 
@@ -442,6 +477,16 @@ Each `if`, `else if`, `else`, and `while` body has its own block scope. Variable
 `if` is statement control flow and does not return a value. `if` without `else` is valid Doria. `else`, `else if`, `given`, and `finally` are optional. A base `if`, `while`, `foreach`, or future control construct does not require `given` or `finally`.
 
 `when` is the planned value-returning conditional/control construct. `when`, `given`, and `finally` are accepted design direction but are not implemented in the current compiler slice.
+
+### Checked errors
+
+The accepted checked error direction is recorded in `docs/decisions/0035-checked-throw-throws-direction.md`.
+
+`throw` raises an error. `throws` declares possible thrown error types in function and method signatures. Thrown errors are checked by the compiler: callers must catch thrown errors or declare them in their own `throws` clause.
+
+`Result<T, E>` is not Doria's default surface error model unless a later accepted decision explicitly adopts it. Runtime panic or fatal-error behavior is separate from checked `throw` / `throws`.
+
+Compiler implementation for `throw`, `throws`, `try`, and `catch` is future work.
 
 ### given predicate blocks
 
@@ -732,7 +777,7 @@ Doria IR is the checked compiler-owned representation of a Doria program. After 
 
 As native code generation matures, Doria IR may lower into a simpler native-oriented IR for control flow, memory layout, runtime calls, and backend code generation.
 
-The native backend is the primary target. It should lower Doria IR, and any later native-oriented IR, toward native machine code and standalone executables. The current Cranelift-backed Stage 8a native backend is deliberately limited to exactly one top-level `function main(): int` or `function main(): void`. `main(): int` returns an explicit process status in the portable `0..125` range, which is a process boundary rather than the Doria `int` range. `main(): void` may fall through or use `return;` and maps normal completion to successful process status `0`. The supported source subset includes readonly and writable integer locals, `=`, `+=`, and `-=` assignments to writable integer locals, `+`/`-`/`*` arithmetic, structured returning `if` blocks, fallthrough `if` statements with visible-local merges, bounded/proven structured `while` loops, unlabeled `break` and `continue`, accepted boolean conditions, exact string-literal `echo` stdout with no implicit newline, and Stage 8a readonly string locals initialized from string literals that can be echoed through supported string expressions. Stage 8a validates loop termination, loop-body scoping, fallthrough branch state merging, loop control, checked integer arithmetic, and literal-backed readonly string-local use before native lowering, then emits real Cranelift control flow and exact stdout byte writes. Stage 7a separated native smoke validation, compile-time smoke evaluation/proof, and Cranelift lowering behind a private `NativeSmokeModule` boundary. That module is not public Doria IR, final MIR, or a permanent local storage model. The native loop verification cap is a backend support limit, not Doria language semantics. It emits unsupported-feature diagnostics for general loops beyond the bounded/proven Stage 8a shape, nested `while`, returns inside `while`, `return` inside fallthrough branch bodies, labeled or numeric loop control, division/modulo, native string values beyond literal-backed readonly string locals and supported `echo`, writable string locals, string assignment, interpolation, concatenation, classes, collections, runtime error behavior, runtime I/O, and broader valid Doria until later native slices are designed.
+The native backend is the primary target. It should lower Doria IR, and any later native-oriented IR, toward native machine code and standalone executables. The current Cranelift-backed Stage 9 native backend is deliberately limited to exactly one top-level `function main(): int` or `function main(): void`. `main(): int` returns an explicit process status in the portable `0..125` range, which is a process boundary rather than the Doria `int` range. `main(): void` may fall through or use `return;` and maps normal completion to successful process status `0`. The supported source subset includes readonly and writable integer locals, `=`, `+=`, and `-=` assignments to writable integer locals, standalone integer `++` / `--`, `+`/`-`/`*` arithmetic, structured returning `if` blocks, fallthrough `if` statements with visible-local merges, bounded/proven structured `while` loops, bounded/proven traditional `for` loops, bounded/proven integer range `foreach`, unlabeled `break` and `continue`, accepted boolean conditions, exact string-literal `echo` stdout with no implicit newline, and readonly string locals initialized from supported compile-time-known string expressions, including string literals and `.` concatenation, plus supported string `echo` expressions. Stage 9 validates loop termination, loop-body scoping, fallthrough branch state merging, loop control, checked integer arithmetic, range binding scope, and compile-time-known readonly string-local and string-concat use before native lowering, then emits real Cranelift control flow and exact stdout byte writes. Stage 7a separated native smoke validation, compile-time smoke evaluation/proof, and Cranelift lowering behind a private `NativeSmokeModule` boundary. That module is not public Doria IR, final MIR, or a permanent local storage model. The native loop verification cap is a backend support limit, not Doria language semantics. It emits unsupported-feature diagnostics for general loops beyond the bounded/proven Stage 9 shape, nested loops, returns inside loops, `return` inside fallthrough branch bodies, labeled or numeric loop control, division/modulo, native string values beyond compile-time-known readonly string locals and supported `echo`, writable string locals, string assignment, interpolation, runtime concatenation, classes, collections, runtime error behavior, runtime I/O, and broader valid Doria until later native slices are designed.
 
 The PHP backend is currently implemented as a compatibility/debugging backend. It emits `<?php` and lowers Doria-only syntax away:
 
@@ -766,9 +811,9 @@ Future work includes:
 - Advanced control-flow design for `do ... while ... finally`, `given ... when`, `given ... while`, `if` chains with possible `finally`, value-returning `when`, `match`, and labeled or numeric loop control.
 - Careful evaluation of `goto`, labeled loop control, and structured conditional compilation without adopting C/C++ textual macros.
 - Async/await and structured concurrency.
-- Broader native backend design and implementation beyond the Stage 8a smoke target.
+- Broader native backend design and implementation beyond the Stage 9 smoke target.
 - Native-oriented IR implementation when native code generation needs it.
-- Broader native code generation and standalone executable production beyond the Stage 8a smoke target.
+- Broader native code generation and standalone executable production beyond the Stage 9 smoke target.
 - Self-hosting path for writing more of `doriac` in Doria.
 - PHP-to-Doria migration tooling.
 - Package management.
