@@ -491,7 +491,7 @@ fn validate_stage_6c_block(
                 native_statements.push(NativeSmokeStmt::For(native_for));
                 terminal_index += 1;
             }
-            Stmt::Foreach(foreach) if matches!(foreach.iterable, Expr::Range { .. }) => {
+            Stmt::Foreach(foreach) if grouped_range_expr(&foreach.iterable).is_some() => {
                 let native_for = validate_stage_9_range_foreach(foreach, &block_states)?;
                 merge_native_values(&mut block_states, &native_for.final_values)?;
                 native_statements.push(NativeSmokeStmt::For(native_for));
@@ -1237,6 +1237,19 @@ fn native_for_initializer_shadow_name(source_name: &str) -> String {
     format!("<for_initializer:{source_name}>")
 }
 
+fn grouped_range_expr(expr: &Expr) -> Option<(&Expr, &Expr, bool)> {
+    match expr {
+        Expr::Grouped { expr, .. } => grouped_range_expr(expr),
+        Expr::Range {
+            start,
+            end,
+            inclusive,
+            ..
+        } => Some((start, end, *inclusive)),
+        _ => None,
+    }
+}
+
 fn validate_stage_9_range_foreach(
     foreach: &hir::ForeachStmt,
     local_states: &HashMap<String, NativeSmokeLocalState>,
@@ -1247,13 +1260,7 @@ fn validate_stage_9_range_foreach(
         ));
     }
 
-    let Expr::Range {
-        start,
-        end,
-        inclusive,
-        ..
-    } = &foreach.iterable
-    else {
+    let Some((start, end, inclusive)) = grouped_range_expr(&foreach.iterable) else {
         return Err(BackendError::new(
             "backend validation failure: Stage 9 range foreach validator received non-range iterable",
         ));
@@ -1287,7 +1294,7 @@ fn validate_stage_9_range_foreach(
     }
 
     let condition = NativeSmokeCondition::Compare {
-        op: if *inclusive {
+        op: if inclusive {
             NativeSmokeCompareOp::LessThanOrEqual
         } else {
             NativeSmokeCompareOp::LessThan

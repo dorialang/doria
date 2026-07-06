@@ -388,14 +388,8 @@ fn emit_foreach(
     indent: usize,
     scopes: &mut PhpNameScopes,
 ) {
-    if let Expr::Range {
-        start,
-        end,
-        inclusive,
-        ..
-    } = &foreach.iterable
-    {
-        emit_range_foreach(foreach, start, end, *inclusive, output, indent, scopes);
+    if let Some((start, end, inclusive)) = grouped_range_expr(&foreach.iterable) {
+        emit_range_foreach(foreach, start, end, inclusive, output, indent, scopes);
         return;
     }
 
@@ -422,6 +416,19 @@ fn emit_foreach(
     }
     scopes.pop();
     writeln(output, indent, "}");
+}
+
+fn grouped_range_expr(expr: &Expr) -> Option<(&Expr, &Expr, bool)> {
+    match expr {
+        Expr::Grouped { expr, .. } => grouped_range_expr(expr),
+        Expr::Range {
+            start,
+            end,
+            inclusive,
+            ..
+        } => Some((start, end, *inclusive)),
+        _ => None,
+    }
 }
 
 fn emit_range_foreach(

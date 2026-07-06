@@ -450,6 +450,11 @@ fn compiles_and_runs_current_native_smoke_examples() {
             55,
         ),
         (
+            "main_foreach_grouped_range_3",
+            "inline_main_foreach_grouped_range_3.doria",
+            3,
+        ),
+        (
             "main_foreach_range_break_42",
             "inline_main_foreach_range_break_42.doria",
             42,
@@ -1863,6 +1868,20 @@ function main(): int
             break;
         }
 
+        $sum += 1;
+    }
+
+    return $sum;
+}
+"#
+        }
+        "main_foreach_grouped_range_3" => {
+            r#"
+function main(): int
+{
+    let writable $sum = 0;
+
+    foreach ((0..2) as $i) {
         $sum += 1;
     }
 

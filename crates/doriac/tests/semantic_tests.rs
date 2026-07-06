@@ -1564,6 +1564,10 @@ function main(): void
     foreach (0..<10 as $i) {
         let $copy = $i;
     }
+
+    foreach ((0..10) as $j) {
+        let $copy = $j;
+    }
 }
 "#,
     )

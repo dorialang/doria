@@ -749,7 +749,7 @@ impl<'program> Checker<'program> {
                 }
             }
             Stmt::Foreach(foreach) => {
-                let range_iterable = matches!(foreach.iterable, Expr::Range { .. });
+                let range_iterable = Self::is_grouped_range_expr(&foreach.iterable);
                 if range_iterable {
                     self.check_expr_with_range_context(
                         &foreach.iterable,
@@ -1367,7 +1367,9 @@ impl<'program> Checker<'program> {
                     self.check_constructor_call(class_name, args, *span, scopes, method_context);
                 }
             }
-            Expr::Grouped { expr, .. } => self.check_expr(expr, scopes, method_context),
+            Expr::Grouped { expr, .. } => {
+                self.check_expr_with_range_context(expr, scopes, method_context, allow_range_expr)
+            }
             Expr::Unary { op, expr, .. } => {
                 self.check_expr(expr, scopes, method_context);
                 self.check_unary_operand(op, expr, scopes, method_context);
@@ -1404,6 +1406,14 @@ impl<'program> Checker<'program> {
             | Expr::Bool { .. }
             | Expr::Null { .. } => {}
             Expr::Int { value, span } => self.check_int_literal_range(value, *span),
+        }
+    }
+
+    fn is_grouped_range_expr(expr: &Expr) -> bool {
+        match expr {
+            Expr::Grouped { expr, .. } => Self::is_grouped_range_expr(expr),
+            Expr::Range { .. } => true,
+            _ => false,
         }
     }
 

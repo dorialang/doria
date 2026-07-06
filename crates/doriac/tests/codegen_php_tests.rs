@@ -313,6 +313,10 @@ function main(): void
         echo "x";
     }
 
+    foreach ((0..2) as $k) {
+        echo "x";
+    }
+
     let writable $j = 0;
     ++$j;
     $j--;
@@ -326,6 +330,8 @@ function main(): void
     assert!(php.contains("; $i__doria"));
     assert!(php.contains(" < $__doria_range_end"));
     assert!(php.contains(" <= $__doria_range_end"));
+    assert!(php.matches("__doria_range_start").count() >= 3);
+    assert!(!php.contains("unsupported range expression"));
     assert!(php.contains("++$j;"));
     assert!(php.contains("$j--;"));
 }
