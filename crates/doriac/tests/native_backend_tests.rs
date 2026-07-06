@@ -445,6 +445,16 @@ fn compiles_and_runs_current_native_smoke_examples() {
             42,
         ),
         (
+            "main_foreach_range_i64_max_single_42",
+            "inline_main_foreach_range_i64_max_single_42.doria",
+            42,
+        ),
+        (
+            "main_foreach_range_i64_max_continue_42",
+            "inline_main_foreach_range_i64_max_continue_42.doria",
+            42,
+        ),
+        (
             "main_foreach_range_shadow_preserves_outer_5",
             "inline_main_foreach_range_shadow_preserves_outer_5.doria",
             5,
@@ -1873,6 +1883,38 @@ function main(): int
     }
 
     return $i;
+}
+"#
+        }
+        "main_foreach_range_i64_max_single_42" => {
+            r#"
+function main(): int
+{
+    let writable $sum = 0;
+
+    foreach (9223372036854775807..9223372036854775807 as $i) {
+        $sum = 42;
+    }
+
+    return $sum;
+}
+"#
+        }
+        "main_foreach_range_i64_max_continue_42" => {
+            r#"
+function main(): int
+{
+    let writable $sum = 42;
+
+    foreach (9223372036854775807..9223372036854775807 as $i) {
+        if ($i == 9223372036854775807) {
+            continue;
+        }
+
+        $sum = 0;
+    }
+
+    return $sum;
 }
 "#
         }

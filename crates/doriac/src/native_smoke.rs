@@ -70,6 +70,7 @@ struct NativeSmokeFor {
     initializer: Option<NativeSmokeForInitializer>,
     condition: NativeSmokeCondition,
     increment: Option<NativeSmokeAssign>,
+    increment_exit_condition: Option<NativeSmokeCondition>,
     body: NativeSmokeFallthroughBlock,
     carried_values: Vec<(String, NativeSmokeValue)>,
     final_values: Vec<(String, NativeSmokeValue)>,
@@ -1121,6 +1122,7 @@ fn validate_stage_9_for(
         initializer,
         condition,
         increment,
+        None,
         body,
         &loop_states,
         local_states,
@@ -1195,6 +1197,11 @@ fn validate_stage_9_range_foreach(
         expr: NativeSmokeExpr::Int(1),
         evaluated_value: 0,
     };
+    let increment_exit_condition = inclusive.then(|| NativeSmokeCondition::Compare {
+        op: NativeSmokeCompareOp::Equal,
+        left: NativeSmokeExpr::Local(native_binding_name.clone()),
+        right: NativeSmokeExpr::Int(end.value),
+    });
     let body =
         validate_stage_6c_while_branch_body(&foreach.body.statements, &body_validation_states)?;
     let body = if native_binding_name != source_binding_name {
@@ -1207,6 +1214,7 @@ fn validate_stage_9_range_foreach(
         Some(initializer),
         condition,
         Some(increment),
+        increment_exit_condition,
         body,
         &loop_states,
         local_states,
@@ -1319,6 +1327,9 @@ fn rename_native_statement_binding(
                 );
                 if let Some(increment) = &mut native_for.increment {
                     rename_native_assignment_binding(increment, source_name, native_name);
+                }
+                if let Some(condition) = &mut native_for.increment_exit_condition {
+                    rename_native_condition_binding(condition, source_name, native_name);
                 }
                 rename_native_fallthrough_binding_in_scope(
                     &mut native_for.body,
@@ -1496,6 +1507,7 @@ fn validate_stage_9_for_like(
     initializer: Option<NativeSmokeForInitializer>,
     condition: NativeSmokeCondition,
     increment: Option<NativeSmokeAssign>,
+    increment_exit_condition: Option<NativeSmokeCondition>,
     body: NativeSmokeFallthroughBlock,
     initial_loop_states: &HashMap<String, NativeSmokeLocalState>,
     outer_states: &HashMap<String, NativeSmokeLocalState>,
@@ -1525,6 +1537,18 @@ fn validate_stage_9_for_like(
 
         if body_evaluation.control == NativeSmokeLoopControl::Break {
             break;
+        }
+
+        if let Some(condition) = &increment_exit_condition {
+            let values = native_state_values(&simulated_states);
+            let Some(exit_before_increment) = evaluate_native_condition(condition, &values) else {
+                return Err(BackendError::new(
+                    "backend validation failure: validated native for increment exit condition could not be re-evaluated",
+                ));
+            };
+            if exit_before_increment {
+                break;
+            }
         }
 
         if let Some(increment) = &increment {
@@ -1558,6 +1582,7 @@ fn validate_stage_9_for_like(
         initializer,
         condition,
         increment,
+        increment_exit_condition,
         body,
         carried_values,
         final_values,
@@ -3272,6 +3297,10 @@ fn lower_native_for(
     let loop_header = builder.create_block();
     let loop_body = builder.create_block();
     let loop_increment = builder.create_block();
+    let loop_increment_apply = native_for
+        .increment_exit_condition
+        .as_ref()
+        .map(|_| builder.create_block());
     let loop_after = builder.create_block();
 
     for (_, value) in &native_for.carried_values {
@@ -3375,6 +3404,40 @@ fn lower_native_for(
             );
             param_index += 1;
         }
+    }
+    if let Some(condition) = &native_for.increment_exit_condition {
+        let Some(loop_increment_apply) = loop_increment_apply else {
+            return Err(BackendError::new(
+                "backend emission failure: validated native for increment guard block was not created",
+            ));
+        };
+        let after_args = native_for
+            .carried_values
+            .iter()
+            .filter(|(_, value)| value.as_int().is_some())
+            .map(|(name, _)| {
+                increment_local_values
+                    .get(name)
+                    .copied()
+                    .map(BlockArg::Value)
+                    .ok_or_else(|| {
+                        BackendError::new(format!(
+                            "backend emission failure: validated native for carried local `{name}` was not lowered"
+                        ))
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        lower_native_condition_branch_with_args(
+            builder,
+            condition,
+            loop_after,
+            &after_args,
+            loop_increment_apply,
+            &[],
+            &increment_local_values,
+        )?;
+        builder.switch_to_block(loop_increment_apply);
+        builder.seal_block(loop_increment_apply);
     }
     if let Some(increment) = &native_for.increment {
         let value = lower_native_assignment(builder, increment, &increment_local_values)?;
