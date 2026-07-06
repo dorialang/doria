@@ -450,22 +450,45 @@ fn emit_range_foreach(
 
     scopes.push();
     let value_name = scopes.declare(&foreach.value.name);
-    let comparator = if inclusive { "<=" } else { "<" };
+    let done_temp = inclusive.then(|| scopes.fresh_temp("__doria_range_done"));
+    if let Some(done_temp) = &done_temp {
+        writeln(output, indent, &format!("${done_temp} = false;"));
+    }
 
     write_indent(output, indent);
     output.push_str("for ($");
     output.push_str(&value_name);
     output.push_str(" = $");
     output.push_str(&start_temp);
-    output.push_str("; $");
+    output.push_str("; ");
+    if let Some(done_temp) = &done_temp {
+        output.push_str("!$");
+        output.push_str(done_temp);
+        output.push_str(" && ");
+    }
+    output.push('$');
     output.push_str(&value_name);
     output.push(' ');
-    output.push_str(comparator);
+    output.push_str(if inclusive { "<=" } else { "<" });
     output.push_str(" $");
     output.push_str(&end_temp);
-    output.push_str("; $");
-    output.push_str(&value_name);
-    output.push_str("++)\n");
+    output.push_str("; ");
+    if let Some(done_temp) = &done_temp {
+        output.push('$');
+        output.push_str(&value_name);
+        output.push_str(" < $");
+        output.push_str(&end_temp);
+        output.push_str(" ? $");
+        output.push_str(&value_name);
+        output.push_str("++ : ($");
+        output.push_str(done_temp);
+        output.push_str(" = true)");
+    } else {
+        output.push('$');
+        output.push_str(&value_name);
+        output.push_str("++");
+    }
+    output.push_str(")\n");
     writeln(output, indent, "{");
     for statement in &foreach.body.statements {
         emit_statement(statement, output, indent + 1, scopes);

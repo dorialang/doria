@@ -337,6 +337,31 @@ function main(): void
 }
 
 #[test]
+fn guards_inclusive_php_ranges_before_terminal_increment() {
+    let php = doriac::compile_source_to_php(
+        "test.doria",
+        r#"
+function main(): void
+{
+    foreach (9223372036854775807..9223372036854775807 as $i) {
+        echo "x";
+    }
+}
+"#,
+    )
+    .expect("compilation should succeed");
+
+    assert!(php.contains("$__doria_range_done"));
+    assert!(php.contains("= false;"));
+    assert!(php.contains("!$__doria_range_done"));
+    assert!(php.contains("&& $i <= $__doria_range_end"));
+    assert!(php.contains("$i < $__doria_range_end"));
+    assert!(php.contains("? $i++ : ($__doria_range_done"));
+    assert!(php.contains("= true)"));
+    assert!(!php.contains("; $i++)"));
+}
+
+#[test]
 fn rejects_standalone_range_before_php_codegen() {
     let err = doriac::compile_source_to_php(
         "test.doria",
