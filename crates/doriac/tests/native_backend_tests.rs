@@ -669,6 +669,26 @@ function main(): void
 "#,
             b"Hello Doria!".as_slice(),
         ),
+        (
+            "main_function_void_call_in_while_body",
+            r#"
+function tick(): void
+{
+    echo ".";
+}
+
+function main(): void
+{
+    let writable $i = 0;
+
+    while ($i < 2) {
+        tick();
+        $i += 1;
+    }
+}
+"#,
+            b"..".as_slice(),
+        ),
     ];
 
     for (stem, source, expected_stdout) in stdout_cases {
@@ -3353,6 +3373,22 @@ function main(): int
 "#,
             "E0408",
             "argument 1 of function `add` expects `int`, got `string`",
+        ),
+        (
+            "int helper used as statement",
+            r#"
+function one(): int
+{
+    return 1;
+}
+
+function main(): void
+{
+    one();
+}
+"#,
+            "B0001",
+            "non-void function `one` cannot be used as a statement",
         ),
     ];
 

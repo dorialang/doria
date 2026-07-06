@@ -617,6 +617,11 @@ fn validate_stage_10_call_statement(
             "unsupported native function call for Stage 10: unknown function `{name}`"
         ))
     })?;
+    if signature.return_type != NativeSmokeFunctionReturn::Void {
+        return Err(BackendError::new(format!(
+            "unsupported native function call for Stage 10: non-void function `{name}` cannot be used as a statement"
+        )));
+    }
     let (args, values) =
         validate_stage_10_call_args(name, args, &signature, local_states, context)?;
     validate_stage_10_function(name, context)?;
@@ -1008,13 +1013,6 @@ fn validate_stage_6c_fallthrough_block(
             }
             Stmt::Echo { expr, .. } => {
                 native_statements.push(validate_stage_6c_echo(expr, &block_states)?);
-            }
-            Stmt::Expr { expr, .. } if matches!(expr, Expr::FunctionCall { .. }) => {
-                native_statements.push(validate_stage_10_call_statement(
-                    expr,
-                    &block_states,
-                    context,
-                )?);
             }
             Stmt::Expr { expr, .. } if matches!(expr, Expr::FunctionCall { .. }) => {
                 native_statements.push(validate_stage_10_call_statement(
@@ -2154,6 +2152,13 @@ fn validate_stage_6c_while_scoped_body(
             }
             Stmt::Echo { expr, .. } => {
                 native_statements.push(validate_stage_6c_echo(expr, &block_states)?);
+            }
+            Stmt::Expr { expr, .. } if matches!(expr, Expr::FunctionCall { .. }) => {
+                native_statements.push(validate_stage_10_call_statement(
+                    expr,
+                    &block_states,
+                    context,
+                )?);
             }
             Stmt::If(if_stmt) => {
                 let native_if =
