@@ -66,6 +66,14 @@ At completion, report assumptions made and critical decisions encountered. If no
 
 ## Working rules
 
+- Treat docs/doria-end-to-end-plan.md as the master execution plan for future work. It answers future-work forks unless Andrew later amends it.
+- Treat supporting roadmap, specification, notes, and decision files as subordinate where they conflict with the end-to-end plan.
+- Stage 11 is MIR + interpreter oracle. Do not describe or implement primitive helper signatures as Stage 11.
+- Do not expand NativeSmokeModule for new language capability slices unless Andrew explicitly approves a temporary compatibility fix. The plan retires it in Stage 11.
+- Doria has a real ownership/borrow checker model in Doria spelling: readonly is shared borrow, writable is exclusive borrow, and take transfers ownership.
+- public, private, and protected are not Doria visibility keywords. Members are externally accessible by default, internal is the only access-surface keyword, and protected is permanently excluded.
+- use is namespace import/alias, uses is trait composition, and with is closure capture. These three keywords are not interchangeable.
+
 - Treat `docs/brand-positioning.md`, `docs/doria-development-plan.md`, `docs/self-hosting.md`, `docs/executable-initializers-and-attributes.md`, `docs/php-interop-and-migration.md`, `docs/performance-and-benchmarking.md`, `docs/mutability-ergonomics.md`, `docs/api-design-guidelines.md`, `docs/decisions/`, and `SPEC.md` as the product direction.
 - Keep compiler work incremental and tested, but never use incremental delivery as an excuse to make unsound language decisions.
 - Do not make PHP the public identity of Doria. PHP is development context, migration context, and one optional compatibility backend; Doria should be described as its own native-first language.

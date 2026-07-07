@@ -11,7 +11,7 @@
 //! - Local slots and temporaries instead of source variables.
 //! - Resolved type IDs rather than parsed type references.
 //! - Lowered method/function calls and constructor initialization.
-//! - A stable boundary for borrow/lifetime analysis.
+//! - A stable boundary for ownership/borrow checking over MIR.
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Program {

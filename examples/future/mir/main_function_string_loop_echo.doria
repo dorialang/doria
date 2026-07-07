@@ -1,0 +1,11 @@
+function mark(string $value): void
+{
+    echo $value;
+}
+
+function main(): void
+{
+    foreach (0..<3 as $i) {
+        mark(".");
+    }
+}

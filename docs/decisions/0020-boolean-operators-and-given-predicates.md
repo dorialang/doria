@@ -281,7 +281,7 @@ given {
 }
 ```
 
-This decision does not decide destructor scheduling, cleanup guarantees, borrow/lifetime behavior, or whether `finally` runs after every possible exit path. Those remain separate control-flow/runtime decisions.
+This decision does not decide destructor scheduling, cleanup guarantees, ownership/borrow-checking behavior, or whether `finally` runs after every possible exit path. Those remain separate control-flow/runtime decisions.
 
 ## if, when, given, and finally
 
