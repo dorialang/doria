@@ -64,7 +64,7 @@ Valid PHP should be easy to migrate to Doria, but Doria-specific syntax does not
 
 Doria does not use `public`, `protected`, or `private` as member visibility modifiers. Class members are externally accessible by default, and `internal` marks implementation details.
 
-The current compiler implementation produces Stage 10 native smoke executables for top-level free functions plus exactly one top-level `function main(): int` or `function main(): void`. `main(): int` returns an explicit process status in the accepted `0..125` portable exit-code range. `main(): void` may fall through or use `return;` and exits successfully with status `0`. Non-`main` helper functions may return `int` or `void`; Stage 10 native parameters are `int` only. The supported native source subset includes Stage 9 readonly and writable integer locals, writable integer assignment, standalone integer `++` / `--`, `+`/`-`/`*` arithmetic, structured returning and fallthrough `if`, bounded/proven `while`, traditional `for`, integer range `foreach`, unlabeled `break` and `continue`, accepted boolean conditions, exact string-literal `echo` stdout, readonly string locals initialized from supported compile-time-known string expressions, `.` string concatenation, supported string `echo` expressions, calls to `int` helpers in supported integer expressions, and calls to `void` helpers in statement position. Native validation rejects recursion, mutual recursion, unsupported native function signatures such as string parameters or string returns, and broader runtime features. It is not yet full native code generation, a package manager, reflection system, macro system, async runtime, PHP migration converter, or full standard library. That implementation status does not make PHP transpilation the language goal.
+The current compiler implementation produces Stage 10 native smoke executables for top-level free functions plus exactly one top-level `function main(): int` or `function main(): void`. `main(): int` returns an explicit process status in the accepted `0..125` portable exit-code range. `main(): void` may fall through or use `return;` and exits successfully with status `0`. Non-`main` helper functions may return `int` or `void`; Stage 10 native parameters are `int` only. The supported native source subset includes Stage 9 readonly and writable integer locals, writable integer assignment, standalone integer `++` / `--`, `+`/`-`/`*` arithmetic, structured returning and fallthrough `if`, bounded/proven `while`, traditional `for`, integer range `foreach`, unlabeled `break` and `continue`, accepted boolean conditions, exact string-literal `echo` stdout, readonly string locals initialized from supported compile-time-known string expressions, `.` string concatenation, supported string `echo` expressions, calls to `int` helpers in supported integer expressions, and calls to `void` helpers in statement position. Native validation rejects recursion, mutual recursion, unsupported native function signatures such as string parameters or string returns, and broader runtime features. It is not yet full native code generation, a package manager, reflection system, macro system, async runtime, PHP migration converter, or full standard library. That implementation status does not make PHP transpilation the language goal. Future implementation order follows docs/doria-end-to-end-plan.md; Stage 11 is MIR + interpreter oracle and retires NativeSmokeModule rather than expanding it.
 
 Doria is not a Rust language. Rust is the current bootstrap implementation language for `doriac`, not the permanent identity of the compiler.
 
@@ -192,7 +192,7 @@ Value-producing `++` / `--` expression semantics are future work.
 
 `declare` is a structured compiler/source directive. It is not a macro system and not textual substitution. Exact grammar and allowed declaration keys require future decisions. Unknown declare keys should be rejected when `declare` is implemented. Possible future uses include warning policy, unsafe/FFI boundary policy, backend/profile constraints, platform configuration, optimization intent, feature gates, and compile-time diagnostics.
 
-`goto` is evaluation-only and is not accepted for implementation yet. If it is ever accepted, it should be constrained so it cannot jump into deeper scopes, bypass visible initialization, bypass cleanup or `finally` obligations, cross protected resource regions, or cross future borrow/lifetime boundaries.
+`goto` is evaluation-only and is not accepted for implementation yet. If it is ever accepted, it should be constrained so it cannot jump into deeper scopes, bypass visible initialization, bypass cleanup or `finally` obligations, cross guarded resource regions, or cross future ownership/borrow-checking boundaries.
 
 Doria should not adopt a C/C++ textual macro preprocessor by default. `#define` and `#undef` textual macro substitution are not accepted. Future conditional compilation and compile-time diagnostics should use structured compiler semantics rather than arbitrary token substitution. Doria source should remain parseable, typed, and semantically checked by `doriac`.
 
@@ -292,7 +292,7 @@ class Parser
 }
 ```
 
-Internal members are accessible only from methods and constructors of the declaring class. They are not accessible from top-level code, free functions, or other classes. No inheritance or `protected` behavior is part of early Doria.
+Internal members are accessible only from methods and constructors of the declaring class. They are not accessible from top-level code, free functions, or other classes. Protected is permanently excluded from Doria; inheritance does not add a third access tier.
 
 Property hooks are planned later for validation and computed properties, but they are not part of the current implementation.
 
@@ -506,7 +506,7 @@ given {
 
 Separate bool predicate lines are implicitly AND-ed in source order with the attached control condition. Bool predicates short-circuit the attached condition and body when false. Inside a predicate, normal boolean short-circuiting applies for `&&` / `and` and `||` / `or`; `xor` does not short-circuit.
 
-The scoped declarations remain scoped to the whole `given` plus attached control construct. The exact lowering, borrow/lifetime interaction, cleanup behavior, and `finally` execution guarantees remain future decisions.
+The scoped declarations remain scoped to the whole `given` plus attached control construct. The exact lowering, ownership/borrow-checker interaction, cleanup behavior, and `finally` execution guarantees remain future decisions.
 
 ## 8. Class syntax
 
@@ -604,7 +604,7 @@ The parser can distinguish namespace/file-scope import `use` from class-body or 
 
 Doria is PHP-shaped, not PHP++. Accepting PHP-shaped OOP declaration syntax does not import PHP dynamic object semantics, magic methods as core behavior, autoloading behavior, reflection behavior, loose typing, PHP visibility rules beyond what Doria has separately accepted, PHP trait conflict-resolution rules without review, or PHP runtime initialization behavior.
 
-OOP declaration vocabulary is accepted separately from final visibility semantics. Doria's accepted early member model remains default-public plus `internal`: class members are accessible by default, `internal` controls API surface, and `writable` controls mutation.
+OOP declaration vocabulary is accepted separately from final visibility semantics. Doria's accepted early member model remains default-accessible plus `internal`: class members are accessible by default, `internal` controls API surface, and `writable` controls mutation.
 
 Constructor property promotion is supported in the current vertical slice. Constructor parameters are promoted to externally accessible properties by default unless marked `internal`:
 

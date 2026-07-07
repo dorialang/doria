@@ -171,7 +171,7 @@ Accepting PHP-shaped OOP declaration syntax does not automatically import:
 - PHP trait conflict-resolution rules without review
 - PHP runtime initialization behavior
 
-Doria's accepted early member model remains default-public plus `internal`. `writable` controls mutation. `internal` controls API surface. OOP declaration vocabulary is accepted separately from final visibility, inheritance, interface dispatch, runtime layout, and ABI semantics.
+Doria's accepted early member model remains default-accessible plus `internal`. `writable` controls mutation. `internal` controls API surface. OOP declaration vocabulary is accepted separately from final visibility, inheritance, interface dispatch, runtime layout, and ABI semantics.
 
 ## Non-goals
 

@@ -948,6 +948,75 @@ class Person
 }
 
 #[test]
+fn checks_bool_and_string_free_function_calls() {
+    doriac::check_source(
+        "test.doria",
+        r#"
+function isAnswer(int $value): bool
+{
+    return $value == 42;
+}
+
+function greet(string $name): void
+{
+    echo "Hello " . $name . "!";
+}
+
+function main(): void
+{
+    if (isAnswer(42)) {
+        greet("Doria");
+    }
+}
+"#,
+    )
+    .expect("semantic check should succeed");
+
+    assert_diagnostic_code(
+        r#"
+function bad(): bool
+{
+    return 1;
+}
+"#,
+        "E0404",
+    );
+
+    assert_diagnostic_code(
+        r#"
+function greet(string $name): void
+{
+    echo $name;
+}
+
+function main(): void
+{
+    greet(42);
+}
+"#,
+        "E0408",
+    );
+
+    assert_diagnostic_code(
+        r#"
+function tick(): void
+{
+}
+
+function main(): int
+{
+    if (tick()) {
+        return 42;
+    }
+
+    return 0;
+}
+"#,
+        "E0416",
+    );
+}
+
+#[test]
 fn rejects_declared_function_return_type_mismatches() {
     for source in [
         r#"

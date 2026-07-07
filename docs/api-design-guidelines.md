@@ -46,7 +46,7 @@ $user->email
 
 ## Property hooks are the escape hatch
 
-A public member can remain property-shaped even when access needs implementation logic. Property hooks should support validation, computed values, lazy decoding, caching, normalization, or guarded access without forcing data-shaped members to become vague noun methods.
+An externally accessible member can remain property-shaped even when access needs implementation logic. Property hooks should support validation, computed values, lazy decoding, caching, normalization, or guarded access without forcing data-shaped members to become vague noun methods.
 
 Possible future shape:
 

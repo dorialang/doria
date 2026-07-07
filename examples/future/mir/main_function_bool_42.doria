@@ -1,0 +1,13 @@
+function isAnswer(int $value): bool
+{
+    return $value == 42;
+}
+
+function main(): int
+{
+    if (isAnswer(42)) {
+        return 42;
+    }
+
+    return 0;
+}

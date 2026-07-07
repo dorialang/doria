@@ -1,0 +1,9 @@
+function greet(string $name): void
+{
+    echo "Hello " . $name . "!";
+}
+
+function main(): void
+{
+    greet("Doria");
+}

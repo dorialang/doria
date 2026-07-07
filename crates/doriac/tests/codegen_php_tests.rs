@@ -183,6 +183,55 @@ function main(): int
 }
 
 #[test]
+fn emits_php_for_bool_helper_condition() {
+    let php = doriac::compile_source_to_php(
+        "test.doria",
+        r#"
+function isAnswer(int $value): bool
+{
+    return $value == 42;
+}
+
+function main(): int
+{
+    if (isAnswer(42)) {
+        return 42;
+    }
+
+    return 0;
+}
+"#,
+    )
+    .expect("compilation should succeed");
+
+    assert!(php.contains("function isAnswer(int $value): bool"));
+    assert!(php.contains("if (isAnswer(42))"));
+}
+
+#[test]
+fn emits_php_for_string_helper_echo() {
+    let php = doriac::compile_source_to_php(
+        "test.doria",
+        r#"
+function greet(string $name): void
+{
+    echo "Hello " . $name . "!";
+}
+
+function main(): void
+{
+    greet("Doria");
+}
+"#,
+    )
+    .expect("compilation should succeed");
+
+    assert!(php.contains("function greet(string $name): void"));
+    assert!(php.contains("echo \"Hello \" . $name . \"!\";"));
+    assert!(php.contains("greet(\"Doria\");"));
+}
+
+#[test]
 fn emits_php_for_stage_10_void_helper_call() {
     let php = doriac::compile_source_to_php(
         "test.doria",

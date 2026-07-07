@@ -108,7 +108,7 @@ Doria should eventually support `match` as a pattern/value selection construct. 
 - Does `finally` run after zero `while` iterations?
 - Is `when` an expression, a statement, or both?
 - Does `when` require an `else` or default branch when used as an expression?
-- What borrow/lifetime rules apply across `given`, the attached control construct, and `finally`?
+- What ownership/borrow-checking rules apply across `given`, the attached control construct, and `finally`?
 - Are variables declared in `given` mutable across `while` iterations?
 - Does `finally` have access to variables declared in `given`?
 - Does `finally` have access to variables declared inside `when`/`while`?

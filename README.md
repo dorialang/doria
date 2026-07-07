@@ -70,7 +70,7 @@ This repository contains the first working vertical slices of `doriac`:
 - Emits PHP for supported syntax through the optional PHP compatibility backend, including `not`, `and`, `or`, and `xor` lowering that preserves Doria boolean semantics.
 - Provides CLI commands and integration tests.
 
-It is intentionally not a complete language yet. The implementation should grow in small, tested compiler increments without compromising Doria's native-first semantics.
+It is intentionally not a complete language yet. The implementation should grow in small, tested compiler increments without compromising Doria's native-first semantics. The Doria End-to-End Development Plan is the master future execution plan; its next implementation stage is Stage 11: MIR + interpreter oracle, which retires NativeSmokeModule rather than expanding it.
 
 ## Quick start
 

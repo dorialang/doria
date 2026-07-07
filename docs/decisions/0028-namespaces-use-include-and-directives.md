@@ -209,7 +209,7 @@ Risks:
 - bypassing variable initialization
 - jumping into scopes
 - breaking readonly/writable analysis
-- complicating borrow/lifetime analysis later
+- complicating ownership/borrow checking over MIR later
 - bypassing future `given` / `finally` cleanup obligations
 - making definite-return analysis harder
 - making CFG lowering harder
@@ -222,8 +222,8 @@ If `goto` is ever accepted later, likely restrictions include:
 - cannot jump into a deeper scope
 - cannot jump past initialization that would be visible at the target
 - cannot bypass cleanup or `finally` obligations
-- cannot jump into or out of protected resource regions
-- cannot cross future borrow/lifetime boundaries
+- cannot jump into or out of guarded resource regions
+- cannot cross future ownership/borrow-checking boundaries
 
 ## C/C++ Textual Preprocessor Evaluation
 
@@ -260,7 +260,7 @@ Textual macros are dangerous for Doria because:
 - macro-expanded syntax can hide errors from source-level reasoning
 - macro systems can undermine type safety
 - macro conditionals can create unparseable inactive code
-- macros complicate diagnostics, source maps, tooling, and future borrow/lifetime analysis
+- macros complicate diagnostics, source maps, tooling, and future ownership/borrow checking over MIR
 
 Doria source should remain parseable, typed, and semantically checked by `doriac`. If a directive changes compilation, it should do so through structured compiler semantics, not arbitrary token substitution.
 

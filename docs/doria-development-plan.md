@@ -1,5 +1,7 @@
 # Doria compiler plan for Codex
 
+Note: docs/doria-end-to-end-plan.md is now the master execution plan for future work. This older plan remains supporting context only where it does not conflict with that master plan.
+
 ## Architecture correction
 
 Doria is not primarily a language that compiles to PHP.
@@ -43,7 +45,7 @@ Doria is a compiled programming language for native applications, command-line t
 - Variables declared only with let or explicit types
 - Everything readonly by default
 - writable keyword for intentional mutation
-- Classes, functions, methods, default-public members, internal members, constructor promotion
+- Classes, functions, methods, default-accessible members, internal members, constructor promotion
 - Collection aliases: List<T>, Dictionary<K, V>, Set<T>
 - Future: generics, borrow checker, async/await, native backend
 ```
@@ -217,7 +219,7 @@ $person->rename("Lucy"); // Okay
 
 ---
 
-## 7. Member access uses default-public plus `internal`
+## 7. Member access uses default-accessible plus `internal`
 
 Doria class members are externally accessible by default. There is no need to write `public`.
 
@@ -247,7 +249,7 @@ writable answers: can this value/member be reassigned or can this method mutate 
 internal answers: can code outside the declaring class access this member?
 ```
 
-Do not use `public`, `protected`, or `private` as Doria member modifiers. Doria does not include `protected` behavior in the early language.
+Do not use `public`, `protected`, or `private` as Doria member modifiers. Protected is permanently excluded from Doria; inheritance does not add a third access tier.
 
 Property hooks are planned later for validation and computed properties, but they are not implemented in this slice.
 
@@ -1118,7 +1120,7 @@ Doria source
 → Native executable
 ```
 
-Doria's native backend direction is a staged Cranelift/LLVM route; see `docs/decisions/0011-native-execution-path.md`. Cranelift is the first native smoke/backend route because it keeps the initial standalone-executable path small. LLVM is the accepted longer-term optimizing backend path once Doria's native-oriented IR, runtime, object layout, and debug-info needs are clearer. MLIR remains a possible future LLVM-ecosystem tool if Doria needs multiple levels of IR and more advanced lowering. A C backend bridge or debug/interpreter route may still be useful as auxiliary tooling, but they are not competing product-direction backend choices. ([LLVM][1]) ([mlir.llvm.org][7])
+Doria's native backend direction is a staged Cranelift/LLVM route; see `docs/decisions/0011-native-execution-path.md`. Cranelift is the first native smoke/backend route because it keeps the initial standalone-executable path small. LLVM is the accepted longer-term optimizing backend path once Doria's native-oriented IR, runtime, object layout, and debug-info needs are clearer. MLIR remains a possible future LLVM-ecosystem tool if Doria needs multiple levels of IR and more advanced lowering. The MIR interpreter is the accepted Stage 11 semantic oracle. A C backend bridge remains only possible auxiliary tooling, not a competing product-direction backend choice. ([LLVM][1]) ([mlir.llvm.org][7])
 
 Do not begin here.
 
@@ -1131,7 +1133,7 @@ Copy this into Codex:
 ```text
 You are helping build a new programming language called Doria.
 
-Doria is a compiled programming language for native applications, command-line tools, services, games, and systems software. It has syntax familiar to PHP-like and C-like language users, including `$variables`, classes, functions, default-public members, `internal` implementation details, constructor property promotion, and C-like blocks. However, it is strongly typed, compiled, readonly by default, and uses `writable` for intentional mutation.
+Doria is a compiled programming language for native applications, command-line tools, services, games, and systems software. It has syntax familiar to PHP-like and C-like language users, including `$variables`, classes, functions, default-accessible members, `internal` implementation details, constructor property promotion, and C-like blocks. However, it is strongly typed, compiled, readonly by default, and uses `writable` for intentional mutation.
 
 Build the first MVP compiler with Rust as the bootstrap implementation language.
 

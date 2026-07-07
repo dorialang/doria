@@ -30,6 +30,7 @@
 
 ## Next Compiler Work
 
+- Follow docs/doria-end-to-end-plan.md as the master execution plan for future work. The next implementation stage is Stage 11: MIR + interpreter oracle, which retires NativeSmokeModule rather than expanding the current native smoke path.
 - Treat `docs/decisions/0011-native-execution-path.md` as the accepted Stage 1 native execution path.
 - Follow the accepted staged Cranelift/LLVM native backend direction: Cranelift first for the smallest native smoke/backend route, LLVM later as the longer-term optimizing backend path.
 - Treat `docs/decisions/0013-stage-2-native-integers.md` as the accepted Stage 2 native integer execution decision.
@@ -85,7 +86,7 @@
 - Add parser/AST support for attributes using `#[...]`.
 - Add named arguments and shared call argument representation for calls and attributes.
 - Preserve property initializer expressions in AST/Doria IR and later lower non-constant initializers correctly.
-- Add property hooks later for validation and computed properties without changing the default-public plus `internal` member model.
+- Add property hooks later for validation and computed properties without changing the default-accessible plus `internal` member model.
 - Add language/design support for `writable class` and `readonly class` as mutability ergonomics before considering shorter mutation keywords.
 - Keep implementation of advanced control-flow constructs as future work: `finally`, `do ... while`, `given`, value-returning `when`, `match`, and labeled or numeric loop control.
 
