@@ -382,35 +382,16 @@ fn completion_items() -> Value {
     let types = [
         "void",
         "int",
-        "int8",
-        "int16",
-        "int32",
-        "int64",
-        "uint8",
-        "uint16",
-        "uint32",
-        "uint64",
         "float",
-        "float32",
-        "float64",
         "string",
         "bool",
         "mixed",
-        "never",
         "object",
         "resource",
         "array",
         "List",
         "Dictionary",
         "Set",
-        "Shared",
-        "Weak",
-        "SharedMut",
-        "Sendable",
-        "Shareable",
-        "Ptr",
-        "MutPtr",
-        "Bytes",
     ];
 
     let mut items = Vec::new();
@@ -617,4 +598,77 @@ fn send_message<W: Write>(writer: &mut W, message: &Value) -> Result<(), String>
     writer
         .write_all(&body)
         .map_err(|error| format!("failed to write LSP body: {error}"))
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn completion_labels() -> Vec<String> {
+        completion_items()["items"]
+            .as_array()
+            .expect("completion items should be an array")
+            .iter()
+            .map(|item| {
+                item["label"]
+                    .as_str()
+                    .expect("completion item labels should be strings")
+                    .to_string()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn completions_do_not_offer_unsupported_future_types() {
+        let labels = completion_labels();
+        for unsupported in [
+            "int8",
+            "int16",
+            "int32",
+            "int64",
+            "uint8",
+            "uint16",
+            "uint32",
+            "uint64",
+            "float32",
+            "float64",
+            "never",
+            "Shared",
+            "Weak",
+            "SharedMut",
+            "Sendable",
+            "Shareable",
+            "Ptr",
+            "MutPtr",
+            "Bytes",
+        ] {
+            assert!(
+                !labels.iter().any(|label| label == unsupported),
+                "unsupported future type `{unsupported}` must not be an active LSP completion"
+            );
+        }
+    }
+
+    #[test]
+    fn completions_keep_supported_types() {
+        let labels = completion_labels();
+        for supported in [
+            "void",
+            "int",
+            "float",
+            "string",
+            "bool",
+            "mixed",
+            "object",
+            "resource",
+            "array",
+            "List",
+            "Dictionary",
+            "Set",
+        ] {
+            assert!(
+                labels.iter().any(|label| label == supported),
+                "supported type `{supported}` should remain an LSP completion"
+            );
+        }
+    }
 }

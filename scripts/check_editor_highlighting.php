@@ -109,6 +109,20 @@ $plannedTypes = [
     'Set',
 ];
 
+$lspSupportedTypes = [
+    'void',
+    'int',
+    'float',
+    'string',
+    'bool',
+    'mixed',
+    'object',
+    'resource',
+    'array',
+    'List',
+    'Dictionary',
+    'Set',
+];
 $wordOperators = ['not', 'and', 'or', 'xor'];
 $rejectedPreprocessor = [
     'include',
@@ -444,13 +458,30 @@ function check_intellij_lexer(): void
 
 function check_lsp_completion_vocabulary(): void
 {
-    global $acceptedKeywords, $primitiveTypes, $plannedTypes, $wordOperators, $notKeywords, $lspServer;
+    global $acceptedKeywords, $primitiveTypes, $plannedTypes, $wordOperators, $notKeywords, $lspServer, $lspSupportedTypes;
 
     $lspText = read_text($lspServer);
-    $tokens = array_unique([...$acceptedKeywords, ...$primitiveTypes, ...$plannedTypes, ...$wordOperators]);
+    $tokens = array_unique([...$acceptedKeywords, ...$wordOperators]);
     sort($tokens);
     foreach ($tokens as $token) {
         require_check(str_contains($lspText, chr(34) . $token . chr(34)), 'LSP completion list is missing ' . $token);
+    }
+
+    require_check(
+        preg_match('/let types = \[(.*?)\];/s', $lspText, $matches) === 1,
+        'LSP completion type list could not be found'
+    );
+    $lspTypeList = $matches[1];
+
+    sort($lspSupportedTypes);
+    foreach ($lspSupportedTypes as $type) {
+        require_check(str_contains($lspTypeList, chr(34) . $type . chr(34)), 'LSP completion type list is missing ' . $type);
+    }
+
+    $unsupportedTypes = array_diff(array_unique([...$primitiveTypes, ...$plannedTypes]), $lspSupportedTypes);
+    sort($unsupportedTypes);
+    foreach ($unsupportedTypes as $type) {
+        require_check(!str_contains($lspTypeList, chr(34) . $type . chr(34)), 'LSP completion type list must not advertise unsupported type ' . $type);
     }
 
     sort($notKeywords);

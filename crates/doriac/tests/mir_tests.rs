@@ -195,6 +195,31 @@ fn debug_target_emits_interpreter_artifact() {
 }
 
 #[test]
+fn debug_backend_emit_handles_stage_11a_hir_directly() {
+    let hir = doriac::lower_source(
+        "test.doria",
+        r#"function main(): int
+{
+    return 42;
+}
+"#,
+    )
+    .expect("source should lower to HIR");
+
+    let output = doriac::backend::emit(&hir, BackendTarget::Debug)
+        .expect("available debug target should emit through the public backend layer");
+
+    let BackendOutput::Text {
+        extension,
+        contents,
+    } = output
+    else {
+        panic!("debug backend should emit text output");
+    };
+    assert_eq!(extension, "debug");
+    assert_eq!(contents, "exit_status: 42\nstdout:\n");
+}
+#[test]
 fn rejects_unsupported_arithmetic_return_as_mir_coverage() {
     let diagnostics = doriac::lower_source_to_mir(
         "test.doria",

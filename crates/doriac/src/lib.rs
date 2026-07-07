@@ -78,12 +78,11 @@ pub fn compile_source(
     target: BackendTarget,
 ) -> Result<backend::BackendOutput, Vec<Diagnostic>> {
     let hir = lower_source(path, text)?;
-    if target == BackendTarget::Debug {
-        return compile_hir_to_debug_output(&hir);
-    }
-
-    backend::emit(&hir, target)
-        .map_err(|error| vec![Diagnostic::new("B0001", error.message, Span::default())])
+    backend::emit(&hir, target).map_err(|error| {
+        error
+            .diagnostics
+            .unwrap_or_else(|| vec![Diagnostic::new("B0001", error.message, Span::default())])
+    })
 }
 
 pub fn parse_source_file(source: &SourceFile) -> DiagnosticResult<Program> {
@@ -102,22 +101,4 @@ pub fn render_diagnostics(
         .map(|diagnostic| diagnostic.render(&source))
         .collect::<Vec<_>>()
         .join("\n")
-}
-
-fn compile_hir_to_debug_output(
-    hir: &hir::Program,
-) -> Result<backend::BackendOutput, Vec<Diagnostic>> {
-    let mir = mir_lowering::lower_program(hir)?;
-    let output = mir_interpreter::interpret(&mir).map_err(|error| {
-        vec![Diagnostic::new(
-            "M1102",
-            format!("MIR interpreter failure: {}", error.message),
-            Span::default(),
-        )]
-    })?;
-
-    Ok(backend::BackendOutput::Text {
-        extension: "debug".to_string(),
-        contents: mir_interpreter::render_debug_output(&output),
-    })
 }
