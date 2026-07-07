@@ -416,6 +416,7 @@ struct NativeSmokeValidationContext<'program> {
     signatures: HashMap<String, NativeSmokeFunctionSignature>,
     function_order: Vec<String>,
     validated: HashMap<String, NativeSmokeFunction>,
+    validated_call_sites: HashSet<(String, Vec<i64>)>,
     validating: Vec<String>,
 }
 
@@ -425,6 +426,7 @@ fn validate_stage_10(program: &hir::Program) -> Result<NativeSmokeModule, Backen
         signatures: HashMap::new(),
         function_order: Vec::new(),
         validated: HashMap::new(),
+        validated_call_sites: HashSet::new(),
         validating: Vec::new(),
     };
     let mut main_count = 0;
@@ -483,21 +485,30 @@ fn validate_stage_10(program: &hir::Program) -> Result<NativeSmokeModule, Backen
         ));
     }
 
+    validate_stage_10_function("main", &[], &mut context)?;
     for name in context.function_order.clone() {
-        validate_stage_10_function(&name, &mut context)?;
+        if name == "main" {
+            continue;
+        }
+        let is_parameterless = context
+            .signatures
+            .get(&name)
+            .map(|signature| signature.params.is_empty())
+            .ok_or_else(|| {
+                BackendError::new(format!(
+                    "backend validation failure: native function `{name}` signature was not collected"
+                ))
+            })?;
+        if is_parameterless {
+            validate_stage_10_function(&name, &[], &mut context)?;
+        }
     }
 
     let functions = context
         .function_order
         .iter()
-        .map(|name| {
-            context.validated.get(name).cloned().ok_or_else(|| {
-                BackendError::new(format!(
-                    "backend validation failure: native function `{name}` was not validated"
-                ))
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+        .filter_map(|name| context.validated.get(name).cloned())
+        .collect::<Vec<_>>();
     let module = NativeSmokeModule {
         functions,
         main_name: "main".to_string(),
@@ -549,11 +560,9 @@ fn unsupported_native_function_signature(function_name: &str) -> BackendError {
 
 fn validate_stage_10_function(
     name: &str,
+    args: &[i64],
     context: &mut NativeSmokeValidationContext<'_>,
 ) -> Result<(), BackendError> {
-    if context.validated.contains_key(name) {
-        return Ok(());
-    }
     if context.validating.iter().any(|active| active == name) {
         return Err(BackendError::new(
             "unsupported native recursive function call for Stage 10",
@@ -570,15 +579,27 @@ fn validate_stage_10_function(
             "backend validation failure: native function `{name}` signature was not collected"
         ))
     })?;
+    if args.len() != signature.params.len() {
+        return Err(BackendError::new(format!(
+            "backend validation failure: native function `{name}` expected {} evaluated argument(s), got {}",
+            signature.params.len(),
+            args.len()
+        )));
+    }
+
+    let call_site = (name.to_string(), args.to_vec());
+    if context.validated_call_sites.contains(&call_site) {
+        return Ok(());
+    }
 
     context.validating.push(name.to_string());
     let mut local_states = HashMap::new();
-    for param in &signature.params {
+    for (param, value) in signature.params.iter().zip(args.iter().copied()) {
         local_states.insert(
             param.name.clone(),
             NativeSmokeLocalState {
                 writable: param.writable,
-                value: NativeSmokeValue::Int(0),
+                value: NativeSmokeValue::Int(value),
             },
         );
     }
@@ -587,18 +608,20 @@ fn validate_stage_10_function(
         &local_states,
         signature.return_type,
         context,
-    )?;
+    );
     context.validating.pop();
+    let body = body?;
 
-    context.validated.insert(
-        name.to_string(),
-        NativeSmokeFunction {
+    context.validated_call_sites.insert(call_site);
+    context
+        .validated
+        .entry(name.to_string())
+        .or_insert(NativeSmokeFunction {
             name: name.to_string(),
             params: signature.params,
             return_type: signature.return_type,
             body,
-        },
-    );
+        });
     Ok(())
 }
 
@@ -624,7 +647,7 @@ fn validate_stage_10_call_statement(
     }
     let (args, values) =
         validate_stage_10_call_args(name, args, &signature, local_states, context)?;
-    validate_stage_10_function(name, context)?;
+    validate_stage_10_function(name, &values, context)?;
     evaluate_native_function_from_context(context, name, &values)?;
     Ok(NativeSmokeStmt::Call(NativeSmokeCall {
         function: name.clone(),
@@ -651,7 +674,7 @@ fn validate_stage_10_int_call(
     }
     let (args, values) =
         validate_stage_10_call_args(name, args, &signature, local_states, context)?;
-    validate_stage_10_function(name, context)?;
+    validate_stage_10_function(name, &values, context)?;
     let value = match evaluate_native_function_from_context(context, name, &values)? {
         NativeSmokeFunctionOutcome::Int(value) => value,
         NativeSmokeFunctionOutcome::Void => {
@@ -5418,6 +5441,29 @@ function main(): int
     }
 
     return $count;
+}
+"#,
+        );
+
+        assert_eq!(evaluate_exit_code(&module), 42);
+    }
+
+    #[test]
+    fn validation_uses_actual_helper_arguments_for_loop_proofs() {
+        let module = validate_test_source(
+            r#"
+function prove(writable int $n): int
+{
+    while ($n == 0) {
+        $n = $n;
+    }
+
+    return 42;
+}
+
+function main(): int
+{
+    return prove(1);
 }
 "#,
         );

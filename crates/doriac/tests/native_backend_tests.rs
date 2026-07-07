@@ -600,6 +600,25 @@ function main(): int
 "#,
             42,
         ),
+        (
+            "main_function_helper_loop_uses_call_argument",
+            r#"
+function prove(writable int $n): int
+{
+    while ($n == 0) {
+        $n = $n;
+    }
+
+    return 42;
+}
+
+function main(): int
+{
+    return prove(1);
+}
+"#,
+            42,
+        ),
     ];
 
     for (stem, source, expected_code) in exit_cases {
