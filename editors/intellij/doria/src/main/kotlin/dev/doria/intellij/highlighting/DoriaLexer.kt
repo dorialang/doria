@@ -370,6 +370,7 @@ class DoriaLexer : LexerBase() {
 
     private fun useTokenType(): IElementType = when {
         isLegacyTraitUseLine() -> DoriaTokenTypes.INVALID
+        isLegacyClosureUseLine() -> DoriaTokenTypes.INVALID
         isImportUseLine() -> DoriaTokenTypes.IMPORT_USE_KEYWORD
         else -> DoriaTokenTypes.KEYWORD
     }
@@ -439,6 +440,9 @@ class DoriaLexer : LexerBase() {
 
     private fun isLegacyTraitUseLine(): Boolean =
         LEGACY_TRAIT_USE_LINE.matches(currentLine())
+
+    private fun isLegacyClosureUseLine(): Boolean =
+        LEGACY_CLOSURE_USE_LINE.matches(currentLine())
 
     private fun isImportUseLine(): Boolean =
         IMPORT_USE_LINE.matches(currentLine())
@@ -703,7 +707,14 @@ class DoriaLexer : LexerBase() {
             "spawn",
             "scope",
             "enum",
+            "case",
             "match",
+            "unsafe",
+            "extern",
+            "open",
+            "override",
+            "with",
+            "take",
             "try",
             "catch",
             "throw",
@@ -712,7 +723,7 @@ class DoriaLexer : LexerBase() {
 
         private val WORD_OPERATORS = setOf("not", "and", "or", "xor")
 
-        private val INVALID_KEYWORDS = setOf("goto")
+        private val INVALID_KEYWORDS = setOf("goto", "require", "require_once", "include_once")
 
         private val MODIFIERS = setOf("writable", "readonly", "internal")
 
@@ -733,18 +744,34 @@ class DoriaLexer : LexerBase() {
             "string",
             "bool",
             "mixed",
+            "never",
             "object",
             "resource",
             "array",
         )
 
-        private val COLLECTION_TYPES = setOf("List", "Dictionary", "Set")
+        private val COLLECTION_TYPES = setOf(
+            "List",
+            "Dictionary",
+            "Set",
+            "Shared",
+            "Weak",
+            "SharedMut",
+            "Sendable",
+            "Shareable",
+            "Ptr",
+            "MutPtr",
+            "Bytes",
+        )
 
         private val TRAIT_USES_LINE =
             Regex("^\\s+uses\\s+[A-Z][A-Za-z0-9_]*(?:\\s*,\\s*[A-Z][A-Za-z0-9_]*)*\\s*;?\\s*(?://.*)?$")
 
         private val LEGACY_TRAIT_USE_LINE =
             Regex("^\\s+use\\s+[A-Z][A-Za-z0-9_]*(?:\\s*,\\s*[A-Z][A-Za-z0-9_]*)*\\s*;?\\s*(?://.*)?$")
+
+        private val LEGACY_CLOSURE_USE_LINE =
+            Regex(".*\\)\\s+use\\s*\\(.*")
 
         private val IMPORT_USE_LINE =
             Regex("^use\\s+[A-Za-z_][A-Za-z0-9_]*(?:\\\\[A-Za-z_][A-Za-z0-9_]*)+(?:\\s+as\\s+[A-Za-z_][A-Za-z0-9_]*)?\\s*;?\\s*(?://.*)?$")
@@ -778,7 +805,7 @@ class DoriaLexer : LexerBase() {
         )
 
         private val STRICT_COMPARISON_OPERATORS = setOf("===", "!==")
-        private val THREE_CHAR_OPERATORS = STRICT_COMPARISON_OPERATORS + setOf("..<")
-        private val TWO_CHAR_OPERATORS = setOf("==", "!=", "<=", ">=", "&&", "||", "??", "=>", "+=", "-=", "++", "--", "..", "->", "::")
+        private val THREE_CHAR_OPERATORS = STRICT_COMPARISON_OPERATORS + setOf("..<", "?->")
+        private val TWO_CHAR_OPERATORS = setOf("==", "!=", "<=", ">=", "&&", "||", "??", "=>", "<<", ">>", "+=", "-=", "++", "--", "..", "->", "::")
     }
 }

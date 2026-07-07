@@ -4,6 +4,8 @@ This extension provides `.doria` language registration, TextMate syntax highligh
 
 Syntax colors depend on the active VS Code theme. This extension improves Doria's TextMate scopes for cleaner highlighting, but it does not ship a custom color theme yet.
 
+The TextMate grammar is editor support only. It highlights accepted and planned Doria vocabulary from the master plan so `.doria` files and Markdown `doria` fences stay readable, but highlighting does not mean the compiler implements every highlighted planned construct.
+
 Double-quoted string interpolation such as `{$this->name}` keeps the string text green while colorizing the variable reference. Single-quoted strings are treated as literal strings.
 
 Before launching the extension, build the language server from the repository root:

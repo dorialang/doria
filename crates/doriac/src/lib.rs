@@ -8,6 +8,8 @@ pub mod lexer;
 pub mod lowering;
 pub mod lsp;
 pub mod mir;
+pub mod mir_interpreter;
+pub mod mir_lowering;
 mod native_smoke;
 pub mod parser;
 pub mod semantics;
@@ -18,7 +20,7 @@ pub mod types;
 use ast::Program;
 use backend::BackendTarget;
 use diagnostics::{Diagnostic, DiagnosticResult};
-use source::SourceFile;
+use source::{SourceFile, Span};
 
 pub fn lex_source(
     path: impl Into<String>,
@@ -49,7 +51,7 @@ pub fn compile_source_to_php(
         _ => Err(vec![Diagnostic::new(
             "B0002",
             "PHP backend did not return text output",
-            crate::source::Span::default(),
+            Span::default(),
         )]),
     }
 }
@@ -62,6 +64,14 @@ pub fn lower_source(
     Ok(lowering::lower_program(&program))
 }
 
+pub fn lower_source_to_mir(
+    path: impl Into<String>,
+    text: impl Into<String>,
+) -> DiagnosticResult<mir::Program> {
+    let hir = lower_source(path, text)?;
+    mir_lowering::lower_program(&hir)
+}
+
 pub fn compile_source(
     path: impl Into<String>,
     text: impl Into<String>,
@@ -69,11 +79,9 @@ pub fn compile_source(
 ) -> Result<backend::BackendOutput, Vec<Diagnostic>> {
     let hir = lower_source(path, text)?;
     backend::emit(&hir, target).map_err(|error| {
-        vec![Diagnostic::new(
-            "B0001",
-            error.message,
-            crate::source::Span::default(),
-        )]
+        error
+            .diagnostics
+            .unwrap_or_else(|| vec![Diagnostic::new("B0001", error.message, Span::default())])
     })
 }
 

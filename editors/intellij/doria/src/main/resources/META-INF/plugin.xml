@@ -16,27 +16,27 @@
 
     <fileType
       name="Doria"
-      language="Doria"
+      language="doria"
       implementationClass="dev.doria.intellij.DoriaFileType"
       fieldName="INSTANCE"
       extensions="doria" />
 
     <lang.syntaxHighlighterFactory
-      language="Doria"
+      language="doria"
       implementationClass="dev.doria.intellij.highlighting.DoriaSyntaxHighlighterFactory" />
 
     <colorSettingsPage implementation="dev.doria.intellij.highlighting.DoriaColorSettingsPage" />
 
     <lang.parserDefinition
-      language="Doria"
+      language="doria"
       implementationClass="dev.doria.intellij.psi.DoriaParserDefinition" />
 
     <lang.commenter
-      language="Doria"
+      language="doria"
       implementationClass="dev.doria.intellij.DoriaCommenter" />
 
     <annotator
-      language="Doria"
+      language="doria"
       implementationClass="dev.doria.intellij.highlighting.DoriaVariableUsageAnnotator" />
 
     <applicationConfigurable

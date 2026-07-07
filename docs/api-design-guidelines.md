@@ -13,7 +13,7 @@ Verbs are methods.
 
 Prefer property access for data:
 
-```php
+```doria
 let $body = $message->body;
 let $headers = $message->headers;
 let $status = $message->status;
@@ -21,7 +21,7 @@ let $status = $message->status;
 
 Avoid vague zero-argument noun methods:
 
-```php
+```doria
 let $body = $message->body();
 let $headers = $message->headers();
 let $status = $message->status();
@@ -35,7 +35,7 @@ Use properties for stored values, state, identifiers, configuration values, comp
 
 Examples:
 
-```php
+```doria
 $message->id
 $message->body
 $message->headers
@@ -50,7 +50,7 @@ An externally accessible member can remain property-shaped even when access need
 
 Possible future shape:
 
-```php
+```doria
 class Message<T>
 {
     internal string $rawBody;
@@ -72,7 +72,7 @@ Use methods for commands, mutations, operations with meaningful work, I/O, async
 
 Examples:
 
-```php
+```doria
 await $message->acknowledge();
 await $message->retryAfter(seconds: 30);
 $report->renderPdf();
@@ -80,7 +80,7 @@ $report->renderPdf();
 
 If a method primarily returns data but must remain a method because it performs I/O, expensive work, decoding, or another explicit operation, name it with a clear verb:
 
-```php
+```doria
 await $message->loadBody();
 $message->decodeBody();
 $repository->findById($id);
@@ -95,7 +95,7 @@ Doria may borrow safety ideas from Rust, but it should not inherit Rust surface 
 
 Avoid making examples and standard APIs feel Rust-shaped:
 
-```php
+```doria
 Ack::ok();
 Result<T, E>;
 Option<T>;
@@ -104,7 +104,7 @@ Dictionary::new();
 
 Prefer Doria/PHP-shaped APIs:
 
-```php
+```doria
 $message->acknowledge();
 return new AcknowledgeMessage();
 return MessageDecision::Acknowledge;

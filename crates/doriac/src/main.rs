@@ -40,6 +40,7 @@ fn run() -> Result<ExitCode, String> {
         }
         "ast" => ast_command(&args[1..]).map(|()| ExitCode::SUCCESS),
         "hir" => hir_command(&args[1..]).map(|()| ExitCode::SUCCESS),
+        "mir" => mir_command(&args[1..]).map(|()| ExitCode::SUCCESS),
         "compile" => compile_command(&args[1..]).map(|()| ExitCode::SUCCESS),
         "run" => run_command(&args[1..]),
         command => Err(format!(
@@ -79,7 +80,7 @@ fn compile_command(args: &[String]) -> Result<(), String> {
 
     if !target.is_available() {
         return Err(format!(
-            "target `{}` ({}) is planned but not implemented yet; available targets are `native` and `php`",
+            "target `{}` ({}) is planned but not implemented yet; available targets are `native`, `php`, and `debug`",
             target.name(),
             target.description()
         ));
@@ -117,6 +118,17 @@ fn hir_command(args: &[String]) -> Result<(), String> {
     let hir = doriac::lower_source(path.clone(), text.clone())
         .map_err(|diagnostics| doriac::render_diagnostics(path, text, &diagnostics))?;
     println!("{hir:#?}");
+    Ok(())
+}
+
+fn mir_command(args: &[String]) -> Result<(), String> {
+    let input = args
+        .first()
+        .ok_or_else(|| "missing input file".to_string())?;
+    let (path, text) = read_source(input)?;
+    let mir = doriac::lower_source_to_mir(path.clone(), text.clone())
+        .map_err(|diagnostics| doriac::render_diagnostics(path, text, &diagnostics))?;
+    print!("{mir}");
     Ok(())
 }
 
@@ -289,7 +301,7 @@ fn direct_executable_hint(path: &Path) -> String {
 
 fn print_help() {
     println!(
-        "doriac 0.1.0\n\nUSAGE:\n    doriac check <source.doria>\n    doriac ast <source.doria>\n    doriac hir <source.doria>\n    doriac compile <source.doria> [--out <file>]\n    doriac compile <source.doria> --target php [--out <file>]\n    doriac run <source.doria>\n\nTARGETS:\n    native    default target for standalone executables\n    php       compatibility and inspection backend\n    debug     planned interpreter/debug backend\n    wasm      planned WebAssembly backend"
+        "doriac 0.1.0\n\nUSAGE:\n    doriac check <source.doria>\n    doriac ast <source.doria>\n    doriac hir <source.doria>\n    doriac mir <source.doria>\n    doriac compile <source.doria> [--out <file>]\n    doriac compile <source.doria> --target php [--out <file>]\n    doriac run <source.doria>\n\nTARGETS:\n    native    default target for standalone executables\n    php       compatibility and inspection backend\n    debug     Stage 11a MIR interpreter debug artifact\n    wasm      planned WebAssembly backend"
     );
 }
 

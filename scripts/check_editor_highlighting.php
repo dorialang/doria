@@ -11,12 +11,16 @@ $root = dirname(__DIR__);
 
 $vscodePackage = $root . '/editors/vscode/doria/package.json';
 $vscodeGrammar = $root . '/editors/vscode/doria/syntaxes/doria.tmLanguage.json';
+$vscodeLanguageConfiguration = $root . '/editors/vscode/doria/language-configuration.json';
 $vscodeExtension = $root . '/editors/vscode/doria/extension.js';
 $intellijLexer = $root . '/editors/intellij/doria/src/main/kotlin/dev/doria/intellij/highlighting/DoriaLexer.kt';
 $intellijTokenTypes = $root . '/editors/intellij/doria/src/main/kotlin/dev/doria/intellij/highlighting/DoriaTokenTypes.kt';
 $intellijSyntaxHighlighter = $root . '/editors/intellij/doria/src/main/kotlin/dev/doria/intellij/highlighting/DoriaSyntaxHighlighter.kt';
 $intellijLspFiles = $root . '/editors/intellij/doria/src/main/kotlin/dev/doria/intellij/lsp/DoriaLspFiles.kt';
+$intellijPluginXml = $root . '/editors/intellij/doria/src/main/resources/META-INF/plugin.xml';
+$lspServer = $root . '/crates/doriac/src/lsp.rs';
 $fixture = $root . '/editors/fixtures/latest-tokens.doria';
+$rejectedFixture = $root . '/editors/fixtures/rejected-syntax.doria';
 
 $acceptedKeywords = [
     'class',
@@ -24,17 +28,48 @@ $acceptedKeywords = [
     'trait',
     'extends',
     'implements',
+    'function',
+    'let',
+    'writable',
+    'readonly',
+    'internal',
     'namespace',
     'use',
     'uses',
     'as',
     'include',
     'declare',
+    'echo',
+    'return',
+    'if',
+    'else',
+    'while',
+    'for',
+    'foreach',
     'break',
     'continue',
+    'true',
+    'false',
+    'null',
+    'new',
+    'throw',
+    'throws',
+    'try',
+    'catch',
+    'finally',
+    'enum',
+    'case',
+    'match',
     'when',
     'given',
-    'finally',
+    'async',
+    'await',
+    'unsafe',
+    'extern',
+    'open',
+    'override',
+    'with',
+    'take',
 ];
 
 $primitiveTypes = [
@@ -54,8 +89,40 @@ $primitiveTypes = [
     'string',
     'bool',
     'mixed',
+    'never',
+    'object',
+    'resource',
+    'array',
 ];
 
+$plannedTypes = [
+    'Shared',
+    'Weak',
+    'SharedMut',
+    'Sendable',
+    'Shareable',
+    'Ptr',
+    'MutPtr',
+    'Bytes',
+    'List',
+    'Dictionary',
+    'Set',
+];
+
+$lspSupportedTypes = [
+    'void',
+    'int',
+    'float',
+    'string',
+    'bool',
+    'mixed',
+    'object',
+    'resource',
+    'array',
+    'List',
+    'Dictionary',
+    'Set',
+];
 $wordOperators = ['not', 'and', 'or', 'xor'];
 $rejectedPreprocessor = [
     'include',
@@ -70,9 +137,9 @@ $rejectedPreprocessor = [
     'warning',
     'error',
 ];
+$rejectedKeywords = ['goto', 'require', 'require_once', 'include_once'];
 $strictComparison = ['===', '!=='];
-$notKeywords = ['Option', 'Result'];
-
+$notKeywords = ['public', 'private', 'protected', 'Result'];
 function fail_check(string $message): never
 {
     fwrite(STDERR, "editor highlighting check failed: {$message}\n");
@@ -173,15 +240,26 @@ function check_vscode_package(): void
     );
 }
 
+function check_vscode_language_configuration(): void
+{
+    global $vscodeLanguageConfiguration;
+
+    $config = load_json($vscodeLanguageConfiguration);
+    foreach (['brackets', 'autoClosingPairs', 'surroundingPairs'] as $key) {
+        $json = json_encode($config[$key] ?? null, JSON_THROW_ON_ERROR);
+        require_check(str_contains($json, '#[') && str_contains($json, ']'), 'VS Code language configuration must include #[...] behavior in ' . $key);
+    }
+}
+
 function check_vscode_grammar(): void
 {
-    global $acceptedKeywords, $primitiveTypes, $wordOperators, $notKeywords, $strictComparison, $rejectedPreprocessor, $vscodeGrammar;
+    global $acceptedKeywords, $primitiveTypes, $plannedTypes, $wordOperators, $notKeywords, $strictComparison, $rejectedPreprocessor, $rejectedKeywords, $vscodeGrammar;
 
     $grammar = load_json($vscodeGrammar);
     $grammarText = json_encode($grammar, JSON_THROW_ON_ERROR);
     $patterns = iterator_to_array(walk_patterns($grammar), false);
 
-    $tokens = array_unique([...$acceptedKeywords, ...$primitiveTypes, ...$wordOperators]);
+    $tokens = array_unique([...$acceptedKeywords, ...$primitiveTypes, ...$plannedTypes, ...$wordOperators]);
     sort($tokens);
     foreach ($tokens as $token) {
         require_check(str_contains($grammarText, $token), "VS Code grammar is missing '{$token}'");
@@ -236,11 +314,23 @@ function check_vscode_grammar(): void
         );
     }
 
+    $invalidKeywordPatterns = [];
+    foreach ($patterns as $pattern) {
+        if (($pattern['name'] ?? null) === 'invalid.illegal.keyword.rejected.doria') {
+            $invalidKeywordPatterns[] = (string) ($pattern['match'] ?? '');
+        }
+    }
+    require_check($invalidKeywordPatterns !== [], 'VS Code grammar must define rejected keyword highlighting');
+    foreach ($rejectedKeywords as $keyword) {
+        require_check(
+            any_match($invalidKeywordPatterns, static fn (string $match): bool => str_contains($match, $keyword)),
+            'VS Code grammar must mark ' . $keyword . ' invalid or unsupported'
+        );
+    }
     require_check(
-        any_match($patterns, static fn (array $pattern): bool => ($pattern['name'] ?? null) === 'invalid.illegal.keyword.goto.doria'),
-        'VS Code grammar must mark goto invalid or unsupported'
+        any_match($invalidKeywordPatterns, static fn (string $match): bool => str_contains($match, 'use') && str_contains($match, '(?=')),
+        'VS Code grammar must mark closure use capture invalid or unsupported'
     );
-
     $importPatterns = array_values(array_filter(
         $patterns,
         static fn (array $pattern): bool => ($pattern['name'] ?? null) === 'meta.import.doria'
@@ -292,8 +382,8 @@ function check_vscode_grammar(): void
 
 function check_intellij_lexer(): void
 {
-    global $acceptedKeywords, $primitiveTypes, $wordOperators, $notKeywords, $strictComparison, $rejectedPreprocessor;
-    global $intellijLexer, $intellijTokenTypes, $intellijSyntaxHighlighter;
+    global $acceptedKeywords, $primitiveTypes, $plannedTypes, $wordOperators, $notKeywords, $strictComparison, $rejectedPreprocessor, $rejectedKeywords;
+    global $intellijLexer, $intellijTokenTypes, $intellijSyntaxHighlighter, $intellijPluginXml;
 
     $lexerText = read_text($intellijLexer);
     $intellijHighlightingText = implode("\n", [
@@ -302,7 +392,7 @@ function check_intellij_lexer(): void
         read_text($intellijSyntaxHighlighter),
     ]);
 
-    $tokens = array_unique([...$acceptedKeywords, ...$primitiveTypes, ...$wordOperators]);
+    $tokens = array_unique([...$acceptedKeywords, ...$primitiveTypes, ...$plannedTypes, ...$wordOperators]);
     sort($tokens);
     foreach ($tokens as $token) {
         require_check(str_contains($lexerText, '"' . $token . '"'), "IntelliJ lexer is missing '{$token}'");
@@ -321,7 +411,12 @@ function check_intellij_lexer(): void
         'IntelliJ lexer must route strict comparison operators to invalid highlighting'
     );
 
-    require_check(str_contains($lexerText, '"goto"') && str_contains($lexerText, 'INVALID_KEYWORDS'), 'IntelliJ lexer must mark goto invalid');
+    foreach ($rejectedKeywords as $keyword) {
+        require_check(
+            str_contains($lexerText, chr(34) . $keyword . chr(34)) && str_contains($lexerText, 'INVALID_KEYWORDS'),
+            'IntelliJ lexer must mark ' . $keyword . ' invalid'
+        );
+    }
     sort($rejectedPreprocessor);
     foreach ($rejectedPreprocessor as $directive) {
         require_check(str_contains($lexerText, '"' . $directive . '"'), "IntelliJ lexer must recognize #{$directive} as unsupported");
@@ -338,6 +433,16 @@ function check_intellij_lexer(): void
         str_contains($lexerText, 'LEGACY_TRAIT_USE_LINE') && str_contains($lexerText, 'isLegacyTraitUseLine() -> DoriaTokenTypes.INVALID'),
         'IntelliJ lexer must mark legacy class-body trait use invalid'
     );
+    require_check(
+        str_contains($lexerText, 'LEGACY_CLOSURE_USE_LINE') && str_contains($lexerText, 'isLegacyClosureUseLine() -> DoriaTokenTypes.INVALID'),
+        'IntelliJ lexer must mark legacy closure use capture invalid'
+    );
+
+    $pluginXml = read_text($intellijPluginXml);
+    require_check(
+        str_contains($pluginXml, 'language=' . chr(34) . 'doria' . chr(34)),
+        'IntelliJ plugin must register the lowercase doria language id for Markdown fences'
+    );
 
     foreach ([
         'DORIA_IMPORT_USE_KEYWORD',
@@ -348,6 +453,40 @@ function check_intellij_lexer(): void
         'DORIA_TRAIT_NAME',
     ] as $tokenType) {
         require_check(str_contains($intellijHighlightingText, $tokenType), "IntelliJ highlighting is missing {$tokenType}");
+    }
+}
+
+function check_lsp_completion_vocabulary(): void
+{
+    global $acceptedKeywords, $primitiveTypes, $plannedTypes, $wordOperators, $notKeywords, $lspServer, $lspSupportedTypes;
+
+    $lspText = read_text($lspServer);
+    $tokens = array_unique([...$acceptedKeywords, ...$wordOperators]);
+    sort($tokens);
+    foreach ($tokens as $token) {
+        require_check(str_contains($lspText, chr(34) . $token . chr(34)), 'LSP completion list is missing ' . $token);
+    }
+
+    require_check(
+        preg_match('/let types = \[(.*?)\];/s', $lspText, $matches) === 1,
+        'LSP completion type list could not be found'
+    );
+    $lspTypeList = $matches[1];
+
+    sort($lspSupportedTypes);
+    foreach ($lspSupportedTypes as $type) {
+        require_check(str_contains($lspTypeList, chr(34) . $type . chr(34)), 'LSP completion type list is missing ' . $type);
+    }
+
+    $unsupportedTypes = array_diff(array_unique([...$primitiveTypes, ...$plannedTypes]), $lspSupportedTypes);
+    sort($unsupportedTypes);
+    foreach ($unsupportedTypes as $type) {
+        require_check(!str_contains($lspTypeList, chr(34) . $type . chr(34)), 'LSP completion type list must not advertise unsupported type ' . $type);
+    }
+
+    sort($notKeywords);
+    foreach ($notKeywords as $token) {
+        require_check(!str_contains($lspText, chr(34) . $token . chr(34)), 'LSP completion list must not advertise ' . $token);
     }
 }
 
@@ -370,32 +509,53 @@ function check_editor_fixture_diagnostics_are_skipped(): void
 
 function check_fixture(): void
 {
-    global $acceptedKeywords, $wordOperators, $fixture;
+    global $fixture, $rejectedFixture, $strictComparison, $rejectedKeywords;
 
     $fixtureText = read_text($fixture);
-    $tokens = array_unique([...$acceptedKeywords, ...$wordOperators]);
-    sort($tokens);
-    foreach ($tokens as $token) {
-        require_check(str_contains($fixtureText, $token), "shared editor fixture is missing '{$token}'");
+    $requiredSnippets = [
+        'internal',
+        'uses HasSlug, TracksChanges;',
+        'with ($base)',
+        'with (take $resource)',
+        'open class Model',
+        'override function save',
+        'throws StorageError',
+        'enum Option',
+        'case Some',
+        'match ($option)',
+        'unsafe',
+        'extern',
+        '#[PhpExport]',
+        '0..<10',
+        '0..10',
+        '?User',
+        '\n\t\r\s',
+        'use App\Repositories\UserRepository;',
+    ];
+    foreach ($requiredSnippets as $snippet) {
+        require_check(str_contains($fixtureText, $snippet), 'shared editor fixture is missing ' . $snippet);
     }
 
-    $numericTokens = ['int8', 'int16', 'int32', 'int64', 'uint8', 'uint16', 'uint32', 'uint64', 'float32', 'float64'];
-    sort($numericTokens);
-    foreach ($numericTokens as $token) {
-        require_check(str_contains($fixtureText, $token), "shared editor fixture is missing '{$token}'");
+    require_check(is_file($rejectedFixture), 'negative editor fixture must exist');
+    $rejectedText = read_text($rejectedFixture);
+    foreach (['public', 'private', 'protected', 'use HasSlug;', 'use ($x)', '#define', '#include'] as $snippet) {
+        require_check(str_contains($rejectedText, $snippet), 'negative editor fixture is missing ' . $snippet);
     }
-
-    require_check(
-        str_contains($fixtureText, 'use App\\Models\\Post;') && str_contains($fixtureText, 'uses HasSlug, TracksChanges;'),
-        'shared editor fixture must include both import-use and trait-composition uses examples'
-    );
+    foreach ($strictComparison as $operator) {
+        require_check(str_contains($rejectedText, $operator), 'negative editor fixture is missing ' . $operator);
+    }
+    foreach ($rejectedKeywords as $keyword) {
+        require_check(str_contains($rejectedText, $keyword), 'negative editor fixture is missing ' . $keyword);
+    }
 }
 
 function main(): int
 {
     check_vscode_package();
+    check_vscode_language_configuration();
     check_vscode_grammar();
     check_intellij_lexer();
+    check_lsp_completion_vocabulary();
     check_editor_fixture_diagnostics_are_skipped();
     check_fixture();
     echo "Doria editor highlighting checks passed.\n";

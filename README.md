@@ -70,7 +70,7 @@ This repository contains the first working vertical slices of `doriac`:
 - Emits PHP for supported syntax through the optional PHP compatibility backend, including `not`, `and`, `or`, and `xor` lowering that preserves Doria boolean semantics.
 - Provides CLI commands and integration tests.
 
-It is intentionally not a complete language yet. The implementation should grow in small, tested compiler increments without compromising Doria's native-first semantics. The Doria End-to-End Development Plan is the master future execution plan; its next implementation stage is Stage 11: MIR + interpreter oracle, which retires NativeSmokeModule rather than expanding it.
+It is intentionally not a complete language yet. The implementation should grow in small, tested compiler increments without compromising Doria's native-first semantics. The Doria End-to-End Development Plan is the master future execution plan; its next implementation stage is Stage 11: MIR + interpreter oracle, which retires NativeSmokeModule rather than expanding it. Stage 11a now seeds inspectable MIR and a debug interpreter for main(): int literal returns, main(): void fallthrough or bare return, and exact string-literal echo; it is not complete Stage 11.
 
 ## Quick start
 
@@ -79,6 +79,7 @@ cargo test
 cargo run -p doriac -- --help
 cargo run -p doriac -- check examples/native/main_void_hello.doria
 cargo run -p doriac -- hir examples/native/main_void_hello.doria
+cargo run -p doriac -- mir examples/debug/main_void_hello.doria
 cargo run -p doriac -- compile examples/native/main_void_hello.doria --out build/native/main_void_hello
 ./build/native/main_void_hello
 ```
@@ -183,6 +184,8 @@ Doria has first-pass editor tooling for `.doria` files:
 - `editors/intellij/doria` contains an IntelliJ Platform plugin with `.doria` file recognition, syntax highlighting, editor settings, and `doria-lsp` integration.
 
 VS Code and IntelliJ / JetBrains highlighting should stay aligned as accepted Doria vocabulary evolves. The shared smoke fixture is `editors/fixtures/latest-tokens.doria`, and `scripts/check_editor_highlighting.php` checks the current editor token guardrails.
+
+Syntax highlighting is editor grammar support, not compiler support. Planned keywords may be highlighted so docs and examples are readable before their compiler stages land. Markdown examples that contain Doria source should use the `doria` fence; generated PHP or PHP interop examples should keep the `php` fence. JetBrains Markdown highlighting depends on the IntelliJ plugin registering Doria as a language id that Markdown can inject for `doria` fences, while `.doria` diagnostics, hover, and completion come from `doria-lsp` when configured.
 
 Build the server before starting either editor extension:
 

@@ -24,13 +24,14 @@
 - Support the first accepted boolean/equality compiler slice: typed `==` / `!=`, rejection of `===` / `!==`, bool-only `!` / `not`, `&&` / `and`, `||` / `or`, and `xor` in the parser, semantic checker, Doria IR, and PHP backend.
 - Stage 10 Cranelift native smoke backend is implemented for top-level free functions plus exactly one top-level `function main(): int` or `function main(): void`. `main(): int` returns an explicit process status in the accepted `0..125` portable exit-code range, while helper `int` returns are Doria `int` values, not process statuses. The supported source subset includes Stage 9 integer/control-flow/string support plus native helper functions with `int` parameters, `int`/`void` returns, calls to `int` helpers in supported integer expressions, and calls to `void` helpers in statement position. Native validation proves accepted loops terminate within the current smoke verification cap and rejects recursion, mutual recursion, unsupported native signatures, and broader runtime features before lowering to real Cranelift functions and control flow.
 - Stage 7a preserves the Stage 6c native source subset while routing current native smoke validation, compile-time smoke evaluation/proof, and Cranelift lowering through a private native smoke module boundary.
+- Stage 11a seeds inspectable MIR and a debug interpreter for main(): int literal returns, main(): void fallthrough or bare return, and exact string-literal echo. NativeSmokeModule still exists temporarily for broader current native smoke coverage and must not receive new language capability expansion without explicit approval.
 - Keep PHP as a compatibility backend only; do not treat PHP output as the proof that Doria semantics are correct.
 - Do not build PHP-to-Doria migration in the current v0.1 slice.
 - Do not start desktop, game engine, raylib, or FFI implementation work in the current v0.1 slice.
 
 ## Next Compiler Work
 
-- Follow docs/doria-end-to-end-plan.md as the master execution plan for future work. The next implementation stage is Stage 11: MIR + interpreter oracle, which retires NativeSmokeModule rather than expanding the current native smoke path.
+- Follow docs/doria-end-to-end-plan.md as the master execution plan for future work. The active implementation slice is Stage 11a: seed MIR + interpreter oracle for the smallest executable subset. Full Stage <=10 MIR port, full interpreter parity, and NativeSmokeModule deletion remain future Stage 11b/11c work.
 - Treat `docs/decisions/0011-native-execution-path.md` as the accepted Stage 1 native execution path.
 - Follow the accepted staged Cranelift/LLVM native backend direction: Cranelift first for the smallest native smoke/backend route, LLVM later as the longer-term optimizing backend path.
 - Treat `docs/decisions/0013-stage-2-native-integers.md` as the accepted Stage 2 native integer execution decision.

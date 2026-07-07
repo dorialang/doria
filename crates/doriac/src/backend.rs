@@ -1,7 +1,8 @@
 use std::path::PathBuf;
 use std::str::FromStr;
 
-use crate::{codegen_native, codegen_php, hir};
+use crate::diagnostics::Diagnostic;
+use crate::{codegen_native, codegen_php, hir, mir_interpreter, mir_lowering};
 
 pub trait Backend {
     fn target(&self) -> BackendTarget;
@@ -19,12 +20,26 @@ pub enum BackendOutput {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BackendError {
     pub message: String,
+    pub diagnostics: Option<Vec<Diagnostic>>,
 }
 
 impl BackendError {
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            diagnostics: None,
+        }
+    }
+
+    pub fn from_diagnostics(diagnostics: Vec<Diagnostic>) -> Self {
+        let message = diagnostics
+            .iter()
+            .map(|diagnostic| format!("{}: {}", diagnostic.code, diagnostic.message))
+            .collect::<Vec<_>>()
+            .join("\n");
+        Self {
+            message,
+            diagnostics: Some(diagnostics),
         }
     }
 }
@@ -48,7 +63,10 @@ impl BackendTarget {
     }
 
     pub fn is_available(self) -> bool {
-        matches!(self, BackendTarget::Native | BackendTarget::Php)
+        matches!(
+            self,
+            BackendTarget::Native | BackendTarget::Php | BackendTarget::Debug
+        )
     }
 
     pub fn description(self) -> &'static str {
@@ -105,11 +123,31 @@ impl Backend for NativeBackend {
     }
 }
 
+pub struct DebugBackend;
+
+impl Backend for DebugBackend {
+    fn target(&self) -> BackendTarget {
+        BackendTarget::Debug
+    }
+
+    fn emit(&self, program: &hir::Program) -> Result<BackendOutput, BackendError> {
+        let mir = mir_lowering::lower_program(program).map_err(BackendError::from_diagnostics)?;
+        let output = mir_interpreter::interpret(&mir)
+            .map_err(|error| BackendError::new(format!("MIR interpreter failure: {error}")))?;
+
+        Ok(BackendOutput::Text {
+            extension: "debug".to_string(),
+            contents: mir_interpreter::render_debug_output(&output),
+        })
+    }
+}
+
 pub fn emit(program: &hir::Program, target: BackendTarget) -> Result<BackendOutput, BackendError> {
     match target {
         BackendTarget::Native => NativeBackend.emit(program),
         BackendTarget::Php => PhpBackend.emit(program),
-        BackendTarget::Debug | BackendTarget::Wasm => Err(format!(
+        BackendTarget::Debug => DebugBackend.emit(program),
+        BackendTarget::Wasm => Err(format!(
             "backend `{}` ({}) is planned but not implemented yet",
             target.name(),
             target.description()

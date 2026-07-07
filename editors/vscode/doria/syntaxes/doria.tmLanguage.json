@@ -117,8 +117,8 @@
           "match": "===|!=="
         },
         {
-          "name": "invalid.illegal.keyword.goto.doria",
-          "match": "\\bgoto\\b"
+          "name": "invalid.illegal.keyword.rejected.doria",
+          "match": "\\b(?:goto|require|require_once|include_once)\\b|\\buse\\b(?=\\s*\\()"
         }
       ]
     },
@@ -509,7 +509,7 @@
         },
         {
           "name": "keyword.control.doria",
-          "match": "\\b(?:return|foreach|as|if|else|while|for|break|continue|when|given|finally|extends|implements|uses)\\b"
+          "match": "\\b(?:return|foreach|as|if|else|while|for|break|continue|when|given|finally|try|catch|extends|implements|uses|with)\\b"
         },
         {
           "name": "keyword.control.exception.doria",
@@ -517,7 +517,7 @@
         },
         {
           "name": "storage.modifier.mutability.doria",
-          "match": "\\b(?:writable|readonly)\\b"
+          "match": "\\b(?:writable|readonly|take)\\b"
         },
         {
           "name": "storage.modifier.visibility.doria",
@@ -537,14 +537,14 @@
         },
         {
           "name": "keyword.other.reserved.doria",
-          "match": "\\b(?:async|await|spawn|scope|enum|match|try|catch)\\b"
+          "match": "\\b(?:async|await|spawn|scope|enum|case|match|unsafe|extern|open|override)\\b"
         }
       ]
     },
     "types": {
       "patterns": [
         {
-          "begin": "\\b(List|Dictionary|Set)\\s*(<)",
+          "begin": "\\b(List|Dictionary|Set|Shared|Weak|SharedMut|Sendable|Shareable|Ptr|MutPtr|Bytes)\\s*(<)",
           "beginCaptures": {
             "1": {
               "name": "support.type.collection.doria"
@@ -571,11 +571,11 @@
         },
         {
           "name": "storage.type.primitive.doria",
-          "match": "\\b(?:void|int|int8|int16|int32|int64|uint8|uint16|uint32|uint64|float|float32|float64|string|bool|mixed|object|resource|array)\\b"
+          "match": "\\b(?:void|int|int8|int16|int32|int64|uint8|uint16|uint32|uint64|float|float32|float64|string|bool|mixed|never|object|resource|array)\\b"
         },
         {
           "name": "support.type.collection.doria",
-          "match": "\\b(?:List|Dictionary|Set)\\b"
+          "match": "\\b(?:List|Dictionary|Set|Shared|Weak|SharedMut|Sendable|Shareable|Ptr|MutPtr|Bytes)\\b"
         },
         {
           "match": "\\b([A-Z][A-Za-z0-9_]*)\\b\\s*(?=\\$)",
@@ -622,7 +622,7 @@
         },
         {
           "name": "keyword.operator.doria",
-          "match": "\\.\\.<|\\.\\.|\\+\\+|--|==|!=|<=|>=|&&|\\|\\||\\?\\?|=>|->|::|\\+=|-=|[=+\\-*/%.<>!?:]"
+          "match": "\\.\\.<|\\.\\.|\\?->|\\+\\+|--|==|!=|<=|>=|&&|\\|\\||\\?\\?|=>|->|::|<<|>>|\\+=|-=|[=+\\-*/%.<>!?:&|^~]"
         }
       ]
     },

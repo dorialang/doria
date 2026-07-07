@@ -13,6 +13,8 @@ The initial plugin targets IntelliJ Platform `2025.2.1+`, where JetBrains expose
 
 This is first-pass Doria support for IntelliJ / JetBrains IDEs. The local IntelliJ highlighter is syntax highlighting only: it does not provide a semantic PSI tree, formatter, inspections, refactors, or compiler diagnostics. Compiler-backed diagnostics, completion, and hover remain separate and come from `doria-lsp` when the language server is configured and available.
 
+The plugin registers the lower-case `doria` language id so Markdown fenced blocks using the `doria` info string can resolve to the Doria highlighter where the JetBrains Markdown plugin performs language injection. Planned keywords are highlighted for documentation readability only; compiler support still follows the staged plan.
+
 ## Build the language server
 
 From the repository root:

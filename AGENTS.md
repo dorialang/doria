@@ -68,7 +68,7 @@ At completion, report assumptions made and critical decisions encountered. If no
 
 - Treat docs/doria-end-to-end-plan.md as the master execution plan for future work. It answers future-work forks unless Andrew later amends it.
 - Treat supporting roadmap, specification, notes, and decision files as subordinate where they conflict with the end-to-end plan.
-- Stage 11 is MIR + interpreter oracle. Do not describe or implement primitive helper signatures as Stage 11.
+- Stage 11 is MIR + interpreter oracle. Stage 11a seeds MIR dumps and the interpreter for a tiny executable subset only; it does not complete Stage 11. Do not describe or implement primitive helper signatures as Stage 11.
 - Do not expand NativeSmokeModule for new language capability slices unless Andrew explicitly approves a temporary compatibility fix. The plan retires it in Stage 11.
 - Doria has a real ownership/borrow checker model in Doria spelling: readonly is shared borrow, writable is exclusive borrow, and take transfers ownership.
 - public, private, and protected are not Doria visibility keywords. Members are externally accessible by default, internal is the only access-surface keyword, and protected is permanently excluded.
@@ -116,6 +116,8 @@ At completion, report assumptions made and critical decisions encountered. If no
 - Do not make PHP output the semantic oracle for Doria OOP behavior.
 - Do not make Doria editor support VS Code-only. Keep VS Code and IntelliJ / JetBrains syntax highlighting aligned.
 - Treat TextMate/editor highlighting as editor UX only, not lexer, parser, compiler, or LSP semantic-token support.
+- Use `doria` fences for Doria Markdown examples. Keep `php` fences only for generated PHP, PHP interop, or PHP migration input/output.
+- Planned Doria keywords may be highlighted in editor tooling to keep docs readable, but highlighting must never be described as compiler implementation.
 - Do not mark rejected Doria syntax such as `===`, `!==`, `#define`, or `#include` as accepted language syntax in editor tooling.
 - Keep self-hosting in mind when designing compiler APIs, diagnostics, source management, Doria IR, and the standard library.
 - Keep native desktop, game engine, C-library binding, and raylib goals visible when designing Doria IR, future native-oriented IR, runtime, memory representation, FFI, and performance benchmarks.

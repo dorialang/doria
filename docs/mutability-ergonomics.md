@@ -18,17 +18,17 @@ Member access is separate from mutability. Doria class members are externally ac
 
 Examples:
 
-```php
+```doria
 let $x = 5;
 $x = 10; // error
 ```
 
-```php
+```doria
 let writable $x = 5;
 $x = 10; // ok
 ```
 
-```php
+```doria
 class Person
 {
     string $id;
@@ -67,7 +67,7 @@ The solution is not to make Doria mutable by default. The solution is to provide
 
 Doria should support:
 
-```php
+```doria
 writable class Person
 {
     string $name;
@@ -83,7 +83,7 @@ Properties in this class are writable by default.
 
 Equivalent to:
 
-```php
+```doria
 class Person
 {
     writable string $name;
@@ -101,7 +101,7 @@ This helps mutable data-heavy classes without making the whole language mutable 
 
 This should still be an error:
 
-```php
+```doria
 writable class Person
 {
     string $name;
@@ -115,7 +115,7 @@ writable class Person
 
 The method must still say:
 
-```php
+```doria
 writable function rename(string $name): void
 {
     $this->name = $name;
@@ -137,7 +137,7 @@ Those should remain separate.
 
 A writable class should allow readonly exceptions:
 
-```php
+```doria
 writable class User
 {
     readonly int $id;
@@ -159,7 +159,7 @@ $name and $email are writable by default because the class is writable.
 
 Doria is already readonly by default, but `readonly class` is still useful as a stronger declaration of intent.
 
-```php
+```doria
 readonly class Money
 {
     int $amount;
@@ -176,7 +176,7 @@ Writable properties should be rejected inside it.
 
 Example error:
 
-```php
+```doria
 readonly class Money
 {
     writable int $amount; // error
@@ -189,7 +189,7 @@ readonly class Money
 
 Property groups may later reduce repetition inside a normal class:
 
-```php
+```doria
 class Person
 {
     writable {
@@ -240,7 +240,7 @@ Do not accept both spellings as valid syntax.
 
 Even if a class is writable, the variable binding still matters.
 
-```php
+```doria
 writable class Person
 {
     string $name;
@@ -250,7 +250,7 @@ let $person = new Person();
 $person->name = "Lucy"; // error: binding is readonly
 ```
 
-```php
+```doria
 let writable $person = new Person();
 $person->name = "Lucy"; // ok
 ```

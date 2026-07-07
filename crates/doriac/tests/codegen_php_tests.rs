@@ -1,4 +1,4 @@
-use doriac::backend::BackendTarget;
+use doriac::backend::{BackendOutput, BackendTarget};
 use doriac::hir;
 
 #[test]
@@ -537,7 +537,28 @@ function greet(string $name): string
 }
 
 #[test]
-fn recognizes_debug_as_planned_backend() {
+fn debug_backend_emits_stage_11a_artifact_and_rejects_broader_source() {
+    let output = doriac::compile_source(
+        "test.doria",
+        r#"function main(): int
+{
+    return 42;
+}
+"#,
+        BackendTarget::Debug,
+    )
+    .expect("debug backend should emit the Stage 11a artifact");
+
+    let BackendOutput::Text {
+        extension,
+        contents,
+    } = output
+    else {
+        panic!("debug backend should return text output");
+    };
+    assert_eq!(extension, "debug");
+    assert_eq!(contents, "exit_status: 42\nstdout:\n");
+
     let err = doriac::compile_source(
         "test.doria",
         r#"
@@ -546,10 +567,12 @@ echo $name;
 "#,
         BackendTarget::Debug,
     )
-    .expect_err("debug backend is planned but not implemented yet");
+    .expect_err("broader source should remain outside Stage 11a MIR coverage");
 
-    assert_eq!(err[0].code, "B0001");
-    assert!(err[0].message.contains("backend `debug`"));
+    assert_eq!(err[0].code, "M1101");
+    assert!(err[0]
+        .message
+        .contains("unsupported MIR Stage 11a coverage"));
 }
 
 #[test]

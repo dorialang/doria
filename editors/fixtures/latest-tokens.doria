@@ -1,22 +1,41 @@
-namespace App\Posts;
+namespace App\Models;
 
-// Namespace import use imports names from namespaces.
-use App\Models\Post;
-use App\Security\Permission;
-use App\Repositories\PostRepository as Posts;
+// Current source-organization direction.
+use App\Repositories\UserRepository;
+use App\Services\ReportService as Reports;
 
-include "src/generated/routes.doria";
+include "support/types.doria";
 
-declare warnings: strict;
+declare(strict_types: true);
 
-interface Renderable
+// Attributes and named arguments are editor-highlighted before full compiler support.
+#[Module(host: "localhost", port: 3306)]
+#[Test]
+class Parser
 {
-    function render(): string;
+    internal int $position = 0;
+    writable string $name;
+    List<Token> $tokens;
+    Dictionary<string, int> $counts;
+    Set<string> $labels;
+
+    function current(): Token
+    {
+        return $this->tokens[$this->position];
+    }
+
+    internal writable function advance(): void
+    {
+        $this->position++;
+    }
 }
 
 trait HasSlug
 {
-    string $slug;
+    function slug(): string
+    {
+        return "post";
+    }
 }
 
 trait TracksChanges
@@ -24,41 +43,52 @@ trait TracksChanges
     int64 $lastChangedAt;
 }
 
-class Article extends Model implements Renderable, JsonSerializable
+class Post
 {
-    // Class-body uses declarations compose traits into the class.
     uses HasSlug, TracksChanges;
-
-    function render(): string
-    {
-        return "post";
-    }
 }
 
-function main(): int
+function main(): void
 {
-    let writable $code = 0;
+    let $name = "Doria";
+    let writable $count = 0;
+    ?User $maybeUser = null;
+
     int8 $tiny = 1;
     int16 $small = 2;
     int32 $medium = 3;
     int64 $large = 9223372036854775807;
-    uint8 $mask = 1;
-    uint16 $port = 8080;
+    uint8 $byte = 1;
+    uint16 $port = 3306;
     uint32 $flags = 0;
     uint64 $id = 18446744073709551615;
+    float $defaultFloat = 1.5;
     float32 $ratio = 1.5;
     float64 $distance = 10.5;
+    bool $enabled = true;
+    mixed $metadata = null;
+    never $impossible = fail();
 
-    while ($code < 42) {
-        $code += 1;
+    echo "Hello " . $name . "!";
+    echo "Hello {$name}";
+    echo "Hello {$this->name}";
+    echo "\n\t\r\s";
 
-        if ($code == 10) {
-            continue;
-        }
+    if ($count == 0 and not false) {
+        echo "ok";
+    } else if ($count != 1 or true) {
+        echo "also ok";
+    } else {
+        echo "done";
+    }
 
-        if ($code == 42) {
-            break;
-        }
+    if (($flags & 1) == 1 || (($flags | 2) ^ 3) != 0) {
+        echo "bitwise";
+    }
+
+    while ($count < 3) {
+        $count++;
+        continue;
     }
 
     for (let writable $i = 0; $i < 10; $i++) {
@@ -66,29 +96,103 @@ function main(): int
     }
 
     foreach (0..<10 as $i) {
-        echo "x";
+        echo "r";
     }
 
-    given {
-        let $user = $session->user;
-
-        not $user->isSuspended;
-        $user->isActivated;
-        $this->isOrgMember($user) and ($this->isOrgMember($user) or $this->isAdmin($user));
-        $user->hasEmail xor $user->hasPhone;
-    } if ($user->can(Permission::EditPost)) {
-        $post->publish();
-    } finally {
-        $audit->record();
+    foreach (0..10 as $i) {
+        break;
     }
 
-    return when ($code) {
-        42 => 42,
-        default => 0,
-    };
+    return;
 }
 
-function loadUser(int $id): User throws UserNotFound
+// Planned/future: ownership, sharing, and marker types from the master plan.
+function share(
+    Shared<User> $user,
+    Weak<User> $parent,
+    SharedMut<Cache> $cache,
+    Bytes $payload,
+    Sendable $task,
+    Shareable $handle,
+): void
 {
-    throw new UserNotFound($id);
+    echo "shared";
+}
+
+// Planned/future: enums and expression-position match.
+enum Option
+{
+    case Some(int $value);
+    case None;
+}
+
+let $score = match ($option) {
+    Some($value) => $value,
+    None => 0,
+};
+
+// Planned/future: checked errors.
+function loadUser(int $id): User throws UserNotFound, DatabaseError
+{
+    if ($id < 1) {
+        throw new UserNotFound($id);
+    }
+
+    return new User();
+}
+
+try {
+    loadUser(42);
+} catch (UserNotFound $e) {
+    echo "missing";
+} finally {
+    echo "done";
+}
+
+// Planned/future: closure capture uses with, not PHP closure use.
+let $adder = function (int $x): int with ($base) {
+    return $x + $base;
+};
+
+let $mover = function (): void with (take $resource) {
+    echo "taken";
+};
+
+// Planned/future: async and await.
+async function fetchUser(int $id): User
+{
+    return await $client->fetchUser($id);
+}
+
+// Planned/future: unsafe and C FFI.
+unsafe {
+    extern "C" {
+        function malloc(uint64 $size): Ptr<void>;
+        function memcpy(MutPtr<void> $dst, Ptr<void> $src, uint64 $size): MutPtr<void>;
+    }
+}
+
+// Planned/future: open classes and explicit overrides.
+open class Model
+{
+    open function save(): void throws StorageError
+    {
+    }
+
+    function id(): string
+    {
+        return "id";
+    }
+}
+
+class Article extends Model implements Publishable
+{
+    override function save(): void throws StorageError
+    {
+    }
+}
+
+#[PhpExport]
+class ImageResizer
+{
 }
