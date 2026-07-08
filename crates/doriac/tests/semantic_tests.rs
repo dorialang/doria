@@ -97,6 +97,18 @@ let $name = $payload->name;
         ),
         (
             r#"
+class User
+{
+    writable string $name;
+}
+
+mixed $payload = new User();
+$payload->name = "Ada";
+"#,
+            "E0433",
+        ),
+        (
+            r#"
 mixed $payload = 1;
 let $sum = $payload + 1;
 "#,
@@ -123,6 +135,13 @@ mixed $payload = "Doria";
 echo "{$payload}";
 "#,
             "E0415",
+        ),
+        (
+            r#"
+mixed $payload = "Doria";
+echo $payload;
+"#,
+            "E0433",
         ),
         (
             r#"
@@ -3019,6 +3038,19 @@ function collect(mixed $payload): void
         "pears" => "ten",
     ];
 }
+"#,
+        r#"
+mixed $payload = "x";
+let $values = [$payload, 1];
+List<int> $numbers = $values;
+"#,
+        r#"
+mixed $payload = "x";
+let $values = [
+    "first" => $payload,
+    "second" => 1,
+];
+Dictionary<string, int> $numbers = $values;
 "#,
     ] {
         assert_type_mismatch(source);

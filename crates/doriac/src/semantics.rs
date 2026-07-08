@@ -664,7 +664,11 @@ impl<'program> Checker<'program> {
                     self.check_assignment_value(assignment, target, scopes, method_context);
                 }
             }
-            Stmt::Echo { expr, .. } | Stmt::Expr { expr, .. } => {
+            Stmt::Echo { expr, .. } => {
+                self.check_expr(expr, scopes, method_context);
+                self.check_mixed_operation(expr, "echo", scopes, method_context);
+            }
+            Stmt::Expr { expr, .. } => {
                 self.check_expr(expr, scopes, method_context);
             }
             Stmt::Return { expr, span } => {
@@ -1842,6 +1846,7 @@ impl<'program> Checker<'program> {
                 span,
             } => {
                 self.check_expr(object, scopes, method_context);
+                self.check_mixed_operation(object, "property write", scopes, method_context);
                 if let Some((class_name, property_info)) =
                     self.lookup_property(object, property, *span, scopes, method_context)
                 {
@@ -2997,15 +3002,15 @@ impl<'program> Checker<'program> {
             }
         }
 
-        if let Some(common) = common {
+        if saw_mixed {
+            self.types.intern(TypeKind::Mixed)
+        } else if let Some(common) = common {
             if saw_empty_collection && !self.is_collection_like_type(common) {
                 return self.types.intern(TypeKind::Heterogeneous);
             }
             common
         } else if saw_empty_collection {
             self.types.intern(TypeKind::EmptyCollection)
-        } else if saw_mixed {
-            self.types.intern(TypeKind::Mixed)
         } else {
             self.types.unknown()
         }
