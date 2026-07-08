@@ -170,7 +170,7 @@ function rename(writable Person $person, string $name): void
 
 Every parameter in Doria source must be explicitly typed. This rule applies to free functions, methods, constructors, anonymous functions, arrow functions, interface requirements, trait requirements, property hook setters, and callback-like declarations. Doria does not infer omitted parameter types.
 
-```php
+```doria
 let $double = fn(int $x) => $x * 2;
 
 let $format = function (int $score): string {

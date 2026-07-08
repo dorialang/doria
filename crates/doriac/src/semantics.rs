@@ -282,10 +282,10 @@ impl<'program> Checker<'program> {
     }
 
     fn resolve_function_signature(&mut self, function: &FunctionDecl) -> FunctionInfo {
-        FunctionInfo {
-            params: self.resolve_param_infos(function),
-            return_ty: self.resolve_function_return_type(function),
-        }
+        let params = self.resolve_param_infos(function);
+        let return_ty = self.resolve_function_return_type(function, &params);
+
+        FunctionInfo { params, return_ty }
     }
 
     fn resolve_param_infos(&mut self, function: &FunctionDecl) -> Vec<ParamInfo> {
@@ -321,14 +321,102 @@ impl<'program> Checker<'program> {
         params
     }
 
-    fn resolve_function_return_type(&mut self, function: &FunctionDecl) -> TypeId {
+    fn resolve_function_return_type(
+        &mut self,
+        function: &FunctionDecl,
+        params: &[ParamInfo],
+    ) -> TypeId {
         function
             .return_type
             .as_ref()
             .map(|return_type| {
                 self.resolve_type_ref_in_position(return_type, function.span, TypePosition::Return)
             })
-            .unwrap_or_else(|| self.types.unknown())
+            .unwrap_or_else(|| self.infer_unannotated_mixed_return_type(function, params))
+    }
+
+    fn infer_unannotated_mixed_return_type(
+        &mut self,
+        function: &FunctionDecl,
+        params: &[ParamInfo],
+    ) -> TypeId {
+        let mut scopes = ScopeStack::new();
+        for param in params {
+            let _ = scopes.declare(
+                param.name.clone(),
+                Binding {
+                    writable: false,
+                    ty: param.ty,
+                    int_constant: None,
+                },
+            );
+        }
+
+        for statement in &function.body.statements {
+            if let Some(ty) = self.infer_mixed_return_from_statement(statement, &mut scopes) {
+                return ty;
+            }
+        }
+
+        self.types.unknown()
+    }
+
+    fn infer_mixed_return_from_statement(
+        &mut self,
+        statement: &Stmt,
+        scopes: &mut ScopeStack,
+    ) -> Option<TypeId> {
+        match statement {
+            Stmt::VarDecl(decl) => {
+                let ty = decl
+                    .ty
+                    .as_ref()
+                    .map(|ty| self.resolve_type_ref_for_return_inference(ty))
+                    .unwrap_or_else(|| self.infer_expr_type(&decl.initializer, scopes, None));
+                let _ = scopes.declare(
+                    decl.name.clone(),
+                    Binding {
+                        writable: decl.writable,
+                        ty,
+                        int_constant: None,
+                    },
+                );
+                None
+            }
+            Stmt::Return {
+                expr: Some(expr), ..
+            } => {
+                let ty = self.infer_expr_type(expr, scopes, None);
+                self.type_contains_mixed(ty).then_some(ty)
+            }
+            _ => None,
+        }
+    }
+
+    fn resolve_type_ref_for_return_inference(&mut self, ty: &TypeRef) -> TypeId {
+        match ty.name.as_str() {
+            "void" if ty.args.is_empty() => self.types.intern(TypeKind::Void),
+            "int" if ty.args.is_empty() => self.types.intern(TypeKind::Int),
+            "float" if ty.args.is_empty() => self.types.intern(TypeKind::Float),
+            "string" if ty.args.is_empty() => self.types.intern(TypeKind::String),
+            "bool" if ty.args.is_empty() => self.types.intern(TypeKind::Bool),
+            "mixed" if ty.args.is_empty() => self.types.intern(TypeKind::Mixed),
+            "array" if ty.args.is_empty() => self.types.intern(TypeKind::Array),
+            "List" if ty.args.len() == 1 => {
+                let element = self.resolve_type_ref_for_return_inference(&ty.args[0]);
+                self.types.intern(TypeKind::List(element))
+            }
+            "Dictionary" if ty.args.len() == 2 => {
+                let key = self.resolve_type_ref_for_return_inference(&ty.args[0]);
+                let value = self.resolve_type_ref_for_return_inference(&ty.args[1]);
+                self.types.intern(TypeKind::Dictionary(key, value))
+            }
+            "Set" if ty.args.len() == 1 => {
+                let element = self.resolve_type_ref_for_return_inference(&ty.args[0]);
+                self.types.intern(TypeKind::Set(element))
+            }
+            _ => self.types.unknown(),
+        }
     }
 
     fn check_class(&mut self, class_decl: &ClassDecl) {
@@ -771,6 +859,12 @@ impl<'program> Checker<'program> {
                     );
                 } else {
                     self.check_expr(&foreach.iterable, scopes, method_context);
+                    self.check_mixed_operation(
+                        &foreach.iterable,
+                        "foreach iterable",
+                        scopes,
+                        method_context,
+                    );
                 }
                 scopes.push();
                 if let Some(key) = &foreach.key {
@@ -1658,6 +1752,17 @@ impl<'program> Checker<'program> {
 
     fn is_mixed_type(&self, ty: TypeId) -> bool {
         matches!(self.types.kind(ty), TypeKind::Mixed)
+    }
+
+    fn type_contains_mixed(&self, ty: TypeId) -> bool {
+        match self.types.kind(ty) {
+            TypeKind::Mixed => true,
+            TypeKind::List(element) | TypeKind::Set(element) => self.type_contains_mixed(*element),
+            TypeKind::Dictionary(key, value) => {
+                self.type_contains_mixed(*key) || self.type_contains_mixed(*value)
+            }
+            _ => false,
+        }
     }
 
     fn report_mixed_operation(&mut self, span: Span, operation: &'static str) {

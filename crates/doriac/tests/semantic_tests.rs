@@ -131,6 +131,15 @@ if ($payload) {
         ),
         (
             r#"
+mixed $payload = [1];
+foreach ($payload as string $item) {
+    echo $item;
+}
+"#,
+            "E0433",
+        ),
+        (
+            r#"
 mixed $payload = "Doria";
 echo "{$payload}";
 "#,
@@ -147,6 +156,28 @@ echo $payload;
             r#"
 mixed $payload = "Doria";
 string $name = $payload;
+"#,
+            "E0403",
+        ),
+        (
+            r#"
+function leak(mixed $payload)
+{
+    return $payload;
+}
+
+string $name = leak(1);
+"#,
+            "E0403",
+        ),
+        (
+            r#"
+function leak(mixed $payload)
+{
+    return [$payload, 1];
+}
+
+List<int> $numbers = leak("x");
 "#,
             "E0403",
         ),
