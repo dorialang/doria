@@ -10,6 +10,7 @@ declare(strict_types: true);
 
 // Attributes and named arguments are editor-highlighted before full compiler support.
 #[Module(host: "localhost", port: 3306)]
+#[App\Routing\Route(path: "/parser", name: "parser.show")]
 #[Test]
 class Parser
 {
@@ -41,6 +42,7 @@ trait HasSlug
 trait TracksChanges
 {
     int64 $lastChangedAt;
+    int[] $changedLines;
 }
 
 class Post

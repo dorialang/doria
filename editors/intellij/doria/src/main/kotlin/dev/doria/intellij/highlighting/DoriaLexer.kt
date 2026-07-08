@@ -11,6 +11,7 @@ class DoriaLexer : LexerBase() {
     private var tokenEnd: Int = 0
     private var tokenType: IElementType? = null
     private var mode: Int = MODE_NORMAL
+    private var attributeBracketDepth: Int = 0
 
     override fun start(buffer: CharSequence, startOffset: Int, endOffset: Int, initialState: Int) {
         this.buffer = buffer
@@ -18,11 +19,12 @@ class DoriaLexer : LexerBase() {
         this.endOffset = endOffset
         this.tokenStart = startOffset
         this.tokenEnd = startOffset
-        this.mode = initialState
+        this.mode = decodeMode(initialState)
+        this.attributeBracketDepth = decodeAttributeBracketDepth(initialState)
         advance()
     }
 
-    override fun getState(): Int = mode
+    override fun getState(): Int = encodeState(mode, attributeBracketDepth)
 
     override fun getTokenType(): IElementType? = tokenType
 
@@ -59,6 +61,10 @@ class DoriaLexer : LexerBase() {
                 scanDocCommentToken()
                 return
             }
+            MODE_ATTRIBUTE -> {
+                scanAttributeToken()
+                return
+            }
         }
 
         scanCodeToken(doubleQuoteStartsInterpolatedString = true)
@@ -69,6 +75,7 @@ class DoriaLexer : LexerBase() {
         when {
             current.isWhitespace() -> scanWhitespace()
             current == '/' && peek(1) == '/' -> scanLineComment()
+            current == '#' && peek(1) == '[' -> scanAttributeStart()
             current == '#' && isPreprocessorDirective() -> scanPreprocessorDirective()
             current == '#' && peek(1) != '[' -> scanLineComment()
             current == '/' && peek(1) == '*' && peek(2) == '*' && peek(3) != '/' -> scanDocCommentStart()
@@ -288,6 +295,72 @@ class DoriaLexer : LexerBase() {
         }
     }
 
+    private fun scanAttributeStart() {
+        tokenEnd = tokenStart + 2
+        tokenType = DoriaTokenTypes.ATTRIBUTE_DELIMITER
+        mode = MODE_ATTRIBUTE
+        attributeBracketDepth = 0
+    }
+
+    private fun scanAttributeToken() {
+        when {
+            buffer[tokenStart].isWhitespace() -> scanWhitespace()
+            buffer[tokenStart] == ']' && attributeBracketDepth == 0 -> {
+                tokenEnd = tokenStart + 1
+                tokenType = DoriaTokenTypes.ATTRIBUTE_DELIMITER
+                mode = MODE_NORMAL
+            }
+            buffer[tokenStart] == '[' -> {
+                tokenEnd = tokenStart + 1
+                tokenType = DoriaTokenTypes.BRACKET
+                attributeBracketDepth++
+            }
+            buffer[tokenStart] == ']' -> {
+                tokenEnd = tokenStart + 1
+                tokenType = DoriaTokenTypes.BRACKET
+                attributeBracketDepth--
+            }
+            buffer[tokenStart] == '"' || buffer[tokenStart] == '\'' -> scanAttributeString()
+            buffer[tokenStart] == '$' -> scanVariable()
+            buffer[tokenStart].isDigit() -> scanNumber()
+            isIdentifierStart(buffer[tokenStart]) -> scanAttributeIdentifier()
+            else -> scanSymbol()
+        }
+    }
+
+    private fun scanAttributeString() {
+        val quote = buffer[tokenStart]
+        tokenEnd = tokenStart + 1
+        var escaped = false
+        var closed = false
+        while (tokenEnd < endOffset && !closed) {
+            val char = buffer[tokenEnd]
+            tokenEnd++
+            when {
+                escaped -> escaped = false
+                char == '\\' -> escaped = true
+                char == quote -> closed = true
+            }
+        }
+        tokenType = DoriaTokenTypes.STRING
+    }
+
+    private fun scanAttributeIdentifier() {
+        tokenEnd = tokenStart + 1
+        while (tokenEnd < endOffset && isIdentifierPart(buffer[tokenEnd])) {
+            tokenEnd++
+        }
+
+        val text = buffer.subSequence(tokenStart, tokenEnd).toString()
+        tokenType = when {
+            nextNonWhitespace(tokenEnd) == ':' -> DoriaTokenTypes.ATTRIBUTE_ARGUMENT
+            text == "true" || text == "false" -> DoriaTokenTypes.BOOLEAN_LITERAL
+            text == "null" -> DoriaTokenTypes.NULL_LITERAL
+            isAttributeNamePosition(text) -> DoriaTokenTypes.ATTRIBUTE_NAME
+            else -> baseIdentifierTokenType(text)
+        }
+    }
+
     private fun scanVariable() {
         tokenEnd = tokenStart + 1
         if (tokenEnd < endOffset && isIdentifierStart(buffer[tokenEnd])) {
@@ -480,6 +553,15 @@ class DoriaLexer : LexerBase() {
         else -> DoriaTokenTypes.FUNCTION_CALL
     }
 
+    private fun isAttributeNamePosition(text: String): Boolean {
+        if (!text.first().isUpperCase()) {
+            return false
+        }
+
+        return previousNonWhitespaceChar() in setOf('[', '\\', ',') ||
+            nextNonWhitespace(tokenEnd) in setOf('\\', '(', ',', ']')
+    }
+
     private fun previousAccessor(): String? {
         var cursor = tokenStart - 1
         while (cursor >= startOffset && buffer[cursor].isWhitespace()) {
@@ -491,6 +573,14 @@ class DoriaLexer : LexerBase() {
 
         val twoChars = buffer.subSequence(cursor - 1, cursor + 1).toString()
         return twoChars.takeIf { it == "->" || it == "::" }
+    }
+
+    private fun previousNonWhitespaceChar(): Char? {
+        var cursor = tokenStart - 1
+        while (cursor >= startOffset && buffer[cursor].isWhitespace()) {
+            cursor--
+        }
+        return if (cursor >= startOffset) buffer[cursor] else null
     }
 
     private fun isDocTypePosition(): Boolean {
@@ -668,14 +758,25 @@ class DoriaLexer : LexerBase() {
 
     private fun isIdentifierPart(char: Char): Boolean = char == '_' || char.isLetterOrDigit()
 
+    private fun encodeState(mode: Int, attributeBracketDepth: Int): Int =
+        mode or (attributeBracketDepth.coerceAtLeast(0) shl STATE_ATTRIBUTE_DEPTH_SHIFT)
+
+    private fun decodeMode(state: Int): Int = state and STATE_MODE_MASK
+
+    private fun decodeAttributeBracketDepth(state: Int): Int =
+        (state ushr STATE_ATTRIBUTE_DEPTH_SHIFT).coerceAtLeast(0)
+
     private data class DocTag(val name: String, val endOffset: Int)
 
     companion object {
+        private const val STATE_MODE_MASK = 0xFF
+        private const val STATE_ATTRIBUTE_DEPTH_SHIFT = 8
         private const val MODE_NORMAL = 0
         private const val MODE_DOUBLE_STRING = 1
         private const val MODE_INTERPOLATION = 2
         const val MODE_DOC_COMMENT = 3
         private const val MODE_SINGLE_STRING = 4
+        private const val MODE_ATTRIBUTE = 5
 
         private val KEYWORDS = setOf(
             "class",
@@ -748,7 +849,6 @@ class DoriaLexer : LexerBase() {
             "bool",
             "mixed",
             "never",
-            "array",
         )
 
         private val RESERVED_TYPES = setOf("resource")

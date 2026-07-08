@@ -48,13 +48,13 @@
       "patterns": [
         {
           "name": "meta.attribute.doria",
-          "begin": "(#\\[)\\s*([A-Za-z_][A-Za-z0-9_]*)",
+          "begin": "(#\\[)\\s*((?:\\\\?[A-Za-z_][A-Za-z0-9_]*)(?:\\\\[A-Za-z_][A-Za-z0-9_]*)*)",
           "beginCaptures": {
             "1": {
               "name": "punctuation.definition.attribute.begin.doria"
             },
             "2": {
-              "name": "entity.name.function.attribute.doria"
+              "name": "entity.name.type.attribute.doria"
             }
           },
           "end": "\\]",
@@ -68,12 +68,16 @@
               "match": "\\b([A-Za-z_][A-Za-z0-9_]*)\\s*(:)",
               "captures": {
                 "1": {
-                  "name": "variable.parameter.named.doria"
+                  "name": "variable.parameter.attribute.doria"
                 },
                 "2": {
                   "name": "punctuation.separator.key-value.doria"
                 }
               }
+            },
+            {
+              "name": "entity.name.type.attribute.doria",
+              "match": "(?:\\\\?[A-Z][A-Za-z0-9_]*)(?:\\\\[A-Za-z_][A-Za-z0-9_]*)*(?=\\s*(?:\\(|,|\\]))"
             },
             {
               "include": "#strings"
@@ -575,7 +579,7 @@
         },
         {
           "name": "storage.type.primitive.doria",
-          "match": "\\b(?:void|int|int8|int16|int32|int64|uint8|uint16|uint32|uint64|float|float32|float64|string|bool|mixed|never|array)\\b"
+          "match": "\\b(?:void|int|int8|int16|int32|int64|uint8|uint16|uint32|uint64|float|float32|float64|string|bool|mixed|never)\\b"
         },
         {
           "name": "support.type.collection.doria",
