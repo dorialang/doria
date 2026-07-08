@@ -379,6 +379,10 @@ fn completion_items() -> Value {
         "with",
         "take",
     ];
+    let planned_keywords = [
+        "enum", "case", "match", "async", "await", "unsafe", "extern", "open", "override", "with",
+        "take", "throw", "throws", "try", "catch", "finally", "when", "given",
+    ];
     let types = [
         "void",
         "int",
@@ -395,11 +399,17 @@ fn completion_items() -> Value {
 
     let mut items = Vec::new();
     items.extend(keywords.into_iter().map(|keyword| {
-        json!({
+        let planned = planned_keywords.contains(&keyword);
+        let mut item = json!({
             "label": keyword,
             "kind": 14,
-            "detail": "Doria keyword",
-        })
+            "detail": if planned { "planned Doria keyword" } else { "Doria keyword" },
+        });
+        if planned {
+            item["documentation"] =
+                json!("Accepted planned Doria syntax; compiler support lands in a later stage.");
+        }
+        item
     }));
     items.extend(types.into_iter().map(|ty| {
         json!({
@@ -421,7 +431,6 @@ fn completion_items() -> Value {
         "items": items,
     })
 }
-
 fn hover_at_offset(text: &str, offset: usize) -> Option<Value> {
     let tokens = crate::lex_source("<lsp>", text.to_string()).ok()?;
     let token = tokens.into_iter().find(|token| {
@@ -608,6 +617,15 @@ fn send_message<W: Write>(writer: &mut W, message: &Value) -> Result<(), String>
 mod tests {
     use super::*;
 
+    fn completion_item(label: &str) -> Value {
+        completion_items()["items"]
+            .as_array()
+            .expect("completion items should be an array")
+            .iter()
+            .find(|item| item["label"] == label)
+            .unwrap_or_else(|| panic!("completion item `{label}` should exist"))
+            .clone()
+    }
     fn completion_labels() -> Vec<String> {
         completion_items()["items"]
             .as_array()
@@ -632,6 +650,59 @@ mod tests {
             .map(ToOwned::to_owned)
     }
 
+    #[test]
+    fn completions_mark_accepted_planned_keywords() {
+        for keyword in [
+            "enum", "case", "match", "async", "await", "unsafe", "extern", "open", "override",
+            "with", "take", "throw", "throws", "try", "catch", "finally", "when", "given",
+        ] {
+            let item = completion_item(keyword);
+            assert_eq!(item["detail"], "planned Doria keyword");
+            assert_eq!(
+                item["documentation"],
+                "Accepted planned Doria syntax; compiler support lands in a later stage."
+            );
+        }
+    }
+
+    #[test]
+    fn completions_keep_rejected_syntax_out() {
+        let labels = completion_labels();
+        let rejected = [
+            ["pub", "lic"].concat(),
+            ["pri", "vate"].concat(),
+            ["pro", "tected"].concat(),
+            ["requ", "ire"].concat(),
+            ["requ", "ire_once"].concat(),
+            ["include", "_once"].concat(),
+            ["=", "=="].concat(),
+            ["!", "=="].concat(),
+            ["#de", "fine"].concat(),
+            ["#inc", "lude"].concat(),
+        ];
+        for rejected in rejected {
+            assert!(
+                !labels.iter().any(|label| label == &rejected),
+                "rejected syntax `{rejected}` must not be an active LSP completion"
+            );
+        }
+    }
+
+    #[test]
+    fn planned_keyword_usage_still_reports_compiler_diagnostics() {
+        let diagnostics = diagnostics_for_document(
+            "test.doria",
+            r#"enum Option
+{
+}
+"#,
+        );
+
+        assert!(
+            !diagnostics.is_empty(),
+            "planned syntax should remain rejected by compiler diagnostics until implemented"
+        );
+    }
     #[test]
     fn completions_do_not_offer_unsupported_future_types() {
         let labels = completion_labels();

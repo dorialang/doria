@@ -1,0 +1,8 @@
+function main(): int
+{
+    let writable $value = 41;
+
+    $value++;
+
+    return $value;
+}

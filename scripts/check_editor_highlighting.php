@@ -72,6 +72,26 @@ $acceptedKeywords = [
     'take',
 ];
 
+$plannedKeywords = [
+    'enum',
+    'case',
+    'match',
+    'async',
+    'await',
+    'unsafe',
+    'extern',
+    'open',
+    'override',
+    'with',
+    'take',
+    'throw',
+    'throws',
+    'try',
+    'catch',
+    'finally',
+    'when',
+    'given',
+];
 $primitiveTypes = [
     'void',
     'int',
@@ -458,7 +478,7 @@ function check_intellij_lexer(): void
 
 function check_lsp_completion_vocabulary(): void
 {
-    global $acceptedKeywords, $primitiveTypes, $plannedTypes, $wordOperators, $notKeywords, $lspServer, $lspSupportedTypes;
+    global $acceptedKeywords, $plannedKeywords, $primitiveTypes, $plannedTypes, $wordOperators, $notKeywords, $lspServer, $lspSupportedTypes;
 
     $lspText = read_text($lspServer);
     $tokens = array_unique([...$acceptedKeywords, ...$wordOperators]);
@@ -466,6 +486,15 @@ function check_lsp_completion_vocabulary(): void
     foreach ($tokens as $token) {
         require_check(str_contains($lspText, chr(34) . $token . chr(34)), 'LSP completion list is missing ' . $token);
     }
+
+    foreach ($plannedKeywords as $keyword) {
+        require_check(str_contains($lspText, chr(34) . $keyword . chr(34)), 'LSP completion list is missing planned keyword ' . $keyword);
+    }
+    require_check(str_contains($lspText, 'planned Doria keyword'), 'LSP planned keyword completions must be clearly marked as planned');
+    require_check(
+        str_contains($lspText, 'Accepted planned Doria syntax; compiler support lands in a later stage.'),
+        'LSP planned keyword completions must explain that compiler support lands later'
+    );
 
     require_check(
         preg_match('/let types = \[(.*?)\];/s', $lspText, $matches) === 1,

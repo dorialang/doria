@@ -8,7 +8,7 @@ Stage 11 introduces MIR as Doria native-oriented, control-flow-oriented compiler
 
 Stage 11 also introduces a MIR interpreter as the debug and semantic-oracle path. The interpreter is intended to validate Doria-visible behavior without relying on PHP, Cranelift, LLVM, or host linker behavior.
 
-Stage 11 eventually retires NativeSmokeModule. Stage 11a only seeds the MIR architecture and interpreter for a tiny executable subset; it does not delete NativeSmokeModule yet and does not port all Stage <=10 native lowering.
+Stage 11 eventually retires NativeSmokeModule. Stage 11a only seeded the MIR architecture and interpreter for a tiny executable subset; Stage 11b expands that seed to integer expressions and integer local slots. NativeSmokeModule remains temporary in Stage 11b and must not receive new language capability expansion.
 
 ## Stage 11a scope
 
@@ -24,9 +24,30 @@ Stage 11a supports:
 
 Unsupported Doria constructs in Stage 11a must be rejected as unsupported MIR Stage 11a coverage, not as invalid Doria.
 
+## Stage 11b scope
+
+Stage 11b expands the MIR seed to integer expressions and integer local slots.
+
+Stage 11b supports:
+
+- MIR int constants.
+- MIR int local slots.
+- Readonly int locals.
+- Writable int locals.
+- Int local assignment.
+- `+=` and `-=` on writable int locals.
+- Standalone `++` and `--` on writable int locals in statement position.
+- Int arithmetic `+`, `-`, and `*`.
+- Return of supported int expressions from `main(): int`.
+- Execution of supported int local statements in `main(): void`.
+- Interpreter evaluation of the Stage 11b subset with checked int64 arithmetic.
+- Debug-target artifacts for the Stage 11b subset.
+
+Unsupported Doria constructs in Stage 11b must be rejected as unsupported MIR Stage 11b coverage, not as invalid Doria.
+
 ## Non-goals
 
-Stage 11a does not add:
+Stage 11b does not add:
 
 - full Stage <=10 MIR port
 - deletion of NativeSmokeModule
@@ -34,10 +55,16 @@ Stage 11a does not add:
 - ownership or borrow checking
 - doria-rt
 - runtime strings
-- bool or string primitive-helper native support
-- function calls in MIR
-- loops in MIR
-- local variables in MIR
+- string locals
+- string concatenation in MIR
+- bool runtime values
+- comparisons or conditions
+- division, modulo, shifts, or bitwise operators
+- `if` / `else`
+- loops
+- `break` or `continue` in MIR
+- function calls
+- helper functions
 - classes, objects, or collections in MIR
 - checked errors
 - LLVM
@@ -47,4 +74,4 @@ Stage 11a does not add:
 
 NativeSmokeModule remains temporary implementation-private bootstrap infrastructure for current native smoke coverage. It must not receive new language capability expansion unless an explicit later task approves a temporary compatibility fix.
 
-MIR becomes the place to grow future native control-flow, interpreter, ownership, borrow-checking, and backend-lowering work. Stage 11b/11c may broaden lowering and parity, but Stage 11a deliberately keeps the supported subset small enough to test end to end.
+MIR becomes the place to grow future native control-flow, interpreter, ownership, borrow-checking, and backend-lowering work. Stage 11b broadens the seed to integer locals and expressions, but Stage 11 is still incomplete and the full Stage <=10 MIR port remains future work.

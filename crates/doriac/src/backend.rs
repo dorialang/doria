@@ -2,6 +2,7 @@ use std::path::PathBuf;
 use std::str::FromStr;
 
 use crate::diagnostics::Diagnostic;
+use crate::source::Span;
 use crate::{codegen_native, codegen_php, hir, mir_interpreter, mir_lowering};
 
 pub trait Backend {
@@ -132,8 +133,13 @@ impl Backend for DebugBackend {
 
     fn emit(&self, program: &hir::Program) -> Result<BackendOutput, BackendError> {
         let mir = mir_lowering::lower_program(program).map_err(BackendError::from_diagnostics)?;
-        let output = mir_interpreter::interpret(&mir)
-            .map_err(|error| BackendError::new(format!("MIR interpreter failure: {error}")))?;
+        let output = mir_interpreter::interpret(&mir).map_err(|error| {
+            BackendError::from_diagnostics(vec![Diagnostic::new(
+                "M1102",
+                format!("MIR interpreter failure: {error}"),
+                Span::default(),
+            )])
+        })?;
 
         Ok(BackendOutput::Text {
             extension: "debug".to_string(),

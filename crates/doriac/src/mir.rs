@@ -12,6 +12,9 @@ pub struct FunctionId(pub usize);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BlockId(pub usize);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct LocalId(pub usize);
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Program {
     pub functions: Vec<Function>,
@@ -23,6 +26,7 @@ pub struct Function {
     pub id: FunctionId,
     pub name: String,
     pub return_type: ReturnType,
+    pub locals: Vec<Local>,
     pub blocks: Vec<BasicBlock>,
     pub entry_block: BlockId,
 }
@@ -34,6 +38,20 @@ pub enum ReturnType {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Local {
+    pub id: LocalId,
+    pub name: String,
+    pub ty: Type,
+    pub writable: bool,
+    pub synthetic: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Type {
+    Int,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BasicBlock {
     pub id: BlockId,
     pub statements: Vec<Statement>,
@@ -41,13 +59,37 @@ pub struct BasicBlock {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Operand {
+    Int(i64),
+    Local(LocalId),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Rvalue {
+    Use(Operand),
+    Binary {
+        op: BinaryOp,
+        left: Operand,
+        right: Operand,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BinaryOp {
+    Add,
+    Subtract,
+    Multiply,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Statement {
+    AssignLocal { target: LocalId, value: Rvalue },
     EchoStringLiteral(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Terminator {
-    ReturnInt(i64),
+    Return(Operand),
     ReturnVoid,
 }
 
@@ -70,6 +112,12 @@ impl fmt::Display for Function {
             "function {}(): {} {{",
             self.name, self.return_type
         )?;
+        if !self.locals.is_empty() {
+            writeln!(formatter, "locals:")?;
+            for local in &self.locals {
+                writeln!(formatter, "    {local}")?;
+            }
+        }
         for block in &self.blocks {
             write!(formatter, "{block}")?;
         }
@@ -86,6 +134,36 @@ impl fmt::Display for ReturnType {
     }
 }
 
+impl fmt::Display for Local {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let role = if self.synthetic {
+            "temp"
+        } else if self.writable {
+            "writable"
+        } else {
+            "readonly"
+        };
+        let name = if self.synthetic {
+            self.name.clone()
+        } else {
+            format!("${}", self.name)
+        };
+        write!(
+            formatter,
+            "local{} {} {}: {}",
+            self.id.0, role, name, self.ty
+        )
+    }
+}
+
+impl fmt::Display for Type {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Type::Int => write!(formatter, "int"),
+        }
+    }
+}
+
 impl fmt::Display for BasicBlock {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(formatter, "block{}:", self.id.0)?;
@@ -96,9 +174,40 @@ impl fmt::Display for BasicBlock {
     }
 }
 
+impl fmt::Display for Operand {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Operand::Int(value) => write!(formatter, "{value}"),
+            Operand::Local(id) => write!(formatter, "local{}", id.0),
+        }
+    }
+}
+
+impl fmt::Display for Rvalue {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Rvalue::Use(operand) => write!(formatter, "{operand}"),
+            Rvalue::Binary { op, left, right } => write!(formatter, "{left} {op} {right}"),
+        }
+    }
+}
+
+impl fmt::Display for BinaryOp {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            BinaryOp::Add => write!(formatter, "+"),
+            BinaryOp::Subtract => write!(formatter, "-"),
+            BinaryOp::Multiply => write!(formatter, "*"),
+        }
+    }
+}
+
 impl fmt::Display for Statement {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Statement::AssignLocal { target, value } => {
+                write!(formatter, "local{} = {value}", target.0)
+            }
             Statement::EchoStringLiteral(value) => {
                 write!(formatter, "echo \"{}\"", escape_debug_string(value))
             }
@@ -109,7 +218,7 @@ impl fmt::Display for Statement {
 impl fmt::Display for Terminator {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Terminator::ReturnInt(value) => write!(formatter, "return {value}"),
+            Terminator::Return(operand) => write!(formatter, "return {operand}"),
             Terminator::ReturnVoid => write!(formatter, "return"),
         }
     }
