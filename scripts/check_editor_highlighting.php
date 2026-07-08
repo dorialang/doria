@@ -110,9 +110,11 @@ $primitiveTypes = [
     'bool',
     'mixed',
     'never',
-    'object',
-    'resource',
     'array',
+];
+
+$reservedTypes = [
+    'resource',
 ];
 
 $plannedTypes = [
@@ -136,8 +138,6 @@ $lspSupportedTypes = [
     'string',
     'bool',
     'mixed',
-    'object',
-    'resource',
     'array',
     'List',
     'Dictionary',
@@ -159,7 +159,7 @@ $rejectedPreprocessor = [
 ];
 $rejectedKeywords = ['goto', 'require', 'require_once', 'include_once'];
 $strictComparison = ['===', '!=='];
-$notKeywords = ['public', 'private', 'protected', 'Result'];
+$notKeywords = ['public', 'private', 'protected', 'Result', 'object'];
 function fail_check(string $message): never
 {
     fwrite(STDERR, "editor highlighting check failed: {$message}\n");
@@ -273,13 +273,13 @@ function check_vscode_language_configuration(): void
 
 function check_vscode_grammar(): void
 {
-    global $acceptedKeywords, $primitiveTypes, $plannedTypes, $wordOperators, $notKeywords, $strictComparison, $rejectedPreprocessor, $rejectedKeywords, $vscodeGrammar;
+    global $acceptedKeywords, $primitiveTypes, $reservedTypes, $plannedTypes, $wordOperators, $notKeywords, $strictComparison, $rejectedPreprocessor, $rejectedKeywords, $vscodeGrammar;
 
     $grammar = load_json($vscodeGrammar);
     $grammarText = json_encode($grammar, JSON_THROW_ON_ERROR);
     $patterns = iterator_to_array(walk_patterns($grammar), false);
 
-    $tokens = array_unique([...$acceptedKeywords, ...$primitiveTypes, ...$plannedTypes, ...$wordOperators]);
+    $tokens = array_unique([...$acceptedKeywords, ...$primitiveTypes, ...$reservedTypes, ...$plannedTypes, ...$wordOperators]);
     sort($tokens);
     foreach ($tokens as $token) {
         require_check(str_contains($grammarText, $token), "VS Code grammar is missing '{$token}'");
@@ -402,7 +402,7 @@ function check_vscode_grammar(): void
 
 function check_intellij_lexer(): void
 {
-    global $acceptedKeywords, $primitiveTypes, $plannedTypes, $wordOperators, $notKeywords, $strictComparison, $rejectedPreprocessor, $rejectedKeywords;
+    global $acceptedKeywords, $primitiveTypes, $reservedTypes, $plannedTypes, $wordOperators, $notKeywords, $strictComparison, $rejectedPreprocessor, $rejectedKeywords;
     global $intellijLexer, $intellijTokenTypes, $intellijSyntaxHighlighter, $intellijPluginXml;
 
     $lexerText = read_text($intellijLexer);
@@ -412,7 +412,7 @@ function check_intellij_lexer(): void
         read_text($intellijSyntaxHighlighter),
     ]);
 
-    $tokens = array_unique([...$acceptedKeywords, ...$primitiveTypes, ...$plannedTypes, ...$wordOperators]);
+    $tokens = array_unique([...$acceptedKeywords, ...$primitiveTypes, ...$reservedTypes, ...$plannedTypes, ...$wordOperators]);
     sort($tokens);
     foreach ($tokens as $token) {
         require_check(str_contains($lexerText, '"' . $token . '"'), "IntelliJ lexer is missing '{$token}'");
@@ -478,7 +478,7 @@ function check_intellij_lexer(): void
 
 function check_lsp_completion_vocabulary(): void
 {
-    global $acceptedKeywords, $plannedKeywords, $primitiveTypes, $plannedTypes, $wordOperators, $notKeywords, $lspServer, $lspSupportedTypes;
+    global $acceptedKeywords, $plannedKeywords, $primitiveTypes, $reservedTypes, $plannedTypes, $wordOperators, $notKeywords, $lspServer, $lspSupportedTypes;
 
     $lspText = read_text($lspServer);
     $tokens = array_unique([...$acceptedKeywords, ...$wordOperators]);
@@ -502,9 +502,21 @@ function check_lsp_completion_vocabulary(): void
     );
     $lspTypeList = $matches[1];
 
+    require_check(
+        preg_match('/let reserved_types = \[(.*?)\];/s', $lspText, $reservedMatches) === 1,
+        'LSP completion reserved type list could not be found'
+    );
+    $lspReservedTypeList = $reservedMatches[1];
+
     sort($lspSupportedTypes);
     foreach ($lspSupportedTypes as $type) {
         require_check(str_contains($lspTypeList, chr(34) . $type . chr(34)), 'LSP completion type list is missing ' . $type);
+    }
+
+    sort($reservedTypes);
+    foreach ($reservedTypes as $type) {
+        require_check(str_contains($lspReservedTypeList, chr(34) . $type . chr(34)), 'LSP completion reserved type list is missing ' . $type);
+        require_check(!str_contains($lspTypeList, chr(34) . $type . chr(34)), 'LSP completion type list must not advertise reserved type ' . $type);
     }
 
     $unsupportedTypes = array_diff(array_unique([...$primitiveTypes, ...$plannedTypes]), $lspSupportedTypes);
