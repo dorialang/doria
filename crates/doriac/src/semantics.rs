@@ -24,8 +24,6 @@ struct Checker<'program> {
     classes: HashMap<String, ClassInfo>,
     functions: HashMap<String, FunctionInfo>,
     function_signatures: HashMap<usize, FunctionInfo>,
-    call_inference_stack: Vec<CallInferenceKey>,
-    call_effect_stack: Vec<CallInferenceKey>,
     types: TypeRegistry,
     diagnostics: Vec<Diagnostic>,
 }
@@ -128,18 +126,6 @@ struct AssignmentTarget {
     destination: AssignmentDestination,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct ParamTypeRefinement {
-    index: usize,
-    ty: TypeId,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum CallInferenceKey {
-    Function(String),
-    Method { class_name: String, method: String },
-}
-
 #[derive(Debug, Clone)]
 enum AssignmentDestination {
     Type,
@@ -161,8 +147,6 @@ impl<'program> Checker<'program> {
             classes: HashMap::new(),
             functions: HashMap::new(),
             function_signatures: HashMap::new(),
-            call_inference_stack: Vec::new(),
-            call_effect_stack: Vec::new(),
             types: TypeRegistry::new(),
             diagnostics: Vec::new(),
         }
@@ -733,6 +717,10 @@ impl<'program> Checker<'program> {
                 let element = self.merge_mixed_return_types(left, right);
                 self.types.intern(TypeKind::List(element))
             }
+            (TypeKind::TypedArray(left), TypeKind::TypedArray(right)) => {
+                let element = self.merge_mixed_return_types(left, right);
+                self.types.intern(TypeKind::TypedArray(element))
+            }
             (
                 TypeKind::Dictionary(left_key, left_value),
                 TypeKind::Dictionary(right_key, right_value),
@@ -758,13 +746,11 @@ impl<'program> Checker<'program> {
     ) -> TypeId {
         let initializer_ty = self.infer_expr_type(initializer, scopes, method_context);
         annotation.map_or(initializer_ty, |ty| {
-            let annotated_ty = self.resolve_type_ref_for_return_inference(ty);
-            self.preserve_known_mixed_collection_shape(annotated_ty, initializer_ty)
+            self.resolve_type_ref_for_return_inference(ty)
         })
     }
 
     fn merge_inferred_binding_type(&mut self, current: TypeId, next: TypeId) -> TypeId {
-        let next = self.preserve_known_mixed_collection_shape(current, next);
         if self.type_contains_mixed(current) {
             self.merge_mixed_return_types(current, next)
         } else {
@@ -789,6 +775,7 @@ impl<'program> Checker<'program> {
             TypeKind::List(value) | TypeKind::Set(value) => {
                 (self.types.intern(TypeKind::Int), value)
             }
+            TypeKind::TypedArray(value) => (self.types.intern(TypeKind::Int), value),
             TypeKind::Dictionary(key, value) => (key, value),
             TypeKind::Mixed => (unknown, self.types.intern(TypeKind::Mixed)),
             _ => (unknown, unknown),
@@ -803,7 +790,10 @@ impl<'program> Checker<'program> {
             "string" if ty.args.is_empty() => self.types.intern(TypeKind::String),
             "bool" if ty.args.is_empty() => self.types.intern(TypeKind::Bool),
             "mixed" if ty.args.is_empty() => self.types.intern(TypeKind::Mixed),
-            "array" if ty.args.is_empty() => self.types.intern(TypeKind::Array),
+            "[]" if ty.args.len() == 1 => {
+                let element = self.resolve_type_ref_for_return_inference(&ty.args[0]);
+                self.types.intern(TypeKind::TypedArray(element))
+            }
             "List" if ty.args.len() == 1 => {
                 let element = self.resolve_type_ref_for_return_inference(&ty.args[0]);
                 self.types.intern(TypeKind::List(element))
@@ -872,11 +862,6 @@ impl<'program> Checker<'program> {
                 name: property.name.clone(),
             },
         );
-        let value_ty = self.infer_expr_type(initializer, &scopes, Some(&initializer_context));
-        let preserved_ty = self.preserve_known_mixed_collection_shape(target_ty, value_ty);
-        if preserved_ty != target_ty {
-            self.preserve_known_mixed_collection_property(class_name, &property.name, preserved_ty);
-        }
     }
 
     fn declare_property(
@@ -1130,7 +1115,7 @@ impl<'program> Checker<'program> {
                             method_context,
                             AssignmentDestination::Type,
                         );
-                        self.preserve_known_mixed_collection_shape(target_ty, value_ty)
+                        target_ty
                     }
                     None => value_ty,
                 };
@@ -1384,7 +1369,7 @@ impl<'program> Checker<'program> {
                             method_context,
                             AssignmentDestination::Type,
                         );
-                        self.preserve_known_mixed_collection_shape(target_ty, value_ty)
+                        target_ty
                     }
                     None => value_ty,
                 };
@@ -1463,12 +1448,6 @@ impl<'program> Checker<'program> {
                 );
                 if assignment_ok {
                     let value_ty = self.infer_expr_type(&assignment.value, scopes, method_context);
-                    self.preserve_known_mixed_collection_assignment(
-                        &assignment.target,
-                        &target,
-                        value_ty,
-                        scopes,
-                    );
                     self.narrow_empty_collection_assignment(
                         &assignment.target,
                         target_ty,
@@ -2210,7 +2189,9 @@ impl<'program> Checker<'program> {
     fn type_contains_mixed(&self, ty: TypeId) -> bool {
         match self.types.kind(ty) {
             TypeKind::Mixed => true,
-            TypeKind::List(element) | TypeKind::Set(element) => self.type_contains_mixed(*element),
+            TypeKind::TypedArray(element) | TypeKind::List(element) | TypeKind::Set(element) => {
+                self.type_contains_mixed(*element)
+            }
             TypeKind::Dictionary(key, value) => {
                 self.type_contains_mixed(*key) || self.type_contains_mixed(*value)
             }
@@ -2595,7 +2576,7 @@ impl<'program> Checker<'program> {
             return;
         };
 
-        let refinements = self.check_call_arguments(
+        self.check_call_arguments(
             &format!("function `{name}`"),
             &function_info.params,
             args,
@@ -2603,7 +2584,6 @@ impl<'program> Checker<'program> {
             scopes,
             method_context,
         );
-        self.apply_function_call_side_effects(name, &refinements, args, scopes, method_context);
     }
 
     fn check_method_call(
@@ -2661,19 +2641,11 @@ impl<'program> Checker<'program> {
             ));
         }
 
-        let refinements = self.check_call_arguments(
+        self.check_call_arguments(
             &format!("method `{class_name}::{method}`"),
             &method_info.params,
             args,
             span,
-            scopes,
-            method_context,
-        );
-        self.apply_method_call_side_effects(
-            &class_name,
-            method,
-            &refinements,
-            args,
             scopes,
             method_context,
         );
@@ -2719,19 +2691,11 @@ impl<'program> Checker<'program> {
             ));
         }
 
-        let refinements = self.check_call_arguments(
+        self.check_call_arguments(
             &format!("method `{class_name}::{method}`"),
             &method_info.params,
             args,
             span,
-            scopes,
-            method_context,
-        );
-        self.apply_method_call_side_effects(
-            class_name,
-            method,
-            &refinements,
-            args,
             scopes,
             method_context,
         );
@@ -2805,19 +2769,11 @@ impl<'program> Checker<'program> {
             ));
         }
 
-        let refinements = self.check_call_arguments(
+        self.check_call_arguments(
             &format!("constructor `{class_name}::__construct`"),
             &constructor.params,
             args,
             span,
-            scopes,
-            method_context,
-        );
-        self.apply_method_call_side_effects(
-            class_name,
-            "__construct",
-            &refinements,
-            args,
             scopes,
             method_context,
         );
@@ -2831,14 +2787,13 @@ impl<'program> Checker<'program> {
         span: Span,
         scopes: &ScopeStack,
         method_context: Option<&MethodContext>,
-    ) -> Vec<ParamTypeRefinement> {
-        let mut refinements = Vec::new();
+    ) {
         let required = params.iter().filter(|param| !param.has_default).count();
         let total = params.len();
 
         if args.len() < required || args.len() > total {
             self.report_argument_count_mismatch(callee, required, total, args.len(), span);
-            return refinements;
+            return;
         }
 
         for (index, (arg, param)) in args.iter().zip(params.iter()).enumerate() {
@@ -2847,10 +2802,6 @@ impl<'program> Checker<'program> {
             if self.is_expr_assignable(param.ty, arg, scopes, method_context)
                 || self.is_assignable(param.ty, got)
             {
-                let ty = self.preserve_known_mixed_collection_shape(param.ty, got);
-                if ty != param.ty {
-                    refinements.push(ParamTypeRefinement { index, ty });
-                }
                 continue;
             }
 
@@ -2864,642 +2815,6 @@ impl<'program> Checker<'program> {
                 ),
                 arg.span(),
             ));
-        }
-
-        refinements
-    }
-
-    fn apply_function_call_side_effects(
-        &mut self,
-        name: &str,
-        refinements: &[ParamTypeRefinement],
-        _args: &[Expr],
-        _scopes: &ScopeStack,
-        _method_context: Option<&MethodContext>,
-    ) {
-        let Some(function) = self.find_function_decl(name).cloned() else {
-            return;
-        };
-
-        let Some(function_info) = self.functions.get(name).cloned() else {
-            return;
-        };
-        let Some(params) = self.refined_params(&function_info.params, refinements) else {
-            return;
-        };
-
-        let key = CallInferenceKey::Function(name.to_string());
-        if self.call_effect_stack.contains(&key) {
-            return;
-        }
-
-        self.call_effect_stack.push(key);
-        self.apply_function_body_side_effects(&function, &params, None);
-        self.call_effect_stack.pop();
-    }
-
-    fn apply_method_call_side_effects(
-        &mut self,
-        class_name: &str,
-        method_name: &str,
-        refinements: &[ParamTypeRefinement],
-        _args: &[Expr],
-        _scopes: &ScopeStack,
-        _method_context: Option<&MethodContext>,
-    ) {
-        let Some(method) = self.find_method_decl(class_name, method_name).cloned() else {
-            return;
-        };
-
-        let Some(method_info) = self
-            .classes
-            .get(class_name)
-            .and_then(|class_info| class_info.methods.get(method_name))
-            .cloned()
-        else {
-            return;
-        };
-        let Some(params) = self.refined_params(&method_info.params, refinements) else {
-            return;
-        };
-
-        let key = CallInferenceKey::Method {
-            class_name: class_name.to_string(),
-            method: method_name.to_string(),
-        };
-        if self.call_effect_stack.contains(&key) {
-            return;
-        }
-
-        let method_context = MethodContext {
-            class_name: class_name.to_string(),
-            writable_this: method.writable_this,
-            this_available: true,
-        };
-        self.call_effect_stack.push(key);
-        self.apply_function_body_side_effects(&method, &params, Some(&method_context));
-        self.call_effect_stack.pop();
-    }
-
-    fn refined_params(
-        &mut self,
-        params: &[ParamInfo],
-        refinements: &[ParamTypeRefinement],
-    ) -> Option<Vec<ParamInfo>> {
-        if refinements.is_empty() {
-            return None;
-        }
-
-        let mut params = params.to_vec();
-        let mut changed = false;
-
-        for refinement in refinements {
-            let Some(param) = params.get_mut(refinement.index) else {
-                continue;
-            };
-
-            let ty = self.merge_refined_mixed_collection_type(param.ty, refinement.ty);
-            if ty != param.ty {
-                param.ty = ty;
-                changed = true;
-            }
-        }
-
-        changed.then_some(params)
-    }
-
-    fn merge_refined_mixed_collection_type(&mut self, current: TypeId, next: TypeId) -> TypeId {
-        let preserved = self.preserve_known_mixed_collection_shape(current, next);
-        if preserved != current {
-            return preserved;
-        }
-
-        if self.type_contains_mixed(current) {
-            self.merge_mixed_return_types(current, next)
-        } else {
-            next
-        }
-    }
-
-    fn find_function_decl(&self, name: &str) -> Option<&FunctionDecl> {
-        self.program.items.iter().find_map(|item| match item {
-            Item::Function(function) if function.name == name => Some(function),
-            _ => None,
-        })
-    }
-
-    fn find_method_decl(&self, class_name: &str, method_name: &str) -> Option<&FunctionDecl> {
-        self.program.items.iter().find_map(|item| match item {
-            Item::Class(class_decl) if class_decl.name == class_name => {
-                class_decl.members.iter().find_map(|member| match member {
-                    ClassMember::Method(method) if method.name == method_name => Some(method),
-                    ClassMember::Property(_) | ClassMember::Method(_) => None,
-                })
-            }
-            _ => None,
-        })
-    }
-
-    fn call_param_refinements(
-        &mut self,
-        params: &[ParamInfo],
-        args: &[Expr],
-        scopes: &ScopeStack,
-        method_context: Option<&MethodContext>,
-    ) -> Vec<ParamTypeRefinement> {
-        params
-            .iter()
-            .zip(args.iter())
-            .enumerate()
-            .filter_map(|(index, (param, arg))| {
-                let got = self.infer_expr_type(arg, scopes, method_context);
-                let ty = self.preserve_known_mixed_collection_shape(param.ty, got);
-                (ty != param.ty).then_some(ParamTypeRefinement { index, ty })
-            })
-            .collect()
-    }
-
-    fn infer_function_call_return_type(
-        &mut self,
-        name: &str,
-        args: &[Expr],
-        scopes: &ScopeStack,
-        method_context: Option<&MethodContext>,
-    ) -> TypeId {
-        let Some(function_info) = self.functions.get(name).cloned() else {
-            return self.types.unknown();
-        };
-        let fallback = function_info.return_ty;
-        let Some(function) = self.find_function_decl(name).cloned() else {
-            return fallback;
-        };
-        if function.return_type.is_some() {
-            return fallback;
-        }
-
-        let refinements =
-            self.call_param_refinements(&function_info.params, args, scopes, method_context);
-        let Some(params) = self.refined_params(&function_info.params, &refinements) else {
-            return fallback;
-        };
-
-        let key = CallInferenceKey::Function(name.to_string());
-        self.infer_call_specific_return_type(key, &function, &params, None, fallback)
-    }
-
-    fn infer_method_call_return_type(
-        &mut self,
-        class_name: &str,
-        method_name: &str,
-        args: &[Expr],
-        scopes: &ScopeStack,
-        method_context: Option<&MethodContext>,
-    ) -> TypeId {
-        let Some(method_info) = self
-            .classes
-            .get(class_name)
-            .and_then(|class_info| class_info.methods.get(method_name))
-            .cloned()
-        else {
-            return self.types.unknown();
-        };
-        let fallback = method_info.return_ty;
-        let Some(method) = self.find_method_decl(class_name, method_name).cloned() else {
-            return fallback;
-        };
-        if method.return_type.is_some() || LifecycleMethod::from_method_name(method_name).is_some()
-        {
-            return fallback;
-        }
-
-        let refinements =
-            self.call_param_refinements(&method_info.params, args, scopes, method_context);
-        let Some(params) = self.refined_params(&method_info.params, &refinements) else {
-            return fallback;
-        };
-
-        let key = CallInferenceKey::Method {
-            class_name: class_name.to_string(),
-            method: method_name.to_string(),
-        };
-        let call_context = MethodContext {
-            class_name: class_name.to_string(),
-            writable_this: method.writable_this,
-            this_available: true,
-        };
-        self.infer_call_specific_return_type(key, &method, &params, Some(&call_context), fallback)
-    }
-
-    fn infer_call_specific_return_type(
-        &mut self,
-        key: CallInferenceKey,
-        function: &FunctionDecl,
-        params: &[ParamInfo],
-        method_context: Option<&MethodContext>,
-        fallback: TypeId,
-    ) -> TypeId {
-        if self.call_inference_stack.contains(&key) {
-            return fallback;
-        }
-
-        self.call_inference_stack.push(key);
-        let inferred = self.infer_unannotated_mixed_return_type(function, params, method_context);
-        self.call_inference_stack.pop();
-
-        if self.type_contains_mixed(inferred) {
-            inferred
-        } else {
-            fallback
-        }
-    }
-
-    fn apply_function_body_side_effects(
-        &mut self,
-        function: &FunctionDecl,
-        params: &[ParamInfo],
-        method_context: Option<&MethodContext>,
-    ) {
-        let mut scopes = ScopeStack::new();
-        for param in params {
-            let _ = scopes.declare(
-                param.name.clone(),
-                Binding {
-                    writable: false,
-                    ty: param.ty,
-                    int_constant: None,
-                },
-            );
-        }
-
-        self.apply_block_side_effects(&function.body, &mut scopes, method_context);
-    }
-
-    fn apply_block_side_effects(
-        &mut self,
-        block: &Block,
-        scopes: &mut ScopeStack,
-        method_context: Option<&MethodContext>,
-    ) {
-        scopes.push();
-        for statement in &block.statements {
-            self.apply_statement_side_effects(statement, scopes, method_context);
-        }
-        scopes.pop();
-    }
-
-    fn apply_statement_side_effects(
-        &mut self,
-        statement: &Stmt,
-        scopes: &mut ScopeStack,
-        method_context: Option<&MethodContext>,
-    ) {
-        match statement {
-            Stmt::VarDecl(decl) => {
-                self.apply_expr_side_effects(&decl.initializer, scopes, method_context);
-                let ty = self.infer_local_declaration_type(
-                    decl.ty.as_ref(),
-                    &decl.initializer,
-                    scopes,
-                    method_context,
-                );
-                let _ = scopes.declare(
-                    decl.name.clone(),
-                    Binding {
-                        writable: decl.writable,
-                        ty,
-                        int_constant: None,
-                    },
-                );
-            }
-            Stmt::Assignment(assignment) => {
-                self.apply_expr_side_effects(&assignment.value, scopes, method_context);
-                self.apply_assignment_side_effects(assignment, scopes, method_context);
-            }
-            Stmt::Echo { expr, .. }
-            | Stmt::Expr { expr, .. }
-            | Stmt::Return {
-                expr: Some(expr), ..
-            } => {
-                self.apply_expr_side_effects(expr, scopes, method_context);
-            }
-            Stmt::Return { expr: None, .. } | Stmt::Break { .. } | Stmt::Continue { .. } => {}
-            Stmt::If(if_stmt) => {
-                self.apply_expr_side_effects(&if_stmt.condition, scopes, method_context);
-                self.apply_block_side_effects(&if_stmt.then_block, scopes, method_context);
-                if let Some(else_branch) = &if_stmt.else_branch {
-                    self.apply_else_branch_side_effects(else_branch, scopes, method_context);
-                }
-            }
-            Stmt::While(while_stmt) => {
-                self.apply_expr_side_effects(&while_stmt.condition, scopes, method_context);
-                self.apply_block_side_effects(&while_stmt.body, scopes, method_context);
-            }
-            Stmt::For(for_stmt) => {
-                scopes.push();
-                if let Some(initializer) = &for_stmt.initializer {
-                    self.apply_for_initializer_side_effects(initializer, scopes, method_context);
-                }
-                if let Some(condition) = &for_stmt.condition {
-                    self.apply_expr_side_effects(condition, scopes, method_context);
-                }
-                self.apply_block_side_effects(&for_stmt.body, scopes, method_context);
-                if let Some(increment) = &for_stmt.increment {
-                    self.apply_for_increment_side_effects(increment, scopes, method_context);
-                }
-                scopes.pop();
-            }
-            Stmt::Foreach(foreach) => {
-                self.apply_expr_side_effects(&foreach.iterable, scopes, method_context);
-                scopes.push();
-                let (key_ty, value_ty) =
-                    self.infer_foreach_binding_types(foreach, scopes, method_context);
-                if let Some(key) = &foreach.key {
-                    let _ = scopes.declare(
-                        key.name.clone(),
-                        Binding {
-                            writable: false,
-                            ty: key_ty,
-                            int_constant: None,
-                        },
-                    );
-                }
-                let _ = scopes.declare(
-                    foreach.value.name.clone(),
-                    Binding {
-                        writable: false,
-                        ty: value_ty,
-                        int_constant: None,
-                    },
-                );
-                for statement in &foreach.body.statements {
-                    self.apply_statement_side_effects(statement, scopes, method_context);
-                }
-                scopes.pop();
-            }
-            Stmt::Increment(_) => {}
-        }
-    }
-
-    fn apply_else_branch_side_effects(
-        &mut self,
-        branch: &ElseBranch,
-        scopes: &mut ScopeStack,
-        method_context: Option<&MethodContext>,
-    ) {
-        match branch {
-            ElseBranch::If(if_stmt) => {
-                self.apply_statement_side_effects(
-                    &Stmt::If((**if_stmt).clone()),
-                    scopes,
-                    method_context,
-                );
-            }
-            ElseBranch::Block(block) => {
-                self.apply_block_side_effects(block, scopes, method_context)
-            }
-        }
-    }
-
-    fn apply_for_initializer_side_effects(
-        &mut self,
-        initializer: &ForInitializer,
-        scopes: &mut ScopeStack,
-        method_context: Option<&MethodContext>,
-    ) {
-        match initializer {
-            ForInitializer::VarDecl(decl) => {
-                self.apply_expr_side_effects(&decl.initializer, scopes, method_context);
-                let ty = self.infer_local_declaration_type(
-                    decl.ty.as_ref(),
-                    &decl.initializer,
-                    scopes,
-                    method_context,
-                );
-                let _ = scopes.declare(
-                    decl.name.clone(),
-                    Binding {
-                        writable: decl.writable,
-                        ty,
-                        int_constant: None,
-                    },
-                );
-            }
-            ForInitializer::Assignment(assignment) => {
-                self.apply_expr_side_effects(&assignment.value, scopes, method_context);
-                self.apply_assignment_side_effects(assignment, scopes, method_context);
-            }
-        }
-    }
-
-    fn apply_for_increment_side_effects(
-        &mut self,
-        increment: &ForIncrement,
-        scopes: &mut ScopeStack,
-        method_context: Option<&MethodContext>,
-    ) {
-        if let ForIncrement::Assignment(assignment) = increment {
-            self.apply_expr_side_effects(&assignment.value, scopes, method_context);
-            self.apply_assignment_side_effects(assignment, scopes, method_context);
-        }
-    }
-
-    fn apply_assignment_side_effects(
-        &mut self,
-        assignment: &Assignment,
-        scopes: &mut ScopeStack,
-        method_context: Option<&MethodContext>,
-    ) {
-        if !matches!(assignment.op, AssignOp::Assign) {
-            return;
-        }
-
-        let value_ty = self.infer_expr_type(&assignment.value, scopes, method_context);
-        match &assignment.target {
-            Expr::Variable { name, .. } => {
-                if let Some(binding) = scopes.lookup_mut(name) {
-                    binding.ty = self.merge_inferred_binding_type(binding.ty, value_ty);
-                }
-            }
-            Expr::PropertyAccess {
-                object, property, ..
-            } => {
-                self.apply_expr_side_effects(object, scopes, method_context);
-                let Some(class_name) = self.expr_class_name(object, scopes, method_context) else {
-                    return;
-                };
-                let Some(property_ty) = self
-                    .classes
-                    .get(&class_name)
-                    .and_then(|class_info| class_info.properties.get(property))
-                    .map(|property| property.ty)
-                else {
-                    return;
-                };
-                let preserved_ty =
-                    self.preserve_known_mixed_collection_shape(property_ty, value_ty);
-                if preserved_ty != property_ty {
-                    self.preserve_known_mixed_collection_property(
-                        &class_name,
-                        property,
-                        preserved_ty,
-                    );
-                }
-            }
-            _ => {}
-        }
-    }
-
-    fn apply_expr_side_effects(
-        &mut self,
-        expr: &Expr,
-        scopes: &mut ScopeStack,
-        method_context: Option<&MethodContext>,
-    ) {
-        match expr {
-            Expr::Array { elements, .. } => {
-                for element in elements {
-                    if let Some(key) = &element.key {
-                        self.apply_expr_side_effects(key, scopes, method_context);
-                    }
-                    self.apply_expr_side_effects(&element.value, scopes, method_context);
-                }
-            }
-            Expr::PropertyAccess { object, .. } => {
-                self.apply_expr_side_effects(object, scopes, method_context);
-            }
-            Expr::MethodCall {
-                object,
-                method,
-                args,
-                ..
-            } => {
-                self.apply_expr_side_effects(object, scopes, method_context);
-                for arg in args {
-                    self.apply_expr_side_effects(arg, scopes, method_context);
-                }
-                let Some(class_name) = self.expr_class_name(object, scopes, method_context) else {
-                    return;
-                };
-                let Some(method_info) = self
-                    .classes
-                    .get(&class_name)
-                    .and_then(|class_info| class_info.methods.get(method))
-                    .cloned()
-                else {
-                    return;
-                };
-                let refinements =
-                    self.call_param_refinements(&method_info.params, args, scopes, method_context);
-                self.apply_method_call_side_effects(
-                    &class_name,
-                    method,
-                    &refinements,
-                    args,
-                    scopes,
-                    method_context,
-                );
-            }
-            Expr::FunctionCall { name, args, .. } => {
-                for arg in args {
-                    self.apply_expr_side_effects(arg, scopes, method_context);
-                }
-                let Some(function_info) = self.functions.get(name).cloned() else {
-                    return;
-                };
-                let refinements = self.call_param_refinements(
-                    &function_info.params,
-                    args,
-                    scopes,
-                    method_context,
-                );
-                self.apply_function_call_side_effects(
-                    name,
-                    &refinements,
-                    args,
-                    scopes,
-                    method_context,
-                );
-            }
-            Expr::StaticCall {
-                class_name,
-                method,
-                args,
-                ..
-            } => {
-                for arg in args {
-                    self.apply_expr_side_effects(arg, scopes, method_context);
-                }
-                let Some(method_info) = self
-                    .classes
-                    .get(class_name)
-                    .and_then(|class_info| class_info.methods.get(method))
-                    .cloned()
-                else {
-                    return;
-                };
-                let refinements =
-                    self.call_param_refinements(&method_info.params, args, scopes, method_context);
-                self.apply_method_call_side_effects(
-                    class_name,
-                    method,
-                    &refinements,
-                    args,
-                    scopes,
-                    method_context,
-                );
-            }
-            Expr::New {
-                class_name, args, ..
-            } => {
-                for arg in args {
-                    self.apply_expr_side_effects(arg, scopes, method_context);
-                }
-                let Some(constructor) = self
-                    .classes
-                    .get(class_name)
-                    .and_then(|class_info| class_info.methods.get("__construct"))
-                    .cloned()
-                else {
-                    return;
-                };
-                let refinements =
-                    self.call_param_refinements(&constructor.params, args, scopes, method_context);
-                self.apply_method_call_side_effects(
-                    class_name,
-                    "__construct",
-                    &refinements,
-                    args,
-                    scopes,
-                    method_context,
-                );
-            }
-            Expr::Grouped { expr, .. } | Expr::Unary { expr, .. } => {
-                self.apply_expr_side_effects(expr, scopes, method_context);
-            }
-            Expr::Binary { left, right, .. }
-            | Expr::Range {
-                start: left,
-                end: right,
-                ..
-            } => {
-                self.apply_expr_side_effects(left, scopes, method_context);
-                self.apply_expr_side_effects(right, scopes, method_context);
-            }
-            Expr::InterpolatedString { parts, .. } => {
-                for part in parts {
-                    if let InterpolatedStringPart::Expr(expr) = part {
-                        self.apply_expr_side_effects(expr, scopes, method_context);
-                    }
-                }
-            }
-            Expr::Variable { .. }
-            | Expr::This { .. }
-            | Expr::Identifier { .. }
-            | Expr::String { .. }
-            | Expr::Int { .. }
-            | Expr::Float { .. }
-            | Expr::Bool { .. }
-            | Expr::Null { .. } => {}
         }
     }
 
@@ -3668,7 +2983,17 @@ impl<'program> Checker<'program> {
                 "E0432",
                 "`resource` is reserved for PHP interop and is not available yet",
             ),
-            "array" => self.resolve_zero_arg_type(ty, span, TypeKind::Array),
+            "[]" => {
+                if !self.expect_type_arg_count(ty, 1, span) {
+                    for arg in &ty.args {
+                        self.resolve_type_ref_in_position(arg, span, TypePosition::Value);
+                    }
+                    return self.types.unknown();
+                }
+                let element =
+                    self.resolve_type_ref_in_position(&ty.args[0], span, TypePosition::Value);
+                self.types.intern(TypeKind::TypedArray(element))
+            }
             "List" => {
                 if !self.expect_type_arg_count(ty, 1, span) {
                     for arg in &ty.args {
@@ -3853,79 +3178,6 @@ impl<'program> Checker<'program> {
         }
     }
 
-    fn preserve_known_mixed_collection_assignment(
-        &mut self,
-        target: &Expr,
-        assignment_target: &AssignmentTarget,
-        value_ty: TypeId,
-        scopes: &mut ScopeStack,
-    ) {
-        let preserved_ty =
-            self.preserve_known_mixed_collection_shape(assignment_target.ty, value_ty);
-        if preserved_ty == assignment_target.ty {
-            return;
-        }
-
-        match &assignment_target.destination {
-            AssignmentDestination::Type => {
-                let Expr::Variable { name, .. } = target else {
-                    return;
-                };
-
-                let Some(binding) = scopes.lookup_mut(name) else {
-                    return;
-                };
-
-                if matches!(self.types.kind(binding.ty), TypeKind::Array) {
-                    binding.ty = preserved_ty;
-                }
-            }
-            AssignmentDestination::Property { class_name, name } => {
-                self.preserve_known_mixed_collection_property(class_name, name, preserved_ty);
-            }
-            AssignmentDestination::Parameter { .. } => {}
-        }
-    }
-
-    fn preserve_known_mixed_collection_property(
-        &mut self,
-        class_name: &str,
-        property_name: &str,
-        preserved_ty: TypeId,
-    ) {
-        let changed = self
-            .classes
-            .get_mut(class_name)
-            .and_then(|class_info| class_info.properties.get_mut(property_name))
-            .is_some_and(|property| {
-                if matches!(self.types.kind(property.ty), TypeKind::Array) {
-                    property.ty = preserved_ty;
-                    true
-                } else {
-                    false
-                }
-            });
-
-        if changed {
-            self.infer_unannotated_mixed_return_signatures();
-        }
-    }
-
-    fn preserve_known_mixed_collection_shape(
-        &self,
-        annotated_ty: TypeId,
-        value_ty: TypeId,
-    ) -> TypeId {
-        if matches!(self.types.kind(annotated_ty), TypeKind::Array)
-            && self.is_non_empty_collection_like_type(value_ty)
-            && self.type_contains_mixed(value_ty)
-        {
-            value_ty
-        } else {
-            annotated_ty
-        }
-    }
-
     fn is_expr_assignable(
         &mut self,
         target: TypeId,
@@ -3957,7 +3209,16 @@ impl<'program> Checker<'program> {
         let target_kind = self.types.kind(target).clone();
 
         match target_kind {
-            TypeKind::Mixed | TypeKind::Unknown | TypeKind::Array => true,
+            TypeKind::Mixed | TypeKind::Unknown => true,
+            TypeKind::TypedArray(element) => {
+                if elements.iter().any(|element| element.key.is_some()) {
+                    return false;
+                }
+
+                elements.iter().all(|array_element| {
+                    self.is_expr_assignable(element, &array_element.value, scopes, method_context)
+                })
+            }
             TypeKind::List(element) => {
                 if self.is_unknown_type(element)
                     || elements.iter().any(|element| element.key.is_some())
@@ -4022,18 +3283,23 @@ impl<'program> Checker<'program> {
             (_, TypeKind::Mixed) => false,
             (TypeKind::Unknown, _) | (_, TypeKind::Unknown) => true,
             (
-                TypeKind::Array,
-                TypeKind::List(_) | TypeKind::Dictionary(_, _) | TypeKind::Set(_),
-            ) => true,
-            (
-                TypeKind::Array | TypeKind::List(_) | TypeKind::Dictionary(_, _) | TypeKind::Set(_),
+                TypeKind::TypedArray(_)
+                | TypeKind::List(_)
+                | TypeKind::Dictionary(_, _)
+                | TypeKind::Set(_),
                 TypeKind::EmptyCollection,
             ) => true,
             (
                 TypeKind::EmptyCollection,
-                TypeKind::Array | TypeKind::List(_) | TypeKind::Dictionary(_, _) | TypeKind::Set(_),
+                TypeKind::TypedArray(_)
+                | TypeKind::List(_)
+                | TypeKind::Dictionary(_, _)
+                | TypeKind::Set(_),
             ) => true,
             (TypeKind::Class(target), TypeKind::Class(value)) => target == value,
+            (TypeKind::TypedArray(target), TypeKind::TypedArray(value)) => {
+                self.is_assignable(target, value)
+            }
             (TypeKind::List(target), TypeKind::List(value)) => self.is_assignable(target, value),
             (
                 TypeKind::Dictionary(target_key, target_value),
@@ -4092,34 +3358,29 @@ impl<'program> Checker<'program> {
                     .map(|property| property.ty)
                     .unwrap_or_else(|| self.types.unknown())
             }
-            Expr::MethodCall {
-                object,
-                method,
-                args,
-                ..
-            } => {
+            Expr::MethodCall { object, method, .. } => {
                 let Some(class_name) = self.expr_class_name(object, scopes, method_context) else {
                     return self.types.unknown();
                 };
-                self.infer_method_call_return_type(
-                    &class_name,
-                    method,
-                    args,
-                    scopes,
-                    method_context,
-                )
+                self.classes
+                    .get(&class_name)
+                    .and_then(|class_info| class_info.methods.get(method))
+                    .map(|method| method.return_ty)
+                    .unwrap_or_else(|| self.types.unknown())
             }
-            Expr::FunctionCall { name, args, .. } => {
-                self.infer_function_call_return_type(name, args, scopes, method_context)
-            }
+            Expr::FunctionCall { name, .. } => self
+                .functions
+                .get(name)
+                .map(|function| function.return_ty)
+                .unwrap_or_else(|| self.types.unknown()),
             Expr::StaticCall {
-                class_name,
-                method,
-                args,
-                ..
-            } => {
-                self.infer_method_call_return_type(class_name, method, args, scopes, method_context)
-            }
+                class_name, method, ..
+            } => self
+                .classes
+                .get(class_name)
+                .and_then(|class_info| class_info.methods.get(method))
+                .map(|method| method.return_ty)
+                .unwrap_or_else(|| self.types.unknown()),
             Expr::Grouped { expr, .. } => self.infer_expr_type(expr, scopes, method_context),
             Expr::Unary { op, expr, .. } => self.infer_unary_type(op, expr, scopes, method_context),
             Expr::Binary {
@@ -4346,7 +3607,7 @@ impl<'program> Checker<'program> {
     fn is_collection_like_type(&self, ty: TypeId) -> bool {
         matches!(
             self.types.kind(ty),
-            TypeKind::Array
+            TypeKind::TypedArray(_)
                 | TypeKind::List(_)
                 | TypeKind::Dictionary(_, _)
                 | TypeKind::Set(_)
@@ -4357,7 +3618,10 @@ impl<'program> Checker<'program> {
     fn is_non_empty_collection_like_type(&self, ty: TypeId) -> bool {
         matches!(
             self.types.kind(ty),
-            TypeKind::Array | TypeKind::List(_) | TypeKind::Dictionary(_, _) | TypeKind::Set(_)
+            TypeKind::TypedArray(_)
+                | TypeKind::List(_)
+                | TypeKind::Dictionary(_, _)
+                | TypeKind::Set(_)
         )
     }
 

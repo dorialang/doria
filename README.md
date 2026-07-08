@@ -221,7 +221,9 @@ For VS Code, the setting is `doria.languageServer.path`. For IntelliJ IDEs, use 
 - `++` and `--` require writable `int` targets; value-producing `++`/`--` expressions are future work.
 - `throw` raises checked errors, and `throws` declares checked thrown error types in signatures. Compiler behavior for checked errors is future work.
 - `Result<T, E>` is not Doria's default surface error model unless a later decision explicitly adopts it.
+- Typed arrays are spelled `T[]`, for example `int[] $numbers`.
 - Collection aliases are `List<T>`, `Dictionary<K, V>`, and `Set<T>`.
+- `array` is not a Doria type spelling; use `T[]` or a named collection type.
 - `int` means `int64`, `float` means `float64`, and the accepted fixed-width numeric family is documented in `docs/decisions/0016-fixed-width-numeric-types.md`; compiler support for those explicit spellings is future work.
 - The compiler must reject invalid Doria before lowering to Doria IR or emitting backend output.
 - The native backend currently accepts the Stage 10 smoke subset: top-level free functions, exactly one `main`, Stage 9 supported integer/control-flow/string shapes, `int` helper parameters, `int`/`void` helper returns, `int` helper calls in supported integer expressions, and `void` helper calls as statements. It rejects broader valid Doria with unsupported-feature diagnostics. Helper `int` returns are Doria `int` values; the `0..125` range is only a process-exit boundary for explicit `main(): int` status values, not the range of Doria `int`.

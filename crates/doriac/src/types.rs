@@ -22,14 +22,18 @@ impl TypeRef {
         }
     }
 
+    pub fn array_of(element: TypeRef) -> Self {
+        Self::generic("[]", vec![element])
+    }
+
     pub fn unknown() -> Self {
         Self::named("Unknown")
     }
 
     pub fn as_class_name(&self) -> Option<&str> {
         match self.name.as_str() {
-            "void" | "int" | "float" | "string" | "bool" | "array" | "mixed" | "null"
-            | "resource" | "List" | "Dictionary" | "Set" | "Unknown" => None,
+            "void" | "int" | "float" | "string" | "bool" | "mixed" | "null" | "resource"
+            | "List" | "Dictionary" | "Set" | "[]" | "Unknown" => None,
             _ => Some(&self.name),
         }
     }
@@ -37,6 +41,10 @@ impl TypeRef {
 
 impl fmt::Display for TypeRef {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.name == "[]" && self.args.len() == 1 {
+            return write!(formatter, "{}[]", self.args[0]);
+        }
+
         if self.args.is_empty() {
             write!(formatter, "{}", self.name)
         } else {
@@ -63,7 +71,7 @@ pub enum TypeKind {
     Bool,
     Null,
     Mixed,
-    Array,
+    TypedArray(TypeId),
     Unknown,
     Heterogeneous,
     EmptyCollection,
@@ -119,7 +127,7 @@ impl TypeRegistry {
             TypeKind::Bool => "bool".to_string(),
             TypeKind::Null => "null".to_string(),
             TypeKind::Mixed => "mixed".to_string(),
-            TypeKind::Array => "array".to_string(),
+            TypeKind::TypedArray(element) => format!("{}[]", self.display(*element)),
             TypeKind::Unknown => "Unknown".to_string(),
             TypeKind::Heterogeneous => "heterogeneous".to_string(),
             TypeKind::EmptyCollection => "[]".to_string(),

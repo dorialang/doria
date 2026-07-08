@@ -83,7 +83,7 @@ The MVP supports:
 - `echo`, `return`, `foreach`, `for`, `if` / `else if` / `else`, and `while`.
 - Assignments.
 - Function calls, method calls, property access, object construction, and literals.
-- List and dictionary literals using PHP-like array syntax.
+- Collection literals using bracket syntax.
 
 Planned near-term syntax includes:
 
@@ -374,6 +374,7 @@ float64
 string
 bool
 mixed
+T[]
 List<T>
 Dictionary<K, V>
 Set<T>
@@ -386,6 +387,7 @@ Reserved or rejected names:
 null      literal only; nullable values are spelled ?T
 resource  reserved for Phase I PHP interop; rejected until specified
 object    not a Doria type
+array     not a Doria type; use T[] for typed arrays or collection aliases
 ```
 
 The compiler keeps parsed type syntax and semantic types separate:
@@ -428,6 +430,22 @@ let $label = match ($payload) {
 
 `void` is valid only as a function or method return type, including `main(): void`; it is not a value type.
 
+Typed arrays use C-style suffix spelling:
+
+```text
+T[]
+```
+
+Examples:
+
+```doria
+int[] $numbers = [1, 2, 3];
+string[] $names = [];
+int[][] $matrix = [[1], []];
+```
+
+`array` is not a Doria type-position name.
+
 Collection aliases have fixed arity:
 
 ```text
@@ -466,7 +484,7 @@ The `.` operator is string concatenation. Both operands must be `string` values 
 
 Numeric widening is not implemented yet; for now `float` is not assignable from `int`, and `int` is not assignable from `float`. The accepted fixed-width numeric family also does not imply implicit widening, narrowing, or scalar coercion. Any future safe numeric widening should be a separate design decision. Named arguments and richer call argument representation are separate future slices.
 
-Simple collection literals infer collection element/key/value types when all clear parts match. Clear heterogeneous collection literals, such as `[1, "two"]`, are rejected by narrow collection alias assignment checks rather than being erased to `Unknown`. The empty literal `[]` stays ambiguous so typed contexts may use it as an empty `List<T>` or `Dictionary<K, V>`. The PHP-compatible `array` annotation remains broad enough to accept list-shaped and dictionary-shaped literals for now, but `array` is not the desired long-term collection model.
+Simple collection literals infer collection element/key/value types when all clear parts match. Clear heterogeneous collection literals, such as `[1, "two"]`, are rejected by typed array and narrow collection alias assignment checks rather than being erased to `Unknown`. The empty literal `[]` stays ambiguous so typed contexts may use it as an empty `T[]`, `List<T>`, or `Dictionary<K, V>`.
 
 ### Equality and boolean operators
 
@@ -740,14 +758,16 @@ Only positional arguments are supported in the current slice. Required parameter
 Doria uses:
 
 ```doria
+int[]
 List<int>
 Dictionary<string, int>
 Set<string>
 ```
 
 Do not use `Vec`.
+Do not use `array` as a type spelling.
 
-The current PHP compatibility backend may lower these aliases to PHP arrays, while the Doria type checker keeps them distinct. The native backend must make deliberate representation choices for each collection family rather than inheriting PHP array behavior.
+The current PHP compatibility backend may lower typed arrays and collection aliases to PHP arrays, while the Doria type checker keeps them distinct. The native backend must make deliberate representation choices for typed arrays and each collection family rather than inheriting PHP array behavior.
 
 The current type foundation resolves explicit annotations, reports unknown type names and invalid collection alias arity, and checks assignment compatibility for typed declarations, property initializers, property writes, parameter defaults, declared return values, and positional call arguments. Classes without constructors cannot be constructed with arguments.
 
@@ -829,7 +849,7 @@ The PHP backend is currently implemented as a compatibility/debugging backend. I
 - `let` is removed.
 - `writable` is removed.
 - `internal` is enforced by Doria before backend emission and may lower to PHP `private` or another backend-specific representation.
-- Collection aliases are emitted as `array` for the current PHP backend only.
+- Typed arrays and collection aliases are emitted as `array` for the current PHP backend only.
 - Doria readonly/writable rules are enforced before Doria IR lowering and backend emission, not at PHP runtime.
 
 For Doria features that PHP cannot express directly, such as object construction in property initializers or richer attribute expressions, the PHP backend should lower to equivalent generated PHP where practical or produce a clear unsupported-feature diagnostic temporarily. PHP limitations must not define Doria semantics.

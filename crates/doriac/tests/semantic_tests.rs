@@ -86,22 +86,35 @@ Dictionary<string, mixed> $byName = [
 }
 
 #[test]
-fn keeps_broad_array_call_refinements_call_scoped() {
+fn rejects_broad_array_type_spelling() {
+    let err = doriac::check_source(
+        "test.doria",
+        r#"
+array $items = [];
+"#,
+    )
+    .expect_err("semantic check should reject the PHP-style broad array type");
+
+    assert!(err
+        .iter()
+        .any(|diagnostic| { diagnostic.code == "E0401" && diagnostic.message.contains("array") }));
+}
+
+#[test]
+fn resolves_typed_array_types() {
     doriac::check_source(
         "test.doria",
         r#"
-function identity(array $items)
+int[] $numbers = [1, 2, 3];
+string[] $names = [];
+int[][] $matrix = [[1], []];
+
+function accept(int[] $items): void
 {
-    return $items;
 }
-
-mixed $payload = 1;
-identity([$payload]);
-
-List<int> $items = identity([1]);
 "#,
     )
-    .expect("mixed-bearing array call evidence should not poison later calls");
+    .expect("typed array declarations should resolve");
 }
 
 #[test]
@@ -337,7 +350,7 @@ string $value = leak(1, true);
             r#"
 function leak(mixed $payload)
 {
-    array $items = [$payload];
+    mixed[] $items = [$payload];
     return $items;
 }
 
@@ -355,7 +368,7 @@ echo [$payload];
         (
             r#"
 mixed $payload = 1;
-array $items = [$payload];
+mixed[] $items = [$payload];
 
 foreach ($items as string $item) {
     echo $item;
@@ -365,7 +378,7 @@ foreach ($items as string $item) {
         ),
         (
             r#"
-function first(array $items)
+function first(mixed[] $items)
 {
     foreach ($items as $item) {
         return $item;
@@ -381,7 +394,7 @@ string $value = first([$payload]);
             r#"
 class Box
 {
-    array $items;
+    mixed[] $items;
 
     function __construct(mixed $payload)
     {
@@ -410,14 +423,14 @@ echo [[$payload], [1]];
         ),
         (
             r#"
-function first(array $items)
+function first(mixed[] $items)
 {
     foreach ($items as $item) {
         return $item;
     }
 }
 
-function forward(array $items)
+function forward(mixed[] $items)
 {
     return first($items);
 }
@@ -431,9 +444,9 @@ string $value = forward([$payload]);
             r#"
 class Box
 {
-    writable array $items;
+    writable mixed[] $items;
 
-    writable function set(array $items): void
+    writable function set(mixed[] $items): void
     {
         $this->items = $items;
     }
@@ -457,9 +470,9 @@ string $value = $box->leak();
             r#"
 class Box
 {
-    array $items;
+    mixed[] $items;
 
-    function __construct(array $items)
+    function __construct(mixed[] $items)
     {
         $this->items = $items;
     }
@@ -487,7 +500,7 @@ function sourceMixed(): mixed
 
 class Box
 {
-    array $items = [sourceMixed()];
+    mixed[] $items = [sourceMixed()];
 
     function leak()
     {
@@ -506,7 +519,7 @@ string $value = $box->leak();
             r#"
 class Box
 {
-    writable array $items;
+    writable mixed[] $items;
 }
 
 function first(Box $box)
@@ -3356,7 +3369,10 @@ List<int> $emptyNumbers = [];
 List<List<int>> $rows = [[1], []];
 List<A> $objects = [new A(), new A()];
 List<mixed> $mixedValues = [1, "two", new A()];
-List<array> $arrays = [[1], ["k" => 2]];
+List<int[]> $arrays = [[1], []];
+int[] $numberArray = [1, 2, 3];
+string[] $emptyStringArray = [];
+int[][] $arrayRows = [[1], []];
 Dictionary<string, int> $counts = [
     "apples" => 5,
 ];
@@ -3377,14 +3393,7 @@ Dictionary<int, int> $indexedCounts = [
     1 => 20,
 ];
 Dictionary<string, int> $emptyCounts = [];
-array $empty = [];
-array $items = [1, 2, 3];
-array $inventory = [
-    "apples" => 5,
-];
-array $mixed = [1, "two"];
 Set<string> $names = [];
-array $itemsFromSet = $names;
 
 class Inventory
 {
@@ -3429,7 +3438,15 @@ class A {}
 List<A> $objects = [new A(), 1];
 "#,
         r#"
-List<array> $arrays = [[1], 2];
+List<int[]> $arrays = [[1], 2];
+"#,
+        r#"
+int[] $numbers = [1, "two"];
+"#,
+        r#"
+int[] $numbers = [
+    "one" => 1,
+];
 "#,
         r#"
 class A {}

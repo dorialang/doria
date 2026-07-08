@@ -390,7 +390,6 @@ fn completion_items() -> Value {
         "string",
         "bool",
         "mixed",
-        "array",
         "List",
         "Dictionary",
         "Set",
@@ -454,8 +453,12 @@ fn hover_description(kind: &TokenKind) -> Option<&'static str> {
         TokenKind::Class => Some("Declares a Doria class."),
         TokenKind::Function => Some("Declares a function or method."),
         TokenKind::Let => Some("Declares a local binding with an inferred type."),
-        TokenKind::Writable => Some("Marks a binding, property, parameter, or method receiver as mutable."),
-        TokenKind::Internal => Some("Marks a class member as hidden from the external object surface."),
+        TokenKind::Writable => {
+            Some("Marks a binding, property, parameter, or method receiver as mutable.")
+        }
+        TokenKind::Internal => {
+            Some("Marks a class member as hidden from the external object surface.")
+        }
         TokenKind::Readonly => Some("Reserved for explicit readonly syntax."),
         TokenKind::Return => Some("Returns a value from the current function."),
         TokenKind::Echo => Some("Emits a value through the current backend."),
@@ -472,9 +475,10 @@ fn hover_description(kind: &TokenKind) -> Option<&'static str> {
         TokenKind::FloatType => Some("The `float` primitive type."),
         TokenKind::StringType => Some("The `string` primitive type."),
         TokenKind::BoolType => Some("The `bool` primitive type."),
-        TokenKind::ArrayType => Some("PHP-compatible array type; prefer `List<T>`, `Dictionary<K, V>`, or `Set<T>` in Doria APIs."),
         TokenKind::True | TokenKind::False => Some("Boolean literal."),
-        TokenKind::Null => Some("Null literal. Nullable values are spelled `?T`; `null` is not a type name."),
+        TokenKind::Null => {
+            Some("Null literal. Nullable values are spelled `?T`; `null` is not a type name.")
+        }
         TokenKind::Reserved(_) => Some("Reserved for future Doria syntax."),
         TokenKind::Identifier(name) => match name.as_str() {
             "List" => Some("Ordered collection alias: `List<T>`."),
@@ -679,6 +683,7 @@ mod tests {
             ["!", "=="].concat(),
             ["#de", "fine"].concat(),
             ["#inc", "lude"].concat(),
+            ["ar", "ray"].concat(),
         ];
         for rejected in rejected {
             assert!(
@@ -745,7 +750,6 @@ mod tests {
             "bool",
             "mixed",
             "resource",
-            "array",
             "List",
             "Dictionary",
             "Set",

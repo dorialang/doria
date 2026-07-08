@@ -87,6 +87,7 @@ At completion, report assumptions made and critical decisions encountered. If no
 - For native work, keep the fast Cranelift profile and optimized LLVM profile semantically equivalent for supported code. Differences may be in compile time, optimization, debug information, and binary quality, not Doria behavior.
 - Do not let Cranelift or LLVM semantics decide Doria semantics. Backend-specific assumptions must remain behind Doria IR or native-oriented IR lowering.
 - Preserve the accepted fixed-width numeric direction: `int` means `int64`, `float` means `float64`, and the accepted explicit numeric spellings are `int8`/`int16`/`int32`/`int64`, `uint8`/`uint16`/`uint32`/`uint64`, and `float32`/`float64`.
+- Do not treat `array` as a Doria type. Doria has C-style typed arrays spelled `T[]`, such as `int[] $numbers`; broader collection APIs use `List<T>`, `Dictionary<K, V>`, `Set<T>`, and future named collection types such as `Queue<T>` or `Stack<T>`. `array $items` and `List<array>` are invalid Doria surface syntax. PHP backend output may still use PHP `array` internally when lowering Doria collections.
 - Preserve the accepted typed equality and boolean operator direction: `==` and `!=` are typed equality/inequality; `===` and `!==` are not Doria syntax; Doria does not use PHP loose comparison.
 - Treat `not` as an exact synonym for `!`, `and` as an exact synonym for `&&`, and `or` as an exact synonym for `||`. Do not import PHP `and` / `or` precedence.
 - Treat `xor` as a bool-only, non-short-circuiting boolean exclusive OR. It is not bitwise XOR.
