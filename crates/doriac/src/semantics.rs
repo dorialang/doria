@@ -83,6 +83,12 @@ enum LifecycleMethod {
     Destructor,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TypePosition {
+    Return,
+    Value,
+}
+
 impl LifecycleMethod {
     fn from_method_name(name: &str) -> Option<Self> {
         match name {
@@ -319,7 +325,9 @@ impl<'program> Checker<'program> {
         function
             .return_type
             .as_ref()
-            .map(|return_type| self.resolve_type_ref(return_type, function.span))
+            .map(|return_type| {
+                self.resolve_type_ref_in_position(return_type, function.span, TypePosition::Return)
+            })
             .unwrap_or_else(|| self.types.unknown())
     }
 
@@ -1007,7 +1015,7 @@ impl<'program> Checker<'program> {
 
                 if matches!(
                     self.types.kind(binding.ty),
-                    TypeKind::Int | TypeKind::Mixed | TypeKind::Unknown
+                    TypeKind::Int | TypeKind::Unknown
                 ) {
                     return;
                 }
@@ -1092,10 +1100,7 @@ impl<'program> Checker<'program> {
     ) {
         self.check_expr(condition, scopes, method_context);
         let ty = self.infer_expr_type(condition, scopes, method_context);
-        if matches!(
-            self.types.kind(ty),
-            TypeKind::Bool | TypeKind::Mixed | TypeKind::Unknown
-        ) {
+        if matches!(self.types.kind(ty), TypeKind::Bool | TypeKind::Unknown) {
             return;
         }
 
@@ -1316,6 +1321,7 @@ impl<'program> Checker<'program> {
                 span,
             } => {
                 self.check_expr(object, scopes, method_context);
+                self.check_mixed_operation(object, "property access", scopes, method_context);
                 self.lookup_property(object, property, *span, scopes, method_context);
             }
             Expr::MethodCall {
@@ -1328,6 +1334,7 @@ impl<'program> Checker<'program> {
                 for arg in args {
                     self.check_expr(arg, scopes, method_context);
                 }
+                self.check_mixed_operation(object, "method call", scopes, method_context);
                 self.check_method_call(object, method, args, *span, scopes, method_context);
             }
             Expr::FunctionCall { name, args, span } => {
@@ -1383,6 +1390,7 @@ impl<'program> Checker<'program> {
                 self.check_expr(left, scopes, method_context);
                 self.check_expr(right, scopes, method_context);
                 self.check_int_constant_arithmetic(left, op, right, *span, scopes);
+                self.check_mixed_binary_operands(left, right, *span, scopes, method_context);
                 self.check_binary_operands(left, op, right, *span, scopes, method_context);
             }
             Expr::Range {
@@ -1424,10 +1432,7 @@ impl<'program> Checker<'program> {
         method_context: Option<&MethodContext>,
     ) {
         let ty = self.infer_expr_type(expr, scopes, method_context);
-        if matches!(
-            self.types.kind(ty),
-            TypeKind::Int | TypeKind::Mixed | TypeKind::Unknown
-        ) {
+        if matches!(self.types.kind(ty), TypeKind::Int | TypeKind::Unknown) {
             return;
         }
 
@@ -1458,6 +1463,11 @@ impl<'program> Checker<'program> {
         match op {
             UnaryOp::Not => {
                 let ty = self.infer_expr_type(expr, scopes, method_context);
+                if self.is_mixed_type(ty) {
+                    self.report_mixed_operation(expr.span(), "boolean operator");
+                    return;
+                }
+
                 if self.is_bool_or_recovery_type(ty) {
                     return;
                 }
@@ -1483,6 +1493,10 @@ impl<'program> Checker<'program> {
         scopes: &ScopeStack,
         method_context: Option<&MethodContext>,
     ) {
+        if self.has_mixed_operand(left, right, scopes, method_context) {
+            return;
+        }
+
         match op {
             BinaryOp::And | BinaryOp::Or | BinaryOp::Xor => {
                 self.check_logical_binary_operands(left, op, right, span, scopes, method_context);
@@ -1575,20 +1589,18 @@ impl<'program> Checker<'program> {
     }
 
     fn is_bool_or_recovery_type(&self, ty: TypeId) -> bool {
-        matches!(
-            self.types.kind(ty),
-            TypeKind::Bool | TypeKind::Mixed | TypeKind::Unknown
-        )
+        matches!(self.types.kind(ty), TypeKind::Bool | TypeKind::Unknown)
     }
 
     fn is_string_or_recovery_type(&self, ty: TypeId) -> bool {
-        matches!(
-            self.types.kind(ty),
-            TypeKind::String | TypeKind::Mixed | TypeKind::Unknown
-        )
+        matches!(self.types.kind(ty), TypeKind::String | TypeKind::Unknown)
     }
 
     fn is_equality_compatible(&self, left: TypeId, right: TypeId) -> bool {
+        if self.is_mixed_type(left) || self.is_mixed_type(right) {
+            return false;
+        }
+
         self.is_assignable(left, right) || self.is_assignable(right, left)
     }
 
@@ -1599,6 +1611,60 @@ impl<'program> Checker<'program> {
             BinaryOp::Xor => "`xor`",
             _ => "logical operator",
         }
+    }
+
+    fn check_mixed_operation(
+        &mut self,
+        expr: &Expr,
+        operation: &'static str,
+        scopes: &ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) {
+        let ty = self.infer_expr_type(expr, scopes, method_context);
+        if self.is_mixed_type(ty) {
+            self.report_mixed_operation(expr.span(), operation);
+        }
+    }
+
+    fn check_mixed_binary_operands(
+        &mut self,
+        left: &Expr,
+        right: &Expr,
+        span: Span,
+        scopes: &ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) {
+        if self.has_mixed_operand(left, right, scopes, method_context) {
+            self.report_mixed_operation(span, "operator");
+        }
+    }
+
+    fn has_mixed_operand(
+        &mut self,
+        left: &Expr,
+        right: &Expr,
+        scopes: &ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) -> bool {
+        let left_ty = self.infer_expr_type(left, scopes, method_context);
+        let right_ty = self.infer_expr_type(right, scopes, method_context);
+
+        self.is_mixed_type(left_ty) || self.is_mixed_type(right_ty)
+    }
+
+    fn is_mixed_type(&self, ty: TypeId) -> bool {
+        matches!(self.types.kind(ty), TypeKind::Mixed)
+    }
+
+    fn report_mixed_operation(&mut self, span: Span, operation: &'static str) {
+        self.diagnostics.push(
+            Diagnostic::new(
+                "E0433",
+                format!("cannot use `mixed` value in {operation} before narrowing"),
+                span,
+            )
+            .with_help("narrow the value with `is` or `match` before using it"),
+        );
     }
 
     fn check_int_constant_arithmetic(
@@ -1726,7 +1792,6 @@ impl<'program> Checker<'program> {
                 | TypeKind::Float
                 | TypeKind::Bool
                 | TypeKind::Null
-                | TypeKind::Mixed
                 | TypeKind::Unknown
         )
     }
@@ -2318,59 +2383,93 @@ impl<'program> Checker<'program> {
     }
 
     fn resolve_type_ref(&mut self, ty: &TypeRef, span: Span) -> TypeId {
+        self.resolve_type_ref_in_position(ty, span, TypePosition::Value)
+    }
+
+    fn resolve_type_ref_in_position(
+        &mut self,
+        ty: &TypeRef,
+        span: Span,
+        position: TypePosition,
+    ) -> TypeId {
         match ty.name.as_str() {
-            "void" => self.resolve_zero_arg_type(ty, span, TypeKind::Void),
+            "void" if position == TypePosition::Return => {
+                self.resolve_zero_arg_type(ty, span, TypeKind::Void)
+            }
+            "void" => {
+                self.reject_type_ref(ty, span, "E0430", "`void` is only valid as a return type")
+            }
             "int" => self.resolve_zero_arg_type(ty, span, TypeKind::Int),
             "float" => self.resolve_zero_arg_type(ty, span, TypeKind::Float),
             "string" => self.resolve_zero_arg_type(ty, span, TypeKind::String),
             "bool" => self.resolve_zero_arg_type(ty, span, TypeKind::Bool),
-            "null" => self.resolve_zero_arg_type(ty, span, TypeKind::Null),
+            "null" => self.reject_type_ref_with_help(
+                ty,
+                span,
+                "E0431",
+                "`null` is a literal, not a type name",
+                "spell nullable values as `?T`, such as `?User`",
+            ),
             "mixed" => self.resolve_zero_arg_type(ty, span, TypeKind::Mixed),
-            "object" => self.resolve_zero_arg_type(ty, span, TypeKind::Object),
-            "resource" => self.resolve_zero_arg_type(ty, span, TypeKind::Resource),
+            "object" => self.reject_type_ref_with_help(
+                ty,
+                span,
+                "E0401",
+                "unknown type `object`",
+                "Doria has no `object` type; use `mixed` and narrow with `is` or `match`",
+            ),
+            "resource" => self.reject_type_ref(
+                ty,
+                span,
+                "E0432",
+                "`resource` is reserved for PHP interop and is not available yet",
+            ),
             "array" => self.resolve_zero_arg_type(ty, span, TypeKind::Array),
             "List" => {
                 if !self.expect_type_arg_count(ty, 1, span) {
                     for arg in &ty.args {
-                        self.resolve_type_ref(arg, span);
+                        self.resolve_type_ref_in_position(arg, span, TypePosition::Value);
                     }
                     return self.types.unknown();
                 }
-                let element = self.resolve_type_ref(&ty.args[0], span);
+                let element =
+                    self.resolve_type_ref_in_position(&ty.args[0], span, TypePosition::Value);
                 self.types.intern(TypeKind::List(element))
             }
             "Dictionary" => {
                 if !self.expect_type_arg_count(ty, 2, span) {
                     for arg in &ty.args {
-                        self.resolve_type_ref(arg, span);
+                        self.resolve_type_ref_in_position(arg, span, TypePosition::Value);
                     }
                     return self.types.unknown();
                 }
-                let key = self.resolve_type_ref(&ty.args[0], span);
-                let value = self.resolve_type_ref(&ty.args[1], span);
+                let key = self.resolve_type_ref_in_position(&ty.args[0], span, TypePosition::Value);
+                let value =
+                    self.resolve_type_ref_in_position(&ty.args[1], span, TypePosition::Value);
                 self.types.intern(TypeKind::Dictionary(key, value))
             }
             "Set" => {
                 if !self.expect_type_arg_count(ty, 1, span) {
                     for arg in &ty.args {
-                        self.resolve_type_ref(arg, span);
+                        self.resolve_type_ref_in_position(arg, span, TypePosition::Value);
                     }
                     return self.types.unknown();
                 }
-                let element = self.resolve_type_ref(&ty.args[0], span);
+                let element =
+                    self.resolve_type_ref_in_position(&ty.args[0], span, TypePosition::Value);
                 self.types.intern(TypeKind::Set(element))
             }
             name if self.classes.contains_key(name) => {
                 if !self.expect_type_arg_count(ty, 0, span) {
                     for arg in &ty.args {
-                        self.resolve_type_ref(arg, span);
+                        self.resolve_type_ref_in_position(arg, span, TypePosition::Value);
                     }
                 }
                 self.types.intern(TypeKind::Class(name.to_string()))
             }
             name => {
                 for arg in &ty.args {
-                    self.resolve_type_ref(arg, span);
+                    self.resolve_type_ref_in_position(arg, span, TypePosition::Value);
                 }
                 self.diagnostics.push(Diagnostic::new(
                     "E0401",
@@ -2380,6 +2479,36 @@ impl<'program> Checker<'program> {
                 self.types.unknown()
             }
         }
+    }
+
+    fn reject_type_ref(
+        &mut self,
+        ty: &TypeRef,
+        span: Span,
+        code: &'static str,
+        message: impl Into<String>,
+    ) -> TypeId {
+        for arg in &ty.args {
+            self.resolve_type_ref_in_position(arg, span, TypePosition::Value);
+        }
+        self.diagnostics.push(Diagnostic::new(code, message, span));
+        self.types.unknown()
+    }
+
+    fn reject_type_ref_with_help(
+        &mut self,
+        ty: &TypeRef,
+        span: Span,
+        code: &'static str,
+        message: impl Into<String>,
+        help: impl Into<String>,
+    ) -> TypeId {
+        for arg in &ty.args {
+            self.resolve_type_ref_in_position(arg, span, TypePosition::Value);
+        }
+        self.diagnostics
+            .push(Diagnostic::new(code, message, span).with_help(help));
+        self.types.unknown()
     }
 
     fn resolve_zero_arg_type(&mut self, ty: &TypeRef, span: Span, kind: TypeKind) -> TypeId {
@@ -2513,7 +2642,7 @@ impl<'program> Checker<'program> {
         match target_kind {
             TypeKind::Mixed | TypeKind::Unknown | TypeKind::Array => true,
             TypeKind::List(element) => {
-                if self.is_mixed_or_unknown_type(element)
+                if self.is_unknown_type(element)
                     || elements.iter().any(|element| element.key.is_some())
                 {
                     return false;
@@ -2524,7 +2653,7 @@ impl<'program> Checker<'program> {
                 })
             }
             TypeKind::Dictionary(key, value) => {
-                if self.is_mixed_or_unknown_type(key) || self.is_mixed_or_unknown_type(value) {
+                if self.is_unknown_type(key) || self.is_unknown_type(value) {
                     return false;
                 }
 
@@ -2559,8 +2688,8 @@ impl<'program> Checker<'program> {
         }
     }
 
-    fn is_mixed_or_unknown_type(&self, ty: TypeId) -> bool {
-        matches!(self.types.kind(ty), TypeKind::Mixed | TypeKind::Unknown)
+    fn is_unknown_type(&self, ty: TypeId) -> bool {
+        matches!(self.types.kind(ty), TypeKind::Unknown)
     }
 
     fn is_assignable(&self, target: TypeId, value: TypeId) -> bool {
@@ -2572,10 +2701,9 @@ impl<'program> Checker<'program> {
         let value_kind = self.types.kind(value).clone();
         match (target_kind, value_kind) {
             (TypeKind::Heterogeneous, _) | (_, TypeKind::Heterogeneous) => false,
-            // TODO: tighten mixed later with narrowing or runtime checks.
-            (TypeKind::Mixed, _) | (_, TypeKind::Mixed) => true,
+            (TypeKind::Mixed, _) => true,
+            (_, TypeKind::Mixed) => false,
             (TypeKind::Unknown, _) | (_, TypeKind::Unknown) => true,
-            (TypeKind::Object, TypeKind::Class(_)) => true,
             (
                 TypeKind::Array,
                 TypeKind::List(_) | TypeKind::Dictionary(_, _) | TypeKind::Set(_),
@@ -2691,7 +2819,6 @@ impl<'program> Checker<'program> {
         match op {
             UnaryOp::Not => match self.types.kind(ty) {
                 TypeKind::Bool => self.types.intern(TypeKind::Bool),
-                TypeKind::Mixed => self.types.intern(TypeKind::Mixed),
                 TypeKind::Unknown => self.types.unknown(),
                 _ => self.types.intern(TypeKind::Heterogeneous),
             },
@@ -2801,7 +2928,6 @@ impl<'program> Checker<'program> {
 
         match (left_kind, right_kind) {
             (TypeKind::Unknown, _) | (_, TypeKind::Unknown) => Some(self.types.unknown()),
-            (TypeKind::Mixed, _) | (_, TypeKind::Mixed) => Some(self.types.intern(TypeKind::Mixed)),
             _ => None,
         }
     }

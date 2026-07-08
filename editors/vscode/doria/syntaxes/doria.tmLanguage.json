@@ -570,8 +570,12 @@
           ]
         },
         {
+          "name": "storage.type.reserved.doria",
+          "match": "\\bresource\\b"
+        },
+        {
           "name": "storage.type.primitive.doria",
-          "match": "\\b(?:void|int|int8|int16|int32|int64|uint8|uint16|uint32|uint64|float|float32|float64|string|bool|mixed|never|object|resource|array)\\b"
+          "match": "\\b(?:void|int|int8|int16|int32|int64|uint8|uint16|uint32|uint64|float|float32|float64|string|bool|mixed|never|array)\\b"
         },
         {
           "name": "support.type.collection.doria",

@@ -672,8 +672,8 @@ class Person
 }
 
 #[test]
-fn lowers_resource_type_to_php_mixed() {
-    let php = doriac::compile_source_to_php(
+fn rejects_resource_type_before_php_codegen() {
+    let err = doriac::compile_source_to_php(
         "test.doria",
         r#"
 class StreamBox
@@ -687,12 +687,14 @@ class StreamBox
 }
 "#,
     )
-    .expect("compilation should succeed");
+    .expect_err("semantic checking should reject resource before PHP codegen");
 
-    assert!(php.contains("public mixed $handle;"));
-    assert!(php.contains("public function read(mixed $handle): mixed"));
-    assert!(!php.contains("resource $handle"));
-    assert!(!php.contains("): resource"));
+    assert!(err.iter().any(|diagnostic| {
+        diagnostic.code == "E0432"
+            && diagnostic
+                .message
+                .contains("`resource` is reserved for PHP interop")
+    }));
 }
 
 #[test]

@@ -54,15 +54,128 @@ int $age = 37;
 float $ratio = 1.5;
 string $name = "Andrew";
 bool $active = true;
-null $empty = null;
-
-function copy(resource $handle): void
-{
-    resource $same = $handle;
-}
+mixed $payload = "dynamic boundary";
 "#,
     )
     .expect("semantic check should succeed");
+}
+
+#[test]
+fn allows_values_to_flow_into_mixed() {
+    doriac::check_source(
+        "test.doria",
+        r#"
+class User {}
+
+mixed $count = 1;
+mixed $name = "Doria";
+mixed $active = true;
+mixed $nothing = null;
+mixed $user = new User();
+mixed $numbers = [1, 2, 3];
+
+List<mixed> $items = [1, "two", new User()];
+Dictionary<string, mixed> $byName = [
+    "count" => 1,
+    "name" => "Doria",
+    "user" => new User(),
+];
+"#,
+    )
+    .expect("semantic check should allow values to flow into mixed");
+}
+
+#[test]
+fn rejects_mixed_operations_before_narrowing() {
+    for (source, code) in [
+        (
+            r#"
+mixed $payload = 1;
+let $name = $payload->name;
+"#,
+            "E0433",
+        ),
+        (
+            r#"
+mixed $payload = 1;
+let $sum = $payload + 1;
+"#,
+            "E0433",
+        ),
+        (
+            r#"
+mixed $payload = 1;
+let $same = $payload == 1;
+"#,
+            "E0433",
+        ),
+        (
+            r#"
+mixed $payload = true;
+if ($payload) {
+}
+"#,
+            "E0416",
+        ),
+        (
+            r#"
+mixed $payload = "Doria";
+echo "{$payload}";
+"#,
+            "E0415",
+        ),
+        (
+            r#"
+mixed $payload = "Doria";
+string $name = $payload;
+"#,
+            "E0403",
+        ),
+    ] {
+        let err =
+            doriac::check_source("test.doria", source).expect_err("semantic check should fail");
+        assert!(
+            err.iter().any(|diagnostic| diagnostic.code == code),
+            "expected {code}, got {err:?}"
+        );
+    }
+}
+
+#[test]
+fn rejects_d21_dynamic_boundary_type_positions() {
+    let cases = [
+        ("null $empty = null;", "E0431", "`null` is a literal"),
+        (
+            "function accept(resource $handle): void {}",
+            "E0432",
+            "`resource` is reserved for PHP interop",
+        ),
+        (
+            "void $nothing = null;",
+            "E0430",
+            "`void` is only valid as a return type",
+        ),
+        (
+            "function accept(void $value): void {}",
+            "E0430",
+            "`void` is only valid as a return type",
+        ),
+        (
+            "function accept(List<void> $values): void {}",
+            "E0430",
+            "`void` is only valid as a return type",
+        ),
+    ];
+
+    for (source, code, message) in cases {
+        let err =
+            doriac::check_source("test.doria", source).expect_err("semantic check should fail");
+        assert!(
+            err.iter()
+                .any(|diagnostic| diagnostic.code == code && diagnostic.message.contains(message)),
+            "expected {code} containing {message}, got {err:?}"
+        );
+    }
 }
 
 #[test]
@@ -1335,15 +1448,15 @@ fn checks_string_interpolation_semantics() {
     doriac::check_source(
         "test.doria",
         r#"
-function render(mixed $value): void
+function render(): void
 {
     string $name = "Andrew";
     int $age = 37;
     float $ratio = 1.5;
     bool $active = true;
-    null $nothing = null;
+    let $nothing = null;
 
-    echo "{$name}{$age}{$ratio}{$active}{$nothing}{$value}";
+    echo "{$name}{$age}{$ratio}{$active}{$nothing}";
 }
 "#,
     )
@@ -1438,24 +1551,6 @@ class Person {}
 
 let $person = new Person();
 echo "{$person}";
-"#,
-            "E0415",
-        ),
-        (
-            r#"
-class Person {}
-
-object $value = new Person();
-echo "{$value}";
-"#,
-            "E0415",
-        ),
-        (
-            r#"
-function show(resource $handle): void
-{
-    echo "{$handle}";
-}
 "#,
             "E0415",
         ),
@@ -2721,27 +2816,8 @@ function accept(
     string $name,
     bool $active,
     mixed $payload,
-    object $instance,
-    resource $handle,
-    null $empty,
 ): void
 {
-}
-"#,
-    )
-    .expect("semantic check should succeed");
-}
-
-#[test]
-fn resolves_null_typed_declarations() {
-    doriac::check_source(
-        "test.doria",
-        r#"
-null $empty = null;
-
-function clear(): void
-{
-    null $value = null;
 }
 "#,
     )
@@ -2786,21 +2862,6 @@ Person $person = new Office();
 }
 
 #[test]
-fn checks_object_assignment_compatibility() {
-    doriac::check_source(
-        "test.doria",
-        r#"
-class Person {}
-
-object $person = new Person();
-"#,
-    )
-    .expect("semantic check should succeed");
-
-    assert_type_mismatch("object $value = 1;");
-}
-
-#[test]
 fn reports_unknown_explicit_type_names() {
     let err = doriac::check_source(
         "test.doria",
@@ -2812,6 +2873,21 @@ UnknownThing $value = 1;
 
     assert!(err.iter().any(|diagnostic| {
         diagnostic.code == "E0401" && diagnostic.message.contains("UnknownThing")
+    }));
+}
+
+#[test]
+fn reports_object_as_unknown_type_with_help() {
+    let err = doriac::check_source("test.doria", "object $value = 1;")
+        .expect_err("semantic check should fail");
+
+    assert!(err.iter().any(|diagnostic| {
+        diagnostic.code == "E0401"
+            && diagnostic.message.contains("object")
+            && diagnostic
+                .help
+                .as_deref()
+                .is_some_and(|help| help.contains("Doria has no `object` type"))
     }));
 }
 
@@ -2844,14 +2920,19 @@ class B {}
 List<int> $numbers = [1, 2, 3];
 List<int> $emptyNumbers = [];
 List<List<int>> $rows = [[1], []];
-List<object> $objects = [new A(), new B()];
+List<A> $objects = [new A(), new A()];
+List<mixed> $mixedValues = [1, "two", new A()];
 List<array> $arrays = [[1], ["k" => 2]];
 Dictionary<string, int> $counts = [
     "apples" => 5,
 ];
-Dictionary<string, object> $objectsByName = [
+Dictionary<string, A> $objectsByName = [
     "a" => new A(),
-    "b" => new B(),
+    "b" => new A(),
+];
+Dictionary<string, mixed> $mixedByName = [
+    "a" => new A(),
+    "b" => 1,
 ];
 Dictionary<string, List<int>> $nestedCounts = [
     "apples" => [5],
@@ -2874,14 +2955,14 @@ array $itemsFromSet = $names;
 class Inventory
 {
     Dictionary<string, int> $counts = [];
-    List<object> $objects = [new A(), new B()];
+    List<A> $objects = [new A(), new A()];
 }
 
 function readCounts(Dictionary<string, int> $counts = []): void
 {
 }
 
-function readObjects(List<object> $objects = [new A(), new B()]): void
+function readObjects(List<A> $objects = [new A(), new A()]): void
 {
 }
 "#,
@@ -2892,7 +2973,6 @@ function readObjects(List<object> $objects = [new A(), new B()]): void
         r#"List<string> $numbers = [1, 2, 3];"#,
         r#"List<int> $numbers = [1, "two"];"#,
         r#"List<int> $numbers = [1, []];"#,
-        r#"List<mixed> $numbers = [1, "two"];"#,
         r#"
 Dictionary<string, string> $counts = [
     "apples" => 5,
@@ -2912,14 +2992,14 @@ Dictionary<string, int> $counts = [
 "#,
         r#"
 class A {}
-List<object> $objects = [new A(), 1];
+List<A> $objects = [new A(), 1];
 "#,
         r#"
 List<array> $arrays = [[1], 2];
 "#,
         r#"
 class A {}
-Dictionary<string, object> $objectsByName = [
+Dictionary<string, A> $objectsByName = [
     "a" => new A(),
     "b" => 1,
 ];

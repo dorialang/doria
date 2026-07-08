@@ -386,13 +386,12 @@ fn completion_items() -> Value {
         "string",
         "bool",
         "mixed",
-        "object",
-        "resource",
         "array",
         "List",
         "Dictionary",
         "Set",
     ];
+    let reserved_types = ["resource"];
 
     let mut items = Vec::new();
     items.extend(keywords.into_iter().map(|keyword| {
@@ -407,6 +406,13 @@ fn completion_items() -> Value {
             "label": ty,
             "kind": 25,
             "detail": "Doria type",
+        })
+    }));
+    items.extend(reserved_types.into_iter().map(|ty| {
+        json!({
+            "label": ty,
+            "kind": 25,
+            "detail": "Reserved Doria type name",
         })
     }));
 
@@ -459,15 +465,14 @@ fn hover_description(kind: &TokenKind) -> Option<&'static str> {
         TokenKind::BoolType => Some("The `bool` primitive type."),
         TokenKind::ArrayType => Some("PHP-compatible array type; prefer `List<T>`, `Dictionary<K, V>`, or `Set<T>` in Doria APIs."),
         TokenKind::True | TokenKind::False => Some("Boolean literal."),
-        TokenKind::Null => Some("Null literal and MVP type name."),
+        TokenKind::Null => Some("Null literal. Nullable values are spelled `?T`; `null` is not a type name."),
         TokenKind::Reserved(_) => Some("Reserved for future Doria syntax."),
         TokenKind::Identifier(name) => match name.as_str() {
             "List" => Some("Ordered collection alias: `List<T>`."),
             "Dictionary" => Some("Key-value collection alias: `Dictionary<K, V>`."),
             "Set" => Some("Unique-value collection alias: `Set<T>`."),
-            "mixed" => Some("Dynamic escape-hatch type."),
-            "object" => Some("Primitive object type."),
-            "resource" => Some("Primitive resource type."),
+            "mixed" => Some("Dynamic boundary type. Narrow with `is` or `match` before using it."),
+            "resource" => Some("Reserved for future PHP interop; not a usable core type."),
             _ => None,
         },
         TokenKind::Variable(_) => Some("Doria variable. Variables must be declared before use."),
@@ -617,6 +622,16 @@ mod tests {
             .collect()
     }
 
+    fn completion_detail(label: &str) -> Option<String> {
+        completion_items()["items"]
+            .as_array()
+            .expect("completion items should be an array")
+            .iter()
+            .find(|item| item["label"].as_str() == Some(label))
+            .and_then(|item| item["detail"].as_str())
+            .map(ToOwned::to_owned)
+    }
+
     #[test]
     fn completions_do_not_offer_unsupported_future_types() {
         let labels = completion_labels();
@@ -658,7 +673,6 @@ mod tests {
             "string",
             "bool",
             "mixed",
-            "object",
             "resource",
             "array",
             "List",
@@ -667,8 +681,16 @@ mod tests {
         ] {
             assert!(
                 labels.iter().any(|label| label == supported),
-                "supported type `{supported}` should remain an LSP completion"
+                "supported or reserved type `{supported}` should remain an LSP completion"
             );
         }
+    }
+
+    #[test]
+    fn completion_marks_resource_as_reserved() {
+        assert_eq!(
+            completion_detail("resource").as_deref(),
+            Some("Reserved Doria type name")
+        );
     }
 }

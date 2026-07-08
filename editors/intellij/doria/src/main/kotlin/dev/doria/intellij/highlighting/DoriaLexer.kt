@@ -191,6 +191,7 @@ class DoriaLexer : LexerBase() {
         tokenType = if (isDocTypePosition()) {
             when (text) {
                 in PRIMITIVE_TYPES -> DoriaTokenTypes.PRIMITIVE_TYPE
+                in RESERVED_TYPES -> DoriaTokenTypes.RESERVED_TYPE
                 in COLLECTION_TYPES -> DoriaTokenTypes.COLLECTION_TYPE
                 else -> if (text.first().isUpperCase()) DoriaTokenTypes.TYPE_NAME else DoriaTokenTypes.DOC_COMMENT
             }
@@ -353,6 +354,8 @@ class DoriaLexer : LexerBase() {
             in MODIFIERS -> DoriaTokenTypes.MODIFIER
 
             in PRIMITIVE_TYPES -> DoriaTokenTypes.PRIMITIVE_TYPE
+
+            in RESERVED_TYPES -> DoriaTokenTypes.RESERVED_TYPE
 
             in COLLECTION_TYPES -> DoriaTokenTypes.COLLECTION_TYPE
 
@@ -745,10 +748,10 @@ class DoriaLexer : LexerBase() {
             "bool",
             "mixed",
             "never",
-            "object",
-            "resource",
             "array",
         )
+
+        private val RESERVED_TYPES = setOf("resource")
 
         private val COLLECTION_TYPES = setOf(
             "List",

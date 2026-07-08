@@ -29,7 +29,7 @@ impl TypeRef {
     pub fn as_class_name(&self) -> Option<&str> {
         match self.name.as_str() {
             "void" | "int" | "float" | "string" | "bool" | "array" | "mixed" | "null"
-            | "object" | "resource" | "List" | "Dictionary" | "Set" | "Unknown" => None,
+            | "resource" | "List" | "Dictionary" | "Set" | "Unknown" => None,
             _ => Some(&self.name),
         }
     }
@@ -63,8 +63,6 @@ pub enum TypeKind {
     Bool,
     Null,
     Mixed,
-    Object,
-    Resource,
     Array,
     Unknown,
     Heterogeneous,
@@ -121,8 +119,6 @@ impl TypeRegistry {
             TypeKind::Bool => "bool".to_string(),
             TypeKind::Null => "null".to_string(),
             TypeKind::Mixed => "mixed".to_string(),
-            TypeKind::Object => "object".to_string(),
-            TypeKind::Resource => "resource".to_string(),
             TypeKind::Array => "array".to_string(),
             TypeKind::Unknown => "Unknown".to_string(),
             TypeKind::Heterogeneous => "heterogeneous".to_string(),

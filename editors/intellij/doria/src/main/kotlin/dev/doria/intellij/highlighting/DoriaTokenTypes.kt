@@ -13,6 +13,7 @@ object DoriaTokenTypes {
     val KEYWORD = DoriaTokenType("DORIA_KEYWORD")
     val MODIFIER = DoriaTokenType("DORIA_MODIFIER")
     val PRIMITIVE_TYPE = DoriaTokenType("DORIA_PRIMITIVE_TYPE")
+    val RESERVED_TYPE = DoriaTokenType("DORIA_RESERVED_TYPE")
     val COLLECTION_TYPE = DoriaTokenType("DORIA_COLLECTION_TYPE")
     val TYPE_NAME = DoriaTokenType("DORIA_TYPE_NAME")
     val IMPORT_USE_KEYWORD = DoriaTokenType("DORIA_IMPORT_USE_KEYWORD")

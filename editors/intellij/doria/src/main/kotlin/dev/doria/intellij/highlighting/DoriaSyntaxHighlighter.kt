@@ -15,6 +15,7 @@ class DoriaSyntaxHighlighter : SyntaxHighlighter {
         DoriaTokenTypes.KEYWORD -> KEYWORD_KEYS
         DoriaTokenTypes.MODIFIER -> MODIFIER_KEYS
         DoriaTokenTypes.PRIMITIVE_TYPE -> PRIMITIVE_TYPE_KEYS
+        DoriaTokenTypes.RESERVED_TYPE -> RESERVED_TYPE_KEYS
         DoriaTokenTypes.COLLECTION_TYPE -> COLLECTION_TYPE_KEYS
         DoriaTokenTypes.TYPE_NAME -> TYPE_NAME_KEYS
         DoriaTokenTypes.IMPORT_USE_KEYWORD -> IMPORT_USE_KEYWORD_KEYS
@@ -60,6 +61,10 @@ class DoriaSyntaxHighlighter : SyntaxHighlighter {
         val PRIMITIVE_TYPE: TextAttributesKey = TextAttributesKey.createTextAttributesKey(
             "DORIA_PRIMITIVE_TYPE",
             DefaultLanguageHighlighterColors.KEYWORD,
+        )
+        val RESERVED_TYPE: TextAttributesKey = TextAttributesKey.createTextAttributesKey(
+            "DORIA_RESERVED_TYPE",
+            DefaultLanguageHighlighterColors.METADATA,
         )
         val COLLECTION_TYPE: TextAttributesKey = TextAttributesKey.createTextAttributesKey(
             "DORIA_COLLECTION_TYPE",
@@ -186,6 +191,7 @@ class DoriaSyntaxHighlighter : SyntaxHighlighter {
         private val KEYWORD_KEYS = arrayOf(KEYWORD)
         private val MODIFIER_KEYS = arrayOf(MODIFIER)
         private val PRIMITIVE_TYPE_KEYS = arrayOf(PRIMITIVE_TYPE)
+        private val RESERVED_TYPE_KEYS = arrayOf(RESERVED_TYPE)
         private val COLLECTION_TYPE_KEYS = arrayOf(COLLECTION_TYPE)
         private val TYPE_NAME_KEYS = arrayOf(TYPE_NAME)
         private val IMPORT_USE_KEYWORD_KEYS = arrayOf(IMPORT_USE_KEYWORD)

@@ -672,7 +672,6 @@ fn emit_member_access(access: &MemberAccess) -> &'static str {
 fn php_type(ty: &TypeRef) -> String {
     match ty.name.as_str() {
         "List" | "Dictionary" | "Set" => "array".to_string(),
-        "resource" => "mixed".to_string(),
         name => name.to_string(),
     }
 }
