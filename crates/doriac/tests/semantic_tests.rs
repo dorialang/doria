@@ -101,6 +101,28 @@ array $items = [];
 }
 
 #[test]
+fn rejects_array_as_class_name() {
+    let err = doriac::check_source(
+        "test.doria",
+        r#"
+class array
+{
+}
+
+array $items = new array();
+"#,
+    )
+    .expect_err("semantic check should reject array as a class/type spelling");
+
+    assert!(err.iter().any(|diagnostic| {
+        diagnostic.code == "E0309" && diagnostic.message.contains("`array`")
+    }));
+    assert!(err
+        .iter()
+        .any(|diagnostic| { diagnostic.code == "E0401" && diagnostic.message.contains("array") }));
+}
+
+#[test]
 fn resolves_typed_array_types() {
     doriac::check_source(
         "test.doria",

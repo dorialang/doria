@@ -177,6 +177,12 @@ impl<'program> Checker<'program> {
                 continue;
             };
 
+            if let Some(message) = Self::reserved_class_name_message(&class_decl.name) {
+                self.diagnostics
+                    .push(Diagnostic::new("E0309", message, class_decl.span));
+                continue;
+            }
+
             if self.classes.contains_key(&class_decl.name) {
                 self.diagnostics.push(Diagnostic::new(
                     "E0300",
@@ -257,6 +263,27 @@ impl<'program> Checker<'program> {
             }
 
             self.classes.insert(class_decl.name.clone(), info);
+        }
+    }
+
+    fn reserved_class_name_message(name: &str) -> Option<String> {
+        match name {
+            "array" => Some(
+                "`array` is not a Doria class name; use typed arrays like `T[]` or collection aliases"
+                    .to_string(),
+            ),
+            "mixed" => Some(
+                "`mixed` is a Doria dynamic-boundary type and cannot be used as a class name"
+                    .to_string(),
+            ),
+            "object" => Some(
+                "`object` is not a Doria type and cannot be used as a class name".to_string(),
+            ),
+            "resource" => Some(
+                "`resource` is reserved for future PHP interop and cannot be used as a class name"
+                    .to_string(),
+            ),
+            _ => None,
         }
     }
 
@@ -2976,6 +3003,13 @@ impl<'program> Checker<'program> {
                 "E0401",
                 "unknown type `object`",
                 "Doria has no `object` type; use `mixed` and narrow with `is` or `match`",
+            ),
+            "array" => self.reject_type_ref_with_help(
+                ty,
+                span,
+                "E0401",
+                "unknown type `array`",
+                "use typed array suffixes like `T[]` or named collection aliases",
             ),
             "resource" => self.reject_type_ref(
                 ty,
