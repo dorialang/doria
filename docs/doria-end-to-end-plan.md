@@ -3,7 +3,7 @@
 **Document ID:** docs/doria-end-to-end-plan.md
 **Status:** Accepted master execution plan for Doria v0.1 → v1.0
 **Audience:** The implementing agent (Codex) and the language designer
-**Supersedes:** This plan is the authoritative future-work execution plan. It supersedes older planning, SPEC, and decision wording only where it explicitly resolves a future-work fork or scheduling question. Already-implemented behavior remains governed by current compiler behavior and accepted decisions until a later stage migrates it.
+**Supersedes:** This plan is the authoritative future-work execution plan. It supersedes older roadmap, SPEC, and decision wording only where it explicitly resolves a future-work fork or scheduling question. Already-implemented behavior remains governed by current compiler behavior and accepted decisions until a later stage migrates it.
 
 ---
 
@@ -34,7 +34,7 @@ These are the load-bearing choices. Each becomes a decision record before its fi
 |---|----------|-------------------------------|
 | D1 | Memory model | **Full ownership + borrow checking — Rust's model in PHP spelling.** Single ownership with move semantics for classes/collections, deterministic `__destruct` at end of owning scope, Copy semantics for primitives/strings, opt-in `Shared<T>`/`Weak<T>`/`SharedMut<T>` for shared ownership. **No tracing GC, no pervasive ARC, no Rust sigils or lifetime annotations in surface syntax** |
 | D2 | Borrow spelling | readonly = shared borrow, `writable` = exclusive borrow, `take` = ownership transfer into the callee. Ordinary borrow rules (many readers XOR one writer; borrows cannot outlive owners; moved values unusable) are enforced entirely at compile time by a non-lexical borrow checker over MIR, with zero runtime cost and no dynamic fallback. Explicit `SharedMut<T>` is the named dynamic-check escape hatch. |
-| D3 | Copy vs move | Copy types: primitives, `bool`, `string`, ranges, enums with Copy payloads. Move types: classes, `List`/`Dictionary`/`Set`, `Bytes`, closures. Explicit duplication uses the future `->clone()` / `Cloneable` surface once method and interface support exist; before that, move-type duplication is deliberately unavailable. No user-defined `struct` in v1.0 — classes are the owned record type (revisit inline layout post-1.0 if engine profiling demands it) |
+| D3 | Copy vs move | Copy types: primitives, `bool`, `string`, ranges, enums with Copy payloads. Move types: classes, `T[]` typed arrays, `List`/`Dictionary`/`Set`, `Bytes`, closures. Explicit duplication uses the future `->clone()` / `Cloneable` surface once method and interface support exist; before that, move-type duplication is deliberately unavailable. No user-defined `struct` in v1.0 — classes are the owned record type (revisit inline layout post-1.0 if engine profiling demands it) |
 | D4 | Integer overflow | Arithmetic overflow panics in both dev and release profiles. Explicit `Int::wrapping_add(...)`, `Int::saturating_add(...)`, `Int::checked_add(...)` for other behavior. A `declare` key may later relax this per-module for engine hot paths |
 | D5 | Nullability | `?Type` optional types (PHP spelling), `??` null coalescing, `?->` null-safe access. `null` is not assignable to non-`?` types. No implicit truthiness |
 | D6 | Enums | PHP 8.1-shaped `enum` declarations extended with payload cases (tagged unions): `case Some(int $value);`. This is Doria's sum type |
@@ -53,6 +53,7 @@ These are the load-bearing choices. Each becomes a decision record before its fi
 | D19 | Naming charter & the built-in/userland boundary | The **entire built-in surface** (language functions, stdlib functions/methods/properties — e.g. `get_time`, `str_starts_with`, `$s->is_empty`) is `snake_case` with uniform, fully-worded names: `str_case_compare`, never `strcasecmp`. **Userland functions and methods are camelCase by convention**, so casing itself marks the boundary: snake_case reads as "Doria built-in", camelCase as "this codebase". Docs, examples, `baton new` templates, and lints all model and enforce the boundary. Types `PascalCase`, constants `SCREAMING_SNAKE_CASE`. §9.1 is checkable API law |
 | D20 | Explicit typing discipline | **Parameter types are never inferred — anywhere.** Free functions, methods, constructors (including promoted parameters), closures, arrow functions, callbacks, and property-hook setters all require written parameter types: `fn($x) => ...` is a compile error, `fn(int $x) => ...` is the language. Named functions and methods must declare return types; only an arrow function's return type may be inferred from its body. `let` locals may infer from their initializer. Nothing ever silently defaults to `mixed`. Full rules in §4.7 |
 | D21 | Dynamic boundary types | `mixed` is Doria's **only** dynamic type and it is **unknown-flavored, never any-flavored**: every value may flow in (implicit boxing), and nothing may be done with it until narrowed via `is` / `match`. `mixed` is a boxed, runtime-tagged **move type** — always, even when holding a Copy value. `object` does not exist. `null` is a literal and the `?T` machinery, never a standalone type-position name. `resource` is reserved for the Phase I PHP bridge, not a core v1.0 type. `void` is return-position only. Full rules in §4.8 |
+| D22 | Sequences: typed arrays + named collections, no `array` | **Doria has no broad PHP-style `array` type** — `array $items` and `List<array>` are invalid, and the identifier is not a type name. C-style **typed arrays** are spelled `T[]` (`int[]`, `string[]`, `mixed[]`, `int[][]`): contiguous, fixed-length-after-creation move types — the engine-grade buffer. **Named collections** are the growable/structured family: `List<T>`, `Dictionary<K, V>`, `Set<T>` (future: `Queue<T>`, `Stack<T>`, ...). Bracket literals are contextually typed collection literals, never evidence of an `array` type. Full rules in §4.9 |
 
 Everything below elaborates these decisions into implementable specifications.
 
@@ -94,12 +95,12 @@ The mapping in one table:
 
 - Every value has exactly one owner: a binding, a property, or a collection slot. When the owning scope ends and the value has not been moved out, the value is destroyed: `__destruct` runs immediately and deterministically, then memory is freed. This is RAII — files, GPU buffers, locks, and sockets close at scope exit with zero GC pauses and zero refcount traffic, exactly what the game engine needs.
 - **Copy types** (primitives, `bool`, `string`, ranges, enums whose payloads are all Copy) duplicate on assignment and argument passing. The ownership machinery is invisible for them, which means most everyday PHP-shaped code never encounters a move at all.
-- **Move types** (classes, `List<T>`, `Dictionary<K, V>`, `Set<T>`, `Bytes`, closures, enums with move payloads): assignment and by-value passing transfer ownership. Using a moved-from binding is a compile error.
+- **Move types** (classes, `T[]` typed arrays, `List<T>`, `Dictionary<K, V>`, `Set<T>`, `Bytes`, closures, enums with move payloads): assignment and by-value passing transfer ownership. Using a moved-from binding is a compile error.
 - Diagnostics use plain ownership vocabulary — *owns*, *gives*, *still using*, *readonly*, *writable* — never *borrow*, *lifetime*, or `'a`:
 
 ```text
-Error[D0203]: $user was given to store() on line 12, so it can no longer be used here
-Help: call $user->clone() before line 12 if you need to keep a copy
+error[D0203]: $user was given to store() on line 12, so it can no longer be used here
+help: call $user->clone() before line 12 if you need to keep a copy
 ```
 
 - Explicit duplication is the future `->clone()` surface, backed by `Cloneable` once method and interface support exist. Until then, move-type duplication is intentionally unavailable except for compiler-internal lowering needs.
@@ -174,7 +175,7 @@ function fastCopy(writable Bytes $dst, Bytes $src): void
 
 ### 3.6 Panics
 
-A panic is a fatal runtime error, distinct from checked `throw`/`throws` per decision 0035: arithmetic overflow, division by zero, out-of-bounds indexing, `SharedMut` access violation, failed `Float::to_int`, explicit `panic("message")`. Default behavior: print `Panic: <message>` plus a Doria `Stack Trace:` section to stderr and exit with status 101. **v1.0 panic policy is abort-only (no unwinding, no catching panics).** This keeps codegen simple and honest; checked errors are the recoverable path.
+A panic is a fatal runtime error, distinct from checked `throw`/`throws` per decision 0035: arithmetic overflow, division by zero, out-of-bounds indexing, `SharedMut` access violation, failed `Float::to_int`, explicit `panic("message")`. Default behavior: print message + Doria stack trace to stderr and exit with status 101. **v1.0 panic policy is abort-only (no unwinding, no catching panics).** This keeps codegen simple and honest; checked errors are the recoverable path.
 
 ---
 
@@ -254,11 +255,11 @@ function first<T>(List<T> $items): ?T
     // ...
 }
 
-class Stack<T>
+class History<T>   // deliberately not Stack<T>: that name is reserved for a future stdlib collection (§4.9)
 {
-    internal writable List<T> $items = [];
+    internal writable List<T> $entries = [];
 
-    writable function push(T $item): void { /* ... */ }
+    writable function push(T $entry): void { /* ... */ }
     writable function pop(): ?T { /* ... */ }
 }
 
@@ -311,6 +312,19 @@ Doria rejects PHP's gradual-typing looseness outright: a signature is a contract
 
 ---
 
+### 4.9 Typed arrays and named collections — there is no `array` (D22)
+
+Doria has **no broad PHP-style `array` type**. `array $items` is invalid Doria; so is `List<array>`. The identifier `array` is not a type name and is rejected with a diagnostic pointing at this section's alternatives. The word may appear in Doria documentation and tooling only when discussing PHP backend lowering/output, PHP migration input, or explicitly rejected syntax.
+
+What Doria has instead is a two-tier sequence model:
+
+- **Typed arrays, spelled C-style `T[]`**: `int[] $numbers`, `string[] $names`, `mixed[] $items`, `int[][] $matrix`. A `T[]` is a contiguous, fixed-length-after-creation array — the engine-grade buffer type: length chosen at creation, elements read and written in place through ordinary readonly/writable borrows, no grow/shrink surface. `T[]` is a move type and participates in ownership and borrow checking exactly like every other move type; indexing borrows the element, `foreach` borrows elements, out-of-bounds indexing panics. (`Bytes` remains the dedicated byte buffer; whether `uint8[]` and `Bytes` interconvert, and how, is decided in record 0070.)
+- **Named collections** are the growable/structured family: `List<T>` (the everyday growable sequence and default workhorse), `Dictionary<K, V>`, `Set<T>`. Future named collections — `Queue<T>`, `Stack<T>`, and similar — join this family under the same `PascalCase<T>` naming and the §9.1 charter.
+- **Bracket literals are collection literals, not arrays.** `[1, 2, 3]` and `["a" => 1]` are contextually typed by the expected type: `int[] $a = [1, 2, 3];` builds a typed array, `List<int> $l = [1, 2, 3];` a list, `Dictionary<string, int> $d = ["a" => 1];` a dictionary. Without an expected type (`let $x = [1, 2, 3];`), a sequence literal defaults to `List<T>` and a keyed literal to `Dictionary<K, V>` — the growable PHP-intuitive reading — with the element/key/value types inferred from the elements (vetoable default; record 0070). `Set<T>` has no literal form in v1.0; use `Set::from([...])`.
+- **Mixed-flow shapes are always valid Doria shapes**: `mixed[]`, `List<mixed>`, `Dictionary<string, mixed>` — never `array`. `std::json`, the PHP bridge, and migration output use these.
+
+---
+
 ## 5. Error handling: checked throw/throws (D8)
 
 Full semantics for decision 0035's accepted direction:
@@ -360,7 +374,7 @@ Rules:
 **Errors escaping `main` — the caller of last resort.** `main` is called by doria-rt's entry glue (`dr_main`), so the runtime is the caller of last resort and its behavior is language-specified, not incidental:
 
 - Because `throws` lowers to a hidden discriminated result (no unwinding), an error propagating out of `main` travels through ordinary returns, and drop elaboration runs `__destruct` at every scope boundary on the way out exactly as on the success path — files flush, sockets close, locks release. An escaping checked error is an *orderly, declared* failure; contrast panics, which abort with no cleanup and exit 101.
-- `dr_main` then prints `Error: <ClassName>: <message>` to stderr — the class name via a minimal type-name intrinsic (drop glue already carries per-type metadata; this is not reflection and must not grow into one) and the message via the `Error` interface's guaranteed readonly `string $message` — destroys the error value, and exits with status **70** (BSD `EX_SOFTWARE`). Never 101.
+- `dr_main` then prints `error: <ClassName>: <message>` to stderr — the class name via a minimal type-name intrinsic (drop glue already carries per-type metadata; this is not reflection and must not grow into one) and the message via the `Error` interface's guaranteed readonly `string $message` — destroys the error value, and exits with status **70** (BSD `EX_SOFTWARE`). Never 101.
 - The 70/101 split is machine-readable triage: a supervisor, orchestrator, or PHP frontend distinguishes "declared failure" (70) from "Doria bug" (101) without parsing stderr.
 - Checked errors carry **no stack traces by default**: they are values and ordinary control flow, and trace capture at every `throw` would tax exactly the hot paths the result ABI keeps cheap. Panics keep traces; errors keep messages. A dev-profile opt-in (trace capture at throw sites under an environment flag) may be added later within record 0049's scope.
 - `async function main` is permitted: the entry glue bootstraps the executor with `main` as the root task, and structured concurrency guarantees no orphan tasks remain when the root task completes with an error — child scopes have already awaited or cancelled their tasks before propagation continues. A synchronous `main` never starts the executor, so non-async programs pay zero async cost. Bootstrap details land with record 0063 / Stage 38.
@@ -551,7 +565,7 @@ PHP's standard library is the cautionary tale this charter exists to prevent: `s
 
 Every stdlib decision record cites this charter, and `baton fmt` plus the stdlib lint enforce it mechanically.
 
-Stdlib API style follows SPEC §6's nouns-are-properties rule and the collection method surface gets its own decision record (List: `add`, `insert_at`, `remove_at`, `contains`, `count` property, `is_empty` property, `map`/`filter`/`reduce` after closures land; Dictionary: `get` returning `?V`, `set`, `remove`, `has`, `keys`, `values`; Set: `add`, `remove`, `has`, `union`, `intersect`).
+Stdlib API style follows SPEC §6's nouns-are-properties rule and the collection method surface gets its own decision record (List: `add`, `insert_at`, `remove_at`, `contains`, `count` property, `is_empty` property, `map`/`filter`/`reduce` after closures land; Dictionary: `get` returning `?V`, `set`, `remove`, `has`, `keys`, `values`; Set: `add`, `remove`, `has`, `union`, `intersect`). The typed-array `T[]` surface (`length` property, iteration, slicing) is decided alongside in record 0070, and future named collections (`Queue<T>`, `Stack<T>`, ...) follow the same charter.
 
 ---
 
@@ -561,7 +575,7 @@ Stdlib API style follows SPEC §6's nouns-are-properties rule and the collection
 Keeps growing opportunistically for migration/debugging; never gates a language feature. Features PHP cannot express lower where practical or emit unsupported-feature diagnostics (unchanged policy).
 
 ### 10.2 PHP → Doria migration (`doriac migrate php`)
-Phase I product, per SPEC §12: conservative output, diagnostics for dynamic PHP (variable variables, `eval`, magic methods, loose comparisons become explicit conversions or `mixed` + TODO diagnostics). Architecturally separate crate `crates/doria-migrate` with its own PHP parser (use `mago`/`php-parser-rs` class of dependency; do not touch the Doria parser).
+Phase I product, per SPEC §12: conservative output, diagnostics for dynamic PHP (variable variables, `eval`, magic methods, loose comparisons become explicit conversions or `mixed` + TODO diagnostics). PHP arrays convert to valid Doria shapes only: `List<mixed>` for list-shaped arrays, `Dictionary<string, mixed>` for associative ones, tightening to precise `T[]` / `List<T>` / `Dictionary<K, V>` where docblocks or inference allow; a PHP `array` type hint is never emitted as Doria — it converts with a diagnostic explaining the §4.9 model. Architecturally separate crate `crates/doria-migrate` with its own PHP parser (use `mago`/`php-parser-rs` class of dependency; do not touch the Doria parser).
 
 ### 10.3 The strategic product: `baton build --php-lib`
 
@@ -595,7 +609,7 @@ $out = $resizer->resize($bytes, 800, 600); // dispatches through FFI into native
 
 Design:
 
-- Exported surface restricted to a bridgeable type set: numerics, `bool`, `string`, `Bytes`, `?T` of those, `List`/`Dictionary` of bridgeable types, and `#[PhpExport]` classes (marshaled as opaque handles rooted as `Shared<T>` on the Doria side; the generated PHP stub holds the handle and releases it in its `__destruct`).
+- Exported surface restricted to a bridgeable type set: numerics, `bool`, `string`, `Bytes`, `?T` of those, `T[]`/`List`/`Dictionary` of bridgeable types, and `#[PhpExport]` classes (marshaled as opaque handles rooted as `Shared<T>` on the Doria side; the generated PHP stub holds the handle and releases it in its `__destruct`).
 - `throws` errors surface as generated PHP exception classes. An error escaping an exported function must surface as that exception and never terminate the host PHP process — the bridge is an FFI boundary, not a process boundary. Panics are the documented exception: under v1.0's abort-only policy a Doria panic aborts the hosting PHP worker (exactly as a crashing native extension would), which is why exported surfaces should prefer `throws` APIs over panicking ones.
 - Transport: C ABI shim generated by `doriac` under Baton orchestration + PHP ≥ 8.0 `FFI` stubs first (zero build tooling required on the PHP side); a Zend-extension emission mode (`--php-ext`) is a later optimization stage for call-overhead-sensitive users.
 - Threading: v1 bridge is single-threaded per PHP request (matches PHP's model); `Shareable` interactions revisited with Phase H.
@@ -618,7 +632,7 @@ Baton lands mid-plan (Phase F), once multi-file compilation exists to orchestrat
 
 0043 MIR + interpreter oracle (§8.1–8.2) is already authored and accepted in `docs/decisions/0043-stage-11-mir-and-interpreter-oracle.md`.
 
-0038 ownership and move semantics (D1, D3) · 0039 borrowing rules, elision, and the borrow checker (D2) · 0040 panics & overflow policy (D4, §3.6) · 0041 division/modulo/shifts (D14) · 0042 numeric conversions (D15) · 0044 doria-rt ABI (D18) · 0045 runtime strings/Bytes (D16) · 0046 nullable types & narrowing (D5) · 0047 enums & payload cases (D6) · 0048 match (D7) · 0049 checked errors full semantics incl. errors escaping `main` (D8, §5) · 0050 generics & monomorphization (D9) · 0051 collections runtime & API surface (§9) · 0052 compiler-internal iteration machinery · 0053 inheritance/open/override (D17) · 0054 interfaces, traits, Cloneable, and public Iterable conformance · 0055 property hooks · 0056 statics & const evaluation · 0057 closures (D10) · 0058 namespaces implementation notes (elaborating 0028) · 0059 attributes & compile-time evaluation policy · 0060 Baton manifest & test convention · 0061 unsafe/FFI (D12) · 0062 php-lib bridge (D13c) · 0063 async & Shareable (D11) · 0064 when grammar · 0065 SIMD/engine intrinsics direction · 0066 `Shared<T>` / `Weak<T>` / `SharedMut<T>` · 0067 naming charter, built-in/userland boundary, and `function_exists` (D19) · 0068 explicit typing discipline (D20) · 0069 dynamic boundary types: `mixed`/`object`/`null`/`resource`/`void` (D21).
+0038 ownership and move semantics (D1, D3) · 0039 borrowing rules, elision, and the borrow checker (D2) · 0040 panics & overflow policy (D4, §3.6) · 0041 division/modulo/shifts (D14) · 0042 numeric conversions (D15) · 0044 doria-rt ABI (D18) · 0045 runtime strings/Bytes (D16) · 0046 nullable types & narrowing (D5) · 0047 enums & payload cases (D6) · 0048 match (D7) · 0049 checked errors full semantics incl. errors escaping `main` (D8, §5) · 0050 generics & monomorphization (D9) · 0051 collections runtime & API surface (§9) · 0052 compiler-internal iteration machinery · 0053 inheritance/open/override (D17) · 0054 interfaces, traits, Cloneable, and public Iterable conformance · 0055 property hooks · 0056 statics & const evaluation · 0057 closures (D10) · 0058 namespaces implementation notes (elaborating 0028) · 0059 attributes & compile-time evaluation policy · 0060 Baton manifest & test convention · 0061 unsafe/FFI (D12) · 0062 php-lib bridge (D13c) · 0063 async & Shareable (D11) · 0064 when grammar · 0065 SIMD/engine intrinsics direction · 0066 `Shared<T>` / `Weak<T>` / `SharedMut<T>` · 0067 naming charter, built-in/userland boundary, and `function_exists` (D19) · 0068 explicit typing discipline (D20) · 0069 dynamic boundary types: `mixed`/`object`/`null`/`resource`/`void` (D21) · 0070 typed arrays `T[]`, collection literals and their defaults, and the rejection of `array` (D22).
 
 Each record follows the existing template: context, decision, alternatives considered, consequences, affected components.
 
@@ -649,15 +663,15 @@ Retire the smoke architecture; make the native path general.
 - **Stage 22 — Nullable + narrowing + `is` + `mixed` statics.** D5 complete, plus D21 static semantics: `mixed` accepts every type and rejects every operation until narrowed; `is`/`match` narrowing over `mixed`; `null` rejected in type position with a `?T` suggestion; `void` restricted to return position; `object` absent from the grammar and reserved-word guardrails; `resource` rejected as reserved. The boxed runtime representation lands in Stage 23. AC: null-safe chaining example; narrowing snapshot diagnostics; mixed operation-rejection and narrowing fixture matrix; null/void/object/resource position-diagnostic snapshots.
 
 ### Phase D — Collections and generics (Stages 23–26)
-- **Stage 23 — Runtime collections + Bytes.** Owned `List/Dictionary/Set` and `Bytes` intrinsics in doria-rt as move types; literals, indexing (`$list[0]` borrows the element; panic OOB), insertion moves values in, `foreach` element borrows (`as $item` readonly, `as writable $item` exclusive). The boxed `mixed` runtime representation (`dr_mixed` tagged box) ships here alongside the other move-type intrinsics. AC: move/borrow fixture matrix over collections; in-place mutation loop example; use-after-move-into-list diagnostic snapshot; mixed box round-trip fixture (int/string/class in, narrowed out).
+- **Stage 23 — Runtime collections, typed arrays + Bytes.** Owned `T[]` typed-array, `List/Dictionary/Set`, and `Bytes` intrinsics in doria-rt as move types; contextually typed collection literals per §4.9 (sequence literals default to `List<T>`, keyed literals to `Dictionary<K, V>`); indexing (`$list[0]` borrows the element; panic OOB), insertion moves values in, `foreach` element borrows (`as $item` readonly, `as writable $item` exclusive); `array` in type position rejected with a §4.9 diagnostic. The boxed `mixed` runtime representation (`dr_mixed` tagged box) ships here alongside the other move-type intrinsics. AC: move/borrow fixture matrix over collections and typed arrays; `int[]`/`int[][]` fixed-length fixtures; literal context-typing fixtures (`int[]` vs `List<int>` from the same literal); in-place mutation loop example; use-after-move-into-list diagnostic snapshot; mixed box round-trip fixture (int/string/class in, narrowed out).
 - **Stage 24 — Generic functions.** D9 for free functions/methods, monomorphization in MIR. AC: `first<T>` works across int/string/class lists.
-- **Stage 25 — Generic classes + compiler-internal iteration machinery.** `Stack<T>` and generic collection/runtime machinery; `foreach` over built-in collections lowers through compiler-internal iteration support. Public generic interfaces, traits, and user-defined `Iterable<T>`/`Iterator<T>` conformance are deferred to Stage 35. AC: generic classes run natively; built-in collections are consumed by `foreach` without user-visible interface conformance.
+- **Stage 25 — Generic classes + compiler-internal iteration machinery.** The §4.5 `History<T>` example and generic collection/runtime machinery; `foreach` over built-in collections lowers through compiler-internal iteration support. Public generic interfaces, traits, and user-defined `Iterable<T>`/`Iterator<T>` conformance are deferred to Stage 35. AC: generic classes run natively; built-in collections are consumed by `foreach` without user-visible interface conformance.
 - **Stage 26 — Collection API surface.** Decision 0051 methods incl. `map`/`filter` once Stage 30 closures exist (split: non-closure API here, closure API revisited in Stage 30). Before Stage 31 include/multi-file support, required stdlib fragments are compiler-bundled or prelude-style rather than source-included. AC: non-closure collection APIs compile and run from the compiler-provided stdlib surface.
 
 ### Phase E — Enums, match, errors (Stages 27–29)
 - **Stage 27 — Enums + payload cases.** D6, inline tagged layout, Copy/move classification per payloads. AC: `Shape` example native.
 - **Stage 28 — match.** D7, exhaustiveness, payload destructuring, narrowing integration; guards fast-follow within the stage. AC: exhaustiveness diagnostics snapshots; `match (true)` chains.
-- **Stage 29 — Checked errors end-to-end.** D8: `throws` ABI, `try/catch/finally`, `Error` interface with property requirement, `main throws`. AC: SPEC-style `loadUser` example; uncovered-error diagnostics; finally-ordering fixture; error-escaping-`main` fixture asserting stderr `Error: <Class>: <message>`, exit status 70, and destructor execution on the propagation path.
+- **Stage 29 — Checked errors end-to-end.** D8: `throws` ABI, `try/catch/finally`, `Error` interface with property requirement, `main throws`. AC: SPEC-style `loadUser` example; uncovered-error diagnostics; finally-ordering fixture; error-escaping-`main` fixture asserting stderr `error: <Class>: <message>`, exit status 70, and destructor execution on the propagation path.
 
 ### Phase F — Multi-file, namespaces, Baton (Stages 30–33)
 - **Stage 30 — Closures.** D10 + D20: explicitly typed closure and arrow-function parameters (omitted parameter types are compile errors with context-derived suggestions), borrow and `take` captures, function types in type position; collection closure APIs unlock. AC: sort-with-comparator example with typed callback parameters; borrow-bound closure escape rejected with a `take` suggestion fixture.
@@ -695,7 +709,7 @@ Retire the smoke architecture; make the native path general.
 
 ## 14. What is explicitly out of scope for v1.0
 
-Tracing GC (never), pervasive ARC as the default model (never), Rust-spelled borrow sigils and lifetime annotations (never — inference and elision only), visibility modifiers beyond the default-accessible + `internal` two-state model — `protected`, `private`, and `public` keywords (never; this is identity, not scope deferral), an `object` type (cut; reintroduce only with concrete PHP-bridge evidence), `resource` as a core type (reserved to the Phase I bridge), `Result<T,E>` surface model (per 0035), unions beyond `?T`, `goto`, textual macros (per 0028), runtime reflection, package registry server, catchable panics, user-defined operator overloading, default interface methods, variadic generics, and bidirectional PHP compatibility guarantees.
+Tracing GC (never), pervasive ARC as the default model (never), Rust-spelled borrow sigils and lifetime annotations (never — inference and elision only), visibility modifiers beyond the default-accessible + `internal` two-state model — `protected`, `private`, and `public` keywords (never; this is identity, not scope deferral), a broad PHP-style `array` type (never — sequences are `T[]` typed arrays and named collections per §4.9), an `object` type (cut; reintroduce only with concrete PHP-bridge evidence), `resource` as a core type (reserved to the Phase I bridge), `Result<T,E>` surface model (per 0035), unions beyond `?T`, `goto`, textual macros (per 0028), runtime reflection, package registry server, catchable panics, user-defined operator overloading, default interface methods, variadic generics, and bidirectional PHP compatibility guarantees.
 
 ---
 
