@@ -330,6 +330,51 @@ foreach ($items as string $item) {
 "#,
             "E0433",
         ),
+        (
+            r#"
+function first(array $items)
+{
+    foreach ($items as $item) {
+        return $item;
+    }
+}
+
+mixed $payload = 1;
+string $value = first([$payload]);
+"#,
+            "E0403",
+        ),
+        (
+            r#"
+class Box
+{
+    array $items;
+
+    function __construct(mixed $payload)
+    {
+        $this->items = [$payload];
+    }
+
+    function leak()
+    {
+        foreach ($this->items as $item) {
+            return $item;
+        }
+    }
+}
+
+let $box = new Box(1);
+string $value = $box->leak();
+"#,
+            "E0403",
+        ),
+        (
+            r#"
+mixed $payload = 1;
+echo [[$payload], [1]];
+"#,
+            "E0433",
+        ),
     ] {
         let err =
             doriac::check_source("test.doria", source).expect_err("semantic check should fail");

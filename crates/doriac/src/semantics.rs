@@ -126,6 +126,12 @@ struct AssignmentTarget {
     destination: AssignmentDestination,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ParamTypeRefinement {
+    index: usize,
+    ty: TypeId,
+}
+
 #[derive(Debug, Clone)]
 enum AssignmentDestination {
     Type,
@@ -774,6 +780,7 @@ impl<'program> Checker<'program> {
                 (self.types.intern(TypeKind::Int), value)
             }
             TypeKind::Dictionary(key, value) => (key, value),
+            TypeKind::Mixed => (unknown, self.types.intern(TypeKind::Mixed)),
             _ => (unknown, unknown),
         }
     }
@@ -1431,18 +1438,19 @@ impl<'program> Checker<'program> {
         match assignment.op {
             AssignOp::Assign => {
                 let target_ty = target.ty;
+                let destination = target.destination.clone();
                 let assignment_ok = self.check_expr_assignable(
                     target.ty,
                     &assignment.value,
                     scopes,
                     method_context,
-                    target.destination,
+                    destination,
                 );
                 if assignment_ok {
                     let value_ty = self.infer_expr_type(&assignment.value, scopes, method_context);
                     self.preserve_known_mixed_collection_assignment(
                         &assignment.target,
-                        target_ty,
+                        &target,
                         value_ty,
                         scopes,
                     );
@@ -2572,7 +2580,7 @@ impl<'program> Checker<'program> {
             return;
         };
 
-        self.check_call_arguments(
+        let refinements = self.check_call_arguments(
             &format!("function `{name}`"),
             &function_info.params,
             args,
@@ -2580,6 +2588,7 @@ impl<'program> Checker<'program> {
             scopes,
             method_context,
         );
+        self.apply_function_param_refinements(name, &refinements);
     }
 
     fn check_method_call(
@@ -2637,7 +2646,7 @@ impl<'program> Checker<'program> {
             ));
         }
 
-        self.check_call_arguments(
+        let refinements = self.check_call_arguments(
             &format!("method `{class_name}::{method}`"),
             &method_info.params,
             args,
@@ -2645,6 +2654,7 @@ impl<'program> Checker<'program> {
             scopes,
             method_context,
         );
+        self.apply_method_param_refinements(&class_name, method, &refinements);
     }
 
     fn check_static_call(
@@ -2687,7 +2697,7 @@ impl<'program> Checker<'program> {
             ));
         }
 
-        self.check_call_arguments(
+        let refinements = self.check_call_arguments(
             &format!("method `{class_name}::{method}`"),
             &method_info.params,
             args,
@@ -2695,6 +2705,7 @@ impl<'program> Checker<'program> {
             scopes,
             method_context,
         );
+        self.apply_method_param_refinements(class_name, method, &refinements);
     }
 
     fn check_direct_lifecycle_method_call(
@@ -2765,7 +2776,7 @@ impl<'program> Checker<'program> {
             ));
         }
 
-        self.check_call_arguments(
+        let refinements = self.check_call_arguments(
             &format!("constructor `{class_name}::__construct`"),
             &constructor.params,
             args,
@@ -2773,6 +2784,7 @@ impl<'program> Checker<'program> {
             scopes,
             method_context,
         );
+        self.apply_method_param_refinements(class_name, "__construct", &refinements);
     }
 
     fn check_call_arguments(
@@ -2783,13 +2795,14 @@ impl<'program> Checker<'program> {
         span: Span,
         scopes: &ScopeStack,
         method_context: Option<&MethodContext>,
-    ) {
+    ) -> Vec<ParamTypeRefinement> {
+        let mut refinements = Vec::new();
         let required = params.iter().filter(|param| !param.has_default).count();
         let total = params.len();
 
         if args.len() < required || args.len() > total {
             self.report_argument_count_mismatch(callee, required, total, args.len(), span);
-            return;
+            return refinements;
         }
 
         for (index, (arg, param)) in args.iter().zip(params.iter()).enumerate() {
@@ -2798,6 +2811,10 @@ impl<'program> Checker<'program> {
             if self.is_expr_assignable(param.ty, arg, scopes, method_context)
                 || self.is_assignable(param.ty, got)
             {
+                let ty = self.preserve_known_mixed_collection_shape(param.ty, got);
+                if ty != param.ty {
+                    refinements.push(ParamTypeRefinement { index, ty });
+                }
                 continue;
             }
 
@@ -2811,6 +2828,126 @@ impl<'program> Checker<'program> {
                 ),
                 arg.span(),
             ));
+        }
+
+        refinements
+    }
+
+    fn apply_function_param_refinements(
+        &mut self,
+        name: &str,
+        refinements: &[ParamTypeRefinement],
+    ) {
+        if refinements.is_empty() {
+            return;
+        }
+
+        let Some(function) = self.program.items.iter().find_map(|item| match item {
+            Item::Function(function) if function.name == name => Some(function.clone()),
+            _ => None,
+        }) else {
+            return;
+        };
+
+        let Some(function_info) = self.functions.get(name).cloned() else {
+            return;
+        };
+        let mut params = function_info.params;
+        if !self.apply_param_refinements_to_params(&mut params, refinements) {
+            return;
+        }
+
+        if let Some(function_info) = self.functions.get_mut(name) {
+            function_info.params = params.clone();
+        }
+        if let Some(signature) = self.function_signatures.get_mut(&function.span.start) {
+            signature.params = params;
+        }
+        self.update_function_mixed_return_signature(&function);
+    }
+
+    fn apply_method_param_refinements(
+        &mut self,
+        class_name: &str,
+        method_name: &str,
+        refinements: &[ParamTypeRefinement],
+    ) {
+        if refinements.is_empty() {
+            return;
+        }
+
+        let Some(method) = self.program.items.iter().find_map(|item| match item {
+            Item::Class(class_decl) if class_decl.name == class_name => {
+                class_decl.members.iter().find_map(|member| match member {
+                    ClassMember::Method(method) if method.name == method_name => {
+                        Some(method.clone())
+                    }
+                    ClassMember::Property(_) | ClassMember::Method(_) => None,
+                })
+            }
+            _ => None,
+        }) else {
+            return;
+        };
+
+        let Some(method_info) = self
+            .classes
+            .get(class_name)
+            .and_then(|class_info| class_info.methods.get(method_name))
+            .cloned()
+        else {
+            return;
+        };
+        let mut params = method_info.params;
+        if !self.apply_param_refinements_to_params(&mut params, refinements) {
+            return;
+        }
+
+        if let Some(method_info) = self
+            .classes
+            .get_mut(class_name)
+            .and_then(|class_info| class_info.methods.get_mut(method_name))
+        {
+            method_info.params = params.clone();
+        }
+        if let Some(signature) = self.function_signatures.get_mut(&method.span.start) {
+            signature.params = params;
+        }
+        self.update_method_mixed_return_signature(class_name, &method);
+    }
+
+    fn apply_param_refinements_to_params(
+        &mut self,
+        params: &mut [ParamInfo],
+        refinements: &[ParamTypeRefinement],
+    ) -> bool {
+        let mut changed = false;
+
+        for refinement in refinements {
+            let Some(param) = params.get_mut(refinement.index) else {
+                continue;
+            };
+
+            let ty = self.merge_refined_mixed_collection_type(param.ty, refinement.ty);
+            if ty != param.ty {
+                param.ty = ty;
+                changed = true;
+            }
+        }
+
+        changed
+    }
+
+    fn merge_refined_mixed_collection_type(&mut self, current: TypeId, next: TypeId) -> TypeId {
+        let preserved = self.preserve_known_mixed_collection_shape(current, next);
+        if preserved != current {
+            return preserved;
+        }
+
+        if self.type_contains_mixed(current) {
+            self.merge_mixed_return_types(current, next)
+        } else {
+            next
         }
     }
 
@@ -3165,27 +3302,85 @@ impl<'program> Checker<'program> {
     }
 
     fn preserve_known_mixed_collection_assignment(
-        &self,
+        &mut self,
         target: &Expr,
-        target_ty: TypeId,
+        assignment_target: &AssignmentTarget,
         value_ty: TypeId,
         scopes: &mut ScopeStack,
     ) {
-        let preserved_ty = self.preserve_known_mixed_collection_shape(target_ty, value_ty);
-        if preserved_ty == target_ty {
+        let preserved_ty =
+            self.preserve_known_mixed_collection_shape(assignment_target.ty, value_ty);
+        if preserved_ty == assignment_target.ty {
             return;
         }
 
-        let Expr::Variable { name, .. } = target else {
-            return;
-        };
+        match &assignment_target.destination {
+            AssignmentDestination::Type => {
+                let Expr::Variable { name, .. } = target else {
+                    return;
+                };
 
-        let Some(binding) = scopes.lookup_mut(name) else {
-            return;
-        };
+                let Some(binding) = scopes.lookup_mut(name) else {
+                    return;
+                };
 
-        if matches!(self.types.kind(binding.ty), TypeKind::Array) {
-            binding.ty = preserved_ty;
+                if matches!(self.types.kind(binding.ty), TypeKind::Array) {
+                    binding.ty = preserved_ty;
+                }
+            }
+            AssignmentDestination::Property { class_name, name } => {
+                self.preserve_known_mixed_collection_property(class_name, name, preserved_ty);
+            }
+            AssignmentDestination::Parameter { .. } => {}
+        }
+    }
+
+    fn preserve_known_mixed_collection_property(
+        &mut self,
+        class_name: &str,
+        property_name: &str,
+        preserved_ty: TypeId,
+    ) {
+        let changed = self
+            .classes
+            .get_mut(class_name)
+            .and_then(|class_info| class_info.properties.get_mut(property_name))
+            .is_some_and(|property| {
+                if matches!(self.types.kind(property.ty), TypeKind::Array) {
+                    property.ty = preserved_ty;
+                    true
+                } else {
+                    false
+                }
+            });
+
+        if changed {
+            self.reinfer_class_mixed_return_signatures(class_name);
+        }
+    }
+
+    fn reinfer_class_mixed_return_signatures(&mut self, class_name: &str) {
+        let methods = self
+            .program
+            .items
+            .iter()
+            .find_map(|item| match item {
+                Item::Class(class_decl) if class_decl.name == class_name => Some(
+                    class_decl
+                        .members
+                        .iter()
+                        .filter_map(|member| match member {
+                            ClassMember::Method(method) => Some(method.clone()),
+                            ClassMember::Property(_) => None,
+                        })
+                        .collect::<Vec<_>>(),
+                ),
+                _ => None,
+            })
+            .unwrap_or_default();
+
+        for method in methods {
+            self.update_method_mixed_return_signature(class_name, &method);
         }
     }
 
@@ -3568,11 +3763,12 @@ impl<'program> Checker<'program> {
 
         for ty in types {
             let kind = self.types.kind(ty).clone();
+            if self.type_contains_mixed(ty) {
+                saw_mixed = true;
+                continue;
+            }
+
             match kind {
-                TypeKind::Mixed => {
-                    saw_mixed = true;
-                    continue;
-                }
                 TypeKind::Unknown => {
                     continue;
                 }
