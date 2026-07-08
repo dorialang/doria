@@ -294,9 +294,9 @@ Emit clear migration diagnostics for the rest.
 Example diagnostic style:
 
 ```text
-warning[MIG020]: dynamic property access cannot be safely converted
+Warning[MIG020]: dynamic property access cannot be safely converted
   source.php:12:5
-help: replace dynamic property access with an explicit property or Dictionary lookup
+Help: replace dynamic property access with an explicit property or Dictionary lookup
 ```
 
 ---

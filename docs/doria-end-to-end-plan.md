@@ -98,8 +98,8 @@ The mapping in one table:
 - Diagnostics use plain ownership vocabulary — *owns*, *gives*, *still using*, *readonly*, *writable* — never *borrow*, *lifetime*, or `'a`:
 
 ```text
-error[D0203]: $user was given to store() on line 12, so it can no longer be used here
-help: call $user->clone() before line 12 if you need to keep a copy
+Error[D0203]: $user was given to store() on line 12, so it can no longer be used here
+Help: call $user->clone() before line 12 if you need to keep a copy
 ```
 
 - Explicit duplication is the future `->clone()` surface, backed by `Cloneable` once method and interface support exist. Until then, move-type duplication is intentionally unavailable except for compiler-internal lowering needs.
@@ -174,7 +174,7 @@ function fastCopy(writable Bytes $dst, Bytes $src): void
 
 ### 3.6 Panics
 
-A panic is a fatal runtime error, distinct from checked `throw`/`throws` per decision 0035: arithmetic overflow, division by zero, out-of-bounds indexing, `SharedMut` access violation, failed `Float::to_int`, explicit `panic("message")`. Default behavior: print message + Doria stack trace to stderr and exit with status 101. **v1.0 panic policy is abort-only (no unwinding, no catching panics).** This keeps codegen simple and honest; checked errors are the recoverable path.
+A panic is a fatal runtime error, distinct from checked `throw`/`throws` per decision 0035: arithmetic overflow, division by zero, out-of-bounds indexing, `SharedMut` access violation, failed `Float::to_int`, explicit `panic("message")`. Default behavior: print `Panic: <message>` plus a Doria `Stack Trace:` section to stderr and exit with status 101. **v1.0 panic policy is abort-only (no unwinding, no catching panics).** This keeps codegen simple and honest; checked errors are the recoverable path.
 
 ---
 
@@ -360,7 +360,7 @@ Rules:
 **Errors escaping `main` — the caller of last resort.** `main` is called by doria-rt's entry glue (`dr_main`), so the runtime is the caller of last resort and its behavior is language-specified, not incidental:
 
 - Because `throws` lowers to a hidden discriminated result (no unwinding), an error propagating out of `main` travels through ordinary returns, and drop elaboration runs `__destruct` at every scope boundary on the way out exactly as on the success path — files flush, sockets close, locks release. An escaping checked error is an *orderly, declared* failure; contrast panics, which abort with no cleanup and exit 101.
-- `dr_main` then prints `error: <ClassName>: <message>` to stderr — the class name via a minimal type-name intrinsic (drop glue already carries per-type metadata; this is not reflection and must not grow into one) and the message via the `Error` interface's guaranteed readonly `string $message` — destroys the error value, and exits with status **70** (BSD `EX_SOFTWARE`). Never 101.
+- `dr_main` then prints `Error: <ClassName>: <message>` to stderr — the class name via a minimal type-name intrinsic (drop glue already carries per-type metadata; this is not reflection and must not grow into one) and the message via the `Error` interface's guaranteed readonly `string $message` — destroys the error value, and exits with status **70** (BSD `EX_SOFTWARE`). Never 101.
 - The 70/101 split is machine-readable triage: a supervisor, orchestrator, or PHP frontend distinguishes "declared failure" (70) from "Doria bug" (101) without parsing stderr.
 - Checked errors carry **no stack traces by default**: they are values and ordinary control flow, and trace capture at every `throw` would tax exactly the hot paths the result ABI keeps cheap. Panics keep traces; errors keep messages. A dev-profile opt-in (trace capture at throw sites under an environment flag) may be added later within record 0049's scope.
 - `async function main` is permitted: the entry glue bootstraps the executor with `main` as the root task, and structured concurrency guarantees no orphan tasks remain when the root task completes with an error — child scopes have already awaited or cancelled their tasks before propagation continues. A synchronous `main` never starts the executor, so non-async programs pay zero async cost. Bootstrap details land with record 0063 / Stage 38.
@@ -657,7 +657,7 @@ Retire the smoke architecture; make the native path general.
 ### Phase E — Enums, match, errors (Stages 27–29)
 - **Stage 27 — Enums + payload cases.** D6, inline tagged layout, Copy/move classification per payloads. AC: `Shape` example native.
 - **Stage 28 — match.** D7, exhaustiveness, payload destructuring, narrowing integration; guards fast-follow within the stage. AC: exhaustiveness diagnostics snapshots; `match (true)` chains.
-- **Stage 29 — Checked errors end-to-end.** D8: `throws` ABI, `try/catch/finally`, `Error` interface with property requirement, `main throws`. AC: SPEC-style `loadUser` example; uncovered-error diagnostics; finally-ordering fixture; error-escaping-`main` fixture asserting stderr `error: <Class>: <message>`, exit status 70, and destructor execution on the propagation path.
+- **Stage 29 — Checked errors end-to-end.** D8: `throws` ABI, `try/catch/finally`, `Error` interface with property requirement, `main throws`. AC: SPEC-style `loadUser` example; uncovered-error diagnostics; finally-ordering fixture; error-escaping-`main` fixture asserting stderr `Error: <Class>: <message>`, exit status 70, and destructor execution on the propagation path.
 
 ### Phase F — Multi-file, namespaces, Baton (Stages 30–33)
 - **Stage 30 — Closures.** D10 + D20: explicitly typed closure and arrow-function parameters (omitted parameter types are compile errors with context-derived suggestions), borrow and `take` captures, function types in type position; collection closure APIs unlock. AC: sort-with-comparator example with typed callback parameters; borrow-bound closure escape rejected with a `take` suggestion fixture.

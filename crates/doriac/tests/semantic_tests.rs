@@ -174,6 +174,52 @@ string $name = leak(1);
             r#"
 function leak(mixed $payload)
 {
+    if (true) {
+        return $payload;
+    }
+}
+
+string $name = leak(1);
+"#,
+            "E0403",
+        ),
+        (
+            r#"
+class Box
+{
+    mixed $payload = "x";
+
+    function leak()
+    {
+        return $this->payload;
+    }
+}
+
+let $box = new Box();
+string $name = $box->leak();
+"#,
+            "E0403",
+        ),
+        (
+            r#"
+function forward(mixed $payload)
+{
+    return identity($payload);
+}
+
+function identity(mixed $payload)
+{
+    return $payload;
+}
+
+string $name = forward(1);
+"#,
+            "E0403",
+        ),
+        (
+            r#"
+function leak(mixed $payload)
+{
     return [$payload, 1];
 }
 

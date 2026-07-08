@@ -132,7 +132,7 @@ Because properties are readonly by default, this means:
 ```doria
 let writable $office = new Office();
 
-$office->manager = new Person(); // error: manager is readonly
+$office->manager = new Person(); // Error: manager is readonly
 ```
 
 If a property is marked `writable`, the property can be reassigned later:
@@ -388,7 +388,7 @@ Example:
 ```doria
 class Office
 {
-    Person $manager = "Andrew"; // error: string is not Person
+    Person $manager = "Andrew"; // Error: string is not Person
 }
 ```
 

@@ -36,12 +36,12 @@ impl Diagnostic {
         );
 
         let mut rendered = format!(
-            "error[{}]: {}\n  --> {}:{}:{}\n   |\n{:>3} | {}\n   | {}",
+            "Error[{}]: {}\n  --> {}:{}:{}\n   |\n{:>3} | {}\n   | {}",
             self.code, self.message, source.path, line, col, line, line_text, marker
         );
 
         if let Some(help) = &self.help {
-            rendered.push_str("\nhelp: ");
+            rendered.push_str("\nHelp: ");
             rendered.push_str(help);
         }
 

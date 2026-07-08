@@ -997,14 +997,14 @@ $person->name = "Lucy";
 Possible diagnostic:
 
 ```text
-error[E0201]: cannot write through readonly variable `$person`
+Error[E0201]: cannot write through readonly variable `$person`
 
   examples/php/person.doria:2:1
   |
 2 | $person->name = "Lucy";
   | ^^^^^^^ `$person` was declared readonly here
   |
-help: declare it as writable:
+Help: declare it as writable:
   |
 1 | let writable $person = new Person("Andrew", 37);
   |     +++++++++
@@ -1025,9 +1025,9 @@ $person->name = "Lucy";
 Diagnostic:
 
 ```text
-error[E0202]: cannot assign to readonly property `Person::$name`
+Error[E0202]: cannot assign to readonly property `Person::$name`
 
-help: mark the property writable:
+Help: mark the property writable:
   writable string $name;
 ```
 

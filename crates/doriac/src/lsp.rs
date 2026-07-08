@@ -491,7 +491,7 @@ fn hover_description(kind: &TokenKind) -> Option<&'static str> {
 
 fn diagnostic_to_lsp(text: &str, diagnostic: &Diagnostic) -> Value {
     let message = if let Some(help) = &diagnostic.help {
-        format!("{}\nhelp: {help}", diagnostic.message)
+        format!("{}\nHelp: {help}", diagnostic.message)
     } else {
         diagnostic.message.clone()
     };

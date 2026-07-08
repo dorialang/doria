@@ -155,6 +155,7 @@ impl<'program> Checker<'program> {
     fn check(&mut self) {
         self.collect_classes();
         self.collect_functions();
+        self.infer_unannotated_mixed_return_signatures();
 
         let mut scopes = ScopeStack::new();
         for item in &self.program.items {
@@ -283,7 +284,7 @@ impl<'program> Checker<'program> {
 
     fn resolve_function_signature(&mut self, function: &FunctionDecl) -> FunctionInfo {
         let params = self.resolve_param_infos(function);
-        let return_ty = self.resolve_function_return_type(function, &params);
+        let return_ty = self.resolve_function_return_type(function);
 
         FunctionInfo { params, return_ty }
     }
@@ -321,24 +322,115 @@ impl<'program> Checker<'program> {
         params
     }
 
-    fn resolve_function_return_type(
-        &mut self,
-        function: &FunctionDecl,
-        params: &[ParamInfo],
-    ) -> TypeId {
+    fn resolve_function_return_type(&mut self, function: &FunctionDecl) -> TypeId {
         function
             .return_type
             .as_ref()
             .map(|return_type| {
                 self.resolve_type_ref_in_position(return_type, function.span, TypePosition::Return)
             })
-            .unwrap_or_else(|| self.infer_unannotated_mixed_return_type(function, params))
+            .unwrap_or_else(|| self.types.unknown())
+    }
+
+    fn infer_unannotated_mixed_return_signatures(&mut self) {
+        let max_iterations = self.program.items.len().saturating_mul(4).max(1);
+
+        for _ in 0..max_iterations {
+            let mut changed = false;
+
+            for item in &self.program.items {
+                match item {
+                    Item::Function(function) => {
+                        changed |= self.update_function_mixed_return_signature(function);
+                    }
+                    Item::Class(class_decl) => {
+                        for member in &class_decl.members {
+                            let ClassMember::Method(method) = member else {
+                                continue;
+                            };
+                            changed |=
+                                self.update_method_mixed_return_signature(&class_decl.name, method);
+                        }
+                    }
+                    Item::Statement(_) => {}
+                }
+            }
+
+            if !changed {
+                break;
+            }
+        }
+    }
+
+    fn update_function_mixed_return_signature(&mut self, function: &FunctionDecl) -> bool {
+        if function.return_type.is_some() {
+            return false;
+        }
+
+        let Some(signature) = self.function_signatures.get(&function.span.start).cloned() else {
+            return false;
+        };
+        let inferred = self.infer_unannotated_mixed_return_type(function, &signature.params, None);
+
+        if !self.type_contains_mixed(inferred) || signature.return_ty == inferred {
+            return false;
+        }
+
+        if let Some(signature) = self.function_signatures.get_mut(&function.span.start) {
+            signature.return_ty = inferred;
+        }
+        if let Some(function_info) = self.functions.get_mut(&function.name) {
+            function_info.return_ty = inferred;
+        }
+        true
+    }
+
+    fn update_method_mixed_return_signature(
+        &mut self,
+        class_name: &str,
+        method: &FunctionDecl,
+    ) -> bool {
+        if method.return_type.is_some() || LifecycleMethod::from_method_name(&method.name).is_some()
+        {
+            return false;
+        }
+
+        let Some(signature) = self.function_signatures.get(&method.span.start).cloned() else {
+            return false;
+        };
+        let method_context = MethodContext {
+            class_name: class_name.to_string(),
+            writable_this: method.writable_this,
+            this_available: true,
+        };
+        let inferred = self.infer_unannotated_mixed_return_type(
+            method,
+            &signature.params,
+            Some(&method_context),
+        );
+
+        if !self.type_contains_mixed(inferred) || signature.return_ty == inferred {
+            return false;
+        }
+
+        if let Some(signature) = self.function_signatures.get_mut(&method.span.start) {
+            signature.return_ty = inferred;
+        }
+        if let Some(method_info) = self
+            .classes
+            .get_mut(class_name)
+            .and_then(|class_info| class_info.methods.get_mut(&method.name))
+        {
+            method_info.return_ty = inferred;
+        }
+        true
     }
 
     fn infer_unannotated_mixed_return_type(
         &mut self,
         function: &FunctionDecl,
         params: &[ParamInfo],
+        method_context: Option<&MethodContext>,
     ) -> TypeId {
         let mut scopes = ScopeStack::new();
         for param in params {
@@ -353,7 +445,9 @@ impl<'program> Checker<'program> {
         }
 
         for statement in &function.body.statements {
-            if let Some(ty) = self.infer_mixed_return_from_statement(statement, &mut scopes) {
+            if let Some(ty) =
+                self.infer_mixed_return_from_statement(statement, &mut scopes, method_context)
+            {
                 return ty;
             }
         }
@@ -365,6 +459,7 @@ impl<'program> Checker<'program> {
         &mut self,
         statement: &Stmt,
         scopes: &mut ScopeStack,
+        method_context: Option<&MethodContext>,
     ) -> Option<TypeId> {
         match statement {
             Stmt::VarDecl(decl) => {
@@ -372,7 +467,9 @@ impl<'program> Checker<'program> {
                     .ty
                     .as_ref()
                     .map(|ty| self.resolve_type_ref_for_return_inference(ty))
-                    .unwrap_or_else(|| self.infer_expr_type(&decl.initializer, scopes, None));
+                    .unwrap_or_else(|| {
+                        self.infer_expr_type(&decl.initializer, scopes, method_context)
+                    });
                 let _ = scopes.declare(
                     decl.name.clone(),
                     Binding {
@@ -383,13 +480,203 @@ impl<'program> Checker<'program> {
                 );
                 None
             }
+            Stmt::Assignment(assignment) => {
+                if matches!(assignment.op, AssignOp::Assign) {
+                    if let Expr::Variable { name, .. } = &assignment.target {
+                        let ty = self.infer_expr_type(&assignment.value, scopes, method_context);
+                        if let Some(binding) = scopes.lookup_mut(name) {
+                            binding.ty = ty;
+                        }
+                    }
+                }
+                None
+            }
             Stmt::Return {
                 expr: Some(expr), ..
             } => {
-                let ty = self.infer_expr_type(expr, scopes, None);
+                let ty = self.infer_expr_type(expr, scopes, method_context);
                 self.type_contains_mixed(ty).then_some(ty)
             }
+            Stmt::If(if_stmt) => {
+                if let Some(ty) =
+                    self.infer_mixed_return_from_block(&if_stmt.then_block, scopes, method_context)
+                {
+                    return Some(ty);
+                }
+
+                if_stmt.else_branch.as_ref().and_then(|branch| {
+                    self.infer_mixed_return_from_else_branch(branch, scopes, method_context)
+                })
+            }
+            Stmt::While(while_stmt) => {
+                self.infer_mixed_return_from_block(&while_stmt.body, scopes, method_context)
+            }
+            Stmt::For(for_stmt) => {
+                scopes.push();
+                if let Some(initializer) = &for_stmt.initializer {
+                    self.infer_mixed_return_from_for_initializer(
+                        initializer,
+                        scopes,
+                        method_context,
+                    );
+                }
+                let result =
+                    self.infer_mixed_return_from_block(&for_stmt.body, scopes, method_context);
+                scopes.pop();
+                result
+            }
+            Stmt::Foreach(foreach) => {
+                self.infer_mixed_return_from_foreach(foreach, scopes, method_context)
+            }
             _ => None,
+        }
+    }
+
+    fn infer_mixed_return_from_block(
+        &mut self,
+        block: &Block,
+        scopes: &mut ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) -> Option<TypeId> {
+        scopes.push();
+        for statement in &block.statements {
+            if let Some(ty) =
+                self.infer_mixed_return_from_statement(statement, scopes, method_context)
+            {
+                scopes.pop();
+                return Some(ty);
+            }
+        }
+        scopes.pop();
+        None
+    }
+
+    fn infer_mixed_return_from_else_branch(
+        &mut self,
+        branch: &ElseBranch,
+        scopes: &mut ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) -> Option<TypeId> {
+        match branch {
+            ElseBranch::If(if_stmt) => self.infer_mixed_return_from_statement(
+                &Stmt::If((**if_stmt).clone()),
+                scopes,
+                method_context,
+            ),
+            ElseBranch::Block(block) => {
+                self.infer_mixed_return_from_block(block, scopes, method_context)
+            }
+        }
+    }
+
+    fn infer_mixed_return_from_for_initializer(
+        &mut self,
+        initializer: &ForInitializer,
+        scopes: &mut ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) {
+        match initializer {
+            ForInitializer::VarDecl(decl) => {
+                let ty = decl
+                    .ty
+                    .as_ref()
+                    .map(|ty| self.resolve_type_ref_for_return_inference(ty))
+                    .unwrap_or_else(|| {
+                        self.infer_expr_type(&decl.initializer, scopes, method_context)
+                    });
+                let _ = scopes.declare(
+                    decl.name.clone(),
+                    Binding {
+                        writable: decl.writable,
+                        ty,
+                        int_constant: None,
+                    },
+                );
+            }
+            ForInitializer::Assignment(assignment) => {
+                if matches!(assignment.op, AssignOp::Assign) {
+                    if let Expr::Variable { name, .. } = &assignment.target {
+                        let ty = self.infer_expr_type(&assignment.value, scopes, method_context);
+                        if let Some(binding) = scopes.lookup_mut(name) {
+                            binding.ty = ty;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn infer_mixed_return_from_foreach(
+        &mut self,
+        foreach: &ForeachStmt,
+        scopes: &mut ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) -> Option<TypeId> {
+        scopes.push();
+        let (inferred_key, inferred_value) =
+            self.infer_foreach_binding_types(foreach, scopes, method_context);
+        if let Some(key) = &foreach.key {
+            let ty = key
+                .ty
+                .as_ref()
+                .map(|ty| self.resolve_type_ref_for_return_inference(ty))
+                .unwrap_or(inferred_key);
+            let _ = scopes.declare(
+                key.name.clone(),
+                Binding {
+                    writable: false,
+                    ty,
+                    int_constant: None,
+                },
+            );
+        }
+
+        let value_ty = foreach
+            .value
+            .ty
+            .as_ref()
+            .map(|ty| self.resolve_type_ref_for_return_inference(ty))
+            .unwrap_or(inferred_value);
+        let _ = scopes.declare(
+            foreach.value.name.clone(),
+            Binding {
+                writable: false,
+                ty: value_ty,
+                int_constant: None,
+            },
+        );
+
+        for statement in &foreach.body.statements {
+            if let Some(ty) =
+                self.infer_mixed_return_from_statement(statement, scopes, method_context)
+            {
+                scopes.pop();
+                return Some(ty);
+            }
+        }
+        scopes.pop();
+        None
+    }
+
+    fn infer_foreach_binding_types(
+        &mut self,
+        foreach: &ForeachStmt,
+        scopes: &ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) -> (TypeId, TypeId) {
+        let unknown = self.types.unknown();
+        if Self::is_grouped_range_expr(&foreach.iterable) {
+            let int = self.types.intern(TypeKind::Int);
+            return (unknown, int);
+        }
+
+        let iterable_ty = self.infer_expr_type(&foreach.iterable, scopes, method_context);
+        match self.types.kind(iterable_ty).clone() {
+            TypeKind::List(value) | TypeKind::Set(value) => {
+                (self.types.intern(TypeKind::Int), value)
+            }
+            TypeKind::Dictionary(key, value) => (key, value),
+            _ => (unknown, unknown),
         }
     }
 

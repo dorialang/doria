@@ -108,7 +108,7 @@ writable class Person
 
     function rename(string $name): void
     {
-        $this->name = $name; // error: method is not writable
+        $this->name = $name; // Error: method is not writable
     }
 }
 ```
@@ -228,8 +228,8 @@ Do not add aliases yet.
 The compiler may offer typo help:
 
 ```text
-error: unknown keyword `writeable`
-help: did you mean `writable`?
+Error: unknown keyword `writeable`
+Help: did you mean `writable`?
 ```
 
 Do not accept both spellings as valid syntax.
@@ -247,7 +247,7 @@ writable class Person
 }
 
 let $person = new Person();
-$person->name = "Lucy"; // error: binding is readonly
+$person->name = "Lucy"; // Error: binding is readonly
 ```
 
 ```doria
