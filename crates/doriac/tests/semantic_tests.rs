@@ -611,6 +611,32 @@ List<mixed> $payloads = leak(1, false);
 }
 
 #[test]
+fn tracks_mixed_assignments_in_for_increments() {
+    assert_type_mismatch(
+        r#"
+function unknownValue()
+{
+    return 0;
+}
+
+function leak(mixed $payload)
+{
+    let writable $keepGoing = true;
+    let writable $value = unknownValue();
+
+    for (; $keepGoing; $value = $payload) {
+        $keepGoing = false;
+    }
+
+    return $value;
+}
+
+string $value = leak(1);
+"#,
+    );
+}
+
+#[test]
 fn rejects_d21_dynamic_boundary_type_positions() {
     let cases = [
         ("null $empty = null;", "E0431", "`null` is a literal"),

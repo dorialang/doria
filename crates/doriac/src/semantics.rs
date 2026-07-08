@@ -548,14 +548,7 @@ impl<'program> Checker<'program> {
                 None
             }
             Stmt::Assignment(assignment) => {
-                if matches!(assignment.op, AssignOp::Assign) {
-                    if let Expr::Variable { name, .. } = &assignment.target {
-                        let ty = self.infer_expr_type(&assignment.value, scopes, method_context);
-                        if let Some(binding) = scopes.lookup_mut(name) {
-                            binding.ty = self.merge_inferred_binding_type(binding.ty, ty);
-                        }
-                    }
-                }
+                self.infer_mixed_return_from_assignment(assignment, scopes, method_context);
                 None
             }
             Stmt::Return {
@@ -590,6 +583,9 @@ impl<'program> Checker<'program> {
                 }
                 let result =
                     self.infer_mixed_return_from_block(&for_stmt.body, scopes, method_context);
+                if let Some(increment) = &for_stmt.increment {
+                    self.infer_mixed_return_from_for_increment(increment, scopes, method_context);
+                }
                 scopes.pop();
                 result
             }
@@ -655,14 +651,36 @@ impl<'program> Checker<'program> {
                 );
             }
             ForInitializer::Assignment(assignment) => {
-                if matches!(assignment.op, AssignOp::Assign) {
-                    if let Expr::Variable { name, .. } = &assignment.target {
-                        let ty = self.infer_expr_type(&assignment.value, scopes, method_context);
-                        if let Some(binding) = scopes.lookup_mut(name) {
-                            binding.ty = self.merge_inferred_binding_type(binding.ty, ty);
-                        }
-                    }
-                }
+                self.infer_mixed_return_from_assignment(assignment, scopes, method_context);
+            }
+        }
+    }
+
+    fn infer_mixed_return_from_for_increment(
+        &mut self,
+        increment: &ForIncrement,
+        scopes: &mut ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) {
+        if let ForIncrement::Assignment(assignment) = increment {
+            self.infer_mixed_return_from_assignment(assignment, scopes, method_context);
+        }
+    }
+
+    fn infer_mixed_return_from_assignment(
+        &mut self,
+        assignment: &Assignment,
+        scopes: &mut ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) {
+        if !matches!(assignment.op, AssignOp::Assign) {
+            return;
+        }
+
+        if let Expr::Variable { name, .. } = &assignment.target {
+            let ty = self.infer_expr_type(&assignment.value, scopes, method_context);
+            if let Some(binding) = scopes.lookup_mut(name) {
+                binding.ty = self.merge_inferred_binding_type(binding.ty, ty);
             }
         }
     }
