@@ -227,6 +227,61 @@ List<int> $numbers = leak("x");
 "#,
             "E0403",
         ),
+        (
+            r#"
+class Box
+{
+    mixed $payload = "x";
+}
+
+function leak(Box $box)
+{
+    Box $same = $box;
+    return $same->payload;
+}
+
+string $payload = leak(new Box());
+"#,
+            "E0403",
+        ),
+        (
+            r#"
+List<mixed> $items = [1];
+
+foreach ($items as string $item) {
+    echo $item;
+}
+"#,
+            "E0433",
+        ),
+        (
+            r#"
+Dictionary<string, mixed> $items = [
+    "count" => 1,
+];
+
+foreach ($items as string $key => int $value) {
+    echo $key;
+}
+"#,
+            "E0433",
+        ),
+        (
+            r#"
+List<mixed> $left = [1];
+List<mixed> $right = [2];
+
+bool $same = $left == $right;
+"#,
+            "E0433",
+        ),
+        (
+            r#"
+writable mixed $payload = 1;
+$payload += 1;
+"#,
+            "E0433",
+        ),
     ] {
         let err =
             doriac::check_source("test.doria", source).expect_err("semantic check should fail");

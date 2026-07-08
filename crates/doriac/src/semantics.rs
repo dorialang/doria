@@ -702,6 +702,9 @@ impl<'program> Checker<'program> {
                 let element = self.resolve_type_ref_for_return_inference(&ty.args[0]);
                 self.types.intern(TypeKind::Set(element))
             }
+            name if ty.args.is_empty() && self.classes.contains_key(name) => {
+                self.types.intern(TypeKind::Class(name.to_string()))
+            }
             _ => self.types.unknown(),
         }
     }
@@ -1137,6 +1140,14 @@ impl<'program> Checker<'program> {
             }
             Stmt::Foreach(foreach) => {
                 let range_iterable = Self::is_grouped_range_expr(&foreach.iterable);
+                let unknown_ty = self.types.unknown();
+                let int_ty = self.types.intern(TypeKind::Int);
+                let (iterable_key_ty, iterable_value_ty) = if range_iterable {
+                    (unknown_ty, int_ty)
+                } else {
+                    self.infer_foreach_binding_types(foreach, scopes, method_context)
+                };
+
                 if range_iterable {
                     self.check_expr_with_range_context(
                         &foreach.iterable,
@@ -1163,10 +1174,15 @@ impl<'program> Checker<'program> {
                         ));
                         self.types.unknown()
                     } else {
-                        key.ty
-                            .as_ref()
-                            .map(|ty| self.resolve_type_ref(ty, foreach.span))
-                            .unwrap_or_else(|| self.types.unknown())
+                        key.ty.as_ref().map_or(iterable_key_ty, |ty| {
+                            let annotated_ty = self.resolve_type_ref(ty, foreach.span);
+                            self.check_foreach_binding_type(
+                                annotated_ty,
+                                iterable_key_ty,
+                                foreach.span,
+                            );
+                            annotated_ty
+                        })
                     };
                     self.declare_binding(
                         scopes,
@@ -1180,26 +1196,21 @@ impl<'program> Checker<'program> {
                     );
                 }
                 let value_ty = if range_iterable {
-                    let int_ty = self.types.intern(TypeKind::Int);
                     if let Some(annotation) = &foreach.value.ty {
                         let annotated_ty = self.resolve_type_ref(annotation, foreach.span);
-                        if !self.is_assignable(annotated_ty, int_ty) {
-                            self.check_assignable(
-                                annotated_ty,
-                                int_ty,
-                                foreach.span,
-                                AssignmentDestination::Type,
-                            );
-                        }
+                        self.check_foreach_binding_type(annotated_ty, int_ty, foreach.span);
                     }
                     int_ty
                 } else {
-                    foreach
-                        .value
-                        .ty
-                        .as_ref()
-                        .map(|ty| self.resolve_type_ref(ty, foreach.span))
-                        .unwrap_or_else(|| self.types.unknown())
+                    foreach.value.ty.as_ref().map_or(iterable_value_ty, |ty| {
+                        let annotated_ty = self.resolve_type_ref(ty, foreach.span);
+                        self.check_foreach_binding_type(
+                            annotated_ty,
+                            iterable_value_ty,
+                            foreach.span,
+                        );
+                        annotated_ty
+                    })
                 };
                 self.declare_binding(
                     scopes,
@@ -1341,6 +1352,21 @@ impl<'program> Checker<'program> {
             }
             AssignOp::AddAssign | AssignOp::SubAssign => {
                 let value_ty = self.infer_expr_type(&assignment.value, scopes, method_context);
+                let target_contains_mixed = self.type_contains_mixed(target.ty);
+                let value_contains_mixed = self.type_contains_mixed(value_ty);
+
+                if target_contains_mixed {
+                    self.report_mixed_operation(assignment.target.span(), "compound assignment");
+                }
+
+                if value_contains_mixed {
+                    self.report_mixed_operation(assignment.value.span(), "compound assignment");
+                }
+
+                if target_contains_mixed || value_contains_mixed {
+                    return;
+                }
+
                 let result_ty = self.infer_numeric_binary_type(target.ty, value_ty);
                 if !self.is_assignable(target.ty, result_ty) {
                     self.check_assignable(
@@ -1982,7 +2008,7 @@ impl<'program> Checker<'program> {
     }
 
     fn is_equality_compatible(&self, left: TypeId, right: TypeId) -> bool {
-        if self.is_mixed_type(left) || self.is_mixed_type(right) {
+        if self.type_contains_mixed(left) || self.type_contains_mixed(right) {
             return false;
         }
 
@@ -2034,7 +2060,7 @@ impl<'program> Checker<'program> {
         let left_ty = self.infer_expr_type(left, scopes, method_context);
         let right_ty = self.infer_expr_type(right, scopes, method_context);
 
-        self.is_mixed_type(left_ty) || self.is_mixed_type(right_ty)
+        self.type_contains_mixed(left_ty) || self.type_contains_mixed(right_ty)
     }
 
     fn is_mixed_type(&self, ty: TypeId) -> bool {
@@ -2061,6 +2087,21 @@ impl<'program> Checker<'program> {
             )
             .with_help("narrow the value with `is` or `match` before using it"),
         );
+    }
+
+    fn check_foreach_binding_type(&mut self, target: TypeId, value: TypeId, span: Span) {
+        if self.is_unknown_type(target) || self.is_unknown_type(value) {
+            return;
+        }
+
+        if self.type_contains_mixed(value) && !self.type_contains_mixed(target) {
+            self.report_mixed_operation(span, "foreach binding");
+            return;
+        }
+
+        if !self.is_assignable(target, value) {
+            self.check_assignable(target, value, span, AssignmentDestination::Type);
+        }
     }
 
     fn check_int_constant_arithmetic(
