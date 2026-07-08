@@ -504,13 +504,12 @@ impl<'program> Checker<'program> {
     ) -> Option<TypeId> {
         match statement {
             Stmt::VarDecl(decl) => {
-                let ty = decl
-                    .ty
-                    .as_ref()
-                    .map(|ty| self.resolve_type_ref_for_return_inference(ty))
-                    .unwrap_or_else(|| {
-                        self.infer_expr_type(&decl.initializer, scopes, method_context)
-                    });
+                let ty = self.infer_local_declaration_type(
+                    decl.ty.as_ref(),
+                    &decl.initializer,
+                    scopes,
+                    method_context,
+                );
                 let _ = scopes.declare(
                     decl.name.clone(),
                     Binding {
@@ -526,7 +525,7 @@ impl<'program> Checker<'program> {
                     if let Expr::Variable { name, .. } = &assignment.target {
                         let ty = self.infer_expr_type(&assignment.value, scopes, method_context);
                         if let Some(binding) = scopes.lookup_mut(name) {
-                            binding.ty = ty;
+                            binding.ty = self.merge_inferred_binding_type(binding.ty, ty);
                         }
                     }
                 }
@@ -613,13 +612,12 @@ impl<'program> Checker<'program> {
     ) {
         match initializer {
             ForInitializer::VarDecl(decl) => {
-                let ty = decl
-                    .ty
-                    .as_ref()
-                    .map(|ty| self.resolve_type_ref_for_return_inference(ty))
-                    .unwrap_or_else(|| {
-                        self.infer_expr_type(&decl.initializer, scopes, method_context)
-                    });
+                let ty = self.infer_local_declaration_type(
+                    decl.ty.as_ref(),
+                    &decl.initializer,
+                    scopes,
+                    method_context,
+                );
                 let _ = scopes.declare(
                     decl.name.clone(),
                     Binding {
@@ -634,7 +632,7 @@ impl<'program> Checker<'program> {
                     if let Expr::Variable { name, .. } = &assignment.target {
                         let ty = self.infer_expr_type(&assignment.value, scopes, method_context);
                         if let Some(binding) = scopes.lookup_mut(name) {
-                            binding.ty = ty;
+                            binding.ty = self.merge_inferred_binding_type(binding.ty, ty);
                         }
                     }
                 }
@@ -732,6 +730,29 @@ impl<'program> Checker<'program> {
                 self.types.intern(TypeKind::Set(element))
             }
             _ => self.types.intern(TypeKind::Mixed),
+        }
+    }
+
+    fn infer_local_declaration_type(
+        &mut self,
+        annotation: Option<&TypeRef>,
+        initializer: &Expr,
+        scopes: &ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) -> TypeId {
+        let initializer_ty = self.infer_expr_type(initializer, scopes, method_context);
+        annotation.map_or(initializer_ty, |ty| {
+            let annotated_ty = self.resolve_type_ref_for_return_inference(ty);
+            self.preserve_known_mixed_collection_shape(annotated_ty, initializer_ty)
+        })
+    }
+
+    fn merge_inferred_binding_type(&mut self, current: TypeId, next: TypeId) -> TypeId {
+        let next = self.preserve_known_mixed_collection_shape(current, next);
+        if self.type_contains_mixed(current) {
+            self.merge_mixed_return_types(current, next)
+        } else {
+            next
         }
     }
 
@@ -1087,7 +1108,7 @@ impl<'program> Checker<'program> {
                             method_context,
                             AssignmentDestination::Type,
                         );
-                        target_ty
+                        self.preserve_known_mixed_collection_shape(target_ty, value_ty)
                     }
                     None => value_ty,
                 };
@@ -1121,7 +1142,7 @@ impl<'program> Checker<'program> {
             }
             Stmt::Echo { expr, .. } => {
                 self.check_expr(expr, scopes, method_context);
-                self.check_mixed_operation(expr, "echo", scopes, method_context);
+                self.check_mixed_value_operation(expr, "echo", scopes, method_context);
             }
             Stmt::Expr { expr, .. } => {
                 self.check_expr(expr, scopes, method_context);
@@ -1341,7 +1362,7 @@ impl<'program> Checker<'program> {
                             method_context,
                             AssignmentDestination::Type,
                         );
-                        target_ty
+                        self.preserve_known_mixed_collection_shape(target_ty, value_ty)
                     }
                     None => value_ty,
                 };
@@ -1419,6 +1440,12 @@ impl<'program> Checker<'program> {
                 );
                 if assignment_ok {
                     let value_ty = self.infer_expr_type(&assignment.value, scopes, method_context);
+                    self.preserve_known_mixed_collection_assignment(
+                        &assignment.target,
+                        target_ty,
+                        value_ty,
+                        scopes,
+                    );
                     self.narrow_empty_collection_assignment(
                         &assignment.target,
                         target_ty,
@@ -2110,6 +2137,19 @@ impl<'program> Checker<'program> {
     ) {
         let ty = self.infer_expr_type(expr, scopes, method_context);
         if self.is_mixed_type(ty) {
+            self.report_mixed_operation(expr.span(), operation);
+        }
+    }
+
+    fn check_mixed_value_operation(
+        &mut self,
+        expr: &Expr,
+        operation: &'static str,
+        scopes: &ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) {
+        let ty = self.infer_expr_type(expr, scopes, method_context);
+        if self.type_contains_mixed(ty) {
             self.report_mixed_operation(expr.span(), operation);
         }
     }
@@ -3121,6 +3161,46 @@ impl<'program> Checker<'program> {
 
         if matches!(self.types.kind(binding.ty), TypeKind::EmptyCollection) {
             binding.ty = value_ty;
+        }
+    }
+
+    fn preserve_known_mixed_collection_assignment(
+        &self,
+        target: &Expr,
+        target_ty: TypeId,
+        value_ty: TypeId,
+        scopes: &mut ScopeStack,
+    ) {
+        let preserved_ty = self.preserve_known_mixed_collection_shape(target_ty, value_ty);
+        if preserved_ty == target_ty {
+            return;
+        }
+
+        let Expr::Variable { name, .. } = target else {
+            return;
+        };
+
+        let Some(binding) = scopes.lookup_mut(name) else {
+            return;
+        };
+
+        if matches!(self.types.kind(binding.ty), TypeKind::Array) {
+            binding.ty = preserved_ty;
+        }
+    }
+
+    fn preserve_known_mixed_collection_shape(
+        &self,
+        annotated_ty: TypeId,
+        value_ty: TypeId,
+    ) -> TypeId {
+        if matches!(self.types.kind(annotated_ty), TypeKind::Array)
+            && self.is_non_empty_collection_like_type(value_ty)
+            && self.type_contains_mixed(value_ty)
+        {
+            value_ty
+        } else {
+            annotated_ty
         }
     }
 

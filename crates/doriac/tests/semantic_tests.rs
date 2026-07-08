@@ -282,6 +282,54 @@ $payload += 1;
 "#,
             "E0433",
         ),
+        (
+            r#"
+function leak(mixed $payload, bool $usePayload)
+{
+    writable mixed $value = "";
+    if ($usePayload) {
+        $value = $payload;
+    } else {
+        $value = "safe";
+    }
+
+    return $value;
+}
+
+string $value = leak(1, true);
+"#,
+            "E0403",
+        ),
+        (
+            r#"
+function leak(mixed $payload)
+{
+    array $items = [$payload];
+    return $items;
+}
+
+List<int> $items = leak(1);
+"#,
+            "E0403",
+        ),
+        (
+            r#"
+mixed $payload = 1;
+echo [$payload];
+"#,
+            "E0433",
+        ),
+        (
+            r#"
+mixed $payload = 1;
+array $items = [$payload];
+
+foreach ($items as string $item) {
+    echo $item;
+}
+"#,
+            "E0433",
+        ),
     ] {
         let err =
             doriac::check_source("test.doria", source).expect_err("semantic check should fail");
