@@ -114,7 +114,7 @@ Stage 11d supports:
 - Early return from inside loops.
 - Exact string-literal `echo` inside loops of `main(): void`.
 - Interpreter execution and debug-target artifacts for the Stage 11d subset.
-- Finite loop execution without a fixed interpreter step limit. The deterministic interpreter detects a non-terminating cycle only when it revisits the same basic block with the same integer-local state.
+- Finite loop execution under a bounded interpreter budget of 100,000 executed basic blocks. Exact-state cycle detection rejects deterministic cycles earlier when the interpreter revisits the same basic block with the same integer-local state, while the execution budget also bounds changing-state loops.
 
 MIR does not gain a high-level loop node. `while` is structured source syntax lowered into the same basic-block control-flow primitives that future backends consume.
 

@@ -1554,6 +1554,29 @@ fn interpreter_allows_finite_while_loops_beyond_the_old_fuel_limit() {
 }
 
 #[test]
+fn debug_target_bounds_changing_state_while_loops() {
+    let diagnostics = doriac::compile_source(
+        "test.doria",
+        r#"function main(): void
+{
+    let writable $i = 0;
+
+    while (true) {
+        $i++;
+    }
+}
+"#,
+        BackendTarget::Debug,
+    )
+    .expect_err("debug execution should have bounded fuel");
+
+    assert_eq!(diagnostics[0].code, "M1102");
+    assert!(diagnostics[0]
+        .message
+        .contains("exhausted its bounded execution fuel"));
+}
+
+#[test]
 fn interpreter_rejects_non_terminating_source_while_loops() {
     let program = lower(
         r#"function main(): void
