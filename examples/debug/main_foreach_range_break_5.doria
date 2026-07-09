@@ -1,0 +1,14 @@
+function main(): int
+{
+    let writable $count = 0;
+
+    foreach (0..<10 as $i) {
+        if ($i == 5) {
+            break;
+        }
+
+        $count++;
+    }
+
+    return $count;
+}

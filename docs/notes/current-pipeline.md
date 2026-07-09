@@ -8,14 +8,15 @@ Documentation role: working note. This file prevents duplicated in-flight work. 
 - PR #59: dynamic boundary type cleanup, explicit parameter types, `mixed`, `object`, `resource`, `null` rules.
 - PR #62: documentation source-of-truth reset and documentation authority guardrails.
 - PR #63: Stage 11c MIR conditions, structured `if` control flow, and multi-block interpreter execution.
+- PR #64: Stage 11d MIR structured `while`, nested `break` / `continue`, and bounded debug interpretation.
 
 ## Active
 
-- Stage 11d: MIR `while` loops and loop control.
+- Stage 11e: MIR traditional `for` loops and integer range `foreach`.
 
-## Next after Stage 11d
+## Next after Stage 11e
 
-- Stage 11e: MIR traditional `for` loops and integer range `foreach`, unless Stage 11d review identifies a blocker.
+- Stage 11f: MIR helper/free-function calls and current native-smoke parity expansion, unless Stage 11e review identifies a blocker.
 
 ## Do not duplicate
 
@@ -23,6 +24,7 @@ Documentation role: working note. This file prevents duplicated in-flight work. 
 - PR #59 dynamic boundary type work.
 - PR #62 documentation source-of-truth work.
 - PR #63 Stage 11c MIR condition and `if` control-flow work.
+- PR #64 Stage 11d MIR `while` and loop-control work.
 - ROADMAP-style planning outside the end-to-end plan.
 
 ## Deferred
