@@ -687,7 +687,7 @@ Retire the smoke architecture; make the native path general.
 ### Phase H — Concurrency (Stages 37–39)
 - **Stage 37 — Concurrency design record 0063.** Paper stage: full async model (executor in doria-rt, task groups, cancellation, `Shareable` rules). Designer sign-off required — this is the one deliberate design gate in the plan.
 - **Stage 38 — async/await codegen.** State-machine lowering in MIR; single-threaded executor first; `async main` entry bootstrap per §5 (executor started only when `main` is async — sync programs pay zero async cost). AC: async file-read example; interpreter parity; async-`main` escaping-error example exits 70 with destructors run.
-- **Stage 39 — Structured task groups + Shareable checking.** Multi-threaded executor; spawn-boundary checks via auto-derived `Sendable`/`Shareable` — with ownership in place this is Rust Send/Sync-grade freedom from data races. AC: parallel map example; data-race fixture rejected at compile time.
+- **Stage 39 — Structured task groups + Shareable checking.** Multithreaded executor; spawn-boundary checks via auto-derived `Sendable`/`Shareable` — with ownership in place this is Rust Send/Sync-grade freedom from data races. AC: parallel map example; data-race fixture rejected at compile time.
 
 ### Phase I — Systems and PHP bridge (Stages 40–42)
 - **Stage 40 — unsafe/FFI.** D12: `unsafe`, `Ptr<T>`, `extern "C"`, linking foreign libs via Baton manifest. AC: bind and call a C function (e.g., zlib) from Doria.
