@@ -55,6 +55,29 @@ function is_active_scanned_path(string $path): bool
     return str_ends_with($path, '.md');
 }
 
+function is_naming_scanned_path(string $path): bool
+{
+    if (
+        is_historical_path($path)
+        || is_redirect_path($path)
+        || $path === 'docs/php-interop-and-migration.md'
+        || $path === 'editors/fixtures/rejected-syntax.doria'
+    ) {
+        return false;
+    }
+
+    if (str_ends_with(strtolower($path), '.md')) {
+        return true;
+    }
+
+    if ($path === 'editors/fixtures/latest-tokens.doria') {
+        return true;
+    }
+
+    return str_starts_with($path, 'examples/')
+        && str_ends_with(strtolower($path), '.doria');
+}
+
 function line_is_negating_or_contextual(string $line): bool
 {
     return preg_match('/\b(not|never|no|without|reject|rejected|invalid|reserved|literal|planned|future|PHP|interop|migration|historical|not Doria)\b/i', $line) === 1;
@@ -70,20 +93,28 @@ $iterator = new RecursiveIteratorIterator(
 );
 
 $markdownFiles = [];
+$namingFiles = [];
 foreach ($iterator as $file) {
     if (!$file->isFile()) {
         continue;
     }
 
     $path = relative_path($root, $file->getPathname());
-    if (is_skipped_path($path) || !str_ends_with(strtolower($path), '.md')) {
+    if (is_skipped_path($path)) {
         continue;
     }
 
-    $markdownFiles[] = $path;
+    if (str_ends_with(strtolower($path), '.md')) {
+        $markdownFiles[] = $path;
+    }
+
+    if (is_naming_scanned_path($path)) {
+        $namingFiles[] = $path;
+    }
 }
 
 sort($markdownFiles);
+sort($namingFiles);
 
 foreach ($markdownFiles as $path) {
     $contents = file_get_contents($root . '/' . $path);
@@ -160,6 +191,50 @@ foreach ($markdownFiles as $path) {
 
         if ($active && preg_match('/debug.*wasm.*recognized planned targets/i', $line) === 1) {
             add_failure($failures, $path, $lineNumber, 'active docs must distinguish current debug support from planned wasm support', $line);
+        }
+    }
+}
+
+$forbiddenNamingExamples = [
+    'Int::wrapping_add',
+    '->is_empty',
+    '->retry_after',
+    '->find_by_id',
+    '->tenant_id',
+    '->status_code',
+];
+
+foreach ($namingFiles as $path) {
+    $contents = file_get_contents($root . '/' . $path);
+    if ($contents === false) {
+        $failures[] = "{$path}: unable to read file for naming checks";
+        continue;
+    }
+
+    $lines = preg_split('/\R/', $contents) ?: [];
+    foreach ($lines as $index => $line) {
+        foreach ($forbiddenNamingExamples as $example) {
+            if (str_contains($line, $example)) {
+                add_failure(
+                    $failures,
+                    $path,
+                    $index + 1,
+                    "active Doria guidance must not use stale snake_case member example {$example}",
+                    $line
+                );
+            }
+        }
+    }
+}
+
+$namingAuthorityPath = 'docs/doria-end-to-end-plan.md';
+$namingAuthority = file_get_contents($root . '/' . $namingAuthorityPath);
+if ($namingAuthority === false) {
+    $failures[] = "{$namingAuthorityPath}: unable to read naming authority";
+} else {
+    foreach (['Int::wrappingAdd', '->isEmpty', '->retryAfter', '->findById', '->tenantId'] as $example) {
+        if (!str_contains($namingAuthority, $example)) {
+            $failures[] = "{$namingAuthorityPath}: missing required corrected naming example {$example}";
         }
     }
 }

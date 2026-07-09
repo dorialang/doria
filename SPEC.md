@@ -355,6 +355,29 @@ If a data-returning operation must be a method because it performs I/O, expensiv
 
 See `docs/api-design-guidelines.md` for the detailed design notes.
 
+### Naming charter
+
+Doria chooses casing by API category, not by whether an implementation is built into the language:
+
+- Built-in free functions use `snake_case`, such as `get_time()` and `str_starts_with()`.
+- Userland free functions, instance methods, static methods, companion/type APIs, properties, parameters, and named arguments use `camelCase`.
+- Classes, interfaces, traits, enums, and enum cases use `PascalCase`.
+- Constants use `SCREAMING_SNAKE_CASE`.
+- Type parameters use single Pascal capitals such as `T`, `K`, and `V`.
+- PHP-shaped magic methods retain their inherited spellings: `__construct` and `__destruct`.
+
+Free-function casing and member/companion casing are intentionally different:
+
+```doria
+let $now = get_time();
+let $matches = str_starts_with($name, "Dor");
+let $wrapped = Int::wrappingAdd(1, 2);
+let $empty = $s->isEmpty();
+let $tenant = $message->tenantId;
+$message->retryAfter(seconds: 30);
+let $person = $repository->findById($id);
+```
+
 ## 7. Basic type system
 
 Accepted type-position names include:
@@ -419,7 +442,7 @@ mixed $payload = Json::decode($line);
 
 let $label = match ($payload) {
     string $value => $value,
-    int $value => Int::to_string($value),
+    int $value => Int::toString($value),
     default => "unknown",
 };
 ```

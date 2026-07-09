@@ -90,7 +90,7 @@ class Office
 {
     Person $manager = new Person();
     List<Person> $staff = [];
-    Dictionary<string, string> $labels = Dictionary::new();
+    Dictionary<string, string> $labels = [];
 }
 ```
 
@@ -169,7 +169,7 @@ Possible future syntax:
 ```doria
 class Registry
 {
-    internal static Dictionary<string, Handler> $handlers = Dictionary::new();
+    internal static Dictionary<string, Handler> $handlers = [];
 }
 ```
 

@@ -222,6 +222,9 @@ For VS Code, the setting is `doria.languageServer.path`. For IntelliJ IDEs, use 
 - `++` and `--` require writable `int` targets; value-producing `++`/`--` expressions are future work.
 - `throw` raises checked errors, and `throws` declares checked thrown error types in signatures. Compiler behavior for checked errors is future work.
 - `Result<T, E>` is not Doria's default surface error model unless a later decision explicitly adopts it.
+- Built-in free functions use `snake_case`, for example `get_time()` and `str_starts_with()`.
+- Userland free functions and all member-style APIs use `camelCase`, including methods, static/companion APIs, properties, parameters, and named arguments. Examples include `Int::wrappingAdd()`, `$s->isEmpty()`, `$message->tenantId`, and `$message->retryAfter(seconds: 30)`.
+- Types and enum cases use `PascalCase`, constants use `SCREAMING_SNAKE_CASE`, and type parameters use single Pascal capitals such as `T`, `K`, and `V`. The inherited magic methods keep `__construct` and `__destruct`.
 - Typed arrays are spelled `T[]`, for example `int[] $numbers`.
 - Collection aliases are `List<T>`, `Dictionary<K, V>`, and `Set<T>`.
 - `array` is not a Doria type spelling; use `T[]` or a named collection type.

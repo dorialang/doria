@@ -52,6 +52,17 @@ Check your source, compile it, then run it.
 Baton currently builds Doria projects.
 ```
 
+## API Naming
+
+Website examples must follow the naming charter:
+
+- Use `snake_case` only for built-in free functions, such as `get_time()` and `str_starts_with()`.
+- Use `camelCase` for userland free functions, methods, static/companion APIs, properties, parameters, and named arguments.
+- Use `PascalCase` for types and enum cases, `SCREAMING_SNAKE_CASE` for constants, and single Pascal capitals for type parameters.
+- Keep `__construct` and `__destruct` in their inherited PHP-shaped spelling.
+
+Member examples should look like `Int::wrappingAdd()`, `$s->isEmpty()`, `$message->tenantId`, `$message->retryAfter(seconds: 30)`, and `$repository->findById($id)`.
+
 ## Constructor Examples
 
 Website docs should teach Doria constructor property promotion as the default/simple class style.

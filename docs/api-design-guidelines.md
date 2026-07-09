@@ -32,6 +32,33 @@ let $status = $message->status();
 
 A bare noun method such as `body()` can be misread as an action, preparation step, mutation, or builder-style method. If the member represents data, make it a property.
 
+## Naming and casing
+
+The naming charter is category-based:
+
+- Built-in free functions use `snake_case`, such as `get_time()` and `str_starts_with()`.
+- Userland free functions use `camelCase`.
+- Instance methods, static methods, and companion/type APIs use `camelCase`, whether they are built in or user-authored.
+- Properties, parameters, and named arguments use `camelCase`.
+- Classes, interfaces, traits, enums, and enum cases use `PascalCase`.
+- Constants use `SCREAMING_SNAKE_CASE`.
+- Type parameters use single Pascal capitals such as `T`, `K`, and `V`.
+- The inherited magic methods keep the PHP-shaped spellings `__construct` and `__destruct`.
+
+Free-function casing and member casing are intentionally different:
+
+```doria
+let $now = get_time();
+let $startsWithDor = str_starts_with($name, "Dor");
+let $wrapped = Int::wrappingAdd(1, 2);
+let $empty = $s->isEmpty();
+let $tenant = $message->tenantId;
+$message->retryAfter(seconds: 30);
+let $person = $repository->findById($id);
+```
+
+Avoid snake_case methods, static methods, properties, parameters, and named arguments unless a later accepted decision introduces a specific exception.
+
 ## Properties are for data
 
 Use properties for stored values, state, identifiers, configuration values, computed values that are conceptually data, cheap derived values, and values exposed through validation or access control.
@@ -42,6 +69,7 @@ Examples:
 $message->id
 $message->body
 $message->headers
+$message->tenantId
 $message->receivedAt
 $alert->severity
 $user->email
