@@ -1,0 +1,17 @@
+function main(): int
+{
+    let writable $i = 0;
+    let writable $count = 0;
+
+    while ($i < 10) {
+        $i++;
+
+        if ($i < 5) {
+            continue;
+        }
+
+        $count++;
+    }
+
+    return $count;
+}

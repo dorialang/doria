@@ -1,8 +1,8 @@
-use std::fmt;
+use std::{collections::HashSet, fmt};
 
 use crate::mir;
 
-const STAGE_11C_MAX_STEPS: usize = 10_000;
+const MAX_EXECUTED_BLOCKS: usize = 100_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InterpreterOutput {
@@ -40,7 +40,8 @@ pub fn interpret(program: &mir::Program) -> Result<InterpreterOutput, Interprete
     let mut stdout = Vec::new();
     let mut locals = vec![None; function.locals.len()];
     let mut current_block = function.entry_block;
-    let mut steps = 0;
+    let mut seen_states = HashSet::new();
+    let mut executed_blocks = 0;
 
     for local in &function.locals {
         if local.id.0 >= locals.len() {
@@ -52,12 +53,18 @@ pub fn interpret(program: &mir::Program) -> Result<InterpreterOutput, Interprete
     }
 
     loop {
-        if steps >= STAGE_11C_MAX_STEPS {
+        if executed_blocks >= MAX_EXECUTED_BLOCKS {
+            return Err(InterpreterError::new(format!(
+                "MIR interpreter exhausted its bounded execution fuel after {MAX_EXECUTED_BLOCKS} basic blocks"
+            )));
+        }
+        executed_blocks += 1;
+
+        if !seen_states.insert((current_block, locals.clone())) {
             return Err(InterpreterError::new(
-                "MIR interpreter exceeded Stage 11c step limit",
+                "MIR interpreter detected a non-terminating control-flow cycle",
             ));
         }
-        steps += 1;
 
         let block = function.blocks.get(current_block.0).ok_or_else(|| {
             InterpreterError::new(format!("MIR block block{} does not exist", current_block.0))

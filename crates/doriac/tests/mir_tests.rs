@@ -16,22 +16,22 @@ fn interpret(source: &str) -> doriac::mir_interpreter::InterpreterOutput {
 
 fn unsupported(source: &str) -> Vec<doriac::diagnostics::Diagnostic> {
     doriac::lower_source_to_mir("test.doria", source)
-        .expect_err("source should be outside Stage 11c MIR coverage")
+        .expect_err("source should be outside Stage 11d MIR coverage")
 }
 
 fn unsupported_after_parsing(source: &str) -> Vec<doriac::diagnostics::Diagnostic> {
     let ast = doriac::parse_source("test.doria", source).expect("source should parse");
     let hir = doriac::lowering::lower_program(&ast);
     doriac::mir_lowering::lower_program(&hir)
-        .expect_err("HIR should be outside Stage 11c MIR coverage")
+        .expect_err("HIR should be outside Stage 11d MIR coverage")
 }
 
-fn assert_stage_11c_unsupported(diagnostics: &[doriac::diagnostics::Diagnostic], detail: &str) {
+fn assert_stage_11d_unsupported(diagnostics: &[doriac::diagnostics::Diagnostic], detail: &str) {
     assert_eq!(diagnostics[0].code, "M1101");
     assert!(
         diagnostics[0]
             .message
-            .contains("unsupported MIR Stage 11c coverage"),
+            .contains("unsupported MIR Stage 11d coverage"),
         "unexpected diagnostic: {}",
         diagnostics[0].message
     );
@@ -855,7 +855,7 @@ fn rejects_unsupported_division_as_mir_coverage() {
 "#,
     );
 
-    assert_stage_11c_unsupported(&diagnostics, "division and modulo");
+    assert_stage_11d_unsupported(&diagnostics, "division and modulo");
 }
 
 #[test]
@@ -868,7 +868,7 @@ fn rejects_comparison_result_as_runtime_value() {
 "#,
     );
 
-    assert_stage_11c_unsupported(&diagnostics, "condition-only");
+    assert_stage_11d_unsupported(&diagnostics, "condition-only");
 }
 
 #[test]
@@ -882,7 +882,7 @@ fn rejects_unsupported_string_local_as_mir_coverage() {
 "#,
     );
 
-    assert_stage_11c_unsupported(&diagnostics, "string locals");
+    assert_stage_11d_unsupported(&diagnostics, "string locals");
 }
 
 #[test]
@@ -895,7 +895,7 @@ fn rejects_unsupported_string_concat_echo_as_mir_coverage() {
 "#,
     );
 
-    assert_stage_11c_unsupported(&diagnostics, "string concatenation");
+    assert_stage_11d_unsupported(&diagnostics, "string concatenation");
 }
 
 #[test]
@@ -913,7 +913,7 @@ function main(): int
 "#,
     );
 
-    assert_stage_11c_unsupported(&diagnostics, "no helper functions");
+    assert_stage_11d_unsupported(&diagnostics, "no helper functions");
 }
 
 #[test]
@@ -1307,7 +1307,7 @@ fn interpreter_preserves_void_fallthrough_after_final_else_if() {
 }
 
 #[test]
-fn interpreter_limits_malformed_mir_control_flow() {
+fn interpreter_rejects_repeated_mir_state_cycles() {
     let program = Program {
         functions: vec![Function {
             id: FunctionId(0),
@@ -1325,10 +1325,10 @@ fn interpreter_limits_malformed_mir_control_flow() {
     };
 
     let error = doriac::mir_interpreter::interpret(&program)
-        .expect_err("malformed cyclic MIR should hit the defensive limit");
+        .expect_err("malformed cyclic MIR should repeat an interpreter state");
     assert_eq!(
         error.message,
-        "MIR interpreter exceeded Stage 11c step limit"
+        "MIR interpreter detected a non-terminating control-flow cycle"
     );
 }
 
@@ -1365,7 +1365,7 @@ fn rejects_truthiness_and_calls_as_stage_11c_conditions() {
 }
 "#,
     );
-    assert_stage_11c_unsupported(&truthiness, "truthiness");
+    assert_stage_11d_unsupported(&truthiness, "truthiness");
 
     let call = unsupported_after_parsing(
         r#"function main(): int
@@ -1378,21 +1378,366 @@ fn rejects_truthiness_and_calls_as_stage_11c_conditions() {
 }
 "#,
     );
-    assert_stage_11c_unsupported(&call, "calls in conditions");
+    assert_stage_11d_unsupported(&call, "calls in conditions");
 }
 
 #[test]
-fn rejects_loops_as_stage_11c_mir_coverage() {
-    let diagnostics = unsupported(
-        r#"function main(): void
+fn lowers_while_to_header_body_and_exit_blocks() {
+    let program = lower(include_str!(
+        "../../../examples/debug/main_while_count_42.doria"
+    ));
+    let blocks = &program.functions[0].blocks;
+
+    assert_eq!(blocks.len(), 4);
+    assert_eq!(blocks[0].terminator, Terminator::Jump(BlockId(1)));
+    assert_eq!(
+        blocks[1].terminator,
+        Terminator::Branch {
+            condition: Condition::Compare {
+                op: CompareOp::Less,
+                left: IntExpression::Use(Operand::Local(LocalId(0))),
+                right: IntExpression::Use(Operand::Int(42)),
+            },
+            then_block: BlockId(2),
+            else_block: BlockId(3),
+        }
+    );
+    assert_eq!(blocks[2].terminator, Terminator::Jump(BlockId(1)));
+    assert_eq!(
+        blocks[3].terminator,
+        Terminator::Return(Operand::Local(LocalId(0)))
+    );
+}
+
+#[test]
+fn lowers_assignment_and_echo_inside_while() {
+    let count = lower(include_str!(
+        "../../../examples/debug/main_while_count_42.doria"
+    ));
+    assert_eq!(
+        count.functions[0].blocks[2].statements,
+        vec![Statement::AssignLocal {
+            target: LocalId(0),
+            value: Rvalue::Binary {
+                op: BinaryOp::Add,
+                left: Operand::Local(LocalId(0)),
+                right: Operand::Int(1),
+            },
+        }]
+    );
+
+    let echo = lower(include_str!(
+        "../../../examples/debug/main_while_echo_xxx.doria"
+    ));
+    assert_eq!(
+        echo.functions[0].blocks[2].statements[0],
+        Statement::EchoStringLiteral("x".to_string())
+    );
+}
+
+#[test]
+fn lowers_break_to_while_exit_and_continue_to_header() {
+    let break_program = lower(include_str!(
+        "../../../examples/debug/main_while_break_42.doria"
+    ));
+    assert_eq!(
+        break_program.functions[0].blocks[4].terminator,
+        Terminator::Jump(BlockId(3))
+    );
+
+    let continue_program = lower(include_str!(
+        "../../../examples/debug/main_while_continue_6.doria"
+    ));
+    assert_eq!(
+        continue_program.functions[0].blocks[4].terminator,
+        Terminator::Jump(BlockId(1))
+    );
+}
+
+#[test]
+fn nested_while_uses_innermost_loop_targets() {
+    let program = lower(
+        r#"function main(): int
+{
+    while (true) {
+        while (true) {
+            break;
+        }
+
+        continue;
+    }
+
+    return 0;
+}
+"#,
+    );
+    let blocks = &program.functions[0].blocks;
+
+    assert_eq!(blocks[5].terminator, Terminator::Jump(BlockId(6)));
+    assert_eq!(blocks[6].terminator, Terminator::Jump(BlockId(1)));
+}
+
+#[test]
+fn lowers_return_inside_while_as_return_terminator() {
+    let program = lower(include_str!(
+        "../../../examples/debug/main_while_return_42.doria"
+    ));
+
+    assert!(program.functions[0]
+        .blocks
+        .iter()
+        .any(|block| { block.terminator == Terminator::Return(Operand::Local(LocalId(0))) }));
+}
+
+#[test]
+fn interprets_stage_11d_while_examples() {
+    for (source, expected) in [
+        (
+            include_str!("../../../examples/debug/main_while_count_42.doria"),
+            42,
+        ),
+        (
+            include_str!("../../../examples/debug/main_while_break_42.doria"),
+            42,
+        ),
+        (
+            include_str!("../../../examples/debug/main_while_continue_6.doria"),
+            6,
+        ),
+        (
+            include_str!("../../../examples/debug/main_while_return_42.doria"),
+            42,
+        ),
+        (
+            include_str!("../../../examples/debug/main_while_nested_6.doria"),
+            6,
+        ),
+    ] {
+        assert_eq!(interpret(source).exit_status, expected);
+    }
+}
+
+#[test]
+fn interpreter_while_false_falls_through() {
+    let output = interpret(
+        r#"function main(): int
 {
     while (false) {
+        return 0;
+    }
+
+    return 42;
+}
+"#,
+    );
+
+    assert_eq!(output.exit_status, 42);
+}
+
+#[test]
+fn interpreter_allows_finite_while_loops_beyond_the_old_fuel_limit() {
+    let source = r#"function main(): int
+{
+    let writable $i = 0;
+
+    while ($i < 5000) {
+        $i++;
+    }
+
+    return 0;
+}
+"#;
+    let output = interpret(source);
+
+    assert_eq!(output.exit_status, 0);
+    assert_eq!(debug_contents(source), "exit_status: 0\nstdout:\n");
+}
+
+#[test]
+fn debug_target_bounds_changing_state_while_loops() {
+    let diagnostics = doriac::compile_source(
+        "test.doria",
+        r#"function main(): void
+{
+    let writable $i = 0;
+
+    while (true) {
+        $i++;
+    }
+}
+"#,
+        BackendTarget::Debug,
+    )
+    .expect_err("debug execution should have bounded fuel");
+
+    assert_eq!(diagnostics[0].code, "M1102");
+    assert!(diagnostics[0]
+        .message
+        .contains("exhausted its bounded execution fuel"));
+}
+
+#[test]
+fn interpreter_rejects_non_terminating_source_while_loops() {
+    let program = lower(
+        r#"function main(): void
+{
+    while (true) {
     }
 }
 "#,
     );
 
-    assert_stage_11c_unsupported(&diagnostics, "loops");
+    let error = doriac::mir_interpreter::interpret(&program)
+        .expect_err("a deterministic source loop should repeat an interpreter state");
+    assert_eq!(
+        error.message,
+        "MIR interpreter detected a non-terminating control-flow cycle"
+    );
+}
+
+#[test]
+fn interpreter_preserves_stdout_across_while_iterations() {
+    let output = interpret(include_str!(
+        "../../../examples/debug/main_while_echo_xxx.doria"
+    ));
+
+    assert_eq!(output.exit_status, 0);
+    assert_eq!(output.stdout, b"xxx");
+}
+
+#[test]
+fn nested_break_exits_only_the_inner_while() {
+    let output = interpret(
+        r#"function main(): int
+{
+    let writable $outer = 0;
+    let writable $count = 0;
+
+    while ($outer < 3) {
+        let writable $inner = 0;
+
+        while ($inner < 3) {
+            $count++;
+            break;
+        }
+
+        $outer++;
+    }
+
+    return $count;
+}
+"#,
+    );
+
+    assert_eq!(output.exit_status, 3);
+}
+
+#[test]
+fn nested_continue_targets_only_the_inner_while() {
+    let output = interpret(
+        r#"function main(): int
+{
+    let writable $outer = 0;
+    let writable $count = 0;
+
+    while ($outer < 3) {
+        let writable $inner = 0;
+
+        while ($inner < 3) {
+            $inner++;
+
+            if ($inner < 3) {
+                continue;
+            }
+
+            $count++;
+        }
+
+        $outer++;
+    }
+
+    return $count;
+}
+"#,
+    );
+
+    assert_eq!(output.exit_status, 3);
+}
+
+#[test]
+fn rejects_break_and_continue_outside_while_in_mir_lowering() {
+    for (source, detail) in [
+        (
+            "function main(): void\n{\n    break;\n}\n",
+            "break requires an enclosing while loop",
+        ),
+        (
+            "function main(): void\n{\n    continue;\n}\n",
+            "continue requires an enclosing while loop",
+        ),
+    ] {
+        let diagnostics = unsupported_after_parsing(source);
+        assert_stage_11d_unsupported(&diagnostics, detail);
+    }
+}
+
+#[test]
+fn rejects_for_and_foreach_as_stage_11d_mir_coverage() {
+    let for_diagnostics = unsupported(include_str!("../../../examples/native/main_for_42.doria"));
+    assert_stage_11d_unsupported(&for_diagnostics, "for loops");
+
+    let foreach_diagnostics = unsupported(include_str!(
+        "../../../examples/native/main_foreach_range_45.doria"
+    ));
+    assert_stage_11d_unsupported(&foreach_diagnostics, "foreach loops");
+}
+
+#[test]
+fn debug_target_handles_stage_11d_examples() {
+    for (source, expected) in [
+        (
+            include_str!("../../../examples/debug/main_while_count_42.doria"),
+            "exit_status: 42\nstdout:\n",
+        ),
+        (
+            include_str!("../../../examples/debug/main_while_break_42.doria"),
+            "exit_status: 42\nstdout:\n",
+        ),
+        (
+            include_str!("../../../examples/debug/main_while_continue_6.doria"),
+            "exit_status: 6\nstdout:\n",
+        ),
+        (
+            include_str!("../../../examples/debug/main_while_echo_xxx.doria"),
+            "exit_status: 0\nstdout: xxx\n",
+        ),
+        (
+            include_str!("../../../examples/debug/main_while_return_42.doria"),
+            "exit_status: 42\nstdout:\n",
+        ),
+        (
+            include_str!("../../../examples/debug/main_while_nested_6.doria"),
+            "exit_status: 6\nstdout:\n",
+        ),
+    ] {
+        assert_eq!(debug_contents(source), expected);
+    }
+}
+
+#[test]
+fn mirrors_native_smoke_exit_for_stage_11d_while_shapes_without_linker() {
+    for source in [
+        include_str!("../../../examples/debug/main_while_count_42.doria"),
+        include_str!("../../../examples/debug/main_while_break_42.doria"),
+    ] {
+        let hir = doriac::lower_source("test.doria", source).expect("source should lower to HIR");
+        let native_exit = doriac::codegen_native::validate_stage_2d(&hir)
+            .expect("native smoke validator should already accept this source");
+        let mir_exit = interpret(source).exit_status;
+
+        assert_eq!(native_exit, 42);
+        assert_eq!(mir_exit, native_exit);
+    }
 }
 
 #[test]

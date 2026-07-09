@@ -1,0 +1,10 @@
+function main(): int
+{
+    let writable $i = 0;
+
+    while ($i < 42) {
+        $i++;
+    }
+
+    return $i;
+}

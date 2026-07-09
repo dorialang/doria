@@ -1,0 +1,14 @@
+function main(): int
+{
+    let writable $i = 0;
+
+    while (true) {
+        $i++;
+
+        if ($i == 42) {
+            break;
+        }
+    }
+
+    return $i;
+}

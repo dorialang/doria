@@ -8,7 +8,7 @@ Stage 11 introduces MIR as Doria native-oriented, control-flow-oriented compiler
 
 Stage 11 also introduces a MIR interpreter as the debug and semantic-oracle path. The interpreter is intended to validate Doria-visible behavior without relying on PHP, Cranelift, LLVM, or host linker behavior.
 
-Stage 11 eventually retires NativeSmokeModule. Stage 11a seeded the MIR architecture and interpreter for a tiny executable subset, Stage 11b expanded that seed to integer expressions and integer local slots, and Stage 11c adds condition evaluation and structured `if` control flow. NativeSmokeModule remains temporary in Stage 11c and must not receive new language capability expansion.
+Stage 11 eventually retires NativeSmokeModule. Stage 11a seeded the MIR architecture and interpreter for a tiny executable subset, Stage 11b expanded that seed to integer expressions and integer local slots, Stage 11c added condition evaluation and structured `if` control flow, and Stage 11d adds structured `while` loops and loop control. NativeSmokeModule remains temporary in Stage 11d and must not receive new language capability expansion.
 
 ## Stage 11a scope
 
@@ -96,8 +96,51 @@ Stage 11c does not add:
 - LLVM
 - Baton
 
+## Stage 11d scope
+
+Stage 11d expands MIR and the MIR interpreter to structured `while` loops and loop control.
+
+Stage 11d supports:
+
+- `while` lowering through the existing backend-independent MIR branch and jump terminators.
+- Reuse of Stage 11c typed condition evaluation for loop conditions.
+- Explicit loop header, body, and exit basic blocks.
+- Body fallthrough and `continue` jumps to the current loop header.
+- `break` jumps to the current loop exit.
+- An explicit loop-target stack so nested loops select the innermost `break` and `continue` targets.
+- Nested `while` loops and loop-body-local int declarations.
+- Stage 11b int local assignment and mutation inside loops.
+- Stage 11c `if` / `else if` / `else` inside loops.
+- Early return from inside loops.
+- Exact string-literal `echo` inside loops of `main(): void`.
+- Interpreter execution and debug-target artifacts for the Stage 11d subset.
+- Finite loop execution under a bounded interpreter budget of 100,000 executed basic blocks. Exact-state cycle detection rejects deterministic cycles earlier when the interpreter revisits the same basic block with the same integer-local state, while the execution budget also bounds changing-state loops.
+
+MIR does not gain a high-level loop node. `while` is structured source syntax lowered into the same basic-block control-flow primitives that future backends consume.
+
+Unsupported Doria constructs in Stage 11d must be rejected as unsupported MIR Stage 11d coverage, not reclassified as invalid Doria.
+
+## Stage 11d non-goals
+
+Stage 11d does not add:
+
+- `for`
+- `foreach`
+- range or collection iteration
+- labeled or numeric `break` / `continue`
+- function calls or helper functions
+- recursion
+- runtime strings or string locals
+- classes, objects, or collections in MIR
+- ownership or borrow checking
+- doria-rt
+- deletion of NativeSmokeModule
+- replacement of Cranelift lowering
+- LLVM
+- Baton
+
 ## Consequences
 
 NativeSmokeModule remains temporary implementation-private bootstrap infrastructure for current native smoke coverage. It must not receive new language capability expansion unless an explicit later task approves a temporary compatibility fix.
 
-MIR is the place to grow future native control-flow, interpreter, ownership, borrow-checking, and backend-lowering work. Stage 11c establishes basic-block control flow and condition execution, but Stage 11 is still incomplete. Loops, function calls, the full Stage <=10 MIR port, Cranelift-over-MIR lowering, and NativeSmokeModule retirement remain future work.
+MIR is the place to grow future native control-flow, interpreter, ownership, borrow-checking, and backend-lowering work. Stage 11d proves that the Stage 11c CFG model can represent backward edges and nested loop control without loop-specific MIR nodes, but Stage 11 is still incomplete. `for`, `foreach`, function calls, the full Stage <=10 MIR port, Cranelift-over-MIR lowering, and NativeSmokeModule retirement remain future work.

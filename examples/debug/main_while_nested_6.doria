@@ -1,0 +1,18 @@
+function main(): int
+{
+    let writable $outer = 0;
+    let writable $count = 0;
+
+    while ($outer < 3) {
+        let writable $inner = 0;
+
+        while ($inner < 2) {
+            $count++;
+            $inner++;
+        }
+
+        $outer++;
+    }
+
+    return $count;
+}

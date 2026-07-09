@@ -1,0 +1,11 @@
+function main(): void
+{
+    let writable $i = 0;
+
+    while ($i < 3) {
+        echo "x";
+        $i++;
+    }
+
+    return;
+}
