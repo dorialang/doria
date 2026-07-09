@@ -494,12 +494,8 @@ impl<'program> Checker<'program> {
             );
         }
 
-        self.infer_mixed_return_from_statements(
-            &function.body.statements,
-            &mut scopes,
-            method_context,
-        )
-        .unwrap_or_else(|| self.types.unknown())
+        self.infer_mixed_return_from_block(&function.body, &mut scopes, method_context)
+            .unwrap_or_else(|| self.types.unknown())
     }
 
     fn infer_mixed_return_from_statements(
@@ -705,11 +701,19 @@ impl<'program> Checker<'program> {
             return;
         }
 
-        if let Expr::Variable { name, .. } = &assignment.target {
+        if let Some(name) = Self::assignment_target_variable_name(&assignment.target) {
             let ty = self.infer_expr_type(&assignment.value, scopes, method_context);
             if let Some(binding) = scopes.lookup_mut(name) {
                 binding.ty = self.merge_inferred_binding_type(binding.ty, ty);
             }
+        }
+    }
+
+    fn assignment_target_variable_name(target: &Expr) -> Option<&str> {
+        match target {
+            Expr::Grouped { expr, .. } => Self::assignment_target_variable_name(expr),
+            Expr::Variable { name, .. } => Some(name),
+            _ => None,
         }
     }
 
@@ -3676,6 +3680,9 @@ impl<'program> Checker<'program> {
 
         if let Some(common) = common {
             if saw_empty_collection && !self.is_collection_like_type(common) {
+                if saw_mixed {
+                    return self.types.intern(TypeKind::Mixed);
+                }
                 return self.types.intern(TypeKind::Heterogeneous);
             }
             common

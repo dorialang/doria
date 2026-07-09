@@ -3816,3 +3816,48 @@ Int $value = new Int();
     )
     .expect("semantic check should succeed");
 }
+
+#[test]
+fn tracks_mixed_return_through_grouped_assignment_targets() {
+    assert_type_mismatch(
+        r#"
+function leak(mixed $payload)
+{
+    let writable $items = [];
+    ($items) = [$payload];
+    return $items;
+}
+
+List<int> $items = leak("x");
+"#,
+    );
+}
+
+#[test]
+fn preserves_mixed_with_empty_collection_literals_in_return_inference() {
+    assert_type_mismatch(
+        r#"
+function leak(mixed $payload)
+{
+    return [$payload, []];
+}
+
+List<int> $items = leak("x");
+"#,
+    );
+}
+
+#[test]
+fn allows_body_locals_to_shadow_params_during_mixed_return_inference() {
+    assert_type_mismatch(
+        r#"
+function leak(int $value, mixed $payload)
+{
+    let $value = $payload;
+    return $value;
+}
+
+string $value = leak(0, 1);
+"#,
+    );
+}
