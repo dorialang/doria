@@ -16,22 +16,22 @@ fn interpret(source: &str) -> doriac::mir_interpreter::InterpreterOutput {
 
 fn unsupported(source: &str) -> Vec<doriac::diagnostics::Diagnostic> {
     doriac::lower_source_to_mir("test.doria", source)
-        .expect_err("source should be outside Stage 11d MIR coverage")
+        .expect_err("source should be outside Stage 11e MIR coverage")
 }
 
 fn unsupported_after_parsing(source: &str) -> Vec<doriac::diagnostics::Diagnostic> {
     let ast = doriac::parse_source("test.doria", source).expect("source should parse");
     let hir = doriac::lowering::lower_program(&ast);
     doriac::mir_lowering::lower_program(&hir)
-        .expect_err("HIR should be outside Stage 11d MIR coverage")
+        .expect_err("HIR should be outside Stage 11e MIR coverage")
 }
 
-fn assert_stage_11d_unsupported(diagnostics: &[doriac::diagnostics::Diagnostic], detail: &str) {
+fn assert_stage_11e_unsupported(diagnostics: &[doriac::diagnostics::Diagnostic], detail: &str) {
     assert_eq!(diagnostics[0].code, "M1101");
     assert!(
         diagnostics[0]
             .message
-            .contains("unsupported MIR Stage 11d coverage"),
+            .contains("unsupported MIR Stage 11e coverage"),
         "unexpected diagnostic: {}",
         diagnostics[0].message
     );
@@ -855,7 +855,7 @@ fn rejects_unsupported_division_as_mir_coverage() {
 "#,
     );
 
-    assert_stage_11d_unsupported(&diagnostics, "division and modulo");
+    assert_stage_11e_unsupported(&diagnostics, "division and modulo");
 }
 
 #[test]
@@ -868,7 +868,7 @@ fn rejects_comparison_result_as_runtime_value() {
 "#,
     );
 
-    assert_stage_11d_unsupported(&diagnostics, "condition-only");
+    assert_stage_11e_unsupported(&diagnostics, "condition-only");
 }
 
 #[test]
@@ -882,7 +882,7 @@ fn rejects_unsupported_string_local_as_mir_coverage() {
 "#,
     );
 
-    assert_stage_11d_unsupported(&diagnostics, "string locals");
+    assert_stage_11e_unsupported(&diagnostics, "string locals");
 }
 
 #[test]
@@ -895,7 +895,7 @@ fn rejects_unsupported_string_concat_echo_as_mir_coverage() {
 "#,
     );
 
-    assert_stage_11d_unsupported(&diagnostics, "string concatenation");
+    assert_stage_11e_unsupported(&diagnostics, "string concatenation");
 }
 
 #[test]
@@ -913,7 +913,7 @@ function main(): int
 "#,
     );
 
-    assert_stage_11d_unsupported(&diagnostics, "no helper functions");
+    assert_stage_11e_unsupported(&diagnostics, "no helper functions");
 }
 
 #[test]
@@ -1365,7 +1365,7 @@ fn rejects_truthiness_and_calls_as_stage_11c_conditions() {
 }
 "#,
     );
-    assert_stage_11d_unsupported(&truthiness, "truthiness");
+    assert_stage_11e_unsupported(&truthiness, "truthiness");
 
     let call = unsupported_after_parsing(
         r#"function main(): int
@@ -1378,7 +1378,7 @@ fn rejects_truthiness_and_calls_as_stage_11c_conditions() {
 }
 "#,
     );
-    assert_stage_11d_unsupported(&call, "calls in conditions");
+    assert_stage_11e_unsupported(&call, "calls in conditions");
 }
 
 #[test]
@@ -1665,31 +1665,20 @@ fn nested_continue_targets_only_the_inner_while() {
 }
 
 #[test]
-fn rejects_break_and_continue_outside_while_in_mir_lowering() {
+fn rejects_break_and_continue_outside_loops_in_mir_lowering() {
     for (source, detail) in [
         (
             "function main(): void\n{\n    break;\n}\n",
-            "break requires an enclosing while loop",
+            "break requires an enclosing loop",
         ),
         (
             "function main(): void\n{\n    continue;\n}\n",
-            "continue requires an enclosing while loop",
+            "continue requires an enclosing loop",
         ),
     ] {
         let diagnostics = unsupported_after_parsing(source);
-        assert_stage_11d_unsupported(&diagnostics, detail);
+        assert_stage_11e_unsupported(&diagnostics, detail);
     }
-}
-
-#[test]
-fn rejects_for_and_foreach_as_stage_11d_mir_coverage() {
-    let for_diagnostics = unsupported(include_str!("../../../examples/native/main_for_42.doria"));
-    assert_stage_11d_unsupported(&for_diagnostics, "for loops");
-
-    let foreach_diagnostics = unsupported(include_str!(
-        "../../../examples/native/main_foreach_range_45.doria"
-    ));
-    assert_stage_11d_unsupported(&foreach_diagnostics, "foreach loops");
 }
 
 #[test]
@@ -1835,4 +1824,581 @@ fn mirrors_native_smoke_exit_for_stage_11a_literal_shapes_without_linker() {
         assert_eq!(native_exit, expected);
         assert_eq!(mir_exit, native_exit);
     }
+}
+
+#[test]
+fn lowers_for_to_initializer_header_body_increment_and_exit_blocks() {
+    let program = lower(include_str!(
+        "../../../examples/debug/main_for_count_10.doria"
+    ));
+    let function = &program.functions[0];
+    let blocks = &function.blocks;
+
+    assert_eq!(blocks.len(), 5);
+    assert_eq!(
+        blocks[0].statements,
+        vec![
+            Statement::AssignLocal {
+                target: LocalId(0),
+                value: Rvalue::Use(Operand::Int(0)),
+            },
+            Statement::AssignLocal {
+                target: LocalId(1),
+                value: Rvalue::Use(Operand::Int(0)),
+            },
+        ]
+    );
+    assert_eq!(blocks[0].terminator, Terminator::Jump(BlockId(1)));
+    assert_eq!(
+        blocks[1].terminator,
+        Terminator::Branch {
+            condition: Condition::Compare {
+                op: CompareOp::Less,
+                left: IntExpression::Use(Operand::Local(LocalId(1))),
+                right: IntExpression::Use(Operand::Int(10)),
+            },
+            then_block: BlockId(2),
+            else_block: BlockId(4),
+        }
+    );
+    assert_eq!(
+        blocks[2].statements,
+        vec![Statement::AssignLocal {
+            target: LocalId(0),
+            value: Rvalue::Binary {
+                op: BinaryOp::Add,
+                left: Operand::Local(LocalId(0)),
+                right: Operand::Int(1),
+            },
+        }]
+    );
+    assert_eq!(blocks[2].terminator, Terminator::Jump(BlockId(3)));
+    assert_eq!(
+        blocks[3].statements,
+        vec![Statement::AssignLocal {
+            target: LocalId(1),
+            value: Rvalue::Binary {
+                op: BinaryOp::Add,
+                left: Operand::Local(LocalId(1)),
+                right: Operand::Int(1),
+            },
+        }]
+    );
+    assert_eq!(blocks[3].terminator, Terminator::Jump(BlockId(1)));
+    assert_eq!(
+        blocks[4].terminator,
+        Terminator::Return(Operand::Local(LocalId(0)))
+    );
+}
+
+#[test]
+fn lowers_exclusive_range_foreach_to_counter_binding_update_and_exit_blocks() {
+    let program = lower(include_str!(
+        "../../../examples/debug/main_foreach_range_exclusive_10.doria"
+    ));
+    let function = &program.functions[0];
+    let blocks = &function.blocks;
+
+    assert_eq!(function.locals.len(), 4);
+    assert!(function.locals[1].synthetic);
+    assert!(function.locals[1].writable);
+    assert!(function.locals[2].synthetic);
+    assert!(!function.locals[2].writable);
+    assert_eq!(function.locals[3].name, "i");
+    assert!(!function.locals[3].synthetic);
+    assert!(!function.locals[3].writable);
+    assert_eq!(blocks.len(), 5);
+    assert_eq!(
+        blocks[1].terminator,
+        Terminator::Branch {
+            condition: Condition::Compare {
+                op: CompareOp::Less,
+                left: IntExpression::Use(Operand::Local(LocalId(1))),
+                right: IntExpression::Use(Operand::Local(LocalId(2))),
+            },
+            then_block: BlockId(2),
+            else_block: BlockId(4),
+        }
+    );
+    assert_eq!(
+        blocks[2].statements[0],
+        Statement::AssignLocal {
+            target: LocalId(3),
+            value: Rvalue::Use(Operand::Local(LocalId(1))),
+        }
+    );
+    assert_eq!(blocks[2].terminator, Terminator::Jump(BlockId(3)));
+    assert_eq!(
+        blocks[3].statements,
+        vec![Statement::AssignLocal {
+            target: LocalId(1),
+            value: Rvalue::Binary {
+                op: BinaryOp::Add,
+                left: Operand::Local(LocalId(1)),
+                right: Operand::Int(1),
+            },
+        }]
+    );
+    assert_eq!(blocks[3].terminator, Terminator::Jump(BlockId(1)));
+}
+
+#[test]
+fn lowers_inclusive_range_foreach_with_terminal_guard() {
+    let program = lower(include_str!(
+        "../../../examples/debug/main_foreach_range_inclusive_11.doria"
+    ));
+    let blocks = &program.functions[0].blocks;
+
+    assert_eq!(blocks.len(), 6);
+    assert_eq!(
+        blocks[1].terminator,
+        Terminator::Branch {
+            condition: Condition::Compare {
+                op: CompareOp::LessEqual,
+                left: IntExpression::Use(Operand::Local(LocalId(1))),
+                right: IntExpression::Use(Operand::Local(LocalId(2))),
+            },
+            then_block: BlockId(2),
+            else_block: BlockId(5),
+        }
+    );
+    assert_eq!(
+        blocks[3].terminator,
+        Terminator::Branch {
+            condition: Condition::Compare {
+                op: CompareOp::Equal,
+                left: IntExpression::Use(Operand::Local(LocalId(1))),
+                right: IntExpression::Use(Operand::Local(LocalId(2))),
+            },
+            then_block: BlockId(5),
+            else_block: BlockId(4),
+        }
+    );
+    assert_eq!(blocks[4].terminator, Terminator::Jump(BlockId(1)));
+    assert_eq!(
+        interpret(include_str!(
+            "../../../examples/debug/main_foreach_range_inclusive_11.doria"
+        ))
+        .exit_status,
+        11
+    );
+}
+
+#[test]
+fn for_and_range_foreach_route_continue_and_break_to_loop_specific_targets() {
+    let for_continue = lower(include_str!(
+        "../../../examples/debug/main_for_continue_6.doria"
+    ));
+    assert_eq!(
+        for_continue.functions[0].blocks[5].terminator,
+        Terminator::Jump(BlockId(3))
+    );
+
+    let for_break = lower(include_str!(
+        "../../../examples/debug/main_for_break_5.doria"
+    ));
+    assert_eq!(
+        for_break.functions[0].blocks[5].terminator,
+        Terminator::Jump(BlockId(4))
+    );
+
+    let foreach_continue = lower(include_str!(
+        "../../../examples/debug/main_foreach_range_continue_6.doria"
+    ));
+    assert_eq!(
+        foreach_continue.functions[0].blocks[5].terminator,
+        Terminator::Jump(BlockId(3))
+    );
+
+    let foreach_break = lower(include_str!(
+        "../../../examples/debug/main_foreach_range_break_5.doria"
+    ));
+    assert_eq!(
+        foreach_break.functions[0].blocks[5].terminator,
+        Terminator::Jump(BlockId(4))
+    );
+}
+
+#[test]
+fn lowers_early_return_inside_for() {
+    let program = lower(
+        r#"function main(): int
+{
+    for (let writable $i = 0; $i < 10; $i++) {
+        return 42;
+    }
+
+    return 0;
+}
+"#,
+    );
+
+    assert!(program.functions[0]
+        .blocks
+        .iter()
+        .any(|block| block.terminator == Terminator::Return(Operand::Int(42))));
+    assert_eq!(
+        doriac::mir_interpreter::interpret(&program)
+            .expect("early return should interpret")
+            .exit_status,
+        42
+    );
+}
+
+#[test]
+fn interprets_for_assignment_and_omitted_increment_forms() {
+    for source in [
+        r#"function main(): int
+{
+    let writable $i = 99;
+    let writable $count = 0;
+
+    for ($i = 0; $i < 3; $i += 1) {
+        $count++;
+    }
+
+    return $count;
+}
+"#,
+        r#"function main(): int
+{
+    let writable $i = 0;
+
+    for (; $i < 3;) {
+        $i++;
+    }
+
+    return $i;
+}
+"#,
+    ] {
+        assert_eq!(interpret(source).exit_status, 3);
+    }
+}
+
+#[test]
+fn for_initializers_and_foreach_bindings_preserve_shadowed_outer_locals() {
+    let output = interpret(
+        r#"function main(): int
+{
+    let writable $i = 5;
+
+    for (let writable $i = 0; $i < 2; $i++) {
+    }
+
+    foreach (0..<2 as $i) {
+    }
+
+    return $i;
+}
+"#,
+    );
+
+    assert_eq!(output.exit_status, 5);
+}
+
+#[test]
+fn interprets_grouped_range_with_stage_11b_expression_bounds() {
+    let output = interpret(
+        r#"function main(): int
+{
+    let $start = 1;
+    let $end = 4;
+    let writable $count = 0;
+
+    foreach (($start - 1)..<($end + 1) as $i) {
+        $count++;
+    }
+
+    return $count;
+}
+"#,
+    );
+
+    assert_eq!(output.exit_status, 5);
+}
+
+#[test]
+fn inclusive_range_stops_before_incrementing_past_int64_max() {
+    let output = interpret(
+        r#"function main(): int
+{
+    let writable $count = 0;
+
+    foreach (9223372036854775807..9223372036854775807 as $i) {
+        $count++;
+    }
+
+    return $count;
+}
+"#,
+    );
+
+    assert_eq!(output.exit_status, 1);
+}
+
+#[test]
+fn inclusive_range_continue_stops_before_incrementing_past_int64_max() {
+    let output = interpret(
+        r#"function main(): int
+{
+    let writable $count = 0;
+
+    foreach (9223372036854775807..9223372036854775807 as $i) {
+        $count++;
+        continue;
+    }
+
+    return $count;
+}
+"#,
+    );
+
+    assert_eq!(output.exit_status, 1);
+}
+
+#[test]
+fn mixed_nested_loops_use_innermost_break_and_continue_targets() {
+    let output = interpret(
+        r#"function main(): int
+{
+    let writable $count = 0;
+    let writable $outer = 0;
+
+    while ($outer < 2) {
+        for (let writable $inner = 0; $inner < 2; $inner++) {
+            foreach (0..<3 as $item) {
+                if ($item < 2) {
+                    continue;
+                }
+
+                $count++;
+                break;
+            }
+        }
+
+        $outer++;
+    }
+
+    return $count;
+}
+"#,
+    );
+
+    assert_eq!(output.exit_status, 4);
+}
+
+#[test]
+fn interpreter_preserves_stdout_across_for_and_foreach_iterations() {
+    let output = interpret(
+        r#"function main(): void
+{
+    for (let writable $i = 0; $i < 3; $i++) {
+        echo "x";
+    }
+
+    foreach (0..<2 as $i) {
+        echo "y";
+    }
+}
+"#,
+    );
+
+    assert_eq!(output.exit_status, 0);
+    assert_eq!(output.stdout, b"xxxyy");
+}
+
+#[test]
+fn interprets_stage_11e_for_and_range_foreach_examples() {
+    for (source, expected) in [
+        (
+            include_str!("../../../examples/debug/main_for_count_10.doria"),
+            10,
+        ),
+        (
+            include_str!("../../../examples/debug/main_for_continue_6.doria"),
+            6,
+        ),
+        (
+            include_str!("../../../examples/debug/main_for_break_5.doria"),
+            5,
+        ),
+        (
+            include_str!("../../../examples/debug/main_foreach_range_exclusive_10.doria"),
+            10,
+        ),
+        (
+            include_str!("../../../examples/debug/main_foreach_range_inclusive_11.doria"),
+            11,
+        ),
+        (
+            include_str!("../../../examples/debug/main_foreach_range_break_5.doria"),
+            5,
+        ),
+        (
+            include_str!("../../../examples/debug/main_foreach_range_continue_6.doria"),
+            6,
+        ),
+        (
+            include_str!("../../../examples/debug/main_nested_loop_mix_6.doria"),
+            6,
+        ),
+    ] {
+        assert_eq!(interpret(source).exit_status, expected);
+    }
+}
+
+#[test]
+fn lowers_early_return_inside_range_foreach() {
+    let output = interpret(
+        r#"function main(): int
+{
+    foreach (0..<10 as $i) {
+        if ($i == 3) {
+            return $i;
+        }
+    }
+
+    return 0;
+}
+"#,
+    );
+
+    assert_eq!(output.exit_status, 3);
+}
+
+#[test]
+fn rejects_unsupported_stage_11e_foreach_shapes() {
+    let collection = unsupported_after_parsing(
+        r#"function main(): void
+{
+    foreach ($items as $item) {
+    }
+}
+"#,
+    );
+    assert_stage_11e_unsupported(&collection, "collection and general iterable foreach");
+
+    let key_value = unsupported_after_parsing(
+        r#"function main(): void
+{
+    foreach (0..<10 as $key => $value) {
+    }
+}
+"#,
+    );
+    assert_stage_11e_unsupported(&key_value, "key bindings");
+
+    let call_bound = unsupported_after_parsing(
+        r#"function main(): void
+{
+    foreach (0..<limit() as $value) {
+    }
+}
+"#,
+    );
+    assert_stage_11e_unsupported(&call_bound, "function calls");
+}
+
+#[test]
+fn debug_target_handles_stage_11e_examples() {
+    for (source, expected) in [
+        (
+            include_str!("../../../examples/debug/main_for_count_10.doria"),
+            "exit_status: 10\nstdout:\n",
+        ),
+        (
+            include_str!("../../../examples/debug/main_for_continue_6.doria"),
+            "exit_status: 6\nstdout:\n",
+        ),
+        (
+            include_str!("../../../examples/debug/main_for_break_5.doria"),
+            "exit_status: 5\nstdout:\n",
+        ),
+        (
+            include_str!("../../../examples/debug/main_foreach_range_exclusive_10.doria"),
+            "exit_status: 10\nstdout:\n",
+        ),
+        (
+            include_str!("../../../examples/debug/main_foreach_range_inclusive_11.doria"),
+            "exit_status: 11\nstdout:\n",
+        ),
+        (
+            include_str!("../../../examples/debug/main_foreach_range_break_5.doria"),
+            "exit_status: 5\nstdout:\n",
+        ),
+        (
+            include_str!("../../../examples/debug/main_foreach_range_continue_6.doria"),
+            "exit_status: 6\nstdout:\n",
+        ),
+        (
+            include_str!("../../../examples/debug/main_nested_loop_mix_6.doria"),
+            "exit_status: 6\nstdout:\n",
+        ),
+    ] {
+        assert_eq!(debug_contents(source), expected);
+    }
+}
+
+#[test]
+fn mirrors_native_smoke_exit_for_stage_11e_loop_shapes_without_linker() {
+    for (source, expected) in [
+        (
+            include_str!("../../../examples/debug/main_for_count_10.doria"),
+            10,
+        ),
+        (
+            include_str!("../../../examples/debug/main_foreach_range_exclusive_10.doria"),
+            10,
+        ),
+        (
+            include_str!("../../../examples/debug/main_foreach_range_inclusive_11.doria"),
+            11,
+        ),
+    ] {
+        let hir = doriac::lower_source("test.doria", source).expect("source should lower to HIR");
+        let native_exit = doriac::codegen_native::validate_stage_2d(&hir)
+            .expect("native smoke validator should already accept this source");
+        let mir_exit = interpret(source).exit_status;
+
+        assert_eq!(native_exit, expected);
+        assert_eq!(mir_exit, native_exit);
+    }
+}
+
+#[test]
+fn debug_target_bounds_changing_state_infinite_for_loops() {
+    let diagnostics = doriac::compile_source(
+        "test.doria",
+        r#"function main(): void
+{
+    for (let writable $i = 0;; $i++) {
+    }
+}
+"#,
+        BackendTarget::Debug,
+    )
+    .expect_err("debug execution should bound an infinite for loop");
+
+    assert_eq!(diagnostics[0].code, "M1102");
+    assert!(diagnostics[0]
+        .message
+        .contains("exhausted its bounded execution fuel"));
+}
+
+#[test]
+fn range_foreach_binding_remains_readonly_before_mir_lowering() {
+    let diagnostics = doriac::lower_source_to_mir(
+        "test.doria",
+        r#"function main(): void
+{
+    foreach (0..<10 as $i) {
+        $i++;
+    }
+}
+"#,
+    )
+    .expect_err("semantic checking should reject mutation of a foreach binding");
+
+    assert_eq!(diagnostics[0].code, "E0201");
 }

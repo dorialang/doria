@@ -66,7 +66,7 @@ Valid PHP should be easy to migrate to Doria, but Doria-specific syntax does not
 
 Doria does not use `public`, `protected`, or `private` as member visibility modifiers. Class members are externally accessible by default, and `internal` marks implementation details.
 
-The current compiler implementation produces Stage 10 native smoke executables for top-level free functions plus exactly one top-level `function main(): int` or `function main(): void`. `main(): int` returns an explicit process status in the accepted `0..125` portable exit-code range. `main(): void` may fall through or use `return;` and exits successfully with status `0`. Non-`main` helper functions may return `int` or `void`; Stage 10 native parameters are `int` only. The supported native source subset includes Stage 9 readonly and writable integer locals, writable integer assignment, standalone integer `++` / `--`, `+`/`-`/`*` arithmetic, structured returning and fallthrough `if`, bounded/proven `while`, traditional `for`, integer range `foreach`, unlabeled `break` and `continue`, accepted boolean conditions, exact string-literal `echo` stdout, readonly string locals initialized from supported compile-time-known string expressions, `.` string concatenation, supported string `echo` expressions, calls to `int` helpers in supported integer expressions, and calls to `void` helpers in statement position. Native validation rejects recursion, mutual recursion, unsupported native function signatures such as string parameters or string returns, and broader runtime features. It is not yet full native code generation, a package manager, reflection system, macro system, async runtime, PHP migration converter, or full standard library. That implementation status does not make PHP transpilation the language goal. Future implementation order follows docs/doria-end-to-end-plan.md; Stage 11 is MIR + interpreter oracle and retires NativeSmokeModule rather than expanding it. Stage 11d expands MIR inspection and the debug interpreter to structured `while` loops, nested `break` and `continue`, integer mutation, Stage 11c conditions and `if` control flow inside loops, early return, and exact string-literal echo in void loops. MIR `for`, `foreach`, function calls, classes, runtime strings, user-authored bool runtime locals, ownership/borrow checking, doria-rt, LLVM, NativeSmokeModule deletion, and the full Stage <=10 MIR port remain future work.
+The current compiler implementation produces Stage 10 native smoke executables for top-level free functions plus exactly one top-level `function main(): int` or `function main(): void`. `main(): int` returns an explicit process status in the accepted `0..125` portable exit-code range. `main(): void` may fall through or use `return;` and exits successfully with status `0`. Non-`main` helper functions may return `int` or `void`; Stage 10 native parameters are `int` only. The supported native source subset includes Stage 9 readonly and writable integer locals, writable integer assignment, standalone integer `++` / `--`, `+`/`-`/`*` arithmetic, structured returning and fallthrough `if`, bounded/proven `while`, traditional `for`, integer range `foreach`, unlabeled `break` and `continue`, accepted boolean conditions, exact string-literal `echo` stdout, readonly string locals initialized from supported compile-time-known string expressions, `.` string concatenation, supported string `echo` expressions, calls to `int` helpers in supported integer expressions, and calls to `void` helpers in statement position. Native validation rejects recursion, mutual recursion, unsupported native function signatures such as string parameters or string returns, and broader runtime features. It is not yet full native code generation, a package manager, reflection system, macro system, async runtime, PHP migration converter, or full standard library. That implementation status does not make PHP transpilation the language goal. Future implementation order follows docs/doria-end-to-end-plan.md; Stage 11 is MIR + interpreter oracle and retires NativeSmokeModule rather than expanding it. Stage 11e expands MIR inspection and the debug interpreter to structured `while`, traditional `for`, and integer range `foreach`, with nested `break` / `continue`, integer mutation, Stage 11c conditions and `if` control flow inside loops, early return, and exact string-literal echo in void loops. Collection iteration, user-defined iterators, MIR function calls, classes, runtime strings, user-authored bool runtime locals, ownership/borrow checking, doria-rt, LLVM, NativeSmokeModule deletion, and the full Stage <=10 MIR port remain future work.
 
 Doria is not a Rust language. Rust is the current bootstrap implementation language for `doriac`, not the permanent identity of the compiler.
 
@@ -355,6 +355,29 @@ If a data-returning operation must be a method because it performs I/O, expensiv
 
 See `docs/api-design-guidelines.md` for the detailed design notes.
 
+### Naming charter
+
+Doria chooses casing by API category, not by whether an implementation is built into the language:
+
+- Built-in free functions use `snake_case`, such as `get_time()` and `str_starts_with()`.
+- Userland free functions, instance methods, static methods, companion/type APIs, properties, parameters, and named arguments use `camelCase`.
+- Classes, interfaces, traits, enums, and enum cases use `PascalCase`.
+- Constants use `SCREAMING_SNAKE_CASE`.
+- Type parameters use single Pascal capitals such as `T`, `K`, and `V`.
+- PHP-shaped magic methods retain their inherited spellings: `__construct` and `__destruct`.
+
+Free-function casing and member/companion casing are intentionally different:
+
+```doria
+let $now = get_time();
+let $matches = str_starts_with($name, "Dor");
+let $wrapped = Int::wrappingAdd(1, 2);
+let $empty = $s->isEmpty();
+let $tenant = $message->tenantId;
+$message->retryAfter(seconds: 30);
+let $person = $repository->findById($id);
+```
+
 ## 7. Basic type system
 
 Accepted type-position names include:
@@ -419,7 +442,7 @@ mixed $payload = Json::decode($line);
 
 let $label = match ($payload) {
     string $value => $value,
-    int $value => Int::to_string($value),
+    int $value => Int::toString($value),
     default => "unknown",
 };
 ```
@@ -844,7 +867,7 @@ Doria IR is the checked compiler-owned representation of a Doria program. After 
 
 As native code generation matures, Doria IR may lower into a simpler native-oriented IR for control flow, memory layout, runtime calls, and backend code generation.
 
-The current Stage 11d MIR is that growing native-oriented, backend-independent control-flow representation for a narrow subset. It contains basic blocks, branch and jump terminators, typed bool condition trees, integer comparison operands, and the Stage 11b integer local slots. The debug target interprets this MIR directly. Stage 11d supports Stage 11c `if` control flow plus structured and nested `while`, innermost-loop `break` and `continue`, loop-local integer declarations, integer mutation, early return, and exact string-literal `echo` in `main(): void`. Source-level `while` lowers to ordinary branch and jump blocks rather than a loop-specific MIR node. Stage 11d does not introduce truthiness, user-authored bool runtime locals, MIR `for`, `foreach`, function calls, runtime strings, classes, ownership/borrow checking, doria-rt, LLVM, or complete Stage 11 coverage.
+The current Stage 11e MIR is that growing native-oriented, backend-independent control-flow representation for a narrow subset. It contains basic blocks, branch and jump terminators, typed bool condition trees, integer comparison operands, and the Stage 11b integer local slots. The debug target interprets this MIR directly. Stage 11e supports Stage 11c `if` control flow plus structured `while`, traditional `for`, integer range `foreach`, innermost-loop `break` and `continue`, mixed nested loops, loop-local integer declarations, integer mutation, early return, and exact string-literal `echo` in `main(): void`. Source-level loops lower to ordinary branch and jump blocks rather than loop-specific MIR nodes. Stage 11e does not introduce truthiness, user-authored bool runtime locals, collection iteration, user-defined iterators, function calls, runtime strings, classes, ownership/borrow checking, doria-rt, LLVM, or complete Stage 11 coverage.
 
 The native backend is the primary target. It should lower Doria IR, and any later native-oriented IR, toward native machine code and standalone executables. The current Cranelift-backed Stage 10 native backend is deliberately limited to top-level free functions and exactly one top-level `function main(): int` or `function main(): void`. `main(): int` returns an explicit process status in the portable `0..125` range, which is a process boundary rather than the Doria `int` range. `main(): void` may fall through or use `return;` and maps normal completion to successful process status `0`. Non-`main` helpers may use `int` parameters and `int` or `void` returns; helper `int` returns are Doria `int` values, not process statuses. The supported source subset includes Stage 9 integer/control-flow/string support plus calls to supported `int` helpers in integer expressions and supported `void` helpers in statement position. Stage 10 validates supported function bodies, argument counts and types, recursion absence, loop termination, loop-body scoping, fallthrough branch state merging, loop control, checked integer arithmetic, range binding scope, and compile-time-known readonly string-local and string-concat use before native lowering, then emits real Cranelift functions, calls, control flow, and exact stdout byte writes. Stage 7a separated native smoke validation, compile-time smoke evaluation/proof, and Cranelift lowering behind a private `NativeSmokeModule` boundary. That module is not public Doria IR, final MIR, a stable ABI, or a permanent local storage model. The native loop verification cap is a backend support limit, not Doria language semantics. The backend emits unsupported-feature diagnostics for recursion, mutual recursion, string parameters or string returns in native, general loops beyond the bounded/proven Stage 9 shape, nested loops, returns inside loops, `return` inside fallthrough branch bodies, labeled or numeric loop control, division/modulo, native string values beyond compile-time-known readonly string locals and supported `echo`, writable string locals, string assignment, interpolation, runtime concatenation, classes, objects, methods/static calls, collections, runtime error behavior, runtime I/O, and broader valid Doria until later native slices are designed.
 

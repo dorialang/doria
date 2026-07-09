@@ -71,6 +71,17 @@ function main(): void
     mixed $metadata = null;
     never $impossible = fail();
 
+    // Naming charter: built-in free functions are snake_case; member APIs are camelCase.
+    let $now = get_time();
+    let $startsWithDor = str_starts_with($name, "Dor");
+    let $wrapped = Int::wrappingAdd(1, 2);
+    let $empty = $name->isEmpty();
+    Message $message = new Message();
+    PersonRepository $repository = new PersonRepository();
+    $message->retryAfter(seconds: 30);
+    echo $message->tenantId;
+    $repository->findById($id);
+
     echo "Hello " . $name . "!";
     echo "Hello {$name}";
     echo "Hello {$this->name}";

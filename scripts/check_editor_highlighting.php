@@ -616,6 +616,13 @@ function check_fixture(): void
         '?User',
         '\n\t\r\s',
         'use App\Repositories\UserRepository;',
+        'get_time()',
+        'str_starts_with($name, "Dor")',
+        'Int::wrappingAdd(1, 2)',
+        '$name->isEmpty()',
+        '$message->retryAfter(seconds: 30)',
+        '$message->tenantId',
+        '$repository->findById($id)',
     ];
     foreach ($requiredSnippets as $snippet) {
         require_check(str_contains($fixtureText, $snippet), 'shared editor fixture is missing ' . $snippet);

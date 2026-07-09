@@ -537,17 +537,13 @@ function greet(string $name): string
 }
 
 #[test]
-fn debug_backend_emits_stage_11d_artifact_and_rejects_broader_source() {
+fn debug_backend_emits_stage_11e_artifact_and_rejects_broader_source() {
     let output = doriac::compile_source(
         "test.doria",
-        r#"function main(): int
-{
-    return 42;
-}
-"#,
+        include_str!("../../../examples/debug/main_for_count_10.doria"),
         BackendTarget::Debug,
     )
-    .expect("debug backend should emit the Stage 11d artifact");
+    .expect("debug backend should emit the Stage 11e artifact");
 
     let BackendOutput::Text {
         extension,
@@ -557,7 +553,7 @@ fn debug_backend_emits_stage_11d_artifact_and_rejects_broader_source() {
         panic!("debug backend should return text output");
     };
     assert_eq!(extension, "debug");
-    assert_eq!(contents, "exit_status: 42\nstdout:\n");
+    assert_eq!(contents, "exit_status: 10\nstdout:\n");
 
     let err = doriac::compile_source(
         "test.doria",
@@ -567,12 +563,12 @@ echo $name;
 "#,
         BackendTarget::Debug,
     )
-    .expect_err("broader source should remain outside Stage 11d MIR coverage");
+    .expect_err("broader source should remain outside Stage 11e MIR coverage");
 
     assert_eq!(err[0].code, "M1101");
     assert!(err[0]
         .message
-        .contains("unsupported MIR Stage 11d coverage"));
+        .contains("unsupported MIR Stage 11e coverage"));
 }
 
 #[test]
