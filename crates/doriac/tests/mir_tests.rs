@@ -1307,7 +1307,7 @@ fn interpreter_preserves_void_fallthrough_after_final_else_if() {
 }
 
 #[test]
-fn interpreter_limits_malformed_mir_control_flow() {
+fn interpreter_rejects_repeated_mir_state_cycles() {
     let program = Program {
         functions: vec![Function {
             id: FunctionId(0),
@@ -1325,10 +1325,10 @@ fn interpreter_limits_malformed_mir_control_flow() {
     };
 
     let error = doriac::mir_interpreter::interpret(&program)
-        .expect_err("malformed cyclic MIR should hit the defensive limit");
+        .expect_err("malformed cyclic MIR should repeat an interpreter state");
     assert_eq!(
         error.message,
-        "MIR interpreter exceeded Stage 11c step limit"
+        "MIR interpreter detected a non-terminating control-flow cycle"
     );
 }
 
@@ -1532,6 +1532,44 @@ fn interpreter_while_false_falls_through() {
     );
 
     assert_eq!(output.exit_status, 42);
+}
+
+#[test]
+fn interpreter_allows_finite_while_loops_beyond_the_old_fuel_limit() {
+    let source = r#"function main(): int
+{
+    let writable $i = 0;
+
+    while ($i < 5000) {
+        $i++;
+    }
+
+    return 0;
+}
+"#;
+    let output = interpret(source);
+
+    assert_eq!(output.exit_status, 0);
+    assert_eq!(debug_contents(source), "exit_status: 0\nstdout:\n");
+}
+
+#[test]
+fn interpreter_rejects_non_terminating_source_while_loops() {
+    let program = lower(
+        r#"function main(): void
+{
+    while (true) {
+    }
+}
+"#,
+    );
+
+    let error = doriac::mir_interpreter::interpret(&program)
+        .expect_err("a deterministic source loop should repeat an interpreter state");
+    assert_eq!(
+        error.message,
+        "MIR interpreter detected a non-terminating control-flow cycle"
+    );
 }
 
 #[test]
