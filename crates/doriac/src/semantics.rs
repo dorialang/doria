@@ -214,6 +214,12 @@ impl<'program> Checker<'program> {
                         self.declare_property(&mut info, &class_decl.name, property);
                     }
                     ClassMember::Method(method) => {
+                        if let Some(message) = Self::reserved_callable_name_message(&method.name) {
+                            self.diagnostics
+                                .push(Diagnostic::new("E0310", message, method.span));
+                            continue;
+                        }
+
                         let signature = self.resolve_function_signature(method);
                         self.function_signatures
                             .insert(method.span.start, signature.clone());
@@ -287,11 +293,38 @@ impl<'program> Checker<'program> {
         }
     }
 
+    fn reserved_callable_name_message(name: &str) -> Option<String> {
+        match name {
+            "array" => Some(
+                "`array` is not a Doria callable name; use typed arrays like `T[]` or collection aliases"
+                    .to_string(),
+            ),
+            "mixed" => Some(
+                "`mixed` is a Doria dynamic-boundary type and cannot be used as a callable name"
+                    .to_string(),
+            ),
+            "object" => Some(
+                "`object` is not a Doria type and cannot be used as a callable name".to_string(),
+            ),
+            "resource" => Some(
+                "`resource` is reserved for future PHP interop and cannot be used as a callable name"
+                    .to_string(),
+            ),
+            _ => None,
+        }
+    }
+
     fn collect_functions(&mut self) {
         for item in &self.program.items {
             let Item::Function(function) = item else {
                 continue;
             };
+
+            if let Some(message) = Self::reserved_callable_name_message(&function.name) {
+                self.diagnostics
+                    .push(Diagnostic::new("E0310", message, function.span));
+                continue;
+            }
 
             let signature = self.resolve_function_signature(function);
             self.function_signatures
@@ -3673,6 +3706,11 @@ impl<'program> Checker<'program> {
 
         if saw_heterogeneous {
             if saw_mixed {
+                if let Some(common) = common {
+                    if self.type_contains_mixed(common) {
+                        return common;
+                    }
+                }
                 return self.types.intern(TypeKind::Mixed);
             }
             return self.types.intern(TypeKind::Heterogeneous);

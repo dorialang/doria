@@ -123,6 +123,35 @@ array $items = new array();
 }
 
 #[test]
+fn rejects_array_as_callable_name() {
+    let err = doriac::check_source(
+        "test.doria",
+        r#"
+function array(): void
+{
+}
+
+class Bag
+{
+    function array(): void
+    {
+    }
+}
+"#,
+    )
+    .expect_err("semantic check should reject array as a callable spelling");
+
+    assert_eq!(
+        err.iter()
+            .filter(
+                |diagnostic| diagnostic.code == "E0310" && diagnostic.message.contains("`array`")
+            )
+            .count(),
+        2
+    );
+}
+
+#[test]
 fn resolves_typed_array_types() {
     doriac::check_source(
         "test.doria",
@@ -151,6 +180,22 @@ List<List<mixed>> $copy = $rows;
 "#,
     )
     .expect("nested collection shape should be preserved while widening inner mixed values");
+}
+
+#[test]
+fn preserves_nested_mixed_collection_shape_after_clear_heterogeneous_elements() {
+    doriac::check_source(
+        "test.doria",
+        r#"
+function rows(mixed $payload)
+{
+    return [[1], ["two"], [$payload]];
+}
+
+List<List<mixed>> $copy = rows(1);
+"#,
+    )
+    .expect("nested mixed collection inference should not depend on literal element order");
 }
 
 #[test]

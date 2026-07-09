@@ -698,6 +698,23 @@ class StreamBox
 }
 
 #[test]
+fn rejects_array_callable_name_before_php_codegen() {
+    let err = doriac::compile_source_to_php(
+        "test.doria",
+        r#"
+function array(): void
+{
+}
+"#,
+    )
+    .expect_err("semantic checking should reject array as a callable before PHP codegen");
+
+    assert!(err.iter().any(|diagnostic| {
+        diagnostic.code == "E0310" && diagnostic.message.contains("`array`")
+    }));
+}
+
+#[test]
 fn lowers_interpolated_string_to_hir() {
     let lowered = doriac::lower_source(
         "test.doria",
