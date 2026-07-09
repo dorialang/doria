@@ -13,13 +13,13 @@ pub fn lower_program(program: &hir::Program) -> DiagnosticResult<mir::Program> {
             hir::Item::Class(class_decl) => {
                 return Err(vec![unsupported(
                     class_decl.span,
-                    "classes are not lowered to MIR in Stage 11b",
+                    "classes are not lowered to MIR in Stage 11c",
                 )]);
             }
             hir::Item::Statement(statement) => {
                 return Err(vec![unsupported(
                     stmt_span(statement),
-                    "top-level statements are not lowered to MIR in Stage 11b",
+                    "top-level statements are not lowered to MIR in Stage 11c",
                 )]);
             }
         }
@@ -32,7 +32,7 @@ pub fn lower_program(program: &hir::Program) -> DiagnosticResult<mir::Program> {
             .map_or_else(Span::default, |function| function.span);
         return Err(vec![unsupported(
             span,
-            "Stage 11b requires exactly one top-level function main and no helper functions",
+            "Stage 11c requires exactly one top-level function main and no helper functions",
         )]);
     }
 
@@ -40,7 +40,7 @@ pub fn lower_program(program: &hir::Program) -> DiagnosticResult<mir::Program> {
     if function.name != "main" {
         return Err(vec![unsupported(
             function.span,
-            "Stage 11b requires the single lowered function to be main",
+            "Stage 11c requires the single lowered function to be main",
         )]);
     }
 
@@ -55,25 +55,21 @@ fn lower_main_function(function: &hir::FunctionDecl) -> DiagnosticResult<mir::Fu
     if !function.params.is_empty() {
         return Err(vec![unsupported(
             function.params[0].span,
-            "main parameters are not lowered to MIR in Stage 11b",
+            "main parameters are not lowered to MIR in Stage 11c",
         )]);
     }
 
     let return_type = lower_return_type(function)?;
-    let mut context = LoweringContext::default();
-    let terminator = lower_main_body(&function.body, return_type, &mut context)?;
-    let block = mir::BasicBlock {
-        id: mir::BlockId(0),
-        statements: context.statements,
-        terminator,
-    };
+    let mut context = LoweringContext::new();
+    lower_main_body(&function.body, return_type, &mut context)?;
+    let (locals, blocks) = context.finish();
 
     Ok(mir::Function {
         id: mir::FunctionId(0),
         name: function.name.clone(),
         return_type,
-        locals: context.locals,
-        blocks: vec![block],
+        locals,
+        blocks,
         entry_block: mir::BlockId(0),
     })
 }
@@ -84,11 +80,11 @@ fn lower_return_type(function: &hir::FunctionDecl) -> DiagnosticResult<mir::Retu
         Some("void") => Ok(mir::ReturnType::Void),
         Some(_) => Err(vec![unsupported(
             function.span,
-            "only main(): int and main(): void are lowered to MIR in Stage 11b",
+            "only main(): int and main(): void are lowered to MIR in Stage 11c",
         )]),
         None => Err(vec![unsupported(
             function.span,
-            "Stage 11b MIR lowering requires an explicit main return type",
+            "Stage 11c MIR lowering requires an explicit main return type",
         )]),
     }
 }
@@ -97,14 +93,33 @@ fn lower_main_body(
     body: &hir::Block,
     return_type: mir::ReturnType,
     context: &mut LoweringContext,
-) -> DiagnosticResult<mir::Terminator> {
-    let mut terminator = None;
+) -> DiagnosticResult<()> {
+    lower_statement_sequence(&body.statements, return_type, context)?;
 
-    for statement in &body.statements {
-        if terminator.is_some() {
+    if context.current_block.is_some() {
+        if return_type == mir::ReturnType::Void {
+            context.terminate_current(mir::Terminator::ReturnVoid);
+        } else {
+            return Err(vec![unsupported(
+                body.span,
+                "main(): int fallthrough is not lowered to MIR in Stage 11c",
+            )]);
+        }
+    }
+
+    Ok(())
+}
+
+fn lower_statement_sequence(
+    statements: &[hir::Stmt],
+    return_type: mir::ReturnType,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<()> {
+    for statement in statements {
+        if context.current_block.is_none() {
             return Err(vec![unsupported(
                 stmt_span(statement),
-                "statements after return are not lowered to MIR in Stage 11b",
+                "statements after return are not lowered to MIR in Stage 11c",
             )]);
         }
 
@@ -113,70 +128,205 @@ fn lower_main_body(
                 if return_type != mir::ReturnType::Void {
                     return Err(vec![unsupported(
                         *span,
-                        "string-literal echo is only lowered for main(): void in Stage 11b",
+                        "string-literal echo is only lowered for main(): void in Stage 11c",
                     )]);
                 }
-                let statement = lower_echo(expr)?;
-                context.statements.push(statement);
+                context.push_statement(lower_echo(expr)?);
             }
             hir::Stmt::Return { expr, span } => {
-                terminator = Some(lower_return(expr.as_ref(), *span, return_type, context)?);
+                let terminator = lower_return(expr.as_ref(), *span, return_type, context)?;
+                context.terminate_current(terminator);
             }
             hir::Stmt::VarDecl(decl) => lower_var_decl(decl, context)?,
             hir::Stmt::Assignment(assignment) => lower_assignment(assignment, context)?,
             hir::Stmt::Increment(increment) => lower_increment(increment, context)?,
-            hir::Stmt::If(_) => {
-                return Err(vec![unsupported(
-                    stmt_span(statement),
-                    "if statements are not lowered to MIR in Stage 11b",
-                )]);
-            }
+            hir::Stmt::If(if_stmt) => lower_if_statement(if_stmt, return_type, context)?,
             hir::Stmt::While(_) | hir::Stmt::For(_) | hir::Stmt::Foreach(_) => {
                 return Err(vec![unsupported(
                     stmt_span(statement),
-                    "loops are not lowered to MIR in Stage 11b",
+                    "loops are not lowered to MIR in Stage 11c",
                 )]);
             }
             hir::Stmt::Break { .. } | hir::Stmt::Continue { .. } => {
                 return Err(vec![unsupported(
                     stmt_span(statement),
-                    "loop control is not lowered to MIR in Stage 11b",
+                    "loop control is not lowered to MIR in Stage 11c",
                 )]);
             }
             hir::Stmt::Expr { expr, span } => {
                 if matches!(expr, hir::Expr::FunctionCall { .. }) {
                     return Err(vec![unsupported(
                         *span,
-                        "function calls are not lowered to MIR in Stage 11b",
+                        "function calls are not lowered to MIR in Stage 11c",
                     )]);
                 }
                 return Err(vec![unsupported(
                     *span,
-                    "expression statements are not lowered to MIR in Stage 11b",
+                    "expression statements are not lowered to MIR in Stage 11c",
                 )]);
             }
         }
     }
 
-    match terminator {
-        Some(terminator) => Ok(terminator),
-        None if return_type == mir::ReturnType::Void => Ok(mir::Terminator::ReturnVoid),
-        None => Err(vec![unsupported(
-            body.span,
-            "main(): int fallthrough is not lowered to MIR in Stage 11b",
-        )]),
-    }
+    Ok(())
 }
 
-#[derive(Default)]
+fn lower_if_statement(
+    if_stmt: &hir::IfStmt,
+    return_type: mir::ReturnType,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<()> {
+    let condition_block = context.current_block();
+    let fallthrough_blocks = lower_if_tree(if_stmt, condition_block, return_type, context)?;
+
+    if fallthrough_blocks.is_empty() {
+        context.current_block = None;
+        return Ok(());
+    }
+
+    let continuation = context.create_block();
+    for block in fallthrough_blocks {
+        context.terminate_block(block, mir::Terminator::Jump(continuation));
+    }
+    context.current_block = Some(continuation);
+    Ok(())
+}
+
+fn lower_if_tree(
+    if_stmt: &hir::IfStmt,
+    condition_block: mir::BlockId,
+    return_type: mir::ReturnType,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<Vec<mir::BlockId>> {
+    context.current_block = Some(condition_block);
+    let condition = lower_condition(&if_stmt.condition, context)?;
+    let then_block = context.create_block();
+    let else_block = context.create_block();
+    context.terminate_current(mir::Terminator::Branch {
+        condition,
+        then_block,
+        else_block,
+    });
+
+    let mut fallthrough_blocks =
+        lower_scoped_block(&if_stmt.then_block, then_block, return_type, context)?;
+
+    match &if_stmt.else_branch {
+        None => fallthrough_blocks.push(else_block),
+        Some(hir::ElseBranch::Block(block)) => {
+            fallthrough_blocks.extend(lower_scoped_block(block, else_block, return_type, context)?);
+        }
+        Some(hir::ElseBranch::If(nested)) => {
+            fallthrough_blocks.extend(lower_if_tree(nested, else_block, return_type, context)?);
+        }
+    }
+
+    Ok(fallthrough_blocks)
+}
+
+fn lower_scoped_block(
+    block: &hir::Block,
+    entry_block: mir::BlockId,
+    return_type: mir::ReturnType,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<Vec<mir::BlockId>> {
+    context.push_scope();
+    context.current_block = Some(entry_block);
+    let result = lower_statement_sequence(&block.statements, return_type, context);
+    let current_block = context.current_block;
+    context.pop_scope();
+    result?;
+    Ok(current_block.into_iter().collect())
+}
+
+struct BlockBuilder {
+    id: mir::BlockId,
+    statements: Vec<mir::Statement>,
+    terminator: Option<mir::Terminator>,
+}
+
 struct LoweringContext {
     locals: Vec<mir::Local>,
-    local_names: HashMap<String, mir::LocalId>,
+    local_scopes: Vec<HashMap<String, mir::LocalId>>,
     temp_counter: usize,
-    statements: Vec<mir::Statement>,
+    blocks: Vec<BlockBuilder>,
+    current_block: Option<mir::BlockId>,
 }
 
 impl LoweringContext {
+    fn new() -> Self {
+        Self {
+            locals: Vec::new(),
+            local_scopes: vec![HashMap::new()],
+            temp_counter: 0,
+            blocks: vec![BlockBuilder {
+                id: mir::BlockId(0),
+                statements: Vec::new(),
+                terminator: None,
+            }],
+            current_block: Some(mir::BlockId(0)),
+        }
+    }
+
+    fn finish(self) -> (Vec<mir::Local>, Vec<mir::BasicBlock>) {
+        let blocks = self
+            .blocks
+            .into_iter()
+            .map(|block| mir::BasicBlock {
+                id: block.id,
+                statements: block.statements,
+                terminator: block
+                    .terminator
+                    .expect("every lowered MIR block must have a terminator"),
+            })
+            .collect();
+        (self.locals, blocks)
+    }
+
+    fn create_block(&mut self) -> mir::BlockId {
+        let id = mir::BlockId(self.blocks.len());
+        self.blocks.push(BlockBuilder {
+            id,
+            statements: Vec::new(),
+            terminator: None,
+        });
+        id
+    }
+
+    fn current_block(&self) -> mir::BlockId {
+        self.current_block
+            .expect("MIR lowering requires a current block")
+    }
+
+    fn push_statement(&mut self, statement: mir::Statement) {
+        let block = self.current_block();
+        self.blocks[block.0].statements.push(statement);
+    }
+
+    fn terminate_current(&mut self, terminator: mir::Terminator) {
+        let block = self.current_block();
+        self.terminate_block(block, terminator);
+        self.current_block = None;
+    }
+
+    fn terminate_block(&mut self, block: mir::BlockId, terminator: mir::Terminator) {
+        let slot = &mut self.blocks[block.0].terminator;
+        assert!(slot.is_none(), "MIR block terminated more than once");
+        *slot = Some(terminator);
+    }
+
+    fn push_scope(&mut self) {
+        self.local_scopes.push(HashMap::new());
+    }
+
+    fn pop_scope(&mut self) {
+        assert!(
+            self.local_scopes.len() > 1,
+            "MIR lowering cannot pop the root local scope"
+        );
+        self.local_scopes.pop();
+    }
+
     fn declare_user_local(&mut self, name: &str, writable: bool) -> mir::LocalId {
         let id = mir::LocalId(self.locals.len());
         self.locals.push(mir::Local {
@@ -186,7 +336,10 @@ impl LoweringContext {
             writable,
             synthetic: false,
         });
-        self.local_names.insert(name.to_string(), id);
+        self.local_scopes
+            .last_mut()
+            .expect("MIR lowering must have a local scope")
+            .insert(name.to_string(), id);
         id
     }
 
@@ -205,12 +358,16 @@ impl LoweringContext {
     }
 
     fn lookup_local(&self, name: &str, span: Span) -> DiagnosticResult<mir::LocalId> {
-        self.local_names.get(name).copied().ok_or_else(|| {
-            vec![unsupported(
-                span,
-                format!("local `${name}` is not available in MIR Stage 11b"),
-            )]
-        })
+        self.local_scopes
+            .iter()
+            .rev()
+            .find_map(|scope| scope.get(name).copied())
+            .ok_or_else(|| {
+                vec![unsupported(
+                    span,
+                    format!("local `${name}` is not available in MIR Stage 11c"),
+                )]
+            })
     }
 }
 
@@ -219,7 +376,7 @@ fn lower_var_decl(decl: &hir::VarDecl, context: &mut LoweringContext) -> Diagnos
         if ty.name != "int" || !ty.args.is_empty() {
             return Err(vec![unsupported(
                 decl.span,
-                format!("only int locals are lowered to MIR in Stage 11b; got `{ty}`"),
+                format!("only int locals are lowered to MIR in Stage 11c; got `{ty}`"),
             )]);
         }
     } else if matches!(
@@ -228,13 +385,13 @@ fn lower_var_decl(decl: &hir::VarDecl, context: &mut LoweringContext) -> Diagnos
     ) {
         return Err(vec![unsupported(
             decl.span,
-            "string locals are not lowered to MIR in Stage 11b",
+            "string locals are not lowered to MIR in Stage 11c",
         )]);
     }
 
     let value = lower_int_rvalue(&decl.initializer, context)?;
     let local = context.declare_user_local(&decl.name, decl.writable);
-    context.statements.push(mir::Statement::AssignLocal {
+    context.push_statement(mir::Statement::AssignLocal {
         target: local,
         value,
     });
@@ -265,9 +422,7 @@ fn lower_assignment(
             }
         }
     };
-    context
-        .statements
-        .push(mir::Statement::AssignLocal { target, value });
+    context.push_statement(mir::Statement::AssignLocal { target, value });
     Ok(())
 }
 
@@ -280,7 +435,7 @@ fn lower_increment(
         hir::IncrementOp::Increment => mir::BinaryOp::Add,
         hir::IncrementOp::Decrement => mir::BinaryOp::Subtract,
     };
-    context.statements.push(mir::Statement::AssignLocal {
+    context.push_statement(mir::Statement::AssignLocal {
         target,
         value: mir::Rvalue::Binary {
             op,
@@ -300,7 +455,7 @@ fn lower_assignment_target(
         hir::Expr::Variable { name, span } => context.lookup_local(name, *span),
         _ => Err(vec![unsupported(
             target.span(),
-            "only local variable assignment targets are lowered to MIR in Stage 11b",
+            "only local variable assignment targets are lowered to MIR in Stage 11c",
         )]),
     }
 }
@@ -310,11 +465,11 @@ fn lower_echo(expr: &hir::Expr) -> DiagnosticResult<mir::Statement> {
         hir::Expr::String { value, .. } => Ok(mir::Statement::EchoStringLiteral(value.clone())),
         hir::Expr::Binary { .. } => Err(vec![unsupported(
             expr.span(),
-            "string concatenation in echo is not lowered to MIR in Stage 11b; only exact string-literal echo is supported",
+            "string concatenation in echo is not lowered to MIR in Stage 11c; only exact string-literal echo is supported",
         )]),
         _ => Err(vec![unsupported(
             expr.span(),
-            "non-literal echo expressions are not lowered to MIR in Stage 11b; only exact string-literal echo is supported",
+            "non-literal echo expressions are not lowered to MIR in Stage 11c; only exact string-literal echo is supported",
         )]),
     }
 }
@@ -333,11 +488,145 @@ fn lower_return(
         }
         (mir::ReturnType::Int, None) => Err(vec![unsupported(
             span,
-            "bare return is not lowered for main(): int in Stage 11b",
+            "bare return is not lowered for main(): int in Stage 11c",
         )]),
         (mir::ReturnType::Void, Some(expr)) => Err(vec![unsupported(
             expr.span(),
-            "return values are not lowered for main(): void in Stage 11b",
+            "return values are not lowered for main(): void in Stage 11c",
+        )]),
+    }
+}
+
+fn lower_condition(
+    expr: &hir::Expr,
+    context: &LoweringContext,
+) -> DiagnosticResult<mir::Condition> {
+    match expr {
+        hir::Expr::Bool { value, .. } => Ok(mir::Condition::Bool(*value)),
+        hir::Expr::Grouped { expr, .. } => lower_condition(expr, context),
+        hir::Expr::Unary {
+            op: hir::UnaryOp::Not,
+            expr,
+            ..
+        } => Ok(mir::Condition::Not(Box::new(lower_condition(
+            expr, context,
+        )?))),
+        hir::Expr::Binary {
+            left, op, right, ..
+        } => match op {
+            hir::BinaryOp::Equal
+            | hir::BinaryOp::NotEqual
+            | hir::BinaryOp::Less
+            | hir::BinaryOp::LessEqual
+            | hir::BinaryOp::Greater
+            | hir::BinaryOp::GreaterEqual => Ok(mir::Condition::Compare {
+                op: lower_compare_op(op),
+                left: lower_condition_int_expr(left, context)?,
+                right: lower_condition_int_expr(right, context)?,
+            }),
+            hir::BinaryOp::And | hir::BinaryOp::Or | hir::BinaryOp::Xor => {
+                Ok(mir::Condition::Binary {
+                    op: lower_condition_binary_op(op),
+                    left: Box::new(lower_condition(left, context)?),
+                    right: Box::new(lower_condition(right, context)?),
+                })
+            }
+            _ => Err(vec![unsupported(
+                expr.span(),
+                "conditions require bool literals, integer comparisons, or boolean condition operators in Stage 11c",
+            )]),
+        },
+        hir::Expr::FunctionCall { .. }
+        | hir::Expr::MethodCall { .. }
+        | hir::Expr::StaticCall { .. } => Err(vec![unsupported(
+            expr.span(),
+            "function and method calls in conditions are not lowered to MIR in Stage 11c",
+        )]),
+        hir::Expr::Int { .. } => Err(vec![unsupported(
+            expr.span(),
+            "integer truthiness is not Doria condition semantics; Stage 11c requires a bool condition",
+        )]),
+        hir::Expr::Variable { .. } => Err(vec![unsupported(
+            expr.span(),
+            "user-authored bool locals are not lowered to MIR in Stage 11c",
+        )]),
+        _ => Err(vec![unsupported(
+            expr.span(),
+            "this condition expression is not lowered to MIR in Stage 11c",
+        )]),
+    }
+}
+
+fn lower_condition_int_expr(
+    expr: &hir::Expr,
+    context: &LoweringContext,
+) -> DiagnosticResult<mir::IntExpression> {
+    match expr {
+        hir::Expr::Int { value, span } => {
+            parse_int_literal(value, *span).map(mir::IntExpression::Use)
+        }
+        hir::Expr::Variable { name, span } => context
+            .lookup_local(name, *span)
+            .map(mir::Operand::Local)
+            .map(mir::IntExpression::Use),
+        hir::Expr::Grouped { expr, .. } => lower_condition_int_expr(expr, context),
+        hir::Expr::Binary {
+            left, op, right, ..
+        } => {
+            let op = lower_condition_int_binary_op(op, expr.span())?;
+            Ok(mir::IntExpression::Binary {
+                op,
+                left: Box::new(lower_condition_int_expr(left, context)?),
+                right: Box::new(lower_condition_int_expr(right, context)?),
+            })
+        }
+        hir::Expr::FunctionCall { .. } => Err(vec![unsupported(
+            expr.span(),
+            "function calls in comparison operands are not lowered to MIR in Stage 11c",
+        )]),
+        _ => Err(vec![unsupported(
+            expr.span(),
+            "only Stage 11b integer expressions are lowered as comparison operands in Stage 11c",
+        )]),
+    }
+}
+
+fn lower_compare_op(op: &hir::BinaryOp) -> mir::CompareOp {
+    match op {
+        hir::BinaryOp::Equal => mir::CompareOp::Equal,
+        hir::BinaryOp::NotEqual => mir::CompareOp::NotEqual,
+        hir::BinaryOp::Less => mir::CompareOp::Less,
+        hir::BinaryOp::LessEqual => mir::CompareOp::LessEqual,
+        hir::BinaryOp::Greater => mir::CompareOp::Greater,
+        hir::BinaryOp::GreaterEqual => mir::CompareOp::GreaterEqual,
+        _ => unreachable!("only comparison operators are lowered as MIR comparisons"),
+    }
+}
+
+fn lower_condition_binary_op(op: &hir::BinaryOp) -> mir::ConditionBinaryOp {
+    match op {
+        hir::BinaryOp::And => mir::ConditionBinaryOp::And,
+        hir::BinaryOp::Or => mir::ConditionBinaryOp::Or,
+        hir::BinaryOp::Xor => mir::ConditionBinaryOp::Xor,
+        _ => unreachable!("only boolean operators are lowered as MIR condition operators"),
+    }
+}
+
+fn lower_condition_int_binary_op(
+    op: &hir::BinaryOp,
+    span: Span,
+) -> DiagnosticResult<mir::BinaryOp> {
+    match op {
+        hir::BinaryOp::Add => Ok(mir::BinaryOp::Add),
+        hir::BinaryOp::Sub => Ok(mir::BinaryOp::Subtract),
+        hir::BinaryOp::Mul => Ok(mir::BinaryOp::Multiply),
+        hir::BinaryOp::Div | hir::BinaryOp::Mod => Err(vec![unsupported(
+            span,
+            "division and modulo in condition operands are not lowered to MIR in Stage 11c",
+        )]),
+        _ => Err(vec![unsupported(
+            span,
+            "only Stage 11b integer arithmetic is lowered inside MIR Stage 11c comparisons",
         )]),
     }
 }
@@ -355,7 +644,7 @@ fn lower_int_operand(
         hir::Expr::Binary { .. } => {
             let value = lower_int_rvalue(expr, context)?;
             let temp = context.declare_temp();
-            context.statements.push(mir::Statement::AssignLocal {
+            context.push_statement(mir::Statement::AssignLocal {
                 target: temp,
                 value,
             });
@@ -392,7 +681,7 @@ fn lower_binary_op(op: &hir::BinaryOp, span: Span) -> DiagnosticResult<mir::Bina
         hir::BinaryOp::Mul => Ok(mir::BinaryOp::Multiply),
         hir::BinaryOp::Div | hir::BinaryOp::Mod => Err(vec![unsupported(
             span,
-            "division and modulo are not lowered to MIR in Stage 11b",
+            "division and modulo are not lowered to MIR in Stage 11c",
         )]),
         hir::BinaryOp::Less
         | hir::BinaryOp::LessEqual
@@ -401,19 +690,19 @@ fn lower_binary_op(op: &hir::BinaryOp, span: Span) -> DiagnosticResult<mir::Bina
         | hir::BinaryOp::Equal
         | hir::BinaryOp::NotEqual => Err(vec![unsupported(
             span,
-            "comparisons are not lowered to MIR in Stage 11b",
+            "comparison results are condition-only and are not lowered as runtime values in MIR Stage 11c",
         )]),
         hir::BinaryOp::Concat => Err(vec![unsupported(
             span,
-            "string concatenation is not lowered to MIR in Stage 11b",
+            "string concatenation is not lowered to MIR in Stage 11c",
         )]),
         hir::BinaryOp::And | hir::BinaryOp::Or | hir::BinaryOp::Xor => Err(vec![unsupported(
             span,
-            "bool runtime values and boolean operators are not lowered to MIR in Stage 11b",
+            "bool runtime values are not lowered to MIR in Stage 11c; boolean operators are condition-only",
         )]),
         hir::BinaryOp::Coalesce => Err(vec![unsupported(
             span,
-            "null coalescing is not lowered to MIR in Stage 11b",
+            "null coalescing is not lowered to MIR in Stage 11c",
         )]),
     }
 }
@@ -422,7 +711,7 @@ fn parse_int_literal(value: &str, span: Span) -> DiagnosticResult<mir::Operand> 
     value.parse::<i64>().map(mir::Operand::Int).map_err(|_| {
         vec![unsupported(
             span,
-            "integer literals outside int64 are not lowered to MIR in Stage 11b",
+            "integer literals outside int64 are not lowered to MIR in Stage 11c",
         )]
     })
 }
@@ -430,27 +719,27 @@ fn parse_int_literal(value: &str, span: Span) -> DiagnosticResult<mir::Operand> 
 fn unsupported_int_expr(expr: &hir::Expr) -> Diagnostic {
     let detail = match expr {
         hir::Expr::String { .. } | hir::Expr::InterpolatedString { .. } => {
-            "string expressions are not lowered to MIR in Stage 11b"
+            "string expressions are not lowered to MIR in Stage 11c"
         }
-        hir::Expr::Float { .. } => "float expressions are not lowered to MIR in Stage 11b",
-        hir::Expr::Bool { .. } => "bool runtime values are not lowered to MIR in Stage 11b",
-        hir::Expr::Null { .. } => "null values are not lowered to MIR in Stage 11b",
-        hir::Expr::Array { .. } => "collections are not lowered to MIR in Stage 11b",
-        hir::Expr::FunctionCall { .. } => "function calls are not lowered to MIR in Stage 11b",
+        hir::Expr::Float { .. } => "float expressions are not lowered to MIR in Stage 11c",
+        hir::Expr::Bool { .. } => "bool runtime values are not lowered to MIR in Stage 11c",
+        hir::Expr::Null { .. } => "null values are not lowered to MIR in Stage 11c",
+        hir::Expr::Array { .. } => "collections are not lowered to MIR in Stage 11c",
+        hir::Expr::FunctionCall { .. } => "function calls are not lowered to MIR in Stage 11c",
         hir::Expr::MethodCall { .. } | hir::Expr::StaticCall { .. } => {
-            "method calls are not lowered to MIR in Stage 11b"
+            "method calls are not lowered to MIR in Stage 11c"
         }
-        hir::Expr::PropertyAccess { .. } => "property access is not lowered to MIR in Stage 11b",
-        hir::Expr::New { .. } => "object construction is not lowered to MIR in Stage 11b",
-        hir::Expr::This { .. } => "$this is not lowered to MIR in Stage 11b",
+        hir::Expr::PropertyAccess { .. } => "property access is not lowered to MIR in Stage 11c",
+        hir::Expr::New { .. } => "object construction is not lowered to MIR in Stage 11c",
+        hir::Expr::This { .. } => "$this is not lowered to MIR in Stage 11c",
         hir::Expr::Identifier { .. } => {
-            "identifiers are not lowered as int expressions in Stage 11b"
+            "identifiers are not lowered as int expressions in Stage 11c"
         }
-        hir::Expr::Unary { .. } => "unary expressions are not lowered to MIR in Stage 11b",
-        hir::Expr::Range { .. } => "ranges are not lowered to MIR in Stage 11b",
-        hir::Expr::Binary { .. } => "this binary expression is not lowered to MIR in Stage 11b",
+        hir::Expr::Unary { .. } => "unary expressions are not lowered to MIR in Stage 11c",
+        hir::Expr::Range { .. } => "ranges are not lowered to MIR in Stage 11c",
+        hir::Expr::Binary { .. } => "this binary expression is not lowered to MIR in Stage 11c",
         hir::Expr::Int { .. } | hir::Expr::Variable { .. } | hir::Expr::Grouped { .. } => {
-            "this int expression is not lowered to MIR in Stage 11b"
+            "this int expression is not lowered to MIR in Stage 11c"
         }
     };
     unsupported(expr.span(), detail)
@@ -474,7 +763,7 @@ fn stmt_span(statement: &hir::Stmt) -> Span {
 fn unsupported(span: Span, detail: impl Into<String>) -> Diagnostic {
     Diagnostic::new(
         "M1101",
-        format!("unsupported MIR Stage 11b coverage: {}", detail.into()),
+        format!("unsupported MIR Stage 11c coverage: {}", detail.into()),
         span,
     )
 }

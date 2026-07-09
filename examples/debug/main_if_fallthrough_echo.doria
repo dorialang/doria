@@ -1,0 +1,8 @@
+function main(): void
+{
+    if (true) {
+        echo "Hello ";
+    }
+
+    echo "Doria!";
+}

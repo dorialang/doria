@@ -1,0 +1,8 @@
+function main(): int
+{
+    if (40 + 2 == 42) {
+        return 42;
+    }
+
+    return 0;
+}

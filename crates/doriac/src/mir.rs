@@ -82,6 +82,49 @@ pub enum BinaryOp {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IntExpression {
+    Use(Operand),
+    Binary {
+        op: BinaryOp,
+        left: Box<IntExpression>,
+        right: Box<IntExpression>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Condition {
+    Bool(bool),
+    Compare {
+        op: CompareOp,
+        left: IntExpression,
+        right: IntExpression,
+    },
+    Not(Box<Condition>),
+    Binary {
+        op: ConditionBinaryOp,
+        left: Box<Condition>,
+        right: Box<Condition>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompareOp {
+    Equal,
+    NotEqual,
+    Less,
+    LessEqual,
+    Greater,
+    GreaterEqual,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConditionBinaryOp {
+    And,
+    Or,
+    Xor,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Statement {
     AssignLocal { target: LocalId, value: Rvalue },
     EchoStringLiteral(String),
@@ -91,6 +134,12 @@ pub enum Statement {
 pub enum Terminator {
     Return(Operand),
     ReturnVoid,
+    Jump(BlockId),
+    Branch {
+        condition: Condition,
+        then_block: BlockId,
+        else_block: BlockId,
+    },
 }
 
 impl fmt::Display for Program {
@@ -202,6 +251,53 @@ impl fmt::Display for BinaryOp {
     }
 }
 
+impl fmt::Display for IntExpression {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            IntExpression::Use(operand) => write!(formatter, "{operand}"),
+            IntExpression::Binary { op, left, right } => {
+                write!(formatter, "({left} {op} {right})")
+            }
+        }
+    }
+}
+
+impl fmt::Display for Condition {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Condition::Bool(value) => write!(formatter, "{value}"),
+            Condition::Compare { op, left, right } => write!(formatter, "{left} {op} {right}"),
+            Condition::Not(condition) => write!(formatter, "!({condition})"),
+            Condition::Binary { op, left, right } => {
+                write!(formatter, "({left}) {op} ({right})")
+            }
+        }
+    }
+}
+
+impl fmt::Display for CompareOp {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CompareOp::Equal => write!(formatter, "=="),
+            CompareOp::NotEqual => write!(formatter, "!="),
+            CompareOp::Less => write!(formatter, "<"),
+            CompareOp::LessEqual => write!(formatter, "<="),
+            CompareOp::Greater => write!(formatter, ">"),
+            CompareOp::GreaterEqual => write!(formatter, ">="),
+        }
+    }
+}
+
+impl fmt::Display for ConditionBinaryOp {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ConditionBinaryOp::And => write!(formatter, "&&"),
+            ConditionBinaryOp::Or => write!(formatter, "||"),
+            ConditionBinaryOp::Xor => write!(formatter, "xor"),
+        }
+    }
+}
+
 impl fmt::Display for Statement {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -220,6 +316,16 @@ impl fmt::Display for Terminator {
         match self {
             Terminator::Return(operand) => write!(formatter, "return {operand}"),
             Terminator::ReturnVoid => write!(formatter, "return"),
+            Terminator::Jump(target) => write!(formatter, "jump block{}", target.0),
+            Terminator::Branch {
+                condition,
+                then_block,
+                else_block,
+            } => write!(
+                formatter,
+                "branch {condition} -> block{}, block{}",
+                then_block.0, else_block.0
+            ),
         }
     }
 }

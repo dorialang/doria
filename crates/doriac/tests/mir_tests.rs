@@ -1,7 +1,8 @@
 use doriac::backend::{BackendOutput, BackendTarget};
 use doriac::mir::{
-    BasicBlock, BinaryOp, BlockId, Function, FunctionId, Local, LocalId, Operand, Program,
-    ReturnType, Rvalue, Statement, Terminator, Type,
+    BasicBlock, BinaryOp, BlockId, CompareOp, Condition, ConditionBinaryOp, Function, FunctionId,
+    IntExpression, Local, LocalId, Operand, Program, ReturnType, Rvalue, Statement, Terminator,
+    Type,
 };
 
 fn lower(source: &str) -> doriac::mir::Program {
@@ -15,15 +16,22 @@ fn interpret(source: &str) -> doriac::mir_interpreter::InterpreterOutput {
 
 fn unsupported(source: &str) -> Vec<doriac::diagnostics::Diagnostic> {
     doriac::lower_source_to_mir("test.doria", source)
-        .expect_err("source should be outside Stage 11b MIR coverage")
+        .expect_err("source should be outside Stage 11c MIR coverage")
 }
 
-fn assert_stage_11b_unsupported(diagnostics: &[doriac::diagnostics::Diagnostic], detail: &str) {
+fn unsupported_after_parsing(source: &str) -> Vec<doriac::diagnostics::Diagnostic> {
+    let ast = doriac::parse_source("test.doria", source).expect("source should parse");
+    let hir = doriac::lowering::lower_program(&ast);
+    doriac::mir_lowering::lower_program(&hir)
+        .expect_err("HIR should be outside Stage 11c MIR coverage")
+}
+
+fn assert_stage_11c_unsupported(diagnostics: &[doriac::diagnostics::Diagnostic], detail: &str) {
     assert_eq!(diagnostics[0].code, "M1101");
     assert!(
         diagnostics[0]
             .message
-            .contains("unsupported MIR Stage 11b coverage"),
+            .contains("unsupported MIR Stage 11c coverage"),
         "unexpected diagnostic: {}",
         diagnostics[0].message
     );
@@ -47,6 +55,54 @@ fn debug_contents(source: &str) -> String {
     };
     assert_eq!(extension, "debug");
     contents
+}
+
+fn conditional_program(condition: Condition, then_status: i64, else_status: i64) -> Program {
+    Program {
+        functions: vec![Function {
+            id: FunctionId(0),
+            name: "main".to_string(),
+            return_type: ReturnType::Int,
+            locals: vec![Local {
+                id: LocalId(0),
+                name: "unassigned".to_string(),
+                ty: Type::Int,
+                writable: false,
+                synthetic: true,
+            }],
+            blocks: vec![
+                BasicBlock {
+                    id: BlockId(0),
+                    statements: Vec::new(),
+                    terminator: Terminator::Branch {
+                        condition,
+                        then_block: BlockId(1),
+                        else_block: BlockId(2),
+                    },
+                },
+                BasicBlock {
+                    id: BlockId(1),
+                    statements: Vec::new(),
+                    terminator: Terminator::Return(Operand::Int(then_status)),
+                },
+                BasicBlock {
+                    id: BlockId(2),
+                    statements: Vec::new(),
+                    terminator: Terminator::Return(Operand::Int(else_status)),
+                },
+            ],
+            entry_block: BlockId(0),
+        }],
+        entry: FunctionId(0),
+    }
+}
+
+fn condition_that_reads_unassigned_local() -> Condition {
+    Condition::Compare {
+        op: CompareOp::Equal,
+        left: IntExpression::Use(Operand::Local(LocalId(0))),
+        right: IntExpression::Use(Operand::Int(0)),
+    }
 }
 
 #[test]
@@ -745,7 +801,7 @@ fn debug_target_emits_interpreter_artifact() {
 }
 
 #[test]
-fn debug_backend_emit_handles_stage_11b_hir_directly() {
+fn debug_backend_emit_handles_stage_11c_hir_directly() {
     let hir = doriac::lower_source(
         "test.doria",
         r#"function main(): int
@@ -799,11 +855,11 @@ fn rejects_unsupported_division_as_mir_coverage() {
 "#,
     );
 
-    assert_stage_11b_unsupported(&diagnostics, "division and modulo");
+    assert_stage_11c_unsupported(&diagnostics, "division and modulo");
 }
 
 #[test]
-fn rejects_unsupported_comparison_as_mir_coverage() {
+fn rejects_comparison_result_as_runtime_value() {
     let diagnostics = unsupported(
         r#"function main(): void
 {
@@ -812,23 +868,7 @@ fn rejects_unsupported_comparison_as_mir_coverage() {
 "#,
     );
 
-    assert_stage_11b_unsupported(&diagnostics, "comparisons");
-}
-
-#[test]
-fn rejects_unsupported_if_statement_as_mir_coverage() {
-    let diagnostics = unsupported(
-        r#"function main(): int
-{
-    if (true) {
-        return 42;
-    }
-    return 0;
-}
-"#,
-    );
-
-    assert_stage_11b_unsupported(&diagnostics, "if statements");
+    assert_stage_11c_unsupported(&diagnostics, "condition-only");
 }
 
 #[test]
@@ -842,7 +882,7 @@ fn rejects_unsupported_string_local_as_mir_coverage() {
 "#,
     );
 
-    assert_stage_11b_unsupported(&diagnostics, "string locals");
+    assert_stage_11c_unsupported(&diagnostics, "string locals");
 }
 
 #[test]
@@ -855,7 +895,7 @@ fn rejects_unsupported_string_concat_echo_as_mir_coverage() {
 "#,
     );
 
-    assert_stage_11b_unsupported(&diagnostics, "string concatenation");
+    assert_stage_11c_unsupported(&diagnostics, "string concatenation");
 }
 
 #[test]
@@ -873,7 +913,502 @@ function main(): int
 "#,
     );
 
-    assert_stage_11b_unsupported(&diagnostics, "no helper functions");
+    assert_stage_11c_unsupported(&diagnostics, "no helper functions");
+}
+
+#[test]
+fn lowers_if_condition_to_branch_terminator() {
+    let program = lower(
+        r#"function main(): int
+{
+    if (40 + 2 == 42) {
+        return 42;
+    }
+
+    return 0;
+}
+"#,
+    );
+
+    assert_eq!(
+        program.functions[0].blocks[0].terminator,
+        Terminator::Branch {
+            condition: Condition::Compare {
+                op: CompareOp::Equal,
+                left: IntExpression::Binary {
+                    op: BinaryOp::Add,
+                    left: Box::new(IntExpression::Use(Operand::Int(40))),
+                    right: Box::new(IntExpression::Use(Operand::Int(2))),
+                },
+                right: IntExpression::Use(Operand::Int(42)),
+            },
+            then_block: BlockId(1),
+            else_block: BlockId(2),
+        }
+    );
+}
+
+#[test]
+fn lowers_if_without_else_through_a_continuation_block() {
+    let program = lower(
+        r#"function main(): int
+{
+    let writable $value = 0;
+
+    if (true) {
+        $value = 42;
+    }
+
+    return $value;
+}
+"#,
+    );
+    let blocks = &program.functions[0].blocks;
+
+    assert_eq!(blocks.len(), 4);
+    assert_eq!(blocks[1].terminator, Terminator::Jump(BlockId(3)));
+    assert_eq!(blocks[2].terminator, Terminator::Jump(BlockId(3)));
+    assert_eq!(
+        blocks[3].terminator,
+        Terminator::Return(Operand::Local(LocalId(0)))
+    );
+}
+
+#[test]
+fn lowers_if_else_to_distinct_return_blocks() {
+    let program = lower(
+        r#"function main(): int
+{
+    if (true) {
+        return 42;
+    } else {
+        return 0;
+    }
+}
+"#,
+    );
+    let blocks = &program.functions[0].blocks;
+
+    assert_eq!(blocks.len(), 3);
+    assert_eq!(blocks[1].terminator, Terminator::Return(Operand::Int(42)));
+    assert_eq!(blocks[2].terminator, Terminator::Return(Operand::Int(0)));
+}
+
+#[test]
+fn lowers_else_if_chain_to_nested_branch_blocks() {
+    let program = lower(include_str!(
+        "../../../examples/debug/main_else_if_42.doria"
+    ));
+    let blocks = &program.functions[0].blocks;
+
+    assert!(matches!(blocks[0].terminator, Terminator::Branch { .. }));
+    assert!(matches!(blocks[2].terminator, Terminator::Branch { .. }));
+    assert_eq!(blocks[3].terminator, Terminator::Return(Operand::Int(42)));
+}
+
+#[test]
+fn lowers_echo_and_assignment_inside_if_branches() {
+    let echo = lower(include_str!(
+        "../../../examples/debug/main_if_fallthrough_echo.doria"
+    ));
+    assert_eq!(
+        echo.functions[0].blocks[1].statements,
+        vec![Statement::EchoStringLiteral("Hello ".to_string())]
+    );
+
+    let assignment = lower(include_str!(
+        "../../../examples/debug/main_if_assignment_42.doria"
+    ));
+    assert_eq!(
+        assignment.functions[0].blocks[1].statements,
+        vec![Statement::AssignLocal {
+            target: LocalId(0),
+            value: Rvalue::Use(Operand::Int(42)),
+        }]
+    );
+}
+
+#[test]
+fn lowers_all_stage_11c_integer_comparisons() {
+    for (operator, expected) in [
+        ("==", CompareOp::Equal),
+        ("!=", CompareOp::NotEqual),
+        ("<", CompareOp::Less),
+        ("<=", CompareOp::LessEqual),
+        (">", CompareOp::Greater),
+        (">=", CompareOp::GreaterEqual),
+    ] {
+        let source = format!(
+            "function main(): int\n{{\n    if (1 {operator} 1) {{\n        return 42;\n    }}\n\n    return 0;\n}}\n"
+        );
+        let program = lower(&source);
+        let Terminator::Branch { condition, .. } = &program.functions[0].blocks[0].terminator
+        else {
+            panic!("comparison should lower to a branch");
+        };
+        assert!(matches!(
+            condition,
+            Condition::Compare { op, .. } if *op == expected
+        ));
+    }
+}
+
+#[test]
+fn lowers_word_and_symbol_condition_operators_equivalently() {
+    for (word, symbol) in [("and", "&&"), ("or", "||"), ("not", "!")] {
+        let word_source = if word == "not" {
+            format!(
+                "function main(): int\n{{\n    if ({word} false) {{\n        return 42;\n    }}\n\n    return 0;\n}}\n"
+            )
+        } else {
+            format!(
+                "function main(): int\n{{\n    if (true {word} true) {{\n        return 42;\n    }}\n\n    return 0;\n}}\n"
+            )
+        };
+        let symbol_source = if symbol == "!" {
+            "function main(): int\n{\n    if (!false) {\n        return 42;\n    }\n\n    return 0;\n}\n".to_string()
+        } else {
+            format!(
+                "function main(): int\n{{\n    if (true {symbol} true) {{\n        return 42;\n    }}\n\n    return 0;\n}}\n"
+            )
+        };
+
+        assert_eq!(lower(&word_source), lower(&symbol_source));
+    }
+
+    let xor = lower(
+        r#"function main(): int
+{
+    if (true xor false) {
+        return 42;
+    }
+
+    return 0;
+}
+"#,
+    );
+    let Terminator::Branch { condition, .. } = &xor.functions[0].blocks[0].terminator else {
+        panic!("xor should lower to a branch");
+    };
+    assert!(matches!(
+        condition,
+        Condition::Binary {
+            op: ConditionBinaryOp::Xor,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn interprets_stage_11c_if_shapes() {
+    for source in [
+        include_str!("../../../examples/debug/main_if_return_42.doria"),
+        include_str!("../../../examples/debug/main_if_else_42.doria"),
+        include_str!("../../../examples/debug/main_if_assignment_42.doria"),
+        include_str!("../../../examples/debug/main_else_if_42.doria"),
+        include_str!("../../../examples/debug/main_condition_words_42.doria"),
+    ] {
+        assert_eq!(interpret(source).exit_status, 42);
+    }
+
+    assert_eq!(
+        interpret(
+            r#"function main(): int
+{
+    if (false) {
+        return 1;
+    }
+
+    return 42;
+}
+"#,
+        )
+        .exit_status,
+        42
+    );
+    assert_eq!(
+        interpret(
+            r#"function main(): int
+{
+    if (false) {
+        return 0;
+    } else {
+        return 42;
+    }
+}
+"#,
+        )
+        .exit_status,
+        42
+    );
+}
+
+#[test]
+fn interprets_nested_if_and_preserves_branch_local_scope() {
+    assert_eq!(
+        interpret(
+            r#"function main(): int
+{
+    if (true) {
+        if (true) {
+            return 42;
+        }
+    }
+
+    return 0;
+}
+"#,
+        )
+        .exit_status,
+        42
+    );
+
+    assert_eq!(
+        interpret(
+            r#"function main(): int
+{
+    let $value = 1;
+
+    if (true) {
+        let $value = 42;
+    }
+
+    return $value;
+}
+"#,
+        )
+        .exit_status,
+        1
+    );
+}
+
+#[test]
+fn interprets_if_echo_across_blocks() {
+    let output = interpret(include_str!(
+        "../../../examples/debug/main_if_fallthrough_echo.doria"
+    ));
+
+    assert_eq!(output.exit_status, 0);
+    assert_eq!(output.stdout, b"Hello Doria!");
+}
+
+#[test]
+fn interprets_all_integer_comparisons() {
+    for condition in ["42 == 42", "42 != 0", "1 < 2", "2 <= 2", "3 > 2", "3 >= 3"] {
+        let source = format!(
+            "function main(): int\n{{\n    if ({condition}) {{\n        return 42;\n    }}\n\n    return 0;\n}}\n"
+        );
+        assert_eq!(interpret(&source).exit_status, 42, "condition: {condition}");
+    }
+}
+
+#[test]
+fn interpreter_short_circuits_and_and_or() {
+    let and = conditional_program(
+        Condition::Binary {
+            op: ConditionBinaryOp::And,
+            left: Box::new(Condition::Bool(false)),
+            right: Box::new(condition_that_reads_unassigned_local()),
+        },
+        0,
+        42,
+    );
+    let or = conditional_program(
+        Condition::Binary {
+            op: ConditionBinaryOp::Or,
+            left: Box::new(Condition::Bool(true)),
+            right: Box::new(condition_that_reads_unassigned_local()),
+        },
+        42,
+        0,
+    );
+
+    assert_eq!(
+        doriac::mir_interpreter::interpret(&and)
+            .expect("and should skip its right operand")
+            .exit_status,
+        42
+    );
+    assert_eq!(
+        doriac::mir_interpreter::interpret(&or)
+            .expect("or should skip its right operand")
+            .exit_status,
+        42
+    );
+}
+
+#[test]
+fn interpreter_evaluates_both_xor_operands() {
+    let program = conditional_program(
+        Condition::Binary {
+            op: ConditionBinaryOp::Xor,
+            left: Box::new(Condition::Bool(true)),
+            right: Box::new(condition_that_reads_unassigned_local()),
+        },
+        42,
+        0,
+    );
+    let error = doriac::mir_interpreter::interpret(&program)
+        .expect_err("xor must evaluate its right operand");
+
+    assert!(error.message.contains("read before assignment"));
+}
+
+#[test]
+fn interpreter_computes_xor_truth_table() {
+    for (left, right, expected) in [
+        (false, false, 0),
+        (false, true, 42),
+        (true, false, 42),
+        (true, true, 0),
+    ] {
+        let source = format!(
+            "function main(): int\n{{\n    if ({left} xor {right}) {{\n        return 42;\n    }}\n\n    return 0;\n}}\n"
+        );
+        assert_eq!(interpret(&source).exit_status, expected);
+    }
+}
+
+#[test]
+fn interpreter_inverts_not_condition() {
+    assert_eq!(
+        interpret(
+            r#"function main(): int
+{
+    if (not false) {
+        return 42;
+    }
+
+    return 0;
+}
+"#,
+        )
+        .exit_status,
+        42
+    );
+}
+
+#[test]
+fn interpreter_preserves_void_fallthrough_after_final_else_if() {
+    let output = interpret(
+        r#"function main(): void
+{
+    if (false) {
+        return;
+    } else if (false) {
+        return;
+    }
+}
+"#,
+    );
+
+    assert_eq!(output.exit_status, 0);
+    assert!(output.stdout.is_empty());
+}
+
+#[test]
+fn interpreter_limits_malformed_mir_control_flow() {
+    let program = Program {
+        functions: vec![Function {
+            id: FunctionId(0),
+            name: "main".to_string(),
+            return_type: ReturnType::Void,
+            locals: Vec::new(),
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                statements: Vec::new(),
+                terminator: Terminator::Jump(BlockId(0)),
+            }],
+            entry_block: BlockId(0),
+        }],
+        entry: FunctionId(0),
+    };
+
+    let error = doriac::mir_interpreter::interpret(&program)
+        .expect_err("malformed cyclic MIR should hit the defensive limit");
+    assert_eq!(
+        error.message,
+        "MIR interpreter exceeded Stage 11c step limit"
+    );
+}
+
+#[test]
+fn debug_target_handles_stage_11c_examples() {
+    for source in [
+        include_str!("../../../examples/debug/main_if_return_42.doria"),
+        include_str!("../../../examples/debug/main_if_else_42.doria"),
+        include_str!("../../../examples/debug/main_if_assignment_42.doria"),
+        include_str!("../../../examples/debug/main_else_if_42.doria"),
+        include_str!("../../../examples/debug/main_condition_words_42.doria"),
+    ] {
+        assert_eq!(debug_contents(source), "exit_status: 42\nstdout:\n");
+    }
+
+    assert_eq!(
+        debug_contents(include_str!(
+            "../../../examples/debug/main_if_fallthrough_echo.doria"
+        )),
+        "exit_status: 0\nstdout: Hello Doria!\n"
+    );
+}
+
+#[test]
+fn rejects_truthiness_and_calls_as_stage_11c_conditions() {
+    let truthiness = unsupported_after_parsing(
+        r#"function main(): int
+{
+    if (42) {
+        return 1;
+    }
+
+    return 0;
+}
+"#,
+    );
+    assert_stage_11c_unsupported(&truthiness, "truthiness");
+
+    let call = unsupported_after_parsing(
+        r#"function main(): int
+{
+    if (isReady()) {
+        return 1;
+    }
+
+    return 0;
+}
+"#,
+    );
+    assert_stage_11c_unsupported(&call, "calls in conditions");
+}
+
+#[test]
+fn rejects_loops_as_stage_11c_mir_coverage() {
+    let diagnostics = unsupported(
+        r#"function main(): void
+{
+    while (false) {
+    }
+}
+"#,
+    );
+
+    assert_stage_11c_unsupported(&diagnostics, "loops");
+}
+
+#[test]
+fn mirrors_native_smoke_exit_for_stage_11c_if_shapes_without_linker() {
+    for source in [
+        include_str!("../../../examples/debug/main_if_return_42.doria"),
+        include_str!("../../../examples/debug/main_if_assignment_42.doria"),
+    ] {
+        let hir = doriac::lower_source("test.doria", source).expect("source should lower to HIR");
+        let native_exit = doriac::codegen_native::validate_stage_2d(&hir)
+            .expect("native smoke validator should already accept this source");
+        let mir_exit = interpret(source).exit_status;
+
+        assert_eq!(native_exit, 42);
+        assert_eq!(mir_exit, native_exit);
+    }
 }
 
 #[test]
