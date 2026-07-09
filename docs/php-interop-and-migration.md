@@ -1,5 +1,8 @@
 # PHP Interop and Migration Strategy
 
+> Documentation role: supporting design note.
+> Source-of-truth hierarchy: `docs/doria-end-to-end-plan.md` owns future sequencing; accepted `docs/decisions/*.md` files own topic-level decisions. This note is subordinate to both.
+
 Doria is its own compiled programming language. PHP interop is an adoption strategy, not Doria's identity and not Doria's correctness target.
 
 Doria's primary goal is native programs: native command-line tools, services, desktop applications, game tooling, systems software, and eventually self-hosted compiler components. PHP interoperability can be valuable, but it is optional and non-authoritative.

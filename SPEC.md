@@ -2,6 +2,8 @@
 
 This document describes the v0.1 direction for Doria.
 
+Documentation role: current language specification. This file records Doria language rules and current implementation status where useful; it is not a parallel roadmap. Future implementation sequencing belongs to `docs/doria-end-to-end-plan.md`, and topic-level accepted decisions belong to `docs/decisions/`.
+
 ## 1. What Doria is
 
 Doria is a statically checked compiled programming language designed for native executables, tooling, services, desktop software, games, and future self-hosting.
@@ -585,7 +587,7 @@ extends
 implements
 ```
 
-`class` declares an object type. Doria already has class syntax in the current compiler surface:
+`class` declares a class type. Doria already has class syntax in the current compiler surface:
 
 ```doria
 class Person

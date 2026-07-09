@@ -1,5 +1,8 @@
 # Doria Brand Positioning
 
+> Documentation role: supporting design note.
+> Source-of-truth hierarchy: `docs/doria-end-to-end-plan.md` owns future sequencing; accepted `docs/decisions/*.md` files own topic-level decisions. This note is subordinate to both.
+
 ## Core rule
 
 Doria should stand on its own.

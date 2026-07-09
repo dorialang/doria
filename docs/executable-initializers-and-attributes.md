@@ -1,5 +1,8 @@
 # Executable Initializers and Attribute Expressions
 
+> Documentation role: supporting design note.
+> Source-of-truth hierarchy: `docs/doria-end-to-end-plan.md` owns future sequencing; accepted `docs/decisions/*.md` files own topic-level decisions. This note is subordinate to both.
+
 Doria has syntax familiar to developers coming from PHP-like and C-like languages, but it should not inherit PHP's restrictions around property default values or attribute arguments.
 
 In PHP, property initializers and attribute arguments are limited to constant values or constant expressions. Doria should allow richer, typed, compiler-checked expressions in both places.

@@ -1,5 +1,8 @@
 # Mutability Ergonomics
 
+> Documentation role: supporting design note.
+> Source-of-truth hierarchy: `docs/doria-end-to-end-plan.md` owns future sequencing; accepted `docs/decisions/*.md` files own topic-level decisions. This note is subordinate to both.
+
 Doria is readonly by default. This is a core safety feature and should not be abandoned simply because some users find `writable` repetitive.
 
 However, Doria should also be pleasant to write. This document records the planned ergonomic tools for reducing repetition while keeping mutation explicit.

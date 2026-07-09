@@ -74,7 +74,7 @@ At completion, report assumptions made and critical decisions encountered. If no
 - public, private, and protected are not Doria visibility keywords. Members are externally accessible by default, internal is the only access-surface keyword, and protected is permanently excluded.
 - use is namespace import/alias, uses is trait composition, and with is closure capture. These three keywords are not interchangeable.
 
-- Treat `docs/brand-positioning.md`, `docs/doria-development-plan.md`, `docs/self-hosting.md`, `docs/executable-initializers-and-attributes.md`, `docs/php-interop-and-migration.md`, `docs/performance-and-benchmarking.md`, `docs/mutability-ergonomics.md`, `docs/api-design-guidelines.md`, `docs/decisions/`, and `SPEC.md` as the product direction.
+- Treat `docs/doria-end-to-end-plan.md`, `docs/decisions/`, `SPEC.md`, `README.md`, `AGENTS.md`, and `docs/information-architecture.md` according to the documentation authority model. Supporting design notes are subordinate to the end-to-end plan and accepted decisions.
 - Keep compiler work incremental and tested, but never use incremental delivery as an excuse to make unsound language decisions.
 - Do not make PHP the public identity of Doria. PHP is development context, migration context, and one optional compatibility backend; Doria should be described as its own native-first language.
 - Do not describe Doria as a Rust language. Rust is only the bootstrap implementation language for the current `doriac`.
@@ -134,6 +134,30 @@ At completion, report assumptions made and critical decisions encountered. If no
 - Do not introduce external Rust crates unless they remove real complexity and the repository is ready to manage that dependency.
 - Do not add repository utility scripts in Python, JavaScript, shell, or another scripting language out of habit. Prefer Rust for compiler/project tooling and PHP for small repository text/JSON/regex helpers unless a different tool has an explicit, documented advantage for that specific task.
 
+## Global planning and documentation hygiene
+
+- The end-to-end plan is the skeleton.
+- Implementation prompts must start from the skeleton, not from local file edits.
+- Before generating or executing a prompt, check whether an open PR already covers the work.
+- Before adding docs, check `docs/information-architecture.md`.
+- Do not create parallel roadmaps.
+- Do not patch stale planning docs when deletion or redirection is the correct fix.
+- Do not list deleted or superseded docs in "Read first."
+- If a file duplicates the end-to-end plan, stop and classify it.
+- A clear picture is required before implementation; a complete picture is not required.
+- Local MVP work must not undermine the long-term architecture.
+- When a design decision affects parser, AST, HIR, MIR, backend, LSP, editor grammar, docs, and tests, plan the full surface area up front, even if implementation is sliced.
+
+Prompt checklist before implementation:
+
+- What stage or decision in the end-to-end plan does this belong to?
+- Is there an open PR already doing this?
+- Which source-of-truth docs own this topic?
+- Which files are active vs historical?
+- Is this a local patch or a skeleton-aligned change?
+- What future speed bumps will this remove?
+- What future work must this avoid duplicating?
+
 ## MVP non-goals
 
 - Full PHP compatibility.
@@ -168,6 +192,13 @@ cargo run -p doriac -- hir examples/person.doria
 cargo run -p doriac -- compile examples/native/main_return_zero.doria --target native --out build/native/main_return_zero
 cargo run -p doriac -- compile examples/native/main_return_42.doria --target native --out build/native/main_return_42
 cargo run -p doriac -- compile examples/native/main_void_hello.doria --target native --out build/native/main_void_hello
+```
+
+Run documentation and editor guardrails for docs/editor changes:
+
+```bash
+php scripts/check_docs_authority.php
+php scripts/check_editor_highlighting.php
 ```
 
 Run backend-specific checks only when the touched task depends on that backend. For the current PHP compatibility backend:

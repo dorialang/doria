@@ -1,5 +1,8 @@
 # Doria End-to-End Plan Adoption
 
+> Documentation role: historical note.
+> This file is preserved for context only. It is not an active roadmap or source of truth. Use `docs/doria-end-to-end-plan.md` for current execution planning.
+
 The updated Doria End-to-End Development Plan is now the master execution plan for future work.
 
 It supersedes older planning wording where the plan explicitly resolves a future-work fork.

@@ -1,5 +1,8 @@
 # Doria Self-Hosting Plan
 
+> Documentation role: supporting design note.
+> Source-of-truth hierarchy: `docs/doria-end-to-end-plan.md` owns future sequencing; accepted `docs/decisions/*.md` files own topic-level decisions. This note is subordinate to both.
+
 Doria's compiler, `doriac`, is initially implemented in Rust, but one of the early strategic goals of the language is to make `doriac` increasingly writable in Doria itself.
 
 This is called **self-hosting** or **bootstrapping**.

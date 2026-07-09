@@ -1,5 +1,8 @@
 # Performance and Benchmarking Plan
 
+> Documentation role: supporting design note.
+> Source-of-truth hierarchy: `docs/doria-end-to-end-plan.md` owns future sequencing; accepted `docs/decisions/*.md` files own topic-level decisions. This note is subordinate to both.
+
 Doria's long-term goal is native machine code and standalone executables. Performance should be measured honestly from early development onward, especially because Doria is intended for native CLI tools, desktop applications, game tooling, game engines, graphics/media work, C-library bindings, and future raylib bindings.
 
 This document records the benchmark direction. It is not a performance claim.

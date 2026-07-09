@@ -70,7 +70,7 @@ This repository contains the first working vertical slices of `doriac`:
 - Emits PHP for supported syntax through the optional PHP compatibility backend, including `not`, `and`, `or`, and `xor` lowering that preserves Doria boolean semantics.
 - Provides CLI commands and integration tests.
 
-It is intentionally not a complete language yet. The implementation should grow in small, tested compiler increments without compromising Doria's native-first semantics. The Doria End-to-End Development Plan is the master future execution plan; the active implementation slice is Stage 11b: MIR integer expressions and locals. Stage 11b extends inspectable MIR and the debug interpreter to readonly/writable int locals, simple writable int mutation, and checked +, -, * arithmetic while preserving Stage 11a literal return and exact string-literal echo coverage. It still does not complete Stage 11: MIR control flow, loops, function calls, classes, runtime strings, ownership/borrow checking, doria-rt, LLVM, and NativeSmokeModule deletion remain future work. NativeSmokeModule still exists temporarily for broader current native smoke coverage, but new language capability work should go through MIR/interpreter rather than expanding it.
+It is intentionally not a complete language yet. The implementation should grow in small, tested compiler increments without compromising Doria's native-first semantics. The Doria End-to-End Development Plan is the master future execution plan; the most recently merged MIR slice is Stage 11b: MIR integer expressions and locals. Stage 11b extends inspectable MIR and the debug interpreter to readonly/writable int locals, simple writable int mutation, and checked +, -, * arithmetic while preserving Stage 11a literal return and exact string-literal echo coverage. It still does not complete Stage 11: MIR control flow, loops, function calls, classes, runtime strings, ownership/borrow checking, doria-rt, LLVM, and NativeSmokeModule deletion remain future work. NativeSmokeModule still exists temporarily for broader current native smoke coverage, but new language capability work should go through MIR/interpreter rather than expanding it.
 
 ## Quick start
 
@@ -171,7 +171,7 @@ doriac compile <source.doria> --target php [--out <file>]
 doriac run <source.doria>
 ```
 
-`compile` defaults to native output and infers an output file name from the input file. `php` is implemented as an explicit compatibility backend. `debug` and `wasm` are recognized planned targets.
+`compile` defaults to native output and infers an output file name from the input file. `php` is implemented as an explicit compatibility backend. The `debug` target exists as a Stage 11a/11b MIR interpreter artifact for inspection, while `wasm` remains planned.
 
 `doriac run` expects a Doria source file, compiles it through the native backend, and runs a temporary executable. To run an executable you already built, run that executable directly, for example `./build/native/main_if_else_42`.
 
@@ -230,36 +230,19 @@ For VS Code, the setting is `doria.languageServer.path`. For IntelliJ IDEs, use 
 - Doria may support features PHP cannot express directly, such as executable instance property initializers and richer attribute expressions.
 - If a language behavior is not specified, implementation work should pause for an explicit design decision rather than inventing behavior silently.
 
-## Design docs
+## Where Things Live
 
-Important project documents:
+- Current quickstart and implementation snapshot: `README.md`
+- Current language specification: `SPEC.md`
+- Master future execution plan: `docs/doria-end-to-end-plan.md`
+- Accepted design decisions: `docs/decisions/`
+- Historical notes: `docs/notes/`
+- Documentation authority model: `docs/information-architecture.md`
 
-```text
-SPEC.md
-AGENTS.md
-docs/doria-end-to-end-plan.md
-docs/doria-development-plan.md
-docs/brand-positioning.md
-docs/self-hosting.md
-docs/executable-initializers-and-attributes.md
-docs/php-interop-and-migration.md
-docs/decisions/0010-native-first-correctness.md
-docs/decisions/0011-native-execution-path.md
-docs/decisions/0012-dual-native-backend-strategy.md
-docs/decisions/0013-stage-2-native-integers.md
-docs/decisions/0014-baton-project-tool.md
-docs/decisions/0015-stage-2b-native-readonly-integer-locals.md
-docs/decisions/0016-fixed-width-numeric-types.md
-docs/decisions/0017-stage-2c-native-int-arithmetic.md
-docs/decisions/0018-stage-2d-native-returned-int-expressions.md
-docs/decisions/0019-stage-4a-native-if-else-returns.md
-docs/decisions/0032-main-void-and-implicit-success.md
-docs/decisions/0033-stage-8a-native-readonly-string-locals-and-echo.md
-docs/decisions/0034-stage-9-mvp-iteration-syntax.md
-docs/decisions/0035-checked-throw-throws-direction.md
-docs/decisions/0036-stage-8-mvp-string-echo-path.md
-docs/decisions/0037-stage-10-native-free-functions.md
-docs/website-content-guidelines.md
+Run the documentation authority guardrail after changing docs:
+
+```bash
+php scripts/check_docs_authority.php
 ```
 
 ## Repository layout
@@ -278,7 +261,9 @@ docs/website-content-guidelines.md
 ├── docs/
 │   ├── brand-positioning.md
 │   ├── decisions/
-│   ├── doria-development-plan.md
+│   ├── doria-end-to-end-plan.md
+│   ├── information-architecture.md
+│   ├── notes/
 │   ├── executable-initializers-and-attributes.md
 │   ├── php-interop-and-migration.md
 │   └── self-hosting.md

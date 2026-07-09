@@ -1,5 +1,8 @@
 # Stage 11 Primitive Helper Branch Review
 
+> Documentation role: historical note.
+> This file is preserved for context only. It is not an active roadmap or source of truth. Use `docs/doria-end-to-end-plan.md` for current execution planning.
+
 Reviewed branch:
 
     feature/stage-11-native-primitive-helper-signatures

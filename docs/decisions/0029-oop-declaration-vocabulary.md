@@ -20,7 +20,7 @@ This is a language-design decision only. It does not implement lexer, parser, AS
 
 ## class
 
-`class` declares an object type.
+`class` declares a class type.
 
 Conceptual syntax:
 

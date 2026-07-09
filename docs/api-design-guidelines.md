@@ -1,5 +1,8 @@
 # Doria API Design Guidelines
 
+> Documentation role: supporting design note.
+> Source-of-truth hierarchy: `docs/doria-end-to-end-plan.md` owns future sequencing; accepted `docs/decisions/*.md` files own topic-level decisions. This note is subordinate to both.
+
 Doria APIs should make intent obvious at the call site.
 
 ## Core rule

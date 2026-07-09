@@ -56,6 +56,9 @@ jobs:
       - name: Check editor highlighting
         run: php scripts/check_editor_highlighting.php
 
+      - name: Check documentation authority
+        run: php scripts/check_docs_authority.php
+
       - name: Smoke check native Doria example
         run: cargo run -p doriac -- check examples/native/main_if_42.doria
 

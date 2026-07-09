@@ -1,5 +1,8 @@
 # Website Content Guidelines
 
+> Documentation role: supporting design note.
+> Source-of-truth hierarchy: `docs/doria-end-to-end-plan.md` owns future sequencing; accepted `docs/decisions/*.md` files own topic-level decisions. This note is subordinate to both.
+
 ## Homepage Toolchain Positioning
 
 The homepage teaches Doria's public workflow as:

@@ -209,7 +209,7 @@ Risks:
 - bypassing variable initialization
 - jumping into scopes
 - breaking readonly/writable analysis
-- complicating ownership/borrow checking over MIR later
+- complicating ownership/borrow checking over MIR and later control-flow lowering
 - bypassing future `given` / `finally` cleanup obligations
 - making definite-return analysis harder
 - making CFG lowering harder
