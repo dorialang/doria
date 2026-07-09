@@ -14,10 +14,13 @@ class DoriaColorSettingsPage : ColorSettingsPage {
     override fun getHighlighter(): SyntaxHighlighter = DoriaSyntaxHighlighter()
 
     override fun getDemoText(): String = """
+        #[Module(host: "localhost", port: 3306)]
+        #[App\Routing\Route(path: "/people")]
         class Person
         {
             writable string ${'$'}name = "Andrew Masiye";
 
+            #[Test]
             function greet(): void
             {
                 echo ${'$'}this->getGreetingMessage();
@@ -71,6 +74,9 @@ class DoriaColorSettingsPage : ColorSettingsPage {
             AttributesDescriptor("Import alias", DoriaSyntaxHighlighter.IMPORT_ALIAS),
             AttributesDescriptor("Trait uses keyword", DoriaSyntaxHighlighter.TRAIT_USES_KEYWORD),
             AttributesDescriptor("Trait name", DoriaSyntaxHighlighter.TRAIT_NAME),
+            AttributesDescriptor("Attribute delimiter", DoriaSyntaxHighlighter.ATTRIBUTE_DELIMITER),
+            AttributesDescriptor("Attribute name", DoriaSyntaxHighlighter.ATTRIBUTE_NAME),
+            AttributesDescriptor("Attribute argument", DoriaSyntaxHighlighter.ATTRIBUTE_ARGUMENT),
             AttributesDescriptor("Function declaration", DoriaSyntaxHighlighter.FUNCTION_DECLARATION),
             AttributesDescriptor("Function call", DoriaSyntaxHighlighter.FUNCTION_CALL),
             AttributesDescriptor("Method call", DoriaSyntaxHighlighter.METHOD_CALL),

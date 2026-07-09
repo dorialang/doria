@@ -83,6 +83,12 @@ enum LifecycleMethod {
     Destructor,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TypePosition {
+    Return,
+    Value,
+}
+
 impl LifecycleMethod {
     fn from_method_name(name: &str) -> Option<Self> {
         match name {
@@ -149,6 +155,7 @@ impl<'program> Checker<'program> {
     fn check(&mut self) {
         self.collect_classes();
         self.collect_functions();
+        self.infer_unannotated_mixed_return_signatures();
 
         let mut scopes = ScopeStack::new();
         for item in &self.program.items {
@@ -169,6 +176,12 @@ impl<'program> Checker<'program> {
             let Item::Class(class_decl) = item else {
                 continue;
             };
+
+            if let Some(message) = Self::reserved_class_name_message(&class_decl.name) {
+                self.diagnostics
+                    .push(Diagnostic::new("E0309", message, class_decl.span));
+                continue;
+            }
 
             if self.classes.contains_key(&class_decl.name) {
                 self.diagnostics.push(Diagnostic::new(
@@ -201,6 +214,12 @@ impl<'program> Checker<'program> {
                         self.declare_property(&mut info, &class_decl.name, property);
                     }
                     ClassMember::Method(method) => {
+                        if let Some(message) = Self::reserved_callable_name_message(&method.name) {
+                            self.diagnostics
+                                .push(Diagnostic::new("E0310", message, method.span));
+                            continue;
+                        }
+
                         let signature = self.resolve_function_signature(method);
                         self.function_signatures
                             .insert(method.span.start, signature.clone());
@@ -253,11 +272,59 @@ impl<'program> Checker<'program> {
         }
     }
 
+    fn reserved_class_name_message(name: &str) -> Option<String> {
+        match name {
+            "array" => Some(
+                "`array` is not a Doria class name; use typed arrays like `T[]` or collection aliases"
+                    .to_string(),
+            ),
+            "mixed" => Some(
+                "`mixed` is a Doria dynamic-boundary type and cannot be used as a class name"
+                    .to_string(),
+            ),
+            "object" => Some(
+                "`object` is not a Doria type and cannot be used as a class name".to_string(),
+            ),
+            "resource" => Some(
+                "`resource` is reserved for future PHP interop and cannot be used as a class name"
+                    .to_string(),
+            ),
+            _ => None,
+        }
+    }
+
+    fn reserved_callable_name_message(name: &str) -> Option<String> {
+        match name {
+            "array" => Some(
+                "`array` is not a Doria callable name; use typed arrays like `T[]` or collection aliases"
+                    .to_string(),
+            ),
+            "mixed" => Some(
+                "`mixed` is a Doria dynamic-boundary type and cannot be used as a callable name"
+                    .to_string(),
+            ),
+            "object" => Some(
+                "`object` is not a Doria type and cannot be used as a callable name".to_string(),
+            ),
+            "resource" => Some(
+                "`resource` is reserved for future PHP interop and cannot be used as a callable name"
+                    .to_string(),
+            ),
+            _ => None,
+        }
+    }
+
     fn collect_functions(&mut self) {
         for item in &self.program.items {
             let Item::Function(function) = item else {
                 continue;
             };
+
+            if let Some(message) = Self::reserved_callable_name_message(&function.name) {
+                self.diagnostics
+                    .push(Diagnostic::new("E0310", message, function.span));
+                continue;
+            }
 
             let signature = self.resolve_function_signature(function);
             self.function_signatures
@@ -276,10 +343,10 @@ impl<'program> Checker<'program> {
     }
 
     fn resolve_function_signature(&mut self, function: &FunctionDecl) -> FunctionInfo {
-        FunctionInfo {
-            params: self.resolve_param_infos(function),
-            return_ty: self.resolve_function_return_type(function),
-        }
+        let params = self.resolve_param_infos(function);
+        let return_ty = self.resolve_function_return_type(function);
+
+        FunctionInfo { params, return_ty }
     }
 
     fn resolve_param_infos(&mut self, function: &FunctionDecl) -> Vec<ParamInfo> {
@@ -319,8 +386,542 @@ impl<'program> Checker<'program> {
         function
             .return_type
             .as_ref()
-            .map(|return_type| self.resolve_type_ref(return_type, function.span))
+            .map(|return_type| {
+                self.resolve_type_ref_in_position(return_type, function.span, TypePosition::Return)
+            })
             .unwrap_or_else(|| self.types.unknown())
+    }
+
+    fn infer_unannotated_mixed_return_signatures(&mut self) {
+        let max_iterations = self.mixed_return_inference_signature_count();
+
+        for _ in 0..max_iterations {
+            let mut changed = false;
+
+            for item in &self.program.items {
+                match item {
+                    Item::Function(function) => {
+                        changed |= self.update_function_mixed_return_signature(function);
+                    }
+                    Item::Class(class_decl) => {
+                        for member in &class_decl.members {
+                            let ClassMember::Method(method) = member else {
+                                continue;
+                            };
+                            changed |=
+                                self.update_method_mixed_return_signature(&class_decl.name, method);
+                        }
+                    }
+                    Item::Statement(_) => {}
+                }
+            }
+
+            if !changed {
+                break;
+            }
+        }
+    }
+
+    fn mixed_return_inference_signature_count(&self) -> usize {
+        self.program
+            .items
+            .iter()
+            .map(|item| match item {
+                Item::Function(function) if function.return_type.is_none() => 1,
+                Item::Class(class_decl) => class_decl
+                    .members
+                    .iter()
+                    .filter(|member| match member {
+                        ClassMember::Method(method) => {
+                            method.return_type.is_none()
+                                && LifecycleMethod::from_method_name(&method.name).is_none()
+                        }
+                        ClassMember::Property(_) => false,
+                    })
+                    .count(),
+                _ => 0,
+            })
+            .sum::<usize>()
+            .max(1)
+    }
+
+    fn update_function_mixed_return_signature(&mut self, function: &FunctionDecl) -> bool {
+        if function.return_type.is_some() {
+            return false;
+        }
+
+        let Some(signature) = self.function_signatures.get(&function.span.start).cloned() else {
+            return false;
+        };
+        let inferred = self.infer_unannotated_mixed_return_type(function, &signature.params, None);
+
+        if !self.type_contains_mixed(inferred) || signature.return_ty == inferred {
+            return false;
+        }
+
+        if let Some(signature) = self.function_signatures.get_mut(&function.span.start) {
+            signature.return_ty = inferred;
+        }
+        if let Some(function_info) = self.functions.get_mut(&function.name) {
+            function_info.return_ty = inferred;
+        }
+        true
+    }
+
+    fn update_method_mixed_return_signature(
+        &mut self,
+        class_name: &str,
+        method: &FunctionDecl,
+    ) -> bool {
+        if method.return_type.is_some() || LifecycleMethod::from_method_name(&method.name).is_some()
+        {
+            return false;
+        }
+
+        let Some(signature) = self.function_signatures.get(&method.span.start).cloned() else {
+            return false;
+        };
+        let method_context = MethodContext {
+            class_name: class_name.to_string(),
+            writable_this: method.writable_this,
+            this_available: true,
+        };
+        let inferred = self.infer_unannotated_mixed_return_type(
+            method,
+            &signature.params,
+            Some(&method_context),
+        );
+
+        if !self.type_contains_mixed(inferred) || signature.return_ty == inferred {
+            return false;
+        }
+
+        if let Some(signature) = self.function_signatures.get_mut(&method.span.start) {
+            signature.return_ty = inferred;
+        }
+        if let Some(method_info) = self
+            .classes
+            .get_mut(class_name)
+            .and_then(|class_info| class_info.methods.get_mut(&method.name))
+        {
+            method_info.return_ty = inferred;
+        }
+        true
+    }
+
+    fn infer_unannotated_mixed_return_type(
+        &mut self,
+        function: &FunctionDecl,
+        params: &[ParamInfo],
+        method_context: Option<&MethodContext>,
+    ) -> TypeId {
+        let mut scopes = ScopeStack::new();
+        for param in params {
+            let _ = scopes.declare(
+                param.name.clone(),
+                Binding {
+                    writable: false,
+                    ty: param.ty,
+                    int_constant: None,
+                },
+            );
+        }
+
+        self.infer_mixed_return_from_block(&function.body, &mut scopes, method_context)
+            .unwrap_or_else(|| self.types.unknown())
+    }
+
+    fn infer_mixed_return_from_statements(
+        &mut self,
+        statements: &[Stmt],
+        scopes: &mut ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) -> Option<TypeId> {
+        let mut inferred = None;
+
+        for statement in statements {
+            let statement_ty =
+                self.infer_mixed_return_from_statement(statement, scopes, method_context);
+            inferred = self.merge_optional_mixed_return_types(inferred, statement_ty);
+
+            if Self::statement_is_terminal(statement) {
+                break;
+            }
+        }
+
+        inferred
+    }
+
+    fn infer_mixed_return_from_statement(
+        &mut self,
+        statement: &Stmt,
+        scopes: &mut ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) -> Option<TypeId> {
+        match statement {
+            Stmt::VarDecl(decl) => {
+                let ty = self.infer_local_declaration_type(
+                    decl.ty.as_ref(),
+                    &decl.initializer,
+                    scopes,
+                    method_context,
+                );
+                let _ = scopes.declare(
+                    decl.name.clone(),
+                    Binding {
+                        writable: decl.writable,
+                        ty,
+                        int_constant: None,
+                    },
+                );
+                None
+            }
+            Stmt::Assignment(assignment) => {
+                self.infer_mixed_return_from_assignment(assignment, scopes, method_context);
+                None
+            }
+            Stmt::Return {
+                expr: Some(expr), ..
+            } => {
+                let ty = self.infer_expr_type(expr, scopes, method_context);
+                self.type_contains_mixed(ty).then_some(ty)
+            }
+            Stmt::If(if_stmt) => {
+                self.infer_mixed_return_from_if_statement(if_stmt, scopes, method_context)
+            }
+            Stmt::While(while_stmt) => {
+                self.infer_mixed_return_from_block(&while_stmt.body, scopes, method_context)
+            }
+            Stmt::For(for_stmt) => {
+                scopes.push();
+                if let Some(initializer) = &for_stmt.initializer {
+                    self.infer_mixed_return_from_for_initializer(
+                        initializer,
+                        scopes,
+                        method_context,
+                    );
+                }
+                let result =
+                    self.infer_mixed_return_from_block(&for_stmt.body, scopes, method_context);
+                if let Some(increment) = &for_stmt.increment {
+                    self.infer_mixed_return_from_for_increment(increment, scopes, method_context);
+                }
+                scopes.pop();
+                result
+            }
+            Stmt::Foreach(foreach) => {
+                self.infer_mixed_return_from_foreach(foreach, scopes, method_context)
+            }
+            _ => None,
+        }
+    }
+
+    fn infer_mixed_return_from_if_statement(
+        &mut self,
+        if_stmt: &IfStmt,
+        scopes: &mut ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) -> Option<TypeId> {
+        let incoming_scopes = scopes.clone();
+        let mut falling_through_scopes = Vec::new();
+
+        let mut then_scopes = incoming_scopes.clone();
+        let mut inferred = self.infer_mixed_return_from_block(
+            &if_stmt.then_block,
+            &mut then_scopes,
+            method_context,
+        );
+        if !Self::block_is_terminal(&if_stmt.then_block) {
+            falling_through_scopes.push(then_scopes);
+        }
+
+        if let Some(branch) = &if_stmt.else_branch {
+            let mut else_scopes = incoming_scopes;
+            let branch_ty =
+                self.infer_mixed_return_from_else_branch(branch, &mut else_scopes, method_context);
+            inferred = self.merge_optional_mixed_return_types(inferred, branch_ty);
+            if !Self::else_branch_is_terminal(branch) {
+                falling_through_scopes.push(else_scopes);
+            }
+        } else {
+            falling_through_scopes.push(incoming_scopes);
+        }
+
+        scopes.replace_types_from_branches(&falling_through_scopes, |left, right| {
+            self.merge_inferred_binding_type(left, right)
+        });
+
+        inferred
+    }
+    fn infer_mixed_return_from_block(
+        &mut self,
+        block: &Block,
+        scopes: &mut ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) -> Option<TypeId> {
+        scopes.push();
+        let inferred =
+            self.infer_mixed_return_from_statements(&block.statements, scopes, method_context);
+        scopes.pop();
+        inferred
+    }
+
+    fn infer_mixed_return_from_else_branch(
+        &mut self,
+        branch: &ElseBranch,
+        scopes: &mut ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) -> Option<TypeId> {
+        match branch {
+            ElseBranch::If(if_stmt) => self.infer_mixed_return_from_statement(
+                &Stmt::If((**if_stmt).clone()),
+                scopes,
+                method_context,
+            ),
+            ElseBranch::Block(block) => {
+                self.infer_mixed_return_from_block(block, scopes, method_context)
+            }
+        }
+    }
+
+    fn infer_mixed_return_from_for_initializer(
+        &mut self,
+        initializer: &ForInitializer,
+        scopes: &mut ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) {
+        match initializer {
+            ForInitializer::VarDecl(decl) => {
+                let ty = self.infer_local_declaration_type(
+                    decl.ty.as_ref(),
+                    &decl.initializer,
+                    scopes,
+                    method_context,
+                );
+                let _ = scopes.declare(
+                    decl.name.clone(),
+                    Binding {
+                        writable: decl.writable,
+                        ty,
+                        int_constant: None,
+                    },
+                );
+            }
+            ForInitializer::Assignment(assignment) => {
+                self.infer_mixed_return_from_assignment(assignment, scopes, method_context);
+            }
+        }
+    }
+
+    fn infer_mixed_return_from_for_increment(
+        &mut self,
+        increment: &ForIncrement,
+        scopes: &mut ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) {
+        if let ForIncrement::Assignment(assignment) = increment {
+            self.infer_mixed_return_from_assignment(assignment, scopes, method_context);
+        }
+    }
+
+    fn infer_mixed_return_from_assignment(
+        &mut self,
+        assignment: &Assignment,
+        scopes: &mut ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) {
+        if !matches!(assignment.op, AssignOp::Assign) {
+            return;
+        }
+
+        if let Some(name) = Self::assignment_target_variable_name(&assignment.target) {
+            let ty = self.infer_expr_type(&assignment.value, scopes, method_context);
+            if let Some(binding) = scopes.lookup_mut(name) {
+                binding.ty = self.merge_inferred_binding_type(binding.ty, ty);
+            }
+        }
+    }
+
+    fn assignment_target_variable_name(target: &Expr) -> Option<&str> {
+        match target {
+            Expr::Grouped { expr, .. } => Self::assignment_target_variable_name(expr),
+            Expr::Variable { name, .. } => Some(name),
+            _ => None,
+        }
+    }
+
+    fn infer_mixed_return_from_foreach(
+        &mut self,
+        foreach: &ForeachStmt,
+        scopes: &mut ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) -> Option<TypeId> {
+        scopes.push();
+        let (inferred_key, inferred_value) =
+            self.infer_foreach_binding_types(foreach, scopes, method_context);
+        if let Some(key) = &foreach.key {
+            let ty = key
+                .ty
+                .as_ref()
+                .map(|ty| self.resolve_type_ref_for_return_inference(ty))
+                .unwrap_or(inferred_key);
+            let _ = scopes.declare(
+                key.name.clone(),
+                Binding {
+                    writable: false,
+                    ty,
+                    int_constant: None,
+                },
+            );
+        }
+
+        let value_ty = foreach
+            .value
+            .ty
+            .as_ref()
+            .map(|ty| self.resolve_type_ref_for_return_inference(ty))
+            .unwrap_or(inferred_value);
+        let _ = scopes.declare(
+            foreach.value.name.clone(),
+            Binding {
+                writable: false,
+                ty: value_ty,
+                int_constant: None,
+            },
+        );
+
+        let inferred = self.infer_mixed_return_from_statements(
+            &foreach.body.statements,
+            scopes,
+            method_context,
+        );
+        scopes.pop();
+        inferred
+    }
+
+    fn merge_optional_mixed_return_types(
+        &mut self,
+        current: Option<TypeId>,
+        next: Option<TypeId>,
+    ) -> Option<TypeId> {
+        let next = next?;
+        if !self.type_contains_mixed(next) {
+            return current;
+        }
+
+        Some(match current {
+            Some(current) => self.merge_mixed_return_types(current, next),
+            None => next,
+        })
+    }
+
+    fn merge_mixed_return_types(&mut self, left: TypeId, right: TypeId) -> TypeId {
+        if left == right {
+            return left;
+        }
+
+        let left_kind = self.types.kind(left).clone();
+        let right_kind = self.types.kind(right).clone();
+        match (left_kind, right_kind) {
+            (TypeKind::List(left), TypeKind::List(right)) => {
+                let element = self.merge_mixed_return_types(left, right);
+                self.types.intern(TypeKind::List(element))
+            }
+            (TypeKind::TypedArray(left), TypeKind::TypedArray(right)) => {
+                let element = self.merge_mixed_return_types(left, right);
+                self.types.intern(TypeKind::TypedArray(element))
+            }
+            (
+                TypeKind::Dictionary(left_key, left_value),
+                TypeKind::Dictionary(right_key, right_value),
+            ) => {
+                let key = self.merge_mixed_return_types(left_key, right_key);
+                let value = self.merge_mixed_return_types(left_value, right_value);
+                self.types.intern(TypeKind::Dictionary(key, value))
+            }
+            (TypeKind::Set(left), TypeKind::Set(right)) => {
+                let element = self.merge_mixed_return_types(left, right);
+                self.types.intern(TypeKind::Set(element))
+            }
+            _ => self.types.intern(TypeKind::Mixed),
+        }
+    }
+
+    fn infer_local_declaration_type(
+        &mut self,
+        annotation: Option<&TypeRef>,
+        initializer: &Expr,
+        scopes: &ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) -> TypeId {
+        let initializer_ty = self.infer_expr_type(initializer, scopes, method_context);
+        annotation.map_or(initializer_ty, |ty| {
+            self.resolve_type_ref_for_return_inference(ty)
+        })
+    }
+
+    fn merge_inferred_binding_type(&mut self, current: TypeId, next: TypeId) -> TypeId {
+        if self.type_contains_mixed(current) {
+            self.merge_mixed_return_types(current, next)
+        } else {
+            next
+        }
+    }
+
+    fn infer_foreach_binding_types(
+        &mut self,
+        foreach: &ForeachStmt,
+        scopes: &ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) -> (TypeId, TypeId) {
+        let unknown = self.types.unknown();
+        if Self::is_grouped_range_expr(&foreach.iterable) {
+            let int = self.types.intern(TypeKind::Int);
+            return (unknown, int);
+        }
+
+        let iterable_ty = self.infer_expr_type(&foreach.iterable, scopes, method_context);
+        match self.types.kind(iterable_ty).clone() {
+            TypeKind::List(value) | TypeKind::Set(value) => {
+                (self.types.intern(TypeKind::Int), value)
+            }
+            TypeKind::TypedArray(value) => (self.types.intern(TypeKind::Int), value),
+            TypeKind::Dictionary(key, value) => (key, value),
+            TypeKind::Mixed => (unknown, self.types.intern(TypeKind::Mixed)),
+            _ => (unknown, unknown),
+        }
+    }
+
+    fn resolve_type_ref_for_return_inference(&mut self, ty: &TypeRef) -> TypeId {
+        match ty.name.as_str() {
+            "void" if ty.args.is_empty() => self.types.intern(TypeKind::Void),
+            "int" if ty.args.is_empty() => self.types.intern(TypeKind::Int),
+            "float" if ty.args.is_empty() => self.types.intern(TypeKind::Float),
+            "string" if ty.args.is_empty() => self.types.intern(TypeKind::String),
+            "bool" if ty.args.is_empty() => self.types.intern(TypeKind::Bool),
+            "mixed" if ty.args.is_empty() => self.types.intern(TypeKind::Mixed),
+            "[]" if ty.args.len() == 1 => {
+                let element = self.resolve_type_ref_for_return_inference(&ty.args[0]);
+                self.types.intern(TypeKind::TypedArray(element))
+            }
+            "List" if ty.args.len() == 1 => {
+                let element = self.resolve_type_ref_for_return_inference(&ty.args[0]);
+                self.types.intern(TypeKind::List(element))
+            }
+            "Dictionary" if ty.args.len() == 2 => {
+                let key = self.resolve_type_ref_for_return_inference(&ty.args[0]);
+                let value = self.resolve_type_ref_for_return_inference(&ty.args[1]);
+                self.types.intern(TypeKind::Dictionary(key, value))
+            }
+            "Set" if ty.args.len() == 1 => {
+                let element = self.resolve_type_ref_for_return_inference(&ty.args[0]);
+                self.types.intern(TypeKind::Set(element))
+            }
+            name if ty.args.is_empty() && self.classes.contains_key(name) => {
+                self.types.intern(TypeKind::Class(name.to_string()))
+            }
+            _ => self.types.unknown(),
+        }
     }
 
     fn check_class(&mut self, class_decl: &ClassDecl) {
@@ -656,7 +1257,11 @@ impl<'program> Checker<'program> {
                     self.check_assignment_value(assignment, target, scopes, method_context);
                 }
             }
-            Stmt::Echo { expr, .. } | Stmt::Expr { expr, .. } => {
+            Stmt::Echo { expr, .. } => {
+                self.check_expr(expr, scopes, method_context);
+                self.check_mixed_value_operation(expr, "echo", scopes, method_context);
+            }
+            Stmt::Expr { expr, .. } => {
                 self.check_expr(expr, scopes, method_context);
             }
             Stmt::Return { expr, span } => {
@@ -750,6 +1355,14 @@ impl<'program> Checker<'program> {
             }
             Stmt::Foreach(foreach) => {
                 let range_iterable = Self::is_grouped_range_expr(&foreach.iterable);
+                let unknown_ty = self.types.unknown();
+                let int_ty = self.types.intern(TypeKind::Int);
+                let (iterable_key_ty, iterable_value_ty) = if range_iterable {
+                    (unknown_ty, int_ty)
+                } else {
+                    self.infer_foreach_binding_types(foreach, scopes, method_context)
+                };
+
                 if range_iterable {
                     self.check_expr_with_range_context(
                         &foreach.iterable,
@@ -759,6 +1372,12 @@ impl<'program> Checker<'program> {
                     );
                 } else {
                     self.check_expr(&foreach.iterable, scopes, method_context);
+                    self.check_mixed_operation(
+                        &foreach.iterable,
+                        "foreach iterable",
+                        scopes,
+                        method_context,
+                    );
                 }
                 scopes.push();
                 if let Some(key) = &foreach.key {
@@ -770,10 +1389,15 @@ impl<'program> Checker<'program> {
                         ));
                         self.types.unknown()
                     } else {
-                        key.ty
-                            .as_ref()
-                            .map(|ty| self.resolve_type_ref(ty, foreach.span))
-                            .unwrap_or_else(|| self.types.unknown())
+                        key.ty.as_ref().map_or(iterable_key_ty, |ty| {
+                            let annotated_ty = self.resolve_type_ref(ty, foreach.span);
+                            self.check_foreach_binding_type(
+                                annotated_ty,
+                                iterable_key_ty,
+                                foreach.span,
+                            );
+                            annotated_ty
+                        })
                     };
                     self.declare_binding(
                         scopes,
@@ -787,26 +1411,21 @@ impl<'program> Checker<'program> {
                     );
                 }
                 let value_ty = if range_iterable {
-                    let int_ty = self.types.intern(TypeKind::Int);
                     if let Some(annotation) = &foreach.value.ty {
                         let annotated_ty = self.resolve_type_ref(annotation, foreach.span);
-                        if !self.is_assignable(annotated_ty, int_ty) {
-                            self.check_assignable(
-                                annotated_ty,
-                                int_ty,
-                                foreach.span,
-                                AssignmentDestination::Type,
-                            );
-                        }
+                        self.check_foreach_binding_type(annotated_ty, int_ty, foreach.span);
                     }
                     int_ty
                 } else {
-                    foreach
-                        .value
-                        .ty
-                        .as_ref()
-                        .map(|ty| self.resolve_type_ref(ty, foreach.span))
-                        .unwrap_or_else(|| self.types.unknown())
+                    foreach.value.ty.as_ref().map_or(iterable_value_ty, |ty| {
+                        let annotated_ty = self.resolve_type_ref(ty, foreach.span);
+                        self.check_foreach_binding_type(
+                            annotated_ty,
+                            iterable_value_ty,
+                            foreach.span,
+                        );
+                        annotated_ty
+                    })
                 };
                 self.declare_binding(
                     scopes,
@@ -929,12 +1548,13 @@ impl<'program> Checker<'program> {
         match assignment.op {
             AssignOp::Assign => {
                 let target_ty = target.ty;
+                let destination = target.destination.clone();
                 let assignment_ok = self.check_expr_assignable(
                     target.ty,
                     &assignment.value,
                     scopes,
                     method_context,
-                    target.destination,
+                    destination,
                 );
                 if assignment_ok {
                     let value_ty = self.infer_expr_type(&assignment.value, scopes, method_context);
@@ -948,6 +1568,21 @@ impl<'program> Checker<'program> {
             }
             AssignOp::AddAssign | AssignOp::SubAssign => {
                 let value_ty = self.infer_expr_type(&assignment.value, scopes, method_context);
+                let target_contains_mixed = self.type_contains_mixed(target.ty);
+                let value_contains_mixed = self.type_contains_mixed(value_ty);
+
+                if target_contains_mixed {
+                    self.report_mixed_operation(assignment.target.span(), "compound assignment");
+                }
+
+                if value_contains_mixed {
+                    self.report_mixed_operation(assignment.value.span(), "compound assignment");
+                }
+
+                if target_contains_mixed || value_contains_mixed {
+                    return;
+                }
+
                 let result_ty = self.infer_numeric_binary_type(target.ty, value_ty);
                 if !self.is_assignable(target.ty, result_ty) {
                     self.check_assignable(
@@ -1007,7 +1642,7 @@ impl<'program> Checker<'program> {
 
                 if matches!(
                     self.types.kind(binding.ty),
-                    TypeKind::Int | TypeKind::Mixed | TypeKind::Unknown
+                    TypeKind::Int | TypeKind::Unknown
                 ) {
                     return;
                 }
@@ -1092,10 +1727,7 @@ impl<'program> Checker<'program> {
     ) {
         self.check_expr(condition, scopes, method_context);
         let ty = self.infer_expr_type(condition, scopes, method_context);
-        if matches!(
-            self.types.kind(ty),
-            TypeKind::Bool | TypeKind::Mixed | TypeKind::Unknown
-        ) {
+        if matches!(self.types.kind(ty), TypeKind::Bool | TypeKind::Unknown) {
             return;
         }
 
@@ -1316,6 +1948,7 @@ impl<'program> Checker<'program> {
                 span,
             } => {
                 self.check_expr(object, scopes, method_context);
+                self.check_mixed_operation(object, "property access", scopes, method_context);
                 self.lookup_property(object, property, *span, scopes, method_context);
             }
             Expr::MethodCall {
@@ -1328,6 +1961,7 @@ impl<'program> Checker<'program> {
                 for arg in args {
                     self.check_expr(arg, scopes, method_context);
                 }
+                self.check_mixed_operation(object, "method call", scopes, method_context);
                 self.check_method_call(object, method, args, *span, scopes, method_context);
             }
             Expr::FunctionCall { name, args, span } => {
@@ -1383,6 +2017,7 @@ impl<'program> Checker<'program> {
                 self.check_expr(left, scopes, method_context);
                 self.check_expr(right, scopes, method_context);
                 self.check_int_constant_arithmetic(left, op, right, *span, scopes);
+                self.check_mixed_binary_operands(left, right, *span, scopes, method_context);
                 self.check_binary_operands(left, op, right, *span, scopes, method_context);
             }
             Expr::Range {
@@ -1424,10 +2059,7 @@ impl<'program> Checker<'program> {
         method_context: Option<&MethodContext>,
     ) {
         let ty = self.infer_expr_type(expr, scopes, method_context);
-        if matches!(
-            self.types.kind(ty),
-            TypeKind::Int | TypeKind::Mixed | TypeKind::Unknown
-        ) {
+        if matches!(self.types.kind(ty), TypeKind::Int | TypeKind::Unknown) {
             return;
         }
 
@@ -1458,6 +2090,11 @@ impl<'program> Checker<'program> {
         match op {
             UnaryOp::Not => {
                 let ty = self.infer_expr_type(expr, scopes, method_context);
+                if self.is_mixed_type(ty) {
+                    self.report_mixed_operation(expr.span(), "boolean operator");
+                    return;
+                }
+
                 if self.is_bool_or_recovery_type(ty) {
                     return;
                 }
@@ -1483,6 +2120,10 @@ impl<'program> Checker<'program> {
         scopes: &ScopeStack,
         method_context: Option<&MethodContext>,
     ) {
+        if self.has_mixed_operand(left, right, scopes, method_context) {
+            return;
+        }
+
         match op {
             BinaryOp::And | BinaryOp::Or | BinaryOp::Xor => {
                 self.check_logical_binary_operands(left, op, right, span, scopes, method_context);
@@ -1575,20 +2216,18 @@ impl<'program> Checker<'program> {
     }
 
     fn is_bool_or_recovery_type(&self, ty: TypeId) -> bool {
-        matches!(
-            self.types.kind(ty),
-            TypeKind::Bool | TypeKind::Mixed | TypeKind::Unknown
-        )
+        matches!(self.types.kind(ty), TypeKind::Bool | TypeKind::Unknown)
     }
 
     fn is_string_or_recovery_type(&self, ty: TypeId) -> bool {
-        matches!(
-            self.types.kind(ty),
-            TypeKind::String | TypeKind::Mixed | TypeKind::Unknown
-        )
+        matches!(self.types.kind(ty), TypeKind::String | TypeKind::Unknown)
     }
 
     fn is_equality_compatible(&self, left: TypeId, right: TypeId) -> bool {
+        if self.type_contains_mixed(left) || self.type_contains_mixed(right) {
+            return false;
+        }
+
         self.is_assignable(left, right) || self.is_assignable(right, left)
     }
 
@@ -1598,6 +2237,103 @@ impl<'program> Checker<'program> {
             BinaryOp::Or => "`or`/`||`",
             BinaryOp::Xor => "`xor`",
             _ => "logical operator",
+        }
+    }
+
+    fn check_mixed_operation(
+        &mut self,
+        expr: &Expr,
+        operation: &'static str,
+        scopes: &ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) {
+        let ty = self.infer_expr_type(expr, scopes, method_context);
+        if self.is_mixed_type(ty) {
+            self.report_mixed_operation(expr.span(), operation);
+        }
+    }
+
+    fn check_mixed_value_operation(
+        &mut self,
+        expr: &Expr,
+        operation: &'static str,
+        scopes: &ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) {
+        let ty = self.infer_expr_type(expr, scopes, method_context);
+        if self.type_contains_mixed(ty) {
+            self.report_mixed_operation(expr.span(), operation);
+        }
+    }
+
+    fn check_mixed_binary_operands(
+        &mut self,
+        left: &Expr,
+        right: &Expr,
+        span: Span,
+        scopes: &ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) {
+        if self.has_mixed_operand(left, right, scopes, method_context) {
+            self.report_mixed_operation(span, "operator");
+        }
+    }
+
+    fn has_mixed_operand(
+        &mut self,
+        left: &Expr,
+        right: &Expr,
+        scopes: &ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) -> bool {
+        let left_ty = self.infer_expr_type(left, scopes, method_context);
+        let right_ty = self.infer_expr_type(right, scopes, method_context);
+
+        self.type_contains_mixed(left_ty) || self.type_contains_mixed(right_ty)
+    }
+
+    fn is_mixed_type(&self, ty: TypeId) -> bool {
+        matches!(self.types.kind(ty), TypeKind::Mixed)
+    }
+
+    fn type_contains_mixed(&self, ty: TypeId) -> bool {
+        match self.types.kind(ty) {
+            TypeKind::Mixed => true,
+            TypeKind::TypedArray(element) | TypeKind::List(element) | TypeKind::Set(element) => {
+                self.type_contains_mixed(*element)
+            }
+            TypeKind::Dictionary(key, value) => {
+                self.type_contains_mixed(*key) || self.type_contains_mixed(*value)
+            }
+            _ => false,
+        }
+    }
+
+    fn report_mixed_operation(&mut self, span: Span, operation: &'static str) {
+        self.diagnostics.push(
+            Diagnostic::new(
+                "E0433",
+                format!("cannot use `mixed` value in {operation} before narrowing"),
+                span,
+            )
+            .with_help(
+                "mixed-value operations are unsupported until narrowing syntax is implemented",
+            ),
+        );
+    }
+
+    fn check_foreach_binding_type(&mut self, target: TypeId, value: TypeId, span: Span) {
+        if self.is_unknown_type(target) || self.is_unknown_type(value) {
+            return;
+        }
+
+        if self.type_contains_mixed(value) && !self.type_contains_mixed(target) {
+            self.report_mixed_operation(span, "foreach binding");
+            return;
+        }
+
+        if !self.is_assignable(target, value) {
+            self.check_assignable(target, value, span, AssignmentDestination::Type);
         }
     }
 
@@ -1726,7 +2462,6 @@ impl<'program> Checker<'program> {
                 | TypeKind::Float
                 | TypeKind::Bool
                 | TypeKind::Null
-                | TypeKind::Mixed
                 | TypeKind::Unknown
         )
     }
@@ -1777,6 +2512,7 @@ impl<'program> Checker<'program> {
                 span,
             } => {
                 self.check_expr(object, scopes, method_context);
+                self.check_mixed_operation(object, "property write", scopes, method_context);
                 if let Some((class_name, property_info)) =
                     self.lookup_property(object, property, *span, scopes, method_context)
                 {
@@ -2318,59 +3054,110 @@ impl<'program> Checker<'program> {
     }
 
     fn resolve_type_ref(&mut self, ty: &TypeRef, span: Span) -> TypeId {
+        self.resolve_type_ref_in_position(ty, span, TypePosition::Value)
+    }
+
+    fn resolve_type_ref_in_position(
+        &mut self,
+        ty: &TypeRef,
+        span: Span,
+        position: TypePosition,
+    ) -> TypeId {
         match ty.name.as_str() {
-            "void" => self.resolve_zero_arg_type(ty, span, TypeKind::Void),
+            "void" if position == TypePosition::Return => {
+                self.resolve_zero_arg_type(ty, span, TypeKind::Void)
+            }
+            "void" => {
+                self.reject_type_ref(ty, span, "E0430", "`void` is only valid as a return type")
+            }
             "int" => self.resolve_zero_arg_type(ty, span, TypeKind::Int),
             "float" => self.resolve_zero_arg_type(ty, span, TypeKind::Float),
             "string" => self.resolve_zero_arg_type(ty, span, TypeKind::String),
             "bool" => self.resolve_zero_arg_type(ty, span, TypeKind::Bool),
-            "null" => self.resolve_zero_arg_type(ty, span, TypeKind::Null),
+            "null" => self.reject_type_ref_with_help(
+                ty,
+                span,
+                "E0431",
+                "`null` is a literal, not a type name",
+                "nullable type syntax like `?T` is planned but not implemented yet; use a supported non-null type or `mixed` for now",
+            ),
             "mixed" => self.resolve_zero_arg_type(ty, span, TypeKind::Mixed),
-            "object" => self.resolve_zero_arg_type(ty, span, TypeKind::Object),
-            "resource" => self.resolve_zero_arg_type(ty, span, TypeKind::Resource),
-            "array" => self.resolve_zero_arg_type(ty, span, TypeKind::Array),
-            "List" => {
+            "object" => self.reject_type_ref_with_help(
+                ty,
+                span,
+                "E0401",
+                "unknown type `object`",
+                "Doria has no `object` type; use `mixed` for dynamic boundaries until narrowing syntax is implemented",
+            ),
+            "array" => self.reject_type_ref_with_help(
+                ty,
+                span,
+                "E0401",
+                "unknown type `array`",
+                "use typed array suffixes like `T[]` or named collection aliases",
+            ),
+            "resource" => self.reject_type_ref(
+                ty,
+                span,
+                "E0432",
+                "`resource` is reserved for PHP interop and is not available yet",
+            ),
+            "[]" => {
                 if !self.expect_type_arg_count(ty, 1, span) {
                     for arg in &ty.args {
-                        self.resolve_type_ref(arg, span);
+                        self.resolve_type_ref_in_position(arg, span, TypePosition::Value);
                     }
                     return self.types.unknown();
                 }
-                let element = self.resolve_type_ref(&ty.args[0], span);
+                let element =
+                    self.resolve_type_ref_in_position(&ty.args[0], span, TypePosition::Value);
+                self.types.intern(TypeKind::TypedArray(element))
+            }
+            "List" => {
+                if !self.expect_type_arg_count(ty, 1, span) {
+                    for arg in &ty.args {
+                        self.resolve_type_ref_in_position(arg, span, TypePosition::Value);
+                    }
+                    return self.types.unknown();
+                }
+                let element =
+                    self.resolve_type_ref_in_position(&ty.args[0], span, TypePosition::Value);
                 self.types.intern(TypeKind::List(element))
             }
             "Dictionary" => {
                 if !self.expect_type_arg_count(ty, 2, span) {
                     for arg in &ty.args {
-                        self.resolve_type_ref(arg, span);
+                        self.resolve_type_ref_in_position(arg, span, TypePosition::Value);
                     }
                     return self.types.unknown();
                 }
-                let key = self.resolve_type_ref(&ty.args[0], span);
-                let value = self.resolve_type_ref(&ty.args[1], span);
+                let key = self.resolve_type_ref_in_position(&ty.args[0], span, TypePosition::Value);
+                let value =
+                    self.resolve_type_ref_in_position(&ty.args[1], span, TypePosition::Value);
                 self.types.intern(TypeKind::Dictionary(key, value))
             }
             "Set" => {
                 if !self.expect_type_arg_count(ty, 1, span) {
                     for arg in &ty.args {
-                        self.resolve_type_ref(arg, span);
+                        self.resolve_type_ref_in_position(arg, span, TypePosition::Value);
                     }
                     return self.types.unknown();
                 }
-                let element = self.resolve_type_ref(&ty.args[0], span);
+                let element =
+                    self.resolve_type_ref_in_position(&ty.args[0], span, TypePosition::Value);
                 self.types.intern(TypeKind::Set(element))
             }
             name if self.classes.contains_key(name) => {
                 if !self.expect_type_arg_count(ty, 0, span) {
                     for arg in &ty.args {
-                        self.resolve_type_ref(arg, span);
+                        self.resolve_type_ref_in_position(arg, span, TypePosition::Value);
                     }
                 }
                 self.types.intern(TypeKind::Class(name.to_string()))
             }
             name => {
                 for arg in &ty.args {
-                    self.resolve_type_ref(arg, span);
+                    self.resolve_type_ref_in_position(arg, span, TypePosition::Value);
                 }
                 self.diagnostics.push(Diagnostic::new(
                     "E0401",
@@ -2380,6 +3167,36 @@ impl<'program> Checker<'program> {
                 self.types.unknown()
             }
         }
+    }
+
+    fn reject_type_ref(
+        &mut self,
+        ty: &TypeRef,
+        span: Span,
+        code: &'static str,
+        message: impl Into<String>,
+    ) -> TypeId {
+        for arg in &ty.args {
+            self.resolve_type_ref_in_position(arg, span, TypePosition::Value);
+        }
+        self.diagnostics.push(Diagnostic::new(code, message, span));
+        self.types.unknown()
+    }
+
+    fn reject_type_ref_with_help(
+        &mut self,
+        ty: &TypeRef,
+        span: Span,
+        code: &'static str,
+        message: impl Into<String>,
+        help: impl Into<String>,
+    ) -> TypeId {
+        for arg in &ty.args {
+            self.resolve_type_ref_in_position(arg, span, TypePosition::Value);
+        }
+        self.diagnostics
+            .push(Diagnostic::new(code, message, span).with_help(help));
+        self.types.unknown()
     }
 
     fn resolve_zero_arg_type(&mut self, ty: &TypeRef, span: Span, kind: TypeKind) -> TypeId {
@@ -2511,9 +3328,18 @@ impl<'program> Checker<'program> {
         let target_kind = self.types.kind(target).clone();
 
         match target_kind {
-            TypeKind::Mixed | TypeKind::Unknown | TypeKind::Array => true,
+            TypeKind::Mixed | TypeKind::Unknown => true,
+            TypeKind::TypedArray(element) => {
+                if elements.iter().any(|element| element.key.is_some()) {
+                    return false;
+                }
+
+                elements.iter().all(|array_element| {
+                    self.is_expr_assignable(element, &array_element.value, scopes, method_context)
+                })
+            }
             TypeKind::List(element) => {
-                if self.is_mixed_or_unknown_type(element)
+                if self.is_unknown_type(element)
                     || elements.iter().any(|element| element.key.is_some())
                 {
                     return false;
@@ -2524,7 +3350,7 @@ impl<'program> Checker<'program> {
                 })
             }
             TypeKind::Dictionary(key, value) => {
-                if self.is_mixed_or_unknown_type(key) || self.is_mixed_or_unknown_type(value) {
+                if self.is_unknown_type(key) || self.is_unknown_type(value) {
                     return false;
                 }
 
@@ -2559,8 +3385,8 @@ impl<'program> Checker<'program> {
         }
     }
 
-    fn is_mixed_or_unknown_type(&self, ty: TypeId) -> bool {
-        matches!(self.types.kind(ty), TypeKind::Mixed | TypeKind::Unknown)
+    fn is_unknown_type(&self, ty: TypeId) -> bool {
+        matches!(self.types.kind(ty), TypeKind::Unknown)
     }
 
     fn is_assignable(&self, target: TypeId, value: TypeId) -> bool {
@@ -2572,23 +3398,27 @@ impl<'program> Checker<'program> {
         let value_kind = self.types.kind(value).clone();
         match (target_kind, value_kind) {
             (TypeKind::Heterogeneous, _) | (_, TypeKind::Heterogeneous) => false,
-            // TODO: tighten mixed later with narrowing or runtime checks.
-            (TypeKind::Mixed, _) | (_, TypeKind::Mixed) => true,
+            (TypeKind::Mixed, _) => true,
+            (_, TypeKind::Mixed) => false,
             (TypeKind::Unknown, _) | (_, TypeKind::Unknown) => true,
-            (TypeKind::Object, TypeKind::Class(_)) => true,
             (
-                TypeKind::Array,
-                TypeKind::List(_) | TypeKind::Dictionary(_, _) | TypeKind::Set(_),
-            ) => true,
-            (
-                TypeKind::Array | TypeKind::List(_) | TypeKind::Dictionary(_, _) | TypeKind::Set(_),
+                TypeKind::TypedArray(_)
+                | TypeKind::List(_)
+                | TypeKind::Dictionary(_, _)
+                | TypeKind::Set(_),
                 TypeKind::EmptyCollection,
             ) => true,
             (
                 TypeKind::EmptyCollection,
-                TypeKind::Array | TypeKind::List(_) | TypeKind::Dictionary(_, _) | TypeKind::Set(_),
+                TypeKind::TypedArray(_)
+                | TypeKind::List(_)
+                | TypeKind::Dictionary(_, _)
+                | TypeKind::Set(_),
             ) => true,
             (TypeKind::Class(target), TypeKind::Class(value)) => target == value,
+            (TypeKind::TypedArray(target), TypeKind::TypedArray(value)) => {
+                self.is_assignable(target, value)
+            }
             (TypeKind::List(target), TypeKind::List(value)) => self.is_assignable(target, value),
             (
                 TypeKind::Dictionary(target_key, target_value),
@@ -2691,7 +3521,6 @@ impl<'program> Checker<'program> {
         match op {
             UnaryOp::Not => match self.types.kind(ty) {
                 TypeKind::Bool => self.types.intern(TypeKind::Bool),
-                TypeKind::Mixed => self.types.intern(TypeKind::Mixed),
                 TypeKind::Unknown => self.types.unknown(),
                 _ => self.types.intern(TypeKind::Heterogeneous),
             },
@@ -2801,7 +3630,6 @@ impl<'program> Checker<'program> {
 
         match (left_kind, right_kind) {
             (TypeKind::Unknown, _) | (_, TypeKind::Unknown) => Some(self.types.unknown()),
-            (TypeKind::Mixed, _) | (_, TypeKind::Mixed) => Some(self.types.intern(TypeKind::Mixed)),
             _ => None,
         }
     }
@@ -2844,14 +3672,15 @@ impl<'program> Checker<'program> {
         let mut common = None;
         let mut saw_empty_collection = false;
         let mut saw_mixed = false;
+        let mut saw_heterogeneous = false;
 
         for ty in types {
             let kind = self.types.kind(ty).clone();
+            if self.type_contains_mixed(ty) {
+                saw_mixed = true;
+            }
+
             match kind {
-                TypeKind::Mixed => {
-                    saw_mixed = true;
-                    continue;
-                }
                 TypeKind::Unknown => {
                     continue;
                 }
@@ -2862,7 +3691,11 @@ impl<'program> Checker<'program> {
                 _ => {
                     if let Some(common_ty) = common {
                         if common_ty != ty {
-                            return self.types.intern(TypeKind::Heterogeneous);
+                            if self.type_contains_mixed(common_ty) || self.type_contains_mixed(ty) {
+                                common = Some(self.merge_mixed_return_types(common_ty, ty));
+                            } else {
+                                saw_heterogeneous = true;
+                            }
                         }
                     } else {
                         common = Some(ty);
@@ -2871,15 +3704,28 @@ impl<'program> Checker<'program> {
             }
         }
 
+        if saw_heterogeneous {
+            if saw_mixed {
+                if let Some(common) = common {
+                    if self.type_contains_mixed(common) {
+                        return common;
+                    }
+                }
+                return self.types.intern(TypeKind::Mixed);
+            }
+            return self.types.intern(TypeKind::Heterogeneous);
+        }
+
         if let Some(common) = common {
             if saw_empty_collection && !self.is_collection_like_type(common) {
+                if saw_mixed {
+                    return self.types.intern(TypeKind::Mixed);
+                }
                 return self.types.intern(TypeKind::Heterogeneous);
             }
             common
         } else if saw_empty_collection {
             self.types.intern(TypeKind::EmptyCollection)
-        } else if saw_mixed {
-            self.types.intern(TypeKind::Mixed)
         } else {
             self.types.unknown()
         }
@@ -2888,7 +3734,7 @@ impl<'program> Checker<'program> {
     fn is_collection_like_type(&self, ty: TypeId) -> bool {
         matches!(
             self.types.kind(ty),
-            TypeKind::Array
+            TypeKind::TypedArray(_)
                 | TypeKind::List(_)
                 | TypeKind::Dictionary(_, _)
                 | TypeKind::Set(_)
@@ -2899,7 +3745,10 @@ impl<'program> Checker<'program> {
     fn is_non_empty_collection_like_type(&self, ty: TypeId) -> bool {
         matches!(
             self.types.kind(ty),
-            TypeKind::Array | TypeKind::List(_) | TypeKind::Dictionary(_, _) | TypeKind::Set(_)
+            TypeKind::TypedArray(_)
+                | TypeKind::List(_)
+                | TypeKind::Dictionary(_, _)
+                | TypeKind::Set(_)
         )
     }
 

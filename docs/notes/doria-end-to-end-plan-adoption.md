@@ -2,7 +2,7 @@
 
 The updated Doria End-to-End Development Plan is now the master execution plan for future work.
 
-It supersedes older roadmap wording where the plan explicitly resolves a future-work fork.
+It supersedes older planning wording where the plan explicitly resolves a future-work fork.
 
 Already-implemented behavior remains governed by existing compiler behavior and accepted decisions until a later stage migrates it.
 

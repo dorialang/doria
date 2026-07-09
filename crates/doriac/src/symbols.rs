@@ -52,7 +52,7 @@ pub struct MethodInfo {
     pub return_ty: TypeId,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct ScopeStack {
     scopes: Vec<HashMap<String, Binding>>,
 }
@@ -93,5 +93,34 @@ impl ScopeStack {
             .iter_mut()
             .rev()
             .find_map(|scope| scope.get_mut(name))
+    }
+
+    pub fn replace_types_from_branches<F>(&mut self, branches: &[ScopeStack], mut merge_type: F)
+    where
+        F: FnMut(TypeId, TypeId) -> TypeId,
+    {
+        for (scope_index, scope) in self.scopes.iter_mut().enumerate() {
+            for (name, binding) in scope.iter_mut() {
+                let mut merged = None;
+                for branch in branches {
+                    let Some(branch_binding) = branch
+                        .scopes
+                        .get(scope_index)
+                        .and_then(|scope| scope.get(name))
+                    else {
+                        continue;
+                    };
+
+                    merged = Some(match merged {
+                        Some(current) => merge_type(current, branch_binding.ty),
+                        None => branch_binding.ty,
+                    });
+                }
+
+                if let Some(ty) = merged {
+                    binding.ty = ty;
+                }
+            }
+        }
     }
 }

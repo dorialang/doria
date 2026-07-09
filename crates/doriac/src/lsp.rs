@@ -390,13 +390,11 @@ fn completion_items() -> Value {
         "string",
         "bool",
         "mixed",
-        "object",
-        "resource",
-        "array",
         "List",
         "Dictionary",
         "Set",
     ];
+    let reserved_types = ["resource"];
 
     let mut items = Vec::new();
     items.extend(keywords.into_iter().map(|keyword| {
@@ -417,6 +415,13 @@ fn completion_items() -> Value {
             "label": ty,
             "kind": 25,
             "detail": "Doria type",
+        })
+    }));
+    items.extend(reserved_types.into_iter().map(|ty| {
+        json!({
+            "label": ty,
+            "kind": 25,
+            "detail": "Reserved Doria type name",
         })
     }));
 
@@ -448,8 +453,12 @@ fn hover_description(kind: &TokenKind) -> Option<&'static str> {
         TokenKind::Class => Some("Declares a Doria class."),
         TokenKind::Function => Some("Declares a function or method."),
         TokenKind::Let => Some("Declares a local binding with an inferred type."),
-        TokenKind::Writable => Some("Marks a binding, property, parameter, or method receiver as mutable."),
-        TokenKind::Internal => Some("Marks a class member as hidden from the external object surface."),
+        TokenKind::Writable => {
+            Some("Marks a binding, property, parameter, or method receiver as mutable.")
+        }
+        TokenKind::Internal => {
+            Some("Marks a class member as hidden from the external object surface.")
+        }
         TokenKind::Readonly => Some("Reserved for explicit readonly syntax."),
         TokenKind::Return => Some("Returns a value from the current function."),
         TokenKind::Echo => Some("Emits a value through the current backend."),
@@ -466,17 +475,17 @@ fn hover_description(kind: &TokenKind) -> Option<&'static str> {
         TokenKind::FloatType => Some("The `float` primitive type."),
         TokenKind::StringType => Some("The `string` primitive type."),
         TokenKind::BoolType => Some("The `bool` primitive type."),
-        TokenKind::ArrayType => Some("PHP-compatible array type; prefer `List<T>`, `Dictionary<K, V>`, or `Set<T>` in Doria APIs."),
         TokenKind::True | TokenKind::False => Some("Boolean literal."),
-        TokenKind::Null => Some("Null literal and MVP type name."),
+        TokenKind::Null => {
+            Some("Null literal. Nullable type syntax like `?T` is planned but not implemented yet; `null` is not a type name.")
+        }
         TokenKind::Reserved(_) => Some("Reserved for future Doria syntax."),
         TokenKind::Identifier(name) => match name.as_str() {
             "List" => Some("Ordered collection alias: `List<T>`."),
             "Dictionary" => Some("Key-value collection alias: `Dictionary<K, V>`."),
             "Set" => Some("Unique-value collection alias: `Set<T>`."),
-            "mixed" => Some("Dynamic escape-hatch type."),
-            "object" => Some("Primitive object type."),
-            "resource" => Some("Primitive resource type."),
+            "mixed" => Some("Dynamic boundary type. Operations on `mixed` require future narrowing syntax before use."),
+            "resource" => Some("Reserved for future PHP interop; not a usable core type."),
             _ => None,
         },
         TokenKind::Variable(_) => Some("Doria variable. Variables must be declared before use."),
@@ -486,7 +495,7 @@ fn hover_description(kind: &TokenKind) -> Option<&'static str> {
 
 fn diagnostic_to_lsp(text: &str, diagnostic: &Diagnostic) -> Value {
     let message = if let Some(help) = &diagnostic.help {
-        format!("{}\nhelp: {help}", diagnostic.message)
+        format!("{}\nHelp: {help}", diagnostic.message)
     } else {
         diagnostic.message.clone()
     };
@@ -635,6 +644,16 @@ mod tests {
             .collect()
     }
 
+    fn completion_detail(label: &str) -> Option<String> {
+        completion_items()["items"]
+            .as_array()
+            .expect("completion items should be an array")
+            .iter()
+            .find(|item| item["label"].as_str() == Some(label))
+            .and_then(|item| item["detail"].as_str())
+            .map(ToOwned::to_owned)
+    }
+
     #[test]
     fn completions_mark_accepted_planned_keywords() {
         for keyword in [
@@ -664,6 +683,7 @@ mod tests {
             ["!", "=="].concat(),
             ["#de", "fine"].concat(),
             ["#inc", "lude"].concat(),
+            ["ar", "ray"].concat(),
         ];
         for rejected in rejected {
             assert!(
@@ -687,6 +707,20 @@ mod tests {
             !diagnostics.is_empty(),
             "planned syntax should remain rejected by compiler diagnostics until implemented"
         );
+    }
+    #[test]
+    fn hover_help_does_not_present_planned_syntax_as_immediate_fixes() {
+        let null_hover = hover_description(&TokenKind::Null).expect("null should have hover text");
+        assert!(null_hover.contains("planned"));
+        assert!(null_hover.contains("not implemented"));
+        assert!(null_hover.contains("`?T`"));
+        assert!(!null_hover.contains("spelled `?T`"));
+
+        let mixed_hover = hover_description(&TokenKind::Identifier("mixed".to_string()))
+            .expect("mixed should have hover text");
+        assert!(mixed_hover.contains("future narrowing syntax"));
+        assert!(!mixed_hover.contains("`is`"));
+        assert!(!mixed_hover.contains("`match`"));
     }
     #[test]
     fn completions_do_not_offer_unsupported_future_types() {
@@ -729,17 +763,23 @@ mod tests {
             "string",
             "bool",
             "mixed",
-            "object",
             "resource",
-            "array",
             "List",
             "Dictionary",
             "Set",
         ] {
             assert!(
                 labels.iter().any(|label| label == supported),
-                "supported type `{supported}` should remain an LSP completion"
+                "supported or reserved type `{supported}` should remain an LSP completion"
             );
         }
+    }
+
+    #[test]
+    fn completion_marks_resource_as_reserved() {
+        assert_eq!(
+            completion_detail("resource").as_deref(),
+            Some("Reserved Doria type name")
+        );
     }
 }

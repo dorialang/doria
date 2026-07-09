@@ -54,15 +54,792 @@ int $age = 37;
 float $ratio = 1.5;
 string $name = "Andrew";
 bool $active = true;
-null $empty = null;
-
-function copy(resource $handle): void
-{
-    resource $same = $handle;
-}
+mixed $payload = "dynamic boundary";
 "#,
     )
     .expect("semantic check should succeed");
+}
+
+#[test]
+fn allows_values_to_flow_into_mixed() {
+    doriac::check_source(
+        "test.doria",
+        r#"
+class User {}
+
+mixed $count = 1;
+mixed $name = "Doria";
+mixed $active = true;
+mixed $nothing = null;
+mixed $user = new User();
+mixed $numbers = [1, 2, 3];
+
+List<mixed> $items = [1, "two", new User()];
+Dictionary<string, mixed> $byName = [
+    "count" => 1,
+    "name" => "Doria",
+    "user" => new User(),
+];
+"#,
+    )
+    .expect("semantic check should allow values to flow into mixed");
+}
+
+#[test]
+fn rejects_broad_array_type_spelling() {
+    let err = doriac::check_source(
+        "test.doria",
+        r#"
+array $items = [];
+"#,
+    )
+    .expect_err("semantic check should reject the PHP-style broad array type");
+
+    assert!(err
+        .iter()
+        .any(|diagnostic| { diagnostic.code == "E0401" && diagnostic.message.contains("array") }));
+}
+
+#[test]
+fn rejects_array_as_class_name() {
+    let err = doriac::check_source(
+        "test.doria",
+        r#"
+class array
+{
+}
+
+array $items = new array();
+"#,
+    )
+    .expect_err("semantic check should reject array as a class/type spelling");
+
+    assert!(err.iter().any(|diagnostic| {
+        diagnostic.code == "E0309" && diagnostic.message.contains("`array`")
+    }));
+    assert!(err
+        .iter()
+        .any(|diagnostic| { diagnostic.code == "E0401" && diagnostic.message.contains("array") }));
+}
+
+#[test]
+fn rejects_array_as_callable_name() {
+    let err = doriac::check_source(
+        "test.doria",
+        r#"
+function array(): void
+{
+}
+
+class Bag
+{
+    function array(): void
+    {
+    }
+}
+"#,
+    )
+    .expect_err("semantic check should reject array as a callable spelling");
+
+    assert_eq!(
+        err.iter()
+            .filter(
+                |diagnostic| diagnostic.code == "E0310" && diagnostic.message.contains("`array`")
+            )
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn resolves_typed_array_types() {
+    doriac::check_source(
+        "test.doria",
+        r#"
+int[] $numbers = [1, 2, 3];
+string[] $names = [];
+int[][] $matrix = [[1], []];
+
+function accept(int[] $items): void
+{
+}
+"#,
+    )
+    .expect("typed array declarations should resolve");
+}
+
+#[test]
+fn preserves_nested_mixed_collection_shape() {
+    doriac::check_source(
+        "test.doria",
+        r#"
+mixed $payload = 1;
+let $rows = [[$payload], [1]];
+
+List<List<mixed>> $copy = $rows;
+"#,
+    )
+    .expect("nested collection shape should be preserved while widening inner mixed values");
+}
+
+#[test]
+fn preserves_nested_mixed_collection_shape_after_clear_heterogeneous_elements() {
+    doriac::check_source(
+        "test.doria",
+        r#"
+function rows(mixed $payload)
+{
+    return [[1], ["two"], [$payload]];
+}
+
+List<List<mixed>> $copy = rows(1);
+"#,
+    )
+    .expect("nested mixed collection inference should not depend on literal element order");
+}
+
+#[test]
+fn rejects_mixed_operations_before_narrowing() {
+    for (source, code) in [
+        (
+            r#"
+mixed $payload = 1;
+let $name = $payload->name;
+"#,
+            "E0433",
+        ),
+        (
+            r#"
+class User
+{
+    writable string $name;
+}
+
+mixed $payload = new User();
+$payload->name = "Ada";
+"#,
+            "E0433",
+        ),
+        (
+            r#"
+mixed $payload = 1;
+let $sum = $payload + 1;
+"#,
+            "E0433",
+        ),
+        (
+            r#"
+mixed $payload = 1;
+let $same = $payload == 1;
+"#,
+            "E0433",
+        ),
+        (
+            r#"
+mixed $payload = true;
+if ($payload) {
+}
+"#,
+            "E0416",
+        ),
+        (
+            r#"
+mixed $payload = [1];
+foreach ($payload as string $item) {
+    echo $item;
+}
+"#,
+            "E0433",
+        ),
+        (
+            r#"
+mixed $payload = "Doria";
+echo "{$payload}";
+"#,
+            "E0415",
+        ),
+        (
+            r#"
+mixed $payload = "Doria";
+echo $payload;
+"#,
+            "E0433",
+        ),
+        (
+            r#"
+mixed $payload = "Doria";
+string $name = $payload;
+"#,
+            "E0403",
+        ),
+        (
+            r#"
+function leak(mixed $payload)
+{
+    return $payload;
+}
+
+string $name = leak(1);
+"#,
+            "E0403",
+        ),
+        (
+            r#"
+function leak(mixed $payload)
+{
+    if (true) {
+        return $payload;
+    }
+}
+
+string $name = leak(1);
+"#,
+            "E0403",
+        ),
+        (
+            r#"
+class Box
+{
+    mixed $payload = "x";
+
+    function leak()
+    {
+        return $this->payload;
+    }
+}
+
+let $box = new Box();
+string $name = $box->leak();
+"#,
+            "E0403",
+        ),
+        (
+            r#"
+function forward(mixed $payload)
+{
+    return identity($payload);
+}
+
+function identity(mixed $payload)
+{
+    return $payload;
+}
+
+string $name = forward(1);
+"#,
+            "E0403",
+        ),
+        (
+            r#"
+function leak(mixed $payload)
+{
+    return [$payload, 1];
+}
+
+List<int> $numbers = leak("x");
+"#,
+            "E0403",
+        ),
+        (
+            r#"
+class Box
+{
+    mixed $payload = "x";
+}
+
+function leak(Box $box)
+{
+    Box $same = $box;
+    return $same->payload;
+}
+
+string $payload = leak(new Box());
+"#,
+            "E0403",
+        ),
+        (
+            r#"
+List<mixed> $items = [1];
+
+foreach ($items as string $item) {
+    echo $item;
+}
+"#,
+            "E0433",
+        ),
+        (
+            r#"
+Dictionary<string, mixed> $items = [
+    "count" => 1,
+];
+
+foreach ($items as string $key => int $value) {
+    echo $key;
+}
+"#,
+            "E0433",
+        ),
+        (
+            r#"
+List<mixed> $left = [1];
+List<mixed> $right = [2];
+
+bool $same = $left == $right;
+"#,
+            "E0433",
+        ),
+        (
+            r#"
+writable mixed $payload = 1;
+$payload += 1;
+"#,
+            "E0433",
+        ),
+        (
+            r#"
+function leak(mixed $payload, bool $usePayload)
+{
+    writable mixed $value = "";
+    if ($usePayload) {
+        $value = $payload;
+    } else {
+        $value = "safe";
+    }
+
+    return $value;
+}
+
+string $value = leak(1, true);
+"#,
+            "E0403",
+        ),
+        (
+            r#"
+function leak(mixed $payload)
+{
+    mixed[] $items = [$payload];
+    return $items;
+}
+
+List<int> $items = leak(1);
+"#,
+            "E0403",
+        ),
+        (
+            r#"
+mixed $payload = 1;
+echo [$payload];
+"#,
+            "E0433",
+        ),
+        (
+            r#"
+mixed $payload = 1;
+mixed[] $items = [$payload];
+
+foreach ($items as string $item) {
+    echo $item;
+}
+"#,
+            "E0433",
+        ),
+        (
+            r#"
+function first(mixed[] $items)
+{
+    foreach ($items as $item) {
+        return $item;
+    }
+}
+
+mixed $payload = 1;
+string $value = first([$payload]);
+"#,
+            "E0403",
+        ),
+        (
+            r#"
+class Box
+{
+    mixed[] $items;
+
+    function __construct(mixed $payload)
+    {
+        $this->items = [$payload];
+    }
+
+    function leak()
+    {
+        foreach ($this->items as $item) {
+            return $item;
+        }
+    }
+}
+
+let $box = new Box(1);
+string $value = $box->leak();
+"#,
+            "E0403",
+        ),
+        (
+            r#"
+mixed $payload = 1;
+echo [[$payload], [1]];
+"#,
+            "E0433",
+        ),
+        (
+            r#"
+function first(mixed[] $items)
+{
+    foreach ($items as $item) {
+        return $item;
+    }
+}
+
+function forward(mixed[] $items)
+{
+    return first($items);
+}
+
+mixed $payload = 1;
+string $value = forward([$payload]);
+"#,
+            "E0403",
+        ),
+        (
+            r#"
+class Box
+{
+    writable mixed[] $items;
+
+    writable function set(mixed[] $items): void
+    {
+        $this->items = $items;
+    }
+
+    function leak()
+    {
+        foreach ($this->items as $item) {
+            return $item;
+        }
+    }
+}
+
+let writable $box = new Box();
+mixed $payload = 1;
+$box->set([$payload]);
+string $value = $box->leak();
+"#,
+            "E0403",
+        ),
+        (
+            r#"
+class Box
+{
+    mixed[] $items;
+
+    function __construct(mixed[] $items)
+    {
+        $this->items = $items;
+    }
+
+    function leak()
+    {
+        foreach ($this->items as $item) {
+            return $item;
+        }
+    }
+}
+
+mixed $payload = 1;
+let $box = new Box([$payload]);
+string $value = $box->leak();
+"#,
+            "E0403",
+        ),
+        (
+            r#"
+function sourceMixed(): mixed
+{
+    return 1;
+}
+
+class Box
+{
+    mixed[] $items = [sourceMixed()];
+
+    function leak()
+    {
+        foreach ($this->items as $item) {
+            return $item;
+        }
+    }
+}
+
+let $box = new Box();
+string $value = $box->leak();
+"#,
+            "E0403",
+        ),
+        (
+            r#"
+class Box
+{
+    writable mixed[] $items;
+}
+
+function first(Box $box)
+{
+    foreach ($box->items as $item) {
+        return $item;
+    }
+}
+
+let writable $box = new Box();
+mixed $payload = 1;
+$box->items = [$payload];
+string $value = first($box);
+"#,
+            "E0403",
+        ),
+    ] {
+        let err =
+            doriac::check_source("test.doria", source).expect_err("semantic check should fail");
+        assert!(
+            err.iter().any(|diagnostic| diagnostic.code == code),
+            "expected {code}, got {err:?}"
+        );
+    }
+}
+
+#[test]
+fn propagates_mixed_return_through_long_method_chains() {
+    let mut source = String::from("class Chain\n{\n");
+    for index in 0..16 {
+        source.push_str(&format!(
+            "    function m{index}(mixed $value)\n    {{\n        return $this->m{}($value);\n    }}\n\n",
+            index + 1
+        ));
+    }
+    source.push_str(
+        r#"    function m16(mixed $value)
+    {
+        return $value;
+    }
+}
+
+let $chain = new Chain();
+string $payload = $chain->m0(1);
+"#,
+    );
+
+    assert_type_mismatch(&source);
+}
+
+#[test]
+fn mixed_operation_help_does_not_point_to_unimplemented_narrowing_syntax() {
+    let err = doriac::check_source(
+        "test.doria",
+        r#"
+mixed $payload = 1;
+let $sum = $payload + 1;
+"#,
+    )
+    .expect_err("semantic check should fail");
+    let diagnostic = err
+        .iter()
+        .find(|diagnostic| diagnostic.code == "E0433")
+        .expect("mixed operation diagnostic should be present");
+    let help = diagnostic
+        .help
+        .as_deref()
+        .expect("diagnostic should have help");
+
+    assert!(help.contains("narrowing syntax is implemented"));
+    assert!(!help.contains("`is`"));
+    assert!(!help.contains("`match`"));
+}
+
+#[test]
+fn null_type_help_marks_nullable_syntax_as_planned() {
+    let err = doriac::check_source(
+        "test.doria",
+        r#"
+null $value = null;
+"#,
+    )
+    .expect_err("semantic check should fail");
+    let diagnostic = err
+        .iter()
+        .find(|diagnostic| diagnostic.code == "E0431")
+        .expect("null type diagnostic should be present");
+    let help = diagnostic
+        .help
+        .as_deref()
+        .expect("diagnostic should have help");
+
+    assert!(help.contains("planned"));
+    assert!(help.contains("not implemented"));
+    assert!(help.contains("`?T`"));
+    assert!(!help.contains("such as `?User`"));
+}
+
+#[test]
+fn isolates_branch_scopes_during_mixed_return_inference() {
+    let err = doriac::check_source(
+        "test.doria",
+        r#"
+function safeValue()
+{
+    return "safe";
+}
+
+function maybeString(mixed $payload, bool $usePayload)
+{
+    let writable $value = safeValue();
+
+    if ($usePayload) {
+        $value = $payload;
+    } else {
+        return $value;
+    }
+
+    return "safe";
+}
+
+string $value = maybeString(1, false);
+"#,
+    )
+    .expect_err("mixed assignment into the local remains rejected");
+
+    let assignment_errors = err
+        .iter()
+        .filter(|diagnostic| diagnostic.code == "E0403")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        assignment_errors.len(),
+        1,
+        "then-branch mixed assignment should not also pollute the caller return type: {err:?}"
+    );
+    assert!(assignment_errors[0]
+        .message
+        .contains("cannot assign value of type `mixed` to `Unknown`"));
+}
+
+#[test]
+fn still_tracks_mixed_branch_assignments_that_can_reach_later_returns() {
+    let err = doriac::check_source(
+        "test.doria",
+        r#"
+function safeValue()
+{
+    return "safe";
+}
+
+function leak(mixed $payload, bool $usePayload)
+{
+    let writable $value = safeValue();
+
+    if ($usePayload) {
+        $value = $payload;
+    }
+
+    return $value;
+}
+
+string $value = leak(1, true);
+"#,
+    )
+    .expect_err("mixed assignment can reach the later return");
+
+    assert!(
+        err.iter().any(|diagnostic| diagnostic.code == "E0403"
+            && diagnostic
+                .message
+                .contains("cannot assign value of type `mixed` to `string`")),
+        "post-if return should still expose mixed to the caller: {err:?}"
+    );
+}
+#[test]
+fn merges_mixed_return_shapes_before_updating_unannotated_signatures() {
+    assert_type_mismatch(
+        r#"
+function leak(mixed $payload, bool $asList)
+{
+    if ($asList) {
+        return [$payload];
+    }
+
+    return $payload;
+}
+
+List<mixed> $payloads = leak(1, false);
+"#,
+    );
+}
+
+#[test]
+fn tracks_mixed_assignments_in_for_increments() {
+    assert_type_mismatch(
+        r#"
+function unknownValue()
+{
+    return 0;
+}
+
+function leak(mixed $payload)
+{
+    let writable $keepGoing = true;
+    let writable $value = unknownValue();
+
+    for (; $keepGoing; $value = $payload) {
+        $keepGoing = false;
+    }
+
+    return $value;
+}
+
+string $value = leak(1);
+"#,
+    );
+}
+
+#[test]
+fn rejects_d21_dynamic_boundary_type_positions() {
+    let cases = [
+        ("null $empty = null;", "E0431", "`null` is a literal"),
+        (
+            "function accept(resource $handle): void {}",
+            "E0432",
+            "`resource` is reserved for PHP interop",
+        ),
+        (
+            "void $nothing = null;",
+            "E0430",
+            "`void` is only valid as a return type",
+        ),
+        (
+            "function accept(void $value): void {}",
+            "E0430",
+            "`void` is only valid as a return type",
+        ),
+        (
+            "function accept(List<void> $values): void {}",
+            "E0430",
+            "`void` is only valid as a return type",
+        ),
+    ];
+
+    for (source, code, message) in cases {
+        let err =
+            doriac::check_source("test.doria", source).expect_err("semantic check should fail");
+        assert!(
+            err.iter()
+                .any(|diagnostic| diagnostic.code == code && diagnostic.message.contains(message)),
+            "expected {code} containing {message}, got {err:?}"
+        );
+    }
 }
 
 #[test]
@@ -1335,15 +2112,15 @@ fn checks_string_interpolation_semantics() {
     doriac::check_source(
         "test.doria",
         r#"
-function render(mixed $value): void
+function render(): void
 {
     string $name = "Andrew";
     int $age = 37;
     float $ratio = 1.5;
     bool $active = true;
-    null $nothing = null;
+    let $nothing = null;
 
-    echo "{$name}{$age}{$ratio}{$active}{$nothing}{$value}";
+    echo "{$name}{$age}{$ratio}{$active}{$nothing}";
 }
 "#,
     )
@@ -1438,24 +2215,6 @@ class Person {}
 
 let $person = new Person();
 echo "{$person}";
-"#,
-            "E0415",
-        ),
-        (
-            r#"
-class Person {}
-
-object $value = new Person();
-echo "{$value}";
-"#,
-            "E0415",
-        ),
-        (
-            r#"
-function show(resource $handle): void
-{
-    echo "{$handle}";
-}
 "#,
             "E0415",
         ),
@@ -2721,27 +3480,8 @@ function accept(
     string $name,
     bool $active,
     mixed $payload,
-    object $instance,
-    resource $handle,
-    null $empty,
 ): void
 {
-}
-"#,
-    )
-    .expect("semantic check should succeed");
-}
-
-#[test]
-fn resolves_null_typed_declarations() {
-    doriac::check_source(
-        "test.doria",
-        r#"
-null $empty = null;
-
-function clear(): void
-{
-    null $value = null;
 }
 "#,
     )
@@ -2786,21 +3526,6 @@ Person $person = new Office();
 }
 
 #[test]
-fn checks_object_assignment_compatibility() {
-    doriac::check_source(
-        "test.doria",
-        r#"
-class Person {}
-
-object $person = new Person();
-"#,
-    )
-    .expect("semantic check should succeed");
-
-    assert_type_mismatch("object $value = 1;");
-}
-
-#[test]
 fn reports_unknown_explicit_type_names() {
     let err = doriac::check_source(
         "test.doria",
@@ -2812,6 +3537,21 @@ UnknownThing $value = 1;
 
     assert!(err.iter().any(|diagnostic| {
         diagnostic.code == "E0401" && diagnostic.message.contains("UnknownThing")
+    }));
+}
+
+#[test]
+fn reports_object_as_unknown_type_with_help() {
+    let err = doriac::check_source("test.doria", "object $value = 1;")
+        .expect_err("semantic check should fail");
+
+    assert!(err.iter().any(|diagnostic| {
+        diagnostic.code == "E0401"
+            && diagnostic.message.contains("object")
+            && diagnostic
+                .help
+                .as_deref()
+                .is_some_and(|help| help.contains("Doria has no `object` type"))
     }));
 }
 
@@ -2844,14 +3584,22 @@ class B {}
 List<int> $numbers = [1, 2, 3];
 List<int> $emptyNumbers = [];
 List<List<int>> $rows = [[1], []];
-List<object> $objects = [new A(), new B()];
-List<array> $arrays = [[1], ["k" => 2]];
+List<A> $objects = [new A(), new A()];
+List<mixed> $mixedValues = [1, "two", new A()];
+List<int[]> $arrays = [[1], []];
+int[] $numberArray = [1, 2, 3];
+string[] $emptyStringArray = [];
+int[][] $arrayRows = [[1], []];
 Dictionary<string, int> $counts = [
     "apples" => 5,
 ];
-Dictionary<string, object> $objectsByName = [
+Dictionary<string, A> $objectsByName = [
     "a" => new A(),
-    "b" => new B(),
+    "b" => new A(),
+];
+Dictionary<string, mixed> $mixedByName = [
+    "a" => new A(),
+    "b" => 1,
 ];
 Dictionary<string, List<int>> $nestedCounts = [
     "apples" => [5],
@@ -2862,26 +3610,19 @@ Dictionary<int, int> $indexedCounts = [
     1 => 20,
 ];
 Dictionary<string, int> $emptyCounts = [];
-array $empty = [];
-array $items = [1, 2, 3];
-array $inventory = [
-    "apples" => 5,
-];
-array $mixed = [1, "two"];
 Set<string> $names = [];
-array $itemsFromSet = $names;
 
 class Inventory
 {
     Dictionary<string, int> $counts = [];
-    List<object> $objects = [new A(), new B()];
+    List<A> $objects = [new A(), new A()];
 }
 
 function readCounts(Dictionary<string, int> $counts = []): void
 {
 }
 
-function readObjects(List<object> $objects = [new A(), new B()]): void
+function readObjects(List<A> $objects = [new A(), new A()]): void
 {
 }
 "#,
@@ -2892,7 +3633,6 @@ function readObjects(List<object> $objects = [new A(), new B()]): void
         r#"List<string> $numbers = [1, 2, 3];"#,
         r#"List<int> $numbers = [1, "two"];"#,
         r#"List<int> $numbers = [1, []];"#,
-        r#"List<mixed> $numbers = [1, "two"];"#,
         r#"
 Dictionary<string, string> $counts = [
     "apples" => 5,
@@ -2912,14 +3652,22 @@ Dictionary<string, int> $counts = [
 "#,
         r#"
 class A {}
-List<object> $objects = [new A(), 1];
+List<A> $objects = [new A(), 1];
 "#,
         r#"
-List<array> $arrays = [[1], 2];
+List<int[]> $arrays = [[1], 2];
+"#,
+        r#"
+int[] $numbers = [1, "two"];
+"#,
+        r#"
+int[] $numbers = [
+    "one" => 1,
+];
 "#,
         r#"
 class A {}
-Dictionary<string, object> $objectsByName = [
+Dictionary<string, A> $objectsByName = [
     "a" => new A(),
     "b" => 1,
 ];
@@ -2939,6 +3687,19 @@ function collect(mixed $payload): void
         "pears" => "ten",
     ];
 }
+"#,
+        r#"
+mixed $payload = "x";
+let $values = [$payload, 1];
+List<int> $numbers = $values;
+"#,
+        r#"
+mixed $payload = "x";
+let $values = [
+    "first" => $payload,
+    "second" => 1,
+];
+Dictionary<string, int> $numbers = $values;
 "#,
     ] {
         assert_type_mismatch(source);
@@ -3099,4 +3860,49 @@ Int $value = new Int();
 "#,
     )
     .expect("semantic check should succeed");
+}
+
+#[test]
+fn tracks_mixed_return_through_grouped_assignment_targets() {
+    assert_type_mismatch(
+        r#"
+function leak(mixed $payload)
+{
+    let writable $items = [];
+    ($items) = [$payload];
+    return $items;
+}
+
+List<int> $items = leak("x");
+"#,
+    );
+}
+
+#[test]
+fn preserves_mixed_with_empty_collection_literals_in_return_inference() {
+    assert_type_mismatch(
+        r#"
+function leak(mixed $payload)
+{
+    return [$payload, []];
+}
+
+List<int> $items = leak("x");
+"#,
+    );
+}
+
+#[test]
+fn allows_body_locals_to_shadow_params_during_mixed_return_inference() {
+    assert_type_mismatch(
+        r#"
+function leak(int $value, mixed $payload)
+{
+    let $value = $payload;
+    return $value;
+}
+
+string $value = leak(0, 1);
+"#,
+    );
 }

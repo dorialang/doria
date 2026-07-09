@@ -110,9 +110,10 @@ $primitiveTypes = [
     'bool',
     'mixed',
     'never',
-    'object',
+];
+
+$reservedTypes = [
     'resource',
-    'array',
 ];
 
 $plannedTypes = [
@@ -129,6 +130,11 @@ $plannedTypes = [
     'Set',
 ];
 
+$rejectedTypes = [
+    'array',
+    'object',
+];
+
 $lspSupportedTypes = [
     'void',
     'int',
@@ -136,9 +142,6 @@ $lspSupportedTypes = [
     'string',
     'bool',
     'mixed',
-    'object',
-    'resource',
-    'array',
     'List',
     'Dictionary',
     'Set',
@@ -159,7 +162,7 @@ $rejectedPreprocessor = [
 ];
 $rejectedKeywords = ['goto', 'require', 'require_once', 'include_once'];
 $strictComparison = ['===', '!=='];
-$notKeywords = ['public', 'private', 'protected', 'Result'];
+$notKeywords = ['public', 'private', 'protected', 'Result', 'object'];
 function fail_check(string $message): never
 {
     fwrite(STDERR, "editor highlighting check failed: {$message}\n");
@@ -273,16 +276,20 @@ function check_vscode_language_configuration(): void
 
 function check_vscode_grammar(): void
 {
-    global $acceptedKeywords, $primitiveTypes, $plannedTypes, $wordOperators, $notKeywords, $strictComparison, $rejectedPreprocessor, $rejectedKeywords, $vscodeGrammar;
+    global $acceptedKeywords, $primitiveTypes, $reservedTypes, $plannedTypes, $wordOperators, $notKeywords, $strictComparison, $rejectedPreprocessor, $rejectedKeywords, $rejectedTypes, $vscodeGrammar;
 
     $grammar = load_json($vscodeGrammar);
     $grammarText = json_encode($grammar, JSON_THROW_ON_ERROR);
     $patterns = iterator_to_array(walk_patterns($grammar), false);
 
-    $tokens = array_unique([...$acceptedKeywords, ...$primitiveTypes, ...$plannedTypes, ...$wordOperators]);
+    $tokens = array_unique([...$acceptedKeywords, ...$primitiveTypes, ...$reservedTypes, ...$plannedTypes, ...$wordOperators]);
     sort($tokens);
     foreach ($tokens as $token) {
         require_check(str_contains($grammarText, $token), "VS Code grammar is missing '{$token}'");
+    }
+
+    foreach ($rejectedTypes as $type) {
+        require_check(!str_contains($grammarText, $type), "VS Code grammar must not highlight rejected type '{$type}'");
     }
 
     sort($notKeywords);
@@ -382,6 +389,20 @@ function check_vscode_grammar(): void
 
     $attributePatterns = $grammar['repository']['attributes']['patterns'] ?? [];
     require_check($attributePatterns !== [], 'VS Code grammar must define attribute highlighting');
+    $attributeBegin = (string) ($attributePatterns[0]['begin'] ?? '');
+    require_check(regex_matches($attributeBegin, '#[Module]'), 'VS Code attribute pattern must match simple attributes');
+    require_check(
+        regex_matches($attributeBegin, '#[App\\Routing\\Route(path: "/parser")]'),
+        'VS Code attribute pattern must match namespaced attributes'
+    );
+    foreach ([
+        'punctuation.definition.attribute.begin.doria',
+        'punctuation.definition.attribute.end.doria',
+        'entity.name.type.attribute.doria',
+        'variable.parameter.attribute.doria',
+    ] as $scope) {
+        require_check(str_contains($grammarText, $scope), "VS Code grammar is missing '{$scope}'");
+    }
     $attributeIncludes = [];
     foreach ($attributePatterns as $attributePattern) {
         foreach (($attributePattern['patterns'] ?? []) as $pattern) {
@@ -402,7 +423,7 @@ function check_vscode_grammar(): void
 
 function check_intellij_lexer(): void
 {
-    global $acceptedKeywords, $primitiveTypes, $plannedTypes, $wordOperators, $notKeywords, $strictComparison, $rejectedPreprocessor, $rejectedKeywords;
+    global $acceptedKeywords, $primitiveTypes, $reservedTypes, $plannedTypes, $wordOperators, $notKeywords, $strictComparison, $rejectedPreprocessor, $rejectedKeywords, $rejectedTypes;
     global $intellijLexer, $intellijTokenTypes, $intellijSyntaxHighlighter, $intellijPluginXml;
 
     $lexerText = read_text($intellijLexer);
@@ -412,10 +433,14 @@ function check_intellij_lexer(): void
         read_text($intellijSyntaxHighlighter),
     ]);
 
-    $tokens = array_unique([...$acceptedKeywords, ...$primitiveTypes, ...$plannedTypes, ...$wordOperators]);
+    $tokens = array_unique([...$acceptedKeywords, ...$primitiveTypes, ...$reservedTypes, ...$plannedTypes, ...$wordOperators]);
     sort($tokens);
     foreach ($tokens as $token) {
         require_check(str_contains($lexerText, '"' . $token . '"'), "IntelliJ lexer is missing '{$token}'");
+    }
+
+    foreach ($rejectedTypes as $type) {
+        require_check(!str_contains($lexerText, chr(34) . $type . chr(34)), "IntelliJ lexer must not highlight rejected type '{$type}'");
     }
 
     sort($notKeywords);
@@ -457,6 +482,16 @@ function check_intellij_lexer(): void
         str_contains($lexerText, 'LEGACY_CLOSURE_USE_LINE') && str_contains($lexerText, 'isLegacyClosureUseLine() -> DoriaTokenTypes.INVALID'),
         'IntelliJ lexer must mark legacy closure use capture invalid'
     );
+    require_check(
+        str_contains($lexerText, 'MODE_ATTRIBUTE') && str_contains($lexerText, 'scanAttributeToken'),
+        'IntelliJ lexer must define an attribute scanning mode'
+    );
+    require_check(
+        str_contains($lexerText, 'DoriaTokenTypes.ATTRIBUTE_DELIMITER') &&
+            str_contains($lexerText, 'DoriaTokenTypes.ATTRIBUTE_NAME') &&
+            str_contains($lexerText, 'DoriaTokenTypes.ATTRIBUTE_ARGUMENT'),
+        'IntelliJ lexer must emit dedicated attribute tokens'
+    );
 
     $pluginXml = read_text($intellijPluginXml);
     require_check(
@@ -471,6 +506,9 @@ function check_intellij_lexer(): void
         'DORIA_IMPORT_ALIAS',
         'DORIA_TRAIT_USES_KEYWORD',
         'DORIA_TRAIT_NAME',
+        'DORIA_ATTRIBUTE_DELIMITER',
+        'DORIA_ATTRIBUTE_NAME',
+        'DORIA_ATTRIBUTE_ARGUMENT',
     ] as $tokenType) {
         require_check(str_contains($intellijHighlightingText, $tokenType), "IntelliJ highlighting is missing {$tokenType}");
     }
@@ -478,7 +516,7 @@ function check_intellij_lexer(): void
 
 function check_lsp_completion_vocabulary(): void
 {
-    global $acceptedKeywords, $plannedKeywords, $primitiveTypes, $plannedTypes, $wordOperators, $notKeywords, $lspServer, $lspSupportedTypes;
+    global $acceptedKeywords, $plannedKeywords, $primitiveTypes, $reservedTypes, $plannedTypes, $wordOperators, $notKeywords, $lspServer, $lspSupportedTypes, $rejectedTypes;
 
     $lspText = read_text($lspServer);
     $tokens = array_unique([...$acceptedKeywords, ...$wordOperators]);
@@ -502,9 +540,26 @@ function check_lsp_completion_vocabulary(): void
     );
     $lspTypeList = $matches[1];
 
+    require_check(
+        preg_match('/let reserved_types = \[(.*?)\];/s', $lspText, $reservedMatches) === 1,
+        'LSP completion reserved type list could not be found'
+    );
+    $lspReservedTypeList = $reservedMatches[1];
+
     sort($lspSupportedTypes);
     foreach ($lspSupportedTypes as $type) {
         require_check(str_contains($lspTypeList, chr(34) . $type . chr(34)), 'LSP completion type list is missing ' . $type);
+    }
+
+    sort($reservedTypes);
+    foreach ($reservedTypes as $type) {
+        require_check(str_contains($lspReservedTypeList, chr(34) . $type . chr(34)), 'LSP completion reserved type list is missing ' . $type);
+        require_check(!str_contains($lspTypeList, chr(34) . $type . chr(34)), 'LSP completion type list must not advertise reserved type ' . $type);
+    }
+
+    foreach ($rejectedTypes as $type) {
+        require_check(!str_contains($lspTypeList, chr(34) . $type . chr(34)), 'LSP completion type list must not advertise rejected type ' . $type);
+        require_check(!str_contains($lspReservedTypeList, chr(34) . $type . chr(34)), 'LSP completion reserved type list must not advertise rejected type ' . $type);
     }
 
     $unsupportedTypes = array_diff(array_unique([...$primitiveTypes, ...$plannedTypes]), $lspSupportedTypes);
@@ -555,6 +610,7 @@ function check_fixture(): void
         'unsafe',
         'extern',
         '#[PhpExport]',
+        '#[App\Routing\Route(path: "/parser", name: "parser.show")]',
         '0..<10',
         '0..10',
         '?User',

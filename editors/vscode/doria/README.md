@@ -1,6 +1,6 @@
 # Doria Language Support
 
-This extension provides `.doria` language registration, TextMate syntax highlighting, editor bracket/comment behavior, and diagnostics from `doria-lsp`.
+This extension provides `.doria` language registration, TextMate syntax highlighting, attribute highlighting, editor bracket/comment behavior, and diagnostics from `doria-lsp`.
 
 Syntax colors depend on the active VS Code theme. This extension improves Doria's TextMate scopes for cleaner highlighting, but it does not ship a custom color theme yet.
 

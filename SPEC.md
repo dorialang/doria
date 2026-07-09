@@ -83,7 +83,7 @@ The MVP supports:
 - `echo`, `return`, `foreach`, `for`, `if` / `else if` / `else`, and `while`.
 - Assignments.
 - Function calls, method calls, property access, object construction, and literals.
-- List and dictionary literals using PHP-like array syntax.
+- Collection literals using bracket syntax.
 
 Planned near-term syntax includes:
 
@@ -252,6 +252,20 @@ Constructor init access is narrower than writable `$this`. Inside `__construct`,
 
 Function parameters are readonly by default and become writable only with `writable`.
 
+Every parameter in Doria source has an explicit type. This applies to all function-like parameter lists: free functions, methods, constructors, anonymous functions, arrow functions, interface requirements, trait requirements, property hook setters, and future callback-style declarations. Doria does not infer omitted parameter types in any context.
+
+Valid:
+
+```doria
+let $double = fn(int $x) => $x * 2;
+
+let $format = function (int $score): string {
+    return "score: {$score}";
+};
+```
+
+Omitting a parameter type is a syntax or semantic error even when the surrounding expression makes the intended type obvious.
+
 Methods receive readonly `$this` by default. A method that mutates `$this` must be declared with `writable function`.
 
 ## 6. Member access
@@ -344,7 +358,7 @@ See `docs/api-design-guidelines.md` for the detailed design notes.
 Accepted type-position names include:
 
 ```text
-void
+void (return position only)
 int
 int8
 int16
@@ -359,14 +373,21 @@ float32
 float64
 string
 bool
-null
 mixed
-object
-resource
+T[]
 List<T>
 Dictionary<K, V>
 Set<T>
 ClassType
+```
+
+Reserved or rejected names:
+
+```text
+null      literal only; nullable values are spelled ?T
+resource  reserved for Phase I PHP interop; rejected until specified
+object    not a Doria type
+array     not a Doria type; use T[] for typed arrays or collection aliases
 ```
 
 The compiler keeps parsed type syntax and semantic types separate:
@@ -379,9 +400,51 @@ TypeKind     resolved semantic type shape
 
 The semantic model also has an internal `Unknown` recovery type for diagnostics and error recovery; it is not the normal spelling for user-authored type declarations.
 
-Lowercase primitive names are type-position names: `int`, `int8`, `int16`, `int32`, `int64`, `uint8`, `uint16`, `uint32`, `uint64`, `float`, `float32`, `float64`, `string`, `bool`, `object`, and `resource`. `int` means `int64`; `float` means `float64`. PascalCase names such as `Int`, `Float`, `String`, `Bool`, `Object`, and `Resource` are reserved for future expression-level standard-library/helper APIs. They are not primitive type spellings, and primitive type names are not namespaces. Future code should prefer APIs such as `Int::parse(...)`, but companion semantics are not part of the current implementation.
+Lowercase primitive names are type-position names: `int`, `int8`, `int16`, `int32`, `int64`, `uint8`, `uint16`, `uint32`, `uint64`, `float`, `float32`, `float64`, `string`, and `bool`. `int` means `int64`; `float` means `float64`. PascalCase names such as `Int`, `Float`, `String`, and `Bool` are reserved for expression-level standard-library/helper APIs. They are not primitive type spellings, and primitive type names are not namespaces. Future code should prefer APIs such as `Int::parse(...)`, but companion semantics are not part of the current implementation.
 
 The fixed-width numeric type family is accepted in `docs/decisions/0016-fixed-width-numeric-types.md`. Current compiler support may lag this accepted direction until the lexer, parser, semantic type model, Doria IR, and backends are updated.
+
+### Dynamic boundary type
+
+`mixed` is Doria's only dynamic type. It has three laws:
+
+1. `mixed` is unknown-flavored, never any-flavored. A `mixed` value permits no property access, method calls, arithmetic, concatenation, interpolation, comparison, or other typed operation until it is narrowed with `is` or `match`.
+2. Any value may flow into `mixed` implicitly. This is the deliberate dynamic-boundary exemption from the no-implicit-conversion rule. Values do not flow out of `mixed` implicitly; source must narrow first. There is no cast spelling.
+3. `mixed` is a boxed, runtime-tagged move type, always, even when the payload is a Copy value.
+
+```doria
+mixed $payload = Json::decode($line);
+
+let $label = match ($payload) {
+    string $value => $value,
+    int $value => Int::to_string($value),
+    default => "unknown",
+};
+```
+
+`object` does not exist in Doria. Use `mixed` for dynamic object-shaped boundaries and narrow with `is` or `match`.
+
+`null` is a literal, not a type-position name. The internal null type exists for nullable machinery, but source spells nullable values as `?T`.
+
+`resource` is reserved for Phase I PHP bridge work and is rejected until the bridge specifies its exact semantics.
+
+`void` is valid only as a function or method return type, including `main(): void`; it is not a value type.
+
+Typed arrays use C-style suffix spelling:
+
+```text
+T[]
+```
+
+Examples:
+
+```doria
+int[] $numbers = [1, 2, 3];
+string[] $names = [];
+int[][] $matrix = [[1], []];
+```
+
+`array` is not a Doria type-position name.
 
 Collection aliases have fixed arity:
 
@@ -415,13 +478,13 @@ This slice supports only variable/property-path interpolation: `$name`, `$this`,
 
 Interpolated strings are represented in the AST and Doria IR as string parts before any backend runs. The PHP backend lowers them explicitly, for example `"Hello, {$name}!"` becomes PHP equivalent to `"Hello, " . $name . "!"`.
 
-Interpolated values may currently be `string`, `int`, `float`, `bool`, `null`, `mixed`, or the internal `Unknown` recovery type. Class values, `object`, `resource`, `List<T>`, `Dictionary<K, V>`, and `Set<T>` are rejected until Doria has a deliberate display/string-conversion design.
+Interpolated values may currently be `string`, `int`, `float`, `bool`, `null`, or the internal `Unknown` recovery type. Class values, `mixed`, `List<T>`, `Dictionary<K, V>`, and `Set<T>` are rejected until Doria has a deliberate display/string-conversion design.
 
 The `.` operator is string concatenation. Both operands must be `string` values or recovery types; Doria does not implicitly convert `int`, `bool`, objects, or other values to `string` for concatenation. The current native Stage 8 smoke backend supports `.` only when the resulting string value is compile-time-known through supported string literals and readonly string locals.
 
 Numeric widening is not implemented yet; for now `float` is not assignable from `int`, and `int` is not assignable from `float`. The accepted fixed-width numeric family also does not imply implicit widening, narrowing, or scalar coercion. Any future safe numeric widening should be a separate design decision. Named arguments and richer call argument representation are separate future slices.
 
-Simple collection literals infer collection element/key/value types when all clear parts match. Clear heterogeneous collection literals, such as `[1, "two"]`, are rejected by narrow collection alias assignment checks rather than being erased to `Unknown`. The empty literal `[]` stays ambiguous so typed contexts may use it as an empty `List<T>` or `Dictionary<K, V>`. The PHP-compatible `array` annotation remains broad enough to accept list-shaped and dictionary-shaped literals for now, but `array` is not the desired long-term collection model.
+Simple collection literals infer collection element/key/value types when all clear parts match. Clear heterogeneous collection literals, such as `[1, "two"]`, are rejected by typed array and narrow collection alias assignment checks rather than being erased to `Unknown`. The empty literal `[]` stays ambiguous so typed contexts may use it as an empty `T[]`, `List<T>`, or `Dictionary<K, V>`.
 
 ### Equality and boolean operators
 
@@ -470,7 +533,7 @@ The accepted boolean/equality/bitwise operator direction is recorded in `docs/de
 
 ### Control-flow conditions
 
-Basic `if` / `else if` / `else` and `while` are MVP syntax. Conditions must be `bool`; Doria does not use PHP-style truthiness for integers, strings, null, objects, resources, or collections. The checker currently allows `mixed` and the internal `Unknown` recovery type so one diagnostic does not cascade into unrelated follow-up errors.
+Basic `if` / `else if` / `else` and `while` are MVP syntax. Conditions must be `bool`; Doria does not use PHP-style truthiness for integers, strings, null, dynamic boundaries, or collections. The checker currently allows the internal `Unknown` recovery type so one diagnostic does not cascade into unrelated follow-up errors.
 
 Each `if`, `else if`, `else`, and `while` body has its own block scope. Variables declared inside those bodies are not visible after the block. Until Doria has path-sensitive definite initialization analysis, constructor readonly init access is available only for direct constructor-body assignments and not inside `if`, `else if`, `else`, or `while` bodies.
 
@@ -695,14 +758,16 @@ Only positional arguments are supported in the current slice. Required parameter
 Doria uses:
 
 ```doria
+int[]
 List<int>
 Dictionary<string, int>
 Set<string>
 ```
 
 Do not use `Vec`.
+Do not use `array` as a type spelling.
 
-The current PHP compatibility backend may lower these aliases to PHP arrays, while the Doria type checker keeps them distinct. The native backend must make deliberate representation choices for each collection family rather than inheriting PHP array behavior.
+The current PHP compatibility backend may lower typed arrays and collection aliases to PHP arrays, while the Doria type checker keeps them distinct. The native backend must make deliberate representation choices for typed arrays and each collection family rather than inheriting PHP array behavior.
 
 The current type foundation resolves explicit annotations, reports unknown type names and invalid collection alias arity, and checks assignment compatibility for typed declarations, property initializers, property writes, parameter defaults, declared return values, and positional call arguments. Classes without constructors cannot be constructed with arguments.
 
@@ -784,8 +849,7 @@ The PHP backend is currently implemented as a compatibility/debugging backend. I
 - `let` is removed.
 - `writable` is removed.
 - `internal` is enforced by Doria before backend emission and may lower to PHP `private` or another backend-specific representation.
-- Collection aliases are emitted as `array` for the current PHP backend only.
-- `resource` is emitted as `mixed` because PHP cannot declare `resource` type hints.
+- Typed arrays and collection aliases are emitted as `array` for the current PHP backend only.
 - Doria readonly/writable rules are enforced before Doria IR lowering and backend emission, not at PHP runtime.
 
 For Doria features that PHP cannot express directly, such as object construction in property initializers or richer attribute expressions, the PHP backend should lower to equivalent generated PHP where practical or produce a clear unsupported-feature diagnostic temporarily. PHP limitations must not define Doria semantics.

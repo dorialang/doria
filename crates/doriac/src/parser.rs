@@ -1038,7 +1038,10 @@ impl Parser {
         }
 
         let end = self
-            .expect(TokenKind::RightBracket, "expected `]` after array literal")?
+            .expect(
+                TokenKind::RightBracket,
+                "expected `]` after collection literal",
+            )?
             .span
             .end;
         Some(Expr::Array {
@@ -1071,7 +1074,6 @@ impl Parser {
             TokenKind::FloatType => "float".to_string(),
             TokenKind::StringType => "string".to_string(),
             TokenKind::BoolType => "bool".to_string(),
-            TokenKind::ArrayType => "array".to_string(),
             TokenKind::Null => "null".to_string(),
             TokenKind::Identifier(name) => name,
             other => {
@@ -1097,11 +1099,21 @@ impl Parser {
             )?;
         }
 
-        Some(if args.is_empty() {
+        let mut ty = if args.is_empty() {
             TypeRef::named(name)
         } else {
             TypeRef::generic(name, args)
-        })
+        };
+
+        while self.match_kind(&TokenKind::LeftBracket) {
+            self.expect(
+                TokenKind::RightBracket,
+                "expected `]` after typed array suffix",
+            )?;
+            ty = TypeRef::array_of(ty);
+        }
+
+        Some(ty)
     }
 
     fn parse_member_access(&mut self) -> MemberAccess {
@@ -1155,7 +1167,6 @@ impl Parser {
                 | TokenKind::FloatType
                 | TokenKind::StringType
                 | TokenKind::BoolType
-                | TokenKind::ArrayType
                 | TokenKind::Null
                 | TokenKind::Identifier(_)
         )
@@ -1297,7 +1308,6 @@ fn token_name(kind: &TokenKind) -> &'static str {
         TokenKind::FloatType => "float",
         TokenKind::StringType => "string",
         TokenKind::BoolType => "bool",
-        TokenKind::ArrayType => "array",
         TokenKind::Reserved(_) => "reserved keyword",
         TokenKind::Identifier(_) => "identifier",
         TokenKind::Variable(_) => "variable",

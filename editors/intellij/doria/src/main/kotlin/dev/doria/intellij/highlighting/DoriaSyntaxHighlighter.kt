@@ -15,6 +15,7 @@ class DoriaSyntaxHighlighter : SyntaxHighlighter {
         DoriaTokenTypes.KEYWORD -> KEYWORD_KEYS
         DoriaTokenTypes.MODIFIER -> MODIFIER_KEYS
         DoriaTokenTypes.PRIMITIVE_TYPE -> PRIMITIVE_TYPE_KEYS
+        DoriaTokenTypes.RESERVED_TYPE -> RESERVED_TYPE_KEYS
         DoriaTokenTypes.COLLECTION_TYPE -> COLLECTION_TYPE_KEYS
         DoriaTokenTypes.TYPE_NAME -> TYPE_NAME_KEYS
         DoriaTokenTypes.IMPORT_USE_KEYWORD -> IMPORT_USE_KEYWORD_KEYS
@@ -23,6 +24,9 @@ class DoriaSyntaxHighlighter : SyntaxHighlighter {
         DoriaTokenTypes.IMPORT_ALIAS -> IMPORT_ALIAS_KEYS
         DoriaTokenTypes.TRAIT_USES_KEYWORD -> TRAIT_USES_KEYWORD_KEYS
         DoriaTokenTypes.TRAIT_NAME -> TRAIT_NAME_KEYS
+        DoriaTokenTypes.ATTRIBUTE_DELIMITER -> ATTRIBUTE_DELIMITER_KEYS
+        DoriaTokenTypes.ATTRIBUTE_NAME -> ATTRIBUTE_NAME_KEYS
+        DoriaTokenTypes.ATTRIBUTE_ARGUMENT -> ATTRIBUTE_ARGUMENT_KEYS
         DoriaTokenTypes.FUNCTION_DECLARATION -> FUNCTION_DECLARATION_KEYS
         DoriaTokenTypes.FUNCTION_CALL -> FUNCTION_CALL_KEYS
         DoriaTokenTypes.METHOD_CALL -> METHOD_CALL_KEYS
@@ -61,6 +65,10 @@ class DoriaSyntaxHighlighter : SyntaxHighlighter {
             "DORIA_PRIMITIVE_TYPE",
             DefaultLanguageHighlighterColors.KEYWORD,
         )
+        val RESERVED_TYPE: TextAttributesKey = TextAttributesKey.createTextAttributesKey(
+            "DORIA_RESERVED_TYPE",
+            DefaultLanguageHighlighterColors.METADATA,
+        )
         val COLLECTION_TYPE: TextAttributesKey = TextAttributesKey.createTextAttributesKey(
             "DORIA_COLLECTION_TYPE",
             DefaultLanguageHighlighterColors.CLASS_NAME,
@@ -92,6 +100,18 @@ class DoriaSyntaxHighlighter : SyntaxHighlighter {
         val TRAIT_NAME: TextAttributesKey = TextAttributesKey.createTextAttributesKey(
             "DORIA_TRAIT_NAME",
             DefaultLanguageHighlighterColors.CLASS_NAME,
+        )
+        val ATTRIBUTE_DELIMITER: TextAttributesKey = TextAttributesKey.createTextAttributesKey(
+            "DORIA_ATTRIBUTE_DELIMITER",
+            DefaultLanguageHighlighterColors.METADATA,
+        )
+        val ATTRIBUTE_NAME: TextAttributesKey = TextAttributesKey.createTextAttributesKey(
+            "DORIA_ATTRIBUTE_NAME",
+            DefaultLanguageHighlighterColors.METADATA,
+        )
+        val ATTRIBUTE_ARGUMENT: TextAttributesKey = TextAttributesKey.createTextAttributesKey(
+            "DORIA_ATTRIBUTE_ARGUMENT",
+            DefaultLanguageHighlighterColors.PARAMETER,
         )
         val FUNCTION_DECLARATION: TextAttributesKey = TextAttributesKey.createTextAttributesKey(
             "DORIA_FUNCTION_DECLARATION",
@@ -186,6 +206,7 @@ class DoriaSyntaxHighlighter : SyntaxHighlighter {
         private val KEYWORD_KEYS = arrayOf(KEYWORD)
         private val MODIFIER_KEYS = arrayOf(MODIFIER)
         private val PRIMITIVE_TYPE_KEYS = arrayOf(PRIMITIVE_TYPE)
+        private val RESERVED_TYPE_KEYS = arrayOf(RESERVED_TYPE)
         private val COLLECTION_TYPE_KEYS = arrayOf(COLLECTION_TYPE)
         private val TYPE_NAME_KEYS = arrayOf(TYPE_NAME)
         private val IMPORT_USE_KEYWORD_KEYS = arrayOf(IMPORT_USE_KEYWORD)
@@ -194,6 +215,9 @@ class DoriaSyntaxHighlighter : SyntaxHighlighter {
         private val IMPORT_ALIAS_KEYS = arrayOf(IMPORT_ALIAS)
         private val TRAIT_USES_KEYWORD_KEYS = arrayOf(TRAIT_USES_KEYWORD)
         private val TRAIT_NAME_KEYS = arrayOf(TRAIT_NAME)
+        private val ATTRIBUTE_DELIMITER_KEYS = arrayOf(ATTRIBUTE_DELIMITER)
+        private val ATTRIBUTE_NAME_KEYS = arrayOf(ATTRIBUTE_NAME)
+        private val ATTRIBUTE_ARGUMENT_KEYS = arrayOf(ATTRIBUTE_ARGUMENT)
         private val FUNCTION_DECLARATION_KEYS = arrayOf(FUNCTION_DECLARATION)
         private val FUNCTION_CALL_KEYS = arrayOf(FUNCTION_CALL)
         private val METHOD_CALL_KEYS = arrayOf(METHOD_CALL)

@@ -48,3 +48,14 @@ Check your source, compile it, then run it.
 ```text
 Baton currently builds Doria projects.
 ```
+
+## Constructor Examples
+
+Website docs should teach Doria constructor property promotion as the default/simple class style.
+
+Guardrails:
+
+- Prefer `function __construct(string $name) { }` over declaring `string $name;` and assigning `$this->name = $name;`.
+- Use promoted modifiers such as `writable`, `internal`, and `internal writable` to teach mutability and API surface.
+- Use manual constructor assignment only when the stored property has a different name, or when the constructor validates, normalizes, transforms, or accepts ownership into a differently named field.
+- Do not use PHP visibility modifiers such as `public`, `private`, or `protected` in Doria examples.

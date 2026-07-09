@@ -168,6 +168,16 @@ function rename(writable Person $person, string $name): void
 }
 ```
 
+Every parameter in Doria source must be explicitly typed. This rule applies to free functions, methods, constructors, anonymous functions, arrow functions, interface requirements, trait requirements, property hook setters, and callback-like declarations. Doria does not infer omitted parameter types.
+
+```doria
+let $double = fn(int $x) => $x * 2;
+
+let $format = function (int $score): string {
+    return "score: {$score}";
+};
+```
+
 ---
 
 ## 6. Methods receive readonly `$this` by default
@@ -421,7 +431,6 @@ int
 float
 string
 bool
-array
 
 Future reserved:
 async
@@ -590,10 +599,8 @@ int
 float
 string
 bool
-null
 mixed
-object
-resource
+T[]
 List<T>
 Dictionary<K, V>
 Set<T>
@@ -608,9 +615,11 @@ TypeId       resolved semantic type identity
 TypeKind     resolved semantic type shape
 ```
 
-The semantic model also has an internal `Unknown` recovery type for diagnostics and error recovery; it is not the normal spelling for user-authored type declarations.
+The semantic model also has internal recovery and flow-analysis types, such as `Unknown` and the internal null type, for diagnostics and later nullable machinery. They are not normal spellings for user-authored type declarations.
 
-Lowercase primitive names are type-position names: `int`, `float`, `string`, `bool`, `object`, and `resource`. PascalCase names such as `Int`, `Float`, `String`, `Bool`, `Object`, and `Resource` are future expression-level companion/helper APIs, not primitive type spellings. Primitive type names are not namespaces, so do not model `int::parse(...)` as valid Doria.
+Lowercase primitive names are type-position names: `int`, `float`, `string`, `bool`, `mixed`, and the fixed-width numeric spellings. PascalCase names such as `Int`, `Float`, `String`, and `Bool` are future expression-level companion/helper APIs, not primitive type spellings. Primitive type names are not namespaces, so do not model `int::parse(...)` as valid Doria.
+
+Do not present `null`, `object`, or `resource` as usable type-position names. `null` is a literal; nullable values are spelled `?T`. Doria has no `object` type; dynamic boundaries use `mixed` and must be narrowed before use. `resource` is reserved for future PHP bridge work and is rejected until that bridge specifies its exact semantics.
 
 Validate collection alias arity while resolving `TypeRef` into semantic types:
 
@@ -667,7 +676,7 @@ Should infer:
 List<int>
 ```
 
-For mixed list values in MVP, reject clear heterogeneous collection literals for narrow collection aliases until the type system is stable. Do not erase cleanly differing element/value types to `Unknown`, because that would let `List<T>` and `Dictionary<K, V>` annotations accept invalid literals. Keep `[]` ambiguous so typed contexts can use it for empty lists or dictionaries. The PHP-compatible `array` annotation remains broad enough to accept list-shaped and dictionary-shaped literals.
+For mixed list values in MVP, reject clear heterogeneous collection literals for typed arrays and narrow collection aliases until the type system is stable. Do not erase cleanly differing element/value types to `Unknown`, because that would let `T[]`, `List<T>`, and `Dictionary<K, V>` annotations accept invalid literals. Keep `[]` ambiguous so typed contexts can use it for empty typed arrays, lists, or dictionaries. `array` is not a Doria type spelling; use `T[]` for typed arrays.
 
 ---
 
@@ -855,7 +864,7 @@ echo "Hello, {$this->profile->displayName}";
 
 Single-quoted strings are plain strings and never interpolate. Interpolation is represented in the Doria AST and Doria IR before backend emission; the PHP backend lowers it to explicit concatenation instead of relying on PHP double-quoted interpolation.
 
-The first slice supports only variable/property paths: `$name`, `$this`, `$user->name`, and repeated `->property` chains. It allows `string`, `int`, `float`, `bool`, `null`, and `mixed` values. Class values, `object`, `resource`, and collection values are rejected until Doria has a deliberate string conversion/display design. Method calls, function calls, arithmetic, comparisons, custom formatting, and full expressions inside interpolation are future work.
+The first slice supports only variable/property paths: `$name`, `$this`, `$user->name`, and repeated `->property` chains. It allows `string`, `int`, `float`, `bool`, and `null` values. `mixed` values, class values, collection values, and reserved names such as `resource` are rejected until Doria has deliberate narrowing and string conversion/display designs. Method calls, function calls, arithmetic, comparisons, custom formatting, and full expressions inside interpolation are future work.
 
 ---
 
@@ -987,14 +996,14 @@ $person->name = "Lucy";
 Possible diagnostic:
 
 ```text
-error[E0201]: cannot write through readonly variable `$person`
+Error[E0201]: cannot write through readonly variable `$person`
 
   examples/php/person.doria:2:1
   |
 2 | $person->name = "Lucy";
   | ^^^^^^^ `$person` was declared readonly here
   |
-help: declare it as writable:
+Help: declare it as writable:
   |
 1 | let writable $person = new Person("Andrew", 37);
   |     +++++++++
@@ -1015,9 +1024,9 @@ $person->name = "Lucy";
 Diagnostic:
 
 ```text
-error[E0202]: cannot assign to readonly property `Person::$name`
+Error[E0202]: cannot assign to readonly property `Person::$name`
 
-help: mark the property writable:
+Help: mark the property writable:
   writable string $name;
 ```
 

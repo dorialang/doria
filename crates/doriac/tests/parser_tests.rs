@@ -12,11 +12,12 @@ let $x = 5;
 let writable $name = "Doria";
 writable int $score = 1;
 null $empty = null;
+int[] $numbers = [1, 2, 3];
 "#,
     )
     .expect("parse should succeed");
 
-    assert_eq!(program.items.len(), 4);
+    assert_eq!(program.items.len(), 5);
     assert!(matches!(
         &program.items[0],
         Item::Statement(Stmt::VarDecl(decl)) if !decl.writable && decl.name == "x"
@@ -35,6 +36,14 @@ null $empty = null;
             if !decl.writable
                 && decl.name == "empty"
                 && matches!(decl.ty.as_ref(), Some(ty) if ty.name == "null")
+    ));
+    assert!(matches!(
+        &program.items[4],
+        Item::Statement(Stmt::VarDecl(decl))
+            if !decl.writable
+                && decl.name == "numbers"
+                && matches!(decl.ty.as_ref(), Some(ty)
+                    if ty.name == "[]" && ty.args.len() == 1 && ty.args[0].name == "int")
     ));
 }
 
