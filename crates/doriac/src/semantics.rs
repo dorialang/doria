@@ -558,16 +558,7 @@ impl<'program> Checker<'program> {
                 self.type_contains_mixed(ty).then_some(ty)
             }
             Stmt::If(if_stmt) => {
-                let mut inferred =
-                    self.infer_mixed_return_from_block(&if_stmt.then_block, scopes, method_context);
-
-                if let Some(branch) = &if_stmt.else_branch {
-                    let branch_ty =
-                        self.infer_mixed_return_from_else_branch(branch, scopes, method_context);
-                    inferred = self.merge_optional_mixed_return_types(inferred, branch_ty);
-                }
-
-                inferred
+                self.infer_mixed_return_from_if_statement(if_stmt, scopes, method_context)
             }
             Stmt::While(while_stmt) => {
                 self.infer_mixed_return_from_block(&while_stmt.body, scopes, method_context)
@@ -596,6 +587,43 @@ impl<'program> Checker<'program> {
         }
     }
 
+    fn infer_mixed_return_from_if_statement(
+        &mut self,
+        if_stmt: &IfStmt,
+        scopes: &mut ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) -> Option<TypeId> {
+        let incoming_scopes = scopes.clone();
+        let mut falling_through_scopes = Vec::new();
+
+        let mut then_scopes = incoming_scopes.clone();
+        let mut inferred = self.infer_mixed_return_from_block(
+            &if_stmt.then_block,
+            &mut then_scopes,
+            method_context,
+        );
+        if !Self::block_is_terminal(&if_stmt.then_block) {
+            falling_through_scopes.push(then_scopes);
+        }
+
+        if let Some(branch) = &if_stmt.else_branch {
+            let mut else_scopes = incoming_scopes;
+            let branch_ty =
+                self.infer_mixed_return_from_else_branch(branch, &mut else_scopes, method_context);
+            inferred = self.merge_optional_mixed_return_types(inferred, branch_ty);
+            if !Self::else_branch_is_terminal(branch) {
+                falling_through_scopes.push(else_scopes);
+            }
+        } else {
+            falling_through_scopes.push(incoming_scopes);
+        }
+
+        scopes.replace_types_from_branches(&falling_through_scopes, |left, right| {
+            self.merge_inferred_binding_type(left, right)
+        });
+
+        inferred
+    }
     fn infer_mixed_return_from_block(
         &mut self,
         block: &Block,
@@ -2251,7 +2279,9 @@ impl<'program> Checker<'program> {
                 format!("cannot use `mixed` value in {operation} before narrowing"),
                 span,
             )
-            .with_help("narrow the value with `is` or `match` before using it"),
+            .with_help(
+                "mixed-value operations are unsupported until narrowing syntax is implemented",
+            ),
         );
     }
 
@@ -3012,7 +3042,7 @@ impl<'program> Checker<'program> {
                 span,
                 "E0431",
                 "`null` is a literal, not a type name",
-                "spell nullable values as `?T`, such as `?User`",
+                "nullable type syntax like `?T` is planned but not implemented yet; use a supported non-null type or `mixed` for now",
             ),
             "mixed" => self.resolve_zero_arg_type(ty, span, TypeKind::Mixed),
             "object" => self.reject_type_ref_with_help(
@@ -3020,7 +3050,7 @@ impl<'program> Checker<'program> {
                 span,
                 "E0401",
                 "unknown type `object`",
-                "Doria has no `object` type; use `mixed` and narrow with `is` or `match`",
+                "Doria has no `object` type; use `mixed` for dynamic boundaries until narrowing syntax is implemented",
             ),
             "array" => self.reject_type_ref_with_help(
                 ty,

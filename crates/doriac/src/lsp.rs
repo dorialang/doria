@@ -477,14 +477,14 @@ fn hover_description(kind: &TokenKind) -> Option<&'static str> {
         TokenKind::BoolType => Some("The `bool` primitive type."),
         TokenKind::True | TokenKind::False => Some("Boolean literal."),
         TokenKind::Null => {
-            Some("Null literal. Nullable values are spelled `?T`; `null` is not a type name.")
+            Some("Null literal. Nullable type syntax like `?T` is planned but not implemented yet; `null` is not a type name.")
         }
         TokenKind::Reserved(_) => Some("Reserved for future Doria syntax."),
         TokenKind::Identifier(name) => match name.as_str() {
             "List" => Some("Ordered collection alias: `List<T>`."),
             "Dictionary" => Some("Key-value collection alias: `Dictionary<K, V>`."),
             "Set" => Some("Unique-value collection alias: `Set<T>`."),
-            "mixed" => Some("Dynamic boundary type. Narrow with `is` or `match` before using it."),
+            "mixed" => Some("Dynamic boundary type. Operations on `mixed` require future narrowing syntax before use."),
             "resource" => Some("Reserved for future PHP interop; not a usable core type."),
             _ => None,
         },
@@ -707,6 +707,20 @@ mod tests {
             !diagnostics.is_empty(),
             "planned syntax should remain rejected by compiler diagnostics until implemented"
         );
+    }
+    #[test]
+    fn hover_help_does_not_present_planned_syntax_as_immediate_fixes() {
+        let null_hover = hover_description(&TokenKind::Null).expect("null should have hover text");
+        assert!(null_hover.contains("planned"));
+        assert!(null_hover.contains("not implemented"));
+        assert!(null_hover.contains("`?T`"));
+        assert!(!null_hover.contains("spelled `?T`"));
+
+        let mixed_hover = hover_description(&TokenKind::Identifier("mixed".to_string()))
+            .expect("mixed should have hover text");
+        assert!(mixed_hover.contains("future narrowing syntax"));
+        assert!(!mixed_hover.contains("`is`"));
+        assert!(!mixed_hover.contains("`match`"));
     }
     #[test]
     fn completions_do_not_offer_unsupported_future_types() {

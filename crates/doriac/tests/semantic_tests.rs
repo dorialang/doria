@@ -593,6 +593,130 @@ string $payload = $chain->m0(1);
 }
 
 #[test]
+fn mixed_operation_help_does_not_point_to_unimplemented_narrowing_syntax() {
+    let err = doriac::check_source(
+        "test.doria",
+        r#"
+mixed $payload = 1;
+let $sum = $payload + 1;
+"#,
+    )
+    .expect_err("semantic check should fail");
+    let diagnostic = err
+        .iter()
+        .find(|diagnostic| diagnostic.code == "E0433")
+        .expect("mixed operation diagnostic should be present");
+    let help = diagnostic
+        .help
+        .as_deref()
+        .expect("diagnostic should have help");
+
+    assert!(help.contains("narrowing syntax is implemented"));
+    assert!(!help.contains("`is`"));
+    assert!(!help.contains("`match`"));
+}
+
+#[test]
+fn null_type_help_marks_nullable_syntax_as_planned() {
+    let err = doriac::check_source(
+        "test.doria",
+        r#"
+null $value = null;
+"#,
+    )
+    .expect_err("semantic check should fail");
+    let diagnostic = err
+        .iter()
+        .find(|diagnostic| diagnostic.code == "E0431")
+        .expect("null type diagnostic should be present");
+    let help = diagnostic
+        .help
+        .as_deref()
+        .expect("diagnostic should have help");
+
+    assert!(help.contains("planned"));
+    assert!(help.contains("not implemented"));
+    assert!(help.contains("`?T`"));
+    assert!(!help.contains("such as `?User`"));
+}
+
+#[test]
+fn isolates_branch_scopes_during_mixed_return_inference() {
+    let err = doriac::check_source(
+        "test.doria",
+        r#"
+function safeValue()
+{
+    return "safe";
+}
+
+function maybeString(mixed $payload, bool $usePayload)
+{
+    let writable $value = safeValue();
+
+    if ($usePayload) {
+        $value = $payload;
+    } else {
+        return $value;
+    }
+
+    return "safe";
+}
+
+string $value = maybeString(1, false);
+"#,
+    )
+    .expect_err("mixed assignment into the local remains rejected");
+
+    let assignment_errors = err
+        .iter()
+        .filter(|diagnostic| diagnostic.code == "E0403")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        assignment_errors.len(),
+        1,
+        "then-branch mixed assignment should not also pollute the caller return type: {err:?}"
+    );
+    assert!(assignment_errors[0]
+        .message
+        .contains("cannot assign value of type `mixed` to `Unknown`"));
+}
+
+#[test]
+fn still_tracks_mixed_branch_assignments_that_can_reach_later_returns() {
+    let err = doriac::check_source(
+        "test.doria",
+        r#"
+function safeValue()
+{
+    return "safe";
+}
+
+function leak(mixed $payload, bool $usePayload)
+{
+    let writable $value = safeValue();
+
+    if ($usePayload) {
+        $value = $payload;
+    }
+
+    return $value;
+}
+
+string $value = leak(1, true);
+"#,
+    )
+    .expect_err("mixed assignment can reach the later return");
+
+    assert!(
+        err.iter().any(|diagnostic| diagnostic.code == "E0403"
+            && diagnostic
+                .message
+                .contains("cannot assign value of type `mixed` to `string`")),
+        "post-if return should still expose mixed to the caller: {err:?}"
+    );
+}
+#[test]
 fn merges_mixed_return_shapes_before_updating_unannotated_signatures() {
     assert_type_mismatch(
         r#"
