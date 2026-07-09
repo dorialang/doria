@@ -1,0 +1,10 @@
+function main(): int
+{
+    let $value = 42;
+
+    if (($value == 42 and true) or false) {
+        return 42;
+    }
+
+    return 0;
+}

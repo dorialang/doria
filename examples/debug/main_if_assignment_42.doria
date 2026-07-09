@@ -1,0 +1,10 @@
+function main(): int
+{
+    let writable $value = 0;
+
+    if (true) {
+        $value = 42;
+    }
+
+    return $value;
+}

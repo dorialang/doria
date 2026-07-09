@@ -301,7 +301,7 @@ fn direct_executable_hint(path: &Path) -> String {
 
 fn print_help() {
     println!(
-        "doriac 0.1.0\n\nUSAGE:\n    doriac check <source.doria>\n    doriac ast <source.doria>\n    doriac hir <source.doria>\n    doriac mir <source.doria>\n    doriac compile <source.doria> [--out <file>]\n    doriac compile <source.doria> --target php [--out <file>]\n    doriac run <source.doria>\n\nTARGETS:\n    native    default target for standalone executables\n    php       compatibility and inspection backend\n    debug     Stage 11b MIR interpreter debug artifact\n    wasm      planned WebAssembly backend"
+        "doriac 0.1.0\n\nUSAGE:\n    doriac check <source.doria>\n    doriac ast <source.doria>\n    doriac hir <source.doria>\n    doriac mir <source.doria>\n    doriac compile <source.doria> [--out <file>]\n    doriac compile <source.doria> --target php [--out <file>]\n    doriac run <source.doria>\n\nTARGETS:\n    native    default target for standalone executables\n    php       compatibility and inspection backend\n    debug     Stage 11c MIR interpreter debug artifact\n    wasm      planned WebAssembly backend"
     );
 }
 
