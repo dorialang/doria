@@ -90,6 +90,27 @@ fn lowers_echo_inside_int_returning_helper_to_object() {
 }
 
 #[test]
+fn lowers_recursive_calls_to_object() {
+    assert_object(include_str!(
+        "../../../examples/native/main_recursive_fibonacci_55.doria"
+    ));
+}
+
+#[test]
+fn lowers_explicit_panic_to_object() {
+    assert_object(include_str!(
+        "../../../examples/native/main_nested_panic_stack.doria"
+    ));
+}
+
+#[test]
+fn lowers_non_terminating_loop_without_executing_it() {
+    assert_object(include_str!(
+        "../../../examples/compile-only/main_infinite_while.doria"
+    ));
+}
+
+#[test]
 fn rejects_malformed_function_id() {
     let mut program = void_program();
     program.functions[0].blocks[0]

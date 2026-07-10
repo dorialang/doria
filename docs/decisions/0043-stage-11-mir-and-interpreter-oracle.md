@@ -242,7 +242,7 @@ Stage 11g supports:
 - The Stage 11d global execution budget and exact-state cycle detection, now including string local state.
 - The Stage 11f defensive call-depth limit and shared stdout across helper calls.
 - Debug-target artifacts for the Stage 11g examples.
-- A Stage <=10 native-smoke versus MIR/debug parity matrix in `docs/notes/stage-11-mir-parity-matrix.md`.
+- A Stage <=10 native-smoke versus MIR/debug parity matrix, now maintained at `docs/notes/native-parity-matrix.md`.
 
 Unsupported Doria constructs in Stage 11g must be rejected as unsupported MIR Stage 11g coverage, unless an earlier semantic diagnostic already rejects the source as invalid Doria.
 
@@ -285,7 +285,7 @@ Stage 11h completes the architecture migration:
 - All MIR functions are declared before body lowering with deterministic implementation-private symbols. A separate exported process wrapper maps `main(): void` to status 0 and validates `main(): int` against the portable `0..125` process boundary.
 - MIR branch and jump terminators lower directly to Cranelift control flow. Recursive condition lowering preserves left-to-right evaluation, short-circuit `and`/`or`, and eager bool-only `xor`.
 - Compile-time-known readonly string locals and concatenations resolve to exact bytes during object lowering. Unix-like and Windows stdout paths use explicit pointer/length writes and retry short writes without defining runtime strings.
-- `crates/doriac/tests/fixtures/stage_11_native_parity_examples.txt` is the executable accepted-example manifest. The differential suite compares exact interpreter/native stdout and process status for every entry and guards against unclassified native examples.
+- The executable accepted-example manifest is now maintained at `crates/doriac/tests/fixtures/native_parity_examples.txt`. The differential suite compares exact interpreter/native output and process status for every entry and guards against unclassified native examples.
 - The private Stage 7-10 native smoke module, evaluator, Cranelift lowerer, fallback paths, and implementation-structure tests have been removed. Equivalent behavior is covered by MIR lowering/interpreter tests, linker-independent MIR-to-object tests, native preflight diagnostics, and the differential suite.
 
 The interpreter preflight is temporary migration-boundary behavior for the deterministic Stage <=10 subset. It is not used to generate machine code and its captured stdout is discarded during native compilation. Stage 12's runtime/panic foundation will revisit which checked failures remain compile-time preflight diagnostics and which become runtime panics.

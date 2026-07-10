@@ -295,6 +295,9 @@ impl<'program> Checker<'program> {
 
     fn reserved_callable_name_message(name: &str) -> Option<String> {
         match name {
+            "panic" => Some(
+                "`panic` is a compiler-known Doria built-in and cannot be redeclared".to_string(),
+            ),
             "array" => Some(
                 "`array` is not a Doria callable name; use typed arrays like `T[]` or collection aliases"
                     .to_string(),
@@ -523,6 +526,7 @@ impl<'program> Checker<'program> {
                     writable: false,
                     ty: param.ty,
                     int_constant: None,
+                    string_constant: None,
                 },
             );
         }
@@ -544,7 +548,7 @@ impl<'program> Checker<'program> {
                 self.infer_mixed_return_from_statement(statement, scopes, method_context);
             inferred = self.merge_optional_mixed_return_types(inferred, statement_ty);
 
-            if Self::statement_is_terminal(statement) {
+            if !crate::return_analysis::statement_falls_through(statement) {
                 break;
             }
         }
@@ -572,6 +576,7 @@ impl<'program> Checker<'program> {
                         writable: decl.writable,
                         ty,
                         int_constant: None,
+                        string_constant: None,
                     },
                 );
                 None
@@ -631,7 +636,7 @@ impl<'program> Checker<'program> {
             &mut then_scopes,
             method_context,
         );
-        if !Self::block_is_terminal(&if_stmt.then_block) {
+        if crate::return_analysis::block_falls_through(&if_stmt.then_block) {
             falling_through_scopes.push(then_scopes);
         }
 
@@ -640,7 +645,7 @@ impl<'program> Checker<'program> {
             let branch_ty =
                 self.infer_mixed_return_from_else_branch(branch, &mut else_scopes, method_context);
             inferred = self.merge_optional_mixed_return_types(inferred, branch_ty);
-            if !Self::else_branch_is_terminal(branch) {
+            if crate::return_analysis::else_branch_falls_through(branch) {
                 falling_through_scopes.push(else_scopes);
             }
         } else {
@@ -704,6 +709,7 @@ impl<'program> Checker<'program> {
                         writable: decl.writable,
                         ty,
                         int_constant: None,
+                        string_constant: None,
                     },
                 );
             }
@@ -771,6 +777,7 @@ impl<'program> Checker<'program> {
                     writable: false,
                     ty,
                     int_constant: None,
+                    string_constant: None,
                 },
             );
         }
@@ -787,6 +794,7 @@ impl<'program> Checker<'program> {
                 writable: false,
                 ty: value_ty,
                 int_constant: None,
+                string_constant: None,
             },
         );
 
@@ -1084,6 +1092,7 @@ impl<'program> Checker<'program> {
                     writable: param.writable,
                     ty,
                     int_constant: None,
+                    string_constant: None,
                 },
                 param.span,
             );
@@ -1241,6 +1250,12 @@ impl<'program> Checker<'program> {
                             &decl.initializer,
                             scopes,
                         ),
+                        string_constant: self.readonly_string_constant(
+                            decl.writable,
+                            ty,
+                            &decl.initializer,
+                            scopes,
+                        ),
                     },
                     decl.span,
                 );
@@ -1261,9 +1276,15 @@ impl<'program> Checker<'program> {
                 self.check_expr(expr, scopes, method_context);
                 self.check_mixed_value_operation(expr, "echo", scopes, method_context);
             }
-            Stmt::Expr { expr, .. } => {
-                self.check_expr(expr, scopes, method_context);
-            }
+            Stmt::Expr { expr, .. } => match expr {
+                Expr::FunctionCall { name, args, span } if name == "panic" => {
+                    for arg in args {
+                        self.check_expr(arg, scopes, method_context);
+                    }
+                    self.check_panic_call(args, *span, scopes, method_context);
+                }
+                _ => self.check_expr(expr, scopes, method_context),
+            },
             Stmt::Return { expr, span } => {
                 self.check_return_statement(
                     expr.as_ref(),
@@ -1406,6 +1427,7 @@ impl<'program> Checker<'program> {
                             writable: false,
                             ty,
                             int_constant: None,
+                            string_constant: None,
                         },
                         foreach.span,
                     );
@@ -1434,6 +1456,7 @@ impl<'program> Checker<'program> {
                         writable: false,
                         ty: value_ty,
                         int_constant: None,
+                        string_constant: None,
                     },
                     foreach.span,
                 );
@@ -1490,6 +1513,12 @@ impl<'program> Checker<'program> {
                         writable: decl.writable,
                         ty,
                         int_constant: self.readonly_int_constant(
+                            decl.writable,
+                            ty,
+                            &decl.initializer,
+                            scopes,
+                        ),
+                        string_constant: self.readonly_string_constant(
                             decl.writable,
                             ty,
                             &decl.initializer,
@@ -1815,39 +1844,8 @@ impl<'program> Checker<'program> {
             return;
         }
 
-        match function.body.statements.last() {
-            Some(statement) if Self::statement_is_terminal(statement) => {}
-            _ => self.report_missing_return_value(context, expected, function.span),
-        }
-    }
-
-    fn statement_is_terminal(statement: &Stmt) -> bool {
-        match statement {
-            Stmt::Return { .. } => true,
-            Stmt::If(if_stmt) => Self::if_statement_is_terminal(if_stmt),
-            _ => false,
-        }
-    }
-
-    fn if_statement_is_terminal(if_stmt: &IfStmt) -> bool {
-        Self::block_is_terminal(&if_stmt.then_block)
-            && if_stmt
-                .else_branch
-                .as_ref()
-                .is_some_and(Self::else_branch_is_terminal)
-    }
-
-    fn block_is_terminal(block: &Block) -> bool {
-        block
-            .statements
-            .last()
-            .is_some_and(Self::statement_is_terminal)
-    }
-
-    fn else_branch_is_terminal(branch: &ElseBranch) -> bool {
-        match branch {
-            ElseBranch::If(if_stmt) => Self::if_statement_is_terminal(if_stmt),
-            ElseBranch::Block(block) => Self::block_is_terminal(block),
+        if crate::return_analysis::analyze(function).fallthrough_reachable {
+            self.report_missing_return_value(context, expected, function.span);
         }
     }
 
@@ -2417,6 +2415,41 @@ impl<'program> Checker<'program> {
         }
     }
 
+    fn readonly_string_constant(
+        &self,
+        writable: bool,
+        ty: TypeId,
+        initializer: &Expr,
+        scopes: &ScopeStack,
+    ) -> Option<String> {
+        if writable || !matches!(self.types.kind(ty), TypeKind::String) {
+            return None;
+        }
+
+        Self::eval_string_constant(initializer, scopes)
+    }
+
+    fn eval_string_constant(expr: &Expr, scopes: &ScopeStack) -> Option<String> {
+        match expr {
+            Expr::String { value, .. } => Some(value.clone()),
+            Expr::Variable { name, .. } => scopes
+                .lookup(name)
+                .and_then(|binding| binding.string_constant.clone()),
+            Expr::Grouped { expr, .. } => Self::eval_string_constant(expr, scopes),
+            Expr::Binary {
+                left,
+                op: BinaryOp::Concat,
+                right,
+                ..
+            } => {
+                let mut value = Self::eval_string_constant(left, scopes)?;
+                value.push_str(&Self::eval_string_constant(right, scopes)?);
+                Some(value)
+            }
+            _ => None,
+        }
+    }
+
     fn is_checked_int_arithmetic_op(op: &BinaryOp) -> bool {
         matches!(op, BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul)
     }
@@ -2679,6 +2712,19 @@ impl<'program> Checker<'program> {
         scopes: &ScopeStack,
         method_context: Option<&MethodContext>,
     ) {
+        if name == "panic" {
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "E0436",
+                    "`panic` may only be called as a standalone statement",
+                    span,
+                )
+                .with_help("use `panic(\"message\");` as its own statement"),
+            );
+            self.check_panic_call(args, span, scopes, method_context);
+            return;
+        }
+
         let Some(function_info) = self.functions.get(name).cloned() else {
             self.diagnostics.push(Diagnostic::new(
                 "E0309",
@@ -2696,6 +2742,73 @@ impl<'program> Checker<'program> {
             scopes,
             method_context,
         );
+    }
+
+    fn check_panic_call(
+        &mut self,
+        args: &[Expr],
+        span: Span,
+        scopes: &ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) {
+        if args.len() != 1 {
+            self.diagnostics.push(Diagnostic::new(
+                "E0434",
+                format!("panic expects exactly 1 argument, got {}", args.len()),
+                span,
+            ));
+            return;
+        }
+
+        let message = &args[0];
+        let message_ty = self.infer_expr_type(message, scopes, method_context);
+        if !matches!(
+            self.types.kind(message_ty),
+            TypeKind::String | TypeKind::Unknown
+        ) {
+            self.diagnostics.push(Diagnostic::new(
+                "E0435",
+                format!(
+                    "panic message must be `string`, got `{}`",
+                    self.types.display(message_ty)
+                ),
+                message.span(),
+            ));
+            return;
+        }
+
+        if !self.is_compile_time_panic_message(message, scopes) {
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "E0435",
+                    "panic message must be a compile-time-known string expression in Stage 12",
+                    message.span(),
+                )
+                .with_help(
+                    "use a string literal, readonly string local, or concatenation of those values",
+                ),
+            );
+        }
+    }
+
+    fn is_compile_time_panic_message(&self, expr: &Expr, scopes: &ScopeStack) -> bool {
+        match expr {
+            Expr::String { .. } => true,
+            Expr::Variable { name, .. } => scopes
+                .lookup(name)
+                .is_some_and(|binding| binding.string_constant.is_some()),
+            Expr::Grouped { expr, .. } => self.is_compile_time_panic_message(expr, scopes),
+            Expr::Binary {
+                left,
+                op: BinaryOp::Concat,
+                right,
+                ..
+            } => {
+                self.is_compile_time_panic_message(left, scopes)
+                    && self.is_compile_time_panic_message(right, scopes)
+            }
+            _ => false,
+        }
     }
 
     fn check_method_call(

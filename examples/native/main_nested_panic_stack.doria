@@ -1,0 +1,14 @@
+function explode(): void
+{
+    panic("boom");
+}
+
+function middle(): void
+{
+    explode();
+}
+
+function main(): void
+{
+    middle();
+}

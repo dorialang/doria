@@ -66,13 +66,14 @@ This repository contains the first working vertical slices of `doriac`:
 - Checks undeclared assignment and readonly/writable mutation rules for locals, properties, `$this`, and writable methods.
 - Checks assignment compatibility, declared returns, typed equality/inequality, bool-only boolean operators, positional call arguments, constructor init access, control-flow conditions, and string interpolation constraints for the supported subset.
 - Lowers the checked AST to Doria IR, the compiler-owned representation used before backend output.
-- Lowers every accepted Stage <=10 executable shape to deterministic MIR functions and basic blocks. The bounded debug interpreter consumes MIR directly, uses typed isolated frames, shares exact stdout bytes without adding a newline, and applies the process-status boundary only to `main(): int`.
-- Emits Cranelift-backed native executables from the same MIR. The current subset includes integer locals and checked arithmetic, structured conditions and loops, top-level helpers with `int` parameters and `int`/`void` returns, compile-time-known readonly string locals and concatenation, and exact string-expression `echo` in supported functions. Helper `int` results retain the full Doria `int` range.
-- Runs the accepted executable manifest through both the MIR interpreter and Cranelift, comparing exact stdout bytes and process status. The retired Stage 7-10 native smoke module is no longer an active compiler path.
+- Lowers the accepted native subset to deterministic MIR functions and basic blocks. The normal debug interpreter has no artificial block or call-depth cap, uses explicit isolated frames, shares exact stdout/stderr bytes without adding a newline, and applies the process-status boundary only to `main(): int`.
+- Emits Cranelift-backed native executables from the same MIR. The current subset includes path-sensitive returns, nested control flow, recursion and mutual recursion, integer locals and checked arithmetic, top-level helpers with `int` parameters and `int`/`void` returns, and compile-time-known readonly string expressions for `echo` and `panic`.
+- Links the allocation-free bootstrap `doria-rt` static library for process entry, exact native output, panic formatting, and Doria function-name stack traces.
+- Runs the durable executable manifest through both the MIR interpreter and Cranelift, comparing exact stdout bytes, stderr bytes, and process status. The retired Stage 7-10 native smoke module is no longer an active compiler path.
 - Emits PHP for supported syntax through the optional PHP compatibility backend, including `not`, `and`, `or`, and `xor` lowering that preserves Doria boolean semantics.
 - Provides CLI commands and integration tests.
 
-It is intentionally not a complete language yet. Stage 11 is complete: the interpreter and Cranelift consume one MIR, and the Stage <=10 parity matrix has no retirement blockers. The current compile-time-known string subset does not define heap strings, allocation, layout, ownership, or a stable string ABI. Stage 12 is next and introduces the minimal runtime/panic foundation plus broader control flow; string parameters/returns, writable runtime strings, collection iteration, methods/classes, ownership/borrow checking, LLVM, and later runtime capabilities remain future work.
+It is intentionally not a complete language yet. Stages 11 and 12 are complete: the interpreter and Cranelift consume one MIR, general supported control flow and recursion share one execution model, and panic behavior is differentially tested. The current compile-time-known string subset does not define heap strings, allocation, layout, ownership, or a stable string ABI. Stage 13 adds the remaining fixed-width integer types and integer operators; string parameters/returns, writable runtime strings, collection iteration, methods/classes, ownership/borrow checking, LLVM, and later runtime capabilities remain future work.
 
 ## Quick start
 
@@ -93,7 +94,7 @@ cargo run -p doriac -- compile examples/php/person.doria --target php --out buil
 php build/php/person.php
 ```
 
-The native backend currently supports the Stage 11 MIR subset: top-level free functions, exactly one parameterless `main`, integer locals and checked `+`/`-`/`*`, typed conditions, structured `if` and loop control, `int` helper parameters, `int`/`void` helper returns, and compile-time-known readonly string-expression echo. `main(): int` returns an explicit process status in the portable `0..125` range; helper `int` returns are full Doria `int` values. `main(): void` maps normal completion to status `0`. MIR lowering and bounded interpreter preflight reject recursion, unsupported signatures, runtime string forms, classes, collections, and broader capabilities before Cranelift emission. PHP output remains a compatibility/debugging backend, not the semantic oracle.
+The native backend currently supports the Stage 12 MIR subset: top-level free functions, exactly one parameterless `main`, path-sensitive `return` checking, nested supported control flow, recursion and mutual recursion, integer locals and checked `+`/`-`/`*`, `int` helper parameters, `int`/`void` helper returns, and compile-time-known readonly string expressions for exact-byte `echo` and fatal `panic`. `main(): int` returns an explicit process status in the portable `0..125` range; helper `int` returns are full Doria `int` values. `main(): void` maps normal completion to status `0`. Native compilation never executes user code as a preflight. PHP output remains a compatibility/debugging backend, not the semantic oracle.
 
 ```bash
 cargo run -p doriac -- compile examples/native/main_return_zero.doria
@@ -160,7 +161,7 @@ cargo run -p doriac -- compile examples/native/main_function_loop_42.doria
 ./main_function_loop_42
 ```
 
-Native compilation lowers MIR to a host object and links it through the platform toolchain. This is not a C backend and does not use PHP output. Execution remains bounded by the temporary Stage 11 deterministic preflight. Division/modulo, labeled or numeric loop control, runtime strings, writable string locals, interpolation, native string parameters or returns, recursion, methods, static calls, object construction, classes, collections, stable ABI, doria-rt, and LLVM output remain future work.
+Native compilation lowers MIR to a host object and links it with `doria-rt` through the platform toolchain. This is not a C backend and does not use PHP output. `doria-rt` currently owns process entry, exact stdout/stderr writes, and abort-only panic behavior; it does not introduce runtime strings or heap allocation. Division/modulo, shifts, bitwise operators, labeled or numeric loop control, writable runtime strings, interpolation, native string parameters or returns, methods, static calls, object construction, classes, collections, a stable runtime ABI, and LLVM output remain future work.
 
 ## CLI
 
@@ -173,7 +174,7 @@ doriac compile <source.doria> --target php [--out <file>]
 doriac run <source.doria>
 ```
 
-`compile` defaults to native output and infers an output file name from the input file. `php` is implemented as an explicit compatibility backend. The `debug` target emits a Stage 11 MIR interpreter artifact for inspection, while `wasm` remains planned.
+`compile` defaults to native output and infers an output file name from the input file. `php` is implemented as an explicit compatibility backend. The `debug` target emits a MIR interpreter artifact for inspection, while `wasm` remains planned.
 
 `doriac run` expects a Doria source file, compiles it through the native backend, and runs a temporary executable. To run an executable you already built, run that executable directly, for example `./build/native/main_if_else_42`.
 
@@ -231,7 +232,7 @@ For VS Code, the setting is `doria.languageServer.path`. For IntelliJ IDEs, use 
 - `array` is not a Doria type spelling; use `T[]` or a named collection type.
 - `int` means `int64`, `float` means `float64`, and the accepted fixed-width numeric family is documented in `docs/decisions/0016-fixed-width-numeric-types.md`; compiler support for those explicit spellings is future work.
 - The compiler must reject invalid Doria before lowering to Doria IR or emitting backend output.
-- The native and debug backends consume the same Stage 11 MIR subset and reject broader valid Doria with unsupported-coverage diagnostics. Helper `int` returns are Doria `int` values; the `0..125` range is only a process-exit boundary for explicit `main(): int` status values, not the range of Doria `int`.
+- The native and debug backends consume the same MIR and the durable parity matrix compares stdout, stderr, and process status. Helper `int` returns are Doria `int` values; the `0..125` range is only a process-exit boundary for explicit `main(): int` status values, not the range of Doria `int`.
 - Doria may support features PHP cannot express directly, such as executable instance property initializers and richer attribute expressions.
 - If a language behavior is not specified, implementation work should pause for an explicit design decision rather than inventing behavior silently.
 

@@ -1,0 +1,13 @@
+function descend(int $remaining): void
+{
+    if ($remaining == 0) {
+        panic("bottom");
+    }
+
+    descend($remaining - 1);
+}
+
+function main(): void
+{
+    descend(2);
+}

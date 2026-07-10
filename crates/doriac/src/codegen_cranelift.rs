@@ -13,9 +13,7 @@ use cranelift_object::{ObjectBuilder, ObjectModule};
 use crate::backend::BackendError;
 use crate::mir;
 
-const ARITHMETIC_OVERFLOW_TRAP: u8 = 1;
-const PROCESS_STATUS_TRAP: u8 = 2;
-const STDOUT_TRAP: u8 = 3;
+const RUNTIME_RETURNED_TRAP: u8 = 1;
 
 pub fn lower_mir_to_object(program: &mir::Program) -> Result<Vec<u8>, BackendError> {
     validate_program(program)?;
@@ -30,7 +28,7 @@ pub fn lower_mir_to_object(program: &mir::Program) -> Result<Vec<u8>, BackendErr
         .finish(settings::Flags::new(flag_builder))
         .map_err(|error| backend_failure(error.to_string()))?;
     let mut module = ObjectModule::new(
-        ObjectBuilder::new(isa, "doria_stage_11", default_libcall_names())
+        ObjectBuilder::new(isa, "doria_stage_12", default_libcall_names())
             .map_err(|error| backend_failure(error.to_string()))?,
     );
 
@@ -68,6 +66,9 @@ pub fn lower_mir_to_object(program: &mir::Program) -> Result<Vec<u8>, BackendErr
 
 fn function_signature(module: &mut ObjectModule, function: &mir::Function) -> Signature {
     let mut signature = module.make_signature();
+    signature
+        .params
+        .push(AbiParam::new(module.target_config().pointer_type()));
     for _ in &function.params {
         signature.params.push(AbiParam::new(types::I64));
     }
@@ -129,6 +130,35 @@ fn define_function(
                 mir::Type::String => None,
             })
             .collect::<Vec<_>>();
+        let pointer_type = module.target_config().pointer_type();
+        let pointer_bytes = pointer_type.bytes();
+        let frame_slot = builder.create_sized_stack_slot(StackSlotData::new(
+            StackSlotKind::ExplicitSlot,
+            pointer_bytes * 3,
+            pointer_bytes.trailing_zeros() as u8,
+        ));
+
+        builder.switch_to_block(entry);
+        initialize_integer_locals(&mut builder, &local_slots);
+        bind_parameters(&mut builder, function, &local_slots, entry)?;
+        let parent_frame = builder.block_params(entry)[0];
+        let function_name = define_named_data(
+            &mut builder,
+            function.name.as_bytes(),
+            module,
+            &format!("__doria_function_name_{}", function.id.0),
+        )?;
+        builder.ins().stack_store(parent_frame, frame_slot, 0);
+        builder
+            .ins()
+            .stack_store(function_name, frame_slot, pointer_bytes as i32);
+        let function_name_length = builder
+            .ins()
+            .iconst(pointer_type, function.name.len() as i64);
+        builder
+            .ins()
+            .stack_store(function_name_length, frame_slot, (pointer_bytes * 2) as i32);
+        let current_frame = builder.ins().stack_addr(pointer_type, frame_slot, 0);
 
         let mut resources = LoweringResources::new(
             module,
@@ -137,22 +167,19 @@ fn define_function(
             &local_slots,
             &string_values,
             function.id,
+            current_frame,
         );
-
-        let mut order = Vec::with_capacity(function.blocks.len());
-        order.push(function.entry_block.0);
-        order.extend((0..function.blocks.len()).filter(|index| *index != function.entry_block.0));
-
-        for block_index in order {
-            let mir_block = &function.blocks[block_index];
-            let block = blocks[block_index];
-            builder.switch_to_block(block);
-
-            if mir_block.id == function.entry_block {
-                initialize_integer_locals(&mut builder, &local_slots);
-                bind_parameters(&mut builder, function, &local_slots, block)?;
+        lower_block(
+            &mut builder,
+            &function.blocks[function.entry_block.0],
+            &blocks,
+            &mut resources,
+        )?;
+        for (block_index, mir_block) in function.blocks.iter().enumerate() {
+            if block_index == function.entry_block.0 {
+                continue;
             }
-
+            builder.switch_to_block(blocks[block_index]);
             lower_block(&mut builder, mir_block, &blocks, &mut resources)?;
         }
 
@@ -181,7 +208,7 @@ fn bind_parameters(
     entry: Block,
 ) -> Result<(), BackendError> {
     let params = builder.block_params(entry).to_vec();
-    for (parameter, value) in function.params.iter().zip(params) {
+    for (parameter, value) in function.params.iter().zip(params.into_iter().skip(1)) {
         let slot = int_slot(slots, *parameter)?;
         builder.ins().stack_store(value, slot, 0);
     }
@@ -212,27 +239,23 @@ fn define_process_main(
         builder.switch_to_block(block);
         builder.seal_block(block);
 
-        let callee = module.declare_func_in_func(entry_id, builder.func);
-        let call = builder.ins().call(callee, &[]);
-        match entry.return_type {
-            mir::ReturnType::Int => {
-                let value = builder.inst_results(call)[0];
-                let negative = builder.ins().icmp_imm(IntCC::SignedLessThan, value, 0);
-                builder
-                    .ins()
-                    .trapnz(negative, TrapCode::unwrap_user(PROCESS_STATUS_TRAP));
-                let too_large = builder.ins().icmp_imm(IntCC::SignedGreaterThan, value, 125);
-                builder
-                    .ins()
-                    .trapnz(too_large, TrapCode::unwrap_user(PROCESS_STATUS_TRAP));
-                let status = builder.ins().ireduce(types::I32, value);
-                builder.ins().return_(&[status]);
-            }
-            mir::ReturnType::Void => {
-                let success = builder.ins().iconst(types::I32, 0);
-                builder.ins().return_(&[success]);
-            }
-        }
+        let pointer_type = module.target_config().pointer_type();
+        let entry_ref = module.declare_func_in_func(entry_id, builder.func);
+        let entry_pointer = builder.ins().func_addr(pointer_type, entry_ref);
+        let mut runtime_signature = module.make_signature();
+        runtime_signature.params.push(AbiParam::new(pointer_type));
+        runtime_signature.returns.push(AbiParam::new(types::I32));
+        let runtime_symbol = match entry.return_type {
+            mir::ReturnType::Int => "dr_v1_main_int",
+            mir::ReturnType::Void => "dr_v1_main_void",
+        };
+        let runtime_id = module
+            .declare_function(runtime_symbol, Linkage::Import, &runtime_signature)
+            .map_err(|error| backend_failure(error.to_string()))?;
+        let runtime = module.declare_func_in_func(runtime_id, builder.func);
+        let call = builder.ins().call(runtime, &[entry_pointer]);
+        let status = builder.inst_results(call)[0];
+        builder.ins().return_(&[status]);
         builder.finalize();
     }
 
@@ -249,11 +272,11 @@ struct LoweringResources<'module, 'program> {
     function_ids: &'program [FuncId],
     local_slots: &'program [Option<StackSlot>],
     string_values: &'program HashMap<mir::LocalId, Vec<u8>>,
-    write_func_id: Option<FuncId>,
-    get_std_handle_func_id: Option<FuncId>,
-    write_file_func_id: Option<FuncId>,
+    write_stdout_func_id: Option<FuncId>,
+    panic_func_id: Option<FuncId>,
     next_data_id: usize,
     function_id: mir::FunctionId,
+    current_frame: Value,
 }
 
 impl<'module, 'program> LoweringResources<'module, 'program> {
@@ -264,6 +287,7 @@ impl<'module, 'program> LoweringResources<'module, 'program> {
         local_slots: &'program [Option<StackSlot>],
         string_values: &'program HashMap<mir::LocalId, Vec<u8>>,
         function_id: mir::FunctionId,
+        current_frame: Value,
     ) -> Self {
         Self {
             module,
@@ -271,65 +295,45 @@ impl<'module, 'program> LoweringResources<'module, 'program> {
             function_ids,
             local_slots,
             string_values,
-            write_func_id: None,
-            get_std_handle_func_id: None,
-            write_file_func_id: None,
+            write_stdout_func_id: None,
+            panic_func_id: None,
             next_data_id: 0,
             function_id,
+            current_frame,
         }
     }
 
-    fn declare_write(&mut self) -> Result<FuncId, BackendError> {
-        if let Some(id) = self.write_func_id {
+    fn declare_write_stdout(&mut self) -> Result<FuncId, BackendError> {
+        if let Some(id) = self.write_stdout_func_id {
             return Ok(id);
         }
         let pointer_type = self.module.target_config().pointer_type();
         let mut signature = self.module.make_signature();
-        signature.params.push(AbiParam::new(types::I32));
         signature.params.push(AbiParam::new(pointer_type));
         signature.params.push(AbiParam::new(pointer_type));
-        signature.returns.push(AbiParam::new(pointer_type));
+        signature.params.push(AbiParam::new(pointer_type));
         let id = self
             .module
-            .declare_function("write", Linkage::Import, &signature)
+            .declare_function("dr_v1_write_stdout", Linkage::Import, &signature)
             .map_err(|error| backend_failure(error.to_string()))?;
-        self.write_func_id = Some(id);
+        self.write_stdout_func_id = Some(id);
         Ok(id)
     }
 
-    fn declare_get_std_handle(&mut self) -> Result<FuncId, BackendError> {
-        if let Some(id) = self.get_std_handle_func_id {
-            return Ok(id);
-        }
-        let pointer_type = self.module.target_config().pointer_type();
-        let mut signature = self.module.make_signature();
-        signature.params.push(AbiParam::new(types::I32));
-        signature.returns.push(AbiParam::new(pointer_type));
-        let id = self
-            .module
-            .declare_function("GetStdHandle", Linkage::Import, &signature)
-            .map_err(|error| backend_failure(error.to_string()))?;
-        self.get_std_handle_func_id = Some(id);
-        Ok(id)
-    }
-
-    fn declare_write_file(&mut self) -> Result<FuncId, BackendError> {
-        if let Some(id) = self.write_file_func_id {
+    fn declare_panic(&mut self) -> Result<FuncId, BackendError> {
+        if let Some(id) = self.panic_func_id {
             return Ok(id);
         }
         let pointer_type = self.module.target_config().pointer_type();
         let mut signature = self.module.make_signature();
         signature.params.push(AbiParam::new(pointer_type));
         signature.params.push(AbiParam::new(pointer_type));
-        signature.params.push(AbiParam::new(types::I32));
         signature.params.push(AbiParam::new(pointer_type));
-        signature.params.push(AbiParam::new(pointer_type));
-        signature.returns.push(AbiParam::new(types::I32));
         let id = self
             .module
-            .declare_function("WriteFile", Linkage::Import, &signature)
+            .declare_function("dr_v1_panic", Linkage::Import, &signature)
             .map_err(|error| backend_failure(error.to_string()))?;
-        self.write_file_func_id = Some(id);
+        self.panic_func_id = Some(id);
         Ok(id)
     }
 }
@@ -378,7 +382,8 @@ fn lower_statement(
             lower_echo_bytes(builder, &bytes, resources)?;
         }
         mir::Statement::CallVoid { function, args } => {
-            let values = lower_call_args(builder, args, resources)?;
+            let mut values = vec![resources.current_frame];
+            values.extend(lower_call_args(builder, args, resources)?);
             let callee = declared_function(builder, resources, *function)?;
             builder.ins().call(callee, &values);
         }
@@ -399,6 +404,15 @@ fn lower_terminator(
         }
         mir::Terminator::ReturnVoid => {
             builder.ins().return_(&[]);
+        }
+        mir::Terminator::Panic(message) => {
+            let bytes = resolve_string_expression(message, resources.string_values)?;
+            lower_runtime_panic(builder, &bytes, resources)?;
+        }
+        mir::Terminator::Unreachable => {
+            builder
+                .ins()
+                .trap(TrapCode::unwrap_user(RUNTIME_RETURNED_TRAP));
         }
         mir::Terminator::Jump(target) => {
             builder.ins().jump(block_for(blocks, *target)?, &[]);
@@ -428,7 +442,7 @@ fn lower_int_rvalue(
         mir::Rvalue::Binary { op, left, right } => {
             let left = lower_operand(builder, left, resources)?;
             let right = lower_operand(builder, right, resources)?;
-            Ok(lower_checked_binary(builder, *op, left, right))
+            lower_checked_binary(builder, *op, left, right, resources)
         }
         mir::Rvalue::Call { function, args } => lower_int_call(builder, *function, args, resources),
         mir::Rvalue::String(_) => Err(malformed_mir(
@@ -447,7 +461,7 @@ fn lower_int_expression(
         mir::IntExpression::Binary { op, left, right } => {
             let left = lower_int_expression(builder, left, resources)?;
             let right = lower_int_expression(builder, right, resources)?;
-            Ok(lower_checked_binary(builder, *op, left, right))
+            lower_checked_binary(builder, *op, left, right, resources)
         }
         mir::IntExpression::Call { function, args } => {
             lower_int_call(builder, *function, args, resources)
@@ -460,16 +474,29 @@ fn lower_checked_binary(
     op: mir::BinaryOp,
     left: Value,
     right: Value,
-) -> Value {
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<Value, BackendError> {
     let (value, overflow) = match op {
         mir::BinaryOp::Add => builder.ins().sadd_overflow(left, right),
         mir::BinaryOp::Subtract => builder.ins().ssub_overflow(left, right),
         mir::BinaryOp::Multiply => builder.ins().smul_overflow(left, right),
     };
+    let panic_block = builder.create_block();
+    let continue_block = builder.create_block();
     builder
         .ins()
-        .trapnz(overflow, TrapCode::unwrap_user(ARITHMETIC_OVERFLOW_TRAP));
-    value
+        .brif(overflow, panic_block, &[], continue_block, &[]);
+
+    builder.switch_to_block(panic_block);
+    let message = match op {
+        mir::BinaryOp::Add => b"integer overflow during addition".as_slice(),
+        mir::BinaryOp::Subtract => b"integer overflow during subtraction".as_slice(),
+        mir::BinaryOp::Multiply => b"integer overflow during multiplication".as_slice(),
+    };
+    lower_runtime_panic(builder, message, resources)?;
+
+    builder.switch_to_block(continue_block);
+    Ok(value)
 }
 
 fn lower_operand(
@@ -492,7 +519,8 @@ fn lower_int_call(
     args: &[mir::IntExpression],
     resources: &mut LoweringResources<'_, '_>,
 ) -> Result<Value, BackendError> {
-    let values = lower_call_args(builder, args, resources)?;
+    let mut values = vec![resources.current_frame];
+    values.extend(lower_call_args(builder, args, resources)?);
     let callee = declared_function(builder, resources, function)?;
     let call = builder.ins().call(callee, &values);
     builder.inst_results(call).first().copied().ok_or_else(|| {
@@ -733,27 +761,6 @@ fn resolve_string_expression(
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum StdoutPlatform {
-    Unix,
-    Windows,
-    Unsupported,
-}
-
-fn stdout_platform(windows: bool, unix: bool) -> StdoutPlatform {
-    if windows {
-        StdoutPlatform::Windows
-    } else if unix {
-        StdoutPlatform::Unix
-    } else {
-        StdoutPlatform::Unsupported
-    }
-}
-
-fn host_stdout_platform() -> StdoutPlatform {
-    stdout_platform(cfg!(windows), cfg!(unix))
-}
-
 fn lower_echo_bytes(
     builder: &mut FunctionBuilder,
     bytes: &[u8],
@@ -763,13 +770,56 @@ fn lower_echo_bytes(
         return Ok(());
     }
     let pointer = define_data(builder, bytes, resources)?;
-    match host_stdout_platform() {
-        StdoutPlatform::Unix => lower_unix_write(builder, bytes.len(), pointer, resources),
-        StdoutPlatform::Windows => lower_windows_write(builder, bytes.len(), pointer, resources),
-        StdoutPlatform::Unsupported => Err(BackendError::new(
-            "native exact-byte stdout is supported only on Unix-like and Windows targets",
-        )),
-    }
+    let pointer_type = resources.module.target_config().pointer_type();
+    let length = builder.ins().iconst(pointer_type, bytes.len() as i64);
+    let write_id = resources.declare_write_stdout()?;
+    let write = resources
+        .module
+        .declare_func_in_func(write_id, builder.func);
+    builder
+        .ins()
+        .call(write, &[resources.current_frame, pointer, length]);
+    Ok(())
+}
+
+fn lower_runtime_panic(
+    builder: &mut FunctionBuilder,
+    message: &[u8],
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<(), BackendError> {
+    let pointer = define_data(builder, message, resources)?;
+    let pointer_type = resources.module.target_config().pointer_type();
+    let length = builder.ins().iconst(pointer_type, message.len() as i64);
+    let panic_id = resources.declare_panic()?;
+    let panic = resources
+        .module
+        .declare_func_in_func(panic_id, builder.func);
+    builder
+        .ins()
+        .call(panic, &[resources.current_frame, pointer, length]);
+    builder
+        .ins()
+        .trap(TrapCode::unwrap_user(RUNTIME_RETURNED_TRAP));
+    Ok(())
+}
+
+fn define_named_data(
+    builder: &mut FunctionBuilder,
+    bytes: &[u8],
+    module: &mut ObjectModule,
+    name: &str,
+) -> Result<Value, BackendError> {
+    let data_id = module
+        .declare_data(name, Linkage::Local, false, false)
+        .map_err(|error| backend_failure(error.to_string()))?;
+    let mut description = DataDescription::new();
+    description.define(bytes.to_vec().into_boxed_slice());
+    module
+        .define_data(data_id, &description)
+        .map_err(|error| backend_failure(error.to_string()))?;
+    let pointer_type = module.target_config().pointer_type();
+    let global = module.declare_data_in_func(data_id, builder.func);
+    Ok(builder.ins().global_value(pointer_type, global))
 }
 
 fn define_data(
@@ -797,157 +847,6 @@ fn define_data(
     Ok(builder.ins().global_value(pointer_type, global))
 }
 
-fn lower_unix_write(
-    builder: &mut FunctionBuilder,
-    byte_count: usize,
-    data_pointer: Value,
-    resources: &mut LoweringResources<'_, '_>,
-) -> Result<(), BackendError> {
-    let write_id = resources.declare_write()?;
-    let write = resources
-        .module
-        .declare_func_in_func(write_id, builder.func);
-    let pointer_type = resources.module.target_config().pointer_type();
-    let fd = builder.ins().iconst(types::I32, 1);
-    let loop_block = builder.create_block();
-    let write_block = builder.create_block();
-    let advance_block = builder.create_block();
-    let error_block = builder.create_block();
-    let done_block = builder.create_block();
-    builder.append_block_param(loop_block, pointer_type);
-    builder.append_block_param(loop_block, pointer_type);
-
-    let zero = builder.ins().iconst(pointer_type, 0);
-    let count = builder.ins().iconst(pointer_type, byte_count as i64);
-    builder
-        .ins()
-        .jump(loop_block, &[BlockArg::Value(zero), BlockArg::Value(count)]);
-
-    builder.switch_to_block(loop_block);
-    let offset = builder.block_params(loop_block)[0];
-    let remaining = builder.block_params(loop_block)[1];
-    let complete = builder.ins().icmp_imm(IntCC::Equal, remaining, 0);
-    builder
-        .ins()
-        .brif(complete, done_block, &[], write_block, &[]);
-
-    builder.switch_to_block(write_block);
-    let current = builder.ins().iadd(data_pointer, offset);
-    let call = builder.ins().call(write, &[fd, current, remaining]);
-    let written = builder.inst_results(call)[0];
-    let progressed = builder.ins().icmp_imm(IntCC::SignedGreaterThan, written, 0);
-    builder
-        .ins()
-        .brif(progressed, advance_block, &[], error_block, &[]);
-
-    builder.switch_to_block(advance_block);
-    let next_offset = builder.ins().iadd(offset, written);
-    let next_remaining = builder.ins().isub(remaining, written);
-    builder.ins().jump(
-        loop_block,
-        &[
-            BlockArg::Value(next_offset),
-            BlockArg::Value(next_remaining),
-        ],
-    );
-
-    builder.switch_to_block(error_block);
-    builder.ins().trap(TrapCode::unwrap_user(STDOUT_TRAP));
-
-    builder.switch_to_block(done_block);
-    Ok(())
-}
-
-fn lower_windows_write(
-    builder: &mut FunctionBuilder,
-    byte_count: usize,
-    data_pointer: Value,
-    resources: &mut LoweringResources<'_, '_>,
-) -> Result<(), BackendError> {
-    let byte_count = i32::try_from(byte_count).map_err(|_| {
-        BackendError::new("Windows exact-byte stdout supports writes up to 2147483647 bytes")
-    })?;
-    let pointer_type = resources.module.target_config().pointer_type();
-    let get_std_handle_id = resources.declare_get_std_handle()?;
-    let get_std_handle = resources
-        .module
-        .declare_func_in_func(get_std_handle_id, builder.func);
-    let stdout = builder.ins().iconst(types::I32, -11);
-    let handle_call = builder.ins().call(get_std_handle, &[stdout]);
-    let handle = builder.inst_results(handle_call)[0];
-
-    let written_slot =
-        builder.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 4, 2));
-    let zero = builder.ins().iconst(types::I32, 0);
-    let written_pointer = builder.ins().stack_addr(pointer_type, written_slot, 0);
-    let overlapped = builder.ins().iconst(pointer_type, 0);
-    let write_file_id = resources.declare_write_file()?;
-    let write_file = resources
-        .module
-        .declare_func_in_func(write_file_id, builder.func);
-
-    let loop_block = builder.create_block();
-    let write_block = builder.create_block();
-    let check_block = builder.create_block();
-    let advance_block = builder.create_block();
-    let error_block = builder.create_block();
-    let done_block = builder.create_block();
-    builder.append_block_param(loop_block, pointer_type);
-    builder.append_block_param(loop_block, types::I32);
-    let offset = builder.ins().iconst(pointer_type, 0);
-    let remaining = builder.ins().iconst(types::I32, i64::from(byte_count));
-    builder.ins().jump(
-        loop_block,
-        &[BlockArg::Value(offset), BlockArg::Value(remaining)],
-    );
-
-    builder.switch_to_block(loop_block);
-    let offset = builder.block_params(loop_block)[0];
-    let remaining = builder.block_params(loop_block)[1];
-    let complete = builder.ins().icmp_imm(IntCC::Equal, remaining, 0);
-    builder
-        .ins()
-        .brif(complete, done_block, &[], write_block, &[]);
-
-    builder.switch_to_block(write_block);
-    builder.ins().stack_store(zero, written_slot, 0);
-    let current = builder.ins().iadd(data_pointer, offset);
-    let call = builder.ins().call(
-        write_file,
-        &[handle, current, remaining, written_pointer, overlapped],
-    );
-    let write_ok = builder.inst_results(call)[0];
-    let succeeded = builder.ins().icmp_imm(IntCC::NotEqual, write_ok, 0);
-    builder
-        .ins()
-        .brif(succeeded, check_block, &[], error_block, &[]);
-
-    builder.switch_to_block(check_block);
-    let written = builder.ins().stack_load(types::I32, written_slot, 0);
-    let progressed = builder.ins().icmp_imm(IntCC::NotEqual, written, 0);
-    builder
-        .ins()
-        .brif(progressed, advance_block, &[], error_block, &[]);
-
-    builder.switch_to_block(advance_block);
-    let written_offset = builder.ins().uextend(pointer_type, written);
-    let next_offset = builder.ins().iadd(offset, written_offset);
-    let next_remaining = builder.ins().isub(remaining, written);
-    builder.ins().jump(
-        loop_block,
-        &[
-            BlockArg::Value(next_offset),
-            BlockArg::Value(next_remaining),
-        ],
-    );
-
-    builder.switch_to_block(error_block);
-    builder.ins().trap(TrapCode::unwrap_user(STDOUT_TRAP));
-
-    builder.switch_to_block(done_block);
-    Ok(())
-}
-
 fn validate_program(program: &mir::Program) -> Result<(), BackendError> {
     let entry = program
         .functions
@@ -971,7 +870,7 @@ fn validate_program(program: &mir::Program) -> Result<(), BackendError> {
         }
         validate_function(program, function)?;
     }
-    validate_acyclic_calls(program)
+    Ok(())
 }
 
 fn validate_function(program: &mir::Program, function: &mir::Function) -> Result<(), BackendError> {
@@ -1073,6 +972,8 @@ fn validate_terminator(
             }
             Ok(())
         }
+        mir::Terminator::Panic(message) => validate_string_expression(function, message),
+        mir::Terminator::Unreachable => Ok(()),
         mir::Terminator::Jump(target) => block_in(function, *target).map(|_| ()),
         mir::Terminator::Branch {
             condition,
@@ -1216,96 +1117,6 @@ fn validate_string_expression(
     }
 }
 
-fn validate_acyclic_calls(program: &mir::Program) -> Result<(), BackendError> {
-    let mut edges = vec![Vec::new(); program.functions.len()];
-    for function in &program.functions {
-        collect_function_calls(function, &mut edges[function.id.0]);
-    }
-    let mut states = vec![0_u8; program.functions.len()];
-    for function in 0..program.functions.len() {
-        visit_call_graph(function, &edges, &mut states)?;
-    }
-    Ok(())
-}
-
-fn collect_function_calls(function: &mir::Function, calls: &mut Vec<mir::FunctionId>) {
-    for block in &function.blocks {
-        for statement in &block.statements {
-            match statement {
-                mir::Statement::AssignLocal { value, .. } => collect_rvalue_calls(value, calls),
-                mir::Statement::CallVoid { function, args } => {
-                    calls.push(*function);
-                    for argument in args {
-                        collect_int_expression_calls(argument, calls);
-                    }
-                }
-                mir::Statement::EchoStringLiteral(_) | mir::Statement::EchoString(_) => {}
-            }
-        }
-        if let mir::Terminator::Branch { condition, .. } = &block.terminator {
-            collect_condition_calls(condition, calls);
-        }
-    }
-}
-
-fn collect_rvalue_calls(value: &mir::Rvalue, calls: &mut Vec<mir::FunctionId>) {
-    if let mir::Rvalue::Call { function, args } = value {
-        calls.push(*function);
-        for argument in args {
-            collect_int_expression_calls(argument, calls);
-        }
-    }
-}
-
-fn collect_int_expression_calls(expression: &mir::IntExpression, calls: &mut Vec<mir::FunctionId>) {
-    match expression {
-        mir::IntExpression::Use(_) => {}
-        mir::IntExpression::Binary { left, right, .. } => {
-            collect_int_expression_calls(left, calls);
-            collect_int_expression_calls(right, calls);
-        }
-        mir::IntExpression::Call { function, args } => {
-            calls.push(*function);
-            for argument in args {
-                collect_int_expression_calls(argument, calls);
-            }
-        }
-    }
-}
-
-fn collect_condition_calls(condition: &mir::Condition, calls: &mut Vec<mir::FunctionId>) {
-    match condition {
-        mir::Condition::Bool(_) => {}
-        mir::Condition::Compare { left, right, .. } => {
-            collect_int_expression_calls(left, calls);
-            collect_int_expression_calls(right, calls);
-        }
-        mir::Condition::Not(condition) => collect_condition_calls(condition, calls),
-        mir::Condition::Binary { left, right, .. } => {
-            collect_condition_calls(left, calls);
-            collect_condition_calls(right, calls);
-        }
-    }
-}
-
-fn visit_call_graph(
-    function: usize,
-    edges: &[Vec<mir::FunctionId>],
-    states: &mut [u8],
-) -> Result<(), BackendError> {
-    match states[function] {
-        1 => return Err(malformed_mir("recursive MIR call graph reached Cranelift")),
-        2 => return Ok(()),
-        _ => {}
-    }
-    states[function] = 1;
-    for callee in &edges[function] {
-        visit_call_graph(callee.0, edges, states)?;
-    }
-    states[function] = 2;
-    Ok(())
-}
-
 fn function_in(
     program: &mir::Program,
     id: mir::FunctionId,
@@ -1365,16 +1176,4 @@ fn malformed_mir(message: impl Into<String>) -> BackendError {
 
 fn backend_failure(message: impl Into<String>) -> BackendError {
     BackendError::new(format!("backend emission failure: {}", message.into()))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn stdout_platform_selection_supports_unix_and_windows() {
-        assert_eq!(stdout_platform(false, true), StdoutPlatform::Unix);
-        assert_eq!(stdout_platform(true, false), StdoutPlatform::Windows);
-        assert_eq!(stdout_platform(false, false), StdoutPlatform::Unsupported);
-    }
 }

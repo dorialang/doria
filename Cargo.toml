@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/doriac"]
+members = ["crates/doria-rt", "crates/doriac"]
 resolver = "2"
 
 [workspace.package]
@@ -7,3 +7,9 @@ edition = "2021"
 license = "MIT"
 repository = "https://github.com/amasiye/doria"
 version = "0.1.0"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"

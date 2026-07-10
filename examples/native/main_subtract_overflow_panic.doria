@@ -1,0 +1,9 @@
+function subtract(int $left, int $right): int
+{
+    return $left - $right;
+}
+
+function main(): int
+{
+    return subtract(0 - 9223372036854775807, 2);
+}

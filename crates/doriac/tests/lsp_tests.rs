@@ -91,3 +91,17 @@ while ($count < 3) {
 
     assert_eq!(diagnostics, Vec::<Value>::new());
 }
+
+#[test]
+fn accepts_builtin_panic_without_lsp_diagnostics() {
+    let diagnostics = diagnostics_for_document(
+        "file:///main_explicit_panic.doria",
+        r#"function main(): void
+{
+    panic("explicit panic");
+}
+"#,
+    );
+
+    assert_eq!(diagnostics, Vec::<Value>::new());
+}

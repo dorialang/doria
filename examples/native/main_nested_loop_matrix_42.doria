@@ -1,0 +1,18 @@
+function main(): int
+{
+    let writable $row = 0;
+    let writable $total = 0;
+
+    while ($row < 6) {
+        let writable $column = 0;
+
+        while ($column < 7) {
+            $total += 1;
+            $column++;
+        }
+
+        $row++;
+    }
+
+    return $total;
+}

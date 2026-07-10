@@ -7,14 +7,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::backend::BackendError;
-use crate::{codegen_cranelift, mir};
+use crate::{codegen_cranelift, mir, runtime_artifact};
 
 pub fn generate_executable(program: &mir::Program) -> Result<Vec<u8>, BackendError> {
     let object_bytes = codegen_cranelift::lower_mir_to_object(program)?;
-    link_object(&object_bytes)
+    let runtime_path = runtime_artifact::locate()?;
+    link_object(&object_bytes, &runtime_path)
 }
 
-fn link_object(object_bytes: &[u8]) -> Result<Vec<u8>, BackendError> {
+fn link_object(object_bytes: &[u8], runtime_path: &Path) -> Result<Vec<u8>, BackendError> {
     let temp_stem = unique_temp_stem();
     let object_path = temp_stem.with_extension(object_extension());
     let executable_path = temp_stem.with_extension(executable_extension());
@@ -22,7 +23,7 @@ fn link_object(object_bytes: &[u8]) -> Result<Vec<u8>, BackendError> {
     fs::write(&object_path, object_bytes)
         .map_err(|error| BackendError::new(format!("backend emission failure: {error}")))?;
 
-    let link_result = invoke_linker(&object_path, &executable_path);
+    let link_result = invoke_linker(&object_path, runtime_path, &executable_path);
     let executable_bytes = match link_result {
         Ok(()) => fs::read(&executable_path)
             .map_err(|error| BackendError::new(format!("backend emission failure: {error}")))?,
@@ -36,17 +37,24 @@ fn link_object(object_bytes: &[u8]) -> Result<Vec<u8>, BackendError> {
     Ok(executable_bytes)
 }
 
-fn invoke_linker(object_path: &Path, executable_path: &Path) -> Result<(), BackendError> {
+fn invoke_linker(
+    object_path: &Path,
+    runtime_path: &Path,
+    executable_path: &Path,
+) -> Result<(), BackendError> {
     // Cranelift emits a host object from MIR, then the host toolchain links it.
     // Doria does not generate C source or use C semantics as an oracle.
     let cc_is_set = env::var_os("CC").is_some();
-    let linker = env::var("CC").unwrap_or_else(|_| default_linker().to_string());
+    let msvc_host = cfg!(all(windows, target_env = "msvc"));
+    let linker = env::var("CC").unwrap_or_else(|_| default_linker(msvc_host).to_string());
     let mut command = Command::new(&linker);
     command.args(linker_arguments(
         &linker,
         cc_is_set,
         cfg!(windows),
+        msvc_host,
         object_path,
+        runtime_path,
         executable_path,
     ));
 
@@ -116,8 +124,8 @@ fn executable_extension() -> &'static str {
     }
 }
 
-fn default_linker() -> &'static str {
-    if cfg!(windows) {
+fn default_linker(msvc_host: bool) -> &'static str {
+    if msvc_host {
         "cl.exe"
     } else {
         "cc"
@@ -128,16 +136,19 @@ fn linker_arguments(
     linker: &str,
     cc_is_set: bool,
     windows: bool,
+    msvc_host: bool,
     object_path: &Path,
+    runtime_path: &Path,
     executable_path: &Path,
 ) -> Vec<OsString> {
-    if windows && (!cc_is_set || is_msvc_style_compiler_driver(linker)) {
+    if windows && ((msvc_host && !cc_is_set) || is_msvc_style_compiler_driver(linker)) {
         // Cranelift-generated objects do not carry MSVC /DEFAULTLIB directives.
         // For the current generated process wrapper, make Doria's main the executable
         // entrypoint instead of relying on CRT startup to discover and call it.
         return vec![
             OsString::from("/nologo"),
             object_path.as_os_str().to_os_string(),
+            runtime_path.as_os_str().to_os_string(),
             OsString::from(format!("/Fe:{}", executable_path.display())),
             OsString::from("/link"),
             OsString::from("/ENTRY:main"),
@@ -148,6 +159,7 @@ fn linker_arguments(
 
     vec![
         object_path.as_os_str().to_os_string(),
+        runtime_path.as_os_str().to_os_string(),
         OsString::from("-o"),
         executable_path.as_os_str().to_os_string(),
     ]
@@ -173,7 +185,9 @@ mod tests {
             "cl.exe",
             false,
             true,
+            true,
             Path::new("main.obj"),
+            Path::new("doria_rt.lib"),
             Path::new("main.exe"),
         );
 
@@ -182,6 +196,7 @@ mod tests {
             vec![
                 OsString::from("/nologo"),
                 OsString::from("main.obj"),
+                OsString::from("doria_rt.lib"),
                 OsString::from("/Fe:main.exe"),
                 OsString::from("/link"),
                 OsString::from("/ENTRY:main"),
@@ -197,7 +212,9 @@ mod tests {
             "clang-cl.exe",
             true,
             true,
+            true,
             Path::new("main.obj"),
+            Path::new("doria_rt.lib"),
             Path::new("main.exe"),
         );
 
@@ -206,6 +223,7 @@ mod tests {
             vec![
                 OsString::from("/nologo"),
                 OsString::from("main.obj"),
+                OsString::from("doria_rt.lib"),
                 OsString::from("/Fe:main.exe"),
                 OsString::from("/link"),
                 OsString::from("/ENTRY:main"),
@@ -221,7 +239,9 @@ mod tests {
             "clang",
             true,
             true,
+            true,
             Path::new("main.obj"),
+            Path::new("doria_rt.lib"),
             Path::new("main.exe"),
         );
 
@@ -229,9 +249,35 @@ mod tests {
             args,
             vec![
                 OsString::from("main.obj"),
+                OsString::from("doria_rt.lib"),
                 OsString::from("-o"),
                 OsString::from("main.exe"),
             ]
         );
+    }
+
+    #[test]
+    fn windows_gnu_default_uses_gnu_compiler_driver_arguments() {
+        let args = linker_arguments(
+            "cc",
+            false,
+            true,
+            false,
+            Path::new("main.obj"),
+            Path::new("libdoria_rt.a"),
+            Path::new("main.exe"),
+        );
+
+        assert_eq!(
+            args,
+            vec![
+                OsString::from("main.obj"),
+                OsString::from("libdoria_rt.a"),
+                OsString::from("-o"),
+                OsString::from("main.exe"),
+            ]
+        );
+        assert_eq!(default_linker(false), "cc");
+        assert_eq!(default_linker(true), "cl.exe");
     }
 }

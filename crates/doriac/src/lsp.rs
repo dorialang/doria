@@ -424,6 +424,12 @@ fn completion_items() -> Value {
             "detail": "Reserved Doria type name",
         })
     }));
+    items.push(json!({
+        "label": "panic",
+        "kind": 3,
+        "detail": "Doria built-in function",
+        "documentation": "Terminates execution with a fatal panic, Doria stack trace, and status 101.",
+    }));
 
     json!({
         "isIncomplete": false,
@@ -486,6 +492,9 @@ fn hover_description(kind: &TokenKind) -> Option<&'static str> {
             "Set" => Some("Unique-value collection alias: `Set<T>`."),
             "mixed" => Some("Dynamic boundary type. Operations on `mixed` require future narrowing syntax before use."),
             "resource" => Some("Reserved for future PHP interop; not a usable core type."),
+            "panic" => Some(
+                "Built-in fatal runtime function: `panic(\"message\");`. Panics are not catchable and exit with status 101.",
+            ),
             _ => None,
         },
         TokenKind::Variable(_) => Some("Doria variable. Variables must be declared before use."),
@@ -781,5 +790,17 @@ mod tests {
             completion_detail("resource").as_deref(),
             Some("Reserved Doria type name")
         );
+    }
+
+    #[test]
+    fn completion_and_hover_expose_panic_as_a_builtin_function() {
+        assert_eq!(
+            completion_detail("panic").as_deref(),
+            Some("Doria built-in function")
+        );
+        let hover = hover_description(&TokenKind::Identifier("panic".to_string()))
+            .expect("panic should have hover text");
+        assert!(hover.contains("status 101"));
+        assert!(hover.contains("not catchable"));
     }
 }

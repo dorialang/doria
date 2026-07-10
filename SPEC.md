@@ -66,7 +66,7 @@ Valid PHP should be easy to migrate to Doria, but Doria-specific syntax does not
 
 Doria does not use `public`, `protected`, or `private` as member visibility modifiers. Class members are externally accessible by default, and `internal` marks implementation details.
 
-The current compiler implementation lowers every accepted Stage <=10 executable shape through MIR. The debug interpreter and Cranelift native backend consume that same MIR, and the executable parity manifest compares exact stdout bytes and process status across both paths. The supported subset has top-level free functions plus exactly one parameterless `function main(): int` or `function main(): void`; integer locals and checked `+`/`-`/`*`; typed conditions; structured `if`, `while`, traditional `for`, integer range `foreach`, `break`, and `continue`; `int` helper parameters and `int`/`void` returns; and compile-time-known readonly string literal/local/`.` expressions for exact-byte `echo` in supported functions. `main(): int` crosses the accepted `0..125` portable process-status boundary, while helper `int` results retain the full Doria `int` range. `main(): void` maps normal completion to status `0`. A bounded interpreter preflight remains at the Stage 11 deterministic migration boundary. Recursion, string parameters/returns, writable runtime strings, collection iteration, methods/classes, doria-rt, ownership/borrow checking, LLVM, and broader runtime features remain unsupported. The former Stage 7-10 native smoke module has been retired; it no longer defines or participates in native compilation.
+The current compiler implementation lowers the accepted native subset through MIR. The debug interpreter and Cranelift native backend consume that same MIR, and the durable executable parity manifest compares exact stdout bytes, stderr bytes, and process status across both paths. The supported subset has top-level free functions plus exactly one parameterless `function main(): int` or `function main(): void`; path-sensitive returns; recursion and mutual recursion; integer locals and checked `+`/`-`/`*`; typed conditions; structured `if`, `while`, traditional `for`, integer range `foreach`, `break`, and `continue`; `int` helper parameters and `int`/`void` returns; and compile-time-known readonly string literal/local/`.` expressions for exact-byte `echo` and fatal `panic`. `main(): int` crosses the accepted `0..125` portable process-status boundary, while helper `int` results retain the full Doria `int` range. `main(): void` maps normal completion to status `0`. Normal interpretation has no artificial block or call-depth cap, and native compilation does not execute user code as a preflight. The allocation-free bootstrap `doria-rt` owns process entry, exact native output, panic formatting, and Doria function-name stack traces. Runtime strings, string parameters/returns, writable runtime strings, collection iteration, methods/classes, ownership/borrow checking, LLVM, and broader runtime features remain unsupported. The former Stage 7-10 native smoke module has been retired; it no longer defines or participates in native compilation.
 
 Doria is not a Rust language. Rust is the current bootstrap implementation language for `doriac`, not the permanent identity of the compiler.
 
@@ -505,7 +505,7 @@ Interpolated strings are represented in the AST and Doria IR as string parts bef
 
 Interpolated values may currently be `string`, `int`, `float`, `bool`, `null`, or the internal `Unknown` recovery type. Class values, `mixed`, `List<T>`, `Dictionary<K, V>`, and `Set<T>` are rejected until Doria has a deliberate display/string-conversion design.
 
-The `.` operator is string concatenation. Both operands must be `string` values or recovery types; Doria does not implicitly convert `int`, `bool`, objects, or other values to `string` for concatenation. The current Stage 11 MIR/interpreter/Cranelift subset supports `.` only when the resulting string value is compile-time-known through supported string literals and readonly string locals.
+The `.` operator is string concatenation. Both operands must be `string` values or recovery types; Doria does not implicitly convert `int`, `bool`, objects, or other values to `string` for concatenation. The current MIR/interpreter/Cranelift subset supports `.` only when the resulting string value is compile-time-known through supported string literals and readonly string locals.
 
 Numeric widening is not implemented yet; for now `float` is not assignable from `int`, and `int` is not assignable from `float`. The accepted fixed-width numeric family also does not imply implicit widening, narrowing, or scalar coercion. Any future safe numeric widening should be a separate design decision. Named arguments and richer call argument representation are separate future slices.
 
@@ -573,6 +573,22 @@ The accepted checked error direction is recorded in `docs/decisions/0035-checked
 `throw` raises an error. `throws` declares possible thrown error types in function and method signatures. Thrown errors are checked by the compiler: callers must catch thrown errors or declare them in their own `throws` clause.
 
 `Result<T, E>` is not Doria's default surface error model unless a later accepted decision explicitly adopts it. Runtime panic or fatal-error behavior is separate from checked `throw` / `throws`.
+
+### Panic
+
+`panic("message");` invokes a compiler-known built-in free function that terminates execution. Panic is fatal, is not catchable, does not unwind, and does not run cleanup or destructors while aborting in v1.0. User code cannot redeclare `panic`.
+
+The current compiler accepts a string literal, readonly compile-time-known string local, or concatenation of those expressions as the panic message. Panic writes a deterministic first line and a Doria function-name stack trace to stderr, then exits with status 101:
+
+```text
+panic: <message>
+stack trace:
+  at <currentFunction>
+  at <callerFunction>
+  at main
+```
+
+Checked `int` addition, subtraction, and multiplication overflow use this panic path. Returning a process status outside `0..125` from `main(): int` also panics. Panic is a runtime outcome, not a compiler diagnostic or malformed-MIR error.
 
 Compiler implementation for `throw`, `throws`, `try`, and `catch` is future work.
 
@@ -759,7 +775,9 @@ function age(): int
 }
 ```
 
-`void` functions and methods may use `return;` or fall through. Lifecycle methods, currently `__construct` and `__destruct`, are void-like: they may omit a return type or explicitly declare `: void`, may use bare `return;`, and may fall through. A non-`void` lifecycle return annotation is an error, returning a value from a `void` function or lifecycle method is an error, and lifecycle methods cannot be called directly as ordinary methods. `__construct` may declare parameters and constructor calls are checked against them through `new Class(...)`. `__destruct` must not declare parameters. For declared non-`void` return types, the current checker requires the final top-level statement of the function or method body to be `return expr;`. This is a deliberate early rule, not full path-sensitive control-flow analysis.
+`void` functions and methods may use `return;` or fall through. Lifecycle methods, currently `__construct` and `__destruct`, are void-like: they may omit a return type or explicitly declare `: void`, may use bare `return;`, and may fall through. A non-`void` lifecycle return annotation is an error, returning a value from a `void` function or lifecycle method is an error, and lifecycle methods cannot be called directly as ordinary methods. `__construct` may declare parameters and constructor calls are checked against them through `new Class(...)`. `__destruct` must not declare parameters.
+
+For declared non-`void` return types, no reachable path may fall through the function body. `return` may occur anywhere in nested control flow. A path ending in `panic()` or a proven non-terminating `while (true)` loop without a reachable `break` is diverging and does not require a return. A loop with a reachable exit must lead to a return or another diverging path. Missing-return diagnostics are produced by path-sensitive source control-flow analysis before MIR lowering.
 
 The program entrypoint may be `main(): int` or `main(): void`. `main(): int` returns an explicit process status. `main(): void` may fall through or use `return;` and maps normal completion to successful status `0`. Returning a value from `main(): void` is the same semantic error as returning a value from any other `void` function.
 
@@ -867,9 +885,9 @@ Doria IR is the checked compiler-owned representation of a Doria program. After 
 
 As native code generation matures, Doria IR may lower into a simpler native-oriented IR for control flow, memory layout, runtime calls, and backend code generation.
 
-The current Stage 11 MIR is Doria's native-oriented, backend-independent control-flow representation for the accepted Stage <=10 executable subset. It contains deterministic top-level functions, typed int/string local slots, basic blocks, typed conditions, int/void call forms, and compile-time-known string expressions. The debug interpreter uses isolated typed frames, shared exact-byte stdout with no implicit newline, a global bounded execution budget, exact-state cycle detection, and a defensive call-depth limit. Cranelift lowers the same MIR directly to object code, using checked signed I64 arithmetic and an exported process-entry wrapper. Helper `int` returns remain full Doria `int` values; only `main(): int` crosses the process-status boundary. Interpreter-private and object-lowering string bytes do not define Doria heap allocation, ownership, layout, termination, or runtime concatenation semantics. Stage 11 excludes writable string locals, string assignment, string parameters/returns, display conversion, collection iteration, methods/static calls, constructors, classes, recursion, ownership/borrow checking, doria-rt, and LLVM.
+MIR is Doria's native-oriented, backend-independent control-flow representation for the current executable subset. It contains deterministic top-level functions, typed int/string local slots, basic blocks, typed conditions, int/void call forms, panic termination, and compile-time-known string expressions. The debug interpreter uses an explicit heap-backed Doria frame stack and exact stdout/stderr buffers. Ordinary interpretation has no fixed execution-fuel or call-depth cap and does not reject repeated states; explicitly limited execution is available only to tests and fuzzing. Recursion and mutual recursion are supported. Interpreter-private string bytes do not define Doria heap allocation, ownership, layout, or runtime concatenation semantics.
 
-The native backend is the primary target. Checked HIR lowers to MIR; the temporary Stage 11 interpreter preflight preserves bounded deterministic execution, checked arithmetic diagnostics, and the process-status boundary; Cranelift then lowers MIR independently to object code; and the host linker produces a standalone executable. The native backend does not consume HIR directly after MIR lowering and has no fallback IR. Integer locals use backend-private stack slots, helper parameters and returns use signed I64 values, and checked arithmetic traps on overflow in emitted code. All MIR functions receive deterministic internal symbols, while a separate exported `main` wrapper maps Doria `main(): void` to status `0` or validates and narrows `main(): int` to the accepted process range. Compile-time-known string locals and concatenations lower to exact byte data and explicit-length stdout writes without defining a runtime string ABI. The native backend emits unsupported-coverage diagnostics for recursion, string parameters/returns, writable/runtime strings, collection iteration, classes, methods/static calls, division/modulo, labeled loop control, runtime error machinery, and broader valid Doria until later stages implement them.
+The native backend is the primary target. Checked HIR lowers to MIR, Cranelift lowers MIR directly to object code, and the host linker combines that object with the bootstrap `doria-rt` static library to produce a standalone executable. Native compilation does not execute user code and has no interpreter preflight or fallback IR. Generated Doria functions maintain runtime stack-frame metadata and pass it through a hidden backend-only parameter. `doria-rt` owns entry policy, exact stdout/stderr writes, abort-only panic formatting, stack traversal, and status 101. Checked signed I64 addition, subtraction, and multiplication branch to runtime panic on overflow. A generated process-entry wrapper routes `main(): void` or `main(): int` through the versioned internal runtime ABI; helper `int` values retain the full Doria range, while only an explicit `main(): int` result crosses the `0..125` process boundary. Compile-time-known string expressions lower to exact byte data and explicit lengths without defining a runtime string ABI. Unsupported-coverage diagnostics remain for string parameters/returns, writable/runtime strings, collection iteration, classes, methods/static calls, division/modulo, shifts and bitwise operators, labeled loop control, and broader valid Doria until later stages implement them.
 
 The PHP backend is currently implemented as a compatibility/debugging backend. It emits `<?php` and lowers Doria-only syntax away:
 
@@ -898,12 +916,12 @@ Future work includes:
 - Attribute syntax and metadata representation.
 - Richer instance property initializers.
 - Named arguments.
-- Full path-sensitive control-flow analysis for returns and constructor initialization.
+- Constructor definite-initialization analysis on the reusable control-flow/dataflow framework.
 - Advanced control-flow design for `do ... while ... finally`, `given ... when`, `given ... while`, `if` chains with possible `finally`, value-returning `when`, `match`, and labeled or numeric loop control.
 - Careful evaluation of `goto`, labeled loop control, and structured conditional compilation without adopting C/C++ textual macros.
 - Async/await and structured concurrency.
-- Broader native runtime and backend implementation beyond the Stage 11 MIR subset.
-- Broader native code generation and standalone executable production beyond the current Stage 11 types and runtime capabilities.
+- Broader native runtime and backend implementation beyond the Stage 12 MIR subset.
+- Broader native code generation and standalone executable production beyond the current Stage 12 types and runtime capabilities.
 - Self-hosting path for writing more of `doriac` in Doria.
 - PHP-to-Doria migration tooling.
 - Package management.

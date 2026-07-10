@@ -1,0 +1,10 @@
+function main(): int
+{
+    let writable $iterations = 0;
+
+    while ($iterations < 100001) {
+        $iterations++;
+    }
+
+    return 42;
+}

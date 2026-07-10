@@ -16,6 +16,7 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  DORIA_RT_PATH: ${{ github.workspace }}/target/debug/libdoria_rt.a
 
 jobs:
   rust:
@@ -42,13 +43,16 @@ jobs:
       - name: Build
         run: cargo build --workspace --all-targets --locked --verbose
 
+      - name: Build doria-rt static library
+        run: cargo build -p doria-rt --locked --verbose
+
       - name: Check host linker for native parity
         run: cc --version
 
       - name: Test
         run: cargo test --workspace --all-targets --locked --verbose
 
-      - name: Run complete MIR and Cranelift parity matrix
+      - name: Run durable interpreter and Cranelift parity matrix
         run: cargo test -p doriac --test native_mir_parity_tests --locked --verbose
 
       - name: Check repository script guardrails

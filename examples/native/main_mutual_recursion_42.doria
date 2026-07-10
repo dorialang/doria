@@ -1,0 +1,26 @@
+function isEven(int $n): int
+{
+    if ($n == 0) {
+        return 1;
+    }
+
+    return isOdd($n - 1);
+}
+
+function isOdd(int $n): int
+{
+    if ($n == 0) {
+        return 0;
+    }
+
+    return isEven($n - 1);
+}
+
+function main(): int
+{
+    if (isEven(42) == 1) {
+        return 42;
+    }
+
+    return 0;
+}

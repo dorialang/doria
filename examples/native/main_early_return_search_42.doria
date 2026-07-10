@@ -1,0 +1,15 @@
+function search(int $limit): int
+{
+    for (let writable $candidate = 0; $candidate < $limit; $candidate++) {
+        if ($candidate == 42) {
+            return $candidate;
+        }
+    }
+
+    return 0;
+}
+
+function main(): int
+{
+    return search(100);
+}

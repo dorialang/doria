@@ -270,9 +270,47 @@ fn emit_statement(
             );
         }
         Stmt::Expr { expr, .. } => {
+            if let Expr::FunctionCall { name, args, .. } = expr {
+                if name == "panic" && args.len() == 1 {
+                    emit_panic(&args[0], output, indent, scopes);
+                    return;
+                }
+            }
             writeln(output, indent, &format!("{};", emit_expr(expr, scopes)));
         }
     }
+}
+
+fn emit_panic(message: &Expr, output: &mut String, indent: usize, scopes: &mut PhpNameScopes) {
+    let frame_name = scopes.fresh_temp("frame");
+    writeln(
+        output,
+        indent,
+        &format!(
+            "fwrite(STDERR, \"panic: \" . {} . \"\\nstack trace:\\n\");",
+            emit_expr(message, scopes)
+        ),
+    );
+    writeln(
+        output,
+        indent,
+        &format!("foreach (debug_backtrace(DEBUG_BACKTRACE_IGNORE_ARGS) as ${frame_name})"),
+    );
+    writeln(output, indent, "{");
+    writeln(
+        output,
+        indent + 1,
+        &format!("if (isset(${frame_name}[\"function\"]))"),
+    );
+    writeln(output, indent + 1, "{");
+    writeln(
+        output,
+        indent + 2,
+        &format!("fwrite(STDERR, \"  at \" . ${frame_name}[\"function\"] . \"\\n\");"),
+    );
+    writeln(output, indent + 1, "}");
+    writeln(output, indent, "}");
+    writeln(output, indent, "exit(101);");
 }
 
 fn emit_for(for_stmt: &ForStmt, output: &mut String, indent: usize, scopes: &mut PhpNameScopes) {

@@ -725,7 +725,7 @@ fn interprets_multiple_echoes_without_newline() {
 }
 
 #[test]
-fn interpreter_reports_arithmetic_overflow() {
+fn interpreter_reports_arithmetic_overflow_as_runtime_panic() {
     let program = Program {
         functions: vec![Function {
             id: FunctionId(0),
@@ -756,14 +756,15 @@ fn interpreter_reports_arithmetic_overflow() {
         entry: FunctionId(0),
     };
 
-    let error = doriac::mir_interpreter::interpret(&program).expect_err("overflow should fail");
-    assert!(error
-        .message
-        .contains("MIR interpreter integer overflow during addition"));
+    let output = doriac::mir_interpreter::interpret(&program).expect("overflow should panic");
+    assert_eq!(output.exit_status, 101);
+    assert!(output
+        .stderr
+        .starts_with(b"panic: integer overflow during addition\n"));
 }
 
 #[test]
-fn interpreter_rejects_main_int_exit_status_126() {
+fn interpreter_panics_for_main_int_exit_status_126() {
     let program = lower(
         r#"function main(): int
 {
@@ -772,14 +773,17 @@ fn interpreter_rejects_main_int_exit_status_126() {
 "#,
     );
 
-    let error =
-        doriac::mir_interpreter::interpret(&program).expect_err("main exit status 126 should fail");
-    assert!(error.message.contains("0..125"));
+    let output = doriac::mir_interpreter::interpret(&program)
+        .expect("main exit status 126 should produce a runtime outcome");
+    assert_eq!(output.exit_status, 101);
+    assert!(output
+        .stderr
+        .starts_with(b"panic: main returned process status outside 0..125\n"));
 }
 
 #[test]
-fn debug_target_surfaces_interpreter_exit_status_diagnostic() {
-    let diagnostics = doriac::compile_source(
+fn debug_target_renders_interpreter_process_status_panic() {
+    let output = doriac::compile_source(
         "test.doria",
         r#"function main(): int
 {
@@ -788,10 +792,12 @@ fn debug_target_surfaces_interpreter_exit_status_diagnostic() {
 "#,
         BackendTarget::Debug,
     )
-    .expect_err("debug backend should preserve interpreter diagnostics");
-
-    assert_eq!(diagnostics[0].code, "M1102");
-    assert!(diagnostics[0].message.contains("0..125"));
+    .expect("debug backend should render the panic outcome");
+    let BackendOutput::Text { contents, .. } = output else {
+        panic!("debug backend should emit text");
+    };
+    assert!(contents.starts_with("exit_status: 101\nstdout:\nstderr: panic: "));
+    assert!(contents.contains("main returned process status outside 0..125"));
 }
 
 #[test]
@@ -1338,7 +1344,7 @@ fn interpreter_preserves_void_fallthrough_after_final_else_if() {
 }
 
 #[test]
-fn interpreter_rejects_repeated_mir_state_cycles() {
+fn explicitly_limited_interpreter_stops_repeated_mir_state_cycles() {
     let program = Program {
         functions: vec![Function {
             id: FunctionId(0),
@@ -1356,12 +1362,15 @@ fn interpreter_rejects_repeated_mir_state_cycles() {
         entry: FunctionId(0),
     };
 
-    let error = doriac::mir_interpreter::interpret(&program)
-        .expect_err("malformed cyclic MIR should repeat an interpreter state");
-    assert_eq!(
-        error.message,
-        "MIR interpreter detected a non-terminating control-flow cycle"
-    );
+    let error = doriac::mir_interpreter::interpret_with_limits(
+        &program,
+        doriac::mir_interpreter::InterpreterLimits {
+            max_executed_blocks: Some(10),
+            max_call_frames: None,
+        },
+    )
+    .expect_err("explicit test limit should stop cyclic MIR");
+    assert!(error.message.contains("explicit test execution limit"));
 }
 
 #[test]
@@ -1586,9 +1595,8 @@ fn interpreter_allows_finite_while_loops_beyond_the_old_fuel_limit() {
 }
 
 #[test]
-fn debug_target_bounds_changing_state_while_loops() {
-    let diagnostics = doriac::compile_source(
-        "test.doria",
+fn explicit_test_limit_bounds_changing_state_while_loops() {
+    let program = lower(
         r#"function main(): void
 {
     let writable $i = 0;
@@ -1598,18 +1606,20 @@ fn debug_target_bounds_changing_state_while_loops() {
     }
 }
 "#,
-        BackendTarget::Debug,
+    );
+    let error = doriac::mir_interpreter::interpret_with_limits(
+        &program,
+        doriac::mir_interpreter::InterpreterLimits {
+            max_executed_blocks: Some(100),
+            max_call_frames: None,
+        },
     )
-    .expect_err("debug execution should have bounded fuel");
-
-    assert_eq!(diagnostics[0].code, "M1102");
-    assert!(diagnostics[0]
-        .message
-        .contains("exhausted its bounded execution fuel"));
+    .expect_err("explicit test limit should stop the loop");
+    assert!(error.message.contains("explicit test execution limit"));
 }
 
 #[test]
-fn interpreter_rejects_non_terminating_source_while_loops() {
+fn explicitly_limited_interpreter_stops_non_terminating_source_while_loops() {
     let program = lower(
         r#"function main(): void
 {
@@ -1619,12 +1629,15 @@ fn interpreter_rejects_non_terminating_source_while_loops() {
 "#,
     );
 
-    let error = doriac::mir_interpreter::interpret(&program)
-        .expect_err("a deterministic source loop should repeat an interpreter state");
-    assert_eq!(
-        error.message,
-        "MIR interpreter detected a non-terminating control-flow cycle"
-    );
+    let error = doriac::mir_interpreter::interpret_with_limits(
+        &program,
+        doriac::mir_interpreter::InterpreterLimits {
+            max_executed_blocks: Some(10),
+            max_call_frames: None,
+        },
+    )
+    .expect_err("explicit test limit should stop the loop");
+    assert!(error.message.contains("explicit test execution limit"));
 }
 
 #[test]
@@ -2384,23 +2397,24 @@ fn cranelift_object_covers_stage_11e_loop_shapes_without_linker() {
 }
 
 #[test]
-fn debug_target_bounds_changing_state_infinite_for_loops() {
-    let diagnostics = doriac::compile_source(
-        "test.doria",
+fn explicit_test_limit_bounds_changing_state_infinite_for_loops() {
+    let program = lower(
         r#"function main(): void
 {
     for (let writable $i = 0;; $i++) {
     }
 }
 "#,
-        BackendTarget::Debug,
+    );
+    let error = doriac::mir_interpreter::interpret_with_limits(
+        &program,
+        doriac::mir_interpreter::InterpreterLimits {
+            max_executed_blocks: Some(100),
+            max_call_frames: None,
+        },
     )
-    .expect_err("debug execution should bound an infinite for loop");
-
-    assert_eq!(diagnostics[0].code, "M1102");
-    assert!(diagnostics[0]
-        .message
-        .contains("exhausted its bounded execution fuel"));
+    .expect_err("explicit test limit should stop the loop");
+    assert!(error.message.contains("explicit test execution limit"));
 }
 
 #[test]
@@ -2708,8 +2722,8 @@ function main(): int
 }
 
 #[test]
-fn stage_11f_rejects_direct_recursion_before_interpretation() {
-    let diagnostics = unsupported(
+fn stage_12_interprets_direct_recursion() {
+    let output = interpret(
         r#"function count(int $n): int
 {
     if ($n == 0) {
@@ -2726,30 +2740,38 @@ function main(): int
 "#,
     );
 
-    assert_stage_11g_unsupported(&diagnostics, "recursive calls are not supported");
+    assert_eq!(output.exit_status, 0);
 }
 
 #[test]
-fn stage_11f_rejects_mutual_recursion_before_interpretation() {
-    let diagnostics = unsupported(
-        r#"function a(): int
+fn stage_12_interprets_mutual_recursion() {
+    let output = interpret(
+        r#"function a(int $remaining): int
 {
-    return b();
+    if ($remaining == 0) {
+        return 42;
+    }
+
+    return b($remaining - 1);
 }
 
-function b(): int
+function b(int $remaining): int
 {
-    return a();
+    if ($remaining == 0) {
+        return 42;
+    }
+
+    return a($remaining - 1);
 }
 
 function main(): int
 {
-    return a();
+    return a(10);
 }
 "#,
     );
 
-    assert_stage_11g_unsupported(&diagnostics, "mutual recursion is not supported");
+    assert_eq!(output.exit_status, 42);
 }
 
 #[test]
@@ -2841,7 +2863,7 @@ fn stage_11f_debug_target_handles_all_examples() {
 }
 
 #[test]
-fn stage_11f_interpreter_has_a_defensive_call_depth_limit() {
+fn explicitly_limited_interpreter_can_bound_call_frames() {
     let program = Program {
         functions: vec![Function {
             id: FunctionId(0),
@@ -2871,9 +2893,17 @@ fn stage_11f_interpreter_has_a_defensive_call_depth_limit() {
         entry: FunctionId(0),
     };
 
-    let error = doriac::mir_interpreter::interpret(&program)
-        .expect_err("malformed recursive MIR should hit the defensive call-depth limit");
-    assert!(error.message.contains("call-depth limit of 256 frames"));
+    let error = doriac::mir_interpreter::interpret_with_limits(
+        &program,
+        doriac::mir_interpreter::InterpreterLimits {
+            max_executed_blocks: None,
+            max_call_frames: Some(32),
+        },
+    )
+    .expect_err("explicit test limit should bound recursive MIR");
+    assert!(error
+        .message
+        .contains("explicit test call-frame limit of 32"));
 }
 
 #[test]

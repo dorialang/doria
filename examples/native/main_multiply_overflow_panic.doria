@@ -1,0 +1,9 @@
+function multiply(int $left, int $right): int
+{
+    return $left * $right;
+}
+
+function main(): int
+{
+    return multiply(4611686018427387904, 2);
+}

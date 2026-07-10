@@ -1,0 +1,9 @@
+function add(int $left, int $right): int
+{
+    return $left + $right;
+}
+
+function main(): int
+{
+    return add(9223372036854775807, 1);
+}

@@ -66,10 +66,6 @@ pub fn lower_program(program: &hir::Program) -> DiagnosticResult<mir::Program> {
         .get("main")
         .expect("exactly one collected main signature")
         .id;
-    let spans = declarations
-        .iter()
-        .map(|function| function.span)
-        .collect::<Vec<_>>();
     let functions = declarations
         .iter()
         .map(|function| {
@@ -80,8 +76,6 @@ pub fn lower_program(program: &hir::Program) -> DiagnosticResult<mir::Program> {
             lower_function(function, signature, &signatures)
         })
         .collect::<Result<Vec<_>, _>>()?;
-
-    validate_call_graph(&functions, &spans)?;
 
     Ok(mir::Program { functions, entry })
 }
@@ -195,11 +189,12 @@ fn lower_function_body(
         if return_type == mir::ReturnType::Void {
             context.terminate_current(mir::Terminator::ReturnVoid);
         } else {
-            return Err(vec![unsupported(
-                body.span,
+            return Err(vec![Diagnostic::new(
+                "I1101",
                 format!(
-                    "function `{function_name}` returning int may not fall through in MIR Stage 11"
+                    "internal compiler consistency error: checked int function `{function_name}` reaches MIR fallthrough"
                 ),
+                body.span,
             )]);
         }
     }
@@ -250,8 +245,13 @@ fn lower_statement_sequence(
                     span: call_span,
                 } = expr
                 {
-                    let call = lower_void_call(name, args, *call_span, context)?;
-                    context.push_statement(call);
+                    if name == "panic" {
+                        let message = lower_panic_message(args, *call_span, context)?;
+                        context.terminate_current(mir::Terminator::Panic(message));
+                    } else {
+                        let call = lower_void_call(name, args, *call_span, context)?;
+                        context.push_statement(call);
+                    }
                 } else {
                     return Err(vec![unsupported(
                         *span,
@@ -282,7 +282,7 @@ fn lower_if_statement(
     for block in fallthrough_blocks {
         context.terminate_block(block, mir::Terminator::Jump(continuation));
     }
-    context.current_block = Some(continuation);
+    context.current_block = context.is_reachable(continuation).then_some(continuation);
     Ok(())
 }
 
@@ -296,11 +296,7 @@ fn lower_if_tree(
     let condition = lower_condition(&if_stmt.condition, context)?;
     let then_block = context.create_block();
     let else_block = context.create_block();
-    context.terminate_current(mir::Terminator::Branch {
-        condition,
-        then_block,
-        else_block,
-    });
+    context.terminate_condition(condition, then_block, else_block);
 
     let mut fallthrough_blocks =
         lower_scoped_block(&if_stmt.then_block, then_block, return_type, context)?;
@@ -330,11 +326,7 @@ fn lower_while_statement(
     context.terminate_current(mir::Terminator::Jump(header_block));
     context.current_block = Some(header_block);
     let condition = lower_condition(&while_stmt.condition, context)?;
-    context.terminate_current(mir::Terminator::Branch {
-        condition,
-        then_block: body_block,
-        else_block: exit_block,
-    });
+    context.terminate_condition(condition, body_block, exit_block);
 
     context.push_loop_targets(LoopTargets {
         continue_block: header_block,
@@ -347,7 +339,7 @@ fn lower_while_statement(
     for block in fallthrough_blocks {
         context.terminate_block(block, mir::Terminator::Jump(header_block));
     }
-    context.current_block = Some(exit_block);
+    context.current_block = context.is_reachable(exit_block).then_some(exit_block);
     Ok(())
 }
 
@@ -389,11 +381,7 @@ fn lower_for_statement_in_scope(
         .map(|condition| lower_condition(condition, context))
         .transpose()?
         .unwrap_or(mir::Condition::Bool(true));
-    context.terminate_current(mir::Terminator::Branch {
-        condition,
-        then_block: body_block,
-        else_block: exit_block,
-    });
+    context.terminate_condition(condition, body_block, exit_block);
 
     context.push_loop_targets(LoopTargets {
         continue_block: increment_block,
@@ -417,7 +405,7 @@ fn lower_for_statement_in_scope(
         }
     }
     context.terminate_current(mir::Terminator::Jump(header_block));
-    context.current_block = Some(exit_block);
+    context.current_block = context.is_reachable(exit_block).then_some(exit_block);
     Ok(())
 }
 
@@ -540,7 +528,7 @@ fn lower_range_foreach_in_scope(
         },
     });
     context.terminate_current(mir::Terminator::Jump(header_block));
-    context.current_block = Some(exit_block);
+    context.current_block = context.is_reachable(exit_block).then_some(exit_block);
     Ok(())
 }
 
@@ -619,6 +607,7 @@ struct LoweringContext {
     local_scopes: Vec<HashMap<String, mir::LocalId>>,
     temp_counter: usize,
     blocks: Vec<BlockBuilder>,
+    reachable_blocks: Vec<bool>,
     current_block: Option<mir::BlockId>,
     loop_targets: Vec<LoopTargets>,
 }
@@ -635,6 +624,7 @@ impl LoweringContext {
                 statements: Vec::new(),
                 terminator: None,
             }],
+            reachable_blocks: vec![true],
             current_block: Some(mir::BlockId(0)),
             loop_targets: Vec::new(),
         }
@@ -647,9 +637,7 @@ impl LoweringContext {
             .map(|block| mir::BasicBlock {
                 id: block.id,
                 statements: block.statements,
-                terminator: block
-                    .terminator
-                    .expect("every lowered MIR block must have a terminator"),
+                terminator: block.terminator.unwrap_or(mir::Terminator::Unreachable),
             })
             .collect();
         (self.locals, blocks)
@@ -662,6 +650,7 @@ impl LoweringContext {
             statements: Vec::new(),
             terminator: None,
         });
+        self.reachable_blocks.push(false);
         id
     }
 
@@ -682,9 +671,39 @@ impl LoweringContext {
     }
 
     fn terminate_block(&mut self, block: mir::BlockId, terminator: mir::Terminator) {
+        if self.is_reachable(block) {
+            for target in terminator_targets(&terminator) {
+                self.reachable_blocks[target.0] = true;
+            }
+        }
         let slot = &mut self.blocks[block.0].terminator;
         assert!(slot.is_none(), "MIR block terminated more than once");
         *slot = Some(terminator);
+    }
+
+    fn terminate_condition(
+        &mut self,
+        condition: mir::Condition,
+        then_block: mir::BlockId,
+        else_block: mir::BlockId,
+    ) {
+        match condition {
+            mir::Condition::Bool(true) => {
+                self.terminate_current(mir::Terminator::Jump(then_block));
+            }
+            mir::Condition::Bool(false) => {
+                self.terminate_current(mir::Terminator::Jump(else_block));
+            }
+            condition => self.terminate_current(mir::Terminator::Branch {
+                condition,
+                then_block,
+                else_block,
+            }),
+        }
+    }
+
+    fn is_reachable(&self, block: mir::BlockId) -> bool {
+        self.reachable_blocks.get(block.0).copied().unwrap_or(false)
     }
 
     fn push_scope(&mut self) {
@@ -783,6 +802,21 @@ impl LoweringContext {
                 format!("call references unknown top-level function `{name}`"),
             )]
         })
+    }
+}
+
+fn terminator_targets(terminator: &mir::Terminator) -> Vec<mir::BlockId> {
+    match terminator {
+        mir::Terminator::Jump(target) => vec![*target],
+        mir::Terminator::Branch {
+            then_block,
+            else_block,
+            ..
+        } => vec![*then_block, *else_block],
+        mir::Terminator::Return(_)
+        | mir::Terminator::ReturnVoid
+        | mir::Terminator::Panic(_)
+        | mir::Terminator::Unreachable => Vec::new(),
     }
 }
 
@@ -929,6 +963,20 @@ fn lower_echo(expr: &hir::Expr, context: &LoweringContext) -> DiagnosticResult<m
         hir::Expr::String { value, .. } => Ok(mir::Statement::EchoStringLiteral(value.clone())),
         _ => lower_string_expression(expr, context).map(mir::Statement::EchoString),
     }
+}
+
+fn lower_panic_message(
+    args: &[hir::Expr],
+    span: Span,
+    context: &LoweringContext,
+) -> DiagnosticResult<mir::StringExpression> {
+    let [message] = args else {
+        return Err(vec![unsupported(
+            span,
+            format!("panic expects exactly 1 argument, got {}", args.len()),
+        )]);
+    };
+    lower_string_expression(message, context)
 }
 
 fn lower_string_expression(
@@ -1372,139 +1420,6 @@ fn unsupported_int_expr(expr: &hir::Expr) -> Diagnostic {
         }
     };
     unsupported(expr.span(), detail)
-}
-
-fn validate_call_graph(functions: &[mir::Function], spans: &[Span]) -> DiagnosticResult<()> {
-    let mut graph = Vec::with_capacity(functions.len());
-    for (index, function) in functions.iter().enumerate() {
-        if function.id.0 != index {
-            return Err(vec![unsupported(
-                spans.get(index).copied().unwrap_or_default(),
-                format!(
-                    "function `{}` has non-deterministic MIR id function{}",
-                    function.name, function.id.0
-                ),
-            )]);
-        }
-
-        let mut calls = collect_function_calls(function);
-        calls.sort_by_key(|function| function.0);
-        calls.dedup();
-        for callee in &calls {
-            if callee.0 >= functions.len() {
-                return Err(vec![unsupported(
-                    spans.get(index).copied().unwrap_or_default(),
-                    format!("call target function{} does not exist", callee.0),
-                )]);
-            }
-            if *callee == function.id {
-                return Err(vec![unsupported(
-                    spans.get(index).copied().unwrap_or_default(),
-                    "recursive calls are not supported",
-                )]);
-            }
-        }
-        graph.push(calls);
-    }
-
-    let mut states = vec![0_u8; graph.len()];
-    for function in 0..graph.len() {
-        if states[function] == 0 {
-            if let Some(caller) = visit_call_graph(function, &graph, &mut states) {
-                return Err(vec![unsupported(
-                    spans.get(caller).copied().unwrap_or_default(),
-                    "mutual recursion is not supported",
-                )]);
-            }
-        }
-    }
-
-    Ok(())
-}
-
-fn visit_call_graph(
-    function: usize,
-    graph: &[Vec<mir::FunctionId>],
-    states: &mut [u8],
-) -> Option<usize> {
-    states[function] = 1;
-    for callee in &graph[function] {
-        match states[callee.0] {
-            0 => {
-                if let Some(caller) = visit_call_graph(callee.0, graph, states) {
-                    return Some(caller);
-                }
-            }
-            1 => return Some(function),
-            _ => {}
-        }
-    }
-    states[function] = 2;
-    None
-}
-
-fn collect_function_calls(function: &mir::Function) -> Vec<mir::FunctionId> {
-    let mut calls = Vec::new();
-    for block in &function.blocks {
-        for statement in &block.statements {
-            match statement {
-                mir::Statement::AssignLocal { value, .. } => {
-                    collect_rvalue_calls(value, &mut calls);
-                }
-                mir::Statement::EchoStringLiteral(_) | mir::Statement::EchoString(_) => {}
-                mir::Statement::CallVoid { function, args } => {
-                    calls.push(*function);
-                    for arg in args {
-                        collect_int_expression_calls(arg, &mut calls);
-                    }
-                }
-            }
-        }
-        if let mir::Terminator::Branch { condition, .. } = &block.terminator {
-            collect_condition_calls(condition, &mut calls);
-        }
-    }
-    calls
-}
-
-fn collect_rvalue_calls(value: &mir::Rvalue, calls: &mut Vec<mir::FunctionId>) {
-    if let mir::Rvalue::Call { function, args } = value {
-        calls.push(*function);
-        for arg in args {
-            collect_int_expression_calls(arg, calls);
-        }
-    }
-}
-
-fn collect_int_expression_calls(expression: &mir::IntExpression, calls: &mut Vec<mir::FunctionId>) {
-    match expression {
-        mir::IntExpression::Use(_) => {}
-        mir::IntExpression::Binary { left, right, .. } => {
-            collect_int_expression_calls(left, calls);
-            collect_int_expression_calls(right, calls);
-        }
-        mir::IntExpression::Call { function, args } => {
-            calls.push(*function);
-            for arg in args {
-                collect_int_expression_calls(arg, calls);
-            }
-        }
-    }
-}
-
-fn collect_condition_calls(condition: &mir::Condition, calls: &mut Vec<mir::FunctionId>) {
-    match condition {
-        mir::Condition::Bool(_) => {}
-        mir::Condition::Compare { left, right, .. } => {
-            collect_int_expression_calls(left, calls);
-            collect_int_expression_calls(right, calls);
-        }
-        mir::Condition::Not(condition) => collect_condition_calls(condition, calls),
-        mir::Condition::Binary { left, right, .. } => {
-            collect_condition_calls(left, calls);
-            collect_condition_calls(right, calls);
-        }
-    }
 }
 
 fn stmt_span(statement: &hir::Stmt) -> Span {

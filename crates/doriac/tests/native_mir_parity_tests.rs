@@ -8,7 +8,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use doriac::backend::{Backend, BackendOutput, NativeBackend};
 
-const MANIFEST: &str = include_str!("fixtures/stage_11_native_parity_examples.txt");
+const MANIFEST: &str = include_str!("fixtures/native_parity_examples.txt");
 
 #[test]
 fn manifest_covers_every_native_example() {
@@ -38,12 +38,9 @@ fn manifest_covers_every_native_example() {
 }
 
 #[test]
-fn interpreter_and_cranelift_match_for_the_complete_stage_11_manifest() {
+fn interpreter_and_cranelift_match_for_the_durable_native_manifest() {
     if !host_linker_is_available() {
-        let message = format!(
-            "Stage 11 native parity requires host linker `{}`",
-            host_linker()
-        );
+        let message = format!("native parity requires host linker `{}`", host_linker());
         if std::env::var_os("CI").is_some() {
             panic!("{message}; CI must not skip the parity matrix");
         }
@@ -104,9 +101,13 @@ fn interpreter_and_cranelift_match_for_the_complete_stage_11_manifest() {
             interpreted.stdout,
             native_output.stdout
         );
-        assert!(
-            native_output.stderr.is_empty(),
-            "native stderr for {relative_path}: {:?}",
+        assert_eq!(
+            native_output.stderr,
+            interpreted.stderr,
+            "stderr mismatch for {relative_path}\ninterpreter status: {}\nnative status: {:?}\ninterpreter stderr: {:?}\nnative stderr: {:?}",
+            interpreted.exit_status,
+            native_status,
+            interpreted.stderr,
             native_output.stderr
         );
     }
@@ -169,7 +170,7 @@ fn temp_executable_path(source: &str) -> PathBuf {
         .collect::<String>();
     let extension = if cfg!(windows) { ".exe" } else { "" };
     std::env::temp_dir().join(format!(
-        "doriac-stage11-parity-{stem}-{}-{nanos}{extension}",
+        "doriac-native-parity-{stem}-{}-{nanos}{extension}",
         std::process::id()
     ))
 }

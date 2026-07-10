@@ -160,6 +160,8 @@ pub enum Statement {
 pub enum Terminator {
     Return(Operand),
     ReturnVoid,
+    Panic(StringExpression),
+    Unreachable,
     Jump(BlockId),
     Branch {
         condition: Condition,
@@ -380,6 +382,8 @@ impl fmt::Display for Terminator {
         match self {
             Terminator::Return(operand) => write!(formatter, "return {operand}"),
             Terminator::ReturnVoid => write!(formatter, "return"),
+            Terminator::Panic(message) => write!(formatter, "panic {message}"),
+            Terminator::Unreachable => write!(formatter, "unreachable"),
             Terminator::Jump(target) => write!(formatter, "jump block{}", target.0),
             Terminator::Branch {
                 condition,
