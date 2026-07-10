@@ -4,6 +4,12 @@ use std::path::{Path, PathBuf};
 
 use crate::backend::BackendError;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArchiveFormat {
+    Gnu,
+    Msvc,
+}
+
 pub fn locate() -> Result<PathBuf, BackendError> {
     let current_executable = env::current_exe().map_err(|error| {
         BackendError::new(format!(
@@ -18,9 +24,14 @@ pub fn locate() -> Result<PathBuf, BackendError> {
     resolve(
         env::var_os("DORIA_RT_PATH").as_deref(),
         &current_executable,
+        option_env!("DORIA_RT_BUILT_PATH").map(Path::new),
         workspace,
         target_override.as_deref(),
-        cfg!(windows),
+        if cfg!(all(windows, target_env = "msvc")) {
+            ArchiveFormat::Msvc
+        } else {
+            ArchiveFormat::Gnu
+        },
         if cfg!(debug_assertions) {
             "debug"
         } else {
@@ -32,12 +43,13 @@ pub fn locate() -> Result<PathBuf, BackendError> {
 fn resolve(
     explicit: Option<&OsStr>,
     current_executable: &Path,
+    compiler_built_runtime: Option<&Path>,
     workspace: &Path,
     target_override: Option<&OsStr>,
-    windows: bool,
+    archive_format: ArchiveFormat,
     profile: &str,
 ) -> Result<PathBuf, BackendError> {
-    let filename = runtime_filename(windows);
+    let filename = runtime_filename(archive_format);
     if let Some(explicit) = explicit {
         let explicit = PathBuf::from(explicit);
         let candidate = if explicit.is_dir() {
@@ -52,6 +64,9 @@ fn resolve(
     }
 
     let mut candidates = Vec::new();
+    if let Some(compiler_built_runtime) = compiler_built_runtime {
+        candidates.push(compiler_built_runtime.to_path_buf());
+    }
     if let Some(parent) = current_executable.parent() {
         candidates.push(parent.join(filename));
         candidates.push(parent.join("../lib/doria").join(filename));
@@ -85,11 +100,10 @@ fn resolve(
         .ok_or_else(|| not_found_error(None))
 }
 
-fn runtime_filename(windows: bool) -> &'static str {
-    if windows {
-        "doria_rt.lib"
-    } else {
-        "libdoria_rt.a"
+fn runtime_filename(archive_format: ArchiveFormat) -> &'static str {
+    match archive_format {
+        ArchiveFormat::Gnu => "libdoria_rt.a",
+        ArchiveFormat::Msvc => "doria_rt.lib",
     }
 }
 
@@ -125,14 +139,15 @@ mod tests {
     #[test]
     fn explicit_runtime_path_wins() {
         let directory = temp_directory("override");
-        let runtime = directory.join(runtime_filename(false));
+        let runtime = directory.join(runtime_filename(ArchiveFormat::Gnu));
         fs::write(&runtime, b"archive").expect("runtime fixture should be written");
         let resolved = resolve(
             Some(runtime.as_os_str()),
             &directory.join("bin/doriac"),
+            None,
             &directory,
             None,
-            false,
+            ArchiveFormat::Gnu,
             "debug",
         )
         .expect("explicit runtime should resolve");
@@ -143,16 +158,19 @@ mod tests {
     #[test]
     fn development_target_directory_is_a_fallback() {
         let directory = temp_directory("target");
-        let runtime = directory.join("target/debug").join(runtime_filename(false));
+        let runtime = directory
+            .join("target/debug")
+            .join(runtime_filename(ArchiveFormat::Gnu));
         fs::create_dir_all(runtime.parent().expect("runtime should have parent"))
             .expect("target directory should be created");
         fs::write(&runtime, b"archive").expect("runtime fixture should be written");
         let resolved = resolve(
             None,
             &directory.join("elsewhere/doriac"),
+            None,
             &directory,
             None,
-            false,
+            ArchiveFormat::Gnu,
             "debug",
         )
         .expect("workspace runtime should resolve");
@@ -166,9 +184,10 @@ mod tests {
         let error = resolve(
             None,
             &directory.join("bin/doriac"),
+            None,
             &directory,
             None,
-            false,
+            ArchiveFormat::Gnu,
             "debug",
         )
         .expect_err("missing runtime should fail");
@@ -177,6 +196,60 @@ mod tests {
             .contains("doria-rt static library was not found"));
         assert!(error.message.contains("cargo build -p doria-rt"));
         assert!(error.message.contains("DORIA_RT_PATH"));
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn runtime_archive_name_matches_the_rust_target_environment() {
+        assert_eq!(runtime_filename(ArchiveFormat::Msvc), "doria_rt.lib");
+        assert_eq!(runtime_filename(ArchiveFormat::Gnu), "libdoria_rt.a");
+    }
+
+    #[test]
+    fn mingw_directory_override_uses_the_gnu_archive_name() {
+        let directory = temp_directory("mingw");
+        let runtime = directory.join("libdoria_rt.a");
+        fs::write(&runtime, b"archive").expect("runtime fixture should be written");
+        let resolved = resolve(
+            Some(directory.as_os_str()),
+            &directory.join("bin/doriac.exe"),
+            None,
+            &directory,
+            None,
+            ArchiveFormat::Gnu,
+            "debug",
+        )
+        .expect("MinGW runtime should resolve");
+        assert_eq!(resolved, runtime);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn compiler_built_archive_precedes_passive_fallbacks() {
+        let directory = temp_directory("compiler-build");
+        let runtime = directory.join("build/libdoria_rt.a");
+        let adjacent = directory.join("bin/libdoria_rt.a");
+        fs::create_dir_all(runtime.parent().expect("runtime should have parent"))
+            .expect("compiler build directory should be created");
+        fs::create_dir_all(
+            adjacent
+                .parent()
+                .expect("adjacent runtime should have parent"),
+        )
+        .expect("compiler bin directory should be created");
+        fs::write(&runtime, b"archive").expect("runtime fixture should be written");
+        fs::write(adjacent, b"stale archive").expect("adjacent fixture should be written");
+        let resolved = resolve(
+            None,
+            &directory.join("bin/doriac"),
+            Some(&runtime),
+            &directory,
+            None,
+            ArchiveFormat::Gnu,
+            "debug",
+        )
+        .expect("compiler-built runtime should resolve before passive fallbacks");
+        assert_eq!(resolved, runtime);
         let _ = fs::remove_dir_all(directory);
     }
 }

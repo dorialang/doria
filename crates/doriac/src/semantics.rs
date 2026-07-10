@@ -526,6 +526,7 @@ impl<'program> Checker<'program> {
                     writable: false,
                     ty: param.ty,
                     int_constant: None,
+                    string_constant: None,
                 },
             );
         }
@@ -575,6 +576,7 @@ impl<'program> Checker<'program> {
                         writable: decl.writable,
                         ty,
                         int_constant: None,
+                        string_constant: None,
                     },
                 );
                 None
@@ -707,6 +709,7 @@ impl<'program> Checker<'program> {
                         writable: decl.writable,
                         ty,
                         int_constant: None,
+                        string_constant: None,
                     },
                 );
             }
@@ -774,6 +777,7 @@ impl<'program> Checker<'program> {
                     writable: false,
                     ty,
                     int_constant: None,
+                    string_constant: None,
                 },
             );
         }
@@ -790,6 +794,7 @@ impl<'program> Checker<'program> {
                 writable: false,
                 ty: value_ty,
                 int_constant: None,
+                string_constant: None,
             },
         );
 
@@ -1087,6 +1092,7 @@ impl<'program> Checker<'program> {
                     writable: param.writable,
                     ty,
                     int_constant: None,
+                    string_constant: None,
                 },
                 param.span,
             );
@@ -1244,6 +1250,12 @@ impl<'program> Checker<'program> {
                             &decl.initializer,
                             scopes,
                         ),
+                        string_constant: self.readonly_string_constant(
+                            decl.writable,
+                            ty,
+                            &decl.initializer,
+                            scopes,
+                        ),
                     },
                     decl.span,
                 );
@@ -1264,9 +1276,15 @@ impl<'program> Checker<'program> {
                 self.check_expr(expr, scopes, method_context);
                 self.check_mixed_value_operation(expr, "echo", scopes, method_context);
             }
-            Stmt::Expr { expr, .. } => {
-                self.check_expr(expr, scopes, method_context);
-            }
+            Stmt::Expr { expr, .. } => match expr {
+                Expr::FunctionCall { name, args, span } if name == "panic" => {
+                    for arg in args {
+                        self.check_expr(arg, scopes, method_context);
+                    }
+                    self.check_panic_call(args, *span, scopes, method_context);
+                }
+                _ => self.check_expr(expr, scopes, method_context),
+            },
             Stmt::Return { expr, span } => {
                 self.check_return_statement(
                     expr.as_ref(),
@@ -1409,6 +1427,7 @@ impl<'program> Checker<'program> {
                             writable: false,
                             ty,
                             int_constant: None,
+                            string_constant: None,
                         },
                         foreach.span,
                     );
@@ -1437,6 +1456,7 @@ impl<'program> Checker<'program> {
                         writable: false,
                         ty: value_ty,
                         int_constant: None,
+                        string_constant: None,
                     },
                     foreach.span,
                 );
@@ -1493,6 +1513,12 @@ impl<'program> Checker<'program> {
                         writable: decl.writable,
                         ty,
                         int_constant: self.readonly_int_constant(
+                            decl.writable,
+                            ty,
+                            &decl.initializer,
+                            scopes,
+                        ),
+                        string_constant: self.readonly_string_constant(
                             decl.writable,
                             ty,
                             &decl.initializer,
@@ -2389,6 +2415,41 @@ impl<'program> Checker<'program> {
         }
     }
 
+    fn readonly_string_constant(
+        &self,
+        writable: bool,
+        ty: TypeId,
+        initializer: &Expr,
+        scopes: &ScopeStack,
+    ) -> Option<String> {
+        if writable || !matches!(self.types.kind(ty), TypeKind::String) {
+            return None;
+        }
+
+        Self::eval_string_constant(initializer, scopes)
+    }
+
+    fn eval_string_constant(expr: &Expr, scopes: &ScopeStack) -> Option<String> {
+        match expr {
+            Expr::String { value, .. } => Some(value.clone()),
+            Expr::Variable { name, .. } => scopes
+                .lookup(name)
+                .and_then(|binding| binding.string_constant.clone()),
+            Expr::Grouped { expr, .. } => Self::eval_string_constant(expr, scopes),
+            Expr::Binary {
+                left,
+                op: BinaryOp::Concat,
+                right,
+                ..
+            } => {
+                let mut value = Self::eval_string_constant(left, scopes)?;
+                value.push_str(&Self::eval_string_constant(right, scopes)?);
+                Some(value)
+            }
+            _ => None,
+        }
+    }
+
     fn is_checked_int_arithmetic_op(op: &BinaryOp) -> bool {
         matches!(op, BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul)
     }
@@ -2652,6 +2713,14 @@ impl<'program> Checker<'program> {
         method_context: Option<&MethodContext>,
     ) {
         if name == "panic" {
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "E0436",
+                    "`panic` may only be called as a standalone statement",
+                    span,
+                )
+                .with_help("use `panic(\"message\");` as its own statement"),
+            );
             self.check_panic_call(args, span, scopes, method_context);
             return;
         }
@@ -2725,9 +2794,9 @@ impl<'program> Checker<'program> {
     fn is_compile_time_panic_message(&self, expr: &Expr, scopes: &ScopeStack) -> bool {
         match expr {
             Expr::String { .. } => true,
-            Expr::Variable { name, .. } => scopes.lookup(name).is_some_and(|binding| {
-                !binding.writable && matches!(self.types.kind(binding.ty), TypeKind::String)
-            }),
+            Expr::Variable { name, .. } => scopes
+                .lookup(name)
+                .is_some_and(|binding| binding.string_constant.is_some()),
             Expr::Grouped { expr, .. } => self.is_compile_time_panic_message(expr, scopes),
             Expr::Binary {
                 left,

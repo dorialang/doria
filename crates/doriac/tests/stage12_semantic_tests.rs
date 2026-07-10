@@ -178,6 +178,16 @@ fn panic_is_not_user_declarable() {
 
 #[test]
 fn panic_requires_one_compile_time_known_string_argument() {
+    assert_valid(
+        r#"function main(): void
+{
+    let $prefix = "fatal";
+    let $message = $prefix . " error";
+    panic($message);
+}
+"#,
+    );
+
     let wrong_arity = doriac::check_source(
         "test.doria",
         r#"function main(): void
@@ -217,6 +227,65 @@ fn panic_requires_one_compile_time_known_string_argument() {
     assert!(runtime_string
         .iter()
         .any(|diagnostic| diagnostic.code == "E0435"));
+
+    let parameter = doriac::check_source(
+        "test.doria",
+        r#"function fail(string $message): void
+{
+    panic($message);
+}
+
+function main(): void
+{
+    fail("boom");
+}
+"#,
+    )
+    .expect_err("panic with a runtime parameter should fail");
+    assert!(parameter
+        .iter()
+        .any(|diagnostic| diagnostic.code == "E0435"));
+
+    let runtime_local = doriac::check_source(
+        "test.doria",
+        r#"function runtimeMessage(): string
+{
+    return "boom";
+}
+
+function main(): void
+{
+    let $message = runtimeMessage();
+    panic($message);
+}
+"#,
+    )
+    .expect_err("panic with a runtime-derived readonly local should fail");
+    assert!(runtime_local
+        .iter()
+        .any(|diagnostic| diagnostic.code == "E0435"));
+}
+
+#[test]
+fn panic_is_rejected_outside_statement_position() {
+    for source in [
+        r#"function fail(): int
+{
+    return panic("boom");
+}
+"#,
+        r#"function main(): void
+{
+    int $code = panic("boom");
+}
+"#,
+    ] {
+        let diagnostics = doriac::check_source("test.doria", source)
+            .expect_err("panic in expression position should fail");
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "E0436" && diagnostic.message.contains("standalone statement")
+        }));
+    }
 }
 
 #[test]

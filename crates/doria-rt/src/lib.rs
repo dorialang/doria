@@ -1,4 +1,6 @@
-#![cfg_attr(not(test), no_std)]
+#![cfg_attr(all(not(test), panic = "abort"), no_std)]
+
+// Linked runtime artifacts always use panic=abort; unwind-mode builds exist only for check/test metadata.
 
 use core::ffi::c_void;
 use core::ptr;
@@ -285,13 +287,13 @@ extern "system" {
     fn ExitProcess(status: u32) -> !;
 }
 
-#[cfg(not(test))]
+#[cfg(all(not(test), panic = "abort"))]
 #[panic_handler]
 fn rust_panic(_information: &core::panic::PanicInfo<'_>) -> ! {
     unsafe { exit_process(PANIC_STATUS) }
 }
 
-#[cfg(not(test))]
+#[cfg(all(not(test), panic = "abort"))]
 #[no_mangle]
 pub extern "C" fn rust_eh_personality() {}
 
