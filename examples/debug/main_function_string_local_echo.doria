@@ -1,0 +1,11 @@
+function hello(): void
+{
+    let $name = "Doria";
+
+    echo "Hello " . $name . "!";
+}
+
+function main(): void
+{
+    hello();
+}

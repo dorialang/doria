@@ -50,6 +50,7 @@ pub struct Local {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Type {
     Int,
+    String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -77,6 +78,7 @@ pub enum Rvalue {
         function: FunctionId,
         args: Vec<IntExpression>,
     },
+    String(StringExpression),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,6 +100,13 @@ pub enum IntExpression {
         function: FunctionId,
         args: Vec<IntExpression>,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StringExpression {
+    Literal(String),
+    Local(LocalId),
+    Concat(Vec<StringExpression>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -140,6 +149,7 @@ pub enum Statement {
         value: Rvalue,
     },
     EchoStringLiteral(String),
+    EchoString(StringExpression),
     CallVoid {
         function: FunctionId,
         args: Vec<IntExpression>,
@@ -236,6 +246,7 @@ impl fmt::Display for Type {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Type::Int => write!(formatter, "int"),
+            Type::String => write!(formatter, "string"),
         }
     }
 }
@@ -265,6 +276,7 @@ impl fmt::Display for Rvalue {
             Rvalue::Use(operand) => write!(formatter, "{operand}"),
             Rvalue::Binary { op, left, right } => write!(formatter, "{left} {op} {right}"),
             Rvalue::Call { function, args } => write_call(formatter, *function, args),
+            Rvalue::String(value) => write!(formatter, "{value}"),
         }
     }
 }
@@ -287,6 +299,27 @@ impl fmt::Display for IntExpression {
                 write!(formatter, "({left} {op} {right})")
             }
             IntExpression::Call { function, args } => write_call(formatter, *function, args),
+        }
+    }
+}
+
+impl fmt::Display for StringExpression {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            StringExpression::Literal(value) => {
+                write!(formatter, "\"{}\"", escape_debug_string(value))
+            }
+            StringExpression::Local(id) => write!(formatter, "local{}", id.0),
+            StringExpression::Concat(parts) => {
+                write!(formatter, "(")?;
+                for (index, part) in parts.iter().enumerate() {
+                    if index > 0 {
+                        write!(formatter, " . ")?;
+                    }
+                    write!(formatter, "{part}")?;
+                }
+                write!(formatter, ")")
+            }
         }
     }
 }
@@ -336,6 +369,7 @@ impl fmt::Display for Statement {
             Statement::EchoStringLiteral(value) => {
                 write!(formatter, "echo \"{}\"", escape_debug_string(value))
             }
+            Statement::EchoString(value) => write!(formatter, "echo {value}"),
             Statement::CallVoid { function, args } => write_call(formatter, *function, args),
         }
     }

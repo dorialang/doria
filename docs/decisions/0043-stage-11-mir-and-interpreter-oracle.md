@@ -8,7 +8,7 @@ Stage 11 introduces MIR as Doria native-oriented, control-flow-oriented compiler
 
 Stage 11 also introduces a MIR interpreter as the debug and semantic-oracle path. The interpreter is intended to validate Doria-visible behavior without relying on PHP, Cranelift, LLVM, or host linker behavior.
 
-Stage 11 eventually retires NativeSmokeModule. Stage 11a seeded the MIR architecture and interpreter for a tiny executable subset, Stage 11b expanded that seed to integer expressions and integer local slots, Stage 11c added condition evaluation and structured `if` control flow, Stage 11d added structured `while` loops and loop control, Stage 11e added traditional `for` loops and integer range `foreach`, and Stage 11f adds top-level free functions and calls. NativeSmokeModule remains temporary in Stage 11f and must not receive new language capability expansion.
+Stage 11 eventually retires NativeSmokeModule. Stage 11a seeded the MIR architecture and interpreter for a tiny executable subset, Stage 11b expanded that seed to integer expressions and integer local slots, Stage 11c added condition evaluation and structured `if` control flow, Stage 11d added structured `while` loops and loop control, Stage 11e added traditional `for` loops and integer range `foreach`, Stage 11f added top-level free functions and calls, and Stage 11g adds readonly string locals plus string-expression echo parity. NativeSmokeModule remains temporary in Stage 11g and must not receive new language capability expansion.
 
 ## Stage 11a scope
 
@@ -226,8 +226,54 @@ Stage 11f does not add:
 - LLVM
 - Baton
 
+## Stage 11g scope
+
+Stage 11g expands MIR lowering and debug interpretation to readonly string locals and string concatenation in echo expressions, then records the current Stage <=10 MIR parity matrix.
+
+Stage 11g supports:
+
+- MIR `string` local slots for readonly inferred and explicitly typed string locals.
+- MIR string expressions containing string literals, readonly string-local reads, and ordered `.` concatenation.
+- Readonly string-local initialization from the supported string-expression subset.
+- Echo of supported string expressions in `main(): void` and void helper functions.
+- String-local and concat echo inside supported `if`, `while`, traditional `for`, and integer range `foreach` bodies.
+- Interpreter-private string values in isolated call frames without defining a Doria runtime representation or ABI.
+- Exact-byte stdout with no implicit newline.
+- The Stage 11d global execution budget and exact-state cycle detection, now including string local state.
+- The Stage 11f defensive call-depth limit and shared stdout across helper calls.
+- Debug-target artifacts for the Stage 11g examples.
+- A Stage <=10 native-smoke versus MIR/debug parity matrix in `docs/notes/stage-11-mir-parity-matrix.md`.
+
+Unsupported Doria constructs in Stage 11g must be rejected as unsupported MIR Stage 11g coverage, unless an earlier semantic diagnostic already rejects the source as invalid Doria.
+
+## Stage 11g non-goals
+
+Stage 11g does not add:
+
+- a runtime heap string model or stable string ABI
+- writable string locals
+- string assignment
+- string parameters or string returns
+- string comparison
+- broader string interpolation expansion
+- implicit display or string conversion
+- echo of int, bool, mixed, objects, or collections
+- methods or static calls
+- constructors
+- classes, objects, or collections in MIR
+- collection iteration or user-defined iterators
+- recursion or mutual recursion
+- ownership or borrow checking
+- doria-rt
+- Cranelift-from-MIR lowering
+- deletion of NativeSmokeModule
+- LLVM
+- Baton
+
+The interpreter may use Rust `String` values internally to execute this compile-time-known subset. That implementation detail does not define Doria allocation, ownership, layout, termination, or runtime concatenation semantics.
+
 ## Consequences
 
 NativeSmokeModule remains temporary implementation-private bootstrap infrastructure for current native smoke coverage. It must not receive new language capability expansion unless an explicit later task approves a temporary compatibility fix.
 
-MIR is the place to grow future native control-flow, interpreter, ownership, borrow-checking, and backend-lowering work. Stage 11f proves that the same CFG and local-slot model can represent multiple free functions, positional calls, isolated interpreter frames, and full-width helper `int` returns while retaining the existing loop model and bounded execution. Stage 11 is still incomplete. Collection iteration, methods and classes, runtime strings, the full Stage <=10 MIR port, Cranelift-over-MIR lowering, and NativeSmokeModule retirement remain future work.
+MIR is the place to grow future native control-flow, interpreter, ownership, borrow-checking, and backend-lowering work. Stage 11g proves that the local-slot and interpreter-frame model can also carry the accepted compile-time-known readonly string/echo subset without defining the future runtime string model. Stage 11 is still incomplete. The parity matrix records the remaining retirement blockers, including Cranelift-from-MIR lowering and the complete differential sweep; collection iteration, methods and classes, runtime strings, ownership, and NativeSmokeModule retirement remain future work.
