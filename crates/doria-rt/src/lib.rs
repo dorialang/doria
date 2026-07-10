@@ -7,6 +7,10 @@ use core::ptr;
 
 const PANIC_STATUS: i32 = 101;
 const EINTR: i32 = 4;
+#[cfg(unix)]
+const SIGPIPE: i32 = 13;
+#[cfg(unix)]
+const SIG_IGN: usize = 1;
 
 #[repr(C)]
 pub struct DrStackFrameV1 {
@@ -65,6 +69,9 @@ pub unsafe extern "C" fn dr_v1_write_stdout(
     bytes: *const u8,
     byte_length: usize,
 ) {
+    #[cfg(unix)]
+    ignore_sigpipe();
+
     if write_stream(Stream::Stdout, bytes, byte_length) {
         return;
     }
@@ -115,6 +122,12 @@ pub unsafe extern "C" fn dr_v1_panic(
 enum Stream {
     Stdout,
     Stderr,
+}
+
+#[cfg(unix)]
+unsafe fn ignore_sigpipe() {
+    // Ignoring it makes write(2) report EPIPE instead of terminating the process by signal.
+    signal(SIGPIPE, SIG_IGN);
 }
 
 unsafe fn write_panic_fragment(bytes: &[u8]) {
@@ -243,6 +256,7 @@ unsafe fn last_errno() -> i32 {
 
 #[cfg(unix)]
 extern "C" {
+    fn signal(signal: i32, handler: usize) -> usize;
     fn write(descriptor: i32, bytes: *const c_void, byte_length: usize) -> isize;
     fn _exit(status: i32) -> !;
 }

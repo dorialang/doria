@@ -1,6 +1,10 @@
 use std::fs;
 use std::io;
+#[cfg(unix)]
+use std::io::Read;
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::process::Stdio;
 use std::process::{Command, Output};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -870,6 +874,54 @@ function main(): void
     let output = temp_executable_path("main_void_large_echo");
     compile_native_source(&source, &output);
     assert_native_run_output(&output, "main_void_large_echo", message.as_bytes());
+    let _ = fs::remove_file(output);
+}
+
+#[cfg(unix)]
+#[test]
+fn native_stdout_broken_pipe_uses_panic_status_and_trace() {
+    if !host_linker_is_available() {
+        eprintln!(
+            "native broken-pipe integration test unavailable: host linker `{}` was not found",
+            host_linker()
+        );
+        return;
+    }
+
+    let message = "Doria".repeat(64 * 1024);
+    let source = format!(
+        r#"
+function main(): void
+{{
+    echo "{message}";
+}}
+"#
+    );
+    let output = temp_executable_path("main_stdout_broken_pipe");
+    compile_native_source(&source, &output);
+
+    let mut child = Command::new(&output)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("native executable should start");
+    drop(child.stdout.take());
+
+    let mut stderr = Vec::new();
+    child
+        .stderr
+        .take()
+        .expect("stderr should be piped")
+        .read_to_end(&mut stderr)
+        .expect("panic stderr should be readable");
+    let status = child.wait().expect("native executable should exit");
+
+    assert_eq!(status.code(), Some(101));
+    assert_eq!(
+        stderr,
+        b"panic: failed to write stdout\nstack trace:\n  at main\n"
+    );
+
     let _ = fs::remove_file(output);
 }
 

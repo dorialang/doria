@@ -1,5 +1,6 @@
 use doriac::backend::{BackendOutput, BackendTarget};
 use doriac::hir;
+use std::process::Command;
 
 #[test]
 fn emits_php_for_simple_program() {
@@ -581,9 +582,62 @@ fn php_backend_lowers_panic_to_stderr_and_status_101() {
     )
     .expect("panic should lower through the compatibility backend");
 
-    assert!(php.contains("fwrite(STDERR, \"panic: \" . \"boom\" . \"\\n\");"));
+    assert!(php.contains("fwrite(STDERR, \"panic: \" . \"boom\" . \"\\nstack trace:\\n\");"));
+    assert!(php.contains("debug_backtrace(DEBUG_BACKTRACE_IGNORE_ARGS)"));
+    assert!(php.contains("fwrite(STDERR, \"  at \""));
     assert!(php.contains("exit(101);"));
     assert!(!php.contains("throw new"));
+}
+
+#[test]
+fn php_backend_panic_trace_preserves_doria_function_frames() {
+    let php = doriac::compile_source_to_php(
+        "test.doria",
+        r#"function panicNow(): void
+{
+    panic("boom");
+}
+
+function middle(): void
+{
+    panicNow();
+}
+
+function main(): void
+{
+    middle();
+}
+"#,
+    )
+    .expect("panic should lower through the compatibility backend");
+
+    assert!(php.contains("foreach (debug_backtrace(DEBUG_BACKTRACE_IGNORE_ARGS)"));
+    assert!(php.contains("[\"function\"]"));
+    assert!(php.contains("\"  at \""));
+
+    let Ok(version) = Command::new("php").arg("--version").output() else {
+        return;
+    };
+    if !version.status.success() {
+        return;
+    }
+
+    let script = format!(
+        "{}\nmain();",
+        php.strip_prefix("<?php").expect("generated PHP header")
+    );
+    let run = Command::new("php")
+        .arg("-r")
+        .arg(script)
+        .output()
+        .expect("PHP should execute generated output");
+
+    assert_eq!(run.status.code(), Some(101));
+    assert!(run.stdout.is_empty());
+    assert_eq!(
+        run.stderr,
+        b"panic: boom\nstack trace:\n  at panicNow\n  at middle\n  at main\n"
+    );
 }
 
 #[test]
