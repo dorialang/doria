@@ -101,3 +101,5 @@ Stage 10 later adds a bounded native free-function call path for `int` parameter
 ## Assumption
 
 The implementation may keep compile-time-known Stage 8 native string values as private `String` values inside native smoke validation and lower only the final exact bytes for supported `echo` expressions. This is an implementation-private shortcut, not a public ABI or runtime string model.
+
+Stage 11h later moved this compile-time-known subset into MIR and direct MIR-to-Cranelift object lowering, then retired the native smoke representation. The original restriction still holds: these compiler-known bytes do not define Doria's future runtime string model or ABI.

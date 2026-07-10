@@ -60,3 +60,7 @@ Stage 7a does not add:
 Unsupported backend coverage must remain an unsupported native backend diagnostic. It must not be described as invalid Doria.
 
 Stage 10 later extends this private native smoke boundary with top-level free functions and calls. That extension remains implementation-private and does not make `NativeSmokeModule` public Doria IR, final MIR, or a stable ABI. See `docs/decisions/0037-stage-10-native-free-functions.md`.
+
+## Retirement
+
+This record describes the historical Stage 7-10 bootstrap architecture. Decision 0043 retired and deleted `NativeSmokeModule` at Stage 11h after accepted Stage <=10 behavior moved to MIR, Cranelift consumed MIR directly, and the manifest-driven differential suite passed.

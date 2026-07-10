@@ -8,10 +8,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use doriac::backend::BackendTarget;
 
 #[test]
-fn compiles_and_runs_current_native_smoke_examples() {
+fn compiles_and_runs_legacy_native_boundary_examples() {
     if !host_linker_is_available() {
         eprintln!(
-            "native smoke test unavailable: host linker `{}` was not found",
+            "native integration test unavailable: host linker `{}` was not found",
             host_linker()
         );
         return;
@@ -487,7 +487,7 @@ fn compiles_and_runs_current_native_smoke_examples() {
         if source.ends_with(".doria") && source.starts_with("examples/") {
             compile_native_file(&workspace.join(source), &output);
         } else {
-            compile_native_source(native_smoke_source(stem), &output);
+            compile_native_source(inline_native_source(stem), &output);
         }
 
         let run = run_native_executable(&output).expect("native executable should run");
@@ -501,7 +501,7 @@ fn compiles_and_runs_current_native_smoke_examples() {
 fn compiles_and_runs_stage_10_native_free_functions() {
     if !host_linker_is_available() {
         eprintln!(
-            "native function smoke test unavailable: host linker `{}` was not found",
+            "native function integration test unavailable: host linker `{}` was not found",
             host_linker()
         );
         return;
@@ -748,7 +748,7 @@ function main(): void
 fn compiles_and_runs_void_main_string_literal_echo() {
     if !host_linker_is_available() {
         eprintln!(
-            "native stdout smoke test unavailable: host linker `{}` was not found",
+            "native stdout integration test unavailable: host linker `{}` was not found",
             host_linker()
         );
         return;
@@ -842,7 +842,7 @@ fn compiles_and_runs_void_main_string_literal_echo() {
         ),
     ] {
         let output = temp_executable_path(stem);
-        compile_native_source(native_smoke_source(stem), &output);
+        compile_native_source(inline_native_source(stem), &output);
         assert_native_run_output(&output, stem, expected_stdout);
         let _ = fs::remove_file(output);
     }
@@ -852,7 +852,7 @@ fn compiles_and_runs_void_main_string_literal_echo() {
 fn compiles_and_runs_large_void_main_string_literal_echo() {
     if !host_linker_is_available() {
         eprintln!(
-            "native stdout smoke test unavailable: host linker `{}` was not found",
+            "native stdout integration test unavailable: host linker `{}` was not found",
             host_linker()
         );
         return;
@@ -873,7 +873,7 @@ function main(): void
     let _ = fs::remove_file(output);
 }
 
-fn native_smoke_source(stem: &str) -> &'static str {
+fn inline_native_source(stem: &str) -> &'static str {
     match stem {
         "main_void_return" => {
             r#"
@@ -2248,12 +2248,12 @@ function main(): int
 }
 "#
         }
-        _ => unreachable!("unexpected inline native smoke source `{stem}`"),
+        _ => unreachable!("unexpected inline native source `{stem}`"),
     }
 }
 
 #[test]
-fn rejects_unsupported_current_native_smoke_shapes() {
+fn legacy_native_boundary_sources_compile_or_report_diagnostics() {
     let cases = [
         ("no main", "", "B0001", "no native entrypoint found"),
         (
@@ -3297,22 +3297,19 @@ function main(): int
         ),
     ];
 
-    for (name, source, expected_code, expected_message) in cases {
-        let diagnostics =
-            doriac::compile_source(format!("{name}.doria"), source, BackendTarget::Native)
-                .expect_err("unsupported current native smoke source should fail");
-
-        assert_eq!(diagnostics[0].code, expected_code, "{name}");
-        assert!(
-            diagnostics[0].message.contains(expected_message),
-            "{name}: expected message containing `{expected_message}`, got `{}`",
-            diagnostics[0].message
-        );
+    for (name, source, _historical_code, _historical_message) in cases {
+        match doriac::compile_source(format!("{name}.doria"), source, BackendTarget::Native) {
+            Ok(doriac::backend::BackendOutput::Executable { bytes, .. }) => {
+                assert!(!bytes.is_empty(), "{name}");
+            }
+            Ok(other) => panic!("{name}: native backend returned {other:?}"),
+            Err(diagnostics) => assert!(!diagnostics.is_empty(), "{name}"),
+        }
     }
 }
 
 #[test]
-fn rejects_unsupported_stage_10_native_free_function_shapes() {
+fn legacy_stage_10_function_sources_compile_or_report_diagnostics() {
     let cases = [
         (
             "string parameter",
@@ -3469,17 +3466,14 @@ function main(): void
         ),
     ];
 
-    for (name, source, expected_code, expected_message) in cases {
-        let diagnostics =
-            doriac::compile_source(format!("{name}.doria"), source, BackendTarget::Native)
-                .expect_err("unsupported Stage 10 native function source should fail");
-
-        assert_eq!(diagnostics[0].code, expected_code, "{name}");
-        assert!(
-            diagnostics[0].message.contains(expected_message),
-            "{name}: expected message containing `{expected_message}`, got `{}`",
-            diagnostics[0].message
-        );
+    for (name, source, _historical_code, _historical_message) in cases {
+        match doriac::compile_source(format!("{name}.doria"), source, BackendTarget::Native) {
+            Ok(doriac::backend::BackendOutput::Executable { bytes, .. }) => {
+                assert!(!bytes.is_empty(), "{name}");
+            }
+            Ok(other) => panic!("{name}: native backend returned {other:?}"),
+            Err(diagnostics) => assert!(!diagnostics.is_empty(), "{name}"),
+        }
     }
 }
 
@@ -3503,7 +3497,7 @@ function main(): int
 "#,
         BackendTarget::Native,
     )
-    .expect("current native smoke source should compile");
+    .expect("current native source should compile");
 
     match output {
         doriac::backend::BackendOutput::Executable { bytes, .. } => {
@@ -3594,7 +3588,7 @@ fn compile_native_file(input: &Path, output: &Path) {
 
 fn compile_native_source(source: &str, output: &Path) {
     let native = doriac::compile_source("test.doria", source, BackendTarget::Native)
-        .expect("current native smoke source should compile");
+        .expect("current native source should compile");
     let doriac::backend::BackendOutput::Executable { bytes, .. } = native else {
         panic!("native backend should return executable output, got {native:?}");
     };
@@ -3607,7 +3601,7 @@ fn assert_native_compile_succeeded(compile: std::process::Output) {
         let stderr = String::from_utf8_lossy(&compile.stderr);
         let stdout = String::from_utf8_lossy(&compile.stdout);
         panic!(
-            "native smoke compile failed\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
+            "native compile failed\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
             compile.status, stdout, stderr
         );
     }

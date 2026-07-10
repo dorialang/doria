@@ -500,7 +500,7 @@ source → lexer → parser → AST
       → backend (Cranelift dev | LLVM release | PHP compat | wasm later)
 ```
 
-- The private `NativeSmokeModule` is retired in Phase A, replaced by the real MIR layer. MIR is the permanent native-oriented IR SPEC §13 anticipated. Until v1.0, MIR is not a stable format.
+- Stage 11h retired the temporary Stage 7-10 native smoke module and replaced it with direct MIR-to-Cranelift lowering. MIR is the permanent native-oriented IR SPEC §13 anticipated. Until v1.0, MIR is not a stable format.
 - Full path-sensitive control-flow analysis (returns on all paths, definite readonly-property initialization on all constructor paths, null narrowing) is one shared dataflow framework built once in Phase A and reused everywhere — it replaces the "final statement must be return" early rule.
 
 ### 8.2 Dual backend (decision 0012, made concrete)
@@ -671,7 +671,7 @@ Stages continue the existing numbering. Every stage = decision record(s) + tests
 ### Phase A — Real native foundation (Stages 11–15)
 Retire the smoke architecture; make the native path general.
 
-- **Stage 11 — MIR + interpreter oracle.** Introduce MIR; port all Stage ≤10 lowering onto it; delete `NativeSmokeModule`; ship the MIR interpreter as `--target debug`; stand up the differential test harness. AC: every existing native example produces identical output under interpreter and Cranelift; no smoke-module code remains.
+- **Stage 11 — MIR + interpreter oracle (complete).** MIR owns all accepted Stage ≤10 executable lowering; the debug interpreter and Cranelift consume the same MIR; the manifest-driven differential harness verifies exact stdout and process status; and no Stage 7-10 smoke-module code remains. Stage 12 is the next implementation stage.
 - **Stage 12 — General control flow + runtime foundation.** Arbitrary/nested loops, `return` anywhere, unbounded `while`, `break`/`continue` everywhere, recursion and mutual recursion; shared dataflow framework replaces the final-statement-return rule with returns-on-all-paths. Create the minimal `crates/doria-rt`, native entry glue, and abort-only panic ABI so later checked panics have a runtime target. AC: recursive Fibonacci, nested-loop matrix example, early-return search all run natively; loop-verification cap removed; a minimal explicit panic smoke exits 101 through doria-rt.
 - **Stage 13 — Full integer family + operators.** All fixed-width types in the compiler; `/`, `%`, shifts, bitwise across widths; contextual integer literals; overflow/div-zero panics with runtime messages through the Stage 12 doria-rt panic machinery. AC: differential tests over an arithmetic torture fixture; panic exit status 101 with message.
 - **Stage 14 — Floats + bool runtime.** `float32/64` arithmetic/comparison codegen, bool as runtime value (not just conditions), `Float`/`Int` conversion companions. AC: numeric integration examples match interpreter bit-for-bit for f64 ops.

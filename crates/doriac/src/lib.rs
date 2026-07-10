@@ -1,5 +1,6 @@
 pub mod ast;
 pub mod backend;
+pub mod codegen_cranelift;
 pub mod codegen_native;
 pub mod codegen_php;
 pub mod diagnostics;
@@ -10,7 +11,6 @@ pub mod lsp;
 pub mod mir;
 pub mod mir_interpreter;
 pub mod mir_lowering;
-mod native_smoke;
 pub mod parser;
 pub mod semantics;
 pub mod source;

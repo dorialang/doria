@@ -7,19 +7,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::backend::BackendError;
-use crate::{hir, native_smoke};
+use crate::{codegen_cranelift, mir};
 
-pub fn generate_executable(program: &hir::Program) -> Result<Vec<u8>, BackendError> {
-    let native_module = native_smoke::validate(program)?;
-    let object_bytes = native_smoke::lower_to_object(&native_module)?;
+pub fn generate_executable(program: &mir::Program) -> Result<Vec<u8>, BackendError> {
+    let object_bytes = codegen_cranelift::lower_mir_to_object(program)?;
     link_object(&object_bytes)
-}
-
-// Historical helper retained for existing callers; it validates against the
-// current native smoke backend.
-pub fn validate_stage_2d(program: &hir::Program) -> Result<i32, BackendError> {
-    let native_module = native_smoke::validate(program)?;
-    Ok(native_smoke::evaluate_exit_code(&native_module))
 }
 
 fn link_object(object_bytes: &[u8]) -> Result<Vec<u8>, BackendError> {
@@ -45,9 +37,8 @@ fn link_object(object_bytes: &[u8]) -> Result<Vec<u8>, BackendError> {
 }
 
 fn invoke_linker(object_path: &Path, executable_path: &Path) -> Result<(), BackendError> {
-    // Stage 7a emits a Cranelift object file from the implementation-private
-    // native smoke IR and asks the host toolchain to link it. This is not a C
-    // backend: Doria never generates C source or uses C semantics as an oracle.
+    // Cranelift emits a host object from MIR, then the host toolchain links it.
+    // Doria does not generate C source or use C semantics as an oracle.
     let cc_is_set = env::var_os("CC").is_some();
     let linker = env::var("CC").unwrap_or_else(|_| default_linker().to_string());
     let mut command = Command::new(&linker);
@@ -142,7 +133,7 @@ fn linker_arguments(
 ) -> Vec<OsString> {
     if windows && (!cc_is_set || is_msvc_style_compiler_driver(linker)) {
         // Cranelift-generated objects do not carry MSVC /DEFAULTLIB directives.
-        // For this tiny native smoke main, make Doria's main the executable
+        // For the current generated process wrapper, make Doria's main the executable
         // entrypoint instead of relying on CRT startup to discover and call it.
         return vec![
             OsString::from("/nologo"),

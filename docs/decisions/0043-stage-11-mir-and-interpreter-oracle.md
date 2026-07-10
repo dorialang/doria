@@ -8,7 +8,7 @@ Stage 11 introduces MIR as Doria native-oriented, control-flow-oriented compiler
 
 Stage 11 also introduces a MIR interpreter as the debug and semantic-oracle path. The interpreter is intended to validate Doria-visible behavior without relying on PHP, Cranelift, LLVM, or host linker behavior.
 
-Stage 11 eventually retires NativeSmokeModule. Stage 11a seeded the MIR architecture and interpreter for a tiny executable subset, Stage 11b expanded that seed to integer expressions and integer local slots, Stage 11c added condition evaluation and structured `if` control flow, Stage 11d added structured `while` loops and loop control, Stage 11e added traditional `for` loops and integer range `foreach`, Stage 11f added top-level free functions and calls, and Stage 11g adds readonly string locals plus string-expression echo parity. NativeSmokeModule remains temporary in Stage 11g and must not receive new language capability expansion.
+Stage 11 is complete. Stage 11a seeded the MIR architecture and interpreter for a tiny executable subset, Stage 11b expanded that seed to integer expressions and integer local slots, Stage 11c added condition evaluation and structured `if` control flow, Stage 11d added structured `while` loops and loop control, Stage 11e added traditional `for` loops and integer range `foreach`, Stage 11f added top-level free functions and calls, Stage 11g added readonly string locals plus string-expression echo parity, and Stage 11h completed parity, moved Cranelift directly onto MIR, established the manifest-driven differential suite, and retired the Stage 7-10 native smoke architecture.
 
 ## Stage 11a scope
 
@@ -265,15 +265,33 @@ Stage 11g does not add:
 - recursion or mutual recursion
 - ownership or borrow checking
 - doria-rt
-- Cranelift-from-MIR lowering
+- direct MIR-to-Cranelift lowering
 - deletion of NativeSmokeModule
 - LLVM
 - Baton
 
 The interpreter may use Rust `String` values internally to execute this compile-time-known subset. That implementation detail does not define Doria allocation, ownership, layout, termination, or runtime concatenation semantics.
 
+## Stage 11h - Stage 11 completion
+
+Stage 11h completes the architecture migration:
+
+- All accepted Stage <=10 executable source lowering passes through MIR.
+- String-expression `echo` is supported in both int-returning and void functions; function return type constrains returns, not unrelated statements.
+- The debug backend executes MIR through the bounded interpreter oracle.
+- The native backend lowers checked HIR to MIR, runs the temporary bounded Stage 11 interpreter preflight, lowers MIR independently to a Cranelift object, and invokes the host linker.
+- Cranelift consumes MIR only. Its lowering module does not depend on HIR, AST, the parser, or the retired smoke representation.
+- Integer parameters and locals lower as signed I64 values using backend-private stack slots. Emitted `+`, `-`, and `*` operations retain checked overflow behavior.
+- All MIR functions are declared before body lowering with deterministic implementation-private symbols. A separate exported process wrapper maps `main(): void` to status 0 and validates `main(): int` against the portable `0..125` process boundary.
+- MIR branch and jump terminators lower directly to Cranelift control flow. Recursive condition lowering preserves left-to-right evaluation, short-circuit `and`/`or`, and eager bool-only `xor`.
+- Compile-time-known readonly string locals and concatenations resolve to exact bytes during object lowering. Unix-like and Windows stdout paths use explicit pointer/length writes and retry short writes without defining runtime strings.
+- `crates/doriac/tests/fixtures/stage_11_native_parity_examples.txt` is the executable accepted-example manifest. The differential suite compares exact interpreter/native stdout and process status for every entry and guards against unclassified native examples.
+- The private Stage 7-10 native smoke module, evaluator, Cranelift lowerer, fallback paths, and implementation-structure tests have been removed. Equivalent behavior is covered by MIR lowering/interpreter tests, linker-independent MIR-to-object tests, native preflight diagnostics, and the differential suite.
+
+The interpreter preflight is temporary migration-boundary behavior for the deterministic Stage <=10 subset. It is not used to generate machine code and its captured stdout is discarded during native compilation. Stage 12's runtime/panic foundation will revisit which checked failures remain compile-time preflight diagnostics and which become runtime panics.
+
 ## Consequences
 
-NativeSmokeModule remains temporary implementation-private bootstrap infrastructure for current native smoke coverage. It must not receive new language capability expansion unless an explicit later task approves a temporary compatibility fix.
+MIR is now the single active native-oriented compiler IR. New native language capability work must extend MIR, its validation/interpreter path, and backend lowering together rather than introducing a parallel representation or direct HIR-to-Cranelift route.
 
-MIR is the place to grow future native control-flow, interpreter, ownership, borrow-checking, and backend-lowering work. Stage 11g proves that the local-slot and interpreter-frame model can also carry the accepted compile-time-known readonly string/echo subset without defining the future runtime string model. Stage 11 is still incomplete. The parity matrix records the remaining retirement blockers, including Cranelift-from-MIR lowering and the complete differential sweep; collection iteration, methods and classes, runtime strings, ownership, and NativeSmokeModule retirement remain future work.
+Stage 11 is complete. Stage 12 is next: general control flow plus the minimal doria-rt runtime/panic foundation. Runtime strings, collection iteration, methods/classes, ownership and borrow checking, stable ABI work, LLVM, and other later capabilities remain outside Stage 11.
