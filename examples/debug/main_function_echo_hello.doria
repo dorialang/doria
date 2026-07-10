@@ -1,0 +1,15 @@
+function hello(): void
+{
+    echo "Hello ";
+}
+
+function subject(): void
+{
+    echo "Doria!";
+}
+
+function main(): void
+{
+    hello();
+    subject();
+}

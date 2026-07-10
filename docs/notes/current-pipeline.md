@@ -9,14 +9,15 @@ Documentation role: working note. This file prevents duplicated in-flight work. 
 - PR #62: documentation source-of-truth reset and documentation authority guardrails.
 - PR #63: Stage 11c MIR conditions, structured `if` control flow, and multi-block interpreter execution.
 - PR #64: Stage 11d MIR structured `while`, nested `break` / `continue`, and bounded debug interpretation.
+- PR #65: Stage 11e MIR traditional `for`, integer range `foreach`, and mixed nested-loop control.
 
 ## Active
 
-- Stage 11e: MIR traditional `for` loops and integer range `foreach`.
+- Stage 11f: MIR top-level free functions and calls.
 
-## Next after Stage 11e
+## Next after Stage 11f
 
-- Stage 11f: MIR helper/free-function calls and current native-smoke parity expansion, unless Stage 11e review identifies a blocker.
+- Stage 11g: Stage <=10 MIR parity sweep and Cranelift-from-MIR bridge planning, unless review identifies a blocker.
 
 ## Do not duplicate
 
@@ -25,6 +26,7 @@ Documentation role: working note. This file prevents duplicated in-flight work. 
 - PR #62 documentation source-of-truth work.
 - PR #63 Stage 11c MIR condition and `if` control-flow work.
 - PR #64 Stage 11d MIR `while` and loop-control work.
+- PR #65 Stage 11e MIR `for`, integer range `foreach`, and mixed-loop work.
 - ROADMAP-style planning outside the end-to-end plan.
 
 ## Deferred

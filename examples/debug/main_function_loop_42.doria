@@ -1,0 +1,15 @@
+function countTo42(): int
+{
+    let writable $count = 0;
+
+    while ($count < 42) {
+        $count++;
+    }
+
+    return $count;
+}
+
+function main(): int
+{
+    return countTo42();
+}

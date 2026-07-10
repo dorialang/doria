@@ -1,0 +1,13 @@
+function answer(): int
+{
+    return 42;
+}
+
+function main(): int
+{
+    if (answer() == 42) {
+        return 42;
+    }
+
+    return 0;
+}
