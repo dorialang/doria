@@ -117,9 +117,14 @@ impl Backend for NativeBackend {
     }
 
     fn emit(&self, program: &hir::Program) -> Result<BackendOutput, BackendError> {
+        let mir = mir_lowering::lower_program(program).map_err(BackendError::from_diagnostics)?;
+        mir_interpreter::interpret(&mir).map_err(|error| {
+            BackendError::new(format!("MIR Stage 11 preflight failure: {error}"))
+        })?;
+
         Ok(BackendOutput::Executable {
             extension: native_executable_extension().to_string(),
-            bytes: codegen_native::generate_executable(program)?,
+            bytes: codegen_native::generate_executable(&mir)?,
         })
     }
 }

@@ -1,0 +1,30 @@
+# Executable source of truth for accepted Stage <=10 native behavior.
+# Classification: INCLUDED_ACCEPTED_STAGE_10
+examples/native/main_arithmetic_42.doria
+examples/native/main_boolean_condition_42.doria
+examples/native/main_break_continue_42.doria
+examples/native/main_for_42.doria
+examples/native/main_foreach_range_45.doria
+examples/native/main_foreach_range_55.doria
+examples/native/main_function_add_42.doria
+examples/native/main_function_echo_hello.doria
+examples/native/main_function_loop_42.doria
+examples/native/main_if_42.doria
+examples/native/main_if_else_42.doria
+examples/native/main_if_fallthrough_42.doria
+examples/native/main_int_arithmetic.doria
+examples/native/main_int_echo_success.doria
+examples/native/main_int_helper_echo_success.doria
+examples/native/main_readonly_local.doria
+examples/native/main_return_42.doria
+examples/native/main_return_arithmetic_42.doria
+examples/native/main_return_zero.doria
+examples/native/main_short_circuit_calls.doria
+examples/native/main_string_concat_hello.doria
+examples/native/main_string_local_hello.doria
+examples/native/main_structured_if_42.doria
+examples/native/main_structured_while_42.doria
+examples/native/main_void_empty.doria
+examples/native/main_void_hello.doria
+examples/native/main_while_42.doria
+examples/native/main_writable_local_42.doria

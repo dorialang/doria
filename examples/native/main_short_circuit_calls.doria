@@ -1,0 +1,28 @@
+function zero(): int
+{
+    echo "z";
+
+    return 0;
+}
+
+function one(): int
+{
+    echo "o";
+
+    return 1;
+}
+
+function main(): void
+{
+    if (zero() == 1 and one() == 1) {
+        echo "x";
+    }
+
+    if (one() == 1 or zero() == 1) {
+        echo "y";
+    }
+
+    if (zero() == 0 xor one() == 0) {
+        echo "q";
+    }
+}

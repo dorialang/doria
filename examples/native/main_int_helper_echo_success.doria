@@ -1,0 +1,15 @@
+function answer(): int
+{
+    echo "Hello ";
+
+    return 42;
+}
+
+function main(): int
+{
+    let $answer = answer();
+
+    echo "Doria!";
+
+    return 0;
+}

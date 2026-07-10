@@ -1,0 +1,6 @@
+function main(): int
+{
+    echo "Hello Doria!";
+
+    return 0;
+}

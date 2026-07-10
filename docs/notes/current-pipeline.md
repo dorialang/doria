@@ -11,14 +11,15 @@ Documentation role: working note. This file prevents duplicated in-flight work. 
 - PR #64: Stage 11d MIR structured `while`, nested `break` / `continue`, and bounded debug interpretation.
 - PR #65: Stage 11e MIR traditional `for`, integer range `foreach`, and mixed nested-loop control.
 - PR #66: Stage 11f MIR top-level free functions, calls, and bounded interpreter frames.
+- PR #67: Stage 11g MIR readonly string locals, string-expression echo parity, and the parity matrix.
 
 ## Active
 
-- Stage 11g: MIR string echo parity and Stage <=10 parity matrix.
+- Stage 11h: complete MIR-native migration, differential suite, and retirement of the Stage 7-10 native smoke architecture.
 
-## Next after Stage 11g
+## Next after Stage 11h
 
-- Stage 11h: Cranelift-from-MIR bridge seed, unless the parity matrix identifies a blocker.
+- Stage 12: general control flow and the minimal doria-rt runtime/panic foundation.
 
 ## Do not duplicate
 
@@ -29,10 +30,10 @@ Documentation role: working note. This file prevents duplicated in-flight work. 
 - PR #64 Stage 11d MIR `while` and loop-control work.
 - PR #65 Stage 11e MIR `for`, integer range `foreach`, and mixed-loop work.
 - PR #66 Stage 11f MIR top-level free functions and calls.
+- PR #67 Stage 11g MIR readonly string locals and string-expression echo work.
 - ROADMAP-style planning outside the end-to-end plan.
 
 ## Deferred
 
 - Full TypeId/TypeKind refactor.
 - Stage 12 general control flow.
-- NativeSmokeModule deletion until MIR covers the accepted Stage <=10 native subset.

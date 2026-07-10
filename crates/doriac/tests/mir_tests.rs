@@ -14,16 +14,22 @@ fn interpret(source: &str) -> doriac::mir_interpreter::InterpreterOutput {
     doriac::mir_interpreter::interpret(&program).expect("MIR should interpret")
 }
 
+fn lower_object(source: &str) -> Vec<u8> {
+    let program = lower(source);
+    doriac::codegen_cranelift::lower_mir_to_object(&program)
+        .expect("MIR should lower to a Cranelift object")
+}
+
 fn unsupported(source: &str) -> Vec<doriac::diagnostics::Diagnostic> {
     doriac::lower_source_to_mir("test.doria", source)
-        .expect_err("source should be outside Stage 11g MIR coverage")
+        .expect_err("source should be outside Stage 11 MIR coverage")
 }
 
 fn unsupported_after_parsing(source: &str) -> Vec<doriac::diagnostics::Diagnostic> {
     let ast = doriac::parse_source("test.doria", source).expect("source should parse");
     let hir = doriac::lowering::lower_program(&ast);
     doriac::mir_lowering::lower_program(&hir)
-        .expect_err("HIR should be outside Stage 11g MIR coverage")
+        .expect_err("HIR should be outside Stage 11 MIR coverage")
 }
 
 fn assert_stage_11g_unsupported(diagnostics: &[doriac::diagnostics::Diagnostic], detail: &str) {
@@ -31,7 +37,7 @@ fn assert_stage_11g_unsupported(diagnostics: &[doriac::diagnostics::Diagnostic],
     assert!(
         diagnostics[0]
             .message
-            .contains("unsupported MIR Stage 11g coverage"),
+            .contains("unsupported MIR Stage 11 coverage"),
         "unexpected diagnostic: {}",
         diagnostics[0].message
     );
@@ -1740,39 +1746,33 @@ fn debug_target_handles_stage_11d_examples() {
 }
 
 #[test]
-fn mirrors_native_smoke_exit_for_stage_11d_while_shapes_without_linker() {
+fn cranelift_object_covers_stage_11d_while_shapes_without_linker() {
     for source in [
         include_str!("../../../examples/debug/main_while_count_42.doria"),
         include_str!("../../../examples/debug/main_while_break_42.doria"),
     ] {
-        let hir = doriac::lower_source("test.doria", source).expect("source should lower to HIR");
-        let native_exit = doriac::codegen_native::validate_stage_2d(&hir)
-            .expect("native smoke validator should already accept this source");
         let mir_exit = interpret(source).exit_status;
 
-        assert_eq!(native_exit, 42);
-        assert_eq!(mir_exit, native_exit);
+        assert_eq!(mir_exit, 42);
+        assert!(!lower_object(source).is_empty());
     }
 }
 
 #[test]
-fn mirrors_native_smoke_exit_for_stage_11c_if_shapes_without_linker() {
+fn cranelift_object_covers_stage_11c_if_shapes_without_linker() {
     for source in [
         include_str!("../../../examples/debug/main_if_return_42.doria"),
         include_str!("../../../examples/debug/main_if_assignment_42.doria"),
     ] {
-        let hir = doriac::lower_source("test.doria", source).expect("source should lower to HIR");
-        let native_exit = doriac::codegen_native::validate_stage_2d(&hir)
-            .expect("native smoke validator should already accept this source");
         let mir_exit = interpret(source).exit_status;
 
-        assert_eq!(native_exit, 42);
-        assert_eq!(mir_exit, native_exit);
+        assert_eq!(mir_exit, 42);
+        assert!(!lower_object(source).is_empty());
     }
 }
 
 #[test]
-fn mirrors_native_smoke_exit_for_stage_11b_int_shapes_without_linker() {
+fn cranelift_object_covers_stage_11b_int_shapes_without_linker() {
     for (source, expected) in [
         (
             r#"function main(): int
@@ -1805,18 +1805,15 @@ fn mirrors_native_smoke_exit_for_stage_11b_int_shapes_without_linker() {
             42,
         ),
     ] {
-        let hir = doriac::lower_source("test.doria", source).expect("source should lower to HIR");
-        let native_exit = doriac::codegen_native::validate_stage_2d(&hir)
-            .expect("native smoke validator should accept source");
         let mir_exit = interpret(source).exit_status;
 
-        assert_eq!(native_exit, expected);
-        assert_eq!(mir_exit, native_exit);
+        assert_eq!(mir_exit, expected);
+        assert!(!lower_object(source).is_empty());
     }
 }
 
 #[test]
-fn mirrors_native_smoke_exit_for_stage_11a_literal_shapes_without_linker() {
+fn cranelift_object_covers_stage_11a_literal_shapes_without_linker() {
     for (source, expected) in [
         (
             r#"function main(): int
@@ -1842,13 +1839,10 @@ fn mirrors_native_smoke_exit_for_stage_11a_literal_shapes_without_linker() {
             0,
         ),
     ] {
-        let hir = doriac::lower_source("test.doria", source).expect("source should lower to HIR");
-        let native_exit = doriac::codegen_native::validate_stage_2d(&hir)
-            .expect("native smoke validator should accept source");
         let mir_exit = interpret(source).exit_status;
 
-        assert_eq!(native_exit, expected);
-        assert_eq!(mir_exit, native_exit);
+        assert_eq!(mir_exit, expected);
+        assert!(!lower_object(source).is_empty());
     }
 }
 
@@ -2367,7 +2361,7 @@ fn debug_target_handles_stage_11e_examples() {
 }
 
 #[test]
-fn mirrors_native_smoke_exit_for_stage_11e_loop_shapes_without_linker() {
+fn cranelift_object_covers_stage_11e_loop_shapes_without_linker() {
     for (source, expected) in [
         (
             include_str!("../../../examples/debug/main_for_count_10.doria"),
@@ -2382,13 +2376,10 @@ fn mirrors_native_smoke_exit_for_stage_11e_loop_shapes_without_linker() {
             11,
         ),
     ] {
-        let hir = doriac::lower_source("test.doria", source).expect("source should lower to HIR");
-        let native_exit = doriac::codegen_native::validate_stage_2d(&hir)
-            .expect("native smoke validator should already accept this source");
         let mir_exit = interpret(source).exit_status;
 
-        assert_eq!(native_exit, expected);
-        assert_eq!(mir_exit, native_exit);
+        assert_eq!(mir_exit, expected);
+        assert!(!lower_object(source).is_empty());
     }
 }
 
@@ -2886,18 +2877,15 @@ fn stage_11f_interpreter_has_a_defensive_call_depth_limit() {
 }
 
 #[test]
-fn stage_11f_matches_native_smoke_for_supported_helpers_without_linker() {
+fn stage_11f_cranelift_object_supports_helpers_without_linker() {
     for source in [
         include_str!("../../../examples/debug/main_function_add_42.doria"),
         include_str!("../../../examples/debug/main_function_loop_42.doria"),
     ] {
-        let hir = doriac::lower_source("test.doria", source).expect("source should lower to HIR");
-        let native_exit = doriac::codegen_native::validate_stage_2d(&hir)
-            .expect("native smoke validator should already accept this source");
         let mir_exit = interpret(source).exit_status;
 
-        assert_eq!(native_exit, 42);
-        assert_eq!(mir_exit, native_exit);
+        assert_eq!(mir_exit, 42);
+        assert!(!lower_object(source).is_empty());
     }
 }
 
@@ -3151,6 +3139,65 @@ fn stage_11g_string_echo_adds_no_implicit_newline() {
 }
 
 #[test]
+fn stage_11h_supports_string_echo_inside_int_returning_functions() {
+    for source in [
+        include_str!("../../../examples/debug/main_int_echo_success.doria"),
+        include_str!("../../../examples/debug/main_int_helper_echo_success.doria"),
+    ] {
+        let program = lower(source);
+        assert!(program.functions.iter().any(|function| {
+            function.return_type == ReturnType::Int
+                && function.blocks.iter().any(|block| {
+                    block.statements.iter().any(|statement| {
+                        matches!(
+                            statement,
+                            Statement::EchoStringLiteral(_) | Statement::EchoString(_)
+                        )
+                    })
+                })
+        }));
+
+        let output = interpret(source);
+        assert_eq!(output.exit_status, 0);
+        assert_eq!(output.stdout, b"Hello Doria!");
+        assert_eq!(
+            debug_contents(source),
+            "exit_status: 0\nstdout: Hello Doria!\n"
+        );
+    }
+}
+
+#[test]
+fn stage_11h_ignores_unreachable_statements_after_terminators() {
+    let output = interpret(
+        r#"function main(): int
+{
+    let writable $value = 42;
+
+    if (false) {
+        return 0;
+        $value = 0;
+    }
+
+    for (let writable $i = 0; $i < 1; $i++) {
+        continue;
+        $value = 0;
+    }
+
+    while (true) {
+        break;
+        $value = 0;
+    }
+
+    return $value;
+}
+"#,
+    );
+
+    assert_eq!(output.exit_status, 42);
+}
+
+#[test]
 fn stage_11g_debug_target_handles_all_examples() {
     for (source, expected) in [
         (
@@ -3183,7 +3230,7 @@ fn stage_11g_debug_target_handles_all_examples() {
 }
 
 #[test]
-fn stage_11g_matches_native_smoke_for_string_echo_shapes_without_linker() {
+fn stage_11g_cranelift_object_supports_string_echo_without_linker() {
     for (source, expected_stdout) in [
         (
             include_str!("../../../examples/debug/main_string_concat_hello.doria"),
@@ -3194,13 +3241,10 @@ fn stage_11g_matches_native_smoke_for_string_echo_shapes_without_linker() {
             b"xxx".as_slice(),
         ),
     ] {
-        let hir = doriac::lower_source("test.doria", source).expect("source should lower to HIR");
-        let native_exit = doriac::codegen_native::validate_stage_2d(&hir)
-            .expect("native smoke validator should already accept this source");
         let mir_output = interpret(source);
 
-        assert_eq!(native_exit, 0);
-        assert_eq!(mir_output.exit_status, native_exit);
+        assert_eq!(mir_output.exit_status, 0);
         assert_eq!(mir_output.stdout, expected_stdout);
+        assert!(!lower_object(source).is_empty());
     }
 }

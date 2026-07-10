@@ -87,3 +87,7 @@ Unsupported backend coverage must remain a clear unsupported native backend diag
 ## Assumption
 
 The implementation may use private local Cranelift symbols for supported Doria helper functions and an exported process `main` wrapper for the executable entrypoint. This is an implementation-private native smoke detail, not a stable Doria ABI or public calling convention.
+
+## Stage 11 retirement pointer
+
+This record remains the authority for the Stage 10 source subset and helper-value/process-status distinction. Its private native smoke implementation was retired by decision 0043 at Stage 11h. The interpreter and Cranelift now consume the same MIR, while internal function symbols and the exported process wrapper remain implementation-private rather than stable ABI.
