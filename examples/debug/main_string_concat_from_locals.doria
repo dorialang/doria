@@ -1,0 +1,8 @@
+function main(): void
+{
+    let $hello = "Hello ";
+    let $name = "Doria";
+    let $bang = "!";
+
+    echo $hello . $name . $bang;
+}

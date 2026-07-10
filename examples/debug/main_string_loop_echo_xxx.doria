@@ -1,0 +1,10 @@
+function main(): void
+{
+    let writable $i = 0;
+    let $mark = "x";
+
+    while ($i < 3) {
+        echo $mark;
+        $i++;
+    }
+}

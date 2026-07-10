@@ -1,8 +1,8 @@
 use doriac::backend::{BackendOutput, BackendTarget};
 use doriac::mir::{
     BasicBlock, BinaryOp, BlockId, CompareOp, Condition, ConditionBinaryOp, Function, FunctionId,
-    IntExpression, Local, LocalId, Operand, Program, ReturnType, Rvalue, Statement, Terminator,
-    Type,
+    IntExpression, Local, LocalId, Operand, Program, ReturnType, Rvalue, Statement,
+    StringExpression, Terminator, Type,
 };
 
 fn lower(source: &str) -> doriac::mir::Program {
@@ -16,22 +16,22 @@ fn interpret(source: &str) -> doriac::mir_interpreter::InterpreterOutput {
 
 fn unsupported(source: &str) -> Vec<doriac::diagnostics::Diagnostic> {
     doriac::lower_source_to_mir("test.doria", source)
-        .expect_err("source should be outside Stage 11f MIR coverage")
+        .expect_err("source should be outside Stage 11g MIR coverage")
 }
 
 fn unsupported_after_parsing(source: &str) -> Vec<doriac::diagnostics::Diagnostic> {
     let ast = doriac::parse_source("test.doria", source).expect("source should parse");
     let hir = doriac::lowering::lower_program(&ast);
     doriac::mir_lowering::lower_program(&hir)
-        .expect_err("HIR should be outside Stage 11f MIR coverage")
+        .expect_err("HIR should be outside Stage 11g MIR coverage")
 }
 
-fn assert_stage_11f_unsupported(diagnostics: &[doriac::diagnostics::Diagnostic], detail: &str) {
+fn assert_stage_11g_unsupported(diagnostics: &[doriac::diagnostics::Diagnostic], detail: &str) {
     assert_eq!(diagnostics[0].code, "M1101");
     assert!(
         diagnostics[0]
             .message
-            .contains("unsupported MIR Stage 11f coverage"),
+            .contains("unsupported MIR Stage 11g coverage"),
         "unexpected diagnostic: {}",
         diagnostics[0].message
     );
@@ -857,7 +857,7 @@ fn rejects_unsupported_division_as_mir_coverage() {
 "#,
     );
 
-    assert_stage_11f_unsupported(&diagnostics, "division and modulo");
+    assert_stage_11g_unsupported(&diagnostics, "division and modulo");
 }
 
 #[test]
@@ -870,12 +870,12 @@ fn rejects_comparison_result_as_runtime_value() {
 "#,
     );
 
-    assert_stage_11f_unsupported(&diagnostics, "condition-only");
+    assert_stage_11g_unsupported(&diagnostics, "condition-only");
 }
 
 #[test]
-fn rejects_unsupported_string_local_as_mir_coverage() {
-    let diagnostics = unsupported(
+fn lowers_readonly_string_local_and_echo() {
+    let program = lower(
         r#"function main(): void
 {
     let $message = "Hello Doria!";
@@ -884,12 +884,24 @@ fn rejects_unsupported_string_local_as_mir_coverage() {
 "#,
     );
 
-    assert_stage_11f_unsupported(&diagnostics, "string locals");
+    let function = &program.functions[program.entry.0];
+    assert_eq!(function.locals[0].ty, Type::String);
+    assert!(!function.locals[0].writable);
+    assert_eq!(
+        function.blocks[0].statements,
+        vec![
+            Statement::AssignLocal {
+                target: LocalId(0),
+                value: Rvalue::String(StringExpression::Literal("Hello Doria!".to_string(),)),
+            },
+            Statement::EchoString(StringExpression::Local(LocalId(0))),
+        ]
+    );
 }
 
 #[test]
-fn rejects_unsupported_string_concat_echo_as_mir_coverage() {
-    let diagnostics = unsupported(
+fn lowers_string_literal_concat_echo() {
+    let program = lower(
         r#"function main(): void
 {
     echo "Hello " . "Doria!";
@@ -897,7 +909,13 @@ fn rejects_unsupported_string_concat_echo_as_mir_coverage() {
 "#,
     );
 
-    assert_stage_11f_unsupported(&diagnostics, "string concatenation");
+    assert_eq!(
+        program.functions[program.entry.0].blocks[0].statements,
+        vec![Statement::EchoString(StringExpression::Concat(vec![
+            StringExpression::Literal("Hello ".to_string()),
+            StringExpression::Literal("Doria!".to_string()),
+        ]))]
+    );
 }
 
 #[test]
@@ -1373,7 +1391,7 @@ fn rejects_truthiness_and_calls_as_stage_11c_conditions() {
 }
 "#,
     );
-    assert_stage_11f_unsupported(&truthiness, "truthiness");
+    assert_stage_11g_unsupported(&truthiness, "truthiness");
 
     let call = unsupported_after_parsing(
         r#"function main(): int
@@ -1386,7 +1404,7 @@ fn rejects_truthiness_and_calls_as_stage_11c_conditions() {
 }
 "#,
     );
-    assert_stage_11f_unsupported(&call, "calls in conditions");
+    assert_stage_11g_unsupported(&call, "calls in conditions");
 }
 
 #[test]
@@ -1685,7 +1703,7 @@ fn rejects_break_and_continue_outside_loops_in_mir_lowering() {
         ),
     ] {
         let diagnostics = unsupported_after_parsing(source);
-        assert_stage_11f_unsupported(&diagnostics, detail);
+        assert_stage_11g_unsupported(&diagnostics, detail);
     }
 }
 
@@ -2285,7 +2303,7 @@ fn rejects_unsupported_stage_11e_foreach_shapes() {
 }
 "#,
     );
-    assert_stage_11f_unsupported(&collection, "collection and general iterable foreach");
+    assert_stage_11g_unsupported(&collection, "collection and general iterable foreach");
 
     let key_value = unsupported_after_parsing(
         r#"function main(): void
@@ -2295,7 +2313,7 @@ fn rejects_unsupported_stage_11e_foreach_shapes() {
 }
 "#,
     );
-    assert_stage_11f_unsupported(&key_value, "key bindings");
+    assert_stage_11g_unsupported(&key_value, "key bindings");
 
     let call_bound = unsupported_after_parsing(
         r#"function main(): void
@@ -2305,7 +2323,7 @@ fn rejects_unsupported_stage_11e_foreach_shapes() {
 }
 "#,
     );
-    assert_stage_11f_unsupported(&call_bound, "unknown top-level function `limit`");
+    assert_stage_11g_unsupported(&call_bound, "unknown top-level function `limit`");
 }
 
 #[test]
@@ -2420,7 +2438,7 @@ fn stage_11f_requires_exactly_one_main() {
 }
 "#,
     );
-    assert_stage_11f_unsupported(&missing, "exactly one top-level function main");
+    assert_stage_11g_unsupported(&missing, "exactly one top-level function main");
 
     let duplicate = unsupported_after_parsing(
         r#"function main(): int
@@ -2434,7 +2452,7 @@ function main(): int
 }
 "#,
     );
-    assert_stage_11f_unsupported(&duplicate, "exactly one top-level function main");
+    assert_stage_11g_unsupported(&duplicate, "exactly one top-level function main");
 }
 
 #[test]
@@ -2638,7 +2656,7 @@ function main(): void
         ),
     ] {
         let diagnostics = unsupported(source);
-        assert_stage_11f_unsupported(&diagnostics, detail);
+        assert_stage_11g_unsupported(&diagnostics, detail);
     }
 }
 
@@ -2656,7 +2674,7 @@ function main(): void
 }
 "#,
     );
-    assert_stage_11f_unsupported(&ignored_int, "cannot be used as a statement");
+    assert_stage_11g_unsupported(&ignored_int, "cannot be used as a statement");
 
     let void_as_int = unsupported_after_parsing(
         r#"function hello(): void
@@ -2669,7 +2687,7 @@ function main(): int
 }
 "#,
     );
-    assert_stage_11f_unsupported(&void_as_int, "cannot be used as an integer expression");
+    assert_stage_11g_unsupported(&void_as_int, "cannot be used as an integer expression");
 }
 
 #[test]
@@ -2692,7 +2710,7 @@ function main(): int
 "#,
     );
 
-    assert_stage_11f_unsupported(
+    assert_stage_11g_unsupported(
         &diagnostics,
         "call arguments support only Stage 11b integer expressions",
     );
@@ -2717,7 +2735,7 @@ function main(): int
 "#,
     );
 
-    assert_stage_11f_unsupported(&diagnostics, "recursive calls are not supported");
+    assert_stage_11g_unsupported(&diagnostics, "recursive calls are not supported");
 }
 
 #[test]
@@ -2740,7 +2758,7 @@ function main(): int
 "#,
     );
 
-    assert_stage_11f_unsupported(&diagnostics, "mutual recursion is not supported");
+    assert_stage_11g_unsupported(&diagnostics, "mutual recursion is not supported");
 }
 
 #[test]
@@ -2880,5 +2898,309 @@ fn stage_11f_matches_native_smoke_for_supported_helpers_without_linker() {
 
         assert_eq!(native_exit, 42);
         assert_eq!(mir_exit, native_exit);
+    }
+}
+
+#[test]
+fn stage_11g_lowers_explicit_string_locals_and_local_concat_in_source_order() {
+    let explicit = lower(
+        r#"function main(): void
+{
+    string $name = "Doria";
+
+    echo $name;
+}
+"#,
+    );
+    let main = &explicit.functions[explicit.entry.0];
+    assert_eq!(main.locals[0].ty, Type::String);
+    assert_eq!(
+        main.blocks[0].statements[1],
+        Statement::EchoString(StringExpression::Local(LocalId(0)))
+    );
+
+    let concat = lower(include_str!(
+        "../../../examples/debug/main_string_concat_from_locals.doria"
+    ));
+    let main = &concat.functions[concat.entry.0];
+    assert_eq!(
+        main.blocks[0].statements.last(),
+        Some(&Statement::EchoString(StringExpression::Concat(vec![
+            StringExpression::Local(LocalId(0)),
+            StringExpression::Local(LocalId(1)),
+            StringExpression::Local(LocalId(2)),
+        ])))
+    );
+}
+
+#[test]
+fn stage_11g_lowers_string_concat_inside_void_helpers() {
+    let program = lower(include_str!(
+        "../../../examples/debug/main_function_string_local_echo.doria"
+    ));
+    let helper = &program.functions[0];
+
+    assert_eq!(helper.name, "hello");
+    assert_eq!(helper.locals[0].ty, Type::String);
+    assert_eq!(
+        helper.blocks[0].statements[1],
+        Statement::EchoString(StringExpression::Concat(vec![
+            StringExpression::Literal("Hello ".to_string()),
+            StringExpression::Local(LocalId(0)),
+            StringExpression::Literal("!".to_string()),
+        ]))
+    );
+}
+
+#[test]
+fn stage_11g_lowers_string_echo_inside_loop_blocks() {
+    let program = lower(include_str!(
+        "../../../examples/debug/main_string_loop_echo_xxx.doria"
+    ));
+    let main = &program.functions[program.entry.0];
+
+    assert!(main.blocks.iter().any(|block| {
+        block.statements.iter().any(|statement| {
+            *statement == Statement::EchoString(StringExpression::Local(LocalId(1)))
+        })
+    }));
+
+    let output = interpret(
+        r#"function main(): void
+{
+    let $mark = "x";
+
+    for (let writable $i = 0; $i < 1; $i++) {
+        echo $mark;
+    }
+
+    foreach (0..<1 as $i) {
+        echo $mark;
+    }
+}
+"#,
+    );
+    assert_eq!(output.stdout, b"xx");
+}
+
+#[test]
+fn stage_11g_supports_readonly_string_local_concat_initializers() {
+    let output = interpret(
+        r#"function main(): void
+{
+    let $name = "Doria";
+    let $message = "Hello " . $name . "!";
+
+    echo $message;
+}
+"#,
+    );
+
+    assert_eq!(output.exit_status, 0);
+    assert_eq!(output.stdout, b"Hello Doria!");
+}
+
+#[test]
+fn stage_11g_rejects_writable_string_locals() {
+    for source in [
+        r#"function main(): void
+{
+    let writable $name = "Doria";
+}
+"#,
+        r#"function main(): void
+{
+    writable string $name = "Doria";
+}
+"#,
+    ] {
+        let diagnostics = unsupported(source);
+        assert_stage_11g_unsupported(&diagnostics, "writable string locals");
+    }
+}
+
+#[test]
+fn stage_11g_rejects_string_assignment_in_mir_lowering() {
+    let diagnostics = unsupported_after_parsing(
+        r#"function main(): void
+{
+    let $name = "Doria";
+    $name = "Other";
+}
+"#,
+    );
+
+    assert_stage_11g_unsupported(&diagnostics, "string assignment");
+}
+
+#[test]
+fn stage_11g_rejects_string_and_int_concat_without_display_conversion() {
+    let diagnostics = unsupported_after_parsing(
+        r#"function main(): void
+{
+    echo "count: " . 42;
+}
+"#,
+    );
+
+    assert_stage_11g_unsupported(
+        &diagnostics,
+        "string concatenation operands must be string expressions",
+    );
+}
+
+#[test]
+fn stage_11g_rejects_string_parameters_and_returns() {
+    let parameter = unsupported(
+        r#"function greet(string $name): void
+{
+    echo "Hello";
+}
+
+function main(): void
+{
+}
+"#,
+    );
+    assert_stage_11g_unsupported(&parameter, "supports only int parameters");
+
+    let return_type = unsupported(
+        r#"function title(): string
+{
+    return "Doria";
+}
+
+function main(): void
+{
+}
+"#,
+    );
+    assert_stage_11g_unsupported(&return_type, "supports only int and void returns");
+}
+
+#[test]
+fn stage_11g_interprets_all_string_examples() {
+    for (source, expected) in [
+        (
+            include_str!("../../../examples/debug/main_string_local_hello.doria"),
+            b"Doria".as_slice(),
+        ),
+        (
+            include_str!("../../../examples/debug/main_string_concat_hello.doria"),
+            b"Hello Doria!".as_slice(),
+        ),
+        (
+            include_str!("../../../examples/debug/main_string_concat_from_locals.doria"),
+            b"Hello Doria!".as_slice(),
+        ),
+        (
+            include_str!("../../../examples/debug/main_function_string_local_echo.doria"),
+            b"Hello Doria!".as_slice(),
+        ),
+        (
+            include_str!("../../../examples/debug/main_string_loop_echo_xxx.doria"),
+            b"xxx".as_slice(),
+        ),
+        (
+            include_str!("../../../examples/debug/main_string_if_echo.doria"),
+            b"Hello Doria!".as_slice(),
+        ),
+    ] {
+        let output = interpret(source);
+        assert_eq!(output.exit_status, 0);
+        assert_eq!(output.stdout, expected);
+    }
+}
+
+#[test]
+fn stage_11g_stdout_accumulates_across_helpers_and_string_expressions() {
+    let output = interpret(
+        r#"function greeting(): void
+{
+    let $hello = "Hello ";
+
+    echo $hello;
+}
+
+function subject(): void
+{
+    let $name = "Doria";
+
+    echo $name . "!";
+}
+
+function main(): void
+{
+    greeting();
+    subject();
+}
+"#,
+    );
+
+    assert_eq!(output.stdout, b"Hello Doria!");
+}
+
+#[test]
+fn stage_11g_string_echo_adds_no_implicit_newline() {
+    let output = interpret(include_str!(
+        "../../../examples/debug/main_string_concat_hello.doria"
+    ));
+
+    assert_eq!(output.stdout, b"Hello Doria!");
+    assert!(!output.stdout.ends_with(b"\n"));
+}
+
+#[test]
+fn stage_11g_debug_target_handles_all_examples() {
+    for (source, expected) in [
+        (
+            include_str!("../../../examples/debug/main_string_local_hello.doria"),
+            "exit_status: 0\nstdout: Doria\n",
+        ),
+        (
+            include_str!("../../../examples/debug/main_string_concat_hello.doria"),
+            "exit_status: 0\nstdout: Hello Doria!\n",
+        ),
+        (
+            include_str!("../../../examples/debug/main_string_concat_from_locals.doria"),
+            "exit_status: 0\nstdout: Hello Doria!\n",
+        ),
+        (
+            include_str!("../../../examples/debug/main_function_string_local_echo.doria"),
+            "exit_status: 0\nstdout: Hello Doria!\n",
+        ),
+        (
+            include_str!("../../../examples/debug/main_string_loop_echo_xxx.doria"),
+            "exit_status: 0\nstdout: xxx\n",
+        ),
+        (
+            include_str!("../../../examples/debug/main_string_if_echo.doria"),
+            "exit_status: 0\nstdout: Hello Doria!\n",
+        ),
+    ] {
+        assert_eq!(debug_contents(source), expected);
+    }
+}
+
+#[test]
+fn stage_11g_matches_native_smoke_for_string_echo_shapes_without_linker() {
+    for (source, expected_stdout) in [
+        (
+            include_str!("../../../examples/debug/main_string_concat_hello.doria"),
+            b"Hello Doria!".as_slice(),
+        ),
+        (
+            include_str!("../../../examples/debug/main_string_loop_echo_xxx.doria"),
+            b"xxx".as_slice(),
+        ),
+    ] {
+        let hir = doriac::lower_source("test.doria", source).expect("source should lower to HIR");
+        let native_exit = doriac::codegen_native::validate_stage_2d(&hir)
+            .expect("native smoke validator should already accept this source");
+        let mir_output = interpret(source);
+
+        assert_eq!(native_exit, 0);
+        assert_eq!(mir_output.exit_status, native_exit);
+        assert_eq!(mir_output.stdout, expected_stdout);
     }
 }

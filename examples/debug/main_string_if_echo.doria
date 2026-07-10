@@ -1,0 +1,8 @@
+function main(): void
+{
+    let $name = "Doria";
+
+    if (true) {
+        echo "Hello " . $name . "!";
+    }
+}

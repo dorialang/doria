@@ -38,6 +38,12 @@ enum FunctionOutcome {
     Void,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum LocalValue {
+    Int(i64),
+    String(String),
+}
+
 struct Interpreter<'program> {
     program: &'program mir::Program,
     stdout: Vec<u8>,
@@ -138,7 +144,12 @@ impl Interpreter<'_> {
             }
         }
         for (parameter, value) in function.params.iter().zip(args.iter().copied()) {
-            assign_local(&mut locals, *parameter, value)?;
+            assign_local(
+                &function.locals,
+                &mut locals,
+                *parameter,
+                LocalValue::Int(value),
+            )?;
         }
 
         let mut current_block = function.entry_block;
@@ -175,9 +186,13 @@ impl Interpreter<'_> {
                 match statement {
                     mir::Statement::AssignLocal { target, value } => {
                         let value = self.eval_rvalue(value, &locals, depth)?;
-                        assign_local(&mut locals, *target, value)?;
+                        assign_local(&function.locals, &mut locals, *target, value)?;
                     }
                     mir::Statement::EchoStringLiteral(value) => {
+                        self.stdout.extend_from_slice(value.as_bytes());
+                    }
+                    mir::Statement::EchoString(value) => {
+                        let value = eval_string_expression(value, &locals)?;
                         self.stdout.extend_from_slice(value.as_bytes());
                     }
                     mir::Statement::CallVoid { function, args } => {
@@ -233,18 +248,21 @@ impl Interpreter<'_> {
     fn eval_rvalue(
         &mut self,
         value: &mir::Rvalue,
-        locals: &[Option<i64>],
+        locals: &[Option<LocalValue>],
         depth: usize,
-    ) -> Result<i64, InterpreterError> {
+    ) -> Result<LocalValue, InterpreterError> {
         match value {
-            mir::Rvalue::Use(operand) => eval_operand(operand, locals),
+            mir::Rvalue::Use(operand) => eval_operand(operand, locals).map(LocalValue::Int),
             mir::Rvalue::Binary { op, left, right } => {
                 let left = eval_operand(left, locals)?;
                 let right = eval_operand(right, locals)?;
-                eval_binary(*op, left, right)
+                eval_binary(*op, left, right).map(LocalValue::Int)
             }
-            mir::Rvalue::Call { function, args } => {
-                self.eval_int_call(*function, args, locals, depth)
+            mir::Rvalue::Call { function, args } => self
+                .eval_int_call(*function, args, locals, depth)
+                .map(LocalValue::Int),
+            mir::Rvalue::String(value) => {
+                eval_string_expression(value, locals).map(LocalValue::String)
             }
         }
     }
@@ -252,7 +270,7 @@ impl Interpreter<'_> {
     fn eval_int_expression(
         &mut self,
         expression: &mir::IntExpression,
-        locals: &[Option<i64>],
+        locals: &[Option<LocalValue>],
         depth: usize,
     ) -> Result<i64, InterpreterError> {
         match expression {
@@ -272,7 +290,7 @@ impl Interpreter<'_> {
         &mut self,
         function: mir::FunctionId,
         args: &[mir::IntExpression],
-        locals: &[Option<i64>],
+        locals: &[Option<LocalValue>],
         depth: usize,
     ) -> Result<i64, InterpreterError> {
         let args = self.eval_call_args(args, locals, depth)?;
@@ -288,7 +306,7 @@ impl Interpreter<'_> {
     fn eval_call_args(
         &mut self,
         args: &[mir::IntExpression],
-        locals: &[Option<i64>],
+        locals: &[Option<LocalValue>],
         depth: usize,
     ) -> Result<Vec<i64>, InterpreterError> {
         args.iter()
@@ -299,7 +317,7 @@ impl Interpreter<'_> {
     fn eval_condition(
         &mut self,
         condition: &mir::Condition,
-        locals: &[Option<i64>],
+        locals: &[Option<LocalValue>],
         depth: usize,
     ) -> Result<bool, InterpreterError> {
         match condition {
@@ -358,10 +376,42 @@ fn eval_compare(op: mir::CompareOp, left: i64, right: i64) -> bool {
     }
 }
 
-fn eval_operand(operand: &mir::Operand, locals: &[Option<i64>]) -> Result<i64, InterpreterError> {
+fn eval_operand(
+    operand: &mir::Operand,
+    locals: &[Option<LocalValue>],
+) -> Result<i64, InterpreterError> {
     match operand {
         mir::Operand::Int(value) => Ok(*value),
-        mir::Operand::Local(id) => read_local(locals, *id),
+        mir::Operand::Local(id) => match read_local(locals, *id)? {
+            LocalValue::Int(value) => Ok(*value),
+            LocalValue::String(_) => Err(InterpreterError::new(format!(
+                "MIR string local local{} was used as an int value",
+                id.0
+            ))),
+        },
+    }
+}
+
+fn eval_string_expression(
+    expression: &mir::StringExpression,
+    locals: &[Option<LocalValue>],
+) -> Result<String, InterpreterError> {
+    match expression {
+        mir::StringExpression::Literal(value) => Ok(value.clone()),
+        mir::StringExpression::Local(id) => match read_local(locals, *id)? {
+            LocalValue::String(value) => Ok(value.clone()),
+            LocalValue::Int(_) => Err(InterpreterError::new(format!(
+                "MIR int local local{} was used as a string value",
+                id.0
+            ))),
+        },
+        mir::StringExpression::Concat(parts) => {
+            let mut value = String::new();
+            for part in parts {
+                value.push_str(&eval_string_expression(part, locals)?);
+            }
+            Ok(value)
+        }
     }
 }
 
@@ -379,11 +429,14 @@ fn eval_binary(op: mir::BinaryOp, left: i64, right: i64) -> Result<i64, Interpre
     }
 }
 
-fn read_local(locals: &[Option<i64>], id: mir::LocalId) -> Result<i64, InterpreterError> {
+fn read_local(
+    locals: &[Option<LocalValue>],
+    id: mir::LocalId,
+) -> Result<&LocalValue, InterpreterError> {
     let slot = locals
         .get(id.0)
         .ok_or_else(|| InterpreterError::new(format!("MIR local local{} does not exist", id.0)))?;
-    slot.ok_or_else(|| {
+    slot.as_ref().ok_or_else(|| {
         InterpreterError::new(format!(
             "MIR local local{} was read before assignment",
             id.0
@@ -392,10 +445,30 @@ fn read_local(locals: &[Option<i64>], id: mir::LocalId) -> Result<i64, Interpret
 }
 
 fn assign_local(
-    locals: &mut [Option<i64>],
+    definitions: &[mir::Local],
+    locals: &mut [Option<LocalValue>],
     id: mir::LocalId,
-    value: i64,
+    value: LocalValue,
 ) -> Result<(), InterpreterError> {
+    let definition = definitions
+        .get(id.0)
+        .filter(|local| local.id == id)
+        .ok_or_else(|| InterpreterError::new(format!("MIR local local{} does not exist", id.0)))?;
+    let compatible = matches!(
+        (definition.ty, &value),
+        (mir::Type::Int, LocalValue::Int(_)) | (mir::Type::String, LocalValue::String(_))
+    );
+    if !compatible {
+        let actual = match value {
+            LocalValue::Int(_) => "int",
+            LocalValue::String(_) => "string",
+        };
+        return Err(InterpreterError::new(format!(
+            "MIR local local{} has type {}, but assignment produced {actual}",
+            id.0, definition.ty
+        )));
+    }
+
     let slot = locals
         .get_mut(id.0)
         .ok_or_else(|| InterpreterError::new(format!("MIR local local{} does not exist", id.0)))?;
