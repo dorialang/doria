@@ -25,6 +25,7 @@ pub struct Program {
 pub struct Function {
     pub id: FunctionId,
     pub name: String,
+    pub params: Vec<LocalId>,
     pub return_type: ReturnType,
     pub locals: Vec<Local>,
     pub blocks: Vec<BasicBlock>,
@@ -72,6 +73,10 @@ pub enum Rvalue {
         left: Operand,
         right: Operand,
     },
+    Call {
+        function: FunctionId,
+        args: Vec<IntExpression>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,6 +93,10 @@ pub enum IntExpression {
         op: BinaryOp,
         left: Box<IntExpression>,
         right: Box<IntExpression>,
+    },
+    Call {
+        function: FunctionId,
+        args: Vec<IntExpression>,
     },
 }
 
@@ -126,8 +135,15 @@ pub enum ConditionBinaryOp {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Statement {
-    AssignLocal { target: LocalId, value: Rvalue },
+    AssignLocal {
+        target: LocalId,
+        value: Rvalue,
+    },
     EchoStringLiteral(String),
+    CallVoid {
+        function: FunctionId,
+        args: Vec<IntExpression>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -156,11 +172,22 @@ impl fmt::Display for Program {
 
 impl fmt::Display for Function {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        writeln!(
-            formatter,
-            "function {}(): {} {{",
-            self.name, self.return_type
-        )?;
+        write!(formatter, "function {}(", self.name)?;
+        for (index, parameter) in self.params.iter().enumerate() {
+            if index > 0 {
+                write!(formatter, ", ")?;
+            }
+            if let Some(local) = self
+                .locals
+                .get(parameter.0)
+                .filter(|local| local.id == *parameter)
+            {
+                write!(formatter, "${}: {}", local.name, local.ty)?;
+            } else {
+                write!(formatter, "local{}", parameter.0)?;
+            }
+        }
+        writeln!(formatter, "): {} {{", self.return_type)?;
         if !self.locals.is_empty() {
             writeln!(formatter, "locals:")?;
             for local in &self.locals {
@@ -237,6 +264,7 @@ impl fmt::Display for Rvalue {
         match self {
             Rvalue::Use(operand) => write!(formatter, "{operand}"),
             Rvalue::Binary { op, left, right } => write!(formatter, "{left} {op} {right}"),
+            Rvalue::Call { function, args } => write_call(formatter, *function, args),
         }
     }
 }
@@ -258,6 +286,7 @@ impl fmt::Display for IntExpression {
             IntExpression::Binary { op, left, right } => {
                 write!(formatter, "({left} {op} {right})")
             }
+            IntExpression::Call { function, args } => write_call(formatter, *function, args),
         }
     }
 }
@@ -307,6 +336,7 @@ impl fmt::Display for Statement {
             Statement::EchoStringLiteral(value) => {
                 write!(formatter, "echo \"{}\"", escape_debug_string(value))
             }
+            Statement::CallVoid { function, args } => write_call(formatter, *function, args),
         }
     }
 }
@@ -332,4 +362,19 @@ impl fmt::Display for Terminator {
 
 fn escape_debug_string(value: &str) -> String {
     value.escape_default().collect()
+}
+
+fn write_call<T: fmt::Display>(
+    formatter: &mut fmt::Formatter<'_>,
+    function: FunctionId,
+    args: &[T],
+) -> fmt::Result {
+    write!(formatter, "call function{}(", function.0)?;
+    for (index, arg) in args.iter().enumerate() {
+        if index > 0 {
+            write!(formatter, ", ")?;
+        }
+        write!(formatter, "{arg}")?;
+    }
+    write!(formatter, ")")
 }

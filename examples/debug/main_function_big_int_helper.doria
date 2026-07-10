@@ -1,0 +1,11 @@
+function big(): int
+{
+    return 9223372036854775807;
+}
+
+function main(): int
+{
+    let $value = big();
+
+    return 0;
+}

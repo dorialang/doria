@@ -1,0 +1,14 @@
+function forty(): int
+{
+    return 40;
+}
+
+function answer(): int
+{
+    return forty() + 2;
+}
+
+function main(): int
+{
+    return answer();
+}

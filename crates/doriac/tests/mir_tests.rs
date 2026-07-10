@@ -16,22 +16,22 @@ fn interpret(source: &str) -> doriac::mir_interpreter::InterpreterOutput {
 
 fn unsupported(source: &str) -> Vec<doriac::diagnostics::Diagnostic> {
     doriac::lower_source_to_mir("test.doria", source)
-        .expect_err("source should be outside Stage 11e MIR coverage")
+        .expect_err("source should be outside Stage 11f MIR coverage")
 }
 
 fn unsupported_after_parsing(source: &str) -> Vec<doriac::diagnostics::Diagnostic> {
     let ast = doriac::parse_source("test.doria", source).expect("source should parse");
     let hir = doriac::lowering::lower_program(&ast);
     doriac::mir_lowering::lower_program(&hir)
-        .expect_err("HIR should be outside Stage 11e MIR coverage")
+        .expect_err("HIR should be outside Stage 11f MIR coverage")
 }
 
-fn assert_stage_11e_unsupported(diagnostics: &[doriac::diagnostics::Diagnostic], detail: &str) {
+fn assert_stage_11f_unsupported(diagnostics: &[doriac::diagnostics::Diagnostic], detail: &str) {
     assert_eq!(diagnostics[0].code, "M1101");
     assert!(
         diagnostics[0]
             .message
-            .contains("unsupported MIR Stage 11e coverage"),
+            .contains("unsupported MIR Stage 11f coverage"),
         "unexpected diagnostic: {}",
         diagnostics[0].message
     );
@@ -62,6 +62,7 @@ fn conditional_program(condition: Condition, then_status: i64, else_status: i64)
         functions: vec![Function {
             id: FunctionId(0),
             name: "main".to_string(),
+            params: Vec::new(),
             return_type: ReturnType::Int,
             locals: vec![Local {
                 id: LocalId(0),
@@ -723,6 +724,7 @@ fn interpreter_reports_arithmetic_overflow() {
         functions: vec![Function {
             id: FunctionId(0),
             name: "main".to_string(),
+            params: Vec::new(),
             return_type: ReturnType::Int,
             locals: vec![Local {
                 id: LocalId(0),
@@ -855,7 +857,7 @@ fn rejects_unsupported_division_as_mir_coverage() {
 "#,
     );
 
-    assert_stage_11e_unsupported(&diagnostics, "division and modulo");
+    assert_stage_11f_unsupported(&diagnostics, "division and modulo");
 }
 
 #[test]
@@ -868,7 +870,7 @@ fn rejects_comparison_result_as_runtime_value() {
 "#,
     );
 
-    assert_stage_11e_unsupported(&diagnostics, "condition-only");
+    assert_stage_11f_unsupported(&diagnostics, "condition-only");
 }
 
 #[test]
@@ -882,7 +884,7 @@ fn rejects_unsupported_string_local_as_mir_coverage() {
 "#,
     );
 
-    assert_stage_11e_unsupported(&diagnostics, "string locals");
+    assert_stage_11f_unsupported(&diagnostics, "string locals");
 }
 
 #[test]
@@ -895,12 +897,12 @@ fn rejects_unsupported_string_concat_echo_as_mir_coverage() {
 "#,
     );
 
-    assert_stage_11e_unsupported(&diagnostics, "string concatenation");
+    assert_stage_11f_unsupported(&diagnostics, "string concatenation");
 }
 
 #[test]
-fn rejects_unsupported_helper_function_as_mir_coverage() {
-    let diagnostics = unsupported(
+fn lowers_multiple_top_level_functions_in_declaration_order() {
+    let program = lower(
         r#"function helper(): int
 {
     return 1;
@@ -913,7 +915,12 @@ function main(): int
 "#,
     );
 
-    assert_stage_11e_unsupported(&diagnostics, "no helper functions");
+    assert_eq!(program.functions.len(), 2);
+    assert_eq!(program.functions[0].id, FunctionId(0));
+    assert_eq!(program.functions[0].name, "helper");
+    assert_eq!(program.functions[1].id, FunctionId(1));
+    assert_eq!(program.functions[1].name, "main");
+    assert_eq!(program.entry, FunctionId(1));
 }
 
 #[test]
@@ -1312,6 +1319,7 @@ fn interpreter_rejects_repeated_mir_state_cycles() {
         functions: vec![Function {
             id: FunctionId(0),
             name: "main".to_string(),
+            params: Vec::new(),
             return_type: ReturnType::Void,
             locals: Vec::new(),
             blocks: vec![BasicBlock {
@@ -1365,7 +1373,7 @@ fn rejects_truthiness_and_calls_as_stage_11c_conditions() {
 }
 "#,
     );
-    assert_stage_11e_unsupported(&truthiness, "truthiness");
+    assert_stage_11f_unsupported(&truthiness, "truthiness");
 
     let call = unsupported_after_parsing(
         r#"function main(): int
@@ -1378,7 +1386,7 @@ fn rejects_truthiness_and_calls_as_stage_11c_conditions() {
 }
 "#,
     );
-    assert_stage_11e_unsupported(&call, "calls in conditions");
+    assert_stage_11f_unsupported(&call, "calls in conditions");
 }
 
 #[test]
@@ -1677,7 +1685,7 @@ fn rejects_break_and_continue_outside_loops_in_mir_lowering() {
         ),
     ] {
         let diagnostics = unsupported_after_parsing(source);
-        assert_stage_11e_unsupported(&diagnostics, detail);
+        assert_stage_11f_unsupported(&diagnostics, detail);
     }
 }
 
@@ -2277,7 +2285,7 @@ fn rejects_unsupported_stage_11e_foreach_shapes() {
 }
 "#,
     );
-    assert_stage_11e_unsupported(&collection, "collection and general iterable foreach");
+    assert_stage_11f_unsupported(&collection, "collection and general iterable foreach");
 
     let key_value = unsupported_after_parsing(
         r#"function main(): void
@@ -2287,7 +2295,7 @@ fn rejects_unsupported_stage_11e_foreach_shapes() {
 }
 "#,
     );
-    assert_stage_11e_unsupported(&key_value, "key bindings");
+    assert_stage_11f_unsupported(&key_value, "key bindings");
 
     let call_bound = unsupported_after_parsing(
         r#"function main(): void
@@ -2297,7 +2305,7 @@ fn rejects_unsupported_stage_11e_foreach_shapes() {
 }
 "#,
     );
-    assert_stage_11e_unsupported(&call_bound, "function calls");
+    assert_stage_11f_unsupported(&call_bound, "unknown top-level function `limit`");
 }
 
 #[test]
@@ -2401,4 +2409,476 @@ fn range_foreach_binding_remains_readonly_before_mir_lowering() {
     .expect_err("semantic checking should reject mutation of a foreach binding");
 
     assert_eq!(diagnostics[0].code, "E0201");
+}
+
+#[test]
+fn stage_11f_requires_exactly_one_main() {
+    let missing = unsupported_after_parsing(
+        r#"function helper(): int
+{
+    return 42;
+}
+"#,
+    );
+    assert_stage_11f_unsupported(&missing, "exactly one top-level function main");
+
+    let duplicate = unsupported_after_parsing(
+        r#"function main(): int
+{
+    return 0;
+}
+
+function main(): int
+{
+    return 1;
+}
+"#,
+    );
+    assert_stage_11f_unsupported(&duplicate, "exactly one top-level function main");
+}
+
+#[test]
+fn stage_11f_lowers_int_parameters_to_function_locals() {
+    let program = lower(include_str!(
+        "../../../examples/debug/main_function_add_42.doria"
+    ));
+    let add = &program.functions[0];
+
+    assert_eq!(add.name, "add");
+    assert_eq!(add.params, vec![LocalId(0), LocalId(1)]);
+    assert_eq!(add.locals.len(), 3);
+    assert_eq!(add.locals[0].name, "left");
+    assert_eq!(add.locals[1].name, "right");
+    assert!(!add.locals[0].synthetic);
+    assert!(!add.locals[1].synthetic);
+    assert_eq!(add.locals[0].ty, Type::Int);
+    assert_eq!(add.locals[1].ty, Type::Int);
+}
+
+#[test]
+fn stage_11f_lowers_int_calls_in_returns_and_arithmetic() {
+    let add_program = lower(include_str!(
+        "../../../examples/debug/main_function_add_42.doria"
+    ));
+    let main = &add_program.functions[1];
+    assert_eq!(
+        main.blocks[0].statements[0],
+        Statement::AssignLocal {
+            target: LocalId(0),
+            value: Rvalue::Call {
+                function: FunctionId(0),
+                args: vec![
+                    IntExpression::Use(Operand::Int(20)),
+                    IntExpression::Use(Operand::Int(22)),
+                ],
+            },
+        }
+    );
+    assert_eq!(
+        main.blocks[0].terminator,
+        Terminator::Return(Operand::Local(LocalId(0)))
+    );
+
+    let chain_program = lower(include_str!(
+        "../../../examples/debug/main_function_chain_42.doria"
+    ));
+    let answer = &chain_program.functions[1];
+    assert!(answer.blocks[0].statements.iter().any(|statement| {
+        matches!(
+            statement,
+            Statement::AssignLocal {
+                value: Rvalue::Call {
+                    function: FunctionId(0),
+                    ..
+                },
+                ..
+            }
+        )
+    }));
+    assert!(answer.blocks[0].statements.iter().any(|statement| {
+        matches!(
+            statement,
+            Statement::AssignLocal {
+                value: Rvalue::Binary {
+                    op: BinaryOp::Add,
+                    ..
+                },
+                ..
+            }
+        )
+    }));
+}
+
+#[test]
+fn stage_11f_lowers_int_calls_in_comparisons() {
+    let program = lower(include_str!(
+        "../../../examples/debug/main_function_if_condition_42.doria"
+    ));
+    let main = &program.functions[1];
+
+    assert_eq!(
+        main.blocks[0].terminator,
+        Terminator::Branch {
+            condition: Condition::Compare {
+                op: CompareOp::Equal,
+                left: IntExpression::Call {
+                    function: FunctionId(0),
+                    args: Vec::new(),
+                },
+                right: IntExpression::Use(Operand::Int(42)),
+            },
+            then_block: BlockId(1),
+            else_block: BlockId(2),
+        }
+    );
+}
+
+#[test]
+fn stage_11f_lowers_void_calls_and_literal_echo_helpers() {
+    let program = lower(include_str!(
+        "../../../examples/debug/main_function_echo_hello.doria"
+    ));
+
+    assert_eq!(
+        program.functions[0].blocks[0].statements,
+        vec![Statement::EchoStringLiteral("Hello ".to_string())]
+    );
+    assert_eq!(
+        program.functions[1].blocks[0].statements,
+        vec![Statement::EchoStringLiteral("Doria!".to_string())]
+    );
+    assert_eq!(
+        program.functions[2].blocks[0].statements,
+        vec![
+            Statement::CallVoid {
+                function: FunctionId(0),
+                args: Vec::new(),
+            },
+            Statement::CallVoid {
+                function: FunctionId(1),
+                args: Vec::new(),
+            },
+        ]
+    );
+}
+
+#[test]
+fn stage_11f_helpers_reuse_existing_loop_lowering() {
+    let while_program = lower(include_str!(
+        "../../../examples/debug/main_function_loop_42.doria"
+    ));
+    assert!(while_program.functions[0].blocks.len() > 1);
+    assert_eq!(
+        interpret(include_str!(
+            "../../../examples/debug/main_function_loop_42.doria"
+        ))
+        .exit_status,
+        42
+    );
+
+    let for_output = interpret(
+        r#"function countWithFor(): int
+{
+    let writable $count = 0;
+
+    for (let writable $i = 0; $i < 3; $i++) {
+        $count++;
+    }
+
+    return $count;
+}
+
+function main(): int
+{
+    return countWithFor();
+}
+"#,
+    );
+    assert_eq!(for_output.exit_status, 3);
+}
+
+#[test]
+fn stage_11f_rejects_unsupported_helper_signatures() {
+    for (source, detail) in [
+        (
+            r#"function greet(string $name): void
+{
+    echo "Hello";
+}
+
+function main(): void
+{
+}
+"#,
+            "supports only int parameters",
+        ),
+        (
+            r#"function title(): string
+{
+    return "Doria";
+}
+
+function main(): void
+{
+}
+"#,
+            "supports only int and void returns",
+        ),
+        (
+            r#"function ok(): bool
+{
+    return true;
+}
+
+function main(): void
+{
+}
+"#,
+            "supports only int and void returns",
+        ),
+    ] {
+        let diagnostics = unsupported(source);
+        assert_stage_11f_unsupported(&diagnostics, detail);
+    }
+}
+
+#[test]
+fn stage_11f_rejects_calls_with_the_wrong_result_context() {
+    let ignored_int = unsupported_after_parsing(
+        r#"function one(): int
+{
+    return 1;
+}
+
+function main(): void
+{
+    one();
+}
+"#,
+    );
+    assert_stage_11f_unsupported(&ignored_int, "cannot be used as a statement");
+
+    let void_as_int = unsupported_after_parsing(
+        r#"function hello(): void
+{
+}
+
+function main(): int
+{
+    return hello();
+}
+"#,
+    );
+    assert_stage_11f_unsupported(&void_as_int, "cannot be used as an integer expression");
+}
+
+#[test]
+fn stage_11f_limits_call_arguments_to_stage_11b_integer_expressions() {
+    let diagnostics = unsupported_after_parsing(
+        r#"function one(): int
+{
+    return 1;
+}
+
+function add(int $left, int $right): int
+{
+    return $left + $right;
+}
+
+function main(): int
+{
+    return add(one(), 41);
+}
+"#,
+    );
+
+    assert_stage_11f_unsupported(
+        &diagnostics,
+        "call arguments support only Stage 11b integer expressions",
+    );
+}
+
+#[test]
+fn stage_11f_rejects_direct_recursion_before_interpretation() {
+    let diagnostics = unsupported(
+        r#"function count(int $n): int
+{
+    if ($n == 0) {
+        return 0;
+    }
+
+    return count($n - 1);
+}
+
+function main(): int
+{
+    return count(1);
+}
+"#,
+    );
+
+    assert_stage_11f_unsupported(&diagnostics, "recursive calls are not supported");
+}
+
+#[test]
+fn stage_11f_rejects_mutual_recursion_before_interpretation() {
+    let diagnostics = unsupported(
+        r#"function a(): int
+{
+    return b();
+}
+
+function b(): int
+{
+    return a();
+}
+
+function main(): int
+{
+    return a();
+}
+"#,
+    );
+
+    assert_stage_11f_unsupported(&diagnostics, "mutual recursion is not supported");
+}
+
+#[test]
+fn stage_11f_interprets_call_arguments_and_preserves_caller_locals() {
+    let argument_output = interpret(
+        r#"function add(int $left, int $right): int
+{
+    return $left + $right;
+}
+
+function main(): int
+{
+    return add(10 + 10, 22);
+}
+"#,
+    );
+    assert_eq!(argument_output.exit_status, 42);
+
+    let caller_output = interpret(
+        r#"function increment(writable int $value): int
+{
+    $value++;
+
+    return $value;
+}
+
+function main(): int
+{
+    let writable $value = 41;
+    let $incremented = increment($value);
+
+    return $value;
+}
+"#,
+    );
+    assert_eq!(caller_output.exit_status, 41);
+}
+
+#[test]
+fn stage_11f_helper_ints_are_not_process_status_bounded() {
+    let output = interpret(include_str!(
+        "../../../examples/debug/main_function_big_int_helper.doria"
+    ));
+
+    assert_eq!(output.exit_status, 0);
+    assert!(output.stdout.is_empty());
+}
+
+#[test]
+fn stage_11f_stdout_accumulates_across_void_helper_calls() {
+    let output = interpret(include_str!(
+        "../../../examples/debug/main_function_echo_hello.doria"
+    ));
+
+    assert_eq!(output.exit_status, 0);
+    assert_eq!(output.stdout, b"Hello Doria!");
+}
+
+#[test]
+fn stage_11f_debug_target_handles_all_examples() {
+    for (source, expected) in [
+        (
+            include_str!("../../../examples/debug/main_function_add_42.doria"),
+            "exit_status: 42\nstdout:\n",
+        ),
+        (
+            include_str!("../../../examples/debug/main_function_chain_42.doria"),
+            "exit_status: 42\nstdout:\n",
+        ),
+        (
+            include_str!("../../../examples/debug/main_function_loop_42.doria"),
+            "exit_status: 42\nstdout:\n",
+        ),
+        (
+            include_str!("../../../examples/debug/main_function_echo_hello.doria"),
+            "exit_status: 0\nstdout: Hello Doria!\n",
+        ),
+        (
+            include_str!("../../../examples/debug/main_function_big_int_helper.doria"),
+            "exit_status: 0\nstdout:\n",
+        ),
+        (
+            include_str!("../../../examples/debug/main_function_if_condition_42.doria"),
+            "exit_status: 42\nstdout:\n",
+        ),
+    ] {
+        assert_eq!(debug_contents(source), expected);
+    }
+}
+
+#[test]
+fn stage_11f_interpreter_has_a_defensive_call_depth_limit() {
+    let program = Program {
+        functions: vec![Function {
+            id: FunctionId(0),
+            name: "main".to_string(),
+            params: Vec::new(),
+            return_type: ReturnType::Int,
+            locals: vec![Local {
+                id: LocalId(0),
+                name: "_tmp0".to_string(),
+                ty: Type::Int,
+                writable: false,
+                synthetic: true,
+            }],
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                statements: vec![Statement::AssignLocal {
+                    target: LocalId(0),
+                    value: Rvalue::Call {
+                        function: FunctionId(0),
+                        args: Vec::new(),
+                    },
+                }],
+                terminator: Terminator::Return(Operand::Local(LocalId(0))),
+            }],
+            entry_block: BlockId(0),
+        }],
+        entry: FunctionId(0),
+    };
+
+    let error = doriac::mir_interpreter::interpret(&program)
+        .expect_err("malformed recursive MIR should hit the defensive call-depth limit");
+    assert!(error.message.contains("call-depth limit of 256 frames"));
+}
+
+#[test]
+fn stage_11f_matches_native_smoke_for_supported_helpers_without_linker() {
+    for source in [
+        include_str!("../../../examples/debug/main_function_add_42.doria"),
+        include_str!("../../../examples/debug/main_function_loop_42.doria"),
+    ] {
+        let hir = doriac::lower_source("test.doria", source).expect("source should lower to HIR");
+        let native_exit = doriac::codegen_native::validate_stage_2d(&hir)
+            .expect("native smoke validator should already accept this source");
+        let mir_exit = interpret(source).exit_status;
+
+        assert_eq!(native_exit, 42);
+        assert_eq!(mir_exit, native_exit);
+    }
 }
