@@ -248,7 +248,7 @@ jobs:
           test "${release_status}" -eq 42
           test "${integer_panic_status}" -eq 101
           test "${float_panic_status}" -eq 101
-          grep -Fx "Panic: integer overflow in addition" build/native/main_add_overflow_panic.stderr
+          grep -Fx "Panic: integer overflow during addition" build/native/main_add_overflow_panic.stderr
           grep -Fx "Stack Trace:" build/native/main_add_overflow_panic.stderr
           grep -Fx "Panic: float-to-integer conversion out of range" build/native/main_float_to_int_nan_panic.stderr
           grep -Fx "Stack Trace:" build/native/main_float_to_int_nan_panic.stderr
@@ -266,7 +266,7 @@ jobs:
           if ($LASTEXITCODE -ne 101) { throw "integer panic status was $LASTEXITCODE" }
           & build/native/main_float_to_int_nan_panic.exe 2>build/native/main_float_to_int_nan_panic.stderr
           if ($LASTEXITCODE -ne 101) { throw "float panic status was $LASTEXITCODE" }
-          if (-not (Select-String -Path build/native/main_add_overflow_panic.stderr -SimpleMatch "Panic: integer overflow in addition")) { throw "missing integer panic" }
+          if (-not (Select-String -Path build/native/main_add_overflow_panic.stderr -SimpleMatch "Panic: integer overflow during addition")) { throw "missing integer panic" }
           if (-not (Select-String -Path build/native/main_add_overflow_panic.stderr -SimpleMatch "Stack Trace:")) { throw "missing integer stack trace" }
           if (-not (Select-String -Path build/native/main_float_to_int_nan_panic.stderr -SimpleMatch "Panic: float-to-integer conversion out of range")) { throw "missing float panic" }
           if (-not (Select-String -Path build/native/main_float_to_int_nan_panic.stderr -SimpleMatch "Stack Trace:")) { throw "missing float stack trace" }
