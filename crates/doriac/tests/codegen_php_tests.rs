@@ -259,6 +259,44 @@ function divide(int $left, int $right): int
 }
 
 #[test]
+fn php_backend_maps_float64_and_allows_float_arithmetic() {
+    let php = doriac::compile_source_to_php(
+        "test.doria",
+        r#"
+function total(): float64
+{
+    writable float $value = 1.5 + 2.5;
+    $value += 1.0;
+    return $value;
+}
+"#,
+    )
+    .expect("PHP should preserve default float arithmetic");
+
+    assert!(php.contains("function total(): float"));
+    assert!(php.contains("$value = 1.5 + 2.5;"));
+    assert!(php.contains("$value += 1.0;"));
+    assert!(!php.contains("float64"));
+}
+
+#[test]
+fn php_backend_rejects_float32_precision() {
+    let diagnostics = doriac::compile_source_to_php(
+        "test.doria",
+        r#"
+function identity(float32 $value): float32
+{
+    return $value;
+}
+"#,
+    )
+    .expect_err("PHP must not emit `float32` as an unknown PHP type");
+
+    assert_eq!(diagnostics[0].code, "B1301");
+    assert!(diagnostics[0].message.contains("`float32` precision"));
+}
+
+#[test]
 fn parenthesizes_unary_not_operands_for_php() {
     let php = doriac::compile_source_to_php(
         "test.doria",

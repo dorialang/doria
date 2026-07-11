@@ -1,4 +1,6 @@
 use doriac::diagnostics::Diagnostic;
+use doriac::hir;
+use doriac::numeric::FloatType;
 
 fn check(source: &str) {
     doriac::check_source("test.doria", source)
@@ -40,7 +42,80 @@ function values(float32 $single, float64 $wide): float
     float $default = 1.0;
     return $default;
 }
+
+function single(): float32
+{
+    return 1.0;
+}
 "#,
+    );
+}
+
+#[test]
+fn preserves_float32_and_float64_as_distinct_semantic_types() {
+    for source in [
+        r#"
+float64 $wide = 1.0;
+float32 $narrow = $wide;
+"#,
+        r#"
+function take(float32 $value): void
+{
+}
+
+float64 $wide = 1.0;
+take($wide);
+"#,
+        r#"
+float32 $left = 1.0;
+float64 $right = 2.0;
+let $result = $left + $right;
+"#,
+    ] {
+        let diagnostics = reject(source);
+        assert!(
+            diagnostics.iter().any(|diagnostic| {
+                diagnostic.code == "E0403"
+                    || diagnostic.code == "E0408"
+                    || diagnostic.code == "E0441"
+            }),
+            "float-width mismatch was not rejected: {diagnostics:#?}"
+        );
+    }
+}
+
+#[test]
+fn hir_semantic_info_retains_contextual_float_widths() {
+    let hir = doriac::lower_source(
+        "test.doria",
+        r#"
+function values(): float64
+{
+    float32 $single = 1.0;
+    float64 $wide = 2.0;
+    return $wide;
+}
+"#,
+    )
+    .expect("width-correct float declarations should lower to HIR");
+
+    let hir::Item::Function(function) = &hir.items[0] else {
+        panic!("expected a function");
+    };
+    let hir::Stmt::VarDecl(single) = &function.body.statements[0] else {
+        panic!("expected the float32 declaration");
+    };
+    let hir::Stmt::VarDecl(wide) = &function.body.statements[1] else {
+        panic!("expected the float64 declaration");
+    };
+
+    assert_eq!(
+        hir.semantic_info.float_type(single.initializer.span()),
+        Some(FloatType::Float32)
+    );
+    assert_eq!(
+        hir.semantic_info.float_type(wide.initializer.span()),
+        Some(FloatType::Float64)
     );
 }
 
@@ -71,6 +146,7 @@ fn rejects_every_required_contextual_literal_boundary() {
         "uint8 $value = -1;",
         "uint64 $value = 18446744073709551616;",
         "let $value = 18446744073709551615;",
+        "mixed $value = 18446744073709551615;",
     ] {
         let diagnostics = reject(source);
         assert!(

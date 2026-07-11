@@ -2,6 +2,34 @@ use std::cmp::Ordering;
 use std::fmt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum FloatType {
+    Float32,
+    Float64,
+}
+
+impl FloatType {
+    pub fn from_source_name(name: &str) -> Option<Self> {
+        match name {
+            "float32" => Some(Self::Float32),
+            "float" | "float64" => Some(Self::Float64),
+            _ => None,
+        }
+    }
+
+    /// Canonical diagnostic spelling. `float64` shares the `float` identity.
+    pub const fn source_name(self) -> &'static str {
+        match self {
+            Self::Float32 => "float32",
+            Self::Float64 => "float",
+        }
+    }
+
+    pub const fn is_default_float(self) -> bool {
+        matches!(self, Self::Float64)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum IntegerType {
     Int8,
     Int16,

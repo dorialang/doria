@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::fmt;
 
-pub use crate::numeric::IntegerType;
+pub use crate::numeric::{FloatType, IntegerType};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TypeRef {
@@ -71,7 +71,7 @@ pub struct TypeId(usize);
 pub enum TypeKind {
     Void,
     Integer(IntegerType),
-    Float,
+    Float(FloatType),
     String,
     Bool,
     Null,
@@ -127,7 +127,7 @@ impl TypeRegistry {
         match self.kind(id) {
             TypeKind::Void => "void".to_string(),
             TypeKind::Integer(integer) => integer.source_name().to_string(),
-            TypeKind::Float => "float".to_string(),
+            TypeKind::Float(float) => float.source_name().to_string(),
             TypeKind::String => "string".to_string(),
             TypeKind::Bool => "bool".to_string(),
             TypeKind::Null => "null".to_string(),

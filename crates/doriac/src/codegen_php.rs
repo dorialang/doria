@@ -3,7 +3,8 @@ use std::collections::{HashMap, HashSet};
 use crate::backend::BackendError;
 use crate::diagnostics::Diagnostic;
 use crate::hir::*;
-use crate::numeric::{parse_decimal_magnitude, IntegerType};
+use crate::numeric::{parse_decimal_magnitude, FloatType, IntegerType};
+use crate::semantics::SemanticInfo;
 use crate::source::Span;
 use crate::types::TypeRef;
 
@@ -26,12 +27,12 @@ pub fn generate(program: &Program) -> Result<String, BackendError> {
 
 fn validate_program(program: &Program) -> Result<(), BackendError> {
     for item in &program.items {
-        validate_item(item)?;
+        validate_item(item, &program.semantic_info)?;
     }
     Ok(())
 }
 
-fn validate_item(item: &Item) -> Result<(), BackendError> {
+fn validate_item(item: &Item, semantic_info: &SemanticInfo) -> Result<(), BackendError> {
     match item {
         Item::Class(class_decl) => {
             for member in &class_decl.members {
@@ -39,30 +40,33 @@ fn validate_item(item: &Item) -> Result<(), BackendError> {
                     ClassMember::Property(property) => {
                         validate_type(&property.ty, property.span)?;
                         if let Some(initializer) = &property.initializer {
-                            validate_expr(initializer)?;
+                            validate_expr(initializer, semantic_info)?;
                         }
                     }
-                    ClassMember::Method(method) => validate_function(method)?,
+                    ClassMember::Method(method) => validate_function(method, semantic_info)?,
                 }
             }
             Ok(())
         }
-        Item::Function(function) => validate_function(function),
-        Item::Statement(statement) => validate_statement(statement),
+        Item::Function(function) => validate_function(function, semantic_info),
+        Item::Statement(statement) => validate_statement(statement, semantic_info),
     }
 }
 
-fn validate_function(function: &FunctionDecl) -> Result<(), BackendError> {
+fn validate_function(
+    function: &FunctionDecl,
+    semantic_info: &SemanticInfo,
+) -> Result<(), BackendError> {
     for param in &function.params {
         validate_type(&param.ty, param.span)?;
         if let Some(default) = &param.default {
-            validate_expr(default)?;
+            validate_expr(default, semantic_info)?;
         }
     }
     if let Some(return_type) = &function.return_type {
         validate_type(return_type, function.span)?;
     }
-    validate_block(&function.body)
+    validate_block(&function.body, semantic_info)
 }
 
 fn validate_type(ty: &TypeRef, span: Span) -> Result<(), BackendError> {
@@ -77,39 +81,47 @@ fn validate_type(ty: &TypeRef, span: Span) -> Result<(), BackendError> {
             ));
         }
     }
+    if let Some(float) = FloatType::from_source_name(&ty.name) {
+        if !float.is_default_float() {
+            return Err(unsupported_numeric_shape(
+                span,
+                "Doria `float32` precision with PHP's platform `float` type",
+            ));
+        }
+    }
     for argument in &ty.args {
         validate_type(argument, span)?;
     }
     Ok(())
 }
 
-fn validate_block(block: &Block) -> Result<(), BackendError> {
+fn validate_block(block: &Block, semantic_info: &SemanticInfo) -> Result<(), BackendError> {
     for statement in &block.statements {
-        validate_statement(statement)?;
+        validate_statement(statement, semantic_info)?;
     }
     Ok(())
 }
 
-fn validate_statement(statement: &Stmt) -> Result<(), BackendError> {
+fn validate_statement(statement: &Stmt, semantic_info: &SemanticInfo) -> Result<(), BackendError> {
     match statement {
         Stmt::VarDecl(decl) => {
             if let Some(ty) = &decl.ty {
                 validate_type(ty, decl.span)?;
             }
-            validate_expr(&decl.initializer)
+            validate_expr(&decl.initializer, semantic_info)
         }
-        Stmt::Assignment(assignment) => validate_assignment(assignment),
-        Stmt::Echo { expr, .. } => validate_expr(expr),
+        Stmt::Assignment(assignment) => validate_assignment(assignment, semantic_info),
+        Stmt::Echo { expr, .. } => validate_expr(expr, semantic_info),
         Stmt::Return { expr, .. } => {
             if let Some(expr) = expr {
-                validate_expr(expr)?;
+                validate_expr(expr, semantic_info)?;
             }
             Ok(())
         }
-        Stmt::If(if_stmt) => validate_if(if_stmt),
+        Stmt::If(if_stmt) => validate_if(if_stmt, semantic_info),
         Stmt::While(while_stmt) => {
-            validate_expr(&while_stmt.condition)?;
-            validate_block(&while_stmt.body)
+            validate_expr(&while_stmt.condition, semantic_info)?;
+            validate_block(&while_stmt.body, semantic_info)
         }
         Stmt::For(for_stmt) => {
             if let Some(initializer) = &for_stmt.initializer {
@@ -118,15 +130,15 @@ fn validate_statement(statement: &Stmt) -> Result<(), BackendError> {
                         if let Some(ty) = &decl.ty {
                             validate_type(ty, decl.span)?;
                         }
-                        validate_expr(&decl.initializer)?;
+                        validate_expr(&decl.initializer, semantic_info)?;
                     }
                     ForInitializer::Assignment(assignment) => {
-                        validate_assignment(assignment)?;
+                        validate_assignment(assignment, semantic_info)?;
                     }
                 }
             }
             if let Some(condition) = &for_stmt.condition {
-                validate_expr(condition)?;
+                validate_expr(condition, semantic_info)?;
             }
             if let Some(increment) = &for_stmt.increment {
                 match increment {
@@ -134,15 +146,15 @@ fn validate_statement(statement: &Stmt) -> Result<(), BackendError> {
                         return Err(unsupported_increment(increment));
                     }
                     ForIncrement::Assignment(assignment) => {
-                        validate_assignment(assignment)?;
+                        validate_assignment(assignment, semantic_info)?;
                     }
                 }
             }
-            validate_block(&for_stmt.body)
+            validate_block(&for_stmt.body, semantic_info)
         }
         Stmt::Break { .. } | Stmt::Continue { .. } => Ok(()),
         Stmt::Foreach(foreach) => {
-            validate_expr(&foreach.iterable)?;
+            validate_expr(&foreach.iterable, semantic_info)?;
             if let Some(key) = &foreach.key {
                 if let Some(ty) = &key.ty {
                     validate_type(ty, foreach.span)?;
@@ -151,28 +163,42 @@ fn validate_statement(statement: &Stmt) -> Result<(), BackendError> {
             if let Some(ty) = &foreach.value.ty {
                 validate_type(ty, foreach.span)?;
             }
-            validate_block(&foreach.body)
+            validate_block(&foreach.body, semantic_info)
         }
         Stmt::Increment(increment) => Err(unsupported_increment(increment)),
-        Stmt::Expr { expr, .. } => validate_expr(expr),
+        Stmt::Expr { expr, .. } => validate_expr(expr, semantic_info),
     }
 }
 
-fn validate_if(if_stmt: &IfStmt) -> Result<(), BackendError> {
-    validate_expr(&if_stmt.condition)?;
-    validate_block(&if_stmt.then_block)?;
+fn validate_if(if_stmt: &IfStmt, semantic_info: &SemanticInfo) -> Result<(), BackendError> {
+    validate_expr(&if_stmt.condition, semantic_info)?;
+    validate_block(&if_stmt.then_block, semantic_info)?;
     if let Some(else_branch) = &if_stmt.else_branch {
         match else_branch {
-            ElseBranch::If(else_if) => validate_if(else_if)?,
-            ElseBranch::Block(block) => validate_block(block)?,
+            ElseBranch::If(else_if) => validate_if(else_if, semantic_info)?,
+            ElseBranch::Block(block) => validate_block(block, semantic_info)?,
         }
     }
     Ok(())
 }
 
-fn validate_assignment(assignment: &Assignment) -> Result<(), BackendError> {
+fn validate_assignment(
+    assignment: &Assignment,
+    semantic_info: &SemanticInfo,
+) -> Result<(), BackendError> {
+    validate_expr(&assignment.target, semantic_info)?;
+    validate_expr(&assignment.value, semantic_info)?;
+
+    // Semantic checking has already required compound-assignment operands to
+    // have one compatible numeric type. The value metadata is sufficient here
+    // because assignment targets are not expression-valued in Doria IR.
+    let float_assignment = semantic_info.float_type(assignment.value.span()).is_some();
     let feature = match assignment.op {
         AssignOp::Assign => None,
+        AssignOp::AddAssign if float_assignment => None,
+        AssignOp::SubAssign if float_assignment => None,
+        AssignOp::MulAssign if float_assignment => None,
+        AssignOp::DivAssign if float_assignment => None,
         AssignOp::AddAssign => Some("checked integer overflow behavior for `+=`"),
         AssignOp::SubAssign => Some("checked integer overflow behavior for `-=`"),
         AssignOp::MulAssign => Some("checked integer overflow behavior for `*=`"),
@@ -187,8 +213,7 @@ fn validate_assignment(assignment: &Assignment) -> Result<(), BackendError> {
     if let Some(feature) = feature {
         return Err(unsupported_integer_shape(assignment.span, feature));
     }
-    validate_expr(&assignment.target)?;
-    validate_expr(&assignment.value)
+    Ok(())
 }
 
 fn unsupported_increment(increment: &IncrementStmt) -> BackendError {
@@ -202,7 +227,7 @@ fn unsupported_increment(increment: &IncrementStmt) -> BackendError {
     )
 }
 
-fn validate_expr(expr: &Expr) -> Result<(), BackendError> {
+fn validate_expr(expr: &Expr, semantic_info: &SemanticInfo) -> Result<(), BackendError> {
     match expr {
         Expr::Variable { .. }
         | Expr::This { .. }
@@ -225,7 +250,7 @@ fn validate_expr(expr: &Expr) -> Result<(), BackendError> {
         Expr::InterpolatedString { parts, .. } => {
             for part in parts {
                 if let InterpolatedStringPart::Expr(expr) = part {
-                    validate_expr(expr)?;
+                    validate_expr(expr, semantic_info)?;
                 }
             }
             Ok(())
@@ -233,18 +258,20 @@ fn validate_expr(expr: &Expr) -> Result<(), BackendError> {
         Expr::Array { elements, .. } => {
             for element in elements {
                 if let Some(key) = &element.key {
-                    validate_expr(key)?;
+                    validate_expr(key, semantic_info)?;
                 }
-                validate_expr(&element.value)?;
+                validate_expr(&element.value, semantic_info)?;
             }
             Ok(())
         }
-        Expr::PropertyAccess { object, .. } => validate_expr(object),
+        Expr::PropertyAccess { object, .. } => validate_expr(object, semantic_info),
         Expr::MethodCall { object, args, .. } => {
-            validate_expr(object)?;
-            validate_exprs(args)
+            validate_expr(object, semantic_info)?;
+            validate_exprs(args, semantic_info)
         }
-        Expr::FunctionCall { args, .. } | Expr::New { args, .. } => validate_exprs(args),
+        Expr::FunctionCall { args, .. } | Expr::New { args, .. } => {
+            validate_exprs(args, semantic_info)
+        }
         Expr::StaticCall {
             class_name,
             method,
@@ -259,19 +286,20 @@ fn validate_expr(expr: &Expr) -> Result<(), BackendError> {
                     ),
                 ));
             }
-            validate_exprs(args)
+            validate_exprs(args, semantic_info)
         }
-        Expr::Grouped { expr, .. } => validate_expr(expr),
+        Expr::Grouped { expr, .. } => validate_expr(expr, semantic_info),
         Expr::Unary { op, expr, span } => {
             let feature = match op {
                 UnaryOp::Not => None,
+                UnaryOp::Negate if semantic_info.float_type(expr.span()).is_some() => None,
                 UnaryOp::Negate => Some("checked integer overflow behavior for unary `-`"),
                 UnaryOp::BitwiseNot => Some("fixed-width Doria bitwise semantics for `~`"),
             };
             if let Some(feature) = feature {
                 return Err(unsupported_integer_shape(*span, feature));
             }
-            validate_expr(expr)
+            validate_expr(expr, semantic_info)
         }
         Expr::Binary {
             left,
@@ -279,7 +307,20 @@ fn validate_expr(expr: &Expr) -> Result<(), BackendError> {
             right,
             span,
         } => {
+            validate_expr(left, semantic_info)?;
+            validate_expr(right, semantic_info)?;
+            let float_operands = matches!(
+                (
+                    semantic_info.float_type(left.span()),
+                    semantic_info.float_type(right.span()),
+                ),
+                (Some(left), Some(right)) if left == right
+            );
             let feature = match op {
+                BinaryOp::Add if float_operands => None,
+                BinaryOp::Sub if float_operands => None,
+                BinaryOp::Mul if float_operands => None,
+                BinaryOp::Div if float_operands => None,
                 BinaryOp::Add => Some("checked integer overflow behavior for `+`"),
                 BinaryOp::Sub => Some("checked integer overflow behavior for `-`"),
                 BinaryOp::Mul => Some("checked integer overflow behavior for `*`"),
@@ -305,24 +346,27 @@ fn validate_expr(expr: &Expr) -> Result<(), BackendError> {
             if let Some(feature) = feature {
                 return Err(unsupported_integer_shape(*span, feature));
             }
-            validate_expr(left)?;
-            validate_expr(right)
+            Ok(())
         }
         Expr::Range { start, end, .. } => {
-            validate_expr(start)?;
-            validate_expr(end)
+            validate_expr(start, semantic_info)?;
+            validate_expr(end, semantic_info)
         }
     }
 }
 
-fn validate_exprs(expressions: &[Expr]) -> Result<(), BackendError> {
+fn validate_exprs(expressions: &[Expr], semantic_info: &SemanticInfo) -> Result<(), BackendError> {
     for expression in expressions {
-        validate_expr(expression)?;
+        validate_expr(expression, semantic_info)?;
     }
     Ok(())
 }
 
 fn unsupported_integer_shape(span: Span, feature: impl Into<String>) -> BackendError {
+    unsupported_numeric_shape(span, feature)
+}
+
+fn unsupported_numeric_shape(span: Span, feature: impl Into<String>) -> BackendError {
     BackendError::from_diagnostics(vec![Diagnostic::new(
         PHP_INTEGER_UNSUPPORTED_CODE,
         format!(
@@ -531,18 +575,16 @@ fn emit_statement(
         Stmt::Assignment(assignment) => {
             let op = match assignment.op {
                 AssignOp::Assign => "=",
-                AssignOp::AddAssign
-                | AssignOp::SubAssign
-                | AssignOp::MulAssign
-                | AssignOp::DivAssign
-                | AssignOp::ModAssign
-                | AssignOp::ShiftLeftAssign
-                | AssignOp::ShiftRightAssign
-                | AssignOp::BitwiseAndAssign
-                | AssignOp::BitwiseOrAssign
-                | AssignOp::BitwiseXorAssign => {
-                    unreachable!("unsupported integer assignment passed PHP capability validation")
-                }
+                AssignOp::AddAssign => "+=",
+                AssignOp::SubAssign => "-=",
+                AssignOp::MulAssign => "*=",
+                AssignOp::DivAssign => "/=",
+                AssignOp::ModAssign => "%=",
+                AssignOp::ShiftLeftAssign => "<<=",
+                AssignOp::ShiftRightAssign => ">>=",
+                AssignOp::BitwiseAndAssign => "&=",
+                AssignOp::BitwiseOrAssign => "|=",
+                AssignOp::BitwiseXorAssign => "^=",
             };
             writeln(
                 output,
@@ -691,18 +733,16 @@ fn emit_for_increment(increment: &ForIncrement, scopes: &PhpNameScopes) -> Strin
 fn emit_assignment(assignment: &Assignment, scopes: &PhpNameScopes) -> String {
     let op = match assignment.op {
         AssignOp::Assign => "=",
-        AssignOp::AddAssign
-        | AssignOp::SubAssign
-        | AssignOp::MulAssign
-        | AssignOp::DivAssign
-        | AssignOp::ModAssign
-        | AssignOp::ShiftLeftAssign
-        | AssignOp::ShiftRightAssign
-        | AssignOp::BitwiseAndAssign
-        | AssignOp::BitwiseOrAssign
-        | AssignOp::BitwiseXorAssign => {
-            unreachable!("unsupported integer assignment passed PHP capability validation")
-        }
+        AssignOp::AddAssign => "+=",
+        AssignOp::SubAssign => "-=",
+        AssignOp::MulAssign => "*=",
+        AssignOp::DivAssign => "/=",
+        AssignOp::ModAssign => "%=",
+        AssignOp::ShiftLeftAssign => "<<=",
+        AssignOp::ShiftRightAssign => ">>=",
+        AssignOp::BitwiseAndAssign => "&=",
+        AssignOp::BitwiseOrAssign => "|=",
+        AssignOp::BitwiseXorAssign => "^=",
     };
     format!(
         "{} {} {}",
@@ -953,7 +993,8 @@ fn emit_expr(expr: &Expr, scopes: &PhpNameScopes) -> String {
         Expr::Grouped { expr, .. } => format!("({})", emit_expr(expr, scopes)),
         Expr::Unary { op, expr, .. } => match op {
             UnaryOp::Not => format!("!({})", emit_expr(expr, scopes)),
-            UnaryOp::Negate | UnaryOp::BitwiseNot => {
+            UnaryOp::Negate => format!("-({})", emit_expr(expr, scopes)),
+            UnaryOp::BitwiseNot => {
                 unreachable!("unsupported integer unary operator passed PHP capability validation")
             }
         },
@@ -1021,18 +1062,16 @@ fn emit_php_string_literal(value: &str) -> String {
 
 fn emit_binary_op(op: &BinaryOp) -> &'static str {
     match op {
-        BinaryOp::Add
-        | BinaryOp::Sub
-        | BinaryOp::Mul
-        | BinaryOp::Div
-        | BinaryOp::Mod
-        | BinaryOp::ShiftLeft
-        | BinaryOp::ShiftRight
-        | BinaryOp::BitwiseAnd
-        | BinaryOp::BitwiseXor
-        | BinaryOp::BitwiseOr => {
-            unreachable!("unsupported integer binary operator passed PHP capability validation")
-        }
+        BinaryOp::Add => "+",
+        BinaryOp::Sub => "-",
+        BinaryOp::Mul => "*",
+        BinaryOp::Div => "/",
+        BinaryOp::Mod => "%",
+        BinaryOp::ShiftLeft => "<<",
+        BinaryOp::ShiftRight => ">>",
+        BinaryOp::BitwiseAnd => "&",
+        BinaryOp::BitwiseXor => "^",
+        BinaryOp::BitwiseOr => "|",
         BinaryOp::Concat => ".",
         BinaryOp::Equal => "===",
         BinaryOp::NotEqual => "!==",
@@ -1057,6 +1096,7 @@ fn emit_member_access(access: &MemberAccess) -> &'static str {
 fn php_type(ty: &TypeRef) -> String {
     match ty.name.as_str() {
         "int" | "int64" => "int".to_string(),
+        "float" | "float32" | "float64" => "float".to_string(),
         "List" | "Dictionary" | "Set" | "[]" => "array".to_string(),
         name => name.to_string(),
     }

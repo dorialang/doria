@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::ast::*;
 use crate::diagnostics::{Diagnostic, DiagnosticResult};
-use crate::numeric::{parse_decimal_magnitude, IntegerType, IntegerValue};
+use crate::numeric::{parse_decimal_magnitude, FloatType, IntegerType, IntegerValue};
 use crate::source::Span;
 use crate::symbols::{
     Binding, ClassInfo, FunctionInfo, MethodInfo, ParamInfo, PropertyInfo, PropertyInitState,
@@ -18,11 +18,19 @@ pub struct SemanticInfo {
     /// lowering pass can consume semantic decisions without re-parsing type
     /// names or guessing contextual literal types.
     pub integer_expression_types: HashMap<(usize, usize), IntegerType>,
+    /// Canonical width for every floating-point-valued source expression.
+    pub float_expression_types: HashMap<(usize, usize), FloatType>,
 }
 
 impl SemanticInfo {
     pub fn integer_type(&self, span: Span) -> Option<IntegerType> {
         self.integer_expression_types
+            .get(&(span.start, span.end))
+            .copied()
+    }
+
+    pub fn float_type(&self, span: Span) -> Option<FloatType> {
+        self.float_expression_types
             .get(&(span.start, span.end))
             .copied()
     }
@@ -34,6 +42,7 @@ pub fn analyze_program(program: &Program) -> DiagnosticResult<SemanticInfo> {
     if checker.diagnostics.is_empty() {
         Ok(SemanticInfo {
             integer_expression_types: checker.integer_expression_types,
+            float_expression_types: checker.float_expression_types,
         })
     } else {
         Err(checker.diagnostics)
@@ -52,6 +61,10 @@ struct Checker<'program> {
     types: TypeRegistry,
     diagnostics: Vec<Diagnostic>,
     integer_expression_types: HashMap<(usize, usize), IntegerType>,
+    float_expression_types: HashMap<(usize, usize), FloatType>,
+    integer_literals: HashMap<(usize, usize), u128>,
+    negative_integer_literals: HashMap<(usize, usize), u128>,
+    negated_integer_literal_operands: HashSet<(usize, usize)>,
 }
 
 #[derive(Debug, Clone)]
@@ -176,6 +189,10 @@ impl<'program> Checker<'program> {
             types: TypeRegistry::new(),
             diagnostics: Vec::new(),
             integer_expression_types: HashMap::new(),
+            float_expression_types: HashMap::new(),
+            integer_literals: HashMap::new(),
+            negative_integer_literals: HashMap::new(),
+            negated_integer_literal_operands: HashSet::new(),
         }
     }
 
@@ -194,6 +211,7 @@ impl<'program> Checker<'program> {
                 Item::Class(class_decl) => self.check_class(class_decl),
             }
         }
+        self.check_pending_integer_literal_ranges();
     }
 
     fn collect_classes(&mut self) {
@@ -948,12 +966,12 @@ impl<'program> Checker<'program> {
             if let Some(integer) = IntegerType::from_source_name(&ty.name) {
                 return self.types.intern(TypeKind::Integer(integer));
             }
+            if let Some(float) = FloatType::from_source_name(&ty.name) {
+                return self.types.intern(TypeKind::Float(float));
+            }
         }
         match ty.name.as_str() {
             "void" if ty.args.is_empty() => self.types.intern(TypeKind::Void),
-            "float" | "float32" | "float64" if ty.args.is_empty() => {
-                self.types.intern(TypeKind::Float)
-            }
             "string" if ty.args.is_empty() => self.types.intern(TypeKind::String),
             "bool" if ty.args.is_empty() => self.types.intern(TypeKind::Bool),
             "mixed" if ty.args.is_empty() => self.types.intern(TypeKind::Mixed),
@@ -1696,6 +1714,9 @@ impl<'program> Checker<'program> {
                 if let TypeKind::Integer(integer) = *self.types.kind(target.ty) {
                     self.contextualize_integer_literals(&assignment.value, integer);
                     value_ty = self.infer_expr_type(&assignment.value, scopes, method_context);
+                } else if let TypeKind::Float(float) = *self.types.kind(target.ty) {
+                    self.contextualize_float_literals(&assignment.value, float);
+                    value_ty = self.infer_expr_type(&assignment.value, scopes, method_context);
                 }
                 let target_contains_mixed = self.type_contains_mixed(target.ty);
                 let value_contains_mixed = self.type_contains_mixed(value_ty);
@@ -2135,7 +2156,18 @@ impl<'program> Checker<'program> {
             Expr::Grouped { expr, .. } => {
                 self.check_expr_with_range_context(expr, scopes, method_context, allow_range_expr)
             }
-            Expr::Unary { op, expr, .. } => {
+            Expr::Unary { op, expr, span } => {
+                if *op == UnaryOp::Negate {
+                    if let (Some(magnitude), Some(operand_span)) = (
+                        Self::unsigned_integer_literal_magnitude(expr),
+                        Self::unsigned_integer_literal_span(expr),
+                    ) {
+                        self.negative_integer_literals
+                            .insert((span.start, span.end), magnitude);
+                        self.negated_integer_literal_operands
+                            .insert((operand_span.start, operand_span.end));
+                    }
+                }
                 self.check_expr(expr, scopes, method_context);
                 self.check_unary_operand(op, expr, scopes, method_context);
             }
@@ -2170,7 +2202,10 @@ impl<'program> Checker<'program> {
             | Expr::Bool { .. }
             | Expr::Null { .. } => {}
             Expr::Int { value, span } => {
-                if parse_decimal_magnitude(value).is_none() {
+                if let Some(magnitude) = parse_decimal_magnitude(value) {
+                    self.integer_literals
+                        .insert((span.start, span.end), magnitude);
+                } else {
                     self.report_integer_literal_range(*span, IntegerType::Int64);
                 }
             }
@@ -2268,6 +2303,37 @@ impl<'program> Checker<'program> {
         self.diagnostics.push(diagnostic);
     }
 
+    fn check_pending_integer_literal_ranges(&mut self) {
+        let mut literals = Vec::new();
+        for ((start, end), magnitude) in &self.integer_literals {
+            if self
+                .negated_integer_literal_operands
+                .contains(&(*start, *end))
+            {
+                continue;
+            }
+            literals.push((*start, *end, *magnitude, false));
+        }
+        literals.extend(
+            self.negative_integer_literals
+                .iter()
+                .map(|((start, end), magnitude)| (*start, *end, *magnitude, true)),
+        );
+        literals.sort_unstable_by_key(|(start, end, _, _)| (*start, *end));
+
+        for (start, end, magnitude, negative) in literals {
+            let span = Span { start, end };
+            let target = self
+                .integer_expression_types
+                .get(&(start, end))
+                .copied()
+                .unwrap_or(IntegerType::Int64);
+            if IntegerValue::from_literal(target, magnitude, negative).is_none() {
+                self.report_integer_literal_range(span, target);
+            }
+        }
+    }
+
     fn integer_literal_parts(expr: &Expr) -> Option<(u128, bool)> {
         match expr {
             Expr::Int { value, .. } => parse_decimal_magnitude(value).map(|value| (value, false)),
@@ -2285,6 +2351,14 @@ impl<'program> Checker<'program> {
         match expr {
             Expr::Int { value, .. } => parse_decimal_magnitude(value),
             Expr::Grouped { expr, .. } => Self::unsigned_integer_literal_magnitude(expr),
+            _ => None,
+        }
+    }
+
+    fn unsigned_integer_literal_span(expr: &Expr) -> Option<Span> {
+        match expr {
+            Expr::Int { span, .. } => Some(*span),
+            Expr::Grouped { expr, .. } => Self::unsigned_integer_literal_span(expr),
             _ => None,
         }
     }
@@ -2353,6 +2427,45 @@ impl<'program> Checker<'program> {
             } => {
                 self.contextualize_integer_literals(left, target);
                 self.contextualize_integer_literals(right, target);
+            }
+            _ => {}
+        }
+    }
+
+    fn is_float_literal(expr: &Expr) -> bool {
+        match expr {
+            Expr::Float { .. } => true,
+            Expr::Grouped { expr, .. } => Self::is_float_literal(expr),
+            _ => false,
+        }
+    }
+
+    fn record_float_expression_type(&mut self, expr: &Expr, float: FloatType) {
+        self.float_expression_types
+            .insert((expr.span().start, expr.span().end), float);
+        if let Expr::Grouped { expr, .. } = expr {
+            self.record_float_expression_type(expr, float);
+        }
+    }
+
+    fn contextualize_float_literals(&mut self, expr: &Expr, target: FloatType) {
+        if Self::is_float_literal(expr) {
+            self.record_float_expression_type(expr, target);
+            return;
+        }
+
+        match expr {
+            Expr::Grouped { expr, .. } => self.contextualize_float_literals(expr, target),
+            Expr::Binary {
+                left,
+                op: BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Mod,
+                right,
+                ..
+            } => {
+                self.contextualize_float_literals(left, target);
+                self.contextualize_float_literals(right, target);
+                self.float_expression_types
+                    .insert((expr.span().start, expr.span().end), target);
             }
             _ => {}
         }
@@ -2469,7 +2582,10 @@ impl<'program> Checker<'program> {
                     (TypeKind::Integer(left), TypeKind::Integer(right)) if left == right
                 ) || matches!(
                     (self.types.kind(left_ty), self.types.kind(right_ty)),
-                    (TypeKind::Float, TypeKind::Float) | (TypeKind::String, TypeKind::String)
+                    (TypeKind::Float(left), TypeKind::Float(right)) if left == right
+                ) || matches!(
+                    (self.types.kind(left_ty), self.types.kind(right_ty)),
+                    (TypeKind::String, TypeKind::String)
                 ) || matches!(
                     (self.types.kind(left_ty), self.types.kind(right_ty)),
                     (TypeKind::Unknown, _) | (_, TypeKind::Unknown)
@@ -2500,7 +2616,7 @@ impl<'program> Checker<'program> {
         let compatible_float = !integers_only
             && matches!(
                 (self.types.kind(left_ty), self.types.kind(right_ty)),
-                (TypeKind::Float, TypeKind::Float)
+                (TypeKind::Float(left), TypeKind::Float(right)) if left == right
             );
         let recovering = matches!(
             (self.types.kind(left_ty), self.types.kind(right_ty)),
@@ -2886,7 +3002,7 @@ impl<'program> Checker<'program> {
             self.types.kind(ty),
             TypeKind::String
                 | TypeKind::Integer(_)
-                | TypeKind::Float
+                | TypeKind::Float(_)
                 | TypeKind::Bool
                 | TypeKind::Null
                 | TypeKind::Unknown
@@ -3618,15 +3734,16 @@ impl<'program> Checker<'program> {
             return self.resolve_zero_arg_type(ty, span, TypeKind::Integer(integer));
         }
 
+        if let Some(float) = FloatType::from_source_name(&ty.name) {
+            return self.resolve_zero_arg_type(ty, span, TypeKind::Float(float));
+        }
+
         match ty.name.as_str() {
             "void" if position == TypePosition::Return => {
                 self.resolve_zero_arg_type(ty, span, TypeKind::Void)
             }
             "void" => {
                 self.reject_type_ref(ty, span, "E0430", "`void` is only valid as a return type")
-            }
-            "float" | "float32" | "float64" => {
-                self.resolve_zero_arg_type(ty, span, TypeKind::Float)
             }
             "string" => self.resolve_zero_arg_type(ty, span, TypeKind::String),
             "bool" => self.resolve_zero_arg_type(ty, span, TypeKind::Bool),
@@ -3843,11 +3960,15 @@ impl<'program> Checker<'program> {
         method_context: Option<&MethodContext>,
         destination: AssignmentDestination,
     ) -> bool {
-        if let TypeKind::Integer(integer) = *self.types.kind(target) {
-            if let Some(fits) = self.check_contextual_integer_literal(value_expr, integer) {
-                return fits;
+        match *self.types.kind(target) {
+            TypeKind::Integer(integer) => {
+                if let Some(fits) = self.check_contextual_integer_literal(value_expr, integer) {
+                    return fits;
+                }
+                self.contextualize_integer_literals(value_expr, integer);
             }
-            self.contextualize_integer_literals(value_expr, integer);
+            TypeKind::Float(float) => self.contextualize_float_literals(value_expr, float),
+            _ => {}
         }
 
         let value = self.infer_expr_type(value_expr, scopes, method_context);
@@ -3894,11 +4015,15 @@ impl<'program> Checker<'program> {
         scopes: &ScopeStack,
         method_context: Option<&MethodContext>,
     ) -> bool {
-        if let TypeKind::Integer(integer) = *self.types.kind(target) {
-            if let Some(fits) = self.check_contextual_integer_literal(value_expr, integer) {
-                return fits;
+        match *self.types.kind(target) {
+            TypeKind::Integer(integer) => {
+                if let Some(fits) = self.check_contextual_integer_literal(value_expr, integer) {
+                    return fits;
+                }
+                self.contextualize_integer_literals(value_expr, integer);
             }
-            self.contextualize_integer_literals(value_expr, integer);
+            TypeKind::Float(float) => self.contextualize_float_literals(value_expr, float),
+            _ => {}
         }
 
         match value_expr {
@@ -4036,9 +4161,16 @@ impl<'program> Checker<'program> {
         method_context: Option<&MethodContext>,
     ) -> TypeId {
         let ty = self.infer_expr_type_unrecorded(expr, scopes, method_context);
-        if let TypeKind::Integer(integer) = self.types.kind(ty) {
-            self.integer_expression_types
-                .insert((expr.span().start, expr.span().end), *integer);
+        match self.types.kind(ty) {
+            TypeKind::Integer(integer) => {
+                self.integer_expression_types
+                    .insert((expr.span().start, expr.span().end), *integer);
+            }
+            TypeKind::Float(float) => {
+                self.float_expression_types
+                    .insert((expr.span().start, expr.span().end), *float);
+            }
+            _ => {}
         }
         ty
     }
@@ -4061,7 +4193,14 @@ impl<'program> Checker<'program> {
                     .unwrap_or(IntegerType::Int64);
                 self.types.intern(TypeKind::Integer(integer))
             }
-            Expr::Float { .. } => self.types.intern(TypeKind::Float),
+            Expr::Float { span, .. } => {
+                let float = self
+                    .float_expression_types
+                    .get(&(span.start, span.end))
+                    .copied()
+                    .unwrap_or(FloatType::Float64);
+                self.types.intern(TypeKind::Float(float))
+            }
             Expr::Bool { .. } => self.types.intern(TypeKind::Bool),
             Expr::Null { .. } => self.types.intern(TypeKind::Null),
             Expr::New { class_name, .. } => {
@@ -4254,6 +4393,29 @@ impl<'program> Checker<'program> {
             right_ty = self.types.intern(TypeKind::Integer(integer));
         }
 
+        let left_float_literal = Self::is_float_literal(left);
+        let right_float_literal = Self::is_float_literal(right);
+        let left_float = match self.types.kind(left_ty) {
+            TypeKind::Float(float) => Some(*float),
+            _ => None,
+        };
+        let right_float = match self.types.kind(right_ty) {
+            TypeKind::Float(float) => Some(*float),
+            _ => None,
+        };
+
+        if left_float_literal && !right_float_literal {
+            if let Some(float) = right_float {
+                self.record_float_expression_type(left, float);
+                left_ty = self.types.intern(TypeKind::Float(float));
+            }
+        } else if right_float_literal && !left_float_literal {
+            if let Some(float) = left_float {
+                self.record_float_expression_type(right, float);
+                right_ty = self.types.intern(TypeKind::Float(float));
+            }
+        }
+
         (left_ty, right_ty)
     }
 
@@ -4268,7 +4430,9 @@ impl<'program> Checker<'program> {
             (TypeKind::Integer(left), TypeKind::Integer(right)) if left == right => {
                 self.types.intern(TypeKind::Integer(left))
             }
-            (TypeKind::Float, TypeKind::Float) => self.types.intern(TypeKind::Float),
+            (TypeKind::Float(left), TypeKind::Float(right)) if left == right => {
+                self.types.intern(TypeKind::Float(left))
+            }
             _ => self.types.intern(TypeKind::Heterogeneous),
         }
     }
@@ -4310,9 +4474,10 @@ impl<'program> Checker<'program> {
             (TypeKind::Integer(left), TypeKind::Integer(right)) if left == right => {
                 self.types.intern(TypeKind::Bool)
             }
-            (TypeKind::Float, TypeKind::Float) | (TypeKind::String, TypeKind::String) => {
+            (TypeKind::Float(left), TypeKind::Float(right)) if left == right => {
                 self.types.intern(TypeKind::Bool)
             }
+            (TypeKind::String, TypeKind::String) => self.types.intern(TypeKind::Bool),
             _ => self.types.intern(TypeKind::Heterogeneous),
         }
     }
