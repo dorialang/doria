@@ -195,10 +195,13 @@ jobs:
           $vcpkg = (Get-Command vcpkg -ErrorAction Stop).Source
           & $vcpkg install "libxml2[core]:x64-windows-static"
           if ($LASTEXITCODE -ne 0) { throw "failed to install LLVM's static libxml2 dependency" }
-          $libxml = Join-Path (Split-Path $vcpkg) "installed\x64-windows-static\lib\libxml2s.lib"
-          if (-not (Test-Path $libxml)) { throw "vcpkg did not provide libxml2s.lib at $libxml" }
+          $libxmlDirectory = Join-Path (Split-Path $vcpkg) "installed\x64-windows-static\lib"
+          $libxml = Join-Path $libxmlDirectory "libxml2s.lib"
+          if (-not (Test-Path $libxml)) { $libxml = Join-Path $libxmlDirectory "libxml2.lib" }
+          if (-not (Test-Path $libxml)) { throw "vcpkg did not provide a static libxml2 library in $libxmlDirectory" }
           Copy-Item $libxml (Join-Path $prefix "lib\libxml2s.lib")
           "LLVM_SYS_181_PREFIX=$prefix" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "RUSTFLAGS=-l bcrypt" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           (Join-Path $prefix "bin") | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
       - name: Confirm pinned LLVM major on Unix
