@@ -549,10 +549,6 @@ fn integer_conversion_hover_at(tokens: &[Token], token_index: usize) -> Option<&
         return Some(description);
     }
 
-    if let Some(description) = cross_kind_conversion_description(name) {
-        return Some(description);
-    }
-
     if token_index < 2 {
         return None;
     }
@@ -573,8 +569,8 @@ fn integer_conversion_hover_at(tokens: &[Token], token_index: usize) -> Option<&
 
 fn cross_kind_conversion_description(name: &str) -> Option<&'static str> {
     match name {
-        "Int::toFloat" | "toFloat" => Some("`Int::toFloat(value)` converts canonical `int`/`int64` to canonical `float`/`float64` using IEEE 754 round-to-nearest, ties-to-even, without panicking."),
-        "Float::toInt" | "toInt" => Some("`Float::toInt(value)` truncates canonical `float`/`float64` toward zero to canonical `int`/`int64`; NaN, infinity, and out-of-range values panic."),
+        "Int::toFloat" => Some("`Int::toFloat(value)` converts canonical `int`/`int64` to canonical `float`/`float64` using IEEE 754 round-to-nearest, ties-to-even, without panicking."),
+        "Float::toInt" => Some("`Float::toInt(value)` truncates canonical `float`/`float64` toward zero to canonical `int`/`int64`; NaN, infinity, and out-of-range values panic."),
         _ => None,
     }
 }
@@ -1035,6 +1031,15 @@ mod tests {
             let offset = source.find(method).unwrap() + 1;
             let hover = hover_at_offset(source, offset).expect("intrinsic should have hover");
             assert!(hover["contents"]["value"].as_str().unwrap().contains(label));
+        }
+
+        for name in ["toFloat", "toInt"] {
+            let source = format!("function {name}(): int {{ return 42; }}");
+            let offset = source.find(name).unwrap() + 1;
+            assert!(
+                hover_at_offset(&source, offset).is_none(),
+                "unqualified user function {name} must not receive intrinsic hover text"
+            );
         }
     }
 

@@ -1687,7 +1687,16 @@ fn validate_float_expression(
         mir::FloatExpression::Negate { operand, .. } => {
             validate_float_expression(program, function, operand)
         }
-        mir::FloatExpression::Binary { left, right, .. } => {
+        mir::FloatExpression::Binary {
+            ty, left, right, ..
+        } => {
+            if left.ty() != *ty || right.ty() != *ty {
+                return Err(malformed_mir(format!(
+                    "{ty} binary expression has {} and {} operands",
+                    left.ty(),
+                    right.ty()
+                )));
+            }
             validate_float_expression(program, function, left)?;
             validate_float_expression(program, function, right)
         }

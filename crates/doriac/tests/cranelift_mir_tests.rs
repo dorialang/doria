@@ -1,8 +1,8 @@
 use doriac::mir::{
-    BasicBlock, BlockId, Function, FunctionId, IntegerExpression, LocalId, Operand, Program,
-    ReturnType, Statement, Terminator,
+    BasicBlock, BlockId, FloatBinaryOp, FloatExpression, Function, FunctionId, IntegerExpression,
+    LocalId, Operand, Program, ReturnType, ScalarType, Statement, Terminator, ValueExpression,
 };
-use doriac::numeric::IntegerType;
+use doriac::numeric::{FloatType, FloatValue, IntegerType};
 
 fn assert_object(source: &str) {
     let program =
@@ -293,6 +293,36 @@ fn rejects_non_int64_process_main_return_type() {
     assert!(error
         .message
         .contains("entry function must return void or int/int64"));
+}
+
+#[test]
+fn rejects_mixed_width_float_binary_operands() {
+    let mut program = void_program();
+    program.functions.push(Function {
+        id: FunctionId(1),
+        name: "mixedWidth".to_string(),
+        params: Vec::new(),
+        return_type: ReturnType::Value(ScalarType::Float(FloatType::Float64)),
+        locals: Vec::new(),
+        blocks: vec![BasicBlock {
+            id: BlockId(0),
+            statements: Vec::new(),
+            terminator: Terminator::Return(ValueExpression::Float(FloatExpression::Binary {
+                ty: FloatType::Float64,
+                op: FloatBinaryOp::Add,
+                left: Box::new(FloatExpression::constant(FloatValue::from_f32(1.0))),
+                right: Box::new(FloatExpression::constant(FloatValue::from_f64(2.0))),
+            })),
+        }],
+        entry_block: BlockId(0),
+    });
+
+    let error = doriac::codegen_cranelift::lower_mir_to_object(&program)
+        .expect_err("mixed-width float operands should fail before object emission");
+    assert!(error.message.contains("malformed MIR"));
+    assert!(error
+        .message
+        .contains("float binary expression has float32 and float operands"));
 }
 
 #[test]

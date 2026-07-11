@@ -417,6 +417,10 @@ function check_vscode_grammar(): void
             "VS Code grammar must classify '{$operator}' as a logical operator"
         );
     }
+    require_check(
+        !any_match($logicalSymbolMatches, static fn (string $match): bool => regex_matches($match, '!=')),
+        "VS Code logical-operator patterns must not split the accepted '!=' operator"
+    );
 
     foreach ($strictComparison as $operator) {
         foreach ($normalOperatorMatches as $match) {

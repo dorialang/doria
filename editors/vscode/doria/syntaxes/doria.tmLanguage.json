@@ -630,7 +630,7 @@
         },
         {
           "name": "keyword.operator.logical.symbol.doria",
-          "match": "&&|\\|\\||!"
+          "match": "&&|\\|\\||!(?!=)"
         },
         {
           "name": "keyword.operator.doria",
