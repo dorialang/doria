@@ -166,6 +166,12 @@ jobs:
         with:
           components: clippy
 
+      - name: Configure MSVC developer environment
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
       - name: Install LLVM 18 on Linux
         if: runner.os == 'Linux'
         shell: bash
@@ -212,7 +218,9 @@ jobs:
       - name: Confirm pinned LLVM major on Windows
         if: runner.os == 'Windows'
         shell: pwsh
-        run: '& "$env:LLVM_SYS_181_PREFIX\bin\llvm-config.exe" --version'
+        run: |
+          & "$env:LLVM_SYS_181_PREFIX\bin\llvm-config.exe" --version
+          cl.exe /? | Out-Null
 
       - name: Build optimized doria-rt and select it explicitly
         shell: bash
