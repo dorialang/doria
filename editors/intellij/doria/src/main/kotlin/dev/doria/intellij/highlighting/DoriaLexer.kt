@@ -422,7 +422,7 @@ class DoriaLexer : LexerBase() {
         when (text) {
             in KEYWORDS -> DoriaTokenTypes.KEYWORD
 
-            in WORD_OPERATORS -> DoriaTokenTypes.OPERATOR
+            in WORD_OPERATORS -> DoriaTokenTypes.LOGICAL_OPERATOR
 
             in MODIFIERS -> DoriaTokenTypes.MODIFIER
 
@@ -473,6 +473,7 @@ class DoriaLexer : LexerBase() {
 
         tokenType = when {
             symbolText in STRICT_COMPARISON_OPERATORS -> DoriaTokenTypes.INVALID
+            symbolText in LOGICAL_SYMBOL_OPERATORS -> DoriaTokenTypes.LOGICAL_OPERATOR
             buffer[tokenStart] == '{' || buffer[tokenStart] == '}' -> DoriaTokenTypes.BRACE
             buffer[tokenStart] == '[' || buffer[tokenStart] == ']' -> DoriaTokenTypes.BRACKET
             buffer[tokenStart] == '(' || buffer[tokenStart] == ')' -> DoriaTokenTypes.PAREN
@@ -826,6 +827,7 @@ class DoriaLexer : LexerBase() {
         )
 
         private val WORD_OPERATORS = setOf("not", "and", "or", "xor")
+        private val LOGICAL_SYMBOL_OPERATORS = setOf("!", "&&", "||")
 
         private val INVALID_KEYWORDS = setOf("goto", "require", "require_once", "include_once")
 

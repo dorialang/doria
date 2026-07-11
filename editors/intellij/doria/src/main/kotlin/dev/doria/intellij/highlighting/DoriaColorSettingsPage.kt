@@ -94,6 +94,7 @@ class DoriaColorSettingsPage : ColorSettingsPage {
             AttributesDescriptor("Doc comment tag", DoriaSyntaxHighlighter.DOC_COMMENT_TAG),
             AttributesDescriptor("Invalid or rejected syntax", DoriaSyntaxHighlighter.INVALID),
             AttributesDescriptor("Operator", DoriaSyntaxHighlighter.OPERATOR),
+            AttributesDescriptor("Logical operator", DoriaSyntaxHighlighter.LOGICAL_OPERATOR),
             AttributesDescriptor("Braces", DoriaSyntaxHighlighter.BRACE),
             AttributesDescriptor("Brackets", DoriaSyntaxHighlighter.BRACKET),
             AttributesDescriptor("Parentheses", DoriaSyntaxHighlighter.PAREN),

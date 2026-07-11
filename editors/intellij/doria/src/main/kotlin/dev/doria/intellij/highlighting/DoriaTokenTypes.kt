@@ -42,6 +42,7 @@ object DoriaTokenTypes {
     val DOC_COMMENT_TAG = DoriaTokenType("DORIA_DOC_COMMENT_TAG")
     val INVALID = DoriaTokenType("DORIA_INVALID")
     val OPERATOR = DoriaTokenType("DORIA_OPERATOR")
+    val LOGICAL_OPERATOR = DoriaTokenType("DORIA_LOGICAL_OPERATOR")
     val BRACE = DoriaTokenType("DORIA_BRACE")
     val BRACKET = DoriaTokenType("DORIA_BRACKET")
     val PAREN = DoriaTokenType("DORIA_PAREN")

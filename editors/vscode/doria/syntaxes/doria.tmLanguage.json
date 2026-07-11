@@ -625,8 +625,12 @@
     "operators": {
       "patterns": [
         {
-          "name": "keyword.operator.word.doria",
+          "name": "keyword.operator.logical.word.doria",
           "match": "\\b(?:not|and|or|xor)\\b"
+        },
+        {
+          "name": "keyword.operator.logical.symbol.doria",
+          "match": "&&|\\|\\||!"
         },
         {
           "name": "keyword.operator.doria",
