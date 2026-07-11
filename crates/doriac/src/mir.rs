@@ -6,7 +6,7 @@
 
 use std::fmt;
 
-use crate::numeric::{IntegerType, IntegerValue};
+use crate::numeric::{FloatType, FloatValue, IntegerType, IntegerValue};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct FunctionId(pub usize);
@@ -36,8 +36,32 @@ pub struct Function {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReturnType {
-    Integer(IntegerType),
+    Value(ScalarType),
     Void,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScalarType {
+    Integer(IntegerType),
+    Float(FloatType),
+    Bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ScalarValue {
+    Integer(IntegerValue),
+    Float(FloatValue),
+    Bool(bool),
+}
+
+impl ScalarValue {
+    pub const fn ty(self) -> ScalarType {
+        match self {
+            Self::Integer(value) => ScalarType::Integer(value.ty),
+            Self::Float(value) => ScalarType::Float(value.ty),
+            Self::Bool(_) => ScalarType::Bool,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,7 +75,7 @@ pub struct Local {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Type {
-    Integer(IntegerType),
+    Scalar(ScalarType),
     String,
 }
 
@@ -64,14 +88,31 @@ pub struct BasicBlock {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Operand {
-    Integer(IntegerValue),
+    Scalar(ScalarValue),
     Local(LocalId),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Rvalue {
-    Integer(IntegerExpression),
+    Value(ValueExpression),
     String(StringExpression),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ValueExpression {
+    Integer(IntegerExpression),
+    Float(FloatExpression),
+    Bool(BoolExpression),
+}
+
+impl ValueExpression {
+    pub const fn ty(&self) -> ScalarType {
+        match self {
+            Self::Integer(value) => ScalarType::Integer(value.ty()),
+            Self::Float(value) => ScalarType::Float(value.ty()),
+            Self::Bool(_) => ScalarType::Bool,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -115,10 +156,13 @@ pub enum IntegerExpression {
         ty: IntegerType,
         value: Box<IntegerExpression>,
     },
+    FloatToInt {
+        value: Box<FloatExpression>,
+    },
     Call {
         ty: IntegerType,
         function: FunctionId,
-        args: Vec<IntegerExpression>,
+        args: Vec<ValueExpression>,
     },
 }
 
@@ -130,6 +174,7 @@ impl IntegerExpression {
             | Self::Binary { ty, .. }
             | Self::Convert { ty, .. }
             | Self::Call { ty, .. } => *ty,
+            Self::FloatToInt { .. } => IntegerType::Int64,
         }
     }
 
@@ -140,7 +185,60 @@ impl IntegerExpression {
     pub const fn constant(value: IntegerValue) -> Self {
         Self::Use {
             ty: value.ty,
-            operand: Operand::Integer(value),
+            operand: Operand::Scalar(ScalarValue::Integer(value)),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FloatBinaryOp {
+    Add,
+    Subtract,
+    Multiply,
+    Divide,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FloatExpression {
+    Use {
+        ty: FloatType,
+        operand: Operand,
+    },
+    Negate {
+        ty: FloatType,
+        operand: Box<FloatExpression>,
+    },
+    Binary {
+        ty: FloatType,
+        op: FloatBinaryOp,
+        left: Box<FloatExpression>,
+        right: Box<FloatExpression>,
+    },
+    IntToFloat {
+        value: Box<IntegerExpression>,
+    },
+    Call {
+        ty: FloatType,
+        function: FunctionId,
+        args: Vec<ValueExpression>,
+    },
+}
+
+impl FloatExpression {
+    pub const fn ty(&self) -> FloatType {
+        match self {
+            Self::Use { ty, .. }
+            | Self::Negate { ty, .. }
+            | Self::Binary { ty, .. }
+            | Self::Call { ty, .. } => *ty,
+            Self::IntToFloat { .. } => FloatType::Float64,
+        }
+    }
+
+    pub const fn constant(value: FloatValue) -> Self {
+        Self::Use {
+            ty: value.ty,
+            operand: Operand::Scalar(ScalarValue::Float(value)),
         }
     }
 }
@@ -153,18 +251,24 @@ pub enum StringExpression {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Condition {
-    Bool(bool),
+pub enum BoolExpression {
+    Use {
+        operand: Operand,
+    },
     Compare {
         op: CompareOp,
-        left: IntegerExpression,
-        right: IntegerExpression,
+        left: Box<ValueExpression>,
+        right: Box<ValueExpression>,
     },
-    Not(Box<Condition>),
+    Not(Box<BoolExpression>),
     Binary {
-        op: ConditionBinaryOp,
-        left: Box<Condition>,
-        right: Box<Condition>,
+        op: BoolBinaryOp,
+        left: Box<BoolExpression>,
+        right: Box<BoolExpression>,
+    },
+    Call {
+        function: FunctionId,
+        args: Vec<ValueExpression>,
     },
 }
 
@@ -179,7 +283,7 @@ pub enum CompareOp {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ConditionBinaryOp {
+pub enum BoolBinaryOp {
     And,
     Or,
     Xor,
@@ -195,19 +299,19 @@ pub enum Statement {
     EchoString(StringExpression),
     CallVoid {
         function: FunctionId,
-        args: Vec<IntegerExpression>,
+        args: Vec<ValueExpression>,
     },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Terminator {
-    Return(IntegerExpression),
+    Return(ValueExpression),
     ReturnVoid,
     Panic(StringExpression),
     Unreachable,
     Jump(BlockId),
     Branch {
-        condition: Condition,
+        condition: BoolExpression,
         then_block: BlockId,
         else_block: BlockId,
     },
@@ -259,7 +363,7 @@ impl fmt::Display for Function {
 impl fmt::Display for ReturnType {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ReturnType::Integer(ty) => write!(formatter, "{ty}"),
+            ReturnType::Value(ty) => write!(formatter, "{ty}"),
             ReturnType::Void => write!(formatter, "void"),
         }
     }
@@ -290,7 +394,7 @@ impl fmt::Display for Local {
 impl fmt::Display for Type {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Type::Integer(ty) => write!(formatter, "{ty}"),
+            Type::Scalar(ty) => write!(formatter, "{ty}"),
             Type::String => write!(formatter, "string"),
         }
     }
@@ -309,7 +413,7 @@ impl fmt::Display for BasicBlock {
 impl fmt::Display for Operand {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Operand::Integer(value) => write!(formatter, "{value}: {}", value.ty),
+            Operand::Scalar(value) => write!(formatter, "{value}"),
             Operand::Local(id) => write!(formatter, "local{}", id.0),
         }
     }
@@ -318,8 +422,41 @@ impl fmt::Display for Operand {
 impl fmt::Display for Rvalue {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Rvalue::Integer(expression) => write!(formatter, "{expression}"),
+            Rvalue::Value(expression) => write!(formatter, "{expression}"),
             Rvalue::String(value) => write!(formatter, "{value}"),
+        }
+    }
+}
+
+impl fmt::Display for ScalarType {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Integer(ty) => write!(formatter, "{ty}"),
+            Self::Float(ty) => write!(formatter, "{ty}"),
+            Self::Bool => formatter.write_str("bool"),
+        }
+    }
+}
+
+impl fmt::Display for ScalarValue {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Integer(value) => write!(formatter, "{value}: {}", value.ty),
+            Self::Float(value) => match value.ty {
+                FloatType::Float32 => write!(formatter, "0x{:08x}: float32", value.bits),
+                FloatType::Float64 => write!(formatter, "0x{:016x}: float", value.bits),
+            },
+            Self::Bool(value) => write!(formatter, "{value}: bool"),
+        }
+    }
+}
+
+impl fmt::Display for ValueExpression {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Integer(value) => write!(formatter, "{value}"),
+            Self::Float(value) => write!(formatter, "{value}"),
+            Self::Bool(value) => write!(formatter, "{value}"),
         }
     }
 }
@@ -354,8 +491,9 @@ impl fmt::Display for IntegerExpression {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             IntegerExpression::Use { ty, operand } => match operand {
-                Operand::Integer(value) => write!(formatter, "{value}: {ty}"),
+                Operand::Scalar(ScalarValue::Integer(value)) => write!(formatter, "{value}: {ty}"),
                 Operand::Local(id) => write!(formatter, "local{}: {ty}", id.0),
+                Operand::Scalar(_) => write!(formatter, "<malformed scalar>: {ty}"),
             },
             IntegerExpression::Unary { ty, op, operand } => {
                 write!(formatter, "({op}{operand}): {ty}")
@@ -369,7 +507,45 @@ impl fmt::Display for IntegerExpression {
             IntegerExpression::Convert { ty, value } => {
                 write!(formatter, "convert<{ty}>({value}): {ty}")
             }
+            IntegerExpression::FloatToInt { value } => {
+                write!(formatter, "Float::toInt({value}): int")
+            }
             IntegerExpression::Call { ty, function, args } => {
+                write_call(formatter, *function, args)?;
+                write!(formatter, ": {ty}")
+            }
+        }
+    }
+}
+
+impl fmt::Display for FloatBinaryOp {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Add => "+",
+            Self::Subtract => "-",
+            Self::Multiply => "*",
+            Self::Divide => "/",
+        })
+    }
+}
+
+impl fmt::Display for FloatExpression {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Use { ty, operand } => match operand {
+                Operand::Scalar(ScalarValue::Float(value)) => write!(formatter, "{value}: {ty}"),
+                Operand::Local(id) => write!(formatter, "local{}: {ty}", id.0),
+                Operand::Scalar(_) => write!(formatter, "<malformed scalar>: {ty}"),
+            },
+            Self::Negate { ty, operand } => write!(formatter, "(-{operand}): {ty}"),
+            Self::Binary {
+                ty,
+                op,
+                left,
+                right,
+            } => write!(formatter, "({left} {op} {right}): {ty}"),
+            Self::IntToFloat { value } => write!(formatter, "Int::toFloat({value}): float"),
+            Self::Call { ty, function, args } => {
                 write_call(formatter, *function, args)?;
                 write!(formatter, ": {ty}")
             }
@@ -398,15 +574,20 @@ impl fmt::Display for StringExpression {
     }
 }
 
-impl fmt::Display for Condition {
+impl fmt::Display for BoolExpression {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Condition::Bool(value) => write!(formatter, "{value}"),
-            Condition::Compare { op, left, right } => write!(formatter, "{left} {op} {right}"),
-            Condition::Not(condition) => write!(formatter, "!({condition})"),
-            Condition::Binary { op, left, right } => {
+            Self::Use { operand } => match operand {
+                Operand::Scalar(ScalarValue::Bool(value)) => write!(formatter, "{value}: bool"),
+                Operand::Local(id) => write!(formatter, "local{}: bool", id.0),
+                Operand::Scalar(_) => formatter.write_str("<malformed scalar>: bool"),
+            },
+            Self::Compare { op, left, right } => write!(formatter, "{left} {op} {right}"),
+            Self::Not(condition) => write!(formatter, "!({condition})"),
+            Self::Binary { op, left, right } => {
                 write!(formatter, "({left}) {op} ({right})")
             }
+            Self::Call { function, args } => write_call(formatter, *function, args),
         }
     }
 }
@@ -424,12 +605,12 @@ impl fmt::Display for CompareOp {
     }
 }
 
-impl fmt::Display for ConditionBinaryOp {
+impl fmt::Display for BoolBinaryOp {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ConditionBinaryOp::And => write!(formatter, "&&"),
-            ConditionBinaryOp::Or => write!(formatter, "||"),
-            ConditionBinaryOp::Xor => write!(formatter, "xor"),
+            BoolBinaryOp::And => write!(formatter, "&&"),
+            BoolBinaryOp::Or => write!(formatter, "||"),
+            BoolBinaryOp::Xor => write!(formatter, "xor"),
         }
     }
 }

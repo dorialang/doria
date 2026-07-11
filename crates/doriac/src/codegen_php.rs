@@ -278,6 +278,14 @@ fn validate_expr(expr: &Expr, semantic_info: &SemanticInfo) -> Result<(), Backen
             args,
             span,
         } => {
+            if (class_name == "Int" && method == "toFloat")
+                || (class_name == "Float" && method == "toInt")
+            {
+                return Err(unsupported_numeric_shape(
+                    *span,
+                    format!("exact Doria conversion semantics for `{class_name}::{method}(...)`"),
+                ));
+            }
             if IntegerType::from_companion_name(class_name).is_some() && method == "from" {
                 return Err(unsupported_integer_shape(
                     *span,
@@ -592,6 +600,18 @@ fn emit_statement(
             writeln(output, indent, &format!("${php_name} = {initializer};"));
         }
         Stmt::Assignment(assignment) => {
+            if assignment.op == AssignOp::DivAssign {
+                let target = emit_assignment_target(&assignment.target, scopes);
+                writeln(
+                    output,
+                    indent,
+                    &format!(
+                        "{target} = fdiv({target}, {});",
+                        emit_expr(&assignment.value, scopes)
+                    ),
+                );
+                return;
+            }
             let op = match assignment.op {
                 AssignOp::Assign => "=",
                 AssignOp::AddAssign => "+=",
@@ -750,6 +770,13 @@ fn emit_for_increment(increment: &ForIncrement, scopes: &PhpNameScopes) -> Strin
 }
 
 fn emit_assignment(assignment: &Assignment, scopes: &PhpNameScopes) -> String {
+    if assignment.op == AssignOp::DivAssign {
+        let target = emit_assignment_target(&assignment.target, scopes);
+        return format!(
+            "{target} = fdiv({target}, {})",
+            emit_expr(&assignment.value, scopes)
+        );
+    }
     let op = match assignment.op {
         AssignOp::Assign => "=",
         AssignOp::AddAssign => "+=",
@@ -1023,6 +1050,11 @@ fn emit_expr(expr: &Expr, scopes: &PhpNameScopes) -> String {
         Expr::Binary {
             left, op, right, ..
         } => match op {
+            BinaryOp::Div => format!(
+                "fdiv({}, {})",
+                emit_expr(left, scopes),
+                emit_expr(right, scopes)
+            ),
             BinaryOp::And => format!(
                 "(({}) && ({}))",
                 emit_expr(left, scopes),

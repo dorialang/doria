@@ -1,0 +1,13 @@
+function calculate(float32 $value): float32
+{
+    writable float32 $result = $value + 2.0;
+    $result *= 2.0;
+    $result /= 2.0;
+    return $result;
+}
+
+function main(): int
+{
+    if (calculate(40.0) == 42.0) { return 42; }
+    return 0;
+}

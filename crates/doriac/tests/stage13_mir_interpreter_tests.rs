@@ -1,4 +1,7 @@
-use doriac::mir::{IntegerBinaryOp, IntegerExpression, ReturnType, Rvalue, Statement, Type};
+use doriac::mir::{
+    IntegerBinaryOp, IntegerExpression, ReturnType, Rvalue, ScalarType, Statement, Type,
+    ValueExpression,
+};
 use doriac::mir_interpreter::{interpret, InterpreterOutput};
 use doriac::numeric::IntegerType;
 
@@ -34,15 +37,15 @@ function main(): int
 
     assert_eq!(
         program.functions[0].return_type,
-        ReturnType::Integer(IntegerType::UInt64)
+        ReturnType::Value(ScalarType::Integer(IntegerType::UInt64))
     );
     assert_eq!(
         program.functions[0].locals[0].ty,
-        Type::Integer(IntegerType::UInt64)
+        Type::Scalar(ScalarType::Integer(IntegerType::UInt64))
     );
     assert_eq!(
         program.functions[1].locals[0].ty,
-        Type::Integer(IntegerType::UInt64)
+        Type::Scalar(ScalarType::Integer(IntegerType::UInt64))
     );
     let dump = program.to_string();
     assert!(dump.contains("18446744073709551615: uint64"), "{dump}");
@@ -72,12 +75,12 @@ function main(): int
     assert!(matches!(
         &program.functions[0].blocks[0].statements[0],
         Statement::AssignLocal {
-            value: Rvalue::Integer(IntegerExpression::Binary {
+            value: Rvalue::Value(ValueExpression::Integer(IntegerExpression::Binary {
                 ty: IntegerType::UInt16,
                 op: IntegerBinaryOp::Divide,
                 left,
                 right,
-            }),
+            })),
             ..
         } if left.ty() == IntegerType::UInt16 && right.ty() == IntegerType::UInt16
     ));

@@ -24,8 +24,263 @@ impl FloatType {
         }
     }
 
+    pub const fn bit_width(self) -> u32 {
+        match self {
+            Self::Float32 => 32,
+            Self::Float64 => 64,
+        }
+    }
+
+    pub const fn storage_bytes(self) -> u32 {
+        self.bit_width() / 8
+    }
+
+    pub const fn explicit_source_name(self) -> &'static str {
+        match self {
+            Self::Float32 => "float32",
+            Self::Float64 => "float64",
+        }
+    }
+
+    pub const fn companion_name(self) -> &'static str {
+        match self {
+            Self::Float32 => "Float32",
+            Self::Float64 => "Float",
+        }
+    }
+
     pub const fn is_default_float(self) -> bool {
         matches!(self, Self::Float64)
+    }
+}
+
+impl fmt::Display for FloatType {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.source_name())
+    }
+}
+
+/// A bit-preserving Doria floating-point value.
+///
+/// Binary32 values use the low 32 bits. Language equality is deliberately
+/// implemented by the comparison helpers rather than this type's structural
+/// equality so IEEE NaN and signed-zero rules are preserved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct FloatValue {
+    pub ty: FloatType,
+    pub bits: u64,
+}
+
+impl FloatValue {
+    pub const fn from_bits(ty: FloatType, bits: u64) -> Self {
+        Self {
+            ty,
+            bits: match ty {
+                FloatType::Float32 => bits & u32::MAX as u64,
+                FloatType::Float64 => bits,
+            },
+        }
+    }
+
+    pub fn from_f32(value: f32) -> Self {
+        Self::from_bits(FloatType::Float32, value.to_bits() as u64)
+    }
+
+    pub fn from_f64(value: f64) -> Self {
+        Self::from_bits(FloatType::Float64, value.to_bits())
+    }
+
+    pub fn parse_decimal(ty: FloatType, text: &str) -> Option<Self> {
+        match ty {
+            FloatType::Float32 => text.parse::<f32>().ok().map(Self::from_f32),
+            FloatType::Float64 => text.parse::<f64>().ok().map(Self::from_f64),
+        }
+    }
+
+    pub fn as_f32(self) -> f32 {
+        debug_assert_eq!(self.ty, FloatType::Float32);
+        f32::from_bits(self.bits as u32)
+    }
+
+    pub fn as_f64(self) -> f64 {
+        debug_assert_eq!(self.ty, FloatType::Float64);
+        f64::from_bits(self.bits)
+    }
+
+    pub fn zero(ty: FloatType) -> Self {
+        match ty {
+            FloatType::Float32 => Self::from_f32(0.0),
+            FloatType::Float64 => Self::from_f64(0.0),
+        }
+    }
+
+    pub fn negate(self) -> Self {
+        match self.ty {
+            FloatType::Float32 => Self::from_f32(-self.as_f32()),
+            FloatType::Float64 => Self::from_f64(-self.as_f64()),
+        }
+    }
+
+    #[allow(clippy::should_implement_trait)]
+    pub fn add(self, right: Self) -> Self {
+        self.binary(
+            right,
+            |left, right| left + right,
+            |left, right| left + right,
+        )
+    }
+
+    pub fn subtract(self, right: Self) -> Self {
+        self.binary(
+            right,
+            |left, right| left - right,
+            |left, right| left - right,
+        )
+    }
+
+    pub fn multiply(self, right: Self) -> Self {
+        self.binary(
+            right,
+            |left, right| left * right,
+            |left, right| left * right,
+        )
+    }
+
+    pub fn divide(self, right: Self) -> Self {
+        self.binary(
+            right,
+            |left, right| left / right,
+            |left, right| left / right,
+        )
+    }
+
+    fn binary(
+        self,
+        right: Self,
+        binary32: impl FnOnce(f32, f32) -> f32,
+        binary64: impl FnOnce(f64, f64) -> f64,
+    ) -> Self {
+        self.require_same_type(right);
+        match self.ty {
+            FloatType::Float32 => Self::from_f32(binary32(self.as_f32(), right.as_f32())),
+            FloatType::Float64 => Self::from_f64(binary64(self.as_f64(), right.as_f64())),
+        }
+    }
+
+    pub fn compare_equal(self, right: Self) -> bool {
+        self.compare(
+            right,
+            |left, right| left == right,
+            |left, right| left == right,
+        )
+    }
+
+    pub fn compare_not_equal(self, right: Self) -> bool {
+        self.compare(
+            right,
+            |left, right| left != right,
+            |left, right| left != right,
+        )
+    }
+
+    pub fn compare_less(self, right: Self) -> bool {
+        self.compare(
+            right,
+            |left, right| left < right,
+            |left, right| left < right,
+        )
+    }
+
+    pub fn compare_less_equal(self, right: Self) -> bool {
+        self.compare(
+            right,
+            |left, right| left <= right,
+            |left, right| left <= right,
+        )
+    }
+
+    pub fn compare_greater(self, right: Self) -> bool {
+        self.compare(
+            right,
+            |left, right| left > right,
+            |left, right| left > right,
+        )
+    }
+
+    pub fn compare_greater_equal(self, right: Self) -> bool {
+        self.compare(
+            right,
+            |left, right| left >= right,
+            |left, right| left >= right,
+        )
+    }
+
+    fn compare(
+        self,
+        right: Self,
+        binary32: impl FnOnce(f32, f32) -> bool,
+        binary64: impl FnOnce(f64, f64) -> bool,
+    ) -> bool {
+        self.require_same_type(right);
+        match self.ty {
+            FloatType::Float32 => binary32(self.as_f32(), right.as_f32()),
+            FloatType::Float64 => binary64(self.as_f64(), right.as_f64()),
+        }
+    }
+
+    pub fn is_nan(self) -> bool {
+        match self.ty {
+            FloatType::Float32 => self.as_f32().is_nan(),
+            FloatType::Float64 => self.as_f64().is_nan(),
+        }
+    }
+
+    pub fn is_infinite(self) -> bool {
+        match self.ty {
+            FloatType::Float32 => self.as_f32().is_infinite(),
+            FloatType::Float64 => self.as_f64().is_infinite(),
+        }
+    }
+
+    pub fn is_finite(self) -> bool {
+        match self.ty {
+            FloatType::Float32 => self.as_f32().is_finite(),
+            FloatType::Float64 => self.as_f64().is_finite(),
+        }
+    }
+
+    pub fn is_negative_zero(self) -> bool {
+        match self.ty {
+            FloatType::Float32 => self.bits as u32 == (-0.0_f32).to_bits(),
+            FloatType::Float64 => self.bits == (-0.0_f64).to_bits(),
+        }
+    }
+
+    pub fn to_i64_checked(self) -> Option<i64> {
+        debug_assert_eq!(self.ty, FloatType::Float64);
+        let value = self.as_f64();
+        if !value.is_finite()
+            || !((-9_223_372_036_854_775_808.0)..9_223_372_036_854_775_808.0).contains(&value)
+        {
+            return None;
+        }
+        Some(value.trunc() as i64)
+    }
+
+    fn require_same_type(self, right: Self) {
+        debug_assert_eq!(
+            self.ty, right.ty,
+            "float engine operands must have one type"
+        );
+    }
+}
+
+impl fmt::Display for FloatValue {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.ty {
+            FloatType::Float32 => write!(formatter, "0x{:08x}", self.bits),
+            FloatType::Float64 => write!(formatter, "0x{:016x}", self.bits),
+        }
     }
 }
 

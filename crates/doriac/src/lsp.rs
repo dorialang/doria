@@ -395,6 +395,8 @@ fn completion_items() -> Value {
         "uint32",
         "uint64",
         "float",
+        "float32",
+        "float64",
         "string",
         "bool",
         "mixed",
@@ -402,7 +404,6 @@ fn completion_items() -> Value {
         "Dictionary",
         "Set",
     ];
-    let planned_types = ["float32", "float64"];
     let reserved_types = ["resource"];
     let integer_conversions = [
         ("Int::from", "int (the int64 alias)"),
@@ -440,15 +441,11 @@ fn completion_items() -> Value {
             item["detail"] = json!("implemented Doria integer type");
             item["documentation"] = json!(documentation);
         }
+        if let Some(documentation) = scalar_runtime_type_description(ty) {
+            item["detail"] = json!("implemented Doria scalar type");
+            item["documentation"] = json!(documentation);
+        }
         item
-    }));
-    items.extend(planned_types.into_iter().map(|ty| {
-        json!({
-            "label": ty,
-            "kind": 25,
-            "detail": "planned Doria primitive type",
-            "documentation": "Accepted primitive spelling; native float values and operations are Stage 14 work.",
-        })
     }));
     items.extend(reserved_types.into_iter().map(|ty| {
         json!({
@@ -473,11 +470,35 @@ fn completion_items() -> Value {
             ),
         })
     }));
+    items.extend([
+        json!({
+            "label": "Int::toFloat",
+            "kind": 3,
+            "detail": "Doria scalar conversion intrinsic",
+            "documentation": "Converts canonical `int`/`int64` to canonical `float`/`float64` with IEEE 754 round-to-nearest, ties-to-even. This conversion does not panic.",
+        }),
+        json!({
+            "label": "Float::toInt",
+            "kind": 3,
+            "detail": "Doria scalar conversion intrinsic",
+            "documentation": "Truncates canonical `float`/`float64` toward zero to canonical `int`/`int64`; NaN, infinity, and out-of-range values panic.",
+        }),
+    ]);
 
     json!({
         "isIncomplete": false,
         "items": items,
     })
+}
+
+fn scalar_runtime_type_description(name: &str) -> Option<&'static str> {
+    match name {
+        "float" => Some("Implemented canonical IEEE 754 binary64 scalar type; exact alias of `float64`."),
+        "float64" => Some("Implemented IEEE 754 binary64 scalar type; exact alias of `float`."),
+        "float32" => Some("Implemented distinct IEEE 754 binary32 scalar type."),
+        "bool" => Some("Implemented Copy scalar type with runtime locals, parameters, returns, calls, and short-circuit operators."),
+        _ => None,
+    }
 }
 
 fn integer_type_description(name: &str) -> Option<&'static str> {
@@ -528,7 +549,11 @@ fn integer_conversion_hover_at(tokens: &[Token], token_index: usize) -> Option<&
         return Some(description);
     }
 
-    if name != "from" || token_index < 2 {
+    if let Some(description) = cross_kind_conversion_description(name) {
+        return Some(description);
+    }
+
+    if token_index < 2 {
         return None;
     }
     if !matches!(tokens[token_index - 1].kind, TokenKind::DoubleColon) {
@@ -538,7 +563,20 @@ fn integer_conversion_hover_at(tokens: &[Token], token_index: usize) -> Option<&
     let TokenKind::Identifier(companion) = &tokens[token_index - 2].kind else {
         return None;
     };
-    integer_conversion_description(companion)
+    match (companion.as_str(), name.as_str()) {
+        ("Int", "toFloat") => cross_kind_conversion_description("Int::toFloat"),
+        ("Float", "toInt") => cross_kind_conversion_description("Float::toInt"),
+        (_, "from") => integer_conversion_description(companion),
+        _ => None,
+    }
+}
+
+fn cross_kind_conversion_description(name: &str) -> Option<&'static str> {
+    match name {
+        "Int::toFloat" | "toFloat" => Some("`Int::toFloat(value)` converts canonical `int`/`int64` to canonical `float`/`float64` using IEEE 754 round-to-nearest, ties-to-even, without panicking."),
+        "Float::toInt" | "toInt" => Some("`Float::toInt(value)` truncates canonical `float`/`float64` toward zero to canonical `int`/`int64`; NaN, infinity, and out-of-range values panic."),
+        _ => None,
+    }
 }
 
 fn integer_conversion_description(companion: &str) -> Option<&'static str> {
@@ -588,15 +626,11 @@ fn hover_description(kind: &TokenKind) -> Option<&'static str> {
         TokenKind::UInt16Type => integer_type_description("uint16"),
         TokenKind::UInt32Type => integer_type_description("uint32"),
         TokenKind::UInt64Type => integer_type_description("uint64"),
-        TokenKind::FloatType => Some("The `float` primitive type."),
-        TokenKind::Float32Type => Some(
-            "Accepted `float32` primitive spelling; native float values and operations are Stage 14 work.",
-        ),
-        TokenKind::Float64Type => Some(
-            "Accepted `float64` primitive spelling; native float values and operations are Stage 14 work.",
-        ),
+        TokenKind::FloatType => scalar_runtime_type_description("float"),
+        TokenKind::Float32Type => scalar_runtime_type_description("float32"),
+        TokenKind::Float64Type => scalar_runtime_type_description("float64"),
         TokenKind::StringType => Some("The `string` primitive type."),
-        TokenKind::BoolType => Some("The `bool` primitive type."),
+        TokenKind::BoolType => scalar_runtime_type_description("bool"),
         TokenKind::True | TokenKind::False => Some("Boolean literal."),
         TokenKind::Null => {
             Some("Null literal. Nullable type syntax like `?T` is planned but not implemented yet; `null` is not a type name.")
@@ -938,21 +972,27 @@ mod tests {
     }
 
     #[test]
-    fn fixed_width_float_completions_and_hover_remain_planned_for_stage_14() {
+    fn float_and_bool_completions_and_hover_mark_stage_14_runtime_coverage() {
         for (name, kind) in [
+            ("float", TokenKind::FloatType),
             ("float32", TokenKind::Float32Type),
             ("float64", TokenKind::Float64Type),
+            ("bool", TokenKind::BoolType),
         ] {
             let item = completion_item(name);
-            assert_eq!(item["detail"], "planned Doria primitive type");
+            assert_eq!(item["detail"], "implemented Doria scalar type");
             assert!(item["documentation"]
                 .as_str()
-                .expect("planned float completion should have documentation")
-                .contains("Stage 14"));
+                .expect("scalar completion should have documentation")
+                .contains("Implemented"));
 
-            let hover = hover_description(&kind).expect("planned float should have hover text");
-            assert!(hover.contains("Stage 14"));
+            let hover = hover_description(&kind).expect("scalar should have hover text");
+            assert!(hover.contains("Implemented"));
         }
+        assert!(completion_item("float")["documentation"]
+            .as_str()
+            .unwrap()
+            .contains("alias of `float64`"));
     }
 
     #[test]
@@ -982,6 +1022,20 @@ mod tests {
             .expect("hover contents should be text");
         assert!(hover_text.contains("`UInt8::from(value)`"));
         assert!(hover_text.contains("Out-of-range conversion panics"));
+    }
+
+    #[test]
+    fn cross_kind_conversion_completions_and_hover_are_exposed() {
+        for (label, source, method) in [
+            ("Int::toFloat", "Int::toFloat($value)", "toFloat"),
+            ("Float::toInt", "Float::toInt($value)", "toInt"),
+        ] {
+            let item = completion_item(label);
+            assert_eq!(item["detail"], "Doria scalar conversion intrinsic");
+            let offset = source.find(method).unwrap() + 1;
+            let hover = hover_at_offset(source, offset).expect("intrinsic should have hover");
+            assert!(hover["contents"]["value"].as_str().unwrap().contains(label));
+        }
     }
 
     #[test]

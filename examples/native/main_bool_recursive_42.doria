@@ -1,0 +1,10 @@
+function reachesZero(int $value): bool
+{
+    if ($value == 0) { return true; }
+    return reachesZero($value - 1);
+}
+function main(): int
+{
+    if (reachesZero(32)) { return 42; }
+    return 0;
+}

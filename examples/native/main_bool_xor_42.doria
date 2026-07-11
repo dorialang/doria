@@ -1,0 +1,8 @@
+function left(): bool { echo "L"; return false; }
+function right(): bool { echo "R"; return true; }
+function main(): int
+{
+    bool $value = left() xor right();
+    if ($value) { return 42; }
+    return 0;
+}

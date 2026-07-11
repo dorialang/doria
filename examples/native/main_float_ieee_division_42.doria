@@ -1,0 +1,7 @@
+function main(): int
+{
+    float $positiveInfinity = 1.0 / 0.0;
+    float $negativeInfinity = -1.0 / 0.0;
+    if ($positiveInfinity > 0.0 and $negativeInfinity < 0.0) { return 42; }
+    return 0;
+}

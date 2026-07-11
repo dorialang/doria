@@ -1,0 +1,6 @@
+function main(): int
+{
+    float $value = 42.0;
+    if ($value == 42.0 and $value >= 42.0 and $value < 43.0) { return 42; }
+    return 0;
+}

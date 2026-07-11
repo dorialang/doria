@@ -1,0 +1,9 @@
+function answer(float $base): float
+{
+    return $base + 2.0;
+}
+
+function main(): int
+{
+    return Float::toInt(answer(40.0));
+}

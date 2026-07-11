@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::ast::*;
 use crate::diagnostics::{Diagnostic, DiagnosticResult};
-use crate::numeric::{parse_decimal_magnitude, FloatType, IntegerType, IntegerValue};
+use crate::numeric::{parse_decimal_magnitude, FloatType, FloatValue, IntegerType, IntegerValue};
 use crate::source::Span;
 use crate::symbols::{
     Binding, ClassInfo, FunctionInfo, MethodInfo, ParamInfo, PropertyInfo, PropertyInitState,
@@ -318,6 +318,11 @@ impl<'program> Checker<'program> {
     }
 
     fn reserved_class_name_message(name: &str) -> Option<String> {
+        if matches!(name, "Float" | "Float32" | "Float64" | "Bool") {
+            return Some(format!(
+                "`{name}` is a compiler-known scalar companion and cannot be redeclared"
+            ));
+        }
         if IntegerType::from_companion_name(name).is_some() {
             return Some(format!(
                 "`{name}` is a compiler-known integer companion and cannot be redeclared"
@@ -344,6 +349,11 @@ impl<'program> Checker<'program> {
     }
 
     fn reserved_callable_name_message(name: &str) -> Option<String> {
+        if matches!(name, "Float" | "Float32" | "Float64" | "Bool") {
+            return Some(format!(
+                "`{name}` is a compiler-known scalar companion and cannot be redeclared"
+            ));
+        }
         if IntegerType::from_companion_name(name).is_some() {
             return Some(format!(
                 "`{name}` is a compiler-known integer companion and cannot be redeclared"
@@ -1130,23 +1140,24 @@ impl<'program> Checker<'program> {
     fn check_function(&mut self, function: &FunctionDecl, method_context: Option<MethodContext>) {
         let mut scopes = ScopeStack::new();
         let signature = self.current_function_signature(function);
-        if method_context.is_none() && function.name == "main" {
-            if let TypeKind::Integer(integer) = self.types.kind(signature.return_ty) {
-                if *integer != IntegerType::Int64 {
-                    self.diagnostics.push(
-                        Diagnostic::new(
-                            "E0442",
-                            format!(
-                                "process entrypoint `main` cannot return `{integer}`; expected `void`, `int`, or `int64`"
-                            ),
-                            function.span,
-                        )
-                        .with_help(
-                            "helper functions may use every fixed-width integer return type",
-                        ),
-                    );
-                }
-            }
+        if method_context.is_none()
+            && function.name == "main"
+            && !matches!(
+                self.types.kind(signature.return_ty),
+                TypeKind::Integer(IntegerType::Int64) | TypeKind::Void | TypeKind::Unknown
+            )
+        {
+            let actual = self.types.display(signature.return_ty);
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "E0442",
+                    format!(
+                        "process entrypoint `main` cannot return `{actual}`; expected `void`, `int`, or `int64`"
+                    ),
+                    function.span,
+                )
+                .with_help("helper functions may return fixed-width integers, floats, or bool"),
+            );
         }
         let return_context = self.return_context_for_function(function, method_context.as_ref());
         for (param, param_info) in function.params.iter().zip(signature.params.iter()) {
@@ -1830,14 +1841,14 @@ impl<'program> Checker<'program> {
 
                 if matches!(
                     self.types.kind(binding.ty),
-                    TypeKind::Integer(_) | TypeKind::Unknown
+                    TypeKind::Integer(_) | TypeKind::Float(_) | TypeKind::Unknown
                 ) {
                     return;
                 }
 
                 self.diagnostics.push(Diagnostic::new(
                     "E0423",
-                    format!("{op_name} requires a writable integer target"),
+                    format!("{op_name} requires a writable integer or float target"),
                     *span,
                 ));
             }
@@ -2201,9 +2212,9 @@ impl<'program> Checker<'program> {
                     ));
                 }
             }
+            Expr::Float { .. } => self.check_float_literal_range(expr, FloatType::Float64),
             Expr::Identifier { .. }
             | Expr::String { .. }
-            | Expr::Float { .. }
             | Expr::Bool { .. }
             | Expr::Null { .. } => {}
             Expr::Int { value, span } => {
@@ -2448,8 +2459,33 @@ impl<'program> Checker<'program> {
     fn record_float_expression_type(&mut self, expr: &Expr, float: FloatType) {
         self.float_expression_types
             .insert((expr.span().start, expr.span().end), float);
+        self.check_float_literal_range(expr, float);
         if let Expr::Grouped { expr, .. } = expr {
             self.record_float_expression_type(expr, float);
+        }
+    }
+
+    fn check_float_literal_range(&mut self, expr: &Expr, target: FloatType) {
+        let Expr::Float { value, span } = expr else {
+            return;
+        };
+        let out_of_range = FloatValue::parse_decimal(target, value)
+            .map(FloatValue::is_infinite)
+            .unwrap_or(true);
+        if out_of_range
+            && !self
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "E0444" && diagnostic.span == *span)
+        {
+            self.diagnostics.push(Diagnostic::new(
+                "E0444",
+                format!(
+                    "floating literal is outside the Doria `{}` finite range",
+                    target.source_name()
+                ),
+                *span,
+            ));
         }
     }
 
@@ -2460,10 +2496,15 @@ impl<'program> Checker<'program> {
         }
 
         match expr {
-            Expr::Grouped { expr, .. } => self.contextualize_float_literals(expr, target),
+            Expr::Grouped { expr, .. }
+            | Expr::Unary {
+                op: UnaryOp::Negate,
+                expr,
+                ..
+            } => self.contextualize_float_literals(expr, target),
             Expr::Binary {
                 left,
-                op: BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Mod,
+                op: BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div,
                 right,
                 ..
             } => {
@@ -2508,6 +2549,7 @@ impl<'program> Checker<'program> {
                 let ty = self.infer_expr_type(expr, scopes, method_context);
                 match self.types.kind(ty) {
                     TypeKind::Integer(integer) if integer.is_signed() => {}
+                    TypeKind::Float(_) => {}
                     TypeKind::Unknown => {}
                     TypeKind::Integer(integer) => self.diagnostics.push(
                         Diagnostic::new(
@@ -2520,7 +2562,7 @@ impl<'program> Checker<'program> {
                     _ => self.diagnostics.push(Diagnostic::new(
                         "E0440",
                         format!(
-                            "unary `-` requires an integer operand, got `{}`",
+                            "unary `-` requires a signed integer or float operand, got `{}`",
                             self.types.display(ty)
                         ),
                         expr.span(),
@@ -3401,6 +3443,29 @@ impl<'program> Checker<'program> {
         scopes: &ScopeStack,
         method_context: Option<&MethodContext>,
     ) {
+        if class_name == "Int" && method == "toFloat" {
+            self.check_cross_kind_intrinsic_argument(
+                "Int::toFloat",
+                args,
+                TypeKind::Integer(IntegerType::Int64),
+                span,
+                scopes,
+                method_context,
+            );
+            return;
+        }
+        if class_name == "Float" && method == "toInt" {
+            self.check_cross_kind_intrinsic_argument(
+                "Float::toInt",
+                args,
+                TypeKind::Float(FloatType::Float64),
+                span,
+                scopes,
+                method_context,
+            );
+            return;
+        }
+
         if let Some(target) = IntegerType::from_companion_name(class_name) {
             if method != "from" {
                 self.diagnostics.push(Diagnostic::new(
@@ -3484,6 +3549,38 @@ impl<'program> Checker<'program> {
             scopes,
             method_context,
         );
+    }
+
+    fn check_cross_kind_intrinsic_argument(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        expected_kind: TypeKind,
+        span: Span,
+        scopes: &ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) {
+        if args.len() != 1 {
+            self.diagnostics.push(Diagnostic::new(
+                "E0443",
+                format!("{name} expects exactly 1 argument, got {}", args.len()),
+                span,
+            ));
+            return;
+        }
+        let expected = self.types.intern(expected_kind);
+        let actual = self.infer_expr_type(&args[0], scopes, method_context);
+        if actual != expected && !self.is_unknown_type(actual) {
+            self.diagnostics.push(Diagnostic::new(
+                "E0443",
+                format!(
+                    "{name} requires a `{}` argument, got `{}`",
+                    self.types.display(expected),
+                    self.types.display(actual)
+                ),
+                args[0].span(),
+            ));
+        }
     }
 
     fn check_direct_lifecycle_method_call(
@@ -4258,6 +4355,12 @@ impl<'program> Checker<'program> {
             Expr::StaticCall {
                 class_name, method, ..
             } => {
+                if class_name == "Int" && method == "toFloat" {
+                    return self.types.intern(TypeKind::Float(FloatType::Float64));
+                }
+                if class_name == "Float" && method == "toInt" {
+                    return self.types.intern(TypeKind::Integer(IntegerType::Int64));
+                }
                 if method == "from" {
                     if let Some(integer) = IntegerType::from_companion_name(class_name) {
                         return self.types.intern(TypeKind::Integer(integer));
@@ -4311,6 +4414,7 @@ impl<'program> Checker<'program> {
                     TypeKind::Integer(integer) if integer.is_signed() => {
                         self.types.intern(TypeKind::Integer(*integer))
                     }
+                    TypeKind::Float(float) => self.types.intern(TypeKind::Float(*float)),
                     TypeKind::Unknown => self.types.unknown(),
                     _ => self.types.intern(TypeKind::Heterogeneous),
                 }

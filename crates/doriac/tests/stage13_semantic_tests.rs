@@ -34,7 +34,7 @@ function main(): int64
 }
 
 #[test]
-fn accepts_planned_float_spellings_without_adding_runtime_float_support() {
+fn accepts_float_spellings_in_semantic_signatures() {
     check(
         r#"
 function values(float32 $single, float64 $wide): float

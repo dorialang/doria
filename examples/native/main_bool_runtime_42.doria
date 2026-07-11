@@ -1,0 +1,8 @@
+function main(): int
+{
+    writable bool $ready = false;
+    $ready = true;
+    bool $answer = $ready and not false;
+    if ($answer == true) { return 42; }
+    return 0;
+}

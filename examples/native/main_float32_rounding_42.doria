@@ -1,0 +1,11 @@
+function main(): int
+{
+    writable float32 $value = 16777216.0;
+    $value += 1.0;
+
+    if ($value == 16777216.0) {
+        return 42;
+    }
+
+    return 0;
+}

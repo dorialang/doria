@@ -1,14 +1,31 @@
 # Durable executable source of truth for accepted native behavior.
-# Highest completed stage: Stage 13
+# Highest completed stage: Stage 14
 examples/native/main_add_overflow_panic.doria
 examples/native/main_arithmetic_42.doria
 examples/native/main_bitwise_42.doria
+examples/native/main_bool_function_42.doria
+examples/native/main_bool_recursive_42.doria
+examples/native/main_bool_runtime_42.doria
+examples/native/main_bool_short_circuit_42.doria
+examples/native/main_bool_xor_42.doria
 examples/native/main_boolean_condition_42.doria
 examples/native/main_break_continue_42.doria
 examples/native/main_divide_by_zero_panic.doria
 examples/native/main_early_return_search_42.doria
 examples/native/main_explicit_panic.doria
 examples/native/main_fixed_width_arithmetic_42.doria
+examples/native/main_float32_arithmetic_42.doria
+examples/native/main_float32_rounding_42.doria
+examples/native/main_float64_arithmetic_42.doria
+examples/native/main_float_comparison_42.doria
+examples/native/main_float_function_abi_42.doria
+examples/native/main_float_ieee_division_42.doria
+examples/native/main_float_nan_comparison_42.doria
+examples/native/main_float_signed_zero_42.doria
+examples/native/main_float_to_int_42.doria
+examples/native/main_float_to_int_infinity_panic.doria
+examples/native/main_float_to_int_nan_panic.doria
+examples/native/main_float_to_int_range_panic.doria
 examples/native/main_for_42.doria
 examples/native/main_foreach_range_45.doria
 examples/native/main_foreach_range_55.doria
@@ -22,6 +39,7 @@ examples/native/main_int8_negation_overflow_panic.doria
 examples/native/main_int_arithmetic.doria
 examples/native/main_int_echo_success.doria
 examples/native/main_int_helper_echo_success.doria
+examples/native/main_int_to_float_42.doria
 examples/native/main_integer_conversion_42.doria
 examples/native/main_integer_conversion_panic.doria
 examples/native/main_integer_div_mod_42.doria

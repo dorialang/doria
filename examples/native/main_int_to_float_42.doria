@@ -1,0 +1,6 @@
+function main(): int
+{
+    float $value = Int::toFloat(42);
+    if ($value == 42.0) { return 42; }
+    return 0;
+}

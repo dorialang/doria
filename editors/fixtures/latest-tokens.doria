@@ -176,6 +176,30 @@ function exerciseStage13Integers(): void
     $accumulator--;
 }
 
+// Stage 14: IEEE floats, runtime bool values, and default cross-kind conversions.
+function exerciseStage14Scalars(int $whole, bool $input): int
+{
+    writable float32 $delta = 0.016;
+    $delta += 1.0;
+    $delta--;
+
+    float $ratio = 1.0 / 3.0;
+    float64 $wideAlias = Int::toFloat($whole);
+    bool $ready = true;
+    let $both = $ready and not false;
+    bool $either = $input or $both;
+    bool $different = $either xor false;
+    bool $symbolNegated = !$input;
+    bool $symbolBoth = $ready && $symbolNegated;
+    bool $symbolEither = $symbolBoth || $different;
+
+    if ($symbolEither and $ratio > 0.0 and $wideAlias >= 0.0) {
+        return Float::toInt($wideAlias);
+    }
+
+    return 0;
+}
+
 // Planned/future: ownership, sharing, and marker types from the master plan.
 function share(
     Shared<User> $user,

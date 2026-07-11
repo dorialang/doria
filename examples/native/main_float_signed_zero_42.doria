@@ -1,0 +1,6 @@
+function main(): int
+{
+    float $negativeZero = -0.0;
+    if (0.0 == $negativeZero and 1.0 / $negativeZero < 0.0) { return 42; }
+    return 0;
+}

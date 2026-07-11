@@ -30,7 +30,11 @@ Checked integer addition, subtraction, multiplication, and signed negation overf
 
 Returning a process status outside `0..125` from `main(): int` also panics at runtime. Interpreter and native execution must produce identical panic stderr, Doria stack trace, and status for every supported panic path.
 
-Indexing panic behavior remains later-stage work. Float runtime values and their panic behavior remain Stage 14 work.
+Stage 14 adds one float-related panic reason: `Float::toInt` panics with
+`float-to-integer conversion out of range` for NaN, infinity, or a truncated
+mathematical value outside the canonical signed 64-bit integer range. Float
+arithmetic itself follows IEEE 754 and does not panic for overflow or division
+by zero. Indexing panic behavior remains later-stage work.
 
 ## Consequences
 

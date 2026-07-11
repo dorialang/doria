@@ -1,0 +1,5 @@
+function main(): int
+{
+    float $value = -42.9;
+    return -Float::toInt($value);
+}

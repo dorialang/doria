@@ -124,9 +124,11 @@ $implementedIntegerTypes = [
     'uint64',
 ];
 
-$plannedFloatTypes = [
+$implementedStage14ScalarTypes = [
+    'float',
     'float32',
     'float64',
+    'bool',
 ];
 
 $reservedTypes = [
@@ -164,6 +166,8 @@ $lspSupportedTypes = [
     'uint32',
     'uint64',
     'float',
+    'float32',
+    'float64',
     'string',
     'bool',
     'mixed',
@@ -203,7 +207,7 @@ $stage13SymbolOperators = [
     '|=',
     '^=',
 ];
-$booleanSymbolOperators = ['&&', '||'];
+$booleanSymbolOperators = ['!', '&&', '||'];
 $rejectedPreprocessor = [
     'include',
     'define',
@@ -390,7 +394,7 @@ function check_vscode_grammar(): void
 
     $wordOperatorMatches = [];
     foreach ($patterns as $pattern) {
-        if (($pattern['name'] ?? null) === 'keyword.operator.word.doria') {
+        if (($pattern['name'] ?? null) === 'keyword.operator.logical.word.doria') {
             $wordOperatorMatches[] = (string) ($pattern['match'] ?? '');
         }
     }
@@ -398,6 +402,19 @@ function check_vscode_grammar(): void
         require_check(
             any_match($wordOperatorMatches, static fn (string $match): bool => regex_fully_matches($match, $operator)),
             "VS Code grammar must classify '{$operator}' as a word operator"
+        );
+    }
+
+    $logicalSymbolMatches = [];
+    foreach ($patterns as $pattern) {
+        if (($pattern['name'] ?? null) === 'keyword.operator.logical.symbol.doria') {
+            $logicalSymbolMatches[] = (string) ($pattern['match'] ?? '');
+        }
+    }
+    foreach ($booleanSymbolOperators as $operator) {
+        require_check(
+            any_match($logicalSymbolMatches, static fn (string $match): bool => regex_fully_matches($match, $operator)),
+            "VS Code grammar must classify '{$operator}' as a logical operator"
         );
     }
 
@@ -664,6 +681,7 @@ function check_intellij_lexer(): void
         'DORIA_ATTRIBUTE_DELIMITER',
         'DORIA_ATTRIBUTE_NAME',
         'DORIA_ATTRIBUTE_ARGUMENT',
+        'DORIA_LOGICAL_OPERATOR',
     ] as $tokenType) {
         require_check(str_contains($intellijHighlightingText, $tokenType), "IntelliJ highlighting is missing {$tokenType}");
     }
@@ -672,7 +690,7 @@ function check_intellij_lexer(): void
 function check_lsp_completion_vocabulary(): void
 {
     global $acceptedKeywords, $plannedKeywords, $primitiveTypes, $reservedTypes, $plannedTypes, $wordOperators, $notKeywords, $lspServer, $lspSupportedTypes, $rejectedTypes;
-    global $implementedIntegerTypes, $plannedFloatTypes;
+    global $implementedIntegerTypes, $implementedStage14ScalarTypes;
 
     $lspText = read_text($lspServer);
     $tokens = array_unique([...$acceptedKeywords, ...$wordOperators]);
@@ -697,12 +715,6 @@ function check_lsp_completion_vocabulary(): void
     $lspTypeList = $matches[1];
 
     require_check(
-        preg_match('/let planned_types = \[(.*?)\];/s', $lspText, $plannedTypeMatches) === 1,
-        'LSP completion planned type list could not be found'
-    );
-    $lspPlannedTypeList = $plannedTypeMatches[1];
-
-    require_check(
         preg_match('/let reserved_types = \[(.*?)\];/s', $lspText, $reservedMatches) === 1,
         'LSP completion reserved type list could not be found'
     );
@@ -724,19 +736,15 @@ function check_lsp_completion_vocabulary(): void
         'LSP completion or hover text must document int as the exact int64 alias'
     );
 
-    foreach ($plannedFloatTypes as $type) {
+    foreach ($implementedStage14ScalarTypes as $type) {
         require_check(
-            str_contains($lspPlannedTypeList, chr(34) . $type . chr(34)),
-            'LSP planned type list is missing ' . $type
-        );
-        require_check(
-            !str_contains($lspTypeList, chr(34) . $type . chr(34)),
-            'LSP must not classify planned Stage 14 type ' . $type . ' as implemented'
+            str_contains($lspTypeList, chr(34) . $type . chr(34)),
+            'LSP must classify Stage 14 scalar type ' . $type . ' as implemented'
         );
     }
     require_check(
-        str_contains($lspText, 'native float values and operations are Stage 14 work'),
-        'LSP planned float detail must identify native float values and operations as Stage 14 work'
+        str_contains($lspText, 'exact alias of `float64`'),
+        'LSP completion or hover text must document float as the exact float64 alias'
     );
 
     sort($reservedTypes);
@@ -766,6 +774,16 @@ function check_lsp_completion_vocabulary(): void
         str_contains($lspText, 'Doria integer conversion intrinsic') &&
             str_contains($lspText, 'Out-of-range conversion panics'),
         'LSP must provide completion and hover details for explicit integer conversions'
+    );
+    foreach (['Int::toFloat', 'Float::toInt'] as $intrinsic) {
+        require_check(
+            str_contains($lspText, chr(34) . $intrinsic . chr(34)),
+            'LSP completion list is missing ' . $intrinsic
+        );
+    }
+    require_check(
+        str_contains($lspText, 'Doria scalar conversion intrinsic'),
+        'LSP must provide completion and hover details for Stage 14 scalar conversions'
     );
 
     sort($notKeywords);
@@ -813,6 +831,14 @@ function check_fixture(): void
         '#[App\Routing\Route(path: "/parser", name: "parser.show")]',
         '0..<10',
         '0..10',
+        'float32 $delta = 0.016;',
+        'float $ratio = 1.0 / 3.0;',
+        'Int::toFloat($whole)',
+        'Float::toInt($wideAlias)',
+        'let $both = $ready and not false;',
+        'bool $symbolNegated = !$input;',
+        'bool $symbolBoth = $ready && $symbolNegated;',
+        'bool $symbolEither = $symbolBoth || $different;',
         '?User',
         '\n\t\r\s',
         'use App\Repositories\UserRepository;',

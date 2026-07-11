@@ -1,0 +1,10 @@
+function main(): int
+{
+    float $value = 0.0 / 0.0;
+
+    if ($value != $value) {
+        return 42;
+    }
+
+    return 0;
+}

@@ -269,6 +269,7 @@ function total(): float64
     $value += 1.0;
     return $value;
 }
+
 "#,
     )
     .expect("PHP should preserve default float arithmetic");
@@ -277,6 +278,37 @@ function total(): float64
     assert!(php.contains("$value = 1.5 + 2.5;"));
     assert!(php.contains("$value += 1.0;"));
     assert!(!php.contains("float64"));
+}
+
+#[test]
+fn php_backend_uses_fdiv_and_rejects_inexact_cross_kind_conversions() {
+    let php = doriac::compile_source_to_php(
+        "test.doria",
+        r#"
+function divide(float $left, float64 $right): float
+{
+    writable float $value = $left / $right;
+    $value /= 2.0;
+    return $value;
+}
+"#,
+    )
+    .expect("PHP should lower IEEE float64 division through fdiv");
+    assert!(php.contains("fdiv($left, $right)"), "{php}");
+    assert!(php.contains("$value = fdiv($value, 2.0);"), "{php}");
+    assert!(!php.contains(" / "), "{php}");
+    assert!(!php.contains("/="), "{php}");
+    assert!(!php.contains("float64"), "{php}");
+
+    for source in [
+        "function main(): int { return Float::toInt(42.0); }",
+        "function helper(): float { return Int::toFloat(42); } function main(): void {}",
+    ] {
+        let diagnostics = doriac::compile_source_to_php("test.doria", source)
+            .expect_err("PHP must reject conversions it cannot prove exact");
+        assert_eq!(diagnostics[0].code, "B1301");
+        assert!(diagnostics[0].message.contains("conversion semantics"));
+    }
 }
 
 #[test]

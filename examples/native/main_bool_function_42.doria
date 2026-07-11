@@ -1,0 +1,7 @@
+function isAnswer(int $value): bool { return $value == 42; }
+function main(): int
+{
+    bool $answer = isAnswer(42);
+    if ($answer) { return 42; }
+    return 0;
+}

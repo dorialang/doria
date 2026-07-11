@@ -55,6 +55,23 @@ Source of truth for sequencing remains `docs/doria-end-to-end-plan.md`. The dura
 | Conversion-out-of-range panic | Covered | Covered | Covered | Checked companion conversion failure agrees on stderr and status 101. |
 | Fixed-width function ABI | Covered | Covered | Covered | Narrow signed/unsigned parameters and returns preserve canonical type and bit pattern. |
 | `uint64` boundary transport | Covered | Covered | Covered | Maximum unsigned 64-bit value survives local, call, return, and comparison paths. |
+| `float` / `float64` alias | Covered | Covered | Covered | One canonical IEEE binary64 type across semantic analysis, MIR, calls, and ABI lowering. |
+| `float32` | Covered | Covered | Covered | Distinct IEEE binary32 locals, parameters, returns, calls, and per-operation rounding. |
+| Contextual float literal rounding | Covered | Covered | Covered | Literals round directly to their expected binary32/binary64 context; unconstrained literals default to binary64. |
+| Float arithmetic | Covered | Covered | Covered | `+`, `-`, `*`, `/`, negation, increments, and compound assignment use the declared width without fast-math. |
+| Float division by zero | Covered | Covered | Covered | Positive/negative infinity and NaN follow IEEE 754 without integer panic behavior. |
+| NaN comparison | Covered | Covered | Covered | Visible unordered comparison behavior matches; payload bits are not compared. |
+| Signed zero | Covered | Covered | Covered | Zeroes compare equal while the sign remains observable through division. |
+| Float parameters, returns, and calls | Covered | Covered | Covered | F32/F64 ABI values remain in their declared widths, including recursive/general helper paths. |
+| Runtime bool locals | Covered | Covered | Covered | Readonly/writable locals use canonical false/true scalar values. |
+| Bool parameters, returns, and calls | Covered | Covered | Covered | Canonical I8 ABI values 0/1 cross helper boundaries. |
+| Bool value short-circuit | Covered | Covered | Covered | `and`/`or` skip the right operand in value and condition position. |
+| Bool eager xor | Covered | Covered | Covered | Both operands execute left-to-right and produce a canonical bool. |
+| `Int::toFloat` | Covered | Covered | Covered | Canonical signed int64 converts to binary64 with IEEE rounding and no panic. |
+| `Float::toInt` | Covered | Covered | Covered | Binary64 truncates toward zero after explicit finite/range checks. |
+| Float-to-int panic | Covered | Covered | Covered | NaN, infinity, and positive `2^63` produce identical message, stack trace, and status 101. |
+| Mixed int/float and float-width rejection | Frontend | Frontend | Covered | Semantic diagnostics prevent implicit cross-kind or cross-width values before MIR. |
+| PHP float32 boundary | Diagnostic | Diagnostic | Covered | PHP never emits unknown float width names; exact float64 division uses `fdiv`. |
 | Invalid process status panic | Covered | Covered | Covered | Runtime entry validates `main(): int` and exits 101 on failure. |
 | Native compile without execution preflight | Covered | Covered | Covered | Infinite-loop source compiles but is excluded from executable parity. |
 | Cranelift lowering source | MIR | MIR | Covered | `codegen_cranelift` has no HIR or retired-smoke dependency. |
@@ -62,6 +79,6 @@ Source of truth for sequencing remains `docs/doria-end-to-end-plan.md`. The dura
 
 ## Retirement Gate
 
-Status: Passed.
+Status: Passed through Stage 14.
 
-All accepted Stage <=13 lowering passes through typed MIR, the interpreter and Cranelift consume the same MIR, every finite native example is required in the executable manifest, and the Stage 7-10 native smoke module remains retired and deleted. Stage 13 is the highest completed stage; Stage 14 float execution and bool runtime values are next.
+All accepted Stage <=14 scalar lowering passes through typed MIR, the interpreter and Cranelift consume the same MIR, every finite native example is required in the executable manifest, and the Stage 7-10 native smoke module remains retired and deleted. Stage 14 is complete after the repository-wide validation gate passed; Stage 15 LLVM release lowering is next.

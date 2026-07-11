@@ -29,7 +29,7 @@ function main(): void
 {
 }
 "#,
-            "Stage 13 MIR supports integer parameters",
+            "Stage 14 MIR supports scalar parameters",
         ),
         (
             "string return",
@@ -42,7 +42,7 @@ function main(): void
 {
 }
 "#,
-            "Stage 13 MIR supports integer and void returns",
+            "Stage 14 MIR supports scalar and void returns",
         ),
         (
             "writable string local",

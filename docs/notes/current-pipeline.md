@@ -4,27 +4,26 @@ Documentation role: working note. This file prevents duplicated in-flight work. 
 
 ## Recently merged
 
-- PR #68: Stage 11 completion, direct MIR-to-Cranelift lowering, the differential parity suite, and retirement of the Stage 7-10 native smoke architecture.
 - PR #69: Stage 12 reusable CFG/dataflow analysis, recursion and mutual recursion, `doria-rt`, abort-only panic with Doria stack traces, and exact stdout/stderr/status parity.
+- PR #70: Stage 13 fixed-width integers, operators, contextual literals, checked conversions, scalar-width ABI coverage, and durable panic parity.
 
 ## Active
 
-- Stage 13 is complete locally on the feature branch: the fixed-width integer family, integer operators, contextual literals, checked conversions, typed MIR/interpreter/Cranelift execution, PHP compatibility boundary, and durable native parity coverage.
-- `int` is the canonical signed 64-bit integer and `int64` is its exact alias. The explicit unsigned family has no bare `uint` alias.
-- Arithmetic, division/remainder, shifts, conversions, fixed-width function ABI values, and `uint64` boundary transport share exact interpreter/native results and panic outcomes.
+- Stage 14 floats and bool runtime is complete locally on `feature/stage-14-floats-and-bool-runtime` after the full formatting, clippy, build, workspace-test, editor/docs, and durable parity validation gate passed.
+- The implementation uses one MIR scalar path for fixed-width integers, binary32/binary64 floats, and bool locals, parameters, returns, calls, assignments, and branches.
+- IEEE special values, bool short-circuiting, `Int::toFloat`, checked `Float::toInt`, PHP boundaries, LSP/editor status, and durable interpreter/native parity are included.
 
 ## Next
 
-- Stage 14: `float32`/`float64` execution and bool runtime values over the same MIR/interpreter/native architecture.
+- Stage 15: LLVM release backend over the same Stage 14 MIR. No Stage 15 implementation is included here.
 
 ## Do not duplicate
 
-- PR #68 Stage 11 completion work.
 - PR #69 Stage 12 CFG/dataflow, recursion, runtime, panic, and durable parity work.
-- Stage 13 integer-model, operator, conversion, and parity work.
+- PR #70 Stage 13 integer-model, operator, conversion, and parity work.
 - ROADMAP-style planning outside the end-to-end plan.
 
 ## Deferred
 
-- Full TypeId/TypeKind refactor.
-- Native float values and operations, float/integer conversions, and bool runtime values until Stage 14.
+- Runtime strings and heap allocation.
+- LLVM/release lowering until Stage 15 begins separately.

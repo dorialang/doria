@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
-use cranelift_codegen::ir::condcodes::IntCC;
+use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
+use cranelift_codegen::ir::immediates::{Ieee32, Ieee64};
 use cranelift_codegen::ir::{
     types, AbiParam, Block, BlockArg, InstBuilder, Signature, StackSlot, StackSlotData,
     StackSlotKind, TrapCode, Type as ClifType, Value,
@@ -12,7 +13,7 @@ use cranelift_object::{ObjectBuilder, ObjectModule};
 
 use crate::backend::BackendError;
 use crate::mir;
-use crate::numeric::{IntegerPanic, IntegerType, IntegerValue};
+use crate::numeric::{FloatType, FloatValue, IntegerPanic, IntegerType, IntegerValue};
 
 const RUNTIME_RETURNED_TRAP: u8 = 1;
 
@@ -76,10 +77,10 @@ fn function_signature(
     for parameter in &function.params {
         signature
             .params
-            .push(integer_abi_param(integer_local_type(function, *parameter)?));
+            .push(scalar_abi_param(scalar_local_type(function, *parameter)?));
     }
-    if let mir::ReturnType::Integer(ty) = function.return_type {
-        signature.returns.push(integer_abi_param(ty));
+    if let mir::ReturnType::Value(ty) = function.return_type {
+        signature.returns.push(scalar_abi_param(ty));
     }
     Ok(signature)
 }
@@ -102,6 +103,30 @@ fn integer_abi_param(ty: IntegerType) -> AbiParam {
         parameter.sext()
     } else {
         parameter.uext()
+    }
+}
+
+fn clif_scalar_type(ty: mir::ScalarType) -> ClifType {
+    match ty {
+        mir::ScalarType::Integer(ty) => clif_integer_type(ty),
+        mir::ScalarType::Float(FloatType::Float32) => types::F32,
+        mir::ScalarType::Float(FloatType::Float64) => types::F64,
+        mir::ScalarType::Bool => types::I8,
+    }
+}
+
+fn scalar_abi_param(ty: mir::ScalarType) -> AbiParam {
+    match ty {
+        mir::ScalarType::Integer(ty) => integer_abi_param(ty),
+        _ => AbiParam::new(clif_scalar_type(ty)),
+    }
+}
+
+fn scalar_storage_bytes(ty: mir::ScalarType) -> u32 {
+    match ty {
+        mir::ScalarType::Integer(ty) => ty.storage_bytes(),
+        mir::ScalarType::Float(ty) => ty.storage_bytes(),
+        mir::ScalarType::Bool => 1,
     }
 }
 
@@ -149,8 +174,8 @@ fn define_function(
             .locals
             .iter()
             .map(|local| match local.ty {
-                mir::Type::Integer(ty) => {
-                    let bytes = ty.storage_bytes();
+                mir::Type::Scalar(ty) => {
+                    let bytes = scalar_storage_bytes(ty);
                     Some(builder.create_sized_stack_slot(StackSlotData::new(
                         StackSlotKind::ExplicitSlot,
                         bytes,
@@ -169,7 +194,7 @@ fn define_function(
         ));
 
         builder.switch_to_block(entry);
-        initialize_integer_locals(&mut builder, function, &local_slots)?;
+        initialize_scalar_locals(&mut builder, function, &local_slots)?;
         bind_parameters(&mut builder, function, &local_slots, entry)?;
         let parent_frame = builder.block_params(entry)[0];
         let function_name = define_named_data(
@@ -224,19 +249,28 @@ fn define_function(
     Ok(())
 }
 
-fn initialize_integer_locals(
+fn initialize_scalar_locals(
     builder: &mut FunctionBuilder,
     function: &mir::Function,
     slots: &[Option<StackSlot>],
 ) -> Result<(), BackendError> {
     for local in &function.locals {
-        let mir::Type::Integer(ty) = local.ty else {
+        let mir::Type::Scalar(ty) = local.ty else {
             continue;
         };
-        let zero = builder.ins().iconst(clif_integer_type(ty), 0);
+        let zero = match ty {
+            mir::ScalarType::Integer(ty) => builder.ins().iconst(clif_integer_type(ty), 0),
+            mir::ScalarType::Float(FloatType::Float32) => {
+                builder.ins().f32const(Ieee32::with_bits(0))
+            }
+            mir::ScalarType::Float(FloatType::Float64) => {
+                builder.ins().f64const(Ieee64::with_bits(0))
+            }
+            mir::ScalarType::Bool => builder.ins().iconst(types::I8, 0),
+        };
         builder
             .ins()
-            .stack_store(zero, integer_slot(slots, local.id)?, 0);
+            .stack_store(zero, local_slot(slots, local.id)?, 0);
     }
     Ok(())
 }
@@ -249,7 +283,7 @@ fn bind_parameters(
 ) -> Result<(), BackendError> {
     let params = builder.block_params(entry).to_vec();
     for (parameter, value) in function.params.iter().zip(params.into_iter().skip(1)) {
-        let slot = integer_slot(slots, *parameter)?;
+        let slot = local_slot(slots, *parameter)?;
         builder.ins().stack_store(value, slot, 0);
     }
     Ok(())
@@ -286,9 +320,11 @@ fn define_process_main(
         runtime_signature.params.push(AbiParam::new(pointer_type));
         runtime_signature.returns.push(AbiParam::new(types::I32));
         let runtime_symbol = match entry.return_type {
-            mir::ReturnType::Integer(IntegerType::Int64) => "dr_v1_main_int",
+            mir::ReturnType::Value(mir::ScalarType::Integer(IntegerType::Int64)) => {
+                "dr_v1_main_int"
+            }
             mir::ReturnType::Void => "dr_v1_main_void",
-            mir::ReturnType::Integer(other) => {
+            mir::ReturnType::Value(other) => {
                 return Err(malformed_mir(format!(
                     "entry function has unsupported process return type {other}"
                 )));
@@ -404,15 +440,15 @@ fn lower_statement(
         mir::Statement::AssignLocal { target, value } => {
             let definition = local_definition(resources.program, resources.function_id, *target)?;
             match definition.ty {
-                mir::Type::Integer(_) => {
-                    let mir::Rvalue::Integer(expression) = value else {
+                mir::Type::Scalar(_) => {
+                    let mir::Rvalue::Value(expression) = value else {
                         return Err(malformed_mir(format!(
-                            "integer local local{} has a non-integer assignment",
+                            "scalar local local{} has a non-scalar assignment",
                             target.0
                         )));
                     };
-                    let value = lower_integer_expression(builder, expression, resources)?;
-                    let slot = integer_slot(resources.local_slots, *target)?;
+                    let value = lower_value_expression(builder, expression, resources)?;
+                    let slot = local_slot(resources.local_slots, *target)?;
                     builder.ins().stack_store(value, slot, 0);
                 }
                 mir::Type::String => {
@@ -450,7 +486,7 @@ fn lower_terminator(
 ) -> Result<(), BackendError> {
     match terminator {
         mir::Terminator::Return(expression) => {
-            let value = lower_integer_expression(builder, expression, resources)?;
+            let value = lower_value_expression(builder, expression, resources)?;
             builder.ins().return_(&[value]);
         }
         mir::Terminator::ReturnVoid => {
@@ -483,6 +519,18 @@ fn lower_terminator(
     Ok(())
 }
 
+fn lower_value_expression(
+    builder: &mut FunctionBuilder,
+    expression: &mir::ValueExpression,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<Value, BackendError> {
+    match expression {
+        mir::ValueExpression::Integer(value) => lower_integer_expression(builder, value, resources),
+        mir::ValueExpression::Float(value) => lower_float_expression(builder, value, resources),
+        mir::ValueExpression::Bool(value) => lower_condition_value(builder, value, resources),
+    }
+}
+
 fn lower_integer_expression(
     builder: &mut FunctionBuilder,
     expression: &mir::IntegerExpression,
@@ -510,6 +558,10 @@ fn lower_integer_expression(
             let source_type = value.ty();
             let value = lower_integer_expression(builder, value, resources)?;
             lower_integer_conversion(builder, source_type, *ty, value, resources)
+        }
+        mir::IntegerExpression::FloatToInt { value } => {
+            let value = lower_float_expression(builder, value, resources)?;
+            lower_float_to_int(builder, value, resources)
         }
         mir::IntegerExpression::Call { ty, function, args } => {
             lower_integer_call(builder, *ty, *function, args, resources)
@@ -814,6 +866,15 @@ fn lower_panic_if(
     panic: IntegerPanic,
     resources: &mut LoweringResources<'_, '_>,
 ) -> Result<(), BackendError> {
+    lower_panic_if_message(builder, condition, panic.message().as_bytes(), resources)
+}
+
+fn lower_panic_if_message(
+    builder: &mut FunctionBuilder,
+    condition: Value,
+    message: &[u8],
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<(), BackendError> {
     let panic_block = builder.create_block();
     let continue_block = builder.create_block();
     builder
@@ -821,7 +882,7 @@ fn lower_panic_if(
         .brif(condition, panic_block, &[], continue_block, &[]);
 
     builder.switch_to_block(panic_block);
-    lower_runtime_panic(builder, panic.message().as_bytes(), resources)?;
+    lower_runtime_panic(builder, message, resources)?;
 
     builder.switch_to_block(continue_block);
     Ok(())
@@ -840,7 +901,7 @@ fn lower_integer_operand(
     resources: &LoweringResources<'_, '_>,
 ) -> Result<Value, BackendError> {
     match operand {
-        mir::Operand::Integer(value) => {
+        mir::Operand::Scalar(mir::ScalarValue::Integer(value)) => {
             if value.ty != ty {
                 return Err(malformed_mir(format!(
                     "{ty} expression contains {} constant",
@@ -851,23 +912,118 @@ fn lower_integer_operand(
         }
         mir::Operand::Local(id) => {
             let definition = local_definition(resources.program, resources.function_id, *id)?;
-            if definition.ty != mir::Type::Integer(ty) {
+            if definition.ty != mir::Type::Scalar(mir::ScalarType::Integer(ty)) {
                 return Err(malformed_mir(format!(
                     "{ty} expression reads local{} with type {}",
                     id.0, definition.ty
                 )));
             }
-            let slot = integer_slot(resources.local_slots, *id)?;
+            let slot = local_slot(resources.local_slots, *id)?;
             Ok(builder.ins().stack_load(clif_integer_type(ty), slot, 0))
         }
+        mir::Operand::Scalar(_) => Err(malformed_mir(
+            "integer expression contains non-integer constant",
+        )),
     }
+}
+
+fn float_constant(builder: &mut FunctionBuilder, value: FloatValue) -> Value {
+    match value.ty {
+        FloatType::Float32 => builder.ins().f32const(Ieee32::with_bits(value.bits as u32)),
+        FloatType::Float64 => builder.ins().f64const(Ieee64::with_bits(value.bits)),
+    }
+}
+
+fn lower_float_expression(
+    builder: &mut FunctionBuilder,
+    expression: &mir::FloatExpression,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<Value, BackendError> {
+    match expression {
+        mir::FloatExpression::Use { ty, operand } => match operand {
+            mir::Operand::Scalar(mir::ScalarValue::Float(value)) if value.ty == *ty => {
+                Ok(float_constant(builder, *value))
+            }
+            mir::Operand::Local(id) => {
+                let expected = mir::Type::Scalar(mir::ScalarType::Float(*ty));
+                let definition = local_definition(resources.program, resources.function_id, *id)?;
+                if definition.ty != expected {
+                    return Err(malformed_mir(format!(
+                        "{ty} expression reads local{} with type {}",
+                        id.0, definition.ty
+                    )));
+                }
+                Ok(builder.ins().stack_load(
+                    clif_scalar_type(mir::ScalarType::Float(*ty)),
+                    local_slot(resources.local_slots, *id)?,
+                    0,
+                ))
+            }
+            _ => Err(malformed_mir(
+                "float expression contains non-float constant",
+            )),
+        },
+        mir::FloatExpression::Negate { operand, .. } => {
+            let operand = lower_float_expression(builder, operand, resources)?;
+            Ok(builder.ins().fneg(operand))
+        }
+        mir::FloatExpression::Binary {
+            op, left, right, ..
+        } => {
+            let left = lower_float_expression(builder, left, resources)?;
+            let right = lower_float_expression(builder, right, resources)?;
+            Ok(match op {
+                mir::FloatBinaryOp::Add => builder.ins().fadd(left, right),
+                mir::FloatBinaryOp::Subtract => builder.ins().fsub(left, right),
+                mir::FloatBinaryOp::Multiply => builder.ins().fmul(left, right),
+                mir::FloatBinaryOp::Divide => builder.ins().fdiv(left, right),
+            })
+        }
+        mir::FloatExpression::IntToFloat { value } => {
+            if value.ty() != IntegerType::Int64 {
+                return Err(malformed_mir("Int::toFloat operand is not canonical int"));
+            }
+            let value = lower_integer_expression(builder, value, resources)?;
+            Ok(builder.ins().fcvt_from_sint(types::F64, value))
+        }
+        mir::FloatExpression::Call { function, args, .. } => {
+            lower_scalar_call(builder, *function, args, resources)
+        }
+    }
+}
+
+fn lower_float_to_int(
+    builder: &mut FunctionBuilder,
+    value: Value,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<Value, BackendError> {
+    let minimum = builder.ins().f64const(Ieee64::with_bits(
+        (-9_223_372_036_854_775_808.0_f64).to_bits(),
+    ));
+    let maximum = builder.ins().f64const(Ieee64::with_bits(
+        (9_223_372_036_854_775_808.0_f64).to_bits(),
+    ));
+    let unordered = builder.ins().fcmp(FloatCC::Unordered, value, value);
+    let below = builder.ins().fcmp(FloatCC::LessThan, value, minimum);
+    let above = builder
+        .ins()
+        .fcmp(FloatCC::GreaterThanOrEqual, value, maximum);
+    let invalid_range = builder.ins().bor(below, above);
+    let invalid = builder.ins().bor(unordered, invalid_range);
+    lower_panic_if_message(
+        builder,
+        invalid,
+        b"float-to-integer conversion out of range",
+        resources,
+    )?;
+    Ok(builder.ins().fcvt_to_sint(types::I64, value))
 }
 
 fn lower_integer_call(
     builder: &mut FunctionBuilder,
     ty: IntegerType,
     function: mir::FunctionId,
-    args: &[mir::IntegerExpression],
+    args: &[mir::ValueExpression],
     resources: &mut LoweringResources<'_, '_>,
 ) -> Result<Value, BackendError> {
     let mut values = vec![resources.current_frame];
@@ -884,12 +1040,29 @@ fn lower_integer_call(
 
 fn lower_call_args(
     builder: &mut FunctionBuilder,
-    args: &[mir::IntegerExpression],
+    args: &[mir::ValueExpression],
     resources: &mut LoweringResources<'_, '_>,
 ) -> Result<Vec<Value>, BackendError> {
     args.iter()
-        .map(|argument| lower_integer_expression(builder, argument, resources))
+        .map(|argument| lower_value_expression(builder, argument, resources))
         .collect()
+}
+
+fn lower_scalar_call(
+    builder: &mut FunctionBuilder,
+    function: mir::FunctionId,
+    args: &[mir::ValueExpression],
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<Value, BackendError> {
+    let mut values = vec![resources.current_frame];
+    values.extend(lower_call_args(builder, args, resources)?);
+    let callee = declared_function(builder, resources, function)?;
+    let call = builder.ins().call(callee, &values);
+    builder
+        .inst_results(call)
+        .first()
+        .copied()
+        .ok_or_else(|| malformed_mir(format!("call to function{} produced no result", function.0)))
 }
 
 fn declared_function(
@@ -908,30 +1081,40 @@ fn declared_function(
 
 fn lower_condition_to_branch(
     builder: &mut FunctionBuilder,
-    condition: &mir::Condition,
+    condition: &mir::BoolExpression,
     then_block: Block,
     else_block: Block,
     resources: &mut LoweringResources<'_, '_>,
 ) -> Result<(), BackendError> {
     match condition {
-        mir::Condition::Bool(true) => {
-            builder.ins().jump(then_block, &[]);
-        }
-        mir::Condition::Bool(false) => {
-            builder.ins().jump(else_block, &[]);
-        }
-        mir::Condition::Compare { op, left, right } => {
-            let ty = left.ty();
-            let left = lower_integer_expression(builder, left, resources)?;
-            let right = lower_integer_expression(builder, right, resources)?;
-            let value = builder.ins().icmp(compare_code(*op, ty), left, right);
+        mir::BoolExpression::Use { operand } => {
+            let value = lower_bool_operand(builder, operand, resources)?;
             builder.ins().brif(value, then_block, &[], else_block, &[]);
         }
-        mir::Condition::Not(condition) => {
+        mir::BoolExpression::Compare { op, left, right } => {
+            let ty = left.ty();
+            let left = lower_value_expression(builder, left, resources)?;
+            let right = lower_value_expression(builder, right, resources)?;
+            let value = match ty {
+                mir::ScalarType::Integer(ty) => {
+                    builder.ins().icmp(compare_code(*op, ty), left, right)
+                }
+                mir::ScalarType::Float(_) => {
+                    builder.ins().fcmp(float_compare_code(*op), left, right)
+                }
+                mir::ScalarType::Bool => match op {
+                    mir::CompareOp::Equal => builder.ins().icmp(IntCC::Equal, left, right),
+                    mir::CompareOp::NotEqual => builder.ins().icmp(IntCC::NotEqual, left, right),
+                    _ => return Err(malformed_mir("ordered bool comparison is invalid")),
+                },
+            };
+            builder.ins().brif(value, then_block, &[], else_block, &[]);
+        }
+        mir::BoolExpression::Not(condition) => {
             lower_condition_to_branch(builder, condition, else_block, then_block, resources)?;
         }
-        mir::Condition::Binary {
-            op: mir::ConditionBinaryOp::And,
+        mir::BoolExpression::Binary {
+            op: mir::BoolBinaryOp::And,
             left,
             right,
         } => {
@@ -940,8 +1123,8 @@ fn lower_condition_to_branch(
             builder.switch_to_block(right_block);
             lower_condition_to_branch(builder, right, then_block, else_block, resources)?;
         }
-        mir::Condition::Binary {
-            op: mir::ConditionBinaryOp::Or,
+        mir::BoolExpression::Binary {
+            op: mir::BoolBinaryOp::Or,
             left,
             right,
         } => {
@@ -950,8 +1133,8 @@ fn lower_condition_to_branch(
             builder.switch_to_block(right_block);
             lower_condition_to_branch(builder, right, then_block, else_block, resources)?;
         }
-        mir::Condition::Binary {
-            op: mir::ConditionBinaryOp::Xor,
+        mir::BoolExpression::Binary {
+            op: mir::BoolBinaryOp::Xor,
             left,
             right,
         } => {
@@ -960,13 +1143,17 @@ fn lower_condition_to_branch(
             let value = builder.ins().icmp(IntCC::NotEqual, left, right);
             builder.ins().brif(value, then_block, &[], else_block, &[]);
         }
+        mir::BoolExpression::Call { function, args } => {
+            let value = lower_scalar_call(builder, *function, args, resources)?;
+            builder.ins().brif(value, then_block, &[], else_block, &[]);
+        }
     }
     Ok(())
 }
 
 fn lower_condition_value(
     builder: &mut FunctionBuilder,
-    condition: &mir::Condition,
+    condition: &mir::BoolExpression,
     resources: &mut LoweringResources<'_, '_>,
 ) -> Result<Value, BackendError> {
     let true_block = builder.create_block();
@@ -1004,6 +1191,42 @@ fn compare_code(op: mir::CompareOp, ty: IntegerType) -> IntCC {
         mir::CompareOp::Greater => IntCC::UnsignedGreaterThan,
         mir::CompareOp::GreaterEqual if ty.is_signed() => IntCC::SignedGreaterThanOrEqual,
         mir::CompareOp::GreaterEqual => IntCC::UnsignedGreaterThanOrEqual,
+    }
+}
+
+fn float_compare_code(op: mir::CompareOp) -> FloatCC {
+    match op {
+        mir::CompareOp::Equal => FloatCC::Equal,
+        mir::CompareOp::NotEqual => FloatCC::NotEqual,
+        mir::CompareOp::Less => FloatCC::LessThan,
+        mir::CompareOp::LessEqual => FloatCC::LessThanOrEqual,
+        mir::CompareOp::Greater => FloatCC::GreaterThan,
+        mir::CompareOp::GreaterEqual => FloatCC::GreaterThanOrEqual,
+    }
+}
+
+fn lower_bool_operand(
+    builder: &mut FunctionBuilder,
+    operand: &mir::Operand,
+    resources: &LoweringResources<'_, '_>,
+) -> Result<Value, BackendError> {
+    match operand {
+        mir::Operand::Scalar(mir::ScalarValue::Bool(value)) => {
+            Ok(builder.ins().iconst(types::I8, i64::from(*value)))
+        }
+        mir::Operand::Local(id) => {
+            let definition = local_definition(resources.program, resources.function_id, *id)?;
+            if definition.ty != mir::Type::Scalar(mir::ScalarType::Bool) {
+                return Err(malformed_mir(format!(
+                    "bool expression reads local{} with type {}",
+                    id.0, definition.ty
+                )));
+            }
+            Ok(builder
+                .ins()
+                .stack_load(types::I8, local_slot(resources.local_slots, *id)?, 0))
+        }
+        _ => Err(malformed_mir("bool expression contains non-bool constant")),
     }
 }
 
@@ -1218,7 +1441,8 @@ fn validate_program(program: &mir::Program) -> Result<(), BackendError> {
     }
     if !matches!(
         entry.return_type,
-        mir::ReturnType::Void | mir::ReturnType::Integer(IntegerType::Int64)
+        mir::ReturnType::Void
+            | mir::ReturnType::Value(mir::ScalarType::Integer(IntegerType::Int64))
     ) {
         return Err(malformed_mir(
             "entry function must return void or int/int64",
@@ -1248,9 +1472,9 @@ fn validate_function(program: &mir::Program, function: &mir::Function) -> Result
     }
     for parameter in &function.params {
         let local = local_in(function, *parameter)?;
-        if !matches!(local.ty, mir::Type::Integer(_)) {
+        if !matches!(local.ty, mir::Type::Scalar(_)) {
             return Err(malformed_mir(format!(
-                "function {} parameter local{} is not an integer",
+                "function {} parameter local{} is not a scalar",
                 function.name, parameter.0
             )));
         }
@@ -1287,11 +1511,11 @@ fn validate_statement(
                     "string local local{} receives an integer rvalue",
                     target.0
                 ))),
-                (mir::Type::Integer(_), mir::Rvalue::String(_)) => Err(malformed_mir(format!(
-                    "integer local local{} receives a string rvalue",
+                (mir::Type::Scalar(_), mir::Rvalue::String(_)) => Err(malformed_mir(format!(
+                    "scalar local local{} receives a string rvalue",
                     target.0
                 ))),
-                (mir::Type::Integer(ty), mir::Rvalue::Integer(expression)) => {
+                (mir::Type::Scalar(ty), mir::Rvalue::Value(expression)) => {
                     if expression.ty() != ty {
                         return Err(malformed_mir(format!(
                             "{} local local{} receives {} expression",
@@ -1300,7 +1524,7 @@ fn validate_statement(
                             expression.ty()
                         )));
                     }
-                    validate_integer_expression(program, function, expression)
+                    validate_value_expression(program, function, expression)
                 }
             }
         }
@@ -1329,7 +1553,7 @@ fn validate_terminator(
 ) -> Result<(), BackendError> {
     match terminator {
         mir::Terminator::Return(expression) => {
-            let mir::ReturnType::Integer(return_type) = function.return_type else {
+            let mir::ReturnType::Value(return_type) = function.return_type else {
                 return Err(malformed_mir(format!(
                     "void function {} has an integer return",
                     function.name
@@ -1343,12 +1567,12 @@ fn validate_terminator(
                     return_type
                 )));
             }
-            validate_integer_expression(program, function, expression)
+            validate_value_expression(program, function, expression)
         }
         mir::Terminator::ReturnVoid => {
             if function.return_type != mir::ReturnType::Void {
                 return Err(malformed_mir(format!(
-                    "integer function {} has a void return",
+                    "scalar function {} has a void return",
                     function.name
                 )));
             }
@@ -1408,13 +1632,16 @@ fn validate_integer_expression(
         mir::IntegerExpression::Convert { value, .. } => {
             validate_integer_expression(program, function, value)
         }
+        mir::IntegerExpression::FloatToInt { value } => {
+            validate_float_expression(program, function, value)
+        }
         mir::IntegerExpression::Call {
             ty,
             function: callee,
             args,
         } => {
             let callee = function_in(program, *callee)?;
-            if callee.return_type != mir::ReturnType::Integer(*ty) {
+            if callee.return_type != mir::ReturnType::Value(mir::ScalarType::Integer(*ty)) {
                 return Err(malformed_mir(format!(
                     "{ty} call targets function {} returning {}",
                     callee.name, callee.return_type
@@ -1425,11 +1652,69 @@ fn validate_integer_expression(
     }
 }
 
+fn validate_value_expression(
+    program: &mir::Program,
+    function: &mir::Function,
+    expression: &mir::ValueExpression,
+) -> Result<(), BackendError> {
+    match expression {
+        mir::ValueExpression::Integer(value) => {
+            validate_integer_expression(program, function, value)
+        }
+        mir::ValueExpression::Float(value) => validate_float_expression(program, function, value),
+        mir::ValueExpression::Bool(value) => validate_condition(program, function, value),
+    }
+}
+
+fn validate_float_expression(
+    program: &mir::Program,
+    function: &mir::Function,
+    expression: &mir::FloatExpression,
+) -> Result<(), BackendError> {
+    match expression {
+        mir::FloatExpression::Use { ty, operand } => match operand {
+            mir::Operand::Scalar(mir::ScalarValue::Float(value)) if value.ty == *ty => Ok(()),
+            mir::Operand::Local(local)
+                if local_in(function, *local)?.ty
+                    == mir::Type::Scalar(mir::ScalarType::Float(*ty)) =>
+            {
+                Ok(())
+            }
+            _ => Err(malformed_mir(
+                "float expression has an incompatible operand",
+            )),
+        },
+        mir::FloatExpression::Negate { operand, .. } => {
+            validate_float_expression(program, function, operand)
+        }
+        mir::FloatExpression::Binary { left, right, .. } => {
+            validate_float_expression(program, function, left)?;
+            validate_float_expression(program, function, right)
+        }
+        mir::FloatExpression::IntToFloat { value } => {
+            validate_integer_expression(program, function, value)
+        }
+        mir::FloatExpression::Call {
+            ty,
+            function: callee,
+            args,
+        } => {
+            let callee = function_in(program, *callee)?;
+            if callee.return_type != mir::ReturnType::Value(mir::ScalarType::Float(*ty)) {
+                return Err(malformed_mir(
+                    "float call targets a function with another return type",
+                ));
+            }
+            validate_call_args(program, function, callee, args)
+        }
+    }
+}
+
 fn validate_call_args(
     program: &mir::Program,
     caller: &mir::Function,
     callee: &mir::Function,
-    args: &[mir::IntegerExpression],
+    args: &[mir::ValueExpression],
 ) -> Result<(), BackendError> {
     if args.len() != callee.params.len() {
         return Err(malformed_mir(format!(
@@ -1440,7 +1725,7 @@ fn validate_call_args(
         )));
     }
     for (index, (argument, parameter)) in args.iter().zip(&callee.params).enumerate() {
-        let parameter_type = integer_local_type(callee, *parameter)?;
+        let parameter_type = scalar_local_type(callee, *parameter)?;
         if argument.ty() != parameter_type {
             return Err(malformed_mir(format!(
                 "call to {} passes {} argument {} to {} parameter",
@@ -1450,7 +1735,7 @@ fn validate_call_args(
                 parameter_type
             )));
         }
-        validate_integer_expression(program, caller, argument)?;
+        validate_value_expression(program, caller, argument)?;
     }
     Ok(())
 }
@@ -1458,11 +1743,19 @@ fn validate_call_args(
 fn validate_condition(
     program: &mir::Program,
     function: &mir::Function,
-    condition: &mir::Condition,
+    condition: &mir::BoolExpression,
 ) -> Result<(), BackendError> {
     match condition {
-        mir::Condition::Bool(_) => Ok(()),
-        mir::Condition::Compare { left, right, .. } => {
+        mir::BoolExpression::Use { operand } => match operand {
+            mir::Operand::Scalar(mir::ScalarValue::Bool(_)) => Ok(()),
+            mir::Operand::Local(local)
+                if local_in(function, *local)?.ty == mir::Type::Scalar(mir::ScalarType::Bool) =>
+            {
+                Ok(())
+            }
+            _ => Err(malformed_mir("bool expression has an incompatible operand")),
+        },
+        mir::BoolExpression::Compare { left, right, .. } => {
             if left.ty() != right.ty() {
                 return Err(malformed_mir(format!(
                     "comparison has {} and {} operands",
@@ -1470,13 +1763,23 @@ fn validate_condition(
                     right.ty()
                 )));
             }
-            validate_integer_expression(program, function, left)?;
-            validate_integer_expression(program, function, right)
+            validate_value_expression(program, function, left)?;
+            validate_value_expression(program, function, right)
         }
-        mir::Condition::Not(condition) => validate_condition(program, function, condition),
-        mir::Condition::Binary { left, right, .. } => {
+        mir::BoolExpression::Not(condition) => validate_condition(program, function, condition),
+        mir::BoolExpression::Binary { left, right, .. } => {
             validate_condition(program, function, left)?;
             validate_condition(program, function, right)
+        }
+        mir::BoolExpression::Call {
+            function: callee,
+            args,
+        } => {
+            let callee = function_in(program, *callee)?;
+            if callee.return_type != mir::ReturnType::Value(mir::ScalarType::Bool) {
+                return Err(malformed_mir("bool call targets a non-bool function"));
+            }
+            validate_call_args(program, function, callee, args)
         }
     }
 }
@@ -1487,14 +1790,13 @@ fn validate_integer_operand(
     operand: &mir::Operand,
 ) -> Result<(), BackendError> {
     match operand {
-        mir::Operand::Integer(value) if value.ty != ty => Err(malformed_mir(format!(
-            "{ty} expression contains {} constant",
-            value.ty
-        ))),
-        mir::Operand::Integer(_) => Ok(()),
+        mir::Operand::Scalar(mir::ScalarValue::Integer(value)) if value.ty != ty => Err(
+            malformed_mir(format!("{ty} expression contains {} constant", value.ty)),
+        ),
+        mir::Operand::Scalar(mir::ScalarValue::Integer(_)) => Ok(()),
         mir::Operand::Local(local) => {
             let definition = local_in(function, *local)?;
-            if definition.ty != mir::Type::Integer(ty) {
+            if definition.ty != mir::Type::Scalar(mir::ScalarType::Integer(ty)) {
                 return Err(malformed_mir(format!(
                     "{ty} expression uses local{} with type {}",
                     local.0, definition.ty
@@ -1502,6 +1804,9 @@ fn validate_integer_operand(
             }
             Ok(())
         }
+        mir::Operand::Scalar(_) => Err(malformed_mir(
+            "integer expression contains non-integer constant",
+        )),
     }
 }
 
@@ -1549,14 +1854,14 @@ fn local_in(function: &mir::Function, id: mir::LocalId) -> Result<&mir::Local, B
         .ok_or_else(|| malformed_mir(format!("LocalId local{} does not exist", id.0)))
 }
 
-fn integer_local_type(
+fn scalar_local_type(
     function: &mir::Function,
     id: mir::LocalId,
-) -> Result<IntegerType, BackendError> {
+) -> Result<mir::ScalarType, BackendError> {
     let local = local_in(function, id)?;
-    let mir::Type::Integer(ty) = local.ty else {
+    let mir::Type::Scalar(ty) = local.ty else {
         return Err(malformed_mir(format!(
-            "LocalId local{} is not an integer local",
+            "LocalId local{} is not a scalar local",
             id.0
         )));
     };
@@ -1586,12 +1891,12 @@ fn block_for(blocks: &[Block], id: mir::BlockId) -> Result<Block, BackendError> 
         .ok_or_else(|| malformed_mir(format!("BlockId block{} does not exist", id.0)))
 }
 
-fn integer_slot(slots: &[Option<StackSlot>], id: mir::LocalId) -> Result<StackSlot, BackendError> {
+fn local_slot(slots: &[Option<StackSlot>], id: mir::LocalId) -> Result<StackSlot, BackendError> {
     slots
         .get(id.0)
         .copied()
         .flatten()
-        .ok_or_else(|| malformed_mir(format!("LocalId local{} is not an integer local", id.0)))
+        .ok_or_else(|| malformed_mir(format!("LocalId local{} is not a scalar local", id.0)))
 }
 
 fn malformed_mir(message: impl Into<String>) -> BackendError {

@@ -1,0 +1,2 @@
+function convert(): int { return Float::toInt(1.0 / 0.0); }
+function main(): int { return convert(); }

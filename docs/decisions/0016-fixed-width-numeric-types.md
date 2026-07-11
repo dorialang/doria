@@ -207,21 +207,20 @@ uint64
 
 `int` and `int64` are the same canonical signed 64-bit integer type. Stage 13 also implements contextual integer-literal typing, the remaining integer operators, and explicit checked integer conversions under decisions 0041 and 0042.
 
-The accepted `float`, `float32`, and `float64` spellings remain part of the language design, but Stage 13 does not implement native floating-point values or operations. Native float execution remains Stage 14 work.
+Stage 14 implements `float32` and canonical `float`/`float64` as real semantic,
+MIR, interpreter, and native runtime values. `float` and `float64` are one
+binary64 type; `float32` is a distinct binary32 type. Decimal literals are
+contextually rounded directly to the expected float width, while unconstrained
+float literals default to `float64`. Decision 0072 defines the exact IEEE 754
+arithmetic, comparison, literal, ABI, and parity contracts.
 
 ## Non-goals
 
 This decision does not:
 
-- implement fixed-width numeric types
-- add lexer keywords
-- change parser behavior
-- change `TypeKind`
-- change Doria IR
-- change native code generation
-- change PHP backend behavior
+- add lexer keywords or numeric literal suffixes
 - define unary minus
-- define numeric literal suffixes
 - define implicit numeric conversions
-- define arithmetic overflow behavior beyond existing accepted literal checks
 - define final process-exit behavior for all Doria integer values
+- define public float payload/bit-inspection APIs
+- define additional cross-kind conversion companions beyond decision 0042

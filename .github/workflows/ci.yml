@@ -57,6 +57,12 @@ jobs:
           cargo test -p doriac --test integer_engine_tests --locked --verbose
           cargo test -p doriac --test stage13_semantic_tests --locked --verbose
 
+      - name: Run focused Stage 14 float engine, semantic, and interpreter tests
+        run: |
+          cargo test -p doriac --test float_engine_tests --locked --verbose
+          cargo test -p doriac --test stage14_semantic_tests --locked --verbose
+          cargo test -p doriac --test stage14_mir_interpreter_tests --locked --verbose
+
       - name: Run focused MIR and linker-independent Cranelift tests
         run: |
           cargo test -p doriac --test mir_tests --locked --verbose
@@ -77,6 +83,29 @@ jobs:
           set -e
           test "${signed_status}" -eq 42
           test "${unsigned_status}" -eq 42
+
+      - name: Smoke Stage 14 native scalar and panic fixtures
+        run: |
+          cargo run -p doriac -- compile examples/native/main_float32_rounding_42.doria --target native --out build/native/main_float32_rounding_42
+          cargo run -p doriac -- compile examples/native/main_float64_arithmetic_42.doria --target native --out build/native/main_float64_arithmetic_42
+          cargo run -p doriac -- compile examples/native/main_bool_short_circuit_42.doria --target native --out build/native/main_bool_short_circuit_42
+          cargo run -p doriac -- compile examples/native/main_float_to_int_nan_panic.doria --target native --out build/native/main_float_to_int_nan_panic
+          set +e
+          build/native/main_float32_rounding_42
+          float32_status=$?
+          build/native/main_float64_arithmetic_42
+          float64_status=$?
+          build/native/main_bool_short_circuit_42
+          bool_status=$?
+          build/native/main_float_to_int_nan_panic 2>build/native/main_float_to_int_nan_panic.stderr
+          panic_status=$?
+          set -e
+          test "${float32_status}" -eq 42
+          test "${float64_status}" -eq 42
+          test "${bool_status}" -eq 42
+          test "${panic_status}" -eq 101
+          grep -Fx "Panic: float-to-integer conversion out of range" build/native/main_float_to_int_nan_panic.stderr
+          grep -Fx "Stack Trace:" build/native/main_float_to_int_nan_panic.stderr
 
       - name: Check repository script guardrails
         run: |

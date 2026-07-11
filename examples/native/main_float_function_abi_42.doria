@@ -1,0 +1,6 @@
+function answer(float32 $narrow, float $wide): float
+{
+    if ($narrow == 2.0) { return $wide + 2.0; }
+    return 0.0;
+}
+function main(): int { return Float::toInt(answer(2.0, 40.0)); }
