@@ -277,12 +277,30 @@ jobs:
           cargo run -p doriac --features llvm-backend -- compile examples/native/main_release_profile_42.doria --release --out build/native/main_release_profile_42.exe
           cargo run -p doriac --features llvm-backend -- compile examples/native/main_add_overflow_panic.doria --release --out build/native/main_add_overflow_panic.exe
           cargo run -p doriac --features llvm-backend -- compile examples/native/main_float_to_int_nan_panic.doria --release --out build/native/main_float_to_int_nan_panic.exe
-          & build/native/main_release_profile_42.exe
-          if ($LASTEXITCODE -ne 42) { throw "release fixture status was $LASTEXITCODE" }
-          & build/native/main_add_overflow_panic.exe 2>build/native/main_add_overflow_panic.stderr
-          if ($LASTEXITCODE -ne 101) { throw "integer panic status was $LASTEXITCODE" }
-          & build/native/main_float_to_int_nan_panic.exe 2>build/native/main_float_to_int_nan_panic.stderr
-          if ($LASTEXITCODE -ne 101) { throw "float panic status was $LASTEXITCODE" }
+          function Invoke-DoriaFixture {
+            param(
+              [string] $Path,
+              [int] $ExpectedStatus,
+              [string] $StderrPath = ""
+            )
+            $start = @{
+              FilePath = (Resolve-Path $Path).Path
+              NoNewWindow = $true
+              PassThru = $true
+              Wait = $true
+            }
+            if ($StderrPath) {
+              $start.RedirectStandardError = [IO.Path]::GetFullPath($StderrPath)
+            }
+            $process = Start-Process @start
+            Write-Host "$Path exited with $($process.ExitCode)"
+            if ($process.ExitCode -ne $ExpectedStatus) {
+              throw "$Path status was $($process.ExitCode), expected $ExpectedStatus"
+            }
+          }
+          Invoke-DoriaFixture build/native/main_release_profile_42.exe 42
+          Invoke-DoriaFixture build/native/main_add_overflow_panic.exe 101 build/native/main_add_overflow_panic.stderr
+          Invoke-DoriaFixture build/native/main_float_to_int_nan_panic.exe 101 build/native/main_float_to_int_nan_panic.stderr
           if (-not (Select-String -Path build/native/main_add_overflow_panic.stderr -SimpleMatch "Panic: integer overflow during addition")) { throw "missing integer panic" }
           if (-not (Select-String -Path build/native/main_add_overflow_panic.stderr -SimpleMatch "Stack Trace:")) { throw "missing integer stack trace" }
           if (-not (Select-String -Path build/native/main_float_to_int_nan_panic.stderr -SimpleMatch "Panic: float-to-integer conversion out of range")) { throw "missing float panic" }
