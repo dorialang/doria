@@ -1,9 +1,36 @@
 use doriac::backend::{BackendOutput, BackendTarget};
 use doriac::mir::{
-    BasicBlock, BinaryOp, BlockId, CompareOp, Condition, ConditionBinaryOp, Function, FunctionId,
-    IntExpression, Local, LocalId, Operand, Program, ReturnType, Rvalue, Statement,
-    StringExpression, Terminator, Type,
+    BasicBlock, BlockId, CompareOp, Condition, ConditionBinaryOp, Function, FunctionId,
+    IntegerBinaryOp, IntegerExpression, Local, LocalId, Operand, Program, ReturnType, Rvalue,
+    Statement, StringExpression, Terminator, Type,
 };
+use doriac::numeric::{IntegerType, IntegerValue};
+
+const DEFAULT_INT: IntegerType = IntegerType::Int64;
+
+fn int_value(value: i64) -> IntegerValue {
+    IntegerValue::from_i128(DEFAULT_INT, value as i128).expect("test int value must fit")
+}
+
+fn int_operand(value: i64) -> Operand {
+    Operand::Integer(int_value(value))
+}
+
+fn integer_expression(operand: Operand) -> IntegerExpression {
+    IntegerExpression::use_operand(DEFAULT_INT, operand)
+}
+
+fn int_constant(value: i64) -> IntegerExpression {
+    IntegerExpression::constant(int_value(value))
+}
+
+fn int_rvalue(value: i64) -> Rvalue {
+    Rvalue::Integer(int_constant(value))
+}
+
+fn local_integer_expression(id: LocalId) -> IntegerExpression {
+    integer_expression(Operand::Local(id))
+}
 
 fn lower(source: &str) -> doriac::mir::Program {
     doriac::lower_source_to_mir("test.doria", source).expect("source should lower to MIR")
@@ -69,11 +96,11 @@ fn conditional_program(condition: Condition, then_status: i64, else_status: i64)
             id: FunctionId(0),
             name: "main".to_string(),
             params: Vec::new(),
-            return_type: ReturnType::Int,
+            return_type: ReturnType::Integer(DEFAULT_INT),
             locals: vec![Local {
                 id: LocalId(0),
                 name: "unassigned".to_string(),
-                ty: Type::Int,
+                ty: Type::Integer(DEFAULT_INT),
                 writable: false,
                 synthetic: true,
             }],
@@ -90,12 +117,12 @@ fn conditional_program(condition: Condition, then_status: i64, else_status: i64)
                 BasicBlock {
                     id: BlockId(1),
                     statements: Vec::new(),
-                    terminator: Terminator::Return(Operand::Int(then_status)),
+                    terminator: Terminator::Return(int_constant(then_status)),
                 },
                 BasicBlock {
                     id: BlockId(2),
                     statements: Vec::new(),
-                    terminator: Terminator::Return(Operand::Int(else_status)),
+                    terminator: Terminator::Return(int_constant(else_status)),
                 },
             ],
             entry_block: BlockId(0),
@@ -107,8 +134,8 @@ fn conditional_program(condition: Condition, then_status: i64, else_status: i64)
 fn condition_that_reads_unassigned_local() -> Condition {
     Condition::Compare {
         op: CompareOp::Equal,
-        left: IntExpression::Use(Operand::Local(LocalId(0))),
-        right: IntExpression::Use(Operand::Int(0)),
+        left: local_integer_expression(LocalId(0)),
+        right: int_constant(0),
     }
 }
 
@@ -124,15 +151,15 @@ fn lowers_main_int_return_42() {
 
     let function = &program.functions[program.entry.0];
     assert_eq!(function.name, "main");
-    assert_eq!(function.return_type, ReturnType::Int);
+    assert_eq!(function.return_type, ReturnType::Integer(DEFAULT_INT));
     assert!(function.locals.is_empty());
     assert_eq!(
         function.blocks[0].terminator,
-        Terminator::Return(Operand::Int(42))
+        Terminator::Return(int_constant(42))
     );
     assert_eq!(
         program.to_string(),
-        "function main(): int {\nblock0:\n    return 42\n}\n"
+        "function main(): int {\nblock0:\n    return 42: int\n}\n"
     );
 }
 
@@ -147,34 +174,20 @@ fn lowers_return_add_42_to_mir_arithmetic() {
     );
 
     let function = &program.functions[0];
-    assert_eq!(
-        function.locals,
-        vec![Local {
-            id: LocalId(0),
-            name: "_tmp0".to_string(),
-            ty: Type::Int,
-            writable: false,
-            synthetic: true,
-        }]
-    );
-    assert_eq!(
-        function.blocks[0].statements,
-        vec![Statement::AssignLocal {
-            target: LocalId(0),
-            value: Rvalue::Binary {
-                op: BinaryOp::Add,
-                left: Operand::Int(40),
-                right: Operand::Int(2),
-            },
-        }]
-    );
+    assert!(function.locals.is_empty());
+    assert!(function.blocks[0].statements.is_empty());
     assert_eq!(
         function.blocks[0].terminator,
-        Terminator::Return(Operand::Local(LocalId(0)))
+        Terminator::Return(IntegerExpression::Binary {
+            ty: DEFAULT_INT,
+            op: IntegerBinaryOp::Add,
+            left: Box::new(int_constant(40)),
+            right: Box::new(int_constant(2)),
+        })
     );
     assert_eq!(
         program.to_string(),
-        "function main(): int {\nlocals:\n    local0 temp _tmp0: int\nblock0:\n    local0 = 40 + 2\n    return local0\n}\n"
+        "function main(): int {\nblock0:\n    return (40: int + 2: int): int\n}\n"
     );
 }
 
@@ -199,12 +212,12 @@ fn lowers_readonly_int_local_to_slot_assignment() {
         function.blocks[0].statements,
         vec![Statement::AssignLocal {
             target: LocalId(0),
-            value: Rvalue::Use(Operand::Int(40)),
+            value: int_rvalue(40),
         }]
     );
     assert_eq!(
         function.blocks[0].terminator,
-        Terminator::Return(Operand::Local(LocalId(0)))
+        Terminator::Return(local_integer_expression(LocalId(0)))
     );
 }
 
@@ -220,7 +233,10 @@ fn lowers_typed_readonly_int_local_to_slot_assignment() {
 "#,
     );
 
-    assert_eq!(program.functions[0].locals[0].ty, Type::Int);
+    assert_eq!(
+        program.functions[0].locals[0].ty,
+        Type::Integer(DEFAULT_INT)
+    );
     assert_eq!(program.functions[0].locals[0].name, "base");
 }
 
@@ -245,7 +261,7 @@ fn lowers_writable_int_local_to_writable_slot_assignment() {
         function.blocks[0].statements,
         vec![Statement::AssignLocal {
             target: LocalId(0),
-            value: Rvalue::Use(Operand::Int(40)),
+            value: int_rvalue(40),
         }]
     );
 }
@@ -263,7 +279,10 @@ fn lowers_typed_writable_int_local_to_writable_slot_assignment() {
     );
 
     assert!(program.functions[0].locals[0].writable);
-    assert_eq!(program.functions[0].locals[0].ty, Type::Int);
+    assert_eq!(
+        program.functions[0].locals[0].ty,
+        Type::Integer(DEFAULT_INT)
+    );
 }
 
 #[test]
@@ -285,11 +304,11 @@ fn lowers_plain_assignment_to_local_assignment() {
         vec![
             Statement::AssignLocal {
                 target: LocalId(0),
-                value: Rvalue::Use(Operand::Int(0)),
+                value: int_rvalue(0),
             },
             Statement::AssignLocal {
                 target: LocalId(0),
-                value: Rvalue::Use(Operand::Int(42)),
+                value: int_rvalue(42),
             },
         ]
     );
@@ -313,11 +332,12 @@ fn lowers_add_assign_to_read_add_write() {
         program.functions[0].blocks[0].statements[1],
         Statement::AssignLocal {
             target: LocalId(0),
-            value: Rvalue::Binary {
-                op: BinaryOp::Add,
-                left: Operand::Local(LocalId(0)),
-                right: Operand::Int(2),
-            },
+            value: Rvalue::Integer(IntegerExpression::Binary {
+                ty: DEFAULT_INT,
+                op: IntegerBinaryOp::Add,
+                left: Box::new(integer_expression(Operand::Local(LocalId(0)))),
+                right: Box::new(integer_expression(int_operand(2))),
+            }),
         }
     );
 }
@@ -340,11 +360,12 @@ fn lowers_sub_assign_to_read_subtract_write() {
         program.functions[0].blocks[0].statements[1],
         Statement::AssignLocal {
             target: LocalId(0),
-            value: Rvalue::Binary {
-                op: BinaryOp::Subtract,
-                left: Operand::Local(LocalId(0)),
-                right: Operand::Int(1),
-            },
+            value: Rvalue::Integer(IntegerExpression::Binary {
+                ty: DEFAULT_INT,
+                op: IntegerBinaryOp::Subtract,
+                left: Box::new(integer_expression(Operand::Local(LocalId(0)))),
+                right: Box::new(integer_expression(int_operand(1))),
+            }),
         }
     );
 }
@@ -379,11 +400,12 @@ fn lowers_post_and_pre_increment_equivalently() {
         post.functions[0].blocks[0].statements[1],
         Statement::AssignLocal {
             target: LocalId(0),
-            value: Rvalue::Binary {
-                op: BinaryOp::Add,
-                left: Operand::Local(LocalId(0)),
-                right: Operand::Int(1),
-            },
+            value: Rvalue::Integer(IntegerExpression::Binary {
+                ty: DEFAULT_INT,
+                op: IntegerBinaryOp::Add,
+                left: Box::new(integer_expression(Operand::Local(LocalId(0)))),
+                right: Box::new(integer_expression(int_operand(1))),
+            }),
         }
     );
 }
@@ -418,11 +440,12 @@ fn lowers_post_and_pre_decrement_equivalently() {
         post.functions[0].blocks[0].statements[1],
         Statement::AssignLocal {
             target: LocalId(0),
-            value: Rvalue::Binary {
-                op: BinaryOp::Subtract,
-                left: Operand::Local(LocalId(0)),
-                right: Operand::Int(1),
-            },
+            value: Rvalue::Integer(IntegerExpression::Binary {
+                ty: DEFAULT_INT,
+                op: IntegerBinaryOp::Subtract,
+                left: Box::new(integer_expression(Operand::Local(LocalId(0)))),
+                right: Box::new(integer_expression(int_operand(1))),
+            }),
         }
     );
 }
@@ -731,11 +754,11 @@ fn interpreter_reports_arithmetic_overflow_as_runtime_panic() {
             id: FunctionId(0),
             name: "main".to_string(),
             params: Vec::new(),
-            return_type: ReturnType::Int,
+            return_type: ReturnType::Integer(DEFAULT_INT),
             locals: vec![Local {
                 id: LocalId(0),
                 name: "_tmp0".to_string(),
-                ty: Type::Int,
+                ty: Type::Integer(DEFAULT_INT),
                 writable: false,
                 synthetic: true,
             }],
@@ -743,13 +766,14 @@ fn interpreter_reports_arithmetic_overflow_as_runtime_panic() {
                 id: BlockId(0),
                 statements: vec![Statement::AssignLocal {
                     target: LocalId(0),
-                    value: Rvalue::Binary {
-                        op: BinaryOp::Add,
-                        left: Operand::Int(i64::MAX),
-                        right: Operand::Int(1),
-                    },
+                    value: Rvalue::Integer(IntegerExpression::Binary {
+                        ty: DEFAULT_INT,
+                        op: IntegerBinaryOp::Add,
+                        left: Box::new(integer_expression(int_operand(i64::MAX))),
+                        right: Box::new(integer_expression(int_operand(1))),
+                    }),
                 }],
-                terminator: Terminator::Return(Operand::Local(LocalId(0))),
+                terminator: Terminator::Return(local_integer_expression(LocalId(0))),
             }],
             entry_block: BlockId(0),
         }],
@@ -760,7 +784,7 @@ fn interpreter_reports_arithmetic_overflow_as_runtime_panic() {
     assert_eq!(output.exit_status, 101);
     assert!(output
         .stderr
-        .starts_with(b"panic: integer overflow during addition\n"));
+        .starts_with(b"Panic: integer overflow during addition\n"));
 }
 
 #[test]
@@ -778,7 +802,7 @@ fn interpreter_panics_for_main_int_exit_status_126() {
     assert_eq!(output.exit_status, 101);
     assert!(output
         .stderr
-        .starts_with(b"panic: main returned process status outside 0..125\n"));
+        .starts_with(b"Panic: main returned process status outside 0..125\n"));
 }
 
 #[test]
@@ -796,7 +820,7 @@ fn debug_target_renders_interpreter_process_status_panic() {
     let BackendOutput::Text { contents, .. } = output else {
         panic!("debug backend should emit text");
     };
-    assert!(contents.starts_with("exit_status: 101\nstdout:\nstderr: panic: "));
+    assert!(contents.starts_with("exit_status: 101\nstdout:\nstderr: Panic: "));
     assert!(contents.contains("main returned process status outside 0..125"));
 }
 
@@ -860,8 +884,8 @@ fn debug_target_handles_stage_11b_examples() {
 }
 
 #[test]
-fn rejects_unsupported_division_as_mir_coverage() {
-    let diagnostics = unsupported(
+fn lowers_and_interprets_integer_division() {
+    let program = lower(
         r#"function main(): int
 {
     return 84 / 2;
@@ -869,7 +893,19 @@ fn rejects_unsupported_division_as_mir_coverage() {
 "#,
     );
 
-    assert_stage_11g_unsupported(&diagnostics, "division and modulo");
+    assert!(matches!(
+        program.functions[0].blocks[0].terminator,
+        Terminator::Return(IntegerExpression::Binary {
+            op: IntegerBinaryOp::Divide,
+            ..
+        })
+    ));
+    assert_eq!(
+        doriac::mir_interpreter::interpret(&program)
+            .expect("division should interpret")
+            .exit_status,
+        42
+    );
 }
 
 #[test]
@@ -972,12 +1008,13 @@ fn lowers_if_condition_to_branch_terminator() {
         Terminator::Branch {
             condition: Condition::Compare {
                 op: CompareOp::Equal,
-                left: IntExpression::Binary {
-                    op: BinaryOp::Add,
-                    left: Box::new(IntExpression::Use(Operand::Int(40))),
-                    right: Box::new(IntExpression::Use(Operand::Int(2))),
+                left: IntegerExpression::Binary {
+                    ty: DEFAULT_INT,
+                    op: IntegerBinaryOp::Add,
+                    left: Box::new(int_constant(40)),
+                    right: Box::new(int_constant(2)),
                 },
-                right: IntExpression::Use(Operand::Int(42)),
+                right: int_constant(42),
             },
             then_block: BlockId(1),
             else_block: BlockId(2),
@@ -1007,7 +1044,7 @@ fn lowers_if_without_else_through_a_continuation_block() {
     assert_eq!(blocks[2].terminator, Terminator::Jump(BlockId(3)));
     assert_eq!(
         blocks[3].terminator,
-        Terminator::Return(Operand::Local(LocalId(0)))
+        Terminator::Return(local_integer_expression(LocalId(0)))
     );
 }
 
@@ -1027,8 +1064,8 @@ fn lowers_if_else_to_distinct_return_blocks() {
     let blocks = &program.functions[0].blocks;
 
     assert_eq!(blocks.len(), 3);
-    assert_eq!(blocks[1].terminator, Terminator::Return(Operand::Int(42)));
-    assert_eq!(blocks[2].terminator, Terminator::Return(Operand::Int(0)));
+    assert_eq!(blocks[1].terminator, Terminator::Return(int_constant(42)));
+    assert_eq!(blocks[2].terminator, Terminator::Return(int_constant(0)));
 }
 
 #[test]
@@ -1040,7 +1077,7 @@ fn lowers_else_if_chain_to_nested_branch_blocks() {
 
     assert!(matches!(blocks[0].terminator, Terminator::Branch { .. }));
     assert!(matches!(blocks[2].terminator, Terminator::Branch { .. }));
-    assert_eq!(blocks[3].terminator, Terminator::Return(Operand::Int(42)));
+    assert_eq!(blocks[3].terminator, Terminator::Return(int_constant(42)));
 }
 
 #[test]
@@ -1060,7 +1097,7 @@ fn lowers_echo_and_assignment_inside_if_branches() {
         assignment.functions[0].blocks[1].statements,
         vec![Statement::AssignLocal {
             target: LocalId(0),
-            value: Rvalue::Use(Operand::Int(42)),
+            value: int_rvalue(42),
         }]
     );
 }
@@ -1436,8 +1473,8 @@ fn lowers_while_to_header_body_and_exit_blocks() {
         Terminator::Branch {
             condition: Condition::Compare {
                 op: CompareOp::Less,
-                left: IntExpression::Use(Operand::Local(LocalId(0))),
-                right: IntExpression::Use(Operand::Int(42)),
+                left: local_integer_expression(LocalId(0)),
+                right: int_constant(42),
             },
             then_block: BlockId(2),
             else_block: BlockId(3),
@@ -1446,7 +1483,7 @@ fn lowers_while_to_header_body_and_exit_blocks() {
     assert_eq!(blocks[2].terminator, Terminator::Jump(BlockId(1)));
     assert_eq!(
         blocks[3].terminator,
-        Terminator::Return(Operand::Local(LocalId(0)))
+        Terminator::Return(local_integer_expression(LocalId(0)))
     );
 }
 
@@ -1459,11 +1496,12 @@ fn lowers_assignment_and_echo_inside_while() {
         count.functions[0].blocks[2].statements,
         vec![Statement::AssignLocal {
             target: LocalId(0),
-            value: Rvalue::Binary {
-                op: BinaryOp::Add,
-                left: Operand::Local(LocalId(0)),
-                right: Operand::Int(1),
-            },
+            value: Rvalue::Integer(IntegerExpression::Binary {
+                ty: DEFAULT_INT,
+                op: IntegerBinaryOp::Add,
+                left: Box::new(integer_expression(Operand::Local(LocalId(0)))),
+                right: Box::new(integer_expression(int_operand(1))),
+            }),
         }]
     );
 
@@ -1524,10 +1562,9 @@ fn lowers_return_inside_while_as_return_terminator() {
         "../../../examples/debug/main_while_return_42.doria"
     ));
 
-    assert!(program.functions[0]
-        .blocks
-        .iter()
-        .any(|block| { block.terminator == Terminator::Return(Operand::Local(LocalId(0))) }));
+    assert!(program.functions[0].blocks.iter().any(|block| {
+        block.terminator == Terminator::Return(local_integer_expression(LocalId(0)))
+    }));
 }
 
 #[test]
@@ -1873,11 +1910,11 @@ fn lowers_for_to_initializer_header_body_increment_and_exit_blocks() {
         vec![
             Statement::AssignLocal {
                 target: LocalId(0),
-                value: Rvalue::Use(Operand::Int(0)),
+                value: int_rvalue(0),
             },
             Statement::AssignLocal {
                 target: LocalId(1),
-                value: Rvalue::Use(Operand::Int(0)),
+                value: int_rvalue(0),
             },
         ]
     );
@@ -1887,8 +1924,8 @@ fn lowers_for_to_initializer_header_body_increment_and_exit_blocks() {
         Terminator::Branch {
             condition: Condition::Compare {
                 op: CompareOp::Less,
-                left: IntExpression::Use(Operand::Local(LocalId(1))),
-                right: IntExpression::Use(Operand::Int(10)),
+                left: local_integer_expression(LocalId(1)),
+                right: int_constant(10),
             },
             then_block: BlockId(2),
             else_block: BlockId(4),
@@ -1898,11 +1935,12 @@ fn lowers_for_to_initializer_header_body_increment_and_exit_blocks() {
         blocks[2].statements,
         vec![Statement::AssignLocal {
             target: LocalId(0),
-            value: Rvalue::Binary {
-                op: BinaryOp::Add,
-                left: Operand::Local(LocalId(0)),
-                right: Operand::Int(1),
-            },
+            value: Rvalue::Integer(IntegerExpression::Binary {
+                ty: DEFAULT_INT,
+                op: IntegerBinaryOp::Add,
+                left: Box::new(integer_expression(Operand::Local(LocalId(0)))),
+                right: Box::new(integer_expression(int_operand(1))),
+            }),
         }]
     );
     assert_eq!(blocks[2].terminator, Terminator::Jump(BlockId(3)));
@@ -1910,17 +1948,18 @@ fn lowers_for_to_initializer_header_body_increment_and_exit_blocks() {
         blocks[3].statements,
         vec![Statement::AssignLocal {
             target: LocalId(1),
-            value: Rvalue::Binary {
-                op: BinaryOp::Add,
-                left: Operand::Local(LocalId(1)),
-                right: Operand::Int(1),
-            },
+            value: Rvalue::Integer(IntegerExpression::Binary {
+                ty: DEFAULT_INT,
+                op: IntegerBinaryOp::Add,
+                left: Box::new(integer_expression(Operand::Local(LocalId(1)))),
+                right: Box::new(integer_expression(int_operand(1))),
+            }),
         }]
     );
     assert_eq!(blocks[3].terminator, Terminator::Jump(BlockId(1)));
     assert_eq!(
         blocks[4].terminator,
-        Terminator::Return(Operand::Local(LocalId(0)))
+        Terminator::Return(local_integer_expression(LocalId(0)))
     );
 }
 
@@ -1946,8 +1985,8 @@ fn lowers_exclusive_range_foreach_to_counter_binding_update_and_exit_blocks() {
         Terminator::Branch {
             condition: Condition::Compare {
                 op: CompareOp::Less,
-                left: IntExpression::Use(Operand::Local(LocalId(1))),
-                right: IntExpression::Use(Operand::Local(LocalId(2))),
+                left: local_integer_expression(LocalId(1)),
+                right: local_integer_expression(LocalId(2)),
             },
             then_block: BlockId(2),
             else_block: BlockId(4),
@@ -1957,7 +1996,7 @@ fn lowers_exclusive_range_foreach_to_counter_binding_update_and_exit_blocks() {
         blocks[2].statements[0],
         Statement::AssignLocal {
             target: LocalId(3),
-            value: Rvalue::Use(Operand::Local(LocalId(1))),
+            value: Rvalue::Integer(local_integer_expression(LocalId(1))),
         }
     );
     assert_eq!(blocks[2].terminator, Terminator::Jump(BlockId(3)));
@@ -1965,11 +2004,12 @@ fn lowers_exclusive_range_foreach_to_counter_binding_update_and_exit_blocks() {
         blocks[3].statements,
         vec![Statement::AssignLocal {
             target: LocalId(1),
-            value: Rvalue::Binary {
-                op: BinaryOp::Add,
-                left: Operand::Local(LocalId(1)),
-                right: Operand::Int(1),
-            },
+            value: Rvalue::Integer(IntegerExpression::Binary {
+                ty: DEFAULT_INT,
+                op: IntegerBinaryOp::Add,
+                left: Box::new(integer_expression(Operand::Local(LocalId(1)))),
+                right: Box::new(integer_expression(int_operand(1))),
+            }),
         }]
     );
     assert_eq!(blocks[3].terminator, Terminator::Jump(BlockId(1)));
@@ -1988,8 +2028,8 @@ fn lowers_inclusive_range_foreach_with_terminal_guard() {
         Terminator::Branch {
             condition: Condition::Compare {
                 op: CompareOp::LessEqual,
-                left: IntExpression::Use(Operand::Local(LocalId(1))),
-                right: IntExpression::Use(Operand::Local(LocalId(2))),
+                left: local_integer_expression(LocalId(1)),
+                right: local_integer_expression(LocalId(2)),
             },
             then_block: BlockId(2),
             else_block: BlockId(5),
@@ -2000,8 +2040,8 @@ fn lowers_inclusive_range_foreach_with_terminal_guard() {
         Terminator::Branch {
             condition: Condition::Compare {
                 op: CompareOp::Equal,
-                left: IntExpression::Use(Operand::Local(LocalId(1))),
-                right: IntExpression::Use(Operand::Local(LocalId(2))),
+                left: local_integer_expression(LocalId(1)),
+                right: local_integer_expression(LocalId(2)),
             },
             then_block: BlockId(5),
             else_block: BlockId(4),
@@ -2069,7 +2109,7 @@ fn lowers_early_return_inside_for() {
     assert!(program.functions[0]
         .blocks
         .iter()
-        .any(|block| block.terminator == Terminator::Return(Operand::Int(42))));
+        .any(|block| block.terminator == Terminator::Return(int_constant(42))));
     assert_eq!(
         doriac::mir_interpreter::interpret(&program)
             .expect("early return should interpret")
@@ -2321,16 +2361,6 @@ fn rejects_unsupported_stage_11e_foreach_shapes() {
 "#,
     );
     assert_stage_11g_unsupported(&key_value, "key bindings");
-
-    let call_bound = unsupported_after_parsing(
-        r#"function main(): void
-{
-    foreach (0..<limit() as $value) {
-    }
-}
-"#,
-    );
-    assert_stage_11g_unsupported(&call_bound, "unknown top-level function `limit`");
 }
 
 #[test]
@@ -2469,13 +2499,13 @@ fn stage_11f_lowers_int_parameters_to_function_locals() {
 
     assert_eq!(add.name, "add");
     assert_eq!(add.params, vec![LocalId(0), LocalId(1)]);
-    assert_eq!(add.locals.len(), 3);
+    assert_eq!(add.locals.len(), 2);
     assert_eq!(add.locals[0].name, "left");
     assert_eq!(add.locals[1].name, "right");
     assert!(!add.locals[0].synthetic);
     assert!(!add.locals[1].synthetic);
-    assert_eq!(add.locals[0].ty, Type::Int);
-    assert_eq!(add.locals[1].ty, Type::Int);
+    assert_eq!(add.locals[0].ty, Type::Integer(DEFAULT_INT));
+    assert_eq!(add.locals[1].ty, Type::Integer(DEFAULT_INT));
 }
 
 #[test]
@@ -2485,51 +2515,25 @@ fn stage_11f_lowers_int_calls_in_returns_and_arithmetic() {
     ));
     let main = &add_program.functions[1];
     assert_eq!(
-        main.blocks[0].statements[0],
-        Statement::AssignLocal {
-            target: LocalId(0),
-            value: Rvalue::Call {
-                function: FunctionId(0),
-                args: vec![
-                    IntExpression::Use(Operand::Int(20)),
-                    IntExpression::Use(Operand::Int(22)),
-                ],
-            },
-        }
-    );
-    assert_eq!(
         main.blocks[0].terminator,
-        Terminator::Return(Operand::Local(LocalId(0)))
+        Terminator::Return(IntegerExpression::Call {
+            ty: DEFAULT_INT,
+            function: FunctionId(0),
+            args: vec![int_constant(20), int_constant(22)],
+        })
     );
 
     let chain_program = lower(include_str!(
         "../../../examples/debug/main_function_chain_42.doria"
     ));
     let answer = &chain_program.functions[1];
-    assert!(answer.blocks[0].statements.iter().any(|statement| {
-        matches!(
-            statement,
-            Statement::AssignLocal {
-                value: Rvalue::Call {
-                    function: FunctionId(0),
-                    ..
-                },
-                ..
-            }
-        )
-    }));
-    assert!(answer.blocks[0].statements.iter().any(|statement| {
-        matches!(
-            statement,
-            Statement::AssignLocal {
-                value: Rvalue::Binary {
-                    op: BinaryOp::Add,
-                    ..
-                },
-                ..
-            }
-        )
-    }));
+    assert!(matches!(
+        answer.blocks[0].terminator,
+        Terminator::Return(IntegerExpression::Binary {
+            op: IntegerBinaryOp::Add,
+            ..
+        })
+    ));
 }
 
 #[test]
@@ -2544,11 +2548,12 @@ fn stage_11f_lowers_int_calls_in_comparisons() {
         Terminator::Branch {
             condition: Condition::Compare {
                 op: CompareOp::Equal,
-                left: IntExpression::Call {
+                left: IntegerExpression::Call {
+                    ty: DEFAULT_INT,
                     function: FunctionId(0),
                     args: Vec::new(),
                 },
-                right: IntExpression::Use(Operand::Int(42)),
+                right: int_constant(42),
             },
             then_block: BlockId(1),
             else_block: BlockId(2),
@@ -2633,7 +2638,7 @@ function main(): void
 {
 }
 "#,
-            "supports only int parameters",
+            "supports integer parameters",
         ),
         (
             r#"function title(): string
@@ -2645,7 +2650,7 @@ function main(): void
 {
 }
 "#,
-            "supports only int and void returns",
+            "supports integer and void returns",
         ),
         (
             r#"function ok(): bool
@@ -2657,7 +2662,7 @@ function main(): void
 {
 }
 "#,
-            "supports only int and void returns",
+            "supports integer and void returns",
         ),
     ] {
         let diagnostics = unsupported(source);
@@ -2668,14 +2673,14 @@ function main(): void
 #[test]
 fn stage_11f_rejects_calls_with_the_wrong_result_context() {
     let ignored_int = unsupported_after_parsing(
-        r#"function one(): int
-{
-    return 1;
-}
-
-function main(): void
+        r#"function main(): void
 {
     one();
+}
+
+function one(): int
+{
+    return 1;
 }
 "#,
     );
@@ -2696,8 +2701,8 @@ function main(): int
 }
 
 #[test]
-fn stage_11f_limits_call_arguments_to_stage_11b_integer_expressions() {
-    let diagnostics = unsupported_after_parsing(
+fn stage_13_lowers_nested_integer_call_arguments() {
+    let output = interpret(
         r#"function one(): int
 {
     return 1;
@@ -2715,10 +2720,7 @@ function main(): int
 "#,
     );
 
-    assert_stage_11g_unsupported(
-        &diagnostics,
-        "call arguments support only Stage 11b integer expressions",
-    );
+    assert_eq!(output.exit_status, 42);
 }
 
 #[test]
@@ -2869,11 +2871,11 @@ fn explicitly_limited_interpreter_can_bound_call_frames() {
             id: FunctionId(0),
             name: "main".to_string(),
             params: Vec::new(),
-            return_type: ReturnType::Int,
+            return_type: ReturnType::Integer(DEFAULT_INT),
             locals: vec![Local {
                 id: LocalId(0),
                 name: "_tmp0".to_string(),
-                ty: Type::Int,
+                ty: Type::Integer(DEFAULT_INT),
                 writable: false,
                 synthetic: true,
             }],
@@ -2881,12 +2883,13 @@ fn explicitly_limited_interpreter_can_bound_call_frames() {
                 id: BlockId(0),
                 statements: vec![Statement::AssignLocal {
                     target: LocalId(0),
-                    value: Rvalue::Call {
+                    value: Rvalue::Integer(IntegerExpression::Call {
+                        ty: DEFAULT_INT,
                         function: FunctionId(0),
                         args: Vec::new(),
-                    },
+                    }),
                 }],
-                terminator: Terminator::Return(Operand::Local(LocalId(0))),
+                terminator: Terminator::Return(local_integer_expression(LocalId(0))),
             }],
             entry_block: BlockId(0),
         }],
@@ -3080,7 +3083,7 @@ function main(): void
 }
 "#,
     );
-    assert_stage_11g_unsupported(&parameter, "supports only int parameters");
+    assert_stage_11g_unsupported(&parameter, "supports integer parameters");
 
     let return_type = unsupported(
         r#"function title(): string
@@ -3093,7 +3096,7 @@ function main(): void
 }
 "#,
     );
-    assert_stage_11g_unsupported(&return_type, "supports only int and void returns");
+    assert_stage_11g_unsupported(&return_type, "supports integer and void returns");
 }
 
 #[test]
@@ -3176,7 +3179,7 @@ fn stage_11h_supports_string_echo_inside_int_returning_functions() {
     ] {
         let program = lower(source);
         assert!(program.functions.iter().any(|function| {
-            function.return_type == ReturnType::Int
+            function.return_type == ReturnType::Integer(DEFAULT_INT)
                 && function.blocks.iter().any(|block| {
                     block.statements.iter().any(|statement| {
                         matches!(

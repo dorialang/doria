@@ -13,6 +13,7 @@ pub mod lsp;
 pub mod mir;
 pub mod mir_interpreter;
 pub mod mir_lowering;
+pub mod numeric;
 pub mod parser;
 pub mod return_analysis;
 pub mod runtime_artifact;
@@ -64,8 +65,13 @@ pub fn lower_source(
     path: impl Into<String>,
     text: impl Into<String>,
 ) -> DiagnosticResult<hir::Program> {
-    let program = check_source(path, text)?;
-    Ok(lowering::lower_program(&program))
+    let source = SourceFile::new(path, text);
+    let program = parse_source_file(&source)?;
+    let semantic_info = semantics::analyze_program(&program)?;
+    Ok(lowering::lower_program_with_semantics(
+        &program,
+        semantic_info,
+    ))
 }
 
 pub fn lower_source_to_mir(

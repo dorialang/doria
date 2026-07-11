@@ -1,0 +1,7 @@
+function main(): int
+{
+    int $value = 256;
+    uint8 $small = UInt8::from($value);
+
+    return Int::from($small);
+}

@@ -1,0 +1,12 @@
+function divide(int8 $value, int8 $divisor): int8
+{
+    return $value / $divisor;
+}
+
+function main(): int
+{
+    int8 $minimum = -128;
+    int8 $negativeOne = -1;
+
+    return Int::from(divide($minimum, $negativeOne));
+}

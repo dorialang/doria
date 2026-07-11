@@ -1,8 +1,16 @@
 use crate::{ast, hir};
 
 pub fn lower_program(program: &ast::Program) -> hir::Program {
+    lower_program_with_semantics(program, crate::semantics::SemanticInfo::default())
+}
+
+pub fn lower_program_with_semantics(
+    program: &ast::Program,
+    semantic_info: crate::semantics::SemanticInfo,
+) -> hir::Program {
     hir::Program {
         items: program.items.iter().map(lower_item).collect(),
+        semantic_info,
     }
 }
 

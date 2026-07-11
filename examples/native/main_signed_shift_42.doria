@@ -1,0 +1,13 @@
+function halve(int8 $value): int8
+{
+    return $value >> 1;
+}
+
+function main(): int
+{
+    if (halve(-84) == -42) {
+        return 42;
+    }
+
+    return 0;
+}

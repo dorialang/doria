@@ -1,14 +1,16 @@
 use std::collections::HashMap;
 
 use crate::diagnostics::{Diagnostic, DiagnosticResult};
+use crate::numeric::{parse_decimal_magnitude, IntegerType, IntegerValue};
+use crate::semantics::SemanticInfo;
 use crate::source::Span;
 use crate::{hir, mir};
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct FunctionSignature {
     id: mir::FunctionId,
     return_type: mir::ReturnType,
-    parameter_count: usize,
+    parameter_types: Vec<IntegerType>,
 }
 
 pub fn lower_program(program: &hir::Program) -> DiagnosticResult<mir::Program> {
@@ -71,9 +73,9 @@ pub fn lower_program(program: &hir::Program) -> DiagnosticResult<mir::Program> {
         .map(|function| {
             let signature = signatures
                 .get(&function.name)
-                .copied()
+                .cloned()
                 .expect("every function signature must be collected");
-            lower_function(function, signature, &signatures)
+            lower_function(function, signature, &signatures, &program.semantic_info)
         })
         .collect::<Result<Vec<_>, _>>()?;
 
@@ -85,13 +87,15 @@ fn collect_function_signature(
     id: mir::FunctionId,
 ) -> DiagnosticResult<FunctionSignature> {
     let return_type = match function.return_type.as_ref() {
-        Some(ty) if is_plain_type(ty, "int") => mir::ReturnType::Int,
+        Some(ty) if integer_type_ref(ty).is_some() => {
+            mir::ReturnType::Integer(integer_type_ref(ty).expect("checked integer type"))
+        }
         Some(ty) if is_plain_type(ty, "void") => mir::ReturnType::Void,
         Some(ty) => {
             return Err(vec![unsupported(
                 function.span,
                 format!(
-                    "function `{}` has unsupported return type `{ty}`; Stage 11 supports only int and void returns",
+                    "function `{}` has unsupported return type `{ty}`; Stage 13 MIR supports integer and void returns",
                     function.name
                 ),
             )]);
@@ -100,7 +104,7 @@ fn collect_function_signature(
             return Err(vec![unsupported(
                 function.span,
                 format!(
-                    "function `{}` requires an explicit int or void return type for MIR Stage 11",
+                    "function `{}` requires an explicit integer or void return type for MIR Stage 13",
                     function.name
                 ),
             )]);
@@ -114,6 +118,19 @@ fn collect_function_signature(
         )]);
     }
 
+    if function.name == "main"
+        && !matches!(
+            return_type,
+            mir::ReturnType::Integer(IntegerType::Int64) | mir::ReturnType::Void
+        )
+    {
+        return Err(vec![unsupported(
+            function.span,
+            "main must return int/int64 or void in Stage 13 MIR",
+        )]);
+    }
+
+    let mut parameter_types = Vec::with_capacity(function.params.len());
     for param in &function.params {
         if param.default.is_some() {
             return Err(vec![unsupported(
@@ -124,22 +141,30 @@ fn collect_function_signature(
                 ),
             )]);
         }
-        if !is_plain_type(&param.ty, "int") {
+        let Some(integer) = integer_type_ref(&param.ty) else {
             return Err(vec![unsupported(
                 param.span,
                 format!(
-                    "function `{}` has unsupported parameter type `{}`; Stage 11 supports only int parameters",
+                    "function `{}` has unsupported parameter type `{}`; Stage 13 MIR supports integer parameters",
                     function.name, param.ty
                 ),
             )]);
-        }
+        };
+        parameter_types.push(integer);
     }
 
     Ok(FunctionSignature {
         id,
         return_type,
-        parameter_count: function.params.len(),
+        parameter_types,
     })
+}
+
+fn integer_type_ref(ty: &crate::types::TypeRef) -> Option<IntegerType> {
+    ty.args
+        .is_empty()
+        .then(|| IntegerType::from_source_name(&ty.name))
+        .flatten()
 }
 
 fn is_plain_type(ty: &crate::types::TypeRef, name: &str) -> bool {
@@ -150,12 +175,16 @@ fn lower_function(
     function: &hir::FunctionDecl,
     signature: FunctionSignature,
     signatures: &HashMap<String, FunctionSignature>,
+    semantic_info: &SemanticInfo,
 ) -> DiagnosticResult<mir::Function> {
-    let mut context = LoweringContext::new(signatures.clone());
+    let mut context = LoweringContext::new(signatures.clone(), semantic_info);
     let params = function
         .params
         .iter()
-        .map(|param| context.declare_user_local(&param.name, param.writable, mir::Type::Int))
+        .zip(signature.parameter_types.iter().copied())
+        .map(|(param, ty)| {
+            context.declare_user_local(&param.name, param.writable, mir::Type::Integer(ty))
+        })
         .collect::<Vec<_>>();
 
     lower_function_body(
@@ -429,10 +458,10 @@ fn lower_foreach_statement(
     };
 
     if let Some(ty) = &foreach.value.ty {
-        if ty.name != "int" || !ty.args.is_empty() {
+        if integer_type_ref(ty).is_none() {
             return Err(vec![unsupported(
                 foreach.span,
-                format!("integer range foreach bindings must use int in Stage 11; got type {ty}"),
+                format!("integer range foreach bindings require an integer type; got `{ty}`"),
             )]);
         }
     }
@@ -451,18 +480,30 @@ fn lower_range_foreach_in_scope(
     return_type: mir::ReturnType,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<()> {
-    let start_value = lower_int_rvalue(start, context)?;
-    let current_local = context.declare_temp(true);
+    let integer_type = context.integer_type(start)?;
+    let end_type = context.integer_type(end)?;
+    if end_type != integer_type {
+        return Err(vec![Diagnostic::new(
+            "I1301",
+            "internal compiler consistency error: checked range endpoints have different integer types",
+            foreach.span,
+        )]);
+    }
+
+    let start_value = lower_integer_expression(start, context)?;
+    ensure_expression_type(&start_value, integer_type, start.span())?;
+    let current_local = context.declare_temp(true, integer_type);
     context.push_statement(mir::Statement::AssignLocal {
         target: current_local,
-        value: start_value,
+        value: mir::Rvalue::Integer(start_value),
     });
 
-    let end_value = lower_int_rvalue(end, context)?;
-    let end_local = context.declare_temp(false);
+    let end_value = lower_integer_expression(end, context)?;
+    ensure_expression_type(&end_value, integer_type, end.span())?;
+    let end_local = context.declare_temp(false, integer_type);
     context.push_statement(mir::Statement::AssignLocal {
         target: end_local,
-        value: end_value,
+        value: mir::Rvalue::Integer(end_value),
     });
 
     let header_block = context.create_block();
@@ -480,14 +521,15 @@ fn lower_range_foreach_in_scope(
             } else {
                 mir::CompareOp::Less
             },
-            left: mir::IntExpression::Use(mir::Operand::Local(current_local)),
-            right: mir::IntExpression::Use(mir::Operand::Local(end_local)),
+            left: local_integer_expression(current_local, integer_type),
+            right: local_integer_expression(end_local, integer_type),
         },
         then_block: body_block,
         else_block: exit_block,
     });
 
-    let binding_local = context.declare_user_local(&foreach.value.name, false, mir::Type::Int);
+    let binding_local =
+        context.declare_user_local(&foreach.value.name, false, mir::Type::Integer(integer_type));
     context.push_loop_targets(LoopTargets {
         continue_block: update_block,
         break_block: exit_block,
@@ -495,7 +537,7 @@ fn lower_range_foreach_in_scope(
     context.current_block = Some(body_block);
     context.push_statement(mir::Statement::AssignLocal {
         target: binding_local,
-        value: mir::Rvalue::Use(mir::Operand::Local(current_local)),
+        value: mir::Rvalue::Integer(local_integer_expression(current_local, integer_type)),
     });
     let body_result = lower_statement_sequence(&foreach.body.statements, return_type, context);
     let body_fallthrough = context.current_block;
@@ -511,8 +553,8 @@ fn lower_range_foreach_in_scope(
         context.terminate_current(mir::Terminator::Branch {
             condition: mir::Condition::Compare {
                 op: mir::CompareOp::Equal,
-                left: mir::IntExpression::Use(mir::Operand::Local(current_local)),
-                right: mir::IntExpression::Use(mir::Operand::Local(end_local)),
+                left: local_integer_expression(current_local, integer_type),
+                right: local_integer_expression(end_local, integer_type),
             },
             then_block: exit_block,
             else_block: increment_block,
@@ -521,11 +563,14 @@ fn lower_range_foreach_in_scope(
     }
     context.push_statement(mir::Statement::AssignLocal {
         target: current_local,
-        value: mir::Rvalue::Binary {
-            op: mir::BinaryOp::Add,
-            left: mir::Operand::Local(current_local),
-            right: mir::Operand::Int(1),
-        },
+        value: mir::Rvalue::Integer(mir::IntegerExpression::Binary {
+            ty: integer_type,
+            op: mir::IntegerBinaryOp::Add,
+            left: Box::new(local_integer_expression(current_local, integer_type)),
+            right: Box::new(mir::IntegerExpression::constant(IntegerValue::one(
+                integer_type,
+            ))),
+        }),
     });
     context.terminate_current(mir::Terminator::Jump(header_block));
     context.current_block = context.is_reachable(exit_block).then_some(exit_block);
@@ -601,8 +646,9 @@ struct LoopTargets {
     break_block: mir::BlockId,
 }
 
-struct LoweringContext {
+struct LoweringContext<'semantic> {
     signatures: HashMap<String, FunctionSignature>,
+    semantic_info: &'semantic SemanticInfo,
     locals: Vec<mir::Local>,
     local_scopes: Vec<HashMap<String, mir::LocalId>>,
     temp_counter: usize,
@@ -612,10 +658,14 @@ struct LoweringContext {
     loop_targets: Vec<LoopTargets>,
 }
 
-impl LoweringContext {
-    fn new(signatures: HashMap<String, FunctionSignature>) -> Self {
+impl<'semantic> LoweringContext<'semantic> {
+    fn new(
+        signatures: HashMap<String, FunctionSignature>,
+        semantic_info: &'semantic SemanticInfo,
+    ) -> Self {
         Self {
             signatures,
+            semantic_info,
             locals: Vec::new(),
             local_scopes: vec![HashMap::new()],
             temp_counter: 0,
@@ -748,14 +798,14 @@ impl LoweringContext {
         id
     }
 
-    fn declare_temp(&mut self, writable: bool) -> mir::LocalId {
+    fn declare_temp(&mut self, writable: bool, ty: IntegerType) -> mir::LocalId {
         let id = mir::LocalId(self.locals.len());
         let name = format!("_tmp{}", self.temp_counter);
         self.temp_counter += 1;
         self.locals.push(mir::Local {
             id,
             name,
-            ty: mir::Type::Int,
+            ty: mir::Type::Integer(ty),
             writable,
             synthetic: true,
         });
@@ -785,7 +835,7 @@ impl LoweringContext {
 
     fn lookup_int_local(&self, name: &str, span: Span) -> DiagnosticResult<mir::LocalId> {
         let local = self.lookup_local(name, span)?;
-        if self.local_type(local) == mir::Type::Int {
+        if matches!(self.local_type(local), mir::Type::Integer(_)) {
             Ok(local)
         } else {
             Err(vec![unsupported(
@@ -796,12 +846,38 @@ impl LoweringContext {
     }
 
     fn lookup_function(&self, name: &str, span: Span) -> DiagnosticResult<FunctionSignature> {
-        self.signatures.get(name).copied().ok_or_else(|| {
+        self.signatures.get(name).cloned().ok_or_else(|| {
             vec![unsupported(
                 span,
                 format!("call references unknown top-level function `{name}`"),
             )]
         })
+    }
+
+    fn integer_type(&self, expr: &hir::Expr) -> DiagnosticResult<IntegerType> {
+        self.semantic_info
+            .integer_type(expr.span())
+            .ok_or_else(|| {
+                vec![Diagnostic::new(
+                    "I1301",
+                    "internal compiler consistency error: checked integer expression has no canonical Stage 13 type",
+                    expr.span(),
+                )]
+            })
+    }
+
+    fn local_integer_type(&self, id: mir::LocalId) -> DiagnosticResult<IntegerType> {
+        match self.local_type(id) {
+            mir::Type::Integer(ty) => Ok(ty),
+            mir::Type::String => Err(vec![Diagnostic::new(
+                "I1301",
+                format!(
+                    "internal compiler consistency error: string local local{} used as an integer",
+                    id.0
+                ),
+                Span::default(),
+            )]),
+        }
     }
 }
 
@@ -822,27 +898,37 @@ fn terminator_targets(terminator: &mir::Terminator) -> Vec<mir::BlockId> {
 
 fn lower_var_decl(decl: &hir::VarDecl, context: &mut LoweringContext) -> DiagnosticResult<()> {
     let ty = match &decl.ty {
-        Some(ty) if is_plain_type(ty, "int") => mir::Type::Int,
+        Some(ty) if integer_type_ref(ty).is_some() => {
+            mir::Type::Integer(integer_type_ref(ty).expect("checked integer type"))
+        }
         Some(ty) if is_plain_type(ty, "string") => mir::Type::String,
         Some(ty) => {
             return Err(vec![unsupported(
                 decl.span,
-                format!("only int and readonly string locals are lowered to MIR in Stage 11; got `{ty}`"),
+                format!("only integer and readonly string locals are lowered to MIR in Stage 13; got `{ty}`"),
             )]);
         }
         None if is_string_local_initializer(&decl.initializer, context) => mir::Type::String,
-        None => mir::Type::Int,
+        None => match context.integer_type(&decl.initializer) {
+            Ok(integer) => mir::Type::Integer(integer),
+            Err(_) => return Err(vec![unsupported_int_expr(&decl.initializer)]),
+        },
     };
 
     if ty == mir::Type::String {
         return lower_string_var_decl(decl, context);
     }
 
-    let value = lower_int_rvalue(&decl.initializer, context)?;
-    let local = context.declare_user_local(&decl.name, decl.writable, mir::Type::Int);
+    let mir::Type::Integer(integer_type) = ty else {
+        unreachable!("string locals return through lower_string_var_decl")
+    };
+    let value = lower_integer_expression(&decl.initializer, context)?;
+    ensure_expression_type(&value, integer_type, decl.initializer.span())?;
+    let local =
+        context.declare_user_local(&decl.name, decl.writable, mir::Type::Integer(integer_type));
     context.push_statement(mir::Statement::AssignLocal {
         target: local,
-        value,
+        value: mir::Rvalue::Integer(value),
     });
     Ok(())
 }
@@ -894,26 +980,25 @@ fn lower_assignment(
         )]);
     }
 
+    let integer_type = context.local_integer_type(target)?;
     let value = match assignment.op {
-        hir::AssignOp::Assign => lower_int_rvalue(&assignment.value, context)?,
-        hir::AssignOp::AddAssign => {
-            let right = lower_int_operand(&assignment.value, context)?;
-            mir::Rvalue::Binary {
-                op: mir::BinaryOp::Add,
-                left: mir::Operand::Local(target),
-                right,
-            }
-        }
-        hir::AssignOp::SubAssign => {
-            let right = lower_int_operand(&assignment.value, context)?;
-            mir::Rvalue::Binary {
-                op: mir::BinaryOp::Subtract,
-                left: mir::Operand::Local(target),
-                right,
+        hir::AssignOp::Assign => lower_integer_expression(&assignment.value, context)?,
+        ref op => {
+            let right = lower_integer_expression(&assignment.value, context)?;
+            ensure_expression_type(&right, integer_type, assignment.value.span())?;
+            mir::IntegerExpression::Binary {
+                ty: integer_type,
+                op: lower_compound_assignment_op(op),
+                left: Box::new(local_integer_expression(target, integer_type)),
+                right: Box::new(right),
             }
         }
     };
-    context.push_statement(mir::Statement::AssignLocal { target, value });
+    ensure_expression_type(&value, integer_type, assignment.value.span())?;
+    context.push_statement(mir::Statement::AssignLocal {
+        target,
+        value: mir::Rvalue::Integer(value),
+    });
     Ok(())
 }
 
@@ -929,17 +1014,21 @@ fn lower_increment(
         )]);
     }
 
+    let integer_type = context.local_integer_type(target)?;
     let op = match increment.op {
-        hir::IncrementOp::Increment => mir::BinaryOp::Add,
-        hir::IncrementOp::Decrement => mir::BinaryOp::Subtract,
+        hir::IncrementOp::Increment => mir::IntegerBinaryOp::Add,
+        hir::IncrementOp::Decrement => mir::IntegerBinaryOp::Subtract,
     };
     context.push_statement(mir::Statement::AssignLocal {
         target,
-        value: mir::Rvalue::Binary {
+        value: mir::Rvalue::Integer(mir::IntegerExpression::Binary {
+            ty: integer_type,
             op,
-            left: mir::Operand::Local(target),
-            right: mir::Operand::Int(1),
-        },
+            left: Box::new(local_integer_expression(target, integer_type)),
+            right: Box::new(mir::IntegerExpression::constant(IntegerValue::one(
+                integer_type,
+            ))),
+        }),
     });
     Ok(())
 }
@@ -1074,24 +1163,25 @@ fn lower_void_call(
     })
 }
 
-fn lower_int_call(
+fn lower_integer_call(
     name: &str,
     args: &[hir::Expr],
     span: Span,
     context: &LoweringContext,
-) -> DiagnosticResult<(mir::FunctionId, Vec<mir::IntExpression>)> {
+) -> DiagnosticResult<(mir::FunctionId, IntegerType, Vec<mir::IntegerExpression>)> {
     let signature = context.lookup_function(name, span)?;
-    if signature.return_type != mir::ReturnType::Int {
+    let mir::ReturnType::Integer(return_type) = signature.return_type else {
         return Err(vec![unsupported(
             span,
             format!(
                 "void function `{name}` cannot be used as an integer expression in MIR Stage 11"
             ),
         )]);
-    }
+    };
 
+    let function = signature.id;
     let args = lower_call_args(name, args, signature, span, context)?;
-    Ok((signature.id, args))
+    Ok((function, return_type, args))
 }
 
 fn lower_call_args(
@@ -1100,51 +1190,35 @@ fn lower_call_args(
     signature: FunctionSignature,
     span: Span,
     context: &LoweringContext,
-) -> DiagnosticResult<Vec<mir::IntExpression>> {
-    if args.len() != signature.parameter_count {
+) -> DiagnosticResult<Vec<mir::IntegerExpression>> {
+    if args.len() != signature.parameter_types.len() {
         return Err(vec![unsupported(
             span,
             format!(
                 "function `{name}` expects {} positional argument(s), got {}",
-                signature.parameter_count,
+                signature.parameter_types.len(),
                 args.len()
             ),
         )]);
     }
 
     args.iter()
-        .map(|arg| lower_call_argument(arg, context))
+        .zip(signature.parameter_types)
+        .map(|(arg, expected)| {
+            let lowered = lower_integer_expression(arg, context)?;
+            if lowered.ty() != expected {
+                return Err(vec![Diagnostic::new(
+                    "I1301",
+                    format!(
+                        "internal compiler consistency error: argument to `{name}` has MIR type `{}`, expected `{expected}`",
+                        lowered.ty()
+                    ),
+                    arg.span(),
+                )]);
+            }
+            Ok(lowered)
+        })
         .collect()
-}
-
-fn lower_call_argument(
-    expr: &hir::Expr,
-    context: &LoweringContext,
-) -> DiagnosticResult<mir::IntExpression> {
-    match expr {
-        hir::Expr::Int { value, span } => {
-            parse_int_literal(value, *span).map(mir::IntExpression::Use)
-        }
-        hir::Expr::Variable { name, span } => context
-            .lookup_int_local(name, *span)
-            .map(mir::Operand::Local)
-            .map(mir::IntExpression::Use),
-        hir::Expr::Grouped { expr, .. } => lower_call_argument(expr, context),
-        hir::Expr::Binary {
-            left, op, right, ..
-        } => {
-            let op = lower_condition_int_binary_op(op, expr.span())?;
-            Ok(mir::IntExpression::Binary {
-                op,
-                left: Box::new(lower_call_argument(left, context)?),
-                right: Box::new(lower_call_argument(right, context)?),
-            })
-        }
-        _ => Err(vec![unsupported(
-            expr.span(),
-            "call arguments support only Stage 11b integer expressions in MIR Stage 11",
-        )]),
-    }
 }
 
 fn lower_return(
@@ -1155,13 +1229,23 @@ fn lower_return(
 ) -> DiagnosticResult<mir::Terminator> {
     match (return_type, expr) {
         (mir::ReturnType::Void, None) => Ok(mir::Terminator::ReturnVoid),
-        (mir::ReturnType::Int, Some(expr)) => {
-            let operand = lower_int_operand(expr, context)?;
-            Ok(mir::Terminator::Return(operand))
+        (mir::ReturnType::Integer(expected), Some(expr)) => {
+            let value = lower_integer_expression(expr, context)?;
+            if value.ty() != expected {
+                return Err(vec![Diagnostic::new(
+                    "I1301",
+                    format!(
+                        "internal compiler consistency error: return expression has MIR type `{}`, expected `{expected}`",
+                        value.ty()
+                    ),
+                    expr.span(),
+                )]);
+            }
+            Ok(mir::Terminator::Return(value))
         }
-        (mir::ReturnType::Int, None) => Err(vec![unsupported(
+        (mir::ReturnType::Integer(_), None) => Err(vec![unsupported(
             span,
-            "bare return is not lowered for int-returning functions in Stage 11",
+            "bare return is not lowered for integer-returning functions in Stage 13",
         )]),
         (mir::ReturnType::Void, Some(expr)) => Err(vec![unsupported(
             expr.span(),
@@ -1194,8 +1278,8 @@ fn lower_condition(
             | hir::BinaryOp::Greater
             | hir::BinaryOp::GreaterEqual => Ok(mir::Condition::Compare {
                 op: lower_compare_op(op),
-                left: lower_condition_int_expr(left, context)?,
-                right: lower_condition_int_expr(right, context)?,
+                left: lower_integer_expression(left, context)?,
+                right: lower_integer_expression(right, context)?,
             }),
             hir::BinaryOp::And | hir::BinaryOp::Or | hir::BinaryOp::Xor => {
                 Ok(mir::Condition::Binary {
@@ -1230,40 +1314,6 @@ fn lower_condition(
     }
 }
 
-fn lower_condition_int_expr(
-    expr: &hir::Expr,
-    context: &LoweringContext,
-) -> DiagnosticResult<mir::IntExpression> {
-    match expr {
-        hir::Expr::Int { value, span } => {
-            parse_int_literal(value, *span).map(mir::IntExpression::Use)
-        }
-        hir::Expr::Variable { name, span } => context
-            .lookup_int_local(name, *span)
-            .map(mir::Operand::Local)
-            .map(mir::IntExpression::Use),
-        hir::Expr::Grouped { expr, .. } => lower_condition_int_expr(expr, context),
-        hir::Expr::Binary {
-            left, op, right, ..
-        } => {
-            let op = lower_condition_int_binary_op(op, expr.span())?;
-            Ok(mir::IntExpression::Binary {
-                op,
-                left: Box::new(lower_condition_int_expr(left, context)?),
-                right: Box::new(lower_condition_int_expr(right, context)?),
-            })
-        }
-        hir::Expr::FunctionCall { name, args, span } => {
-            let (function, args) = lower_int_call(name, args, *span, context)?;
-            Ok(mir::IntExpression::Call { function, args })
-        }
-        _ => Err(vec![unsupported(
-            expr.span(),
-            "only Stage 11b integer expressions are lowered as comparison operands in Stage 11",
-        )]),
-    }
-}
-
 fn lower_compare_op(op: &hir::BinaryOp) -> mir::CompareOp {
     match op {
         hir::BinaryOp::Equal => mir::CompareOp::Equal,
@@ -1285,81 +1335,148 @@ fn lower_condition_binary_op(op: &hir::BinaryOp) -> mir::ConditionBinaryOp {
     }
 }
 
-fn lower_condition_int_binary_op(
-    op: &hir::BinaryOp,
-    span: Span,
-) -> DiagnosticResult<mir::BinaryOp> {
-    match op {
-        hir::BinaryOp::Add => Ok(mir::BinaryOp::Add),
-        hir::BinaryOp::Sub => Ok(mir::BinaryOp::Subtract),
-        hir::BinaryOp::Mul => Ok(mir::BinaryOp::Multiply),
-        hir::BinaryOp::Div | hir::BinaryOp::Mod => Err(vec![unsupported(
-            span,
-            "division and modulo in condition operands are not lowered to MIR in Stage 11",
-        )]),
-        _ => Err(vec![unsupported(
-            span,
-            "only Stage 11b integer arithmetic is lowered inside MIR Stage 11 comparisons",
-        )]),
-    }
-}
-
-fn lower_int_operand(
+fn lower_integer_expression(
     expr: &hir::Expr,
-    context: &mut LoweringContext,
-) -> DiagnosticResult<mir::Operand> {
-    match expr {
-        hir::Expr::Int { value, span } => parse_int_literal(value, *span),
-        hir::Expr::Variable { name, span } => context
-            .lookup_int_local(name, *span)
-            .map(mir::Operand::Local),
-        hir::Expr::Grouped { expr, .. } => lower_int_operand(expr, context),
-        hir::Expr::Binary { .. } | hir::Expr::FunctionCall { .. } => {
-            let value = lower_int_rvalue(expr, context)?;
-            let temp = context.declare_temp(false);
-            context.push_statement(mir::Statement::AssignLocal {
-                target: temp,
-                value,
-            });
-            Ok(mir::Operand::Local(temp))
+    context: &LoweringContext,
+) -> DiagnosticResult<mir::IntegerExpression> {
+    if let hir::Expr::FunctionCall { name, span, .. } = expr {
+        if context.lookup_function(name, *span)?.return_type == mir::ReturnType::Void {
+            return Err(vec![unsupported(
+                *span,
+                format!(
+                    "void function `{name}` cannot be used as an integer expression in MIR Stage 11"
+                ),
+            )]);
         }
-        _ => Err(vec![unsupported_int_expr(expr)]),
     }
-}
 
-fn lower_int_rvalue(
-    expr: &hir::Expr,
-    context: &mut LoweringContext,
-) -> DiagnosticResult<mir::Rvalue> {
+    if let Some((magnitude, negative)) = integer_literal_parts(expr) {
+        let ty = context.integer_type(expr)?;
+        let value = IntegerValue::from_literal(ty, magnitude, negative).ok_or_else(|| {
+            vec![Diagnostic::new(
+                "I1301",
+                format!("internal compiler consistency error: checked literal does not fit `{ty}`"),
+                expr.span(),
+            )]
+        })?;
+        return Ok(mir::IntegerExpression::constant(value));
+    }
+
+    if let hir::Expr::FunctionCall { name, args, span } = expr {
+        let (function, return_type, args) = lower_integer_call(name, args, *span, context)?;
+        let ty = context.integer_type(expr)?;
+        if return_type != ty {
+            return Err(vec![Diagnostic::new(
+                "I1301",
+                format!(
+                    "internal compiler consistency error: function `{name}` returns `{return_type}`, expression metadata says `{ty}`"
+                ),
+                *span,
+            )]);
+        }
+        return Ok(mir::IntegerExpression::Call { ty, function, args });
+    }
+
+    let ty = context.integer_type(expr)?;
     match expr {
-        hir::Expr::Int { .. } | hir::Expr::Variable { .. } | hir::Expr::Grouped { .. } => {
-            lower_int_operand(expr, context).map(mir::Rvalue::Use)
+        hir::Expr::Variable { name, span } => {
+            let local = context.lookup_int_local(name, *span)?;
+            let local_type = context.local_integer_type(local)?;
+            if local_type != ty {
+                return Err(vec![Diagnostic::new(
+                    "I1301",
+                    format!(
+                        "internal compiler consistency error: `${name}` has MIR type `{local_type}`, expression metadata says `{ty}`"
+                    ),
+                    *span,
+                )]);
+            }
+            Ok(local_integer_expression(local, ty))
+        }
+        hir::Expr::Grouped { expr, .. } => {
+            let lowered = lower_integer_expression(expr, context)?;
+            ensure_expression_type(&lowered, ty, expr.span())?;
+            Ok(lowered)
+        }
+        hir::Expr::Unary { op, expr, .. } => {
+            let operand = lower_integer_expression(expr, context)?;
+            ensure_expression_type(&operand, ty, expr.span())?;
+            let op = match op {
+                hir::UnaryOp::Negate => mir::IntegerUnaryOp::Negate,
+                hir::UnaryOp::BitwiseNot => mir::IntegerUnaryOp::BitwiseNot,
+                hir::UnaryOp::Not => return Err(vec![unsupported_int_expr(expr)]),
+            };
+            Ok(mir::IntegerExpression::Unary {
+                ty,
+                op,
+                operand: Box::new(operand),
+            })
         }
         hir::Expr::Binary {
             left, op, right, ..
         } => {
-            let op = lower_binary_op(op, expr.span())?;
-            let left = lower_int_operand(left, context)?;
-            let right = lower_int_operand(right, context)?;
-            Ok(mir::Rvalue::Binary { op, left, right })
+            let op = lower_integer_binary_op(op, expr.span())?;
+            let left = lower_integer_expression(left, context)?;
+            let right = lower_integer_expression(right, context)?;
+            ensure_expression_type(&left, ty, expr.span())?;
+            ensure_expression_type(&right, ty, expr.span())?;
+            Ok(mir::IntegerExpression::Binary {
+                ty,
+                op,
+                left: Box::new(left),
+                right: Box::new(right),
+            })
         }
-        hir::Expr::FunctionCall { name, args, span } => {
-            let (function, args) = lower_int_call(name, args, *span, context)?;
-            Ok(mir::Rvalue::Call { function, args })
+        hir::Expr::FunctionCall { .. } => unreachable!("function calls return before type lookup"),
+        hir::Expr::StaticCall {
+            class_name,
+            method,
+            args,
+            span,
+        } if method == "from" && IntegerType::from_companion_name(class_name).is_some() => {
+            let [value] = args.as_slice() else {
+                return Err(vec![Diagnostic::new(
+                    "I1301",
+                    "internal compiler consistency error: checked integer conversion does not have exactly one argument",
+                    *span,
+                )]);
+            };
+            let target = IntegerType::from_companion_name(class_name)
+                .expect("guarded integer companion name");
+            if target != ty {
+                return Err(vec![Diagnostic::new(
+                    "I1301",
+                    format!(
+                        "internal compiler consistency error: `{class_name}::from` targets `{target}`, expression metadata says `{ty}`"
+                    ),
+                    *span,
+                )]);
+            }
+            Ok(mir::IntegerExpression::Convert {
+                ty,
+                value: Box::new(lower_integer_expression(value, context)?),
+            })
         }
+        hir::Expr::Int { .. } => unreachable!("integer literal handled before expression match"),
         _ => Err(vec![unsupported_int_expr(expr)]),
     }
 }
 
-fn lower_binary_op(op: &hir::BinaryOp, span: Span) -> DiagnosticResult<mir::BinaryOp> {
+fn lower_integer_binary_op(
+    op: &hir::BinaryOp,
+    span: Span,
+) -> DiagnosticResult<mir::IntegerBinaryOp> {
     match op {
-        hir::BinaryOp::Add => Ok(mir::BinaryOp::Add),
-        hir::BinaryOp::Sub => Ok(mir::BinaryOp::Subtract),
-        hir::BinaryOp::Mul => Ok(mir::BinaryOp::Multiply),
-        hir::BinaryOp::Div | hir::BinaryOp::Mod => Err(vec![unsupported(
-            span,
-            "division and modulo are not lowered to MIR in Stage 11",
-        )]),
+        hir::BinaryOp::Add => Ok(mir::IntegerBinaryOp::Add),
+        hir::BinaryOp::Sub => Ok(mir::IntegerBinaryOp::Subtract),
+        hir::BinaryOp::Mul => Ok(mir::IntegerBinaryOp::Multiply),
+        hir::BinaryOp::Div => Ok(mir::IntegerBinaryOp::Divide),
+        hir::BinaryOp::Mod => Ok(mir::IntegerBinaryOp::Remainder),
+        hir::BinaryOp::ShiftLeft => Ok(mir::IntegerBinaryOp::ShiftLeft),
+        hir::BinaryOp::ShiftRight => Ok(mir::IntegerBinaryOp::ShiftRight),
+        hir::BinaryOp::BitwiseAnd => Ok(mir::IntegerBinaryOp::BitwiseAnd),
+        hir::BinaryOp::BitwiseXor => Ok(mir::IntegerBinaryOp::BitwiseXor),
+        hir::BinaryOp::BitwiseOr => Ok(mir::IntegerBinaryOp::BitwiseOr),
         hir::BinaryOp::Less
         | hir::BinaryOp::LessEqual
         | hir::BinaryOp::Greater
@@ -1384,13 +1501,64 @@ fn lower_binary_op(op: &hir::BinaryOp, span: Span) -> DiagnosticResult<mir::Bina
     }
 }
 
-fn parse_int_literal(value: &str, span: Span) -> DiagnosticResult<mir::Operand> {
-    value.parse::<i64>().map(mir::Operand::Int).map_err(|_| {
-        vec![unsupported(
+fn lower_compound_assignment_op(op: &hir::AssignOp) -> mir::IntegerBinaryOp {
+    match op {
+        hir::AssignOp::AddAssign => mir::IntegerBinaryOp::Add,
+        hir::AssignOp::SubAssign => mir::IntegerBinaryOp::Subtract,
+        hir::AssignOp::MulAssign => mir::IntegerBinaryOp::Multiply,
+        hir::AssignOp::DivAssign => mir::IntegerBinaryOp::Divide,
+        hir::AssignOp::ModAssign => mir::IntegerBinaryOp::Remainder,
+        hir::AssignOp::ShiftLeftAssign => mir::IntegerBinaryOp::ShiftLeft,
+        hir::AssignOp::ShiftRightAssign => mir::IntegerBinaryOp::ShiftRight,
+        hir::AssignOp::BitwiseAndAssign => mir::IntegerBinaryOp::BitwiseAnd,
+        hir::AssignOp::BitwiseXorAssign => mir::IntegerBinaryOp::BitwiseXor,
+        hir::AssignOp::BitwiseOrAssign => mir::IntegerBinaryOp::BitwiseOr,
+        hir::AssignOp::Assign => unreachable!("plain assignment does not have a binary operator"),
+    }
+}
+
+fn local_integer_expression(local: mir::LocalId, ty: IntegerType) -> mir::IntegerExpression {
+    mir::IntegerExpression::use_operand(ty, mir::Operand::Local(local))
+}
+
+fn ensure_expression_type(
+    expression: &mir::IntegerExpression,
+    expected: IntegerType,
+    span: Span,
+) -> DiagnosticResult<()> {
+    if expression.ty() == expected {
+        Ok(())
+    } else {
+        Err(vec![Diagnostic::new(
+            "I1301",
+            format!(
+                "internal compiler consistency error: integer expression has MIR type `{}`, expected `{expected}`",
+                expression.ty()
+            ),
             span,
-            "integer literals outside int64 are not lowered to MIR in Stage 11",
-        )]
-    })
+        )])
+    }
+}
+
+fn integer_literal_parts(expr: &hir::Expr) -> Option<(u128, bool)> {
+    match expr {
+        hir::Expr::Int { value, .. } => parse_decimal_magnitude(value).map(|value| (value, false)),
+        hir::Expr::Grouped { expr, .. } => integer_literal_parts(expr),
+        hir::Expr::Unary {
+            op: hir::UnaryOp::Negate,
+            expr,
+            ..
+        } => unsigned_integer_literal_magnitude(expr).map(|magnitude| (magnitude, true)),
+        _ => None,
+    }
+}
+
+fn unsigned_integer_literal_magnitude(expr: &hir::Expr) -> Option<u128> {
+    match expr {
+        hir::Expr::Int { value, .. } => parse_decimal_magnitude(value),
+        hir::Expr::Grouped { expr, .. } => unsigned_integer_literal_magnitude(expr),
+        _ => None,
+    }
 }
 
 fn unsupported_int_expr(expr: &hir::Expr) -> Diagnostic {
@@ -1414,7 +1582,19 @@ fn unsupported_int_expr(expr: &hir::Expr) -> Diagnostic {
         }
         hir::Expr::Unary { .. } => "unary expressions are not lowered to MIR in Stage 11",
         hir::Expr::Range { .. } => "ranges are not lowered to MIR in Stage 11",
-        hir::Expr::Binary { .. } => "this binary expression is not lowered to MIR in Stage 11",
+        hir::Expr::Binary {
+            op:
+                hir::BinaryOp::Equal
+                | hir::BinaryOp::NotEqual
+                | hir::BinaryOp::Less
+                | hir::BinaryOp::LessEqual
+                | hir::BinaryOp::Greater
+                | hir::BinaryOp::GreaterEqual,
+            ..
+        } => {
+            "comparison results are condition-only and are not lowered as runtime values in Stage 13 MIR"
+        }
+        hir::Expr::Binary { .. } => "this binary expression is not lowered to MIR in Stage 13",
         hir::Expr::Int { .. } | hir::Expr::Variable { .. } | hir::Expr::Grouped { .. } => {
             "this int expression is not lowered to MIR in Stage 11"
         }

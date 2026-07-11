@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::fmt;
 
+pub use crate::numeric::{FloatType, IntegerType};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TypeRef {
     pub name: String,
@@ -31,9 +33,12 @@ impl TypeRef {
     }
 
     pub fn as_class_name(&self) -> Option<&str> {
+        if IntegerType::from_source_name(&self.name).is_some() {
+            return None;
+        }
         match self.name.as_str() {
-            "void" | "int" | "float" | "string" | "bool" | "mixed" | "null" | "resource"
-            | "List" | "Dictionary" | "Set" | "[]" | "Unknown" => None,
+            "void" | "float" | "float32" | "float64" | "string" | "bool" | "mixed" | "null"
+            | "resource" | "List" | "Dictionary" | "Set" | "[]" | "Unknown" => None,
             _ => Some(&self.name),
         }
     }
@@ -65,8 +70,8 @@ pub struct TypeId(usize);
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum TypeKind {
     Void,
-    Int,
-    Float,
+    Integer(IntegerType),
+    Float(FloatType),
     String,
     Bool,
     Null,
@@ -121,8 +126,8 @@ impl TypeRegistry {
     pub fn display(&self, id: TypeId) -> String {
         match self.kind(id) {
             TypeKind::Void => "void".to_string(),
-            TypeKind::Int => "int".to_string(),
-            TypeKind::Float => "float".to_string(),
+            TypeKind::Integer(integer) => integer.source_name().to_string(),
+            TypeKind::Float(float) => float.source_name().to_string(),
             TypeKind::String => "string".to_string(),
             TypeKind::Bool => "bool".to_string(),
             TypeKind::Null => "null".to_string(),

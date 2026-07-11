@@ -1,0 +1,9 @@
+function answer(uint8 $base): uint8
+{
+    return $base + 2;
+}
+
+function main(): int
+{
+    return Int::from(answer(40));
+}

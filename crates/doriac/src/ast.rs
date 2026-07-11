@@ -158,6 +158,14 @@ pub enum AssignOp {
     Assign,
     AddAssign,
     SubAssign,
+    MulAssign,
+    DivAssign,
+    ModAssign,
+    ShiftLeftAssign,
+    ShiftRightAssign,
+    BitwiseAndAssign,
+    BitwiseOrAssign,
+    BitwiseXorAssign,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -300,6 +308,8 @@ pub struct ArrayElement {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UnaryOp {
     Not,
+    Negate,
+    BitwiseNot,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -309,6 +319,11 @@ pub enum BinaryOp {
     Mul,
     Div,
     Mod,
+    ShiftLeft,
+    ShiftRight,
+    BitwiseAnd,
+    BitwiseXor,
+    BitwiseOr,
     Concat,
     Equal,
     NotEqual,

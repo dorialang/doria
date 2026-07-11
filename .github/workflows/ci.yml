@@ -52,8 +52,31 @@ jobs:
       - name: Test
         run: cargo test --workspace --all-targets --locked --verbose
 
-      - name: Run durable interpreter and Cranelift parity matrix
+      - name: Run focused Stage 13 integer engine and semantic tests
+        run: |
+          cargo test -p doriac --test integer_engine_tests --locked --verbose
+          cargo test -p doriac --test stage13_semantic_tests --locked --verbose
+
+      - name: Run focused MIR and linker-independent Cranelift tests
+        run: |
+          cargo test -p doriac --test mir_tests --locked --verbose
+          cargo test -p doriac --test cranelift_mir_tests --locked --verbose
+
+      - name: Run complete durable interpreter and Cranelift parity matrix
         run: cargo test -p doriac --test native_mir_parity_tests --locked --verbose
+
+      - name: Smoke signed and unsigned narrow-width native fixtures
+        run: |
+          cargo run -p doriac -- compile examples/native/main_integer_div_mod_42.doria --target native --out build/native/main_integer_div_mod_42
+          cargo run -p doriac -- compile examples/native/main_fixed_width_arithmetic_42.doria --target native --out build/native/main_fixed_width_arithmetic_42
+          set +e
+          build/native/main_integer_div_mod_42
+          signed_status=$?
+          build/native/main_fixed_width_arithmetic_42
+          unsigned_status=$?
+          set -e
+          test "${signed_status}" -eq 42
+          test "${unsigned_status}" -eq 42
 
       - name: Check repository script guardrails
         run: |

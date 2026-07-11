@@ -8,7 +8,7 @@ fn emits_php_for_simple_program() {
         "test.doria",
         r#"
 let writable $count = 0;
-$count += 1;
+$count = 1;
 echo $count;
 "#,
     )
@@ -16,7 +16,7 @@ echo $count;
 
     assert!(php.starts_with("<?php"));
     assert!(php.contains("$count = 0;"));
-    assert!(php.contains("$count += 1;"));
+    assert!(php.contains("$count = 1;"));
     assert!(php.contains("echo $count;"));
 }
 
@@ -91,6 +91,247 @@ echo "01" != "1";
 }
 
 #[test]
+fn php_backend_keeps_exact_int64_alias_and_signed_comparison_subset() {
+    let php = doriac::compile_source_to_php(
+        "test.doria",
+        r#"
+function isLess(int64 $left, int $right): bool
+{
+    return $left < $right;
+}
+
+function identity(int64 $value): int64
+{
+    return $value;
+}
+"#,
+    )
+    .expect("the exact signed integer subset should remain supported by PHP");
+
+    assert!(php.contains("function isLess(int $left, int $right): bool"));
+    assert!(php.contains("return $left < $right;"));
+    assert!(php.contains("function identity(int $value): int"));
+}
+
+#[test]
+fn php_backend_rejects_stage_13_integer_shapes_it_cannot_preserve() {
+    let cases = [
+        (
+            "checked overflow",
+            r#"
+function add(int $left, int $right): int
+{
+    return $left + $right;
+}
+"#,
+            "checked integer overflow behavior for `+`",
+        ),
+        (
+            "checked compound assignment",
+            r#"
+function update(): void
+{
+    let writable $value = 1;
+    $value += 1;
+}
+"#,
+            "checked integer overflow behavior for `+=`",
+        ),
+        (
+            "checked increment",
+            r#"
+function update(): void
+{
+    let writable $value = 1;
+    $value++;
+}
+"#,
+            "checked integer overflow behavior for `++`",
+        ),
+        (
+            "integer division",
+            r#"
+function divide(int $left, int $right): int
+{
+    return $left / $right;
+}
+"#,
+            "Doria integer division semantics for `/`",
+        ),
+        (
+            "integer shift",
+            r#"
+function shift(int $value, int $count): int
+{
+    return $value << $count;
+}
+"#,
+            "Doria integer shift semantics for `<<`",
+        ),
+        (
+            "fixed-width bitwise",
+            r#"
+function mask(int $left, int $right): int
+{
+    return $left & $right;
+}
+"#,
+            "fixed-width Doria bitwise semantics for `&`",
+        ),
+        (
+            "nondefault width",
+            r#"
+function identity(int8 $value): int8
+{
+    return $value;
+}
+"#,
+            "Doria `int8` width and signedness",
+        ),
+        (
+            "uint64 maximum",
+            r#"
+function maximum(): uint64
+{
+    return 18446744073709551615;
+}
+"#,
+            "Doria `uint64` width and signedness",
+        ),
+        (
+            "unsigned comparison",
+            r#"
+function isLess(uint32 $left, uint32 $right): bool
+{
+    return $left < $right;
+}
+"#,
+            "Doria `uint32` width and signedness",
+        ),
+        (
+            "checked conversion",
+            r#"
+function convert(): void
+{
+    let $value = Int8::from(1);
+}
+"#,
+            "checked Doria integer conversion semantics for `Int8::from(...)`",
+        ),
+    ];
+
+    for (name, source, expected) in cases {
+        let diagnostics = match doriac::compile_source_to_php("test.doria", source) {
+            Ok(php) => panic!("{name} unexpectedly generated PHP:\n{php}"),
+            Err(diagnostics) => diagnostics,
+        };
+
+        assert_eq!(diagnostics[0].code, "B1301", "{name}: {diagnostics:?}");
+        assert!(
+            diagnostics[0]
+                .message
+                .contains("PHP compatibility backend cannot preserve"),
+            "{name}: {diagnostics:?}"
+        );
+        assert!(
+            diagnostics[0].message.contains(expected),
+            "{name}: {diagnostics:?}"
+        );
+    }
+}
+
+#[test]
+fn php_capability_failure_does_not_make_valid_doria_fail_check() {
+    let source = r#"
+function divide(int $left, int $right): int
+{
+    return $left / $right;
+}
+"#;
+
+    doriac::check_source("test.doria", source)
+        .expect("PHP compatibility limitations must not affect Doria checking");
+
+    let diagnostics = doriac::compile_source_to_php("test.doria", source)
+        .expect_err("PHP generation must reject integer division rather than emit PHP `/`");
+    assert_eq!(diagnostics[0].code, "B1301");
+    assert!(diagnostics[0].message.contains("integer division"));
+}
+
+#[test]
+fn php_backend_maps_float64_and_allows_float_arithmetic() {
+    let php = doriac::compile_source_to_php(
+        "test.doria",
+        r#"
+function total(): float64
+{
+    writable float $value = 1.5 + 2.5;
+    $value += 1.0;
+    return $value;
+}
+"#,
+    )
+    .expect("PHP should preserve default float arithmetic");
+
+    assert!(php.contains("function total(): float"));
+    assert!(php.contains("$value = 1.5 + 2.5;"));
+    assert!(php.contains("$value += 1.0;"));
+    assert!(!php.contains("float64"));
+}
+
+#[test]
+fn php_backend_rejects_float32_precision() {
+    let diagnostics = doriac::compile_source_to_php(
+        "test.doria",
+        r#"
+function identity(float32 $value): float32
+{
+    return $value;
+}
+"#,
+    )
+    .expect_err("PHP must not emit `float32` as an unknown PHP type");
+
+    assert_eq!(diagnostics[0].code, "B1301");
+    assert!(diagnostics[0].message.contains("`float32` precision"));
+}
+
+#[test]
+fn php_backend_allows_negative_integer_literals_but_rejects_runtime_negation() {
+    let php = doriac::compile_source_to_php(
+        "test.doria",
+        r#"
+function negativeOne(): int
+{
+    return -1;
+}
+
+function minimum(): int
+{
+    return -9223372036854775808;
+}
+"#,
+    )
+    .expect("in-range signed integer literals should lower to PHP");
+
+    assert!(php.contains("return -(1);"));
+    assert!(php.contains("return (-9223372036854775807 - 1);"));
+
+    let diagnostics = doriac::compile_source_to_php(
+        "test.doria",
+        r#"
+function negate(int $value): int
+{
+    return -$value;
+}
+"#,
+    )
+    .expect_err("runtime checked integer negation must remain unsupported in PHP");
+    assert_eq!(diagnostics[0].code, "B1301");
+    assert!(diagnostics[0].message.contains("unary `-`"));
+}
+
+#[test]
 fn parenthesizes_unary_not_operands_for_php() {
     let php = doriac::compile_source_to_php(
         "test.doria",
@@ -160,27 +401,27 @@ function main(): void
 }
 
 #[test]
-fn emits_php_for_stage_10_helper_function_call() {
+fn emits_php_for_stage_10_integer_helper_function_call() {
     let php = doriac::compile_source_to_php(
         "test.doria",
         r#"
-function add(int $left, int $right): int
+function identity(int $value): int
 {
-    return $left + $right;
+    return $value;
 }
 
 function main(): int
 {
-    return add(20, 22);
+    return identity(42);
 }
 "#,
     )
     .expect("compilation should succeed");
 
-    assert!(php.contains("function add(int $left, int $right): int"));
-    assert!(php.contains("return $left + $right;"));
+    assert!(php.contains("function identity(int $value): int"));
+    assert!(php.contains("return $value;"));
     assert!(php.contains("function main(): int"));
-    assert!(php.contains("return add(20, 22);"));
+    assert!(php.contains("return identity(42);"));
 }
 
 #[test]
@@ -351,7 +592,7 @@ if ($count < 10) {
 
 while ($count < 10) {
     echo $count;
-    $count += 1;
+    $count = 10;
 }
 "#,
     )
@@ -360,7 +601,7 @@ while ($count < 10) {
     assert!(php.contains("if ($count < 10)\n{\n    echo \"small\";\n}"));
     assert!(php.contains("else if ($count < 20)\n{\n    echo \"medium\";\n}"));
     assert!(php.contains("else\n{\n    echo \"large\";\n}"));
-    assert!(php.contains("while ($count < 10)\n{\n    echo $count;\n    $count += 1;\n}"));
+    assert!(php.contains("while ($count < 10)\n{\n    echo $count;\n    $count = 10;\n}"));
 }
 
 #[test]
@@ -373,7 +614,7 @@ function main(): void
     let writable $code = 0;
 
     while ($code < 10) {
-        $code += 1;
+        $code = 10;
 
         if ($code == 5) {
             continue;
@@ -393,16 +634,12 @@ function main(): void
 }
 
 #[test]
-fn emits_php_for_stage_9_iteration() {
+fn emits_php_for_stage_9_range_iteration() {
     let php = doriac::compile_source_to_php(
         "test.doria",
         r#"
 function main(): void
 {
-    for (let writable $i = 0; $i < 10; $i++) {
-        echo "x";
-    }
-
     foreach (0..<10 as $i) {
         echo "x";
     }
@@ -414,24 +651,17 @@ function main(): void
     foreach ((0..2) as $k) {
         echo "x";
     }
-
-    let writable $j = 0;
-    ++$j;
-    $j--;
 }
 "#,
     )
     .expect("compilation should succeed");
 
-    assert!(php.contains("for ($i = 0; $i < 10; $i++)"));
     assert!(php.contains("__doria_range_start"));
     assert!(php.contains("; $i__doria"));
     assert!(php.contains(" < $__doria_range_end"));
     assert!(php.contains(" <= $__doria_range_end"));
     assert!(php.matches("__doria_range_start").count() >= 3);
     assert!(!php.contains("unsupported range expression"));
-    assert!(php.contains("++$j;"));
-    assert!(php.contains("$j--;"));
 }
 
 #[test]
@@ -582,7 +812,7 @@ fn php_backend_lowers_panic_to_stderr_and_status_101() {
     )
     .expect("panic should lower through the compatibility backend");
 
-    assert!(php.contains("fwrite(STDERR, \"panic: \" . \"boom\" . \"\\nstack trace:\\n\");"));
+    assert!(php.contains("fwrite(STDERR, \"Panic: \" . \"boom\" . \"\\nStack Trace:\\n\");"));
     assert!(php.contains("debug_backtrace(DEBUG_BACKTRACE_IGNORE_ARGS)"));
     assert!(php.contains("fwrite(STDERR, \"  at \""));
     assert!(php.contains("exit(101);"));
@@ -636,7 +866,7 @@ function main(): void
     assert!(run.stdout.is_empty());
     assert_eq!(
         run.stderr,
-        b"panic: boom\nstack trace:\n  at panicNow\n  at middle\n  at main\n"
+        b"Panic: boom\nStack Trace:\n  at panicNow\n  at middle\n  at main\n"
     );
 }
 

@@ -119,6 +119,63 @@ function main(): void
     return;
 }
 
+// Stage 13: fixed-width integers, explicit conversions, and integer operators.
+function exerciseStage13Integers(): void
+{
+    int8 $minimumInt8 = -128;
+    int16 $maximumInt16 = 32767;
+    int32 $maximumInt32 = 2147483647;
+    int64 $maximumInt64 = 9223372036854775807;
+    uint8 $maximumUInt8 = 255;
+    uint16 $maximumUInt16 = 65535;
+    uint32 $maximumUInt32 = 4294967295;
+    uint64 $maximumUInt64 = 18446744073709551615;
+
+    int $defaultInt = Int::from($maximumInt16);
+    int8 $convertedInt8 = Int8::from($minimumInt8);
+    int16 $convertedInt16 = Int16::from($minimumInt8);
+    int32 $convertedInt32 = Int32::from($maximumInt16);
+    int64 $convertedInt64 = Int64::from($maximumInt32);
+    uint8 $convertedUInt8 = UInt8::from($maximumUInt8);
+    uint16 $convertedUInt16 = UInt16::from($maximumUInt8);
+    uint32 $convertedUInt32 = UInt32::from($maximumUInt16);
+    uint64 $convertedUInt64 = UInt64::from($maximumUInt32);
+
+    let $negated = -$defaultInt;
+    let $complemented = ~$defaultInt;
+    let $sum = $defaultInt + 2;
+    let $difference = $defaultInt - 2;
+    let $product = $defaultInt * 2;
+    let $quotient = $defaultInt / 2;
+    let $remainder = $defaultInt % 2;
+    let $shiftedLeft = $defaultInt << 1;
+    let $shiftedRight = $defaultInt >> 1;
+    let $masked = $defaultInt & 255;
+    let $combined = $defaultInt | 1;
+    let $toggled = $defaultInt ^ 1;
+    let $equal = $defaultInt == 42;
+    let $notEqual = $defaultInt != 0;
+    let $less = $defaultInt < 100;
+    let $lessOrEqual = $defaultInt <= 42;
+    let $greater = $defaultInt > 0;
+    let $greaterOrEqual = $defaultInt >= 42;
+    let $booleanXor = true xor false;
+
+    writable int16 $accumulator = 12;
+    $accumulator += 3;
+    $accumulator -= 2;
+    $accumulator *= 2;
+    $accumulator /= 2;
+    $accumulator %= 5;
+    $accumulator <<= 1;
+    $accumulator >>= 1;
+    $accumulator &= 7;
+    $accumulator |= 8;
+    $accumulator ^= 3;
+    $accumulator++;
+    $accumulator--;
+}
+
 // Planned/future: ownership, sharing, and marker types from the master plan.
 function share(
     Shared<User> $user,

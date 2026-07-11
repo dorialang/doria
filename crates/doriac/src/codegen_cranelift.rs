@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::{
     types, AbiParam, Block, BlockArg, InstBuilder, Signature, StackSlot, StackSlotData,
-    StackSlotKind, TrapCode, Value,
+    StackSlotKind, TrapCode, Type as ClifType, Value,
 };
 use cranelift_codegen::settings::{self, Configurable};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
@@ -12,6 +12,7 @@ use cranelift_object::{ObjectBuilder, ObjectModule};
 
 use crate::backend::BackendError;
 use crate::mir;
+use crate::numeric::{IntegerPanic, IntegerType, IntegerValue};
 
 const RUNTIME_RETURNED_TRAP: u8 = 1;
 
@@ -28,13 +29,13 @@ pub fn lower_mir_to_object(program: &mir::Program) -> Result<Vec<u8>, BackendErr
         .finish(settings::Flags::new(flag_builder))
         .map_err(|error| backend_failure(error.to_string()))?;
     let mut module = ObjectModule::new(
-        ObjectBuilder::new(isa, "doria_stage_12", default_libcall_names())
+        ObjectBuilder::new(isa, "doria_stage_13", default_libcall_names())
             .map_err(|error| backend_failure(error.to_string()))?,
     );
 
     let mut function_ids = Vec::with_capacity(program.functions.len());
     for function in &program.functions {
-        let signature = function_signature(&mut module, function);
+        let signature = function_signature(&mut module, function)?;
         let function_id = module
             .declare_function(&function_symbol(function), Linkage::Local, &signature)
             .map_err(|error| backend_failure(error.to_string()))?;
@@ -64,18 +65,44 @@ pub fn lower_mir_to_object(program: &mir::Program) -> Result<Vec<u8>, BackendErr
         .map_err(|error| backend_failure(error.to_string()))
 }
 
-fn function_signature(module: &mut ObjectModule, function: &mir::Function) -> Signature {
+fn function_signature(
+    module: &mut ObjectModule,
+    function: &mir::Function,
+) -> Result<Signature, BackendError> {
     let mut signature = module.make_signature();
     signature
         .params
         .push(AbiParam::new(module.target_config().pointer_type()));
-    for _ in &function.params {
-        signature.params.push(AbiParam::new(types::I64));
+    for parameter in &function.params {
+        signature
+            .params
+            .push(integer_abi_param(integer_local_type(function, *parameter)?));
     }
-    if function.return_type == mir::ReturnType::Int {
-        signature.returns.push(AbiParam::new(types::I64));
+    if let mir::ReturnType::Integer(ty) = function.return_type {
+        signature.returns.push(integer_abi_param(ty));
     }
-    signature
+    Ok(signature)
+}
+
+fn clif_integer_type(ty: IntegerType) -> ClifType {
+    match ty.bit_width() {
+        8 => types::I8,
+        16 => types::I16,
+        32 => types::I32,
+        64 => types::I64,
+        width => unreachable!("canonical Doria integer has unsupported width {width}"),
+    }
+}
+
+fn integer_abi_param(ty: IntegerType) -> AbiParam {
+    let parameter = AbiParam::new(clif_integer_type(ty));
+    if ty.bit_width() == 64 {
+        parameter
+    } else if ty.is_signed() {
+        parameter.sext()
+    } else {
+        parameter.uext()
+    }
 }
 
 fn function_symbol(function: &mir::Function) -> String {
@@ -102,7 +129,7 @@ fn define_function(
     let function_id = *function_ids
         .get(function.id.0)
         .ok_or_else(|| malformed_mir(format!("function{} was not declared", function.id.0)))?;
-    let signature = function_signature(module, function);
+    let signature = function_signature(module, function)?;
     let string_values = resolve_string_locals(function)?;
     let mut context = module.make_context();
     context.func.signature = signature;
@@ -122,11 +149,14 @@ fn define_function(
             .locals
             .iter()
             .map(|local| match local.ty {
-                mir::Type::Int => Some(builder.create_sized_stack_slot(StackSlotData::new(
-                    StackSlotKind::ExplicitSlot,
-                    8,
-                    3,
-                ))),
+                mir::Type::Integer(ty) => {
+                    let bytes = ty.storage_bytes();
+                    Some(builder.create_sized_stack_slot(StackSlotData::new(
+                        StackSlotKind::ExplicitSlot,
+                        bytes,
+                        bytes.trailing_zeros() as u8,
+                    )))
+                }
                 mir::Type::String => None,
             })
             .collect::<Vec<_>>();
@@ -139,7 +169,7 @@ fn define_function(
         ));
 
         builder.switch_to_block(entry);
-        initialize_integer_locals(&mut builder, &local_slots);
+        initialize_integer_locals(&mut builder, function, &local_slots)?;
         bind_parameters(&mut builder, function, &local_slots, entry)?;
         let parent_frame = builder.block_params(entry)[0];
         let function_name = define_named_data(
@@ -194,11 +224,21 @@ fn define_function(
     Ok(())
 }
 
-fn initialize_integer_locals(builder: &mut FunctionBuilder, slots: &[Option<StackSlot>]) {
-    let zero = builder.ins().iconst(types::I64, 0);
-    for slot in slots.iter().flatten() {
-        builder.ins().stack_store(zero, *slot, 0);
+fn initialize_integer_locals(
+    builder: &mut FunctionBuilder,
+    function: &mir::Function,
+    slots: &[Option<StackSlot>],
+) -> Result<(), BackendError> {
+    for local in &function.locals {
+        let mir::Type::Integer(ty) = local.ty else {
+            continue;
+        };
+        let zero = builder.ins().iconst(clif_integer_type(ty), 0);
+        builder
+            .ins()
+            .stack_store(zero, integer_slot(slots, local.id)?, 0);
     }
+    Ok(())
 }
 
 fn bind_parameters(
@@ -209,7 +249,7 @@ fn bind_parameters(
 ) -> Result<(), BackendError> {
     let params = builder.block_params(entry).to_vec();
     for (parameter, value) in function.params.iter().zip(params.into_iter().skip(1)) {
-        let slot = int_slot(slots, *parameter)?;
+        let slot = integer_slot(slots, *parameter)?;
         builder.ins().stack_store(value, slot, 0);
     }
     Ok(())
@@ -246,8 +286,13 @@ fn define_process_main(
         runtime_signature.params.push(AbiParam::new(pointer_type));
         runtime_signature.returns.push(AbiParam::new(types::I32));
         let runtime_symbol = match entry.return_type {
-            mir::ReturnType::Int => "dr_v1_main_int",
+            mir::ReturnType::Integer(IntegerType::Int64) => "dr_v1_main_int",
             mir::ReturnType::Void => "dr_v1_main_void",
+            mir::ReturnType::Integer(other) => {
+                return Err(malformed_mir(format!(
+                    "entry function has unsupported process return type {other}"
+                )));
+            }
         };
         let runtime_id = module
             .declare_function(runtime_symbol, Linkage::Import, &runtime_signature)
@@ -359,9 +404,15 @@ fn lower_statement(
         mir::Statement::AssignLocal { target, value } => {
             let definition = local_definition(resources.program, resources.function_id, *target)?;
             match definition.ty {
-                mir::Type::Int => {
-                    let value = lower_int_rvalue(builder, value, resources)?;
-                    let slot = int_slot(resources.local_slots, *target)?;
+                mir::Type::Integer(_) => {
+                    let mir::Rvalue::Integer(expression) = value else {
+                        return Err(malformed_mir(format!(
+                            "integer local local{} has a non-integer assignment",
+                            target.0
+                        )));
+                    };
+                    let value = lower_integer_expression(builder, expression, resources)?;
+                    let slot = integer_slot(resources.local_slots, *target)?;
                     builder.ins().stack_store(value, slot, 0);
                 }
                 mir::Type::String => {
@@ -398,8 +449,8 @@ fn lower_terminator(
     resources: &mut LoweringResources<'_, '_>,
 ) -> Result<(), BackendError> {
     match terminator {
-        mir::Terminator::Return(operand) => {
-            let value = lower_operand(builder, operand, resources)?;
+        mir::Terminator::Return(expression) => {
+            let value = lower_integer_expression(builder, expression, resources)?;
             builder.ins().return_(&[value]);
         }
         mir::Terminator::ReturnVoid => {
@@ -432,91 +483,391 @@ fn lower_terminator(
     Ok(())
 }
 
-fn lower_int_rvalue(
+fn lower_integer_expression(
     builder: &mut FunctionBuilder,
-    value: &mir::Rvalue,
-    resources: &mut LoweringResources<'_, '_>,
-) -> Result<Value, BackendError> {
-    match value {
-        mir::Rvalue::Use(operand) => lower_operand(builder, operand, resources),
-        mir::Rvalue::Binary { op, left, right } => {
-            let left = lower_operand(builder, left, resources)?;
-            let right = lower_operand(builder, right, resources)?;
-            lower_checked_binary(builder, *op, left, right, resources)
-        }
-        mir::Rvalue::Call { function, args } => lower_int_call(builder, *function, args, resources),
-        mir::Rvalue::String(_) => Err(malformed_mir(
-            "string rvalue reached integer Cranelift lowering",
-        )),
-    }
-}
-
-fn lower_int_expression(
-    builder: &mut FunctionBuilder,
-    expression: &mir::IntExpression,
+    expression: &mir::IntegerExpression,
     resources: &mut LoweringResources<'_, '_>,
 ) -> Result<Value, BackendError> {
     match expression {
-        mir::IntExpression::Use(operand) => lower_operand(builder, operand, resources),
-        mir::IntExpression::Binary { op, left, right } => {
-            let left = lower_int_expression(builder, left, resources)?;
-            let right = lower_int_expression(builder, right, resources)?;
-            lower_checked_binary(builder, *op, left, right, resources)
+        mir::IntegerExpression::Use { ty, operand } => {
+            lower_integer_operand(builder, *ty, operand, resources)
         }
-        mir::IntExpression::Call { function, args } => {
-            lower_int_call(builder, *function, args, resources)
+        mir::IntegerExpression::Unary { ty, op, operand } => {
+            let operand = lower_integer_expression(builder, operand, resources)?;
+            lower_integer_unary(builder, *ty, *op, operand, resources)
+        }
+        mir::IntegerExpression::Binary {
+            ty,
+            op,
+            left,
+            right,
+        } => {
+            let left = lower_integer_expression(builder, left, resources)?;
+            let right = lower_integer_expression(builder, right, resources)?;
+            lower_integer_binary(builder, *ty, *op, left, right, resources)
+        }
+        mir::IntegerExpression::Convert { ty, value } => {
+            let source_type = value.ty();
+            let value = lower_integer_expression(builder, value, resources)?;
+            lower_integer_conversion(builder, source_type, *ty, value, resources)
+        }
+        mir::IntegerExpression::Call { ty, function, args } => {
+            lower_integer_call(builder, *ty, *function, args, resources)
         }
     }
 }
 
-fn lower_checked_binary(
+fn lower_integer_unary(
     builder: &mut FunctionBuilder,
-    op: mir::BinaryOp,
+    ty: IntegerType,
+    op: mir::IntegerUnaryOp,
+    operand: Value,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<Value, BackendError> {
+    match op {
+        mir::IntegerUnaryOp::Negate => {
+            let zero = builder.ins().iconst(clif_integer_type(ty), 0);
+            let (value, overflow) = builder.ins().ssub_overflow(zero, operand);
+            lower_panic_if(builder, overflow, IntegerPanic::OverflowNegation, resources)?;
+            Ok(value)
+        }
+        mir::IntegerUnaryOp::BitwiseNot => Ok(builder.ins().bnot(operand)),
+    }
+}
+
+fn lower_integer_binary(
+    builder: &mut FunctionBuilder,
+    ty: IntegerType,
+    op: mir::IntegerBinaryOp,
+    left: Value,
+    right: Value,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<Value, BackendError> {
+    match op {
+        mir::IntegerBinaryOp::Add
+        | mir::IntegerBinaryOp::Subtract
+        | mir::IntegerBinaryOp::Multiply => {
+            lower_checked_arithmetic(builder, ty, op, left, right, resources)
+        }
+        mir::IntegerBinaryOp::Divide => lower_integer_division(builder, ty, left, right, resources),
+        mir::IntegerBinaryOp::Remainder => {
+            lower_integer_remainder(builder, ty, left, right, resources)
+        }
+        mir::IntegerBinaryOp::ShiftLeft | mir::IntegerBinaryOp::ShiftRight => {
+            lower_integer_shift(builder, ty, op, left, right, resources)
+        }
+        mir::IntegerBinaryOp::BitwiseAnd => Ok(builder.ins().band(left, right)),
+        mir::IntegerBinaryOp::BitwiseXor => Ok(builder.ins().bxor(left, right)),
+        mir::IntegerBinaryOp::BitwiseOr => Ok(builder.ins().bor(left, right)),
+    }
+}
+
+fn lower_checked_arithmetic(
+    builder: &mut FunctionBuilder,
+    ty: IntegerType,
+    op: mir::IntegerBinaryOp,
     left: Value,
     right: Value,
     resources: &mut LoweringResources<'_, '_>,
 ) -> Result<Value, BackendError> {
     let (value, overflow) = match op {
-        mir::BinaryOp::Add => builder.ins().sadd_overflow(left, right),
-        mir::BinaryOp::Subtract => builder.ins().ssub_overflow(left, right),
-        mir::BinaryOp::Multiply => builder.ins().smul_overflow(left, right),
+        mir::IntegerBinaryOp::Add if ty.is_signed() => builder.ins().sadd_overflow(left, right),
+        mir::IntegerBinaryOp::Add => builder.ins().uadd_overflow(left, right),
+        mir::IntegerBinaryOp::Subtract if ty.is_signed() => {
+            builder.ins().ssub_overflow(left, right)
+        }
+        mir::IntegerBinaryOp::Subtract => builder.ins().usub_overflow(left, right),
+        mir::IntegerBinaryOp::Multiply if ty.is_signed() => {
+            builder.ins().smul_overflow(left, right)
+        }
+        mir::IntegerBinaryOp::Multiply => builder.ins().umul_overflow(left, right),
+        _ => unreachable!("non-arithmetic operator reached checked arithmetic lowering"),
     };
+    let panic = match op {
+        mir::IntegerBinaryOp::Add => IntegerPanic::OverflowAddition,
+        mir::IntegerBinaryOp::Subtract => IntegerPanic::OverflowSubtraction,
+        mir::IntegerBinaryOp::Multiply => IntegerPanic::OverflowMultiplication,
+        _ => unreachable!("non-arithmetic operator reached checked arithmetic lowering"),
+    };
+    lower_panic_if(builder, overflow, panic, resources)?;
+    Ok(value)
+}
+
+fn lower_integer_division(
+    builder: &mut FunctionBuilder,
+    ty: IntegerType,
+    left: Value,
+    right: Value,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<Value, BackendError> {
+    let zero = builder.ins().iconst(clif_integer_type(ty), 0);
+    let divides_by_zero = builder.ins().icmp(IntCC::Equal, right, zero);
+    lower_panic_if(
+        builder,
+        divides_by_zero,
+        IntegerPanic::DivisionByZero,
+        resources,
+    )?;
+
+    if ty.is_signed() {
+        let minimum = integer_constant(
+            builder,
+            IntegerValue::from_bits(ty, 1_u64 << (ty.bit_width() - 1)),
+        );
+        let negative_one = integer_constant(builder, IntegerValue::from_bits(ty, ty.mask()));
+        let is_minimum = builder.ins().icmp(IntCC::Equal, left, minimum);
+        let is_negative_one = builder.ins().icmp(IntCC::Equal, right, negative_one);
+        let overflows = builder.ins().band(is_minimum, is_negative_one);
+        lower_panic_if(
+            builder,
+            overflows,
+            IntegerPanic::DivisionOverflow,
+            resources,
+        )?;
+        Ok(builder.ins().sdiv(left, right))
+    } else {
+        Ok(builder.ins().udiv(left, right))
+    }
+}
+
+fn lower_integer_remainder(
+    builder: &mut FunctionBuilder,
+    ty: IntegerType,
+    left: Value,
+    right: Value,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<Value, BackendError> {
+    let zero = builder.ins().iconst(clif_integer_type(ty), 0);
+    let divides_by_zero = builder.ins().icmp(IntCC::Equal, right, zero);
+    lower_panic_if(
+        builder,
+        divides_by_zero,
+        IntegerPanic::RemainderByZero,
+        resources,
+    )?;
+
+    if !ty.is_signed() {
+        return Ok(builder.ins().urem(left, right));
+    }
+
+    let minimum = integer_constant(
+        builder,
+        IntegerValue::from_bits(ty, 1_u64 << (ty.bit_width() - 1)),
+    );
+    let negative_one = integer_constant(builder, IntegerValue::from_bits(ty, ty.mask()));
+    let is_minimum = builder.ins().icmp(IntCC::Equal, left, minimum);
+    let is_negative_one = builder.ins().icmp(IntCC::Equal, right, negative_one);
+    let special_case = builder.ins().band(is_minimum, is_negative_one);
+    let zero_block = builder.create_block();
+    let remainder_block = builder.create_block();
+    let done_block = builder.create_block();
+    builder.append_block_param(done_block, clif_integer_type(ty));
+    builder
+        .ins()
+        .brif(special_case, zero_block, &[], remainder_block, &[]);
+
+    builder.switch_to_block(zero_block);
+    builder.ins().jump(done_block, &[BlockArg::Value(zero)]);
+
+    builder.switch_to_block(remainder_block);
+    let remainder = builder.ins().srem(left, right);
+    builder
+        .ins()
+        .jump(done_block, &[BlockArg::Value(remainder)]);
+
+    builder.switch_to_block(done_block);
+    Ok(builder.block_params(done_block)[0])
+}
+
+fn lower_integer_shift(
+    builder: &mut FunctionBuilder,
+    ty: IntegerType,
+    op: mir::IntegerBinaryOp,
+    left: Value,
+    right: Value,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<Value, BackendError> {
+    let width = builder
+        .ins()
+        .iconst(clif_integer_type(ty), ty.bit_width() as i64);
+    let too_large = builder
+        .ins()
+        .icmp(IntCC::UnsignedGreaterThanOrEqual, right, width);
+    let invalid = if ty.is_signed() {
+        let zero = builder.ins().iconst(clif_integer_type(ty), 0);
+        let negative = builder.ins().icmp(IntCC::SignedLessThan, right, zero);
+        builder.ins().bor(negative, too_large)
+    } else {
+        too_large
+    };
+    lower_panic_if(
+        builder,
+        invalid,
+        IntegerPanic::ShiftCountOutOfRange,
+        resources,
+    )?;
+
+    match op {
+        mir::IntegerBinaryOp::ShiftLeft => Ok(builder.ins().ishl(left, right)),
+        mir::IntegerBinaryOp::ShiftRight if ty.is_signed() => Ok(builder.ins().sshr(left, right)),
+        mir::IntegerBinaryOp::ShiftRight => Ok(builder.ins().ushr(left, right)),
+        _ => unreachable!("non-shift operator reached shift lowering"),
+    }
+}
+
+fn lower_integer_conversion(
+    builder: &mut FunctionBuilder,
+    source: IntegerType,
+    target: IntegerType,
+    value: Value,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<Value, BackendError> {
+    if let Some(out_of_range) = conversion_out_of_range(builder, source, target, value) {
+        lower_panic_if(
+            builder,
+            out_of_range,
+            IntegerPanic::ConversionOutOfRange,
+            resources,
+        )?;
+    }
+
+    Ok(match target.bit_width().cmp(&source.bit_width()) {
+        std::cmp::Ordering::Equal => value,
+        std::cmp::Ordering::Less => builder.ins().ireduce(clif_integer_type(target), value),
+        std::cmp::Ordering::Greater if source.is_signed() => {
+            builder.ins().sextend(clif_integer_type(target), value)
+        }
+        std::cmp::Ordering::Greater => builder.ins().uextend(clif_integer_type(target), value),
+    })
+}
+
+fn conversion_out_of_range(
+    builder: &mut FunctionBuilder,
+    source: IntegerType,
+    target: IntegerType,
+    value: Value,
+) -> Option<Value> {
+    match (source.is_signed(), target.is_signed()) {
+        (true, true) if target.bit_width() < source.bit_width() => {
+            let minimum = integer_constant(
+                builder,
+                IntegerValue::from_i128(source, target.min_value())
+                    .expect("narrow signed minimum fits source"),
+            );
+            let maximum = integer_constant(
+                builder,
+                IntegerValue::from_i128(source, target.max_value())
+                    .expect("narrow signed maximum fits source"),
+            );
+            let below = builder.ins().icmp(IntCC::SignedLessThan, value, minimum);
+            let above = builder.ins().icmp(IntCC::SignedGreaterThan, value, maximum);
+            Some(builder.ins().bor(below, above))
+        }
+        (true, false) => {
+            let zero = builder.ins().iconst(clif_integer_type(source), 0);
+            let negative = builder.ins().icmp(IntCC::SignedLessThan, value, zero);
+            if target.bit_width() < source.bit_width() {
+                let maximum = integer_constant(
+                    builder,
+                    IntegerValue::from_u128(source, target.max_value() as u128)
+                        .expect("narrow unsigned maximum fits signed source"),
+                );
+                let above = builder
+                    .ins()
+                    .icmp(IntCC::UnsignedGreaterThan, value, maximum);
+                Some(builder.ins().bor(negative, above))
+            } else {
+                Some(negative)
+            }
+        }
+        (false, false) if target.bit_width() < source.bit_width() => {
+            let maximum = integer_constant(
+                builder,
+                IntegerValue::from_u128(source, target.max_value() as u128)
+                    .expect("narrow unsigned maximum fits source"),
+            );
+            Some(
+                builder
+                    .ins()
+                    .icmp(IntCC::UnsignedGreaterThan, value, maximum),
+            )
+        }
+        (false, true) if target.bit_width() <= source.bit_width() => {
+            let maximum = integer_constant(
+                builder,
+                IntegerValue::from_u128(source, target.max_value() as u128)
+                    .expect("signed maximum fits unsigned source"),
+            );
+            Some(
+                builder
+                    .ins()
+                    .icmp(IntCC::UnsignedGreaterThan, value, maximum),
+            )
+        }
+        _ => None,
+    }
+}
+
+fn lower_panic_if(
+    builder: &mut FunctionBuilder,
+    condition: Value,
+    panic: IntegerPanic,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<(), BackendError> {
     let panic_block = builder.create_block();
     let continue_block = builder.create_block();
     builder
         .ins()
-        .brif(overflow, panic_block, &[], continue_block, &[]);
+        .brif(condition, panic_block, &[], continue_block, &[]);
 
     builder.switch_to_block(panic_block);
-    let message = match op {
-        mir::BinaryOp::Add => b"integer overflow during addition".as_slice(),
-        mir::BinaryOp::Subtract => b"integer overflow during subtraction".as_slice(),
-        mir::BinaryOp::Multiply => b"integer overflow during multiplication".as_slice(),
-    };
-    lower_runtime_panic(builder, message, resources)?;
+    lower_runtime_panic(builder, panic.message().as_bytes(), resources)?;
 
     builder.switch_to_block(continue_block);
-    Ok(value)
+    Ok(())
 }
 
-fn lower_operand(
+fn integer_constant(builder: &mut FunctionBuilder, value: IntegerValue) -> Value {
+    builder
+        .ins()
+        .iconst(clif_integer_type(value.ty), value.bits as i64)
+}
+
+fn lower_integer_operand(
     builder: &mut FunctionBuilder,
+    ty: IntegerType,
     operand: &mir::Operand,
     resources: &LoweringResources<'_, '_>,
 ) -> Result<Value, BackendError> {
     match operand {
-        mir::Operand::Int(value) => Ok(builder.ins().iconst(types::I64, *value)),
+        mir::Operand::Integer(value) => {
+            if value.ty != ty {
+                return Err(malformed_mir(format!(
+                    "{ty} expression contains {} constant",
+                    value.ty
+                )));
+            }
+            Ok(integer_constant(builder, *value))
+        }
         mir::Operand::Local(id) => {
-            let slot = int_slot(resources.local_slots, *id)?;
-            Ok(builder.ins().stack_load(types::I64, slot, 0))
+            let definition = local_definition(resources.program, resources.function_id, *id)?;
+            if definition.ty != mir::Type::Integer(ty) {
+                return Err(malformed_mir(format!(
+                    "{ty} expression reads local{} with type {}",
+                    id.0, definition.ty
+                )));
+            }
+            let slot = integer_slot(resources.local_slots, *id)?;
+            Ok(builder.ins().stack_load(clif_integer_type(ty), slot, 0))
         }
     }
 }
 
-fn lower_int_call(
+fn lower_integer_call(
     builder: &mut FunctionBuilder,
+    ty: IntegerType,
     function: mir::FunctionId,
-    args: &[mir::IntExpression],
+    args: &[mir::IntegerExpression],
     resources: &mut LoweringResources<'_, '_>,
 ) -> Result<Value, BackendError> {
     let mut values = vec![resources.current_frame];
@@ -525,19 +876,19 @@ fn lower_int_call(
     let call = builder.ins().call(callee, &values);
     builder.inst_results(call).first().copied().ok_or_else(|| {
         malformed_mir(format!(
-            "int call to function{} produced no result",
-            function.0
+            "{ty} call to function{} produced no result",
+            function.0,
         ))
     })
 }
 
 fn lower_call_args(
     builder: &mut FunctionBuilder,
-    args: &[mir::IntExpression],
+    args: &[mir::IntegerExpression],
     resources: &mut LoweringResources<'_, '_>,
 ) -> Result<Vec<Value>, BackendError> {
     args.iter()
-        .map(|argument| lower_int_expression(builder, argument, resources))
+        .map(|argument| lower_integer_expression(builder, argument, resources))
         .collect()
 }
 
@@ -570,9 +921,10 @@ fn lower_condition_to_branch(
             builder.ins().jump(else_block, &[]);
         }
         mir::Condition::Compare { op, left, right } => {
-            let left = lower_int_expression(builder, left, resources)?;
-            let right = lower_int_expression(builder, right, resources)?;
-            let value = builder.ins().icmp(compare_code(*op), left, right);
+            let ty = left.ty();
+            let left = lower_integer_expression(builder, left, resources)?;
+            let right = lower_integer_expression(builder, right, resources)?;
+            let value = builder.ins().icmp(compare_code(*op, ty), left, right);
             builder.ins().brif(value, then_block, &[], else_block, &[]);
         }
         mir::Condition::Not(condition) => {
@@ -640,14 +992,18 @@ fn lower_condition_value(
     Ok(builder.block_params(done_block)[0])
 }
 
-fn compare_code(op: mir::CompareOp) -> IntCC {
+fn compare_code(op: mir::CompareOp, ty: IntegerType) -> IntCC {
     match op {
         mir::CompareOp::Equal => IntCC::Equal,
         mir::CompareOp::NotEqual => IntCC::NotEqual,
-        mir::CompareOp::Less => IntCC::SignedLessThan,
-        mir::CompareOp::LessEqual => IntCC::SignedLessThanOrEqual,
-        mir::CompareOp::Greater => IntCC::SignedGreaterThan,
-        mir::CompareOp::GreaterEqual => IntCC::SignedGreaterThanOrEqual,
+        mir::CompareOp::Less if ty.is_signed() => IntCC::SignedLessThan,
+        mir::CompareOp::Less => IntCC::UnsignedLessThan,
+        mir::CompareOp::LessEqual if ty.is_signed() => IntCC::SignedLessThanOrEqual,
+        mir::CompareOp::LessEqual => IntCC::UnsignedLessThanOrEqual,
+        mir::CompareOp::Greater if ty.is_signed() => IntCC::SignedGreaterThan,
+        mir::CompareOp::Greater => IntCC::UnsignedGreaterThan,
+        mir::CompareOp::GreaterEqual if ty.is_signed() => IntCC::SignedGreaterThanOrEqual,
+        mir::CompareOp::GreaterEqual => IntCC::UnsignedGreaterThanOrEqual,
     }
 }
 
@@ -860,6 +1216,14 @@ fn validate_program(program: &mir::Program) -> Result<(), BackendError> {
     if !entry.params.is_empty() {
         return Err(malformed_mir("entry function declares parameters"));
     }
+    if !matches!(
+        entry.return_type,
+        mir::ReturnType::Void | mir::ReturnType::Integer(IntegerType::Int64)
+    ) {
+        return Err(malformed_mir(
+            "entry function must return void or int/int64",
+        ));
+    }
 
     for (index, function) in program.functions.iter().enumerate() {
         if function.id != mir::FunctionId(index) {
@@ -884,9 +1248,9 @@ fn validate_function(program: &mir::Program, function: &mir::Function) -> Result
     }
     for parameter in &function.params {
         let local = local_in(function, *parameter)?;
-        if local.ty != mir::Type::Int {
+        if !matches!(local.ty, mir::Type::Integer(_)) {
             return Err(malformed_mir(format!(
-                "function {} parameter local{} is not int",
+                "function {} parameter local{} is not an integer",
                 function.name, parameter.0
             )));
         }
@@ -920,14 +1284,24 @@ fn validate_statement(
                     validate_string_expression(function, expression)
                 }
                 (mir::Type::String, _) => Err(malformed_mir(format!(
-                    "string local local{} receives an int rvalue",
+                    "string local local{} receives an integer rvalue",
                     target.0
                 ))),
-                (mir::Type::Int, mir::Rvalue::String(_)) => Err(malformed_mir(format!(
-                    "int local local{} receives a string rvalue",
+                (mir::Type::Integer(_), mir::Rvalue::String(_)) => Err(malformed_mir(format!(
+                    "integer local local{} receives a string rvalue",
                     target.0
                 ))),
-                (mir::Type::Int, value) => validate_rvalue(program, function, value),
+                (mir::Type::Integer(ty), mir::Rvalue::Integer(expression)) => {
+                    if expression.ty() != ty {
+                        return Err(malformed_mir(format!(
+                            "{} local local{} receives {} expression",
+                            ty,
+                            target.0,
+                            expression.ty()
+                        )));
+                    }
+                    validate_integer_expression(program, function, expression)
+                }
             }
         }
         mir::Statement::EchoStringLiteral(_) => Ok(()),
@@ -939,7 +1313,7 @@ fn validate_statement(
             let callee = function_in(program, *callee)?;
             if callee.return_type != mir::ReturnType::Void {
                 return Err(malformed_mir(format!(
-                    "void call targets int function {}",
+                    "void call targets integer function {}",
                     callee.name
                 )));
             }
@@ -954,19 +1328,27 @@ fn validate_terminator(
     terminator: &mir::Terminator,
 ) -> Result<(), BackendError> {
     match terminator {
-        mir::Terminator::Return(operand) => {
-            if function.return_type != mir::ReturnType::Int {
+        mir::Terminator::Return(expression) => {
+            let mir::ReturnType::Integer(return_type) = function.return_type else {
                 return Err(malformed_mir(format!(
-                    "void function {} has an int return",
+                    "void function {} has an integer return",
                     function.name
                 )));
+            };
+            if expression.ty() != return_type {
+                return Err(malformed_mir(format!(
+                    "function {} returns {} expression from {} function",
+                    function.name,
+                    expression.ty(),
+                    return_type
+                )));
             }
-            validate_operand(function, operand)
+            validate_integer_expression(program, function, expression)
         }
         mir::Terminator::ReturnVoid => {
             if function.return_type != mir::ReturnType::Void {
                 return Err(malformed_mir(format!(
-                    "int function {} has a void return",
+                    "integer function {} has a void return",
                     function.name
                 )));
             }
@@ -987,64 +1369,67 @@ fn validate_terminator(
     }
 }
 
-fn validate_rvalue(
+fn validate_integer_expression(
     program: &mir::Program,
     function: &mir::Function,
-    value: &mir::Rvalue,
-) -> Result<(), BackendError> {
-    match value {
-        mir::Rvalue::Use(operand) => validate_operand(function, operand),
-        mir::Rvalue::Binary { left, right, .. } => {
-            validate_operand(function, left)?;
-            validate_operand(function, right)
-        }
-        mir::Rvalue::Call {
-            function: callee,
-            args,
-        } => validate_int_call(program, function, *callee, args),
-        mir::Rvalue::String(expression) => validate_string_expression(function, expression),
-    }
-}
-
-fn validate_int_expression(
-    program: &mir::Program,
-    function: &mir::Function,
-    expression: &mir::IntExpression,
+    expression: &mir::IntegerExpression,
 ) -> Result<(), BackendError> {
     match expression {
-        mir::IntExpression::Use(operand) => validate_operand(function, operand),
-        mir::IntExpression::Binary { left, right, .. } => {
-            validate_int_expression(program, function, left)?;
-            validate_int_expression(program, function, right)
+        mir::IntegerExpression::Use { ty, operand } => {
+            validate_integer_operand(function, *ty, operand)
         }
-        mir::IntExpression::Call {
+        mir::IntegerExpression::Unary { ty, op, operand } => {
+            if operand.ty() != *ty {
+                return Err(malformed_mir(format!(
+                    "{ty} unary expression contains {} operand",
+                    operand.ty()
+                )));
+            }
+            if matches!(op, mir::IntegerUnaryOp::Negate) && !ty.is_signed() {
+                return Err(malformed_mir(format!(
+                    "unsigned {ty} expression uses unary negation"
+                )));
+            }
+            validate_integer_expression(program, function, operand)
+        }
+        mir::IntegerExpression::Binary {
+            ty, left, right, ..
+        } => {
+            if left.ty() != *ty || right.ty() != *ty {
+                return Err(malformed_mir(format!(
+                    "{ty} binary expression has {} and {} operands",
+                    left.ty(),
+                    right.ty()
+                )));
+            }
+            validate_integer_expression(program, function, left)?;
+            validate_integer_expression(program, function, right)
+        }
+        mir::IntegerExpression::Convert { value, .. } => {
+            validate_integer_expression(program, function, value)
+        }
+        mir::IntegerExpression::Call {
+            ty,
             function: callee,
             args,
-        } => validate_int_call(program, function, *callee, args),
+        } => {
+            let callee = function_in(program, *callee)?;
+            if callee.return_type != mir::ReturnType::Integer(*ty) {
+                return Err(malformed_mir(format!(
+                    "{ty} call targets function {} returning {}",
+                    callee.name, callee.return_type
+                )));
+            }
+            validate_call_args(program, function, callee, args)
+        }
     }
-}
-
-fn validate_int_call(
-    program: &mir::Program,
-    caller: &mir::Function,
-    callee: mir::FunctionId,
-    args: &[mir::IntExpression],
-) -> Result<(), BackendError> {
-    let callee = function_in(program, callee)?;
-    if callee.return_type != mir::ReturnType::Int {
-        return Err(malformed_mir(format!(
-            "int call targets void function {}",
-            callee.name
-        )));
-    }
-    validate_call_args(program, caller, callee, args)
 }
 
 fn validate_call_args(
     program: &mir::Program,
     caller: &mir::Function,
     callee: &mir::Function,
-    args: &[mir::IntExpression],
+    args: &[mir::IntegerExpression],
 ) -> Result<(), BackendError> {
     if args.len() != callee.params.len() {
         return Err(malformed_mir(format!(
@@ -1054,8 +1439,18 @@ fn validate_call_args(
             args.len()
         )));
     }
-    for argument in args {
-        validate_int_expression(program, caller, argument)?;
+    for (index, (argument, parameter)) in args.iter().zip(&callee.params).enumerate() {
+        let parameter_type = integer_local_type(callee, *parameter)?;
+        if argument.ty() != parameter_type {
+            return Err(malformed_mir(format!(
+                "call to {} passes {} argument {} to {} parameter",
+                callee.name,
+                argument.ty(),
+                index + 1,
+                parameter_type
+            )));
+        }
+        validate_integer_expression(program, caller, argument)?;
     }
     Ok(())
 }
@@ -1068,8 +1463,15 @@ fn validate_condition(
     match condition {
         mir::Condition::Bool(_) => Ok(()),
         mir::Condition::Compare { left, right, .. } => {
-            validate_int_expression(program, function, left)?;
-            validate_int_expression(program, function, right)
+            if left.ty() != right.ty() {
+                return Err(malformed_mir(format!(
+                    "comparison has {} and {} operands",
+                    left.ty(),
+                    right.ty()
+                )));
+            }
+            validate_integer_expression(program, function, left)?;
+            validate_integer_expression(program, function, right)
         }
         mir::Condition::Not(condition) => validate_condition(program, function, condition),
         mir::Condition::Binary { left, right, .. } => {
@@ -1079,17 +1481,28 @@ fn validate_condition(
     }
 }
 
-fn validate_operand(function: &mir::Function, operand: &mir::Operand) -> Result<(), BackendError> {
-    if let mir::Operand::Local(local) = operand {
-        let definition = local_in(function, *local)?;
-        if definition.ty != mir::Type::Int {
-            return Err(malformed_mir(format!(
-                "string local local{} is used as an int operand",
-                local.0
-            )));
+fn validate_integer_operand(
+    function: &mir::Function,
+    ty: IntegerType,
+    operand: &mir::Operand,
+) -> Result<(), BackendError> {
+    match operand {
+        mir::Operand::Integer(value) if value.ty != ty => Err(malformed_mir(format!(
+            "{ty} expression contains {} constant",
+            value.ty
+        ))),
+        mir::Operand::Integer(_) => Ok(()),
+        mir::Operand::Local(local) => {
+            let definition = local_in(function, *local)?;
+            if definition.ty != mir::Type::Integer(ty) {
+                return Err(malformed_mir(format!(
+                    "{ty} expression uses local{} with type {}",
+                    local.0, definition.ty
+                )));
+            }
+            Ok(())
         }
     }
-    Ok(())
 }
 
 fn validate_string_expression(
@@ -1136,6 +1549,20 @@ fn local_in(function: &mir::Function, id: mir::LocalId) -> Result<&mir::Local, B
         .ok_or_else(|| malformed_mir(format!("LocalId local{} does not exist", id.0)))
 }
 
+fn integer_local_type(
+    function: &mir::Function,
+    id: mir::LocalId,
+) -> Result<IntegerType, BackendError> {
+    let local = local_in(function, id)?;
+    let mir::Type::Integer(ty) = local.ty else {
+        return Err(malformed_mir(format!(
+            "LocalId local{} is not an integer local",
+            id.0
+        )));
+    };
+    Ok(ty)
+}
+
 fn block_in(function: &mir::Function, id: mir::BlockId) -> Result<&mir::BasicBlock, BackendError> {
     function
         .blocks
@@ -1159,12 +1586,12 @@ fn block_for(blocks: &[Block], id: mir::BlockId) -> Result<Block, BackendError> 
         .ok_or_else(|| malformed_mir(format!("BlockId block{} does not exist", id.0)))
 }
 
-fn int_slot(slots: &[Option<StackSlot>], id: mir::LocalId) -> Result<StackSlot, BackendError> {
+fn integer_slot(slots: &[Option<StackSlot>], id: mir::LocalId) -> Result<StackSlot, BackendError> {
     slots
         .get(id.0)
         .copied()
         .flatten()
-        .ok_or_else(|| malformed_mir(format!("LocalId local{} is not an int local", id.0)))
+        .ok_or_else(|| malformed_mir(format!("LocalId local{} is not an integer local", id.0)))
 }
 
 fn malformed_mir(message: impl Into<String>) -> BackendError {

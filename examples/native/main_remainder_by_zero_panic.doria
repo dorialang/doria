@@ -1,0 +1,9 @@
+function remainder(uint16 $value, uint16 $divisor): uint16
+{
+    return $value % $divisor;
+}
+
+function main(): int
+{
+    return Int::from(remainder(42, 0));
+}

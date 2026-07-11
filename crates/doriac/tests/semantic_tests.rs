@@ -884,7 +884,7 @@ function main(): int
 }
 
 #[test]
-fn rejects_constant_integer_arithmetic_overflow_before_lowering() {
+fn accepts_constant_integer_arithmetic_that_is_checked_at_runtime() {
     for source in [
         r#"
 function main(): int
@@ -909,23 +909,10 @@ function main(): int
 }
 "#,
     ] {
-        let check_err = doriac::check_source("test.doria", source)
-            .expect_err("semantic check should reject constant integer overflow");
-        assert!(
-            check_err
-                .iter()
-                .any(|diagnostic| diagnostic.code == "E0418"),
-            "expected E0418, got {check_err:?}"
-        );
-
-        let lower_err = doriac::lower_source("test.doria", source)
-            .expect_err("lowering should not run after semantic integer overflow failure");
-        assert!(
-            lower_err
-                .iter()
-                .any(|diagnostic| diagnostic.code == "E0418"),
-            "expected E0418, got {lower_err:?}"
-        );
+        doriac::check_source("test.doria", source)
+            .expect("overflowing arithmetic is a runtime panic, not a semantic error");
+        doriac::lower_source("test.doria", source)
+            .expect("checked arithmetic should reach backend-neutral lowering");
     }
 }
 
@@ -3850,13 +3837,13 @@ Int $value = 1;
 }
 
 #[test]
-fn pascal_case_type_names_resolve_when_declared_as_classes() {
+fn non_companion_pascal_case_type_names_resolve_when_declared_as_classes() {
     doriac::check_source(
         "test.doria",
         r#"
-class Int {}
+class Invoice {}
 
-Int $value = new Int();
+Invoice $value = new Invoice();
 "#,
     )
     .expect("semantic check should succeed");

@@ -1,0 +1,6 @@
+function main(): int
+{
+    uint8 $value = 21;
+
+    return Int::from($value << 1);
+}

@@ -1,0 +1,15 @@
+function roundTrip(uint64 $value): uint64
+{
+    return $value;
+}
+
+function main(): int
+{
+    uint64 $maximum = 18446744073709551615;
+
+    if (roundTrip($maximum) == $maximum) {
+        return 42;
+    }
+
+    return 0;
+}

@@ -66,7 +66,7 @@ fn explicit_panic_is_a_runtime_outcome() {
     assert_eq!(output.exit_status, 101);
     assert_eq!(
         output.stderr,
-        b"panic: explicit panic\nstack trace:\n  at main\n"
+        b"Panic: explicit panic\nStack Trace:\n  at main\n"
     );
 }
 
@@ -81,7 +81,7 @@ fn panic_accepts_readonly_compile_time_string_concatenation() {
 "#,
     );
     assert_eq!(output.exit_status, 101);
-    assert!(output.stderr.starts_with(b"panic: runtime boom\n"));
+    assert!(output.stderr.starts_with(b"Panic: runtime boom\n"));
 }
 
 #[test]
@@ -92,7 +92,7 @@ fn nested_panic_uses_source_function_names() {
     assert_eq!(output.exit_status, 101);
     assert_eq!(
         output.stderr,
-        b"panic: boom\nstack trace:\n  at explode\n  at middle\n  at main\n"
+        b"Panic: boom\nStack Trace:\n  at explode\n  at middle\n  at main\n"
     );
 }
 
@@ -104,7 +104,7 @@ fn recursive_panic_trace_retains_recursive_frames() {
     assert_eq!(output.exit_status, 101);
     assert_eq!(
         output.stderr,
-        b"panic: bottom\nstack trace:\n  at descend\n  at descend\n  at descend\n  at main\n"
+        b"Panic: bottom\nStack Trace:\n  at descend\n  at descend\n  at descend\n  at main\n"
     );
 }
 
@@ -116,7 +116,7 @@ fn checked_addition_overflow_panics() {
     assert_eq!(output.exit_status, 101);
     assert!(output
         .stderr
-        .starts_with(b"panic: integer overflow during addition\n"));
+        .starts_with(b"Panic: integer overflow during addition\n"));
 }
 
 #[test]
@@ -127,7 +127,7 @@ fn checked_subtraction_overflow_panics() {
     assert_eq!(output.exit_status, 101);
     assert!(output
         .stderr
-        .starts_with(b"panic: integer overflow during subtraction\n"));
+        .starts_with(b"Panic: integer overflow during subtraction\n"));
 }
 
 #[test]
@@ -138,7 +138,7 @@ fn checked_multiplication_overflow_panics() {
     assert_eq!(output.exit_status, 101);
     assert!(output
         .stderr
-        .starts_with(b"panic: integer overflow during multiplication\n"));
+        .starts_with(b"Panic: integer overflow during multiplication\n"));
 }
 
 #[test]
@@ -149,6 +149,6 @@ fn invalid_main_status_panics() {
     assert_eq!(output.exit_status, 101);
     assert_eq!(
         output.stderr,
-        b"panic: main returned process status outside 0..125\nstack trace:\n  at main\n"
+        b"Panic: main returned process status outside 0..125\nStack Trace:\n  at main\n"
     );
 }

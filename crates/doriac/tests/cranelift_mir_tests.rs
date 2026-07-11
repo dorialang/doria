@@ -1,7 +1,8 @@
 use doriac::mir::{
-    BasicBlock, BlockId, Function, FunctionId, LocalId, Operand, Program, ReturnType, Statement,
-    Terminator,
+    BasicBlock, BlockId, Function, FunctionId, IntegerExpression, LocalId, Operand, Program,
+    ReturnType, Statement, Terminator,
 };
+use doriac::numeric::IntegerType;
 
 fn assert_object(source: &str) {
     let program =
@@ -104,6 +105,103 @@ fn lowers_explicit_panic_to_object() {
 }
 
 #[test]
+fn lowers_stage_13_integer_widths_operators_and_conversions_to_object() {
+    assert_object(
+        r#"
+function countdown(int8 $value): int8
+{
+    if ($value == 0) {
+        return 42;
+    }
+    return countdown($value - 1);
+}
+
+function mix(uint8 $input): uint8
+{
+    writable uint8 $value = $input;
+    $value += 3;
+    $value *= 4;
+    $value /= 2;
+    $value %= 7;
+    $value <<= 2;
+    $value >>= 1;
+    $value |= 8;
+    $value ^= 1;
+    $value &= 15;
+    $value -= 1;
+    $value++;
+    $value--;
+    return $value;
+}
+
+function identityInt32(int32 $value): int32
+{
+    return $value;
+}
+
+function identityUInt32(uint32 $value): uint32
+{
+    return $value;
+}
+
+function identityInt64(int64 $value): int64
+{
+    return $value;
+}
+
+function identityUInt64(uint64 $value): uint64
+{
+    return $value;
+}
+
+function signedMath(int16 $value): int16
+{
+    let $negated = -$value;
+    let $restored = -$negated;
+    return ($restored / 3) * 3 + ($restored % 3);
+}
+
+function quotient(int16 $left, int16 $right): int16
+{
+    return $left / $right;
+}
+
+function remainder(int16 $left, int16 $right): int16
+{
+    return $left % $right;
+}
+
+function main(): int
+{
+    uint64 $maximum = 18446744073709551615;
+    uint16 $wide = UInt16::from(mix(5));
+    uint8 $back = UInt8::from($wide);
+    int8 $negative = -1;
+    int16 $signedWide = Int16::from($negative);
+    int16 $unsignedWide = Int16::from($back);
+    if (countdown(2) == 42
+        && $back == 12
+        && $signedWide == -1
+        && $unsignedWide == 12
+        && signedMath(-7) == -7
+        && quotient(-7, 3) == -2
+        && remainder(-7, 3) == -1
+        && (~$back & 15) == 3
+        && (-8 >> 2) == -2
+        && identityInt32(2147483647) == 2147483647
+        && identityUInt32(4294967295) == 4294967295
+        && identityInt64(-9223372036854775808) == -9223372036854775808
+        && identityUInt64($maximum) == 18446744073709551615
+        && $maximum > 9223372036854775807) {
+        return 42;
+    }
+    return 0;
+}
+"#,
+    );
+}
+
+#[test]
 fn lowers_non_terminating_loop_without_executing_it() {
     assert_object(include_str!(
         "../../../examples/compile-only/main_infinite_while.doria"
@@ -129,13 +227,29 @@ fn rejects_malformed_function_id() {
 #[test]
 fn rejects_malformed_local_id() {
     let mut program = void_program();
-    program.functions[0].return_type = ReturnType::Int;
-    program.functions[0].blocks[0].terminator = Terminator::Return(Operand::Local(LocalId(99)));
+    program.functions[0].return_type = ReturnType::Integer(IntegerType::Int64);
+    program.functions[0].blocks[0].terminator = Terminator::Return(IntegerExpression::use_operand(
+        IntegerType::Int64,
+        Operand::Local(LocalId(99)),
+    ));
 
     let error = doriac::codegen_cranelift::lower_mir_to_object(&program)
         .expect_err("malformed LocalId should fail before object emission");
     assert!(error.message.contains("malformed MIR"));
     assert!(error.message.contains("LocalId local99"));
+}
+
+#[test]
+fn rejects_non_int64_process_main_return_type() {
+    let mut program = void_program();
+    program.functions[0].return_type = ReturnType::Integer(IntegerType::UInt8);
+
+    let error = doriac::codegen_cranelift::lower_mir_to_object(&program)
+        .expect_err("narrow process entry return should fail before object emission");
+    assert!(error.message.contains("malformed MIR"));
+    assert!(error
+        .message
+        .contains("entry function must return void or int/int64"));
 }
 
 #[test]

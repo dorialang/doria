@@ -1,0 +1,11 @@
+function negate(int8 $value): int8
+{
+    return -$value;
+}
+
+function main(): int
+{
+    int8 $minimum = -128;
+
+    return Int::from(negate($minimum));
+}

@@ -6,6 +6,8 @@
 
 use std::fmt;
 
+use crate::numeric::{IntegerType, IntegerValue};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct FunctionId(pub usize);
 
@@ -34,7 +36,7 @@ pub struct Function {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReturnType {
-    Int,
+    Integer(IntegerType),
     Void,
 }
 
@@ -49,7 +51,7 @@ pub struct Local {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Type {
-    Int,
+    Integer(IntegerType),
     String,
 }
 
@@ -62,44 +64,85 @@ pub struct BasicBlock {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Operand {
-    Int(i64),
+    Integer(IntegerValue),
     Local(LocalId),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Rvalue {
-    Use(Operand),
-    Binary {
-        op: BinaryOp,
-        left: Operand,
-        right: Operand,
-    },
-    Call {
-        function: FunctionId,
-        args: Vec<IntExpression>,
-    },
+    Integer(IntegerExpression),
     String(StringExpression),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BinaryOp {
+pub enum IntegerUnaryOp {
+    Negate,
+    BitwiseNot,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IntegerBinaryOp {
     Add,
     Subtract,
     Multiply,
+    Divide,
+    Remainder,
+    ShiftLeft,
+    ShiftRight,
+    BitwiseAnd,
+    BitwiseXor,
+    BitwiseOr,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum IntExpression {
-    Use(Operand),
+pub enum IntegerExpression {
+    Use {
+        ty: IntegerType,
+        operand: Operand,
+    },
+    Unary {
+        ty: IntegerType,
+        op: IntegerUnaryOp,
+        operand: Box<IntegerExpression>,
+    },
     Binary {
-        op: BinaryOp,
-        left: Box<IntExpression>,
-        right: Box<IntExpression>,
+        ty: IntegerType,
+        op: IntegerBinaryOp,
+        left: Box<IntegerExpression>,
+        right: Box<IntegerExpression>,
+    },
+    Convert {
+        ty: IntegerType,
+        value: Box<IntegerExpression>,
     },
     Call {
+        ty: IntegerType,
         function: FunctionId,
-        args: Vec<IntExpression>,
+        args: Vec<IntegerExpression>,
     },
+}
+
+impl IntegerExpression {
+    pub const fn ty(&self) -> IntegerType {
+        match self {
+            Self::Use { ty, .. }
+            | Self::Unary { ty, .. }
+            | Self::Binary { ty, .. }
+            | Self::Convert { ty, .. }
+            | Self::Call { ty, .. } => *ty,
+        }
+    }
+
+    pub const fn use_operand(ty: IntegerType, operand: Operand) -> Self {
+        Self::Use { ty, operand }
+    }
+
+    pub const fn constant(value: IntegerValue) -> Self {
+        Self::Use {
+            ty: value.ty,
+            operand: Operand::Integer(value),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -114,8 +157,8 @@ pub enum Condition {
     Bool(bool),
     Compare {
         op: CompareOp,
-        left: IntExpression,
-        right: IntExpression,
+        left: IntegerExpression,
+        right: IntegerExpression,
     },
     Not(Box<Condition>),
     Binary {
@@ -152,13 +195,13 @@ pub enum Statement {
     EchoString(StringExpression),
     CallVoid {
         function: FunctionId,
-        args: Vec<IntExpression>,
+        args: Vec<IntegerExpression>,
     },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Terminator {
-    Return(Operand),
+    Return(IntegerExpression),
     ReturnVoid,
     Panic(StringExpression),
     Unreachable,
@@ -216,7 +259,7 @@ impl fmt::Display for Function {
 impl fmt::Display for ReturnType {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ReturnType::Int => write!(formatter, "int"),
+            ReturnType::Integer(ty) => write!(formatter, "{ty}"),
             ReturnType::Void => write!(formatter, "void"),
         }
     }
@@ -247,7 +290,7 @@ impl fmt::Display for Local {
 impl fmt::Display for Type {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Type::Int => write!(formatter, "int"),
+            Type::Integer(ty) => write!(formatter, "{ty}"),
             Type::String => write!(formatter, "string"),
         }
     }
@@ -266,7 +309,7 @@ impl fmt::Display for BasicBlock {
 impl fmt::Display for Operand {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Operand::Int(value) => write!(formatter, "{value}"),
+            Operand::Integer(value) => write!(formatter, "{value}: {}", value.ty),
             Operand::Local(id) => write!(formatter, "local{}", id.0),
         }
     }
@@ -275,32 +318,61 @@ impl fmt::Display for Operand {
 impl fmt::Display for Rvalue {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Rvalue::Use(operand) => write!(formatter, "{operand}"),
-            Rvalue::Binary { op, left, right } => write!(formatter, "{left} {op} {right}"),
-            Rvalue::Call { function, args } => write_call(formatter, *function, args),
+            Rvalue::Integer(expression) => write!(formatter, "{expression}"),
             Rvalue::String(value) => write!(formatter, "{value}"),
         }
     }
 }
 
-impl fmt::Display for BinaryOp {
+impl fmt::Display for IntegerUnaryOp {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            BinaryOp::Add => write!(formatter, "+"),
-            BinaryOp::Subtract => write!(formatter, "-"),
-            BinaryOp::Multiply => write!(formatter, "*"),
+            IntegerUnaryOp::Negate => write!(formatter, "-"),
+            IntegerUnaryOp::BitwiseNot => write!(formatter, "~"),
         }
     }
 }
 
-impl fmt::Display for IntExpression {
+impl fmt::Display for IntegerBinaryOp {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            IntExpression::Use(operand) => write!(formatter, "{operand}"),
-            IntExpression::Binary { op, left, right } => {
-                write!(formatter, "({left} {op} {right})")
+            IntegerBinaryOp::Add => write!(formatter, "+"),
+            IntegerBinaryOp::Subtract => write!(formatter, "-"),
+            IntegerBinaryOp::Multiply => write!(formatter, "*"),
+            IntegerBinaryOp::Divide => write!(formatter, "/"),
+            IntegerBinaryOp::Remainder => write!(formatter, "%"),
+            IntegerBinaryOp::ShiftLeft => write!(formatter, "<<"),
+            IntegerBinaryOp::ShiftRight => write!(formatter, ">>"),
+            IntegerBinaryOp::BitwiseAnd => write!(formatter, "&"),
+            IntegerBinaryOp::BitwiseXor => write!(formatter, "^"),
+            IntegerBinaryOp::BitwiseOr => write!(formatter, "|"),
+        }
+    }
+}
+
+impl fmt::Display for IntegerExpression {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            IntegerExpression::Use { ty, operand } => match operand {
+                Operand::Integer(value) => write!(formatter, "{value}: {ty}"),
+                Operand::Local(id) => write!(formatter, "local{}: {ty}", id.0),
+            },
+            IntegerExpression::Unary { ty, op, operand } => {
+                write!(formatter, "({op}{operand}): {ty}")
             }
-            IntExpression::Call { function, args } => write_call(formatter, *function, args),
+            IntegerExpression::Binary {
+                ty,
+                op,
+                left,
+                right,
+            } => write!(formatter, "({left} {op} {right}): {ty}"),
+            IntegerExpression::Convert { ty, value } => {
+                write!(formatter, "convert<{ty}>({value}): {ty}")
+            }
+            IntegerExpression::Call { ty, function, args } => {
+                write_call(formatter, *function, args)?;
+                write!(formatter, ": {ty}")
+            }
         }
     }
 }

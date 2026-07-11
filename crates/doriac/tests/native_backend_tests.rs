@@ -749,6 +749,331 @@ function main(): void
 }
 
 #[test]
+fn compiles_and_runs_stage_13_typed_integer_codegen() {
+    if !host_linker_is_available() {
+        eprintln!(
+            "native Stage 13 integration test unavailable: host linker `{}` was not found",
+            host_linker()
+        );
+        return;
+    }
+
+    let source = r#"
+function countdown(int8 $value): int8
+{
+    if ($value == 0) {
+        return 42;
+    }
+    return countdown($value - 1);
+}
+
+function mix(uint8 $input): uint8
+{
+    writable uint8 $value = $input;
+    $value += 3;
+    $value *= 4;
+    $value /= 2;
+    $value %= 7;
+    $value <<= 2;
+    $value >>= 1;
+    $value |= 8;
+    $value ^= 1;
+    $value &= 15;
+    $value -= 1;
+    $value++;
+    $value--;
+    return $value;
+}
+
+function identityInt32(int32 $value): int32
+{
+    return $value;
+}
+
+function identityUInt32(uint32 $value): uint32
+{
+    return $value;
+}
+
+function identityInt64(int64 $value): int64
+{
+    return $value;
+}
+
+function identityUInt64(uint64 $value): uint64
+{
+    return $value;
+}
+
+function signedMath(int16 $value): int16
+{
+    let $negated = -$value;
+    let $restored = -$negated;
+    return ($restored / 3) * 3 + ($restored % 3);
+}
+
+function quotient(int16 $left, int16 $right): int16
+{
+    return $left / $right;
+}
+
+function remainder(int16 $left, int16 $right): int16
+{
+    return $left % $right;
+}
+
+function minimumRemainder(int8 $left, int8 $right): int8
+{
+    return $left % $right;
+}
+
+function shiftLeft(uint8 $value, uint8 $count): uint8
+{
+    return $value << $count;
+}
+
+function shiftRight(uint8 $value, uint8 $count): uint8
+{
+    return $value >> $count;
+}
+
+function main(): int
+{
+    uint64 $maximum = 18446744073709551615;
+    uint16 $wide = UInt16::from(mix(5));
+    uint8 $back = UInt8::from($wide);
+    int8 $negative = -1;
+    int16 $signedWide = Int16::from($negative);
+    int16 $unsignedWide = Int16::from($back);
+    if (countdown(2) == 42
+        && $back == 12
+        && $signedWide == -1
+        && $unsignedWide == 12
+        && signedMath(-7) == -7
+        && quotient(-7, 3) == -2
+        && remainder(-7, 3) == -1
+        && minimumRemainder(-128, -1) == 0
+        && (~$back & 15) == 3
+        && (-8 >> 2) == -2
+        && shiftLeft(128, 1) == 0
+        && shiftRight(128, 7) == 1
+        && identityInt32(2147483647) == 2147483647
+        && identityUInt32(4294967295) == 4294967295
+        && identityInt64(-9223372036854775808) == -9223372036854775808
+        && identityUInt64($maximum) == 18446744073709551615
+        && $maximum > 9223372036854775807) {
+        return 42;
+    }
+    return 0;
+}
+"#;
+
+    let output = temp_executable_path("stage13_typed_integer_codegen");
+    compile_native_source(source, &output);
+    let run = run_native_executable(&output).expect("native executable should run");
+    assert_eq!(run.status.code(), Some(42));
+    assert!(run.stdout.is_empty());
+    assert!(run.stderr.is_empty());
+    let _ = fs::remove_file(output);
+}
+
+#[test]
+fn stage_13_native_integer_failures_use_runtime_panic_and_doria_frames() {
+    if !host_linker_is_available() {
+        eprintln!(
+            "native Stage 13 panic test unavailable: host linker `{}` was not found",
+            host_linker()
+        );
+        return;
+    }
+
+    let cases = [
+        (
+            "addition",
+            "integer overflow during addition",
+            r#"function fail(int8 $value): int8
+{
+    return $value + 1;
+}
+function main(): int
+{
+    let $unused = fail(127);
+    return 0;
+}
+"#,
+        ),
+        (
+            "subtraction",
+            "integer overflow during subtraction",
+            r#"function fail(uint8 $value): uint8
+{
+    return $value - 1;
+}
+function main(): int
+{
+    let $unused = fail(0);
+    return 0;
+}
+"#,
+        ),
+        (
+            "multiplication",
+            "integer overflow during multiplication",
+            r#"function fail(uint8 $value): uint8
+{
+    return $value * 2;
+}
+function main(): int
+{
+    let $unused = fail(128);
+    return 0;
+}
+"#,
+        ),
+        (
+            "negation",
+            "integer overflow during negation",
+            r#"function fail(int8 $value): int8
+{
+    return -$value;
+}
+function main(): int
+{
+    let $unused = fail(-128);
+    return 0;
+}
+"#,
+        ),
+        (
+            "division_zero",
+            "integer division by zero",
+            r#"function fail(int8 $value, int8 $divisor): int8
+{
+    return $value / $divisor;
+}
+function main(): int
+{
+    let $unused = fail(1, 0);
+    return 0;
+}
+"#,
+        ),
+        (
+            "division_overflow",
+            "integer division overflow",
+            r#"function fail(int8 $value, int8 $divisor): int8
+{
+    return $value / $divisor;
+}
+function main(): int
+{
+    let $unused = fail(-128, -1);
+    return 0;
+}
+"#,
+        ),
+        (
+            "remainder_zero",
+            "integer remainder by zero",
+            r#"function fail(int8 $value, int8 $divisor): int8
+{
+    return $value % $divisor;
+}
+function main(): int
+{
+    let $unused = fail(1, 0);
+    return 0;
+}
+"#,
+        ),
+        (
+            "shift",
+            "integer shift count out of range",
+            r#"function fail(uint8 $value, uint8 $count): uint8
+{
+    return $value << $count;
+}
+function main(): int
+{
+    let $unused = fail(1, 8);
+    return 0;
+}
+"#,
+        ),
+        (
+            "negative_shift",
+            "integer shift count out of range",
+            r#"function fail(int8 $value, int8 $count): int8
+{
+    return $value >> $count;
+}
+function main(): int
+{
+    let $unused = fail(1, -1);
+    return 0;
+}
+"#,
+        ),
+        (
+            "conversion",
+            "integer conversion out of range",
+            r#"function fail(int $value): uint8
+{
+    return UInt8::from($value);
+}
+function main(): int
+{
+    let $unused = fail(256);
+    return 0;
+}
+"#,
+        ),
+        (
+            "negative_conversion",
+            "integer conversion out of range",
+            r#"function fail(int8 $value): uint16
+{
+    return UInt16::from($value);
+}
+function main(): int
+{
+    let $unused = fail(-1);
+    return 0;
+}
+"#,
+        ),
+        (
+            "unsigned_to_signed_conversion",
+            "integer conversion out of range",
+            r#"function fail(uint64 $value): int64
+{
+    return Int64::from($value);
+}
+function main(): int
+{
+    let $unused = fail(18446744073709551615);
+    return 0;
+}
+"#,
+        ),
+    ];
+
+    for (stem, message, source) in cases {
+        let output = temp_executable_path(&format!("stage13_{stem}_panic"));
+        compile_native_source(source, &output);
+        let run = run_native_executable(&output).expect("native executable should run");
+        assert_eq!(run.status.code(), Some(101), "{stem}");
+        assert!(run.stdout.is_empty(), "{stem}");
+        assert_eq!(
+            String::from_utf8(run.stderr).expect("panic stderr should be UTF-8"),
+            format!("Panic: {message}\nStack Trace:\n  at fail\n  at main\n"),
+            "{stem}"
+        );
+        let _ = fs::remove_file(output);
+    }
+}
+
+#[test]
 fn compiles_and_runs_void_main_string_literal_echo() {
     if !host_linker_is_available() {
         eprintln!(
@@ -919,7 +1244,7 @@ function main(): void
     assert_eq!(status.code(), Some(101));
     assert_eq!(
         stderr,
-        b"panic: failed to write stdout\nstack trace:\n  at main\n"
+        b"Panic: failed to write stdout\nStack Trace:\n  at main\n"
     );
 
     let _ = fs::remove_file(output);

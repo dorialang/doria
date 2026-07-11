@@ -104,7 +104,7 @@ impl Backend for PhpBackend {
     fn emit(&self, program: &hir::Program) -> Result<BackendOutput, BackendError> {
         Ok(BackendOutput::Text {
             extension: "php".to_string(),
-            contents: codegen_php::generate(program),
+            contents: codegen_php::generate(program)?,
         })
     }
 }

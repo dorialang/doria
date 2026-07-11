@@ -1,0 +1,9 @@
+function divide(int8 $value, int8 $divisor): int8
+{
+    return $value / $divisor;
+}
+
+function main(): int
+{
+    return Int::from(divide(42, 0));
+}

@@ -112,6 +112,23 @@ $primitiveTypes = [
     'never',
 ];
 
+$implementedIntegerTypes = [
+    'int',
+    'int8',
+    'int16',
+    'int32',
+    'int64',
+    'uint8',
+    'uint16',
+    'uint32',
+    'uint64',
+];
+
+$plannedFloatTypes = [
+    'float32',
+    'float64',
+];
+
 $reservedTypes = [
     'resource',
 ];
@@ -138,6 +155,14 @@ $rejectedTypes = [
 $lspSupportedTypes = [
     'void',
     'int',
+    'int8',
+    'int16',
+    'int32',
+    'int64',
+    'uint8',
+    'uint16',
+    'uint32',
+    'uint64',
     'float',
     'string',
     'bool',
@@ -147,6 +172,38 @@ $lspSupportedTypes = [
     'Set',
 ];
 $wordOperators = ['not', 'and', 'or', 'xor'];
+$stage13SymbolOperators = [
+    '-',
+    '~',
+    '+',
+    '*',
+    '/',
+    '%',
+    '<<',
+    '>>',
+    '&',
+    '|',
+    '^',
+    '==',
+    '!=',
+    '<',
+    '<=',
+    '>',
+    '>=',
+    '++',
+    '--',
+    '+=',
+    '-=',
+    '*=',
+    '/=',
+    '%=',
+    '<<=',
+    '>>=',
+    '&=',
+    '|=',
+    '^=',
+];
+$booleanSymbolOperators = ['&&', '||'];
 $rejectedPreprocessor = [
     'include',
     'define',
@@ -245,6 +302,11 @@ function regex_matches(string $pattern, string $subject): bool
     return $result === 1;
 }
 
+function regex_fully_matches(string $pattern, string $subject): bool
+{
+    return regex_matches('\\A(?:' . $pattern . ')\\z', $subject);
+}
+
 function check_vscode_package(): void
 {
     global $vscodePackage;
@@ -276,7 +338,8 @@ function check_vscode_language_configuration(): void
 
 function check_vscode_grammar(): void
 {
-    global $acceptedKeywords, $primitiveTypes, $reservedTypes, $plannedTypes, $wordOperators, $notKeywords, $strictComparison, $rejectedPreprocessor, $rejectedKeywords, $rejectedTypes, $vscodeGrammar;
+    global $acceptedKeywords, $primitiveTypes, $reservedTypes, $plannedTypes, $wordOperators, $stage13SymbolOperators, $booleanSymbolOperators;
+    global $notKeywords, $strictComparison, $rejectedPreprocessor, $rejectedKeywords, $rejectedTypes, $vscodeGrammar;
 
     $grammar = load_json($vscodeGrammar);
     $grammarText = json_encode($grammar, JSON_THROW_ON_ERROR);
@@ -292,6 +355,20 @@ function check_vscode_grammar(): void
         require_check(!str_contains($grammarText, $type), "VS Code grammar must not highlight rejected type '{$type}'");
     }
 
+    $primitiveTypeMatches = [];
+    foreach ($patterns as $pattern) {
+        if (($pattern['name'] ?? null) === 'storage.type.primitive.doria') {
+            $primitiveTypeMatches[] = (string) ($pattern['match'] ?? '');
+        }
+    }
+    require_check($primitiveTypeMatches !== [], 'VS Code grammar must define primitive type highlighting');
+    foreach ($primitiveTypes as $type) {
+        require_check(
+            any_match($primitiveTypeMatches, static fn (string $match): bool => regex_fully_matches($match, $type)),
+            "VS Code grammar must classify '{$type}' as a primitive type"
+        );
+    }
+
     sort($notKeywords);
     foreach ($notKeywords as $token) {
         require_check(!str_contains($grammarText, $token), "VS Code grammar must not treat '{$token}' as a keyword");
@@ -304,6 +381,26 @@ function check_vscode_grammar(): void
         }
     }
     require_check($normalOperatorMatches !== [], 'VS Code grammar must define normal operator highlighting');
+    foreach (array_unique([...$stage13SymbolOperators, ...$booleanSymbolOperators]) as $operator) {
+        require_check(
+            any_match($normalOperatorMatches, static fn (string $match): bool => regex_fully_matches($match, $operator)),
+            "VS Code grammar must highlight '{$operator}' as one complete operator token"
+        );
+    }
+
+    $wordOperatorMatches = [];
+    foreach ($patterns as $pattern) {
+        if (($pattern['name'] ?? null) === 'keyword.operator.word.doria') {
+            $wordOperatorMatches[] = (string) ($pattern['match'] ?? '');
+        }
+    }
+    foreach ($wordOperators as $operator) {
+        require_check(
+            any_match($wordOperatorMatches, static fn (string $match): bool => regex_fully_matches($match, $operator)),
+            "VS Code grammar must classify '{$operator}' as a word operator"
+        );
+    }
+
     foreach ($strictComparison as $operator) {
         foreach ($normalOperatorMatches as $match) {
             require_check(
@@ -321,8 +418,14 @@ function check_vscode_grammar(): void
     }
     foreach ($strictComparison as $operator) {
         require_check(
-            any_match($invalidOperatorPatterns, static fn (string $match): bool => str_contains($match, $operator)),
+            any_match($invalidOperatorPatterns, static fn (string $match): bool => regex_fully_matches($match, $operator)),
             "VS Code grammar must mark '{$operator}' invalid"
+        );
+    }
+    foreach (['&', '|'] as $operator) {
+        require_check(
+            !any_match($invalidOperatorPatterns, static fn (string $match): bool => regex_fully_matches($match, $operator)),
+            "VS Code grammar must not mark single '{$operator}' invalid"
         );
     }
 
@@ -423,7 +526,8 @@ function check_vscode_grammar(): void
 
 function check_intellij_lexer(): void
 {
-    global $acceptedKeywords, $primitiveTypes, $reservedTypes, $plannedTypes, $wordOperators, $notKeywords, $strictComparison, $rejectedPreprocessor, $rejectedKeywords, $rejectedTypes;
+    global $acceptedKeywords, $primitiveTypes, $reservedTypes, $plannedTypes, $wordOperators, $stage13SymbolOperators, $booleanSymbolOperators;
+    global $notKeywords, $strictComparison, $rejectedPreprocessor, $rejectedKeywords, $rejectedTypes;
     global $intellijLexer, $intellijTokenTypes, $intellijSyntaxHighlighter, $intellijPluginXml;
 
     $lexerText = read_text($intellijLexer);
@@ -439,6 +543,18 @@ function check_intellij_lexer(): void
         require_check(str_contains($lexerText, '"' . $token . '"'), "IntelliJ lexer is missing '{$token}'");
     }
 
+    require_check(
+        preg_match('/private val PRIMITIVE_TYPES = setOf\\((.*?)\\n\\s*\\)/s', $lexerText, $primitiveMatches) === 1,
+        'IntelliJ primitive type classification could not be found'
+    );
+    $primitiveTypeList = $primitiveMatches[1];
+    foreach ($primitiveTypes as $type) {
+        require_check(
+            str_contains($primitiveTypeList, '"' . $type . '"'),
+            "IntelliJ lexer must classify '{$type}' as a primitive type"
+        );
+    }
+
     foreach ($rejectedTypes as $type) {
         require_check(!str_contains($lexerText, chr(34) . $type . chr(34)), "IntelliJ lexer must not highlight rejected type '{$type}'");
     }
@@ -452,8 +568,47 @@ function check_intellij_lexer(): void
         require_check(str_contains($lexerText, '"' . $operator . '"'), "IntelliJ lexer must recognize '{$operator}'");
     }
     require_check(
+        preg_match('/private val STRICT_COMPARISON_OPERATORS = setOf\\((.*?)\\)/s', $lexerText, $strictOperatorMatches) === 1,
+        'IntelliJ invalid strict-comparison classification could not be found'
+    );
+    $strictOperatorList = $strictOperatorMatches[1];
+    foreach (['&', '|'] as $operator) {
+        require_check(
+            !str_contains($strictOperatorList, '"' . $operator . '"'),
+            "IntelliJ lexer must not mark single '{$operator}' invalid"
+        );
+    }
+    require_check(
         str_contains($lexerText, 'STRICT_COMPARISON_OPERATORS') && str_contains($lexerText, 'DoriaTokenTypes.INVALID'),
         'IntelliJ lexer must route strict comparison operators to invalid highlighting'
+    );
+
+    require_check(
+        preg_match('/private val THREE_CHAR_OPERATORS =\\s*(.*?)\\n\\s*private val TWO_CHAR_OPERATORS/s', $lexerText, $threeCharacterMatches) === 1,
+        'IntelliJ three-character operator classification could not be found'
+    );
+    require_check(
+        preg_match('/private val TWO_CHAR_OPERATORS = setOf\\((.*?)\\n\\s*\\)/s', $lexerText, $twoCharacterMatches) === 1,
+        'IntelliJ two-character operator classification could not be found'
+    );
+    $threeCharacterOperatorList = $threeCharacterMatches[1];
+    $twoCharacterOperatorList = $twoCharacterMatches[1];
+    foreach (array_unique([...$stage13SymbolOperators, ...$booleanSymbolOperators]) as $operator) {
+        $operatorLength = strlen($operator);
+        if ($operatorLength === 1) {
+            continue;
+        }
+
+        $operatorList = $operatorLength === 3 ? $threeCharacterOperatorList : $twoCharacterOperatorList;
+        require_check(
+            str_contains($operatorList, '"' . $operator . '"'),
+            "IntelliJ lexer must tokenize '{$operator}' as one complete operator token"
+        );
+    }
+    require_check(
+        str_contains($lexerText, 'three in THREE_CHAR_OPERATORS -> three') &&
+            str_contains($lexerText, 'two in TWO_CHAR_OPERATORS -> two'),
+        'IntelliJ lexer must prefer three-character operators before two-character operators'
     );
 
     foreach ($rejectedKeywords as $keyword) {
@@ -517,6 +672,7 @@ function check_intellij_lexer(): void
 function check_lsp_completion_vocabulary(): void
 {
     global $acceptedKeywords, $plannedKeywords, $primitiveTypes, $reservedTypes, $plannedTypes, $wordOperators, $notKeywords, $lspServer, $lspSupportedTypes, $rejectedTypes;
+    global $implementedIntegerTypes, $plannedFloatTypes;
 
     $lspText = read_text($lspServer);
     $tokens = array_unique([...$acceptedKeywords, ...$wordOperators]);
@@ -541,6 +697,12 @@ function check_lsp_completion_vocabulary(): void
     $lspTypeList = $matches[1];
 
     require_check(
+        preg_match('/let planned_types = \[(.*?)\];/s', $lspText, $plannedTypeMatches) === 1,
+        'LSP completion planned type list could not be found'
+    );
+    $lspPlannedTypeList = $plannedTypeMatches[1];
+
+    require_check(
         preg_match('/let reserved_types = \[(.*?)\];/s', $lspText, $reservedMatches) === 1,
         'LSP completion reserved type list could not be found'
     );
@@ -550,6 +712,32 @@ function check_lsp_completion_vocabulary(): void
     foreach ($lspSupportedTypes as $type) {
         require_check(str_contains($lspTypeList, chr(34) . $type . chr(34)), 'LSP completion type list is missing ' . $type);
     }
+
+    foreach ($implementedIntegerTypes as $type) {
+        require_check(
+            str_contains($lspTypeList, chr(34) . $type . chr(34)),
+            'LSP must classify Stage 13 integer type ' . $type . ' as implemented'
+        );
+    }
+    require_check(
+        str_contains($lspText, '`int` is an exact alias for `int64`'),
+        'LSP completion or hover text must document int as the exact int64 alias'
+    );
+
+    foreach ($plannedFloatTypes as $type) {
+        require_check(
+            str_contains($lspPlannedTypeList, chr(34) . $type . chr(34)),
+            'LSP planned type list is missing ' . $type
+        );
+        require_check(
+            !str_contains($lspTypeList, chr(34) . $type . chr(34)),
+            'LSP must not classify planned Stage 14 type ' . $type . ' as implemented'
+        );
+    }
+    require_check(
+        str_contains($lspText, 'native float values and operations are Stage 14 work'),
+        'LSP planned float detail must identify native float values and operations as Stage 14 work'
+    );
 
     sort($reservedTypes);
     foreach ($reservedTypes as $type) {
@@ -567,6 +755,18 @@ function check_lsp_completion_vocabulary(): void
     foreach ($unsupportedTypes as $type) {
         require_check(!str_contains($lspTypeList, chr(34) . $type . chr(34)), 'LSP completion type list must not advertise unsupported type ' . $type);
     }
+
+    foreach (['Int', 'Int8', 'Int16', 'Int32', 'Int64', 'UInt8', 'UInt16', 'UInt32', 'UInt64'] as $companion) {
+        require_check(
+            str_contains($lspText, chr(34) . $companion . '::from' . chr(34)),
+            'LSP completion list is missing ' . $companion . '::from'
+        );
+    }
+    require_check(
+        str_contains($lspText, 'Doria integer conversion intrinsic') &&
+            str_contains($lspText, 'Out-of-range conversion panics'),
+        'LSP must provide completion and hover details for explicit integer conversions'
+    );
 
     sort($notKeywords);
     foreach ($notKeywords as $token) {
@@ -626,6 +826,64 @@ function check_fixture(): void
     ];
     foreach ($requiredSnippets as $snippet) {
         require_check(str_contains($fixtureText, $snippet), 'shared editor fixture is missing ' . $snippet);
+    }
+
+    $stage13TypeSnippets = [
+        'int8 $minimumInt8 = -128;',
+        'int16 $maximumInt16 = 32767;',
+        'int32 $maximumInt32 = 2147483647;',
+        'int64 $maximumInt64 = 9223372036854775807;',
+        'uint8 $maximumUInt8 = 255;',
+        'uint16 $maximumUInt16 = 65535;',
+        'uint32 $maximumUInt32 = 4294967295;',
+        'uint64 $maximumUInt64 = 18446744073709551615;',
+    ];
+    foreach ($stage13TypeSnippets as $snippet) {
+        require_check(str_contains($fixtureText, $snippet), 'shared editor fixture is missing Stage 13 type snippet ' . $snippet);
+    }
+
+    foreach (['Int', 'Int8', 'Int16', 'Int32', 'Int64', 'UInt8', 'UInt16', 'UInt32', 'UInt64'] as $companion) {
+        require_check(
+            str_contains($fixtureText, $companion . '::from('),
+            'shared editor fixture is missing Stage 13 conversion ' . $companion . '::from'
+        );
+    }
+
+    $stage13OperatorSnippets = [
+        'let $negated = -$defaultInt;',
+        'let $complemented = ~$defaultInt;',
+        'let $sum = $defaultInt + 2;',
+        'let $difference = $defaultInt - 2;',
+        'let $product = $defaultInt * 2;',
+        'let $quotient = $defaultInt / 2;',
+        'let $remainder = $defaultInt % 2;',
+        'let $shiftedLeft = $defaultInt << 1;',
+        'let $shiftedRight = $defaultInt >> 1;',
+        'let $masked = $defaultInt & 255;',
+        'let $combined = $defaultInt | 1;',
+        'let $toggled = $defaultInt ^ 1;',
+        'let $equal = $defaultInt == 42;',
+        'let $notEqual = $defaultInt != 0;',
+        'let $less = $defaultInt < 100;',
+        'let $lessOrEqual = $defaultInt <= 42;',
+        'let $greater = $defaultInt > 0;',
+        'let $greaterOrEqual = $defaultInt >= 42;',
+        'let $booleanXor = true xor false;',
+        '$accumulator += 3;',
+        '$accumulator -= 2;',
+        '$accumulator *= 2;',
+        '$accumulator /= 2;',
+        '$accumulator %= 5;',
+        '$accumulator <<= 1;',
+        '$accumulator >>= 1;',
+        '$accumulator &= 7;',
+        '$accumulator |= 8;',
+        '$accumulator ^= 3;',
+        '$accumulator++;',
+        '$accumulator--;',
+    ];
+    foreach ($stage13OperatorSnippets as $snippet) {
+        require_check(str_contains($fixtureText, $snippet), 'shared editor fixture is missing Stage 13 operator snippet ' . $snippet);
     }
 
     require_check(is_file($rejectedFixture), 'negative editor fixture must exist');

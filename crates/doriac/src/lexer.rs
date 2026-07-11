@@ -40,7 +40,17 @@ pub enum TokenKind {
     Null,
     Void,
     IntType,
+    Int8Type,
+    Int16Type,
+    Int32Type,
+    Int64Type,
+    UInt8Type,
+    UInt16Type,
+    UInt32Type,
+    UInt64Type,
     FloatType,
+    Float32Type,
+    Float64Type,
     StringType,
     BoolType,
     Reserved(String),
@@ -65,6 +75,14 @@ pub enum TokenKind {
     MinusMinus,
     PlusEquals,
     MinusEquals,
+    StarEquals,
+    SlashEquals,
+    PercentEquals,
+    ShiftLeftEquals,
+    ShiftRightEquals,
+    AmpersandEquals,
+    PipeEquals,
+    CaretEquals,
     EqualEqual,
     EqualEqualEqual,
     BangEqual,
@@ -73,6 +91,12 @@ pub enum TokenKind {
     LessEqual,
     Greater,
     GreaterEqual,
+    ShiftLeft,
+    ShiftRight,
+    Ampersand,
+    Pipe,
+    Caret,
+    Tilde,
     AndAnd,
     OrOr,
     Bang,
@@ -167,9 +191,27 @@ impl<'source> Lexer<'source> {
                         self.token(TokenKind::Minus, start)
                     }
                 }
-                b'*' => self.token(TokenKind::Star, start),
-                b'/' => self.token(TokenKind::Slash, start),
-                b'%' => self.token(TokenKind::Percent, start),
+                b'*' => {
+                    if self.match_byte(b'=') {
+                        self.token(TokenKind::StarEquals, start)
+                    } else {
+                        self.token(TokenKind::Star, start)
+                    }
+                }
+                b'/' => {
+                    if self.match_byte(b'=') {
+                        self.token(TokenKind::SlashEquals, start)
+                    } else {
+                        self.token(TokenKind::Slash, start)
+                    }
+                }
+                b'%' => {
+                    if self.match_byte(b'=') {
+                        self.token(TokenKind::PercentEquals, start)
+                    } else {
+                        self.token(TokenKind::Percent, start)
+                    }
+                }
                 b'.' => {
                     if self.match_byte(b'.') {
                         if self.match_byte(b'<') {
@@ -198,14 +240,26 @@ impl<'source> Lexer<'source> {
                     }
                 }
                 b'<' => {
-                    if self.match_byte(b'=') {
+                    if self.match_byte(b'<') {
+                        if self.match_byte(b'=') {
+                            self.token(TokenKind::ShiftLeftEquals, start)
+                        } else {
+                            self.token(TokenKind::ShiftLeft, start)
+                        }
+                    } else if self.match_byte(b'=') {
                         self.token(TokenKind::LessEqual, start)
                     } else {
                         self.token(TokenKind::Less, start)
                     }
                 }
                 b'>' => {
-                    if self.match_byte(b'=') {
+                    if self.match_byte(b'>') {
+                        if self.match_byte(b'=') {
+                            self.token(TokenKind::ShiftRightEquals, start)
+                        } else {
+                            self.token(TokenKind::ShiftRight, start)
+                        }
+                    } else if self.match_byte(b'=') {
                         self.token(TokenKind::GreaterEqual, start)
                     } else {
                         self.token(TokenKind::Greater, start)
@@ -214,19 +268,29 @@ impl<'source> Lexer<'source> {
                 b'&' => {
                     if self.match_byte(b'&') {
                         self.token(TokenKind::AndAnd, start)
+                    } else if self.match_byte(b'=') {
+                        self.token(TokenKind::AmpersandEquals, start)
                     } else {
-                        self.error("unexpected `&`; did you mean `&&`?", start, self.index);
-                        continue;
+                        self.token(TokenKind::Ampersand, start)
                     }
                 }
                 b'|' => {
                     if self.match_byte(b'|') {
                         self.token(TokenKind::OrOr, start)
+                    } else if self.match_byte(b'=') {
+                        self.token(TokenKind::PipeEquals, start)
                     } else {
-                        self.error("unexpected `|`; did you mean `||`?", start, self.index);
-                        continue;
+                        self.token(TokenKind::Pipe, start)
                     }
                 }
+                b'^' => {
+                    if self.match_byte(b'=') {
+                        self.token(TokenKind::CaretEquals, start)
+                    } else {
+                        self.token(TokenKind::Caret, start)
+                    }
+                }
+                b'~' => self.token(TokenKind::Tilde, start),
                 b'?' => {
                     if self.match_byte(b'?') {
                         self.token(TokenKind::QuestionQuestion, start)
@@ -328,7 +392,17 @@ impl<'source> Lexer<'source> {
             "null" => TokenKind::Null,
             "void" => TokenKind::Void,
             "int" => TokenKind::IntType,
+            "int8" => TokenKind::Int8Type,
+            "int16" => TokenKind::Int16Type,
+            "int32" => TokenKind::Int32Type,
+            "int64" => TokenKind::Int64Type,
+            "uint8" => TokenKind::UInt8Type,
+            "uint16" => TokenKind::UInt16Type,
+            "uint32" => TokenKind::UInt32Type,
+            "uint64" => TokenKind::UInt64Type,
             "float" => TokenKind::FloatType,
+            "float32" => TokenKind::Float32Type,
+            "float64" => TokenKind::Float64Type,
             "string" => TokenKind::StringType,
             "bool" => TokenKind::BoolType,
             "not" => TokenKind::Not,

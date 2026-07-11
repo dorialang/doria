@@ -5,26 +5,26 @@ Documentation role: working note. This file prevents duplicated in-flight work. 
 ## Recently merged
 
 - PR #68: Stage 11 completion, direct MIR-to-Cranelift lowering, the differential parity suite, and retirement of the Stage 7-10 native smoke architecture.
+- PR #69: Stage 12 reusable CFG/dataflow analysis, recursion and mutual recursion, `doria-rt`, abort-only panic with Doria stack traces, and exact stdout/stderr/status parity.
 
-## Completed locally
+## Active
 
-- Stage 12: general control flow and the minimal `doria-rt` runtime/panic foundation.
-- Path-sensitive return analysis now uses a reusable source CFG and dataflow engine.
-- Recursion and mutual recursion are supported without ordinary interpreter block or call-depth caps.
-- Native compilation no longer executes user code as a preflight.
-- `doria-rt` owns process entry, exact native output, abort-only panic status 101, and Doria function-name stack traces.
+- Stage 13 is complete locally on the feature branch: the fixed-width integer family, integer operators, contextual literals, checked conversions, typed MIR/interpreter/Cranelift execution, PHP compatibility boundary, and durable native parity coverage.
+- `int` is the canonical signed 64-bit integer and `int64` is its exact alias. The explicit unsigned family has no bare `uint` alias.
+- Arithmetic, division/remainder, shifts, conversions, fixed-width function ABI values, and `uint64` boundary transport share exact interpreter/native results and panic outcomes.
 
 ## Next
 
-- Stage 13: full fixed-width integer family and remaining integer operators.
+- Stage 14: `float32`/`float64` execution and bool runtime values over the same MIR/interpreter/native architecture.
 
 ## Do not duplicate
 
 - PR #68 Stage 11 completion work.
-- Stage 12 CFG/dataflow, recursion, runtime, panic, and durable parity work.
+- PR #69 Stage 12 CFG/dataflow, recursion, runtime, panic, and durable parity work.
+- Stage 13 integer-model, operator, conversion, and parity work.
 - ROADMAP-style planning outside the end-to-end plan.
 
 ## Deferred
 
 - Full TypeId/TypeKind refactor.
-- Stage 13 numeric expansion until Stage 12 is reviewed and merged.
+- Native float values and operations, float/integer conversions, and bool runtime values until Stage 14.

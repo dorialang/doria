@@ -1,0 +1,9 @@
+function shift(uint8 $value, uint8 $count): uint8
+{
+    return $value << $count;
+}
+
+function main(): int
+{
+    return Int::from(shift(1, 8));
+}

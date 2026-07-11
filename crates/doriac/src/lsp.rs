@@ -4,7 +4,7 @@ use std::io::{self, BufRead, Write};
 use serde_json::{json, Value};
 
 use crate::diagnostics::Diagnostic;
-use crate::lexer::TokenKind;
+use crate::lexer::{Token, TokenKind};
 use crate::source::Span;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -386,6 +386,14 @@ fn completion_items() -> Value {
     let types = [
         "void",
         "int",
+        "int8",
+        "int16",
+        "int32",
+        "int64",
+        "uint8",
+        "uint16",
+        "uint32",
+        "uint64",
         "float",
         "string",
         "bool",
@@ -394,7 +402,19 @@ fn completion_items() -> Value {
         "Dictionary",
         "Set",
     ];
+    let planned_types = ["float32", "float64"];
     let reserved_types = ["resource"];
+    let integer_conversions = [
+        ("Int::from", "int (the int64 alias)"),
+        ("Int8::from", "int8"),
+        ("Int16::from", "int16"),
+        ("Int32::from", "int32"),
+        ("Int64::from", "int64"),
+        ("UInt8::from", "uint8"),
+        ("UInt16::from", "uint16"),
+        ("UInt32::from", "uint32"),
+        ("UInt64::from", "uint64"),
+    ];
 
     let mut items = Vec::new();
     items.extend(keywords.into_iter().map(|keyword| {
@@ -411,10 +431,23 @@ fn completion_items() -> Value {
         item
     }));
     items.extend(types.into_iter().map(|ty| {
-        json!({
+        let mut item = json!({
             "label": ty,
             "kind": 25,
             "detail": "Doria type",
+        });
+        if let Some(documentation) = integer_type_description(ty) {
+            item["detail"] = json!("implemented Doria integer type");
+            item["documentation"] = json!(documentation);
+        }
+        item
+    }));
+    items.extend(planned_types.into_iter().map(|ty| {
+        json!({
+            "label": ty,
+            "kind": 25,
+            "detail": "planned Doria primitive type",
+            "documentation": "Accepted primitive spelling; native float values and operations are Stage 14 work.",
         })
     }));
     items.extend(reserved_types.into_iter().map(|ty| {
@@ -430,20 +463,52 @@ fn completion_items() -> Value {
         "detail": "Doria built-in function",
         "documentation": "Terminates execution with a fatal panic, Doria stack trace, and status 101.",
     }));
+    items.extend(integer_conversions.into_iter().map(|(label, target)| {
+        json!({
+            "label": label,
+            "kind": 3,
+            "detail": "Doria integer conversion intrinsic",
+            "documentation": format!(
+                "Compiler-known explicit conversion to `{target}`. Accepts exactly one integer expression and panics when the value is out of range."
+            ),
+        })
+    }));
 
     json!({
         "isIncomplete": false,
         "items": items,
     })
 }
+
+fn integer_type_description(name: &str) -> Option<&'static str> {
+    match name {
+        "int" => {
+            Some("Implemented signed 64-bit integer type. `int` is an exact alias for `int64`.")
+        }
+        "int8" => Some("Implemented signed 8-bit integer type."),
+        "int16" => Some("Implemented signed 16-bit integer type."),
+        "int32" => Some("Implemented signed 32-bit integer type."),
+        "int64" => {
+            Some("Implemented signed 64-bit integer type; the same canonical type as `int`.")
+        }
+        "uint8" => Some("Implemented unsigned 8-bit integer type."),
+        "uint16" => Some("Implemented unsigned 16-bit integer type."),
+        "uint32" => Some("Implemented unsigned 32-bit integer type."),
+        "uint64" => Some("Implemented unsigned 64-bit integer type."),
+        _ => None,
+    }
+}
+
 fn hover_at_offset(text: &str, offset: usize) -> Option<Value> {
     let tokens = crate::lex_source("<lsp>", text.to_string()).ok()?;
-    let token = tokens.into_iter().find(|token| {
+    let token_index = tokens.iter().position(|token| {
         !matches!(token.kind, TokenKind::Eof)
             && token.span.start <= offset
             && offset <= token.span.end
     })?;
-    let description = hover_description(&token.kind)?;
+    let token = &tokens[token_index];
+    let description = integer_conversion_hover_at(&tokens, token_index)
+        .or_else(|| hover_description(&token.kind))?;
 
     Some(json!({
         "contents": {
@@ -452,6 +517,43 @@ fn hover_at_offset(text: &str, offset: usize) -> Option<Value> {
         },
         "range": span_to_range(text, token.span),
     }))
+}
+
+fn integer_conversion_hover_at(tokens: &[Token], token_index: usize) -> Option<&'static str> {
+    let TokenKind::Identifier(name) = &tokens[token_index].kind else {
+        return None;
+    };
+
+    if let Some(description) = integer_conversion_description(name) {
+        return Some(description);
+    }
+
+    if name != "from" || token_index < 2 {
+        return None;
+    }
+    if !matches!(tokens[token_index - 1].kind, TokenKind::DoubleColon) {
+        return None;
+    }
+
+    let TokenKind::Identifier(companion) = &tokens[token_index - 2].kind else {
+        return None;
+    };
+    integer_conversion_description(companion)
+}
+
+fn integer_conversion_description(companion: &str) -> Option<&'static str> {
+    match companion {
+        "Int" => Some("`Int::from(value)` explicitly converts one integer expression to `int`, the exact `int64` alias. Out-of-range conversion panics."),
+        "Int8" => Some("`Int8::from(value)` explicitly converts one integer expression to `int8`. Out-of-range conversion panics."),
+        "Int16" => Some("`Int16::from(value)` explicitly converts one integer expression to `int16`. Out-of-range conversion panics."),
+        "Int32" => Some("`Int32::from(value)` explicitly converts one integer expression to `int32`. Out-of-range conversion panics."),
+        "Int64" => Some("`Int64::from(value)` explicitly converts one integer expression to `int64`, the same canonical type as `int`. Out-of-range conversion panics."),
+        "UInt8" => Some("`UInt8::from(value)` explicitly converts one integer expression to `uint8`. Out-of-range conversion panics."),
+        "UInt16" => Some("`UInt16::from(value)` explicitly converts one integer expression to `uint16`. Out-of-range conversion panics."),
+        "UInt32" => Some("`UInt32::from(value)` explicitly converts one integer expression to `uint32`. Out-of-range conversion panics."),
+        "UInt64" => Some("`UInt64::from(value)` explicitly converts one integer expression to `uint64`. Out-of-range conversion panics."),
+        _ => None,
+    }
 }
 
 fn hover_description(kind: &TokenKind) -> Option<&'static str> {
@@ -477,8 +579,22 @@ fn hover_description(kind: &TokenKind) -> Option<&'static str> {
         TokenKind::Or => Some("Boolean OR operator; exact synonym for `||`."),
         TokenKind::Xor => Some("Bool-only exclusive OR operator."),
         TokenKind::Void => Some("The `void` return type."),
-        TokenKind::IntType => Some("The `int` primitive type."),
+        TokenKind::IntType => integer_type_description("int"),
+        TokenKind::Int8Type => integer_type_description("int8"),
+        TokenKind::Int16Type => integer_type_description("int16"),
+        TokenKind::Int32Type => integer_type_description("int32"),
+        TokenKind::Int64Type => integer_type_description("int64"),
+        TokenKind::UInt8Type => integer_type_description("uint8"),
+        TokenKind::UInt16Type => integer_type_description("uint16"),
+        TokenKind::UInt32Type => integer_type_description("uint32"),
+        TokenKind::UInt64Type => integer_type_description("uint64"),
         TokenKind::FloatType => Some("The `float` primitive type."),
+        TokenKind::Float32Type => Some(
+            "Accepted `float32` primitive spelling; native float values and operations are Stage 14 work.",
+        ),
+        TokenKind::Float64Type => Some(
+            "Accepted `float64` primitive spelling; native float values and operations are Stage 14 work.",
+        ),
         TokenKind::StringType => Some("The `string` primitive type."),
         TokenKind::BoolType => Some("The `bool` primitive type."),
         TokenKind::True | TokenKind::False => Some("Boolean literal."),
@@ -492,6 +608,8 @@ fn hover_description(kind: &TokenKind) -> Option<&'static str> {
             "Set" => Some("Unique-value collection alias: `Set<T>`."),
             "mixed" => Some("Dynamic boundary type. Operations on `mixed` require future narrowing syntax before use."),
             "resource" => Some("Reserved for future PHP interop; not a usable core type."),
+            companion @ ("Int" | "Int8" | "Int16" | "Int32" | "Int64" | "UInt8"
+            | "UInt16" | "UInt32" | "UInt64") => integer_conversion_description(companion),
             "panic" => Some(
                 "Built-in fatal runtime function: `panic(\"message\");`. Panics are not catchable and exit with status 101.",
             ),
@@ -732,19 +850,9 @@ mod tests {
         assert!(!mixed_hover.contains("`match`"));
     }
     #[test]
-    fn completions_do_not_offer_unsupported_future_types() {
+    fn completions_do_not_offer_unrelated_future_types() {
         let labels = completion_labels();
         for unsupported in [
-            "int8",
-            "int16",
-            "int32",
-            "int64",
-            "uint8",
-            "uint16",
-            "uint32",
-            "uint64",
-            "float32",
-            "float64",
             "never",
             "Shared",
             "Weak",
@@ -768,7 +876,17 @@ mod tests {
         for supported in [
             "void",
             "int",
+            "int8",
+            "int16",
+            "int32",
+            "int64",
+            "uint8",
+            "uint16",
+            "uint32",
+            "uint64",
             "float",
+            "float32",
+            "float64",
             "string",
             "bool",
             "mixed",
@@ -782,6 +900,88 @@ mod tests {
                 "supported or reserved type `{supported}` should remain an LSP completion"
             );
         }
+    }
+
+    #[test]
+    fn integer_type_completions_and_hover_mark_stage_13_coverage() {
+        let integer_types = [
+            ("int", TokenKind::IntType),
+            ("int8", TokenKind::Int8Type),
+            ("int16", TokenKind::Int16Type),
+            ("int32", TokenKind::Int32Type),
+            ("int64", TokenKind::Int64Type),
+            ("uint8", TokenKind::UInt8Type),
+            ("uint16", TokenKind::UInt16Type),
+            ("uint32", TokenKind::UInt32Type),
+            ("uint64", TokenKind::UInt64Type),
+        ];
+
+        for (name, kind) in integer_types {
+            let item = completion_item(name);
+            assert_eq!(item["detail"], "implemented Doria integer type");
+            assert!(item["documentation"]
+                .as_str()
+                .expect("integer type completion should have documentation")
+                .contains("Implemented"));
+
+            let hover = hover_description(&kind).expect("integer type should have hover text");
+            assert!(hover.contains("Implemented"));
+        }
+
+        let int_documentation = completion_item("int")["documentation"]
+            .as_str()
+            .expect("int completion should have documentation")
+            .to_string();
+        assert!(int_documentation.contains("exact alias for `int64`"));
+        let int_hover = hover_description(&TokenKind::IntType).expect("int should have hover text");
+        assert!(int_hover.contains("exact alias for `int64`"));
+    }
+
+    #[test]
+    fn fixed_width_float_completions_and_hover_remain_planned_for_stage_14() {
+        for (name, kind) in [
+            ("float32", TokenKind::Float32Type),
+            ("float64", TokenKind::Float64Type),
+        ] {
+            let item = completion_item(name);
+            assert_eq!(item["detail"], "planned Doria primitive type");
+            assert!(item["documentation"]
+                .as_str()
+                .expect("planned float completion should have documentation")
+                .contains("Stage 14"));
+
+            let hover = hover_description(&kind).expect("planned float should have hover text");
+            assert!(hover.contains("Stage 14"));
+        }
+    }
+
+    #[test]
+    fn integer_conversion_completions_and_hover_are_exposed() {
+        for companion in [
+            "Int", "Int8", "Int16", "Int32", "Int64", "UInt8", "UInt16", "UInt32", "UInt64",
+        ] {
+            let label = format!("{companion}::from");
+            let item = completion_item(&label);
+            assert_eq!(item["detail"], "Doria integer conversion intrinsic");
+            assert!(item["documentation"]
+                .as_str()
+                .expect("conversion completion should have documentation")
+                .contains("panics"));
+
+            let hover = hover_description(&TokenKind::Identifier(companion.to_string()))
+                .expect("conversion companion should have hover text");
+            assert!(hover.contains(&label));
+        }
+
+        let source = "let $converted = UInt8::from($value);";
+        let from_offset = source.find("from").expect("source should contain from") + 1;
+        let hover = hover_at_offset(source, from_offset)
+            .expect("from in a conversion intrinsic should have contextual hover text");
+        let hover_text = hover["contents"]["value"]
+            .as_str()
+            .expect("hover contents should be text");
+        assert!(hover_text.contains("`UInt8::from(value)`"));
+        assert!(hover_text.contains("Out-of-range conversion panics"));
     }
 
     #[test]

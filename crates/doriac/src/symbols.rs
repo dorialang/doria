@@ -1,13 +1,14 @@
 use std::collections::HashMap;
 
 use crate::ast::MemberAccess;
+use crate::numeric::IntegerValue;
 use crate::types::TypeId;
 
 #[derive(Debug, Clone)]
 pub struct Binding {
     pub writable: bool,
     pub ty: TypeId,
-    pub int_constant: Option<i64>,
+    pub int_constant: Option<IntegerValue>,
     pub string_constant: Option<String>,
 }
 

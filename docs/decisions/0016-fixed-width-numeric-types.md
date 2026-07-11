@@ -192,11 +192,22 @@ The compiler's semantic type model and Doria IR should eventually distinguish th
 
 ## Implementation status
 
-This is a design decision only. It does not implement fixed-width numeric support.
+Stage 13 implements the fixed-width integer family as real compiler and runtime types:
 
-The current compiler may still model only broad `int` and `float` semantic kinds until a later implementation task updates the lexer/parser/type resolver/semantic checker/Doria IR/backends.
+```doria
+int8
+int16
+int32
+int64
+uint8
+uint16
+uint32
+uint64
+```
 
-Implementation must not be inferred from this decision. Future work should add tests and diagnostics for the accepted type spellings before claiming support.
+`int` and `int64` are the same canonical signed 64-bit integer type. Stage 13 also implements contextual integer-literal typing, the remaining integer operators, and explicit checked integer conversions under decisions 0041 and 0042.
+
+The accepted `float`, `float32`, and `float64` spellings remain part of the language design, but Stage 13 does not implement native floating-point values or operations. Native float execution remains Stage 14 work.
 
 ## Non-goals
 

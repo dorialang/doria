@@ -1,0 +1,9 @@
+function overflow(uint8 $value): uint8
+{
+    return $value + 1;
+}
+
+function main(): int
+{
+    return Int::from(overflow(255));
+}

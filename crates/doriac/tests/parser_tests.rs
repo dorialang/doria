@@ -1,5 +1,5 @@
 use doriac::ast::{
-    BinaryOp, ClassMember, ElseBranch, Expr, ForIncrement, ForInitializer, IncrementOp,
+    AssignOp, BinaryOp, ClassMember, ElseBranch, Expr, ForIncrement, ForInitializer, IncrementOp,
     IncrementPosition, InterpolatedStringPart, Item, MemberAccess, Stmt, UnaryOp,
 };
 
@@ -47,6 +47,66 @@ int[] $numbers = [1, 2, 3];
     ));
 }
 
+#[test]
+fn parses_stage_13_primitive_type_spellings() {
+    let program = doriac::parse_source(
+        "test.doria",
+        r#"
+int8 $int8Value = 0;
+int16 $int16Value = 0;
+int32 $int32Value = 0;
+int64 $int64Value = 0;
+uint8 $uint8Value = 0;
+uint16 $uint16Value = 0;
+uint32 $uint32Value = 0;
+uint64 $uint64Value = 0;
+float32 $float32Value = 0.0;
+float64 $float64Value = 0.0;
+"#,
+    )
+    .expect("parse should succeed");
+
+    let names = program
+        .items
+        .iter()
+        .map(|item| {
+            let Item::Statement(Stmt::VarDecl(decl)) = item else {
+                panic!("expected variable declaration");
+            };
+            decl.ty
+                .as_ref()
+                .expect("expected explicit type")
+                .name
+                .as_str()
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        names,
+        [
+            "int8", "int16", "int32", "int64", "uint8", "uint16", "uint32", "uint64", "float32",
+            "float64",
+        ]
+    );
+}
+
+#[test]
+fn parses_adjacent_nested_generic_type_closers_after_shift_tokens_are_added() {
+    let program = doriac::parse_source(
+        "test.doria",
+        "Dictionary<string, List<uint64>> $values = [];",
+    )
+    .expect("nested generic type should parse without whitespace between closing angles");
+
+    let Item::Statement(Stmt::VarDecl(decl)) = &program.items[0] else {
+        panic!("expected variable declaration");
+    };
+    let ty = decl.ty.as_ref().expect("expected explicit type");
+    assert_eq!(ty.name, "Dictionary");
+    assert_eq!(ty.args[1].name, "List");
+    assert_eq!(ty.args[1].args[0].name, "uint64");
+}
+
 fn parse_echo_expr(source: &str) -> Expr {
     let program = doriac::parse_source("test.doria", source).expect("parse should succeed");
     let Item::Statement(Stmt::Echo { expr, .. }) = &program.items[0] else {
@@ -84,6 +144,162 @@ fn parses_boolean_word_operators() {
             op: UnaryOp::Not,
             ..
         }
+    ));
+}
+
+#[test]
+fn parses_stage_13_unary_and_binary_operators() {
+    for (source, expected) in [
+        ("echo -$value;", UnaryOp::Negate),
+        ("echo ~$value;", UnaryOp::BitwiseNot),
+    ] {
+        assert!(matches!(
+            parse_echo_expr(source),
+            Expr::Unary { op, .. } if op == expected
+        ));
+    }
+
+    for (source, expected) in [
+        ("echo $a / $b;", BinaryOp::Div),
+        ("echo $a % $b;", BinaryOp::Mod),
+        ("echo $a << $b;", BinaryOp::ShiftLeft),
+        ("echo $a >> $b;", BinaryOp::ShiftRight),
+        ("echo $a & $b;", BinaryOp::BitwiseAnd),
+        ("echo $a ^ $b;", BinaryOp::BitwiseXor),
+        ("echo $a | $b;", BinaryOp::BitwiseOr),
+    ] {
+        assert!(matches!(
+            parse_echo_expr(source),
+            Expr::Binary { op, .. } if op == expected
+        ));
+    }
+}
+
+#[test]
+fn parses_shift_below_additive_precedence() {
+    let Expr::Binary {
+        left,
+        op: BinaryOp::ShiftLeft,
+        right,
+        ..
+    } = parse_echo_expr("echo 1 + 2 << 1;")
+    else {
+        panic!("expected outer shift-left expression");
+    };
+
+    assert!(matches!(
+        left.as_ref(),
+        Expr::Binary {
+            op: BinaryOp::Add,
+            ..
+        }
+    ));
+    assert!(matches!(right.as_ref(), Expr::Int { value, .. } if value == "1"));
+}
+
+#[test]
+fn parses_equality_before_bitwise_and() {
+    let Expr::Binary {
+        left,
+        op: BinaryOp::BitwiseAnd,
+        right,
+        ..
+    } = parse_echo_expr("echo 1 & 2 == 0;")
+    else {
+        panic!("expected outer bitwise-and expression");
+    };
+
+    assert!(matches!(left.as_ref(), Expr::Int { value, .. } if value == "1"));
+    assert!(matches!(
+        right.as_ref(),
+        Expr::Binary {
+            op: BinaryOp::Equal,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn keeps_bitwise_and_boolean_xor_distinct() {
+    assert!(matches!(
+        parse_echo_expr("echo $a ^ $b;"),
+        Expr::Binary {
+            op: BinaryOp::BitwiseXor,
+            ..
+        }
+    ));
+    assert!(matches!(
+        parse_echo_expr("echo $a xor $b;"),
+        Expr::Binary {
+            op: BinaryOp::Xor,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn parses_all_stage_13_compound_assignments() {
+    let program = doriac::parse_source(
+        "test.doria",
+        r#"
+$value += 1;
+$value -= 1;
+$value *= 1;
+$value /= 1;
+$value %= 1;
+$value <<= 1;
+$value >>= 1;
+$value &= 1;
+$value |= 1;
+$value ^= 1;
+"#,
+    )
+    .expect("compound assignments should parse");
+
+    let expected = [
+        AssignOp::AddAssign,
+        AssignOp::SubAssign,
+        AssignOp::MulAssign,
+        AssignOp::DivAssign,
+        AssignOp::ModAssign,
+        AssignOp::ShiftLeftAssign,
+        AssignOp::ShiftRightAssign,
+        AssignOp::BitwiseAndAssign,
+        AssignOp::BitwiseOrAssign,
+        AssignOp::BitwiseXorAssign,
+    ];
+
+    for (item, expected) in program.items.iter().zip(expected) {
+        assert!(matches!(
+            item,
+            Item::Statement(Stmt::Assignment(assignment)) if assignment.op == expected
+        ));
+    }
+}
+
+#[test]
+fn structural_lowering_preserves_stage_13_operator_variants() {
+    let ast = doriac::parse_source(
+        "test.doria",
+        "$value <<= 1; echo ~-$value | $mask ^ $other & 1;",
+    )
+    .expect("parse should succeed");
+    let hir = doriac::lowering::lower_program(&ast);
+
+    assert!(matches!(
+        &hir.items[0],
+        doriac::hir::Item::Statement(doriac::hir::Stmt::Assignment(assignment))
+            if assignment.op == AssignOp::ShiftLeftAssign
+    ));
+    assert!(matches!(
+        &hir.items[1],
+        doriac::hir::Item::Statement(doriac::hir::Stmt::Echo {
+            expr: doriac::hir::Expr::Binary {
+                op: BinaryOp::BitwiseOr,
+                ..
+            },
+            ..
+        })
     ));
 }
 

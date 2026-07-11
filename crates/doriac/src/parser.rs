@@ -7,6 +7,7 @@ use crate::types::TypeRef;
 pub struct Parser {
     tokens: Vec<Token>,
     current: usize,
+    pending_type_argument_close: Option<Span>,
     diagnostics: Vec<Diagnostic>,
 }
 
@@ -15,6 +16,7 @@ impl Parser {
         Self {
             tokens,
             current: 0,
+            pending_type_argument_close: None,
             diagnostics: Vec::new(),
         }
     }
@@ -289,6 +291,8 @@ impl Parser {
 
         if self.can_start_typed_decl() {
             let checkpoint = self.current;
+            let diagnostics_checkpoint = self.diagnostics.len();
+            let pending_type_argument_close_checkpoint = self.pending_type_argument_close;
             let start = self.peek().span.start;
             let writable = self.match_kind(&TokenKind::Writable);
             if let Some(ty) = self.parse_type_ref() {
@@ -312,6 +316,8 @@ impl Parser {
                 }
             }
             self.current = checkpoint;
+            self.pending_type_argument_close = pending_type_argument_close_checkpoint;
+            self.diagnostics.truncate(diagnostics_checkpoint);
         }
 
         let expr = self.parse_expression()?;
@@ -686,12 +692,22 @@ impl Parser {
     }
 
     fn parse_unary(&mut self) -> Option<Expr> {
-        if self.match_kind(&TokenKind::Bang) || self.match_kind(&TokenKind::Not) {
+        let op = if self.match_kind(&TokenKind::Bang) || self.match_kind(&TokenKind::Not) {
+            Some(UnaryOp::Not)
+        } else if self.match_kind(&TokenKind::Minus) {
+            Some(UnaryOp::Negate)
+        } else if self.match_kind(&TokenKind::Tilde) {
+            Some(UnaryOp::BitwiseNot)
+        } else {
+            None
+        };
+
+        if let Some(op) = op {
             let op_span = self.previous().span;
             let expr = self.parse_unary()?;
             let span = op_span.merge(expr.span());
             return Some(Expr::Unary {
-                op: UnaryOp::Not,
+                op,
                 expr: Box::new(expr),
                 span,
             });
@@ -1068,10 +1084,32 @@ impl Parser {
     }
 
     fn parse_type_ref(&mut self) -> Option<TypeRef> {
+        let ty = self.parse_type_ref_inner();
+        match (ty, self.pending_type_argument_close.take()) {
+            (Some(ty), None) => Some(ty),
+            (Some(_), Some(span)) => {
+                self.error("unexpected `>` after type", span);
+                None
+            }
+            (None, _) => None,
+        }
+    }
+
+    fn parse_type_ref_inner(&mut self) -> Option<TypeRef> {
         let name = match self.advance().kind.clone() {
             TokenKind::Void => "void".to_string(),
             TokenKind::IntType => "int".to_string(),
+            TokenKind::Int8Type => "int8".to_string(),
+            TokenKind::Int16Type => "int16".to_string(),
+            TokenKind::Int32Type => "int32".to_string(),
+            TokenKind::Int64Type => "int64".to_string(),
+            TokenKind::UInt8Type => "uint8".to_string(),
+            TokenKind::UInt16Type => "uint16".to_string(),
+            TokenKind::UInt32Type => "uint32".to_string(),
+            TokenKind::UInt64Type => "uint64".to_string(),
             TokenKind::FloatType => "float".to_string(),
+            TokenKind::Float32Type => "float32".to_string(),
+            TokenKind::Float64Type => "float64".to_string(),
             TokenKind::StringType => "string".to_string(),
             TokenKind::BoolType => "bool".to_string(),
             TokenKind::Null => "null".to_string(),
@@ -1088,15 +1126,12 @@ impl Parser {
         let mut args = Vec::new();
         if self.match_kind(&TokenKind::Less) {
             loop {
-                args.push(self.parse_type_ref()?);
+                args.push(self.parse_type_ref_inner()?);
                 if !self.match_kind(&TokenKind::Comma) {
                     break;
                 }
             }
-            self.expect(
-                TokenKind::Greater,
-                "expected `>` after generic type arguments",
-            )?;
+            self.expect_type_argument_close()?;
         }
 
         let mut ty = if args.is_empty() {
@@ -1105,7 +1140,8 @@ impl Parser {
             TypeRef::generic(name, args)
         };
 
-        while self.match_kind(&TokenKind::LeftBracket) {
+        while self.pending_type_argument_close.is_none() && self.match_kind(&TokenKind::LeftBracket)
+        {
             self.expect(
                 TokenKind::RightBracket,
                 "expected `]` after typed array suffix",
@@ -1114,6 +1150,30 @@ impl Parser {
         }
 
         Some(ty)
+    }
+
+    fn expect_type_argument_close(&mut self) -> Option<()> {
+        if self.pending_type_argument_close.take().is_some() {
+            return Some(());
+        }
+
+        if self.check(&TokenKind::Greater) {
+            self.advance();
+            return Some(());
+        }
+
+        if self.check(&TokenKind::ShiftRight) {
+            let span = self.advance().span;
+            let split = span.start + 1;
+            self.pending_type_argument_close = Some(Span::new(split, span.end));
+            return Some(());
+        }
+
+        self.error(
+            "expected `>` after generic type arguments",
+            self.peek().span,
+        );
+        None
     }
 
     fn parse_member_access(&mut self) -> MemberAccess {
@@ -1131,6 +1191,22 @@ impl Parser {
             Some(AssignOp::AddAssign)
         } else if self.match_kind(&TokenKind::MinusEquals) {
             Some(AssignOp::SubAssign)
+        } else if self.match_kind(&TokenKind::StarEquals) {
+            Some(AssignOp::MulAssign)
+        } else if self.match_kind(&TokenKind::SlashEquals) {
+            Some(AssignOp::DivAssign)
+        } else if self.match_kind(&TokenKind::PercentEquals) {
+            Some(AssignOp::ModAssign)
+        } else if self.match_kind(&TokenKind::ShiftLeftEquals) {
+            Some(AssignOp::ShiftLeftAssign)
+        } else if self.match_kind(&TokenKind::ShiftRightEquals) {
+            Some(AssignOp::ShiftRightAssign)
+        } else if self.match_kind(&TokenKind::AmpersandEquals) {
+            Some(AssignOp::BitwiseAndAssign)
+        } else if self.match_kind(&TokenKind::PipeEquals) {
+            Some(AssignOp::BitwiseOrAssign)
+        } else if self.match_kind(&TokenKind::CaretEquals) {
+            Some(AssignOp::BitwiseXorAssign)
         } else {
             None
         }
@@ -1142,18 +1218,23 @@ impl Parser {
             TokenKind::Xor => Some((BinaryOp::Xor, 1)),
             TokenKind::AndAnd | TokenKind::And => Some((BinaryOp::And, 2)),
             TokenKind::QuestionQuestion => Some((BinaryOp::Coalesce, 3)),
-            TokenKind::EqualEqual => Some((BinaryOp::Equal, 4)),
-            TokenKind::BangEqual => Some((BinaryOp::NotEqual, 4)),
-            TokenKind::Less => Some((BinaryOp::Less, 5)),
-            TokenKind::LessEqual => Some((BinaryOp::LessEqual, 5)),
-            TokenKind::Greater => Some((BinaryOp::Greater, 5)),
-            TokenKind::GreaterEqual => Some((BinaryOp::GreaterEqual, 5)),
-            TokenKind::Plus => Some((BinaryOp::Add, 6)),
-            TokenKind::Minus => Some((BinaryOp::Sub, 6)),
-            TokenKind::Dot => Some((BinaryOp::Concat, 6)),
-            TokenKind::Star => Some((BinaryOp::Mul, 7)),
-            TokenKind::Slash => Some((BinaryOp::Div, 7)),
-            TokenKind::Percent => Some((BinaryOp::Mod, 7)),
+            TokenKind::Pipe => Some((BinaryOp::BitwiseOr, 4)),
+            TokenKind::Caret => Some((BinaryOp::BitwiseXor, 5)),
+            TokenKind::Ampersand => Some((BinaryOp::BitwiseAnd, 6)),
+            TokenKind::EqualEqual => Some((BinaryOp::Equal, 7)),
+            TokenKind::BangEqual => Some((BinaryOp::NotEqual, 7)),
+            TokenKind::Less => Some((BinaryOp::Less, 8)),
+            TokenKind::LessEqual => Some((BinaryOp::LessEqual, 8)),
+            TokenKind::Greater => Some((BinaryOp::Greater, 8)),
+            TokenKind::GreaterEqual => Some((BinaryOp::GreaterEqual, 8)),
+            TokenKind::ShiftLeft => Some((BinaryOp::ShiftLeft, 9)),
+            TokenKind::ShiftRight => Some((BinaryOp::ShiftRight, 9)),
+            TokenKind::Plus => Some((BinaryOp::Add, 10)),
+            TokenKind::Minus => Some((BinaryOp::Sub, 10)),
+            TokenKind::Dot => Some((BinaryOp::Concat, 10)),
+            TokenKind::Star => Some((BinaryOp::Mul, 11)),
+            TokenKind::Slash => Some((BinaryOp::Div, 11)),
+            TokenKind::Percent => Some((BinaryOp::Mod, 11)),
             _ => None,
         }
     }
@@ -1164,7 +1245,17 @@ impl Parser {
             TokenKind::Writable
                 | TokenKind::Void
                 | TokenKind::IntType
+                | TokenKind::Int8Type
+                | TokenKind::Int16Type
+                | TokenKind::Int32Type
+                | TokenKind::Int64Type
+                | TokenKind::UInt8Type
+                | TokenKind::UInt16Type
+                | TokenKind::UInt32Type
+                | TokenKind::UInt64Type
                 | TokenKind::FloatType
+                | TokenKind::Float32Type
+                | TokenKind::Float64Type
                 | TokenKind::StringType
                 | TokenKind::BoolType
                 | TokenKind::Null
@@ -1305,7 +1396,17 @@ fn token_name(kind: &TokenKind) -> &'static str {
         TokenKind::Null => "null",
         TokenKind::Void => "void",
         TokenKind::IntType => "int",
+        TokenKind::Int8Type => "int8",
+        TokenKind::Int16Type => "int16",
+        TokenKind::Int32Type => "int32",
+        TokenKind::Int64Type => "int64",
+        TokenKind::UInt8Type => "uint8",
+        TokenKind::UInt16Type => "uint16",
+        TokenKind::UInt32Type => "uint32",
+        TokenKind::UInt64Type => "uint64",
         TokenKind::FloatType => "float",
+        TokenKind::Float32Type => "float32",
+        TokenKind::Float64Type => "float64",
         TokenKind::StringType => "string",
         TokenKind::BoolType => "bool",
         TokenKind::Reserved(_) => "reserved keyword",
@@ -1327,6 +1428,14 @@ fn token_name(kind: &TokenKind) -> &'static str {
         TokenKind::MinusMinus => "--",
         TokenKind::PlusEquals => "+=",
         TokenKind::MinusEquals => "-=",
+        TokenKind::StarEquals => "*=",
+        TokenKind::SlashEquals => "/=",
+        TokenKind::PercentEquals => "%=",
+        TokenKind::ShiftLeftEquals => "<<=",
+        TokenKind::ShiftRightEquals => ">>=",
+        TokenKind::AmpersandEquals => "&=",
+        TokenKind::PipeEquals => "|=",
+        TokenKind::CaretEquals => "^=",
         TokenKind::EqualEqual => "==",
         TokenKind::EqualEqualEqual => "===",
         TokenKind::BangEqual => "!=",
@@ -1335,6 +1444,12 @@ fn token_name(kind: &TokenKind) -> &'static str {
         TokenKind::LessEqual => "<=",
         TokenKind::Greater => ">",
         TokenKind::GreaterEqual => ">=",
+        TokenKind::ShiftLeft => "<<",
+        TokenKind::ShiftRight => ">>",
+        TokenKind::Ampersand => "&",
+        TokenKind::Pipe => "|",
+        TokenKind::Caret => "^",
+        TokenKind::Tilde => "~",
         TokenKind::AndAnd => "&&",
         TokenKind::OrOr => "||",
         TokenKind::Bang => "!",

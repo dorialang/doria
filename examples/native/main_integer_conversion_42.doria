@@ -1,0 +1,6 @@
+function main(): int
+{
+    uint64 $value = 42;
+
+    return Int::from($value);
+}

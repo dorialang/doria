@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::ast::*;
 use crate::diagnostics::{Diagnostic, DiagnosticResult};
+use crate::numeric::{parse_decimal_magnitude, FloatType, IntegerType, IntegerValue};
 use crate::source::Span;
 use crate::symbols::{
     Binding, ClassInfo, FunctionInfo, MethodInfo, ParamInfo, PropertyInfo, PropertyInitState,
@@ -9,14 +10,47 @@ use crate::symbols::{
 };
 use crate::types::{TypeId, TypeKind, TypeRef, TypeRegistry};
 
-pub fn check_program(program: &Program) -> DiagnosticResult<()> {
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SemanticInfo {
+    /// Canonical integer type for every integer-valued source expression.
+    ///
+    /// Spans are stable across AST-to-HIR structural lowering, so the MIR
+    /// lowering pass can consume semantic decisions without re-parsing type
+    /// names or guessing contextual literal types.
+    pub integer_expression_types: HashMap<(usize, usize), IntegerType>,
+    /// Canonical width for every floating-point-valued source expression.
+    pub float_expression_types: HashMap<(usize, usize), FloatType>,
+}
+
+impl SemanticInfo {
+    pub fn integer_type(&self, span: Span) -> Option<IntegerType> {
+        self.integer_expression_types
+            .get(&(span.start, span.end))
+            .copied()
+    }
+
+    pub fn float_type(&self, span: Span) -> Option<FloatType> {
+        self.float_expression_types
+            .get(&(span.start, span.end))
+            .copied()
+    }
+}
+
+pub fn analyze_program(program: &Program) -> DiagnosticResult<SemanticInfo> {
     let mut checker = Checker::new(program);
     checker.check();
     if checker.diagnostics.is_empty() {
-        Ok(())
+        Ok(SemanticInfo {
+            integer_expression_types: checker.integer_expression_types,
+            float_expression_types: checker.float_expression_types,
+        })
     } else {
         Err(checker.diagnostics)
     }
+}
+
+pub fn check_program(program: &Program) -> DiagnosticResult<()> {
+    analyze_program(program).map(|_| ())
 }
 
 struct Checker<'program> {
@@ -26,6 +60,11 @@ struct Checker<'program> {
     function_signatures: HashMap<usize, FunctionInfo>,
     types: TypeRegistry,
     diagnostics: Vec<Diagnostic>,
+    integer_expression_types: HashMap<(usize, usize), IntegerType>,
+    float_expression_types: HashMap<(usize, usize), FloatType>,
+    integer_literals: HashMap<(usize, usize), u128>,
+    negative_integer_literals: HashMap<(usize, usize), u128>,
+    negated_integer_literal_operands: HashSet<(usize, usize)>,
 }
 
 #[derive(Debug, Clone)]
@@ -135,7 +174,7 @@ enum AssignmentDestination {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum IntConstantEval {
-    Known(i64),
+    Known(IntegerValue),
     Unknown,
     Invalid,
 }
@@ -149,6 +188,11 @@ impl<'program> Checker<'program> {
             function_signatures: HashMap::new(),
             types: TypeRegistry::new(),
             diagnostics: Vec::new(),
+            integer_expression_types: HashMap::new(),
+            float_expression_types: HashMap::new(),
+            integer_literals: HashMap::new(),
+            negative_integer_literals: HashMap::new(),
+            negated_integer_literal_operands: HashSet::new(),
         }
     }
 
@@ -167,6 +211,7 @@ impl<'program> Checker<'program> {
                 Item::Class(class_decl) => self.check_class(class_decl),
             }
         }
+        self.check_pending_integer_literal_ranges();
     }
 
     fn collect_classes(&mut self) {
@@ -273,6 +318,11 @@ impl<'program> Checker<'program> {
     }
 
     fn reserved_class_name_message(name: &str) -> Option<String> {
+        if IntegerType::from_companion_name(name).is_some() {
+            return Some(format!(
+                "`{name}` is a compiler-known integer companion and cannot be redeclared"
+            ));
+        }
         match name {
             "array" => Some(
                 "`array` is not a Doria class name; use typed arrays like `T[]` or collection aliases"
@@ -294,6 +344,11 @@ impl<'program> Checker<'program> {
     }
 
     fn reserved_callable_name_message(name: &str) -> Option<String> {
+        if IntegerType::from_companion_name(name).is_some() {
+            return Some(format!(
+                "`{name}` is a compiler-known integer companion and cannot be redeclared"
+            ));
+        }
         match name {
             "panic" => Some(
                 "`panic` is a compiler-known Doria built-in and cannot be redeclared".to_string(),
@@ -884,16 +939,22 @@ impl<'program> Checker<'program> {
     ) -> (TypeId, TypeId) {
         let unknown = self.types.unknown();
         if Self::is_grouped_range_expr(&foreach.iterable) {
-            let int = self.types.intern(TypeKind::Int);
-            return (unknown, int);
+            let integer = self
+                .range_integer_type(&foreach.iterable, scopes, method_context)
+                .unwrap_or(IntegerType::Int64);
+            return (unknown, self.types.intern(TypeKind::Integer(integer)));
         }
 
         let iterable_ty = self.infer_expr_type(&foreach.iterable, scopes, method_context);
         match self.types.kind(iterable_ty).clone() {
-            TypeKind::List(value) | TypeKind::Set(value) => {
-                (self.types.intern(TypeKind::Int), value)
-            }
-            TypeKind::TypedArray(value) => (self.types.intern(TypeKind::Int), value),
+            TypeKind::List(value) | TypeKind::Set(value) => (
+                self.types.intern(TypeKind::Integer(IntegerType::Int64)),
+                value,
+            ),
+            TypeKind::TypedArray(value) => (
+                self.types.intern(TypeKind::Integer(IntegerType::Int64)),
+                value,
+            ),
             TypeKind::Dictionary(key, value) => (key, value),
             TypeKind::Mixed => (unknown, self.types.intern(TypeKind::Mixed)),
             _ => (unknown, unknown),
@@ -901,10 +962,16 @@ impl<'program> Checker<'program> {
     }
 
     fn resolve_type_ref_for_return_inference(&mut self, ty: &TypeRef) -> TypeId {
+        if ty.args.is_empty() {
+            if let Some(integer) = IntegerType::from_source_name(&ty.name) {
+                return self.types.intern(TypeKind::Integer(integer));
+            }
+            if let Some(float) = FloatType::from_source_name(&ty.name) {
+                return self.types.intern(TypeKind::Float(float));
+            }
+        }
         match ty.name.as_str() {
             "void" if ty.args.is_empty() => self.types.intern(TypeKind::Void),
-            "int" if ty.args.is_empty() => self.types.intern(TypeKind::Int),
-            "float" if ty.args.is_empty() => self.types.intern(TypeKind::Float),
             "string" if ty.args.is_empty() => self.types.intern(TypeKind::String),
             "bool" if ty.args.is_empty() => self.types.intern(TypeKind::Bool),
             "mixed" if ty.args.is_empty() => self.types.intern(TypeKind::Mixed),
@@ -1063,6 +1130,24 @@ impl<'program> Checker<'program> {
     fn check_function(&mut self, function: &FunctionDecl, method_context: Option<MethodContext>) {
         let mut scopes = ScopeStack::new();
         let signature = self.current_function_signature(function);
+        if method_context.is_none() && function.name == "main" {
+            if let TypeKind::Integer(integer) = self.types.kind(signature.return_ty) {
+                if *integer != IntegerType::Int64 {
+                    self.diagnostics.push(
+                        Diagnostic::new(
+                            "E0442",
+                            format!(
+                                "process entrypoint `main` cannot return `{integer}`; expected `void`, `int`, or `int64`"
+                            ),
+                            function.span,
+                        )
+                        .with_help(
+                            "helper functions may use every fixed-width integer return type",
+                        ),
+                    );
+                }
+            }
+        }
         let return_context = self.return_context_for_function(function, method_context.as_ref());
         for (param, param_info) in function.params.iter().zip(signature.params.iter()) {
             let ty = param_info.ty;
@@ -1236,7 +1321,12 @@ impl<'program> Checker<'program> {
                         );
                         target_ty
                     }
-                    None => value_ty,
+                    None => {
+                        if let TypeKind::Integer(integer) = *self.types.kind(value_ty) {
+                            self.contextualize_integer_literals(&decl.initializer, integer);
+                        }
+                        value_ty
+                    }
                 };
                 self.declare_binding(
                     scopes,
@@ -1376,8 +1466,22 @@ impl<'program> Checker<'program> {
             }
             Stmt::Foreach(foreach) => {
                 let range_iterable = Self::is_grouped_range_expr(&foreach.iterable);
+                if range_iterable {
+                    if let Some(integer) = foreach
+                        .value
+                        .ty
+                        .as_ref()
+                        .and_then(|ty| ty.args.is_empty().then_some(ty))
+                        .and_then(|ty| IntegerType::from_source_name(&ty.name))
+                    {
+                        self.contextualize_range_literals(&foreach.iterable, integer);
+                    }
+                }
                 let unknown_ty = self.types.unknown();
-                let int_ty = self.types.intern(TypeKind::Int);
+                let range_integer = self
+                    .range_integer_type(&foreach.iterable, scopes, method_context)
+                    .unwrap_or(IntegerType::Int64);
+                let int_ty = self.types.intern(TypeKind::Integer(range_integer));
                 let (iterable_key_ty, iterable_value_ty) = if range_iterable {
                     (unknown_ty, int_ty)
                 } else {
@@ -1504,7 +1608,12 @@ impl<'program> Checker<'program> {
                         );
                         target_ty
                     }
-                    None => value_ty,
+                    None => {
+                        if let TypeKind::Integer(integer) = *self.types.kind(value_ty) {
+                            self.contextualize_integer_literals(&decl.initializer, integer);
+                        }
+                        value_ty
+                    }
                 };
                 self.declare_binding(
                     scopes,
@@ -1595,8 +1704,24 @@ impl<'program> Checker<'program> {
                     );
                 }
             }
-            AssignOp::AddAssign | AssignOp::SubAssign => {
-                let value_ty = self.infer_expr_type(&assignment.value, scopes, method_context);
+            AssignOp::AddAssign
+            | AssignOp::SubAssign
+            | AssignOp::MulAssign
+            | AssignOp::DivAssign
+            | AssignOp::ModAssign
+            | AssignOp::ShiftLeftAssign
+            | AssignOp::ShiftRightAssign
+            | AssignOp::BitwiseAndAssign
+            | AssignOp::BitwiseOrAssign
+            | AssignOp::BitwiseXorAssign => {
+                let mut value_ty = self.infer_expr_type(&assignment.value, scopes, method_context);
+                if let TypeKind::Integer(integer) = *self.types.kind(target.ty) {
+                    self.contextualize_integer_literals(&assignment.value, integer);
+                    value_ty = self.infer_expr_type(&assignment.value, scopes, method_context);
+                } else if let TypeKind::Float(float) = *self.types.kind(target.ty) {
+                    self.contextualize_float_literals(&assignment.value, float);
+                    value_ty = self.infer_expr_type(&assignment.value, scopes, method_context);
+                }
                 let target_contains_mixed = self.type_contains_mixed(target.ty);
                 let value_contains_mixed = self.type_contains_mixed(value_ty);
 
@@ -1612,14 +1737,48 @@ impl<'program> Checker<'program> {
                     return;
                 }
 
+                let integers_only = matches!(
+                    assignment.op,
+                    AssignOp::ModAssign
+                        | AssignOp::ShiftLeftAssign
+                        | AssignOp::ShiftRightAssign
+                        | AssignOp::BitwiseAndAssign
+                        | AssignOp::BitwiseOrAssign
+                        | AssignOp::BitwiseXorAssign
+                );
                 let result_ty = self.infer_numeric_binary_type(target.ty, value_ty);
-                if !self.is_assignable(target.ty, result_ty) {
-                    self.check_assignable(
+                if integers_only
+                    && !matches!(
+                        self.types.kind(result_ty),
+                        TypeKind::Integer(_) | TypeKind::Unknown
+                    )
+                {
+                    self.report_integer_operand_mismatch(
                         target.ty,
-                        result_ty,
-                        assignment.value.span(),
-                        target.destination,
+                        value_ty,
+                        assignment.span,
+                        "compound assignment",
                     );
+                    return;
+                }
+                if !self.is_assignable(target.ty, result_ty) {
+                    if matches!(self.types.kind(target.ty), TypeKind::Integer(_))
+                        && matches!(self.types.kind(value_ty), TypeKind::Integer(_))
+                    {
+                        self.report_integer_operand_mismatch(
+                            target.ty,
+                            value_ty,
+                            assignment.span,
+                            "compound assignment",
+                        );
+                    } else {
+                        self.check_assignable(
+                            target.ty,
+                            result_ty,
+                            assignment.value.span(),
+                            target.destination,
+                        );
+                    }
                 }
             }
         }
@@ -1671,14 +1830,14 @@ impl<'program> Checker<'program> {
 
                 if matches!(
                     self.types.kind(binding.ty),
-                    TypeKind::Int | TypeKind::Unknown
+                    TypeKind::Integer(_) | TypeKind::Unknown
                 ) {
                     return;
                 }
 
                 self.diagnostics.push(Diagnostic::new(
                     "E0423",
-                    format!("{op_name} requires writable int target"),
+                    format!("{op_name} requires a writable integer target"),
                     *span,
                 ));
             }
@@ -2002,7 +2161,18 @@ impl<'program> Checker<'program> {
             Expr::Grouped { expr, .. } => {
                 self.check_expr_with_range_context(expr, scopes, method_context, allow_range_expr)
             }
-            Expr::Unary { op, expr, .. } => {
+            Expr::Unary { op, expr, span } => {
+                if *op == UnaryOp::Negate {
+                    if let (Some(magnitude), Some(operand_span)) = (
+                        Self::unsigned_integer_literal_magnitude(expr),
+                        Self::unsigned_integer_literal_span(expr),
+                    ) {
+                        self.negative_integer_literals
+                            .insert((span.start, span.end), magnitude);
+                        self.negated_integer_literal_operands
+                            .insert((operand_span.start, operand_span.end));
+                    }
+                }
                 self.check_expr(expr, scopes, method_context);
                 self.check_unary_operand(op, expr, scopes, method_context);
             }
@@ -2014,7 +2184,6 @@ impl<'program> Checker<'program> {
             } => {
                 self.check_expr(left, scopes, method_context);
                 self.check_expr(right, scopes, method_context);
-                self.check_int_constant_arithmetic(left, op, right, *span, scopes);
                 self.check_mixed_binary_operands(left, right, *span, scopes, method_context);
                 self.check_binary_operands(left, op, right, *span, scopes, method_context);
             }
@@ -2023,8 +2192,7 @@ impl<'program> Checker<'program> {
             } => {
                 self.check_expr(start, scopes, method_context);
                 self.check_expr(end, scopes, method_context);
-                self.check_range_endpoint_type(start, scopes, method_context);
-                self.check_range_endpoint_type(end, scopes, method_context);
+                self.check_range_operands(start, end, *span, scopes, method_context);
                 if !allow_range_expr {
                     self.diagnostics.push(Diagnostic::new(
                         "E0426",
@@ -2038,7 +2206,14 @@ impl<'program> Checker<'program> {
             | Expr::Float { .. }
             | Expr::Bool { .. }
             | Expr::Null { .. } => {}
-            Expr::Int { value, span } => self.check_int_literal_range(value, *span),
+            Expr::Int { value, span } => {
+                if let Some(magnitude) = parse_decimal_magnitude(value) {
+                    self.integer_literals
+                        .insert((span.start, span.end), magnitude);
+                } else {
+                    self.report_integer_literal_range(*span, IntegerType::Int64);
+                }
+            }
         }
     }
 
@@ -2050,31 +2225,254 @@ impl<'program> Checker<'program> {
         }
     }
 
-    fn check_range_endpoint_type(
+    fn range_integer_type(
         &mut self,
         expr: &Expr,
         scopes: &ScopeStack,
         method_context: Option<&MethodContext>,
+    ) -> Option<IntegerType> {
+        match expr {
+            Expr::Grouped { expr, .. } => self.range_integer_type(expr, scopes, method_context),
+            Expr::Range { start, end, .. } => {
+                let ty = self.infer_binary_type(start, &BinaryOp::Add, end, scopes, method_context);
+                match self.types.kind(ty) {
+                    TypeKind::Integer(integer) => Some(*integer),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn check_range_operands(
+        &mut self,
+        start: &Expr,
+        end: &Expr,
+        span: Span,
+        scopes: &ScopeStack,
+        method_context: Option<&MethodContext>,
     ) {
-        let ty = self.infer_expr_type(expr, scopes, method_context);
-        if matches!(self.types.kind(ty), TypeKind::Int | TypeKind::Unknown) {
+        let (start_ty, end_ty) =
+            self.infer_contextual_binary_operand_types(start, end, scopes, method_context);
+        match (self.types.kind(start_ty), self.types.kind(end_ty)) {
+            (TypeKind::Integer(start), TypeKind::Integer(end)) if start == end => {}
+            (TypeKind::Integer(_), TypeKind::Integer(_)) => {
+                self.report_integer_operand_mismatch(start_ty, end_ty, span, "range")
+            }
+            (TypeKind::Unknown, _) | (_, TypeKind::Unknown) => {}
+            _ => self.diagnostics.push(Diagnostic::new(
+                "E0424",
+                format!(
+                    "range endpoints must be integers of the same type, got `{}` and `{}`",
+                    self.types.display(start_ty),
+                    self.types.display(end_ty)
+                ),
+                span,
+            )),
+        }
+    }
+
+    fn contextualize_range_literals(&mut self, expr: &Expr, target: IntegerType) {
+        match expr {
+            Expr::Grouped { expr, .. } => self.contextualize_range_literals(expr, target),
+            Expr::Range { start, end, .. } => {
+                self.contextualize_integer_literals(start, target);
+                self.contextualize_integer_literals(end, target);
+            }
+            _ => {}
+        }
+    }
+
+    fn report_integer_literal_range(&mut self, span: Span, target: IntegerType) {
+        if self
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E0417" && diagnostic.span == span)
+        {
             return;
         }
 
-        self.diagnostics.push(Diagnostic::new(
-            "E0424",
-            "range endpoints must be int",
-            expr.span(),
-        ));
+        let mut diagnostic = Diagnostic::new(
+            "E0417",
+            format!(
+                "integer literal is outside the Doria `{}` range",
+                target.source_name()
+            ),
+            span,
+        );
+        if target == IntegerType::Int64 {
+            diagnostic = diagnostic.with_help(
+                "unconstrained integer literals default to `int`; add a `uint64` context when that is intended",
+            );
+        }
+        self.diagnostics.push(diagnostic);
     }
 
-    fn check_int_literal_range(&mut self, value: &str, span: Span) {
-        if value.parse::<i64>().is_err() {
-            self.diagnostics.push(Diagnostic::new(
-                "E0417",
-                "integer literal is outside the Doria `int` range",
-                span,
-            ));
+    fn check_pending_integer_literal_ranges(&mut self) {
+        let mut literals = Vec::new();
+        for ((start, end), magnitude) in &self.integer_literals {
+            if self
+                .negated_integer_literal_operands
+                .contains(&(*start, *end))
+            {
+                continue;
+            }
+            literals.push((*start, *end, *magnitude, false));
+        }
+        literals.extend(
+            self.negative_integer_literals
+                .iter()
+                .map(|((start, end), magnitude)| (*start, *end, *magnitude, true)),
+        );
+        literals.sort_unstable_by_key(|(start, end, _, _)| (*start, *end));
+
+        for (start, end, magnitude, negative) in literals {
+            let span = Span { start, end };
+            let target = self
+                .integer_expression_types
+                .get(&(start, end))
+                .copied()
+                .unwrap_or(IntegerType::Int64);
+            if IntegerValue::from_literal(target, magnitude, negative).is_none() {
+                self.report_integer_literal_range(span, target);
+            }
+        }
+    }
+
+    fn integer_literal_parts(expr: &Expr) -> Option<(u128, bool)> {
+        match expr {
+            Expr::Int { value, .. } => parse_decimal_magnitude(value).map(|value| (value, false)),
+            Expr::Grouped { expr, .. } => Self::integer_literal_parts(expr),
+            Expr::Unary {
+                op: UnaryOp::Negate,
+                expr,
+                ..
+            } => Self::unsigned_integer_literal_magnitude(expr).map(|value| (value, true)),
+            _ => None,
+        }
+    }
+
+    fn unsigned_integer_literal_magnitude(expr: &Expr) -> Option<u128> {
+        match expr {
+            Expr::Int { value, .. } => parse_decimal_magnitude(value),
+            Expr::Grouped { expr, .. } => Self::unsigned_integer_literal_magnitude(expr),
+            _ => None,
+        }
+    }
+
+    fn unsigned_integer_literal_span(expr: &Expr) -> Option<Span> {
+        match expr {
+            Expr::Int { span, .. } => Some(*span),
+            Expr::Grouped { expr, .. } => Self::unsigned_integer_literal_span(expr),
+            _ => None,
+        }
+    }
+
+    fn record_integer_expression_type(&mut self, expr: &Expr, integer: IntegerType) {
+        self.integer_expression_types
+            .insert((expr.span().start, expr.span().end), integer);
+        match expr {
+            Expr::Grouped { expr, .. }
+            | Expr::Unary {
+                op: UnaryOp::Negate,
+                expr,
+                ..
+            } => self.record_integer_expression_type(expr, integer),
+            _ => {}
+        }
+    }
+
+    /// Returns `Some(true/false)` for a literal form and `None` for a
+    /// non-literal expression. A contextual literal is typing, not conversion.
+    fn check_contextual_integer_literal(
+        &mut self,
+        expr: &Expr,
+        target: IntegerType,
+    ) -> Option<bool> {
+        let (magnitude, negative) = Self::integer_literal_parts(expr)?;
+        if IntegerValue::from_literal(target, magnitude, negative).is_some() {
+            self.record_integer_expression_type(expr, target);
+            Some(true)
+        } else {
+            self.report_integer_literal_range(expr.span(), target);
+            Some(false)
+        }
+    }
+
+    fn contextualize_integer_literals(&mut self, expr: &Expr, target: IntegerType) {
+        if self
+            .check_contextual_integer_literal(expr, target)
+            .is_some()
+        {
+            return;
+        }
+
+        match expr {
+            Expr::Grouped { expr, .. }
+            | Expr::Unary {
+                op: UnaryOp::Negate | UnaryOp::BitwiseNot,
+                expr,
+                ..
+            } => self.contextualize_integer_literals(expr, target),
+            Expr::Binary {
+                left,
+                op:
+                    BinaryOp::Add
+                    | BinaryOp::Sub
+                    | BinaryOp::Mul
+                    | BinaryOp::Div
+                    | BinaryOp::Mod
+                    | BinaryOp::ShiftLeft
+                    | BinaryOp::ShiftRight
+                    | BinaryOp::BitwiseAnd
+                    | BinaryOp::BitwiseXor
+                    | BinaryOp::BitwiseOr,
+                right,
+                ..
+            } => {
+                self.contextualize_integer_literals(left, target);
+                self.contextualize_integer_literals(right, target);
+            }
+            _ => {}
+        }
+    }
+
+    fn is_float_literal(expr: &Expr) -> bool {
+        match expr {
+            Expr::Float { .. } => true,
+            Expr::Grouped { expr, .. } => Self::is_float_literal(expr),
+            _ => false,
+        }
+    }
+
+    fn record_float_expression_type(&mut self, expr: &Expr, float: FloatType) {
+        self.float_expression_types
+            .insert((expr.span().start, expr.span().end), float);
+        if let Expr::Grouped { expr, .. } = expr {
+            self.record_float_expression_type(expr, float);
+        }
+    }
+
+    fn contextualize_float_literals(&mut self, expr: &Expr, target: FloatType) {
+        if Self::is_float_literal(expr) {
+            self.record_float_expression_type(expr, target);
+            return;
+        }
+
+        match expr {
+            Expr::Grouped { expr, .. } => self.contextualize_float_literals(expr, target),
+            Expr::Binary {
+                left,
+                op: BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Mod,
+                right,
+                ..
+            } => {
+                self.contextualize_float_literals(left, target);
+                self.contextualize_float_literals(right, target);
+                self.float_expression_types
+                    .insert((expr.span().start, expr.span().end), target);
+            }
+            _ => {}
         }
     }
 
@@ -2106,6 +2504,45 @@ impl<'program> Checker<'program> {
                     expr.span(),
                 ));
             }
+            UnaryOp::Negate => {
+                let ty = self.infer_expr_type(expr, scopes, method_context);
+                match self.types.kind(ty) {
+                    TypeKind::Integer(integer) if integer.is_signed() => {}
+                    TypeKind::Unknown => {}
+                    TypeKind::Integer(integer) => self.diagnostics.push(
+                        Diagnostic::new(
+                            "E0440",
+                            format!("unary `-` requires a signed integer operand, got `{integer}`"),
+                            expr.span(),
+                        )
+                        .with_help("explicitly convert to a signed integer type first"),
+                    ),
+                    _ => self.diagnostics.push(Diagnostic::new(
+                        "E0440",
+                        format!(
+                            "unary `-` requires an integer operand, got `{}`",
+                            self.types.display(ty)
+                        ),
+                        expr.span(),
+                    )),
+                }
+            }
+            UnaryOp::BitwiseNot => {
+                let ty = self.infer_expr_type(expr, scopes, method_context);
+                if !matches!(
+                    self.types.kind(ty),
+                    TypeKind::Integer(_) | TypeKind::Unknown
+                ) {
+                    self.diagnostics.push(Diagnostic::new(
+                        "E0440",
+                        format!(
+                            "bitwise operator `~` requires an integer operand, got `{}`",
+                            self.types.display(ty)
+                        ),
+                        expr.span(),
+                    ));
+                }
+            }
         }
     }
 
@@ -2132,8 +2569,91 @@ impl<'program> Checker<'program> {
             BinaryOp::Concat => {
                 self.check_concat_operands(left, right, span, scopes, method_context);
             }
-            _ => {}
+            BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div => {
+                self.check_numeric_binary_operands(left, right, span, scopes, method_context, false)
+            }
+            BinaryOp::Mod
+            | BinaryOp::ShiftLeft
+            | BinaryOp::ShiftRight
+            | BinaryOp::BitwiseAnd
+            | BinaryOp::BitwiseXor
+            | BinaryOp::BitwiseOr => {
+                self.check_numeric_binary_operands(left, right, span, scopes, method_context, true)
+            }
+            BinaryOp::Less | BinaryOp::LessEqual | BinaryOp::Greater | BinaryOp::GreaterEqual => {
+                let (left_ty, right_ty) =
+                    self.infer_contextual_binary_operand_types(left, right, scopes, method_context);
+                if matches!(
+                    (self.types.kind(left_ty), self.types.kind(right_ty)),
+                    (TypeKind::Integer(left), TypeKind::Integer(right)) if left == right
+                ) || matches!(
+                    (self.types.kind(left_ty), self.types.kind(right_ty)),
+                    (TypeKind::Float(left), TypeKind::Float(right)) if left == right
+                ) || matches!(
+                    (self.types.kind(left_ty), self.types.kind(right_ty)),
+                    (TypeKind::String, TypeKind::String)
+                ) || matches!(
+                    (self.types.kind(left_ty), self.types.kind(right_ty)),
+                    (TypeKind::Unknown, _) | (_, TypeKind::Unknown)
+                ) {
+                    return;
+                }
+                self.report_integer_operand_mismatch(left_ty, right_ty, span, "comparison");
+            }
+            BinaryOp::Coalesce => {}
         }
+    }
+
+    fn check_numeric_binary_operands(
+        &mut self,
+        left: &Expr,
+        right: &Expr,
+        span: Span,
+        scopes: &ScopeStack,
+        method_context: Option<&MethodContext>,
+        integers_only: bool,
+    ) {
+        let (left_ty, right_ty) =
+            self.infer_contextual_binary_operand_types(left, right, scopes, method_context);
+        let compatible_integer = matches!(
+            (self.types.kind(left_ty), self.types.kind(right_ty)),
+            (TypeKind::Integer(left), TypeKind::Integer(right)) if left == right
+        );
+        let compatible_float = !integers_only
+            && matches!(
+                (self.types.kind(left_ty), self.types.kind(right_ty)),
+                (TypeKind::Float(left), TypeKind::Float(right)) if left == right
+            );
+        let recovering = matches!(
+            (self.types.kind(left_ty), self.types.kind(right_ty)),
+            (TypeKind::Unknown, _) | (_, TypeKind::Unknown)
+        );
+        if compatible_integer || compatible_float || recovering {
+            return;
+        }
+
+        self.report_integer_operand_mismatch(left_ty, right_ty, span, "integer operator");
+    }
+
+    fn report_integer_operand_mismatch(
+        &mut self,
+        left: TypeId,
+        right: TypeId,
+        span: Span,
+        operation: &str,
+    ) {
+        self.diagnostics.push(
+            Diagnostic::new(
+                "E0441",
+                format!(
+                    "{operation} operands must have the same integer type, got `{}` and `{}`",
+                    self.types.display(left),
+                    self.types.display(right)
+                ),
+                span,
+            )
+            .with_help("explicitly convert one operand with a companion `::from(...)` call"),
+        );
     }
 
     fn check_logical_binary_operands(
@@ -2145,8 +2665,8 @@ impl<'program> Checker<'program> {
         scopes: &ScopeStack,
         method_context: Option<&MethodContext>,
     ) {
-        let left_ty = self.infer_expr_type(left, scopes, method_context);
-        let right_ty = self.infer_expr_type(right, scopes, method_context);
+        let (left_ty, right_ty) =
+            self.infer_contextual_binary_operand_types(left, right, scopes, method_context);
         if self.is_bool_or_recovery_type(left_ty) && self.is_bool_or_recovery_type(right_ty) {
             return;
         }
@@ -2171,13 +2691,13 @@ impl<'program> Checker<'program> {
         scopes: &ScopeStack,
         method_context: Option<&MethodContext>,
     ) {
-        let left_ty = self.infer_expr_type(left, scopes, method_context);
-        let right_ty = self.infer_expr_type(right, scopes, method_context);
+        let (left_ty, right_ty) =
+            self.infer_contextual_binary_operand_types(left, right, scopes, method_context);
         if self.is_equality_compatible(left_ty, right_ty) {
             return;
         }
 
-        self.diagnostics.push(Diagnostic::new(
+        let mut diagnostic = Diagnostic::new(
             "E0420",
             format!(
                 "equality operands must have compatible types, got `{}` and `{}`",
@@ -2185,7 +2705,15 @@ impl<'program> Checker<'program> {
                 self.types.display(right_ty)
             ),
             span,
-        ));
+        );
+        if matches!(self.types.kind(left_ty), TypeKind::Integer(_))
+            && matches!(self.types.kind(right_ty), TypeKind::Integer(_))
+        {
+            diagnostic = diagnostic.with_help(
+                "integer comparisons do not widen implicitly; explicitly convert one operand",
+            );
+        }
+        self.diagnostics.push(diagnostic);
     }
 
     fn check_concat_operands(
@@ -2335,70 +2863,54 @@ impl<'program> Checker<'program> {
         }
     }
 
-    fn check_int_constant_arithmetic(
-        &mut self,
-        left: &Expr,
-        op: &BinaryOp,
-        right: &Expr,
-        span: Span,
-        scopes: &ScopeStack,
-    ) {
-        if !Self::is_checked_int_arithmetic_op(op) {
-            return;
-        }
-
-        let (IntConstantEval::Known(left), IntConstantEval::Known(right)) = (
-            Self::eval_int_constant(left, scopes),
-            Self::eval_int_constant(right, scopes),
-        ) else {
-            return;
-        };
-
-        if Self::checked_int_arithmetic(left, op, right).is_some() {
-            return;
-        }
-
-        self.diagnostics.push(Diagnostic::new(
-            "E0418",
-            "integer arithmetic overflows the Doria `int` range",
-            span,
-        ));
-    }
-
     fn readonly_int_constant(
         &self,
         writable: bool,
         ty: TypeId,
         initializer: &Expr,
         scopes: &ScopeStack,
-    ) -> Option<i64> {
-        if writable || !matches!(self.types.kind(ty), TypeKind::Int) {
+    ) -> Option<IntegerValue> {
+        let TypeKind::Integer(integer) = *self.types.kind(ty) else {
+            return None;
+        };
+        if writable {
             return None;
         }
 
-        match Self::eval_int_constant(initializer, scopes) {
+        match Self::eval_int_constant(initializer, scopes, integer) {
             IntConstantEval::Known(value) => Some(value),
             IntConstantEval::Unknown | IntConstantEval::Invalid => None,
         }
     }
 
-    fn eval_int_constant(expr: &Expr, scopes: &ScopeStack) -> IntConstantEval {
+    fn eval_int_constant(expr: &Expr, scopes: &ScopeStack, target: IntegerType) -> IntConstantEval {
         match expr {
-            Expr::Int { value, .. } => value
-                .parse::<i64>()
+            Expr::Int { value, .. } => parse_decimal_magnitude(value)
+                .and_then(|magnitude| IntegerValue::from_literal(target, magnitude, false))
                 .map(IntConstantEval::Known)
                 .unwrap_or(IntConstantEval::Invalid),
             Expr::Variable { name, .. } => scopes
                 .lookup(name)
                 .and_then(|binding| binding.int_constant)
+                .filter(|value| value.ty == target)
                 .map(IntConstantEval::Known)
                 .unwrap_or(IntConstantEval::Unknown),
-            Expr::Grouped { expr, .. } => Self::eval_int_constant(expr, scopes),
+            Expr::Grouped { expr, .. } => Self::eval_int_constant(expr, scopes, target),
+            Expr::Unary {
+                op: UnaryOp::Negate,
+                expr,
+                ..
+            } => match Self::unsigned_integer_literal_magnitude(expr)
+                .and_then(|magnitude| IntegerValue::from_literal(target, magnitude, true))
+            {
+                Some(value) => IntConstantEval::Known(value),
+                None => IntConstantEval::Invalid,
+            },
             Expr::Binary {
                 left, op, right, ..
             } if Self::is_checked_int_arithmetic_op(op) => {
-                let left = Self::eval_int_constant(left, scopes);
-                let right = Self::eval_int_constant(right, scopes);
+                let left = Self::eval_int_constant(left, scopes, target);
+                let right = Self::eval_int_constant(right, scopes, target);
                 match (left, right) {
                     (IntConstantEval::Known(left), IntConstantEval::Known(right)) => {
                         Self::checked_int_arithmetic(left, op, right)
@@ -2454,11 +2966,15 @@ impl<'program> Checker<'program> {
         matches!(op, BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul)
     }
 
-    fn checked_int_arithmetic(left: i64, op: &BinaryOp, right: i64) -> Option<i64> {
+    fn checked_int_arithmetic(
+        left: IntegerValue,
+        op: &BinaryOp,
+        right: IntegerValue,
+    ) -> Option<IntegerValue> {
         match op {
-            BinaryOp::Add => left.checked_add(right),
-            BinaryOp::Sub => left.checked_sub(right),
-            BinaryOp::Mul => left.checked_mul(right),
+            BinaryOp::Add => left.checked_add(right).ok(),
+            BinaryOp::Sub => left.checked_sub(right).ok(),
+            BinaryOp::Mul => left.checked_mul(right).ok(),
             _ => None,
         }
     }
@@ -2491,8 +3007,8 @@ impl<'program> Checker<'program> {
         matches!(
             self.types.kind(ty),
             TypeKind::String
-                | TypeKind::Int
-                | TypeKind::Float
+                | TypeKind::Integer(_)
+                | TypeKind::Float(_)
                 | TypeKind::Bool
                 | TypeKind::Null
                 | TypeKind::Unknown
@@ -2885,6 +3401,50 @@ impl<'program> Checker<'program> {
         scopes: &ScopeStack,
         method_context: Option<&MethodContext>,
     ) {
+        if let Some(target) = IntegerType::from_companion_name(class_name) {
+            if method != "from" {
+                self.diagnostics.push(Diagnostic::new(
+                    "E0304",
+                    format!(
+                        "unknown integer companion intrinsic `{class_name}::{method}`; only `{class_name}::from(...)` is available"
+                    ),
+                    span,
+                ));
+                return;
+            }
+            if args.len() != 1 {
+                self.diagnostics.push(Diagnostic::new(
+                    "E0443",
+                    format!(
+                        "{}::from expects exactly 1 argument, got {}",
+                        target.companion_name(),
+                        args.len()
+                    ),
+                    span,
+                ));
+                return;
+            }
+
+            let argument = &args[0];
+            self.contextualize_integer_literals(argument, IntegerType::Int64);
+            let argument_ty = self.infer_expr_type(argument, scopes, method_context);
+            if !matches!(
+                self.types.kind(argument_ty),
+                TypeKind::Integer(_) | TypeKind::Unknown
+            ) {
+                self.diagnostics.push(Diagnostic::new(
+                    "E0443",
+                    format!(
+                        "{}::from requires an integer argument, got `{}`",
+                        target.companion_name(),
+                        self.types.display(argument_ty)
+                    ),
+                    argument.span(),
+                ));
+            }
+            return;
+        }
+
         let Some(class_info) = self.classes.get(class_name).cloned() else {
             self.diagnostics.push(Diagnostic::new(
                 "E0305",
@@ -3176,6 +3736,14 @@ impl<'program> Checker<'program> {
         span: Span,
         position: TypePosition,
     ) -> TypeId {
+        if let Some(integer) = IntegerType::from_source_name(&ty.name) {
+            return self.resolve_zero_arg_type(ty, span, TypeKind::Integer(integer));
+        }
+
+        if let Some(float) = FloatType::from_source_name(&ty.name) {
+            return self.resolve_zero_arg_type(ty, span, TypeKind::Float(float));
+        }
+
         match ty.name.as_str() {
             "void" if position == TypePosition::Return => {
                 self.resolve_zero_arg_type(ty, span, TypeKind::Void)
@@ -3183,8 +3751,6 @@ impl<'program> Checker<'program> {
             "void" => {
                 self.reject_type_ref(ty, span, "E0430", "`void` is only valid as a return type")
             }
-            "int" => self.resolve_zero_arg_type(ty, span, TypeKind::Int),
-            "float" => self.resolve_zero_arg_type(ty, span, TypeKind::Float),
             "string" => self.resolve_zero_arg_type(ty, span, TypeKind::String),
             "bool" => self.resolve_zero_arg_type(ty, span, TypeKind::Bool),
             "null" => self.reject_type_ref_with_help(
@@ -3215,6 +3781,33 @@ impl<'program> Checker<'program> {
                 "E0432",
                 "`resource` is reserved for PHP interop and is not available yet",
             ),
+            "uint" => self.reject_type_ref_with_help(
+                ty,
+                span,
+                "E0401",
+                "Doria has no bare `uint`; use an explicit width such as `uint64`",
+                "choose `uint8`, `uint16`, `uint32`, or `uint64`",
+            ),
+            "i8" | "i16" | "i32" | "i64" => {
+                let width = &ty.name[1..];
+                self.reject_type_ref_with_help(
+                    ty,
+                    span,
+                    "E0401",
+                    format!("Doria uses `int{width}`, not `{}`", ty.name),
+                    "use the Doria fixed-width integer spelling",
+                )
+            }
+            "u8" | "u16" | "u32" | "u64" => {
+                let width = &ty.name[1..];
+                self.reject_type_ref_with_help(
+                    ty,
+                    span,
+                    "E0401",
+                    format!("Doria uses `uint{width}`, not `{}`", ty.name),
+                    "use the Doria fixed-width integer spelling",
+                )
+            }
             "[]" => {
                 if !self.expect_type_arg_count(ty, 1, span) {
                     for arg in &ty.args {
@@ -3373,6 +3966,17 @@ impl<'program> Checker<'program> {
         method_context: Option<&MethodContext>,
         destination: AssignmentDestination,
     ) -> bool {
+        match *self.types.kind(target) {
+            TypeKind::Integer(integer) => {
+                if let Some(fits) = self.check_contextual_integer_literal(value_expr, integer) {
+                    return fits;
+                }
+                self.contextualize_integer_literals(value_expr, integer);
+            }
+            TypeKind::Float(float) => self.contextualize_float_literals(value_expr, float),
+            _ => {}
+        }
+
         let value = self.infer_expr_type(value_expr, scopes, method_context);
         if self.is_expr_assignable(target, value_expr, scopes, method_context)
             || self.is_assignable(target, value)
@@ -3417,6 +4021,17 @@ impl<'program> Checker<'program> {
         scopes: &ScopeStack,
         method_context: Option<&MethodContext>,
     ) -> bool {
+        match *self.types.kind(target) {
+            TypeKind::Integer(integer) => {
+                if let Some(fits) = self.check_contextual_integer_literal(value_expr, integer) {
+                    return fits;
+                }
+                self.contextualize_integer_literals(value_expr, integer);
+            }
+            TypeKind::Float(float) => self.contextualize_float_literals(value_expr, float),
+            _ => {}
+        }
+
         match value_expr {
             Expr::Grouped { expr, .. } => {
                 self.is_expr_assignable(target, expr, scopes, method_context)
@@ -3479,7 +4094,7 @@ impl<'program> Checker<'program> {
                     let key_ok = if let Some(key_expr) = &array_element.key {
                         self.is_expr_assignable(key, key_expr, scopes, method_context)
                     } else {
-                        let implicit_key = self.types.intern(TypeKind::Int);
+                        let implicit_key = self.types.intern(TypeKind::Integer(IntegerType::Int64));
                         self.is_assignable(key, implicit_key)
                     };
                     let value_ok = self.is_expr_assignable(
@@ -3551,12 +4166,47 @@ impl<'program> Checker<'program> {
         scopes: &ScopeStack,
         method_context: Option<&MethodContext>,
     ) -> TypeId {
+        let ty = self.infer_expr_type_unrecorded(expr, scopes, method_context);
+        match self.types.kind(ty) {
+            TypeKind::Integer(integer) => {
+                self.integer_expression_types
+                    .insert((expr.span().start, expr.span().end), *integer);
+            }
+            TypeKind::Float(float) => {
+                self.float_expression_types
+                    .insert((expr.span().start, expr.span().end), *float);
+            }
+            _ => {}
+        }
+        ty
+    }
+
+    fn infer_expr_type_unrecorded(
+        &mut self,
+        expr: &Expr,
+        scopes: &ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) -> TypeId {
         match expr {
             Expr::String { .. } | Expr::InterpolatedString { .. } => {
                 self.types.intern(TypeKind::String)
             }
-            Expr::Int { .. } => self.types.intern(TypeKind::Int),
-            Expr::Float { .. } => self.types.intern(TypeKind::Float),
+            Expr::Int { span, .. } => {
+                let integer = self
+                    .integer_expression_types
+                    .get(&(span.start, span.end))
+                    .copied()
+                    .unwrap_or(IntegerType::Int64);
+                self.types.intern(TypeKind::Integer(integer))
+            }
+            Expr::Float { span, .. } => {
+                let float = self
+                    .float_expression_types
+                    .get(&(span.start, span.end))
+                    .copied()
+                    .unwrap_or(FloatType::Float64);
+                self.types.intern(TypeKind::Float(float))
+            }
             Expr::Bool { .. } => self.types.intern(TypeKind::Bool),
             Expr::Null { .. } => self.types.intern(TypeKind::Null),
             Expr::New { class_name, .. } => {
@@ -3607,14 +4257,22 @@ impl<'program> Checker<'program> {
                 .unwrap_or_else(|| self.types.unknown()),
             Expr::StaticCall {
                 class_name, method, ..
-            } => self
-                .classes
-                .get(class_name)
-                .and_then(|class_info| class_info.methods.get(method))
-                .map(|method| method.return_ty)
-                .unwrap_or_else(|| self.types.unknown()),
+            } => {
+                if method == "from" {
+                    if let Some(integer) = IntegerType::from_companion_name(class_name) {
+                        return self.types.intern(TypeKind::Integer(integer));
+                    }
+                }
+                self.classes
+                    .get(class_name)
+                    .and_then(|class_info| class_info.methods.get(method))
+                    .map(|method| method.return_ty)
+                    .unwrap_or_else(|| self.types.unknown())
+            }
             Expr::Grouped { expr, .. } => self.infer_expr_type(expr, scopes, method_context),
-            Expr::Unary { op, expr, .. } => self.infer_unary_type(op, expr, scopes, method_context),
+            Expr::Unary { op, expr, span } => {
+                self.infer_unary_type(op, expr, *span, scopes, method_context)
+            }
             Expr::Binary {
                 left, op, right, ..
             } => self.infer_binary_type(left, op, right, scopes, method_context),
@@ -3627,6 +4285,7 @@ impl<'program> Checker<'program> {
         &mut self,
         op: &UnaryOp,
         expr: &Expr,
+        span: Span,
         scopes: &ScopeStack,
         method_context: Option<&MethodContext>,
     ) -> TypeId {
@@ -3634,6 +4293,30 @@ impl<'program> Checker<'program> {
         match op {
             UnaryOp::Not => match self.types.kind(ty) {
                 TypeKind::Bool => self.types.intern(TypeKind::Bool),
+                TypeKind::Unknown => self.types.unknown(),
+                _ => self.types.intern(TypeKind::Heterogeneous),
+            },
+            UnaryOp::Negate => {
+                if Self::integer_literal_parts(expr).is_some() {
+                    self.check_contextual_integer_literal(
+                        &Expr::Unary {
+                            op: UnaryOp::Negate,
+                            expr: Box::new(expr.clone()),
+                            span,
+                        },
+                        IntegerType::Int64,
+                    );
+                }
+                match self.types.kind(ty) {
+                    TypeKind::Integer(integer) if integer.is_signed() => {
+                        self.types.intern(TypeKind::Integer(*integer))
+                    }
+                    TypeKind::Unknown => self.types.unknown(),
+                    _ => self.types.intern(TypeKind::Heterogeneous),
+                }
+            }
+            UnaryOp::BitwiseNot => match self.types.kind(ty) {
+                TypeKind::Integer(integer) => self.types.intern(TypeKind::Integer(*integer)),
                 TypeKind::Unknown => self.types.unknown(),
                 _ => self.types.intern(TypeKind::Heterogeneous),
             },
@@ -3648,13 +4331,20 @@ impl<'program> Checker<'program> {
         scopes: &ScopeStack,
         method_context: Option<&MethodContext>,
     ) -> TypeId {
-        let left_ty = self.infer_expr_type(left, scopes, method_context);
-        let right_ty = self.infer_expr_type(right, scopes, method_context);
+        let (left_ty, right_ty) =
+            self.infer_contextual_binary_operand_types(left, right, scopes, method_context);
 
         match op {
-            BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Mod => {
-                self.infer_numeric_binary_type(left_ty, right_ty)
-            }
+            BinaryOp::Add
+            | BinaryOp::Sub
+            | BinaryOp::Mul
+            | BinaryOp::Div
+            | BinaryOp::Mod
+            | BinaryOp::ShiftLeft
+            | BinaryOp::ShiftRight
+            | BinaryOp::BitwiseAnd
+            | BinaryOp::BitwiseXor
+            | BinaryOp::BitwiseOr => self.infer_numeric_binary_type(left_ty, right_ty),
             BinaryOp::Concat => self.infer_concat_binary_type(left_ty, right_ty),
             BinaryOp::Equal | BinaryOp::NotEqual => self.types.intern(TypeKind::Bool),
             BinaryOp::Less | BinaryOp::LessEqual | BinaryOp::Greater | BinaryOp::GreaterEqual => {
@@ -3667,6 +4357,74 @@ impl<'program> Checker<'program> {
         }
     }
 
+    fn infer_contextual_binary_operand_types(
+        &mut self,
+        left: &Expr,
+        right: &Expr,
+        scopes: &ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) -> (TypeId, TypeId) {
+        let mut left_ty = self.infer_expr_type(left, scopes, method_context);
+        let mut right_ty = self.infer_expr_type(right, scopes, method_context);
+
+        let left_literal = Self::integer_literal_parts(left).is_some();
+        let right_literal = Self::integer_literal_parts(right).is_some();
+        let left_integer = match self.types.kind(left_ty) {
+            TypeKind::Integer(integer) => Some(*integer),
+            _ => None,
+        };
+        let right_integer = match self.types.kind(right_ty) {
+            TypeKind::Integer(integer) => Some(*integer),
+            _ => None,
+        };
+
+        if left_literal && !right_literal {
+            if let Some(integer) = right_integer {
+                self.check_contextual_integer_literal(left, integer);
+                left_ty = self.types.intern(TypeKind::Integer(integer));
+            }
+        } else if right_literal && !left_literal {
+            if let Some(integer) = left_integer {
+                self.check_contextual_integer_literal(right, integer);
+                right_ty = self.types.intern(TypeKind::Integer(integer));
+            }
+        } else if left_literal && right_literal {
+            let integer = match (left_integer, right_integer) {
+                (Some(left), Some(right)) if left == right => left,
+                _ => IntegerType::Int64,
+            };
+            self.check_contextual_integer_literal(left, integer);
+            self.check_contextual_integer_literal(right, integer);
+            left_ty = self.types.intern(TypeKind::Integer(integer));
+            right_ty = self.types.intern(TypeKind::Integer(integer));
+        }
+
+        let left_float_literal = Self::is_float_literal(left);
+        let right_float_literal = Self::is_float_literal(right);
+        let left_float = match self.types.kind(left_ty) {
+            TypeKind::Float(float) => Some(*float),
+            _ => None,
+        };
+        let right_float = match self.types.kind(right_ty) {
+            TypeKind::Float(float) => Some(*float),
+            _ => None,
+        };
+
+        if left_float_literal && !right_float_literal {
+            if let Some(float) = right_float {
+                self.record_float_expression_type(left, float);
+                left_ty = self.types.intern(TypeKind::Float(float));
+            }
+        } else if right_float_literal && !left_float_literal {
+            if let Some(float) = left_float {
+                self.record_float_expression_type(right, float);
+                right_ty = self.types.intern(TypeKind::Float(float));
+            }
+        }
+
+        (left_ty, right_ty)
+    }
+
     fn infer_numeric_binary_type(&mut self, left: TypeId, right: TypeId) -> TypeId {
         if let Some(recovery) = self.recovery_binary_type(left, right) {
             return recovery;
@@ -3675,8 +4433,12 @@ impl<'program> Checker<'program> {
         let left_kind = self.types.kind(left).clone();
         let right_kind = self.types.kind(right).clone();
         match (left_kind, right_kind) {
-            (TypeKind::Int, TypeKind::Int) => self.types.intern(TypeKind::Int),
-            (TypeKind::Float, TypeKind::Float) => self.types.intern(TypeKind::Float),
+            (TypeKind::Integer(left), TypeKind::Integer(right)) if left == right => {
+                self.types.intern(TypeKind::Integer(left))
+            }
+            (TypeKind::Float(left), TypeKind::Float(right)) if left == right => {
+                self.types.intern(TypeKind::Float(left))
+            }
             _ => self.types.intern(TypeKind::Heterogeneous),
         }
     }
@@ -3715,9 +4477,13 @@ impl<'program> Checker<'program> {
         let left_kind = self.types.kind(left).clone();
         let right_kind = self.types.kind(right).clone();
         match (left_kind, right_kind) {
-            (TypeKind::Int, TypeKind::Int)
-            | (TypeKind::Float, TypeKind::Float)
-            | (TypeKind::String, TypeKind::String) => self.types.intern(TypeKind::Bool),
+            (TypeKind::Integer(left), TypeKind::Integer(right)) if left == right => {
+                self.types.intern(TypeKind::Bool)
+            }
+            (TypeKind::Float(left), TypeKind::Float(right)) if left == right => {
+                self.types.intern(TypeKind::Bool)
+            }
+            (TypeKind::String, TypeKind::String) => self.types.intern(TypeKind::Bool),
             _ => self.types.intern(TypeKind::Heterogeneous),
         }
     }
@@ -3758,27 +4524,71 @@ impl<'program> Checker<'program> {
         }
 
         if elements.iter().any(|element| element.key.is_some()) {
-            let mut key_types = Vec::new();
-            let mut value_types = Vec::new();
-            for element in elements {
-                if let Some(key) = &element.key {
-                    key_types.push(self.infer_expr_type(key, scopes, method_context));
-                } else {
-                    key_types.push(self.types.intern(TypeKind::Int));
-                }
-                value_types.push(self.infer_expr_type(&element.value, scopes, method_context));
-            }
+            let explicit_keys = elements
+                .iter()
+                .filter_map(|element| element.key.as_ref())
+                .collect::<Vec<_>>();
+            let mut key_types =
+                self.infer_collection_member_types(&explicit_keys, scopes, method_context);
+            key_types.extend(
+                elements
+                    .iter()
+                    .filter(|element| element.key.is_none())
+                    .map(|_| self.types.intern(TypeKind::Integer(IntegerType::Int64))),
+            );
+            let values = elements
+                .iter()
+                .map(|element| &element.value)
+                .collect::<Vec<_>>();
+            let value_types = self.infer_collection_member_types(&values, scopes, method_context);
             let key = self.common_clear_type(key_types);
             let value = self.common_clear_type(value_types);
             self.types.intern(TypeKind::Dictionary(key, value))
         } else {
-            let mut element_types = Vec::new();
-            for element in elements {
-                element_types.push(self.infer_expr_type(&element.value, scopes, method_context));
-            }
+            let values = elements
+                .iter()
+                .map(|element| &element.value)
+                .collect::<Vec<_>>();
+            let element_types = self.infer_collection_member_types(&values, scopes, method_context);
             let element = self.common_clear_type(element_types);
             self.types.intern(TypeKind::List(element))
         }
+    }
+
+    fn infer_collection_member_types(
+        &mut self,
+        expressions: &[&Expr],
+        scopes: &ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) -> Vec<TypeId> {
+        let mut contextual_integer = None;
+        for expr in expressions {
+            if Self::integer_literal_parts(expr).is_some() {
+                continue;
+            }
+            let ty = self.infer_expr_type(expr, scopes, method_context);
+            if let TypeKind::Integer(integer) = self.types.kind(ty) {
+                match contextual_integer {
+                    None => contextual_integer = Some(*integer),
+                    Some(current) if current == *integer => {}
+                    Some(_) => {
+                        contextual_integer = None;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if let Some(integer) = contextual_integer {
+            for expr in expressions {
+                self.contextualize_integer_literals(expr, integer);
+            }
+        }
+
+        expressions
+            .iter()
+            .map(|expr| self.infer_expr_type(expr, scopes, method_context))
+            .collect()
     }
 
     fn common_clear_type(&mut self, types: Vec<TypeId>) -> TypeId {

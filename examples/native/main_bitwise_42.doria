@@ -1,0 +1,7 @@
+function main(): int
+{
+    uint8 $value = 170;
+    uint8 $mask = 63;
+
+    return Int::from($value & $mask);
+}

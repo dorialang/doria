@@ -109,6 +109,75 @@ fn lexes_boolean_word_operators() {
 }
 
 #[test]
+fn lexes_stage_13_primitive_type_spellings() {
+    let kinds =
+        token_kinds("int int8 int16 int32 int64 uint8 uint16 uint32 uint64 float float32 float64");
+
+    assert_eq!(
+        kinds,
+        vec![
+            TokenKind::IntType,
+            TokenKind::Int8Type,
+            TokenKind::Int16Type,
+            TokenKind::Int32Type,
+            TokenKind::Int64Type,
+            TokenKind::UInt8Type,
+            TokenKind::UInt16Type,
+            TokenKind::UInt32Type,
+            TokenKind::UInt64Type,
+            TokenKind::FloatType,
+            TokenKind::Float32Type,
+            TokenKind::Float64Type,
+            TokenKind::Eof,
+        ]
+    );
+}
+
+#[test]
+fn lexes_stage_13_integer_operators_and_compound_assignments() {
+    let kinds = token_kinds("<< >> & | ^ ~ *= /= %= <<= >>= &= |= ^=");
+
+    assert_eq!(
+        kinds,
+        vec![
+            TokenKind::ShiftLeft,
+            TokenKind::ShiftRight,
+            TokenKind::Ampersand,
+            TokenKind::Pipe,
+            TokenKind::Caret,
+            TokenKind::Tilde,
+            TokenKind::StarEquals,
+            TokenKind::SlashEquals,
+            TokenKind::PercentEquals,
+            TokenKind::ShiftLeftEquals,
+            TokenKind::ShiftRightEquals,
+            TokenKind::AmpersandEquals,
+            TokenKind::PipeEquals,
+            TokenKind::CaretEquals,
+            TokenKind::Eof,
+        ]
+    );
+}
+
+#[test]
+fn keeps_boolean_and_bitwise_symbol_tokens_distinct() {
+    let kinds = token_kinds("& && | || ^ xor");
+
+    assert_eq!(
+        kinds,
+        vec![
+            TokenKind::Ampersand,
+            TokenKind::AndAnd,
+            TokenKind::Pipe,
+            TokenKind::OrOr,
+            TokenKind::Caret,
+            TokenKind::Xor,
+            TokenKind::Eof,
+        ]
+    );
+}
+
+#[test]
 fn rejects_php_strict_equality_tokens() {
     for (source, message) in [
         (

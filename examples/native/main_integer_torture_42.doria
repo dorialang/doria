@@ -1,0 +1,36 @@
+function main(): int
+{
+    writable int8 $signed = -40;
+    $signed -= 2;
+
+    writable uint8 $unsigned = 6;
+    $unsigned *= 7;
+
+    uint16 $quotient = 84 / 2;
+    uint32 $masked = 170 & 63;
+    int16 $negative = -84;
+    int16 $shift = 1;
+    int16 $shifted = $negative >> $shift;
+    uint64 $wide = UInt64::from($unsigned);
+
+    if ($signed != -42) {
+        return 0;
+    }
+    if ($unsigned != 42) {
+        return 0;
+    }
+    if ($quotient != 42) {
+        return 0;
+    }
+    if ($masked != 42) {
+        return 0;
+    }
+    if ($shifted != -42) {
+        return 0;
+    }
+    if ($wide != 42) {
+        return 0;
+    }
+
+    return 42;
+}

@@ -11,6 +11,7 @@ pub use crate::ast::{AssignOp, BinaryOp, IncrementOp, IncrementPosition, MemberA
 #[derive(Debug, Clone, PartialEq)]
 pub struct Program {
     pub items: Vec<Item>,
+    pub semantic_info: crate::semantics::SemanticInfo,
 }
 
 #[derive(Debug, Clone, PartialEq)]

@@ -104,9 +104,9 @@ pub unsafe extern "C" fn dr_v1_panic(
     message: *const u8,
     message_length: usize,
 ) -> ! {
-    write_panic_fragment(b"panic: ");
+    write_panic_fragment(b"Panic: ");
     write_panic_bytes(message, message_length);
-    write_panic_fragment(b"\nstack trace:\n");
+    write_panic_fragment(b"\nStack Trace:\n");
 
     let mut frame = current_frame;
     while !frame.is_null() {

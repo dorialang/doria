@@ -66,7 +66,7 @@ Valid PHP should be easy to migrate to Doria, but Doria-specific syntax does not
 
 Doria does not use `public`, `protected`, or `private` as member visibility modifiers. Class members are externally accessible by default, and `internal` marks implementation details.
 
-The current compiler implementation lowers the accepted native subset through MIR. The debug interpreter and Cranelift native backend consume that same MIR, and the durable executable parity manifest compares exact stdout bytes, stderr bytes, and process status across both paths. The supported subset has top-level free functions plus exactly one parameterless `function main(): int` or `function main(): void`; path-sensitive returns; recursion and mutual recursion; integer locals and checked `+`/`-`/`*`; typed conditions; structured `if`, `while`, traditional `for`, integer range `foreach`, `break`, and `continue`; `int` helper parameters and `int`/`void` returns; and compile-time-known readonly string literal/local/`.` expressions for exact-byte `echo` and fatal `panic`. `main(): int` crosses the accepted `0..125` portable process-status boundary, while helper `int` results retain the full Doria `int` range. `main(): void` maps normal completion to status `0`. Normal interpretation has no artificial block or call-depth cap, and native compilation does not execute user code as a preflight. The allocation-free bootstrap `doria-rt` owns process entry, exact native output, panic formatting, and Doria function-name stack traces. Runtime strings, string parameters/returns, writable runtime strings, collection iteration, methods/classes, ownership/borrow checking, LLVM, and broader runtime features remain unsupported. The former Stage 7-10 native smoke module has been retired; it no longer defines or participates in native compilation.
+The current compiler implementation lowers the accepted native subset through typed MIR. The debug interpreter and Cranelift native backend consume that same MIR, and the durable executable parity manifest compares exact stdout bytes, stderr bytes, and process status across both paths. The supported subset has top-level free functions plus exactly one parameterless `function main(): int`/`int64` or `function main(): void`; path-sensitive returns; recursion and mutual recursion; all eight fixed-width integer types; contextual integer literals; checked arithmetic, division/remainder, shifts, bitwise operations, negation, increments/compound assignments, and explicit checked integer conversions; typed conditions; structured `if`, `while`, traditional `for`, integer range `foreach`, `break`, and `continue`; fixed-width integer helper parameters/returns; and compile-time-known readonly string literal/local/`.` expressions for exact-byte `echo` and fatal `panic`. `main(): int` crosses the accepted `0..125` portable process-status boundary, while helper integer results retain their full declared range, including all `uint64` values. `main(): void` maps normal completion to status `0`. Normal interpretation has no artificial block or call-depth cap, and native compilation does not execute user code as a preflight. The allocation-free bootstrap `doria-rt` owns process entry, exact native output, panic formatting, and Doria function-name stack traces. Runtime floats, runtime bool values, runtime strings, string parameters/returns, writable runtime strings, collection iteration, methods/classes, ownership/borrow checking, LLVM, and broader runtime features remain unsupported. The former Stage 7-10 native smoke module has been retired; it no longer defines or participates in native compilation.
 
 Doria is not a Rust language. Rust is the current bootstrap implementation language for `doriac`, not the permanent identity of the compiler.
 
@@ -425,9 +425,56 @@ TypeKind     resolved semantic type shape
 
 The semantic model also has an internal `Unknown` recovery type for diagnostics and error recovery; it is not the normal spelling for user-authored type declarations.
 
-Lowercase primitive names are type-position names: `int`, `int8`, `int16`, `int32`, `int64`, `uint8`, `uint16`, `uint32`, `uint64`, `float`, `float32`, `float64`, `string`, and `bool`. `int` means `int64`; `float` means `float64`. PascalCase names such as `Int`, `Float`, `String`, and `Bool` are reserved for expression-level standard-library/helper APIs. They are not primitive type spellings, and primitive type names are not namespaces. Future code should prefer APIs such as `Int::parse(...)`, but companion semantics are not part of the current implementation.
+Lowercase primitive names are type-position names: `int`, `int8`, `int16`, `int32`, `int64`, `uint8`, `uint16`, `uint32`, `uint64`, `float`, `float32`, `float64`, `string`, and `bool`. PascalCase names are expression-level standard-library/helper or compiler-known companion APIs, not primitive type spellings or namespaces.
 
-The fixed-width numeric type family is accepted in `docs/decisions/0016-fixed-width-numeric-types.md`. Current compiler support may lag this accepted direction until the lexer, parser, semantic type model, Doria IR, and backends are updated.
+### Fixed-width integers
+
+Stage 13 implements these canonical integer types through semantic analysis, typed MIR, the debug interpreter, and Cranelift:
+
+```text
+int8   int16   int32   int64
+uint8  uint16  uint32  uint64
+```
+
+`int` is signed 64-bit. `int64` is an exact source alias of `int`; they have one canonical semantic and runtime type. Doria has no bare `uint`, no pointer-width integer type, and no Rust-style `i8`/`u8`/`usize`/`isize` spellings.
+
+`float` means `float64`, and `float32`/`float64` remain accepted primitive type spellings. Native float values, float arithmetic, float comparison, bool runtime values, and float/integer conversions remain Stage 14 work.
+
+An unconstrained decimal integer literal defaults to `int`. A literal may instead adopt an expected integer type from a declaration, parameter, return, assignment, or typed binary operand when its mathematical value fits that type. Contextual literal typing is not an implicit conversion. Out-of-range literals are compile-time errors. Stage 13 adds no numeric suffixes and no hexadecimal, octal, or binary literal syntax.
+
+Both operands of an integer binary operator must resolve to the same canonical integer type. Nonliteral values never widen or narrow implicitly, and Doria has no C-style integer promotions. The implemented integer operators are:
+
+```text
+-  ~
++  -  *  /  %
+<<  >>
+&  ^  |
+==  !=  <  <=  >  >=
+++  --
++=  -=  *=  /=  %=  <<=  >>=  &=  |=  ^=
+```
+
+`+`, `-`, `*`, and signed negation are checked. Signed overflow, unsigned overflow, and unsigned underflow panic. Signed division truncates toward zero; division by zero panics, and signed minimum divided by `-1` panics. Signed remainder uses that quotient and gives a nonzero remainder the dividend's sign; remainder by zero panics, while signed minimum remainder `-1` is zero. Unsigned division and remainder use ordinary unsigned arithmetic.
+
+Shift operands have one canonical integer type. A negative signed shift count or a count greater than or equal to the left operand's width panics. Left shift discards bits beyond the fixed width after validating the count. Signed right shift is arithmetic; unsigned right shift is logical. `&`, `|`, `^`, and `~` operate on the fixed-width two's-complement bit pattern and do not overflow. The word `xor` remains the distinct bool-only operator.
+
+Explicit integer conversion uses compiler-known PascalCase companion intrinsics:
+
+```doria
+Int::from($value)
+Int8::from($value)
+Int16::from($value)
+Int32::from($value)
+Int64::from($value)
+UInt8::from($value)
+UInt16::from($value)
+UInt32::from($value)
+UInt64::from($value)
+```
+
+`Int` and `Int64` target the same canonical `int64` type. Each `from` accepts exactly one integer expression. Same-type and exact widening conversions preserve the value; narrowing and signedness-changing conversions are checked and panic with `integer conversion out of range` when the value cannot be represented. Stage 13 adds no `as` cast and no wrapping, saturating, or unchecked conversion API.
+
+The exact operator, panic, and conversion rules are authoritative in decisions 0041 and 0042. The PHP compatibility backend supports only integer shapes it can preserve exactly; it emits a backend unsupported-feature diagnostic for precise Stage 13 behavior that PHP cannot represent rather than changing Doria semantics.
 
 ### Dynamic boundary type
 
@@ -503,11 +550,11 @@ This slice supports only variable/property-path interpolation: `$name`, `$this`,
 
 Interpolated strings are represented in the AST and Doria IR as string parts before any backend runs. The PHP backend lowers them explicitly, for example `"Hello, {$name}!"` becomes PHP equivalent to `"Hello, " . $name . "!"`.
 
-Interpolated values may currently be `string`, `int`, `float`, `bool`, `null`, or the internal `Unknown` recovery type. Class values, `mixed`, `List<T>`, `Dictionary<K, V>`, and `Set<T>` are rejected until Doria has a deliberate display/string-conversion design.
+Interpolated values may currently be `string`, a fixed-width integer, `float`, `bool`, `null`, or the internal `Unknown` recovery type. Class values, `mixed`, `List<T>`, `Dictionary<K, V>`, and `Set<T>` are rejected until Doria has a deliberate display/string-conversion design.
 
 The `.` operator is string concatenation. Both operands must be `string` values or recovery types; Doria does not implicitly convert `int`, `bool`, objects, or other values to `string` for concatenation. The current MIR/interpreter/Cranelift subset supports `.` only when the resulting string value is compile-time-known through supported string literals and readonly string locals.
 
-Numeric widening is not implemented yet; for now `float` is not assignable from `int`, and `int` is not assignable from `float`. The accepted fixed-width numeric family also does not imply implicit widening, narrowing, or scalar coercion. Any future safe numeric widening should be a separate design decision. Named arguments and richer call argument representation are separate future slices.
+There is no implicit widening, narrowing, or scalar coercion between distinct integer types. `float` is not assignable from an integer, and an integer is not assignable from `float`; float/integer conversion remains Stage 14. Named arguments and richer call argument representation are separate future slices.
 
 Simple collection literals infer collection element/key/value types when all clear parts match. Clear heterogeneous collection literals, such as `[1, "two"]`, are rejected by typed array and narrow collection alias assignment checks rather than being erased to `Unknown`. The empty literal `[]` stays ambiguous so typed contexts may use it as an empty `T[]`, `List<T>`, or `Dictionary<K, V>`.
 
@@ -554,7 +601,7 @@ Accepted bitwise operators are:
 
 Do not add `nand`, `nor`, `implies`, `iff`, `unless`, `^^`, `===`, or `!==` as core syntax without a new accepted decision. Future helper APIs such as `Bool::all(...)`, `Bool::any(...)`, `Bool::none(...)`, or `Bool::one(...)` may be considered separately.
 
-The accepted boolean/equality/bitwise operator direction is recorded in `docs/decisions/0020-boolean-operators-and-given-predicates.md`. Current compiler support includes typed `==` / `!=` checking, rejection of `===` / `!==`, `not` / `and` / `or` / `xor` parsing, bool-only semantic checking, Doria IR lowering, PHP backend lowering for the supported subset, and Stage 9 native lowering for supported `if`, `while`, `for`, and integer range `foreach` conditions, writable integer assignment in supported native blocks, unlabeled `break` / `continue` inside supported native loops, and supported string `echo` expressions, including compile-time-known `.` string concatenation. Bitwise operators and broader native expression lowering remain future implementation work.
+The accepted boolean/equality/bitwise operator direction is recorded in `docs/decisions/0020-boolean-operators-and-given-predicates.md`, with exact Stage 13 integer behavior in decision 0041. Current compiler support includes typed `==` / `!=`, rejection of `===` / `!==`, bool-only `not` / `and` / `or` / `xor`, fixed-width integer `&` / `|` / `^` / `~`, Doria IR and typed MIR lowering, and native execution for supported conditions and integer expressions. PHP lowers its exact supported subset and diagnoses precise integer behavior it cannot preserve.
 
 ### Control-flow conditions
 
@@ -581,14 +628,14 @@ The accepted checked error direction is recorded in `docs/decisions/0035-checked
 The current compiler accepts a string literal, readonly compile-time-known string local, or concatenation of those expressions as the panic message. Panic writes a deterministic first line and a Doria function-name stack trace to stderr, then exits with status 101:
 
 ```text
-panic: <message>
-stack trace:
+Panic: <message>
+Stack Trace:
   at <currentFunction>
   at <callerFunction>
   at main
 ```
 
-Checked `int` addition, subtraction, and multiplication overflow use this panic path. Returning a process status outside `0..125` from `main(): int` also panics. Panic is a runtime outcome, not a compiler diagnostic or malformed-MIR error.
+Checked integer addition, subtraction, multiplication, and signed negation overflow use this panic path for every integer width. Division by zero, signed division overflow, remainder by zero, an out-of-range shift count, and an out-of-range explicit conversion use the same path with the deterministic messages in decisions 0041 and 0042. Returning a process status outside `0..125` from `main(): int` also panics. Panic is a runtime outcome, not a compiler diagnostic or malformed-MIR error.
 
 Compiler implementation for `throw`, `throws`, `try`, and `catch` is future work.
 
@@ -885,9 +932,9 @@ Doria IR is the checked compiler-owned representation of a Doria program. After 
 
 As native code generation matures, Doria IR may lower into a simpler native-oriented IR for control flow, memory layout, runtime calls, and backend code generation.
 
-MIR is Doria's native-oriented, backend-independent control-flow representation for the current executable subset. It contains deterministic top-level functions, typed int/string local slots, basic blocks, typed conditions, int/void call forms, panic termination, and compile-time-known string expressions. The debug interpreter uses an explicit heap-backed Doria frame stack and exact stdout/stderr buffers. Ordinary interpretation has no fixed execution-fuel or call-depth cap and does not reject repeated states; explicitly limited execution is available only to tests and fuzzing. Recursion and mutual recursion are supported. Interpreter-private string bytes do not define Doria heap allocation, ownership, layout, or runtime concatenation semantics.
+MIR is Doria's native-oriented, backend-independent control-flow representation for the current executable subset. It contains deterministic top-level functions, canonical fixed-width integer types, typed integer/string local slots, basic blocks, typed conditions, fixed-width integer/void call forms, checked integer operations and conversions, panic termination, and compile-time-known string expressions. The debug interpreter uses an explicit heap-backed Doria frame stack and exact stdout/stderr buffers. Ordinary interpretation has no fixed execution-fuel or call-depth cap and does not reject repeated states; explicitly limited execution is available only to tests and fuzzing. Recursion and mutual recursion are supported. Interpreter-private string bytes do not define Doria heap allocation, ownership, layout, or runtime concatenation semantics.
 
-The native backend is the primary target. Checked HIR lowers to MIR, Cranelift lowers MIR directly to object code, and the host linker combines that object with the bootstrap `doria-rt` static library to produce a standalone executable. Native compilation does not execute user code and has no interpreter preflight or fallback IR. Generated Doria functions maintain runtime stack-frame metadata and pass it through a hidden backend-only parameter. `doria-rt` owns entry policy, exact stdout/stderr writes, abort-only panic formatting, stack traversal, and status 101. Checked signed I64 addition, subtraction, and multiplication branch to runtime panic on overflow. A generated process-entry wrapper routes `main(): void` or `main(): int` through the versioned internal runtime ABI; helper `int` values retain the full Doria range, while only an explicit `main(): int` result crosses the `0..125` process boundary. Compile-time-known string expressions lower to exact byte data and explicit lengths without defining a runtime string ABI. Unsupported-coverage diagnostics remain for string parameters/returns, writable/runtime strings, collection iteration, classes, methods/static calls, division/modulo, shifts and bitwise operators, labeled loop control, and broader valid Doria until later stages implement them.
+The native backend is the primary target. Checked HIR lowers to MIR, Cranelift lowers MIR directly to object code, and the host linker combines that object with the bootstrap `doria-rt` static library to produce a standalone executable. Native compilation does not execute user code and has no interpreter preflight or fallback IR. Generated Doria functions maintain runtime stack-frame metadata and pass it through a hidden backend-only parameter. `doria-rt` owns entry policy, exact stdout/stderr writes, abort-only panic formatting, stack traversal, and status 101. Cranelift selects width- and signedness-correct instructions for checked arithmetic, division/remainder, shifts, bitwise operations, comparisons, and conversions; every runtime failure branches to the shared Doria panic path instead of exposing a backend trap. A generated process-entry wrapper routes `main(): void` or canonical `main(): int`/`int64` through the versioned internal runtime ABI. Fixed-width helper values retain their full ranges, including `uint64` maximum, while only an explicit `main(): int` result crosses the `0..125` process boundary. Compile-time-known string expressions lower to exact byte data and explicit lengths without defining a runtime string ABI. Unsupported-coverage diagnostics remain for runtime floats/bools, string parameters/returns, writable/runtime strings, collection iteration, classes, methods/general static calls, labeled loop control, and broader valid Doria until later stages implement them.
 
 The PHP backend is currently implemented as a compatibility/debugging backend. It emits `<?php` and lowers Doria-only syntax away:
 
@@ -896,6 +943,8 @@ The PHP backend is currently implemented as a compatibility/debugging backend. I
 - `internal` is enforced by Doria before backend emission and may lower to PHP `private` or another backend-specific representation.
 - Typed arrays and collection aliases are emitted as `array` for the current PHP backend only.
 - Doria readonly/writable rules are enforced before Doria IR lowering and backend emission, not at PHP runtime.
+- `int`/`int64` remain the exact supported signed-integer alias subset.
+- Checked arithmetic, nondefault widths, unsigned semantics, division/remainder, shifts/bitwise operations, and integer companion conversions produce a clear backend unsupported-feature diagnostic whenever PHP cannot preserve the Doria behavior exactly.
 
 For Doria features that PHP cannot express directly, such as object construction in property initializers or richer attribute expressions, the PHP backend should lower to equivalent generated PHP where practical or produce a clear unsupported-feature diagnostic temporarily. PHP limitations must not define Doria semantics.
 
@@ -920,8 +969,8 @@ Future work includes:
 - Advanced control-flow design for `do ... while ... finally`, `given ... when`, `given ... while`, `if` chains with possible `finally`, value-returning `when`, `match`, and labeled or numeric loop control.
 - Careful evaluation of `goto`, labeled loop control, and structured conditional compilation without adopting C/C++ textual macros.
 - Async/await and structured concurrency.
-- Broader native runtime and backend implementation beyond the Stage 12 MIR subset.
-- Broader native code generation and standalone executable production beyond the current Stage 12 types and runtime capabilities.
+- Native float and bool runtime implementation beyond the Stage 13 MIR subset.
+- Broader native code generation and standalone executable production beyond the current Stage 13 types and runtime capabilities.
 - Self-hosting path for writing more of `doriac` in Doria.
 - PHP-to-Doria migration tooling.
 - Package management.

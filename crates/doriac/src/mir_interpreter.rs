@@ -1,6 +1,7 @@
 use std::fmt;
 
 use crate::mir;
+use crate::numeric::{IntegerPanic, IntegerType, IntegerValue};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InterpreterOutput {
@@ -38,32 +39,34 @@ impl std::error::Error for InterpreterError {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FunctionOutcome {
-    Int(i64),
+    Integer(IntegerValue),
     Void,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum LocalValue {
-    Int(i64),
+    Integer(IntegerValue),
     String(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EvaluationValue {
-    Int(i64),
+    Integer(IntegerValue),
     Bool(bool),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReturnExpectation {
-    Int,
+    Integer(IntegerType),
     Void,
 }
 
 #[derive(Debug, Clone)]
 enum EvaluationTask {
-    Int(mir::IntExpression),
-    Binary(mir::BinaryOp),
+    Integer(mir::IntegerExpression),
+    Unary(mir::IntegerUnaryOp),
+    Binary(mir::IntegerBinaryOp),
+    Convert(IntegerType),
     Condition(mir::Condition),
     Compare(mir::CompareOp),
     Not,
@@ -76,6 +79,7 @@ enum EvaluationTask {
         expectation: ReturnExpectation,
     },
     Assign(mir::LocalId),
+    ReturnInteger(IntegerType),
     Branch {
         then_block: mir::BlockId,
         else_block: mir::BlockId,
@@ -213,7 +217,22 @@ impl Interpreter<'_> {
                             target.0
                         )));
                     }
-                    (mir::Type::Int, value) => self.queue_int_assignment(target, value)?,
+                    (mir::Type::Integer(expected), mir::Rvalue::Integer(expression)) => {
+                        if expression.ty() != expected {
+                            return Err(InterpreterError::new(format!(
+                                "MIR integer local local{} has type {expected}, but its rvalue has type {}",
+                                target.0,
+                                expression.ty()
+                            )));
+                        }
+                        self.queue_integer_assignment(target, expression)?;
+                    }
+                    (mir::Type::Integer(_), mir::Rvalue::String(_)) => {
+                        return Err(InterpreterError::new(format!(
+                            "MIR integer local local{} received a string value",
+                            target.0
+                        )));
+                    }
                 }
             }
             mir::Statement::EchoStringLiteral(value) => {
@@ -237,14 +256,23 @@ impl Interpreter<'_> {
     ) -> Result<StepOutcome, InterpreterError> {
         match terminator {
             mir::Terminator::Return(operand) => {
-                if function.return_type != mir::ReturnType::Int {
+                let mir::ReturnType::Integer(expected) = function.return_type else {
                     return Err(InterpreterError::new(format!(
-                        "MIR void function {} returned an int value",
+                        "MIR void function {} returned an integer value",
                         function.name
                     )));
+                };
+                if operand.ty() != expected {
+                    return Err(InterpreterError::new(format!(
+                        "MIR function {} returns {expected}, but its return expression has type {}",
+                        function.name,
+                        operand.ty()
+                    )));
                 }
-                let value = eval_operand(&operand, &self.current_frame()?.locals)?;
-                self.complete_frame(FunctionOutcome::Int(value))
+                let frame = self.current_frame_mut()?;
+                frame.tasks.push(EvaluationTask::ReturnInteger(expected));
+                frame.tasks.push(EvaluationTask::Integer(operand));
+                Ok(StepOutcome::Continue)
             }
             mir::Terminator::ReturnVoid => {
                 if function.return_type != mir::ReturnType::Void {
@@ -285,22 +313,41 @@ impl Interpreter<'_> {
 
     fn execute_task(&mut self, task: EvaluationTask) -> Result<StepOutcome, InterpreterError> {
         match task {
-            EvaluationTask::Int(expression) => self.expand_int_expression(expression)?,
-            EvaluationTask::Binary(op) => {
-                let right = self.pop_int()?;
-                let left = self.pop_int()?;
-                let value = match eval_binary(op, left, right) {
-                    Some(value) => value,
-                    None => return Ok(StepOutcome::Panic(overflow_message(op).to_string())),
+            EvaluationTask::Integer(expression) => self.expand_integer_expression(expression)?,
+            EvaluationTask::Unary(op) => {
+                let operand = self.pop_integer()?;
+                let value = match eval_unary(op, operand) {
+                    Ok(value) => value,
+                    Err(panic) => return Ok(StepOutcome::Panic(panic.message().to_string())),
                 };
                 self.current_frame_mut()?
                     .values
-                    .push(EvaluationValue::Int(value));
+                    .push(EvaluationValue::Integer(value));
+            }
+            EvaluationTask::Binary(op) => {
+                let right = self.pop_integer()?;
+                let left = self.pop_integer()?;
+                let value = match eval_binary(op, left, right) {
+                    Ok(value) => value,
+                    Err(panic) => return Ok(StepOutcome::Panic(panic.message().to_string())),
+                };
+                self.current_frame_mut()?
+                    .values
+                    .push(EvaluationValue::Integer(value));
+            }
+            EvaluationTask::Convert(target) => {
+                let value = match self.pop_integer()?.convert(target) {
+                    Ok(value) => value,
+                    Err(panic) => return Ok(StepOutcome::Panic(panic.message().to_string())),
+                };
+                self.current_frame_mut()?
+                    .values
+                    .push(EvaluationValue::Integer(value));
             }
             EvaluationTask::Condition(condition) => self.expand_condition(condition)?,
             EvaluationTask::Compare(op) => {
-                let right = self.pop_int()?;
-                let left = self.pop_int()?;
+                let right = self.pop_integer()?;
+                let left = self.pop_integer()?;
                 let value = eval_compare(op, left, right);
                 self.current_frame_mut()?
                     .values
@@ -350,14 +397,24 @@ impl Interpreter<'_> {
                 self.push_frame(function, &args, Some(expectation))?;
             }
             EvaluationTask::Assign(target) => {
-                let value = self.pop_int()?;
+                let value = self.pop_integer()?;
                 let function = function_in(self.program, self.current_frame()?.function)?;
                 assign_local(
                     &function.locals,
                     &mut self.current_frame_mut()?.locals,
                     target,
-                    LocalValue::Int(value),
+                    LocalValue::Integer(value),
                 )?;
+            }
+            EvaluationTask::ReturnInteger(expected) => {
+                let value = self.pop_integer()?;
+                if value.ty != expected {
+                    return Err(InterpreterError::new(format!(
+                        "MIR return evaluation produced {}, expected {expected}",
+                        value.ty
+                    )));
+                }
+                return self.complete_frame(FunctionOutcome::Integer(value));
             }
             EvaluationTask::Branch {
                 then_block,
@@ -375,25 +432,64 @@ impl Interpreter<'_> {
         Ok(StepOutcome::Continue)
     }
 
-    fn expand_int_expression(
+    fn expand_integer_expression(
         &mut self,
-        expression: mir::IntExpression,
+        expression: mir::IntegerExpression,
     ) -> Result<(), InterpreterError> {
         match expression {
-            mir::IntExpression::Use(operand) => {
+            mir::IntegerExpression::Use { ty, operand } => {
                 let value = eval_operand(&operand, &self.current_frame()?.locals)?;
+                if value.ty != ty {
+                    return Err(InterpreterError::new(format!(
+                        "MIR operand evaluation produced {}, expression declares {ty}",
+                        value.ty
+                    )));
+                }
                 self.current_frame_mut()?
                     .values
-                    .push(EvaluationValue::Int(value));
+                    .push(EvaluationValue::Integer(value));
             }
-            mir::IntExpression::Binary { op, left, right } => {
+            mir::IntegerExpression::Unary { ty, op, operand } => {
+                if operand.ty() != ty {
+                    return Err(InterpreterError::new(format!(
+                        "MIR {ty} unary expression has operand type {}",
+                        operand.ty()
+                    )));
+                }
+                if op == mir::IntegerUnaryOp::Negate && !ty.is_signed() {
+                    return Err(InterpreterError::new(format!(
+                        "MIR unary negation requires a signed integer, got {ty}"
+                    )));
+                }
+                let frame = self.current_frame_mut()?;
+                frame.tasks.push(EvaluationTask::Unary(op));
+                frame.tasks.push(EvaluationTask::Integer(*operand));
+            }
+            mir::IntegerExpression::Binary {
+                ty,
+                op,
+                left,
+                right,
+            } => {
+                if left.ty() != ty || right.ty() != ty {
+                    return Err(InterpreterError::new(format!(
+                        "MIR {ty} binary expression has operand types {} and {}",
+                        left.ty(),
+                        right.ty()
+                    )));
+                }
                 let frame = self.current_frame_mut()?;
                 frame.tasks.push(EvaluationTask::Binary(op));
-                frame.tasks.push(EvaluationTask::Int(*right));
-                frame.tasks.push(EvaluationTask::Int(*left));
+                frame.tasks.push(EvaluationTask::Integer(*right));
+                frame.tasks.push(EvaluationTask::Integer(*left));
             }
-            mir::IntExpression::Call { function, args } => {
-                self.queue_call(function, args, ReturnExpectation::Int)?;
+            mir::IntegerExpression::Convert { ty, value } => {
+                let frame = self.current_frame_mut()?;
+                frame.tasks.push(EvaluationTask::Convert(ty));
+                frame.tasks.push(EvaluationTask::Integer(*value));
+            }
+            mir::IntegerExpression::Call { ty, function, args } => {
+                self.queue_call(function, args, ReturnExpectation::Integer(ty))?;
             }
         }
         Ok(())
@@ -406,10 +502,17 @@ impl Interpreter<'_> {
                 .values
                 .push(EvaluationValue::Bool(value)),
             mir::Condition::Compare { op, left, right } => {
+                if left.ty() != right.ty() {
+                    return Err(InterpreterError::new(format!(
+                        "MIR comparison has operand types {} and {}",
+                        left.ty(),
+                        right.ty()
+                    )));
+                }
                 let frame = self.current_frame_mut()?;
                 frame.tasks.push(EvaluationTask::Compare(op));
-                frame.tasks.push(EvaluationTask::Int(right));
-                frame.tasks.push(EvaluationTask::Int(left));
+                frame.tasks.push(EvaluationTask::Integer(right));
+                frame.tasks.push(EvaluationTask::Integer(left));
             }
             mir::Condition::Not(condition) => {
                 let frame = self.current_frame_mut()?;
@@ -448,42 +551,21 @@ impl Interpreter<'_> {
         Ok(())
     }
 
-    fn queue_int_assignment(
+    fn queue_integer_assignment(
         &mut self,
         target: mir::LocalId,
-        value: mir::Rvalue,
+        value: mir::IntegerExpression,
     ) -> Result<(), InterpreterError> {
-        self.current_frame_mut()?
-            .tasks
-            .push(EvaluationTask::Assign(target));
-        match value {
-            mir::Rvalue::Use(operand) => self
-                .current_frame_mut()?
-                .tasks
-                .push(EvaluationTask::Int(mir::IntExpression::Use(operand))),
-            mir::Rvalue::Binary { op, left, right } => self.current_frame_mut()?.tasks.push(
-                EvaluationTask::Int(mir::IntExpression::Binary {
-                    op,
-                    left: Box::new(mir::IntExpression::Use(left)),
-                    right: Box::new(mir::IntExpression::Use(right)),
-                }),
-            ),
-            mir::Rvalue::Call { function, args } => {
-                self.queue_call(function, args, ReturnExpectation::Int)?;
-            }
-            mir::Rvalue::String(_) => {
-                return Err(InterpreterError::new(
-                    "MIR string rvalue reached integer evaluation",
-                ));
-            }
-        }
+        let frame = self.current_frame_mut()?;
+        frame.tasks.push(EvaluationTask::Assign(target));
+        frame.tasks.push(EvaluationTask::Integer(value));
         Ok(())
     }
 
     fn queue_call(
         &mut self,
         function: mir::FunctionId,
-        args: Vec<mir::IntExpression>,
+        args: Vec<mir::IntegerExpression>,
         expectation: ReturnExpectation,
     ) -> Result<(), InterpreterError> {
         let frame = self.current_frame_mut()?;
@@ -493,7 +575,7 @@ impl Interpreter<'_> {
             expectation,
         });
         for argument in args.into_iter().rev() {
-            frame.tasks.push(EvaluationTask::Int(argument));
+            frame.tasks.push(EvaluationTask::Integer(argument));
         }
         Ok(())
     }
@@ -501,7 +583,7 @@ impl Interpreter<'_> {
     fn push_frame(
         &mut self,
         function_id: mir::FunctionId,
-        args: &[i64],
+        args: &[IntegerValue],
         caller_expectation: Option<ReturnExpectation>,
     ) -> Result<(), InterpreterError> {
         if let Some(limit) = self.limits.max_call_frames {
@@ -531,11 +613,24 @@ impl Interpreter<'_> {
             }
         }
         for (parameter, value) in function.params.iter().zip(args.iter().copied()) {
+            let definition = local_in(function, *parameter)?;
+            let mir::Type::Integer(expected) = definition.ty else {
+                return Err(InterpreterError::new(format!(
+                    "MIR function {} parameter local{} is not an integer",
+                    function.name, parameter.0
+                )));
+            };
+            if value.ty != expected {
+                return Err(InterpreterError::new(format!(
+                    "MIR function {} parameter local{} expects {expected}, got {}",
+                    function.name, parameter.0, value.ty
+                )));
+            }
             assign_local(
                 &function.locals,
                 &mut locals,
                 *parameter,
-                LocalValue::Int(value),
+                LocalValue::Integer(value),
             )?;
         }
         block_in(function, function.entry_block)?;
@@ -564,16 +659,27 @@ impl Interpreter<'_> {
             return Ok(StepOutcome::EntryReturned(outcome));
         };
         match (expectation, outcome) {
-            (ReturnExpectation::Int, FunctionOutcome::Int(value)) => self
-                .current_frame_mut()?
-                .values
-                .push(EvaluationValue::Int(value)),
-            (ReturnExpectation::Void, FunctionOutcome::Void) => {}
-            (ReturnExpectation::Int, FunctionOutcome::Void) => {
-                return Err(InterpreterError::new("MIR int call returned a void value"));
+            (ReturnExpectation::Integer(expected), FunctionOutcome::Integer(value)) => {
+                if value.ty != expected {
+                    return Err(InterpreterError::new(format!(
+                        "MIR integer call expected {expected}, returned {}",
+                        value.ty
+                    )));
+                }
+                self.current_frame_mut()?
+                    .values
+                    .push(EvaluationValue::Integer(value));
             }
-            (ReturnExpectation::Void, FunctionOutcome::Int(_)) => {
-                return Err(InterpreterError::new("MIR void call returned an int value"));
+            (ReturnExpectation::Void, FunctionOutcome::Void) => {}
+            (ReturnExpectation::Integer(_), FunctionOutcome::Void) => {
+                return Err(InterpreterError::new(
+                    "MIR integer call returned a void value",
+                ));
+            }
+            (ReturnExpectation::Void, FunctionOutcome::Integer(_)) => {
+                return Err(InterpreterError::new(
+                    "MIR void call returned an integer value",
+                ));
             }
         }
         Ok(StepOutcome::Continue)
@@ -592,7 +698,7 @@ impl Interpreter<'_> {
         Ok(())
     }
 
-    fn take_call_arguments(&mut self, count: usize) -> Result<Vec<i64>, InterpreterError> {
+    fn take_call_arguments(&mut self, count: usize) -> Result<Vec<IntegerValue>, InterpreterError> {
         let frame = self.current_frame_mut()?;
         if frame.values.len() < count {
             return Err(InterpreterError::new(
@@ -604,7 +710,7 @@ impl Interpreter<'_> {
             .values
             .drain(start..)
             .map(|value| match value {
-                EvaluationValue::Int(value) => Ok(value),
+                EvaluationValue::Integer(value) => Ok(value),
                 EvaluationValue::Bool(_) => Err(InterpreterError::new(
                     "MIR call argument evaluation produced a bool value",
                 )),
@@ -612,9 +718,9 @@ impl Interpreter<'_> {
             .collect()
     }
 
-    fn pop_int(&mut self) -> Result<i64, InterpreterError> {
+    fn pop_integer(&mut self) -> Result<IntegerValue, InterpreterError> {
         match self.current_frame_mut()?.values.pop() {
-            Some(EvaluationValue::Int(value)) => Ok(value),
+            Some(EvaluationValue::Integer(value)) => Ok(value),
             Some(EvaluationValue::Bool(_)) => Err(InterpreterError::new(
                 "MIR integer evaluation produced a bool value",
             )),
@@ -627,7 +733,7 @@ impl Interpreter<'_> {
     fn pop_bool(&mut self) -> Result<bool, InterpreterError> {
         match self.current_frame_mut()?.values.pop() {
             Some(EvaluationValue::Bool(value)) => Ok(value),
-            Some(EvaluationValue::Int(_)) => Err(InterpreterError::new(
+            Some(EvaluationValue::Integer(_)) => Err(InterpreterError::new(
                 "MIR condition evaluation produced an int value",
             )),
             None => Err(InterpreterError::new(
@@ -654,7 +760,10 @@ impl Interpreter<'_> {
         outcome: FunctionOutcome,
     ) -> Result<InterpreterOutput, InterpreterError> {
         match (entry.return_type, outcome) {
-            (mir::ReturnType::Int, FunctionOutcome::Int(value)) => {
+            (mir::ReturnType::Integer(IntegerType::Int64), FunctionOutcome::Integer(value))
+                if value.ty == IntegerType::Int64 =>
+            {
+                let value = value.signed_value();
                 if (0..=125).contains(&value) {
                     Ok(InterpreterOutput {
                         stdout: self.stdout.clone(),
@@ -673,12 +782,18 @@ impl Interpreter<'_> {
                 stderr: Vec::new(),
                 exit_status: 0,
             }),
-            (mir::ReturnType::Int, FunctionOutcome::Void) => Err(InterpreterError::new(
-                "MIR int entry function returned void",
+            (mir::ReturnType::Integer(_), FunctionOutcome::Void) => Err(InterpreterError::new(
+                "MIR integer entry function returned void",
             )),
-            (mir::ReturnType::Void, FunctionOutcome::Int(_)) => Err(InterpreterError::new(
-                "MIR void entry function returned an int value",
+            (mir::ReturnType::Void, FunctionOutcome::Integer(_)) => Err(InterpreterError::new(
+                "MIR void entry function returned an integer value",
             )),
+            (mir::ReturnType::Integer(ty), FunctionOutcome::Integer(value)) => {
+                Err(InterpreterError::new(format!(
+                    "MIR entry must return int, but signature/value were {ty}/{}",
+                    value.ty
+                )))
+            }
         }
     }
 
@@ -699,9 +814,9 @@ impl Interpreter<'_> {
 
     fn panic_output_with_trace(&self, message: &str, trace: &[&str]) -> InterpreterOutput {
         let mut stderr = Vec::new();
-        stderr.extend_from_slice(b"panic: ");
+        stderr.extend_from_slice(b"Panic: ");
         stderr.extend_from_slice(message.as_bytes());
-        stderr.extend_from_slice(b"\nstack trace:\n");
+        stderr.extend_from_slice(b"\nStack Trace:\n");
         for function in trace {
             stderr.extend_from_slice(b"  at ");
             stderr.extend_from_slice(function.as_bytes());
@@ -732,41 +847,55 @@ pub fn render_debug_output(output: &InterpreterOutput) -> String {
     }
 }
 
-fn eval_compare(op: mir::CompareOp, left: i64, right: i64) -> bool {
+fn eval_compare(op: mir::CompareOp, left: IntegerValue, right: IntegerValue) -> bool {
+    let ordering = left.compare(right);
     match op {
-        mir::CompareOp::Equal => left == right,
-        mir::CompareOp::NotEqual => left != right,
-        mir::CompareOp::Less => left < right,
-        mir::CompareOp::LessEqual => left <= right,
-        mir::CompareOp::Greater => left > right,
-        mir::CompareOp::GreaterEqual => left >= right,
+        mir::CompareOp::Equal => ordering.is_eq(),
+        mir::CompareOp::NotEqual => !ordering.is_eq(),
+        mir::CompareOp::Less => ordering.is_lt(),
+        mir::CompareOp::LessEqual => !ordering.is_gt(),
+        mir::CompareOp::Greater => ordering.is_gt(),
+        mir::CompareOp::GreaterEqual => !ordering.is_lt(),
     }
 }
 
-fn eval_binary(op: mir::BinaryOp, left: i64, right: i64) -> Option<i64> {
+fn eval_unary(
+    op: mir::IntegerUnaryOp,
+    operand: IntegerValue,
+) -> Result<IntegerValue, IntegerPanic> {
     match op {
-        mir::BinaryOp::Add => left.checked_add(right),
-        mir::BinaryOp::Subtract => left.checked_sub(right),
-        mir::BinaryOp::Multiply => left.checked_mul(right),
+        mir::IntegerUnaryOp::Negate => operand.checked_neg(),
+        mir::IntegerUnaryOp::BitwiseNot => Ok(operand.bitwise_not()),
     }
 }
 
-fn overflow_message(op: mir::BinaryOp) -> &'static str {
+fn eval_binary(
+    op: mir::IntegerBinaryOp,
+    left: IntegerValue,
+    right: IntegerValue,
+) -> Result<IntegerValue, IntegerPanic> {
     match op {
-        mir::BinaryOp::Add => "integer overflow during addition",
-        mir::BinaryOp::Subtract => "integer overflow during subtraction",
-        mir::BinaryOp::Multiply => "integer overflow during multiplication",
+        mir::IntegerBinaryOp::Add => left.checked_add(right),
+        mir::IntegerBinaryOp::Subtract => left.checked_sub(right),
+        mir::IntegerBinaryOp::Multiply => left.checked_mul(right),
+        mir::IntegerBinaryOp::Divide => left.divide(right),
+        mir::IntegerBinaryOp::Remainder => left.remainder(right),
+        mir::IntegerBinaryOp::ShiftLeft => left.shift_left(right),
+        mir::IntegerBinaryOp::ShiftRight => left.shift_right(right),
+        mir::IntegerBinaryOp::BitwiseAnd => Ok(left.bitwise_and(right)),
+        mir::IntegerBinaryOp::BitwiseXor => Ok(left.bitwise_xor(right)),
+        mir::IntegerBinaryOp::BitwiseOr => Ok(left.bitwise_or(right)),
     }
 }
 
 fn eval_operand(
     operand: &mir::Operand,
     locals: &[Option<LocalValue>],
-) -> Result<i64, InterpreterError> {
+) -> Result<IntegerValue, InterpreterError> {
     match operand {
-        mir::Operand::Int(value) => Ok(*value),
+        mir::Operand::Integer(value) => Ok(*value),
         mir::Operand::Local(id) => match read_local(locals, *id)? {
-            LocalValue::Int(value) => Ok(*value),
+            LocalValue::Integer(value) => Ok(*value),
             LocalValue::String(_) => Err(InterpreterError::new(format!(
                 "MIR string local local{} was used as an int value",
                 id.0
@@ -783,7 +912,7 @@ fn eval_string_expression(
         mir::StringExpression::Literal(value) => Ok(value.clone()),
         mir::StringExpression::Local(id) => match read_local(locals, *id)? {
             LocalValue::String(value) => Ok(value.clone()),
-            LocalValue::Int(_) => Err(InterpreterError::new(format!(
+            LocalValue::Integer(_) => Err(InterpreterError::new(format!(
                 "MIR int local local{} was used as a string value",
                 id.0
             ))),
@@ -826,11 +955,14 @@ fn assign_local(
         .ok_or_else(|| InterpreterError::new(format!("MIR local local{} does not exist", id.0)))?;
     let compatible = matches!(
         (definition.ty, &value),
-        (mir::Type::Int, LocalValue::Int(_)) | (mir::Type::String, LocalValue::String(_))
+        (mir::Type::Integer(expected), LocalValue::Integer(actual)) if expected == actual.ty
+    ) || matches!(
+        (definition.ty, &value),
+        (mir::Type::String, LocalValue::String(_))
     );
     if !compatible {
-        let actual = match value {
-            LocalValue::Int(_) => "int",
+        let actual = match &value {
+            LocalValue::Integer(value) => value.ty.source_name(),
             LocalValue::String(_) => "string",
         };
         return Err(InterpreterError::new(format!(

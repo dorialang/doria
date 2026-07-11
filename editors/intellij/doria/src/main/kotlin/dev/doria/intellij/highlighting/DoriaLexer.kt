@@ -908,7 +908,32 @@ class DoriaLexer : LexerBase() {
         )
 
         private val STRICT_COMPARISON_OPERATORS = setOf("===", "!==")
-        private val THREE_CHAR_OPERATORS = STRICT_COMPARISON_OPERATORS + setOf("..<", "?->")
-        private val TWO_CHAR_OPERATORS = setOf("==", "!=", "<=", ">=", "&&", "||", "??", "=>", "<<", ">>", "+=", "-=", "++", "--", "..", "->", "::")
+        private val THREE_CHAR_OPERATORS =
+            STRICT_COMPARISON_OPERATORS + setOf("..<", "?->", "<<=", ">>=")
+        private val TWO_CHAR_OPERATORS = setOf(
+            "==",
+            "!=",
+            "<=",
+            ">=",
+            "&&",
+            "||",
+            "??",
+            "=>",
+            "<<",
+            ">>",
+            "+=",
+            "-=",
+            "*=",
+            "/=",
+            "%=",
+            "&=",
+            "|=",
+            "^=",
+            "++",
+            "--",
+            "..",
+            "->",
+            "::",
+        )
     }
 }
