@@ -1,0 +1,13 @@
+function selectCode(float $value, bool $enabled): int
+{
+    if ($enabled and $value > 41.0) {
+        return Float::toInt($value);
+    }
+
+    return 0;
+}
+
+function main(): int
+{
+    return selectCode(42.75, true);
+}

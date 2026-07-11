@@ -2,7 +2,7 @@ use std::env;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
-use crate::backend::BackendError;
+use crate::backend::{BackendError, NativeProfile};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ArchiveFormat {
@@ -10,7 +10,7 @@ enum ArchiveFormat {
     Msvc,
 }
 
-pub fn locate() -> Result<PathBuf, BackendError> {
+pub fn locate(profile: NativeProfile) -> Result<PathBuf, BackendError> {
     let current_executable = env::current_exe().map_err(|error| {
         BackendError::new(format!(
             "doria-rt static library was not found: failed to locate doriac: {error}\nhelp: build it with `cargo build -p doria-rt` or set DORIA_RT_PATH"
@@ -32,12 +32,15 @@ pub fn locate() -> Result<PathBuf, BackendError> {
         } else {
             ArchiveFormat::Gnu
         },
-        if cfg!(debug_assertions) {
-            "debug"
-        } else {
-            "release"
-        },
+        profile_directory(profile),
     )
+}
+
+const fn profile_directory(profile: NativeProfile) -> &'static str {
+    match profile {
+        NativeProfile::Fast => "debug",
+        NativeProfile::Release => "release",
+    }
 }
 
 fn resolve(
@@ -63,18 +66,6 @@ fn resolve(
         return Err(not_found_error(Some(&candidate)));
     }
 
-    let mut candidates = Vec::new();
-    if let Some(compiler_built_runtime) = compiler_built_runtime {
-        candidates.push(compiler_built_runtime.to_path_buf());
-    }
-    if let Some(parent) = current_executable.parent() {
-        candidates.push(parent.join(filename));
-        candidates.push(parent.join("../lib/doria").join(filename));
-        if let Some(profile_directory) = parent.parent() {
-            candidates.push(profile_directory.join(filename));
-        }
-    }
-
     let target_root = target_override.map_or_else(
         || workspace.join("target"),
         |target| {
@@ -86,7 +77,24 @@ fn resolve(
             }
         },
     );
-    candidates.push(target_root.join(profile).join(filename));
+    let preferred_profile_runtime = target_root.join(profile).join(filename);
+    let mut candidates = Vec::new();
+    if profile == "release" {
+        candidates.push(preferred_profile_runtime.clone());
+    }
+    if let Some(compiler_built_runtime) = compiler_built_runtime {
+        candidates.push(compiler_built_runtime.to_path_buf());
+    }
+    if let Some(parent) = current_executable.parent() {
+        candidates.push(parent.join(filename));
+        candidates.push(parent.join("../lib/doria").join(filename));
+        if let Some(profile_directory) = parent.parent() {
+            candidates.push(profile_directory.join(filename));
+        }
+    }
+    if profile != "release" {
+        candidates.push(preferred_profile_runtime);
+    }
     let alternate_profile = if profile == "debug" {
         "release"
     } else {
@@ -250,6 +258,30 @@ mod tests {
         )
         .expect("compiler-built runtime should resolve before passive fallbacks");
         assert_eq!(resolved, runtime);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn release_profile_prefers_release_runtime_over_compiler_built_fallback() {
+        let directory = temp_directory("release-preference");
+        let compiler_built = directory.join("build/libdoria_rt.a");
+        let release = directory.join("target/release/libdoria_rt.a");
+        fs::create_dir_all(compiler_built.parent().unwrap()).unwrap();
+        fs::create_dir_all(release.parent().unwrap()).unwrap();
+        fs::write(&compiler_built, b"debug").unwrap();
+        fs::write(&release, b"release").unwrap();
+
+        let resolved = resolve(
+            None,
+            &directory.join("bin/doriac"),
+            Some(&compiler_built),
+            &directory,
+            None,
+            ArchiveFormat::Gnu,
+            "release",
+        )
+        .expect("release runtime should resolve");
+        assert_eq!(resolved, release);
         let _ = fs::remove_dir_all(directory);
     }
 }

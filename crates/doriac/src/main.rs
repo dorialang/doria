@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, ExitStatus};
 use std::str::FromStr;
 
-use doriac::backend::{BackendOutput, BackendTarget};
+use doriac::backend::{BackendOutput, BackendTarget, CompileOptions, NativeProfile};
 
 fn main() -> ExitCode {
     match run() {
@@ -54,6 +54,7 @@ fn compile_command(args: &[String]) -> Result<(), String> {
         .first()
         .ok_or_else(|| "missing input file".to_string())?;
     let mut target = BackendTarget::Native;
+    let mut release = false;
     let mut out = None::<String>;
     let mut index = 1;
     while index < args.len() {
@@ -74,8 +75,16 @@ fn compile_command(args: &[String]) -> Result<(), String> {
                 );
                 index += 2;
             }
+            "--release" => {
+                release = true;
+                index += 1;
+            }
             flag => return Err(format!("unknown compile option `{flag}`")),
         }
+    }
+
+    if release && target != BackendTarget::Native {
+        return Err("--release is only valid for the native target".to_string());
     }
 
     if !target.is_available() {
@@ -91,7 +100,15 @@ fn compile_command(args: &[String]) -> Result<(), String> {
         Some(out) => PathBuf::from(out),
         None => default_output_path(input, target)?,
     };
-    let output = doriac::compile_source(path.clone(), text.clone(), target)
+    let options = CompileOptions {
+        target,
+        native_profile: if release {
+            NativeProfile::Release
+        } else {
+            NativeProfile::Fast
+        },
+    };
+    let output = doriac::compile_source_with_options(path.clone(), text.clone(), options)
         .map_err(|diagnostics| doriac::render_diagnostics(path, text, &diagnostics))?;
 
     write_backend_output(&out_path, output)?;
@@ -223,13 +240,26 @@ fn run_command(args: &[String]) -> Result<ExitCode, String> {
     let input = args
         .first()
         .ok_or_else(|| "missing input file".to_string())?;
-    if args.len() > 1 {
-        return Err(format!("unknown run option `{}`", args[1]));
+    let mut release = false;
+    for option in &args[1..] {
+        match option.as_str() {
+            "--release" => release = true,
+            option => return Err(format!("unknown run option `{option}`")),
+        }
     }
 
     let (path, text) = read_source(input)?;
-    let output = doriac::compile_source(path.clone(), text.clone(), BackendTarget::Native)
-        .map_err(|diagnostics| doriac::render_diagnostics(path, text, &diagnostics))?;
+    let profile = if release {
+        NativeProfile::Release
+    } else {
+        NativeProfile::Fast
+    };
+    let output = doriac::compile_source_with_options(
+        path.clone(),
+        text.clone(),
+        CompileOptions::native(profile),
+    )
+    .map_err(|diagnostics| doriac::render_diagnostics(path, text, &diagnostics))?;
 
     let temp_path = temp_run_executable_path(input);
     write_backend_output(&temp_path, output)
@@ -301,7 +331,7 @@ fn direct_executable_hint(path: &Path) -> String {
 
 fn print_help() {
     println!(
-        "doriac 0.1.0\n\nUSAGE:\n    doriac check <source.doria>\n    doriac ast <source.doria>\n    doriac hir <source.doria>\n    doriac mir <source.doria>\n    doriac compile <source.doria> [--out <file>]\n    doriac compile <source.doria> --target php [--out <file>]\n    doriac run <source.doria>\n\nTARGETS:\n    native    default target for standalone executables\n    php       compatibility and inspection backend\n    debug     MIR interpreter debug artifact\n    wasm      planned WebAssembly backend"
+        "doriac 0.1.0\n\nUSAGE:\n    doriac check <source.doria>\n    doriac ast <source.doria>\n    doriac hir <source.doria>\n    doriac mir <source.doria>\n    doriac compile <source.doria> [--release] [--out <file>]\n    doriac compile <source.doria> --target php [--out <file>]\n    doriac run <source.doria> [--release]\n\nNATIVE PROFILES:\n    fast       default Cranelift profile for rapid local feedback\n    release    LLVM optimized profile selected with --release\n\nTARGETS:\n    native    default target for standalone executables\n    php       compatibility and inspection backend\n    debug     MIR interpreter debug artifact\n    wasm      planned WebAssembly backend"
     );
 }
 

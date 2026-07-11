@@ -54,6 +54,7 @@ examples/native/main_nested_panic_stack.doria
 examples/native/main_readonly_local.doria
 examples/native/main_recursive_depth_512_42.doria
 examples/native/main_recursive_fibonacci_55.doria
+examples/native/main_release_profile_42.doria
 examples/native/main_recursive_panic_stack.doria
 examples/native/main_remainder_by_zero_panic.doria
 examples/native/main_return_42.doria

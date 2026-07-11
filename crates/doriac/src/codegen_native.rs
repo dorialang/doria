@@ -6,13 +6,31 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::backend::BackendError;
+use crate::backend::{BackendError, NativeProfile};
 use crate::{codegen_cranelift, mir, runtime_artifact};
 
-pub fn generate_executable(program: &mir::Program) -> Result<Vec<u8>, BackendError> {
-    let object_bytes = codegen_cranelift::lower_mir_to_object(program)?;
-    let runtime_path = runtime_artifact::locate()?;
+pub fn generate_executable(
+    program: &mir::Program,
+    profile: NativeProfile,
+) -> Result<Vec<u8>, BackendError> {
+    let object_bytes = match profile {
+        NativeProfile::Fast => codegen_cranelift::lower_mir_to_object(program)?,
+        NativeProfile::Release => lower_release_object(program)?,
+    };
+    let runtime_path = runtime_artifact::locate(profile)?;
     link_object(&object_bytes, &runtime_path)
+}
+
+#[cfg(feature = "llvm-backend")]
+fn lower_release_object(program: &mir::Program) -> Result<Vec<u8>, BackendError> {
+    crate::codegen_llvm::lower_mir_to_object(program)
+}
+
+#[cfg(not(feature = "llvm-backend"))]
+fn lower_release_object(_program: &mir::Program) -> Result<Vec<u8>, BackendError> {
+    Err(BackendError::new(
+        "LLVM release support is not available in this doriac build\nhelp: rebuild doriac with the llvm-backend feature",
+    ))
 }
 
 fn link_object(object_bytes: &[u8], runtime_path: &Path) -> Result<Vec<u8>, BackendError> {

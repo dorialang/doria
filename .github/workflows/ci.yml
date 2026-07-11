@@ -144,3 +144,129 @@ jobs:
 
       - name: Smoke compile PHP compatibility example
         run: cargo run -p doriac -- compile examples/php/person.doria --target php --out build/php/person.php
+
+  llvm-release:
+    name: llvm-release-${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-14, windows-2025]
+    runs-on: ${{ matrix.os }}
+    env:
+      DORIA_LLVM_VERSION: 18
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Install LLVM 18 on Linux
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes llvm-18-dev libffi-dev
+          echo "LLVM_SYS_181_PREFIX=/usr/lib/llvm-18" >> "$GITHUB_ENV"
+
+      - name: Install LLVM 18.1.8 on macOS
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          brew install llvm@18
+          llvm_prefix="$(brew --prefix llvm@18)"
+          echo "LLVM_SYS_181_PREFIX=${llvm_prefix}" >> "$GITHUB_ENV"
+          echo "DYLD_FALLBACK_LIBRARY_PATH=${llvm_prefix}/lib" >> "$GITHUB_ENV"
+          echo "${llvm_prefix}/bin" >> "$GITHUB_PATH"
+
+      - name: Install LLVM 18.1.8 development archive on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP "clang+llvm-18.1.8-x86_64-pc-windows-msvc.tar.xz"
+          $prefix = Join-Path $env:RUNNER_TEMP "clang+llvm-18.1.8-x86_64-pc-windows-msvc"
+          Invoke-WebRequest -Uri "https://github.com/llvm/llvm-project/releases/download/llvmorg-18.1.8/clang%2Bllvm-18.1.8-x86_64-pc-windows-msvc.tar.xz" -OutFile $archive
+          tar -xf $archive -C $env:RUNNER_TEMP
+          "LLVM_SYS_181_PREFIX=$prefix" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          (Join-Path $prefix "bin") | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Confirm pinned LLVM major on Unix
+        if: runner.os != 'Windows'
+        shell: bash
+        run: "${LLVM_SYS_181_PREFIX}/bin/llvm-config --version"
+
+      - name: Confirm pinned LLVM major on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: '& "$env:LLVM_SYS_181_PREFIX\bin\llvm-config.exe" --version'
+
+      - name: Build optimized doria-rt and select it explicitly
+        shell: bash
+        run: |
+          cargo build -p doria-rt --release --locked --verbose
+          if [[ "${RUNNER_OS}" == "Windows" ]]; then
+            echo "DORIA_RT_PATH=${GITHUB_WORKSPACE}/target/release/doria_rt.lib" >> "$GITHUB_ENV"
+          else
+            echo "DORIA_RT_PATH=${GITHUB_WORKSPACE}/target/release/libdoria_rt.a" >> "$GITHUB_ENV"
+          fi
+
+      - name: Clippy LLVM-enabled compiler
+        run: cargo clippy -p doriac --all-targets --features llvm-backend --locked -- -D warnings
+
+      - name: Build LLVM-enabled compiler
+        run: cargo build -p doriac --all-targets --features llvm-backend --locked --verbose
+
+      - name: Run shared validator and LLVM-focused tests
+        run: |
+          cargo test -p doriac --test mir_validation_tests --features llvm-backend --locked --verbose
+          cargo test -p doriac --test llvm_mir_tests --features llvm-backend --locked --verbose
+          cargo test -p doriac --test cli_tests --features llvm-backend --locked --verbose
+
+      - name: Run complete interpreter, Cranelift, and LLVM parity manifest
+        run: cargo test -p doriac --test native_mir_parity_tests --features llvm-backend --locked --verbose
+
+      - name: Smoke LLVM release profile and panic parity on Unix
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          cargo run -p doriac --features llvm-backend -- compile examples/native/main_release_profile_42.doria --release --out build/native/main_release_profile_42
+          cargo run -p doriac --features llvm-backend -- compile examples/native/main_add_overflow_panic.doria --release --out build/native/main_add_overflow_panic
+          cargo run -p doriac --features llvm-backend -- compile examples/native/main_float_to_int_nan_panic.doria --release --out build/native/main_float_to_int_nan_panic
+          set +e
+          build/native/main_release_profile_42
+          release_status=$?
+          build/native/main_add_overflow_panic 2>build/native/main_add_overflow_panic.stderr
+          integer_panic_status=$?
+          build/native/main_float_to_int_nan_panic 2>build/native/main_float_to_int_nan_panic.stderr
+          float_panic_status=$?
+          set -e
+          test "${release_status}" -eq 42
+          test "${integer_panic_status}" -eq 101
+          test "${float_panic_status}" -eq 101
+          grep -Fx "Panic: integer overflow in addition" build/native/main_add_overflow_panic.stderr
+          grep -Fx "Stack Trace:" build/native/main_add_overflow_panic.stderr
+          grep -Fx "Panic: float-to-integer conversion out of range" build/native/main_float_to_int_nan_panic.stderr
+          grep -Fx "Stack Trace:" build/native/main_float_to_int_nan_panic.stderr
+
+      - name: Smoke LLVM release profile and panic parity on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          cargo run -p doriac --features llvm-backend -- compile examples/native/main_release_profile_42.doria --release --out build/native/main_release_profile_42.exe
+          cargo run -p doriac --features llvm-backend -- compile examples/native/main_add_overflow_panic.doria --release --out build/native/main_add_overflow_panic.exe
+          cargo run -p doriac --features llvm-backend -- compile examples/native/main_float_to_int_nan_panic.doria --release --out build/native/main_float_to_int_nan_panic.exe
+          & build/native/main_release_profile_42.exe
+          if ($LASTEXITCODE -ne 42) { throw "release fixture status was $LASTEXITCODE" }
+          & build/native/main_add_overflow_panic.exe 2>build/native/main_add_overflow_panic.stderr
+          if ($LASTEXITCODE -ne 101) { throw "integer panic status was $LASTEXITCODE" }
+          & build/native/main_float_to_int_nan_panic.exe 2>build/native/main_float_to_int_nan_panic.stderr
+          if ($LASTEXITCODE -ne 101) { throw "float panic status was $LASTEXITCODE" }
+          if (-not (Select-String -Path build/native/main_add_overflow_panic.stderr -SimpleMatch "Panic: integer overflow in addition")) { throw "missing integer panic" }
+          if (-not (Select-String -Path build/native/main_add_overflow_panic.stderr -SimpleMatch "Stack Trace:")) { throw "missing integer stack trace" }
+          if (-not (Select-String -Path build/native/main_float_to_int_nan_panic.stderr -SimpleMatch "Panic: float-to-integer conversion out of range")) { throw "missing float panic" }
+          if (-not (Select-String -Path build/native/main_float_to_int_nan_panic.stderr -SimpleMatch "Stack Trace:")) { throw "missing float stack trace" }

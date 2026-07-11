@@ -6,7 +6,7 @@ use std::process::{Command, Output};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use doriac::backend::{Backend, BackendOutput, NativeBackend};
+use doriac::backend::NativeProfile;
 
 const MANIFEST: &str = include_str!("fixtures/native_parity_examples.txt");
 
@@ -38,9 +38,9 @@ fn manifest_covers_every_native_example() {
 }
 
 #[test]
-fn interpreter_and_cranelift_match_for_the_durable_native_manifest() {
+fn interpreter_cranelift_and_enabled_llvm_match_for_the_durable_native_manifest() {
     if !host_linker_is_available() {
-        let message = format!("native parity requires host linker `{}`", host_linker());
+        let message = format!("native parity requires host linker {}", host_linker());
         if std::env::var_os("CI").is_some() {
             panic!("{message}; CI must not skip the parity matrix");
         }
@@ -52,67 +52,79 @@ fn interpreter_and_cranelift_match_for_the_durable_native_manifest() {
     for relative_path in manifest_paths() {
         let path = workspace.join(&relative_path);
         let source = fs::read_to_string(&path).unwrap_or_else(|error| {
-            panic!("failed to read parity source `{relative_path}`: {error}")
+            panic!("failed to read parity source {relative_path}: {error}")
         });
         let hir = doriac::lower_source(relative_path.clone(), source.clone()).unwrap_or_else(
             |diagnostics| {
-                panic!("frontend rejected parity source `{relative_path}`: {diagnostics:#?}")
+                panic!("frontend rejected parity source {relative_path}: {diagnostics:#?}")
             },
         );
         let mir = doriac::mir_lowering::lower_program(&hir).unwrap_or_else(|diagnostics| {
-            panic!("MIR rejected parity source `{relative_path}`: {diagnostics:#?}")
+            panic!("MIR rejected parity source {relative_path}: {diagnostics:#?}")
         });
         let interpreted = doriac::mir_interpreter::interpret(&mir).unwrap_or_else(|error| {
-            panic!("interpreter rejected parity source `{relative_path}`: {error}")
+            panic!("interpreter rejected parity source {relative_path}: {error}")
         });
 
-        let native = NativeBackend.emit(&hir).unwrap_or_else(|error| {
-            panic!("native backend rejected parity source `{relative_path}`: {error:?}")
-        });
-        let BackendOutput::Executable { bytes, .. } = native else {
-            panic!("native backend returned non-executable output for `{relative_path}`");
-        };
-        let executable = temp_executable_path(&relative_path);
-        fs::write(&executable, bytes).unwrap_or_else(|error| {
-            panic!("failed to write parity executable for `{relative_path}`: {error}")
-        });
-        make_executable(&executable);
-        let native_output = run_native_executable(&executable).unwrap_or_else(|error| {
-            panic!("failed to run parity executable for `{relative_path}`: {error}")
-        });
-        let _ = fs::remove_file(&executable);
+        let fast_output = compile_and_run(&mir, NativeProfile::Fast, &relative_path, "Cranelift");
+        assert_matches_interpreter(&relative_path, "Cranelift fast", &interpreted, &fast_output);
 
-        let native_status = native_output.status.code();
-        assert_eq!(
-            native_status,
-            Some(interpreted.exit_status),
-            "status mismatch for {relative_path}\ninterpreter status: {}\nnative status: {:?}\ninterpreter stdout: {:?}\nnative stdout: {:?}",
-            interpreted.exit_status,
-            native_status,
-            interpreted.stdout,
-            native_output.stdout
-        );
-        assert_eq!(
-            native_output.stdout,
-            interpreted.stdout,
-            "stdout mismatch for {relative_path}\ninterpreter status: {}\nnative status: {:?}\ninterpreter stdout: {:?}\nnative stdout: {:?}",
-            interpreted.exit_status,
-            native_status,
-            interpreted.stdout,
-            native_output.stdout
-        );
-        assert_eq!(
-            native_output.stderr,
-            interpreted.stderr,
-            "stderr mismatch for {relative_path}\ninterpreter status: {}\nnative status: {:?}\ninterpreter stderr: {:?}\nnative stderr: {:?}",
-            interpreted.exit_status,
-            native_status,
-            interpreted.stderr,
-            native_output.stderr
-        );
+        #[cfg(feature = "llvm-backend")]
+        {
+            let release_output =
+                compile_and_run(&mir, NativeProfile::Release, &relative_path, "LLVM");
+            assert_matches_interpreter(
+                &relative_path,
+                "LLVM release",
+                &interpreted,
+                &release_output,
+            );
+        }
     }
 }
 
+fn compile_and_run(
+    mir: &doriac::mir::Program,
+    profile: NativeProfile,
+    relative_path: &str,
+    backend: &str,
+) -> Output {
+    let bytes = doriac::codegen_native::generate_executable(mir, profile).unwrap_or_else(|error| {
+        panic!("{backend} backend rejected parity source {relative_path}: {error:?}")
+    });
+    let executable = temp_executable_path(&format!("{backend}-{relative_path}"));
+    fs::write(&executable, bytes).unwrap_or_else(|error| {
+        panic!("failed to write {backend} parity executable for {relative_path}: {error}")
+    });
+    make_executable(&executable);
+    let output = run_native_executable(&executable).unwrap_or_else(|error| {
+        panic!("failed to run {backend} parity executable for {relative_path}: {error}")
+    });
+    let _ = fs::remove_file(&executable);
+    output
+}
+
+fn assert_matches_interpreter(
+    relative_path: &str,
+    backend: &str,
+    interpreted: &doriac::mir_interpreter::InterpreterOutput,
+    native_output: &Output,
+) {
+    let native_status = native_output.status.code();
+    assert_eq!(
+        native_status,
+        Some(interpreted.exit_status),
+        "status mismatch for {relative_path} ({backend})"
+    );
+    assert_eq!(
+        native_output.stdout, interpreted.stdout,
+        "stdout mismatch for {relative_path} ({backend})"
+    );
+    assert_eq!(
+        native_output.stderr, interpreted.stderr,
+        "stderr mismatch for {relative_path} ({backend})"
+    );
+}
 fn manifest_paths() -> BTreeSet<String> {
     MANIFEST
         .lines()

@@ -53,6 +53,43 @@ pub enum BackendTarget {
     Wasm,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeProfile {
+    Fast,
+    Release,
+}
+
+impl NativeProfile {
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Fast => "fast",
+            Self::Release => "release",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompileOptions {
+    pub target: BackendTarget,
+    pub native_profile: NativeProfile,
+}
+
+impl CompileOptions {
+    pub const fn new(target: BackendTarget) -> Self {
+        Self {
+            target,
+            native_profile: NativeProfile::Fast,
+        }
+    }
+
+    pub const fn native(native_profile: NativeProfile) -> Self {
+        Self {
+            target: BackendTarget::Native,
+            native_profile,
+        }
+    }
+}
+
 impl BackendTarget {
     pub fn name(self) -> &'static str {
         match self {
@@ -117,12 +154,19 @@ impl Backend for NativeBackend {
     }
 
     fn emit(&self, program: &hir::Program) -> Result<BackendOutput, BackendError> {
-        let mir = mir_lowering::lower_program(program).map_err(BackendError::from_diagnostics)?;
-        Ok(BackendOutput::Executable {
-            extension: native_executable_extension().to_string(),
-            bytes: codegen_native::generate_executable(&mir)?,
-        })
+        emit_native(program, NativeProfile::Fast)
     }
+}
+
+fn emit_native(
+    program: &hir::Program,
+    native_profile: NativeProfile,
+) -> Result<BackendOutput, BackendError> {
+    let mir = mir_lowering::lower_program(program).map_err(BackendError::from_diagnostics)?;
+    Ok(BackendOutput::Executable {
+        extension: native_executable_extension().to_string(),
+        bytes: codegen_native::generate_executable(&mir, native_profile)?,
+    })
 }
 
 pub struct DebugBackend;
@@ -150,14 +194,27 @@ impl Backend for DebugBackend {
 }
 
 pub fn emit(program: &hir::Program, target: BackendTarget) -> Result<BackendOutput, BackendError> {
-    match target {
-        BackendTarget::Native => NativeBackend.emit(program),
+    emit_with_options(program, CompileOptions::new(target))
+}
+
+pub fn emit_with_options(
+    program: &hir::Program,
+    options: CompileOptions,
+) -> Result<BackendOutput, BackendError> {
+    if options.target != BackendTarget::Native && options.native_profile == NativeProfile::Release {
+        return Err(BackendError::new(
+            "--release is only valid for the native target",
+        ));
+    }
+
+    match options.target {
+        BackendTarget::Native => emit_native(program, options.native_profile),
         BackendTarget::Php => PhpBackend.emit(program),
         BackendTarget::Debug => DebugBackend.emit(program),
         BackendTarget::Wasm => Err(format!(
             "backend `{}` ({}) is planned but not implemented yet",
-            target.name(),
-            target.description()
+            options.target.name(),
+            options.target.description()
         )
         .into()),
     }

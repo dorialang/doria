@@ -137,6 +137,89 @@ fn run_rejects_binary_input_with_source_hint() {
 }
 
 #[test]
+fn release_rejects_non_native_targets() {
+    for target in ["php", "debug", "wasm"] {
+        let output = Command::new(doriac_bin())
+            .arg("compile")
+            .arg("missing.doria")
+            .arg("--target")
+            .arg(target)
+            .arg("--release")
+            .output()
+            .expect("doriac binary should run");
+        assert_failure_contains(
+            &format!("release {target} target"),
+            output,
+            "--release is only valid for the native target",
+        );
+    }
+}
+
+#[cfg(not(feature = "llvm-backend"))]
+#[test]
+fn release_never_falls_back_when_llvm_support_is_disabled() {
+    let temp_dir = temp_dir_path("release-disabled");
+    fs::create_dir_all(&temp_dir).expect("temp directory should be created");
+    fs::write(
+        temp_dir.join("main.doria"),
+        "function main(): int { return 42; }",
+    )
+    .expect("source file should be writable");
+
+    for command in ["compile", "run"] {
+        let output = Command::new(doriac_bin())
+            .current_dir(&temp_dir)
+            .arg(command)
+            .arg("main.doria")
+            .arg("--release")
+            .output()
+            .expect("doriac binary should run");
+        assert_failure_contains(
+            &format!("{command} without LLVM support"),
+            output,
+            "LLVM release support is not available in this doriac build",
+        );
+    }
+    let _ = fs::remove_dir_all(temp_dir);
+}
+
+#[cfg(feature = "llvm-backend")]
+#[test]
+fn release_compile_and_run_use_the_enabled_llvm_profile() {
+    if !host_linker_is_available() {
+        return;
+    }
+    let temp_dir = temp_dir_path("release-enabled");
+    fs::create_dir_all(&temp_dir).expect("temp directory should be created");
+    fs::write(
+        temp_dir.join("main.doria"),
+        "function main(): int { return 42; }",
+    )
+    .expect("source file should be writable");
+
+    let compile = Command::new(doriac_bin())
+        .current_dir(&temp_dir)
+        .arg("compile")
+        .arg("main.doria")
+        .arg("--release")
+        .arg("--out")
+        .arg(native_output_name("release-main"))
+        .output()
+        .expect("doriac binary should run");
+    assert_success("LLVM release compile", compile);
+
+    let run = Command::new(doriac_bin())
+        .current_dir(&temp_dir)
+        .arg("run")
+        .arg("main.doria")
+        .arg("--release")
+        .output()
+        .expect("doriac binary should run");
+    assert_eq!(run.status.code(), Some(42));
+    let _ = fs::remove_dir_all(temp_dir);
+}
+
+#[test]
 fn compile_rejects_inferred_native_output_that_would_overwrite_input() {
     let temp_dir = temp_dir_path("native-overwrite-guard");
     fs::create_dir_all(&temp_dir).expect("temp directory should be created");

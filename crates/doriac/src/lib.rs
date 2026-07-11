@@ -1,6 +1,8 @@
 pub mod ast;
 pub mod backend;
 pub mod codegen_cranelift;
+#[cfg(feature = "llvm-backend")]
+pub mod codegen_llvm;
 pub mod codegen_native;
 pub mod codegen_php;
 pub mod control_flow;
@@ -13,6 +15,8 @@ pub mod lsp;
 pub mod mir;
 pub mod mir_interpreter;
 pub mod mir_lowering;
+pub mod mir_validation;
+pub mod native_abi;
 pub mod numeric;
 pub mod parser;
 pub mod return_analysis;
@@ -23,7 +27,7 @@ pub mod symbols;
 pub mod types;
 
 use ast::Program;
-use backend::BackendTarget;
+use backend::{BackendTarget, CompileOptions};
 use diagnostics::{Diagnostic, DiagnosticResult};
 use source::{SourceFile, Span};
 
@@ -87,8 +91,16 @@ pub fn compile_source(
     text: impl Into<String>,
     target: BackendTarget,
 ) -> Result<backend::BackendOutput, Vec<Diagnostic>> {
+    compile_source_with_options(path, text, CompileOptions::new(target))
+}
+
+pub fn compile_source_with_options(
+    path: impl Into<String>,
+    text: impl Into<String>,
+    options: CompileOptions,
+) -> Result<backend::BackendOutput, Vec<Diagnostic>> {
     let hir = lower_source(path, text)?;
-    backend::emit(&hir, target).map_err(|error| {
+    backend::emit_with_options(&hir, options).map_err(|error| {
         error
             .diagnostics
             .unwrap_or_else(|| vec![Diagnostic::new("B0001", error.message, Span::default())])
