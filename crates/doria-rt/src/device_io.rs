@@ -92,6 +92,13 @@ const STD_OUTPUT_HANDLE: u32 = -11_i32 as u32;
 const STD_ERROR_HANDLE: u32 = -12_i32 as u32;
 #[cfg(windows)]
 const INVALID_HANDLE_VALUE: *mut c_void = -1_isize as *mut c_void;
+#[cfg(windows)]
+const ERROR_BROKEN_PIPE: u32 = 109;
+
+#[cfg(windows)]
+fn is_pipe_eof(error: u32) -> bool {
+    error == ERROR_BROKEN_PIPE
+}
 
 #[cfg(windows)]
 unsafe fn handle(stream: StandardStream) -> *mut c_void {
@@ -234,6 +241,9 @@ pub(crate) unsafe fn read(
             ptr::null_mut(),
         ) == 0
         {
+            if is_pipe_eof(GetLastError()) {
+                return Ok(0);
+            }
             return Err(());
         }
         return Ok(read as usize);
@@ -385,6 +395,7 @@ extern "C" {
 #[cfg(windows)]
 extern "system" {
     fn GetStdHandle(standard_handle: u32) -> *mut c_void;
+    fn GetLastError() -> u32;
     fn GetConsoleMode(handle: *mut c_void, mode: *mut u32) -> i32;
     fn ReadFile(
         handle: *mut c_void,
@@ -425,6 +436,13 @@ mod tests {
         assert_eq!(StandardStream::Stdin as u8, 0);
         assert_eq!(StandardStream::Stdout as u8, 1);
         assert_eq!(StandardStream::Stderr as u8, 2);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn closed_pipe_is_stdin_eof() {
+        assert!(is_pipe_eof(ERROR_BROKEN_PIPE));
+        assert!(!is_pipe_eof(5));
     }
 
     #[cfg(unix)]
