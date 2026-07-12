@@ -1,0 +1,12 @@
+function main(): void
+{
+    let writable $count = 0;
+    let writable $line = readline();
+
+    while ($line != null) {
+        $count++;
+        $line = readline();
+    }
+
+    echo $count;
+}

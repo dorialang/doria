@@ -1,0 +1,13 @@
+function main(): void
+{
+    echo sprintf(
+        "%05d|%-6s|%.2f|%x|%X|%o|%b|%%",
+        42,
+        "Doria",
+        3.14159,
+        255,
+        255,
+        255,
+        255,
+    );
+}

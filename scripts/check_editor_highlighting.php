@@ -221,7 +221,7 @@ $rejectedPreprocessor = [
     'warning',
     'error',
 ];
-$rejectedKeywords = ['goto', 'require', 'require_once', 'include_once'];
+$rejectedKeywords = ['goto', 'require', 'require_once', 'include_once', 'print'];
 $strictComparison = ['===', '!=='];
 $notKeywords = ['public', 'private', 'protected', 'Result', 'object'];
 function fail_check(string $message): never

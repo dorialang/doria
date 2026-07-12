@@ -1194,3 +1194,52 @@ fn compiles_person_example_with_explicit_interpolation() {
     assert!(!php.contains("{$this->name}"));
     assert!(!php.contains("{$this->age}"));
 }
+
+#[test]
+fn php_backend_lowers_stage17_io_with_doria_failure_checks() {
+    let php = doriac::compile_source_to_php(
+        "test.doria",
+        r#"
+function main(): void
+{
+    let writable $line = readline();
+    if ($line != null) { write_stderr($line); }
+    let $contents = read_file("input.txt");
+    write_file("copy.txt", $contents);
+    printf("enabled=%s", false);
+    echo sprintf("%05d", 42);
+}
+"#,
+    )
+    .expect("Stage 17 PHP compatibility lowering should succeed");
+
+    assert!(php.contains("function __doria_readline(): ?string"));
+    assert!(php.contains("if ($line === false) { return null; }"));
+    assert!(php.contains("str_ends_with($line, \"\\n\")"));
+    assert!(php.contains("str_ends_with($line, \"\\r\")"));
+    assert!(php.contains("__doria_read_file(\"input.txt\")"));
+    assert!(php.contains("$contents === false"));
+    assert!(php.contains("__doria_write_file(\"copy.txt\", $contents)"));
+    assert!(php.contains("$written === false || $written !== strlen($contents)"));
+    assert!(php.contains("__doria_write_stderr($line)"));
+    assert!(php.contains("__doria_printf(\"enabled=%s\", __doria_display(false))"));
+    assert!(php.contains("__doria_sprintf(\"%05d\", 42)"));
+}
+
+#[test]
+fn php_backend_keeps_stage17_frontend_rejections_and_uint64_honesty() {
+    for source in [
+        "function main(): void { print(\"x\"); }",
+        "function main(): void { let $format = \"%d\"; echo sprintf($format, 1); }",
+    ] {
+        doriac::compile_source_to_php("test.doria", source)
+            .expect_err("invalid Doria must fail before PHP lowering");
+    }
+
+    let error = doriac::compile_source_to_php(
+        "test.doria",
+        "function main(): void { uint64 $value = 18446744073709551615; echo sprintf(\"%d\", $value); }",
+    )
+    .expect_err("PHP must reject uint64 formatting it cannot preserve");
+    assert!(error.iter().any(|diagnostic| diagnostic.code == "B1301"));
+}

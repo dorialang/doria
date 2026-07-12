@@ -122,7 +122,7 @@
         },
         {
           "name": "invalid.illegal.keyword.rejected.doria",
-          "match": "\\b(?:goto|require|require_once|include_once)\\b|\\buse\\b(?=\\s*\\()"
+          "match": "\\b(?:goto|require|require_once|include_once|print)\\b|\\buse\\b(?=\\s*\\()"
         }
       ]
     },

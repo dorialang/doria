@@ -82,9 +82,14 @@ fn validate_statement(
                 (mir::Type::String, mir::Rvalue::String(expression)) => {
                     validate_string_expression(program, function, expression)
                 }
-                (mir::Type::String, _) => Err(malformed_mir(format!(
-                    "string local local{} receives an integer rvalue",
+                (mir::Type::String, mir::Rvalue::NullableString(_)) => Err(malformed_mir(format!(
+                    "string local local{} receives a nullable-string rvalue",
                     target.0
+                ))),
+                (mir::Type::String, mir::Rvalue::Value(value)) => Err(malformed_mir(format!(
+                    "string local local{} receives a {} rvalue",
+                    target.0,
+                    value.ty()
                 ))),
                 (mir::Type::NullableString, mir::Rvalue::NullableString(expression)) => {
                     validate_nullable_string_expression(program, function, expression)

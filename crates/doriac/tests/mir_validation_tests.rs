@@ -1,7 +1,9 @@
+use doriac::format_string::{FormatConversion, FormatPiece, FormatSpec};
 use doriac::mir::{
-    BasicBlock, BlockId, FloatBinaryOp, FloatExpression, Function, FunctionId, Local, LocalId,
-    Operand, Program, ReturnType, Rvalue, ScalarType, ScalarValue, Statement, StringExpression,
-    Terminator, Type, ValueExpression,
+    BasicBlock, BlockId, FloatBinaryOp, FloatExpression, FormatArgument, FormatExpression,
+    Function, FunctionId, Local, LocalId, NullableStringExpression, Operand, Program, ReturnType,
+    Rvalue, ScalarType, ScalarValue, Statement, StringExpression, Terminator, Type,
+    ValueExpression,
 };
 use doriac::numeric::{FloatType, FloatValue, IntegerType, IntegerValue};
 
@@ -95,9 +97,82 @@ fn shared_validator_rejects_scalar_string_assignment_mixing() {
 
     let error = doriac::mir_validation::validate_program(&program)
         .expect_err("scalar assigned to string local must be rejected");
+    assert!(error.message.contains("string local local0 receives"));
+    assert!(error.message.contains("rvalue"));
+}
+
+#[test]
+fn shared_validator_rejects_nullable_string_main_return() {
+    let mut program = valid_void_program();
+    program.functions[0].return_type = ReturnType::Value(Type::NullableString);
+    program.functions[0].blocks[0].terminator =
+        Terminator::Return(Rvalue::NullableString(NullableStringExpression::Null));
+    let error = doriac::mir_validation::validate_program(&program)
+        .expect_err("main returning nullable string must be rejected");
     assert!(error
         .message
-        .contains("string local local0 receives an integer rvalue"));
+        .contains("entry function must return void or int/int64"));
+}
+
+#[test]
+fn shared_validator_rejects_nullable_rvalue_assigned_to_plain_string() {
+    let mut program = valid_void_program();
+    program.functions[0].locals.push(Local {
+        id: LocalId(0),
+        name: "value".to_string(),
+        ty: Type::String,
+        writable: true,
+        synthetic: false,
+    });
+    program.functions[0].blocks[0]
+        .statements
+        .push(Statement::AssignLocal {
+            target: LocalId(0),
+            value: Rvalue::NullableString(NullableStringExpression::Null),
+        });
+    let error = doriac::mir_validation::validate_program(&program)
+        .expect_err("nullable rvalue must not enter a plain string local");
+    assert!(error.message.contains("string local"));
+    assert!(error.message.contains("nullable-string rvalue"));
+}
+
+#[test]
+fn shared_validator_rejects_invalid_format_index_and_argument_type() {
+    for format in [
+        FormatExpression {
+            pieces: vec![FormatPiece::Argument {
+                index: 1,
+                spec: decimal_spec(),
+            }],
+            arguments: vec![],
+        },
+        FormatExpression {
+            pieces: vec![FormatPiece::Argument {
+                index: 0,
+                spec: decimal_spec(),
+            }],
+            arguments: vec![FormatArgument::String(StringExpression::Literal(
+                "wrong".to_string(),
+            ))],
+        },
+    ] {
+        let mut program = valid_void_program();
+        program.functions[0].blocks[0]
+            .statements
+            .push(Statement::Printf(format));
+        doriac::mir_validation::validate_program(&program)
+            .expect_err("invalid checked format MIR must be rejected");
+    }
+}
+
+fn decimal_spec() -> FormatSpec {
+    FormatSpec {
+        conversion: FormatConversion::Decimal,
+        width: None,
+        precision: None,
+        left_align: false,
+        zero_pad: false,
+    }
 }
 
 fn valid_void_program() -> Program {

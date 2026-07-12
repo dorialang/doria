@@ -293,3 +293,13 @@ class Article extends Model implements Publishable
 class ImageResizer
 {
 }
+
+// Stage 17 compiler-known I/O and checked formatting built-ins.
+let writable $line = readline();
+if ($line != null) {
+    echo sprintf("line=%s", $line);
+}
+printf("code=%05d", 42);
+let $text = read_file("input.txt");
+write_file("copy.txt", $text);
+write_stderr("done");

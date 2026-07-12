@@ -75,12 +75,23 @@ Source of truth for sequencing remains `docs/doria-end-to-end-plan.md`. The dura
 | Mixed int/float and float-width rejection | Frontend | Frontend | Frontend | Covered | Semantic diagnostics prevent implicit cross-kind or cross-width values before MIR. |
 | PHP float32 boundary | Diagnostic | Diagnostic | Diagnostic | Covered | PHP never emits unknown float width names; exact float64 division uses `fdiv`. |
 | Invalid process status panic | Covered | Covered | Covered | Covered | Runtime entry validates `main(): int` and exits 101 on failure. |
+| Narrow `?string` seed and flow guards | Covered | Covered | Covered | Covered | `readline` EOF is distinct from empty string; assignment invalidates or re-establishes non-null facts. |
+| `readline` and repeated buffering | Covered | Covered | Covered | Covered | Raw sidecar stdin covers LF, CRLF, empty lines, buffered subsequent lines, and final unterminated input. |
+| `read_file` | Covered | Covered | Covered | Covered | Complete UTF-8 text and Unicode content agree through isolated fixture directories. |
+| `write_file` and file side effects | Covered | Covered | Covered | Covered | Create/truncate output is compared byte-for-byte against expected files. |
+| `write_stderr` | Covered | Covered | Covered | Covered | Exact stderr bytes with no implicit newline. |
+| Checked `sprintf` | Covered | Covered | Covered | Covered | One validated MIR plan covers every accepted conversion, width, alignment, padding, and precision form. |
+| Checked `printf` | Covered | Covered | Covered | Covered | Same plan as `sprintf`; exact stdout, void result, and no implicit newline. |
+| Format failures | Frontend | Frontend | Frontend | Covered | Dynamic, malformed, unsupported, wrong-arity, and wrong-type formats are rejected before MIR. |
+| I/O panic failures | Covered | Covered | Covered | Covered | Missing-file panic preserves exact message, Doria stack trace, and status 101. |
+| Windows Unicode output | Unit + CI | Unit + CI | Unit + CI | Covered | Interactive console uses wide writes; redirected handles preserve exact UTF-8 bytes. |
+| Per-stream interactivity foundation | Runtime | Runtime | Runtime | Covered | Internal stdin/stdout/stderr detection is independent and is not exposed as a public Doria API. |
 | Native compile without execution preflight | Covered | Covered | Covered | Covered | Infinite-loop source compiles but is excluded from executable parity. |
 | Native lowering source | MIR | MIR | MIR | Covered | `codegen_cranelift` and `codegen_llvm` consume validated MIR with no HIR or retired-smoke dependency. |
 | Complete differential harness | Manifest-driven | Manifest-driven | Manifest-driven | Covered | CI requires a runtime artifact and linker; stdout, stderr, and status are exact. |
 
 ## Retirement Gate
 
-Status: Passed through Stage 16 after this branch's full validation gates pass.
+Status: Passed through Stage 17 after this branch's full validation gates pass.
 
-All accepted Stage <=16 scalar and string lowering passes through typed MIR and shared MIR validation. The interpreter, Cranelift fast profile, and LLVM release profile consume that same MIR; every finite native example is required in the executable manifest; and the Stage 7-10 native smoke module remains retired and deleted. Stage 17 `std::io` and formatted I/O is next.
+All accepted Stage <=17 scalar, string, checked-format, and text-I/O lowering passes through typed MIR and shared MIR validation. The interpreter, Cranelift fast profile, and LLVM release profile consume that same MIR; every finite native example is required in the executable manifest with deterministic sidecars where needed; and the Stage 7-10 native smoke module remains retired and deleted. Stage 18 full expression interpolation and `Displayable` is next.

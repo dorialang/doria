@@ -8,17 +8,19 @@ Documentation role: working note. This file prevents duplicated in-flight work. 
 - PR #70: Stage 13 fixed-width integers, operators, contextual literals, checked conversions, scalar-width ABI coverage, and durable panic parity.
 - PR #71: Stage 14 IEEE floats, runtime bool values, explicit default numeric conversions, shared scalar MIR, and durable interpreter/Cranelift parity.
 - PR #72: Stage 15 LLVM release backend over shared validated MIR and triple differential parity.
+- PR #73: Stage 16 runtime strings and canonical display conversion.
+- PR #74: Stage 17 compiler/runtime core for narrow nullable strings, checked formatting, and UTF-8 I/O.
 
 ## Active
 
-- Stage 16 runtime strings and canonical display conversion are complete on `feature/stage-16-runtime-strings-display` after the branch validation gates pass.
+- Stage 17 integration, parity, examples, documentation, editor, and CI closure is active on `feature/stage-17-completion-parity-docs`.
 - Native remains one target: direct compile/run uses the Cranelift fast profile, while `--release` selects LLVM 18 over the same validated typed MIR.
-- Immutable UTF-8 strings are Copy source values backed by private refcounted buffers. Runtime locals, rebinding, parameters, returns, calls, concatenation, byte comparison, primitive display, interpolation, echo, and panic messages share MIR and `doria-rt`.
-- The durable manifest compares exact interpreter, Cranelift, and LLVM stdout, stderr, and status, including panic and Stage 16 string fixtures.
+- Immutable UTF-8 strings and the narrow Stage 17 `?string` seed are private refcounted runtime values. Checked format plans and I/O operations are validated MIR consumed by all three execution paths.
+- The durable manifest supports raw stdin, isolated seeded files, and exact interpreter/Cranelift/LLVM stdout, stderr, status, and generated-file comparison.
 
 ## Next
 
-- Stage 17: `std::io` v0 and formatted I/O.
+- Stage 18: full expression interpolation and `Displayable`.
 
 ## Do not duplicate
 

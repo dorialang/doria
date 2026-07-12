@@ -26,3 +26,5 @@ require_once "x.doria";
 include_once "x.doria";
 
 goto done;
+
+print("use echo");

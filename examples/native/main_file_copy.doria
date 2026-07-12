@@ -1,0 +1,6 @@
+function main(): void
+{
+    let $contents = read_file("input.txt");
+    write_file("copy.txt", $contents);
+    echo read_file("copy.txt");
+}

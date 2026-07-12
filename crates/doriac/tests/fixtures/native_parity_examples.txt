@@ -1,5 +1,5 @@
 # Durable executable source of truth for accepted native behavior.
-# Highest completed stage: Stage 16
+# Highest completed stage: Stage 17
 examples/native/main_add_overflow_panic.doria
 examples/native/main_arithmetic_42.doria
 examples/native/main_bitwise_42.doria
@@ -27,6 +27,7 @@ examples/native/main_float_to_int_42.doria
 examples/native/main_float_to_int_infinity_panic.doria
 examples/native/main_float_to_int_nan_panic.doria
 examples/native/main_float_to_int_range_panic.doria
+examples/native/main_file_copy.doria
 examples/native/main_for_42.doria
 examples/native/main_foreach_range_45.doria
 examples/native/main_foreach_range_55.doria
@@ -47,15 +48,19 @@ examples/native/main_integer_div_mod_42.doria
 examples/native/main_integer_torture_42.doria
 examples/native/main_invalid_status_panic.doria
 examples/native/main_long_while_42.doria
+examples/native/main_line_count.doria
 examples/native/main_multiply_overflow_panic.doria
 examples/native/main_mutual_recursion_42.doria
+examples/native/main_missing_file_panic.doria
 examples/native/main_narrow_recursive_42.doria
 examples/native/main_nested_loop_matrix_42.doria
 examples/native/main_nested_panic_stack.doria
 examples/native/main_readonly_local.doria
+examples/native/main_readline_echo.doria
 examples/native/main_recursive_depth_512_42.doria
 examples/native/main_recursive_fibonacci_55.doria
 examples/native/main_release_profile_42.doria
+examples/native/main_printf_42.doria
 examples/native/main_recursive_panic_stack.doria
 examples/native/main_remainder_by_zero_panic.doria
 examples/native/main_runtime_interpolation.doria
@@ -69,6 +74,8 @@ examples/native/main_shift_count_panic.doria
 examples/native/main_short_circuit_calls.doria
 examples/native/main_signed_division_overflow_panic.doria
 examples/native/main_signed_shift_42.doria
+examples/native/main_sprintf_matrix.doria
+examples/native/main_stage17_io_stress.doria
 examples/native/main_string_concat_hello.doria
 examples/native/main_string_comparison_42.doria
 examples/native/main_string_local_hello.doria
@@ -81,4 +88,5 @@ examples/native/main_unsigned_shift_42.doria
 examples/native/main_void_empty.doria
 examples/native/main_void_hello.doria
 examples/native/main_while_42.doria
+examples/native/main_write_stderr.doria
 examples/native/main_writable_local_42.doria

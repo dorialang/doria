@@ -481,7 +481,12 @@ impl<'source> Lexer<'source> {
                     }
                 }
             } else {
-                value.push(self.advance() as char);
+                let character = self.source.text[self.index..]
+                    .chars()
+                    .next()
+                    .expect("peek observed a UTF-8 character");
+                value.push(character);
+                self.index += character.len_utf8();
             }
         }
 

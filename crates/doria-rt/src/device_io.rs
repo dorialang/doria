@@ -76,7 +76,12 @@ pub(crate) unsafe fn flush(stream: StandardStream) -> bool {
 
 #[cfg(unix)]
 pub(crate) unsafe fn is_interactive(stream: StandardStream) -> bool {
-    isatty(descriptor(stream)) == 1
+    is_interactive_descriptor(descriptor(stream))
+}
+
+#[cfg(unix)]
+unsafe fn is_interactive_descriptor(descriptor: i32) -> bool {
+    isatty(descriptor) == 1
 }
 
 #[cfg(windows)]
@@ -109,6 +114,11 @@ pub(crate) unsafe fn is_interactive(stream: StandardStream) -> bool {
     let Some(handle) = valid_handle(stream) else {
         return false;
     };
+    is_console_handle(handle)
+}
+
+#[cfg(windows)]
+unsafe fn is_console_handle(handle: *mut c_void) -> bool {
     let mut mode = 0_u32;
     GetConsoleMode(handle, &mut mode) != 0
 }
@@ -415,6 +425,46 @@ mod tests {
         assert_eq!(StandardStream::Stdin as u8, 0);
         assert_eq!(StandardStream::Stdout as u8, 1);
         assert_eq!(StandardStream::Stderr as u8, 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pipes_and_redirected_files_are_not_interactive() {
+        use std::fs::File;
+        use std::os::fd::AsRawFd;
+        use std::os::unix::net::UnixStream;
+
+        let (left, right) = UnixStream::pair().expect("Unix stream pair");
+        let redirected = File::open("/dev/null").expect("/dev/null");
+        unsafe {
+            assert!(!is_interactive_descriptor(left.as_raw_fd()));
+            assert!(!is_interactive_descriptor(right.as_raw_fd()));
+            assert!(!is_interactive_descriptor(redirected.as_raw_fd()));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pseudo_terminal_master_is_interactive() {
+        use std::fs::OpenOptions;
+        use std::os::fd::AsRawFd;
+
+        let terminal = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/ptmx")
+            .expect("Linux PTY multiplexer");
+        assert!(unsafe { is_interactive_descriptor(terminal.as_raw_fd()) });
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn redirected_windows_file_handle_is_not_a_console() {
+        use std::fs::File;
+        use std::os::windows::io::AsRawHandle;
+
+        let file = File::open("NUL").expect("Windows NUL device");
+        assert!(!unsafe { is_console_handle(file.as_raw_handle().cast()) });
     }
 
     #[cfg(windows)]

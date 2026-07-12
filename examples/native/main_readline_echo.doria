@@ -1,0 +1,10 @@
+function main(): void
+{
+    let writable $line = readline();
+
+    while ($line != null) {
+        echo $line;
+        echo "\n";
+        $line = readline();
+    }
+}

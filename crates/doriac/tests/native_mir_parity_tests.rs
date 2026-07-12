@@ -1,8 +1,8 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -62,23 +62,38 @@ fn interpreter_cranelift_and_enabled_llvm_match_for_the_durable_native_manifest(
         let mir = doriac::mir_lowering::lower_program(&hir).unwrap_or_else(|diagnostics| {
             panic!("MIR rejected parity source {relative_path}: {diagnostics:#?}")
         });
-        let interpreted = doriac::mir_interpreter::interpret(&mir).unwrap_or_else(|error| {
+        let fixture = IoFixture::load(&workspace, &relative_path);
+        let interpreted = doriac::mir_interpreter::interpret_with_io(
+            &mir,
+            doriac::mir_interpreter::MirIo {
+                stdin: fixture.stdin.clone(),
+                files: fixture.files.clone(),
+            },
+        )
+        .unwrap_or_else(|error| {
             panic!("interpreter rejected parity source {relative_path}: {error}")
         });
+        fixture.assert_expected(&relative_path, &interpreted);
 
-        let fast_output = compile_and_run(&mir, NativeProfile::Fast, &relative_path, "Cranelift");
-        assert_matches_interpreter(&relative_path, "Cranelift fast", &interpreted, &fast_output);
+        let fast = compile_and_run(
+            &mir,
+            NativeProfile::Fast,
+            &relative_path,
+            "Cranelift",
+            &fixture,
+        );
+        assert_matches_interpreter(&relative_path, "Cranelift fast", &interpreted, &fast);
 
         #[cfg(feature = "llvm-backend")]
         {
-            let release_output =
-                compile_and_run(&mir, NativeProfile::Release, &relative_path, "LLVM");
-            assert_matches_interpreter(
+            let release = compile_and_run(
+                &mir,
+                NativeProfile::Release,
                 &relative_path,
-                "LLVM release",
-                &interpreted,
-                &release_output,
+                "LLVM",
+                &fixture,
             );
+            assert_matches_interpreter(&relative_path, "LLVM release", &interpreted, &release);
         }
     }
 }
@@ -88,42 +103,63 @@ fn compile_and_run(
     profile: NativeProfile,
     relative_path: &str,
     backend: &str,
-) -> Output {
+    fixture: &IoFixture,
+) -> NativeRun {
     let bytes = doriac::codegen_native::generate_executable(mir, profile).unwrap_or_else(|error| {
         panic!("{backend} backend rejected parity source {relative_path}: {error:?}")
     });
-    let executable = temp_executable_path(&format!("{backend}-{relative_path}"));
+    let working_directory = temp_working_directory(&format!("{backend}-{relative_path}"));
+    fs::create_dir_all(&working_directory).unwrap_or_else(|error| {
+        panic!("failed to create isolated directory for {relative_path}: {error}")
+    });
+    fixture.seed_native_files(&working_directory, relative_path);
+    let executable = working_directory.join(if cfg!(windows) {
+        "program.exe"
+    } else {
+        "program"
+    });
     fs::write(&executable, bytes).unwrap_or_else(|error| {
         panic!("failed to write {backend} parity executable for {relative_path}: {error}")
     });
     make_executable(&executable);
-    let output = run_native_executable(&executable).unwrap_or_else(|error| {
-        panic!("failed to run {backend} parity executable for {relative_path}: {error}")
+    let output = run_native_executable(&executable, &working_directory, &fixture.stdin)
+        .unwrap_or_else(|error| {
+            panic!("failed to run {backend} parity executable for {relative_path}: {error}")
+        });
+    let files = fixture.read_expected_native_files(&working_directory, relative_path);
+    fs::remove_dir_all(&working_directory).unwrap_or_else(|error| {
+        panic!("failed to clean isolated directory for {relative_path}: {error}")
     });
-    let _ = fs::remove_file(&executable);
-    output
+    NativeRun { output, files }
 }
 
 fn assert_matches_interpreter(
     relative_path: &str,
     backend: &str,
-    interpreted: &doriac::mir_interpreter::InterpreterOutput,
-    native_output: &Output,
+    interpreted: &doriac::mir_interpreter::InterpreterIoOutput,
+    native: &NativeRun,
 ) {
-    let native_status = native_output.status.code();
+    let native_status = native.output.status.code();
     assert_eq!(
         native_status,
-        Some(interpreted.exit_status),
+        Some(interpreted.output.exit_status),
         "status mismatch for {relative_path} ({backend})"
     );
     assert_eq!(
-        native_output.stdout, interpreted.stdout,
+        native.output.stdout, interpreted.output.stdout,
         "stdout mismatch for {relative_path} ({backend})"
     );
     assert_eq!(
-        native_output.stderr, interpreted.stderr,
+        native.output.stderr, interpreted.output.stderr,
         "stderr mismatch for {relative_path} ({backend})"
     );
+    for (path, bytes) in &native.files {
+        assert_eq!(
+            interpreted.files.get(path),
+            Some(bytes),
+            "file mismatch for {relative_path} ({backend}): {path}"
+        );
+    }
 }
 fn manifest_paths() -> BTreeSet<String> {
     MANIFEST
@@ -165,7 +201,7 @@ fn default_linker() -> &'static str {
     }
 }
 
-fn temp_executable_path(source: &str) -> PathBuf {
+fn temp_working_directory(source: &str) -> PathBuf {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_nanos())
@@ -180,19 +216,31 @@ fn temp_executable_path(source: &str) -> PathBuf {
             }
         })
         .collect::<String>();
-    let extension = if cfg!(windows) { ".exe" } else { "" };
     std::env::temp_dir().join(format!(
-        "doriac-native-parity-{stem}-{}-{nanos}{extension}",
+        "doriac-native-parity-{stem}-{}-{nanos}",
         std::process::id()
     ))
 }
 
-fn run_native_executable(executable: &Path) -> io::Result<Output> {
+fn run_native_executable(executable: &Path, cwd: &Path, stdin: &[u8]) -> io::Result<Output> {
     const MAX_ATTEMPTS: usize = 20;
 
     for attempt in 0..MAX_ATTEMPTS {
-        match Command::new(executable).output() {
-            Ok(output) => return Ok(output),
+        match Command::new(executable)
+            .current_dir(cwd)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+        {
+            Ok(mut child) => {
+                child
+                    .stdin
+                    .take()
+                    .expect("piped stdin should be available")
+                    .write_all(stdin)?;
+                return child.wait_with_output();
+            }
             Err(error) if is_transient_executable_busy(&error) && attempt + 1 < MAX_ATTEMPTS => {
                 thread::sleep(Duration::from_millis(25));
             }
@@ -200,6 +248,149 @@ fn run_native_executable(executable: &Path) -> io::Result<Output> {
         }
     }
     unreachable!("retry loop returns on its final attempt")
+}
+
+#[derive(Debug)]
+struct NativeRun {
+    output: Output,
+    files: BTreeMap<String, Vec<u8>>,
+}
+
+#[derive(Debug, Default)]
+struct IoFixture {
+    stdin: Vec<u8>,
+    files: BTreeMap<String, Vec<u8>>,
+    expected_files: BTreeMap<String, Vec<u8>>,
+    expected_stdout: Option<Vec<u8>>,
+    expected_stderr: Option<Vec<u8>>,
+    expected_status: Option<i32>,
+}
+
+impl IoFixture {
+    fn load(workspace: &Path, relative_path: &str) -> Self {
+        let stem = Path::new(relative_path)
+            .file_stem()
+            .expect("parity source should have a file stem");
+        let root = workspace
+            .join("crates/doriac/tests/fixtures/native_io")
+            .join(stem);
+        if !root.exists() {
+            return Self::default();
+        }
+        let expected_status = read_optional(&root.join("expected_status")).map(|bytes| {
+            std::str::from_utf8(&bytes)
+                .expect("expected_status should be UTF-8")
+                .trim()
+                .parse()
+                .expect("expected_status should contain a decimal process status")
+        });
+        Self {
+            stdin: read_optional(&root.join("stdin")).unwrap_or_default(),
+            files: read_tree(&root.join("files")),
+            expected_files: read_tree(&root.join("expected_files")),
+            expected_stdout: read_optional(&root.join("expected_stdout")),
+            expected_stderr: read_optional(&root.join("expected_stderr")),
+            expected_status,
+        }
+    }
+
+    fn assert_expected(
+        &self,
+        relative_path: &str,
+        interpreted: &doriac::mir_interpreter::InterpreterIoOutput,
+    ) {
+        if let Some(expected) = &self.expected_stdout {
+            assert_eq!(
+                &interpreted.output.stdout, expected,
+                "stdout fixture mismatch for {relative_path}"
+            );
+        }
+        if let Some(expected) = &self.expected_stderr {
+            assert_eq!(
+                &interpreted.output.stderr, expected,
+                "stderr fixture mismatch for {relative_path}"
+            );
+        }
+        if let Some(expected) = self.expected_status {
+            assert_eq!(
+                interpreted.output.exit_status, expected,
+                "status fixture mismatch for {relative_path}"
+            );
+        }
+        for (path, expected) in &self.expected_files {
+            assert_eq!(
+                interpreted.files.get(path),
+                Some(expected),
+                "file fixture mismatch for {relative_path}: {path}"
+            );
+        }
+    }
+
+    fn seed_native_files(&self, root: &Path, relative_path: &str) {
+        for (path, bytes) in &self.files {
+            let destination = root.join(path);
+            if let Some(parent) = destination.parent() {
+                fs::create_dir_all(parent).unwrap_or_else(|error| {
+                    panic!("failed to create seeded directory for {relative_path}: {error}")
+                });
+            }
+            fs::write(&destination, bytes).unwrap_or_else(|error| {
+                panic!("failed to seed {path} for {relative_path}: {error}")
+            });
+        }
+    }
+
+    fn read_expected_native_files(
+        &self,
+        root: &Path,
+        relative_path: &str,
+    ) -> BTreeMap<String, Vec<u8>> {
+        self.expected_files
+            .keys()
+            .map(|path| {
+                let bytes = fs::read(root.join(path)).unwrap_or_else(|error| {
+                    panic!("failed to read generated {path} for {relative_path}: {error}")
+                });
+                (path.clone(), bytes)
+            })
+            .collect()
+    }
+}
+
+fn read_optional(path: &Path) -> Option<Vec<u8>> {
+    path.exists().then(|| {
+        fs::read(path).unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()))
+    })
+}
+
+fn read_tree(root: &Path) -> BTreeMap<String, Vec<u8>> {
+    let mut files = BTreeMap::new();
+    if root.exists() {
+        read_tree_into(root, root, &mut files);
+    }
+    files
+}
+
+fn read_tree_into(root: &Path, directory: &Path, files: &mut BTreeMap<String, Vec<u8>>) {
+    for entry in fs::read_dir(directory)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", directory.display()))
+    {
+        let path = entry.expect("fixture entry should be readable").path();
+        if path.is_dir() {
+            read_tree_into(root, &path, files);
+        } else {
+            let relative = path
+                .strip_prefix(root)
+                .expect("fixture file should be under its root")
+                .to_string_lossy()
+                .replace('\\', "/");
+            files.insert(
+                relative,
+                fs::read(&path)
+                    .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display())),
+            );
+        }
+    }
 }
 
 fn is_transient_executable_busy(error: &io::Error) -> bool {

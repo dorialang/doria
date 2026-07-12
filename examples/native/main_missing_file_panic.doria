@@ -1,0 +1,4 @@
+function main(): void
+{
+    echo read_file("does-not-exist.txt");
+}

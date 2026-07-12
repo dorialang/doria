@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use crate::diagnostics::{Diagnostic, DiagnosticResult};
-use crate::format_string;
+use crate::format_string::{self, FormatConversion, FormatPiece};
 use crate::numeric::{parse_decimal_magnitude, FloatType, FloatValue, IntegerType, IntegerValue};
 use crate::semantics::SemanticInfo;
 use crate::source::Span;
@@ -1383,10 +1383,17 @@ fn lower_format_expression(
         )]);
     };
     let pieces = format_string::parse(value, *format_span).map_err(|error| vec![error])?;
+    let specs = pieces.iter().filter_map(|piece| match piece {
+        FormatPiece::Argument { spec, .. } => Some(*spec),
+        FormatPiece::Literal(_) => None,
+    });
     let arguments = args[1..]
         .iter()
-        .map(|argument| {
-            if is_string_local_initializer(argument, context) {
+        .zip(specs)
+        .map(|(argument, spec)| {
+            if spec.conversion == FormatConversion::Display {
+                lower_display_string_expression(argument, context).map(mir::FormatArgument::String)
+            } else if is_string_local_initializer(argument, context) {
                 lower_string_expression(argument, context).map(mir::FormatArgument::String)
             } else {
                 lower_value_expression(argument, context).map(mir::FormatArgument::Value)

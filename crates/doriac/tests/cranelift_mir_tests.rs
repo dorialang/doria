@@ -106,6 +106,28 @@ fn lowers_explicit_panic_to_object() {
 }
 
 #[test]
+fn lowers_complete_stage17_io_and_format_mir_to_object() {
+    for source in [
+        include_str!("../../../examples/native/main_readline_echo.doria"),
+        include_str!("../../../examples/native/main_file_copy.doria"),
+        include_str!("../../../examples/native/main_sprintf_matrix.doria"),
+        include_str!("../../../examples/native/main_printf_42.doria"),
+        include_str!("../../../examples/native/main_write_stderr.doria"),
+        include_str!("../../../examples/native/main_missing_file_panic.doria"),
+        r#"
+function identity(?string $value): ?string { return $value; }
+function main(): void
+{
+    let $line = identity(readline());
+    if ($line != null) { echo $line; }
+}
+"#,
+    ] {
+        assert_object(source);
+    }
+}
+
+#[test]
 fn lowers_stage_13_integer_widths_operators_and_conversions_to_object() {
     assert_object(
         r#"

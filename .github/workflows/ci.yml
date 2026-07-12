@@ -34,7 +34,7 @@ jobs:
         with:
           components: rustfmt, clippy
 
-      - name: Install Stage 16 leak checker
+      - name: Install native leak checker
         run: |
           sudo apt-get update
           sudo apt-get install --yes valgrind
@@ -73,6 +73,13 @@ jobs:
           cargo test -p doria-rt --locked --verbose
           cargo test -p doriac --test stage16_runtime_string_tests --locked --verbose
 
+      - name: Run focused Stage 17 I/O, format, nullable-flow, and MIR validation tests
+        run: |
+          cargo test -p doria-rt --locked --verbose
+          cargo test -p doriac --test stage17_io_tests --locked --verbose
+          cargo test -p doriac --test mir_validation_tests --locked --verbose
+          cargo test -p doriac --test cranelift_mir_tests --locked --verbose
+
       - name: Run focused MIR and linker-independent Cranelift tests
         run: |
           cargo test -p doriac --test mir_tests --locked --verbose
@@ -85,6 +92,15 @@ jobs:
         run: |
           cargo run -p doriac -- compile examples/native/main_runtime_string_builder.doria --out build/native/main_runtime_string_builder
           valgrind --leak-check=full --show-leak-kinds=all --errors-for-leak-kinds=definite,indirect --error-exitcode=1 build/native/main_runtime_string_builder
+
+      - name: Leak-check Stage 17 Cranelift I/O and formatting
+        run: |
+          cargo run -p doriac -- compile examples/native/main_stage17_io_stress.doria --out build/native/main_stage17_io_stress
+          work="$(mktemp -d)"
+          cp crates/doriac/tests/fixtures/native_io/main_stage17_io_stress/files/seed.txt "$work/seed.txt"
+          cp build/native/main_stage17_io_stress "$work/program"
+          (cd "$work" && valgrind --leak-check=full --show-leak-kinds=all --errors-for-leak-kinds=definite,indirect --error-exitcode=1 ./program < "$GITHUB_WORKSPACE/crates/doriac/tests/fixtures/native_io/main_stage17_io_stress/stdin")
+          rm -rf "$work"
 
       - name: Smoke signed and unsigned narrow-width native fixtures
         run: |
@@ -247,6 +263,9 @@ jobs:
             echo "DORIA_RT_PATH=${GITHUB_WORKSPACE}/target/release/libdoria_rt.a" >> "$GITHUB_ENV"
           fi
 
+      - name: Run tier-1 Stage 17 runtime I/O tests
+        run: cargo test -p doria-rt --release --locked --verbose
+
       - name: Clippy LLVM-enabled compiler
         run: cargo clippy -p doriac --all-targets --features llvm-backend --locked -- -D warnings
 
@@ -258,6 +277,7 @@ jobs:
           cargo test -p doriac --test mir_validation_tests --features llvm-backend --locked --verbose
           cargo test -p doriac --test llvm_mir_tests --features llvm-backend --locked --verbose
           cargo test -p doriac --test cli_tests --features llvm-backend --locked --verbose
+          cargo test -p doriac --test stage17_io_tests --features llvm-backend --locked --verbose
 
       - name: Run complete interpreter, Cranelift, and LLVM parity manifest
         run: cargo test -p doriac --test native_mir_parity_tests --features llvm-backend --locked --verbose
@@ -268,6 +288,17 @@ jobs:
         run: |
           cargo run -p doriac --features llvm-backend -- compile examples/native/main_runtime_string_builder.doria --release --out build/native/main_runtime_string_builder_release
           valgrind --leak-check=full --show-leak-kinds=all --errors-for-leak-kinds=definite,indirect --error-exitcode=1 build/native/main_runtime_string_builder_release
+
+      - name: Leak-check Stage 17 LLVM I/O and formatting
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          cargo run -p doriac --features llvm-backend -- compile examples/native/main_stage17_io_stress.doria --release --out build/native/main_stage17_io_stress_release
+          work="$(mktemp -d)"
+          cp crates/doriac/tests/fixtures/native_io/main_stage17_io_stress/files/seed.txt "$work/seed.txt"
+          cp build/native/main_stage17_io_stress_release "$work/program"
+          (cd "$work" && valgrind --leak-check=full --show-leak-kinds=all --errors-for-leak-kinds=definite,indirect --error-exitcode=1 ./program < "$GITHUB_WORKSPACE/crates/doriac/tests/fixtures/native_io/main_stage17_io_stress/stdin")
+          rm -rf "$work"
 
       - name: Smoke LLVM release profile and panic parity on Unix
         if: runner.os != 'Windows'

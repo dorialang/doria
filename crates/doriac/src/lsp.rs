@@ -460,6 +460,49 @@ fn completion_items() -> Value {
         "detail": "Doria built-in function",
         "documentation": "Terminates execution with a fatal panic, Doria stack trace, and status 101.",
     }));
+    items.extend(
+        [
+            (
+                "readline",
+                "readline(): ?string",
+                "Reads one UTF-8 line, strips LF or CRLF, and returns null only at EOF.",
+            ),
+            (
+                "sprintf",
+                "sprintf(string $format, ...): string",
+                "Formats values with a compile-time-checked literal format string in Stage 17.",
+            ),
+            (
+                "printf",
+                "printf(string $format, ...): void",
+                "Writes a compile-time-checked format with no added newline and returns void.",
+            ),
+            (
+                "read_file",
+                "read_file(string $path): string",
+                "Reads a complete UTF-8 text file or panics on failure.",
+            ),
+            (
+                "write_file",
+                "write_file(string $path, string $contents): void",
+                "Creates or truncates a UTF-8 text file and writes exact bytes.",
+            ),
+            (
+                "write_stderr",
+                "write_stderr(string $value): void",
+                "Writes exact UTF-8 bytes to stderr without adding a newline.",
+            ),
+        ]
+        .into_iter()
+        .map(|(label, detail, documentation)| {
+            json!({
+                "label": label,
+                "kind": 3,
+                "detail": detail,
+                "documentation": documentation,
+            })
+        }),
+    );
     items.extend(integer_conversions.into_iter().map(|(label, target)| {
         json!({
             "label": label,
@@ -625,12 +668,10 @@ fn hover_description(kind: &TokenKind) -> Option<&'static str> {
         TokenKind::FloatType => scalar_runtime_type_description("float"),
         TokenKind::Float32Type => scalar_runtime_type_description("float32"),
         TokenKind::Float64Type => scalar_runtime_type_description("float64"),
-        TokenKind::StringType => Some("The `string` primitive type."),
+        TokenKind::StringType => Some("The immutable UTF-8 `string` primitive type. Stage 17 also supports the narrow `?string` EOF seed used by `readline`.") ,
         TokenKind::BoolType => scalar_runtime_type_description("bool"),
         TokenKind::True | TokenKind::False => Some("Boolean literal."),
-        TokenKind::Null => {
-            Some("Null literal. Nullable type syntax like `?T` is planned but not implemented yet; `null` is not a type name.")
-        }
+        TokenKind::Null => Some("Null literal. Stage 17 supports `?string` narrowly for `readline` EOF; general nullable types remain planned for Stage 22."),
         TokenKind::Reserved(_) => Some("Reserved for future Doria syntax."),
         TokenKind::Identifier(name) => match name.as_str() {
             "List" => Some("Ordered collection alias: `List<T>`."),
@@ -643,6 +684,12 @@ fn hover_description(kind: &TokenKind) -> Option<&'static str> {
             "panic" => Some(
                 "Built-in fatal runtime function: `panic(\"message\");`. Panics are not catchable and exit with status 101.",
             ),
+            "readline" => Some("`readline(): ?string` reads one UTF-8 line, strips LF or CRLF, preserves empty and unterminated final lines, and returns `null` only at EOF."),
+            "sprintf" => Some("`sprintf(string $format, ...): string` uses a compile-time-checked literal format string in Stage 17."),
+            "printf" => Some("`printf(string $format, ...): void` uses the same checked formatter as `sprintf`, adds no newline, and returns void."),
+            "read_file" => Some("`read_file(string $path): string` reads complete UTF-8 text and panics on failure."),
+            "write_file" => Some("`write_file(string $path, string $contents): void` creates or truncates a UTF-8 text file and writes exact bytes."),
+            "write_stderr" => Some("`write_stderr(string $value): void` writes exact bytes to stderr without adding a newline."),
             _ => None,
         },
         TokenKind::Variable(_) => Some("Doria variable. Variables must be declared before use."),
@@ -869,9 +916,8 @@ mod tests {
     fn hover_help_does_not_present_planned_syntax_as_immediate_fixes() {
         let null_hover = hover_description(&TokenKind::Null).expect("null should have hover text");
         assert!(null_hover.contains("planned"));
-        assert!(null_hover.contains("not implemented"));
-        assert!(null_hover.contains("`?T`"));
-        assert!(!null_hover.contains("spelled `?T`"));
+        assert!(null_hover.contains("Stage 22"));
+        assert!(null_hover.contains("`?string`"));
 
         let mixed_hover = hover_description(&TokenKind::Identifier("mixed".to_string()))
             .expect("mixed should have hover text");
@@ -1061,5 +1107,39 @@ mod tests {
             .expect("panic should have hover text");
         assert!(hover.contains("status 101"));
         assert!(hover.contains("not catchable"));
+    }
+
+    #[test]
+    fn completions_and_hover_expose_stage17_builtins() {
+        for (name, signature, required_hover) in [
+            ("readline", "readline(): ?string", "only at EOF"),
+            (
+                "sprintf",
+                "sprintf(string $format, ...): string",
+                "literal format",
+            ),
+            (
+                "printf",
+                "printf(string $format, ...): void",
+                "adds no newline",
+            ),
+            ("read_file", "read_file(string $path): string", "UTF-8"),
+            (
+                "write_file",
+                "write_file(string $path, string $contents): void",
+                "UTF-8",
+            ),
+            (
+                "write_stderr",
+                "write_stderr(string $value): void",
+                "without adding a newline",
+            ),
+        ] {
+            assert_eq!(completion_detail(name).as_deref(), Some(signature));
+            let hover = hover_description(&TokenKind::Identifier(name.to_string()))
+                .expect("Stage 17 builtin should have hover text");
+            assert!(hover.contains(required_hover), "{name}: {hover}");
+        }
+        assert!(!completion_labels().contains(&"print".to_string()));
     }
 }

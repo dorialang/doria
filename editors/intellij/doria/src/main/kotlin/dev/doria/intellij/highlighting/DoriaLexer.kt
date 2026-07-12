@@ -837,7 +837,7 @@ class DoriaLexer : LexerBase() {
         private val WORD_OPERATORS = setOf("not", "and", "or", "xor")
         private val LOGICAL_SYMBOL_OPERATORS = setOf("!", "&&", "||")
 
-        private val INVALID_KEYWORDS = setOf("goto", "require", "require_once", "include_once")
+        private val INVALID_KEYWORDS = setOf("goto", "require", "require_once", "include_once", "print")
 
         private val MODIFIERS = setOf("writable", "readonly", "internal")
 
