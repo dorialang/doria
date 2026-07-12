@@ -86,10 +86,19 @@ fn validate_statement(
                     "string local local{} receives an integer rvalue",
                     target.0
                 ))),
-                (mir::Type::Scalar(_), mir::Rvalue::String(_)) => Err(malformed_mir(format!(
-                    "scalar local local{} receives a string rvalue",
+                (mir::Type::NullableString, mir::Rvalue::NullableString(expression)) => {
+                    validate_nullable_string_expression(program, function, expression)
+                }
+                (mir::Type::NullableString, _) => Err(malformed_mir(format!(
+                    "nullable-string local local{} receives another rvalue type",
                     target.0
                 ))),
+                (mir::Type::Scalar(_), mir::Rvalue::String(_) | mir::Rvalue::NullableString(_)) => {
+                    Err(malformed_mir(format!(
+                        "scalar local local{} receives a string rvalue",
+                        target.0
+                    )))
+                }
                 (mir::Type::Scalar(ty), mir::Rvalue::Value(expression)) => {
                     if expression.ty() != ty {
                         return Err(malformed_mir(format!(
@@ -120,6 +129,12 @@ fn validate_statement(
             }
             validate_call_args(program, function, callee, args)
         }
+        mir::Statement::Printf(format) => validate_format_expression(program, function, format),
+        mir::Statement::WriteFile { path, contents } => {
+            validate_string_expression(program, function, path)?;
+            validate_string_expression(program, function, contents)
+        }
+        mir::Statement::WriteStderr(value) => validate_string_expression(program, function, value),
     }
 }
 
@@ -253,6 +268,9 @@ fn validate_rvalue(
     match expression {
         mir::Rvalue::Value(value) => validate_value_expression(program, function, value),
         mir::Rvalue::String(value) => validate_string_expression(program, function, value),
+        mir::Rvalue::NullableString(value) => {
+            validate_nullable_string_expression(program, function, value)
+        }
     }
 }
 
@@ -385,6 +403,15 @@ fn validate_condition(
             validate_string_expression(program, function, left)?;
             validate_string_expression(program, function, right)
         }
+        mir::BoolExpression::NullableStringCompare { op, left, right } => {
+            if !matches!(op, mir::CompareOp::Equal | mir::CompareOp::NotEqual) {
+                return Err(malformed_mir(
+                    "ordered nullable-string comparison is invalid",
+                ));
+            }
+            validate_nullable_string_expression(program, function, left)?;
+            validate_nullable_string_expression(program, function, right)
+        }
         mir::BoolExpression::Not(condition) => validate_condition(program, function, condition),
         mir::BoolExpression::Binary { left, right, .. } => {
             validate_condition(program, function, left)?;
@@ -448,6 +475,14 @@ fn validate_string_expression(
             }
             Ok(())
         }
+        mir::StringExpression::NullableLocalAssumeNonNull(local) => {
+            if local_in(function, *local)?.ty != mir::Type::NullableString {
+                return Err(malformed_mir(
+                    "nonnull string expression references another local type",
+                ));
+            }
+            Ok(())
+        }
         mir::StringExpression::Concat(parts) => {
             for part in parts {
                 validate_string_expression(program, function, part)?;
@@ -467,7 +502,96 @@ fn validate_string_expression(
             }
             validate_call_args(program, function, callee, args)
         }
+        mir::StringExpression::ReadFile(path) => {
+            validate_string_expression(program, function, path)
+        }
+        mir::StringExpression::Format(format) => {
+            validate_format_expression(program, function, format)
+        }
     }
+}
+
+fn validate_nullable_string_expression(
+    program: &mir::Program,
+    function: &mir::Function,
+    expression: &mir::NullableStringExpression,
+) -> Result<(), BackendError> {
+    match expression {
+        mir::NullableStringExpression::Null | mir::NullableStringExpression::ReadLine => Ok(()),
+        mir::NullableStringExpression::String(value) => {
+            validate_string_expression(program, function, value)
+        }
+        mir::NullableStringExpression::Local(local) => {
+            if local_in(function, *local)?.ty != mir::Type::NullableString {
+                return Err(malformed_mir(
+                    "nullable-string expression references another local type",
+                ));
+            }
+            Ok(())
+        }
+        mir::NullableStringExpression::Call {
+            function: callee,
+            args,
+        } => {
+            let callee = function_in(program, *callee)?;
+            if callee.return_type != mir::ReturnType::Value(mir::Type::NullableString) {
+                return Err(malformed_mir(
+                    "nullable-string call targets another return type",
+                ));
+            }
+            validate_call_args(program, function, callee, args)
+        }
+    }
+}
+
+fn validate_format_expression(
+    program: &mir::Program,
+    function: &mir::Function,
+    format: &mir::FormatExpression,
+) -> Result<(), BackendError> {
+    use crate::format_string::{FormatConversion, FormatPiece};
+    for argument in &format.arguments {
+        match argument {
+            mir::FormatArgument::Value(value) => {
+                validate_value_expression(program, function, value)?
+            }
+            mir::FormatArgument::String(value) => {
+                validate_string_expression(program, function, value)?
+            }
+        }
+    }
+    for piece in &format.pieces {
+        let FormatPiece::Argument { index, spec } = piece else {
+            continue;
+        };
+        let argument = format
+            .arguments
+            .get(*index as usize)
+            .ok_or_else(|| malformed_mir("format argument index is out of bounds"))?;
+        let valid = matches!(
+            (spec.conversion, argument),
+            (FormatConversion::Display, mir::FormatArgument::Value(_))
+                | (FormatConversion::Display, mir::FormatArgument::String(_))
+                | (
+                    FormatConversion::Decimal
+                        | FormatConversion::HexLower
+                        | FormatConversion::HexUpper
+                        | FormatConversion::Octal
+                        | FormatConversion::Binary,
+                    mir::FormatArgument::Value(mir::ValueExpression::Integer(_)),
+                )
+                | (
+                    FormatConversion::Float,
+                    mir::FormatArgument::Value(mir::ValueExpression::Float(_)),
+                )
+        );
+        if !valid {
+            return Err(malformed_mir(
+                "format conversion and argument type disagree",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn function_in(

@@ -6,9 +6,13 @@ use core::ffi::c_void;
 use core::mem;
 use core::ptr;
 
+mod device_io;
+mod file_io;
+mod line_io;
+
+use device_io::StandardStream;
+
 const PANIC_STATUS: i32 = 101;
-#[cfg(unix)]
-const EINTR: i32 = 4;
 #[cfg(unix)]
 const SIGPIPE: i32 = 13;
 #[cfg(unix)]
@@ -83,7 +87,7 @@ pub unsafe extern "C" fn dr_v1_write_stdout(
     #[cfg(unix)]
     ignore_sigpipe();
 
-    if write_stream(Stream::Stdout, bytes, byte_length) {
+    if device_io::write(StandardStream::Stdout, bytes, byte_length) {
         return;
     }
     static MESSAGE: &[u8] = b"failed to write stdout";
@@ -97,8 +101,140 @@ pub unsafe extern "C" fn dr_v1_write_stdout(
 /// `bytes` must be readable for `byte_length` bytes.
 #[no_mangle]
 pub unsafe extern "C" fn dr_v1_write_stderr(bytes: *const u8, byte_length: usize) {
-    if !write_stream(Stream::Stderr, bytes, byte_length) {
+    if !device_io::write(StandardStream::Stderr, bytes, byte_length) {
         exit_process(PANIC_STATUS);
+    }
+}
+
+/// Flushes stdout through the implementation-private standard-device abstraction.
+///
+/// # Safety
+/// `current_frame` must be null or a valid frame chain for panic reporting.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_flush_stdout(current_frame: *const DrStackFrameV1) {
+    if !device_io::flush(StandardStream::Stdout) {
+        static MESSAGE: &[u8] = b"failed to flush stdout";
+        dr_v1_panic(current_frame, MESSAGE.as_ptr(), MESSAGE.len());
+    }
+}
+
+/// Flushes stderr through the implementation-private standard-device abstraction.
+///
+/// # Safety
+/// `current_frame` must be null or a valid frame chain for panic reporting.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_flush_stderr(current_frame: *const DrStackFrameV1) {
+    if !device_io::flush(StandardStream::Stderr) {
+        static MESSAGE: &[u8] = b"failed to flush stderr";
+        dr_v1_panic(current_frame, MESSAGE.as_ptr(), MESSAGE.len());
+    }
+}
+
+/// Returns whether one standard stream is attached to an interactive terminal.
+///
+/// Stream identifiers are 0=stdin, 1=stdout, and 2=stderr. Unknown identifiers return false.
+///
+/// # Safety
+/// This operation has no pointer preconditions.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_stream_is_interactive(stream: u8) -> u8 {
+    let stream = match stream {
+        0 => StandardStream::Stdin,
+        1 => StandardStream::Stdout,
+        2 => StandardStream::Stderr,
+        _ => return 0,
+    };
+    u8::from(device_io::is_interactive(stream))
+}
+
+/// Reads one UTF-8 line from stdin, returning null only for EOF before bytes.
+///
+/// The returned non-null string is owned. LF and CRLF endings are removed.
+///
+/// # Safety
+/// `current_frame` must be null or a valid frame chain for panic reporting.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_read_stdin_line(
+    current_frame: *const DrStackFrameV1,
+) -> *mut DrStringV1 {
+    match line_io::read_line() {
+        Ok(Some((bytes, length))) => dr_v1_string_from_utf8(bytes, length),
+        Ok(None) => ptr::null_mut(),
+        Err(line_io::ReadLineError::InvalidUtf8) => {
+            static MESSAGE: &[u8] = b"stdin contained invalid UTF-8";
+            dr_v1_panic(current_frame, MESSAGE.as_ptr(), MESSAGE.len())
+        }
+        Err(line_io::ReadLineError::Read) => {
+            static MESSAGE: &[u8] = b"failed to read stdin";
+            dr_v1_panic(current_frame, MESSAGE.as_ptr(), MESSAGE.len())
+        }
+        Err(line_io::ReadLineError::Allocation) => {
+            static MESSAGE: &[u8] = b"string allocation failed";
+            dr_v1_panic(current_frame, MESSAGE.as_ptr(), MESSAGE.len())
+        }
+    }
+}
+
+/// Reads a complete UTF-8 text file into an owned runtime string.
+///
+/// # Safety
+/// `path` must identify a live runtime string and `current_frame` must be null or valid.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_read_file(
+    current_frame: *const DrStackFrameV1,
+    path: *const DrStringV1,
+) -> *mut DrStringV1 {
+    let path = core::slice::from_raw_parts(string_bytes(path), (*path).byte_length);
+    match file_io::read_file(path) {
+        Ok(contents) => {
+            let bytes = core::slice::from_raw_parts(contents.bytes, contents.length);
+            if core::str::from_utf8(bytes).is_err() {
+                static MESSAGE: &[u8] = b"file contained invalid UTF-8";
+                dr_v1_panic(current_frame, MESSAGE.as_ptr(), MESSAGE.len());
+            }
+            dr_v1_string_from_utf8(bytes.as_ptr(), bytes.len())
+        }
+        Err(file_io::FileError::PathNul) => {
+            static MESSAGE: &[u8] = b"file path contained an embedded NUL";
+            dr_v1_panic(current_frame, MESSAGE.as_ptr(), MESSAGE.len())
+        }
+        Err(file_io::FileError::Allocation) => {
+            static MESSAGE: &[u8] = b"string allocation failed";
+            dr_v1_panic(current_frame, MESSAGE.as_ptr(), MESSAGE.len())
+        }
+        Err(_) => {
+            static MESSAGE: &[u8] = b"failed to read file";
+            dr_v1_panic(current_frame, MESSAGE.as_ptr(), MESSAGE.len())
+        }
+    }
+}
+
+/// Creates or truncates a text file and writes exact runtime-string bytes.
+///
+/// # Safety
+/// Both strings must be live and `current_frame` must be null or valid.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_write_file(
+    current_frame: *const DrStackFrameV1,
+    path: *const DrStringV1,
+    contents: *const DrStringV1,
+) {
+    let path = core::slice::from_raw_parts(string_bytes(path), (*path).byte_length);
+    let contents = core::slice::from_raw_parts(string_bytes(contents), (*contents).byte_length);
+    match file_io::write_file(path, contents) {
+        Ok(()) => {}
+        Err(file_io::FileError::PathNul) => {
+            static MESSAGE: &[u8] = b"file path contained an embedded NUL";
+            dr_v1_panic(current_frame, MESSAGE.as_ptr(), MESSAGE.len())
+        }
+        Err(file_io::FileError::Allocation) => {
+            static MESSAGE: &[u8] = b"string allocation failed";
+            dr_v1_panic(current_frame, MESSAGE.as_ptr(), MESSAGE.len())
+        }
+        Err(_) => {
+            static MESSAGE: &[u8] = b"failed to write file";
+            dr_v1_panic(current_frame, MESSAGE.as_ptr(), MESSAGE.len())
+        }
     }
 }
 
@@ -252,6 +388,21 @@ pub unsafe extern "C" fn dr_v1_string_compare(
     }
 }
 
+/// Compares two nullable runtime strings for value equality.
+///
+/// # Safety
+/// Each pointer must be null or identify a live doria-rt string.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_nullable_string_equal(
+    left: *const DrStringV1,
+    right: *const DrStringV1,
+) -> u8 {
+    if left.is_null() || right.is_null() {
+        return u8::from(left == right);
+    }
+    u8::from(dr_v1_string_compare(left, right) == 0)
+}
+
 #[no_mangle]
 /// Returns the explicit byte pointer for a live string.
 ///
@@ -280,6 +431,25 @@ pub unsafe extern "C" fn dr_v1_write_string_stdout(
     string: *const DrStringV1,
 ) {
     dr_v1_write_stdout(current_frame, string_bytes(string), (*string).byte_length)
+}
+
+/// Writes a borrowed string to stderr without adding a newline.
+///
+/// # Safety
+/// `string` must identify a live runtime string and `current_frame` must be null or valid.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_write_string_stderr(
+    current_frame: *const DrStackFrameV1,
+    string: *const DrStringV1,
+) {
+    if !device_io::write(
+        StandardStream::Stderr,
+        string_bytes(string),
+        (*string).byte_length,
+    ) {
+        static MESSAGE: &[u8] = b"failed to write stderr";
+        dr_v1_panic(current_frame, MESSAGE.as_ptr(), MESSAGE.len());
+    }
 }
 
 #[no_mangle]
@@ -330,6 +500,275 @@ pub unsafe extern "C" fn dr_v1_string_from_f64(value: f64) -> *mut DrStringV1 {
 pub unsafe extern "C" fn dr_v1_string_from_bool(value: u8) -> *mut DrStringV1 {
     let bytes: &[u8] = if value == 0 { b"false" } else { b"true" };
     dr_v1_string_from_utf8(bytes.as_ptr(), bytes.len())
+}
+
+const FORMAT_LEFT_ALIGN: u8 = 1;
+const FORMAT_ZERO_PAD: u8 = 2;
+const FORMAT_DECIMAL: u8 = 1;
+const FORMAT_HEX_LOWER: u8 = 2;
+const FORMAT_HEX_UPPER: u8 = 3;
+const FORMAT_OCTAL: u8 = 4;
+const FORMAT_BINARY: u8 = 5;
+
+/// Applies Stage 17 byte-counted width to a borrowed string.
+///
+/// # Safety
+/// `value` must identify a live runtime string.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_format_string(
+    value: *const DrStringV1,
+    width: u32,
+    flags: u8,
+) -> *mut DrStringV1 {
+    padded_string(
+        string_bytes(value),
+        (*value).byte_length,
+        width,
+        flags,
+        false,
+    )
+}
+
+/// Formats a signed integer using a validated Stage 17 integer conversion.
+///
+/// # Safety
+/// `conversion`, `bit_width`, and flags must come from validated MIR.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_format_i64(
+    value: i64,
+    bit_width: u8,
+    conversion: u8,
+    width: u32,
+    flags: u8,
+) -> *mut DrStringV1 {
+    let mut buffer = [0_u8; 65];
+    let (start, length) = if conversion == FORMAT_DECIMAL {
+        signed_decimal(
+            value,
+            (&mut buffer[..20]).try_into().expect("20-byte prefix"),
+        )
+    } else {
+        let mask = if bit_width == 64 {
+            u64::MAX
+        } else {
+            (1_u64 << bit_width) - 1
+        };
+        unsigned_base((value as u64) & mask, conversion, &mut buffer)
+    };
+    padded_string(
+        buffer.as_ptr().add(start),
+        length,
+        width,
+        flags,
+        value < 0 && conversion == FORMAT_DECIMAL,
+    )
+}
+
+/// Formats an unsigned integer using a validated Stage 17 integer conversion.
+///
+/// # Safety
+/// `conversion` and flags must come from validated MIR.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_format_u64(
+    value: u64,
+    conversion: u8,
+    width: u32,
+    flags: u8,
+) -> *mut DrStringV1 {
+    let mut buffer = [0_u8; 65];
+    let (start, length) = if conversion == FORMAT_DECIMAL {
+        let mut decimal = [0_u8; 20];
+        let result = unsigned_decimal(value, &mut decimal);
+        let start = buffer.len() - result.1;
+        buffer[start..].copy_from_slice(&decimal[result.0..]);
+        (start, result.1)
+    } else {
+        unsigned_base(value, conversion, &mut buffer)
+    };
+    padded_string(buffer.as_ptr().add(start), length, width, flags, false)
+}
+
+/// Formats a binary32 value with validated fixed precision and width.
+///
+/// # Safety
+/// Precision and flags must come from validated MIR.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_format_f32(
+    value: f32,
+    precision: u32,
+    width: u32,
+    flags: u8,
+) -> *mut DrStringV1 {
+    format_fixed_float(
+        value as f64,
+        value.is_sign_negative(),
+        precision,
+        width,
+        flags,
+    )
+}
+
+/// Formats a binary64 value with validated fixed precision and width.
+///
+/// # Safety
+/// Precision and flags must come from validated MIR.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_format_f64(
+    value: f64,
+    precision: u32,
+    width: u32,
+    flags: u8,
+) -> *mut DrStringV1 {
+    format_fixed_float(value, value.is_sign_negative(), precision, width, flags)
+}
+
+unsafe fn format_fixed_float(
+    value: f64,
+    negative: bool,
+    precision: u32,
+    width: u32,
+    flags: u8,
+) -> *mut DrStringV1 {
+    if value.is_nan() {
+        return padded_string(b"NaN".as_ptr(), 3, width, flags, false);
+    }
+    if value == f64::INFINITY {
+        return padded_string(b"Infinity".as_ptr(), 8, width, flags, false);
+    }
+    if value == f64::NEG_INFINITY {
+        return padded_string(b"-Infinity".as_ptr(), 9, width, flags, true);
+    }
+    let precision = precision as usize;
+    let mut factor = 1_u128;
+    for _ in 0..precision {
+        factor = factor
+            .checked_mul(10)
+            .unwrap_or_else(|| string_runtime_panic(b"formatted float precision is too large"));
+    }
+    let scaled = value.abs() * factor as f64;
+    if !scaled.is_finite() || scaled > u128::MAX as f64 {
+        string_runtime_panic(b"formatted float magnitude is too large");
+    }
+    let truncated = scaled as u128;
+    let fraction = scaled - truncated as f64;
+    let rounded = if fraction > 0.5 || (fraction == 0.5 && truncated & 1 == 1) {
+        truncated
+            .checked_add(1)
+            .unwrap_or_else(|| string_runtime_panic(b"formatted float magnitude is too large"))
+    } else {
+        truncated
+    };
+    let integer = rounded / factor;
+    let fractional = rounded % factor;
+    let mut digits = [0_u8; 39];
+    let (integer_start, integer_length) = unsigned_decimal_u128(integer, &mut digits);
+    let sign_length = usize::from(negative);
+    let decimal_length = usize::from(precision != 0);
+    let length = sign_length
+        .checked_add(integer_length)
+        .and_then(|length| length.checked_add(decimal_length))
+        .and_then(|length| length.checked_add(precision))
+        .unwrap_or_else(|| string_runtime_panic(b"string length overflow"));
+    let raw = allocate_string(length);
+    let mut cursor = 0;
+    if negative {
+        *string_bytes_mut(raw) = b'-';
+        cursor += 1;
+    }
+    ptr::copy_nonoverlapping(
+        digits.as_ptr().add(integer_start),
+        string_bytes_mut(raw).add(cursor),
+        integer_length,
+    );
+    cursor += integer_length;
+    if precision != 0 {
+        *string_bytes_mut(raw).add(cursor) = b'.';
+        cursor += 1;
+        let mut divisor = factor / 10;
+        for _ in 0..precision {
+            *string_bytes_mut(raw).add(cursor) = b'0' + ((fractional / divisor) % 10) as u8;
+            cursor += 1;
+            divisor = core::cmp::max(divisor / 10, 1);
+        }
+    }
+    let padded = padded_string(string_bytes(raw), length, width, flags, negative);
+    dr_v1_string_release(raw);
+    padded
+}
+
+unsafe fn padded_string(
+    bytes: *const u8,
+    length: usize,
+    width: u32,
+    flags: u8,
+    negative_decimal: bool,
+) -> *mut DrStringV1 {
+    let width = width as usize;
+    if width <= length {
+        return dr_v1_string_from_utf8(bytes, length);
+    }
+    let result = allocate_string(width);
+    let padding = width - length;
+    let left = flags & FORMAT_LEFT_ALIGN != 0;
+    let zero = flags & FORMAT_ZERO_PAD != 0 && !left;
+    if left {
+        ptr::copy_nonoverlapping(bytes, string_bytes_mut(result), length);
+        ptr::write_bytes(string_bytes_mut(result).add(length), b' ', padding);
+    } else if zero && negative_decimal {
+        *string_bytes_mut(result) = b'-';
+        ptr::write_bytes(string_bytes_mut(result).add(1), b'0', padding);
+        ptr::copy_nonoverlapping(
+            bytes.add(1),
+            string_bytes_mut(result).add(1 + padding),
+            length - 1,
+        );
+    } else {
+        ptr::write_bytes(
+            string_bytes_mut(result),
+            if zero { b'0' } else { b' ' },
+            padding,
+        );
+        ptr::copy_nonoverlapping(bytes, string_bytes_mut(result).add(padding), length);
+    }
+    result
+}
+
+fn unsigned_base(mut value: u64, conversion: u8, buffer: &mut [u8; 65]) -> (usize, usize) {
+    let radix = match conversion {
+        FORMAT_HEX_LOWER | FORMAT_HEX_UPPER => 16,
+        FORMAT_OCTAL => 8,
+        FORMAT_BINARY => 2,
+        _ => 10,
+    };
+    let uppercase = conversion == FORMAT_HEX_UPPER;
+    let mut cursor = buffer.len();
+    loop {
+        cursor -= 1;
+        let digit = (value % radix) as u8;
+        buffer[cursor] = match digit {
+            0..=9 => b'0' + digit,
+            _ if uppercase => b'A' + digit - 10,
+            _ => b'a' + digit - 10,
+        };
+        value /= radix;
+        if value == 0 {
+            break;
+        }
+    }
+    (cursor, buffer.len() - cursor)
+}
+
+fn unsigned_decimal_u128(mut value: u128, buffer: &mut [u8; 39]) -> (usize, usize) {
+    let mut cursor = buffer.len();
+    loop {
+        cursor -= 1;
+        buffer[cursor] = b'0' + (value % 10) as u8;
+        value /= 10;
+        if value == 0 {
+            break;
+        }
+    }
+    (cursor, buffer.len() - cursor)
 }
 
 unsafe fn float_string_f32(value: f32) -> *mut DrStringV1 {
@@ -442,12 +881,6 @@ unsafe fn allocate(_byte_length: usize) -> *mut u8 {
 #[cfg(not(any(unix, windows)))]
 unsafe fn deallocate(_memory: *mut u8) {}
 
-#[derive(Clone, Copy)]
-enum Stream {
-    Stdout,
-    Stderr,
-}
-
 #[cfg(unix)]
 unsafe fn ignore_sigpipe() {
     // Ignoring it makes write(2) report EPIPE instead of terminating the process by signal.
@@ -459,69 +892,9 @@ unsafe fn write_panic_fragment(bytes: &[u8]) {
 }
 
 unsafe fn write_panic_bytes(bytes: *const u8, byte_length: usize) {
-    if !write_stream(Stream::Stderr, bytes, byte_length) {
+    if !device_io::write(StandardStream::Stderr, bytes, byte_length) {
         exit_process(PANIC_STATUS);
     }
-}
-
-#[cfg(unix)]
-unsafe fn write_stream(stream: Stream, bytes: *const u8, byte_length: usize) -> bool {
-    let descriptor = match stream {
-        Stream::Stdout => 1,
-        Stream::Stderr => 2,
-    };
-    let mut offset = 0;
-    while offset < byte_length {
-        let written = write(
-            descriptor,
-            bytes.add(offset).cast::<c_void>(),
-            byte_length - offset,
-        );
-        if written > 0 {
-            offset += written as usize;
-            continue;
-        }
-        if written < 0 && last_errno() == EINTR {
-            continue;
-        }
-        return false;
-    }
-    true
-}
-
-#[cfg(windows)]
-unsafe fn write_stream(stream: Stream, bytes: *const u8, byte_length: usize) -> bool {
-    let standard_handle = match stream {
-        Stream::Stdout => STD_OUTPUT_HANDLE,
-        Stream::Stderr => STD_ERROR_HANDLE,
-    };
-    let handle = GetStdHandle(standard_handle);
-    if handle.is_null() || handle == INVALID_HANDLE_VALUE {
-        return false;
-    }
-
-    let mut offset = 0;
-    while offset < byte_length {
-        let request = core::cmp::min(byte_length - offset, u32::MAX as usize) as u32;
-        let mut written = 0_u32;
-        let succeeded = WriteFile(
-            handle,
-            bytes.add(offset).cast::<c_void>(),
-            request,
-            &mut written,
-            ptr::null_mut(),
-        );
-        if succeeded == 0 || written == 0 {
-            return false;
-        }
-        offset += written as usize;
-    }
-    true
-}
-
-#[cfg(not(any(unix, windows)))]
-unsafe fn write_stream(_stream: Stream, _bytes: *const u8, _byte_length: usize) -> bool {
-    false
 }
 
 #[cfg(unix)]
@@ -541,78 +914,13 @@ unsafe fn exit_process(_status: i32) -> ! {
     }
 }
 
-#[cfg(all(unix, any(target_os = "linux", target_os = "android")))]
-unsafe fn last_errno() -> i32 {
-    *__errno_location()
-}
-
-#[cfg(all(
-    unix,
-    any(
-        target_os = "macos",
-        target_os = "ios",
-        target_os = "freebsd",
-        target_os = "openbsd",
-        target_os = "netbsd",
-        target_os = "dragonfly"
-    )
-))]
-unsafe fn last_errno() -> i32 {
-    *__error()
-}
-
-#[cfg(all(
-    unix,
-    not(any(
-        target_os = "linux",
-        target_os = "android",
-        target_os = "macos",
-        target_os = "ios",
-        target_os = "freebsd",
-        target_os = "openbsd",
-        target_os = "netbsd",
-        target_os = "dragonfly"
-    ))
-))]
-unsafe fn last_errno() -> i32 {
-    0
-}
-
 #[cfg(unix)]
 extern "C" {
     fn signal(signal: i32, handler: usize) -> usize;
-    fn write(descriptor: i32, bytes: *const c_void, byte_length: usize) -> isize;
     fn _exit(status: i32) -> !;
     fn malloc(byte_length: usize) -> *mut c_void;
     fn free(memory: *mut c_void);
 }
-
-#[cfg(all(unix, any(target_os = "linux", target_os = "android")))]
-extern "C" {
-    fn __errno_location() -> *mut i32;
-}
-
-#[cfg(all(
-    unix,
-    any(
-        target_os = "macos",
-        target_os = "ios",
-        target_os = "freebsd",
-        target_os = "openbsd",
-        target_os = "netbsd",
-        target_os = "dragonfly"
-    )
-))]
-extern "C" {
-    fn __error() -> *mut i32;
-}
-
-#[cfg(windows)]
-const STD_OUTPUT_HANDLE: u32 = -11_i32 as u32;
-#[cfg(windows)]
-const STD_ERROR_HANDLE: u32 = -12_i32 as u32;
-#[cfg(windows)]
-const INVALID_HANDLE_VALUE: *mut c_void = -1_isize as *mut c_void;
 
 // Doria's Windows executables deliberately do not link the C runtime. Rust and ryu still lower
 // byte copies/fills and floating-point use to these MSVC support symbols, so the runtime owns the
@@ -675,6 +983,49 @@ pub unsafe extern "C" fn memmove(
     destination
 }
 
+/// Compares `count` bytes lexicographically as unsigned values.
+///
+/// # Safety
+///
+/// `left` and `right` must both be valid for reads of `count` bytes.
+#[cfg(windows)]
+#[no_mangle]
+pub unsafe extern "C" fn memcmp(left: *const c_void, right: *const c_void, count: usize) -> i32 {
+    let left = left.cast::<u8>();
+    let right = right.cast::<u8>();
+    for index in 0..count {
+        let left_byte = ptr::read_volatile(left.add(index));
+        let right_byte = ptr::read_volatile(right.add(index));
+        if left_byte != right_byte {
+            return i32::from(left_byte) - i32::from(right_byte);
+        }
+    }
+    0
+}
+
+/// Lets Windows continue searching when precompiled `core` unwind metadata is inspected.
+///
+/// Doria's runtime is abort-only and never initiates SEH/C++ unwinding. The Rust-distributed
+/// `core` archive can nevertheless reference the MSVC language-specific handler, while Doria
+/// deliberately links without the CRT. Returning `ExceptionContinueSearch` preserves the
+/// abort-only boundary if an unrelated structured exception reaches this metadata.
+///
+/// # Safety
+///
+/// This function may only be entered by the Windows exception dispatcher with its four native
+/// dispatcher pointers. Doria code must never call it directly.
+#[cfg(all(windows, target_env = "msvc"))]
+#[no_mangle]
+pub unsafe extern "C" fn __CxxFrameHandler3(
+    _exception_record: *mut c_void,
+    _establisher_frame: *mut c_void,
+    _context_record: *mut c_void,
+    _dispatcher_context: *mut c_void,
+) -> i32 {
+    const EXCEPTION_CONTINUE_SEARCH: i32 = 1;
+    EXCEPTION_CONTINUE_SEARCH
+}
+
 /// Fills `count` bytes at `destination` with the low byte of `value`.
 ///
 /// # Safety
@@ -692,14 +1043,6 @@ pub unsafe extern "C" fn memset(destination: *mut c_void, value: i32, count: usi
 
 #[cfg(windows)]
 extern "system" {
-    fn GetStdHandle(standard_handle: u32) -> *mut c_void;
-    fn WriteFile(
-        handle: *mut c_void,
-        bytes: *const c_void,
-        byte_length: u32,
-        written: *mut u32,
-        overlapped: *mut c_void,
-    ) -> i32;
     fn GetProcessHeap() -> *mut c_void;
     fn HeapAlloc(heap: *mut c_void, flags: u32, byte_length: usize) -> *mut c_void;
     fn HeapFree(heap: *mut c_void, flags: u32, memory: *mut c_void) -> i32;
@@ -814,6 +1157,21 @@ mod tests {
 
             memmove(moved.as_mut_ptr().cast(), moved.as_ptr().add(1).cast(), 4);
             assert_eq!(moved, [1, 2, 3, 4, 4]);
+
+            assert_eq!(memcmp(b"abc".as_ptr().cast(), b"abc".as_ptr().cast(), 3), 0);
+            assert!(memcmp(b"abc".as_ptr().cast(), b"abd".as_ptr().cast(), 3) < 0);
+            assert!(memcmp(b"abe".as_ptr().cast(), b"abd".as_ptr().cast(), 3) > 0);
+
+            #[cfg(target_env = "msvc")]
+            assert_eq!(
+                __CxxFrameHandler3(
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                ),
+                1
+            );
         }
     }
 }

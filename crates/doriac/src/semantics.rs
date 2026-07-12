@@ -1,7 +1,9 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::ast::*;
+use crate::builtins::Builtin;
 use crate::diagnostics::{Diagnostic, DiagnosticResult};
+use crate::format_string::{self, FormatConversion, FormatPiece};
 use crate::numeric::{parse_decimal_magnitude, FloatType, FloatValue, IntegerType, IntegerValue};
 use crate::source::Span;
 use crate::symbols::{
@@ -360,9 +362,9 @@ impl<'program> Checker<'program> {
             ));
         }
         match name {
-            "panic" => Some(
-                "`panic` is a compiler-known Doria built-in and cannot be redeclared".to_string(),
-            ),
+            name if Builtin::from_name(name).is_some() => Some(format!(
+                "`{name}` is a compiler-known Doria built-in and cannot be redeclared"
+            )),
             "array" => Some(
                 "`array` is not a Doria callable name; use typed arrays like `T[]` or collection aliases"
                     .to_string(),
@@ -590,6 +592,7 @@ impl<'program> Checker<'program> {
                 Binding {
                     writable: false,
                     ty: param.ty,
+                    declared_ty: param.ty,
                     int_constant: None,
                     string_constant: None,
                 },
@@ -640,6 +643,7 @@ impl<'program> Checker<'program> {
                     Binding {
                         writable: decl.writable,
                         ty,
+                        declared_ty: ty,
                         int_constant: None,
                         string_constant: None,
                     },
@@ -773,6 +777,7 @@ impl<'program> Checker<'program> {
                     Binding {
                         writable: decl.writable,
                         ty,
+                        declared_ty: ty,
                         int_constant: None,
                         string_constant: None,
                     },
@@ -841,6 +846,7 @@ impl<'program> Checker<'program> {
                 Binding {
                     writable: false,
                     ty,
+                    declared_ty: ty,
                     int_constant: None,
                     string_constant: None,
                 },
@@ -858,6 +864,7 @@ impl<'program> Checker<'program> {
             Binding {
                 writable: false,
                 ty: value_ty,
+                declared_ty: value_ty,
                 int_constant: None,
                 string_constant: None,
             },
@@ -972,6 +979,13 @@ impl<'program> Checker<'program> {
     }
 
     fn resolve_type_ref_for_return_inference(&mut self, ty: &TypeRef) -> TypeId {
+        if ty.nullable {
+            return if ty.name == "string" && ty.args.is_empty() {
+                self.types.intern(TypeKind::NullableString)
+            } else {
+                self.types.unknown()
+            };
+        }
         if ty.args.is_empty() {
             if let Some(integer) = IntegerType::from_source_name(&ty.name) {
                 return self.types.intern(TypeKind::Integer(integer));
@@ -1187,6 +1201,7 @@ impl<'program> Checker<'program> {
                 Binding {
                     writable: param.writable,
                     ty,
+                    declared_ty: ty,
                     int_constant: None,
                     string_constant: None,
                 },
@@ -1345,6 +1360,7 @@ impl<'program> Checker<'program> {
                     Binding {
                         writable: decl.writable,
                         ty,
+                        declared_ty: ty,
                         int_constant: self.readonly_int_constant(
                             decl.writable,
                             ty,
@@ -1408,12 +1424,14 @@ impl<'program> Checker<'program> {
             }
             Stmt::If(if_stmt) => {
                 self.check_condition(&if_stmt.condition, scopes, method_context);
+                let mut then_scopes = scopes.clone();
+                self.apply_non_null_narrowing(&if_stmt.condition, &mut then_scopes);
                 let mut then_constructor_init_context = constructor_init_context
                     .as_deref()
                     .map(ConstructorInitContext::without_readonly_init);
                 self.check_block(
                     &if_stmt.then_block,
-                    scopes,
+                    &mut then_scopes,
                     method_context,
                     then_constructor_init_context.as_mut(),
                     return_context,
@@ -1432,12 +1450,14 @@ impl<'program> Checker<'program> {
             }
             Stmt::While(while_stmt) => {
                 self.check_condition(&while_stmt.condition, scopes, method_context);
+                let mut body_scopes = scopes.clone();
+                self.apply_non_null_narrowing(&while_stmt.condition, &mut body_scopes);
                 let mut loop_constructor_init_context = constructor_init_context
                     .as_deref()
                     .map(ConstructorInitContext::without_readonly_init);
                 self.check_block(
                     &while_stmt.body,
-                    scopes,
+                    &mut body_scopes,
                     method_context,
                     loop_constructor_init_context.as_mut(),
                     return_context,
@@ -1552,6 +1572,7 @@ impl<'program> Checker<'program> {
                         Binding {
                             writable: false,
                             ty,
+                            declared_ty: ty,
                             int_constant: None,
                             string_constant: None,
                         },
@@ -1581,6 +1602,7 @@ impl<'program> Checker<'program> {
                     Binding {
                         writable: false,
                         ty: value_ty,
+                        declared_ty: value_ty,
                         int_constant: None,
                         string_constant: None,
                     },
@@ -1604,6 +1626,32 @@ impl<'program> Checker<'program> {
             Stmt::Increment(increment) => {
                 self.check_increment_statement(increment, scopes, method_context);
             }
+        }
+    }
+
+    fn apply_non_null_narrowing(&mut self, condition: &Expr, scopes: &mut ScopeStack) {
+        let Expr::Binary {
+            left, op, right, ..
+        } = condition
+        else {
+            if let Expr::Grouped { expr, .. } = condition {
+                self.apply_non_null_narrowing(expr, scopes);
+            }
+            return;
+        };
+        if *op != BinaryOp::NotEqual {
+            return;
+        }
+        let name = match (&**left, &**right) {
+            (Expr::Variable { name, .. }, Expr::Null { .. })
+            | (Expr::Null { .. }, Expr::Variable { name, .. }) => name,
+            _ => return,
+        };
+        let Some(binding) = scopes.lookup_mut(name) else {
+            return;
+        };
+        if matches!(self.types.kind(binding.ty), TypeKind::NullableString) {
+            binding.ty = self.types.intern(TypeKind::String);
         }
     }
 
@@ -1643,6 +1691,7 @@ impl<'program> Checker<'program> {
                     Binding {
                         writable: decl.writable,
                         ty,
+                        declared_ty: ty,
                         int_constant: self.readonly_int_constant(
                             decl.writable,
                             ty,
@@ -1724,6 +1773,7 @@ impl<'program> Checker<'program> {
                         value_ty,
                         scopes,
                     );
+                    self.update_nullable_assignment_flow_type(&assignment.target, value_ty, scopes);
                 }
             }
             AssignOp::AddAssign
@@ -3114,7 +3164,14 @@ impl<'program> Checker<'program> {
                         );
                     }
                     Some(AssignmentTarget {
-                        ty: binding.ty,
+                        ty: if matches!(
+                            self.types.kind(binding.declared_ty),
+                            TypeKind::NullableString
+                        ) {
+                            binding.declared_ty
+                        } else {
+                            binding.ty
+                        },
                         destination: AssignmentDestination::Type,
                     })
                 }
@@ -3309,6 +3366,11 @@ impl<'program> Checker<'program> {
             return;
         }
 
+        if let Some(builtin) = Builtin::from_name(name) {
+            self.check_builtin_call(builtin, args, span, scopes, method_context);
+            return;
+        }
+
         let Some(function_info) = self.functions.get(name).cloned() else {
             self.diagnostics.push(Diagnostic::new(
                 "E0309",
@@ -3326,6 +3388,143 @@ impl<'program> Checker<'program> {
             scopes,
             method_context,
         );
+    }
+
+    fn check_builtin_call(
+        &mut self,
+        builtin: Builtin,
+        args: &[Expr],
+        span: Span,
+        scopes: &ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) {
+        let expected = match builtin {
+            Builtin::Readline => Some(0),
+            Builtin::ReadFile | Builtin::WriteStderr => Some(1),
+            Builtin::WriteFile => Some(2),
+            Builtin::Sprintf | Builtin::Printf => None,
+            Builtin::Panic => return self.check_panic_call(args, span, scopes, method_context),
+        };
+        if let Some(expected) = expected {
+            if args.len() != expected {
+                self.diagnostics.push(Diagnostic::new(
+                    "E0450",
+                    format!(
+                        "{} expects exactly {expected} arguments, got {}",
+                        builtin.name(),
+                        args.len()
+                    ),
+                    span,
+                ));
+                return;
+            }
+        } else if args.is_empty() {
+            self.diagnostics.push(Diagnostic::new(
+                "E0451",
+                format!("{} expects a literal format argument", builtin.name()),
+                span,
+            ));
+            return;
+        }
+
+        match builtin {
+            Builtin::ReadFile | Builtin::WriteStderr => {
+                self.require_builtin_string_arg(builtin, &args[0], scopes, method_context)
+            }
+            Builtin::WriteFile => {
+                self.require_builtin_string_arg(builtin, &args[0], scopes, method_context);
+                self.require_builtin_string_arg(builtin, &args[1], scopes, method_context);
+            }
+            Builtin::Sprintf | Builtin::Printf => {
+                let Some(Expr::String { value, span }) = args.first() else {
+                    self.diagnostics.push(Diagnostic::new(
+                        "E0452",
+                        format!("{} format must be a direct string literal", builtin.name()),
+                        args[0].span(),
+                    ));
+                    return;
+                };
+                let pieces = match format_string::parse(value, *span) {
+                    Ok(pieces) => pieces,
+                    Err(diagnostic) => {
+                        self.diagnostics.push(diagnostic);
+                        return;
+                    }
+                };
+                let specs = pieces
+                    .iter()
+                    .filter_map(|piece| match piece {
+                        FormatPiece::Argument { spec, .. } => Some(*spec),
+                        FormatPiece::Literal(_) => None,
+                    })
+                    .collect::<Vec<_>>();
+                if args.len() - 1 != specs.len() {
+                    self.diagnostics.push(Diagnostic::new(
+                        "E0456",
+                        format!(
+                            "{} format expects {} arguments, got {}",
+                            builtin.name(),
+                            specs.len(),
+                            args.len() - 1
+                        ),
+                        *span,
+                    ));
+                    return;
+                }
+                for (argument, spec) in args[1..].iter().zip(specs) {
+                    let ty = self.infer_expr_type(argument, scopes, method_context);
+                    let valid = match spec.conversion {
+                        FormatConversion::Display => self.is_display_convertible_type(ty),
+                        FormatConversion::Decimal
+                        | FormatConversion::HexLower
+                        | FormatConversion::HexUpper
+                        | FormatConversion::Octal
+                        | FormatConversion::Binary => {
+                            matches!(
+                                self.types.kind(ty),
+                                TypeKind::Integer(_) | TypeKind::Unknown
+                            )
+                        }
+                        FormatConversion::Float => {
+                            matches!(self.types.kind(ty), TypeKind::Float(_) | TypeKind::Unknown)
+                        }
+                    };
+                    if !valid {
+                        self.diagnostics.push(Diagnostic::new(
+                            "E0457",
+                            format!(
+                                "format conversion `{}` does not accept `{}`",
+                                spec.conversion.specifier(),
+                                self.types.display(ty)
+                            ),
+                            argument.span(),
+                        ));
+                    }
+                }
+            }
+            Builtin::Readline | Builtin::Panic => {}
+        }
+    }
+
+    fn require_builtin_string_arg(
+        &mut self,
+        builtin: Builtin,
+        argument: &Expr,
+        scopes: &ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) {
+        let ty = self.infer_expr_type(argument, scopes, method_context);
+        if !matches!(self.types.kind(ty), TypeKind::String | TypeKind::Unknown) {
+            self.diagnostics.push(Diagnostic::new(
+                "E0453",
+                format!(
+                    "{} expects `string`, got `{}`",
+                    builtin.name(),
+                    self.types.display(ty)
+                ),
+                argument.span(),
+            ));
+        }
     }
 
     fn check_panic_call(
@@ -3825,6 +4024,18 @@ impl<'program> Checker<'program> {
         span: Span,
         position: TypePosition,
     ) -> TypeId {
+        if ty.nullable {
+            if ty.name == "string" && ty.args.is_empty() {
+                return self.types.intern(TypeKind::NullableString);
+            }
+            return self.reject_type_ref_with_help(
+                ty,
+                span,
+                "E0454",
+                format!("Stage 17 supports `?string`, not `{ty}`"),
+                "general nullable types remain Stage 22",
+            );
+        }
         if let Some(integer) = IntegerType::from_source_name(&ty.name) {
             return self.resolve_zero_arg_type(ty, span, TypeKind::Integer(integer));
         }
@@ -4103,6 +4314,31 @@ impl<'program> Checker<'program> {
         }
     }
 
+    fn update_nullable_assignment_flow_type(
+        &self,
+        target: &Expr,
+        value_ty: TypeId,
+        scopes: &mut ScopeStack,
+    ) {
+        let Some(name) = Self::assignment_target_variable_name(target) else {
+            return;
+        };
+        let Some(binding) = scopes.lookup_mut(name) else {
+            return;
+        };
+        if !matches!(
+            self.types.kind(binding.declared_ty),
+            TypeKind::NullableString
+        ) {
+            return;
+        }
+        binding.ty = if matches!(self.types.kind(value_ty), TypeKind::String) {
+            value_ty
+        } else {
+            binding.declared_ty
+        };
+    }
+
     fn is_expr_assignable(
         &mut self,
         target: TypeId,
@@ -4218,6 +4454,7 @@ impl<'program> Checker<'program> {
             (TypeKind::Mixed, _) => true,
             (_, TypeKind::Mixed) => false,
             (TypeKind::Unknown, _) | (_, TypeKind::Unknown) => true,
+            (TypeKind::NullableString, TypeKind::String | TypeKind::Null) => true,
             (
                 TypeKind::TypedArray(_)
                 | TypeKind::List(_)
@@ -4339,11 +4576,23 @@ impl<'program> Checker<'program> {
                     .map(|method| method.return_ty)
                     .unwrap_or_else(|| self.types.unknown())
             }
-            Expr::FunctionCall { name, .. } => self
-                .functions
-                .get(name)
-                .map(|function| function.return_ty)
-                .unwrap_or_else(|| self.types.unknown()),
+            Expr::FunctionCall { name, .. } => {
+                if let Some(builtin) = Builtin::from_name(name) {
+                    match builtin {
+                        Builtin::Readline => self.types.intern(TypeKind::NullableString),
+                        Builtin::Sprintf | Builtin::ReadFile => self.types.intern(TypeKind::String),
+                        Builtin::Printf
+                        | Builtin::WriteFile
+                        | Builtin::WriteStderr
+                        | Builtin::Panic => self.types.intern(TypeKind::Void),
+                    }
+                } else {
+                    self.functions
+                        .get(name)
+                        .map(|function| function.return_ty)
+                        .unwrap_or_else(|| self.types.unknown())
+                }
+            }
             Expr::StaticCall {
                 class_name, method, ..
             } => {

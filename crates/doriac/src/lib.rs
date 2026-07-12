@@ -1,5 +1,6 @@
 pub mod ast;
 pub mod backend;
+pub mod builtins;
 pub mod codegen_cranelift;
 #[cfg(feature = "llvm-backend")]
 pub mod codegen_llvm;
@@ -8,6 +9,7 @@ pub mod codegen_php;
 pub mod control_flow;
 pub mod dataflow;
 pub mod diagnostics;
+pub mod format_string;
 pub mod hir;
 pub mod lexer;
 pub mod lowering;

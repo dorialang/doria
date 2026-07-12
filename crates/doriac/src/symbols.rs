@@ -8,6 +8,7 @@ use crate::types::TypeId;
 pub struct Binding {
     pub writable: bool,
     pub ty: TypeId,
+    pub declared_ty: TypeId,
     pub int_constant: Option<IntegerValue>,
     pub string_constant: Option<String>,
 }

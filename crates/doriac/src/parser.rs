@@ -217,6 +217,18 @@ impl Parser {
     }
 
     fn parse_statement(&mut self) -> Option<Stmt> {
+        if matches!(&self.peek().kind, TokenKind::Identifier(name) if name == "print") {
+            let span = self.advance().span;
+            self.diagnostics.push(
+                Diagnostic::new("P0017", "Doria does not support `print`; use `echo`", span)
+                    .with_help("echo writes output and does not return a value"),
+            );
+            while !self.check(&TokenKind::Semicolon) && !self.is_at_end() {
+                self.advance();
+            }
+            self.match_kind(&TokenKind::Semicolon);
+            return None;
+        }
         if self.match_kind(&TokenKind::Let) {
             return self.parse_let_decl();
         }
@@ -1096,6 +1108,7 @@ impl Parser {
     }
 
     fn parse_type_ref_inner(&mut self) -> Option<TypeRef> {
+        let nullable = self.match_kind(&TokenKind::Question);
         let name = match self.advance().kind.clone() {
             TokenKind::Void => "void".to_string(),
             TokenKind::IntType => "int".to_string(),
@@ -1149,7 +1162,7 @@ impl Parser {
             ty = TypeRef::array_of(ty);
         }
 
-        Some(ty)
+        Some(if nullable { ty.nullable() } else { ty })
     }
 
     fn expect_type_argument_close(&mut self) -> Option<()> {

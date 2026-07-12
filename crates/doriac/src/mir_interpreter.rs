@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fmt;
 
 use crate::mir;
@@ -47,12 +48,14 @@ enum FunctionOutcome {
 enum LocalValue {
     Scalar(mir::ScalarValue),
     String(String),
+    NullableString(Option<String>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum EvaluationValue {
     Scalar(mir::ScalarValue),
     String(String),
+    NullableString(Option<String>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,6 +69,14 @@ enum EvaluationTask {
     Rvalue(mir::Rvalue),
     Value(mir::ValueExpression),
     String(mir::StringExpression),
+    NullableString(mir::NullableStringExpression),
+    BuildNullableSome,
+    NullableStringCompare(mir::CompareOp),
+    Format(mir::FormatExpression),
+    BuildFormat(mir::FormatExpression),
+    ReadFile,
+    WriteFile,
+    WriteStderr,
     StringConcat(usize),
     StringDisplay,
     StringCompare(mir::CompareOp),
@@ -113,9 +124,25 @@ struct CallFrame {
 struct Interpreter<'program> {
     program: &'program mir::Program,
     stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    stdin: Vec<u8>,
+    stdin_cursor: usize,
+    files: BTreeMap<String, Vec<u8>>,
     frames: Vec<CallFrame>,
     limits: InterpreterLimits,
     executed_blocks: usize,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MirIo {
+    pub stdin: Vec<u8>,
+    pub files: BTreeMap<String, Vec<u8>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InterpreterIoOutput {
+    pub output: InterpreterOutput,
+    pub files: BTreeMap<String, Vec<u8>>,
 }
 
 enum StepOutcome {
@@ -125,20 +152,28 @@ enum StepOutcome {
 }
 
 pub fn interpret(program: &mir::Program) -> Result<InterpreterOutput, InterpreterError> {
-    interpret_internal(program, InterpreterLimits::default())
+    Ok(interpret_with_io(program, MirIo::default())?.output)
+}
+
+pub fn interpret_with_io(
+    program: &mir::Program,
+    io: MirIo,
+) -> Result<InterpreterIoOutput, InterpreterError> {
+    interpret_internal(program, InterpreterLimits::default(), io)
 }
 
 pub fn interpret_with_limits(
     program: &mir::Program,
     limits: InterpreterLimits,
 ) -> Result<InterpreterOutput, InterpreterError> {
-    interpret_internal(program, limits)
+    Ok(interpret_internal(program, limits, MirIo::default())?.output)
 }
 
 fn interpret_internal(
     program: &mir::Program,
     limits: InterpreterLimits,
-) -> Result<InterpreterOutput, InterpreterError> {
+    io: MirIo,
+) -> Result<InterpreterIoOutput, InterpreterError> {
     let entry = function_in(program, program.entry)?;
     if !entry.params.is_empty() {
         return Err(InterpreterError::new(
@@ -149,6 +184,10 @@ fn interpret_internal(
     let mut interpreter = Interpreter {
         program,
         stdout: Vec::new(),
+        stderr: Vec::new(),
+        stdin: io.stdin,
+        stdin_cursor: 0,
+        files: io.files,
         frames: Vec::new(),
         limits,
         executed_blocks: 0,
@@ -158,9 +197,19 @@ fn interpret_internal(
     loop {
         match interpreter.step()? {
             StepOutcome::Continue => {}
-            StepOutcome::Panic(message) => return Ok(interpreter.panic_output(&message)),
+            StepOutcome::Panic(message) => {
+                let output = interpreter.panic_output(&message);
+                return Ok(InterpreterIoOutput {
+                    output,
+                    files: interpreter.files,
+                });
+            }
             StepOutcome::EntryReturned(outcome) => {
-                return interpreter.finish_entry(entry, outcome);
+                let output = interpreter.finish_entry(entry, outcome)?;
+                return Ok(InterpreterIoOutput {
+                    output,
+                    files: interpreter.files,
+                });
             }
         }
     }
@@ -225,6 +274,17 @@ impl Interpreter<'_> {
                             target.0
                         )));
                     }
+                    (mir::Type::NullableString, mir::Rvalue::NullableString(expression)) => {
+                        let frame = self.current_frame_mut()?;
+                        frame.tasks.push(EvaluationTask::Assign(target));
+                        frame.tasks.push(EvaluationTask::NullableString(expression));
+                    }
+                    (mir::Type::NullableString, _) => {
+                        return Err(InterpreterError::new(format!(
+                            "MIR nullable-string local local{} received another value type",
+                            target.0
+                        )));
+                    }
                     (mir::Type::Scalar(expected), mir::Rvalue::Value(expression)) => {
                         if expression.ty() != expected {
                             return Err(InterpreterError::new(format!(
@@ -235,7 +295,7 @@ impl Interpreter<'_> {
                         }
                         self.queue_value_assignment(target, expression)?;
                     }
-                    (mir::Type::Scalar(_), mir::Rvalue::String(_)) => {
+                    (mir::Type::Scalar(_), _) => {
                         return Err(InterpreterError::new(format!(
                             "MIR scalar local local{} received a string value",
                             target.0
@@ -253,6 +313,22 @@ impl Interpreter<'_> {
             }
             mir::Statement::CallVoid { function, args } => {
                 self.queue_call(function, args, ReturnExpectation::Void)?;
+            }
+            mir::Statement::Printf(format) => {
+                let frame = self.current_frame_mut()?;
+                frame.tasks.push(EvaluationTask::Echo);
+                frame.tasks.push(EvaluationTask::Format(format));
+            }
+            mir::Statement::WriteFile { path, contents } => {
+                let frame = self.current_frame_mut()?;
+                frame.tasks.push(EvaluationTask::WriteFile);
+                frame.tasks.push(EvaluationTask::String(contents));
+                frame.tasks.push(EvaluationTask::String(path));
+            }
+            mir::Statement::WriteStderr(value) => {
+                let frame = self.current_frame_mut()?;
+                frame.tasks.push(EvaluationTask::WriteStderr);
+                frame.tasks.push(EvaluationTask::String(value));
             }
         }
         Ok(StepOutcome::Continue)
@@ -333,6 +409,10 @@ impl Interpreter<'_> {
                     .current_frame_mut()?
                     .tasks
                     .push(EvaluationTask::String(value)),
+                mir::Rvalue::NullableString(value) => self
+                    .current_frame_mut()?
+                    .tasks
+                    .push(EvaluationTask::NullableString(value)),
             },
             EvaluationTask::Value(expression) => match expression {
                 mir::ValueExpression::Integer(value) => {
@@ -352,6 +432,78 @@ impl Interpreter<'_> {
                 }
             },
             EvaluationTask::String(expression) => self.expand_string_expression(expression)?,
+            EvaluationTask::NullableString(expression) => {
+                self.expand_nullable_string_expression(expression)?
+            }
+            EvaluationTask::BuildNullableSome => {
+                let value = self.pop_string()?;
+                self.push_nullable_string(Some(value))?;
+            }
+            EvaluationTask::NullableStringCompare(op) => {
+                let right = self.pop_nullable_string()?;
+                let left = self.pop_nullable_string()?;
+                let result = match op {
+                    mir::CompareOp::Equal => left == right,
+                    mir::CompareOp::NotEqual => left != right,
+                    _ => {
+                        return Err(InterpreterError::new(
+                            "MIR ordered nullable-string comparison is invalid",
+                        ))
+                    }
+                };
+                self.push_scalar(mir::ScalarValue::Bool(result))?;
+            }
+            EvaluationTask::Format(format) => {
+                let frame = self.current_frame_mut()?;
+                frame
+                    .tasks
+                    .push(EvaluationTask::BuildFormat(format.clone()));
+                for argument in format.arguments.into_iter().rev() {
+                    match argument {
+                        mir::FormatArgument::Value(value) => {
+                            frame.tasks.push(EvaluationTask::Value(value));
+                        }
+                        mir::FormatArgument::String(value) => {
+                            frame.tasks.push(EvaluationTask::String(value));
+                        }
+                    }
+                }
+            }
+            EvaluationTask::BuildFormat(format) => {
+                let values = self.take_evaluation_values(format.arguments.len())?;
+                self.push_string(render_format(&format, &values)?)?;
+            }
+            EvaluationTask::ReadFile => {
+                let path = self.pop_string()?;
+                if path.as_bytes().contains(&0) {
+                    return Ok(StepOutcome::Panic(
+                        "file path contained an embedded NUL".to_string(),
+                    ));
+                }
+                let Some(bytes) = self.files.get(&path) else {
+                    return Ok(StepOutcome::Panic("failed to read file".to_string()));
+                };
+                let Ok(value) = String::from_utf8(bytes.clone()) else {
+                    return Ok(StepOutcome::Panic(
+                        "file contained invalid UTF-8".to_string(),
+                    ));
+                };
+                self.push_string(value)?;
+            }
+            EvaluationTask::WriteFile => {
+                let contents = self.pop_string()?;
+                let path = self.pop_string()?;
+                if path.as_bytes().contains(&0) {
+                    return Ok(StepOutcome::Panic(
+                        "file path contained an embedded NUL".to_string(),
+                    ));
+                }
+                self.files.insert(path, contents.into_bytes());
+            }
+            EvaluationTask::WriteStderr => {
+                let value = self.pop_string()?;
+                self.stderr.extend_from_slice(value.as_bytes());
+            }
             EvaluationTask::StringConcat(count) => {
                 let mut parts = Vec::with_capacity(count);
                 for _ in 0..count {
@@ -692,6 +844,12 @@ impl Interpreter<'_> {
                 frame.tasks.push(EvaluationTask::String(*right));
                 frame.tasks.push(EvaluationTask::String(*left));
             }
+            mir::BoolExpression::NullableStringCompare { op, left, right } => {
+                let frame = self.current_frame_mut()?;
+                frame.tasks.push(EvaluationTask::NullableStringCompare(op));
+                frame.tasks.push(EvaluationTask::NullableString(*right));
+                frame.tasks.push(EvaluationTask::NullableString(*left));
+            }
             mir::BoolExpression::Not(condition) => {
                 let frame = self.current_frame_mut()?;
                 frame.tasks.push(EvaluationTask::Not);
@@ -751,6 +909,27 @@ impl Interpreter<'_> {
                             id.0
                         )))
                     }
+                    LocalValue::NullableString(_) => {
+                        return Err(InterpreterError::new(format!(
+                            "MIR nullable-string local local{} was used as a string value",
+                            id.0
+                        )))
+                    }
+                }
+            }
+            mir::StringExpression::NullableLocalAssumeNonNull(id) => {
+                match read_local(&self.current_frame()?.locals, id)? {
+                    LocalValue::NullableString(Some(value)) => self.push_string(value.clone())?,
+                    LocalValue::NullableString(None) => {
+                        return Err(InterpreterError::new(
+                            "MIR nonnull string expression observed null",
+                        ))
+                    }
+                    _ => {
+                        return Err(InterpreterError::new(
+                            "MIR nonnull string expression references another local type",
+                        ))
+                    }
                 }
             }
             mir::StringExpression::Concat(parts) => {
@@ -768,6 +947,69 @@ impl Interpreter<'_> {
             }
             mir::StringExpression::Call { function, args } => {
                 self.queue_call(function, args, ReturnExpectation::Value(mir::Type::String))?;
+            }
+            mir::StringExpression::ReadFile(path) => {
+                let frame = self.current_frame_mut()?;
+                frame.tasks.push(EvaluationTask::ReadFile);
+                frame.tasks.push(EvaluationTask::String(*path));
+            }
+            mir::StringExpression::Format(format) => {
+                self.current_frame_mut()?
+                    .tasks
+                    .push(EvaluationTask::Format(*format));
+            }
+        }
+        Ok(())
+    }
+
+    fn expand_nullable_string_expression(
+        &mut self,
+        expression: mir::NullableStringExpression,
+    ) -> Result<(), InterpreterError> {
+        match expression {
+            mir::NullableStringExpression::Null => self.push_nullable_string(None)?,
+            mir::NullableStringExpression::String(value) => {
+                let frame = self.current_frame_mut()?;
+                frame.tasks.push(EvaluationTask::BuildNullableSome);
+                frame.tasks.push(EvaluationTask::String(value));
+            }
+            mir::NullableStringExpression::Local(local) => {
+                match read_local(&self.current_frame()?.locals, local)? {
+                    LocalValue::NullableString(value) => {
+                        self.push_nullable_string(value.clone())?;
+                    }
+                    _ => {
+                        return Err(InterpreterError::new(format!(
+                            "MIR non-nullable local local{} used as ?string",
+                            local.0
+                        )))
+                    }
+                }
+            }
+            mir::NullableStringExpression::ReadLine => {
+                if self.stdin_cursor == self.stdin.len() {
+                    self.push_nullable_string(None)?;
+                } else {
+                    let remaining = &self.stdin[self.stdin_cursor..];
+                    let newline = remaining.iter().position(|byte| *byte == b'\n');
+                    let consumed = newline.map_or(remaining.len(), |index| index + 1);
+                    let mut line_length = newline.unwrap_or(remaining.len());
+                    if line_length != 0 && remaining[line_length - 1] == b'\r' {
+                        line_length -= 1;
+                    }
+                    let line = core::str::from_utf8(&remaining[..line_length])
+                        .map_err(|_| InterpreterError::new("stdin contained invalid UTF-8"))?
+                        .to_string();
+                    self.stdin_cursor += consumed;
+                    self.push_nullable_string(Some(line))?;
+                }
+            }
+            mir::NullableStringExpression::Call { function, args } => {
+                self.queue_call(
+                    function,
+                    args,
+                    ReturnExpectation::Value(mir::Type::NullableString),
+                )?;
             }
         }
         Ok(())
@@ -883,6 +1125,7 @@ impl Interpreter<'_> {
                 self.current_frame_mut()?.values.push(match value {
                     LocalValue::Scalar(value) => EvaluationValue::Scalar(value),
                     LocalValue::String(value) => EvaluationValue::String(value),
+                    LocalValue::NullableString(value) => EvaluationValue::NullableString(value),
                 });
             }
             (ReturnExpectation::Void, FunctionOutcome::Void) => {}
@@ -927,6 +1170,7 @@ impl Interpreter<'_> {
             .map(|value| match value {
                 EvaluationValue::Scalar(value) => Ok(LocalValue::Scalar(value)),
                 EvaluationValue::String(value) => Ok(LocalValue::String(value)),
+                EvaluationValue::NullableString(value) => Ok(LocalValue::NullableString(value)),
             })
             .collect()
     }
@@ -943,6 +1187,9 @@ impl Interpreter<'_> {
             Some(EvaluationValue::Scalar(value)) => Ok(value),
             Some(EvaluationValue::String(_)) => Err(InterpreterError::new(
                 "MIR scalar evaluation produced a string",
+            )),
+            Some(EvaluationValue::NullableString(_)) => Err(InterpreterError::new(
+                "MIR scalar evaluation produced a nullable string",
             )),
             None => Err(InterpreterError::new(
                 "MIR scalar evaluation produced no value",
@@ -963,16 +1210,52 @@ impl Interpreter<'_> {
             Some(EvaluationValue::Scalar(_)) => Err(InterpreterError::new(
                 "MIR string evaluation produced a scalar",
             )),
+            Some(EvaluationValue::NullableString(_)) => Err(InterpreterError::new(
+                "MIR string evaluation produced a nullable string",
+            )),
             None => Err(InterpreterError::new(
                 "MIR string evaluation produced no value",
             )),
         }
     }
 
+    fn push_nullable_string(&mut self, value: Option<String>) -> Result<(), InterpreterError> {
+        self.current_frame_mut()?
+            .values
+            .push(EvaluationValue::NullableString(value));
+        Ok(())
+    }
+
+    fn pop_nullable_string(&mut self) -> Result<Option<String>, InterpreterError> {
+        match self.current_frame_mut()?.values.pop() {
+            Some(EvaluationValue::NullableString(value)) => Ok(value),
+            Some(_) => Err(InterpreterError::new(
+                "MIR nullable-string evaluation produced another value type",
+            )),
+            None => Err(InterpreterError::new(
+                "MIR nullable-string evaluation produced no value",
+            )),
+        }
+    }
+
+    fn take_evaluation_values(
+        &mut self,
+        count: usize,
+    ) -> Result<Vec<EvaluationValue>, InterpreterError> {
+        let frame = self.current_frame_mut()?;
+        if frame.values.len() < count {
+            return Err(InterpreterError::new(
+                "MIR format evaluation produced too few values",
+            ));
+        }
+        Ok(frame.values.drain(frame.values.len() - count..).collect())
+    }
+
     fn pop_local_value(&mut self) -> Result<LocalValue, InterpreterError> {
         match self.current_frame_mut()?.values.pop() {
             Some(EvaluationValue::Scalar(value)) => Ok(LocalValue::Scalar(value)),
             Some(EvaluationValue::String(value)) => Ok(LocalValue::String(value)),
+            Some(EvaluationValue::NullableString(value)) => Ok(LocalValue::NullableString(value)),
             None => Err(InterpreterError::new("MIR evaluation produced no value")),
         }
     }
@@ -1032,7 +1315,7 @@ impl Interpreter<'_> {
                 if (0..=125).contains(&value) {
                     Ok(InterpreterOutput {
                         stdout: self.stdout.clone(),
-                        stderr: Vec::new(),
+                        stderr: self.stderr.clone(),
                         exit_status: value as i32,
                     })
                 } else {
@@ -1044,7 +1327,7 @@ impl Interpreter<'_> {
             }
             (mir::ReturnType::Void, FunctionOutcome::Void) => Ok(InterpreterOutput {
                 stdout: self.stdout.clone(),
-                stderr: Vec::new(),
+                stderr: self.stderr.clone(),
                 exit_status: 0,
             }),
             (mir::ReturnType::Value(_), FunctionOutcome::Void) => Err(InterpreterError::new(
@@ -1079,6 +1362,7 @@ impl Interpreter<'_> {
 
     fn panic_output_with_trace(&self, message: &str, trace: &[&str]) -> InterpreterOutput {
         let mut stderr = Vec::new();
+        stderr.extend_from_slice(&self.stderr);
         stderr.extend_from_slice(b"Panic: ");
         stderr.extend_from_slice(message.as_bytes());
         stderr.extend_from_slice(b"\nStack Trace:\n");
@@ -1200,6 +1484,10 @@ fn eval_operand(
                 "MIR string local local{} was used as a scalar value",
                 id.0
             ))),
+            LocalValue::NullableString(_) => Err(InterpreterError::new(format!(
+                "MIR nullable-string local local{} was used as a scalar value",
+                id.0
+            ))),
         },
     }
 }
@@ -1208,6 +1496,7 @@ fn local_value_type(value: &LocalValue) -> mir::Type {
     match value {
         LocalValue::Scalar(value) => mir::Type::Scalar(value.ty()),
         LocalValue::String(_) => mir::Type::String,
+        LocalValue::NullableString(_) => mir::Type::NullableString,
     }
 }
 
@@ -1262,6 +1551,130 @@ fn display_float64(value: f64) -> String {
     }
 }
 
+fn render_format(
+    format: &mir::FormatExpression,
+    values: &[EvaluationValue],
+) -> Result<String, InterpreterError> {
+    use crate::format_string::{FormatConversion, FormatPiece};
+
+    let mut output = String::new();
+    for piece in &format.pieces {
+        match piece {
+            FormatPiece::Literal(value) => output.push_str(value),
+            FormatPiece::Argument { index, spec } => {
+                let value = values.get(*index as usize).ok_or_else(|| {
+                    InterpreterError::new("MIR format argument index is out of bounds")
+                })?;
+                let rendered = match (spec.conversion, value) {
+                    (FormatConversion::Display, EvaluationValue::Scalar(value)) => {
+                        display_scalar(*value)
+                    }
+                    (FormatConversion::Display, EvaluationValue::String(value)) => value.clone(),
+                    (
+                        FormatConversion::Decimal,
+                        EvaluationValue::Scalar(mir::ScalarValue::Integer(value)),
+                    ) => {
+                        if value.ty.is_signed() {
+                            value.signed_value().to_string()
+                        } else {
+                            value.unsigned_value().to_string()
+                        }
+                    }
+                    (
+                        FormatConversion::HexLower
+                        | FormatConversion::HexUpper
+                        | FormatConversion::Octal
+                        | FormatConversion::Binary,
+                        EvaluationValue::Scalar(mir::ScalarValue::Integer(value)),
+                    ) => format_integer_base(*value, spec.conversion),
+                    (
+                        FormatConversion::Float,
+                        EvaluationValue::Scalar(mir::ScalarValue::Float(value)),
+                    ) => format_fixed_float(*value, spec.precision.unwrap_or(6)),
+                    _ => {
+                        return Err(InterpreterError::new(
+                            "MIR format conversion and argument type disagree",
+                        ))
+                    }
+                };
+                output.push_str(&apply_width(rendered, *spec));
+            }
+        }
+    }
+    Ok(output)
+}
+
+fn format_integer_base(
+    value: IntegerValue,
+    conversion: crate::format_string::FormatConversion,
+) -> String {
+    use crate::format_string::FormatConversion;
+    let bits = value.unsigned_value();
+    match conversion {
+        FormatConversion::HexLower => format!("{bits:x}"),
+        FormatConversion::HexUpper => format!("{bits:X}"),
+        FormatConversion::Octal => format!("{bits:o}"),
+        FormatConversion::Binary => format!("{bits:b}"),
+        _ => unreachable!("only integer-base conversions reach this helper"),
+    }
+}
+
+fn format_fixed_float(value: FloatValue, precision: u32) -> String {
+    let precision = precision as usize;
+    match value.ty {
+        crate::numeric::FloatType::Float32 => {
+            let value = value.as_f32();
+            if value.is_nan() {
+                "NaN".to_string()
+            } else if value == f32::INFINITY {
+                "Infinity".to_string()
+            } else if value == f32::NEG_INFINITY {
+                "-Infinity".to_string()
+            } else {
+                format!("{value:.precision$}")
+            }
+        }
+        crate::numeric::FloatType::Float64 => {
+            let value = value.as_f64();
+            if value.is_nan() {
+                "NaN".to_string()
+            } else if value == f64::INFINITY {
+                "Infinity".to_string()
+            } else if value == f64::NEG_INFINITY {
+                "-Infinity".to_string()
+            } else {
+                format!("{value:.precision$}")
+            }
+        }
+    }
+}
+
+fn apply_width(mut value: String, spec: crate::format_string::FormatSpec) -> String {
+    let width = spec.width.unwrap_or(0) as usize;
+    if value.len() >= width {
+        return value;
+    }
+    let padding = width - value.len();
+    if spec.left_align {
+        value.extend(core::iter::repeat_n(' ', padding));
+        return value;
+    }
+    let fill = if spec.zero_pad { '0' } else { ' ' };
+    if fill == '0' && value.starts_with('-') {
+        let tail = value.split_off(1);
+        let mut padded = String::with_capacity(width);
+        padded.push('-');
+        padded.extend(core::iter::repeat_n('0', padding));
+        padded.push_str(&tail);
+        padded
+    } else {
+        let mut padded = String::with_capacity(width);
+        padded.extend(core::iter::repeat_n(fill, padding));
+        padded.push_str(&value);
+        padded
+    }
+}
+
 fn read_local(
     locals: &[Option<LocalValue>],
     id: mir::LocalId,
@@ -1294,6 +1707,7 @@ fn assign_local(
     ) || matches!(
         (definition.ty, &value),
         (mir::Type::String, LocalValue::String(_))
+            | (mir::Type::NullableString, LocalValue::NullableString(_))
     );
     if !compatible {
         let actual = match &value {
@@ -1303,6 +1717,7 @@ fn assign_local(
                 mir::ScalarType::Bool => "bool",
             },
             LocalValue::String(_) => "string",
+            LocalValue::NullableString(_) => "?string",
         };
         return Err(InterpreterError::new(format!(
             "MIR local local{} has type {}, but assignment produced {actual}",

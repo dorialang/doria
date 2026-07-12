@@ -12,12 +12,15 @@ use cranelift_module::{default_libcall_names, DataDescription, FuncId, Linkage, 
 use cranelift_object::{ObjectBuilder, ObjectModule};
 
 use crate::backend::BackendError;
+use crate::format_string::{FormatConversion, FormatPiece};
 use crate::mir;
 use crate::mir_validation;
 use crate::native_abi::{
-    function_symbol, STRING_COMPARE, STRING_CONCAT, STRING_DATA, STRING_FROM_BOOL, STRING_FROM_F32,
-    STRING_FROM_F64, STRING_FROM_I64, STRING_FROM_U64, STRING_FROM_UTF8, STRING_LENGTH,
-    STRING_RELEASE, STRING_RETAIN, STRING_WRITE_STDOUT,
+    function_symbol, FORMAT_F32, FORMAT_F64, FORMAT_I64, FORMAT_STRING, FORMAT_U64,
+    NULLABLE_STRING_EQUAL, READ_FILE, READ_STDIN_LINE, STRING_COMPARE, STRING_CONCAT, STRING_DATA,
+    STRING_FROM_BOOL, STRING_FROM_F32, STRING_FROM_F64, STRING_FROM_I64, STRING_FROM_U64,
+    STRING_FROM_UTF8, STRING_LENGTH, STRING_RELEASE, STRING_RETAIN, STRING_WRITE_STDERR,
+    STRING_WRITE_STDOUT, WRITE_FILE,
 };
 use crate::numeric::{FloatType, FloatValue, IntegerPanic, IntegerType, IntegerValue};
 
@@ -134,7 +137,7 @@ fn scalar_abi_param(ty: mir::ScalarType) -> AbiParam {
 fn type_abi_param(ty: mir::Type, pointer_type: ClifType) -> AbiParam {
     match ty {
         mir::Type::Scalar(ty) => scalar_abi_param(ty),
-        mir::Type::String => AbiParam::new(pointer_type),
+        mir::Type::String | mir::Type::NullableString => AbiParam::new(pointer_type),
     }
 }
 
@@ -182,11 +185,13 @@ fn define_function(
                         bytes.trailing_zeros() as u8,
                     )))
                 }
-                mir::Type::String => Some(builder.create_sized_stack_slot(StackSlotData::new(
-                    StackSlotKind::ExplicitSlot,
-                    u32::from(module.target_config().pointer_bytes()),
-                    module.target_config().pointer_bytes().trailing_zeros() as u8,
-                ))),
+                mir::Type::String | mir::Type::NullableString => {
+                    Some(builder.create_sized_stack_slot(StackSlotData::new(
+                        StackSlotKind::ExplicitSlot,
+                        u32::from(module.target_config().pointer_bytes()),
+                        module.target_config().pointer_bytes().trailing_zeros() as u8,
+                    )))
+                }
             })
             .collect::<Vec<_>>();
         let pointer_type = module.target_config().pointer_type();
@@ -271,7 +276,7 @@ fn initialize_locals(
                 builder.ins().f64const(Ieee64::with_bits(0))
             }
             mir::Type::Scalar(mir::ScalarType::Bool) => builder.ins().iconst(types::I8, 0),
-            mir::Type::String => builder.ins().iconst(pointer_type, 0),
+            mir::Type::String | mir::Type::NullableString => builder.ins().iconst(pointer_type, 0),
         };
         builder
             .ins()
@@ -301,7 +306,10 @@ fn retain_string_parameters(
 ) -> Result<(), BackendError> {
     let pointer = resources.module.target_config().pointer_type();
     for parameter in &function.params {
-        if local_in(function, *parameter)?.ty == mir::Type::String {
+        if matches!(
+            local_in(function, *parameter)?.ty,
+            mir::Type::String | mir::Type::NullableString
+        ) {
             let slot = local_slot(resources.local_slots, *parameter)?;
             let value = builder.ins().stack_load(pointer, slot, 0);
             let retained = retain_string(builder, value, resources)?;
@@ -320,7 +328,7 @@ fn cleanup_string_locals(
     let string_locals = function
         .locals
         .iter()
-        .filter(|local| local.ty == mir::Type::String)
+        .filter(|local| matches!(local.ty, mir::Type::String | mir::Type::NullableString))
         .map(|local| local.id)
         .collect::<Vec<_>>();
     for local in string_locals {
@@ -531,6 +539,21 @@ fn lower_statement(
                     release_string(builder, old_value, resources)?;
                     builder.ins().stack_store(new_value, slot, 0);
                 }
+                mir::Type::NullableString => {
+                    let mir::Rvalue::NullableString(expression) = value else {
+                        return Err(malformed_mir(format!(
+                            "nullable-string local local{} has another assignment type",
+                            target.0
+                        )));
+                    };
+                    let new_value =
+                        lower_nullable_string_expression(builder, expression, resources)?;
+                    let slot = local_slot(resources.local_slots, *target)?;
+                    let pointer_type = resources.module.target_config().pointer_type();
+                    let old_value = builder.ins().stack_load(pointer_type, slot, 0);
+                    release_string(builder, old_value, resources)?;
+                    builder.ins().stack_store(new_value, slot, 0);
+                }
             }
         }
         mir::Statement::EchoStringLiteral(value) => {
@@ -554,6 +577,47 @@ fn lower_statement(
         }
         mir::Statement::CallVoid { function, args } => {
             let _ = lower_function_call(builder, *function, args, resources)?;
+        }
+        mir::Statement::WriteStderr(value) => {
+            let string = lower_string_expression(builder, value, resources)?;
+            let pointer = resources.module.target_config().pointer_type();
+            let _ = runtime_call(
+                builder,
+                STRING_WRITE_STDERR,
+                &[pointer, pointer],
+                None,
+                &[resources.current_frame, string],
+                resources,
+            )?;
+            release_string(builder, string, resources)?;
+        }
+        mir::Statement::Printf(format) => {
+            let string = lower_format_expression(builder, format, resources)?;
+            let pointer = resources.module.target_config().pointer_type();
+            let _ = runtime_call(
+                builder,
+                STRING_WRITE_STDOUT,
+                &[pointer, pointer],
+                None,
+                &[resources.current_frame, string],
+                resources,
+            )?;
+            release_string(builder, string, resources)?;
+        }
+        mir::Statement::WriteFile { path, contents } => {
+            let path = lower_string_expression(builder, path, resources)?;
+            let contents = lower_string_expression(builder, contents, resources)?;
+            let pointer = resources.module.target_config().pointer_type();
+            let _ = runtime_call(
+                builder,
+                WRITE_FILE,
+                &[pointer, pointer, pointer],
+                None,
+                &[resources.current_frame, path, contents],
+                resources,
+            )?;
+            release_string(builder, path, resources)?;
+            release_string(builder, contents, resources)?;
         }
     }
     Ok(())
@@ -642,6 +706,9 @@ fn lower_rvalue(
     match expression {
         mir::Rvalue::Value(value) => lower_value_expression(builder, value, resources),
         mir::Rvalue::String(value) => lower_string_expression(builder, value, resources),
+        mir::Rvalue::NullableString(value) => {
+            lower_nullable_string_expression(builder, value, resources)
+        }
     }
 }
 
@@ -720,6 +787,14 @@ fn lower_string_expression(
                     .stack_load(pointer, local_slot(resources.local_slots, *local)?, 0);
             retain_string(builder, value, resources)
         }
+        mir::StringExpression::NullableLocalAssumeNonNull(local) => {
+            let pointer = resources.module.target_config().pointer_type();
+            let value =
+                builder
+                    .ins()
+                    .stack_load(pointer, local_slot(resources.local_slots, *local)?, 0);
+            retain_string(builder, value, resources)
+        }
         mir::StringExpression::Concat(parts) => {
             let mut parts = parts.iter();
             let Some(first) = parts.next() else {
@@ -784,7 +859,202 @@ fn lower_string_expression(
             lower_function_call(builder, *function, args, resources)?
                 .ok_or_else(|| malformed_mir("string call produced no result"))
         }
+        mir::StringExpression::ReadFile(path) => {
+            let path = lower_string_expression(builder, path, resources)?;
+            let pointer = resources.module.target_config().pointer_type();
+            let result = runtime_call(
+                builder,
+                READ_FILE,
+                &[pointer, pointer],
+                Some(pointer),
+                &[resources.current_frame, path],
+                resources,
+            )?
+            .ok_or_else(|| backend_failure("read_file produced no result"))?;
+            release_string(builder, path, resources)?;
+            Ok(result)
+        }
+        mir::StringExpression::Format(format) => {
+            lower_format_expression(builder, format, resources)
+        }
     }
+}
+
+fn lower_nullable_string_expression(
+    builder: &mut FunctionBuilder,
+    expression: &mir::NullableStringExpression,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<Value, BackendError> {
+    let pointer = resources.module.target_config().pointer_type();
+    match expression {
+        mir::NullableStringExpression::Null => Ok(builder.ins().iconst(pointer, 0)),
+        mir::NullableStringExpression::String(value) => {
+            lower_string_expression(builder, value, resources)
+        }
+        mir::NullableStringExpression::Local(local) => {
+            let value =
+                builder
+                    .ins()
+                    .stack_load(pointer, local_slot(resources.local_slots, *local)?, 0);
+            retain_string(builder, value, resources)
+        }
+        mir::NullableStringExpression::ReadLine => runtime_call(
+            builder,
+            READ_STDIN_LINE,
+            &[pointer],
+            Some(pointer),
+            &[resources.current_frame],
+            resources,
+        )?
+        .ok_or_else(|| backend_failure("readline produced no result")),
+        mir::NullableStringExpression::Call { function, args } => {
+            lower_function_call(builder, *function, args, resources)?
+                .ok_or_else(|| malformed_mir("nullable-string call produced no result"))
+        }
+    }
+}
+
+fn lower_format_expression(
+    builder: &mut FunctionBuilder,
+    format: &mir::FormatExpression,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<Value, BackendError> {
+    let pointer = resources.module.target_config().pointer_type();
+    let mut result = lower_string_expression(
+        builder,
+        &mir::StringExpression::Literal(String::new()),
+        resources,
+    )?;
+    for piece in &format.pieces {
+        let next = match piece {
+            FormatPiece::Literal(value) => lower_string_expression(
+                builder,
+                &mir::StringExpression::Literal(value.clone()),
+                resources,
+            )?,
+            FormatPiece::Argument { index, spec } => {
+                let argument = format
+                    .arguments
+                    .get(*index as usize)
+                    .ok_or_else(|| malformed_mir("format argument index is out of bounds"))?;
+                lower_format_argument(builder, argument, *spec, resources)?
+            }
+        };
+        let concatenated = runtime_call(
+            builder,
+            STRING_CONCAT,
+            &[pointer, pointer],
+            Some(pointer),
+            &[result, next],
+            resources,
+        )?
+        .ok_or_else(|| backend_failure("format concatenation produced no result"))?;
+        release_string(builder, result, resources)?;
+        release_string(builder, next, resources)?;
+        result = concatenated;
+    }
+    Ok(result)
+}
+
+fn lower_format_argument(
+    builder: &mut FunctionBuilder,
+    argument: &mir::FormatArgument,
+    spec: crate::format_string::FormatSpec,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<Value, BackendError> {
+    let pointer = resources.module.target_config().pointer_type();
+    let width = builder
+        .ins()
+        .iconst(types::I32, i64::from(spec.width.unwrap_or(0)));
+    let flags_value = u8::from(spec.left_align) | (u8::from(spec.zero_pad) << 1);
+    let flags = builder.ins().iconst(types::I8, i64::from(flags_value));
+    if spec.conversion == FormatConversion::Display {
+        let string = match argument {
+            mir::FormatArgument::String(value) => {
+                lower_string_expression(builder, value, resources)?
+            }
+            mir::FormatArgument::Value(value) => lower_string_expression(
+                builder,
+                &mir::StringExpression::Display(value.clone()),
+                resources,
+            )?,
+        };
+        let formatted = runtime_call(
+            builder,
+            FORMAT_STRING,
+            &[pointer, types::I32, types::I8],
+            Some(pointer),
+            &[string, width, flags],
+            resources,
+        )?
+        .ok_or_else(|| backend_failure("string formatting produced no result"))?;
+        release_string(builder, string, resources)?;
+        return Ok(formatted);
+    }
+
+    if let mir::FormatArgument::Value(mir::ValueExpression::Float(float)) = argument {
+        let value = lower_float_expression(builder, float, resources)?;
+        let precision = builder
+            .ins()
+            .iconst(types::I32, i64::from(spec.precision.unwrap_or(6)));
+        let (name, ty) = match float.ty() {
+            FloatType::Float32 => (FORMAT_F32, types::F32),
+            FloatType::Float64 => (FORMAT_F64, types::F64),
+        };
+        return runtime_call(
+            builder,
+            name,
+            &[ty, types::I32, types::I32, types::I8],
+            Some(pointer),
+            &[value, precision, width, flags],
+            resources,
+        )?
+        .ok_or_else(|| backend_failure("float formatting produced no result"));
+    }
+
+    let mir::FormatArgument::Value(mir::ValueExpression::Integer(integer)) = argument else {
+        return Err(malformed_mir(
+            "format conversion and argument type disagree",
+        ));
+    };
+    let ty = integer.ty();
+    let mut value = lower_integer_expression(builder, integer, resources)?;
+    if ty.bit_width() < 64 {
+        value = if ty.is_signed() {
+            builder.ins().sextend(types::I64, value)
+        } else {
+            builder.ins().uextend(types::I64, value)
+        };
+    }
+    let conversion = match spec.conversion {
+        FormatConversion::Decimal => 1,
+        FormatConversion::HexLower => 2,
+        FormatConversion::HexUpper => 3,
+        FormatConversion::Octal => 4,
+        FormatConversion::Binary => 5,
+        _ => {
+            return Err(malformed_mir(
+                "integer argument has non-integer format conversion",
+            ))
+        }
+    };
+    let conversion = builder.ins().iconst(types::I8, conversion);
+    let (name, params, values) = if ty.is_signed() {
+        let bit_width = builder.ins().iconst(types::I8, i64::from(ty.bit_width()));
+        (
+            FORMAT_I64,
+            vec![types::I64, types::I8, types::I8, types::I32, types::I8],
+            vec![value, bit_width, conversion, width, flags],
+        )
+    } else {
+        (
+            FORMAT_U64,
+            vec![types::I64, types::I8, types::I32, types::I8],
+            vec![value, conversion, width, flags],
+        )
+    };
+    runtime_call(builder, name, &params, Some(pointer), &values, resources)?
+        .ok_or_else(|| backend_failure("integer formatting produced no result"))
 }
 
 fn lower_integer_expression(
@@ -1304,7 +1574,7 @@ fn lower_call_args(
     let mut owned_strings = Vec::new();
     for argument in args {
         let value = lower_rvalue(builder, argument, resources)?;
-        if argument.ty() == mir::Type::String {
+        if matches!(argument.ty(), mir::Type::String | mir::Type::NullableString) {
             owned_strings.push(value);
         }
         values.push(value);
@@ -1413,6 +1683,31 @@ fn lower_condition_to_branch(
                 mir::CompareOp::GreaterEqual => IntCC::SignedGreaterThanOrEqual,
             };
             let value = builder.ins().icmp(code, compared, zero);
+            builder.ins().brif(value, then_block, &[], else_block, &[]);
+        }
+        mir::BoolExpression::NullableStringCompare { op, left, right } => {
+            let pointer = resources.module.target_config().pointer_type();
+            let left = lower_nullable_string_expression(builder, left, resources)?;
+            let right = lower_nullable_string_expression(builder, right, resources)?;
+            let equal = runtime_call(
+                builder,
+                NULLABLE_STRING_EQUAL,
+                &[pointer, pointer],
+                Some(types::I8),
+                &[left, right],
+                resources,
+            )?
+            .ok_or_else(|| backend_failure("nullable-string comparison produced no result"))?;
+            release_string(builder, left, resources)?;
+            release_string(builder, right, resources)?;
+            let value = match op {
+                mir::CompareOp::Equal => equal,
+                mir::CompareOp::NotEqual => {
+                    let zero = builder.ins().iconst(types::I8, 0);
+                    builder.ins().icmp(IntCC::Equal, equal, zero)
+                }
+                _ => return Err(malformed_mir("ordered nullable comparison is invalid")),
+            };
             builder.ins().brif(value, then_block, &[], else_block, &[]);
         }
         mir::BoolExpression::Not(condition) => {
@@ -1609,6 +1904,9 @@ fn resolve_string_expression_from_definitions(
         mir::StringExpression::Local(local) => {
             resolve_string_local(*local, definitions, values, visiting)
         }
+        mir::StringExpression::NullableLocalAssumeNonNull(_) => {
+            Err(malformed_mir("runtime string expression is not a constant"))
+        }
         mir::StringExpression::Concat(parts) => {
             let mut value = Vec::new();
             for part in parts {
@@ -1621,7 +1919,10 @@ fn resolve_string_expression_from_definitions(
             }
             Ok(value)
         }
-        mir::StringExpression::Display(_) | mir::StringExpression::Call { .. } => {
+        mir::StringExpression::Display(_)
+        | mir::StringExpression::Call { .. }
+        | mir::StringExpression::ReadFile(_)
+        | mir::StringExpression::Format(_) => {
             Err(malformed_mir("runtime string expression is not a constant"))
         }
     }
@@ -1640,6 +1941,9 @@ fn resolve_string_expression(
                 local.0
             ))
         }),
+        mir::StringExpression::NullableLocalAssumeNonNull(_) => {
+            Err(malformed_mir("runtime string expression is not a constant"))
+        }
         mir::StringExpression::Concat(parts) => {
             let mut value = Vec::new();
             for part in parts {
@@ -1647,7 +1951,10 @@ fn resolve_string_expression(
             }
             Ok(value)
         }
-        mir::StringExpression::Display(_) | mir::StringExpression::Call { .. } => {
+        mir::StringExpression::Display(_)
+        | mir::StringExpression::Call { .. }
+        | mir::StringExpression::ReadFile(_)
+        | mir::StringExpression::Format(_) => {
             Err(malformed_mir("runtime string expression is not a constant"))
         }
     }

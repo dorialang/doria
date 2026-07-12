@@ -1,0 +1,434 @@
+use core::ffi::c_void;
+#[cfg(windows)]
+use core::ptr;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum StandardStream {
+    Stdin = 0,
+    Stdout = 1,
+    Stderr = 2,
+}
+
+#[cfg(unix)]
+const EINTR: i32 = 4;
+
+#[cfg(unix)]
+const fn descriptor(stream: StandardStream) -> i32 {
+    match stream {
+        StandardStream::Stdin => 0,
+        StandardStream::Stdout => 1,
+        StandardStream::Stderr => 2,
+    }
+}
+
+/// Reads raw bytes without applying UTF-8 validation or line rules.
+///
+/// Returns `Ok(0)` only for EOF. `destination` must be writable for `capacity` bytes.
+#[cfg(unix)]
+pub(crate) unsafe fn read(
+    stream: StandardStream,
+    destination: *mut u8,
+    capacity: usize,
+) -> Result<usize, ()> {
+    if stream != StandardStream::Stdin {
+        return Err(());
+    }
+    loop {
+        let result = libc_read(descriptor(stream), destination.cast::<c_void>(), capacity);
+        if result >= 0 {
+            return Ok(result as usize);
+        }
+        if last_errno() != EINTR {
+            return Err(());
+        }
+    }
+}
+
+/// Writes raw bytes without adding text or line semantics.
+#[cfg(unix)]
+pub(crate) unsafe fn write(stream: StandardStream, bytes: *const u8, byte_length: usize) -> bool {
+    if stream == StandardStream::Stdin {
+        return false;
+    }
+    let mut offset = 0;
+    while offset < byte_length {
+        let result = libc_write(
+            descriptor(stream),
+            bytes.add(offset).cast::<c_void>(),
+            byte_length - offset,
+        );
+        if result > 0 {
+            offset += result as usize;
+        } else if result < 0 && last_errno() == EINTR {
+            continue;
+        } else {
+            return false;
+        }
+    }
+    true
+}
+
+/// Raw writes are currently unbuffered, so flushing is intentionally a successful no-op.
+pub(crate) unsafe fn flush(stream: StandardStream) -> bool {
+    stream != StandardStream::Stdin
+}
+
+#[cfg(unix)]
+pub(crate) unsafe fn is_interactive(stream: StandardStream) -> bool {
+    isatty(descriptor(stream)) == 1
+}
+
+#[cfg(windows)]
+const STD_INPUT_HANDLE: u32 = -10_i32 as u32;
+#[cfg(windows)]
+const STD_OUTPUT_HANDLE: u32 = -11_i32 as u32;
+#[cfg(windows)]
+const STD_ERROR_HANDLE: u32 = -12_i32 as u32;
+#[cfg(windows)]
+const INVALID_HANDLE_VALUE: *mut c_void = -1_isize as *mut c_void;
+
+#[cfg(windows)]
+unsafe fn handle(stream: StandardStream) -> *mut c_void {
+    let identifier = match stream {
+        StandardStream::Stdin => STD_INPUT_HANDLE,
+        StandardStream::Stdout => STD_OUTPUT_HANDLE,
+        StandardStream::Stderr => STD_ERROR_HANDLE,
+    };
+    GetStdHandle(identifier)
+}
+
+#[cfg(windows)]
+unsafe fn valid_handle(stream: StandardStream) -> Option<*mut c_void> {
+    let handle = handle(stream);
+    (!handle.is_null() && handle != INVALID_HANDLE_VALUE).then_some(handle)
+}
+
+#[cfg(windows)]
+pub(crate) unsafe fn is_interactive(stream: StandardStream) -> bool {
+    let Some(handle) = valid_handle(stream) else {
+        return false;
+    };
+    let mut mode = 0_u32;
+    GetConsoleMode(handle, &mut mode) != 0
+}
+
+#[cfg(windows)]
+pub(crate) unsafe fn write(stream: StandardStream, bytes: *const u8, byte_length: usize) -> bool {
+    if stream == StandardStream::Stdin {
+        return false;
+    }
+    let Some(handle) = valid_handle(stream) else {
+        return false;
+    };
+    if is_interactive(stream) {
+        return write_console_utf8(handle, bytes, byte_length);
+    }
+    write_file_bytes(handle, bytes, byte_length)
+}
+
+#[cfg(windows)]
+unsafe fn write_file_bytes(handle: *mut c_void, bytes: *const u8, byte_length: usize) -> bool {
+    let mut offset = 0;
+    while offset < byte_length {
+        let request = core::cmp::min(byte_length - offset, u32::MAX as usize) as u32;
+        let mut written = 0_u32;
+        if WriteFile(
+            handle,
+            bytes.add(offset).cast::<c_void>(),
+            request,
+            &mut written,
+            ptr::null_mut(),
+        ) == 0
+            || written == 0
+        {
+            return false;
+        }
+        offset += written as usize;
+    }
+    true
+}
+
+#[cfg(windows)]
+unsafe fn write_console_utf8(handle: *mut c_void, bytes: *const u8, byte_length: usize) -> bool {
+    let input = core::slice::from_raw_parts(bytes, byte_length);
+    let Ok(text) = core::str::from_utf8(input) else {
+        return false;
+    };
+    let mut wide = [0_u16; 1024];
+    let mut length = 0_usize;
+    for character in text.chars() {
+        let mut encoded = [0_u16; 2];
+        let units = character.encode_utf16(&mut encoded);
+        if length + units.len() > wide.len() {
+            if !write_console_units(handle, wide.as_ptr(), length) {
+                return false;
+            }
+            length = 0;
+        }
+        wide[length..length + units.len()].copy_from_slice(units);
+        length += units.len();
+    }
+    length == 0 || write_console_units(handle, wide.as_ptr(), length)
+}
+
+#[cfg(windows)]
+unsafe fn write_console_units(handle: *mut c_void, units: *const u16, length: usize) -> bool {
+    let mut offset = 0;
+    while offset < length {
+        let request = core::cmp::min(length - offset, u32::MAX as usize) as u32;
+        let mut written = 0_u32;
+        if WriteConsoleW(
+            handle,
+            units.add(offset).cast::<c_void>(),
+            request,
+            &mut written,
+            ptr::null_mut(),
+        ) == 0
+            || written == 0
+        {
+            return false;
+        }
+        offset += written as usize;
+    }
+    true
+}
+
+#[cfg(windows)]
+static mut CONSOLE_INPUT_BYTES: [u8; 2048] = [0; 2048];
+#[cfg(windows)]
+static mut CONSOLE_INPUT_START: usize = 0;
+#[cfg(windows)]
+static mut CONSOLE_INPUT_END: usize = 0;
+
+#[cfg(windows)]
+pub(crate) unsafe fn read(
+    stream: StandardStream,
+    destination: *mut u8,
+    capacity: usize,
+) -> Result<usize, ()> {
+    if stream != StandardStream::Stdin {
+        return Err(());
+    }
+    let Some(handle) = valid_handle(stream) else {
+        return Err(());
+    };
+    if !is_interactive(stream) {
+        let request = core::cmp::min(capacity, u32::MAX as usize) as u32;
+        let mut read = 0_u32;
+        if ReadFile(
+            handle,
+            destination.cast::<c_void>(),
+            request,
+            &mut read,
+            ptr::null_mut(),
+        ) == 0
+        {
+            return Err(());
+        }
+        return Ok(read as usize);
+    }
+
+    if CONSOLE_INPUT_START == CONSOLE_INPUT_END {
+        let mut wide = [0_u16; 512];
+        let mut read = 0_u32;
+        if ReadConsoleW(
+            handle,
+            wide.as_mut_ptr().cast::<c_void>(),
+            wide.len() as u32,
+            &mut read,
+            ptr::null_mut(),
+        ) == 0
+        {
+            return Err(());
+        }
+        if read == 0 {
+            return Ok(0);
+        }
+        CONSOLE_INPUT_START = 0;
+        CONSOLE_INPUT_END = utf16_to_utf8(
+            &wide[..read as usize],
+            core::ptr::addr_of_mut!(CONSOLE_INPUT_BYTES).cast::<u8>(),
+            2048,
+        )
+        .ok_or(())?;
+    }
+
+    let available = CONSOLE_INPUT_END - CONSOLE_INPUT_START;
+    let copied = core::cmp::min(available, capacity);
+    ptr::copy_nonoverlapping(
+        core::ptr::addr_of!(CONSOLE_INPUT_BYTES)
+            .cast::<u8>()
+            .add(CONSOLE_INPUT_START),
+        destination,
+        copied,
+    );
+    CONSOLE_INPUT_START += copied;
+    Ok(copied)
+}
+
+#[cfg(windows)]
+unsafe fn utf16_to_utf8(units: &[u16], destination: *mut u8, capacity: usize) -> Option<usize> {
+    let mut written = 0_usize;
+    for decoded in core::char::decode_utf16(units.iter().copied()) {
+        let character = decoded.ok()?;
+        let mut encoded = [0_u8; 4];
+        let bytes = character.encode_utf8(&mut encoded).as_bytes();
+        if written.checked_add(bytes.len())? > capacity {
+            return None;
+        }
+        ptr::copy_nonoverlapping(bytes.as_ptr(), destination.add(written), bytes.len());
+        written += bytes.len();
+    }
+    Some(written)
+}
+
+#[cfg(not(any(unix, windows)))]
+pub(crate) unsafe fn read(
+    _stream: StandardStream,
+    _destination: *mut u8,
+    _capacity: usize,
+) -> Result<usize, ()> {
+    Err(())
+}
+
+#[cfg(not(any(unix, windows)))]
+pub(crate) unsafe fn write(
+    _stream: StandardStream,
+    _bytes: *const u8,
+    _byte_length: usize,
+) -> bool {
+    false
+}
+
+#[cfg(not(any(unix, windows)))]
+pub(crate) unsafe fn is_interactive(_stream: StandardStream) -> bool {
+    false
+}
+
+#[cfg(all(unix, any(target_os = "linux", target_os = "android")))]
+unsafe fn last_errno() -> i32 {
+    *__errno_location()
+}
+
+#[cfg(all(
+    unix,
+    any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "dragonfly"
+    )
+))]
+unsafe fn last_errno() -> i32 {
+    *__error()
+}
+
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "dragonfly"
+    ))
+))]
+unsafe fn last_errno() -> i32 {
+    0
+}
+
+#[cfg(unix)]
+extern "C" {
+    #[link_name = "read"]
+    fn libc_read(descriptor: i32, bytes: *mut c_void, byte_length: usize) -> isize;
+    #[link_name = "write"]
+    fn libc_write(descriptor: i32, bytes: *const c_void, byte_length: usize) -> isize;
+    fn isatty(descriptor: i32) -> i32;
+}
+
+#[cfg(all(unix, any(target_os = "linux", target_os = "android")))]
+extern "C" {
+    fn __errno_location() -> *mut i32;
+}
+
+#[cfg(all(
+    unix,
+    any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "dragonfly"
+    )
+))]
+extern "C" {
+    fn __error() -> *mut i32;
+}
+
+#[cfg(windows)]
+extern "system" {
+    fn GetStdHandle(standard_handle: u32) -> *mut c_void;
+    fn GetConsoleMode(handle: *mut c_void, mode: *mut u32) -> i32;
+    fn ReadFile(
+        handle: *mut c_void,
+        bytes: *mut c_void,
+        byte_length: u32,
+        read: *mut u32,
+        overlapped: *mut c_void,
+    ) -> i32;
+    fn ReadConsoleW(
+        handle: *mut c_void,
+        buffer: *mut c_void,
+        characters: u32,
+        read: *mut u32,
+        input_control: *mut c_void,
+    ) -> i32;
+    fn WriteFile(
+        handle: *mut c_void,
+        bytes: *const c_void,
+        byte_length: u32,
+        written: *mut u32,
+        overlapped: *mut c_void,
+    ) -> i32;
+    fn WriteConsoleW(
+        handle: *mut c_void,
+        buffer: *const c_void,
+        characters: u32,
+        written: *mut u32,
+        reserved: *mut c_void,
+    ) -> i32;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stream_identifiers_are_stable_and_independent() {
+        assert_eq!(StandardStream::Stdin as u8, 0);
+        assert_eq!(StandardStream::Stdout as u8, 1);
+        assert_eq!(StandardStream::Stderr as u8, 2);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn utf16_conversion_preserves_unicode_and_embedded_nul() {
+        let source = "Doria — café — 漢字 — 🎮\0done"
+            .encode_utf16()
+            .collect::<std::vec::Vec<_>>();
+        let mut output = [0_u8; 128];
+        let length = unsafe { utf16_to_utf8(&source, output.as_mut_ptr(), output.len()) }
+            .expect("valid UTF-16 should convert");
+        assert_eq!(
+            &output[..length],
+            "Doria — café — 漢字 — 🎮\0done".as_bytes()
+        );
+    }
+}

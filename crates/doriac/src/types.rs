@@ -7,6 +7,7 @@ pub use crate::numeric::{FloatType, IntegerType};
 pub struct TypeRef {
     pub name: String,
     pub args: Vec<TypeRef>,
+    pub nullable: bool,
 }
 
 impl TypeRef {
@@ -14,6 +15,7 @@ impl TypeRef {
         Self {
             name: name.into(),
             args: Vec::new(),
+            nullable: false,
         }
     }
 
@@ -21,6 +23,7 @@ impl TypeRef {
         Self {
             name: name.into(),
             args,
+            nullable: false,
         }
     }
 
@@ -30,6 +33,11 @@ impl TypeRef {
 
     pub fn unknown() -> Self {
         Self::named("Unknown")
+    }
+
+    pub fn nullable(mut self) -> Self {
+        self.nullable = true;
+        self
     }
 
     pub fn as_class_name(&self) -> Option<&str> {
@@ -46,6 +54,9 @@ impl TypeRef {
 
 impl fmt::Display for TypeRef {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.nullable {
+            write!(formatter, "?")?;
+        }
         if self.name == "[]" && self.args.len() == 1 {
             return write!(formatter, "{}[]", self.args[0]);
         }
@@ -73,6 +84,7 @@ pub enum TypeKind {
     Integer(IntegerType),
     Float(FloatType),
     String,
+    NullableString,
     Bool,
     Null,
     Mixed,
@@ -129,6 +141,7 @@ impl TypeRegistry {
             TypeKind::Integer(integer) => integer.source_name().to_string(),
             TypeKind::Float(float) => float.source_name().to_string(),
             TypeKind::String => "string".to_string(),
+            TypeKind::NullableString => "?string".to_string(),
             TypeKind::Bool => "bool".to_string(),
             TypeKind::Null => "null".to_string(),
             TypeKind::Mixed => "mixed".to_string(),

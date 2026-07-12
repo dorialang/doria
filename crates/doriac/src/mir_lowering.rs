@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use crate::diagnostics::{Diagnostic, DiagnosticResult};
+use crate::format_string;
 use crate::numeric::{parse_decimal_magnitude, FloatType, FloatValue, IntegerType, IntegerValue};
 use crate::semantics::SemanticInfo;
 use crate::source::Span;
@@ -91,6 +92,9 @@ fn collect_function_signature(
             scalar_type_ref(ty).expect("checked scalar type"),
         )),
         Some(ty) if is_plain_type(ty, "string") => mir::ReturnType::Value(mir::Type::String),
+        Some(ty) if is_nullable_string_type(ty) => {
+            mir::ReturnType::Value(mir::Type::NullableString)
+        }
         Some(ty) if is_plain_type(ty, "void") => mir::ReturnType::Void,
         Some(ty) => {
             return Err(vec![unsupported(
@@ -148,6 +152,8 @@ fn collect_function_signature(
             mir::Type::Scalar(scalar)
         } else if is_plain_type(&param.ty, "string") {
             mir::Type::String
+        } else if is_nullable_string_type(&param.ty) {
+            mir::Type::NullableString
         } else {
             return Err(vec![unsupported(
                 param.span,
@@ -189,7 +195,11 @@ fn scalar_type_ref(ty: &crate::types::TypeRef) -> Option<mir::ScalarType> {
 }
 
 fn is_plain_type(ty: &crate::types::TypeRef, name: &str) -> bool {
-    ty.name == name && ty.args.is_empty()
+    !ty.nullable && ty.name == name && ty.args.is_empty()
+}
+
+fn is_nullable_string_type(ty: &crate::types::TypeRef) -> bool {
+    ty.nullable && ty.name == "string" && ty.args.is_empty()
 }
 
 fn lower_function(
@@ -296,6 +306,31 @@ fn lower_statement_sequence(
                     if name == "panic" {
                         let message = lower_panic_message(args, *call_span, context)?;
                         context.terminate_current(mir::Terminator::Panic(message));
+                    } else if name == "printf" {
+                        context.push_statement(mir::Statement::Printf(lower_format_expression(
+                            args, *call_span, context,
+                        )?));
+                    } else if name == "write_file" {
+                        let [path, contents] = args.as_slice() else {
+                            return Err(vec![unsupported(
+                                *call_span,
+                                "write_file expects 2 arguments",
+                            )]);
+                        };
+                        context.push_statement(mir::Statement::WriteFile {
+                            path: lower_string_expression(path, context)?,
+                            contents: lower_string_expression(contents, context)?,
+                        });
+                    } else if name == "write_stderr" {
+                        let [value] = args.as_slice() else {
+                            return Err(vec![unsupported(
+                                *call_span,
+                                "write_stderr expects 1 argument",
+                            )]);
+                        };
+                        context.push_statement(mir::Statement::WriteStderr(
+                            lower_string_expression(value, context)?,
+                        ));
                     } else {
                         let call = lower_void_call(name, args, *call_span, context)?;
                         context.push_statement(call);
@@ -941,7 +976,7 @@ impl<'semantic> LoweringContext<'semantic> {
     fn local_scalar_type(&self, id: mir::LocalId) -> DiagnosticResult<mir::ScalarType> {
         match self.local_type(id) {
             mir::Type::Scalar(ty) => Ok(ty),
-            mir::Type::String => Err(vec![Diagnostic::new(
+            mir::Type::String | mir::Type::NullableString => Err(vec![Diagnostic::new(
                 "I1401",
                 format!(
                     "internal compiler consistency error: string local local{} used as a scalar",
@@ -974,6 +1009,7 @@ fn lower_var_decl(decl: &hir::VarDecl, context: &mut LoweringContext) -> Diagnos
             mir::Type::Scalar(scalar_type_ref(ty).expect("checked scalar type"))
         }
         Some(ty) if is_plain_type(ty, "string") => mir::Type::String,
+        Some(ty) if is_nullable_string_type(ty) => mir::Type::NullableString,
         Some(ty) => {
             return Err(vec![unsupported(
                 decl.span,
@@ -981,11 +1017,23 @@ fn lower_var_decl(decl: &hir::VarDecl, context: &mut LoweringContext) -> Diagnos
             )]);
         }
         None if is_string_local_initializer(&decl.initializer, context) => mir::Type::String,
+        None if is_nullable_string_initializer(&decl.initializer, context) => {
+            mir::Type::NullableString
+        }
         None => mir::Type::Scalar(lower_value_expression(&decl.initializer, context)?.ty()),
     };
 
     if ty == mir::Type::String {
         return lower_string_var_decl(decl, context);
+    }
+    if ty == mir::Type::NullableString {
+        let value = lower_nullable_string_expression(&decl.initializer, context)?;
+        let local = context.declare_user_local(&decl.name, decl.writable, ty);
+        context.push_statement(mir::Statement::AssignLocal {
+            target: local,
+            value: mir::Rvalue::NullableString(value),
+        });
+        return Ok(());
     }
 
     let mir::Type::Scalar(scalar_type) = ty else {
@@ -1002,6 +1050,23 @@ fn lower_var_decl(decl: &hir::VarDecl, context: &mut LoweringContext) -> Diagnos
     Ok(())
 }
 
+fn is_nullable_string_initializer(expr: &hir::Expr, context: &LoweringContext) -> bool {
+    match expr {
+        hir::Expr::Null { .. } => true,
+        hir::Expr::Grouped { expr, .. } => is_nullable_string_initializer(expr, context),
+        hir::Expr::Variable { name, span } => context
+            .lookup_local(name, *span)
+            .is_ok_and(|local| context.local_type(local) == mir::Type::NullableString),
+        hir::Expr::FunctionCall { name, span, .. } if name == "readline" => true,
+        hir::Expr::FunctionCall { name, span, .. } => {
+            context.lookup_function(name, *span).is_ok_and(|signature| {
+                signature.return_type == mir::ReturnType::Value(mir::Type::NullableString)
+            })
+        }
+        _ => false,
+    }
+}
+
 fn is_string_local_initializer(expr: &hir::Expr, context: &LoweringContext) -> bool {
     match expr {
         hir::Expr::String { .. } | hir::Expr::InterpolatedString { .. } => true,
@@ -1013,6 +1078,11 @@ fn is_string_local_initializer(expr: &hir::Expr, context: &LoweringContext) -> b
         hir::Expr::Variable { name, span } => context
             .lookup_local(name, *span)
             .is_ok_and(|local| context.local_type(local) == mir::Type::String),
+        hir::Expr::FunctionCall { name, .. }
+            if matches!(name.as_str(), "sprintf" | "read_file") =>
+        {
+            true
+        }
         hir::Expr::FunctionCall { name, span, .. } => {
             context.lookup_function(name, *span).is_ok_and(|signature| {
                 signature.return_type == mir::ReturnType::Value(mir::Type::String)
@@ -1050,6 +1120,22 @@ fn lower_assignment(
         context.push_statement(mir::Statement::AssignLocal {
             target,
             value: mir::Rvalue::String(lower_string_expression(&assignment.value, context)?),
+        });
+        return Ok(());
+    }
+    if context.local_type(target) == mir::Type::NullableString {
+        if assignment.op != hir::AssignOp::Assign {
+            return Err(vec![unsupported(
+                assignment.span,
+                "nullable-string compound assignment is invalid",
+            )]);
+        }
+        context.push_statement(mir::Statement::AssignLocal {
+            target,
+            value: mir::Rvalue::NullableString(lower_nullable_string_expression(
+                &assignment.value,
+                context,
+            )?),
         });
         return Ok(());
     }
@@ -1170,6 +1256,8 @@ fn lower_string_expression(
             let local = context.lookup_local(name, *span)?;
             if context.local_type(local) == mir::Type::String {
                 Ok(mir::StringExpression::Local(local))
+            } else if context.local_type(local) == mir::Type::NullableString {
+                Ok(mir::StringExpression::NullableLocalAssumeNonNull(local))
             } else {
                 Err(vec![unsupported(
                     *span,
@@ -1201,6 +1289,19 @@ fn lower_string_expression(
             Ok(mir::StringExpression::Concat(lowered))
         }
         hir::Expr::FunctionCall { name, args, span } => {
+            if name == "read_file" {
+                let [path] = args.as_slice() else {
+                    return Err(vec![unsupported(*span, "read_file expects 1 argument")]);
+                };
+                return Ok(mir::StringExpression::ReadFile(Box::new(
+                    lower_string_expression(path, context)?,
+                )));
+            }
+            if name == "sprintf" {
+                return Ok(mir::StringExpression::Format(Box::new(
+                    lower_format_expression(args, *span, context)?,
+                )));
+            }
             let signature = context.lookup_function(name, *span)?;
             if signature.return_type != mir::ReturnType::Value(mir::Type::String) {
                 return Err(vec![unsupported(*span, format!("function `{name}` does not return string"))]);
@@ -1217,11 +1318,91 @@ fn lower_string_expression(
     }
 }
 
+fn lower_nullable_string_expression(
+    expr: &hir::Expr,
+    context: &LoweringContext,
+) -> DiagnosticResult<mir::NullableStringExpression> {
+    match expr {
+        hir::Expr::Null { .. } => Ok(mir::NullableStringExpression::Null),
+        hir::Expr::Grouped { expr, .. } => lower_nullable_string_expression(expr, context),
+        hir::Expr::Variable { name, span } => {
+            let local = context.lookup_local(name, *span)?;
+            match context.local_type(local) {
+                mir::Type::NullableString => Ok(mir::NullableStringExpression::Local(local)),
+                mir::Type::String => Ok(mir::NullableStringExpression::String(
+                    mir::StringExpression::Local(local),
+                )),
+                _ => Err(vec![unsupported(
+                    *span,
+                    "expected nullable string expression",
+                )]),
+            }
+        }
+        hir::Expr::FunctionCall { name, args, span } if name == "readline" => {
+            if !args.is_empty() {
+                return Err(vec![unsupported(*span, "readline expects no arguments")]);
+            }
+            Ok(mir::NullableStringExpression::ReadLine)
+        }
+        hir::Expr::FunctionCall { name, args, span } => {
+            let signature = context.lookup_function(name, *span)?;
+            if signature.return_type != mir::ReturnType::Value(mir::Type::NullableString) {
+                return Err(vec![unsupported(
+                    *span,
+                    format!("function `{name}` does not return ?string"),
+                )]);
+            }
+            Ok(mir::NullableStringExpression::Call {
+                function: signature.id,
+                args: lower_call_args(name, args, signature, *span, context)?,
+            })
+        }
+        _ if is_string_local_initializer(expr, context) => Ok(
+            mir::NullableStringExpression::String(lower_string_expression(expr, context)?),
+        ),
+        _ => Err(vec![unsupported(
+            expr.span(),
+            "expected nullable string expression",
+        )]),
+    }
+}
+
+fn lower_format_expression(
+    args: &[hir::Expr],
+    span: Span,
+    context: &LoweringContext,
+) -> DiagnosticResult<mir::FormatExpression> {
+    let Some(hir::Expr::String {
+        value,
+        span: format_span,
+    }) = args.first()
+    else {
+        return Err(vec![unsupported(
+            span,
+            "format must be a direct string literal",
+        )]);
+    };
+    let pieces = format_string::parse(value, *format_span).map_err(|error| vec![error])?;
+    let arguments = args[1..]
+        .iter()
+        .map(|argument| {
+            if is_string_local_initializer(argument, context) {
+                lower_string_expression(argument, context).map(mir::FormatArgument::String)
+            } else {
+                lower_value_expression(argument, context).map(mir::FormatArgument::Value)
+            }
+        })
+        .collect::<DiagnosticResult<Vec<_>>>()?;
+    Ok(mir::FormatExpression { pieces, arguments })
+}
+
 fn lower_display_string_expression(
     expr: &hir::Expr,
     context: &LoweringContext,
 ) -> DiagnosticResult<mir::StringExpression> {
-    if is_string_local_initializer(expr, context) {
+    let narrowed_nullable_local = matches!(expr, hir::Expr::Variable { name, span }
+        if context.lookup_local(name, *span).is_ok_and(|local| context.local_type(local) == mir::Type::NullableString));
+    if is_string_local_initializer(expr, context) || narrowed_nullable_local {
         lower_string_expression(expr, context)
     } else {
         lower_value_expression(expr, context).map(mir::StringExpression::Display)
@@ -1252,6 +1433,8 @@ fn append_string_concat_parts(
             let local = context.lookup_local(name, *span)?;
             if context.local_type(local) == mir::Type::String {
                 parts.push(mir::StringExpression::Local(local));
+            } else if context.local_type(local) == mir::Type::NullableString {
+                parts.push(mir::StringExpression::NullableLocalAssumeNonNull(local));
             } else {
                 parts.push(mir::StringExpression::Display(lower_value_expression(
                     expr, context,
@@ -1424,6 +1607,14 @@ fn lower_condition(
                         left: Box::new(lower_string_expression(left, context)?),
                         right: Box::new(lower_string_expression(right, context)?),
                     })
+                } else if is_nullable_string_initializer(left, context)
+                    || is_nullable_string_initializer(right, context)
+                {
+                    Ok(mir::BoolExpression::NullableStringCompare {
+                        op: lower_compare_op(op),
+                        left: Box::new(lower_nullable_string_expression(left, context)?),
+                        right: Box::new(lower_nullable_string_expression(right, context)?),
+                    })
                 } else {
                     Ok(mir::BoolExpression::Compare {
                         op: lower_compare_op(op),
@@ -1517,7 +1708,9 @@ fn lower_value_expression(
 }
 
 fn lower_rvalue(expr: &hir::Expr, context: &LoweringContext) -> DiagnosticResult<mir::Rvalue> {
-    if is_string_local_initializer(expr, context) {
+    if is_nullable_string_initializer(expr, context) {
+        lower_nullable_string_expression(expr, context).map(mir::Rvalue::NullableString)
+    } else if is_string_local_initializer(expr, context) {
         lower_string_expression(expr, context).map(mir::Rvalue::String)
     } else {
         lower_value_expression(expr, context).map(mir::Rvalue::Value)

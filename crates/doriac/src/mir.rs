@@ -6,6 +6,7 @@
 
 use std::fmt;
 
+use crate::format_string::FormatPiece;
 use crate::numeric::{FloatType, FloatValue, IntegerType, IntegerValue};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -77,6 +78,7 @@ pub struct Local {
 pub enum Type {
     Scalar(ScalarType),
     String,
+    NullableString,
 }
 
 impl From<ScalarType> for Type {
@@ -102,6 +104,7 @@ pub enum Operand {
 pub enum Rvalue {
     Value(ValueExpression),
     String(StringExpression),
+    NullableString(NullableStringExpression),
 }
 
 impl Rvalue {
@@ -109,6 +112,7 @@ impl Rvalue {
         match self {
             Self::Value(value) => Type::Scalar(value.ty()),
             Self::String(_) => Type::String,
+            Self::NullableString(_) => Type::NullableString,
         }
     }
 }
@@ -262,12 +266,39 @@ impl FloatExpression {
 pub enum StringExpression {
     Literal(String),
     Local(LocalId),
+    NullableLocalAssumeNonNull(LocalId),
     Concat(Vec<StringExpression>),
     Display(ValueExpression),
     Call {
         function: FunctionId,
         args: Vec<Rvalue>,
     },
+    ReadFile(Box<StringExpression>),
+    Format(Box<FormatExpression>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NullableStringExpression {
+    Null,
+    String(StringExpression),
+    Local(LocalId),
+    ReadLine,
+    Call {
+        function: FunctionId,
+        args: Vec<Rvalue>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FormatArgument {
+    Value(ValueExpression),
+    String(StringExpression),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FormatExpression {
+    pub pieces: Vec<FormatPiece>,
+    pub arguments: Vec<FormatArgument>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -284,6 +315,11 @@ pub enum BoolExpression {
         op: CompareOp,
         left: Box<StringExpression>,
         right: Box<StringExpression>,
+    },
+    NullableStringCompare {
+        op: CompareOp,
+        left: Box<NullableStringExpression>,
+        right: Box<NullableStringExpression>,
     },
     Not(Box<BoolExpression>),
     Binary {
@@ -326,6 +362,12 @@ pub enum Statement {
         function: FunctionId,
         args: Vec<Rvalue>,
     },
+    Printf(FormatExpression),
+    WriteFile {
+        path: StringExpression,
+        contents: StringExpression,
+    },
+    WriteStderr(StringExpression),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -421,6 +463,7 @@ impl fmt::Display for Type {
         match self {
             Type::Scalar(ty) => write!(formatter, "{ty}"),
             Type::String => write!(formatter, "string"),
+            Type::NullableString => write!(formatter, "?string"),
         }
     }
 }
@@ -449,6 +492,7 @@ impl fmt::Display for Rvalue {
         match self {
             Rvalue::Value(expression) => write!(formatter, "{expression}"),
             Rvalue::String(value) => write!(formatter, "{value}"),
+            Rvalue::NullableString(value) => write!(formatter, "{value}"),
         }
     }
 }
@@ -585,6 +629,9 @@ impl fmt::Display for StringExpression {
                 write!(formatter, "\"{}\"", escape_debug_string(value))
             }
             StringExpression::Local(id) => write!(formatter, "local{}", id.0),
+            StringExpression::NullableLocalAssumeNonNull(id) => {
+                write!(formatter, "nonnull(local{})", id.0)
+            }
             StringExpression::Concat(parts) => {
                 write!(formatter, "(")?;
                 for (index, part) in parts.iter().enumerate() {
@@ -597,7 +644,44 @@ impl fmt::Display for StringExpression {
             }
             StringExpression::Display(value) => write!(formatter, "display({value})"),
             StringExpression::Call { function, args } => write_call(formatter, *function, args),
+            StringExpression::ReadFile(path) => write!(formatter, "read_file({path})"),
+            StringExpression::Format(format) => write!(formatter, "format({format})"),
         }
+    }
+}
+
+impl fmt::Display for NullableStringExpression {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Null => formatter.write_str("null"),
+            Self::String(value) => write!(formatter, "some({value})"),
+            Self::Local(local) => write!(formatter, "local{}", local.0),
+            Self::ReadLine => formatter.write_str("readline()"),
+            Self::Call { function, args } => write_call(formatter, *function, args),
+        }
+    }
+}
+
+impl fmt::Display for FormatArgument {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Value(value) => write!(formatter, "{value}"),
+            Self::String(value) => write!(formatter, "{value}"),
+        }
+    }
+}
+
+impl fmt::Display for FormatExpression {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "plan[{} pieces]", self.pieces.len())?;
+        write!(formatter, "(")?;
+        for (index, argument) in self.arguments.iter().enumerate() {
+            if index != 0 {
+                write!(formatter, ", ")?;
+            }
+            write!(formatter, "{argument}")?;
+        }
+        write!(formatter, ")")
     }
 }
 
@@ -611,6 +695,9 @@ impl fmt::Display for BoolExpression {
             },
             Self::Compare { op, left, right } => write!(formatter, "{left} {op} {right}"),
             Self::StringCompare { op, left, right } => write!(formatter, "{left} {op} {right}"),
+            Self::NullableStringCompare { op, left, right } => {
+                write!(formatter, "{left} {op} {right}")
+            }
             Self::Not(condition) => write!(formatter, "!({condition})"),
             Self::Binary { op, left, right } => {
                 write!(formatter, "({left}) {op} ({right})")
@@ -654,6 +741,11 @@ impl fmt::Display for Statement {
             }
             Statement::EchoString(value) => write!(formatter, "echo {value}"),
             Statement::CallVoid { function, args } => write_call(formatter, *function, args),
+            Statement::Printf(format) => write!(formatter, "printf {format}"),
+            Statement::WriteFile { path, contents } => {
+                write!(formatter, "write_file({path}, {contents})")
+            }
+            Statement::WriteStderr(value) => write!(formatter, "write_stderr({value})"),
         }
     }
 }

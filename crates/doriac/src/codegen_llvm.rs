@@ -18,12 +18,15 @@ use inkwell::values::{
 use inkwell::{AddressSpace, FloatPredicate, IntPredicate, OptimizationLevel};
 
 use crate::backend::BackendError;
+use crate::format_string::{FormatConversion, FormatPiece};
 use crate::mir;
 use crate::mir_validation;
 use crate::native_abi::{
-    function_symbol, STRING_COMPARE, STRING_CONCAT, STRING_DATA, STRING_FROM_BOOL, STRING_FROM_F32,
-    STRING_FROM_F64, STRING_FROM_I64, STRING_FROM_U64, STRING_FROM_UTF8, STRING_LENGTH,
-    STRING_RELEASE, STRING_RETAIN, STRING_WRITE_STDOUT,
+    function_symbol, FORMAT_F32, FORMAT_F64, FORMAT_I64, FORMAT_STRING, FORMAT_U64,
+    NULLABLE_STRING_EQUAL, READ_FILE, READ_STDIN_LINE, STRING_COMPARE, STRING_CONCAT, STRING_DATA,
+    STRING_FROM_BOOL, STRING_FROM_F32, STRING_FROM_F64, STRING_FROM_I64, STRING_FROM_U64,
+    STRING_FROM_UTF8, STRING_LENGTH, STRING_RELEASE, STRING_RETAIN, STRING_WRITE_STDERR,
+    STRING_WRITE_STDOUT, WRITE_FILE,
 };
 use crate::numeric::{FloatType, FloatValue, IntegerPanic, IntegerType, IntegerValue};
 
@@ -186,7 +189,7 @@ fn define_function<'ctx>(
                 build(builder.build_store(slot, scalar_zero(context, ty)))?;
                 local_slots.push(Some(slot));
             }
-            mir::Type::String => {
+            mir::Type::String | mir::Type::NullableString => {
                 let slot = build(builder.build_alloca(
                     context.ptr_type(AddressSpace::default()),
                     &format!("local{}", local.id.0),
@@ -365,6 +368,24 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                         self.release_string(old)?;
                         build(self.builder.build_store(slot, value))?;
                     }
+                    mir::Type::NullableString => {
+                        let mir::Rvalue::NullableString(expression) = value else {
+                            return Err(malformed_mir(format!(
+                                "nullable-string local local{} has another assignment type",
+                                target.0
+                            )));
+                        };
+                        let value = self.lower_nullable_string_expression(expression)?;
+                        let slot = local_slot(&self.local_slots, *target)?;
+                        let old = build(self.builder.build_load(
+                            self.context.ptr_type(AddressSpace::default()),
+                            slot,
+                            "nullable-string.old",
+                        ))?
+                        .into_pointer_value();
+                        self.release_string(old)?;
+                        build(self.builder.build_store(slot, value))?;
+                    }
                 }
             }
             mir::Statement::EchoStringLiteral(value) => self.lower_echo(value.as_bytes())?,
@@ -381,6 +402,41 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             }
             mir::Statement::CallVoid { function, args } => {
                 let _ = self.lower_call(*function, args, false)?;
+            }
+            mir::Statement::WriteStderr(value) => {
+                let value = self.lower_string_expression(value)?;
+                let pointer = self.context.ptr_type(AddressSpace::default());
+                let _ = self.call_runtime(
+                    STRING_WRITE_STDERR,
+                    &[pointer.into(), pointer.into()],
+                    None,
+                    &[self.current_frame.into(), value.into()],
+                )?;
+                self.release_string(value)?;
+            }
+            mir::Statement::Printf(format) => {
+                let value = self.lower_format_expression(format)?;
+                let pointer = self.context.ptr_type(AddressSpace::default());
+                let _ = self.call_runtime(
+                    STRING_WRITE_STDOUT,
+                    &[pointer.into(), pointer.into()],
+                    None,
+                    &[self.current_frame.into(), value.into()],
+                )?;
+                self.release_string(value)?;
+            }
+            mir::Statement::WriteFile { path, contents } => {
+                let path = self.lower_string_expression(path)?;
+                let contents = self.lower_string_expression(contents)?;
+                let pointer = self.context.ptr_type(AddressSpace::default());
+                let _ = self.call_runtime(
+                    WRITE_FILE,
+                    &[pointer.into(), pointer.into(), pointer.into()],
+                    None,
+                    &[self.current_frame.into(), path.into(), contents.into()],
+                )?;
+                self.release_string(path)?;
+                self.release_string(contents)?;
             }
         }
         Ok(())
@@ -468,6 +524,42 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         match expression {
             mir::Rvalue::Value(value) => self.lower_value_expression(value),
             mir::Rvalue::String(value) => Ok(self.lower_string_expression(value)?.into()),
+            mir::Rvalue::NullableString(value) => {
+                Ok(self.lower_nullable_string_expression(value)?.into())
+            }
+        }
+    }
+
+    fn lower_nullable_string_expression(
+        &mut self,
+        expression: &mir::NullableStringExpression,
+    ) -> Result<PointerValue<'ctx>, BackendError> {
+        let pointer = self.context.ptr_type(AddressSpace::default());
+        match expression {
+            mir::NullableStringExpression::Null => Ok(pointer.const_null()),
+            mir::NullableStringExpression::String(value) => self.lower_string_expression(value),
+            mir::NullableStringExpression::Local(local) => {
+                let value = build(self.builder.build_load(
+                    pointer,
+                    local_slot(&self.local_slots, *local)?,
+                    "nullable-string.local",
+                ))?
+                .into_pointer_value();
+                self.retain_string(value)
+            }
+            mir::NullableStringExpression::ReadLine => Ok(self
+                .call_runtime(
+                    READ_STDIN_LINE,
+                    &[pointer.into()],
+                    Some(pointer.into()),
+                    &[self.current_frame.into()],
+                )?
+                .ok_or_else(|| backend_failure("readline produced no result"))?
+                .into_pointer_value()),
+            mir::NullableStringExpression::Call { function, args } => Ok(self
+                .lower_call(*function, args, true)?
+                .ok_or_else(|| malformed_mir("nullable-string call produced no result"))?
+                .into_pointer_value()),
         }
     }
 
@@ -520,7 +612,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
     fn cleanup_string_locals(&self) -> Result<(), BackendError> {
         let pointer = self.context.ptr_type(AddressSpace::default());
         for local in &self.function.locals {
-            if local.ty == mir::Type::String {
+            if matches!(local.ty, mir::Type::String | mir::Type::NullableString) {
                 let value = build(self.builder.build_load(
                     pointer,
                     local_slot(&self.local_slots, local.id)?,
@@ -536,7 +628,10 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
     fn retain_string_parameters(&self) -> Result<(), BackendError> {
         let pointer = self.context.ptr_type(AddressSpace::default());
         for parameter in &self.function.params {
-            if local_in(self.function, *parameter)?.ty == mir::Type::String {
+            if matches!(
+                local_in(self.function, *parameter)?.ty,
+                mir::Type::String | mir::Type::NullableString
+            ) {
                 let slot = local_slot(&self.local_slots, *parameter)?;
                 let value = build(self.builder.build_load(pointer, slot, "string.parameter"))?
                     .into_pointer_value();
@@ -578,7 +673,8 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     .ok_or_else(|| backend_failure("string allocation produced no result"))?
                     .into_pointer_value())
             }
-            mir::StringExpression::Local(local) => {
+            mir::StringExpression::Local(local)
+            | mir::StringExpression::NullableLocalAssumeNonNull(local) => {
                 let value = build(self.builder.build_load(
                     pointer,
                     local_slot(&self.local_slots, *local)?,
@@ -677,7 +773,179 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 .lower_call(*function, args, true)?
                 .ok_or_else(|| malformed_mir("string call produced no result"))?
                 .into_pointer_value()),
+            mir::StringExpression::ReadFile(path) => {
+                let path = self.lower_string_expression(path)?;
+                let result = self
+                    .call_runtime(
+                        READ_FILE,
+                        &[pointer.into(), pointer.into()],
+                        Some(pointer.into()),
+                        &[self.current_frame.into(), path.into()],
+                    )?
+                    .ok_or_else(|| backend_failure("read_file produced no result"))?
+                    .into_pointer_value();
+                self.release_string(path)?;
+                Ok(result)
+            }
+            mir::StringExpression::Format(format) => self.lower_format_expression(format),
         }
+    }
+
+    fn lower_format_expression(
+        &mut self,
+        format: &mir::FormatExpression,
+    ) -> Result<PointerValue<'ctx>, BackendError> {
+        let pointer = self.context.ptr_type(AddressSpace::default());
+        let mut result =
+            self.lower_string_expression(&mir::StringExpression::Literal(String::new()))?;
+        for piece in &format.pieces {
+            let next =
+                match piece {
+                    FormatPiece::Literal(value) => self
+                        .lower_string_expression(&mir::StringExpression::Literal(value.clone()))?,
+                    FormatPiece::Argument { index, spec } => {
+                        let argument = format.arguments.get(*index as usize).ok_or_else(|| {
+                            malformed_mir("format argument index is out of bounds")
+                        })?;
+                        self.lower_format_argument(argument, *spec)?
+                    }
+                };
+            let concatenated = self
+                .call_runtime(
+                    STRING_CONCAT,
+                    &[pointer.into(), pointer.into()],
+                    Some(pointer.into()),
+                    &[result.into(), next.into()],
+                )?
+                .ok_or_else(|| backend_failure("format concatenation produced no result"))?
+                .into_pointer_value();
+            self.release_string(result)?;
+            self.release_string(next)?;
+            result = concatenated;
+        }
+        Ok(result)
+    }
+
+    fn lower_format_argument(
+        &mut self,
+        argument: &mir::FormatArgument,
+        spec: crate::format_string::FormatSpec,
+    ) -> Result<PointerValue<'ctx>, BackendError> {
+        let pointer = self.context.ptr_type(AddressSpace::default());
+        let i8_type = self.context.i8_type();
+        let i32_type = self.context.i32_type();
+        let i64_type = self.context.i64_type();
+        let width = i32_type.const_int(u64::from(spec.width.unwrap_or(0)), false);
+        let flags_value = u8::from(spec.left_align) | (u8::from(spec.zero_pad) << 1);
+        let flags = i8_type.const_int(u64::from(flags_value), false);
+
+        if spec.conversion == FormatConversion::Display {
+            let string = match argument {
+                mir::FormatArgument::String(value) => self.lower_string_expression(value)?,
+                mir::FormatArgument::Value(value) => {
+                    self.lower_string_expression(&mir::StringExpression::Display(value.clone()))?
+                }
+            };
+            let formatted = self
+                .call_runtime(
+                    FORMAT_STRING,
+                    &[pointer.into(), i32_type.into(), i8_type.into()],
+                    Some(pointer.into()),
+                    &[string.into(), width.into(), flags.into()],
+                )?
+                .ok_or_else(|| backend_failure("string formatting produced no result"))?
+                .into_pointer_value();
+            self.release_string(string)?;
+            return Ok(formatted);
+        }
+
+        if let mir::FormatArgument::Value(mir::ValueExpression::Float(float)) = argument {
+            let value = self.lower_float_expression(float)?;
+            let precision = i32_type.const_int(u64::from(spec.precision.unwrap_or(6)), false);
+            let (name, ty): (&str, BasicMetadataTypeEnum<'ctx>) = match float.ty() {
+                FloatType::Float32 => (FORMAT_F32, self.context.f32_type().into()),
+                FloatType::Float64 => (FORMAT_F64, self.context.f64_type().into()),
+            };
+            return Ok(self
+                .call_runtime(
+                    name,
+                    &[ty, i32_type.into(), i32_type.into(), i8_type.into()],
+                    Some(pointer.into()),
+                    &[value.into(), precision.into(), width.into(), flags.into()],
+                )?
+                .ok_or_else(|| backend_failure("float formatting produced no result"))?
+                .into_pointer_value());
+        }
+
+        let mir::FormatArgument::Value(mir::ValueExpression::Integer(integer)) = argument else {
+            return Err(malformed_mir(
+                "format conversion and argument type disagree",
+            ));
+        };
+        let ty = integer.ty();
+        let mut value = self.lower_integer_expression(integer)?;
+        if ty.bit_width() < 64 {
+            value = if ty.is_signed() {
+                build(
+                    self.builder
+                        .build_int_s_extend(value, i64_type, "format.sext"),
+                )?
+            } else {
+                build(
+                    self.builder
+                        .build_int_z_extend(value, i64_type, "format.zext"),
+                )?
+            };
+        }
+        let conversion = match spec.conversion {
+            FormatConversion::Decimal => 1,
+            FormatConversion::HexLower => 2,
+            FormatConversion::HexUpper => 3,
+            FormatConversion::Octal => 4,
+            FormatConversion::Binary => 5,
+            _ => {
+                return Err(malformed_mir(
+                    "integer argument has non-integer format conversion",
+                ))
+            }
+        };
+        let conversion = i8_type.const_int(conversion, false);
+        let result = if ty.is_signed() {
+            let bit_width = i8_type.const_int(u64::from(ty.bit_width()), false);
+            self.call_runtime(
+                FORMAT_I64,
+                &[
+                    i64_type.into(),
+                    i8_type.into(),
+                    i8_type.into(),
+                    i32_type.into(),
+                    i8_type.into(),
+                ],
+                Some(pointer.into()),
+                &[
+                    value.into(),
+                    bit_width.into(),
+                    conversion.into(),
+                    width.into(),
+                    flags.into(),
+                ],
+            )?
+        } else {
+            self.call_runtime(
+                FORMAT_U64,
+                &[
+                    i64_type.into(),
+                    i8_type.into(),
+                    i32_type.into(),
+                    i8_type.into(),
+                ],
+                Some(pointer.into()),
+                &[value.into(), conversion.into(), width.into(), flags.into()],
+            )?
+        };
+        Ok(result
+            .ok_or_else(|| backend_failure("integer formatting produced no result"))?
+            .into_pointer_value())
     }
 
     fn lower_integer_expression(
@@ -1289,7 +1557,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         let mut owned_strings = Vec::new();
         for argument in args {
             let value = self.lower_rvalue(argument)?;
-            if argument.ty() == mir::Type::String {
+            if matches!(argument.ty(), mir::Type::String | mir::Type::NullableString) {
                 owned_strings.push(value.into_pointer_value());
             }
             values.push(value.into());
@@ -1436,6 +1704,43 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     self.context.i32_type().const_zero(),
                     "string.compare",
                 ))?;
+                build(
+                    self.builder
+                        .build_conditional_branch(condition, then_block, else_block),
+                )?;
+            }
+            mir::BoolExpression::NullableStringCompare { op, left, right } => {
+                let pointer = self.context.ptr_type(AddressSpace::default());
+                let left = self.lower_nullable_string_expression(left)?;
+                let right = self.lower_nullable_string_expression(right)?;
+                let equal = self
+                    .call_runtime(
+                        NULLABLE_STRING_EQUAL,
+                        &[pointer.into(), pointer.into()],
+                        Some(self.context.i8_type().into()),
+                        &[left.into(), right.into()],
+                    )?
+                    .ok_or_else(|| {
+                        backend_failure("nullable-string comparison produced no result")
+                    })?
+                    .into_int_value();
+                self.release_string(left)?;
+                self.release_string(right)?;
+                let condition = match op {
+                    mir::CompareOp::Equal => build(self.builder.build_int_compare(
+                        IntPredicate::NE,
+                        equal,
+                        self.context.i8_type().const_zero(),
+                        "nullable-string.equal",
+                    ))?,
+                    mir::CompareOp::NotEqual => build(self.builder.build_int_compare(
+                        IntPredicate::EQ,
+                        equal,
+                        self.context.i8_type().const_zero(),
+                        "nullable-string.not-equal",
+                    ))?,
+                    _ => return Err(malformed_mir("ordered nullable comparison is invalid")),
+                };
                 build(
                     self.builder
                         .build_conditional_branch(condition, then_block, else_block),
@@ -1677,7 +1982,9 @@ fn scalar_type(context: &Context, ty: mir::ScalarType) -> BasicTypeEnum<'_> {
 fn llvm_type(context: &Context, ty: mir::Type) -> BasicTypeEnum<'_> {
     match ty {
         mir::Type::Scalar(ty) => scalar_type(context, ty),
-        mir::Type::String => context.ptr_type(AddressSpace::default()).into(),
+        mir::Type::String | mir::Type::NullableString => {
+            context.ptr_type(AddressSpace::default()).into()
+        }
     }
 }
 
@@ -1876,7 +2183,11 @@ fn resolve_string_expression_from_definitions(
             }
             Ok(value)
         }
-        mir::StringExpression::Display(_) | mir::StringExpression::Call { .. } => {
+        mir::StringExpression::Display(_)
+        | mir::StringExpression::Call { .. }
+        | mir::StringExpression::NullableLocalAssumeNonNull(_)
+        | mir::StringExpression::ReadFile(_)
+        | mir::StringExpression::Format(_) => {
             Err(malformed_mir("runtime string expression is not a constant"))
         }
     }
@@ -1902,7 +2213,11 @@ fn resolve_string_expression(
             }
             Ok(value)
         }
-        mir::StringExpression::Display(_) | mir::StringExpression::Call { .. } => {
+        mir::StringExpression::Display(_)
+        | mir::StringExpression::Call { .. }
+        | mir::StringExpression::NullableLocalAssumeNonNull(_)
+        | mir::StringExpression::ReadFile(_)
+        | mir::StringExpression::Format(_) => {
             Err(malformed_mir("runtime string expression is not a constant"))
         }
     }
