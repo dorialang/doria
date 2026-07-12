@@ -78,3 +78,55 @@ fn nullable_and_format_diagnostics_are_checked_before_mir() {
         );
     }
 }
+
+#[test]
+fn nullable_assignment_invalidates_non_null_narrowing() {
+    let source = r#"
+function main(): void
+{
+    let writable $line = readline();
+    if ($line != null) {
+        $line = null;
+        echo $line;
+    }
+}
+"#;
+    let diagnostics = doriac::check_source("test.doria", source)
+        .expect_err("a null assignment must invalidate the non-null flow fact");
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E0445"),
+        "expected nullable display diagnostic, got {diagnostics:?}"
+    );
+
+    doriac::lower_source_to_mir(
+        "test.doria",
+        r#"
+function main(): void
+{
+    let writable $line = readline();
+    if ($line != null) {
+        $line = "known";
+        echo $line;
+    }
+}
+"#,
+    )
+    .expect("assigning a non-null string should establish a new non-null flow fact");
+}
+
+#[test]
+fn format_type_diagnostics_use_source_specifiers() {
+    let diagnostics = doriac::check_source(
+        "test.doria",
+        "function main(): void { echo sprintf(\"%x\", 1.5); }",
+    )
+    .expect_err("float passed to %x should fail");
+    assert!(
+        diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "E0457" && diagnostic.message.contains("`%x`")
+        }),
+        "expected source format spelling, got {diagnostics:?}"
+    );
+}

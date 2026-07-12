@@ -12,6 +12,20 @@ pub enum FormatConversion {
     Binary,
 }
 
+impl FormatConversion {
+    pub const fn specifier(self) -> &'static str {
+        match self {
+            Self::Display => "%s",
+            Self::Decimal => "%d",
+            Self::Float => "%f",
+            Self::HexLower => "%x",
+            Self::HexUpper => "%X",
+            Self::Octal => "%o",
+            Self::Binary => "%b",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FormatSpec {
     pub conversion: FormatConversion,

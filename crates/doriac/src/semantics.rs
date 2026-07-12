@@ -1773,6 +1773,7 @@ impl<'program> Checker<'program> {
                         value_ty,
                         scopes,
                     );
+                    self.update_nullable_assignment_flow_type(&assignment.target, value_ty, scopes);
                 }
             }
             AssignOp::AddAssign
@@ -3492,8 +3493,8 @@ impl<'program> Checker<'program> {
                         self.diagnostics.push(Diagnostic::new(
                             "E0457",
                             format!(
-                                "format conversion `{:?}` does not accept `{}`",
-                                spec.conversion,
+                                "format conversion `{}` does not accept `{}`",
+                                spec.conversion.specifier(),
                                 self.types.display(ty)
                             ),
                             argument.span(),
@@ -4311,6 +4312,31 @@ impl<'program> Checker<'program> {
         if matches!(self.types.kind(binding.ty), TypeKind::EmptyCollection) {
             binding.ty = value_ty;
         }
+    }
+
+    fn update_nullable_assignment_flow_type(
+        &self,
+        target: &Expr,
+        value_ty: TypeId,
+        scopes: &mut ScopeStack,
+    ) {
+        let Some(name) = Self::assignment_target_variable_name(target) else {
+            return;
+        };
+        let Some(binding) = scopes.lookup_mut(name) else {
+            return;
+        };
+        if !matches!(
+            self.types.kind(binding.declared_ty),
+            TypeKind::NullableString
+        ) {
+            return;
+        }
+        binding.ty = if matches!(self.types.kind(value_ty), TypeKind::String) {
+            value_ty
+        } else {
+            binding.declared_ty
+        };
     }
 
     fn is_expr_assignable(
