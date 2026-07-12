@@ -323,7 +323,7 @@ unsafe fn last_errno() -> i32 {
 
 #[cfg(unix)]
 extern "C" {
-    fn open(path: *const u8, flags: i32, mode: u32) -> i32;
+    fn open(path: *const u8, flags: i32, ...) -> i32;
     fn read(descriptor: i32, bytes: *mut c_void, byte_length: usize) -> isize;
     fn write(descriptor: i32, bytes: *const c_void, byte_length: usize) -> isize;
     fn close(descriptor: i32) -> i32;
