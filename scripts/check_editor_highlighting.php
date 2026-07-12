@@ -18,6 +18,8 @@ $intellijTokenTypes = $root . '/editors/intellij/doria/src/main/kotlin/dev/doria
 $intellijSyntaxHighlighter = $root . '/editors/intellij/doria/src/main/kotlin/dev/doria/intellij/highlighting/DoriaSyntaxHighlighter.kt';
 $intellijLspFiles = $root . '/editors/intellij/doria/src/main/kotlin/dev/doria/intellij/lsp/DoriaLspFiles.kt';
 $intellijPluginXml = $root . '/editors/intellij/doria/src/main/resources/META-INF/plugin.xml';
+$intellijPluginIcon = $root . '/editors/intellij/doria/src/main/resources/META-INF/pluginIcon.svg';
+$doriaLogo = $root . '/res/images/doria-app-icon-warm.svg';
 $lspServer = $root . '/crates/doriac/src/lsp.rs';
 $fixture = $root . '/editors/fixtures/latest-tokens.doria';
 $rejectedFixture = $root . '/editors/fixtures/rejected-syntax.doria';
@@ -316,6 +318,10 @@ function check_vscode_package(): void
     global $vscodePackage;
 
     $package = load_json($vscodePackage);
+    require_check(
+        ($package['version'] ?? null) === '2026.3.1' && ($package['doriaToolchainVersion'] ?? null) === '2026.03.1',
+        'VS Code package must carry the SemVer-compatible encoding of Doria CalVer 2026.03.1'
+    );
     $grammars = $package['contributes']['grammars'] ?? [];
     require_check(
         any_match(
@@ -568,7 +574,7 @@ function check_intellij_lexer(): void
 {
     global $acceptedKeywords, $primitiveTypes, $reservedTypes, $plannedTypes, $wordOperators, $stage13SymbolOperators, $booleanSymbolOperators;
     global $notKeywords, $strictComparison, $rejectedPreprocessor, $rejectedKeywords, $rejectedTypes;
-    global $intellijLexer, $intellijTokenTypes, $intellijSyntaxHighlighter, $intellijPluginXml;
+    global $intellijLexer, $intellijTokenTypes, $intellijSyntaxHighlighter, $intellijPluginXml, $intellijPluginIcon, $doriaLogo;
 
     $lexerText = read_text($intellijLexer);
     $intellijHighlightingText = implode("\n", [
@@ -700,11 +706,25 @@ function check_intellij_lexer(): void
         strpos($lexerText, 'isCallName() -> callableTokenType()') < strpos($lexerText, 'text.first().isUpperCase() -> DoriaTokenTypes.TYPE_NAME'),
         'IntelliJ lexer must prioritize call syntax over identifier capitalization'
     );
+    foreach (['FUNCTION_CALL', 'METHOD_CALL', 'STATIC_METHOD_CALL'] as $callStyle) {
+        require_check(
+            preg_match(
+                '/val ' . $callStyle . ': TextAttributesKey = TextAttributesKey\.createTextAttributesKey\(\s*"DORIA_' . $callStyle . '",\s*DefaultLanguageHighlighterColors\.FUNCTION_DECLARATION,/s',
+                $intellijHighlightingText
+            ) === 1,
+            'IntelliJ ' . $callStyle . ' must inherit the visible function-declaration color instead of a theme-white call style'
+        );
+    }
 
     $pluginXml = read_text($intellijPluginXml);
     require_check(
         str_contains($pluginXml, 'language=' . chr(34) . 'doria' . chr(34)),
         'IntelliJ plugin must register the lowercase doria language id for Markdown fences'
+    );
+    require_check(is_file($intellijPluginIcon), 'IntelliJ plugin must package META-INF/pluginIcon.svg');
+    require_check(
+        rtrim(read_text($intellijPluginIcon)) === rtrim(read_text($doriaLogo)),
+        'IntelliJ plugin icon must use the canonical Doria README SVG'
     );
 
     foreach ([

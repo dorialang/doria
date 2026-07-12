@@ -33,6 +33,7 @@ function __doria_readline(): ?string
 {
     $line = fgets(STDIN);
     if ($line === false) { return null; }
+    if (preg_match('//u', $line) !== 1) { __doria_io_panic("stdin contained invalid UTF-8"); }
     if (str_ends_with($line, "\n")) {
         $line = substr($line, 0, -1);
         if (str_ends_with($line, "\r")) { $line = substr($line, 0, -1); }
@@ -329,6 +330,9 @@ fn validate_expr(expr: &Expr, semantic_info: &SemanticInfo) -> Result<(), Backen
             validate_expr(object, semantic_info)?;
             validate_exprs(args, semantic_info)
         }
+        Expr::FunctionCall { name, args, .. } if matches!(name.as_str(), "sprintf" | "printf") => {
+            validate_php_format_call(args, semantic_info)
+        }
         Expr::FunctionCall { args, .. } | Expr::New { args, .. } => {
             validate_exprs(args, semantic_info)
         }
@@ -446,6 +450,34 @@ fn validate_display_expr(expr: &Expr, semantic_info: &SemanticInfo) -> Result<()
         ));
     }
     validate_expr(expr, semantic_info)
+}
+
+fn validate_php_format_call(
+    args: &[Expr],
+    semantic_info: &SemanticInfo,
+) -> Result<(), BackendError> {
+    let Some(format) = args.first() else {
+        return Ok(());
+    };
+    validate_expr(format, semantic_info)?;
+    let Expr::String { value, span } = format else {
+        return validate_exprs(&args[1..], semantic_info);
+    };
+    let Ok(pieces) = format_string::parse(value, *span) else {
+        return validate_exprs(&args[1..], semantic_info);
+    };
+    let conversions = pieces.iter().filter_map(|piece| match piece {
+        FormatPiece::Argument { spec, .. } => Some(spec.conversion),
+        FormatPiece::Literal(_) => None,
+    });
+    for (argument, conversion) in args[1..].iter().zip(conversions) {
+        if conversion == FormatConversion::Display {
+            validate_display_expr(argument, semantic_info)?;
+        } else {
+            validate_expr(argument, semantic_info)?;
+        }
+    }
+    Ok(())
 }
 
 fn validate_exprs(expressions: &[Expr], semantic_info: &SemanticInfo) -> Result<(), BackendError> {

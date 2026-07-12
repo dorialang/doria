@@ -1215,6 +1215,9 @@ function main(): void
 
     assert!(php.contains("function __doria_readline(): ?string"));
     assert!(php.contains("if ($line === false) { return null; }"));
+    assert!(php.contains(
+        "if (preg_match('//u', $line) !== 1) { __doria_io_panic(\"stdin contained invalid UTF-8\"); }"
+    ));
     assert!(php.contains("str_ends_with($line, \"\\n\")"));
     assert!(php.contains("str_ends_with($line, \"\\r\")"));
     assert!(php.contains("__doria_read_file(\"input.txt\")"));
@@ -1224,6 +1227,21 @@ function main(): void
     assert!(php.contains("__doria_write_stderr($line)"));
     assert!(php.contains("__doria_printf(\"enabled=%s\", __doria_display(false))"));
     assert!(php.contains("__doria_sprintf(\"%05d\", 42)"));
+}
+
+#[test]
+fn php_backend_rejects_noncanonical_float_display_in_checked_formats() {
+    for source in [
+        "function main(): void { echo sprintf(\"%s\", 1.5); }",
+        "function main(): void { printf(\"%s\", 1.5); }",
+    ] {
+        let diagnostics = doriac::compile_source_to_php("test.doria", source)
+            .expect_err("PHP must reject float display formatting it cannot preserve canonically");
+        assert_eq!(diagnostics[0].code, "B1301");
+        assert!(diagnostics[0]
+            .message
+            .contains("canonical Stage 16 float display formatting"));
+    }
 }
 
 #[test]
