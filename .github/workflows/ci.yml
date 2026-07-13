@@ -36,7 +36,7 @@ jobs:
         run: cargo install cargo-fuzz --version 0.13.1 --locked
 
       - name: Run bounded parser fuzzing
-        run: cargo fuzz run parser fuzz/corpus/parser -- -max_total_time=30 -timeout=2 -max_len=4096
+        run: cargo +nightly fuzz run parser fuzz/corpus/parser -- -max_total_time=30 -timeout=2 -max_len=4096
 
       - name: Preserve parser fuzz artifacts
         if: failure()
