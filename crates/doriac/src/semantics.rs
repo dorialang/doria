@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::ast::*;
-use crate::builtins::Builtin;
+use crate::builtins::{php_function_suggestion, Builtin};
 use crate::diagnostics::{Diagnostic, DiagnosticResult};
 use crate::format_string::{self, FormatConversion, FormatPiece};
 use crate::numeric::{parse_decimal_magnitude, FloatType, FloatValue, IntegerType, IntegerValue};
@@ -362,10 +362,9 @@ impl<'program> Checker<'program> {
             ));
         }
         match name {
-            "readline" => Some(
-                "Doria uses `read_line`; the PHP spelling `readline` cannot be declared"
-                    .to_string(),
-            ),
+            name if php_function_suggestion(name) == Some("read_line") => Some(format!(
+                "Doria uses `read_line`; the PHP spelling `{name}` cannot be declared"
+            )),
             name if Builtin::from_name(name).is_some() => Some(format!(
                 "`{name}` is a compiler-known Doria built-in and cannot be redeclared"
             )),
@@ -3396,21 +3395,6 @@ impl<'program> Checker<'program> {
             return;
         }
 
-        if name == "readline" {
-            self.diagnostics.push(
-                Diagnostic::new(
-                    "E0461",
-                    "Doria uses `read_line`, not the PHP spelling `readline`",
-                    span,
-                )
-                .with_help("replace `readline()` with `read_line()`"),
-            );
-            for arg in args {
-                self.check_expr(arg, scopes, method_context);
-            }
-            return;
-        }
-
         if name == "panic" {
             self.diagnostics.push(
                 Diagnostic::new(
@@ -3430,11 +3414,25 @@ impl<'program> Checker<'program> {
         }
 
         let Some(function_info) = self.functions.get(name).cloned() else {
-            self.diagnostics.push(Diagnostic::new(
-                "E0309",
-                format!("unknown function `{name}`"),
-                span,
-            ));
+            if let Some(suggestion) = php_function_suggestion(name) {
+                self.diagnostics.push(
+                    Diagnostic::new(
+                        "E0461",
+                        format!("unknown function `{name}`; did you mean `{suggestion}`?"),
+                        span,
+                    )
+                    .with_help(format!("replace `{name}()` with `{suggestion}()`")),
+                );
+                for arg in args {
+                    self.check_expr(arg, scopes, method_context);
+                }
+            } else {
+                self.diagnostics.push(Diagnostic::new(
+                    "E0309",
+                    format!("unknown function `{name}`"),
+                    span,
+                ));
+            }
             return;
         };
 

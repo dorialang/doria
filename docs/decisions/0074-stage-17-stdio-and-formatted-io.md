@@ -7,9 +7,9 @@ Status: Accepted
 Stage 16 established immutable UTF-8 runtime strings and canonical primitive display conversion
 across the interpreter, Cranelift, LLVM, and `doria-rt`. Stage 17 needs synchronous text I/O and
 compile-time-checked formatting without exposing platform handles or prematurely designing the
-future `std::term` API. Existing accepted decisions already occupy 0071 and 0072, so this record
-uses the next unused repository number. The future terminal decision receives its number when it
-is authored.
+future `std::term` API. Existing accepted decisions already occupy 0071 through 0073, so this
+record uses the next unused repository number. The future terminal decision receives its number
+when it is authored.
 
 ## Decision
 
@@ -29,16 +29,21 @@ rejected with guidance to use `echo`. `printf` writes exact bytes, adds no newli
 void. Format arguments evaluate left-to-right exactly once. Stage 17 requires a direct string
 literal format; interpolated and local formats are rejected.
 
+The accepted stdin spelling is `read_line`, not PHP's fused `readline`. The unknown-function
+diagnostic consults shared PHP-to-Doria spelling data and offers `read_line` as a fixit. The same
+data is intended for the future `doriac migrate php` command.
+
 ### Optional-string seed
 
-Stage 17 implements `?string` through declarations, inference, parameters, returns, assignments,
+Stage 17 introduces the Stage 22 nullable model early in this one return position and implements
+`?string` through declarations, inference, parameters, returns, assignments,
 arguments, calls, MIR, and native ABI. Native null is a null runtime-string pointer; a non-null
 value is a normal `DrStringV1` pointer, and the existing retain/release ABI remains null-safe. An
 empty string is never null. `string` and `null` assign to `?string`; a possibly-null string does
 not assign to `string` and is not display-convertible. Equality and inequality with null are
 supported. A `$value != null` true edge narrows the binding to string until assignment invalidates
-the fact. Ordered nullable comparison and the broader Stage 22 nullable feature set remain
-deferred.
+the fact. This is not an I/O-only optional type and will not be replaced; Stage 22 generalizes the
+same model. Ordered nullable comparison and the remaining Stage 22 feature set remain deferred.
 
 ### Line input
 
@@ -54,8 +59,10 @@ one newline remain available for the next call.
 normalization. `write_file` creates or truncates and writes exact bytes. Paths reject embedded
 NUL. Failures panic with stable messages: `failed to read file`, `file contained invalid UTF-8`,
 `failed to write file`, or `file path contained an embedded NUL`. `write_stderr` writes exact bytes
-without a newline. I/O errors are fatal status-101 panics until checked errors land at Stage 29;
-successful behavior is stable while the later recoverable error surface may evolve.
+without a newline. I/O errors are fatal status-101 panics until checked errors land at Stage 29.
+At that stage these free functions migrate to declared `throws` signatures; `null` from
+`read_line` remains EOF only. The text/binary/stream tiers and migration are recorded separately
+in Decision 0075.
 
 ### Checked formatting
 

@@ -1178,6 +1178,47 @@ fn compiles_and_runs_void_main_string_literal_echo() {
 }
 
 #[test]
+fn native_read_file_panics_before_invalid_utf8_enters_a_string() {
+    if !host_linker_is_available() {
+        eprintln!(
+            "native invalid-UTF-8 integration test unavailable: host linker `{}` was not found",
+            host_linker()
+        );
+        return;
+    }
+
+    let directory = temp_working_directory("invalid_utf8_file");
+    fs::create_dir_all(&directory).expect("temporary directory should be created");
+    fs::write(directory.join("invalid.txt"), [b'D', 0xff, b'a'])
+        .expect("invalid UTF-8 fixture should be written");
+    let output = directory.join(if cfg!(windows) {
+        "program.exe"
+    } else {
+        "program"
+    });
+    compile_native_source(
+        r#"
+function main(): void
+{
+    echo read_file("invalid.txt");
+}
+"#,
+        &output,
+    );
+
+    let run = run_native_executable_in_directory(&output, &directory)
+        .expect("native executable should run");
+    assert_eq!(run.status.code(), Some(101));
+    assert!(run.stdout.is_empty());
+    assert_eq!(
+        run.stderr,
+        b"Panic: file contained invalid UTF-8\nStack Trace:\n  at main\n"
+    );
+
+    let _ = fs::remove_dir_all(directory);
+}
+
+#[test]
 fn compiles_and_runs_large_void_main_string_literal_echo() {
     if !host_linker_is_available() {
         eprintln!(
@@ -1225,11 +1266,8 @@ function main(): void
     let output = temp_executable_path("main_stdout_broken_pipe");
     compile_native_source(&source, &output);
 
-    let mut child = Command::new(&output)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("native executable should start");
+    let mut child =
+        spawn_native_executable_with_piped_output(&output).expect("native executable should start");
     drop(child.stdout.take());
 
     let mut stderr = Vec::new();
@@ -3928,11 +3966,31 @@ fn assert_native_run_output(output: &Path, stem: &str, expected_stdout: &[u8]) {
 }
 
 fn run_native_executable(output: &Path) -> io::Result<Output> {
+    retry_transient_executable_busy(|| Command::new(output).output())
+}
+
+fn run_native_executable_in_directory(output: &Path, directory: &Path) -> io::Result<Output> {
+    retry_transient_executable_busy(|| Command::new(output).current_dir(directory).output())
+}
+
+#[cfg(unix)]
+fn spawn_native_executable_with_piped_output(output: &Path) -> io::Result<std::process::Child> {
+    retry_transient_executable_busy(|| {
+        Command::new(output)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+    })
+}
+
+fn retry_transient_executable_busy<T>(
+    mut operation: impl FnMut() -> io::Result<T>,
+) -> io::Result<T> {
     const MAX_ATTEMPTS: usize = 20;
 
     for attempt in 0..MAX_ATTEMPTS {
-        match Command::new(output).output() {
-            Ok(output) => return Ok(output),
+        match operation() {
+            Ok(value) => return Ok(value),
             Err(error) if is_transient_executable_busy(&error) && attempt + 1 < MAX_ATTEMPTS => {
                 thread::sleep(Duration::from_millis(25));
             }
@@ -4002,6 +4060,14 @@ fn temp_executable_path(stem: &str) -> PathBuf {
         "doriac-{stem}-{}-{nanos}{extension}",
         std::process::id()
     ))
+}
+
+fn temp_working_directory(stem: &str) -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    std::env::temp_dir().join(format!("doriac-{stem}-{}-{nanos}", std::process::id()))
 }
 
 fn host_linker_is_available() -> bool {

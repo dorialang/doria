@@ -9,6 +9,18 @@ pub enum Builtin {
     WriteStderr,
 }
 
+/// A PHP free-function spelling and its Doria naming-charter replacement.
+///
+/// This table is compiler-owned data so diagnostics and the future PHP
+/// migration command can teach the same spellings without duplicating policy.
+pub const PHP_FUNCTION_SUGGESTIONS: &[(&str, &str)] = &[("readline", "read_line")];
+
+pub fn php_function_suggestion(name: &str) -> Option<&'static str> {
+    PHP_FUNCTION_SUGGESTIONS
+        .iter()
+        .find_map(|(php, doria)| (*php == name).then_some(*doria))
+}
+
 impl Builtin {
     pub fn from_name(name: &str) -> Option<Self> {
         match name {

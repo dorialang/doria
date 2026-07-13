@@ -63,7 +63,9 @@ Doria was created by a PHP developer who wanted compile-time safety and native p
 
 🚧 **Doria is in early, active development and is not yet ready for use.** The compiler is being built stage by stage against a comprehensive language specification, with a native-first architecture and differential testing at every step. Expect rapid change, breaking changes, and honest roadmaps rather than promises.
 
-Stages 11–17 are implemented on the current compiler branch. Immutable UTF-8 strings are real runtime values with Copy semantics, and Stage 17 adds `read_line(): ?string`, UTF-8 text-file helpers, exact stderr output, and compiler-checked `sprintf`/`printf`. The interpreter, Cranelift fast profile, and LLVM release profile consume the same validated MIR and the durable parity suite compares exact stdin-driven output, panic text, status, and file side effects. Stage 18 full expression interpolation and `Displayable` is next; general nullable types remain Stage 22, and `Bytes` remains Stage 23.
+Stages 11–17 are implemented on the current compiler branch. Immutable UTF-8 strings are real runtime values with Copy semantics, and Stage 17 adds `read_line(): ?string`, UTF-8 text-file helpers, exact stderr output, and compiler-checked `sprintf`/`printf`. `?string` is the first supported use of the nullable model that Stage 22 generalizes. `read_file` validates text before creating a string; Stage 17 I/O failures panic, while Stage 29 moves these functions to declared `throws` signatures. Binary `read_file_bytes`/`write_file_bytes` arrive with `Bytes` at Stage 23, and stream objects follow checked errors after Stage 29.
+
+The interpreter, Cranelift fast profile, and LLVM release profile consume the same validated MIR and the durable parity suite compares exact stdin-driven output, panic text, status, and file side effects. Stage 18 full expression interpolation and `Displayable` is next.
 
 Watch this organization to follow along as the language, the `doriac` compiler, the `baton` build tool, and the standard library take shape.
 

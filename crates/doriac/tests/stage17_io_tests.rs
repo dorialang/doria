@@ -64,6 +64,84 @@ fn php_readline_spelling_is_rejected_with_doria_guidance() {
 }
 
 #[test]
+fn php_readline_fixit_matches_diagnostic_snapshot() {
+    let diagnostics = doriac::check_source(
+        "test.doria",
+        "function main(): void { let $line = readline(); }",
+    )
+    .expect_err("the PHP spelling must produce a diagnostic");
+    let diagnostic = diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.code == "E0461")
+        .expect("the PHP spelling diagnostic should be present");
+    let snapshot = format!(
+        "code: {}\nmessage: {}\nhelp: {}\nspan: {}..{}\n",
+        diagnostic.code,
+        diagnostic.message,
+        diagnostic.help.as_deref().unwrap_or(""),
+        diagnostic.span.start,
+        diagnostic.span.end,
+    );
+
+    let expected =
+        include_str!("fixtures/diagnostics/php_readline_fixit.txt").replace("\r\n", "\n");
+    assert_eq!(snapshot, expected);
+}
+
+#[test]
+fn unimplemented_doria_replacements_are_not_suggested() {
+    let diagnostics = doriac::check_source(
+        "test.doria",
+        "function main(): void { let $result = strcasecmp(\"a\", \"b\"); }",
+    )
+    .expect_err("an undeclared function should remain unknown");
+    assert!(diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == "E0309"
+            && diagnostic.message == "unknown function `strcasecmp`"
+            && diagnostic.help.is_none()
+    }));
+
+    doriac::check_source(
+        "test.doria",
+        r#"
+function strcasecmp(string $left, string $right): int
+{
+    return 0;
+}
+
+function main(): void
+{
+    let $result = strcasecmp("a", "b");
+}
+"#,
+    )
+    .expect("the fixit table must not shadow a declared userland function");
+}
+
+#[test]
+fn read_file_rejects_invalid_utf8_before_constructing_a_string() {
+    let mut files = BTreeMap::new();
+    files.insert("invalid.txt".to_string(), vec![b'D', 0xff, b'a']);
+    let output = interpret(
+        r#"
+function main(): void
+{
+    echo read_file("invalid.txt");
+}
+"#,
+        b"",
+        files,
+    );
+
+    assert!(output.output.stdout.is_empty());
+    assert_eq!(output.output.exit_status, 101);
+    assert_eq!(
+        output.output.stderr,
+        b"Panic: file contained invalid UTF-8\nStack Trace:\n  at main\n"
+    );
+}
+
+#[test]
 fn files_stderr_and_checked_formatting_share_deterministic_io() {
     let mut files = BTreeMap::new();
     files.insert("input.txt".to_string(), "Dória\0line".as_bytes().to_vec());
