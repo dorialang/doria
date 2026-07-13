@@ -323,7 +323,7 @@ unsafe fn last_errno() -> i32 {
 
 #[cfg(unix)]
 extern "C" {
-    fn open(path: *const u8, flags: i32, mode: u32) -> i32;
+    fn open(path: *const u8, flags: i32, ...) -> i32;
     fn read(descriptor: i32, bytes: *mut c_void, byte_length: usize) -> isize;
     fn write(descriptor: i32, bytes: *const c_void, byte_length: usize) -> isize;
     fn close(descriptor: i32) -> i32;
@@ -365,4 +365,57 @@ extern "system" {
         overlapped: *mut c_void,
     ) -> i32;
     fn CloseHandle(handle: *mut c_void) -> i32;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    fn path(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "doria-stage17-{}-{name}-Dória-漢字",
+            std::process::id()
+        ))
+    }
+
+    fn path_bytes(path: &std::path::Path) -> Vec<u8> {
+        path.to_string_lossy().as_bytes().to_vec()
+    }
+
+    #[test]
+    fn text_file_layer_creates_truncates_and_preserves_exact_bytes() {
+        let path = path("roundtrip");
+        let path_bytes = path_bytes(&path);
+        unsafe {
+            write_file(&path_bytes, b"long initial contents").expect("initial write");
+            write_file(&path_bytes, "Dória\n漢字\0🎮".as_bytes()).expect("truncate write");
+            let contents = read_file(&path_bytes).expect("round-trip read");
+            assert_eq!(
+                core::slice::from_raw_parts(contents.bytes, contents.length),
+                "Dória\n漢字\0🎮".as_bytes()
+            );
+            write_file(&path_bytes, b"").expect("empty write");
+            let empty = read_file(&path_bytes).expect("empty read");
+            assert_eq!(empty.length, 0);
+        }
+        fs::remove_file(path).expect("fixture cleanup");
+    }
+
+    #[test]
+    fn text_file_layer_reports_missing_and_embedded_nul_paths() {
+        let missing = path("missing");
+        let _ = fs::remove_file(&missing);
+        unsafe {
+            assert!(matches!(
+                read_file(&path_bytes(&missing)),
+                Err(FileError::Read)
+            ));
+            assert!(matches!(read_file(b"bad\0path"), Err(FileError::PathNul)));
+            assert!(matches!(
+                write_file(b"bad\0path", b"x"),
+                Err(FileError::PathNul)
+            ));
+        }
+    }
 }

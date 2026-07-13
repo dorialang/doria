@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use crate::diagnostics::{Diagnostic, DiagnosticResult};
-use crate::format_string;
+use crate::format_string::{self, FormatConversion, FormatPiece};
 use crate::numeric::{parse_decimal_magnitude, FloatType, FloatValue, IntegerType, IntegerValue};
 use crate::semantics::SemanticInfo;
 use crate::source::Span;
@@ -1057,7 +1057,7 @@ fn is_nullable_string_initializer(expr: &hir::Expr, context: &LoweringContext) -
         hir::Expr::Variable { name, span } => context
             .lookup_local(name, *span)
             .is_ok_and(|local| context.local_type(local) == mir::Type::NullableString),
-        hir::Expr::FunctionCall { name, span, .. } if name == "readline" => true,
+        hir::Expr::FunctionCall { name, span, .. } if name == "read_line" => true,
         hir::Expr::FunctionCall { name, span, .. } => {
             context.lookup_function(name, *span).is_ok_and(|signature| {
                 signature.return_type == mir::ReturnType::Value(mir::Type::NullableString)
@@ -1338,9 +1338,9 @@ fn lower_nullable_string_expression(
                 )]),
             }
         }
-        hir::Expr::FunctionCall { name, args, span } if name == "readline" => {
+        hir::Expr::FunctionCall { name, args, span } if name == "read_line" => {
             if !args.is_empty() {
-                return Err(vec![unsupported(*span, "readline expects no arguments")]);
+                return Err(vec![unsupported(*span, "read_line expects no arguments")]);
             }
             Ok(mir::NullableStringExpression::ReadLine)
         }
@@ -1383,10 +1383,17 @@ fn lower_format_expression(
         )]);
     };
     let pieces = format_string::parse(value, *format_span).map_err(|error| vec![error])?;
+    let specs = pieces.iter().filter_map(|piece| match piece {
+        FormatPiece::Argument { spec, .. } => Some(*spec),
+        FormatPiece::Literal(_) => None,
+    });
     let arguments = args[1..]
         .iter()
-        .map(|argument| {
-            if is_string_local_initializer(argument, context) {
+        .zip(specs)
+        .map(|(argument, spec)| {
+            if spec.conversion == FormatConversion::Display {
+                lower_display_string_expression(argument, context).map(mir::FormatArgument::String)
+            } else if is_string_local_initializer(argument, context) {
                 lower_string_expression(argument, context).map(mir::FormatArgument::String)
             } else {
                 lower_value_expression(argument, context).map(mir::FormatArgument::Value)
@@ -1513,7 +1520,7 @@ fn lower_call_args(
     args.iter()
         .zip(signature.parameter_types)
         .map(|(arg, expected)| {
-            let lowered = lower_rvalue(arg, context)?;
+            let lowered = lower_rvalue_as_expected(arg, expected, context)?;
             if lowered.ty() != expected {
                 return Err(vec![Diagnostic::new(
                     "I1301",
@@ -1538,7 +1545,7 @@ fn lower_return(
     match (return_type, expr) {
         (mir::ReturnType::Void, None) => Ok(mir::Terminator::ReturnVoid),
         (mir::ReturnType::Value(expected), Some(expr)) => {
-            let value = lower_rvalue(expr, context)?;
+            let value = lower_rvalue_as_expected(expr, expected, context)?;
             if value.ty() != expected {
                 return Err(vec![Diagnostic::new(
                     "I1301",
@@ -1707,13 +1714,17 @@ fn lower_value_expression(
     lower_condition(expr, context).map(mir::ValueExpression::Bool)
 }
 
-fn lower_rvalue(expr: &hir::Expr, context: &LoweringContext) -> DiagnosticResult<mir::Rvalue> {
-    if is_nullable_string_initializer(expr, context) {
-        lower_nullable_string_expression(expr, context).map(mir::Rvalue::NullableString)
-    } else if is_string_local_initializer(expr, context) {
-        lower_string_expression(expr, context).map(mir::Rvalue::String)
-    } else {
-        lower_value_expression(expr, context).map(mir::Rvalue::Value)
+fn lower_rvalue_as_expected(
+    expr: &hir::Expr,
+    expected: mir::Type,
+    context: &LoweringContext,
+) -> DiagnosticResult<mir::Rvalue> {
+    match expected {
+        mir::Type::String => lower_string_expression(expr, context).map(mir::Rvalue::String),
+        mir::Type::NullableString => {
+            lower_nullable_string_expression(expr, context).map(mir::Rvalue::NullableString)
+        }
+        mir::Type::Scalar(_) => lower_value_expression(expr, context).map(mir::Rvalue::Value),
     }
 }
 

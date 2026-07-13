@@ -45,6 +45,25 @@ fn lexes_string_quote_kinds() {
 }
 
 #[test]
+fn preserves_utf8_string_literal_characters() {
+    let kinds = token_kinds(r#""Doria — café — 漢字 — 🎮""#);
+    assert!(matches!(
+        &kinds[0],
+        TokenKind::StringLiteral { value, .. }
+            if value == "Doria — café — 漢字 — 🎮"
+    ));
+}
+
+#[test]
+fn preserves_unknown_escapes_before_utf8_characters() {
+    let kinds = token_kinds(r#""\\é\\漢\\🎮""#);
+    assert!(matches!(
+        &kinds[0],
+        TokenKind::StringLiteral { value, .. } if value == "\\é\\漢\\🎮"
+    ));
+}
+
+#[test]
 fn lexes_basic_control_flow_keywords() {
     let kinds = token_kinds("if else while");
     assert!(matches!(kinds[0], TokenKind::If));

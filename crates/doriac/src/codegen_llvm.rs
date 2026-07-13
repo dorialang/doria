@@ -554,7 +554,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     Some(pointer.into()),
                     &[self.current_frame.into()],
                 )?
-                .ok_or_else(|| backend_failure("readline produced no result"))?
+                .ok_or_else(|| backend_failure("read_line produced no result"))?
                 .into_pointer_value()),
             mir::NullableStringExpression::Call { function, args } => Ok(self
                 .lower_call(*function, args, true)?

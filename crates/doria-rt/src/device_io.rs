@@ -76,7 +76,12 @@ pub(crate) unsafe fn flush(stream: StandardStream) -> bool {
 
 #[cfg(unix)]
 pub(crate) unsafe fn is_interactive(stream: StandardStream) -> bool {
-    isatty(descriptor(stream)) == 1
+    is_interactive_descriptor(descriptor(stream))
+}
+
+#[cfg(unix)]
+unsafe fn is_interactive_descriptor(descriptor: i32) -> bool {
+    isatty(descriptor) == 1
 }
 
 #[cfg(windows)]
@@ -87,6 +92,13 @@ const STD_OUTPUT_HANDLE: u32 = -11_i32 as u32;
 const STD_ERROR_HANDLE: u32 = -12_i32 as u32;
 #[cfg(windows)]
 const INVALID_HANDLE_VALUE: *mut c_void = -1_isize as *mut c_void;
+#[cfg(windows)]
+const ERROR_BROKEN_PIPE: u32 = 109;
+
+#[cfg(windows)]
+fn is_pipe_eof(error: u32) -> bool {
+    error == ERROR_BROKEN_PIPE
+}
 
 #[cfg(windows)]
 unsafe fn handle(stream: StandardStream) -> *mut c_void {
@@ -109,6 +121,11 @@ pub(crate) unsafe fn is_interactive(stream: StandardStream) -> bool {
     let Some(handle) = valid_handle(stream) else {
         return false;
     };
+    is_console_handle(handle)
+}
+
+#[cfg(windows)]
+unsafe fn is_console_handle(handle: *mut c_void) -> bool {
     let mut mode = 0_u32;
     GetConsoleMode(handle, &mut mode) != 0
 }
@@ -224,6 +241,9 @@ pub(crate) unsafe fn read(
             ptr::null_mut(),
         ) == 0
         {
+            if is_pipe_eof(GetLastError()) {
+                return Ok(0);
+            }
             return Err(());
         }
         return Ok(read as usize);
@@ -375,6 +395,7 @@ extern "C" {
 #[cfg(windows)]
 extern "system" {
     fn GetStdHandle(standard_handle: u32) -> *mut c_void;
+    fn GetLastError() -> u32;
     fn GetConsoleMode(handle: *mut c_void, mode: *mut u32) -> i32;
     fn ReadFile(
         handle: *mut c_void,
@@ -415,6 +436,53 @@ mod tests {
         assert_eq!(StandardStream::Stdin as u8, 0);
         assert_eq!(StandardStream::Stdout as u8, 1);
         assert_eq!(StandardStream::Stderr as u8, 2);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn closed_pipe_is_stdin_eof() {
+        assert!(is_pipe_eof(ERROR_BROKEN_PIPE));
+        assert!(!is_pipe_eof(5));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pipes_and_redirected_files_are_not_interactive() {
+        use std::fs::File;
+        use std::os::fd::AsRawFd;
+        use std::os::unix::net::UnixStream;
+
+        let (left, right) = UnixStream::pair().expect("Unix stream pair");
+        let redirected = File::open("/dev/null").expect("/dev/null");
+        unsafe {
+            assert!(!is_interactive_descriptor(left.as_raw_fd()));
+            assert!(!is_interactive_descriptor(right.as_raw_fd()));
+            assert!(!is_interactive_descriptor(redirected.as_raw_fd()));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pseudo_terminal_master_is_interactive() {
+        use std::fs::OpenOptions;
+        use std::os::fd::AsRawFd;
+
+        let terminal = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/ptmx")
+            .expect("Linux PTY multiplexer");
+        assert!(unsafe { is_interactive_descriptor(terminal.as_raw_fd()) });
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn redirected_windows_file_handle_is_not_a_console() {
+        use std::fs::File;
+        use std::os::windows::io::AsRawHandle;
+
+        let file = File::open("NUL").expect("Windows NUL device");
+        assert!(!unsafe { is_console_handle(file.as_raw_handle().cast()) });
     }
 
     #[cfg(windows)]

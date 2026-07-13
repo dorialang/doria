@@ -1,0 +1,15 @@
+function main(): void
+{
+    let writable $contents = read_file("seed.txt");
+    let writable $line = read_line();
+    let writable $count = 0;
+
+    while ($line != null) {
+        $contents = $contents . sprintf("|%s:%d", $line, $count);
+        write_file("output.txt", $contents);
+        $line = read_line();
+        $count++;
+    }
+
+    echo read_file("output.txt");
+}

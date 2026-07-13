@@ -2,7 +2,8 @@
   "name": "doria-language-support",
   "displayName": "Doria Language Support",
   "description": "Syntax highlighting and language server diagnostics for .doria files.",
-  "version": "0.1.0",
+  "version": "2026.3.1-canary",
+  "doriaToolchainVersion": "2026.03.1-canary",
   "publisher": "doria",
   "engines": {
     "vscode": "^1.85.0"

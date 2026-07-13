@@ -93,3 +93,25 @@ fn rejects_malformed_mixed_width_float_mir_before_llvm_emission() {
         .message
         .contains("float binary expression has float32 and float operands"));
 }
+
+#[test]
+fn lowers_complete_stage17_io_and_format_mir_to_verified_objects() {
+    for source in [
+        include_str!("../../../examples/native/main_read_line_echo.doria"),
+        include_str!("../../../examples/native/main_file_copy.doria"),
+        include_str!("../../../examples/native/main_sprintf_matrix.doria"),
+        include_str!("../../../examples/native/main_printf_42.doria"),
+        include_str!("../../../examples/native/main_write_stderr.doria"),
+        include_str!("../../../examples/native/main_missing_file_panic.doria"),
+        r#"
+function identity(?string $value): ?string { return $value; }
+function main(): void
+{
+    let $line = identity(read_line());
+    if ($line != null) { echo $line; }
+}
+"#,
+    ] {
+        assert_object(source);
+    }
+}

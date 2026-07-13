@@ -362,6 +362,10 @@ impl<'program> Checker<'program> {
             ));
         }
         match name {
+            "readline" => Some(
+                "Doria uses `read_line`; the PHP spelling `readline` cannot be declared"
+                    .to_string(),
+            ),
             name if Builtin::from_name(name).is_some() => Some(format!(
                 "`{name}` is a compiler-known Doria built-in and cannot be redeclared"
             )),
@@ -389,6 +393,34 @@ impl<'program> Checker<'program> {
             let Item::Function(function) = item else {
                 continue;
             };
+
+            if function
+                .name
+                .get(.."__doria_".len())
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("__doria_"))
+            {
+                self.diagnostics.push(
+                    Diagnostic::new(
+                        "E0310",
+                        "top-level function names beginning with `__doria_` are reserved for compiler-generated helpers",
+                        function.span,
+                    )
+                    .with_help("choose a function name that does not begin with `__doria_`"),
+                );
+                continue;
+            }
+
+            if function.name == "print" {
+                self.diagnostics.push(
+                    Diagnostic::new(
+                        "E0310",
+                        "Doria does not support a top-level `print` function; use `echo`",
+                        function.span,
+                    )
+                    .with_help("remove the `print` declaration and use `echo` for output"),
+                );
+                continue;
+            }
 
             if let Some(message) = Self::reserved_callable_name_message(&function.name) {
                 self.diagnostics
@@ -3353,6 +3385,32 @@ impl<'program> Checker<'program> {
         scopes: &ScopeStack,
         method_context: Option<&MethodContext>,
     ) {
+        if name == "print" {
+            self.diagnostics.push(
+                Diagnostic::new("E0462", "Doria does not support `print`; use `echo`", span)
+                    .with_help("echo writes output and does not return a value"),
+            );
+            for arg in args {
+                self.check_expr(arg, scopes, method_context);
+            }
+            return;
+        }
+
+        if name == "readline" {
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "E0461",
+                    "Doria uses `read_line`, not the PHP spelling `readline`",
+                    span,
+                )
+                .with_help("replace `readline()` with `read_line()`"),
+            );
+            for arg in args {
+                self.check_expr(arg, scopes, method_context);
+            }
+            return;
+        }
+
         if name == "panic" {
             self.diagnostics.push(
                 Diagnostic::new(
@@ -3399,7 +3457,7 @@ impl<'program> Checker<'program> {
         method_context: Option<&MethodContext>,
     ) {
         let expected = match builtin {
-            Builtin::Readline => Some(0),
+            Builtin::ReadLine => Some(0),
             Builtin::ReadFile | Builtin::WriteStderr => Some(1),
             Builtin::WriteFile => Some(2),
             Builtin::Sprintf | Builtin::Printf => None,
@@ -3502,7 +3560,7 @@ impl<'program> Checker<'program> {
                     }
                 }
             }
-            Builtin::Readline | Builtin::Panic => {}
+            Builtin::ReadLine | Builtin::Panic => {}
         }
     }
 
@@ -4579,7 +4637,7 @@ impl<'program> Checker<'program> {
             Expr::FunctionCall { name, .. } => {
                 if let Some(builtin) = Builtin::from_name(name) {
                     match builtin {
-                        Builtin::Readline => self.types.intern(TypeKind::NullableString),
+                        Builtin::ReadLine => self.types.intern(TypeKind::NullableString),
                         Builtin::Sprintf | Builtin::ReadFile => self.types.intern(TypeKind::String),
                         Builtin::Printf
                         | Builtin::WriteFile

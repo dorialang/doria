@@ -906,7 +906,7 @@ fn lower_nullable_string_expression(
             &[resources.current_frame],
             resources,
         )?
-        .ok_or_else(|| backend_failure("readline produced no result")),
+        .ok_or_else(|| backend_failure("read_line produced no result")),
         mir::NullableStringExpression::Call { function, args } => {
             lower_function_call(builder, *function, args, resources)?
                 .ok_or_else(|| malformed_mir("nullable-string call produced no result"))

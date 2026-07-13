@@ -122,7 +122,7 @@
         },
         {
           "name": "invalid.illegal.keyword.rejected.doria",
-          "match": "\\b(?:goto|require|require_once|include_once)\\b|\\buse\\b(?=\\s*\\()"
+          "match": "\\b(?:goto|require|require_once|include_once|print)\\b|\\buse\\b(?=\\s*\\()"
         }
       ]
     },
@@ -605,12 +605,8 @@
     "calls": {
       "patterns": [
         {
-          "match": "\\b([A-Za-z_][A-Za-z0-9_]*)\\s*(?=\\()",
-          "captures": {
-            "1": {
-              "name": "entity.name.function.call.doria"
-            }
-          }
+          "name": "entity.name.function.call.doria",
+          "match": "\\b[A-Za-z_][A-Za-z0-9_]*\\b(?=\\s*\\()"
         }
       ]
     },

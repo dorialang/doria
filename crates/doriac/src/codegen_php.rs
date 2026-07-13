@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::backend::BackendError;
 use crate::diagnostics::Diagnostic;
+use crate::format_string::{self, FormatConversion, FormatPiece};
 use crate::hir::*;
 use crate::numeric::{parse_decimal_magnitude, FloatType, IntegerType};
 use crate::semantics::SemanticInfo;
@@ -15,6 +16,89 @@ pub fn generate(program: &Program) -> Result<String, BackendError> {
 
     let mut output = String::from(
         "<?php\n\nfunction __doria_display(string|int|bool $value): string\n{\n    if (is_bool($value)) { return $value ? 'true' : 'false'; }\n    return (string) $value;\n}\n\nfunction __doria_less(string|int|float|bool $left, string|int|float|bool $right): bool\n{\n    if (is_string($left) && is_string($right)) { return strcmp($left, $right) < 0; }\n    return $left < $right;\n}\n\nfunction __doria_less_equal(string|int|float|bool $left, string|int|float|bool $right): bool\n{\n    if (is_string($left) && is_string($right)) { return strcmp($left, $right) <= 0; }\n    return $left <= $right;\n}\n\nfunction __doria_greater(string|int|float|bool $left, string|int|float|bool $right): bool\n{\n    if (is_string($left) && is_string($right)) { return strcmp($left, $right) > 0; }\n    return $left > $right;\n}\n\nfunction __doria_greater_equal(string|int|float|bool $left, string|int|float|bool $right): bool\n{\n    if (is_string($left) && is_string($right)) { return strcmp($left, $right) >= 0; }\n    return $left >= $right;\n}\n\n",
+    );
+    output.push_str(
+        r#"function __doria_io_panic(string $message)
+{
+    fwrite(STDERR, "Panic: " . $message . "\nStack Trace:\n");
+    $helperFunctions = [
+        "__doria_io_panic",
+        "__doria_read_line",
+        "__doria_read_file",
+        "__doria_write_file",
+        "__doria_write_all",
+        "__doria_write_stderr",
+        "__doria_sprintf",
+        "__doria_printf",
+    ];
+    foreach (debug_backtrace(DEBUG_BACKTRACE_IGNORE_ARGS) as $frame) {
+        if (isset($frame["function"]) &&
+            (isset($frame["class"]) || !in_array($frame["function"], $helperFunctions, true))) {
+            fwrite(STDERR, "  at " . $frame["function"] . "\n");
+        }
+    }
+    exit(101);
+}
+
+function __doria_read_line(): ?string
+{
+    $line = @fgets(STDIN);
+    if ($line === false) {
+        if (feof(STDIN)) { return null; }
+        __doria_io_panic("failed to read stdin");
+    }
+    if (preg_match('//u', $line) !== 1) { __doria_io_panic("stdin contained invalid UTF-8"); }
+    if (str_ends_with($line, "\n")) {
+        $line = substr($line, 0, -1);
+        if (str_ends_with($line, "\r")) { $line = substr($line, 0, -1); }
+    }
+    return $line;
+}
+
+function __doria_read_file(string $path): string
+{
+    if (str_contains($path, "\0")) { __doria_io_panic("file path contained an embedded NUL"); }
+    $contents = @file_get_contents($path);
+    if ($contents === false) { __doria_io_panic("failed to read file"); }
+    if (preg_match('//u', $contents) !== 1) { __doria_io_panic("file contained invalid UTF-8"); }
+    return $contents;
+}
+
+function __doria_write_file(string $path, string $contents): void
+{
+    if (str_contains($path, "\0")) { __doria_io_panic("file path contained an embedded NUL"); }
+    $written = @file_put_contents($path, $contents);
+    if ($written === false || $written !== strlen($contents)) { __doria_io_panic("failed to write file"); }
+}
+
+function __doria_write_all(mixed $stream, string $value, string $failure): void
+{
+    $offset = 0;
+    $length = strlen($value);
+    while ($offset < $length) {
+        $written = @fwrite($stream, substr($value, $offset));
+        if ($written === false || $written === 0) { __doria_io_panic($failure); }
+        $offset += $written;
+    }
+}
+
+function __doria_write_stderr(string $value): void
+{
+    __doria_write_all(STDERR, $value, "failed to write stderr");
+}
+
+function __doria_sprintf(string $format, mixed ...$values): string
+{
+    return sprintf($format, ...$values);
+}
+
+function __doria_printf(string $format, mixed ...$values): void
+{
+    $value = sprintf($format, ...$values);
+    __doria_write_all(STDOUT, $value, "failed to write stdout");
+}
+
+"#,
     );
     let mut scopes = PhpNameScopes::new();
     for item in &program.items {
@@ -271,6 +355,9 @@ fn validate_expr(expr: &Expr, semantic_info: &SemanticInfo) -> Result<(), Backen
             validate_expr(object, semantic_info)?;
             validate_exprs(args, semantic_info)
         }
+        Expr::FunctionCall { name, args, .. } if matches!(name.as_str(), "sprintf" | "printf") => {
+            validate_php_format_call(args, semantic_info)
+        }
         Expr::FunctionCall { args, .. } | Expr::New { args, .. } => {
             validate_exprs(args, semantic_info)
         }
@@ -388,6 +475,39 @@ fn validate_display_expr(expr: &Expr, semantic_info: &SemanticInfo) -> Result<()
         ));
     }
     validate_expr(expr, semantic_info)
+}
+
+fn validate_php_format_call(
+    args: &[Expr],
+    semantic_info: &SemanticInfo,
+) -> Result<(), BackendError> {
+    let Some(format) = args.first() else {
+        return Ok(());
+    };
+    validate_expr(format, semantic_info)?;
+    let Expr::String { value, span } = format else {
+        return validate_exprs(&args[1..], semantic_info);
+    };
+    let Ok(pieces) = format_string::parse(value, *span) else {
+        return validate_exprs(&args[1..], semantic_info);
+    };
+    let conversions = pieces.iter().filter_map(|piece| match piece {
+        FormatPiece::Argument { spec, .. } => Some(spec.conversion),
+        FormatPiece::Literal(_) => None,
+    });
+    for (argument, conversion) in args[1..].iter().zip(conversions) {
+        match conversion {
+            FormatConversion::Display => validate_display_expr(argument, semantic_info)?,
+            FormatConversion::Float => {
+                return Err(unsupported_numeric_shape(
+                    argument.span(),
+                    "canonical Stage 17 `%f` formatting",
+                ));
+            }
+            _ => validate_expr(argument, semantic_info)?,
+        }
+    }
+    Ok(())
 }
 
 fn validate_exprs(expressions: &[Expr], semantic_info: &SemanticInfo) -> Result<(), BackendError> {
@@ -1024,13 +1144,7 @@ fn emit_expr(expr: &Expr, scopes: &PhpNameScopes) -> String {
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
-        Expr::FunctionCall { name, args, .. } => format!(
-            "{name}({})",
-            args.iter()
-                .map(|arg| emit_expr(arg, scopes))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
+        Expr::FunctionCall { name, args, .. } => emit_function_call(name, args, scopes),
         Expr::StaticCall {
             class_name,
             method,
@@ -1181,6 +1295,74 @@ fn emit_binary_op(op: &BinaryOp) -> &'static str {
     }
 }
 
+fn emit_function_call(name: &str, args: &[Expr], scopes: &PhpNameScopes) -> String {
+    let helper = match name {
+        "read_line" => "__doria_read_line",
+        "read_file" => "__doria_read_file",
+        "write_file" => "__doria_write_file",
+        "write_stderr" => "__doria_write_stderr",
+        "sprintf" => "__doria_sprintf",
+        "printf" => "__doria_printf",
+        _ => name,
+    };
+    let mut emitted = args
+        .iter()
+        .map(|argument| emit_expr(argument, scopes))
+        .collect::<Vec<_>>();
+    if matches!(name, "sprintf" | "printf") {
+        if let Some(Expr::String { value, span }) = args.first() {
+            if let Ok(pieces) = format_string::parse(value, *span) {
+                emitted[0] = emit_php_string_literal(&php_format_from_plan(&pieces));
+                let conversions = pieces.iter().filter_map(|piece| match piece {
+                    FormatPiece::Argument { spec, .. } => Some(spec.conversion),
+                    FormatPiece::Literal(_) => None,
+                });
+                for (argument, conversion) in emitted.iter_mut().skip(1).zip(conversions) {
+                    if conversion == FormatConversion::Display {
+                        *argument = format!("__doria_display({argument})");
+                    }
+                }
+            }
+        }
+    }
+    format!("{helper}({})", emitted.join(", "))
+}
+
+fn php_format_from_plan(pieces: &[FormatPiece]) -> String {
+    let mut format = String::new();
+    for piece in pieces {
+        match piece {
+            FormatPiece::Literal(value) => format.push_str(&value.replace('%', "%%")),
+            FormatPiece::Argument { spec, .. } => {
+                format.push('%');
+                if spec.left_align {
+                    format.push('-');
+                }
+                if spec.zero_pad {
+                    format.push('0');
+                }
+                if let Some(width) = spec.width {
+                    format.push_str(&width.to_string());
+                }
+                if let Some(precision) = spec.precision {
+                    format.push('.');
+                    format.push_str(&precision.to_string());
+                }
+                format.push(match spec.conversion {
+                    FormatConversion::Display => 's',
+                    FormatConversion::Decimal => 'd',
+                    FormatConversion::Float => 'F',
+                    FormatConversion::HexLower => 'x',
+                    FormatConversion::HexUpper => 'X',
+                    FormatConversion::Octal => 'o',
+                    FormatConversion::Binary => 'b',
+                });
+            }
+        }
+    }
+    format
+}
+
 fn emit_member_access(access: &MemberAccess) -> &'static str {
     match access {
         MemberAccess::External => "public",
@@ -1189,11 +1371,16 @@ fn emit_member_access(access: &MemberAccess) -> &'static str {
 }
 
 fn php_type(ty: &TypeRef) -> String {
-    match ty.name.as_str() {
+    let name = match ty.name.as_str() {
         "int" | "int64" => "int".to_string(),
         "float" | "float32" | "float64" => "float".to_string(),
         "List" | "Dictionary" | "Set" | "[]" => "array".to_string(),
         name => name.to_string(),
+    };
+    if ty.nullable {
+        format!("?{name}")
+    } else {
+        name
     }
 }
 

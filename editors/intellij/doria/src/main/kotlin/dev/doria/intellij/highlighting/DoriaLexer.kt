@@ -446,8 +446,9 @@ class DoriaLexer : LexerBase() {
 
             else -> when {
                 isFunctionDeclarationName() -> DoriaTokenTypes.FUNCTION_DECLARATION
+                isConstructorTypeName() -> DoriaTokenTypes.TYPE_NAME
+                isCallName() -> callableTokenType()
                 text.first().isUpperCase() -> DoriaTokenTypes.TYPE_NAME
-                nextNonWhitespace(tokenEnd) == '(' -> callableTokenType()
                 else -> DoriaTokenTypes.IDENTIFIER
             }
         }
@@ -555,6 +556,40 @@ class DoriaLexer : LexerBase() {
 
     private fun isFunctionDeclarationName(): Boolean =
         nextNonWhitespace(tokenEnd) == '(' && previousIdentifier() == "function"
+
+    private fun isCallName(): Boolean = nextNonWhitespace(tokenEnd) == '('
+
+    private fun isConstructorTypeName(): Boolean {
+        if (nextNonWhitespace(tokenEnd) != '(') {
+            return false
+        }
+
+        var cursor = tokenStart - 1
+        while (cursor >= startOffset && buffer[cursor].isWhitespace()) {
+            cursor--
+        }
+        while (cursor >= startOffset && buffer[cursor] == '\\') {
+            cursor--
+            while (cursor >= startOffset && buffer[cursor].isWhitespace()) {
+                cursor--
+            }
+            while (cursor >= startOffset && isIdentifierPart(buffer[cursor])) {
+                cursor--
+            }
+            while (cursor >= startOffset && buffer[cursor].isWhitespace()) {
+                cursor--
+            }
+        }
+        if (cursor < startOffset || !isIdentifierPart(buffer[cursor])) {
+            return false
+        }
+
+        val end = cursor + 1
+        while (cursor >= startOffset && isIdentifierPart(buffer[cursor])) {
+            cursor--
+        }
+        return buffer.subSequence(cursor + 1, end).toString() == "new"
+    }
 
     private fun callableTokenType(): IElementType = when (previousAccessor()) {
         "->" -> DoriaTokenTypes.METHOD_CALL
@@ -837,7 +872,7 @@ class DoriaLexer : LexerBase() {
         private val WORD_OPERATORS = setOf("not", "and", "or", "xor")
         private val LOGICAL_SYMBOL_OPERATORS = setOf("!", "&&", "||")
 
-        private val INVALID_KEYWORDS = setOf("goto", "require", "require_once", "include_once")
+        private val INVALID_KEYWORDS = setOf("goto", "require", "require_once", "include_once", "print")
 
         private val MODIFIERS = setOf("writable", "readonly", "internal")
 

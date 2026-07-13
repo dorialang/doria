@@ -1,7 +1,7 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Builtin {
     Panic,
-    Readline,
+    ReadLine,
     Sprintf,
     Printf,
     ReadFile,
@@ -13,7 +13,7 @@ impl Builtin {
     pub fn from_name(name: &str) -> Option<Self> {
         match name {
             "panic" => Some(Self::Panic),
-            "readline" => Some(Self::Readline),
+            "read_line" => Some(Self::ReadLine),
             "sprintf" => Some(Self::Sprintf),
             "printf" => Some(Self::Printf),
             "read_file" => Some(Self::ReadFile),
@@ -26,7 +26,7 @@ impl Builtin {
     pub const fn name(self) -> &'static str {
         match self {
             Self::Panic => "panic",
-            Self::Readline => "readline",
+            Self::ReadLine => "read_line",
             Self::Sprintf => "sprintf",
             Self::Printf => "printf",
             Self::ReadFile => "read_file",

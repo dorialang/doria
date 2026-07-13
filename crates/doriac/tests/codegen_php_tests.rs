@@ -962,6 +962,56 @@ function main(): void
 }
 
 #[test]
+fn php_io_panic_trace_preserves_allowed_doria_helper_named_methods() {
+    let php = doriac::compile_source_to_php(
+        "test.doria",
+        r#"
+class Reader
+{
+    function __doria_read_file(): void
+    {
+        read_file("__doria_missing_stage17_frame_test__/missing.txt");
+    }
+}
+
+function main(): void
+{
+    let $reader = new Reader();
+    $reader->__doria_read_file();
+}
+"#,
+    )
+    .expect("allowed helper-named methods should lower through PHP compatibility");
+
+    assert!(php.contains("isset($frame[\"class\"])"));
+    assert!(php.contains("in_array($frame[\"function\"], $helperFunctions, true)"));
+
+    let Ok(version) = Command::new("php").arg("--version").output() else {
+        return;
+    };
+    if !version.status.success() {
+        return;
+    }
+
+    let script = format!(
+        "{}\nmain();",
+        php.strip_prefix("<?php").expect("generated PHP header")
+    );
+    let run = Command::new("php")
+        .arg("-r")
+        .arg(script)
+        .output()
+        .expect("PHP should execute generated output");
+
+    assert_eq!(run.status.code(), Some(101));
+    assert!(run.stdout.is_empty());
+    assert_eq!(
+        run.stderr,
+        b"Panic: failed to read file\nStack Trace:\n  at __doria_read_file\n  at main\n"
+    );
+}
+
+#[test]
 fn php_backend_uses_text_output_shape() {
     let output = doriac::compile_source(
         "test.doria",
@@ -1101,6 +1151,23 @@ function array(): void
 }
 
 #[test]
+fn rejects_compiler_helper_function_namespace_before_php_codegen() {
+    let err = doriac::compile_source_to_php(
+        "test.doria",
+        r#"
+function __doria_read_line(): void
+{
+}
+"#,
+    )
+    .expect_err("compiler helper names must be rejected before PHP codegen");
+
+    assert!(err.iter().any(|diagnostic| {
+        diagnostic.code == "E0310" && diagnostic.message.contains("`__doria_`")
+    }));
+}
+
+#[test]
 fn lowers_interpolated_string_to_hir() {
     let lowered = doriac::lower_source(
         "test.doria",
@@ -1193,4 +1260,75 @@ fn compiles_person_example_with_explicit_interpolation() {
     ));
     assert!(!php.contains("{$this->name}"));
     assert!(!php.contains("{$this->age}"));
+}
+
+#[test]
+fn php_backend_lowers_stage17_io_with_doria_failure_checks() {
+    let php = doriac::compile_source_to_php(
+        "test.doria",
+        r#"
+function main(): void
+{
+    let writable $line = read_line();
+    if ($line != null) { write_stderr($line); }
+    let $contents = read_file("input.txt");
+    write_file("copy.txt", $contents);
+    printf("enabled=%s", false);
+    echo sprintf("%05d", 42);
+}
+"#,
+    )
+    .expect("Stage 17 PHP compatibility lowering should succeed");
+
+    assert!(php.contains("function __doria_read_line(): ?string"));
+    assert!(php.contains("function __doria_io_panic(string $message)"));
+    assert!(!php.contains("function __doria_io_panic(string $message): never"));
+    assert!(php.contains("if ($line === false)"));
+    assert!(php.contains("if (feof(STDIN)) { return null; }"));
+    assert!(php.contains("__doria_io_panic(\"failed to read stdin\")"));
+    assert!(php.contains(
+        "if (preg_match('//u', $line) !== 1) { __doria_io_panic(\"stdin contained invalid UTF-8\"); }"
+    ));
+    assert!(php.contains("str_ends_with($line, \"\\n\")"));
+    assert!(php.contains("str_ends_with($line, \"\\r\")"));
+    assert!(php.contains("__doria_read_file(\"input.txt\")"));
+    assert!(php.contains("$contents === false"));
+    assert!(php.contains("__doria_write_file(\"copy.txt\", $contents)"));
+    assert!(php.contains("$written === false || $written !== strlen($contents)"));
+    assert!(php.contains("__doria_write_stderr($line)"));
+    assert!(php.contains("__doria_printf(\"enabled=%s\", __doria_display(false))"));
+    assert!(php.contains("__doria_sprintf(\"%05d\", 42)"));
+}
+
+#[test]
+fn php_backend_rejects_noncanonical_float_display_in_checked_formats() {
+    for source in [
+        "function main(): void { echo sprintf(\"%s\", 1.5); }",
+        "function main(): void { printf(\"%s\", 1.5); }",
+    ] {
+        let diagnostics = doriac::compile_source_to_php("test.doria", source)
+            .expect_err("PHP must reject float display formatting it cannot preserve canonically");
+        assert_eq!(diagnostics[0].code, "B1301");
+        assert!(diagnostics[0]
+            .message
+            .contains("canonical Stage 16 float display formatting"));
+    }
+}
+
+#[test]
+fn php_backend_keeps_stage17_frontend_rejections_and_uint64_honesty() {
+    for source in [
+        "function main(): void { print(\"x\"); }",
+        "function main(): void { let $format = \"%d\"; echo sprintf($format, 1); }",
+    ] {
+        doriac::compile_source_to_php("test.doria", source)
+            .expect_err("invalid Doria must fail before PHP lowering");
+    }
+
+    let error = doriac::compile_source_to_php(
+        "test.doria",
+        "function main(): void { uint64 $value = 18446744073709551615; echo sprintf(\"%d\", $value); }",
+    )
+    .expect_err("PHP must reject uint64 formatting it cannot preserve");
+    assert!(error.iter().any(|diagnostic| diagnostic.code == "B1301"));
 }

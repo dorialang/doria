@@ -121,15 +121,15 @@ class DoriaSyntaxHighlighter : SyntaxHighlighter {
         )
         val FUNCTION_CALL: TextAttributesKey = TextAttributesKey.createTextAttributesKey(
             "DORIA_FUNCTION_CALL",
-            DefaultLanguageHighlighterColors.FUNCTION_CALL,
+            DefaultLanguageHighlighterColors.FUNCTION_DECLARATION,
         )
         val METHOD_CALL: TextAttributesKey = TextAttributesKey.createTextAttributesKey(
             "DORIA_METHOD_CALL",
-            DefaultLanguageHighlighterColors.INSTANCE_METHOD,
+            DefaultLanguageHighlighterColors.FUNCTION_DECLARATION,
         )
         val STATIC_METHOD_CALL: TextAttributesKey = TextAttributesKey.createTextAttributesKey(
             "DORIA_STATIC_METHOD_CALL",
-            DefaultLanguageHighlighterColors.STATIC_METHOD,
+            DefaultLanguageHighlighterColors.FUNCTION_DECLARATION,
         )
         val IDENTIFIER: TextAttributesKey = TextAttributesKey.createTextAttributesKey(
             "DORIA_IDENTIFIER",

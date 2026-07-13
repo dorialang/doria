@@ -17,7 +17,7 @@ is authored.
 
 Stage 17 adds compiler-known free functions that cannot be redeclared:
 
-- `readline(): ?string`
+- `read_line(): ?string`
 - `sprintf(string-literal-format, ...arguments): string`
 - `printf(string-literal-format, ...arguments): void`
 - `read_file(string $path): string`
@@ -42,7 +42,7 @@ deferred.
 
 ### Line input
 
-`readline` reads stdin synchronously. It removes one LF or one CRLF line ending and no other
+`read_line` reads stdin synchronously. It removes one LF or one CRLF line ending and no other
 whitespace. Empty lines return a non-null empty string. EOF after bytes returns the final line;
 EOF before bytes returns null. Embedded NUL is preserved. Invalid UTF-8 panics with `stdin
 contained invalid UTF-8`; an OS failure panics with `failed to read stdin`. Buffered bytes beyond
@@ -87,8 +87,8 @@ normal returns release non-returned locals and panic remains abort-only.
 
 1. raw standard-device reads, writes, explicit stdout/stderr flush, and independent stdin/stdout/
    stderr interactivity queries;
-2. UTF-8 text and readline line discipline, including buffering and newline removal;
-3. language operations used by echo, printf, write_stderr, readline, panic, and future stdlib
+2. UTF-8 text and read_line line discipline, including buffering and newline removal;
+3. language operations used by echo, printf, write_stderr, read_line, panic, and future stdlib
    wrappers.
 
 Raw reads never detect newlines. Flush may be an intentional no-op while raw writes are

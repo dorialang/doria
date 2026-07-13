@@ -25,13 +25,11 @@ pub(crate) unsafe fn read_line() -> Result<Option<(*const u8, usize)>, ReadLineE
     loop {
         if let Some(newline) = find_newline() {
             let line_start = START;
-            let mut line_end = newline;
-            if line_end > line_start && *BUFFER.add(line_end - 1) == b'\r' {
-                line_end -= 1;
-            }
+            let raw = core::slice::from_raw_parts(BUFFER.add(line_start), newline + 1 - line_start);
+            let line_length = strip_line_ending(raw).len();
             START = newline + 1;
-            validate_utf8(BUFFER.add(line_start), line_end - line_start)?;
-            return Ok(Some((BUFFER.add(line_start), line_end - line_start)));
+            validate_utf8(BUFFER.add(line_start), line_length)?;
+            return Ok(Some((BUFFER.add(line_start), line_length)));
         }
 
         if EOF {
@@ -54,6 +52,13 @@ pub(crate) unsafe fn read_line() -> Result<Option<(*const u8, usize)>, ReadLineE
             END += read;
         }
     }
+}
+
+fn strip_line_ending(bytes: &[u8]) -> &[u8] {
+    let Some(without_lf) = bytes.strip_suffix(b"\n") else {
+        return bytes;
+    };
+    without_lf.strip_suffix(b"\r").unwrap_or(without_lf)
 }
 
 unsafe fn find_newline() -> Option<usize> {
@@ -106,4 +111,24 @@ unsafe fn ensure_capacity(required: usize) -> Result<(), ReadLineError> {
     BUFFER = replacement;
     CAPACITY = required;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::strip_line_ending;
+
+    #[test]
+    fn line_discipline_strips_only_lf_and_crlf() {
+        for (input, expected) in [
+            (b"alpha\n".as_slice(), b"alpha".as_slice()),
+            (b"alpha\r\n".as_slice(), b"alpha".as_slice()),
+            (b"\n".as_slice(), b"".as_slice()),
+            (b"final".as_slice(), b"final".as_slice()),
+            (b"space \t\r".as_slice(), b"space \t\r".as_slice()),
+            (b"a\0b\n".as_slice(), b"a\0b".as_slice()),
+            ("Dória 🎮\n".as_bytes(), "Dória 🎮".as_bytes()),
+        ] {
+            assert_eq!(strip_line_ending(input), expected);
+        }
+    }
 }

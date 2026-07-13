@@ -14,10 +14,13 @@ $vscodeGrammar = $root . '/editors/vscode/doria/syntaxes/doria.tmLanguage.json';
 $vscodeLanguageConfiguration = $root . '/editors/vscode/doria/language-configuration.json';
 $vscodeExtension = $root . '/editors/vscode/doria/extension.js';
 $intellijLexer = $root . '/editors/intellij/doria/src/main/kotlin/dev/doria/intellij/highlighting/DoriaLexer.kt';
+$intellijBuildGradle = $root . '/editors/intellij/doria/build.gradle';
 $intellijTokenTypes = $root . '/editors/intellij/doria/src/main/kotlin/dev/doria/intellij/highlighting/DoriaTokenTypes.kt';
 $intellijSyntaxHighlighter = $root . '/editors/intellij/doria/src/main/kotlin/dev/doria/intellij/highlighting/DoriaSyntaxHighlighter.kt';
 $intellijLspFiles = $root . '/editors/intellij/doria/src/main/kotlin/dev/doria/intellij/lsp/DoriaLspFiles.kt';
 $intellijPluginXml = $root . '/editors/intellij/doria/src/main/resources/META-INF/plugin.xml';
+$intellijPluginIcon = $root . '/editors/intellij/doria/src/main/resources/META-INF/pluginIcon.svg';
+$doriaLogo = $root . '/res/images/doria-app-icon-warm.svg';
 $lspServer = $root . '/crates/doriac/src/lsp.rs';
 $fixture = $root . '/editors/fixtures/latest-tokens.doria';
 $rejectedFixture = $root . '/editors/fixtures/rejected-syntax.doria';
@@ -221,7 +224,7 @@ $rejectedPreprocessor = [
     'warning',
     'error',
 ];
-$rejectedKeywords = ['goto', 'require', 'require_once', 'include_once'];
+$rejectedKeywords = ['goto', 'require', 'require_once', 'include_once', 'print'];
 $strictComparison = ['===', '!=='];
 $notKeywords = ['public', 'private', 'protected', 'Result', 'object'];
 function fail_check(string $message): never
@@ -316,6 +319,11 @@ function check_vscode_package(): void
     global $vscodePackage;
 
     $package = load_json($vscodePackage);
+    require_check(
+        ($package['version'] ?? null) === '2026.3.1-canary' &&
+            ($package['doriaToolchainVersion'] ?? null) === '2026.03.1-canary',
+        'VS Code package must carry the pre-1.0 canary encoding of Doria CalVer 2026.03.1-canary'
+    );
     $grammars = $package['contributes']['grammars'] ?? [];
     require_check(
         any_match(
@@ -511,6 +519,25 @@ function check_vscode_grammar(): void
         require_check(str_contains($grammarText, $scope), "VS Code grammar is missing '{$scope}'");
     }
 
+    $callPatterns = $grammar['repository']['calls']['patterns'] ?? [];
+    $functionCallMatches = [];
+    foreach ($callPatterns as $pattern) {
+        if (($pattern['name'] ?? null) === 'entity.name.function.call.doria') {
+            $functionCallMatches[] = (string) ($pattern['match'] ?? '');
+        }
+    }
+    require_check($functionCallMatches !== [], 'VS Code grammar must define contextual function-call highlighting');
+    foreach (['read_file', 'calculateReport', 'saveReport', 'formatReport'] as $call) {
+        require_check(
+            any_match($functionCallMatches, static fn (string $match): bool => regex_matches($match, $call . ' (')),
+            "VS Code grammar must highlight arbitrary call name '{$call}' before an opening parenthesis"
+        );
+    }
+    require_check(
+        !any_match($functionCallMatches, static fn (string $match): bool => regex_matches($match, 'calculateReport;')),
+        'VS Code grammar must not classify a bare identifier as a function call'
+    );
+
     $attributePatterns = $grammar['repository']['attributes']['patterns'] ?? [];
     require_check($attributePatterns !== [], 'VS Code grammar must define attribute highlighting');
     $attributeBegin = (string) ($attributePatterns[0]['begin'] ?? '');
@@ -549,7 +576,12 @@ function check_intellij_lexer(): void
 {
     global $acceptedKeywords, $primitiveTypes, $reservedTypes, $plannedTypes, $wordOperators, $stage13SymbolOperators, $booleanSymbolOperators;
     global $notKeywords, $strictComparison, $rejectedPreprocessor, $rejectedKeywords, $rejectedTypes;
-    global $intellijLexer, $intellijTokenTypes, $intellijSyntaxHighlighter, $intellijPluginXml;
+    global $intellijLexer, $intellijBuildGradle, $intellijTokenTypes, $intellijSyntaxHighlighter, $intellijPluginXml, $intellijPluginIcon, $doriaLogo;
+
+    require_check(
+        str_contains(read_text($intellijBuildGradle), "version = '2026.03.1-canary'"),
+        'IntelliJ package must carry the pre-1.0 Doria CalVer canary suffix'
+    );
 
     $lexerText = read_text($intellijLexer);
     $intellijHighlightingText = implode("\n", [
@@ -668,11 +700,44 @@ function check_intellij_lexer(): void
             str_contains($lexerText, 'DoriaTokenTypes.ATTRIBUTE_ARGUMENT'),
         'IntelliJ lexer must emit dedicated attribute tokens'
     );
+    require_check(
+        str_contains($lexerText, "private fun isCallName(): Boolean = nextNonWhitespace(tokenEnd) == '('") &&
+            str_contains($lexerText, 'isCallName() -> callableTokenType()') &&
+            str_contains($lexerText, 'callableTokenType()') &&
+            str_contains($lexerText, '"->" -> DoriaTokenTypes.METHOD_CALL') &&
+            str_contains($lexerText, '"::" -> DoriaTokenTypes.STATIC_METHOD_CALL') &&
+            str_contains($lexerText, 'else -> DoriaTokenTypes.FUNCTION_CALL'),
+        'IntelliJ lexer must classify calls from parenthesis and accessor context rather than a name list'
+    );
+    require_check(
+        str_contains($lexerText, 'isConstructorTypeName() -> DoriaTokenTypes.TYPE_NAME') &&
+            str_contains($lexerText, "buffer[cursor] == '\\\\'") &&
+            str_contains($lexerText, 'toString() == "new"') &&
+            strpos($lexerText, 'isConstructorTypeName() -> DoriaTokenTypes.TYPE_NAME') <
+                strpos($lexerText, 'isCallName() -> callableTokenType()') &&
+            strpos($lexerText, 'isCallName() -> callableTokenType()') <
+                strpos($lexerText, 'text.first().isUpperCase() -> DoriaTokenTypes.TYPE_NAME'),
+        'IntelliJ lexer must preserve constructor type names while prioritizing other call syntax over capitalization'
+    );
+    foreach (['FUNCTION_CALL', 'METHOD_CALL', 'STATIC_METHOD_CALL'] as $callStyle) {
+        require_check(
+            preg_match(
+                '/val ' . $callStyle . ': TextAttributesKey = TextAttributesKey\.createTextAttributesKey\(\s*"DORIA_' . $callStyle . '",\s*DefaultLanguageHighlighterColors\.FUNCTION_DECLARATION,/s',
+                $intellijHighlightingText
+            ) === 1,
+            'IntelliJ ' . $callStyle . ' must inherit the visible function-declaration color instead of a theme-white call style'
+        );
+    }
 
     $pluginXml = read_text($intellijPluginXml);
     require_check(
         str_contains($pluginXml, 'language=' . chr(34) . 'doria' . chr(34)),
         'IntelliJ plugin must register the lowercase doria language id for Markdown fences'
+    );
+    require_check(is_file($intellijPluginIcon), 'IntelliJ plugin must package META-INF/pluginIcon.svg');
+    require_check(
+        rtrim(read_text($intellijPluginIcon)) === rtrim(read_text($doriaLogo)),
+        'IntelliJ plugin icon must use the canonical Doria README SVG'
     );
 
     foreach ([
@@ -687,6 +752,9 @@ function check_intellij_lexer(): void
         'DORIA_ATTRIBUTE_ARGUMENT',
         'DORIA_LOGICAL_OPERATOR',
         'DORIA_PROPERTY',
+        'DORIA_FUNCTION_CALL',
+        'DORIA_METHOD_CALL',
+        'DORIA_STATIC_METHOD_CALL',
     ] as $tokenType) {
         require_check(str_contains($intellijHighlightingText, $tokenType), "IntelliJ highlighting is missing {$tokenType}");
     }
@@ -847,6 +915,11 @@ function check_fixture(): void
         'echo "Profile: {$this->profile->displayName}";',
         'echo "Count: {$count}";',
         "echo 'Literal {\$name}';",
+        'read_file("input.txt")',
+        'calculateReport($text)',
+        '$repository->saveReport($customResult)',
+        'ReportFormatter::formatReport($customResult)',
+        'new App\Report()',
         '?User',
         '\n\t\r\s',
         'use App\Repositories\UserRepository;',

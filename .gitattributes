@@ -1,0 +1,2 @@
+# Native parity fixtures are byte-exact inputs and expected outputs.
+crates/doriac/tests/fixtures/native_io/** -text

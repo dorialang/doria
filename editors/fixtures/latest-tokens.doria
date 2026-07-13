@@ -77,6 +77,7 @@ function main(): void
     let $wrapped = Int::wrappingAdd(1, 2);
     let $empty = $name->isEmpty();
     Message $message = new Message();
+    let $report = new App\Report();
     PersonRepository $repository = new PersonRepository();
     $message->retryAfter(seconds: 30);
     echo $message->tenantId;
@@ -293,3 +294,16 @@ class Article extends Model implements Publishable
 class ImageResizer
 {
 }
+
+// Stage 17 compiler-known I/O and checked formatting built-ins.
+let writable $line = read_line();
+if ($line != null) {
+    echo sprintf("line=%s", $line);
+}
+printf("code=%05d", 42);
+let $text = read_file("input.txt");
+write_file("copy.txt", $text);
+write_stderr("done");
+let $customResult = calculateReport($text);
+$repository->saveReport($customResult);
+ReportFormatter::formatReport($customResult);

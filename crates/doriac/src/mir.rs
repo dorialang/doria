@@ -656,7 +656,7 @@ impl fmt::Display for NullableStringExpression {
             Self::Null => formatter.write_str("null"),
             Self::String(value) => write!(formatter, "some({value})"),
             Self::Local(local) => write!(formatter, "local{}", local.0),
-            Self::ReadLine => formatter.write_str("readline()"),
+            Self::ReadLine => formatter.write_str("read_line()"),
             Self::Call { function, args } => write_call(formatter, *function, args),
         }
     }
