@@ -1214,7 +1214,9 @@ function main(): void
     .expect("Stage 17 PHP compatibility lowering should succeed");
 
     assert!(php.contains("function __doria_read_line(): ?string"));
-    assert!(php.contains("if ($line === false) { return null; }"));
+    assert!(php.contains("if ($line === false)"));
+    assert!(php.contains("if (feof(STDIN)) { return null; }"));
+    assert!(php.contains("__doria_io_panic(\"failed to read stdin\")"));
     assert!(php.contains(
         "if (preg_match('//u', $line) !== 1) { __doria_io_panic(\"stdin contained invalid UTF-8\"); }"
     ));
