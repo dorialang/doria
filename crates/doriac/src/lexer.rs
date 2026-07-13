@@ -468,16 +468,21 @@ impl<'source> Lexer<'source> {
 
             if byte == b'\\' {
                 self.advance();
-                match self.advance() {
-                    b'n' => value.push('\n'),
-                    b'r' => value.push('\r'),
-                    b't' => value.push('\t'),
-                    b'\\' => value.push('\\'),
-                    b'\'' => value.push('\''),
-                    b'"' => value.push('"'),
+                let Some(character) = self.source.text[self.index..].chars().next() else {
+                    value.push('\\');
+                    continue;
+                };
+                self.index += character.len_utf8();
+                match character {
+                    'n' => value.push('\n'),
+                    'r' => value.push('\r'),
+                    't' => value.push('\t'),
+                    '\\' => value.push('\\'),
+                    '\'' => value.push('\''),
+                    '"' => value.push('"'),
                     other => {
                         value.push('\\');
-                        value.push(other as char);
+                        value.push(other);
                     }
                 }
             } else {

@@ -1214,19 +1214,40 @@ function main(): void
     .expect("Stage 17 PHP compatibility lowering should succeed");
 
     assert!(php.contains("function __doria_readline(): ?string"));
-    assert!(php.contains("if ($line === false) { return null; }"));
+    assert!(php.contains("$line = @fgets(STDIN);"));
+    assert!(php.contains("if (feof(STDIN)) { return null; }"));
+    assert!(php.contains("__doria_io_panic(\"failed to read stdin\")"));
     assert!(php.contains(
         "if (preg_match('//u', $line) !== 1) { __doria_io_panic(\"stdin contained invalid UTF-8\"); }"
     ));
     assert!(php.contains("str_ends_with($line, \"\\n\")"));
     assert!(php.contains("str_ends_with($line, \"\\r\")"));
     assert!(php.contains("__doria_read_file(\"input.txt\")"));
+    assert!(php.contains("str_contains($path, \"\\0\")"));
+    assert!(php.contains("$contents = @file_get_contents($path);"));
     assert!(php.contains("$contents === false"));
     assert!(php.contains("__doria_write_file(\"copy.txt\", $contents)"));
+    assert!(php.contains("$written = @file_put_contents($path, $contents);"));
     assert!(php.contains("$written === false || $written !== strlen($contents)"));
     assert!(php.contains("__doria_write_stderr($line)"));
+    assert!(php.contains("function __doria_write_all(mixed $stream"));
+    assert!(php.contains("while ($offset < $length)"));
+    assert!(php.contains("$offset += $written;"));
     assert!(php.contains("__doria_printf(\"enabled=%s\", __doria_display(false))"));
     assert!(php.contains("__doria_sprintf(\"%05d\", 42)"));
+}
+
+#[test]
+fn php_backend_rejects_noncanonical_float_conversion_in_checked_formats() {
+    let diagnostics = doriac::compile_source_to_php(
+        "test.doria",
+        "function main(): void { echo sprintf(\"%.2f\", -0.0); }",
+    )
+    .expect_err("PHP must reject `%f` formatting it cannot preserve canonically");
+    assert_eq!(diagnostics[0].code, "B1301");
+    assert!(diagnostics[0]
+        .message
+        .contains("canonical Stage 17 `%f` formatting"));
 }
 
 #[test]
