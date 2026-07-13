@@ -296,7 +296,9 @@ class Article extends Model implements Displayable
 }
 
 echo "sum: {left() + right()}";
-echo "literal brace: \\{ and bare }";
+echo "nested string: {sprintf("value={left() + right()}")}";
+echo "commented: {left() /* } { */ + right()}";
+echo "literal brace: \{ and bare }";
 
 #[PhpExport]
 class ImageResizer

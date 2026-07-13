@@ -235,24 +235,7 @@
               "match": "\\\\."
             },
             {
-              "name": "meta.interpolation.doria",
-              "begin": "(?<!\\\\)(\\{)",
-              "beginCaptures": {
-                "1": {
-                  "name": "punctuation.section.interpolation.begin.doria"
-                }
-              },
-              "end": "\\}",
-              "endCaptures": {
-                "0": {
-                  "name": "punctuation.section.interpolation.end.doria"
-                }
-              },
-              "patterns": [
-                {
-                  "include": "$self"
-                }
-              ]
+              "include": "#interpolationExpression"
             }
           ]
         },
@@ -266,6 +249,59 @@
               "match": "\\\\."
             }
           ]
+        }
+      ]
+    },
+    "interpolationExpression": {
+      "name": "meta.interpolation.expression.doria",
+      "begin": "(\\{)",
+      "beginCaptures": {
+        "1": {
+          "name": "punctuation.section.interpolation.begin.doria"
+        }
+      },
+      "end": "(\\})",
+      "endCaptures": {
+        "1": {
+          "name": "punctuation.section.interpolation.end.doria"
+        }
+      },
+      "patterns": [
+        {
+          "include": "#interpolationExpression"
+        },
+        {
+          "include": "#invalid"
+        },
+        {
+          "include": "#comments"
+        },
+        {
+          "include": "#strings"
+        },
+        {
+          "include": "#accessors"
+        },
+        {
+          "include": "#variables"
+        },
+        {
+          "include": "#numbers"
+        },
+        {
+          "include": "#keywords"
+        },
+        {
+          "include": "#types"
+        },
+        {
+          "include": "#calls"
+        },
+        {
+          "include": "#operators"
+        },
+        {
+          "include": "#punctuation"
         }
       ]
     },
