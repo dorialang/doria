@@ -141,6 +141,27 @@ function main(): void
 }
 
 #[test]
+fn narrowed_read_line_values_lower_as_strings_in_calls_and_returns() {
+    let output = interpret(
+        r#"
+function identity(string $value): string { return $value; }
+function nextLine(): string
+{
+    let $line = read_line();
+    if ($line != null) { return identity($line); }
+    return "fallback";
+}
+function main(): void { echo nextLine(); }
+"#,
+        "Dória\n".as_bytes(),
+        BTreeMap::new(),
+    );
+    assert_eq!(output.output.stdout, "Dória".as_bytes());
+    assert!(output.output.stderr.is_empty());
+    assert_eq!(output.output.exit_status, 0);
+}
+
+#[test]
 fn nullable_flow_joins_loops_and_nested_guards_are_sound() {
     for source in [
         r#"

@@ -394,7 +394,11 @@ impl<'program> Checker<'program> {
                 continue;
             };
 
-            if function.name.starts_with("__doria_") {
+            if function
+                .name
+                .get(.."__doria_".len())
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("__doria_"))
+            {
                 self.diagnostics.push(
                     Diagnostic::new(
                         "E0310",

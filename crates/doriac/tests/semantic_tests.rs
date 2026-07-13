@@ -3100,12 +3100,20 @@ fn reserves_compiler_generated_top_level_function_namespace() {
         "test.doria",
         r#"
 function __doria_read_line(): void {}
+function __Doria_mixed_case_helper(): void {}
 function main(): void {}
 "#,
     )
     .expect_err("compiler-generated top-level function names must be reserved");
 
-    assert!(err.iter().any(|diagnostic| {
+    assert_eq!(
+        err.iter()
+            .filter(|diagnostic| diagnostic.code == "E0310")
+            .count(),
+        2,
+        "every ASCII case variant of the generated helper prefix must be reserved"
+    );
+    assert!(err.iter().all(|diagnostic| {
         diagnostic.code == "E0310"
             && diagnostic.message.contains("`__doria_`")
             && diagnostic.help.as_deref()
