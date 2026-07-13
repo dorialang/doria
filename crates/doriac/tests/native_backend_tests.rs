@@ -1268,11 +1268,8 @@ function main(): void
     let output = temp_executable_path("main_stdout_broken_pipe");
     compile_native_source(&source, &output);
 
-    let mut child = Command::new(&output)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("native executable should start");
+    let mut child =
+        spawn_native_executable_with_piped_output(&output).expect("native executable should start");
     drop(child.stdout.take());
 
     let mut stderr = Vec::new();
@@ -3971,11 +3968,27 @@ fn assert_native_run_output(output: &Path, stem: &str, expected_stdout: &[u8]) {
 }
 
 fn run_native_executable(output: &Path) -> io::Result<Output> {
+    retry_transient_executable_busy(|| Command::new(output).output())
+}
+
+#[cfg(unix)]
+fn spawn_native_executable_with_piped_output(output: &Path) -> io::Result<std::process::Child> {
+    retry_transient_executable_busy(|| {
+        Command::new(output)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+    })
+}
+
+fn retry_transient_executable_busy<T>(
+    mut operation: impl FnMut() -> io::Result<T>,
+) -> io::Result<T> {
     const MAX_ATTEMPTS: usize = 20;
 
     for attempt in 0..MAX_ATTEMPTS {
-        match Command::new(output).output() {
-            Ok(output) => return Ok(output),
+        match operation() {
+            Ok(value) => return Ok(value),
             Err(error) if is_transient_executable_busy(&error) && attempt + 1 < MAX_ATTEMPTS => {
                 thread::sleep(Duration::from_millis(25));
             }
