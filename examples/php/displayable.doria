@@ -1,0 +1,14 @@
+class Label implements Displayable
+{
+    function toString(): string
+    {
+        return "Doria";
+    }
+}
+
+let $label = new Label();
+
+echo $label;
+echo " {$label}";
+echo " " . $label;
+echo sprintf(" %s", $label);

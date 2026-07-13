@@ -66,7 +66,7 @@ Valid PHP should be easy to migrate to Doria, but Doria-specific syntax does not
 
 Doria does not use `public`, `protected`, or `private` as member visibility modifiers. Class members are externally accessible by default, and `internal` marks implementation details.
 
-The current compiler implementation lowers the accepted native subset through validated typed MIR. The debug interpreter, default Cranelift fast profile, and `--release` LLVM profile consume that same MIR, and the durable executable parity manifest compares exact stdin-driven stdout bytes, stderr bytes, process status, and declared file side effects across all three paths. The supported subset includes top-level free functions; parameterless int/void `main`; structured control flow and recursion; fixed-width numerics and bool; immutable UTF-8 strings; the narrow Stage 17 `?string` seed; checked formatting; UTF-8 line/file I/O; exact stdout/stderr; and fatal panic. Native strings are private non-atomic refcounted buffers and are Copy at the source level. `main(): int` crosses the accepted `0..125` process boundary and `main(): void` maps normal completion to status `0`. Release optimization does not change observable semantics. `doria-rt` owns process entry, runtime strings, raw standard-device I/O, line discipline, text-file I/O, exact output, panic formatting, and Doria stack traces. Collections, methods/classes, general ownership/borrow checking, arbitrary-expression interpolation/`Displayable`, general nullable types, and `Bytes` remain unsupported. The former Stage 7-10 native smoke module remains retired.
+The current compiler implementation lowers the accepted native subset through validated typed MIR. The debug interpreter, default Cranelift fast profile, and `--release` LLVM profile consume that same MIR, and the durable executable parity manifest compares exact stdin-driven stdout bytes, stderr bytes, process status, and declared file side effects across all three paths. The supported subset includes top-level free functions; parameterless int/void `main`; structured control flow and recursion; fixed-width numerics and bool; immutable UTF-8 strings; full primitive expression interpolation; the narrow Stage 17 `?string` seed; checked formatting; UTF-8 line/file I/O; exact stdout/stderr; and fatal panic. Native strings are private non-atomic refcounted buffers and are Copy at the source level. `main(): int` crosses the accepted `0..125` process boundary and `main(): void` maps normal completion to status `0`. Release optimization does not change observable semantics. `doria-rt` owns process entry, runtime strings, raw standard-device I/O, line discipline, text-file I/O, exact output, panic formatting, and Doria stack traces. Collections, native methods/classes, general ownership checking, general nullable types, and `Bytes` remain unsupported. The compiler-known `Displayable` contract is checked by the frontend and supported by the PHP compatibility backend; native class layout and method dispatch remain Stages 19 and 20. The former Stage 7-10 native smoke module remains retired.
 
 Doria is not a Rust language. Rust is the current bootstrap implementation language for `doriac`, not the permanent identity of the compiler.
 
@@ -546,11 +546,27 @@ echo "Hello, {$name}";
 echo "Hello, {$this->profile->displayName}";
 ```
 
-This slice supports only variable/property-path interpolation: `$name`, `$this`, `$user->name`, and repeated property access. Unbraced interpolation, method calls, function calls, arithmetic, comparisons, custom formatting, and full expressions inside interpolation are future work.
+The contents of each interpolation brace use the ordinary Doria expression grammar. Variables, property paths, grouping, arithmetic, comparisons, function calls, static calls, string calls, and nested expression structure retain their normal parsing and semantic rules. Parts evaluate left-to-right and exactly once; interpolation adds no newline.
 
 Interpolated strings are represented in the AST and Doria IR as string parts before any backend runs. The PHP backend lowers them explicitly, for example `"Hello, {$name}!"` becomes PHP equivalent to `"Hello, " . $name . "!"`.
 
-Interpolated values may currently be `string`, a fixed-width integer, `float`, `bool`, or the internal `Unknown` recovery type. They use the same canonical display conversion as `echo` and `.`. Null, class values, `mixed`, `List<T>`, `Dictionary<K, V>`, and `Set<T>` are rejected. Arbitrary expression interpolation and `Displayable` remain Stage 18.
+Literal opening braces in double-quoted strings are written `\{`. A bare `}` is literal outside an open interpolation, and `\}` is accepted but not required. Brace doubling is not an escape. A bare `{` that does not begin a valid expression is an error with a machine-applicable `\{` fix. Single-quoted strings remain non-interpolating and are the simple choice for brace-heavy text.
+
+Interpolated values may be `string`, a fixed-width integer, `float`, `bool`, or an explicitly conforming `Displayable` class. They use the same canonical display conversion as `echo`, `.`, and Stage 17 `%s`. Null, nullable values without a non-null proof, `mixed`, typed arrays, `List<T>`, `Dictionary<K, V>`, and `Set<T>` are rejected.
+
+`Displayable` is a narrow compiler-known nominal interface contract, not general interface support:
+
+```doria
+class Label implements Displayable
+{
+    function toString(): string
+    {
+        return "Doria";
+    }
+}
+```
+
+Conformance requires the explicit `implements Displayable` declaration and exactly an externally accessible readonly instance `function toString(): string` with no parameters. Method-name coincidence does not conform, and Doria has no `__toString` magic method. Display conversion is limited to interpolation, `echo`, `.`, and `%s`; it does not permit implicit class-to-string assignment. The PHP compatibility backend can execute this exact subset. Native class values and method dispatch remain Stages 19 and 20, while general interfaces remain Stage 35.
 
 The `.` operator is runtime string concatenation. Each operand may be a display-convertible primitive, but at least one operand of that binary operation must already be statically `string`; therefore `"x=" . 1` is valid while `1 . 2` is rejected. The result is `string`, evaluation is left-to-right, and no conversion is implied outside display contexts. `echo`, `.`, and current interpolation parts use decimal integers, shortest-round-trip locale-independent binary32/binary64 floats, lowercase `true`/`false`, and strings unchanged.
 
@@ -579,7 +595,7 @@ Binary file I/O is planned for Stage 23 as `read_file_bytes(...)` and `write_fil
 
 `sprintf` and `printf` require a direct literal format in Stage 17. The compiler parses it into a validated MIR plan before any backend runs. Accepted conversions are `%s`, `%d`, `%f`, `%x`, `%X`, `%o`, `%b`, and `%%`; accepted controls are decimal field width, `-` left alignment, `0` numeric zero padding, and `.N` precision on `%f`. Width for `%s` counts UTF-8 bytes. Formatting is deterministic and locale-independent. `printf` uses the same plan, returns `void`, and adds no newline. `print` is rejected in favor of `echo`; dynamic/positional formats, `*` width, `%e`, `%g`, and `sscanf` are not accepted.
 
-The runtime separates raw standard-device reads/writes and explicit flush from buffered line discipline. It detects stdin, stdout, and stderr interactivity independently for internal use. On Windows, interactive console text uses validated UTF-8 converted to wide console operations; redirected handles preserve exact UTF-8 bytes. This is infrastructure for the future Stage 46 `Console` API, not a public terminal API. Binary data and `Bytes` remain Stage 23, and arbitrary-expression interpolation plus `Displayable` remain Stage 18.
+The runtime separates raw standard-device reads/writes and explicit flush from buffered line discipline. It detects stdin, stdout, and stderr interactivity independently for internal use. On Windows, interactive console text uses validated UTF-8 converted to wide console operations; redirected handles preserve exact UTF-8 bytes. This is infrastructure for the future Stage 46 `Console` API, not a public terminal API. Binary data and `Bytes` remain Stage 23.
 
 ### Equality and boolean operators
 
@@ -960,7 +976,7 @@ As native code generation matures, Doria IR may lower into a simpler native-orie
 
 MIR is Doria's native-oriented, backend-independent control-flow representation for the executable subset. It contains typed scalar and string locals, parameters, calls and returns; runtime string literal/local/call/concatenation/display expressions; string comparison; basic blocks; checked numeric operations/conversions; and panic termination. The debug interpreter uses safe private string values, an explicit heap-backed Doria frame stack, and exact stdout/stderr buffers. It models source value behavior, not native refcount layout. Ordinary interpretation has no fixed execution-fuel or call-depth cap and does not reject repeated states.
 
-Native is the primary target. Checked HIR lowers to typed MIR, shared MIR validation gates both native lowerers, Cranelift emits the default fast object, LLVM 18 emits the O3 `--release` object, and the host linker combines either object with `doria-rt`. Native compilation has no interpreter preflight, fallback IR, or release-to-fast fallback. `doria-rt` owns entry policy, immutable refcounted runtime strings, Stage 17 text I/O and formatting support, exact stdout/stderr writes, abort-only panic formatting, stack traversal, and status 101. Both lowerers share scalar and opaque string ABI conventions and clean up owned string locals on normal returns. Runtime failures use the shared panic path. Only canonical int/void entry results cross the process boundary. Unsupported coverage remains for collections, classes/methods, general ownership checking, Stage 18 displayable classes/arbitrary interpolation, Stage 22 general nullable types, and Stage 23 `Bytes`.
+Native is the primary target. Checked HIR lowers to typed MIR, shared MIR validation gates both native lowerers, Cranelift emits the default fast object, LLVM 18 emits the O3 `--release` object, and the host linker combines either object with `doria-rt`. Native compilation has no interpreter preflight, fallback IR, or release-to-fast fallback. `doria-rt` owns entry policy, immutable refcounted runtime strings, Stage 17 text I/O and formatting support, exact stdout/stderr writes, abort-only panic formatting, stack traversal, and status 101. Both lowerers share scalar and opaque string ABI conventions and clean up owned string locals on normal returns. Runtime failures use the shared panic path. Only canonical int/void entry results cross the process boundary. Full primitive expression interpolation is covered across both native profiles. Unsupported coverage remains for collections, native classes/methods including `Displayable` dispatch, general ownership checking, Stage 22 general nullable types, and Stage 23 `Bytes`.
 
 The PHP backend is currently implemented as a compatibility/debugging backend. It emits `<?php` and lowers Doria-only syntax away:
 

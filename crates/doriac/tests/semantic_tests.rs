@@ -2203,7 +2203,7 @@ class Person {}
 let $person = new Person();
 echo "{$person}";
 "#,
-            "E0415",
+            "E0462",
         ),
         (
             r#"
@@ -2234,6 +2234,93 @@ function show(Set<int> $items): void
         ),
     ] {
         assert_diagnostic_code(source, code);
+    }
+}
+
+#[test]
+fn checks_compiler_known_displayable_conformance_and_display_contexts() {
+    doriac::check_source(
+        "test.doria",
+        r#"
+class Label implements Displayable
+{
+    function toString(): string
+    {
+        return "Doria";
+    }
+}
+
+let $label = new Label();
+echo $label;
+echo "label={$label}";
+echo "label=" . $label;
+echo sprintf("%s", $label);
+"#,
+    )
+    .expect("explicit Displayable conformance should enable every display context");
+
+    for member in [
+        "",
+        "function toString(int $value): string { return \"Doria\"; }",
+        "function toString(): int { return 1; }",
+        "static function toString(): string { return \"Doria\"; }",
+        "writable function toString(): string { return \"Doria\"; }",
+        "internal function toString(): string { return \"Doria\"; }",
+        "function ToString(): string { return \"Doria\"; }",
+        "function to_string(): string { return \"Doria\"; }",
+        "function __toString(): string { return \"Doria\"; }",
+    ] {
+        let source = format!("class Label implements Displayable {{ {member} }}");
+        assert_diagnostic_code(&source, "E0463");
+    }
+}
+
+#[test]
+fn rejects_non_displayable_classes_in_every_display_context() {
+    for display in [
+        "echo $token;",
+        "echo \"token={$token}\";",
+        "echo \"token=\" . $token;",
+        "echo sprintf(\"%s\", $token);",
+    ] {
+        let source = format!("class Token {{}} let $token = new Token(); {display}");
+        let diagnostics = doriac::check_source("test.doria", &source)
+            .expect_err("non-Displayable class should be rejected in display contexts");
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "E0462"
+                && diagnostic.message.contains("`Token` cannot be displayed")
+                && diagnostic.message.contains("function toString(): string")
+        }));
+    }
+
+    assert_diagnostic_code(
+        r#"
+class Token
+{
+    function toString(): string { return "coincidence"; }
+}
+let $token = new Token();
+echo $token;
+"#,
+        "E0462",
+    );
+    assert_diagnostic_code(
+        "class Token {} let $token = new Token(); string $text = $token;",
+        "E0403",
+    );
+}
+
+#[test]
+fn reserves_displayable_and_defers_general_interfaces() {
+    assert_diagnostic_code("class Displayable {}", "E0309");
+    assert_diagnostic_code("class Label implements Other {}", "E0464");
+
+    for source in ["interface Displayable {}", "interface Other {}"] {
+        let diagnostics = doriac::parse_source("test.doria", source)
+            .expect_err("interface declarations remain outside the Stage 18 subset");
+        assert!(diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "P0003"));
     }
 }
 

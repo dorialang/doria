@@ -1,6 +1,9 @@
 use serde_json::Value;
 
-use doriac::lsp::{byte_offset_to_position, diagnostics_for_document, position_to_byte_offset};
+use doriac::lsp::{
+    byte_offset_to_position, code_actions_for_document, diagnostics_for_document,
+    position_to_byte_offset,
+};
 
 #[test]
 fn maps_byte_offsets_to_utf16_lsp_positions() {
@@ -52,6 +55,39 @@ $count = 1;
         .as_str()
         .expect("message should be string")
         .contains("readonly variable"));
+}
+
+#[test]
+fn exposes_literal_brace_fix_data_at_original_source_span() {
+    let text = "echo \"literal {word}\";";
+    let diagnostics = diagnostics_for_document("file:///brace.doria", text);
+    let diagnostic = diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic["code"] == "P0002")
+        .expect("literal brace diagnostic should be published");
+
+    assert_eq!(diagnostic["data"]["fix"]["newText"], "\\{");
+    assert_eq!(diagnostic["data"]["fix"]["range"]["start"]["line"], 0);
+    assert_eq!(
+        diagnostic["data"]["fix"]["range"]["start"]["character"],
+        text.find('{').expect("opening brace")
+    );
+}
+
+#[test]
+fn exposes_literal_brace_fix_as_a_preferred_code_action() {
+    let uri = "file:///brace.doria";
+    let text = "echo \"literal {word}\";";
+    let actions = code_actions_for_document(uri, text);
+
+    assert_eq!(actions.len(), 1);
+    assert_eq!(actions[0]["kind"], "quickfix");
+    assert_eq!(actions[0]["isPreferred"], true);
+    assert_eq!(actions[0]["edit"]["changes"][uri][0]["newText"], "\\{");
+    assert_eq!(
+        actions[0]["edit"]["changes"][uri][0]["range"]["start"]["character"],
+        text.find('{').expect("opening brace")
+    );
 }
 
 #[test]

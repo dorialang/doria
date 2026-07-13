@@ -106,6 +106,38 @@ pub fn diagnostics_for_document(uri: &str, text: &str) -> Vec<Value> {
     }
 }
 
+pub fn code_actions_for_document(uri: &str, text: &str) -> Vec<Value> {
+    let Err(diagnostics) = crate::check_source(uri.to_string(), text.to_string()) else {
+        return Vec::new();
+    };
+
+    diagnostics
+        .iter()
+        .filter_map(|diagnostic| {
+            let fix = diagnostic.fix.as_ref()?;
+            let edit = json!({
+                "range": span_to_range(text, fix.span),
+                "newText": fix.replacement,
+            });
+            let mut changes = serde_json::Map::new();
+            changes.insert(uri.to_string(), Value::Array(vec![edit]));
+
+            Some(json!({
+                "title": diagnostic
+                    .help
+                    .as_deref()
+                    .unwrap_or("Apply compiler-suggested fix"),
+                "kind": "quickfix",
+                "diagnostics": [diagnostic_to_lsp(text, diagnostic)],
+                "isPreferred": true,
+                "edit": {
+                    "changes": changes,
+                },
+            }))
+        })
+        .collect()
+}
+
 impl Server {
     fn handle_message<W: Write>(&mut self, message: Value, writer: &mut W) -> Result<bool, String> {
         let Some(method) = message.get("method").and_then(Value::as_str) else {
@@ -139,6 +171,12 @@ impl Server {
                 if let Some(id) = id {
                     let hover = self.hover(message.get("params"));
                     send_response(writer, id, hover.unwrap_or(Value::Null))?;
+                }
+            }
+            "textDocument/codeAction" => {
+                if let Some(id) = id {
+                    let actions = self.code_actions(message.get("params"));
+                    send_response(writer, id, actions)?;
                 }
             }
             _ => {
@@ -300,6 +338,21 @@ impl Server {
         let offset = position_to_byte_offset(&document.text, line, character);
         hover_at_offset(&document.text, offset)
     }
+
+    fn code_actions(&self, params: Option<&Value>) -> Value {
+        let Some(uri) = params
+            .and_then(|params| params.get("textDocument"))
+            .and_then(|text_document| text_document.get("uri"))
+            .and_then(Value::as_str)
+        else {
+            return json!([]);
+        };
+        let Some(document) = self.documents.get(uri) else {
+            return json!([]);
+        };
+
+        Value::Array(code_actions_for_document(uri, &document.text))
+    }
 }
 
 fn initialize_result() -> Value {
@@ -315,7 +368,8 @@ fn initialize_result() -> Value {
             "completionProvider": {
                 "triggerCharacters": ["$", ">", ":"]
             },
-            "hoverProvider": true
+            "hoverProvider": true,
+            "codeActionProvider": true
         },
         "serverInfo": {
             "name": "doria-lsp",
@@ -380,8 +434,25 @@ fn completion_items() -> Value {
         "take",
     ];
     let planned_keywords = [
-        "enum", "case", "match", "async", "await", "unsafe", "extern", "open", "override", "with",
-        "take", "throw", "throws", "try", "catch", "finally", "when", "given",
+        "interface",
+        "enum",
+        "case",
+        "match",
+        "async",
+        "await",
+        "unsafe",
+        "extern",
+        "open",
+        "override",
+        "with",
+        "take",
+        "throw",
+        "throws",
+        "try",
+        "catch",
+        "finally",
+        "when",
+        "given",
     ];
     let types = [
         "void",
@@ -453,6 +524,18 @@ fn completion_items() -> Value {
             "kind": 25,
             "detail": "Reserved Doria type name",
         })
+    }));
+    items.push(json!({
+        "label": "Displayable",
+        "kind": 8,
+        "detail": "compiler-known Doria interface",
+        "documentation": "`interface Displayable` requires an explicit `implements Displayable` declaration and exactly `function toString(): string`. It controls interpolation, echo, concatenation, and `%s`; general interfaces remain planned for Stage 35.",
+    }));
+    items.push(json!({
+        "label": "toString",
+        "kind": 2,
+        "detail": "function toString(): string",
+        "documentation": "The exact readonly instance method required by the compiler-known `Displayable` contract.",
     }));
     items.push(json!({
         "label": "panic",
@@ -636,6 +719,12 @@ fn integer_conversion_description(companion: &str) -> Option<&'static str> {
 fn hover_description(kind: &TokenKind) -> Option<&'static str> {
     match kind {
         TokenKind::Class => Some("Declares a Doria class."),
+        TokenKind::Interface => Some(
+            "General interface declarations are planned for Stage 35. Stage 18 provides only the compiler-known `Displayable` contract.",
+        ),
+        TokenKind::Implements => Some(
+            "Declares nominal conformance. Stage 18 supports only the compiler-known `Displayable` contract; general conformance is planned for Stage 35.",
+        ),
         TokenKind::Function => Some("Declares a function or method."),
         TokenKind::Let => Some("Declares a local binding with an inferred type."),
         TokenKind::Writable => {
@@ -674,6 +763,8 @@ fn hover_description(kind: &TokenKind) -> Option<&'static str> {
         TokenKind::Null => Some("Null literal. Stage 17 supports `?string` narrowly for `read_line` EOF; general nullable types remain planned for Stage 22."),
         TokenKind::Reserved(_) => Some("Reserved for future Doria syntax."),
         TokenKind::Identifier(name) => match name.as_str() {
+            "Displayable" => Some("`interface Displayable` is the compiler-known display contract. A class must explicitly declare `implements Displayable` and provide `function toString(): string`. It controls interpolation, echo, concatenation, and `%s`; general interfaces remain planned for Stage 35."),
+            "toString" => Some("`function toString(): string` is the exact externally accessible readonly instance method required by `Displayable`."),
             "List" => Some("Ordered collection alias: `List<T>`."),
             "Dictionary" => Some("Key-value collection alias: `Dictionary<K, V>`."),
             "Set" => Some("Unique-value collection alias: `Set<T>`."),
@@ -704,13 +795,22 @@ fn diagnostic_to_lsp(text: &str, diagnostic: &Diagnostic) -> Value {
         diagnostic.message.clone()
     };
 
-    json!({
+    let mut value = json!({
         "range": span_to_range(text, diagnostic.span),
         "severity": 1,
         "code": diagnostic.code,
         "source": "doriac",
         "message": message,
-    })
+    });
+    if let Some(fix) = &diagnostic.fix {
+        value["data"] = json!({
+            "fix": {
+                "range": span_to_range(text, fix.span),
+                "newText": fix.replacement,
+            }
+        });
+    }
+    value
 }
 
 fn span_to_range(text: &str, span: Span) -> Value {
@@ -911,6 +1011,31 @@ mod tests {
             !diagnostics.is_empty(),
             "planned syntax should remain rejected by compiler diagnostics until implemented"
         );
+    }
+
+    #[test]
+    fn completion_and_hover_document_the_narrow_displayable_contract() {
+        let completion = completion_item("Displayable");
+        let documentation = completion["documentation"]
+            .as_str()
+            .expect("Displayable completion should have documentation");
+        assert!(documentation.contains("interface Displayable"));
+        assert!(documentation.contains("function toString(): string"));
+        assert!(documentation.contains("interpolation, echo, concatenation, and `%s`"));
+        assert!(documentation.contains("general interfaces remain planned for Stage 35"));
+
+        let source = "class Label implements Displayable {}";
+        let hover = hover_at_offset(
+            source,
+            source.find("Displayable").expect("Displayable token"),
+        )
+        .expect("Displayable should provide hover information");
+        let text = hover["contents"]["value"]
+            .as_str()
+            .expect("hover contents should be markdown");
+        assert!(text.contains("interface Displayable"));
+        assert!(text.contains("function toString(): string"));
+        assert!(text.contains("general interfaces remain planned for Stage 35"));
     }
     #[test]
     fn hover_help_does_not_present_planned_syntax_as_immediate_fixes() {

@@ -110,6 +110,16 @@ function main(): void
     let $line = identity(read_line());
     if ($line != null) { echo $line; }
 }
+
+#[test]
+fn lowers_stage_18_expression_interpolation_to_verified_objects() {
+    for source in [
+        include_str!("../../../examples/native/main_expression_interpolation.doria"),
+        include_str!("../../../examples/native/main_expression_interpolation_order.doria"),
+    ] {
+        assert_object(source);
+    }
+}
 "#,
     ] {
         assert_object(source);

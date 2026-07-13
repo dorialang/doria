@@ -15,6 +15,7 @@ pub struct Binding {
 
 #[derive(Debug, Clone)]
 pub struct ClassInfo {
+    pub implements_displayable: bool,
     pub properties: HashMap<String, PropertyInfo>,
     pub methods: HashMap<String, MethodInfo>,
 }
@@ -51,6 +52,7 @@ pub struct FunctionInfo {
 pub struct MethodInfo {
     pub access: MemberAccess,
     pub writable_this: bool,
+    pub is_static: bool,
     pub params: Vec<ParamInfo>,
     pub return_ty: TypeId,
 }

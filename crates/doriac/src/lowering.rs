@@ -25,6 +25,7 @@ fn lower_item(item: &ast::Item) -> hir::Item {
 fn lower_class(class_decl: &ast::ClassDecl) -> hir::ClassDecl {
     hir::ClassDecl {
         name: class_decl.name.clone(),
+        implements: class_decl.implements.clone(),
         members: class_decl.members.iter().map(lower_class_member).collect(),
         span: class_decl.span,
     }
@@ -54,6 +55,7 @@ fn lower_function(function: &ast::FunctionDecl) -> hir::FunctionDecl {
     hir::FunctionDecl {
         access: function.access.clone(),
         writable_this: function.writable_this,
+        is_static: function.is_static,
         name: function.name.clone(),
         params: function.params.iter().map(lower_param).collect(),
         return_type: function.return_type.clone(),
@@ -321,7 +323,10 @@ fn lower_interpolated_string_part(
     part: &ast::InterpolatedStringPart,
 ) -> hir::InterpolatedStringPart {
     match part {
-        ast::InterpolatedStringPart::Text(text) => hir::InterpolatedStringPart::Text(text.clone()),
+        ast::InterpolatedStringPart::Text { value, span } => hir::InterpolatedStringPart::Text {
+            value: value.clone(),
+            span: *span,
+        },
         ast::InterpolatedStringPart::Expr(expr) => {
             hir::InterpolatedStringPart::Expr(lower_expr(expr))
         }

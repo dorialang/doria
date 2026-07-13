@@ -283,12 +283,20 @@ open class Model
     }
 }
 
-class Article extends Model implements Publishable
+class Article extends Model implements Displayable
 {
+    function toString(): string
+    {
+        return "Article #{articleId()}";
+    }
+
     override function save(): void throws StorageError
     {
     }
 }
+
+echo "sum: {left() + right()}";
+echo "literal brace: \\{ and bare }";
 
 #[PhpExport]
 class ImageResizer

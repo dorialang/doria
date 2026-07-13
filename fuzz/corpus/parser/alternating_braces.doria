@@ -1,0 +1,1 @@
+function main(): void { int $x = 1; echo "\{a} {$x} \{b} {$x + 1} \{c} {($x + 2)} \{d} {$x} \{e} {$x + 3} } \}"; }

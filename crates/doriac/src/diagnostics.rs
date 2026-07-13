@@ -3,11 +3,18 @@ use crate::source::{SourceFile, Span};
 pub type DiagnosticResult<T> = Result<T, Vec<Diagnostic>>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FixIt {
+    pub span: Span,
+    pub replacement: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Diagnostic {
     pub code: &'static str,
     pub message: String,
     pub span: Span,
     pub help: Option<String>,
+    pub fix: Option<FixIt>,
 }
 
 impl Diagnostic {
@@ -17,11 +24,20 @@ impl Diagnostic {
             message: message.into(),
             span,
             help: None,
+            fix: None,
         }
     }
 
     pub fn with_help(mut self, help: impl Into<String>) -> Self {
         self.help = Some(help.into());
+        self
+    }
+
+    pub fn with_fix(mut self, span: Span, replacement: impl Into<String>) -> Self {
+        self.fix = Some(FixIt {
+            span,
+            replacement: replacement.into(),
+        });
         self
     }
 

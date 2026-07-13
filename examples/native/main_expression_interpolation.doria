@@ -1,0 +1,14 @@
+function a(): int
+{
+    return 19;
+}
+
+function b(): int
+{
+    return 23;
+}
+
+function main(): void
+{
+    echo "sum: {a() + b()}";
+}

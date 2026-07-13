@@ -1,0 +1,3 @@
+echo "";
+echo "ordinary";
+echo 'single { braces } stay literal';

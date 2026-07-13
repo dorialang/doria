@@ -1,0 +1,5 @@
+code: P0002
+message: unescaped `{` does not begin a valid interpolation expression
+help: write `\{` for a literal brace
+span: 14..15
+fix: 14..15 -> "\\{"

@@ -42,6 +42,21 @@ Source of truth for sequencing remains `docs/doria-end-to-end-plan.md`. The dura
 | Void helper calls | Covered | Covered | Covered | Covered | Shared stdout preserves source call order. |
 | Runtime string locals, rebinding, parameters, returns and calls | Covered | Covered | Covered | Covered | Immutable UTF-8 Copy values use the private refcounted runtime ABI. |
 | Runtime concat and primitive display | Covered | Covered | Covered | Covered | Decimal integers, shortest-round-trip floats, lowercase bools, and current interpolation agree exactly. |
+| Arithmetic expression interpolation | Covered | Covered | Covered | Covered | `main_expression_interpolation.doria` produces exact `sum: 42` bytes. |
+| Function-call interpolation | Covered | Covered | Covered | Covered | Ordinary calls lower inside interpolation without a second expression grammar. |
+| Interpolation exactly-once evaluation | Covered | Covered | Covered | Covered | Side-effecting calls execute once per embedded expression. |
+| Interpolation left-to-right evaluation | Covered | Covered | Covered | Covered | `main_expression_interpolation_order.doria` produces exact `LR=42`. |
+| Bool expression interpolation | Covered | Covered | Covered | Covered | Reuses lowercase canonical bool display. |
+| Float expression interpolation | Covered | Covered | Covered | Covered | Reuses deterministic shortest-round-trip display for each declared width. |
+| String expression interpolation | Covered | Covered | Covered | Covered | Literal, local, concatenation, and string-call values retain exact bytes. |
+| Literal-brace escaping | Frontend | Frontend | Frontend | Covered | `\{` is required for literal `{`; bare `}` and `\}` are accepted; doubling is rejected. |
+| Malformed interpolation diagnostics | Frontend | Frontend | Frontend | Covered | Empty, unterminated, and malformed inner expressions retain original source spans. |
+| Malformed literal-brace diagnostic | Frontend | Frontend | Frontend | Covered | P0002 carries a machine-applicable replacement of `{` with `\{`. |
+| Non-Displayable diagnostics | Frontend | Frontend | Frontend | Covered | Every display context names the class and exact `Displayable::toString` contract. |
+| `Displayable` frontend conformance | Frontend | Frontend | Frontend | Covered | Explicit nominal conformance and exact method shape are checked before MIR. |
+| `Displayable` native execution | Deferred | Deferred | Deferred | Stage 19/20 | No class placeholder enters MIR before class layout and method dispatch. |
+| PHP `Displayable` subset | N/A | N/A | N/A | Covered | Generated private interface invokes Doria `toString` exactly once and never relies on `__toString`. |
+| Parser fuzzing | Frontend | Frontend | Frontend | Covered | Bounded CI fuzzing seeds nested strings, braces, malformed expressions, and UTF-8 offsets. |
 | String equality and ordering | Covered | Covered | Covered | Covered | Equality is exact-byte and ordering is unsigned byte-lexicographic. |
 | String echo in int-returning functions | Covered | Covered | Covered | Covered | Statement validity is independent of function return type. |
 | Short-circuit conditions with helper calls | Covered | Covered | Covered | Covered | `and`/`or` short-circuit; `xor` evaluates both in order. |
@@ -92,6 +107,6 @@ Source of truth for sequencing remains `docs/doria-end-to-end-plan.md`. The dura
 
 ## Retirement Gate
 
-Status: Passed through Stage 17 after this branch's full validation gates pass.
+Status: Passed through Stage 18 after this branch's full validation gates pass.
 
-All accepted Stage <=17 scalar, string, checked-format, and text-I/O lowering passes through typed MIR and shared MIR validation. The interpreter, Cranelift fast profile, and LLVM release profile consume that same MIR; every finite native example is required in the executable manifest with deterministic sidecars where needed; and the Stage 7-10 native smoke module remains retired and deleted. Stage 18 full expression interpolation and `Displayable` is next.
+All accepted Stage <=18 scalar, string, interpolation, checked-format, and text-I/O lowering passes through typed MIR and shared MIR validation. The interpreter, Cranelift fast profile, and LLVM release profile consume that same MIR; every finite native example is required in the executable manifest with deterministic sidecars where needed; and the Stage 7-10 native smoke module remains retired and deleted. Stage 19 ownership, moves, destruction, and native class layout is next.

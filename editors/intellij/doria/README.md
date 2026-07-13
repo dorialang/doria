@@ -67,7 +67,7 @@ Make sure `*.doria` is listed under `Doria`, and remove it from `Text` or `Plain
 
 The syntax highlighter, file type registration, comments, and settings page only require the IntelliJ Platform module. `doria-lsp` integration is enabled when the IDE also provides JetBrains' LSP module.
 
-Double-quoted string interpolation such as `{$this->name}` keeps the string text green while colorizing the variable reference. Single-quoted strings are treated as literal strings.
+Double-quoted interpolation uses the ordinary Doria expression grammar, so expressions such as `{left() + right()}` receive normal token scopes inside the string. Literal opening braces use `\{`; single-quoted strings remain non-interpolating.
 
 VS Code and IntelliJ / JetBrains highlighting should stay aligned. The shared smoke fixture is:
 

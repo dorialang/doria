@@ -15,7 +15,7 @@ pub fn generate(program: &Program) -> Result<String, BackendError> {
     validate_program(program)?;
 
     let mut output = String::from(
-        "<?php\n\nfunction __doria_display(string|int|bool $value): string\n{\n    if (is_bool($value)) { return $value ? 'true' : 'false'; }\n    return (string) $value;\n}\n\nfunction __doria_less(string|int|float|bool $left, string|int|float|bool $right): bool\n{\n    if (is_string($left) && is_string($right)) { return strcmp($left, $right) < 0; }\n    return $left < $right;\n}\n\nfunction __doria_less_equal(string|int|float|bool $left, string|int|float|bool $right): bool\n{\n    if (is_string($left) && is_string($right)) { return strcmp($left, $right) <= 0; }\n    return $left <= $right;\n}\n\nfunction __doria_greater(string|int|float|bool $left, string|int|float|bool $right): bool\n{\n    if (is_string($left) && is_string($right)) { return strcmp($left, $right) > 0; }\n    return $left > $right;\n}\n\nfunction __doria_greater_equal(string|int|float|bool $left, string|int|float|bool $right): bool\n{\n    if (is_string($left) && is_string($right)) { return strcmp($left, $right) >= 0; }\n    return $left >= $right;\n}\n\n",
+        "<?php\n\ninterface __DoriaDisplayable\n{\n    public function toString(): string;\n}\n\nfunction __doria_display(string|int|float|bool|__DoriaDisplayable $value): string\n{\n    if ($value instanceof __DoriaDisplayable) { return $value->toString(); }\n    if (is_bool($value)) { return $value ? 'true' : 'false'; }\n    return (string) $value;\n}\n\nfunction __doria_less(string|int|float|bool $left, string|int|float|bool $right): bool\n{\n    if (is_string($left) && is_string($right)) { return strcmp($left, $right) < 0; }\n    return $left < $right;\n}\n\nfunction __doria_less_equal(string|int|float|bool $left, string|int|float|bool $right): bool\n{\n    if (is_string($left) && is_string($right)) { return strcmp($left, $right) <= 0; }\n    return $left <= $right;\n}\n\nfunction __doria_greater(string|int|float|bool $left, string|int|float|bool $right): bool\n{\n    if (is_string($left) && is_string($right)) { return strcmp($left, $right) > 0; }\n    return $left > $right;\n}\n\nfunction __doria_greater_equal(string|int|float|bool $left, string|int|float|bool $right): bool\n{\n    if (is_string($left) && is_string($right)) { return strcmp($left, $right) >= 0; }\n    return $left >= $right;\n}\n\n",
     );
     output.push_str(
         r#"function __doria_io_panic(string $message)
@@ -631,7 +631,20 @@ fn emit_item(item: &Item, output: &mut String, indent: usize, scopes: &mut PhpNa
 }
 
 fn emit_class(class_decl: &ClassDecl, output: &mut String, indent: usize) {
-    writeln(output, indent, &format!("class {}", class_decl.name));
+    let implements = if class_decl
+        .implements
+        .iter()
+        .any(|interface| interface == "Displayable")
+    {
+        " implements __DoriaDisplayable"
+    } else {
+        ""
+    };
+    writeln(
+        output,
+        indent,
+        &format!("class {}{implements}", class_decl.name),
+    );
     writeln(output, indent, "{");
     for member in &class_decl.members {
         match member {
@@ -670,6 +683,9 @@ fn emit_function(function: &FunctionDecl, output: &mut String, indent: usize, is
     if is_method {
         output.push_str(emit_member_access(&function.access));
         output.push(' ');
+        if function.is_static {
+            output.push_str("static ");
+        }
     }
     output.push_str("function ");
     output.push_str(&function.name);
@@ -1246,7 +1262,7 @@ fn emit_interpolated_string(parts: &[InterpolatedStringPart], scopes: &PhpNameSc
 
     for part in parts {
         match part {
-            InterpolatedStringPart::Text(text) => {
+            InterpolatedStringPart::Text { value: text, .. } => {
                 if !text.is_empty() {
                     emitted.push(emit_php_string_literal(text));
                 }

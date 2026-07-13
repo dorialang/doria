@@ -1,0 +1,18 @@
+function left(): int
+{
+    echo "L";
+
+    return 20;
+}
+
+function right(): int
+{
+    echo "R";
+
+    return 22;
+}
+
+function main(): void
+{
+    echo "={left() + right()}";
+}

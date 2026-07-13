@@ -1,5 +1,6 @@
 use crate::diagnostics::{Diagnostic, DiagnosticResult};
 use crate::source::{SourceFile, Span};
+use crate::string_literal::{decode_escape, interpolation_close};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Token {
@@ -16,6 +17,8 @@ pub enum StringQuoteKind {
 #[derive(Debug, Clone, PartialEq)]
 pub enum TokenKind {
     Class,
+    Interface,
+    Implements,
     Function,
     Internal,
     Static,
@@ -60,6 +63,7 @@ pub enum TokenKind {
     FloatLiteral(String),
     StringLiteral {
         value: String,
+        raw: String,
         quote: StringQuoteKind,
     },
     Equals,
@@ -368,6 +372,8 @@ impl<'source> Lexer<'source> {
         let text = &self.source.text[start..self.index];
         let kind = match text {
             "class" => TokenKind::Class,
+            "interface" => TokenKind::Interface,
+            "implements" => TokenKind::Implements,
             "function" => TokenKind::Function,
             "internal" => TokenKind::Internal,
             "static" => TokenKind::Static,
@@ -409,8 +415,8 @@ impl<'source> Lexer<'source> {
             "and" => TokenKind::And,
             "or" => TokenKind::Or,
             "xor" => TokenKind::Xor,
-            "async" | "await" | "spawn" | "scope" | "interface" | "trait" | "enum" | "match"
-            | "try" | "catch" => TokenKind::Reserved(text.to_string()),
+            "async" | "await" | "spawn" | "scope" | "trait" | "enum" | "match" | "try"
+            | "catch" => TokenKind::Reserved(text.to_string()),
             _ => TokenKind::Identifier(text.to_string()),
         };
 
@@ -452,6 +458,7 @@ impl<'source> Lexer<'source> {
         } else {
             StringQuoteKind::Single
         };
+        let content_start = self.index;
         let mut value = String::new();
 
         while let Some(byte) = self.peek() {
@@ -460,6 +467,7 @@ impl<'source> Lexer<'source> {
                 return Token {
                     kind: TokenKind::StringLiteral {
                         value,
+                        raw: self.source.text[content_start..self.index - 1].to_string(),
                         quote: quote_kind,
                     },
                     span: Span::new(start, self.index),
@@ -473,18 +481,21 @@ impl<'source> Lexer<'source> {
                     continue;
                 };
                 self.index += character.len_utf8();
-                match character {
-                    'n' => value.push('\n'),
-                    'r' => value.push('\r'),
-                    't' => value.push('\t'),
-                    '\\' => value.push('\\'),
-                    '\'' => value.push('\''),
-                    '"' => value.push('"'),
-                    other => {
-                        value.push('\\');
-                        value.push(other);
-                    }
+                if let Some(decoded) = decode_escape(character) {
+                    value.push(decoded);
+                } else {
+                    value.push('\\');
+                    value.push(character);
                 }
+            } else if matches!(quote_kind, StringQuoteKind::Double) && byte == b'{' {
+                let open = self.index;
+                let Some(close) = interpolation_close(&self.source.text, open) else {
+                    self.error("unterminated string interpolation", open, self.bytes.len());
+                    self.index = self.bytes.len();
+                    break;
+                };
+                value.push_str(&self.source.text[open..=close]);
+                self.index = close + 1;
             } else {
                 let character = self.source.text[self.index..]
                     .chars()
@@ -499,6 +510,7 @@ impl<'source> Lexer<'source> {
         Token {
             kind: TokenKind::StringLiteral {
                 value,
+                raw: self.source.text[content_start..self.index].to_string(),
                 quote: quote_kind,
             },
             span: Span::new(start, self.index),

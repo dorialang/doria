@@ -1,0 +1,4 @@
+code: E0462
+message: `Token` cannot be displayed; implement `Displayable` with `function toString(): string`
+help: add `implements Displayable` and an externally accessible readonly `function toString(): string` method
+span: 48..54

@@ -33,6 +33,7 @@ fn lexes_string_quote_kinds() {
         TokenKind::StringLiteral {
             value,
             quote: StringQuoteKind::Single,
+            ..
         } if value == "{}"
     ));
     assert!(matches!(
@@ -40,6 +41,7 @@ fn lexes_string_quote_kinds() {
         TokenKind::StringLiteral {
             value,
             quote: StringQuoteKind::Double,
+            ..
         } if value == "{}"
     ));
 }

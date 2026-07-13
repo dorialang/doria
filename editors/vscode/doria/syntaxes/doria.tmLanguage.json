@@ -236,24 +236,21 @@
             },
             {
               "name": "meta.interpolation.doria",
-              "begin": "(\\{)(?=\\$)",
+              "begin": "(?<!\\\\)(\\{)",
               "beginCaptures": {
                 "1": {
-                  "name": "string.quoted.double.doria"
+                  "name": "punctuation.section.interpolation.begin.doria"
                 }
               },
               "end": "\\}",
               "endCaptures": {
                 "0": {
-                  "name": "string.quoted.double.doria"
+                  "name": "punctuation.section.interpolation.end.doria"
                 }
               },
               "patterns": [
                 {
-                  "include": "#accessors"
-                },
-                {
-                  "include": "#variables"
+                  "include": "$self"
                 }
               ]
             }
@@ -505,7 +502,11 @@
         },
         {
           "name": "keyword.control.doria",
-          "match": "\\b(?:return|foreach|as|if|else|while|for|break|continue|when|given|finally|try|catch|extends|implements|uses|with)\\b"
+          "match": "\\b(?:return|foreach|as|if|else|while|for|break|continue|when|given|finally|try|catch|extends|uses|with)\\b"
+        },
+        {
+          "name": "keyword.declaration.implements.doria",
+          "match": "\\bimplements\\b"
         },
         {
           "name": "keyword.control.exception.doria",
