@@ -14,6 +14,7 @@ $vscodeGrammar = $root . '/editors/vscode/doria/syntaxes/doria.tmLanguage.json';
 $vscodeLanguageConfiguration = $root . '/editors/vscode/doria/language-configuration.json';
 $vscodeExtension = $root . '/editors/vscode/doria/extension.js';
 $intellijLexer = $root . '/editors/intellij/doria/src/main/kotlin/dev/doria/intellij/highlighting/DoriaLexer.kt';
+$intellijBuildGradle = $root . '/editors/intellij/doria/build.gradle';
 $intellijTokenTypes = $root . '/editors/intellij/doria/src/main/kotlin/dev/doria/intellij/highlighting/DoriaTokenTypes.kt';
 $intellijSyntaxHighlighter = $root . '/editors/intellij/doria/src/main/kotlin/dev/doria/intellij/highlighting/DoriaSyntaxHighlighter.kt';
 $intellijLspFiles = $root . '/editors/intellij/doria/src/main/kotlin/dev/doria/intellij/lsp/DoriaLspFiles.kt';
@@ -319,8 +320,9 @@ function check_vscode_package(): void
 
     $package = load_json($vscodePackage);
     require_check(
-        ($package['version'] ?? null) === '2026.3.1' && ($package['doriaToolchainVersion'] ?? null) === '2026.03.1',
-        'VS Code package must carry the SemVer-compatible encoding of Doria CalVer 2026.03.1'
+        ($package['version'] ?? null) === '2026.3.1-canary' &&
+            ($package['doriaToolchainVersion'] ?? null) === '2026.03.1-canary',
+        'VS Code package must carry the pre-1.0 canary encoding of Doria CalVer 2026.03.1-canary'
     );
     $grammars = $package['contributes']['grammars'] ?? [];
     require_check(
@@ -574,7 +576,12 @@ function check_intellij_lexer(): void
 {
     global $acceptedKeywords, $primitiveTypes, $reservedTypes, $plannedTypes, $wordOperators, $stage13SymbolOperators, $booleanSymbolOperators;
     global $notKeywords, $strictComparison, $rejectedPreprocessor, $rejectedKeywords, $rejectedTypes;
-    global $intellijLexer, $intellijTokenTypes, $intellijSyntaxHighlighter, $intellijPluginXml, $intellijPluginIcon, $doriaLogo;
+    global $intellijLexer, $intellijBuildGradle, $intellijTokenTypes, $intellijSyntaxHighlighter, $intellijPluginXml, $intellijPluginIcon, $doriaLogo;
+
+    require_check(
+        str_contains(read_text($intellijBuildGradle), "version = '2026.03.1-canary'"),
+        'IntelliJ package must carry the pre-1.0 Doria CalVer canary suffix'
+    );
 
     $lexerText = read_text($intellijLexer);
     $intellijHighlightingText = implode("\n", [

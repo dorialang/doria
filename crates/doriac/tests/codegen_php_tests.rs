@@ -962,6 +962,56 @@ function main(): void
 }
 
 #[test]
+fn php_io_panic_trace_preserves_allowed_doria_helper_named_methods() {
+    let php = doriac::compile_source_to_php(
+        "test.doria",
+        r#"
+class Reader
+{
+    function __doria_read_file(): void
+    {
+        read_file("__doria_missing_stage17_frame_test__/missing.txt");
+    }
+}
+
+function main(): void
+{
+    let $reader = new Reader();
+    $reader->__doria_read_file();
+}
+"#,
+    )
+    .expect("allowed helper-named methods should lower through PHP compatibility");
+
+    assert!(php.contains("isset($frame[\"class\"])"));
+    assert!(php.contains("in_array($frame[\"function\"], $helperFunctions, true)"));
+
+    let Ok(version) = Command::new("php").arg("--version").output() else {
+        return;
+    };
+    if !version.status.success() {
+        return;
+    }
+
+    let script = format!(
+        "{}\nmain();",
+        php.strip_prefix("<?php").expect("generated PHP header")
+    );
+    let run = Command::new("php")
+        .arg("-r")
+        .arg(script)
+        .output()
+        .expect("PHP should execute generated output");
+
+    assert_eq!(run.status.code(), Some(101));
+    assert!(run.stdout.is_empty());
+    assert_eq!(
+        run.stderr,
+        b"Panic: failed to read file\nStack Trace:\n  at __doria_read_file\n  at main\n"
+    );
+}
+
+#[test]
 fn php_backend_uses_text_output_shape() {
     let output = doriac::compile_source(
         "test.doria",

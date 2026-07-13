@@ -410,6 +410,18 @@ impl<'program> Checker<'program> {
                 continue;
             }
 
+            if function.name == "print" {
+                self.diagnostics.push(
+                    Diagnostic::new(
+                        "E0310",
+                        "Doria does not support a top-level `print` function; use `echo`",
+                        function.span,
+                    )
+                    .with_help("remove the `print` declaration and use `echo` for output"),
+                );
+                continue;
+            }
+
             if let Some(message) = Self::reserved_callable_name_message(&function.name) {
                 self.diagnostics
                     .push(Diagnostic::new("E0310", message, function.span));
@@ -3373,6 +3385,17 @@ impl<'program> Checker<'program> {
         scopes: &ScopeStack,
         method_context: Option<&MethodContext>,
     ) {
+        if name == "print" {
+            self.diagnostics.push(
+                Diagnostic::new("E0462", "Doria does not support `print`; use `echo`", span)
+                    .with_help("echo writes output and does not return a value"),
+            );
+            for arg in args {
+                self.check_expr(arg, scopes, method_context);
+            }
+            return;
+        }
+
         if name == "readline" {
             self.diagnostics.push(
                 Diagnostic::new(

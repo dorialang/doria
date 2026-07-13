@@ -3134,6 +3134,44 @@ function main(): void {}
 }
 
 #[test]
+fn reserves_top_level_print_with_echo_guidance() {
+    let err = doriac::check_source(
+        "test.doria",
+        r#"
+function print(string $value): void {}
+function main(): void
+{
+    let $result = print("hello");
+}
+"#,
+    )
+    .expect_err("print must remain a rejected top-level spelling");
+
+    assert!(err.iter().any(|diagnostic| {
+        diagnostic.code == "E0310"
+            && diagnostic.message.contains("`print`")
+            && diagnostic.message.contains("`echo`")
+    }));
+    assert!(err.iter().any(|diagnostic| {
+        diagnostic.code == "E0462"
+            && diagnostic.message.contains("`print`")
+            && diagnostic.message.contains("`echo`")
+    }));
+
+    doriac::check_source(
+        "test.doria",
+        r#"
+class Logger
+{
+    function print(string $value): void {}
+}
+function main(): void {}
+"#,
+    )
+    .expect("a receiver-qualified method named print is not the rejected top-level spelling");
+}
+
+#[test]
 fn checks_duplicate_global_functions_against_their_own_return_annotations() {
     let err = doriac::check_source(
         "test.doria",

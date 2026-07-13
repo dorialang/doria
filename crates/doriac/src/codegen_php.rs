@@ -21,8 +21,19 @@ pub fn generate(program: &Program) -> Result<String, BackendError> {
         r#"function __doria_io_panic(string $message)
 {
     fwrite(STDERR, "Panic: " . $message . "\nStack Trace:\n");
+    $helperFunctions = [
+        "__doria_io_panic",
+        "__doria_read_line",
+        "__doria_read_file",
+        "__doria_write_file",
+        "__doria_write_all",
+        "__doria_write_stderr",
+        "__doria_sprintf",
+        "__doria_printf",
+    ];
     foreach (debug_backtrace(DEBUG_BACKTRACE_IGNORE_ARGS) as $frame) {
-        if (isset($frame["function"]) && !str_starts_with($frame["function"], "__doria_")) {
+        if (isset($frame["function"]) &&
+            (isset($frame["class"]) || !in_array($frame["function"], $helperFunctions, true))) {
             fwrite(STDERR, "  at " . $frame["function"] . "\n");
         }
     }

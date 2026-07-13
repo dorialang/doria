@@ -2,7 +2,7 @@
 
 This directory contains first-pass Doria support for IntelliJ-based IDEs.
 
-Plugin releases track the Doria toolchain CalVer. The target release is `2026.03.1`.
+Plugin releases track the Doria toolchain CalVer. The target release is `2026.03.1-canary`.
 
 It provides:
 
