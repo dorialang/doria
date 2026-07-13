@@ -3095,6 +3095,37 @@ function greet(): void {}
 }
 
 #[test]
+fn reserves_compiler_generated_top_level_function_namespace() {
+    let err = doriac::check_source(
+        "test.doria",
+        r#"
+function __doria_read_line(): void {}
+function main(): void {}
+"#,
+    )
+    .expect_err("compiler-generated top-level function names must be reserved");
+
+    assert!(err.iter().any(|diagnostic| {
+        diagnostic.code == "E0310"
+            && diagnostic.message.contains("`__doria_`")
+            && diagnostic.help.as_deref()
+                == Some("choose a function name that does not begin with `__doria_`")
+    }));
+
+    doriac::check_source(
+        "test.doria",
+        r#"
+class Example
+{
+    function __doria_helper(): void {}
+}
+function main(): void {}
+"#,
+    )
+    .expect("the generated global namespace must not reserve method names");
+}
+
+#[test]
 fn checks_duplicate_global_functions_against_their_own_return_annotations() {
     let err = doriac::check_source(
         "test.doria",

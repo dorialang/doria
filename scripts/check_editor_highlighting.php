@@ -704,7 +704,8 @@ function check_intellij_lexer(): void
     );
     require_check(
         str_contains($lexerText, 'isConstructorTypeName() -> DoriaTokenTypes.TYPE_NAME') &&
-            str_contains($lexerText, 'previousIdentifier() == "new"') &&
+            str_contains($lexerText, "buffer[cursor] == '\\\\'") &&
+            str_contains($lexerText, 'toString() == "new"') &&
             strpos($lexerText, 'isConstructorTypeName() -> DoriaTokenTypes.TYPE_NAME') <
                 strpos($lexerText, 'isCallName() -> callableTokenType()') &&
             strpos($lexerText, 'isCallName() -> callableTokenType()') <
@@ -911,6 +912,7 @@ function check_fixture(): void
         'calculateReport($text)',
         '$repository->saveReport($customResult)',
         'ReportFormatter::formatReport($customResult)',
+        'new App\Report()',
         '?User',
         '\n\t\r\s',
         'use App\Repositories\UserRepository;',

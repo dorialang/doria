@@ -825,6 +825,9 @@ function greet(string $name): void
 }
 ```
 
+Top-level function names beginning with `__doria_` are reserved for compiler-generated helpers.
+The prefix does not reserve method names or otherwise change Doria's member model.
+
 Parameters are readonly unless marked `writable`:
 
 ```doria

@@ -394,6 +394,18 @@ impl<'program> Checker<'program> {
                 continue;
             };
 
+            if function.name.starts_with("__doria_") {
+                self.diagnostics.push(
+                    Diagnostic::new(
+                        "E0310",
+                        "top-level function names beginning with `__doria_` are reserved for compiler-generated helpers",
+                        function.span,
+                    )
+                    .with_help("choose a function name that does not begin with `__doria_`"),
+                );
+                continue;
+            }
+
             if let Some(message) = Self::reserved_callable_name_message(&function.name) {
                 self.diagnostics
                     .push(Diagnostic::new("E0310", message, function.span));

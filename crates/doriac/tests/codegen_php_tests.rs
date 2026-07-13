@@ -1101,6 +1101,23 @@ function array(): void
 }
 
 #[test]
+fn rejects_compiler_helper_function_namespace_before_php_codegen() {
+    let err = doriac::compile_source_to_php(
+        "test.doria",
+        r#"
+function __doria_read_line(): void
+{
+}
+"#,
+    )
+    .expect_err("compiler helper names must be rejected before PHP codegen");
+
+    assert!(err.iter().any(|diagnostic| {
+        diagnostic.code == "E0310" && diagnostic.message.contains("`__doria_`")
+    }));
+}
+
+#[test]
 fn lowers_interpolated_string_to_hir() {
     let lowered = doriac::lower_source(
         "test.doria",
@@ -1214,6 +1231,8 @@ function main(): void
     .expect("Stage 17 PHP compatibility lowering should succeed");
 
     assert!(php.contains("function __doria_read_line(): ?string"));
+    assert!(php.contains("function __doria_io_panic(string $message)"));
+    assert!(!php.contains("function __doria_io_panic(string $message): never"));
     assert!(php.contains("if ($line === false)"));
     assert!(php.contains("if (feof(STDIN)) { return null; }"));
     assert!(php.contains("__doria_io_panic(\"failed to read stdin\")"));

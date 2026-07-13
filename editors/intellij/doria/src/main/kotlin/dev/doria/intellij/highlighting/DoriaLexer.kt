@@ -559,8 +559,37 @@ class DoriaLexer : LexerBase() {
 
     private fun isCallName(): Boolean = nextNonWhitespace(tokenEnd) == '('
 
-    private fun isConstructorTypeName(): Boolean =
-        nextNonWhitespace(tokenEnd) == '(' && previousIdentifier() == "new"
+    private fun isConstructorTypeName(): Boolean {
+        if (nextNonWhitespace(tokenEnd) != '(') {
+            return false
+        }
+
+        var cursor = tokenStart - 1
+        while (cursor >= startOffset && buffer[cursor].isWhitespace()) {
+            cursor--
+        }
+        while (cursor >= startOffset && buffer[cursor] == '\\') {
+            cursor--
+            while (cursor >= startOffset && buffer[cursor].isWhitespace()) {
+                cursor--
+            }
+            while (cursor >= startOffset && isIdentifierPart(buffer[cursor])) {
+                cursor--
+            }
+            while (cursor >= startOffset && buffer[cursor].isWhitespace()) {
+                cursor--
+            }
+        }
+        if (cursor < startOffset || !isIdentifierPart(buffer[cursor])) {
+            return false
+        }
+
+        val end = cursor + 1
+        while (cursor >= startOffset && isIdentifierPart(buffer[cursor])) {
+            cursor--
+        }
+        return buffer.subSequence(cursor + 1, end).toString() == "new"
+    }
 
     private fun callableTokenType(): IElementType = when (previousAccessor()) {
         "->" -> DoriaTokenTypes.METHOD_CALL
