@@ -126,7 +126,12 @@ fn compile_and_run(
         .unwrap_or_else(|error| {
             panic!("failed to run {backend} parity executable for {relative_path}: {error}")
         });
-    let files = fixture.read_expected_native_files(&working_directory, relative_path);
+    let mut files = read_tree(&working_directory);
+    files.remove(if cfg!(windows) {
+        "program.exe"
+    } else {
+        "program"
+    });
     fs::remove_dir_all(&working_directory).unwrap_or_else(|error| {
         panic!("failed to clean isolated directory for {relative_path}: {error}")
     });
@@ -153,13 +158,10 @@ fn assert_matches_interpreter(
         native.output.stderr, interpreted.output.stderr,
         "stderr mismatch for {relative_path} ({backend})"
     );
-    for (path, bytes) in &native.files {
-        assert_eq!(
-            interpreted.files.get(path),
-            Some(bytes),
-            "file mismatch for {relative_path} ({backend}): {path}"
-        );
-    }
+    assert_eq!(
+        native.files, interpreted.files,
+        "file side-effect mismatch for {relative_path} ({backend})"
+    );
 }
 fn manifest_paths() -> BTreeSet<String> {
     MANIFEST
@@ -363,22 +365,6 @@ impl IoFixture {
                 panic!("failed to seed {path} for {relative_path}: {error}")
             });
         }
-    }
-
-    fn read_expected_native_files(
-        &self,
-        root: &Path,
-        relative_path: &str,
-    ) -> BTreeMap<String, Vec<u8>> {
-        self.expected_files
-            .keys()
-            .map(|path| {
-                let bytes = fs::read(root.join(path)).unwrap_or_else(|error| {
-                    panic!("failed to read generated {path} for {relative_path}: {error}")
-                });
-                (path.clone(), bytes)
-            })
-            .collect()
     }
 }
 

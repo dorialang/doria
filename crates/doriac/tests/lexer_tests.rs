@@ -55,6 +55,15 @@ fn preserves_utf8_string_literal_characters() {
 }
 
 #[test]
+fn preserves_unknown_escapes_before_utf8_characters() {
+    let kinds = token_kinds(r#""\\é\\漢\\🎮""#);
+    assert!(matches!(
+        &kinds[0],
+        TokenKind::StringLiteral { value, .. } if value == "\\é\\漢\\🎮"
+    ));
+}
+
+#[test]
 fn lexes_basic_control_flow_keywords() {
     let kinds = token_kinds("if else while");
     assert!(matches!(kinds[0], TokenKind::If));

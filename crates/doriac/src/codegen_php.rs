@@ -31,8 +31,11 @@ pub fn generate(program: &Program) -> Result<String, BackendError> {
 
 function __doria_read_line(): ?string
 {
-    $line = fgets(STDIN);
-    if ($line === false) { return null; }
+    $line = @fgets(STDIN);
+    if ($line === false) {
+        if (feof(STDIN)) { return null; }
+        __doria_io_panic("failed to read stdin");
+    }
     if (preg_match('//u', $line) !== 1) { __doria_io_panic("stdin contained invalid UTF-8"); }
     if (str_ends_with($line, "\n")) {
         $line = substr($line, 0, -1);
@@ -43,7 +46,8 @@ function __doria_read_line(): ?string
 
 function __doria_read_file(string $path): string
 {
-    $contents = file_get_contents($path);
+    if (str_contains($path, "\0")) { __doria_io_panic("file path contained an embedded NUL"); }
+    $contents = @file_get_contents($path);
     if ($contents === false) { __doria_io_panic("failed to read file"); }
     if (preg_match('//u', $contents) !== 1) { __doria_io_panic("file contained invalid UTF-8"); }
     return $contents;
@@ -51,14 +55,25 @@ function __doria_read_file(string $path): string
 
 function __doria_write_file(string $path, string $contents): void
 {
-    $written = file_put_contents($path, $contents);
+    if (str_contains($path, "\0")) { __doria_io_panic("file path contained an embedded NUL"); }
+    $written = @file_put_contents($path, $contents);
     if ($written === false || $written !== strlen($contents)) { __doria_io_panic("failed to write file"); }
+}
+
+function __doria_write_all(mixed $stream, string $value, string $failure): void
+{
+    $offset = 0;
+    $length = strlen($value);
+    while ($offset < $length) {
+        $written = @fwrite($stream, substr($value, $offset));
+        if ($written === false || $written === 0) { __doria_io_panic($failure); }
+        $offset += $written;
+    }
 }
 
 function __doria_write_stderr(string $value): void
 {
-    $written = fwrite(STDERR, $value);
-    if ($written === false || $written !== strlen($value)) { __doria_io_panic("failed to write stderr"); }
+    __doria_write_all(STDERR, $value, "failed to write stderr");
 }
 
 function __doria_sprintf(string $format, mixed ...$values): string
@@ -69,8 +84,7 @@ function __doria_sprintf(string $format, mixed ...$values): string
 function __doria_printf(string $format, mixed ...$values): void
 {
     $value = sprintf($format, ...$values);
-    $written = fwrite(STDOUT, $value);
-    if ($written === false || $written !== strlen($value)) { __doria_io_panic("failed to write stdout"); }
+    __doria_write_all(STDOUT, $value, "failed to write stdout");
 }
 
 "#,
@@ -471,10 +485,15 @@ fn validate_php_format_call(
         FormatPiece::Literal(_) => None,
     });
     for (argument, conversion) in args[1..].iter().zip(conversions) {
-        if conversion == FormatConversion::Display {
-            validate_display_expr(argument, semantic_info)?;
-        } else {
-            validate_expr(argument, semantic_info)?;
+        match conversion {
+            FormatConversion::Display => validate_display_expr(argument, semantic_info)?,
+            FormatConversion::Float => {
+                return Err(unsupported_numeric_shape(
+                    argument.span(),
+                    "canonical Stage 17 `%f` formatting",
+                ));
+            }
+            _ => validate_expr(argument, semantic_info)?,
         }
     }
     Ok(())
