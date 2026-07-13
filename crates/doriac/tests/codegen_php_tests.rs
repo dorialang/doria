@@ -1429,3 +1429,24 @@ fn php_backend_preserves_the_exact_displayable_contract() {
     assert_eq!(run.stdout, b"Doria Doria Doria Doria");
     assert!(run.stderr.is_empty());
 }
+
+#[test]
+fn php_backend_reserves_display_helper_class_name_case_insensitively() {
+    for name in [
+        "__DoriaDisplayable",
+        "__doriadisplayable",
+        "__DORIADISPLAYABLE",
+    ] {
+        let diagnostics = doriac::compile_source_to_php(
+            "reserved_display_helper.doria",
+            format!("class {name} {{}}"),
+        )
+        .expect_err("PHP display helper name variants must be reserved");
+
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "E0309"
+                && diagnostic.message.contains("`__DoriaDisplayable`")
+                && diagnostic.message.contains("reserved")
+        }));
+    }
+}

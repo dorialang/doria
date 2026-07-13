@@ -420,11 +420,13 @@ impl<'program> Checker<'program> {
                 "`{name}` is a compiler-known integer companion and cannot be redeclared"
             ));
         }
-        match name {
-            "__DoriaDisplayable" => Some(
+        if name.eq_ignore_ascii_case("__DoriaDisplayable") {
+            return Some(
                 "`__DoriaDisplayable` is reserved for compiler-generated PHP compatibility output"
                     .to_string(),
-            ),
+            );
+        }
+        match name {
             "Displayable" => Some(
                 "`Displayable` is a compiler-known interface and cannot be redeclared"
                     .to_string(),

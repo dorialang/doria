@@ -502,6 +502,8 @@ fn rejects_malformed_string_interpolation() {
         ),
         ("echo \"Hello, {}\";", "empty string interpolation"),
         ("echo \"Hello, {$}\";", "expected variable name after `$`"),
+        ("echo \"{/* comment */}\";", "expected expression"),
+        ("echo \"{// comment\n}\";", "expected expression"),
         ("echo \"A literal {word}\";", "unescaped `{`"),
         ("echo \"{{word}}\";", "unescaped `{`"),
     ] {

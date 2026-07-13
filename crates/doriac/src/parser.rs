@@ -1071,6 +1071,13 @@ impl Parser {
             token.span.start += inner_span.start;
             token.span.end += inner_span.start;
         }
+        if tokens
+            .first()
+            .is_some_and(|token| matches!(token.kind, TokenKind::Eof))
+        {
+            self.error("expected expression", tokens[0].span);
+            return None;
+        }
 
         let mut nested = Parser::new(tokens);
         let expr = nested.parse_expression();
