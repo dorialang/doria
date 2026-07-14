@@ -916,7 +916,7 @@ class DoriaLexer : LexerBase() {
 
         private val INVALID_KEYWORDS = setOf("goto", "require", "require_once", "include_once", "print")
 
-        private val MODIFIERS = setOf("writable", "readonly", "internal")
+        private val MODIFIERS = setOf("take", "writable", "readonly", "internal")
 
         private val PRIMITIVE_TYPES = setOf(
             "void",

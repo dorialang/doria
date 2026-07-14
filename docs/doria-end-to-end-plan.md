@@ -103,7 +103,7 @@ The mapping in one table:
 
 ```text
 error[D0203]: $user was given to store() on line 12, so it can no longer be used here
-help: call $user->clone() before line 12 if you need to keep a copy
+help: $user gave away ownership at line 12 and cannot be used afterward
 ```
 
 - Explicit duplication is the future `->clone()` surface, backed by `Cloneable` once method and interface support exist. Until then, move-type duplication is intentionally unavailable except for compiler-internal lowering needs.

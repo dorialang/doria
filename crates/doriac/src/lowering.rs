@@ -67,6 +67,7 @@ fn lower_function(function: &ast::FunctionDecl) -> hir::FunctionDecl {
 fn lower_param(param: &ast::Param) -> hir::Param {
     hir::Param {
         promoted_access: param.promoted_access.clone(),
+        take: param.take,
         writable: param.writable,
         ty: param.ty.clone(),
         name: param.name.clone(),

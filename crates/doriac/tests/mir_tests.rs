@@ -110,6 +110,7 @@ fn debug_contents(source: &str) -> String {
 
 fn conditional_program(condition: Condition, then_status: i64, else_status: i64) -> Program {
     Program {
+        classes: vec![],
         functions: vec![Function {
             id: FunctionId(0),
             name: "main".to_string(),
@@ -770,6 +771,7 @@ fn interprets_multiple_echoes_without_newline() {
 #[test]
 fn interpreter_reports_arithmetic_overflow_as_runtime_panic() {
     let program = Program {
+        classes: vec![],
         functions: vec![Function {
             id: FunctionId(0),
             name: "main".to_string(),
@@ -1407,6 +1409,7 @@ fn interpreter_preserves_void_fallthrough_after_final_else_if() {
 #[test]
 fn explicitly_limited_interpreter_stops_repeated_mir_state_cycles() {
     let program = Program {
+        classes: vec![],
         functions: vec![Function {
             id: FunctionId(0),
             name: "main".to_string(),
@@ -2877,6 +2880,7 @@ fn stage_11f_debug_target_handles_all_examples() {
 #[test]
 fn explicitly_limited_interpreter_can_bound_call_frames() {
     let program = Program {
+        classes: vec![],
         functions: vec![Function {
             id: FunctionId(0),
             name: "main".to_string(),

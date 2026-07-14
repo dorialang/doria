@@ -33,6 +33,7 @@ $acceptedKeywords = [
     'implements',
     'function',
     'let',
+    'take',
     'writable',
     'readonly',
     'internal',

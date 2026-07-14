@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use crate::class_layout::{compute_class_layout, ClassId, FieldType};
 use crate::diagnostics::{Diagnostic, DiagnosticResult};
 use crate::format_string::{self, FormatConversion, FormatPiece};
 use crate::numeric::{parse_decimal_magnitude, FloatType, FloatValue, IntegerType, IntegerValue};
@@ -14,17 +15,41 @@ struct FunctionSignature {
     parameter_types: Vec<mir::Type>,
 }
 
+#[derive(Clone, Copy)]
+struct CallableDecl<'a> {
+    function: &'a hir::FunctionDecl,
+    receiver: Option<ClassId>,
+}
+
 pub fn lower_program(program: &hir::Program) -> DiagnosticResult<mir::Program> {
+    let class_ids = program
+        .semantic_info
+        .classes
+        .iter()
+        .map(|class| (class.name.clone(), class.id))
+        .collect::<HashMap<_, _>>();
     let mut declarations = Vec::new();
 
     for item in &program.items {
         match item {
-            hir::Item::Function(function) => declarations.push(function),
+            hir::Item::Function(function) => declarations.push(CallableDecl {
+                function,
+                receiver: None,
+            }),
             hir::Item::Class(class_decl) => {
-                return Err(vec![unsupported(
-                    class_decl.span,
-                    "classes are not lowered to MIR in Stage 11",
-                )]);
+                let class = *class_ids
+                    .get(&class_decl.name)
+                    .expect("checked class has a stable identity");
+                for member in &class_decl.members {
+                    if let hir::ClassMember::Method(method) = member {
+                        if matches!(method.name.as_str(), "__construct" | "__destruct") {
+                            declarations.push(CallableDecl {
+                                function: method,
+                                receiver: Some(class),
+                            });
+                        }
+                    }
+                }
             }
             hir::Item::Statement(statement) => {
                 return Err(vec![unsupported(
@@ -38,12 +63,14 @@ pub fn lower_program(program: &hir::Program) -> DiagnosticResult<mir::Program> {
     let main_indices = declarations
         .iter()
         .enumerate()
-        .filter_map(|(index, function)| (function.name == "main").then_some(index))
+        .filter_map(|(index, declaration)| {
+            (declaration.receiver.is_none() && declaration.function.name == "main").then_some(index)
+        })
         .collect::<Vec<_>>();
     if main_indices.len() != 1 {
         let span = main_indices
             .get(1)
-            .map_or_else(Span::default, |index| declarations[*index].span);
+            .map_or_else(Span::default, |index| declarations[*index].function.span);
         return Err(vec![unsupported(
             span,
             "Stage 11 requires exactly one top-level function main",
@@ -51,8 +78,10 @@ pub fn lower_program(program: &hir::Program) -> DiagnosticResult<mir::Program> {
     }
 
     let mut signatures = HashMap::new();
-    for (index, function) in declarations.iter().enumerate() {
-        if signatures.contains_key(&function.name) {
+    let mut callable_signatures = Vec::new();
+    for (index, declaration) in declarations.iter().enumerate() {
+        let function = declaration.function;
+        if declaration.receiver.is_none() && signatures.contains_key(&function.name) {
             return Err(vec![unsupported(
                 function.span,
                 format!(
@@ -61,8 +90,16 @@ pub fn lower_program(program: &hir::Program) -> DiagnosticResult<mir::Program> {
                 ),
             )]);
         }
-        let signature = collect_function_signature(function, mir::FunctionId(index))?;
-        signatures.insert(function.name.clone(), signature);
+        let signature = collect_function_signature(
+            function,
+            mir::FunctionId(index),
+            &class_ids,
+            declaration.receiver.is_some(),
+        )?;
+        if declaration.receiver.is_none() {
+            signatures.insert(function.name.clone(), signature.clone());
+        }
+        callable_signatures.push(signature);
     }
 
     let entry = signatures
@@ -71,21 +108,83 @@ pub fn lower_program(program: &hir::Program) -> DiagnosticResult<mir::Program> {
         .id;
     let functions = declarations
         .iter()
-        .map(|function| {
-            let signature = signatures
-                .get(&function.name)
-                .cloned()
-                .expect("every function signature must be collected");
-            lower_function(function, signature, &signatures, &program.semantic_info)
+        .zip(callable_signatures)
+        .map(|(declaration, signature)| {
+            lower_function(
+                declaration.function,
+                signature,
+                &signatures,
+                &program.semantic_info,
+                declaration.receiver,
+            )
         })
         .collect::<Result<Vec<_>, _>>()?;
 
-    Ok(mir::Program { functions, entry })
+    let classes = program
+        .semantic_info
+        .classes
+        .iter()
+        .map(|class| {
+            let properties = class
+                .properties
+                .iter()
+                .map(|property| {
+                    Ok(mir::Property {
+                        id: property.id,
+                        name: property.name.clone(),
+                        ty: mir_type_ref(&property.ty, &class_ids).ok_or_else(|| {
+                            vec![unsupported(
+                                Span::default(),
+                                format!(
+                                    "property `${}` has a type outside the Stage 19 native class subset",
+                                    property.name
+                                ),
+                            )]
+                        })?,
+                        writable: property.writable,
+                        promoted: property.promoted,
+                    })
+                })
+                .collect::<DiagnosticResult<Vec<_>>>()?;
+            let layout = compute_class_layout(
+                class.id,
+                properties.iter().map(|property| {
+                    (
+                        property.id,
+                        field_type(property.ty).expect("checked Stage 19 property type"),
+                    )
+                }),
+                std::mem::size_of::<usize>() as u32,
+            );
+            let lifecycle = |name: &str| {
+                declarations.iter().enumerate().find_map(|(index, declaration)| {
+                    (declaration.receiver == Some(class.id) && declaration.function.name == name)
+                        .then_some(mir::FunctionId(index))
+                })
+            };
+            Ok(mir::Class {
+                id: class.id,
+                name: class.name.clone(),
+                properties,
+                layout,
+                constructor: lifecycle("__construct"),
+                destructor: lifecycle("__destruct"),
+            })
+        })
+        .collect::<DiagnosticResult<Vec<_>>>()?;
+
+    Ok(mir::Program {
+        classes,
+        functions,
+        entry,
+    })
 }
 
 fn collect_function_signature(
     function: &hir::FunctionDecl,
     id: mir::FunctionId,
+    class_ids: &HashMap<String, ClassId>,
+    lifecycle: bool,
 ) -> DiagnosticResult<FunctionSignature> {
     let return_type = match function.return_type.as_ref() {
         Some(ty) if scalar_type_ref(ty).is_some() => mir::ReturnType::Value(mir::Type::Scalar(
@@ -96,6 +195,9 @@ fn collect_function_signature(
             mir::ReturnType::Value(mir::Type::NullableString)
         }
         Some(ty) if is_plain_type(ty, "void") => mir::ReturnType::Void,
+        Some(ty) if mir_type_ref(ty, class_ids).is_some() => {
+            mir::ReturnType::Value(mir_type_ref(ty, class_ids).expect("checked class return"))
+        }
         Some(ty) => {
             return Err(vec![unsupported(
                 function.span,
@@ -105,6 +207,7 @@ fn collect_function_signature(
                 ),
             )]);
         }
+        None if lifecycle => mir::ReturnType::Void,
         None => {
             return Err(vec![unsupported(
                 function.span,
@@ -148,12 +251,8 @@ fn collect_function_signature(
                 ),
             )]);
         }
-        let parameter_type = if let Some(scalar) = scalar_type_ref(&param.ty) {
-            mir::Type::Scalar(scalar)
-        } else if is_plain_type(&param.ty, "string") {
-            mir::Type::String
-        } else if is_nullable_string_type(&param.ty) {
-            mir::Type::NullableString
+        let parameter_type = if let Some(ty) = mir_type_ref(&param.ty, class_ids) {
+            ty
         } else {
             return Err(vec![unsupported(
                 param.span,
@@ -171,6 +270,32 @@ fn collect_function_signature(
         return_type,
         parameter_types,
     })
+}
+
+fn mir_type_ref(
+    ty: &crate::types::TypeRef,
+    class_ids: &HashMap<String, ClassId>,
+) -> Option<mir::Type> {
+    scalar_type_ref(ty)
+        .map(mir::Type::Scalar)
+        .or_else(|| is_plain_type(ty, "string").then_some(mir::Type::String))
+        .or_else(|| is_nullable_string_type(ty).then_some(mir::Type::NullableString))
+        .or_else(|| {
+            (!ty.nullable && ty.args.is_empty())
+                .then(|| class_ids.get(&ty.name).copied().map(mir::Type::Class))
+                .flatten()
+        })
+}
+
+fn field_type(ty: mir::Type) -> Option<FieldType> {
+    match ty {
+        mir::Type::Scalar(mir::ScalarType::Integer(ty)) => Some(FieldType::Integer(ty)),
+        mir::Type::Scalar(mir::ScalarType::Float(ty)) => Some(FieldType::Float(ty)),
+        mir::Type::Scalar(mir::ScalarType::Bool) => Some(FieldType::Bool),
+        mir::Type::String => Some(FieldType::String),
+        mir::Type::NullableString => Some(FieldType::NullableString),
+        mir::Type::Class(class) => Some(FieldType::Class(class)),
+    }
 }
 
 fn integer_type_ref(ty: &crate::types::TypeRef) -> Option<IntegerType> {
@@ -207,14 +332,21 @@ fn lower_function(
     signature: FunctionSignature,
     signatures: &HashMap<String, FunctionSignature>,
     semantic_info: &SemanticInfo,
+    receiver: Option<ClassId>,
 ) -> DiagnosticResult<mir::Function> {
     let mut context = LoweringContext::new(signatures.clone(), semantic_info);
-    let params = function
-        .params
-        .iter()
-        .zip(signature.parameter_types.iter().copied())
-        .map(|(param, ty)| context.declare_user_local(&param.name, param.writable, ty))
-        .collect::<Vec<_>>();
+    let mut params = Vec::new();
+    if let Some(class) = receiver {
+        params.push(context.declare_user_local("this", false, mir::Type::Class(class)));
+    }
+    params.extend(
+        function
+            .params
+            .iter()
+            .zip(signature.parameter_types.iter().copied())
+            .map(|(param, ty)| context.declare_user_local(&param.name, param.writable, ty))
+            .collect::<Vec<_>>(),
+    );
 
     lower_function_body(
         &function.body,
@@ -226,7 +358,10 @@ fn lower_function(
 
     Ok(mir::Function {
         id: signature.id,
-        name: function.name.clone(),
+        name: receiver.map_or_else(
+            || function.name.clone(),
+            |class| format!("class#{}::{}", class.0, function.name),
+        ),
         params,
         return_type: signature.return_type,
         locals,
@@ -976,14 +1111,16 @@ impl<'semantic> LoweringContext<'semantic> {
     fn local_scalar_type(&self, id: mir::LocalId) -> DiagnosticResult<mir::ScalarType> {
         match self.local_type(id) {
             mir::Type::Scalar(ty) => Ok(ty),
-            mir::Type::String | mir::Type::NullableString => Err(vec![Diagnostic::new(
-                "I1401",
-                format!(
+            mir::Type::String | mir::Type::NullableString | mir::Type::Class(_) => {
+                Err(vec![Diagnostic::new(
+                    "I1401",
+                    format!(
                     "internal compiler consistency error: string local local{} used as a scalar",
                     id.0
                 ),
-                Span::default(),
-            )]),
+                    Span::default(),
+                )])
+            }
         }
     }
 }
@@ -1725,6 +1862,10 @@ fn lower_rvalue_as_expected(
             lower_nullable_string_expression(expr, context).map(mir::Rvalue::NullableString)
         }
         mir::Type::Scalar(_) => lower_value_expression(expr, context).map(mir::Rvalue::Value),
+        mir::Type::Class(_) => Err(vec![unsupported(
+            expr.span(),
+            "class rvalue lowering is not available for this expression",
+        )]),
     }
 }
 

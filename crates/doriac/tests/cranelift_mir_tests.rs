@@ -375,6 +375,7 @@ fn rejects_malformed_block_id() {
 
 fn void_program() -> Program {
     Program {
+        classes: vec![],
         functions: vec![Function {
             id: FunctionId(0),
             name: "main".to_string(),

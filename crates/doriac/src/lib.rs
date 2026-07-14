@@ -1,6 +1,7 @@
 pub mod ast;
 pub mod backend;
 pub mod builtins;
+pub mod class_layout;
 pub mod codegen_cranelift;
 #[cfg(feature = "llvm-backend")]
 pub mod codegen_llvm;
@@ -20,6 +21,7 @@ pub mod mir_lowering;
 pub mod mir_validation;
 pub mod native_abi;
 pub mod numeric;
+pub mod ownership;
 pub mod parser;
 pub mod return_analysis;
 pub mod runtime_artifact;

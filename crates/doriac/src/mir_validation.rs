@@ -94,6 +94,10 @@ fn validate_statement(
                 (mir::Type::NullableString, mir::Rvalue::NullableString(expression)) => {
                     validate_nullable_string_expression(program, function, expression)
                 }
+                (mir::Type::NullableString, mir::Rvalue::Class(_)) => Err(malformed_mir(format!(
+                    "nullable-string local local{} receives a class rvalue",
+                    target.0
+                ))),
                 (mir::Type::NullableString, _) => Err(malformed_mir(format!(
                     "nullable-string local local{} receives another rvalue type",
                     target.0
@@ -114,6 +118,21 @@ fn validate_statement(
                         )));
                     }
                     validate_value_expression(program, function, expression)
+                }
+                (mir::Type::Class(expected), mir::Rvalue::Class(expression))
+                    if expression.class() == expected =>
+                {
+                    validate_class_expression(program, function, expression)
+                }
+                (mir::Type::Class(expected), _) => Err(malformed_mir(format!(
+                    "class#{} local local{} receives a mismatched rvalue",
+                    expected.0, target.0
+                ))),
+                (mir::Type::String | mir::Type::Scalar(_), mir::Rvalue::Class(_)) => {
+                    Err(malformed_mir(format!(
+                        "non-class local local{} receives a class rvalue",
+                        target.0
+                    )))
                 }
             }
         }
@@ -140,6 +159,9 @@ fn validate_statement(
             validate_string_expression(program, function, contents)
         }
         mir::Statement::WriteStderr(value) => validate_string_expression(program, function, value),
+        mir::Statement::AssignProperty { .. } | mir::Statement::DropClass { .. } => {
+            Err(malformed_mir("class operation is not fully validated yet"))
+        }
     }
 }
 
@@ -275,6 +297,60 @@ fn validate_rvalue(
         mir::Rvalue::String(value) => validate_string_expression(program, function, value),
         mir::Rvalue::NullableString(value) => {
             validate_nullable_string_expression(program, function, value)
+        }
+        mir::Rvalue::Class(value) => validate_class_expression(program, function, value),
+    }
+}
+
+fn validate_class_expression(
+    program: &mir::Program,
+    function: &mir::Function,
+    expression: &mir::ClassExpression,
+) -> Result<(), BackendError> {
+    let class = expression.class();
+    if program
+        .classes
+        .get(class.0)
+        .is_none_or(|definition| definition.id != class)
+    {
+        return Err(malformed_mir(format!("unknown class#{}", class.0)));
+    }
+    match expression {
+        mir::ClassExpression::Local { local, .. } => {
+            let definition = local_in(function, *local)?;
+            if definition.ty == mir::Type::Class(class) {
+                Ok(())
+            } else {
+                Err(malformed_mir(format!(
+                    "class rvalue uses non-class local local{}",
+                    local.0
+                )))
+            }
+        }
+        mir::ClassExpression::Call {
+            function: callee,
+            args,
+            ..
+        } => {
+            let callee = function_in(program, *callee)?;
+            validate_call_args(program, function, callee, args)
+        }
+        mir::ClassExpression::New {
+            properties,
+            args,
+            constructor,
+            ..
+        } => {
+            for property in properties {
+                if let mir::PropertyValueSource::Expression(value) = &property.source {
+                    validate_rvalue(program, function, value)?;
+                }
+            }
+            if let Some(constructor) = constructor {
+                let constructor = function_in(program, *constructor)?;
+                validate_call_args(program, function, constructor, args)?;
+            }
+            Ok(())
         }
     }
 }

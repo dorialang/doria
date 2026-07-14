@@ -226,7 +226,21 @@ impl Parser {
         }
 
         let access = self.parse_member_access();
-        let writable = self.match_kind(&TokenKind::Writable);
+        let ownership_modifier_insert = Span::new(self.peek().span.start, self.peek().span.start);
+        let mut take_span = None;
+        let mut writable_span = None;
+        while self.check(&TokenKind::Take) || self.check(&TokenKind::Writable) {
+            let token = self.advance().clone();
+            match token.kind {
+                TokenKind::Take if take_span.is_none() => take_span = Some(token.span),
+                TokenKind::Writable if writable_span.is_none() => writable_span = Some(token.span),
+                TokenKind::Take => self.error("duplicate `take` parameter modifier", token.span),
+                TokenKind::Writable => {
+                    self.error("duplicate `writable` parameter modifier", token.span)
+                }
+                _ => unreachable!("modifier loop accepts only take/writable"),
+            }
+        }
         let ty = self.parse_type_ref()?;
         let (name, name_span) = self.expect_variable("expected parameter variable name")?;
         let default = if self.match_kind(&TokenKind::Equals) {
@@ -239,7 +253,11 @@ impl Parser {
 
         Some(Param {
             promoted_access: is_constructor.then_some(access),
-            writable,
+            take: take_span.is_some(),
+            take_span,
+            writable: writable_span.is_some(),
+            writable_span,
+            ownership_modifier_insert,
             ty,
             name,
             default,
@@ -1539,6 +1557,7 @@ fn token_name(kind: &TokenKind) -> &'static str {
         TokenKind::Internal => "internal",
         TokenKind::Static => "static",
         TokenKind::Let => "let",
+        TokenKind::Take => "take",
         TokenKind::Writable => "writable",
         TokenKind::Readonly => "readonly",
         TokenKind::Return => "return",

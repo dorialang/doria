@@ -189,7 +189,7 @@ fn define_function<'ctx>(
                 build(builder.build_store(slot, scalar_zero(context, ty)))?;
                 local_slots.push(Some(slot));
             }
-            mir::Type::String | mir::Type::NullableString => {
+            mir::Type::String | mir::Type::NullableString | mir::Type::Class(_) => {
                 let slot = build(builder.build_alloca(
                     context.ptr_type(AddressSpace::default()),
                     &format!("local{}", local.id.0),
@@ -386,6 +386,11 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                         self.release_string(old)?;
                         build(self.builder.build_store(slot, value))?;
                     }
+                    mir::Type::Class(_) => {
+                        return Err(malformed_mir(
+                            "class assignment reached LLVM before Stage 19 lowering",
+                        ));
+                    }
                 }
             }
             mir::Statement::EchoStringLiteral(value) => self.lower_echo(value.as_bytes())?,
@@ -437,6 +442,11 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 )?;
                 self.release_string(path)?;
                 self.release_string(contents)?;
+            }
+            mir::Statement::AssignProperty { .. } | mir::Statement::DropClass { .. } => {
+                return Err(malformed_mir(
+                    "class operation reached LLVM before Stage 19 lowering",
+                ));
             }
         }
         Ok(())
@@ -527,6 +537,9 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             mir::Rvalue::NullableString(value) => {
                 Ok(self.lower_nullable_string_expression(value)?.into())
             }
+            mir::Rvalue::Class(_) => Err(malformed_mir(
+                "class rvalue reached LLVM before Stage 19 lowering",
+            )),
         }
     }
 
@@ -1982,7 +1995,7 @@ fn scalar_type(context: &Context, ty: mir::ScalarType) -> BasicTypeEnum<'_> {
 fn llvm_type(context: &Context, ty: mir::Type) -> BasicTypeEnum<'_> {
     match ty {
         mir::Type::Scalar(ty) => scalar_type(context, ty),
-        mir::Type::String | mir::Type::NullableString => {
+        mir::Type::String | mir::Type::NullableString | mir::Type::Class(_) => {
             context.ptr_type(AddressSpace::default()).into()
         }
     }

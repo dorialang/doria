@@ -387,6 +387,7 @@ fn completion_items() -> Value {
         "implements",
         "function",
         "let",
+        "take",
         "writable",
         "readonly",
         "internal",
@@ -727,6 +728,9 @@ fn hover_description(kind: &TokenKind) -> Option<&'static str> {
         ),
         TokenKind::Function => Some("Declares a function or method."),
         TokenKind::Let => Some("Declares a local binding with an inferred type."),
+        TokenKind::Take => Some(
+            "Gives ownership of a move-type argument to this parameter. Call sites remain unmarked.",
+        ),
         TokenKind::Writable => {
             Some("Marks a binding, property, parameter, or method receiver as mutable.")
         }

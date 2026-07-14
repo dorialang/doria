@@ -39,6 +39,7 @@ pub enum PropertyInitState {
 pub struct ParamInfo {
     pub name: String,
     pub ty: TypeId,
+    pub take: bool,
     pub has_default: bool,
 }
 

@@ -10,6 +10,7 @@ use crate::source::Span;
 use crate::types::TypeRef;
 
 const PHP_INTEGER_UNSUPPORTED_CODE: &str = "B1301";
+const PHP_OWNERSHIP_UNSUPPORTED_CODE: &str = "B1901";
 
 pub fn generate(program: &Program) -> Result<String, BackendError> {
     validate_program(program)?;
@@ -144,6 +145,12 @@ fn validate_function(
     semantic_info: &SemanticInfo,
     is_method: bool,
 ) -> Result<(), BackendError> {
+    if is_method && function.name == "__destruct" {
+        return Err(unsupported_ownership_shape(
+            function.span,
+            "deterministic scope-based `__destruct` timing",
+        ));
+    }
     if is_method
         && matches!(function.name.as_str(), "__construct" | "__destruct")
         && (function.is_static || function.writable_this)
@@ -154,6 +161,12 @@ fn validate_function(
         )));
     }
     for param in &function.params {
+        if param.take {
+            return Err(unsupported_ownership_shape(
+                param.span,
+                format!("ownership transfer through `take ${}`", param.name),
+            ));
+        }
         validate_type(&param.ty, param.span)?;
         if let Some(default) = &param.default {
             validate_expr(default, semantic_info)?;
@@ -542,6 +555,17 @@ fn unsupported_integer_shape(span: Span, feature: impl Into<String>) -> BackendE
 fn unsupported_numeric_shape(span: Span, feature: impl Into<String>) -> BackendError {
     BackendError::from_diagnostics(vec![Diagnostic::new(
         PHP_INTEGER_UNSUPPORTED_CODE,
+        format!(
+            "PHP compatibility backend cannot preserve {} exactly; use the `native` or `debug` target for this valid Doria program",
+            feature.into()
+        ),
+        span,
+    )])
+}
+
+fn unsupported_ownership_shape(span: Span, feature: impl Into<String>) -> BackendError {
+    BackendError::from_diagnostics(vec![Diagnostic::new(
+        PHP_OWNERSHIP_UNSUPPORTED_CODE,
         format!(
             "PHP compatibility backend cannot preserve {} exactly; use the `native` or `debug` target for this valid Doria program",
             feature.into()

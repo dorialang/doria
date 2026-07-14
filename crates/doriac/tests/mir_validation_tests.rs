@@ -177,6 +177,7 @@ fn decimal_spec() -> FormatSpec {
 
 fn valid_void_program() -> Program {
     Program {
+        classes: vec![],
         functions: vec![Function {
             id: FunctionId(0),
             name: "main".to_string(),

@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::ast::*;
 use crate::builtins::{php_function_suggestion, Builtin};
+use crate::class_layout::{ClassId, PropertyId};
 use crate::diagnostics::{Diagnostic, DiagnosticResult};
 use crate::format_string::{self, FormatConversion, FormatPiece};
 use crate::numeric::{parse_decimal_magnitude, FloatType, FloatValue, IntegerType, IntegerValue};
@@ -22,6 +23,24 @@ pub struct SemanticInfo {
     pub integer_expression_types: HashMap<(usize, usize), IntegerType>,
     /// Canonical width for every floating-point-valued source expression.
     pub float_expression_types: HashMap<(usize, usize), FloatType>,
+    /// Stable nominal class identities and the total Stage 19 property order.
+    pub classes: Vec<ClassSemanticInfo>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClassSemanticInfo {
+    pub id: ClassId,
+    pub name: String,
+    pub properties: Vec<PropertySemanticInfo>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PropertySemanticInfo {
+    pub id: PropertyId,
+    pub name: String,
+    pub ty: TypeRef,
+    pub writable: bool,
+    pub promoted: bool,
 }
 
 impl SemanticInfo {
@@ -42,13 +61,75 @@ pub fn analyze_program(program: &Program) -> DiagnosticResult<SemanticInfo> {
     let mut checker = Checker::new(program);
     checker.check();
     if checker.diagnostics.is_empty() {
+        checker
+            .diagnostics
+            .extend(crate::ownership::check_program(program));
+    }
+    if checker.diagnostics.is_empty() {
         Ok(SemanticInfo {
             integer_expression_types: checker.integer_expression_types,
             float_expression_types: checker.float_expression_types,
+            classes: collect_ordered_class_semantics(program),
         })
     } else {
         Err(checker.diagnostics)
     }
+}
+
+fn collect_ordered_class_semantics(program: &Program) -> Vec<ClassSemanticInfo> {
+    program
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            Item::Class(class) => Some(class),
+            _ => None,
+        })
+        .enumerate()
+        .map(|(class_index, class)| {
+            let id = ClassId(class_index);
+            let explicit = class.members.iter().filter_map(|member| match member {
+                ClassMember::Property(property) => Some((
+                    property.name.clone(),
+                    property.ty.clone(),
+                    property.writable,
+                    false,
+                )),
+                _ => None,
+            });
+            let promoted = class.members.iter().find_map(|member| match member {
+                ClassMember::Method(method) if method.name == "__construct" => {
+                    Some(method.params.iter().filter_map(|param| {
+                        param
+                            .promoted_access
+                            .as_ref()
+                            .map(|_| (param.name.clone(), param.ty.clone(), param.writable, true))
+                    }))
+                }
+                _ => None,
+            });
+            let mut properties = explicit.collect::<Vec<_>>();
+            if let Some(promoted) = promoted {
+                properties.extend(promoted);
+            }
+            ClassSemanticInfo {
+                id,
+                name: class.name.clone(),
+                properties: properties
+                    .into_iter()
+                    .enumerate()
+                    .map(
+                        |(index, (name, ty, writable, promoted))| PropertySemanticInfo {
+                            id: PropertyId { class: id, index },
+                            name,
+                            ty,
+                            writable,
+                            promoted,
+                        },
+                    )
+                    .collect(),
+            }
+        })
+        .collect()
 }
 
 pub fn check_program(program: &Program) -> DiagnosticResult<()> {
@@ -601,6 +682,44 @@ impl<'program> Checker<'program> {
             let ty = self.resolve_type_ref(&param.ty, param.span);
             let has_default = param.default.is_some();
 
+            if param.take && param.writable {
+                let span = param
+                    .take_span
+                    .zip(param.writable_span)
+                    .map(|(take, writable)| take.merge(writable))
+                    .unwrap_or(param.span);
+                self.diagnostics.push(
+                    Diagnostic::new(
+                        "E0467",
+                        "a parameter cannot be both `take` and `writable`",
+                        span,
+                    )
+                    .with_help(
+                        "use `take` to give ownership to the callee, or `writable` for exclusive mutation without giving ownership",
+                    ),
+                );
+            }
+
+            if param.promoted_access.is_some()
+                && matches!(self.types.kind(ty), TypeKind::Class(_))
+                && !param.take
+            {
+                self.diagnostics.push(
+                    Diagnostic::new(
+                        "E0468",
+                        format!(
+                            "promoted move-type parameter `${}` must use `take`",
+                            param.name
+                        ),
+                        param.span,
+                    )
+                    .with_help(
+                        "promotion gives ownership directly to the new property; insert `take`",
+                    )
+                    .with_fix(param.ownership_modifier_insert, "take "),
+                );
+            }
+
             if !has_default && saw_optional {
                 self.diagnostics.push(Diagnostic::new(
                     "E0410",
@@ -619,6 +738,7 @@ impl<'program> Checker<'program> {
             params.push(ParamInfo {
                 name: param.name.clone(),
                 ty,
+                take: param.take,
                 has_default,
             });
         }

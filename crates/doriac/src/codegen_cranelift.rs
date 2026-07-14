@@ -137,7 +137,9 @@ fn scalar_abi_param(ty: mir::ScalarType) -> AbiParam {
 fn type_abi_param(ty: mir::Type, pointer_type: ClifType) -> AbiParam {
     match ty {
         mir::Type::Scalar(ty) => scalar_abi_param(ty),
-        mir::Type::String | mir::Type::NullableString => AbiParam::new(pointer_type),
+        mir::Type::String | mir::Type::NullableString | mir::Type::Class(_) => {
+            AbiParam::new(pointer_type)
+        }
     }
 }
 
@@ -185,7 +187,7 @@ fn define_function(
                         bytes.trailing_zeros() as u8,
                     )))
                 }
-                mir::Type::String | mir::Type::NullableString => {
+                mir::Type::String | mir::Type::NullableString | mir::Type::Class(_) => {
                     Some(builder.create_sized_stack_slot(StackSlotData::new(
                         StackSlotKind::ExplicitSlot,
                         u32::from(module.target_config().pointer_bytes()),
@@ -276,7 +278,9 @@ fn initialize_locals(
                 builder.ins().f64const(Ieee64::with_bits(0))
             }
             mir::Type::Scalar(mir::ScalarType::Bool) => builder.ins().iconst(types::I8, 0),
-            mir::Type::String | mir::Type::NullableString => builder.ins().iconst(pointer_type, 0),
+            mir::Type::String | mir::Type::NullableString | mir::Type::Class(_) => {
+                builder.ins().iconst(pointer_type, 0)
+            }
         };
         builder
             .ins()
@@ -554,6 +558,11 @@ fn lower_statement(
                     release_string(builder, old_value, resources)?;
                     builder.ins().stack_store(new_value, slot, 0);
                 }
+                mir::Type::Class(_) => {
+                    return Err(malformed_mir(
+                        "class assignment reached Cranelift before Stage 19 lowering",
+                    ));
+                }
             }
         }
         mir::Statement::EchoStringLiteral(value) => {
@@ -618,6 +627,11 @@ fn lower_statement(
             )?;
             release_string(builder, path, resources)?;
             release_string(builder, contents, resources)?;
+        }
+        mir::Statement::AssignProperty { .. } | mir::Statement::DropClass { .. } => {
+            return Err(malformed_mir(
+                "class operation reached Cranelift before Stage 19 lowering",
+            ));
         }
     }
     Ok(())
@@ -709,6 +723,9 @@ fn lower_rvalue(
         mir::Rvalue::NullableString(value) => {
             lower_nullable_string_expression(builder, value, resources)
         }
+        mir::Rvalue::Class(_) => Err(malformed_mir(
+            "class rvalue reached Cranelift before Stage 19 lowering",
+        )),
     }
 }
 
