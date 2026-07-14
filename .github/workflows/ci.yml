@@ -19,6 +19,33 @@ env:
   DORIA_RT_PATH: ${{ github.workspace }}/target/debug/libdoria_rt.a
 
 jobs:
+  parser-fuzz:
+    name: parser-fuzz
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Install pinned cargo-fuzz
+        run: cargo install cargo-fuzz --version 0.13.1 --locked
+
+      - name: Run bounded parser fuzzing
+        run: cargo +nightly fuzz run parser fuzz/corpus/parser -- -max_total_time=30 -timeout=2 -max_len=4096
+
+      - name: Preserve parser fuzz artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: parser-fuzz-artifacts
+          path: fuzz/artifacts/parser
+          if-no-files-found: ignore
+
   rust:
     name: rust
     runs-on: ubuntu-latest
@@ -79,6 +106,13 @@ jobs:
           cargo test -p doriac --test stage17_io_tests --locked --verbose
           cargo test -p doriac --test mir_validation_tests --locked --verbose
           cargo test -p doriac --test cranelift_mir_tests --locked --verbose
+
+      - name: Run focused Stage 18 parser, semantic, diagnostic, and LSP tests
+        run: |
+          cargo test -p doriac --test parser_tests --locked --verbose
+          cargo test -p doriac --test semantic_tests --locked --verbose
+          cargo test -p doriac --test stage18_tests --locked --verbose
+          cargo test -p doriac --test lsp_tests --locked --verbose
 
       - name: Run focused MIR and linker-independent Cranelift tests
         run: |
@@ -278,6 +312,7 @@ jobs:
           cargo test -p doriac --test llvm_mir_tests --features llvm-backend --locked --verbose
           cargo test -p doriac --test cli_tests --features llvm-backend --locked --verbose
           cargo test -p doriac --test stage17_io_tests --features llvm-backend --locked --verbose
+          cargo test -p doriac --test stage18_tests --features llvm-backend --locked --verbose
 
       - name: Run complete interpreter, Cranelift, and LLVM parity manifest
         run: cargo test -p doriac --test native_mir_parity_tests --features llvm-backend --locked --verbose

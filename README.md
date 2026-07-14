@@ -63,9 +63,9 @@ Doria was created by a PHP developer who wanted compile-time safety and native p
 
 🚧 **Doria is in early, active development and is not yet ready for use.** The compiler is being built stage by stage against a comprehensive language specification, with a native-first architecture and differential testing at every step. Expect rapid change, breaking changes, and honest roadmaps rather than promises.
 
-Stages 11–17 are implemented on the current compiler branch. Immutable UTF-8 strings are real runtime values with Copy semantics, and Stage 17 adds `read_line(): ?string`, UTF-8 text-file helpers, exact stderr output, and compiler-checked `sprintf`/`printf`. `?string` is the first supported use of the nullable model that Stage 22 generalizes. `read_file` validates text before creating a string; Stage 17 I/O failures panic, while Stage 29 moves these functions to declared `throws` signatures. Binary `read_file_bytes`/`write_file_bytes` arrive with `Bytes` at Stage 23, and stream objects follow checked errors after Stage 29.
+Stages 11–18 are implemented on the current compiler branch. Double-quoted strings accept ordinary Doria expressions inside interpolation braces, and primitive expression interpolation runs through the interpreter, Cranelift, and LLVM. Stage 18 also adds the compiler-known nominal `Displayable` contract for class display conversion; native class execution remains staged for the class layout and dispatch work that follows.
 
-The interpreter, Cranelift fast profile, and LLVM release profile consume the same validated MIR and the durable parity suite compares exact stdin-driven output, panic text, status, and file side effects. Stage 18 full expression interpolation and `Displayable` is next.
+The interpreter, Cranelift fast profile, and LLVM release profile consume the same validated MIR and the durable parity suite compares exact stdin-driven output, panic text, status, and file side effects. Stage 19 ownership, moves, destruction, and native class layout is next.
 
 Watch this organization to follow along as the language, the `doriac` compiler, the `baton` build tool, and the standard library take shape.
 

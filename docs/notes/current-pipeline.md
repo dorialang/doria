@@ -4,31 +4,28 @@ Documentation role: working note. This file prevents duplicated in-flight work. 
 
 ## Recently merged
 
-- PR #69: Stage 12 reusable CFG/dataflow analysis, recursion and mutual recursion, `doria-rt`, abort-only panic with Doria stack traces, and exact stdout/stderr/status parity.
-- PR #70: Stage 13 fixed-width integers, operators, contextual literals, checked conversions, scalar-width ABI coverage, and durable panic parity.
-- PR #71: Stage 14 IEEE floats, runtime bool values, explicit default numeric conversions, shared scalar MIR, and durable interpreter/Cranelift parity.
-- PR #72: Stage 15 LLVM release backend over shared validated MIR and triple differential parity.
-- PR #73: Stage 16 runtime strings and canonical display conversion.
-- PR #74: Stage 17 compiler/runtime core for narrow nullable strings, checked formatting, and UTF-8 I/O.
+- PR #75: Stage 17 integration, parity, examples, editor, docs, and CI closure.
+- PR #76: Stage 17 naming, I/O-tier, and migration-guidance corrections.
 
 ## Active
 
-- Stage 17 integration, parity, examples, documentation, editor, and CI closure is active on `feature/stage-17-completion-parity-docs`.
+- Stage 18 full expression interpolation and compiler-known `Displayable` is active on `feature/stage-18-expression-interpolation-displayable`.
 - Native remains one target: direct compile/run uses the Cranelift fast profile, while `--release` selects LLVM 18 over the same validated typed MIR.
-- Immutable UTF-8 strings and the narrow Stage 17 `?string` seed are private refcounted runtime values. Checked format plans and I/O operations are validated MIR consumed by all three execution paths.
+- Ordinary expression interpolation of primitive/string values lowers through the existing ordered MIR string and display operations consumed by all three execution paths.
+- `Displayable` conformance is checked by the frontend and executable through the PHP compatibility subset. Native class layout and method dispatch remain Stages 19 and 20.
 - The durable manifest supports raw stdin, isolated seeded files, and exact interpreter/Cranelift/LLVM stdout, stderr, status, and generated-file comparison.
 
 ## Next
 
-- Stage 18: full expression interpolation and `Displayable`.
+- Stage 19: ownership, moves, destruction, and native class layout.
 
 ## Do not duplicate
 
-- PR #69 Stage 12 CFG/dataflow, recursion, runtime, panic, and durable parity work.
-- PR #70 Stage 13 integer-model, operator, conversion, and parity work.
+- Stage 17 I/O and formatting work from PRs #75 and #76.
 - ROADMAP-style planning outside the end-to-end plan.
 
 ## Deferred
 
-- Full arbitrary-expression interpolation and `Displayable` until Stage 18.
+- Native `Displayable` class execution until Stages 19 and 20.
+- General interface declarations and conformance until Stage 35.
 - `Bytes` until Stage 23.

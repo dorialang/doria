@@ -1,0 +1,1 @@
+function main(): void { echo "before \" {identity("inner \\"quote\\"")} after"; }

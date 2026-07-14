@@ -1,0 +1,4 @@
+code: E0411
+message: destructor `__destruct` cannot declare parameters
+help: 
+span: 15..53

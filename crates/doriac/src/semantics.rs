@@ -181,6 +181,15 @@ enum IntConstantEval {
     Invalid,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DisplayConversionKind {
+    Primitive,
+    DisplayableClass,
+    NonDisplayableClass,
+    Excluded,
+    Recovery,
+}
+
 impl<'program> Checker<'program> {
     fn new(program: &'program Program) -> Self {
         Self {
@@ -242,6 +251,7 @@ impl<'program> Checker<'program> {
             self.classes.insert(
                 class_decl.name.clone(),
                 ClassInfo {
+                    implements_displayable: false,
                     properties: HashMap::new(),
                     methods: HashMap::new(),
                 },
@@ -251,6 +261,10 @@ impl<'program> Checker<'program> {
 
         for class_decl in declared_classes {
             let mut info = ClassInfo {
+                implements_displayable: class_decl
+                    .implements
+                    .iter()
+                    .any(|name| name == "Displayable"),
                 properties: HashMap::new(),
                 methods: HashMap::new(),
             };
@@ -270,6 +284,8 @@ impl<'program> Checker<'program> {
                         let signature = self.resolve_function_signature(method);
                         self.function_signatures
                             .insert(method.span.start, signature.clone());
+
+                        self.check_lifecycle_declaration_shape(method);
 
                         if method.name == "__destruct" && !method.params.is_empty() {
                             self.diagnostics.push(Diagnostic::new(
@@ -293,7 +309,10 @@ impl<'program> Checker<'program> {
                                 method.name.clone(),
                                 MethodInfo {
                                     access: method.access.clone(),
-                                    writable_this: method.writable_this,
+                                    writable_this: method.writable_this
+                                        && LifecycleMethod::from_method_name(&method.name)
+                                            .is_none(),
+                                    is_static: method.is_static,
                                     params: signature.params,
                                     return_ty: signature.return_ty,
                                 },
@@ -315,7 +334,121 @@ impl<'program> Checker<'program> {
                 }
             }
 
+            self.check_class_interfaces(class_decl, &info);
+
             self.classes.insert(class_decl.name.clone(), info);
+        }
+    }
+
+    fn check_class_interfaces(&mut self, class_decl: &ClassDecl, info: &ClassInfo) {
+        let mut seen = HashSet::new();
+        for interface in &class_decl.implements {
+            if !seen.insert(interface) {
+                self.diagnostics.push(Diagnostic::new(
+                    "E0464",
+                    format!(
+                        "class `{}` implements `{interface}` more than once",
+                        class_decl.name
+                    ),
+                    class_decl.span,
+                ));
+                continue;
+            }
+            if interface != "Displayable" {
+                self.diagnostics.push(Diagnostic::new(
+                    "E0464",
+                    format!(
+                        "general interface conformance for `{interface}` is planned for Stage 35 and is not implemented yet"
+                    ),
+                    class_decl.span,
+                ));
+            }
+        }
+
+        if !info.implements_displayable {
+            return;
+        }
+
+        let Some(method) = info.methods.get("toString") else {
+            let help = if info.methods.contains_key("__toString") {
+                "Doria does not use `__toString`; declare `function toString(): string`"
+            } else if info.methods.contains_key("to_string") {
+                "Doria member names use camelCase; declare `function toString(): string`"
+            } else {
+                "declare `function toString(): string`"
+            };
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "E0463",
+                    format!(
+                        "class `{}` implements `Displayable` but does not provide `toString(): string`",
+                        class_decl.name
+                    ),
+                    class_decl.span,
+                )
+                .with_help(help),
+            );
+            return;
+        };
+
+        let valid = method.access == MemberAccess::External
+            && !method.writable_this
+            && !method.is_static
+            && method.params.is_empty()
+            && matches!(self.types.kind(method.return_ty), TypeKind::String);
+        if !valid {
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "E0463",
+                    format!(
+                        "class `{}` has an incompatible `Displayable::toString` method",
+                        class_decl.name
+                    ),
+                    class_decl.span,
+                )
+                .with_help(
+                    "declare exactly `function toString(): string` as an externally accessible readonly instance method",
+                ),
+            );
+        }
+    }
+
+    fn check_lifecycle_declaration_shape(&mut self, method: &FunctionDecl) {
+        let Some(lifecycle) = LifecycleMethod::from_method_name(&method.name) else {
+            return;
+        };
+
+        if let Some(span) = method.static_span {
+            let message = match lifecycle {
+                LifecycleMethod::Constructor => {
+                    "`__construct` is invoked by `new` and cannot be `static`"
+                }
+                LifecycleMethod::Destructor => {
+                    "`__destruct` is invoked automatically when an instance is destroyed and cannot be `static`"
+                }
+            };
+            self.diagnostics
+                .push(Diagnostic::new("E0465", message, span));
+        }
+
+        if let Some(span) = method.writable_span {
+            let help = match lifecycle {
+                LifecycleMethod::Constructor => {
+                    "remove `writable`; construction grants `__construct` its access to the new instance"
+                }
+                LifecycleMethod::Destructor => {
+                    "remove `writable`; destruction invokes `__destruct` through the lifecycle protocol"
+                }
+            };
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "E0466",
+                    format!("`{}` cannot be declared `writable`", lifecycle.doria_name()),
+                    span,
+                )
+                .with_help(help)
+                .with_fix(span, ""),
+            );
         }
     }
 
@@ -330,7 +463,17 @@ impl<'program> Checker<'program> {
                 "`{name}` is a compiler-known integer companion and cannot be redeclared"
             ));
         }
+        if name.eq_ignore_ascii_case("__DoriaDisplayable") {
+            return Some(
+                "`__DoriaDisplayable` is reserved for compiler-generated PHP compatibility output"
+                    .to_string(),
+            );
+        }
         match name {
+            "Displayable" => Some(
+                "`Displayable` is a compiler-known interface and cannot be redeclared"
+                    .to_string(),
+            ),
             "array" => Some(
                 "`array` is not a Doria class name; use typed arrays like `T[]` or collection aliases"
                     .to_string(),
@@ -1061,12 +1204,13 @@ impl<'program> Checker<'program> {
                     self.check_property_initializer(&class_decl.name, property);
                 }
                 ClassMember::Method(method) => {
+                    let lifecycle = LifecycleMethod::from_method_name(&method.name);
                     self.check_function(
                         method,
                         Some(MethodContext {
                             class_name: class_decl.name.clone(),
-                            writable_this: method.writable_this,
-                            this_available: true,
+                            writable_this: method.writable_this && lifecycle.is_none(),
+                            this_available: !method.is_static,
                         }),
                     );
                 }
@@ -1424,7 +1568,12 @@ impl<'program> Checker<'program> {
                 self.check_expr(expr, scopes, method_context);
                 self.check_mixed_value_operation(expr, "echo", scopes, method_context);
                 let ty = self.infer_expr_type(expr, scopes, method_context);
-                if !self.is_display_convertible_type(ty) {
+                if matches!(
+                    self.display_conversion_kind(ty),
+                    DisplayConversionKind::NonDisplayableClass
+                ) {
+                    self.report_non_displayable_class(ty, expr.span());
+                } else if !self.is_display_convertible_type(ty) {
                     self.diagnostics.push(Diagnostic::new(
                         "E0445",
                         format!(
@@ -2860,6 +3009,19 @@ impl<'program> Checker<'program> {
     ) {
         let left_ty = self.infer_expr_type(left, scopes, method_context);
         let right_ty = self.infer_expr_type(right, scopes, method_context);
+        let mut rejected_class = false;
+        for (ty, expr) in [(left_ty, left), (right_ty, right)] {
+            if matches!(
+                self.display_conversion_kind(ty),
+                DisplayConversionKind::NonDisplayableClass
+            ) {
+                self.report_non_displayable_class(ty, expr.span());
+                rejected_class = true;
+            }
+        }
+        if rejected_class {
+            return;
+        }
         let has_string = matches!(
             self.types.kind(left_ty),
             TypeKind::String | TypeKind::Unknown
@@ -2890,13 +3052,48 @@ impl<'program> Checker<'program> {
 
     fn is_display_convertible_type(&self, ty: TypeId) -> bool {
         matches!(
-            self.types.kind(ty),
-            TypeKind::String
-                | TypeKind::Integer(_)
-                | TypeKind::Float(_)
-                | TypeKind::Bool
-                | TypeKind::Unknown
+            self.display_conversion_kind(ty),
+            DisplayConversionKind::Primitive
+                | DisplayConversionKind::DisplayableClass
+                | DisplayConversionKind::Recovery
         )
+    }
+
+    fn display_conversion_kind(&self, ty: TypeId) -> DisplayConversionKind {
+        match self.types.kind(ty) {
+            TypeKind::String | TypeKind::Integer(_) | TypeKind::Float(_) | TypeKind::Bool => {
+                DisplayConversionKind::Primitive
+            }
+            TypeKind::Class(name) => {
+                if self
+                    .classes
+                    .get(name)
+                    .is_some_and(|class| class.implements_displayable)
+                {
+                    DisplayConversionKind::DisplayableClass
+                } else {
+                    DisplayConversionKind::NonDisplayableClass
+                }
+            }
+            TypeKind::Unknown => DisplayConversionKind::Recovery,
+            _ => DisplayConversionKind::Excluded,
+        }
+    }
+
+    fn report_non_displayable_class(&mut self, ty: TypeId, span: Span) {
+        let class_name = self.types.display(ty);
+        self.diagnostics.push(
+            Diagnostic::new(
+                "E0462",
+                format!(
+                    "`{class_name}` cannot be displayed; implement `Displayable` with `function toString(): string`"
+                ),
+                span,
+            )
+            .with_help(
+                "add `implements Displayable` and an externally accessible readonly `function toString(): string` method",
+            ),
+        );
     }
 
     fn is_equality_compatible(&self, left: TypeId, right: TypeId) -> bool {
@@ -3142,7 +3339,12 @@ impl<'program> Checker<'program> {
 
             self.check_expr(expr, scopes, method_context);
             let ty = self.infer_expr_type(expr, scopes, method_context);
-            if !self.is_interpolatable_type(ty) {
+            if matches!(
+                self.display_conversion_kind(ty),
+                DisplayConversionKind::NonDisplayableClass
+            ) {
+                self.report_non_displayable_class(ty, expr.span());
+            } else if !self.is_display_convertible_type(ty) {
                 let ty_name = self.types.display(ty);
                 self.diagnostics.push(Diagnostic::new(
                     "E0415",
@@ -3151,17 +3353,6 @@ impl<'program> Checker<'program> {
                 ));
             }
         }
-    }
-
-    fn is_interpolatable_type(&self, ty: TypeId) -> bool {
-        matches!(
-            self.types.kind(ty),
-            TypeKind::String
-                | TypeKind::Integer(_)
-                | TypeKind::Float(_)
-                | TypeKind::Bool
-                | TypeKind::Unknown
-        )
     }
 
     fn check_assignment_target(
@@ -3529,6 +3720,15 @@ impl<'program> Checker<'program> {
                 }
                 for (argument, spec) in args[1..].iter().zip(specs) {
                     let ty = self.infer_expr_type(argument, scopes, method_context);
+                    if spec.conversion == FormatConversion::Display
+                        && matches!(
+                            self.display_conversion_kind(ty),
+                            DisplayConversionKind::NonDisplayableClass
+                        )
+                    {
+                        self.report_non_displayable_class(ty, argument.span());
+                        continue;
+                    }
                     let valid = match spec.conversion {
                         FormatConversion::Display => self.is_display_convertible_type(ty),
                         FormatConversion::Decimal
@@ -4849,24 +5049,15 @@ impl<'program> Checker<'program> {
             return recovery;
         }
 
-        let left_kind = self.types.kind(left).clone();
-        let right_kind = self.types.kind(right).clone();
-        match (&left_kind, &right_kind) {
-            (TypeKind::String, right) if Self::is_display_kind(right) => {
-                self.types.intern(TypeKind::String)
-            }
-            (left, TypeKind::String) if Self::is_display_kind(left) => {
-                self.types.intern(TypeKind::String)
-            }
-            _ => self.types.intern(TypeKind::Heterogeneous),
+        let left_is_string = matches!(self.types.kind(left), TypeKind::String);
+        let right_is_string = matches!(self.types.kind(right), TypeKind::String);
+        if (left_is_string && self.is_display_convertible_type(right))
+            || (right_is_string && self.is_display_convertible_type(left))
+        {
+            self.types.intern(TypeKind::String)
+        } else {
+            self.types.intern(TypeKind::Heterogeneous)
         }
-    }
-
-    fn is_display_kind(kind: &TypeKind) -> bool {
-        matches!(
-            kind,
-            TypeKind::String | TypeKind::Integer(_) | TypeKind::Float(_) | TypeKind::Bool
-        )
     }
 
     fn infer_logical_binary_type(&mut self, left: TypeId, right: TypeId) -> TypeId {

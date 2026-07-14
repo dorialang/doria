@@ -1278,7 +1278,7 @@ fn lower_string_expression(
             let mut lowered = Vec::new();
             for part in parts {
                 match part {
-                    hir::InterpolatedStringPart::Text(text) => {
+                    hir::InterpolatedStringPart::Text { value: text, .. } => {
                         lowered.push(mir::StringExpression::Literal(text.clone()));
                     }
                     hir::InterpolatedStringPart::Expr(expr) => {

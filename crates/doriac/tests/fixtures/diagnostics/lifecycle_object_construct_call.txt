@@ -1,0 +1,4 @@
+code: E0414
+message: constructor `Person::__construct` cannot be called directly
+help: construct `Person` with `new Person(...)`
+span: 80..102

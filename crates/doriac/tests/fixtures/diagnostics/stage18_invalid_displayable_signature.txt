@@ -1,0 +1,4 @@
+code: E0463
+message: class `Label` has an incompatible `Displayable::toString` method
+help: declare exactly `function toString(): string` as an externally accessible readonly instance method
+span: 0..93

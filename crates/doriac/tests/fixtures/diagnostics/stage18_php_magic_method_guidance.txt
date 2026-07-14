@@ -1,0 +1,4 @@
+code: E0463
+message: class `Label` implements `Displayable` but does not provide `toString(): string`
+help: Doria does not use `__toString`; declare `function toString(): string`
+span: 0..88

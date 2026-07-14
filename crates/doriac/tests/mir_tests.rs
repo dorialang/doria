@@ -3277,3 +3277,42 @@ fn stage_11g_cranelift_object_supports_string_echo_without_linker() {
         assert!(!lower_object(source).is_empty());
     }
 }
+
+#[test]
+fn stage_18_expression_interpolation_reuses_ordered_display_mir() {
+    let source = include_str!("../../../examples/native/main_expression_interpolation.doria");
+    let first = lower(source);
+    let second = lower(source);
+    assert_eq!(first.to_string(), second.to_string());
+    assert!(first.to_string().contains("display("));
+
+    let output = doriac::mir_interpreter::interpret(&first).expect("MIR should interpret");
+    assert_eq!(output.exit_status, 0);
+    assert_eq!(output.stdout, b"sum: 42");
+    assert!(output.stderr.is_empty());
+    assert!(!doriac::codegen_cranelift::lower_mir_to_object(&first)
+        .expect("Stage 18 primitive interpolation should lower to Cranelift")
+        .is_empty());
+
+    let ordered = interpret(include_str!(
+        "../../../examples/native/main_expression_interpolation_order.doria"
+    ));
+    assert_eq!(ordered.exit_status, 0);
+    assert_eq!(ordered.stdout, b"LR=42");
+    assert!(ordered.stderr.is_empty());
+}
+
+#[test]
+fn stage_18_native_class_execution_stops_before_mir() {
+    let diagnostics = doriac::lower_source_to_mir(
+        "displayable.doria",
+        include_str!("../../../examples/php/displayable.doria"),
+    )
+    .expect_err("native class layout and method dispatch begin in Stages 19 and 20");
+    assert!(diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == "M1101"
+            && diagnostic
+                .message
+                .contains("classes are not lowered to MIR")
+    }));
+}

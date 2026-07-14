@@ -1,7 +1,8 @@
 use crate::ast::*;
 use crate::diagnostics::{Diagnostic, DiagnosticResult};
-use crate::lexer::{StringQuoteKind, Token, TokenKind};
-use crate::source::Span;
+use crate::lexer::{Lexer, StringQuoteKind, Token, TokenKind};
+use crate::source::{SourceFile, Span};
+use crate::string_literal::{decode_escape, interpolation_close};
 use crate::types::TypeRef;
 
 pub struct Parser {
@@ -41,8 +42,11 @@ impl Parser {
     fn parse_item(&mut self) -> Option<Item> {
         if self.match_kind(&TokenKind::Class) {
             self.parse_class().map(Item::Class)
+        } else if self.match_kind(&TokenKind::Interface) {
+            self.parse_unsupported_interface();
+            None
         } else if self.match_kind(&TokenKind::Function) {
-            self.parse_function(MemberAccess::External, false, self.previous().span)
+            self.parse_function(MemberAccess::External, None, None, self.previous().span)
                 .map(Item::Function)
         } else {
             self.parse_statement().map(Item::Statement)
@@ -52,6 +56,16 @@ impl Parser {
     fn parse_class(&mut self) -> Option<ClassDecl> {
         let start = self.previous().span.start;
         let name = self.expect_identifier("expected class name")?;
+        let mut implements = Vec::new();
+        if self.match_kind(&TokenKind::Implements) {
+            loop {
+                implements
+                    .push(self.expect_identifier("expected interface name after `implements`")?);
+                if !self.match_kind(&TokenKind::Comma) {
+                    break;
+                }
+            }
+        }
         self.expect(TokenKind::LeftBrace, "expected `{` after class name")?;
 
         let mut members = Vec::new();
@@ -70,6 +84,7 @@ impl Parser {
 
         Some(ClassDecl {
             name,
+            implements,
             members,
             span: Span::new(start, end),
         })
@@ -77,14 +92,26 @@ impl Parser {
 
     fn parse_class_member(&mut self) -> Option<ClassMember> {
         let access = self.parse_member_access();
-        self.match_kind(&TokenKind::Static);
+        let static_span = self
+            .match_kind(&TokenKind::Static)
+            .then(|| self.previous().span);
 
-        let writable = self.match_kind(&TokenKind::Writable);
+        let writable_span = self
+            .match_kind(&TokenKind::Writable)
+            .then(|| self.previous().span);
         if self.match_kind(&TokenKind::Function) {
             let start = self.previous().span.start;
             return self
-                .parse_function(access, writable, Span::new(start, start))
+                .parse_function(access, writable_span, static_span, Span::new(start, start))
                 .map(ClassMember::Method);
+        }
+
+        if static_span.is_some() {
+            self.error(
+                "static properties are not implemented yet",
+                self.previous().span,
+            );
+            return None;
         }
 
         let start = self.peek().span.start;
@@ -105,7 +132,7 @@ impl Parser {
 
         Some(ClassMember::Property(PropertyDecl {
             access,
-            writable,
+            writable: writable_span.is_some(),
             ty,
             name,
             initializer,
@@ -116,7 +143,8 @@ impl Parser {
     fn parse_function(
         &mut self,
         access: MemberAccess,
-        writable_this: bool,
+        writable_span: Option<Span>,
+        static_span: Option<Span>,
         start_span: Span,
     ) -> Option<FunctionDecl> {
         let start = start_span.start;
@@ -148,13 +176,42 @@ impl Parser {
         let span = Span::new(start, body.span.end);
         Some(FunctionDecl {
             access,
-            writable_this,
+            writable_this: writable_span.is_some(),
+            writable_span,
+            is_static: static_span.is_some(),
+            static_span,
             name,
             params,
             return_type,
             body,
             span,
         })
+    }
+
+    fn parse_unsupported_interface(&mut self) {
+        let start = self.previous().span.start;
+        let name = self.expect_identifier("expected interface name");
+        let message = if matches!(name.as_deref(), Some("Displayable")) {
+            "`Displayable` is a compiler-known interface and cannot be redeclared"
+        } else {
+            "general interface declarations are planned for Stage 35 and are not implemented yet"
+        };
+
+        let mut end = self.previous().span.end;
+        if self.match_kind(&TokenKind::LeftBrace) {
+            let mut depth = 1_usize;
+            while depth > 0 && !self.is_at_end() {
+                let token = self.advance();
+                end = token.span.end;
+                match token.kind {
+                    TokenKind::LeftBrace => depth += 1,
+                    TokenKind::RightBrace => depth -= 1,
+                    _ => {}
+                }
+            }
+        }
+        self.diagnostics
+            .push(Diagnostic::new("P0003", message, Span::new(start, end)));
     }
 
     fn parse_param(&mut self, is_constructor: bool) -> Option<Param> {
@@ -827,6 +884,15 @@ impl Parser {
     }
 
     fn parse_primary(&mut self) -> Option<Expr> {
+        if self.is_at_end() {
+            let span = if self.current == 0 {
+                self.peek().span
+            } else {
+                self.previous().span
+            };
+            self.error("expected expression", span);
+            return None;
+        }
         let token = self.advance().clone();
         match token.kind {
             TokenKind::Variable(name) => {
@@ -861,8 +927,8 @@ impl Parser {
                     })
                 }
             }
-            TokenKind::StringLiteral { value, quote } => {
-                self.parse_string_literal(value, quote, token.span)
+            TokenKind::StringLiteral { value, raw, quote } => {
+                self.parse_string_literal(value, raw, quote, token.span)
             }
             TokenKind::IntLiteral(value) => Some(Expr::Int {
                 value,
@@ -905,45 +971,71 @@ impl Parser {
     fn parse_string_literal(
         &mut self,
         value: String,
+        raw: String,
         quote: StringQuoteKind,
         span: Span,
     ) -> Option<Expr> {
-        if matches!(quote, StringQuoteKind::Single) || !value.contains('{') {
+        if matches!(quote, StringQuoteKind::Single) {
             return Some(Expr::String { value, span });
         }
 
-        let bytes = value.as_bytes();
         let mut parts = Vec::new();
+        let mut text = String::new();
         let mut cursor = 0;
         let mut text_start = 0;
         let mut has_interpolation = false;
 
-        while let Some(open_offset) = value[cursor..].find('{') {
-            let open = cursor + open_offset;
-            if open + 1 >= value.len() || bytes[open + 1] != b'$' {
-                cursor = open + 1;
+        while cursor < raw.len() {
+            let character = raw[cursor..]
+                .chars()
+                .next()
+                .expect("cursor is on a UTF-8 boundary");
+            if character == '\\' {
+                cursor += 1;
+                let Some(escaped) = raw[cursor..].chars().next() else {
+                    text.push('\\');
+                    break;
+                };
+                cursor += escaped.len_utf8();
+                if let Some(decoded) = decode_escape(escaped) {
+                    text.push(decoded);
+                } else {
+                    text.push('\\');
+                    text.push(escaped);
+                }
                 continue;
             }
 
-            let inner_start = open + 1;
-            let Some(close_offset) = value[inner_start..].find('}') else {
-                self.error("unterminated string interpolation", span);
+            if character != '{' {
+                text.push(character);
+                cursor += character.len_utf8();
+                continue;
+            }
+
+            let open = cursor;
+            let Some(close) = interpolation_close(&raw, open) else {
+                self.error(
+                    "unterminated string interpolation",
+                    Span::new(span.start + 1 + open, span.end.saturating_sub(1)),
+                );
                 return None;
             };
-            let close = inner_start + close_offset;
-            let inner = &value[inner_start..close];
-            if inner == "$" {
-                self.error("empty string interpolation", span);
+            if !text.is_empty() {
+                parts.push(InterpolatedStringPart::Text {
+                    value: std::mem::take(&mut text),
+                    span: Span::new(span.start + 1 + text_start, span.start + 1 + open),
+                });
+            }
+
+            let inner_start = open + 1;
+            let inner = &raw[inner_start..close];
+            let inner_span = Span::new(span.start + 1 + inner_start, span.start + 1 + close);
+            if inner.trim().is_empty() {
+                self.error("empty string interpolation", inner_span);
                 return None;
             }
 
-            if open > text_start {
-                parts.push(InterpolatedStringPart::Text(
-                    value[text_start..open].to_string(),
-                ));
-            }
-
-            let expr = self.parse_interpolation_expr(inner, span)?;
+            let expr = self.parse_interpolation_expr(inner, inner_span, open, span)?;
             parts.push(InterpolatedStringPart::Expr(expr));
             has_interpolation = true;
             cursor = close + 1;
@@ -951,79 +1043,134 @@ impl Parser {
         }
 
         if !has_interpolation {
-            return Some(Expr::String { value, span });
+            return Some(Expr::String { value: text, span });
         }
-
-        if text_start < value.len() {
-            parts.push(InterpolatedStringPart::Text(
-                value[text_start..].to_string(),
-            ));
+        if !text.is_empty() {
+            parts.push(InterpolatedStringPart::Text {
+                value: text,
+                span: Span::new(span.start + 1 + text_start, span.start + 1 + raw.len()),
+            });
         }
-
         Some(Expr::InterpolatedString { parts, span })
     }
 
-    fn parse_interpolation_expr(&mut self, inner: &str, span: Span) -> Option<Expr> {
-        if !inner.starts_with('$') {
-            self.error("unsupported string interpolation expression", span);
+    fn parse_interpolation_expr(
+        &mut self,
+        inner: &str,
+        inner_span: Span,
+        open_offset: usize,
+        string_span: Span,
+    ) -> Option<Expr> {
+        let opening_brace_span = Span::new(
+            string_span.start + 1 + open_offset,
+            string_span.start + 2 + open_offset,
+        );
+        if inner.trim_start().starts_with('{') {
+            self.report_literal_open_brace(opening_brace_span);
             return None;
         }
 
-        let mut cursor = 1;
-        let Some(name) = Self::consume_interpolation_identifier(inner, &mut cursor) else {
-            self.error("unsupported string interpolation expression", span);
-            return None;
-        };
-
-        let mut expr = if name == "this" {
-            Expr::This { span }
-        } else {
-            Expr::Variable { name, span }
-        };
-
-        while cursor < inner.len() {
-            if !inner[cursor..].starts_with("->") {
-                self.error("unsupported string interpolation expression", span);
+        let fragment = SourceFile::new("<interpolation>", inner);
+        let mut tokens = match Lexer::new(&fragment).lex() {
+            Ok(tokens) => tokens,
+            Err(mut diagnostics) => {
+                for diagnostic in &mut diagnostics {
+                    diagnostic.span.start += inner_span.start;
+                    diagnostic.span.end += inner_span.start;
+                }
+                self.diagnostics.extend(diagnostics);
                 return None;
             }
-            cursor += 2;
+        };
+        for token in &mut tokens {
+            token.span.start += inner_span.start;
+            token.span.end += inner_span.start;
+        }
+        if tokens
+            .first()
+            .is_some_and(|token| matches!(token.kind, TokenKind::Eof))
+        {
+            self.error("expected expression", tokens[0].span);
+            return None;
+        }
 
-            let Some(property) = Self::consume_interpolation_identifier(inner, &mut cursor) else {
-                self.error("unsupported string interpolation expression", span);
-                return None;
-            };
+        let mut nested = Parser::new(tokens);
+        let expr = nested.parse_expression();
+        if expr.is_some() && !nested.is_at_end() {
+            let unexpected = nested.peek().clone();
+            nested.error(
+                format!(
+                    "unexpected {} after interpolation expression",
+                    token_name(&unexpected.kind)
+                ),
+                unexpected.span,
+            );
+        }
+        if !nested.diagnostics.is_empty() {
+            self.diagnostics.extend(nested.diagnostics);
+            return None;
+        }
 
-            expr = Expr::PropertyAccess {
-                object: Box::new(expr),
-                property,
-                span,
-            };
+        let expr = expr?;
+        if Self::contains_bare_identifier(&expr) {
+            self.report_literal_open_brace(opening_brace_span);
+            return None;
         }
 
         Some(expr)
     }
 
-    fn consume_interpolation_identifier(input: &str, cursor: &mut usize) -> Option<String> {
-        let bytes = input.as_bytes();
-        if *cursor >= bytes.len() || !Self::is_identifier_start_byte(bytes[*cursor]) {
-            return None;
+    fn contains_bare_identifier(expr: &Expr) -> bool {
+        match expr {
+            Expr::Identifier { .. } => true,
+            Expr::InterpolatedString { parts, .. } => parts.iter().any(|part| match part {
+                InterpolatedStringPart::Text { .. } => false,
+                InterpolatedStringPart::Expr(expr) => Self::contains_bare_identifier(expr),
+            }),
+            Expr::Array { elements, .. } => elements.iter().any(|element| {
+                element
+                    .key
+                    .as_ref()
+                    .is_some_and(Self::contains_bare_identifier)
+                    || Self::contains_bare_identifier(&element.value)
+            }),
+            Expr::PropertyAccess { object, .. } => Self::contains_bare_identifier(object),
+            Expr::MethodCall { object, args, .. } => {
+                Self::contains_bare_identifier(object)
+                    || args.iter().any(Self::contains_bare_identifier)
+            }
+            Expr::FunctionCall { args, .. }
+            | Expr::StaticCall { args, .. }
+            | Expr::New { args, .. } => args.iter().any(Self::contains_bare_identifier),
+            Expr::Grouped { expr, .. } | Expr::Unary { expr, .. } => {
+                Self::contains_bare_identifier(expr)
+            }
+            Expr::Binary { left, right, .. } => {
+                Self::contains_bare_identifier(left) || Self::contains_bare_identifier(right)
+            }
+            Expr::Range { start, end, .. } => {
+                Self::contains_bare_identifier(start) || Self::contains_bare_identifier(end)
+            }
+            Expr::Variable { .. }
+            | Expr::This { .. }
+            | Expr::String { .. }
+            | Expr::Int { .. }
+            | Expr::Float { .. }
+            | Expr::Bool { .. }
+            | Expr::Null { .. } => false,
         }
-
-        let start = *cursor;
-        *cursor += 1;
-        while *cursor < bytes.len() && Self::is_identifier_part_byte(bytes[*cursor]) {
-            *cursor += 1;
-        }
-
-        Some(input[start..*cursor].to_string())
     }
 
-    fn is_identifier_start_byte(byte: u8) -> bool {
-        byte == b'_' || byte.is_ascii_alphabetic()
-    }
-
-    fn is_identifier_part_byte(byte: u8) -> bool {
-        byte == b'_' || byte.is_ascii_alphanumeric()
+    fn report_literal_open_brace(&mut self, span: Span) {
+        self.diagnostics.push(
+            Diagnostic::new(
+                "P0002",
+                "unescaped `{` does not begin a valid interpolation expression",
+                span,
+            )
+            .with_help("write `\\{` for a literal brace")
+            .with_fix(span, "\\{"),
+        );
     }
 
     fn parse_new(&mut self, start: usize) -> Option<Expr> {
@@ -1363,6 +1510,7 @@ impl Parser {
             }
             match self.peek().kind {
                 TokenKind::Class
+                | TokenKind::Interface
                 | TokenKind::Function
                 | TokenKind::Let
                 | TokenKind::Echo
@@ -1385,6 +1533,8 @@ impl Parser {
 fn token_name(kind: &TokenKind) -> &'static str {
     match kind {
         TokenKind::Class => "class",
+        TokenKind::Interface => "interface",
+        TokenKind::Implements => "implements",
         TokenKind::Function => "function",
         TokenKind::Internal => "internal",
         TokenKind::Static => "static",

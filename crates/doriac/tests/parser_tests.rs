@@ -370,14 +370,18 @@ fn parses_plain_and_interpolated_strings() {
         Expr::String { value, .. } if value == "Hello"
     ));
     assert!(matches!(
-        parse_echo_expr("echo \"{}\";"),
+        parse_echo_expr("echo \"\\{}\";"),
         Expr::String { value, .. } if value == "{}"
     ));
 
     let Expr::InterpolatedString { parts, .. } = parse_echo_expr("echo \"Hello, {$name}\";") else {
         panic!("expected interpolated string");
     };
-    assert!(matches!(&parts[0], InterpolatedStringPart::Text(text) if text == "Hello, "));
+    assert!(matches!(
+        &parts[0],
+        InterpolatedStringPart::Text { value, span }
+            if value == "Hello, " && *span == doriac::source::Span::new(6, 13)
+    ));
     assert!(matches!(
         &parts[1],
         InterpolatedStringPart::Expr(Expr::Variable { name, .. }) if name == "name"
@@ -402,7 +406,10 @@ fn parses_plain_and_interpolated_strings() {
         &parts[0],
         InterpolatedStringPart::Expr(Expr::Variable { name, .. }) if name == "first"
     ));
-    assert!(matches!(&parts[1], InterpolatedStringPart::Text(text) if text == " "));
+    assert!(matches!(
+        &parts[1],
+        InterpolatedStringPart::Text { value, .. } if value == " "
+    ));
     assert!(matches!(
         &parts[2],
         InterpolatedStringPart::Expr(Expr::Variable { name, .. }) if name == "last"
@@ -410,30 +417,169 @@ fn parses_plain_and_interpolated_strings() {
 }
 
 #[test]
-fn rejects_malformed_or_unsupported_string_interpolation() {
+fn parses_full_expressions_inside_interpolated_strings() {
+    for (source, expected) in [
+        ("echo \"{$a + $b}\";", "binary"),
+        ("echo \"{formatValue($value)}\";", "function call"),
+        ("echo \"{($a + $b) * 2}\";", "grouped expression"),
+        ("echo \"{Counter::next()}\";", "static call"),
+        ("echo \"{true}\";", "boolean"),
+        ("echo \"{$a < $b}\";", "comparison"),
+    ] {
+        let Expr::InterpolatedString { parts, .. } = parse_echo_expr(source) else {
+            panic!("expected an interpolated string for {expected}");
+        };
+        assert!(
+            matches!(parts.as_slice(), [InterpolatedStringPart::Expr(_)]),
+            "expected one {expected} interpolation, got {parts:?}"
+        );
+    }
+
+    let Expr::InterpolatedString { parts, .. } =
+        parse_echo_expr("echo \"{formatValue(\"left\")} {formatValue('right')}\";")
+    else {
+        panic!("expected interpolated string with nested quoted arguments");
+    };
+    assert_eq!(parts.len(), 3);
+
+    let Expr::InterpolatedString { parts, .. } =
+        parse_echo_expr("echo \"{formatValue(1 /* } */ + 2)}\";")
+    else {
+        panic!("expected interpolation with an ordinary expression comment");
+    };
+    assert!(matches!(
+        parts.as_slice(),
+        [InterpolatedStringPart::Expr(Expr::FunctionCall { .. })]
+    ));
+
+    let Expr::InterpolatedString { parts, .. } = parse_echo_expr(r#"echo "{$first}{$second}";"#)
+    else {
+        panic!("expected adjacent interpolation parts");
+    };
+    assert_eq!(parts.len(), 2);
+}
+
+#[test]
+fn applies_the_stage_18_literal_brace_rule() {
+    assert!(matches!(
+        parse_echo_expr(r#"echo "\{literal}";"#),
+        Expr::String { value, .. } if value == "{literal}"
+    ));
+    assert!(matches!(
+        parse_echo_expr(r#"echo "right } and escaped \}";"#),
+        Expr::String { value, .. } if value == "right } and escaped }"
+    ));
+
+    let Expr::InterpolatedString { parts, .. } = parse_echo_expr(r#"echo "\{{$value}}";"#) else {
+        panic!("expected escaped brace adjacent to interpolation");
+    };
+    assert!(matches!(
+        parts.as_slice(),
+        [
+            InterpolatedStringPart::Text { value: open, .. },
+            InterpolatedStringPart::Expr(Expr::Variable { name, .. }),
+            InterpolatedStringPart::Text { value: close, .. },
+        ] if open == "{" && name == "value" && close == "}"
+    ));
+
+    let Expr::InterpolatedString { parts, .. } = parse_echo_expr(r#"echo "{formatValue("\{")}";"#)
+    else {
+        panic!("expected interpolation containing an escaped brace in an inner string");
+    };
+    assert!(matches!(
+        parts.as_slice(),
+        [InterpolatedStringPart::Expr(Expr::FunctionCall { name, .. })]
+            if name == "formatValue"
+    ));
+}
+
+#[test]
+fn rejects_malformed_string_interpolation() {
     for (source, message) in [
         (
             "echo \"Hello, {$name\";",
             "unterminated string interpolation",
         ),
-        ("echo \"Hello, {$}\";", "empty string interpolation"),
-        (
-            "echo \"Total: {$a + $b}\";",
-            "unsupported string interpolation expression",
-        ),
-        (
-            "echo \"Name: {$user->name()}\";",
-            "unsupported string interpolation expression",
-        ),
+        ("echo \"Hello, {}\";", "empty string interpolation"),
+        ("echo \"Hello, {$}\";", "expected variable name after `$`"),
+        ("echo \"{/* comment */}\";", "expected expression"),
+        ("echo \"{// comment\n}\";", "expected expression"),
+        ("echo \"A literal {word}\";", "unescaped `{`"),
+        ("echo \"{foo-bar}\";", "unescaped `{`"),
+        ("echo \"{word . suffix}\";", "unescaped `{`"),
+        ("echo \"{{word}}\";", "unescaped `{`"),
     ] {
         let err = doriac::parse_source("test.doria", source)
-            .expect_err("parse should reject unsupported interpolation");
+            .expect_err("parse should reject malformed interpolation");
         assert!(
             err.iter()
                 .any(|diagnostic| diagnostic.message.contains(message)),
             "expected diagnostic containing {message}, got {err:?}"
         );
     }
+}
+
+#[test]
+fn rejects_truncated_collections_without_recursive_eof_parsing() {
+    for source in ["[", "f.unction ma { ec ;void { ec ; [\n"] {
+        let diagnostics = doriac::parse_source("fuzz-regression.doria", source)
+            .expect_err("truncated collection input must produce a diagnostic");
+        assert!(!diagnostics.is_empty());
+    }
+}
+
+#[test]
+fn identifier_composite_interpolations_receive_the_literal_brace_fix() {
+    for source in ["echo \"{foo-bar}\";", "echo \"{word . suffix}\";"] {
+        let diagnostics = doriac::parse_source("test.doria", source)
+            .expect_err("bare identifier composites must not become interpolation expressions");
+        let diagnostic = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == "P0002")
+            .unwrap_or_else(|| panic!("expected P0002 for {source}, got {diagnostics:?}"));
+        let fix = diagnostic
+            .fix
+            .as_ref()
+            .expect("P0002 should carry a machine-applicable fix");
+        assert_eq!(fix.replacement, "\\{");
+        assert_eq!(fix.span.start, source.find('{').expect("opening brace"));
+    }
+}
+
+#[test]
+fn keeps_interpolation_diagnostics_on_original_source_offsets() {
+    let source = "echo \"prefix {1 + } suffix\";";
+    let diagnostics = doriac::parse_source("test.doria", source)
+        .expect_err("malformed interpolation expression should fail");
+    let diagnostic = diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.message.contains("expected expression"))
+        .expect("ordinary parser diagnostic should be preserved");
+    assert_eq!(diagnostic.span.start, source.find('+').expect("operator"));
+
+    let source = "echo \"literal {word}\";";
+    let diagnostics = doriac::parse_source("test.doria", source)
+        .expect_err("bare literal opening brace should fail");
+    let diagnostic = diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.code == "P0002")
+        .expect("literal brace diagnostic should be present");
+    let fix = diagnostic
+        .fix
+        .as_ref()
+        .expect("diagnostic should carry a fix");
+    assert_eq!(fix.span, diagnostic.span);
+    assert_eq!(fix.replacement, "\\{");
+
+    let diagnostics = doriac::parse_source("test.doria", "echo \"{1 + }\"; echo \"{2 + }\";")
+        .expect_err("each malformed interpolation should be diagnosed");
+    assert_eq!(
+        diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.message == "expected expression")
+            .count(),
+        2
+    );
 }
 #[test]
 fn parses_if_else_and_while_control_flow() {

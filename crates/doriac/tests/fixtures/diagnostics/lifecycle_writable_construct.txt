@@ -1,0 +1,5 @@
+code: E0466
+message: `__construct` cannot be declared `writable`
+help: remove `writable`; construction grants `__construct` its access to the new instance
+span: 15..23
+fix: 15..23 -> ""

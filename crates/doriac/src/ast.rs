@@ -16,6 +16,7 @@ pub enum Item {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ClassDecl {
     pub name: String,
+    pub implements: Vec<String>,
     pub members: Vec<ClassMember>,
     pub span: Span,
 }
@@ -46,6 +47,9 @@ pub struct PropertyDecl {
 pub struct FunctionDecl {
     pub access: MemberAccess,
     pub writable_this: bool,
+    pub writable_span: Option<Span>,
+    pub is_static: bool,
+    pub static_span: Option<Span>,
     pub name: String,
     pub params: Vec<Param>,
     pub return_type: Option<TypeRef>,
@@ -295,7 +299,7 @@ pub enum Expr {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum InterpolatedStringPart {
-    Text(String),
+    Text { value: String, span: Span },
     Expr(Expr),
 }
 

@@ -25,8 +25,11 @@ pub mod return_analysis;
 pub mod runtime_artifact;
 pub mod semantics;
 pub mod source;
+pub mod string_literal;
 pub mod symbols;
 pub mod types;
+
+pub const TOOLCHAIN_VERSION: &str = env!("DORIA_TOOLCHAIN_VERSION");
 
 use ast::Program;
 use backend::{BackendTarget, CompileOptions};

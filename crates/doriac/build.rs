@@ -4,6 +4,10 @@ use std::path::PathBuf;
 use std::process::Command;
 
 fn main() {
+    let package_version = env::var("CARGO_PKG_VERSION").expect("Cargo package version");
+    let toolchain_version = canonical_toolchain_version(&package_version);
+    println!("cargo:rustc-env=DORIA_TOOLCHAIN_VERSION={toolchain_version}");
+
     let manifest_dir =
         PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("manifest directory"));
     let runtime_dir = manifest_dir.join("../doria-rt");
@@ -12,6 +16,10 @@ fn main() {
     let runtime_manifest = runtime_dir.join("Cargo.toml");
     println!("cargo:rerun-if-changed={}", runtime_source_dir.display());
     println!("cargo:rerun-if-changed={}", runtime_manifest.display());
+
+    if env::var_os("CARGO_FEATURE_BUNDLED_RUNTIME").is_none() {
+        return;
+    }
 
     let target = env::var("TARGET").expect("Cargo target triple");
     let filename = if target.ends_with("windows-msvc") {
@@ -74,4 +82,31 @@ fn main() {
     assert!(status.success(), "failed to build doria-rt static library");
 
     println!("cargo:rustc-env=DORIA_RT_BUILT_PATH={}", output.display());
+}
+
+fn canonical_toolchain_version(package_version: &str) -> String {
+    let mut components = package_version.splitn(3, '.');
+    let year = components.next().expect("toolchain version year");
+    let month = components
+        .next()
+        .expect("toolchain version month")
+        .parse::<u8>()
+        .expect("numeric toolchain version month");
+    let release = components.next().expect("toolchain version release");
+    assert!(
+        year.len() == 4 && year.bytes().all(|byte| byte.is_ascii_digit()),
+        "toolchain version year must use four digits"
+    );
+    assert!(
+        (1..=12).contains(&month),
+        "toolchain version month must be between 1 and 12"
+    );
+    let release_number = release
+        .split_once('-')
+        .map_or(release, |(number, _)| number);
+    assert!(
+        !release_number.is_empty() && release_number.bytes().all(|byte| byte.is_ascii_digit()),
+        "toolchain release number must be numeric"
+    );
+    format!("{year}.{month:02}.{release}")
 }

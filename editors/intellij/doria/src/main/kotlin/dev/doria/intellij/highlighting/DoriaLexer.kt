@@ -12,6 +12,7 @@ class DoriaLexer : LexerBase() {
     private var tokenType: IElementType? = null
     private var mode: Int = MODE_NORMAL
     private var attributeBracketDepth: Int = 0
+    private var interpolationBraceDepth: Int = 0
 
     override fun start(buffer: CharSequence, startOffset: Int, endOffset: Int, initialState: Int) {
         this.buffer = buffer
@@ -21,10 +22,11 @@ class DoriaLexer : LexerBase() {
         this.tokenEnd = startOffset
         this.mode = decodeMode(initialState)
         this.attributeBracketDepth = decodeAttributeBracketDepth(initialState)
+        this.interpolationBraceDepth = decodeInterpolationBraceDepth(initialState)
         advance()
     }
 
-    override fun getState(): Int = encodeState(mode, attributeBracketDepth)
+    override fun getState(): Int = encodeState(mode, attributeBracketDepth, interpolationBraceDepth)
 
     override fun getTokenType(): IElementType? = tokenType
 
@@ -55,6 +57,14 @@ class DoriaLexer : LexerBase() {
             }
             MODE_INTERPOLATION -> {
                 scanInterpolationToken()
+                return
+            }
+            MODE_INTERPOLATION_DOUBLE_STRING -> {
+                scanInterpolationStringToken('"')
+                return
+            }
+            MODE_INTERPOLATION_SINGLE_STRING -> {
+                scanInterpolationStringToken('\'')
                 return
             }
             MODE_DOC_COMMENT -> {
@@ -248,11 +258,12 @@ class DoriaLexer : LexerBase() {
                 }
                 return
             }
-            if (char == '{' && tokenEnd + 1 < endOffset && buffer[tokenEnd + 1] == '$') {
+            if (char == '{') {
                 if (tokenEnd == contentStart) {
                     tokenEnd++
                     tokenType = DoriaTokenTypes.STRING
                     mode = MODE_INTERPOLATION
+                    interpolationBraceDepth = 0
                 } else {
                     tokenType = DoriaTokenTypes.STRING
                 }
@@ -276,31 +287,53 @@ class DoriaLexer : LexerBase() {
 
     private fun scanInterpolationToken() {
         when {
-            buffer[tokenStart] == '}' -> {
+            buffer[tokenStart] == '}' && interpolationBraceDepth == 0 -> {
                 tokenEnd = tokenStart + 1
                 tokenType = DoriaTokenTypes.STRING
                 mode = MODE_DOUBLE_STRING
             }
-            buffer[tokenStart] == '$' -> scanVariable()
-            buffer[tokenStart] == '-' && peek(1) == '>' -> {
-                tokenEnd = tokenStart + 2
-                tokenType = DoriaTokenTypes.OPERATOR
-            }
-            isIdentifierStart(buffer[tokenStart]) -> scanInterpolationProperty()
-            buffer[tokenStart].isWhitespace() -> scanWhitespace()
-            else -> {
+            buffer[tokenStart] == '}' -> {
                 tokenEnd = tokenStart + 1
-                tokenType = DoriaTokenTypes.OPERATOR
+                tokenType = DoriaTokenTypes.BRACE
+                interpolationBraceDepth--
             }
+            buffer[tokenStart] == '{' -> {
+                tokenEnd = tokenStart + 1
+                tokenType = DoriaTokenTypes.BRACE
+                interpolationBraceDepth++
+            }
+            buffer[tokenStart] == '"' -> {
+                mode = MODE_INTERPOLATION_DOUBLE_STRING
+                scanInterpolationStringToken('"', tokenStart + 1)
+            }
+            buffer[tokenStart] == '\'' -> {
+                mode = MODE_INTERPOLATION_SINGLE_STRING
+                scanInterpolationStringToken('\'', tokenStart + 1)
+            }
+            else -> scanCodeToken(doubleQuoteStartsInterpolatedString = false)
         }
     }
 
-    private fun scanInterpolationProperty() {
-        tokenEnd = tokenStart + 1
-        while (tokenEnd < endOffset && isIdentifierPart(buffer[tokenEnd])) {
+    private fun scanInterpolationStringToken(quote: Char, contentStart: Int = tokenStart) {
+        tokenEnd = contentStart
+        while (tokenEnd < endOffset) {
+            val char = buffer[tokenEnd]
+            if (char == '\\') {
+                if (tokenEnd == tokenStart) {
+                    scanEscapeSequence()
+                } else {
+                    tokenType = DoriaTokenTypes.STRING
+                }
+                return
+            }
             tokenEnd++
+            if (char == quote) {
+                mode = MODE_INTERPOLATION
+                tokenType = DoriaTokenTypes.STRING
+                return
+            }
         }
-        tokenType = DoriaTokenTypes.PROPERTY
+        tokenType = DoriaTokenTypes.STRING
     }
 
     private fun scanAttributeStart() {
@@ -802,25 +835,34 @@ class DoriaLexer : LexerBase() {
 
     private fun isIdentifierPart(char: Char): Boolean = char == '_' || char.isLetterOrDigit()
 
-    private fun encodeState(mode: Int, attributeBracketDepth: Int): Int =
-        mode or (attributeBracketDepth.coerceAtLeast(0) shl STATE_ATTRIBUTE_DEPTH_SHIFT)
+    private fun encodeState(mode: Int, attributeBracketDepth: Int, interpolationBraceDepth: Int): Int =
+        mode or
+            ((attributeBracketDepth.coerceAtLeast(0) and STATE_DEPTH_MASK) shl STATE_ATTRIBUTE_DEPTH_SHIFT) or
+            ((interpolationBraceDepth.coerceAtLeast(0) and STATE_DEPTH_MASK) shl STATE_INTERPOLATION_DEPTH_SHIFT)
 
     private fun decodeMode(state: Int): Int = state and STATE_MODE_MASK
 
     private fun decodeAttributeBracketDepth(state: Int): Int =
-        (state ushr STATE_ATTRIBUTE_DEPTH_SHIFT).coerceAtLeast(0)
+        (state ushr STATE_ATTRIBUTE_DEPTH_SHIFT) and STATE_DEPTH_MASK
+
+    private fun decodeInterpolationBraceDepth(state: Int): Int =
+        (state ushr STATE_INTERPOLATION_DEPTH_SHIFT) and STATE_DEPTH_MASK
 
     private data class DocTag(val name: String, val endOffset: Int)
 
     companion object {
         private const val STATE_MODE_MASK = 0xFF
+        private const val STATE_DEPTH_MASK = 0xFFF
         private const val STATE_ATTRIBUTE_DEPTH_SHIFT = 8
+        private const val STATE_INTERPOLATION_DEPTH_SHIFT = 20
         private const val MODE_NORMAL = 0
         private const val MODE_DOUBLE_STRING = 1
         private const val MODE_INTERPOLATION = 2
         const val MODE_DOC_COMMENT = 3
         private const val MODE_SINGLE_STRING = 4
         private const val MODE_ATTRIBUTE = 5
+        private const val MODE_INTERPOLATION_DOUBLE_STRING = 6
+        private const val MODE_INTERPOLATION_SINGLE_STRING = 7
 
         private val KEYWORDS = setOf(
             "class",

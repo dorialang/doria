@@ -14,6 +14,8 @@ examples/native/main_divide_by_zero_panic.doria
 examples/native/main_display_conversion.doria
 examples/native/main_early_return_search_42.doria
 examples/native/main_explicit_panic.doria
+examples/native/main_expression_interpolation.doria
+examples/native/main_expression_interpolation_order.doria
 examples/native/main_fixed_width_arithmetic_42.doria
 examples/native/main_float32_arithmetic_42.doria
 examples/native/main_float32_rounding_42.doria

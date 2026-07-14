@@ -23,6 +23,10 @@ fn run() -> Result<ExitCode, String> {
         print_help();
         return Ok(ExitCode::SUCCESS);
     }
+    if args[0] == "--version" || args[0] == "-V" {
+        println!("doriac {}", doriac::TOOLCHAIN_VERSION);
+        return Ok(ExitCode::SUCCESS);
+    }
 
     match args[0].as_str() {
         "check" => {
@@ -331,7 +335,8 @@ fn direct_executable_hint(path: &Path) -> String {
 
 fn print_help() {
     println!(
-        "doriac 0.1.0\n\nUSAGE:\n    doriac check <source.doria>\n    doriac ast <source.doria>\n    doriac hir <source.doria>\n    doriac mir <source.doria>\n    doriac compile <source.doria> [--release] [--out <file>]\n    doriac compile <source.doria> --target php [--out <file>]\n    doriac run <source.doria> [--release]\n\nNATIVE PROFILES:\n    fast       default Cranelift profile for rapid local feedback\n    release    LLVM optimized profile selected with --release\n\nTARGETS:\n    native    default target for standalone executables\n    php       compatibility and inspection backend\n    debug     MIR interpreter debug artifact\n    wasm      planned WebAssembly backend"
+        "doriac {}\n\nUSAGE:\n    doriac check <source.doria>\n    doriac ast <source.doria>\n    doriac hir <source.doria>\n    doriac mir <source.doria>\n    doriac compile <source.doria> [--release] [--out <file>]\n    doriac compile <source.doria> --target php [--out <file>]\n    doriac run <source.doria> [--release]\n\nNATIVE PROFILES:\n    fast       default Cranelift profile for rapid local feedback\n    release    LLVM optimized profile selected with --release\n\nTARGETS:\n    native    default target for standalone executables\n    php       compatibility and inspection backend\n    debug     MIR interpreter debug artifact\n    wasm      planned WebAssembly backend",
+        doriac::TOOLCHAIN_VERSION
     );
 }
 

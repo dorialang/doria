@@ -4,6 +4,20 @@ use std::process::{Command, Output};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[test]
+fn version_uses_canonical_toolchain_calver() {
+    let output = Command::new(doriac_bin())
+        .arg("--version")
+        .output()
+        .expect("doriac binary should run");
+
+    assert_success("version", output.clone());
+    assert_eq!(
+        String::from_utf8(output.stdout).expect("version output should be UTF-8"),
+        "doriac 2026.03.1-canary\n"
+    );
+}
+
+#[test]
 fn compile_defaults_to_native_executable() {
     if !host_linker_is_available() {
         eprintln!(

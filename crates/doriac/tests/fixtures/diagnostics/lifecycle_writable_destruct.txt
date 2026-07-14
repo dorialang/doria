@@ -1,0 +1,5 @@
+code: E0466
+message: `__destruct` cannot be declared `writable`
+help: remove `writable`; destruction invokes `__destruct` through the lifecycle protocol
+span: 15..23
+fix: 15..23 -> ""

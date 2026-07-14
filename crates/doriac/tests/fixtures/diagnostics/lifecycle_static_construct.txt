@@ -1,0 +1,4 @@
+code: E0465
+message: `__construct` is invoked by `new` and cannot be `static`
+help: 
+span: 15..21

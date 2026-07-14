@@ -33,6 +33,7 @@ fn lexes_string_quote_kinds() {
         TokenKind::StringLiteral {
             value,
             quote: StringQuoteKind::Single,
+            ..
         } if value == "{}"
     ));
     assert!(matches!(
@@ -40,6 +41,28 @@ fn lexes_string_quote_kinds() {
         TokenKind::StringLiteral {
             value,
             quote: StringQuoteKind::Double,
+            ..
+        } if value == "{}"
+    ));
+}
+
+#[test]
+fn preserves_brace_backslashes_only_in_single_quoted_strings() {
+    let kinds = token_kinds(r#"'\{\}' "\{\}""#);
+    assert!(matches!(
+        &kinds[0],
+        TokenKind::StringLiteral {
+            value,
+            quote: StringQuoteKind::Single,
+            ..
+        } if value == "\\{\\}"
+    ));
+    assert!(matches!(
+        &kinds[1],
+        TokenKind::StringLiteral {
+            value,
+            quote: StringQuoteKind::Double,
+            ..
         } if value == "{}"
     ));
 }

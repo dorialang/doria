@@ -115,3 +115,13 @@ function main(): void
         assert_object(source);
     }
 }
+
+#[test]
+fn lowers_stage_18_expression_interpolation_to_verified_objects() {
+    for source in [
+        include_str!("../../../examples/native/main_expression_interpolation.doria"),
+        include_str!("../../../examples/native/main_expression_interpolation_order.doria"),
+    ] {
+        assert_object(source);
+    }
+}

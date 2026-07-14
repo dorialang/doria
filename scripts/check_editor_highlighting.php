@@ -357,6 +357,25 @@ function check_vscode_grammar(): void
     $grammarText = json_encode($grammar, JSON_THROW_ON_ERROR);
     $patterns = iterator_to_array(walk_patterns($grammar), false);
 
+    $interpolationPatterns = array_values(array_filter(
+        $patterns,
+        static fn (array $pattern): bool => ($pattern['name'] ?? null) === 'meta.interpolation.expression.doria'
+    ));
+    require_check($interpolationPatterns !== [], 'VS Code grammar must define interpolation scopes');
+    $interpolationJson = json_encode($interpolationPatterns, JSON_THROW_ON_ERROR);
+    require_check(
+        str_contains($interpolationJson, '#interpolationExpression') &&
+            str_contains($interpolationJson, '#strings') &&
+            str_contains($interpolationJson, '#calls') &&
+            str_contains($interpolationJson, '#operators') &&
+            !str_contains($interpolationJson, '(?=\\$)'),
+        'VS Code interpolation must embed balanced ordinary Doria expressions rather than a variable-only grammar'
+    );
+    require_check(
+        str_contains($grammarText, 'keyword.declaration.implements.doria'),
+        'VS Code must scope active implements syntax as a declaration keyword'
+    );
+
     $tokens = array_unique([...$acceptedKeywords, ...$primitiveTypes, ...$reservedTypes, ...$plannedTypes, ...$wordOperators]);
     sort($tokens);
     foreach ($tokens as $token) {
@@ -695,6 +714,15 @@ function check_intellij_lexer(): void
         'IntelliJ lexer must define an attribute scanning mode'
     );
     require_check(
+        str_contains($lexerText, 'MODE_INTERPOLATION_DOUBLE_STRING') &&
+            str_contains($lexerText, 'MODE_INTERPOLATION_SINGLE_STRING') &&
+            str_contains($lexerText, 'scanCodeToken(doubleQuoteStartsInterpolatedString = false)') &&
+            str_contains($lexerText, 'interpolationBraceDepth++') &&
+            str_contains($lexerText, 'interpolationBraceDepth--') &&
+            str_contains($lexerText, 'decodeInterpolationBraceDepth'),
+        'IntelliJ interpolation must reuse ordinary code scanning and preserve balanced braces and nested quoted strings'
+    );
+    require_check(
         str_contains($lexerText, 'DoriaTokenTypes.ATTRIBUTE_DELIMITER') &&
             str_contains($lexerText, 'DoriaTokenTypes.ATTRIBUTE_NAME') &&
             str_contains($lexerText, 'DoriaTokenTypes.ATTRIBUTE_ARGUMENT'),
@@ -914,6 +942,12 @@ function check_fixture(): void
         'bool $symbolEither = $symbolBoth || $different;',
         'echo "Profile: {$this->profile->displayName}";',
         'echo "Count: {$count}";',
+        'echo "sum: {left() + right()}";',
+        'echo "nested string: {sprintf("value={left() + right()}")}";',
+        'echo "commented: {left() /* } { */ + right()}";',
+        'echo "literal brace: \{ and bare }";',
+        'implements Displayable',
+        'function toString(): string',
         "echo 'Literal {\$name}';",
         'read_file("input.txt")',
         'calculateReport($text)',

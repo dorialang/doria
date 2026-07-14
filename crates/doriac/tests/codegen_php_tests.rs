@@ -1108,6 +1108,29 @@ class Person
 }
 
 #[test]
+fn rejects_static_lifecycle_methods_before_php_emission() {
+    let err = doriac::compile_source_to_php(
+        "test.doria",
+        r#"
+class Person
+{
+    static function __construct()
+    {
+    }
+}
+"#,
+    )
+    .expect_err("semantic checking should reject static construction before PHP codegen");
+
+    assert!(err.iter().any(|diagnostic| {
+        diagnostic.code == "E0465"
+            && diagnostic
+                .message
+                .contains("invoked by `new` and cannot be `static`")
+    }));
+}
+
+#[test]
 fn rejects_resource_type_before_php_codegen() {
     let err = doriac::compile_source_to_php(
         "test.doria",
@@ -1185,7 +1208,11 @@ echo "Hello, {$name}";
         panic!("expected interpolated string in HIR");
     };
 
-    assert!(matches!(&parts[0], hir::InterpolatedStringPart::Text(text) if text == "Hello, "));
+    assert!(matches!(
+        &parts[0],
+        hir::InterpolatedStringPart::Text { value, span }
+            if value == "Hello, " && span.start < span.end
+    ));
     assert!(matches!(
         &parts[1],
         hir::InterpolatedStringPart::Expr(hir::Expr::Variable { name, .. }) if name == "name"
@@ -1331,4 +1358,118 @@ fn php_backend_keeps_stage17_frontend_rejections_and_uint64_honesty() {
     )
     .expect_err("PHP must reject uint64 formatting it cannot preserve");
     assert!(error.iter().any(|diagnostic| diagnostic.code == "B1301"));
+}
+
+#[test]
+fn php_backend_preserves_stage_18_expression_interpolation_order() {
+    let php = doriac::compile_source_to_php(
+        "test.doria",
+        r#"
+function left(): int
+{
+    echo "L";
+    return 20;
+}
+
+function right(): int
+{
+    echo "R";
+    return 22;
+}
+
+function main(): void
+{
+    echo "={left() == 20 and right() == 22}";
+}
+"#,
+    )
+    .expect("Stage 18 expression interpolation should lower to PHP");
+
+    assert!(php.contains("__doria_display(((left() === 20) && (right() === 22)))"));
+
+    let Ok(version) = Command::new("php").arg("--version").output() else {
+        return;
+    };
+    if !version.status.success() {
+        return;
+    }
+    let script = format!(
+        "{}\nmain();",
+        php.strip_prefix("<?php").expect("generated PHP header")
+    );
+    let run = Command::new("php")
+        .arg("-r")
+        .arg(script)
+        .output()
+        .expect("PHP should execute generated Stage 18 output");
+    assert!(run.status.success());
+    assert_eq!(run.stdout, b"LR=true");
+    assert!(run.stderr.is_empty());
+}
+
+#[test]
+fn php_backend_rejects_checked_integer_interpolation_it_cannot_preserve() {
+    let diagnostics = doriac::compile_source_to_php(
+        "main_expression_interpolation.doria",
+        include_str!("../../../examples/native/main_expression_interpolation.doria"),
+    )
+    .expect_err("PHP must not silently replace checked Doria integer arithmetic");
+
+    assert!(diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == "B1301"
+            && diagnostic
+                .message
+                .contains("checked integer overflow behavior for `+`")
+    }));
+}
+
+#[test]
+fn php_backend_preserves_the_exact_displayable_contract() {
+    let php = doriac::compile_source_to_php(
+        "displayable.doria",
+        include_str!("../../../examples/php/displayable.doria"),
+    )
+    .expect("the exact Displayable subset should lower to PHP");
+
+    assert!(php.contains("interface __DoriaDisplayable"));
+    assert!(php.contains("class Label implements __DoriaDisplayable"));
+    assert!(php.contains("public function toString(): string"));
+    assert!(php.contains("$value->toString()"));
+    assert!(!php.contains("__toString"));
+
+    let Ok(version) = Command::new("php").arg("--version").output() else {
+        return;
+    };
+    if !version.status.success() {
+        return;
+    }
+    let run = Command::new("php")
+        .arg("-r")
+        .arg(php.strip_prefix("<?php").expect("generated PHP header"))
+        .output()
+        .expect("PHP should execute generated Displayable output");
+    assert!(run.status.success());
+    assert_eq!(run.stdout, b"Doria Doria Doria Doria");
+    assert!(run.stderr.is_empty());
+}
+
+#[test]
+fn php_backend_reserves_display_helper_class_name_case_insensitively() {
+    for name in [
+        "__DoriaDisplayable",
+        "__doriadisplayable",
+        "__DORIADISPLAYABLE",
+    ] {
+        let diagnostics = doriac::compile_source_to_php(
+            "reserved_display_helper.doria",
+            format!("class {name} {{}}"),
+        )
+        .expect_err("PHP display helper name variants must be reserved");
+
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "E0309"
+                && diagnostic.message.contains("`__DoriaDisplayable`")
+                && diagnostic.message.contains("reserved")
+        }));
+    }
 }

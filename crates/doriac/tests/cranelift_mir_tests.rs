@@ -85,6 +85,16 @@ fn lowers_string_local_concat_echo_to_object() {
 }
 
 #[test]
+fn lowers_stage_18_expression_interpolation_to_object() {
+    for source in [
+        include_str!("../../../examples/native/main_expression_interpolation.doria"),
+        include_str!("../../../examples/native/main_expression_interpolation_order.doria"),
+    ] {
+        assert_object(source);
+    }
+}
+
+#[test]
 fn lowers_echo_inside_int_returning_helper_to_object() {
     assert_object(include_str!(
         "../../../examples/native/main_int_helper_echo_success.doria"

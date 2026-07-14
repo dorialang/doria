@@ -42,7 +42,7 @@ Float special values are `NaN`, `Infinity`, `-Infinity`, `0`, and `-0`. Formatti
 
 The concatenation operator produces `string` and accepts display-convertible primitives only when at least one operand of that binary operation is statically `string`. Thus `"x=" . 1` and `1 . "x"` are valid, while `1 . 2` is invalid. Evaluation is left-to-right. Conversion is not implicit outside display contexts; `string $value = 42;` remains invalid.
 
-Full arbitrary-expression interpolation and `Displayable` remain Stage 18. `Bytes` remains Stage 23. Null, mixed, collections, classes, enums, closures, pointers, and future optionals are not display-convertible in Stage 16.
+Stage 16 intentionally deferred full arbitrary-expression interpolation and class display conversion. Stage 18, recorded in decision 0079, completes ordinary expression interpolation and adds the compiler-known nominal `Displayable` path without changing this decision's primitive conversion or runtime-string history. Native class execution still waits for Stages 19 and 20. `Bytes` remains Stage 23.
 
 ### Native representation and ownership
 

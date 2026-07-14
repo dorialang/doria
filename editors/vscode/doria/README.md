@@ -8,7 +8,7 @@ Syntax colors depend on the active VS Code theme. This extension improves Doria'
 
 The TextMate grammar is editor support only. It highlights accepted and planned Doria vocabulary from the master plan so `.doria` files and Markdown `doria` fences stay readable, but highlighting does not mean the compiler implements every highlighted planned construct.
 
-Double-quoted string interpolation such as `{$this->name}` keeps the string text green while colorizing the variable reference. Single-quoted strings are treated as literal strings.
+Double-quoted interpolation uses the ordinary Doria expression grammar, so expressions such as `{left() + right()}` receive normal token scopes inside the string. Literal opening braces use `\{`; single-quoted strings remain non-interpolating.
 
 Before launching the extension, build the language server from the repository root:
 

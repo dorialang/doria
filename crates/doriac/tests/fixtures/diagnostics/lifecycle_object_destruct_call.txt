@@ -1,0 +1,4 @@
+code: E0414
+message: destructor `Person::__destruct` cannot be called directly
+help: destructors are invoked by the runtime, not user code
+span: 79..100
