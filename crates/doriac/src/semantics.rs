@@ -701,7 +701,7 @@ impl<'program> Checker<'program> {
             }
 
             if param.promoted_access.is_some()
-                && matches!(self.types.kind(ty), TypeKind::Class(_))
+                && matches!(self.types.kind(ty), TypeKind::Class(_) | TypeKind::Mixed)
                 && !param.take
             {
                 let diagnostic = Diagnostic::new(

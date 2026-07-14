@@ -6,13 +6,13 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::ast::{self, AssignOp, ClassMember, Expr, Item, Stmt};
+use crate::ast::{self, AssignOp, BinaryOp, ClassMember, Expr, Item, Stmt};
 use crate::diagnostics::Diagnostic;
 use crate::source::Span;
 
 #[derive(Debug, Clone)]
 struct Parameter {
-    class: Option<String>,
+    move_type: bool,
     take: bool,
 }
 
@@ -20,6 +20,7 @@ struct Parameter {
 struct Signature {
     params: Vec<Parameter>,
     returns: Option<String>,
+    returns_move_type: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,6 +36,7 @@ enum State {
 struct Binding {
     class: Option<String>,
     mixed: bool,
+    borrowed_place: bool,
     writable: bool,
     state: State,
 }
@@ -200,7 +202,7 @@ pub fn check_program(program: &ast::Program) -> Vec<Diagnostic> {
                 }
             }
             Item::Statement(statement) => {
-                checker.check_statement(statement, &mut top_level_scopes, None);
+                checker.check_statement(statement, &mut top_level_scopes, false);
             }
         }
     }
@@ -213,9 +215,7 @@ fn signature(function: &ast::FunctionDecl, classes: &HashSet<String>) -> Signatu
             .params
             .iter()
             .map(|param| Parameter {
-                class: classes
-                    .contains(&param.ty.name)
-                    .then(|| param.ty.name.clone()),
+                move_type: classes.contains(&param.ty.name) || param.ty.name == "mixed",
                 take: param.take,
             })
             .collect(),
@@ -224,6 +224,10 @@ fn signature(function: &ast::FunctionDecl, classes: &HashSet<String>) -> Signatu
             .as_ref()
             .filter(|ty| classes.contains(&ty.name))
             .map(|ty| ty.name.clone()),
+        returns_move_type: function
+            .return_type
+            .as_ref()
+            .is_some_and(|ty| classes.contains(&ty.name) || ty.name == "mixed"),
     }
 }
 
@@ -282,12 +286,18 @@ impl Checker {
             std::mem::replace(&mut self.receiver_class, receiver_class.map(str::to_owned));
         let mut scopes = Scopes::new();
         for param in &function.params {
-            if self.classes.contains(&param.ty.name) {
+            let class = self
+                .classes
+                .contains(&param.ty.name)
+                .then(|| param.ty.name.clone());
+            let mixed = param.ty.name == "mixed";
+            if class.is_some() || mixed {
                 scopes.declare(
                     param.name.clone(),
                     Binding {
-                        class: Some(param.ty.name.clone()),
-                        mixed: false,
+                        class,
+                        mixed,
+                        borrowed_place: !param.take,
                         writable: param.writable,
                         state: if param.take && param.promoted_access.is_some() {
                             State::Given { at: param.span }
@@ -300,12 +310,11 @@ impl Checker {
                 );
             }
         }
-        let return_class = function
+        let return_move_type = function
             .return_type
             .as_ref()
-            .filter(|ty| self.classes.contains(&ty.name))
-            .map(|ty| ty.name.as_str());
-        self.check_block(&function.body, &mut scopes, return_class, false);
+            .is_some_and(|ty| self.classes.contains(&ty.name) || ty.name == "mixed");
+        self.check_block(&function.body, &mut scopes, return_move_type, false);
         self.receiver_class = previous_receiver;
     }
 
@@ -313,7 +322,7 @@ impl Checker {
         &mut self,
         block: &ast::Block,
         scopes: &mut Scopes,
-        return_class: Option<&str>,
+        return_move_type: bool,
         nested: bool,
     ) -> Flow {
         if nested {
@@ -324,7 +333,7 @@ impl Checker {
             if !flow.falls_through {
                 break;
             }
-            let statement_flow = self.check_statement(statement, scopes, return_class);
+            let statement_flow = self.check_statement(statement, scopes, return_move_type);
             flow.falls_through = statement_flow.falls_through;
             flow.backedges.extend(statement_flow.backedges);
             flow.breaks.extend(statement_flow.breaks);
@@ -345,7 +354,7 @@ impl Checker {
         &mut self,
         statement: &Stmt,
         scopes: &mut Scopes,
-        return_class: Option<&str>,
+        return_move_type: bool,
     ) -> Flow {
         match statement {
             Stmt::VarDecl(decl) => {
@@ -356,10 +365,11 @@ impl Checker {
                     .map(|ty| ty.name.clone());
                 let mixed = decl.ty.as_ref().is_some_and(|ty| ty.name == "mixed");
                 let class = declared_class.or_else(|| self.expr_class(&decl.initializer, scopes));
+                let initializer_moves = self.expr_is_move_value(&decl.initializer, scopes);
                 self.use_expr(
                     &decl.initializer,
                     scopes,
-                    if class.is_some() {
+                    if initializer_moves {
                         UseMode::Give
                     } else {
                         UseMode::Borrow
@@ -371,6 +381,7 @@ impl Checker {
                         Binding {
                             class,
                             mixed,
+                            borrowed_place: false,
                             writable: decl.writable,
                             state: State::Owned,
                         },
@@ -386,6 +397,7 @@ impl Checker {
                 }
                 if let Expr::Variable { name, span } = &assignment.target {
                     let value_class = self.expr_class(&assignment.value, scopes);
+                    let value_moves = self.expr_is_move_value(&assignment.value, scopes);
                     let target = scopes.get(name).cloned();
                     let class_assignment = value_class.is_some()
                         && target
@@ -423,14 +435,18 @@ impl Checker {
                         self.use_expr(
                             &assignment.value,
                             scopes,
-                            if value_class.is_some() {
+                            if value_moves {
                                 UseMode::Give
                             } else {
                                 UseMode::Borrow
                             },
                         );
                         if let Some(binding) = scopes.get_mut(name) {
-                            binding.state = State::Owned;
+                            binding.state = if binding.borrowed_place {
+                                State::Borrowed
+                            } else {
+                                State::Owned
+                            };
                             if binding.mixed {
                                 binding.class = value_class;
                             }
@@ -473,7 +489,7 @@ impl Checker {
                     self.use_expr(
                         expr,
                         scopes,
-                        if return_class.is_some() {
+                        if return_move_type {
                             UseMode::Give
                         } else {
                             UseMode::Borrow
@@ -486,18 +502,22 @@ impl Checker {
                 self.use_expr(&statement.condition, scopes, UseMode::Borrow);
                 let before = scopes.clone();
                 let mut then_scopes = before.clone();
-                let mut then_flow =
-                    self.check_block(&statement.then_block, &mut then_scopes, return_class, true);
+                let mut then_flow = self.check_block(
+                    &statement.then_block,
+                    &mut then_scopes,
+                    return_move_type,
+                    true,
+                );
                 let mut else_scopes = before.clone();
                 let mut else_flow = if let Some(branch) = &statement.else_branch {
                     match branch {
                         ast::ElseBranch::If(nested) => self.check_statement(
                             &Stmt::If((**nested).clone()),
                             &mut else_scopes,
-                            return_class,
+                            return_move_type,
                         ),
                         ast::ElseBranch::Block(block) => {
-                            self.check_block(block, &mut else_scopes, return_class, true)
+                            self.check_block(block, &mut else_scopes, return_move_type, true)
                         }
                     }
                 } else {
@@ -522,14 +542,18 @@ impl Checker {
                 let before = scopes.clone();
                 let mut body = before.clone();
                 let mut body_flow =
-                    self.check_block(&statement.body, &mut body, return_class, true);
+                    self.check_block(&statement.body, &mut body, return_move_type, true);
                 if body_flow.falls_through {
                     body_flow.backedges.push(body);
                 }
                 for repeat in &mut body_flow.backedges {
                     self.use_expr(&statement.condition, repeat, UseMode::Borrow);
                 }
-                self.check_second_iteration(&statement.body, &body_flow.backedges, return_class);
+                self.check_second_iteration(
+                    &statement.body,
+                    &body_flow.backedges,
+                    return_move_type,
+                );
                 let mut exits = body_flow.backedges;
                 exits.extend(body_flow.breaks);
                 merge_loop_exit(scopes, &before, &exits);
@@ -543,14 +567,14 @@ impl Checker {
                             let _ = self.check_statement(
                                 &Stmt::VarDecl(decl.clone()),
                                 scopes,
-                                return_class,
+                                return_move_type,
                             );
                         }
                         ast::ForInitializer::Assignment(assignment) => {
                             let _ = self.check_statement(
                                 &Stmt::Assignment(assignment.clone()),
                                 scopes,
-                                return_class,
+                                return_move_type,
                             );
                         }
                     }
@@ -561,30 +585,14 @@ impl Checker {
                 let before = scopes.clone();
                 let mut body = before.clone();
                 let mut body_flow =
-                    self.check_block(&statement.body, &mut body, return_class, true);
+                    self.check_block(&statement.body, &mut body, return_move_type, true);
                 if body_flow.falls_through {
                     body_flow.backedges.push(body);
                 }
                 for repeat in &mut body_flow.backedges {
-                    if let Some(increment) = &statement.increment {
-                        match increment {
-                            ast::ForIncrement::Assignment(assignment) => {
-                                let _ = self.check_statement(
-                                    &Stmt::Assignment(assignment.clone()),
-                                    repeat,
-                                    return_class,
-                                );
-                            }
-                            ast::ForIncrement::Increment(increment) => {
-                                self.use_expr(&increment.target, repeat, UseMode::Borrow)
-                            }
-                        }
-                    }
-                    if let Some(condition) = &statement.condition {
-                        self.use_expr(condition, repeat, UseMode::Borrow);
-                    }
+                    self.check_for_tail(statement, repeat, return_move_type);
                 }
-                self.check_second_iteration(&statement.body, &body_flow.backedges, return_class);
+                self.check_for_second_iteration(statement, &body_flow.backedges, return_move_type);
                 let mut exits = body_flow.backedges;
                 exits.extend(body_flow.breaks);
                 merge_loop_exit(scopes, &before, &exits);
@@ -596,11 +604,15 @@ impl Checker {
                 let before = scopes.clone();
                 let mut body = before.clone();
                 let mut body_flow =
-                    self.check_block(&statement.body, &mut body, return_class, true);
+                    self.check_block(&statement.body, &mut body, return_move_type, true);
                 if body_flow.falls_through {
                     body_flow.backedges.push(body);
                 }
-                self.check_second_iteration(&statement.body, &body_flow.backedges, return_class);
+                self.check_second_iteration(
+                    &statement.body,
+                    &body_flow.backedges,
+                    return_move_type,
+                );
                 let mut exits = body_flow.backedges;
                 exits.extend(body_flow.breaks);
                 merge_loop_exit(scopes, &before, &exits);
@@ -623,13 +635,63 @@ impl Checker {
         &mut self,
         body: &ast::Block,
         backedges: &[Scopes],
-        return_class: Option<&str>,
+        return_move_type: bool,
     ) {
         for backedge in backedges {
             let diagnostics_before = self.diagnostics.len();
             let mut second_iteration = backedge.clone();
-            let _ = self.check_block(body, &mut second_iteration, return_class, true);
+            let _ = self.check_block(body, &mut second_iteration, return_move_type, true);
             self.deduplicate_diagnostics_from(diagnostics_before);
+        }
+    }
+
+    fn check_for_second_iteration(
+        &mut self,
+        statement: &ast::ForStmt,
+        entries: &[Scopes],
+        return_move_type: bool,
+    ) {
+        for entry in entries {
+            let diagnostics_before = self.diagnostics.len();
+            let mut second_iteration = entry.clone();
+            let mut flow = self.check_block(
+                &statement.body,
+                &mut second_iteration,
+                return_move_type,
+                true,
+            );
+            if flow.falls_through {
+                flow.backedges.push(second_iteration);
+            }
+            for backedge in &mut flow.backedges {
+                self.check_for_tail(statement, backedge, return_move_type);
+            }
+            self.deduplicate_diagnostics_from(diagnostics_before);
+        }
+    }
+
+    fn check_for_tail(
+        &mut self,
+        statement: &ast::ForStmt,
+        scopes: &mut Scopes,
+        return_move_type: bool,
+    ) {
+        if let Some(increment) = &statement.increment {
+            match increment {
+                ast::ForIncrement::Assignment(assignment) => {
+                    let _ = self.check_statement(
+                        &Stmt::Assignment(assignment.clone()),
+                        scopes,
+                        return_move_type,
+                    );
+                }
+                ast::ForIncrement::Increment(increment) => {
+                    self.use_expr(&increment.target, scopes, UseMode::Borrow);
+                }
+            }
+        }
+        if let Some(condition) = &statement.condition {
+            self.use_expr(condition, scopes, UseMode::Borrow);
         }
     }
 
@@ -715,7 +777,7 @@ impl Checker {
             }
             Expr::FunctionCall { name, args, .. } => {
                 let signature = self.signatures.get(name).cloned().unwrap_or_default();
-                self.use_call_args(args, &signature, scopes);
+                self.use_call_args(None, args, &signature, scopes);
             }
             Expr::New {
                 class_name, args, ..
@@ -725,7 +787,7 @@ impl Checker {
                     .get(class_name)
                     .cloned()
                     .unwrap_or_default();
-                self.use_call_args(args, &signature, scopes);
+                self.use_call_args(None, args, &signature, scopes);
             }
             Expr::MethodCall {
                 object,
@@ -737,8 +799,7 @@ impl Checker {
                     .expr_class(object, scopes)
                     .and_then(|class| self.methods.get(&(class, method.clone())).cloned())
                     .unwrap_or_default();
-                self.use_expr(object, scopes, UseMode::Borrow);
-                self.use_call_args(args, &signature, scopes);
+                self.use_call_args(Some(object), args, &signature, scopes);
             }
             Expr::StaticCall {
                 class_name,
@@ -751,7 +812,7 @@ impl Checker {
                     .get(&(class_name.clone(), method.clone()))
                     .cloned()
                     .unwrap_or_default();
-                self.use_call_args(args, &signature, scopes);
+                self.use_call_args(None, args, &signature, scopes);
             }
             Expr::InterpolatedString { parts, .. } => {
                 for part in parts {
@@ -769,6 +830,26 @@ impl Checker {
                 }
             }
             Expr::Unary { expr, .. } => self.use_expr(expr, scopes, UseMode::Borrow),
+            Expr::Binary {
+                left,
+                op: op @ (BinaryOp::And | BinaryOp::Or),
+                right,
+                ..
+            } => {
+                self.use_expr(left, scopes, UseMode::Borrow);
+                match (op, bool_literal(left)) {
+                    (BinaryOp::And, Some(false)) | (BinaryOp::Or, Some(true)) => {}
+                    (BinaryOp::And, Some(true)) | (BinaryOp::Or, Some(false)) => {
+                        self.use_expr(right, scopes, UseMode::Borrow);
+                    }
+                    _ => {
+                        let without_right = scopes.clone();
+                        let mut with_right = without_right.clone();
+                        self.use_expr(right, &mut with_right, UseMode::Borrow);
+                        scopes.merge_from(&without_right, &with_right);
+                    }
+                }
+            }
             Expr::Binary { left, right, .. }
             | Expr::Range {
                 start: left,
@@ -797,14 +878,76 @@ impl Checker {
         }
     }
 
-    fn use_call_args(&mut self, args: &[Expr], signature: &Signature, scopes: &mut Scopes) {
+    fn use_call_args(
+        &mut self,
+        receiver: Option<&Expr>,
+        args: &[Expr],
+        signature: &Signature,
+        scopes: &mut Scopes,
+    ) {
+        let mut borrowed = HashSet::new();
+        if let Some(name) = receiver.and_then(variable_name) {
+            if scopes.get(name).is_some() {
+                borrowed.insert(name);
+            }
+        }
         for (index, arg) in args.iter().enumerate() {
-            let mode = signature
-                .params
-                .get(index)
-                .filter(|param| param.take && param.class.is_some())
-                .map_or(UseMode::Borrow, |_| UseMode::Give);
+            let mode = call_arg_mode(signature, index);
+            if mode == UseMode::Borrow {
+                if let Some(name) = variable_name(arg) {
+                    if scopes.get(name).is_some() {
+                        borrowed.insert(name);
+                    }
+                }
+            }
+        }
+
+        if let Some(receiver) = receiver {
+            self.use_expr(receiver, scopes, UseMode::Borrow);
+        }
+        for (index, arg) in args.iter().enumerate() {
+            let mode = call_arg_mode(signature, index);
+            if mode == UseMode::Give {
+                if let Some(name) = variable_name(arg).filter(|name| borrowed.contains(name)) {
+                    self.diagnostics.push(
+                        Diagnostic::new(
+                            "E0471",
+                            format!("`${name}` cannot be borrowed and given away in the same call"),
+                            arg.span(),
+                        )
+                        .with_help("pass distinct owners for borrowed and ownership-taking inputs"),
+                    );
+                }
+            }
             self.use_expr(arg, scopes, mode);
+        }
+    }
+
+    fn expr_is_move_value(&self, expr: &Expr, scopes: &Scopes) -> bool {
+        match expr {
+            Expr::Variable { name, .. } => scopes.get(name).is_some(),
+            Expr::Grouped { expr, .. } => self.expr_is_move_value(expr, scopes),
+            Expr::New { class_name, .. } => self.classes.contains(class_name),
+            Expr::FunctionCall { name, .. } => self
+                .signatures
+                .get(name)
+                .is_some_and(|signature| signature.returns_move_type),
+            Expr::MethodCall { object, method, .. } => {
+                let Some(class) = self.expr_class(object, scopes) else {
+                    return false;
+                };
+                self.methods
+                    .get(&(class, method.clone()))
+                    .is_some_and(|signature| signature.returns_move_type)
+            }
+            Expr::StaticCall {
+                class_name, method, ..
+            } => self
+                .methods
+                .get(&(class_name.clone(), method.clone()))
+                .is_some_and(|signature| signature.returns_move_type),
+            Expr::PropertyAccess { .. } => self.expr_class(expr, scopes).is_some(),
+            _ => false,
         }
     }
 
@@ -851,6 +994,22 @@ fn variable_name(expr: &Expr) -> Option<&str> {
     match expr {
         Expr::Variable { name, .. } => Some(name),
         Expr::Grouped { expr, .. } => variable_name(expr),
+        _ => None,
+    }
+}
+
+fn call_arg_mode(signature: &Signature, index: usize) -> UseMode {
+    signature
+        .params
+        .get(index)
+        .filter(|param| param.take && param.move_type)
+        .map_or(UseMode::Borrow, |_| UseMode::Give)
+}
+
+fn bool_literal(expr: &Expr) -> Option<bool> {
+    match expr {
+        Expr::Bool { value, .. } => Some(*value),
+        Expr::Grouped { expr, .. } => bool_literal(expr),
         _ => None,
     }
 }

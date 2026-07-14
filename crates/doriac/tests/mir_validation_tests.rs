@@ -314,6 +314,15 @@ fn shared_validator_rejects_class_new_with_missing_properties() {
     assert!(error.message.contains("does not initialize property0"));
 }
 
+#[test]
+fn shared_validator_requires_constructors_to_return_void() {
+    let mut program = class_new_program();
+    program.functions[1].return_type = ReturnType::Value(Type::String);
+    let error = doriac::mir_validation::validate_program(&program)
+        .expect_err("constructors cannot return values");
+    assert!(error.message.contains("constructor") && error.message.contains("return void"));
+}
+
 fn decimal_spec() -> FormatSpec {
     FormatSpec {
         conversion: FormatConversion::Decimal,

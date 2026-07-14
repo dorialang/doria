@@ -355,3 +355,106 @@ fn assigning_a_class_owner_into_mixed_moves_the_source() {
         .iter()
         .any(|diagnostic| diagnostic.code == "E0470"));
 }
+
+#[test]
+fn for_increment_ownership_transfers_are_rechecked() {
+    let diagnostics = doriac::check_source(
+        "for-increment-move.doria",
+        "class Guard {} function repeat(bool $again, take Guard $guard): void { writable mixed $slot = 1; for (; $again; $slot = $guard) {} }",
+    )
+    .expect_err("a later for increment would transfer an already moved owner");
+    assert!(diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == "E0470"));
+}
+
+#[test]
+fn mixed_declaration_initializers_move_the_box() {
+    let diagnostics = doriac::check_source(
+        "mixed-declaration-move.doria",
+        "function duplicate(): void { mixed $first = 1; mixed $second = $first; mixed $third = $first; }",
+    )
+    .expect_err("a mixed box has only one owner");
+    assert!(diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == "E0470"));
+}
+
+#[test]
+fn promoted_mixed_parameter_requires_take() {
+    let source = "class Box { function __construct(mixed $payload) {} }";
+    let diagnostics = doriac::check_source("mixed-promotion.doria", source)
+        .expect_err("promoting mixed must transfer its box");
+    let diagnostic = diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.code == "E0468")
+        .expect("mixed promotion diagnostic");
+    assert_eq!(
+        diagnostic.fix.as_ref().map(|fix| fix.replacement.as_str()),
+        Some("take ")
+    );
+
+    doriac::check_source(
+        "mixed-promotion-ok.doria",
+        "class Box { function __construct(take mixed $payload) {} }",
+    )
+    .expect("take mixed transfers the promoted box");
+}
+
+#[test]
+fn take_mixed_parameters_are_tracked_as_move_owners() {
+    let diagnostics = doriac::check_source(
+        "take-mixed.doria",
+        "function sink(take mixed $value): void {} function twice(take mixed $value): void { sink($value); sink($value); }",
+    )
+    .expect_err("the first call consumes the mixed box");
+    assert!(diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == "E0470"));
+}
+
+#[test]
+fn a_call_cannot_borrow_and_take_the_same_owner() {
+    for source in [
+        "class Guard {} function inspect(Guard $borrowed, take Guard $owned): void {} function route(take Guard $guard): void { inspect($guard, $guard); }",
+        "class Guard { function consume(take Guard $owned): void {} } function route(take Guard $guard): void { $guard->consume($guard); }",
+    ] {
+        let diagnostics = doriac::check_source("overlapping-call.doria", source)
+            .expect_err("a call cannot borrow and take one owner simultaneously");
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "E0471" && diagnostic.message.contains("same call")
+        }));
+    }
+}
+
+#[test]
+fn assigning_through_a_writable_parameter_keeps_it_borrowed() {
+    let diagnostics = doriac::check_source(
+        "writable-owner.doria",
+        "class Guard {} function consume(take Guard $guard): void {} function route(writable Guard $slot): void { $slot = new Guard(); consume($slot); }",
+    )
+    .expect_err("the caller owns the replacement stored through its borrowed slot");
+    assert!(diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == "E0474"));
+}
+
+#[test]
+fn boolean_short_circuiting_preserves_unreached_owners() {
+    for condition in ["false && probe($guard)", "true || probe($guard)"] {
+        let source = format!(
+            "class Guard {{}} function probe(take Guard $guard): bool {{ return true; }} function consume(take Guard $guard): void {{}} function route(take Guard $guard): void {{ if ({condition}) {{}} consume($guard); }}"
+        );
+        doriac::check_source("short-circuit.doria", source)
+            .expect("the right operand is unreachable and cannot consume the owner");
+    }
+
+    let diagnostics = doriac::check_source(
+        "conditional-short-circuit.doria",
+        "class Guard {} function probe(take Guard $guard): bool { return true; } function consume(take Guard $guard): void {} function route(bool $enabled, take Guard $guard): void { if ($enabled && probe($guard)) {} consume($guard); }",
+    )
+    .expect_err("a reachable right operand may consume the owner");
+    assert!(diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == "E0470"));
+}

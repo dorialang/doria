@@ -359,6 +359,12 @@ fn validate_class_expression(
                 .map(|constructor| function_in(program, constructor))
                 .transpose()?;
             let constructor_parameters = if let Some(constructor) = constructor {
+                if constructor.return_type != mir::ReturnType::Void {
+                    return Err(malformed_mir(format!(
+                        "constructor {} does not return void",
+                        constructor.name
+                    )));
+                }
                 let Some((receiver, parameters)) = constructor.params.split_first() else {
                     return Err(malformed_mir(format!(
                         "constructor {} has no implicit receiver",
