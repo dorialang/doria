@@ -604,6 +604,83 @@ fn owning_array_literals_move_their_elements() {
 }
 
 #[test]
+fn collection_reassignment_moves_the_source_owner() {
+    for collection in [
+        "Guard[]",
+        "List<Guard>",
+        "Dictionary<string, Guard>",
+        "Set<Guard>",
+    ] {
+        let source = format!(
+            "class Guard {{}} function sink(take {collection} $items): void {{}} function route(take {collection} $src): void {{ writable {collection} $dst = []; $dst = $src; sink($src); }}"
+        );
+        let diagnostics = doriac::check_source("collection-reassignment.doria", source)
+            .expect_err("assigning the collection transfers its owner");
+        assert!(diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E0470"));
+    }
+}
+
+#[test]
+fn borrowed_array_arguments_still_move_owned_elements_into_the_temporary() {
+    let diagnostics = doriac::check_source(
+        "borrowed-array-element.doria",
+        "class Guard {} function inspect(Guard[] $items): void {} function consume(take Guard $guard): void {} function route(take Guard $guard): void { inspect([$guard]); consume($guard); }",
+    )
+    .expect_err("the temporary array owns its class element");
+    assert!(diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == "E0470"));
+}
+
+#[test]
+fn promoted_collection_parameters_require_take() {
+    for collection in [
+        "Guard[]",
+        "List<Guard>",
+        "Dictionary<string, Guard>",
+        "Set<Guard>",
+    ] {
+        let source = format!(
+            "class Guard {{}} class Box {{ function __construct({collection} $items) {{}} }}"
+        );
+        let diagnostics = doriac::check_source("collection-promotion.doria", source)
+            .expect_err("promotion must transfer collection ownership");
+        assert!(diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E0468"));
+
+        doriac::check_source(
+            "collection-promotion-take.doria",
+            format!(
+                "class Guard {{}} class Box {{ function __construct(take {collection} $items) {{}} }}"
+            ),
+        )
+        .expect("take transfers the collection into the promoted property");
+    }
+}
+
+#[test]
+fn collection_properties_are_move_values() {
+    for collection in [
+        "Guard[]",
+        "List<Guard>",
+        "Dictionary<string, Guard>",
+        "Set<Guard>",
+    ] {
+        let source = format!(
+            "class Guard {{}} function sink(take {collection} $items): void {{}} class Box {{ {collection} $items = []; function release(): void {{ sink($this->items); }} }}"
+        );
+        let diagnostics = doriac::check_source("collection-property-move.doria", source)
+            .expect_err("direct collection-property moves remain unsupported");
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "E0472" && diagnostic.message.contains("moves out")
+        }));
+    }
+}
+
+#[test]
 fn literal_if_conditions_skip_unreachable_owner_moves() {
     for body in [
         "if (false) { consume($guard); } consume($guard);",

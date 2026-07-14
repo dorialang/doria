@@ -2847,9 +2847,9 @@ class Accumulator
 {
     writable int $count = 0;
 
-    function __construct(List<int> $items)
+    function __construct(take List<int> $items)
     {
-        foreach ($items as int $item) {
+        foreach ($this->items as int $item) {
             $this->count += $item;
         }
     }

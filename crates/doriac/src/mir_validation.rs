@@ -145,6 +145,9 @@ fn field_type(ty: mir::Type) -> FieldType {
 }
 
 fn validate_function(program: &mir::Program, function: &mir::Function) -> Result<(), BackendError> {
+    if let mir::ReturnType::Value(ty) = function.return_type {
+        validate_type(program, ty)?;
+    }
     for (index, local) in function.locals.iter().enumerate() {
         if local.id != mir::LocalId(index) {
             return Err(malformed_mir(format!(
@@ -152,6 +155,7 @@ fn validate_function(program: &mir::Program, function: &mir::Function) -> Result
                 function.name, local.id.0
             )));
         }
+        validate_type(program, local.ty)?;
     }
     for parameter in &function.params {
         let local = local_in(function, *parameter)?;
@@ -169,6 +173,13 @@ fn validate_function(program: &mir::Program, function: &mir::Function) -> Result
             validate_statement(program, function, statement)?;
         }
         validate_terminator(program, function, &block.terminator)?;
+    }
+    Ok(())
+}
+
+fn validate_type(program: &mir::Program, ty: mir::Type) -> Result<(), BackendError> {
+    if let mir::Type::Class(class) = ty {
+        class_in(program, class)?;
     }
     Ok(())
 }

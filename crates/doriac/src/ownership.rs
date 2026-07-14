@@ -158,7 +158,7 @@ pub(crate) fn check_program_with_inferred_move_returns(
                             let property_class = classes
                                 .contains(&property.ty.name)
                                 .then(|| property.ty.name.clone());
-                            let move_type = property_class.is_some() || property.ty.name == "mixed";
+                            let move_type = type_ref_is_move_type(&property.ty, &classes);
                             if move_type {
                                 properties.insert(
                                     (class.name.clone(), property.name.clone()),
@@ -182,8 +182,7 @@ pub(crate) fn check_program_with_inferred_move_returns(
                                     let property_class = classes
                                         .contains(&param.ty.name)
                                         .then(|| param.ty.name.clone());
-                                    let move_type =
-                                        property_class.is_some() || param.ty.name == "mixed";
+                                    let move_type = type_ref_is_move_type(&param.ty, &classes);
                                     if param.promoted_access.is_some() && move_type {
                                         properties.insert(
                                             (class.name.clone(), param.name.clone()),
@@ -262,7 +261,7 @@ fn signature(
         returns_move_type: function
             .return_type
             .as_ref()
-            .is_some_and(|ty| classes.contains(&ty.name) || ty.name == "mixed")
+            .is_some_and(|ty| type_ref_is_move_type(ty, classes))
             || inferred_move_returns.contains(&function.span.start),
     }
 }
@@ -447,7 +446,8 @@ impl Checker {
                             .as_ref()
                             .is_some_and(|binding| binding.mixed || binding.class == value_class);
                     let mixed_assignment = target.as_ref().is_some_and(|binding| binding.mixed);
-                    if class_assignment || mixed_assignment {
+                    let move_assignment = target.is_some() && value_moves;
+                    if class_assignment || mixed_assignment || move_assignment {
                         if variable_name(&assignment.value).is_some_and(|source| source == name) {
                             self.diagnostics.push(
                                 Diagnostic::new(
@@ -900,7 +900,12 @@ impl Checker {
                     if let Some(key) = &element.key {
                         self.use_expr(key, scopes, UseMode::Borrow);
                     }
-                    self.use_expr(&element.value, scopes, mode);
+                    let element_mode = if self.expr_is_move_value(&element.value, scopes) {
+                        UseMode::Give
+                    } else {
+                        UseMode::Borrow
+                    };
+                    self.use_expr(&element.value, scopes, element_mode);
                 }
             }
             Expr::Unary { expr, .. } => self.use_expr(expr, scopes, UseMode::Borrow),

@@ -429,6 +429,51 @@ fn shared_validator_rejects_unknown_property_class_references() {
 }
 
 #[test]
+fn shared_validator_rejects_unknown_classes_in_function_types() {
+    let mut local = valid_void_program();
+    local.functions[0].locals.push(class_local(0, ClassId(99)));
+    let error = doriac::mir_validation::validate_program(&local)
+        .expect_err("local types must reference declared classes");
+    assert!(error.message.contains("ClassId class#99 does not exist"));
+
+    let mut parameter = valid_void_program();
+    parameter.functions.push(Function {
+        id: FunctionId(1),
+        name: "missingClassParameter".to_string(),
+        params: vec![LocalId(0)],
+        return_type: ReturnType::Void,
+        locals: vec![class_local(0, ClassId(99))],
+        blocks: vec![BasicBlock {
+            id: BlockId(0),
+            statements: vec![],
+            terminator: Terminator::ReturnVoid,
+        }],
+        entry_block: BlockId(0),
+    });
+    let error = doriac::mir_validation::validate_program(&parameter)
+        .expect_err("parameter types must reference declared classes");
+    assert!(error.message.contains("ClassId class#99 does not exist"));
+
+    let mut returned = valid_void_program();
+    returned.functions.push(Function {
+        id: FunctionId(1),
+        name: "missingClass".to_string(),
+        params: vec![],
+        return_type: ReturnType::Value(Type::Class(ClassId(99))),
+        locals: vec![],
+        blocks: vec![BasicBlock {
+            id: BlockId(0),
+            statements: vec![],
+            terminator: Terminator::Unreachable,
+        }],
+        entry_block: BlockId(0),
+    });
+    let error = doriac::mir_validation::validate_program(&returned)
+        .expect_err("return types must reference declared classes");
+    assert!(error.message.contains("ClassId class#99 does not exist"));
+}
+
+#[test]
 fn shared_validator_checks_lifecycle_metadata_even_when_unused() {
     let mut valid = class_program();
     valid.classes[0].destructor = Some(FunctionId(1));
