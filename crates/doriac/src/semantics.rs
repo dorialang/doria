@@ -704,20 +704,28 @@ impl<'program> Checker<'program> {
                 && matches!(self.types.kind(ty), TypeKind::Class(_))
                 && !param.take
             {
-                self.diagnostics.push(
-                    Diagnostic::new(
-                        "E0468",
-                        format!(
-                            "promoted move-type parameter `${}` must use `take`",
-                            param.name
-                        ),
-                        param.span,
-                    )
-                    .with_help(
-                        "promotion gives ownership directly to the new property; insert `take`",
-                    )
-                    .with_fix(param.ownership_modifier_insert, "take "),
+                let diagnostic = Diagnostic::new(
+                    "E0468",
+                    format!(
+                        "promoted move-type parameter `${}` must use `take`",
+                        param.name
+                    ),
+                    param.span,
                 );
+                self.diagnostics
+                    .push(if let Some(writable_span) = param.writable_span {
+                        diagnostic
+                            .with_help(
+                                "promotion transfers ownership; replace `writable` with `take`",
+                            )
+                            .with_fix(writable_span, "take")
+                    } else {
+                        diagnostic
+                        .with_help(
+                            "promotion gives ownership directly to the new property; insert `take`",
+                        )
+                        .with_fix(param.ownership_modifier_insert, "take ")
+                    });
             }
 
             if !has_default && saw_optional {

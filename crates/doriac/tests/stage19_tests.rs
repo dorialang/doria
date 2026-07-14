@@ -190,3 +190,99 @@ fn constructor_parameter_is_still_a_promoted_property_in_the_ast() {
         });
     assert!(constructor.unwrap().params[0].promoted_access.is_some());
 }
+
+#[test]
+fn borrowed_class_parameters_and_this_cannot_be_given_away() {
+    for source in [
+        "class Guard {} function consume(take Guard $guard): void {} function wrapper(Guard $guard): void { consume($guard); }",
+        "class Guard { function giveSelf(): void { consume($this); } } function consume(take Guard $guard): void {}",
+    ] {
+        let diagnostics = doriac::check_source("borrowed.doria", source)
+            .expect_err("borrowed class values cannot be transferred");
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "E0474" && diagnostic.message.contains("cannot be given away")
+        }));
+    }
+}
+
+#[test]
+fn method_and_static_take_parameters_move_their_arguments() {
+    for source in [
+        "class Guard {} class Box { function consume(take Guard $guard): void {} } function test(Box $box, take Guard $guard): void { $box->consume($guard); $box->consume($guard); }",
+        "class Guard {} class Box { static function consume(take Guard $guard): void {} } function test(take Guard $guard): void { Box::consume($guard); Box::consume($guard); }",
+    ] {
+        let diagnostics = doriac::check_source("method-take.doria", source)
+            .expect_err("the second ownership transfer must be rejected");
+        assert!(diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E0470"));
+    }
+}
+
+#[test]
+fn class_typed_properties_cannot_be_moved_out_directly() {
+    let source = "class Child {} class Parent { function __construct(take Child $child) {} function release(): void { consume($this->child); } } function consume(take Child $child): void {}";
+    let diagnostics = doriac::check_source("property-move.doria", source)
+        .expect_err("direct property moves remain unsupported");
+    assert!(diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == "E0472" && diagnostic.message.contains("moves out")
+    }));
+}
+
+#[test]
+fn top_level_ownership_state_is_preserved_between_statements() {
+    let source = "class Guard {} function consume(take Guard $guard): void {} let $guard = new Guard(); consume($guard); consume($guard);";
+    let diagnostics = doriac::check_source("top-level-move.doria", source)
+        .expect_err("top-level use after move must be rejected");
+    assert!(diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == "E0470"));
+}
+
+#[test]
+fn terminating_branch_does_not_poison_the_fallthrough_owner() {
+    doriac::check_source(
+        "branch-return.doria",
+        "class Guard {} function consume(take Guard $guard): void {} function route(bool $condition, take Guard $guard): void { if ($condition) { consume($guard); return; } consume($guard); }",
+    )
+    .expect("the moved branch cannot reach the second transfer");
+}
+
+#[test]
+fn parenthesized_self_moves_are_rejected() {
+    let program = doriac::parse_source(
+        "grouped-self-move.doria",
+        "class Guard {} function reset(take Guard $guard): void { $guard = ($guard); }",
+    )
+    .expect("self-move source should parse");
+    let diagnostics = doriac::ownership::check_program(&program);
+    assert!(diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == "E0471"));
+}
+
+#[test]
+fn repeatable_loop_body_cannot_move_the_same_owner_twice() {
+    let diagnostics = doriac::check_source(
+        "loop-move.doria",
+        "class Guard {} function consume(take Guard $guard): void {} function repeat(bool $again, take Guard $guard): void { while ($again) { consume($guard); } }",
+    )
+    .expect_err("a later loop iteration would transfer an already moved value");
+    assert!(diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == "E0470"));
+}
+
+#[test]
+fn writable_move_promotion_fix_replaces_writable_with_take() {
+    let source = "class Person {} class Team { function __construct(writable Person $manager) {} }";
+    let diagnostics = doriac::check_source("writable-promotion.doria", source)
+        .expect_err("writable promotion must transfer ownership instead");
+    let diagnostic = diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.code == "E0468")
+        .expect("promotion diagnostic");
+    let fix = diagnostic.fix.as_ref().expect("replacement fix");
+    assert_eq!(fix.replacement, "take");
+    assert_eq!(&source[fix.span.start..fix.span.end], "writable");
+}

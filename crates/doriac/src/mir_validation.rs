@@ -1,5 +1,7 @@
 //! Backend-independent structural and type validation for native MIR.
 
+use std::collections::HashSet;
+
 use crate::backend::BackendError;
 use crate::mir;
 use crate::numeric::IntegerType;
@@ -308,13 +310,13 @@ fn validate_class_expression(
     expression: &mir::ClassExpression,
 ) -> Result<(), BackendError> {
     let class = expression.class();
-    if program
+    let Some(class_definition) = program
         .classes
         .get(class.0)
-        .is_none_or(|definition| definition.id != class)
-    {
+        .filter(|definition| definition.id == class)
+    else {
         return Err(malformed_mir(format!("unknown class#{}", class.0)));
-    }
+    };
     match expression {
         mir::ClassExpression::Local { local, .. } => {
             let definition = local_in(function, *local)?;
@@ -333,6 +335,12 @@ fn validate_class_expression(
             ..
         } => {
             let callee = function_in(program, *callee)?;
+            if callee.return_type != mir::ReturnType::Value(mir::Type::Class(class)) {
+                return Err(malformed_mir(format!(
+                    "class#{} call targets a function with another return type",
+                    class.0
+                )));
+            }
             validate_call_args(program, function, callee, args)
         }
         mir::ClassExpression::New {
@@ -341,14 +349,90 @@ fn validate_class_expression(
             constructor,
             ..
         } => {
+            if class_definition.constructor != *constructor {
+                return Err(malformed_mir(format!(
+                    "class#{} new expression names the wrong constructor",
+                    class.0
+                )));
+            }
+            let constructor = constructor
+                .map(|constructor| function_in(program, constructor))
+                .transpose()?;
+            let constructor_parameters = if let Some(constructor) = constructor {
+                let Some((receiver, parameters)) = constructor.params.split_first() else {
+                    return Err(malformed_mir(format!(
+                        "constructor {} has no implicit receiver",
+                        constructor.name
+                    )));
+                };
+                if local_in(constructor, *receiver)?.ty != mir::Type::Class(class) {
+                    return Err(malformed_mir(format!(
+                        "constructor {} has an incompatible implicit receiver",
+                        constructor.name
+                    )));
+                }
+                parameters
+            } else {
+                if !args.is_empty() {
+                    return Err(malformed_mir(format!(
+                        "class#{} without a constructor receives arguments",
+                        class.0
+                    )));
+                }
+                &[]
+            };
+
+            let mut initialized = HashSet::new();
             for property in properties {
-                if let mir::PropertyValueSource::Expression(value) = &property.source {
-                    validate_rvalue(program, function, value)?;
+                let Some(definition) = class_definition
+                    .properties
+                    .get(property.property.index)
+                    .filter(|definition| definition.id == property.property)
+                else {
+                    return Err(malformed_mir(format!(
+                        "class#{} new expression initializes an unknown property slot",
+                        class.0
+                    )));
+                };
+                if !initialized.insert(property.property) {
+                    return Err(malformed_mir(format!(
+                        "class#{} new expression initializes property{} more than once",
+                        class.0, property.property.index
+                    )));
+                }
+                let source_type = match &property.source {
+                    mir::PropertyValueSource::Expression(value) => {
+                        validate_rvalue(program, function, value)?;
+                        value.ty()
+                    }
+                    mir::PropertyValueSource::ConstructorArgument(index) => args
+                        .get(*index)
+                        .ok_or_else(|| {
+                            malformed_mir(format!(
+                                "class#{} property{} references constructor argument {} but only {} exist",
+                                class.0,
+                                property.property.index,
+                                index,
+                                args.len()
+                            ))
+                        })?
+                        .ty(),
+                };
+                if source_type != definition.ty {
+                    return Err(malformed_mir(format!(
+                        "class#{} property{} has type {} but its initializer has type {}",
+                        class.0, property.property.index, definition.ty, source_type
+                    )));
                 }
             }
             if let Some(constructor) = constructor {
-                let constructor = function_in(program, *constructor)?;
-                validate_call_args(program, function, constructor, args)?;
+                validate_call_args_for_params(
+                    program,
+                    function,
+                    constructor,
+                    constructor_parameters,
+                    args,
+                )?;
             }
             Ok(())
         }
@@ -425,15 +509,25 @@ fn validate_call_args(
     callee: &mir::Function,
     args: &[mir::Rvalue],
 ) -> Result<(), BackendError> {
-    if args.len() != callee.params.len() {
+    validate_call_args_for_params(program, caller, callee, &callee.params, args)
+}
+
+fn validate_call_args_for_params(
+    program: &mir::Program,
+    caller: &mir::Function,
+    callee: &mir::Function,
+    params: &[mir::LocalId],
+    args: &[mir::Rvalue],
+) -> Result<(), BackendError> {
+    if args.len() != params.len() {
         return Err(malformed_mir(format!(
             "call to {} expects {} arguments, got {}",
             callee.name,
-            callee.params.len(),
+            params.len(),
             args.len()
         )));
     }
-    for (index, (argument, parameter)) in args.iter().zip(&callee.params).enumerate() {
+    for (index, (argument, parameter)) in args.iter().zip(params).enumerate() {
         let parameter_type = local_in(callee, *parameter)?.ty;
         if argument.ty() != parameter_type {
             return Err(malformed_mir(format!(

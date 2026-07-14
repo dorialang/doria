@@ -1,9 +1,10 @@
+use doriac::class_layout::{compute_class_layout, ClassId, FieldType, PropertyId};
 use doriac::format_string::{FormatConversion, FormatPiece, FormatSpec};
 use doriac::mir::{
-    BasicBlock, BlockId, FloatBinaryOp, FloatExpression, FormatArgument, FormatExpression,
-    Function, FunctionId, Local, LocalId, NullableStringExpression, Operand, Program, ReturnType,
-    Rvalue, ScalarType, ScalarValue, Statement, StringExpression, Terminator, Type,
-    ValueExpression,
+    BasicBlock, BlockId, Class, ClassExpression, FloatBinaryOp, FloatExpression, FormatArgument,
+    FormatExpression, Function, FunctionId, Local, LocalId, NullableStringExpression, Operand,
+    Program, Property, PropertyValue, PropertyValueSource, ReturnType, Rvalue, ScalarType,
+    ScalarValue, Statement, StringExpression, Terminator, Type, ValueExpression,
 };
 use doriac::numeric::{FloatType, FloatValue, IntegerType, IntegerValue};
 
@@ -165,6 +166,146 @@ fn shared_validator_rejects_invalid_format_index_and_argument_type() {
     }
 }
 
+#[test]
+fn shared_validator_requires_class_calls_to_return_the_declared_class() {
+    let mut program = class_program();
+    program.functions[0].locals.push(class_local(0, ClassId(0)));
+    program.functions[0].blocks[0]
+        .statements
+        .push(Statement::AssignLocal {
+            target: LocalId(0),
+            value: Rvalue::Class(ClassExpression::Call {
+                class: ClassId(0),
+                function: FunctionId(1),
+                args: vec![],
+            }),
+        });
+    program.functions.push(Function {
+        id: FunctionId(1),
+        name: "makeOther".to_string(),
+        params: vec![],
+        return_type: ReturnType::Value(Type::Class(ClassId(1))),
+        locals: vec![class_local(0, ClassId(1))],
+        blocks: vec![BasicBlock {
+            id: BlockId(0),
+            statements: vec![],
+            terminator: Terminator::Return(Rvalue::Class(ClassExpression::Local {
+                class: ClassId(1),
+                local: LocalId(0),
+            })),
+        }],
+        entry_block: BlockId(0),
+    });
+
+    let error = doriac::mir_validation::validate_program(&program)
+        .expect_err("class calls cannot lie about their return class");
+    assert!(error
+        .message
+        .contains("class#0 call targets a function with another return type"));
+}
+
+#[test]
+fn shared_validator_skips_the_implicit_constructor_receiver() {
+    let mut program = class_program();
+    program.classes[0].constructor = Some(FunctionId(1));
+    program.functions[0].locals.push(class_local(0, ClassId(0)));
+    program.functions[0].blocks[0]
+        .statements
+        .push(Statement::AssignLocal {
+            target: LocalId(0),
+            value: Rvalue::Class(ClassExpression::New {
+                class: ClassId(0),
+                properties: vec![],
+                constructor: Some(FunctionId(1)),
+                args: vec![Rvalue::String(StringExpression::Literal(
+                    "value".to_string(),
+                ))],
+            }),
+        });
+    program.functions.push(Function {
+        id: FunctionId(1),
+        name: "Message::__construct".to_string(),
+        params: vec![LocalId(0), LocalId(1)],
+        return_type: ReturnType::Void,
+        locals: vec![
+            class_local(0, ClassId(0)),
+            Local {
+                id: LocalId(1),
+                name: "text".to_string(),
+                ty: Type::String,
+                writable: false,
+                synthetic: false,
+            },
+        ],
+        blocks: vec![BasicBlock {
+            id: BlockId(0),
+            statements: vec![],
+            terminator: Terminator::ReturnVoid,
+        }],
+        entry_block: BlockId(0),
+    });
+
+    doriac::mir_validation::validate_program(&program)
+        .expect("source constructor arguments exclude the synthetic receiver");
+}
+
+#[test]
+fn shared_validator_rejects_invalid_class_new_property_sources() {
+    let property = PropertyId {
+        class: ClassId(0),
+        index: 0,
+    };
+    for value in [
+        PropertyValue {
+            property: PropertyId {
+                class: ClassId(1),
+                index: 0,
+            },
+            source: PropertyValueSource::ConstructorArgument(0),
+        },
+        PropertyValue {
+            property,
+            source: PropertyValueSource::Expression(Rvalue::Value(ValueExpression::Integer(
+                doriac::mir::IntegerExpression::constant(IntegerValue::from_bits(
+                    IntegerType::Int64,
+                    1,
+                )),
+            ))),
+        },
+        PropertyValue {
+            property,
+            source: PropertyValueSource::ConstructorArgument(99),
+        },
+    ] {
+        let mut program = class_new_program();
+        let Statement::AssignLocal {
+            value: Rvalue::Class(ClassExpression::New { properties, .. }),
+            ..
+        } = &mut program.functions[0].blocks[0].statements[0]
+        else {
+            panic!("class new fixture");
+        };
+        properties.push(value);
+        doriac::mir_validation::validate_program(&program)
+            .expect_err("invalid class property initialization must be rejected");
+    }
+
+    let mut valid = class_new_program();
+    let Statement::AssignLocal {
+        value: Rvalue::Class(ClassExpression::New { properties, .. }),
+        ..
+    } = &mut valid.functions[0].blocks[0].statements[0]
+    else {
+        panic!("class new fixture");
+    };
+    properties.push(PropertyValue {
+        property,
+        source: PropertyValueSource::ConstructorArgument(0),
+    });
+    doriac::mir_validation::validate_program(&valid)
+        .expect("matching constructor property source should validate");
+}
+
 fn decimal_spec() -> FormatSpec {
     FormatSpec {
         conversion: FormatConversion::Decimal,
@@ -193,4 +334,85 @@ fn valid_void_program() -> Program {
         }],
         entry: FunctionId(0),
     }
+}
+
+fn class_program() -> Program {
+    let mut program = valid_void_program();
+    program.classes = [ClassId(0), ClassId(1)]
+        .into_iter()
+        .map(|id| Class {
+            id,
+            name: format!("Class{}", id.0),
+            properties: vec![],
+            layout: compute_class_layout(id, [], 8),
+            constructor: None,
+            destructor: None,
+        })
+        .collect();
+    program
+}
+
+fn class_local(index: usize, class: ClassId) -> Local {
+    Local {
+        id: LocalId(index),
+        name: format!("class{index}"),
+        ty: Type::Class(class),
+        writable: false,
+        synthetic: false,
+    }
+}
+
+fn class_new_program() -> Program {
+    let mut program = class_program();
+    let property = PropertyId {
+        class: ClassId(0),
+        index: 0,
+    };
+    program.classes[0].properties.push(Property {
+        id: property,
+        name: "text".to_string(),
+        ty: Type::String,
+        writable: false,
+        promoted: true,
+    });
+    program.classes[0].layout =
+        compute_class_layout(ClassId(0), [(property, FieldType::String)], 8);
+    program.classes[0].constructor = Some(FunctionId(1));
+    program.functions[0].locals.push(class_local(0, ClassId(0)));
+    program.functions[0].blocks[0]
+        .statements
+        .push(Statement::AssignLocal {
+            target: LocalId(0),
+            value: Rvalue::Class(ClassExpression::New {
+                class: ClassId(0),
+                properties: vec![],
+                constructor: Some(FunctionId(1)),
+                args: vec![Rvalue::String(StringExpression::Literal(
+                    "value".to_string(),
+                ))],
+            }),
+        });
+    program.functions.push(Function {
+        id: FunctionId(1),
+        name: "Message::__construct".to_string(),
+        params: vec![LocalId(0), LocalId(1)],
+        return_type: ReturnType::Void,
+        locals: vec![
+            class_local(0, ClassId(0)),
+            Local {
+                id: LocalId(1),
+                name: "text".to_string(),
+                ty: Type::String,
+                writable: false,
+                synthetic: false,
+            },
+        ],
+        blocks: vec![BasicBlock {
+            id: BlockId(0),
+            statements: vec![],
+            terminator: Terminator::ReturnVoid,
+        }],
+        entry_block: BlockId(0),
+    });
+    program
 }
