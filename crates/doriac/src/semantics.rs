@@ -66,7 +66,7 @@ pub fn analyze_program(program: &Program) -> DiagnosticResult<SemanticInfo> {
             .iter()
             .filter_map(|(span_start, signature)| {
                 checker
-                    .type_contains_mixed(signature.return_ty)
+                    .type_is_move_type(signature.return_ty)
                     .then_some(*span_start)
             })
             .collect();
@@ -303,7 +303,7 @@ impl<'program> Checker<'program> {
     fn check(&mut self) {
         self.collect_classes();
         self.collect_functions();
-        self.infer_unannotated_mixed_return_signatures();
+        self.infer_unannotated_move_return_signatures();
 
         let mut scopes = ScopeStack::new();
         for item in &self.program.items {
@@ -712,18 +712,7 @@ impl<'program> Checker<'program> {
                 );
             }
 
-            if param.promoted_access.is_some()
-                && matches!(
-                    self.types.kind(ty),
-                    TypeKind::Class(_)
-                        | TypeKind::Mixed
-                        | TypeKind::TypedArray(_)
-                        | TypeKind::List(_)
-                        | TypeKind::Dictionary(_, _)
-                        | TypeKind::Set(_)
-                )
-                && !param.take
-            {
+            if param.promoted_access.is_some() && self.type_is_move_type(ty) && !param.take {
                 let diagnostic = Diagnostic::new(
                     "E0468",
                     format!(
@@ -784,8 +773,8 @@ impl<'program> Checker<'program> {
             .unwrap_or_else(|| self.types.unknown())
     }
 
-    fn infer_unannotated_mixed_return_signatures(&mut self) {
-        let max_iterations = self.mixed_return_inference_signature_count();
+    fn infer_unannotated_move_return_signatures(&mut self) {
+        let max_iterations = self.move_return_inference_signature_count();
 
         for _ in 0..max_iterations {
             let mut changed = false;
@@ -793,7 +782,7 @@ impl<'program> Checker<'program> {
             for item in &self.program.items {
                 match item {
                     Item::Function(function) => {
-                        changed |= self.update_function_mixed_return_signature(function);
+                        changed |= self.update_function_move_return_signature(function);
                     }
                     Item::Class(class_decl) => {
                         for member in &class_decl.members {
@@ -801,7 +790,7 @@ impl<'program> Checker<'program> {
                                 continue;
                             };
                             changed |=
-                                self.update_method_mixed_return_signature(&class_decl.name, method);
+                                self.update_method_move_return_signature(&class_decl.name, method);
                         }
                     }
                     Item::Statement(_) => {}
@@ -814,7 +803,7 @@ impl<'program> Checker<'program> {
         }
     }
 
-    fn mixed_return_inference_signature_count(&self) -> usize {
+    fn move_return_inference_signature_count(&self) -> usize {
         self.program
             .items
             .iter()
@@ -837,7 +826,7 @@ impl<'program> Checker<'program> {
             .max(1)
     }
 
-    fn update_function_mixed_return_signature(&mut self, function: &FunctionDecl) -> bool {
+    fn update_function_move_return_signature(&mut self, function: &FunctionDecl) -> bool {
         if function.return_type.is_some() {
             return false;
         }
@@ -845,9 +834,9 @@ impl<'program> Checker<'program> {
         let Some(signature) = self.function_signatures.get(&function.span.start).cloned() else {
             return false;
         };
-        let inferred = self.infer_unannotated_mixed_return_type(function, &signature.params, None);
+        let inferred = self.infer_unannotated_move_return_type(function, &signature.params, None);
 
-        if !self.type_contains_mixed(inferred) || signature.return_ty == inferred {
+        if !self.type_is_move_type(inferred) || signature.return_ty == inferred {
             return false;
         }
 
@@ -860,7 +849,7 @@ impl<'program> Checker<'program> {
         true
     }
 
-    fn update_method_mixed_return_signature(
+    fn update_method_move_return_signature(
         &mut self,
         class_name: &str,
         method: &FunctionDecl,
@@ -878,13 +867,13 @@ impl<'program> Checker<'program> {
             writable_this: method.writable_this,
             this_available: true,
         };
-        let inferred = self.infer_unannotated_mixed_return_type(
+        let inferred = self.infer_unannotated_move_return_type(
             method,
             &signature.params,
             Some(&method_context),
         );
 
-        if !self.type_contains_mixed(inferred) || signature.return_ty == inferred {
+        if !self.type_is_move_type(inferred) || signature.return_ty == inferred {
             return false;
         }
 
@@ -901,7 +890,7 @@ impl<'program> Checker<'program> {
         true
     }
 
-    fn infer_unannotated_mixed_return_type(
+    fn infer_unannotated_move_return_type(
         &mut self,
         function: &FunctionDecl,
         params: &[ParamInfo],
@@ -921,11 +910,11 @@ impl<'program> Checker<'program> {
             );
         }
 
-        self.infer_mixed_return_from_block(&function.body, &mut scopes, method_context)
+        self.infer_move_return_from_block(&function.body, &mut scopes, method_context)
             .unwrap_or_else(|| self.types.unknown())
     }
 
-    fn infer_mixed_return_from_statements(
+    fn infer_move_return_from_statements(
         &mut self,
         statements: &[Stmt],
         scopes: &mut ScopeStack,
@@ -935,8 +924,8 @@ impl<'program> Checker<'program> {
 
         for statement in statements {
             let statement_ty =
-                self.infer_mixed_return_from_statement(statement, scopes, method_context);
-            inferred = self.merge_optional_mixed_return_types(inferred, statement_ty);
+                self.infer_move_return_from_statement(statement, scopes, method_context);
+            inferred = self.merge_optional_inferred_return_types(inferred, statement_ty);
 
             if !crate::return_analysis::statement_falls_through(statement) {
                 break;
@@ -946,7 +935,7 @@ impl<'program> Checker<'program> {
         inferred
     }
 
-    fn infer_mixed_return_from_statement(
+    fn infer_move_return_from_statement(
         &mut self,
         statement: &Stmt,
         scopes: &mut ScopeStack,
@@ -973,46 +962,43 @@ impl<'program> Checker<'program> {
                 None
             }
             Stmt::Assignment(assignment) => {
-                self.infer_mixed_return_from_assignment(assignment, scopes, method_context);
+                self.infer_move_return_from_assignment(assignment, scopes, method_context);
                 None
             }
             Stmt::Return {
                 expr: Some(expr), ..
-            } => {
-                let ty = self.infer_expr_type(expr, scopes, method_context);
-                self.type_contains_mixed(ty).then_some(ty)
-            }
+            } => Some(self.infer_expr_type(expr, scopes, method_context)),
             Stmt::If(if_stmt) => {
-                self.infer_mixed_return_from_if_statement(if_stmt, scopes, method_context)
+                self.infer_move_return_from_if_statement(if_stmt, scopes, method_context)
             }
             Stmt::While(while_stmt) => {
-                self.infer_mixed_return_from_block(&while_stmt.body, scopes, method_context)
+                self.infer_move_return_from_block(&while_stmt.body, scopes, method_context)
             }
             Stmt::For(for_stmt) => {
                 scopes.push();
                 if let Some(initializer) = &for_stmt.initializer {
-                    self.infer_mixed_return_from_for_initializer(
+                    self.infer_move_return_from_for_initializer(
                         initializer,
                         scopes,
                         method_context,
                     );
                 }
                 let result =
-                    self.infer_mixed_return_from_block(&for_stmt.body, scopes, method_context);
+                    self.infer_move_return_from_block(&for_stmt.body, scopes, method_context);
                 if let Some(increment) = &for_stmt.increment {
-                    self.infer_mixed_return_from_for_increment(increment, scopes, method_context);
+                    self.infer_move_return_from_for_increment(increment, scopes, method_context);
                 }
                 scopes.pop();
                 result
             }
             Stmt::Foreach(foreach) => {
-                self.infer_mixed_return_from_foreach(foreach, scopes, method_context)
+                self.infer_move_return_from_foreach(foreach, scopes, method_context)
             }
             _ => None,
         }
     }
 
-    fn infer_mixed_return_from_if_statement(
+    fn infer_move_return_from_if_statement(
         &mut self,
         if_stmt: &IfStmt,
         scopes: &mut ScopeStack,
@@ -1022,7 +1008,7 @@ impl<'program> Checker<'program> {
         let mut falling_through_scopes = Vec::new();
 
         let mut then_scopes = incoming_scopes.clone();
-        let mut inferred = self.infer_mixed_return_from_block(
+        let mut inferred = self.infer_move_return_from_block(
             &if_stmt.then_block,
             &mut then_scopes,
             method_context,
@@ -1034,8 +1020,8 @@ impl<'program> Checker<'program> {
         if let Some(branch) = &if_stmt.else_branch {
             let mut else_scopes = incoming_scopes;
             let branch_ty =
-                self.infer_mixed_return_from_else_branch(branch, &mut else_scopes, method_context);
-            inferred = self.merge_optional_mixed_return_types(inferred, branch_ty);
+                self.infer_move_return_from_else_branch(branch, &mut else_scopes, method_context);
+            inferred = self.merge_optional_inferred_return_types(inferred, branch_ty);
             if crate::return_analysis::else_branch_falls_through(branch) {
                 falling_through_scopes.push(else_scopes);
             }
@@ -1049,7 +1035,7 @@ impl<'program> Checker<'program> {
 
         inferred
     }
-    fn infer_mixed_return_from_block(
+    fn infer_move_return_from_block(
         &mut self,
         block: &Block,
         scopes: &mut ScopeStack,
@@ -1057,30 +1043,30 @@ impl<'program> Checker<'program> {
     ) -> Option<TypeId> {
         scopes.push();
         let inferred =
-            self.infer_mixed_return_from_statements(&block.statements, scopes, method_context);
+            self.infer_move_return_from_statements(&block.statements, scopes, method_context);
         scopes.pop();
         inferred
     }
 
-    fn infer_mixed_return_from_else_branch(
+    fn infer_move_return_from_else_branch(
         &mut self,
         branch: &ElseBranch,
         scopes: &mut ScopeStack,
         method_context: Option<&MethodContext>,
     ) -> Option<TypeId> {
         match branch {
-            ElseBranch::If(if_stmt) => self.infer_mixed_return_from_statement(
+            ElseBranch::If(if_stmt) => self.infer_move_return_from_statement(
                 &Stmt::If((**if_stmt).clone()),
                 scopes,
                 method_context,
             ),
             ElseBranch::Block(block) => {
-                self.infer_mixed_return_from_block(block, scopes, method_context)
+                self.infer_move_return_from_block(block, scopes, method_context)
             }
         }
     }
 
-    fn infer_mixed_return_from_for_initializer(
+    fn infer_move_return_from_for_initializer(
         &mut self,
         initializer: &ForInitializer,
         scopes: &mut ScopeStack,
@@ -1106,23 +1092,23 @@ impl<'program> Checker<'program> {
                 );
             }
             ForInitializer::Assignment(assignment) => {
-                self.infer_mixed_return_from_assignment(assignment, scopes, method_context);
+                self.infer_move_return_from_assignment(assignment, scopes, method_context);
             }
         }
     }
 
-    fn infer_mixed_return_from_for_increment(
+    fn infer_move_return_from_for_increment(
         &mut self,
         increment: &ForIncrement,
         scopes: &mut ScopeStack,
         method_context: Option<&MethodContext>,
     ) {
         if let ForIncrement::Assignment(assignment) = increment {
-            self.infer_mixed_return_from_assignment(assignment, scopes, method_context);
+            self.infer_move_return_from_assignment(assignment, scopes, method_context);
         }
     }
 
-    fn infer_mixed_return_from_assignment(
+    fn infer_move_return_from_assignment(
         &mut self,
         assignment: &Assignment,
         scopes: &mut ScopeStack,
@@ -1148,7 +1134,7 @@ impl<'program> Checker<'program> {
         }
     }
 
-    fn infer_mixed_return_from_foreach(
+    fn infer_move_return_from_foreach(
         &mut self,
         foreach: &ForeachStmt,
         scopes: &mut ScopeStack,
@@ -1192,7 +1178,7 @@ impl<'program> Checker<'program> {
             },
         );
 
-        let inferred = self.infer_mixed_return_from_statements(
+        let inferred = self.infer_move_return_from_statements(
             &foreach.body.statements,
             scopes,
             method_context,
@@ -1201,23 +1187,23 @@ impl<'program> Checker<'program> {
         inferred
     }
 
-    fn merge_optional_mixed_return_types(
+    fn merge_optional_inferred_return_types(
         &mut self,
         current: Option<TypeId>,
         next: Option<TypeId>,
     ) -> Option<TypeId> {
         let next = next?;
-        if !self.type_contains_mixed(next) {
+        if matches!(self.types.kind(next), TypeKind::Unknown) {
             return current;
         }
-
         Some(match current {
-            Some(current) => self.merge_mixed_return_types(current, next),
+            Some(current) if matches!(self.types.kind(current), TypeKind::Unknown) => next,
+            Some(current) => self.merge_inferred_return_types(current, next),
             None => next,
         })
     }
 
-    fn merge_mixed_return_types(&mut self, left: TypeId, right: TypeId) -> TypeId {
+    fn merge_inferred_return_types(&mut self, left: TypeId, right: TypeId) -> TypeId {
         if left == right {
             return left;
         }
@@ -1226,23 +1212,23 @@ impl<'program> Checker<'program> {
         let right_kind = self.types.kind(right).clone();
         match (left_kind, right_kind) {
             (TypeKind::List(left), TypeKind::List(right)) => {
-                let element = self.merge_mixed_return_types(left, right);
+                let element = self.merge_inferred_return_types(left, right);
                 self.types.intern(TypeKind::List(element))
             }
             (TypeKind::TypedArray(left), TypeKind::TypedArray(right)) => {
-                let element = self.merge_mixed_return_types(left, right);
+                let element = self.merge_inferred_return_types(left, right);
                 self.types.intern(TypeKind::TypedArray(element))
             }
             (
                 TypeKind::Dictionary(left_key, left_value),
                 TypeKind::Dictionary(right_key, right_value),
             ) => {
-                let key = self.merge_mixed_return_types(left_key, right_key);
-                let value = self.merge_mixed_return_types(left_value, right_value);
+                let key = self.merge_inferred_return_types(left_key, right_key);
+                let value = self.merge_inferred_return_types(left_value, right_value);
                 self.types.intern(TypeKind::Dictionary(key, value))
             }
             (TypeKind::Set(left), TypeKind::Set(right)) => {
-                let element = self.merge_mixed_return_types(left, right);
+                let element = self.merge_inferred_return_types(left, right);
                 self.types.intern(TypeKind::Set(element))
             }
             _ => self.types.intern(TypeKind::Mixed),
@@ -1264,7 +1250,7 @@ impl<'program> Checker<'program> {
 
     fn merge_inferred_binding_type(&mut self, current: TypeId, next: TypeId) -> TypeId {
         if self.type_contains_mixed(current) {
-            self.merge_mixed_return_types(current, next)
+            self.merge_inferred_return_types(current, next)
         } else {
             next
         }
@@ -3330,6 +3316,20 @@ impl<'program> Checker<'program> {
         }
     }
 
+    fn type_is_move_type(&self, ty: TypeId) -> bool {
+        matches!(
+            self.types.kind(ty),
+            TypeKind::Class(_)
+                | TypeKind::Mixed
+                | TypeKind::TypedArray(_)
+                | TypeKind::List(_)
+                | TypeKind::Dictionary(_, _)
+                | TypeKind::Set(_)
+                | TypeKind::EmptyCollection
+                | TypeKind::Heterogeneous
+        )
+    }
+
     fn report_mixed_operation(&mut self, span: Span, operation: &'static str) {
         self.diagnostics.push(
             Diagnostic::new(
@@ -5367,7 +5367,7 @@ impl<'program> Checker<'program> {
                     if let Some(common_ty) = common {
                         if common_ty != ty {
                             if self.type_contains_mixed(common_ty) || self.type_contains_mixed(ty) {
-                                common = Some(self.merge_mixed_return_types(common_ty, ty));
+                                common = Some(self.merge_inferred_return_types(common_ty, ty));
                             } else {
                                 saw_heterogeneous = true;
                             }

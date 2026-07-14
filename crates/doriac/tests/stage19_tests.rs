@@ -315,6 +315,22 @@ fn inferred_mixed_returns_are_move_values_for_functions_and_methods() {
 }
 
 #[test]
+fn inferred_move_returns_cover_classes_collections_methods_and_forward_calls() {
+    for source in [
+        "class Guard {} function make() { return new Guard(); } function duplicate(): void { let $first = make(); let $second = $first; let $third = $first; }",
+        "class Guard {} class Factory { function make() { return new Guard(); } } function duplicate(Factory $factory): void { let $first = $factory->make(); let $second = $first; let $third = $first; }",
+        "class Guard {} function forward() { return make(); } function make() { return new Guard(); } function duplicate(): void { let $first = forward(); let $second = $first; let $third = $first; }",
+        "class Guard {} function make() { Guard[] $items = []; return $items; } function duplicate(): void { let $first = make(); let $second = $first; let $third = $first; }",
+    ] {
+        let diagnostics = doriac::check_source("inferred-move-return.doria", source)
+            .expect_err("every inferred move return must retain one-owner semantics");
+        assert!(diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E0470"));
+    }
+}
+
+#[test]
 fn inferred_mixed_return_transfers_the_return_expression() {
     let diagnostics = doriac::check_source(
         "inferred-mixed-return.doria",
@@ -613,6 +629,20 @@ fn owning_array_literals_move_their_elements() {
 }
 
 #[test]
+fn owning_dictionary_literals_move_their_keys() {
+    for key in ["$guard", "($guard)"] {
+        let source = format!(
+            "class Guard {{}} function consume(take Guard $guard): void {{}} function route(take Guard $guard): void {{ mixed $payload = [{key} => 1]; consume($guard); }}"
+        );
+        let diagnostics = doriac::check_source("dictionary-key-move.doria", source)
+            .expect_err("the dictionary payload owns move-typed keys and values");
+        assert!(diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E0470"));
+    }
+}
+
+#[test]
 fn collection_reassignment_moves_the_source_owner() {
     for collection in [
         "Guard[]",
@@ -718,5 +748,25 @@ fn literal_if_conditions_skip_unreachable_owner_moves() {
         );
         doriac::check_source("literal-if.doria", source)
             .expect("unreachable branches cannot consume the owner");
+    }
+}
+
+#[test]
+fn constant_boolean_expressions_drive_ownership_reachability() {
+    for body in [
+        "if (false && true) { consume($guard); } consume($guard);",
+        "if (true || false) {} else { consume($guard); } consume($guard);",
+        "if (!true) { consume($guard); } consume($guard);",
+        "if (false xor false) { consume($guard); } consume($guard);",
+        "if ($enabled && false) { consume($guard); } consume($guard);",
+        "if ($enabled || true) {} else { consume($guard); } consume($guard);",
+        "while (false && true) { consume($guard); } consume($guard);",
+        "for (; !true; ) { consume($guard); } consume($guard);",
+    ] {
+        let source = format!(
+            "class Guard {{}} function consume(take Guard $guard): void {{}} function route(bool $enabled, take Guard $guard): void {{ {body} }}"
+        );
+        doriac::check_source("constant-reachability.doria", source)
+            .expect("constant boolean reachability must exclude impossible ownership transfers");
     }
 }

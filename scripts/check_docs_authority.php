@@ -239,6 +239,25 @@ if ($namingAuthority === false) {
     }
 }
 
+if ($namingAuthority !== false) {
+    $requiredIoGuidance = [
+        'Formatted I/O — the v1.0 minimal set (record 0074)',
+        '`read_file(string $path): string`',
+        '`read_file_bytes(string $path, ...): Bytes`',
+    ];
+    foreach ($requiredIoGuidance as $guidance) {
+        if (!str_contains($namingAuthority, $guidance)) {
+            $failures[] = "{$namingAuthorityPath}: missing required I/O authority guidance {$guidance}";
+        }
+    }
+
+    foreach (['Formatted I/O — the v1.0 minimal set (record 0071)', '`read_file(): string`', '`read_file_bytes(): Bytes`'] as $staleGuidance) {
+        if (str_contains($namingAuthority, $staleGuidance)) {
+            $failures[] = "{$namingAuthorityPath}: contains stale I/O authority guidance {$staleGuidance}";
+        }
+    }
+}
+
 if ($failures !== []) {
     fwrite(STDERR, "docs authority check failed:\n");
     foreach ($failures as $failure) {
