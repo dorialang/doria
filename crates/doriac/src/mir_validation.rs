@@ -490,7 +490,13 @@ fn validate_class_expression(
             };
 
             let mut initialized = HashSet::new();
-            for property in properties {
+            for (position, property) in properties.iter().enumerate() {
+                if property.property.index != position {
+                    return Err(malformed_mir(format!(
+                        "class#{} new expression initializes property{} out of construction order",
+                        class.0, property.property.index
+                    )));
+                }
                 let Some(definition) = class_definition
                     .properties
                     .get(property.property.index)

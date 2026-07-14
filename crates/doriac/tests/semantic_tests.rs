@@ -187,7 +187,7 @@ fn preserves_nested_mixed_collection_shape_after_clear_heterogeneous_elements() 
     doriac::check_source(
         "test.doria",
         r#"
-function rows(mixed $payload)
+function rows(take mixed $payload)
 {
     return [[1], ["two"], [$payload]];
 }

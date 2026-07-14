@@ -315,6 +315,65 @@ fn shared_validator_rejects_class_new_with_missing_properties() {
 }
 
 #[test]
+fn shared_validator_requires_class_properties_in_construction_order() {
+    let mut program = class_new_program();
+    let first = PropertyId {
+        class: ClassId(0),
+        index: 0,
+    };
+    let second = PropertyId {
+        class: ClassId(0),
+        index: 1,
+    };
+    program.classes[0].properties.push(Property {
+        id: second,
+        name: "other".to_string(),
+        ty: Type::String,
+        writable: false,
+        promoted: true,
+    });
+    program.classes[0].layout = compute_class_layout(
+        ClassId(0),
+        [(first, FieldType::String), (second, FieldType::String)],
+        std::mem::size_of::<usize>() as u32,
+    );
+    program.functions[1].params.push(LocalId(2));
+    program.functions[1].locals.push(Local {
+        id: LocalId(2),
+        name: "other".to_string(),
+        ty: Type::String,
+        writable: false,
+        synthetic: false,
+    });
+    let Statement::AssignLocal {
+        value: Rvalue::Class(ClassExpression::New {
+            properties, args, ..
+        }),
+        ..
+    } = &mut program.functions[0].blocks[0].statements[0]
+    else {
+        panic!("class new fixture");
+    };
+    args.push(Rvalue::String(StringExpression::Literal(
+        "other".to_string(),
+    )));
+    properties.extend([
+        PropertyValue {
+            property: second,
+            source: PropertyValueSource::ConstructorArgument(1),
+        },
+        PropertyValue {
+            property: first,
+            source: PropertyValueSource::ConstructorArgument(0),
+        },
+    ]);
+
+    let error = doriac::mir_validation::validate_program(&program)
+        .expect_err("property initializers must retain canonical construction order");
+    assert!(error.message.contains("out of construction order"));
+}
+
+#[test]
 fn shared_validator_requires_constructors_to_return_void() {
     let mut program = class_new_program();
     program.functions[1].return_type = ReturnType::Value(Type::String);

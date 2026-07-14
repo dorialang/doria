@@ -209,6 +209,7 @@ pub(crate) fn check_program_with_inferred_move_returns(
         constructors,
         methods,
         properties,
+        inferred_move_returns: inferred_move_returns.clone(),
         receiver_class: None,
         diagnostics: Vec::new(),
     };
@@ -249,7 +250,7 @@ fn signature(
             .params
             .iter()
             .map(|param| Parameter {
-                move_type: classes.contains(&param.ty.name) || param.ty.name == "mixed",
+                move_type: type_ref_is_move_type(&param.ty, classes),
                 take: param.take,
             })
             .collect(),
@@ -311,6 +312,7 @@ struct Checker {
     constructors: HashMap<String, Signature>,
     methods: HashMap<(String, String), Signature>,
     properties: HashMap<(String, String), PropertyInfo>,
+    inferred_move_returns: HashSet<usize>,
     receiver_class: Option<String>,
     diagnostics: Vec<Diagnostic>,
 }
@@ -326,7 +328,7 @@ impl Checker {
                 .contains(&param.ty.name)
                 .then(|| param.ty.name.clone());
             let mixed = param.ty.name == "mixed";
-            if class.is_some() || mixed {
+            if type_ref_is_move_type(&param.ty, &self.classes) {
                 scopes.declare(
                     param.name.clone(),
                     Binding {
@@ -348,7 +350,8 @@ impl Checker {
         let return_move_type = function
             .return_type
             .as_ref()
-            .is_some_and(|ty| self.classes.contains(&ty.name) || ty.name == "mixed");
+            .is_some_and(|ty| type_ref_is_move_type(ty, &self.classes))
+            || self.inferred_move_returns.contains(&function.span.start);
         self.check_block(&function.body, &mut scopes, return_move_type, false);
         self.receiver_class = previous_receiver;
     }
@@ -402,16 +405,20 @@ impl Checker {
                 let initializer_moves = self.expr_is_move_value(&decl.initializer, scopes);
                 let mixed = decl.ty.as_ref().is_some_and(|ty| ty.name == "mixed")
                     || (decl.ty.is_none() && class.is_none() && initializer_moves);
+                let declared_move_type = decl
+                    .ty
+                    .as_ref()
+                    .is_some_and(|ty| type_ref_is_move_type(ty, &self.classes));
                 self.use_expr(
                     &decl.initializer,
                     scopes,
-                    if initializer_moves || mixed {
+                    if initializer_moves || class.is_some() || mixed || declared_move_type {
                         UseMode::Give
                     } else {
                         UseMode::Borrow
                     },
                 );
-                if class.is_some() || mixed {
+                if class.is_some() || mixed || declared_move_type {
                     scopes.declare(
                         decl.name.clone(),
                         Binding {
@@ -471,7 +478,7 @@ impl Checker {
                         self.use_expr(
                             &assignment.value,
                             scopes,
-                            if value_moves {
+                            if value_moves || class_assignment {
                                 UseMode::Give
                             } else {
                                 UseMode::Borrow
@@ -644,6 +651,10 @@ impl Checker {
                 }
                 if let Some(condition) = &statement.condition {
                     self.use_expr(condition, scopes, UseMode::Borrow);
+                    if bool_literal(condition) == Some(false) {
+                        scopes.pop();
+                        return Flow::fallthrough();
+                    }
                 }
                 let before = scopes.clone();
                 let mut body = before.clone();
@@ -949,7 +960,7 @@ impl Checker {
         scopes: &mut Scopes,
     ) {
         let mut borrowed = HashSet::new();
-        if let Some(name) = receiver.and_then(variable_name) {
+        if let Some(name) = receiver.and_then(ownership_root_name) {
             if scopes.get(name).is_some() {
                 borrowed.insert(name);
             }
@@ -957,7 +968,7 @@ impl Checker {
         for (index, arg) in args.iter().enumerate() {
             let mode = call_arg_mode(signature, index);
             if mode == UseMode::Borrow {
-                if let Some(name) = variable_name(arg) {
+                if let Some(name) = ownership_root_name(arg) {
                     if scopes.get(name).is_some() {
                         borrowed.insert(name);
                     }
@@ -971,7 +982,8 @@ impl Checker {
         for (index, arg) in args.iter().enumerate() {
             let mode = call_arg_mode(signature, index);
             if mode == UseMode::Give {
-                if let Some(name) = variable_name(arg).filter(|name| borrowed.contains(name)) {
+                if let Some(name) = ownership_root_name(arg).filter(|name| borrowed.contains(name))
+                {
                     self.diagnostics.push(
                         Diagnostic::new(
                             "E0471",
@@ -990,6 +1002,7 @@ impl Checker {
         match expr {
             Expr::Variable { name, .. } => scopes.get(name).is_some(),
             Expr::Grouped { expr, .. } => self.expr_is_move_value(expr, scopes),
+            Expr::Array { .. } => true,
             Expr::New { class_name, .. } => self.classes.contains(class_name),
             Expr::FunctionCall { name, .. } => self
                 .signatures
@@ -1019,6 +1032,7 @@ impl Checker {
                     .get(&(class, property.clone()))
                     .is_some_and(|property| property.move_type)
             }
+            Expr::This { .. } => self.receiver_class.is_some(),
             _ => false,
         }
     }
@@ -1068,6 +1082,24 @@ fn variable_name(expr: &Expr) -> Option<&str> {
         Expr::Grouped { expr, .. } => variable_name(expr),
         _ => None,
     }
+}
+
+fn ownership_root_name(expr: &Expr) -> Option<&str> {
+    match expr {
+        Expr::Variable { name, .. } => Some(name),
+        Expr::PropertyAccess { object, .. } | Expr::Grouped { expr: object, .. } => {
+            ownership_root_name(object)
+        }
+        _ => None,
+    }
+}
+
+fn type_ref_is_move_type(ty: &crate::types::TypeRef, classes: &HashSet<String>) -> bool {
+    classes.contains(&ty.name)
+        || matches!(
+            ty.name.as_str(),
+            "mixed" | "[]" | "List" | "Dictionary" | "Set"
+        )
 }
 
 fn call_arg_mode(signature: &Signature, index: usize) -> UseMode {

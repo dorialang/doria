@@ -283,6 +283,15 @@ fn unreachable_false_loop_body_does_not_move_its_owner() {
 }
 
 #[test]
+fn unreachable_false_for_body_does_not_move_its_owner() {
+    doriac::check_source(
+        "false-for-move.doria",
+        "class Guard {} function consume(take Guard $guard): void {} function route(take Guard $guard): void { for (; false; ) { consume($guard); } consume($guard); }",
+    )
+    .expect("a literal-false for body cannot give away its owner");
+}
+
+#[test]
 fn inferred_mixed_returns_are_move_values_for_functions_and_methods() {
     for source in [
         "function make() { mixed $value = 1; return $value; } function duplicate(): void { let $first = make(); let $second = $first; let $third = $first; }",
@@ -294,6 +303,68 @@ fn inferred_mixed_returns_are_move_values_for_functions_and_methods() {
             .iter()
             .any(|diagnostic| diagnostic.code == "E0470"));
     }
+}
+
+#[test]
+fn inferred_mixed_return_transfers_the_return_expression() {
+    let diagnostics = doriac::check_source(
+        "inferred-mixed-return.doria",
+        "function forward(mixed $value) { return $value; }",
+    )
+    .expect_err("returning a borrowed inferred-mixed value would create a second owner");
+    assert!(diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == "E0474"));
+}
+
+#[test]
+fn collection_take_parameters_transfer_their_owners() {
+    for collection in ["List<Guard>", "Guard[]"] {
+        let source = format!(
+            "class Guard {{}} function sink(take {collection} $items): void {{}} function twice(take {collection} $items): void {{ sink($items); sink($items); }}"
+        );
+        let diagnostics = doriac::check_source("collection-take.doria", source)
+            .expect_err("the collection owner cannot be transferred twice");
+        assert!(diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E0470"));
+    }
+}
+
+#[test]
+fn assigning_an_array_to_mixed_moves_its_elements() {
+    let diagnostics = doriac::check_source(
+        "mixed-array-assignment.doria",
+        "class Guard {} function consume(take Guard $guard): void {} function route(take Guard $guard): void { writable mixed $slot = 1; $slot = [$guard]; consume($guard); }",
+    )
+    .expect_err("the mixed array becomes the owner of its class element");
+    assert!(diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == "E0470"));
+}
+
+#[test]
+fn property_borrows_overlap_with_taking_their_root_owner() {
+    let diagnostics = doriac::check_source(
+        "property-root-overlap.doria",
+        "class Child {} class Parent { function __construct(take Child $child) {} } function inspect(Child $child, take Parent $parent): void {} function route(take Parent $parent): void { inspect($parent->child, $parent); }",
+    )
+    .expect_err("a property borrow cannot overlap taking its root owner");
+    assert!(diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == "E0471"));
+}
+
+#[test]
+fn borrowed_this_cannot_initialize_a_new_owner() {
+    let diagnostics = doriac::check_source(
+        "this-owner-copy.doria",
+        "class Guard { function duplicate(): void { let $copy = $this; consume($copy); } } function consume(take Guard $guard): void {}",
+    )
+    .expect_err("a local owner cannot be created from the borrowed receiver");
+    assert!(diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == "E0474"));
 }
 
 #[test]
