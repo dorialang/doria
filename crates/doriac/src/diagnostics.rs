@@ -19,9 +19,14 @@ pub struct Diagnostic {
 
 impl Diagnostic {
     pub fn new(code: &'static str, message: impl Into<String>, span: Span) -> Self {
+        let message = message.into();
+        debug_assert!(
+            !contains_development_stage_reference(&message),
+            "user-facing diagnostic `{code}` exposes a development stage: {message}"
+        );
         Self {
             code,
-            message: message.into(),
+            message,
             span,
             help: None,
             fix: None,
@@ -29,7 +34,13 @@ impl Diagnostic {
     }
 
     pub fn with_help(mut self, help: impl Into<String>) -> Self {
-        self.help = Some(help.into());
+        let help = help.into();
+        debug_assert!(
+            !contains_development_stage_reference(&help),
+            "user-facing help for `{}` exposes a development stage: {help}",
+            self.code
+        );
+        self.help = Some(help);
         self
     }
 
@@ -62,5 +73,38 @@ impl Diagnostic {
         }
 
         rendered
+    }
+}
+
+fn contains_development_stage_reference(text: &str) -> bool {
+    let mut words = text.split_whitespace();
+    while let Some(word) = words.next() {
+        if word.trim_matches(|character: char| !character.is_ascii_alphanumeric()) == "Stage"
+            && words.next().is_some_and(|next| {
+                next.trim_matches(|character: char| !character.is_ascii_alphanumeric())
+                    .starts_with(|character: char| character.is_ascii_digit())
+            })
+        {
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::contains_development_stage_reference;
+
+    #[test]
+    fn user_facing_diagnostics_reject_numbered_development_stages() {
+        assert!(contains_development_stage_reference(
+            "unsupported MIR Stage 11 coverage"
+        ));
+        assert!(contains_development_stage_reference(
+            "planned for Stage 35."
+        ));
+        assert!(!contains_development_stage_reference(
+            "class property access is not supported by native compilation"
+        ));
     }
 }

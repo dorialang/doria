@@ -37,6 +37,52 @@ const STRING_HEADER_SIZE: usize = mem::size_of::<DrStringV1>();
 pub type DrMainIntV1 = unsafe extern "C" fn(*const DrStackFrameV1) -> i64;
 pub type DrMainVoidV1 = unsafe extern "C" fn(*const DrStackFrameV1);
 
+/// Allocates a headerless native class payload.
+///
+/// This is a private, versioned compiler/runtime ABI. `byte_alignment` is
+/// currently bounded by the platform allocator alignment because every Stage
+/// 19 property is at most pointer/f64 aligned. Empty classes receive a unique,
+/// freeable one-byte allocation. Allocation failure panics with status 101.
+///
+/// # Safety
+///
+/// `current_frame` must be null or a valid generated frame chain. The returned
+/// pointer must be released exactly once with `dr_v1_class_free`.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_class_allocate(
+    current_frame: *const DrStackFrameV1,
+    byte_length: usize,
+    byte_alignment: usize,
+) -> *mut u8 {
+    let supported_alignment = mem::align_of::<u64>().max(mem::align_of::<usize>());
+    if byte_alignment == 0
+        || !byte_alignment.is_power_of_two()
+        || byte_alignment > supported_alignment
+    {
+        static MESSAGE: &[u8] = b"class allocation failed";
+        dr_v1_panic(current_frame, MESSAGE.as_ptr(), MESSAGE.len());
+    }
+    let payload = allocate(byte_length.max(1));
+    if payload.is_null() {
+        static MESSAGE: &[u8] = b"class allocation failed";
+        dr_v1_panic(current_frame, MESSAGE.as_ptr(), MESSAGE.len());
+    }
+    payload
+}
+
+/// Frees a payload returned by `dr_v1_class_allocate`.
+///
+/// # Safety
+///
+/// `payload` must be null or a live class payload allocated by the matching
+/// runtime. A live payload may be passed exactly once.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_class_free(payload: *mut u8) {
+    if !payload.is_null() {
+        deallocate(payload);
+    }
+}
+
 /// Invokes a generated Doria integer entry function and maps its result to a process status.
 ///
 /// # Safety
@@ -1077,6 +1123,20 @@ mod tests {
             core::mem::align_of::<DrStackFrameV1>(),
             core::mem::align_of::<usize>()
         );
+    }
+
+    #[test]
+    fn headerless_class_allocation_handles_empty_and_nonempty_payloads() {
+        unsafe {
+            for size in [0, 1, 24] {
+                let payload = dr_v1_class_allocate(ptr::null(), size, 8);
+                assert!(!payload.is_null());
+                if size > 0 {
+                    ptr::write_bytes(payload, 0xa5, size);
+                }
+                dr_v1_class_free(payload);
+            }
+        }
     }
 
     #[test]

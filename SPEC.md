@@ -254,7 +254,9 @@ Constructor init access is narrower than writable `$this`. Inside `__construct`,
 
 The access `__construct` has to the instance under construction is granted by the construction protocol itself and is never declared. Explicit `writable` on `__construct` or `__destruct` is a compile error with a machine-applicable fix that removes `writable`. This removes a spelling, not an access rule: it does not make `$this` writable and does not widen constructor init access beyond the narrow rules above plus normal mutation of writable properties. Lifecycle methods are compiler-invoked protocol points, not ordinary methods. Stages 19 and 21 formalize construction natively through drop elaboration and definite initialization without changing these source-level rules.
 
-Function parameters are readonly by default and become writable only with `writable`.
+Function parameters are readonly by default and become writable only with `writable`. A `take` parameter gives the callee ownership of a class move value; the call site remains unmarked, and the caller cannot use that value afterward. `take` and `writable` are mutually exclusive. Copy-type arguments retain their ordinary Copy behavior.
+
+Readonly controls mutation, not ownership transfer: a readonly class binding may be moved from. Assigning a new owner to that moved-from binding is mutation and therefore requires `writable`. Direct moves into or out of nested owned properties remain unsupported until writable-path move rules are specified.
 
 Every parameter in Doria source has an explicit type. This applies to all function-like parameter lists: free functions, methods, constructors, anonymous functions, arrow functions, interface requirements, trait requirements, property hook setters, and future callback-style declarations. Doria does not infer omitted parameter types in any context.
 
@@ -593,7 +595,7 @@ write_stderr(string $value): void
 
 `read_file` and `write_file` are text-file functions. `read_file` reads an entire file and validates UTF-8 before constructing a `string`; invalid bytes never enter a Doria string. `write_file` creates or truncates a text file and writes the string's exact bytes. `write_stderr` writes exact bytes without adding a newline. Stage 17 I/O failures, including invalid UTF-8 and operating-system read/write failures, use the fatal panic path with a clear message; `null` from `read_line` means EOF and never signals an error. At Stage 29 these free functions migrate to declared `throws` signatures when checked errors are implemented.
 
-Binary file I/O is planned for Stage 23 as `read_file_bytes(...)` and `write_file_bytes(...)`. Their parameter contracts remain a Stage 23 design decision. `File` and stream objects, including RAII close and buffered/seekable access, are planned after Stage 29. These future tiers do not change the Stage 17 text and EOF contracts.
+Binary file I/O is planned for Stage 23 as `read_file_bytes(string $path, ...)` and `write_file_bytes(string $path, ...)`. The path is required; any additional parameters and their complete contracts remain a Stage 23 design decision. `File` and stream objects, including RAII close and buffered/seekable access, are planned after Stage 29. These future tiers do not change the Stage 17 text and EOF contracts.
 
 `sprintf` and `printf` require a direct literal format in Stage 17. The compiler parses it into a validated MIR plan before any backend runs. Accepted conversions are `%s`, `%d`, `%f`, `%x`, `%X`, `%o`, `%b`, and `%%`; accepted controls are decimal field width, `-` left alignment, `0` numeric zero padding, and `.N` precision on `%f`. Width for `%s` counts UTF-8 bytes. Formatting is deterministic and locale-independent. `printf` uses the same plan, returns `void`, and adds no newline. `print` is rejected in favor of `echo`; dynamic/positional formats, `*` width, `%e`, `%g`, and `sscanf` are not accepted.
 

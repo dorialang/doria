@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use crate::class_layout::{compute_class_layout, ClassId, FieldType};
 use crate::diagnostics::{Diagnostic, DiagnosticResult};
 use crate::format_string::{self, FormatConversion, FormatPiece};
 use crate::numeric::{parse_decimal_magnitude, FloatType, FloatValue, IntegerType, IntegerValue};
@@ -14,22 +15,46 @@ struct FunctionSignature {
     parameter_types: Vec<mir::Type>,
 }
 
+#[derive(Clone, Copy)]
+struct CallableDecl<'a> {
+    function: &'a hir::FunctionDecl,
+    receiver: Option<ClassId>,
+}
+
 pub fn lower_program(program: &hir::Program) -> DiagnosticResult<mir::Program> {
+    let class_ids = program
+        .semantic_info
+        .classes
+        .iter()
+        .map(|class| (class.name.clone(), class.id))
+        .collect::<HashMap<_, _>>();
     let mut declarations = Vec::new();
 
     for item in &program.items {
         match item {
-            hir::Item::Function(function) => declarations.push(function),
+            hir::Item::Function(function) => declarations.push(CallableDecl {
+                function,
+                receiver: None,
+            }),
             hir::Item::Class(class_decl) => {
-                return Err(vec![unsupported(
-                    class_decl.span,
-                    "classes are not lowered to MIR in Stage 11",
-                )]);
+                let class = *class_ids
+                    .get(&class_decl.name)
+                    .expect("checked class has a stable identity");
+                for member in &class_decl.members {
+                    if let hir::ClassMember::Method(method) = member {
+                        if matches!(method.name.as_str(), "__construct" | "__destruct") {
+                            declarations.push(CallableDecl {
+                                function: method,
+                                receiver: Some(class),
+                            });
+                        }
+                    }
+                }
             }
             hir::Item::Statement(statement) => {
                 return Err(vec![unsupported(
                     stmt_span(statement),
-                    "top-level statements are not lowered to MIR in Stage 11",
+                    "top-level executable statements are not supported by native compilation",
                 )]);
             }
         }
@@ -38,31 +63,43 @@ pub fn lower_program(program: &hir::Program) -> DiagnosticResult<mir::Program> {
     let main_indices = declarations
         .iter()
         .enumerate()
-        .filter_map(|(index, function)| (function.name == "main").then_some(index))
+        .filter_map(|(index, declaration)| {
+            (declaration.receiver.is_none() && declaration.function.name == "main").then_some(index)
+        })
         .collect::<Vec<_>>();
     if main_indices.len() != 1 {
         let span = main_indices
             .get(1)
-            .map_or_else(Span::default, |index| declarations[*index].span);
+            .map_or_else(Span::default, |index| declarations[*index].function.span);
         return Err(vec![unsupported(
             span,
-            "Stage 11 requires exactly one top-level function main",
+            "native programs require exactly one top-level `main` function",
         )]);
     }
 
     let mut signatures = HashMap::new();
-    for (index, function) in declarations.iter().enumerate() {
-        if signatures.contains_key(&function.name) {
+    let mut callable_signatures = Vec::new();
+    for (index, declaration) in declarations.iter().enumerate() {
+        let function = declaration.function;
+        if declaration.receiver.is_none() && signatures.contains_key(&function.name) {
             return Err(vec![unsupported(
                 function.span,
                 format!(
-                    "duplicate top-level function `{}` is not lowered to MIR",
+                    "duplicate top-level function `{}` cannot be compiled",
                     function.name
                 ),
             )]);
         }
-        let signature = collect_function_signature(function, mir::FunctionId(index))?;
-        signatures.insert(function.name.clone(), signature);
+        let signature = collect_function_signature(
+            function,
+            mir::FunctionId(index),
+            &class_ids,
+            declaration.receiver.is_some(),
+        )?;
+        if declaration.receiver.is_none() {
+            signatures.insert(function.name.clone(), signature.clone());
+        }
+        callable_signatures.push(signature);
     }
 
     let entry = signatures
@@ -71,21 +108,83 @@ pub fn lower_program(program: &hir::Program) -> DiagnosticResult<mir::Program> {
         .id;
     let functions = declarations
         .iter()
-        .map(|function| {
-            let signature = signatures
-                .get(&function.name)
-                .cloned()
-                .expect("every function signature must be collected");
-            lower_function(function, signature, &signatures, &program.semantic_info)
+        .zip(callable_signatures)
+        .map(|(declaration, signature)| {
+            lower_function(
+                declaration.function,
+                signature,
+                &signatures,
+                &program.semantic_info,
+                declaration.receiver,
+            )
         })
         .collect::<Result<Vec<_>, _>>()?;
 
-    Ok(mir::Program { functions, entry })
+    let classes = program
+        .semantic_info
+        .classes
+        .iter()
+        .map(|class| {
+            let properties = class
+                .properties
+                .iter()
+                .map(|property| {
+                    Ok(mir::Property {
+                        id: property.id,
+                        name: property.name.clone(),
+                        ty: mir_type_ref(&property.ty, &class_ids).ok_or_else(|| {
+                            vec![unsupported(
+                                Span::default(),
+                                format!(
+                                    "property `${}` has a type that is not supported by native class compilation",
+                                    property.name
+                                ),
+                            )]
+                        })?,
+                        writable: property.writable,
+                        promoted: property.promoted,
+                    })
+                })
+                .collect::<DiagnosticResult<Vec<_>>>()?;
+            let layout = compute_class_layout(
+                class.id,
+                properties.iter().map(|property| {
+                    (
+                        property.id,
+                        field_type(property.ty).expect("checked native property type"),
+                    )
+                }),
+                std::mem::size_of::<usize>() as u32,
+            );
+            let lifecycle = |name: &str| {
+                declarations.iter().enumerate().find_map(|(index, declaration)| {
+                    (declaration.receiver == Some(class.id) && declaration.function.name == name)
+                        .then_some(mir::FunctionId(index))
+                })
+            };
+            Ok(mir::Class {
+                id: class.id,
+                name: class.name.clone(),
+                properties,
+                layout,
+                constructor: lifecycle("__construct"),
+                destructor: lifecycle("__destruct"),
+            })
+        })
+        .collect::<DiagnosticResult<Vec<_>>>()?;
+
+    Ok(mir::Program {
+        classes,
+        functions,
+        entry,
+    })
 }
 
 fn collect_function_signature(
     function: &hir::FunctionDecl,
     id: mir::FunctionId,
+    class_ids: &HashMap<String, ClassId>,
+    lifecycle: bool,
 ) -> DiagnosticResult<FunctionSignature> {
     let return_type = match function.return_type.as_ref() {
         Some(ty) if scalar_type_ref(ty).is_some() => mir::ReturnType::Value(mir::Type::Scalar(
@@ -96,20 +195,24 @@ fn collect_function_signature(
             mir::ReturnType::Value(mir::Type::NullableString)
         }
         Some(ty) if is_plain_type(ty, "void") => mir::ReturnType::Void,
+        Some(ty) if mir_type_ref(ty, class_ids).is_some() => {
+            mir::ReturnType::Value(mir_type_ref(ty, class_ids).expect("checked class return"))
+        }
         Some(ty) => {
             return Err(vec![unsupported(
                 function.span,
                 format!(
-                    "function `{}` has unsupported return type `{ty}`; Stage 14 MIR supports scalar and void returns",
+                    "function `{}` has return type `{ty}`, which is not supported by native compilation",
                     function.name
                 ),
             )]);
         }
+        None if lifecycle => mir::ReturnType::Void,
         None => {
             return Err(vec![unsupported(
                 function.span,
                 format!(
-                    "function `{}` requires an explicit scalar or void return type for MIR Stage 14",
+                    "function `{}` requires an explicit return type for native compilation",
                     function.name
                 ),
             )]);
@@ -119,7 +222,7 @@ fn collect_function_signature(
     if function.name == "main" && !function.params.is_empty() {
         return Err(vec![unsupported(
             function.params[0].span,
-            "main parameters are not lowered to MIR in Stage 11",
+            "the native entry function `main` cannot declare parameters",
         )]);
     }
 
@@ -133,7 +236,7 @@ fn collect_function_signature(
     {
         return Err(vec![unsupported(
             function.span,
-            "main must return int/int64 or void in Stage 13 MIR",
+            "the native entry function `main` must return `int`, `int64`, or `void`",
         )]);
     }
 
@@ -143,22 +246,18 @@ fn collect_function_signature(
             return Err(vec![unsupported(
                 param.span,
                 format!(
-                    "default arguments are not lowered for function `{}` in MIR Stage 11",
+                    "default arguments are not supported by native compilation for function `{}`",
                     function.name
                 ),
             )]);
         }
-        let parameter_type = if let Some(scalar) = scalar_type_ref(&param.ty) {
-            mir::Type::Scalar(scalar)
-        } else if is_plain_type(&param.ty, "string") {
-            mir::Type::String
-        } else if is_nullable_string_type(&param.ty) {
-            mir::Type::NullableString
+        let parameter_type = if let Some(ty) = mir_type_ref(&param.ty, class_ids) {
+            ty
         } else {
             return Err(vec![unsupported(
                 param.span,
                 format!(
-                    "function `{}` has unsupported parameter type `{}`; Stage 14 MIR supports scalar parameters",
+                    "function `{}` has parameter type `{}`, which is not supported by native compilation",
                     function.name, param.ty
                 ),
             )]);
@@ -171,6 +270,32 @@ fn collect_function_signature(
         return_type,
         parameter_types,
     })
+}
+
+fn mir_type_ref(
+    ty: &crate::types::TypeRef,
+    class_ids: &HashMap<String, ClassId>,
+) -> Option<mir::Type> {
+    scalar_type_ref(ty)
+        .map(mir::Type::Scalar)
+        .or_else(|| is_plain_type(ty, "string").then_some(mir::Type::String))
+        .or_else(|| is_nullable_string_type(ty).then_some(mir::Type::NullableString))
+        .or_else(|| {
+            (!ty.nullable && ty.args.is_empty())
+                .then(|| class_ids.get(&ty.name).copied().map(mir::Type::Class))
+                .flatten()
+        })
+}
+
+fn field_type(ty: mir::Type) -> Option<FieldType> {
+    match ty {
+        mir::Type::Scalar(mir::ScalarType::Integer(ty)) => Some(FieldType::Integer(ty)),
+        mir::Type::Scalar(mir::ScalarType::Float(ty)) => Some(FieldType::Float(ty)),
+        mir::Type::Scalar(mir::ScalarType::Bool) => Some(FieldType::Bool),
+        mir::Type::String => Some(FieldType::String),
+        mir::Type::NullableString => Some(FieldType::NullableString),
+        mir::Type::Class(class) => Some(FieldType::Class(class)),
+    }
 }
 
 fn integer_type_ref(ty: &crate::types::TypeRef) -> Option<IntegerType> {
@@ -207,14 +332,21 @@ fn lower_function(
     signature: FunctionSignature,
     signatures: &HashMap<String, FunctionSignature>,
     semantic_info: &SemanticInfo,
+    receiver: Option<ClassId>,
 ) -> DiagnosticResult<mir::Function> {
     let mut context = LoweringContext::new(signatures.clone(), semantic_info);
-    let params = function
-        .params
-        .iter()
-        .zip(signature.parameter_types.iter().copied())
-        .map(|(param, ty)| context.declare_user_local(&param.name, param.writable, ty))
-        .collect::<Vec<_>>();
+    let mut params = Vec::new();
+    if let Some(class) = receiver {
+        params.push(context.declare_user_local("this", false, mir::Type::Class(class)));
+    }
+    params.extend(
+        function
+            .params
+            .iter()
+            .zip(signature.parameter_types.iter().copied())
+            .map(|(param, ty)| context.declare_user_local(&param.name, param.writable, ty))
+            .collect::<Vec<_>>(),
+    );
 
     lower_function_body(
         &function.body,
@@ -226,7 +358,10 @@ fn lower_function(
 
     Ok(mir::Function {
         id: signature.id,
-        name: function.name.clone(),
+        name: receiver.map_or_else(
+            || function.name.clone(),
+            |class| format!("class#{}::{}", class.0, function.name),
+        ),
         params,
         return_type: signature.return_type,
         locals,
@@ -338,7 +473,7 @@ fn lower_statement_sequence(
                 } else {
                     return Err(vec![unsupported(
                         *span,
-                        "expression statements other than void free-function calls are not lowered to MIR in Stage 11",
+                        "only calls to void free functions can be used as expression statements in native compilation",
                     )]);
                 }
             }
@@ -502,14 +637,14 @@ fn lower_foreach_statement(
     if foreach.key.is_some() {
         return Err(vec![unsupported(
             foreach.span,
-            "integer range foreach key bindings are not lowered to MIR in Stage 11",
+            "integer range `foreach` does not support key bindings in native compilation",
         )]);
     }
 
     let Some((start, end, inclusive)) = grouped_range_parts(&foreach.iterable) else {
         return Err(vec![unsupported(
             foreach.iterable.span(),
-            "collection and general iterable foreach are not lowered to MIR in Stage 11; only integer ranges are supported",
+            "native compilation currently supports `foreach` only over integer ranges",
         )]);
     };
 
@@ -684,7 +819,7 @@ fn lower_loop_control(
         };
         vec![unsupported(
             span,
-            format!("{keyword} requires an enclosing loop in MIR Stage 11"),
+            format!("`{keyword}` requires an enclosing loop"),
         )]
     })?;
     let target = match control {
@@ -900,7 +1035,7 @@ impl<'semantic> LoweringContext<'semantic> {
             .ok_or_else(|| {
                 vec![unsupported(
                     span,
-                    format!("local `${name}` is not available in MIR Stage 11"),
+                    format!("local `${name}` is not available in this native expression"),
                 )]
             })
     }
@@ -923,7 +1058,7 @@ impl<'semantic> LoweringContext<'semantic> {
         } else {
             Err(vec![unsupported(
                 span,
-                format!("string local `${name}` cannot be used as an int expression in Stage 11"),
+                format!("string local `${name}` cannot be used as an integer expression"),
             )])
         }
     }
@@ -943,7 +1078,7 @@ impl<'semantic> LoweringContext<'semantic> {
             .ok_or_else(|| {
                 vec![Diagnostic::new(
                     "I1301",
-                    "internal compiler consistency error: checked integer expression has no canonical Stage 13 type",
+                    "internal compiler consistency error: checked integer expression has no canonical integer type",
                     expr.span(),
                 )]
             })
@@ -953,7 +1088,7 @@ impl<'semantic> LoweringContext<'semantic> {
         self.semantic_info.float_type(expr.span()).ok_or_else(|| {
             vec![Diagnostic::new(
                 "I1401",
-                "internal compiler consistency error: checked float expression has no canonical Stage 14 type",
+                "internal compiler consistency error: checked float expression has no canonical float type",
                 expr.span(),
             )]
         })
@@ -976,14 +1111,16 @@ impl<'semantic> LoweringContext<'semantic> {
     fn local_scalar_type(&self, id: mir::LocalId) -> DiagnosticResult<mir::ScalarType> {
         match self.local_type(id) {
             mir::Type::Scalar(ty) => Ok(ty),
-            mir::Type::String | mir::Type::NullableString => Err(vec![Diagnostic::new(
-                "I1401",
-                format!(
+            mir::Type::String | mir::Type::NullableString | mir::Type::Class(_) => {
+                Err(vec![Diagnostic::new(
+                    "I1401",
+                    format!(
                     "internal compiler consistency error: string local local{} used as a scalar",
                     id.0
                 ),
-                Span::default(),
-            )]),
+                    Span::default(),
+                )])
+            }
         }
     }
 }
@@ -1004,6 +1141,22 @@ fn terminator_targets(terminator: &mir::Terminator) -> Vec<mir::BlockId> {
 }
 
 fn lower_var_decl(decl: &hir::VarDecl, context: &mut LoweringContext) -> DiagnosticResult<()> {
+    let declares_class = decl.ty.as_ref().is_some_and(|ty| {
+        !ty.nullable
+            && ty.args.is_empty()
+            && context
+                .semantic_info
+                .classes
+                .iter()
+                .any(|class| class.name == ty.name)
+    });
+    if declares_class || matches!(&decl.initializer, hir::Expr::New { .. }) {
+        return Err(vec![unsupported(
+            decl.initializer.span(),
+            "class rvalue lowering is not available for this expression",
+        )]);
+    }
+
     let ty = match &decl.ty {
         Some(ty) if scalar_type_ref(ty).is_some() => {
             mir::Type::Scalar(scalar_type_ref(ty).expect("checked scalar type"))
@@ -1013,7 +1166,7 @@ fn lower_var_decl(decl: &hir::VarDecl, context: &mut LoweringContext) -> Diagnos
         Some(ty) => {
             return Err(vec![unsupported(
                 decl.span,
-                format!("only scalar and readonly string locals are lowered to MIR in Stage 14; got `{ty}`"),
+                format!("local type `{ty}` is not supported by native compilation"),
             )]);
         }
         None if is_string_local_initializer(&decl.initializer, context) => mir::Type::String,
@@ -1161,7 +1314,7 @@ fn lower_increment(
     if context.local_type(target) == mir::Type::String {
         return Err(vec![unsupported(
             increment.span,
-            "string increment and decrement are not lowered to MIR in Stage 11",
+            "string values cannot be incremented or decremented",
         )]);
     }
 
@@ -1220,7 +1373,7 @@ fn lower_assignment_target(
         hir::Expr::Variable { name, span } => context.lookup_local(name, *span),
         _ => Err(vec![unsupported(
             target.span(),
-            "only local variable assignment targets are lowered to MIR in Stage 11",
+            "this assignment target is not supported by native compilation",
         )]),
     }
 }
@@ -1261,7 +1414,7 @@ fn lower_string_expression(
             } else {
                 Err(vec![unsupported(
                     *span,
-                    "string expressions may reference only readonly string locals in Stage 11",
+                    "this local cannot be used as a string expression",
                 )])
             }
         }
@@ -1304,7 +1457,10 @@ fn lower_string_expression(
             }
             let signature = context.lookup_function(name, *span)?;
             if signature.return_type != mir::ReturnType::Value(mir::Type::String) {
-                return Err(vec![unsupported(*span, format!("function `{name}` does not return string"))]);
+                return Err(vec![unsupported(
+                    *span,
+                    format!("function `{name}` does not return string"),
+                )]);
             }
             Ok(mir::StringExpression::Call {
                 function: signature.id,
@@ -1313,7 +1469,7 @@ fn lower_string_expression(
         }
         _ => Err(vec![unsupported(
             expr.span(),
-            "echo supports only string literals, readonly string locals, and string concatenation in Stage 11",
+            "this expression cannot be written by `echo` in native compilation",
         )]),
     }
 }
@@ -1407,6 +1563,12 @@ fn lower_display_string_expression(
     expr: &hir::Expr,
     context: &LoweringContext,
 ) -> DiagnosticResult<mir::StringExpression> {
+    if matches!(expr, hir::Expr::PropertyAccess { .. }) {
+        return Err(vec![unsupported(
+            expr.span(),
+            "class property access is not supported by native compilation",
+        )]);
+    }
     let narrowed_nullable_local = matches!(expr, hir::Expr::Variable { name, span }
         if context.lookup_local(name, *span).is_ok_and(|local| context.local_type(local) == mir::Type::NullableString));
     if is_string_local_initializer(expr, context) || narrowed_nullable_local {
@@ -1466,7 +1628,7 @@ fn lower_void_call(
     if signature.return_type != mir::ReturnType::Void {
         return Err(vec![unsupported(
             span,
-            format!("non-void function `{name}` cannot be used as a statement in MIR Stage 11"),
+            format!("non-void function `{name}` cannot be used as a statement"),
         )]);
     }
 
@@ -1488,9 +1650,7 @@ fn lower_integer_call(
     else {
         return Err(vec![unsupported(
             span,
-            format!(
-                "void function `{name}` cannot be used as an integer expression in MIR Stage 11"
-            ),
+            format!("void function `{name}` cannot be used as an integer expression"),
         )]);
     };
 
@@ -1560,11 +1720,11 @@ fn lower_return(
         }
         (mir::ReturnType::Value(_), None) => Err(vec![unsupported(
             span,
-            "bare return is not lowered for scalar-returning functions in Stage 14",
+            "a value-returning function cannot use a bare `return`",
         )]),
         (mir::ReturnType::Void, Some(expr)) => Err(vec![unsupported(
             expr.span(),
-            "return values are not lowered for void functions in Stage 11",
+            "a `void` function cannot return a value",
         )]),
     }
 }
@@ -1639,7 +1799,7 @@ fn lower_condition(
             }
             _ => Err(vec![unsupported(
                 expr.span(),
-                "conditions require bool values, scalar comparisons, or boolean operators in Stage 14",
+                "conditions require boolean values, scalar comparisons, or boolean operators",
             )]),
         },
         hir::Expr::FunctionCall { name, args, span } => {
@@ -1659,15 +1819,15 @@ fn lower_condition(
         }
         hir::Expr::MethodCall { .. } | hir::Expr::StaticCall { .. } => Err(vec![unsupported(
             expr.span(),
-            "method calls in conditions are not lowered to Stage 14 MIR",
+            "method calls in conditions are not supported by native compilation",
         )]),
         hir::Expr::Int { .. } => Err(vec![unsupported(
             expr.span(),
-            "integer truthiness is not Doria condition semantics; Stage 11 requires a bool condition",
+            "integer truthiness is not supported; conditions require a `bool` value",
         )]),
         _ => Err(vec![unsupported(
             expr.span(),
-            "this condition expression is not lowered to MIR in Stage 11",
+            "this expression cannot be used as a condition in native compilation",
         )]),
     }
 }
@@ -1725,6 +1885,10 @@ fn lower_rvalue_as_expected(
             lower_nullable_string_expression(expr, context).map(mir::Rvalue::NullableString)
         }
         mir::Type::Scalar(_) => lower_value_expression(expr, context).map(mir::Rvalue::Value),
+        mir::Type::Class(_) => Err(vec![unsupported(
+            expr.span(),
+            "class rvalue lowering is not available for this expression",
+        )]),
     }
 }
 
@@ -1814,7 +1978,7 @@ fn lower_float_expression(
         }
         _ => Err(vec![unsupported(
             expr.span(),
-            "this float expression is not lowered to Stage 14 MIR",
+            "this float expression is not supported by native compilation",
         )]),
     }
 }
@@ -1827,9 +1991,7 @@ fn lower_integer_expression(
         if context.lookup_function(name, *span)?.return_type == mir::ReturnType::Void {
             return Err(vec![unsupported(
                 *span,
-                format!(
-                    "void function `{name}` cannot be used as an integer expression in MIR Stage 11"
-                ),
+                format!("void function `{name}` cannot be used as an integer expression"),
             )]);
         }
     }
@@ -1985,11 +2147,11 @@ fn lower_integer_binary_op(
         | hir::BinaryOp::Equal
         | hir::BinaryOp::NotEqual => Err(vec![unsupported(
             span,
-            "comparison results are condition-only and are not lowered as runtime values in MIR Stage 11",
+            "comparison results cannot be used as integer runtime values",
         )]),
         hir::BinaryOp::Concat => Err(vec![unsupported(
             span,
-            "string concatenation is not lowered to MIR in Stage 11",
+            "string concatenation cannot be used as an integer expression",
         )]),
         hir::BinaryOp::And | hir::BinaryOp::Or | hir::BinaryOp::Xor => Err(vec![unsupported(
             span,
@@ -1997,7 +2159,7 @@ fn lower_integer_binary_op(
         )]),
         hir::BinaryOp::Coalesce => Err(vec![unsupported(
             span,
-            "null coalescing is not lowered to MIR in Stage 11",
+            "null coalescing cannot be used as an integer expression",
         )]),
     }
 }
@@ -2140,24 +2302,26 @@ fn unsigned_integer_literal_magnitude(expr: &hir::Expr) -> Option<u128> {
 fn unsupported_int_expr(expr: &hir::Expr) -> Diagnostic {
     let detail = match expr {
         hir::Expr::String { .. } | hir::Expr::InterpolatedString { .. } => {
-            "string expressions are not lowered to MIR in Stage 11"
+            "a string expression cannot be used as an integer expression"
         }
-        hir::Expr::Float { .. } => "float expressions are not lowered to MIR in Stage 11",
+        hir::Expr::Float { .. } => "a float expression cannot be used as an integer expression",
         hir::Expr::Bool { .. } => "bool value reached integer-only MIR lowering",
-        hir::Expr::Null { .. } => "null values are not lowered to MIR in Stage 11",
-        hir::Expr::Array { .. } => "collections are not lowered to MIR in Stage 11",
-        hir::Expr::FunctionCall { .. } => "function calls are not lowered to MIR in Stage 11",
+        hir::Expr::Null { .. } => "`null` cannot be used as an integer expression",
+        hir::Expr::Array { .. } => "a collection cannot be used as an integer expression",
+        hir::Expr::FunctionCall { .. } => {
+            "this function call cannot be used as an integer expression"
+        }
         hir::Expr::MethodCall { .. } | hir::Expr::StaticCall { .. } => {
-            "method calls are not lowered to MIR in Stage 11"
+            "a method call cannot be used as an integer expression"
         }
-        hir::Expr::PropertyAccess { .. } => "property access is not lowered to MIR in Stage 11",
-        hir::Expr::New { .. } => "object construction is not lowered to MIR in Stage 11",
-        hir::Expr::This { .. } => "$this is not lowered to MIR in Stage 11",
-        hir::Expr::Identifier { .. } => {
-            "identifiers are not lowered as int expressions in Stage 11"
+        hir::Expr::PropertyAccess { .. } => {
+            "class property access cannot be used as an integer expression"
         }
-        hir::Expr::Unary { .. } => "unary expressions are not lowered to MIR in Stage 11",
-        hir::Expr::Range { .. } => "ranges are not lowered to MIR in Stage 11",
+        hir::Expr::New { .. } => "object construction cannot be used as an integer expression",
+        hir::Expr::This { .. } => "`$this` cannot be used as an integer expression",
+        hir::Expr::Identifier { .. } => "this identifier cannot be used as an integer expression",
+        hir::Expr::Unary { .. } => "this unary expression cannot be used as an integer expression",
+        hir::Expr::Range { .. } => "a range cannot be used as an integer expression",
         hir::Expr::Binary {
             op:
                 hir::BinaryOp::Equal
@@ -2167,12 +2331,12 @@ fn unsupported_int_expr(expr: &hir::Expr) -> Diagnostic {
                 | hir::BinaryOp::Greater
                 | hir::BinaryOp::GreaterEqual,
             ..
-        } => {
-            "comparison results are condition-only and are not lowered as runtime values in Stage 13 MIR"
+        } => "comparison results cannot be used as integer runtime values",
+        hir::Expr::Binary { .. } => {
+            "this binary expression cannot be used as an integer expression"
         }
-        hir::Expr::Binary { .. } => "this binary expression is not lowered to MIR in Stage 13",
         hir::Expr::Int { .. } | hir::Expr::Variable { .. } | hir::Expr::Grouped { .. } => {
-            "this int expression is not lowered to MIR in Stage 11"
+            "this integer expression is not supported by native compilation"
         }
     };
     unsupported(expr.span(), detail)
@@ -2194,9 +2358,5 @@ fn stmt_span(statement: &hir::Stmt) -> Span {
 }
 
 fn unsupported(span: Span, detail: impl Into<String>) -> Diagnostic {
-    Diagnostic::new(
-        "M1101",
-        format!("unsupported MIR Stage 11 coverage: {}", detail.into()),
-        span,
-    )
+    Diagnostic::new("M1101", detail, span)
 }

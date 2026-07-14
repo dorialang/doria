@@ -50,6 +50,11 @@ class Post
     uses HasSlug, TracksChanges;
 }
 
+function publish(take Post $post): void
+{
+    return;
+}
+
 function main(): void
 {
     let $name = "Doria";

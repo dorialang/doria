@@ -128,7 +128,7 @@ fn rejects_non_string_concat_and_non_display_echo() {
 #[test]
 fn rejects_string_scalar_boundary_mismatches_and_string_main() {
     for source in [
-        "function take(string $value): void {} function main(): void { take(1); }",
+        "function acceptString(string $value): void {} function main(): void { acceptString(1); }",
         "function bad(): string { return 1; } function main(): void {}",
         "function bad(): int { return \"x\"; } function main(): void {}",
         "function main(): string { return \"x\"; }",

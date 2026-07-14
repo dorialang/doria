@@ -59,12 +59,12 @@ float64 $wide = 1.0;
 float32 $narrow = $wide;
 "#,
         r#"
-function take(float32 $value): void
+function acceptFloat32(float32 $value): void
 {
 }
 
 float64 $wide = 1.0;
-take($wide);
+acceptFloat32($wide);
 "#,
         r#"
 float32 $left = 1.0;

@@ -187,7 +187,7 @@ fn preserves_nested_mixed_collection_shape_after_clear_heterogeneous_elements() 
     doriac::check_source(
         "test.doria",
         r#"
-function rows(mixed $payload)
+function rows(take mixed $payload)
 {
     return [[1], ["two"], [$payload]];
 }
@@ -2122,7 +2122,7 @@ class Profile
 
 class Person
 {
-    function __construct(Profile $profile)
+    function __construct(take Profile $profile)
     {
     }
 
@@ -2847,9 +2847,9 @@ class Accumulator
 {
     writable int $count = 0;
 
-    function __construct(List<int> $items)
+    function __construct(take List<int> $items)
     {
-        foreach ($items as int $item) {
+        foreach ($this->items as int $item) {
             $this->count += $item;
         }
     }
@@ -3950,14 +3950,13 @@ class Office
 {
     Person $manager;
 
-    function __construct(Person $owner)
+    function __construct(take Person $owner)
     {
     }
 
     function index(List<Person> $people): Dictionary<string, Person>
     {
         foreach ($people as Person $person) {
-            let $copy = $person;
         }
 
         return [];

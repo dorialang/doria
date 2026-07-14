@@ -10,6 +10,7 @@ use crate::source::Span;
 use crate::types::TypeRef;
 
 const PHP_INTEGER_UNSUPPORTED_CODE: &str = "B1301";
+const PHP_OWNERSHIP_UNSUPPORTED_CODE: &str = "B1901";
 
 pub fn generate(program: &Program) -> Result<String, BackendError> {
     validate_program(program)?;
@@ -144,6 +145,12 @@ fn validate_function(
     semantic_info: &SemanticInfo,
     is_method: bool,
 ) -> Result<(), BackendError> {
+    if is_method && function.name == "__destruct" {
+        return Err(unsupported_ownership_shape(
+            function.span,
+            "deterministic scope-based `__destruct` timing",
+        ));
+    }
     if is_method
         && matches!(function.name.as_str(), "__construct" | "__destruct")
         && (function.is_static || function.writable_this)
@@ -154,6 +161,12 @@ fn validate_function(
         )));
     }
     for param in &function.params {
+        if param.take && is_move_type(&param.ty, semantic_info) {
+            return Err(unsupported_ownership_shape(
+                param.span,
+                format!("ownership transfer through `take ${}`", param.name),
+            ));
+        }
         validate_type(&param.ty, param.span)?;
         if let Some(default) = &param.default {
             validate_expr(default, semantic_info)?;
@@ -163,6 +176,15 @@ fn validate_function(
         validate_type(return_type, function.span)?;
     }
     validate_block(&function.body, semantic_info)
+}
+
+fn is_move_type(ty: &TypeRef, semantic_info: &SemanticInfo) -> bool {
+    ty.name == "mixed"
+        || matches!(ty.name.as_str(), "[]" | "List" | "Dictionary" | "Set")
+        || semantic_info
+            .classes
+            .iter()
+            .any(|class| class.name == ty.name)
 }
 
 fn validate_type(ty: &TypeRef, span: Span) -> Result<(), BackendError> {
@@ -481,7 +503,7 @@ fn validate_display_expr(expr: &Expr, semantic_info: &SemanticInfo) -> Result<()
     if semantic_info.float_type(expr.span()).is_some() {
         return Err(unsupported_numeric_shape(
             expr.span(),
-            "canonical Stage 16 float display formatting",
+            "canonical float display formatting",
         ));
     }
     validate_expr(expr, semantic_info)
@@ -511,7 +533,7 @@ fn validate_php_format_call(
             FormatConversion::Float => {
                 return Err(unsupported_numeric_shape(
                     argument.span(),
-                    "canonical Stage 17 `%f` formatting",
+                    "canonical `%f` float formatting",
                 ));
             }
             _ => validate_expr(argument, semantic_info)?,
@@ -542,6 +564,17 @@ fn unsupported_integer_shape(span: Span, feature: impl Into<String>) -> BackendE
 fn unsupported_numeric_shape(span: Span, feature: impl Into<String>) -> BackendError {
     BackendError::from_diagnostics(vec![Diagnostic::new(
         PHP_INTEGER_UNSUPPORTED_CODE,
+        format!(
+            "PHP compatibility backend cannot preserve {} exactly; use the `native` or `debug` target for this valid Doria program",
+            feature.into()
+        ),
+        span,
+    )])
+}
+
+fn unsupported_ownership_shape(span: Span, feature: impl Into<String>) -> BackendError {
+    BackendError::from_diagnostics(vec![Diagnostic::new(
+        PHP_OWNERSHIP_UNSUPPORTED_CODE,
         format!(
             "PHP compatibility backend cannot preserve {} exactly; use the `native` or `debug` target for this valid Doria program",
             feature.into()

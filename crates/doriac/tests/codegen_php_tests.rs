@@ -328,7 +328,7 @@ fn php_backend_rejects_noncanonical_float_display() {
         assert_eq!(diagnostics[0].code, "B1301");
         assert!(diagnostics[0]
             .message
-            .contains("canonical Stage 16 float display formatting"));
+            .contains("canonical float display formatting"));
     }
 }
 
@@ -885,10 +885,14 @@ echo $name;
 "#,
         BackendTarget::Debug,
     )
-    .expect_err("broader source should remain outside Stage 11g MIR coverage");
+    .expect_err("broader source should remain outside native compilation coverage");
 
     assert_eq!(err[0].code, "M1101");
-    assert!(err[0].message.contains("unsupported MIR Stage 11 coverage"));
+    assert!(err[0]
+        .message
+        .contains("top-level executable statements are not supported"));
+    assert!(!err[0].message.contains("Stage "));
+    assert!(!err[0].message.contains("MIR"));
 }
 
 #[test]
@@ -1081,7 +1085,7 @@ class Person
 }
 
 #[test]
-fn omits_lifecycle_method_return_types_for_php() {
+fn omits_constructor_return_type_for_php() {
     let php = doriac::compile_source_to_php(
         "test.doria",
         r#"
@@ -1091,20 +1095,50 @@ class Person
     {
         return;
     }
-
-    function __destruct(): void
-    {
-        return;
-    }
 }
 "#,
     )
     .expect("compilation should succeed");
 
     assert!(php.contains("public function __construct()"));
-    assert!(php.contains("public function __destruct()"));
     assert!(!php.contains("__construct(): void"));
-    assert!(!php.contains("__destruct(): void"));
+}
+
+#[test]
+fn rejects_deterministic_destruction_that_php_cannot_preserve() {
+    let diagnostics = doriac::compile_source_to_php(
+        "test.doria",
+        "class Person { function __destruct(): void { return; } }",
+    )
+    .expect_err("PHP destruction timing is not Doria scope destruction");
+    assert!(diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == "B1901"));
+}
+
+#[test]
+fn allows_take_on_copy_parameters_in_php() {
+    let php = doriac::compile_source_to_php(
+        "test.doria",
+        "function identity(take int $value): int { return $value; } function main(): int { return identity(42); }",
+    )
+    .expect("take on a Copy value is a semantic no-op");
+
+    assert!(php.contains("function identity(int $value): int"));
+    assert!(!php.contains("take int"));
+}
+
+#[test]
+fn rejects_take_on_move_parameters_in_php() {
+    let diagnostics = doriac::compile_source_to_php(
+        "test.doria",
+        "class Guard {} function consume(take Guard $guard): void {}",
+    )
+    .expect_err("PHP cannot preserve class ownership transfer");
+
+    assert!(diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == "B1901"));
 }
 
 #[test]
@@ -1338,7 +1372,7 @@ fn php_backend_rejects_noncanonical_float_display_in_checked_formats() {
         assert_eq!(diagnostics[0].code, "B1301");
         assert!(diagnostics[0]
             .message
-            .contains("canonical Stage 16 float display formatting"));
+            .contains("canonical float display formatting"));
     }
 }
 

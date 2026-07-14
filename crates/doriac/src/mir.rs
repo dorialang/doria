@@ -6,6 +6,7 @@
 
 use std::fmt;
 
+use crate::class_layout::{ClassId, ClassLayout, PropertyId};
 use crate::format_string::FormatPiece;
 use crate::numeric::{FloatType, FloatValue, IntegerType, IntegerValue};
 
@@ -20,8 +21,28 @@ pub struct LocalId(pub usize);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Program {
+    pub classes: Vec<Class>,
     pub functions: Vec<Function>,
     pub entry: FunctionId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Class {
+    pub id: ClassId,
+    pub name: String,
+    pub properties: Vec<Property>,
+    pub layout: ClassLayout,
+    pub constructor: Option<FunctionId>,
+    pub destructor: Option<FunctionId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Property {
+    pub id: PropertyId,
+    pub name: String,
+    pub ty: Type,
+    pub writable: bool,
+    pub promoted: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,6 +100,7 @@ pub enum Type {
     Scalar(ScalarType),
     String,
     NullableString,
+    Class(ClassId),
 }
 
 impl From<ScalarType> for Type {
@@ -105,6 +127,7 @@ pub enum Rvalue {
     Value(ValueExpression),
     String(StringExpression),
     NullableString(NullableStringExpression),
+    Class(ClassExpression),
 }
 
 impl Rvalue {
@@ -113,8 +136,50 @@ impl Rvalue {
             Self::Value(value) => Type::Scalar(value.ty()),
             Self::String(_) => Type::String,
             Self::NullableString(_) => Type::NullableString,
+            Self::Class(value) => Type::Class(value.class()),
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClassExpression {
+    Local {
+        class: ClassId,
+        local: LocalId,
+    },
+    Call {
+        class: ClassId,
+        function: FunctionId,
+        args: Vec<Rvalue>,
+    },
+    New {
+        class: ClassId,
+        properties: Vec<PropertyValue>,
+        constructor: Option<FunctionId>,
+        args: Vec<Rvalue>,
+    },
+}
+
+impl ClassExpression {
+    pub const fn class(&self) -> ClassId {
+        match self {
+            Self::Local { class, .. } | Self::Call { class, .. } | Self::New { class, .. } => {
+                *class
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PropertyValue {
+    pub property: PropertyId,
+    pub source: PropertyValueSource,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PropertyValueSource {
+    Expression(Rvalue),
+    ConstructorArgument(usize),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -368,6 +433,15 @@ pub enum Statement {
         contents: StringExpression,
     },
     WriteStderr(StringExpression),
+    AssignProperty {
+        object: LocalId,
+        property: PropertyId,
+        value: Rvalue,
+    },
+    DropClass {
+        local: LocalId,
+        class: ClassId,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -464,6 +538,7 @@ impl fmt::Display for Type {
             Type::Scalar(ty) => write!(formatter, "{ty}"),
             Type::String => write!(formatter, "string"),
             Type::NullableString => write!(formatter, "?string"),
+            Type::Class(class) => write!(formatter, "class#{}", class.0),
         }
     }
 }
@@ -493,6 +568,21 @@ impl fmt::Display for Rvalue {
             Rvalue::Value(expression) => write!(formatter, "{expression}"),
             Rvalue::String(value) => write!(formatter, "{value}"),
             Rvalue::NullableString(value) => write!(formatter, "{value}"),
+            Rvalue::Class(value) => write!(formatter, "{value}"),
+        }
+    }
+}
+
+impl fmt::Display for ClassExpression {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Local { local, .. } => write!(formatter, "move local{}", local.0),
+            Self::Call {
+                class, function, ..
+            } => {
+                write!(formatter, "call fn{} -> class#{}", function.0, class.0)
+            }
+            Self::New { class, .. } => write!(formatter, "new class#{}", class.0),
         }
     }
 }
@@ -746,6 +836,18 @@ impl fmt::Display for Statement {
                 write!(formatter, "write_file({path}, {contents})")
             }
             Statement::WriteStderr(value) => write!(formatter, "write_stderr({value})"),
+            Statement::AssignProperty {
+                object,
+                property,
+                value,
+            } => write!(
+                formatter,
+                "local{}->property{} = {value}",
+                object.0, property.index
+            ),
+            Statement::DropClass { local, class } => {
+                write!(formatter, "drop class#{} local{}", class.0, local.0)
+            }
         }
     }
 }

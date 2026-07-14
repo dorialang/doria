@@ -25,6 +25,8 @@ pub const STRING_FROM_U64: &str = "dr_v1_string_from_u64";
 pub const STRING_FROM_F32: &str = "dr_v1_string_from_f32";
 pub const STRING_FROM_F64: &str = "dr_v1_string_from_f64";
 pub const STRING_FROM_BOOL: &str = "dr_v1_string_from_bool";
+pub const CLASS_ALLOCATE: &str = "dr_v1_class_allocate";
+pub const CLASS_FREE: &str = "dr_v1_class_free";
 
 pub fn function_symbol(function: &mir::Function) -> String {
     let sanitized = function

@@ -301,6 +301,11 @@ impl Interpreter<'_> {
                             target.0
                         )));
                     }
+                    (mir::Type::Class(_), _) => {
+                        return Err(InterpreterError::new(
+                            "class assignment reached the interpreter before class lowering completed",
+                        ));
+                    }
                 }
             }
             mir::Statement::EchoStringLiteral(value) => {
@@ -329,6 +334,11 @@ impl Interpreter<'_> {
                 let frame = self.current_frame_mut()?;
                 frame.tasks.push(EvaluationTask::WriteStderr);
                 frame.tasks.push(EvaluationTask::String(value));
+            }
+            mir::Statement::AssignProperty { .. } | mir::Statement::DropClass { .. } => {
+                return Err(InterpreterError::new(
+                    "class operation reached the interpreter before class lowering completed",
+                ));
             }
         }
         Ok(StepOutcome::Continue)
@@ -413,6 +423,11 @@ impl Interpreter<'_> {
                     .current_frame_mut()?
                     .tasks
                     .push(EvaluationTask::NullableString(value)),
+                mir::Rvalue::Class(_) => {
+                    return Err(InterpreterError::new(
+                        "class value reached the interpreter before class lowering completed",
+                    ));
+                }
             },
             EvaluationTask::Value(expression) => match expression {
                 mir::ValueExpression::Integer(value) => {

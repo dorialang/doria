@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::ast::*;
 use crate::builtins::{php_function_suggestion, Builtin};
+use crate::class_layout::{ClassId, PropertyId};
 use crate::diagnostics::{Diagnostic, DiagnosticResult};
 use crate::format_string::{self, FormatConversion, FormatPiece};
 use crate::numeric::{parse_decimal_magnitude, FloatType, FloatValue, IntegerType, IntegerValue};
@@ -22,6 +23,24 @@ pub struct SemanticInfo {
     pub integer_expression_types: HashMap<(usize, usize), IntegerType>,
     /// Canonical width for every floating-point-valued source expression.
     pub float_expression_types: HashMap<(usize, usize), FloatType>,
+    /// Stable nominal class identities and the total Stage 19 property order.
+    pub classes: Vec<ClassSemanticInfo>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClassSemanticInfo {
+    pub id: ClassId,
+    pub name: String,
+    pub properties: Vec<PropertySemanticInfo>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PropertySemanticInfo {
+    pub id: PropertyId,
+    pub name: String,
+    pub ty: TypeRef,
+    pub writable: bool,
+    pub promoted: bool,
 }
 
 impl SemanticInfo {
@@ -42,13 +61,87 @@ pub fn analyze_program(program: &Program) -> DiagnosticResult<SemanticInfo> {
     let mut checker = Checker::new(program);
     checker.check();
     if checker.diagnostics.is_empty() {
+        let inferred_move_returns = checker
+            .function_signatures
+            .iter()
+            .filter_map(|(span_start, signature)| {
+                checker
+                    .type_is_move_type(signature.return_ty)
+                    .then_some(*span_start)
+            })
+            .collect();
+        checker
+            .diagnostics
+            .extend(crate::ownership::check_program_with_inferred_move_returns(
+                program,
+                &inferred_move_returns,
+            ));
+    }
+    if checker.diagnostics.is_empty() {
         Ok(SemanticInfo {
             integer_expression_types: checker.integer_expression_types,
             float_expression_types: checker.float_expression_types,
+            classes: collect_ordered_class_semantics(program),
         })
     } else {
         Err(checker.diagnostics)
     }
+}
+
+fn collect_ordered_class_semantics(program: &Program) -> Vec<ClassSemanticInfo> {
+    program
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            Item::Class(class) => Some(class),
+            _ => None,
+        })
+        .enumerate()
+        .map(|(class_index, class)| {
+            let id = ClassId(class_index);
+            let explicit = class.members.iter().filter_map(|member| match member {
+                ClassMember::Property(property) => Some((
+                    property.name.clone(),
+                    property.ty.clone(),
+                    property.writable,
+                    false,
+                )),
+                _ => None,
+            });
+            let promoted = class.members.iter().find_map(|member| match member {
+                ClassMember::Method(method) if method.name == "__construct" => {
+                    Some(method.params.iter().filter_map(|param| {
+                        param
+                            .promoted_access
+                            .as_ref()
+                            .map(|_| (param.name.clone(), param.ty.clone(), param.writable, true))
+                    }))
+                }
+                _ => None,
+            });
+            let mut properties = explicit.collect::<Vec<_>>();
+            if let Some(promoted) = promoted {
+                properties.extend(promoted);
+            }
+            ClassSemanticInfo {
+                id,
+                name: class.name.clone(),
+                properties: properties
+                    .into_iter()
+                    .enumerate()
+                    .map(
+                        |(index, (name, ty, writable, promoted))| PropertySemanticInfo {
+                            id: PropertyId { class: id, index },
+                            name,
+                            ty,
+                            writable,
+                            promoted,
+                        },
+                    )
+                    .collect(),
+            }
+        })
+        .collect()
 }
 
 pub fn check_program(program: &Program) -> DiagnosticResult<()> {
@@ -210,7 +303,7 @@ impl<'program> Checker<'program> {
     fn check(&mut self) {
         self.collect_classes();
         self.collect_functions();
-        self.infer_unannotated_mixed_return_signatures();
+        self.infer_unannotated_move_return_signatures();
 
         let mut scopes = ScopeStack::new();
         for item in &self.program.items {
@@ -358,7 +451,7 @@ impl<'program> Checker<'program> {
                 self.diagnostics.push(Diagnostic::new(
                     "E0464",
                     format!(
-                        "general interface conformance for `{interface}` is planned for Stage 35 and is not implemented yet"
+                        "general interface conformance for `{interface}` is not supported by this compiler"
                     ),
                     class_decl.span,
                 ));
@@ -601,6 +694,49 @@ impl<'program> Checker<'program> {
             let ty = self.resolve_type_ref(&param.ty, param.span);
             let has_default = param.default.is_some();
 
+            if param.take && param.writable {
+                let span = param
+                    .take_span
+                    .zip(param.writable_span)
+                    .map(|(take, writable)| take.merge(writable))
+                    .unwrap_or(param.span);
+                self.diagnostics.push(
+                    Diagnostic::new(
+                        "E0467",
+                        "a parameter cannot be both `take` and `writable`",
+                        span,
+                    )
+                    .with_help(
+                        "use `take` to give ownership to the callee, or `writable` for exclusive mutation without giving ownership",
+                    ),
+                );
+            }
+
+            if param.promoted_access.is_some() && self.type_is_move_type(ty) && !param.take {
+                let diagnostic = Diagnostic::new(
+                    "E0468",
+                    format!(
+                        "promoted move-type parameter `${}` must use `take`",
+                        param.name
+                    ),
+                    param.span,
+                );
+                self.diagnostics
+                    .push(if let Some(writable_span) = param.writable_span {
+                        diagnostic
+                            .with_help(
+                                "promotion transfers ownership; replace `writable` with `take`",
+                            )
+                            .with_fix(writable_span, "take")
+                    } else {
+                        diagnostic
+                        .with_help(
+                            "promotion gives ownership directly to the new property; insert `take`",
+                        )
+                        .with_fix(param.ownership_modifier_insert, "take ")
+                    });
+            }
+
             if !has_default && saw_optional {
                 self.diagnostics.push(Diagnostic::new(
                     "E0410",
@@ -619,6 +755,7 @@ impl<'program> Checker<'program> {
             params.push(ParamInfo {
                 name: param.name.clone(),
                 ty,
+                take: param.take,
                 has_default,
             });
         }
@@ -636,8 +773,8 @@ impl<'program> Checker<'program> {
             .unwrap_or_else(|| self.types.unknown())
     }
 
-    fn infer_unannotated_mixed_return_signatures(&mut self) {
-        let max_iterations = self.mixed_return_inference_signature_count();
+    fn infer_unannotated_move_return_signatures(&mut self) {
+        let max_iterations = self.move_return_inference_signature_count();
 
         for _ in 0..max_iterations {
             let mut changed = false;
@@ -645,7 +782,7 @@ impl<'program> Checker<'program> {
             for item in &self.program.items {
                 match item {
                     Item::Function(function) => {
-                        changed |= self.update_function_mixed_return_signature(function);
+                        changed |= self.update_function_move_return_signature(function);
                     }
                     Item::Class(class_decl) => {
                         for member in &class_decl.members {
@@ -653,7 +790,7 @@ impl<'program> Checker<'program> {
                                 continue;
                             };
                             changed |=
-                                self.update_method_mixed_return_signature(&class_decl.name, method);
+                                self.update_method_move_return_signature(&class_decl.name, method);
                         }
                     }
                     Item::Statement(_) => {}
@@ -666,7 +803,7 @@ impl<'program> Checker<'program> {
         }
     }
 
-    fn mixed_return_inference_signature_count(&self) -> usize {
+    fn move_return_inference_signature_count(&self) -> usize {
         self.program
             .items
             .iter()
@@ -689,7 +826,7 @@ impl<'program> Checker<'program> {
             .max(1)
     }
 
-    fn update_function_mixed_return_signature(&mut self, function: &FunctionDecl) -> bool {
+    fn update_function_move_return_signature(&mut self, function: &FunctionDecl) -> bool {
         if function.return_type.is_some() {
             return false;
         }
@@ -697,9 +834,9 @@ impl<'program> Checker<'program> {
         let Some(signature) = self.function_signatures.get(&function.span.start).cloned() else {
             return false;
         };
-        let inferred = self.infer_unannotated_mixed_return_type(function, &signature.params, None);
+        let inferred = self.infer_unannotated_move_return_type(function, &signature.params, None);
 
-        if !self.type_contains_mixed(inferred) || signature.return_ty == inferred {
+        if !self.type_is_move_type(inferred) || signature.return_ty == inferred {
             return false;
         }
 
@@ -712,7 +849,7 @@ impl<'program> Checker<'program> {
         true
     }
 
-    fn update_method_mixed_return_signature(
+    fn update_method_move_return_signature(
         &mut self,
         class_name: &str,
         method: &FunctionDecl,
@@ -730,13 +867,13 @@ impl<'program> Checker<'program> {
             writable_this: method.writable_this,
             this_available: true,
         };
-        let inferred = self.infer_unannotated_mixed_return_type(
+        let inferred = self.infer_unannotated_move_return_type(
             method,
             &signature.params,
             Some(&method_context),
         );
 
-        if !self.type_contains_mixed(inferred) || signature.return_ty == inferred {
+        if !self.type_is_move_type(inferred) || signature.return_ty == inferred {
             return false;
         }
 
@@ -753,7 +890,7 @@ impl<'program> Checker<'program> {
         true
     }
 
-    fn infer_unannotated_mixed_return_type(
+    fn infer_unannotated_move_return_type(
         &mut self,
         function: &FunctionDecl,
         params: &[ParamInfo],
@@ -773,11 +910,11 @@ impl<'program> Checker<'program> {
             );
         }
 
-        self.infer_mixed_return_from_block(&function.body, &mut scopes, method_context)
+        self.infer_move_return_from_block(&function.body, &mut scopes, method_context)
             .unwrap_or_else(|| self.types.unknown())
     }
 
-    fn infer_mixed_return_from_statements(
+    fn infer_move_return_from_statements(
         &mut self,
         statements: &[Stmt],
         scopes: &mut ScopeStack,
@@ -787,8 +924,8 @@ impl<'program> Checker<'program> {
 
         for statement in statements {
             let statement_ty =
-                self.infer_mixed_return_from_statement(statement, scopes, method_context);
-            inferred = self.merge_optional_mixed_return_types(inferred, statement_ty);
+                self.infer_move_return_from_statement(statement, scopes, method_context);
+            inferred = self.merge_optional_inferred_return_types(inferred, statement_ty);
 
             if !crate::return_analysis::statement_falls_through(statement) {
                 break;
@@ -798,7 +935,7 @@ impl<'program> Checker<'program> {
         inferred
     }
 
-    fn infer_mixed_return_from_statement(
+    fn infer_move_return_from_statement(
         &mut self,
         statement: &Stmt,
         scopes: &mut ScopeStack,
@@ -825,46 +962,43 @@ impl<'program> Checker<'program> {
                 None
             }
             Stmt::Assignment(assignment) => {
-                self.infer_mixed_return_from_assignment(assignment, scopes, method_context);
+                self.infer_move_return_from_assignment(assignment, scopes, method_context);
                 None
             }
             Stmt::Return {
                 expr: Some(expr), ..
-            } => {
-                let ty = self.infer_expr_type(expr, scopes, method_context);
-                self.type_contains_mixed(ty).then_some(ty)
-            }
+            } => Some(self.infer_expr_type(expr, scopes, method_context)),
             Stmt::If(if_stmt) => {
-                self.infer_mixed_return_from_if_statement(if_stmt, scopes, method_context)
+                self.infer_move_return_from_if_statement(if_stmt, scopes, method_context)
             }
             Stmt::While(while_stmt) => {
-                self.infer_mixed_return_from_block(&while_stmt.body, scopes, method_context)
+                self.infer_move_return_from_block(&while_stmt.body, scopes, method_context)
             }
             Stmt::For(for_stmt) => {
                 scopes.push();
                 if let Some(initializer) = &for_stmt.initializer {
-                    self.infer_mixed_return_from_for_initializer(
+                    self.infer_move_return_from_for_initializer(
                         initializer,
                         scopes,
                         method_context,
                     );
                 }
                 let result =
-                    self.infer_mixed_return_from_block(&for_stmt.body, scopes, method_context);
+                    self.infer_move_return_from_block(&for_stmt.body, scopes, method_context);
                 if let Some(increment) = &for_stmt.increment {
-                    self.infer_mixed_return_from_for_increment(increment, scopes, method_context);
+                    self.infer_move_return_from_for_increment(increment, scopes, method_context);
                 }
                 scopes.pop();
                 result
             }
             Stmt::Foreach(foreach) => {
-                self.infer_mixed_return_from_foreach(foreach, scopes, method_context)
+                self.infer_move_return_from_foreach(foreach, scopes, method_context)
             }
             _ => None,
         }
     }
 
-    fn infer_mixed_return_from_if_statement(
+    fn infer_move_return_from_if_statement(
         &mut self,
         if_stmt: &IfStmt,
         scopes: &mut ScopeStack,
@@ -874,7 +1008,7 @@ impl<'program> Checker<'program> {
         let mut falling_through_scopes = Vec::new();
 
         let mut then_scopes = incoming_scopes.clone();
-        let mut inferred = self.infer_mixed_return_from_block(
+        let mut inferred = self.infer_move_return_from_block(
             &if_stmt.then_block,
             &mut then_scopes,
             method_context,
@@ -886,8 +1020,8 @@ impl<'program> Checker<'program> {
         if let Some(branch) = &if_stmt.else_branch {
             let mut else_scopes = incoming_scopes;
             let branch_ty =
-                self.infer_mixed_return_from_else_branch(branch, &mut else_scopes, method_context);
-            inferred = self.merge_optional_mixed_return_types(inferred, branch_ty);
+                self.infer_move_return_from_else_branch(branch, &mut else_scopes, method_context);
+            inferred = self.merge_optional_inferred_return_types(inferred, branch_ty);
             if crate::return_analysis::else_branch_falls_through(branch) {
                 falling_through_scopes.push(else_scopes);
             }
@@ -901,7 +1035,7 @@ impl<'program> Checker<'program> {
 
         inferred
     }
-    fn infer_mixed_return_from_block(
+    fn infer_move_return_from_block(
         &mut self,
         block: &Block,
         scopes: &mut ScopeStack,
@@ -909,30 +1043,30 @@ impl<'program> Checker<'program> {
     ) -> Option<TypeId> {
         scopes.push();
         let inferred =
-            self.infer_mixed_return_from_statements(&block.statements, scopes, method_context);
+            self.infer_move_return_from_statements(&block.statements, scopes, method_context);
         scopes.pop();
         inferred
     }
 
-    fn infer_mixed_return_from_else_branch(
+    fn infer_move_return_from_else_branch(
         &mut self,
         branch: &ElseBranch,
         scopes: &mut ScopeStack,
         method_context: Option<&MethodContext>,
     ) -> Option<TypeId> {
         match branch {
-            ElseBranch::If(if_stmt) => self.infer_mixed_return_from_statement(
+            ElseBranch::If(if_stmt) => self.infer_move_return_from_statement(
                 &Stmt::If((**if_stmt).clone()),
                 scopes,
                 method_context,
             ),
             ElseBranch::Block(block) => {
-                self.infer_mixed_return_from_block(block, scopes, method_context)
+                self.infer_move_return_from_block(block, scopes, method_context)
             }
         }
     }
 
-    fn infer_mixed_return_from_for_initializer(
+    fn infer_move_return_from_for_initializer(
         &mut self,
         initializer: &ForInitializer,
         scopes: &mut ScopeStack,
@@ -958,23 +1092,23 @@ impl<'program> Checker<'program> {
                 );
             }
             ForInitializer::Assignment(assignment) => {
-                self.infer_mixed_return_from_assignment(assignment, scopes, method_context);
+                self.infer_move_return_from_assignment(assignment, scopes, method_context);
             }
         }
     }
 
-    fn infer_mixed_return_from_for_increment(
+    fn infer_move_return_from_for_increment(
         &mut self,
         increment: &ForIncrement,
         scopes: &mut ScopeStack,
         method_context: Option<&MethodContext>,
     ) {
         if let ForIncrement::Assignment(assignment) = increment {
-            self.infer_mixed_return_from_assignment(assignment, scopes, method_context);
+            self.infer_move_return_from_assignment(assignment, scopes, method_context);
         }
     }
 
-    fn infer_mixed_return_from_assignment(
+    fn infer_move_return_from_assignment(
         &mut self,
         assignment: &Assignment,
         scopes: &mut ScopeStack,
@@ -1000,7 +1134,7 @@ impl<'program> Checker<'program> {
         }
     }
 
-    fn infer_mixed_return_from_foreach(
+    fn infer_move_return_from_foreach(
         &mut self,
         foreach: &ForeachStmt,
         scopes: &mut ScopeStack,
@@ -1044,7 +1178,7 @@ impl<'program> Checker<'program> {
             },
         );
 
-        let inferred = self.infer_mixed_return_from_statements(
+        let inferred = self.infer_move_return_from_statements(
             &foreach.body.statements,
             scopes,
             method_context,
@@ -1053,23 +1187,23 @@ impl<'program> Checker<'program> {
         inferred
     }
 
-    fn merge_optional_mixed_return_types(
+    fn merge_optional_inferred_return_types(
         &mut self,
         current: Option<TypeId>,
         next: Option<TypeId>,
     ) -> Option<TypeId> {
         let next = next?;
-        if !self.type_contains_mixed(next) {
+        if matches!(self.types.kind(next), TypeKind::Unknown) {
             return current;
         }
-
         Some(match current {
-            Some(current) => self.merge_mixed_return_types(current, next),
+            Some(current) if matches!(self.types.kind(current), TypeKind::Unknown) => next,
+            Some(current) => self.merge_inferred_return_types(current, next),
             None => next,
         })
     }
 
-    fn merge_mixed_return_types(&mut self, left: TypeId, right: TypeId) -> TypeId {
+    fn merge_inferred_return_types(&mut self, left: TypeId, right: TypeId) -> TypeId {
         if left == right {
             return left;
         }
@@ -1078,23 +1212,23 @@ impl<'program> Checker<'program> {
         let right_kind = self.types.kind(right).clone();
         match (left_kind, right_kind) {
             (TypeKind::List(left), TypeKind::List(right)) => {
-                let element = self.merge_mixed_return_types(left, right);
+                let element = self.merge_inferred_return_types(left, right);
                 self.types.intern(TypeKind::List(element))
             }
             (TypeKind::TypedArray(left), TypeKind::TypedArray(right)) => {
-                let element = self.merge_mixed_return_types(left, right);
+                let element = self.merge_inferred_return_types(left, right);
                 self.types.intern(TypeKind::TypedArray(element))
             }
             (
                 TypeKind::Dictionary(left_key, left_value),
                 TypeKind::Dictionary(right_key, right_value),
             ) => {
-                let key = self.merge_mixed_return_types(left_key, right_key);
-                let value = self.merge_mixed_return_types(left_value, right_value);
+                let key = self.merge_inferred_return_types(left_key, right_key);
+                let value = self.merge_inferred_return_types(left_value, right_value);
                 self.types.intern(TypeKind::Dictionary(key, value))
             }
             (TypeKind::Set(left), TypeKind::Set(right)) => {
-                let element = self.merge_mixed_return_types(left, right);
+                let element = self.merge_inferred_return_types(left, right);
                 self.types.intern(TypeKind::Set(element))
             }
             _ => self.types.intern(TypeKind::Mixed),
@@ -1116,7 +1250,7 @@ impl<'program> Checker<'program> {
 
     fn merge_inferred_binding_type(&mut self, current: TypeId, next: TypeId) -> TypeId {
         if self.type_contains_mixed(current) {
-            self.merge_mixed_return_types(current, next)
+            self.merge_inferred_return_types(current, next)
         } else {
             next
         }
@@ -3182,6 +3316,20 @@ impl<'program> Checker<'program> {
         }
     }
 
+    fn type_is_move_type(&self, ty: TypeId) -> bool {
+        matches!(
+            self.types.kind(ty),
+            TypeKind::Class(_)
+                | TypeKind::Mixed
+                | TypeKind::TypedArray(_)
+                | TypeKind::List(_)
+                | TypeKind::Dictionary(_, _)
+                | TypeKind::Set(_)
+                | TypeKind::EmptyCollection
+                | TypeKind::Heterogeneous
+        )
+    }
+
     fn report_mixed_operation(&mut self, span: Span, operation: &'static str) {
         self.diagnostics.push(
             Diagnostic::new(
@@ -4288,8 +4436,8 @@ impl<'program> Checker<'program> {
                 ty,
                 span,
                 "E0454",
-                format!("Stage 17 supports `?string`, not `{ty}`"),
-                "general nullable types remain Stage 22",
+                format!("nullable type `{ty}` is not supported by this compiler"),
+                "only `?string` is currently available as a nullable type",
             );
         }
         if let Some(integer) = IntegerType::from_source_name(&ty.name) {
@@ -5219,7 +5367,7 @@ impl<'program> Checker<'program> {
                     if let Some(common_ty) = common {
                         if common_ty != ty {
                             if self.type_contains_mixed(common_ty) || self.type_contains_mixed(ty) {
-                                common = Some(self.merge_mixed_return_types(common_ty, ty));
+                                common = Some(self.merge_inferred_return_types(common_ty, ty));
                             } else {
                                 saw_heterogeneous = true;
                             }

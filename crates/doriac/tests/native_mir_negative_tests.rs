@@ -26,19 +26,20 @@ fn native_and_debug_share_remaining_post_stage16_mir_coverage_diagnostics() {
     }
 }
 "#,
-            "collection and general iterable foreach",
+            "supports `foreach` only over integer ranges",
         ),
         (
-            "class",
+            "executable class construction",
             r#"class Person
 {
 }
 
 function main(): void
 {
+    let $person = new Person();
 }
 "#,
-            "classes are not lowered to MIR",
+            "class rvalue lowering is not available",
         ),
     ] {
         let native = compile_error(source, BackendTarget::Native);

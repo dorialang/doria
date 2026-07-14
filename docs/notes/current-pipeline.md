@@ -9,7 +9,8 @@ Documentation role: working note. This file prevents duplicated in-flight work. 
 
 ## Active
 
-- Stage 18 full expression interpolation and compiler-known `Displayable` is active on `feature/stage-18-expression-interpolation-displayable`.
+- Stage 18 full expression interpolation and compiler-known `Displayable` is merged.
+- Stage 19 ownership, moves, destruction, and native class layout is active on `feature/stage-19-ownership-moves-destruction`.
 - Native remains one target: direct compile/run uses the Cranelift fast profile, while `--release` selects LLVM 18 over the same validated typed MIR.
 - Ordinary expression interpolation of primitive/string values lowers through the existing ordered MIR string and display operations consumed by all three execution paths.
 - `Displayable` conformance is checked by the frontend and executable through the PHP compatibility subset. Native class layout and method dispatch remain Stages 19 and 20.
@@ -17,7 +18,7 @@ Documentation role: working note. This file prevents duplicated in-flight work. 
 
 ## Next
 
-- Stage 19: ownership, moves, destruction, and native class layout.
+- Stage 20: methods, statics, and `internal` native lowering.
 
 ## Do not duplicate
 

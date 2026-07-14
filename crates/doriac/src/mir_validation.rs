@@ -1,10 +1,17 @@
 //! Backend-independent structural and type validation for native MIR.
 
+use std::collections::HashSet;
+
 use crate::backend::BackendError;
+use crate::class_layout::{compute_class_layout, ClassId, FieldType};
 use crate::mir;
 use crate::numeric::IntegerType;
 
 pub fn validate_program(program: &mir::Program) -> Result<(), BackendError> {
+    for (index, class) in program.classes.iter().enumerate() {
+        validate_class(program, index, class)?;
+    }
+
     let entry = program
         .functions
         .get(program.entry.0)
@@ -41,7 +48,106 @@ pub fn validate_program(program: &mir::Program) -> Result<(), BackendError> {
     Ok(())
 }
 
+fn validate_class(
+    program: &mir::Program,
+    index: usize,
+    class: &mir::Class,
+) -> Result<(), BackendError> {
+    let expected_id = ClassId(index);
+    if class.id != expected_id {
+        return Err(malformed_mir(format!(
+            "class table slot {index} contains class#{}",
+            class.id.0
+        )));
+    }
+
+    for (property_index, property) in class.properties.iter().enumerate() {
+        if property.id.class != class.id || property.id.index != property_index {
+            return Err(malformed_mir(format!(
+                "class#{} property slot {property_index} contains property#{}:{}",
+                class.id.0, property.id.class.0, property.id.index
+            )));
+        }
+        if let mir::Type::Class(referenced) = property.ty {
+            class_in(program, referenced)?;
+        }
+    }
+
+    let pointer_size = std::mem::size_of::<usize>() as u32;
+    let expected_layout = compute_class_layout(
+        class.id,
+        class
+            .properties
+            .iter()
+            .map(|property| (property.id, field_type(property.ty))),
+        pointer_size,
+    );
+    if class.layout != expected_layout {
+        return Err(malformed_mir(format!(
+            "class#{} layout does not match its property table",
+            class.id.0
+        )));
+    }
+
+    if let Some(constructor) = class.constructor {
+        validate_lifecycle(program, class.id, constructor, "constructor", false)?;
+    }
+    if let Some(destructor) = class.destructor {
+        validate_lifecycle(program, class.id, destructor, "destructor", true)?;
+    }
+    Ok(())
+}
+
+fn validate_lifecycle(
+    program: &mir::Program,
+    class: ClassId,
+    function: mir::FunctionId,
+    kind: &str,
+    receiver_only: bool,
+) -> Result<(), BackendError> {
+    let function = function_in(program, function)?;
+    if function.return_type != mir::ReturnType::Void {
+        return Err(malformed_mir(format!(
+            "class#{} {kind} {} does not return void",
+            class.0, function.name
+        )));
+    }
+    let Some((receiver, parameters)) = function.params.split_first() else {
+        return Err(malformed_mir(format!(
+            "class#{} {kind} {} has no implicit receiver",
+            class.0, function.name
+        )));
+    };
+    if local_in(function, *receiver)?.ty != mir::Type::Class(class) {
+        return Err(malformed_mir(format!(
+            "class#{} {kind} {} has an incompatible implicit receiver",
+            class.0, function.name
+        )));
+    }
+    if receiver_only && !parameters.is_empty() {
+        return Err(malformed_mir(format!(
+            "class#{} destructor {} declares parameters",
+            class.0, function.name
+        )));
+    }
+    Ok(())
+}
+
+fn field_type(ty: mir::Type) -> FieldType {
+    match ty {
+        mir::Type::Scalar(mir::ScalarType::Integer(integer)) => FieldType::Integer(integer),
+        mir::Type::Scalar(mir::ScalarType::Float(float)) => FieldType::Float(float),
+        mir::Type::Scalar(mir::ScalarType::Bool) => FieldType::Bool,
+        mir::Type::String => FieldType::String,
+        mir::Type::NullableString => FieldType::NullableString,
+        mir::Type::Class(class) => FieldType::Class(class),
+    }
+}
+
 fn validate_function(program: &mir::Program, function: &mir::Function) -> Result<(), BackendError> {
+    if let mir::ReturnType::Value(ty) = function.return_type {
+        validate_type(program, ty)?;
+    }
     for (index, local) in function.locals.iter().enumerate() {
         if local.id != mir::LocalId(index) {
             return Err(malformed_mir(format!(
@@ -49,6 +155,7 @@ fn validate_function(program: &mir::Program, function: &mir::Function) -> Result
                 function.name, local.id.0
             )));
         }
+        validate_type(program, local.ty)?;
     }
     for parameter in &function.params {
         let local = local_in(function, *parameter)?;
@@ -66,6 +173,13 @@ fn validate_function(program: &mir::Program, function: &mir::Function) -> Result
             validate_statement(program, function, statement)?;
         }
         validate_terminator(program, function, &block.terminator)?;
+    }
+    Ok(())
+}
+
+fn validate_type(program: &mir::Program, ty: mir::Type) -> Result<(), BackendError> {
+    if let mir::Type::Class(class) = ty {
+        class_in(program, class)?;
     }
     Ok(())
 }
@@ -94,6 +208,10 @@ fn validate_statement(
                 (mir::Type::NullableString, mir::Rvalue::NullableString(expression)) => {
                     validate_nullable_string_expression(program, function, expression)
                 }
+                (mir::Type::NullableString, mir::Rvalue::Class(_)) => Err(malformed_mir(format!(
+                    "nullable-string local local{} receives a class rvalue",
+                    target.0
+                ))),
                 (mir::Type::NullableString, _) => Err(malformed_mir(format!(
                     "nullable-string local local{} receives another rvalue type",
                     target.0
@@ -114,6 +232,21 @@ fn validate_statement(
                         )));
                     }
                     validate_value_expression(program, function, expression)
+                }
+                (mir::Type::Class(expected), mir::Rvalue::Class(expression))
+                    if expression.class() == expected =>
+                {
+                    validate_class_expression(program, function, expression)
+                }
+                (mir::Type::Class(expected), _) => Err(malformed_mir(format!(
+                    "class#{} local local{} receives a mismatched rvalue",
+                    expected.0, target.0
+                ))),
+                (mir::Type::String | mir::Type::Scalar(_), mir::Rvalue::Class(_)) => {
+                    Err(malformed_mir(format!(
+                        "non-class local local{} receives a class rvalue",
+                        target.0
+                    )))
                 }
             }
         }
@@ -140,6 +273,9 @@ fn validate_statement(
             validate_string_expression(program, function, contents)
         }
         mir::Statement::WriteStderr(value) => validate_string_expression(program, function, value),
+        mir::Statement::AssignProperty { .. } | mir::Statement::DropClass { .. } => {
+            Err(malformed_mir("class operation is not fully validated yet"))
+        }
     }
 }
 
@@ -276,6 +412,190 @@ fn validate_rvalue(
         mir::Rvalue::NullableString(value) => {
             validate_nullable_string_expression(program, function, value)
         }
+        mir::Rvalue::Class(value) => validate_class_expression(program, function, value),
+    }
+}
+
+fn validate_class_expression(
+    program: &mir::Program,
+    function: &mir::Function,
+    expression: &mir::ClassExpression,
+) -> Result<(), BackendError> {
+    let class = expression.class();
+    let Some(class_definition) = program
+        .classes
+        .get(class.0)
+        .filter(|definition| definition.id == class)
+    else {
+        return Err(malformed_mir(format!("unknown class#{}", class.0)));
+    };
+    match expression {
+        mir::ClassExpression::Local { local, .. } => {
+            let definition = local_in(function, *local)?;
+            if definition.ty == mir::Type::Class(class) {
+                Ok(())
+            } else {
+                Err(malformed_mir(format!(
+                    "class rvalue uses non-class local local{}",
+                    local.0
+                )))
+            }
+        }
+        mir::ClassExpression::Call {
+            function: callee,
+            args,
+            ..
+        } => {
+            let callee = function_in(program, *callee)?;
+            if callee.return_type != mir::ReturnType::Value(mir::Type::Class(class)) {
+                return Err(malformed_mir(format!(
+                    "class#{} call targets a function with another return type",
+                    class.0
+                )));
+            }
+            validate_call_args(program, function, callee, args)
+        }
+        mir::ClassExpression::New {
+            properties,
+            args,
+            constructor,
+            ..
+        } => {
+            if class_definition.constructor != *constructor {
+                return Err(malformed_mir(format!(
+                    "class#{} new expression names the wrong constructor",
+                    class.0
+                )));
+            }
+            let constructor = constructor
+                .map(|constructor| function_in(program, constructor))
+                .transpose()?;
+            let constructor_parameters = if let Some(constructor) = constructor {
+                if constructor.return_type != mir::ReturnType::Void {
+                    return Err(malformed_mir(format!(
+                        "constructor {} does not return void",
+                        constructor.name
+                    )));
+                }
+                let Some((receiver, parameters)) = constructor.params.split_first() else {
+                    return Err(malformed_mir(format!(
+                        "constructor {} has no implicit receiver",
+                        constructor.name
+                    )));
+                };
+                if local_in(constructor, *receiver)?.ty != mir::Type::Class(class) {
+                    return Err(malformed_mir(format!(
+                        "constructor {} has an incompatible implicit receiver",
+                        constructor.name
+                    )));
+                }
+                parameters
+            } else {
+                if !args.is_empty() {
+                    return Err(malformed_mir(format!(
+                        "class#{} without a constructor receives arguments",
+                        class.0
+                    )));
+                }
+                &[]
+            };
+
+            let mut initialized = HashSet::new();
+            let mut consumed_class_arguments = HashSet::new();
+            let mut consumed_class_locals = HashSet::new();
+            for (position, property) in properties.iter().enumerate() {
+                if property.property.index != position {
+                    return Err(malformed_mir(format!(
+                        "class#{} new expression initializes property{} out of construction order",
+                        class.0, property.property.index
+                    )));
+                }
+                let Some(definition) = class_definition
+                    .properties
+                    .get(property.property.index)
+                    .filter(|definition| definition.id == property.property)
+                else {
+                    return Err(malformed_mir(format!(
+                        "class#{} new expression initializes an unknown property slot",
+                        class.0
+                    )));
+                };
+                if !initialized.insert(property.property) {
+                    return Err(malformed_mir(format!(
+                        "class#{} new expression initializes property{} more than once",
+                        class.0, property.property.index
+                    )));
+                }
+                let source_type = match &property.source {
+                    mir::PropertyValueSource::Expression(value) => {
+                        validate_rvalue(program, function, value)?;
+                        if let mir::Rvalue::Class(mir::ClassExpression::Local { local, .. }) = value
+                        {
+                            if !consumed_class_locals.insert(*local) {
+                                return Err(malformed_mir(format!(
+                                    "class#{} new expression gives class local local{} to more than one property",
+                                    class.0, local.0
+                                )));
+                            }
+                        }
+                        value.ty()
+                    }
+                    mir::PropertyValueSource::ConstructorArgument(index) => {
+                        let argument = args.get(*index).ok_or_else(|| {
+                            malformed_mir(format!(
+                                "class#{} property{} references constructor argument {} but only {} exist",
+                                class.0,
+                                property.property.index,
+                                index,
+                                args.len()
+                            ))
+                        })?;
+                        if matches!(argument.ty(), mir::Type::Class(_))
+                            && !consumed_class_arguments.insert(*index)
+                        {
+                            return Err(malformed_mir(format!(
+                                "class#{} new expression gives constructor argument {} to more than one property",
+                                class.0, index
+                            )));
+                        }
+                        argument.ty()
+                    }
+                };
+                if source_type != definition.ty {
+                    return Err(malformed_mir(format!(
+                        "class#{} property{} has type {} but its initializer has type {}",
+                        class.0, property.property.index, definition.ty, source_type
+                    )));
+                }
+            }
+            if initialized.len() != class_definition.properties.len() {
+                let missing = class_definition
+                    .properties
+                    .iter()
+                    .find(|property| !initialized.contains(&property.id))
+                    .expect("property count differs");
+                return Err(malformed_mir(format!(
+                    "class#{} new expression does not initialize property{}",
+                    class.0, missing.id.index
+                )));
+            }
+            if let Some(constructor) = constructor {
+                validate_call_args_for_params(
+                    program,
+                    function,
+                    constructor,
+                    constructor_parameters,
+                    args,
+                )?;
+                if let Some(index) = consumed_class_arguments.iter().min() {
+                    return Err(malformed_mir(format!(
+                        "class#{} new expression gives constructor argument {} to a property and also passes it to {}",
+                        class.0, index, constructor.name
+                    )));
+                }
+            }
+            Ok(())
+        }
     }
 }
 
@@ -349,15 +669,25 @@ fn validate_call_args(
     callee: &mir::Function,
     args: &[mir::Rvalue],
 ) -> Result<(), BackendError> {
-    if args.len() != callee.params.len() {
+    validate_call_args_for_params(program, caller, callee, &callee.params, args)
+}
+
+fn validate_call_args_for_params(
+    program: &mir::Program,
+    caller: &mir::Function,
+    callee: &mir::Function,
+    params: &[mir::LocalId],
+    args: &[mir::Rvalue],
+) -> Result<(), BackendError> {
+    if args.len() != params.len() {
         return Err(malformed_mir(format!(
             "call to {} expects {} arguments, got {}",
             callee.name,
-            callee.params.len(),
+            params.len(),
             args.len()
         )));
     }
-    for (index, (argument, parameter)) in args.iter().zip(&callee.params).enumerate() {
+    for (index, (argument, parameter)) in args.iter().zip(params).enumerate() {
         let parameter_type = local_in(callee, *parameter)?.ty;
         if argument.ty() != parameter_type {
             return Err(malformed_mir(format!(
@@ -608,6 +938,14 @@ fn function_in(
         .get(id.0)
         .filter(|function| function.id == id)
         .ok_or_else(|| malformed_mir(format!("FunctionId function{} does not exist", id.0)))
+}
+
+fn class_in(program: &mir::Program, id: ClassId) -> Result<&mir::Class, BackendError> {
+    program
+        .classes
+        .get(id.0)
+        .filter(|class| class.id == id)
+        .ok_or_else(|| malformed_mir(format!("ClassId class#{} does not exist", id.0)))
 }
 
 fn local_in(function: &mir::Function, id: mir::LocalId) -> Result<&mir::Local, BackendError> {

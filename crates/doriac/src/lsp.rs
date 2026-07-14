@@ -387,6 +387,7 @@ fn completion_items() -> Value {
         "implements",
         "function",
         "let",
+        "take",
         "writable",
         "readonly",
         "internal",
@@ -529,7 +530,7 @@ fn completion_items() -> Value {
         "label": "Displayable",
         "kind": 8,
         "detail": "compiler-known Doria interface",
-        "documentation": "`interface Displayable` requires an explicit `implements Displayable` declaration and exactly `function toString(): string`. It controls interpolation, echo, concatenation, and `%s`; general interfaces remain planned for Stage 35.",
+        "documentation": "`interface Displayable` requires an explicit `implements Displayable` declaration and exactly `function toString(): string`. It controls interpolation, echo, concatenation, and `%s`. Other interfaces are not supported by this compiler.",
     }));
     items.push(json!({
         "label": "toString",
@@ -553,7 +554,7 @@ fn completion_items() -> Value {
             (
                 "sprintf",
                 "sprintf(string $format, ...): string",
-                "Formats values with a compile-time-checked literal format string in Stage 17.",
+                "Formats values with a compile-time-checked literal format string.",
             ),
             (
                 "printf",
@@ -720,13 +721,16 @@ fn hover_description(kind: &TokenKind) -> Option<&'static str> {
     match kind {
         TokenKind::Class => Some("Declares a Doria class."),
         TokenKind::Interface => Some(
-            "General interface declarations are planned for Stage 35. Stage 18 provides only the compiler-known `Displayable` contract.",
+            "Declares an interface. This compiler currently provides only the compiler-known `Displayable` contract.",
         ),
         TokenKind::Implements => Some(
-            "Declares nominal conformance. Stage 18 supports only the compiler-known `Displayable` contract; general conformance is planned for Stage 35.",
+            "Declares nominal conformance. This compiler currently supports only the compiler-known `Displayable` contract.",
         ),
         TokenKind::Function => Some("Declares a function or method."),
         TokenKind::Let => Some("Declares a local binding with an inferred type."),
+        TokenKind::Take => Some(
+            "Gives ownership of a move-type argument to this parameter. Call sites remain unmarked.",
+        ),
         TokenKind::Writable => {
             Some("Marks a binding, property, parameter, or method receiver as mutable.")
         }
@@ -757,13 +761,13 @@ fn hover_description(kind: &TokenKind) -> Option<&'static str> {
         TokenKind::FloatType => scalar_runtime_type_description("float"),
         TokenKind::Float32Type => scalar_runtime_type_description("float32"),
         TokenKind::Float64Type => scalar_runtime_type_description("float64"),
-        TokenKind::StringType => Some("The immutable UTF-8 `string` primitive type. Stage 17 also supports the narrow `?string` EOF seed used by `read_line`.") ,
+        TokenKind::StringType => Some("The immutable UTF-8 `string` primitive type. The nullable form `?string` represents the EOF result of `read_line`.") ,
         TokenKind::BoolType => scalar_runtime_type_description("bool"),
         TokenKind::True | TokenKind::False => Some("Boolean literal."),
-        TokenKind::Null => Some("Null literal. Stage 17 supports `?string` narrowly for `read_line` EOF; general nullable types remain planned for Stage 22."),
+        TokenKind::Null => Some("Null literal. This compiler currently supports `null` through the narrow `?string` result of `read_line`."),
         TokenKind::Reserved(_) => Some("Reserved for future Doria syntax."),
         TokenKind::Identifier(name) => match name.as_str() {
-            "Displayable" => Some("`interface Displayable` is the compiler-known display contract. A class must explicitly declare `implements Displayable` and provide `function toString(): string`. It controls interpolation, echo, concatenation, and `%s`; general interfaces remain planned for Stage 35."),
+            "Displayable" => Some("`interface Displayable` is the compiler-known display contract. A class must explicitly declare `implements Displayable` and provide `function toString(): string`. It controls interpolation, echo, concatenation, and `%s`. Other interfaces are not supported by this compiler."),
             "toString" => Some("`function toString(): string` is the exact externally accessible readonly instance method required by `Displayable`."),
             "List" => Some("Ordered collection alias: `List<T>`."),
             "Dictionary" => Some("Key-value collection alias: `Dictionary<K, V>`."),
@@ -776,7 +780,7 @@ fn hover_description(kind: &TokenKind) -> Option<&'static str> {
                 "Built-in fatal runtime function: `panic(\"message\");`. Panics are not catchable and exit with status 101.",
             ),
             "read_line" => Some("`read_line(): ?string` reads one UTF-8 line, strips LF or CRLF, preserves empty and unterminated final lines, and returns `null` only at EOF."),
-            "sprintf" => Some("`sprintf(string $format, ...): string` uses a compile-time-checked literal format string in Stage 17."),
+            "sprintf" => Some("`sprintf(string $format, ...): string` uses a compile-time-checked literal format string."),
             "printf" => Some("`printf(string $format, ...): void` uses the same checked formatter as `sprintf`, adds no newline, and returns void."),
             "read_file" => Some("`read_file(string $path): string` reads complete UTF-8 text and panics on failure."),
             "write_file" => Some("`write_file(string $path, string $contents): void` creates or truncates a UTF-8 text file and writes exact bytes."),
@@ -1031,7 +1035,7 @@ mod tests {
         assert!(documentation.contains("interface Displayable"));
         assert!(documentation.contains("function toString(): string"));
         assert!(documentation.contains("interpolation, echo, concatenation, and `%s`"));
-        assert!(documentation.contains("general interfaces remain planned for Stage 35"));
+        assert!(documentation.contains("Other interfaces are not supported by this compiler"));
 
         let source = "class Label implements Displayable {}";
         let hover = hover_at_offset(
@@ -1044,14 +1048,14 @@ mod tests {
             .expect("hover contents should be markdown");
         assert!(text.contains("interface Displayable"));
         assert!(text.contains("function toString(): string"));
-        assert!(text.contains("general interfaces remain planned for Stage 35"));
+        assert!(text.contains("Other interfaces are not supported by this compiler"));
     }
     #[test]
     fn hover_help_does_not_present_planned_syntax_as_immediate_fixes() {
         let null_hover = hover_description(&TokenKind::Null).expect("null should have hover text");
-        assert!(null_hover.contains("planned"));
-        assert!(null_hover.contains("Stage 22"));
+        assert!(null_hover.contains("narrow `?string` result of `read_line`"));
         assert!(null_hover.contains("`?string`"));
+        assert!(!null_hover.contains("Stage "));
 
         let mixed_hover = hover_description(&TokenKind::Identifier("mixed".to_string()))
             .expect("mixed should have hover text");

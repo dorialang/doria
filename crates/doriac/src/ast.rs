@@ -60,7 +60,11 @@ pub struct FunctionDecl {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Param {
     pub promoted_access: Option<MemberAccess>,
+    pub take: bool,
+    pub take_span: Option<Span>,
     pub writable: bool,
+    pub writable_span: Option<Span>,
+    pub ownership_modifier_insert: Span,
     pub ty: TypeRef,
     pub name: String,
     pub default: Option<Expr>,
