@@ -41,6 +41,12 @@ struct Binding {
     state: State,
 }
 
+#[derive(Debug, Clone)]
+struct PropertyInfo {
+    class: Option<String>,
+    move_type: bool,
+}
+
 #[derive(Debug, Clone, Default)]
 struct Scopes(Vec<HashMap<String, Binding>>);
 
@@ -139,10 +145,17 @@ pub fn check_program(program: &ast::Program) -> Vec<Diagnostic> {
                 for member in &class.members {
                     match member {
                         ClassMember::Property(property) => {
-                            if classes.contains(&property.ty.name) {
+                            let property_class = classes
+                                .contains(&property.ty.name)
+                                .then(|| property.ty.name.clone());
+                            let move_type = property_class.is_some() || property.ty.name == "mixed";
+                            if move_type {
                                 properties.insert(
                                     (class.name.clone(), property.name.clone()),
-                                    property.ty.name.clone(),
+                                    PropertyInfo {
+                                        class: property_class,
+                                        move_type,
+                                    },
                                 );
                             }
                         }
@@ -155,12 +168,18 @@ pub fn check_program(program: &ast::Program) -> Vec<Diagnostic> {
                             if method.name == "__construct" {
                                 constructors.insert(class.name.clone(), method_signature);
                                 for param in &method.params {
-                                    if param.promoted_access.is_some()
-                                        && classes.contains(&param.ty.name)
-                                    {
+                                    let property_class = classes
+                                        .contains(&param.ty.name)
+                                        .then(|| param.ty.name.clone());
+                                    let move_type =
+                                        property_class.is_some() || param.ty.name == "mixed";
+                                    if param.promoted_access.is_some() && move_type {
                                         properties.insert(
                                             (class.name.clone(), param.name.clone()),
-                                            param.ty.name.clone(),
+                                            PropertyInfo {
+                                                class: property_class,
+                                                move_type,
+                                            },
                                         );
                                     }
                                 }
@@ -275,7 +294,7 @@ struct Checker {
     signatures: HashMap<String, Signature>,
     constructors: HashMap<String, Signature>,
     methods: HashMap<(String, String), Signature>,
-    properties: HashMap<(String, String), String>,
+    properties: HashMap<(String, String), PropertyInfo>,
     receiver_class: Option<String>,
     diagnostics: Vec<Diagnostic>,
 }
@@ -363,13 +382,14 @@ impl Checker {
                     .as_ref()
                     .filter(|ty| self.classes.contains(&ty.name))
                     .map(|ty| ty.name.clone());
-                let mixed = decl.ty.as_ref().is_some_and(|ty| ty.name == "mixed");
                 let class = declared_class.or_else(|| self.expr_class(&decl.initializer, scopes));
                 let initializer_moves = self.expr_is_move_value(&decl.initializer, scopes);
+                let mixed = decl.ty.as_ref().is_some_and(|ty| ty.name == "mixed")
+                    || (decl.ty.is_none() && class.is_none() && initializer_moves);
                 self.use_expr(
                     &decl.initializer,
                     scopes,
-                    if initializer_moves {
+                    if initializer_moves || mixed {
                         UseMode::Give
                     } else {
                         UseMode::Borrow
@@ -455,7 +475,7 @@ impl Checker {
                         self.use_expr(&assignment.value, scopes, UseMode::Borrow);
                     }
                 } else {
-                    if self.expr_class(&assignment.value, scopes).is_some() {
+                    if self.expr_is_move_value(&assignment.value, scopes) {
                         self.diagnostics.push(
                             Diagnostic::new(
                                 "E0472",
@@ -500,6 +520,30 @@ impl Checker {
             }
             Stmt::If(statement) => {
                 self.use_expr(&statement.condition, scopes, UseMode::Borrow);
+                if let Some(condition) = bool_literal(&statement.condition) {
+                    if condition {
+                        return self.check_block(
+                            &statement.then_block,
+                            scopes,
+                            return_move_type,
+                            true,
+                        );
+                    }
+                    return if let Some(branch) = &statement.else_branch {
+                        match branch {
+                            ast::ElseBranch::If(nested) => self.check_statement(
+                                &Stmt::If((**nested).clone()),
+                                scopes,
+                                return_move_type,
+                            ),
+                            ast::ElseBranch::Block(block) => {
+                                self.check_block(block, scopes, return_move_type, true)
+                            }
+                        }
+                    } else {
+                        Flow::fallthrough()
+                    };
+                }
                 let before = scopes.clone();
                 let mut then_scopes = before.clone();
                 let mut then_flow = self.check_block(
@@ -761,7 +805,7 @@ impl Checker {
             }
             Expr::Grouped { expr, .. } => self.use_expr(expr, scopes, mode),
             Expr::PropertyAccess { object, span, .. } => {
-                if mode == UseMode::Give && self.expr_class(expr, scopes).is_some() {
+                if mode == UseMode::Give && self.expr_is_move_value(expr, scopes) {
                     self.diagnostics.push(
                         Diagnostic::new(
                             "E0472",
@@ -826,7 +870,7 @@ impl Checker {
                     if let Some(key) = &element.key {
                         self.use_expr(key, scopes, UseMode::Borrow);
                     }
-                    self.use_expr(&element.value, scopes, UseMode::Borrow);
+                    self.use_expr(&element.value, scopes, mode);
                 }
             }
             Expr::Unary { expr, .. } => self.use_expr(expr, scopes, UseMode::Borrow),
@@ -946,7 +990,16 @@ impl Checker {
                 .methods
                 .get(&(class_name.clone(), method.clone()))
                 .is_some_and(|signature| signature.returns_move_type),
-            Expr::PropertyAccess { .. } => self.expr_class(expr, scopes).is_some(),
+            Expr::PropertyAccess {
+                object, property, ..
+            } => {
+                let Some(class) = self.expr_class(object, scopes) else {
+                    return false;
+                };
+                self.properties
+                    .get(&(class, property.clone()))
+                    .is_some_and(|property| property.move_type)
+            }
             _ => false,
         }
     }
@@ -969,7 +1022,7 @@ impl Checker {
                 let object_class = self.expr_class(object, scopes)?;
                 self.properties
                     .get(&(object_class, property.clone()))
-                    .cloned()
+                    .and_then(|property| property.class.clone())
             }
             Expr::MethodCall { object, method, .. } => {
                 let object_class = self.expr_class(object, scopes)?;

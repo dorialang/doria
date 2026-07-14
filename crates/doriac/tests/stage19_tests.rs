@@ -458,3 +458,67 @@ fn boolean_short_circuiting_preserves_unreached_owners() {
         .iter()
         .any(|diagnostic| diagnostic.code == "E0470"));
 }
+
+#[test]
+fn inferred_mixed_locals_are_tracked_as_move_owners() {
+    let diagnostics = doriac::check_source(
+        "inferred-mixed-owner.doria",
+        "function make(): mixed { mixed $value = 1; return $value; } function duplicate(): void { let $first = make(); let $second = $first; let $third = $first; }",
+    )
+    .expect_err("an inferred mixed local still owns one box");
+    assert!(diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == "E0470"));
+}
+
+#[test]
+fn mixed_owner_moves_into_properties_remain_unsupported() {
+    let diagnostics = doriac::check_source(
+        "mixed-property-assignment.doria",
+        "function sink(take mixed $value): void {} class Box { writable mixed $payload = 1; writable function store(take mixed $value): void { $this->payload = $value; sink($value); } }",
+    )
+    .expect_err("direct moves into properties remain unsupported");
+    assert!(diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == "E0472" && diagnostic.message.contains("moves into")
+    }));
+}
+
+#[test]
+fn mixed_properties_are_move_values() {
+    for source in [
+        "class Box { mixed $payload = 1; function release(): mixed { return $this->payload; } }",
+        "function sink(take mixed $value): void {} class Box { mixed $payload = 1; function release(): void { sink($this->payload); } }",
+    ] {
+        let diagnostics = doriac::check_source("mixed-property-move.doria", source)
+            .expect_err("direct moves out of mixed properties remain unsupported");
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "E0472" && diagnostic.message.contains("moves out")
+        }));
+    }
+}
+
+#[test]
+fn owning_array_literals_move_their_elements() {
+    let diagnostics = doriac::check_source(
+        "array-element-move.doria",
+        "class Guard {} function consume(take Guard $guard): void {} function route(take Guard $guard): void { mixed $payload = [$guard]; consume($guard); }",
+    )
+    .expect_err("the array literal owns its class element");
+    assert!(diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == "E0470"));
+}
+
+#[test]
+fn literal_if_conditions_skip_unreachable_owner_moves() {
+    for body in [
+        "if (false) { consume($guard); } consume($guard);",
+        "if (true) {} else { consume($guard); } consume($guard);",
+    ] {
+        let source = format!(
+            "class Guard {{}} function consume(take Guard $guard): void {{}} function route(take Guard $guard): void {{ {body} }}"
+        );
+        doriac::check_source("literal-if.doria", source)
+            .expect("unreachable branches cannot consume the owner");
+    }
+}
