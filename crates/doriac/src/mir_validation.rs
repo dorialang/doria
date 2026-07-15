@@ -118,9 +118,16 @@ fn validate_lifecycle(
             class.0, function.name
         )));
     };
-    if local_in(function, *receiver)?.ty != mir::Type::Class(class) {
+    let receiver_definition = local_in(function, *receiver)?;
+    if receiver_definition.ty != mir::Type::Class(class) {
         return Err(malformed_mir(format!(
             "class#{} {kind} {} has an incompatible implicit receiver",
+            class.0, function.name
+        )));
+    }
+    if receiver_definition.owned {
+        return Err(malformed_mir(format!(
+            "class#{} {kind} {} marks its implicit receiver as owned",
             class.0, function.name
         )));
     }
@@ -301,6 +308,12 @@ fn validate_statement(
                     property.index,
                     value.ty(),
                     property_definition.ty
+                )));
+            }
+            if rvalue_transfers_class_local(value, object.id) {
+                return Err(malformed_mir(format!(
+                    "assignment to property{} consumes its receiver local{}",
+                    property.index, object.id.0
                 )));
             }
             validate_rvalue(program, function, value)?;
@@ -494,6 +507,226 @@ fn require_owned_class_expression(
             "{destination} receives borrowed class property{}",
             property.index
         ))),
+    }
+}
+
+fn persistent_class_borrow(value: &mir::Rvalue) -> Option<mir::LocalId> {
+    match value {
+        mir::Rvalue::Class(mir::ClassExpression::Local {
+            local,
+            transfer: false,
+            ..
+        }) => Some(*local),
+        mir::Rvalue::Class(mir::ClassExpression::Property { object, .. }) => Some(*object),
+        _ => None,
+    }
+}
+
+fn rvalue_transfers_class_local(value: &mir::Rvalue, local: mir::LocalId) -> bool {
+    let mut transfers = Vec::new();
+    collect_rvalue_class_local_transfers(value, &mut transfers);
+    transfers.contains(&local)
+}
+
+fn collect_rvalue_class_local_transfers(value: &mir::Rvalue, transfers: &mut Vec<mir::LocalId>) {
+    match value {
+        mir::Rvalue::Value(value) => collect_value_class_local_transfers(value, transfers),
+        mir::Rvalue::String(value) => collect_string_class_local_transfers(value, transfers),
+        mir::Rvalue::NullableString(value) => {
+            collect_nullable_string_class_local_transfers(value, transfers)
+        }
+        mir::Rvalue::Class(value) => collect_class_expression_local_transfers(value, transfers),
+    }
+}
+
+fn collect_rvalue_args_class_local_transfers(
+    args: &[mir::Rvalue],
+    transfers: &mut Vec<mir::LocalId>,
+) {
+    for value in args {
+        collect_rvalue_class_local_transfers(value, transfers);
+    }
+}
+
+fn collect_value_class_local_transfers(
+    value: &mir::ValueExpression,
+    transfers: &mut Vec<mir::LocalId>,
+) {
+    match value {
+        mir::ValueExpression::Integer(value) => {
+            collect_integer_class_local_transfers(value, transfers)
+        }
+        mir::ValueExpression::Float(value) => collect_float_class_local_transfers(value, transfers),
+        mir::ValueExpression::Bool(value) => collect_bool_class_local_transfers(value, transfers),
+    }
+}
+
+fn collect_integer_class_local_transfers(
+    value: &mir::IntegerExpression,
+    transfers: &mut Vec<mir::LocalId>,
+) {
+    match value {
+        mir::IntegerExpression::Use { .. } => {}
+        mir::IntegerExpression::Unary { operand, .. }
+        | mir::IntegerExpression::Convert { value: operand, .. } => {
+            collect_integer_class_local_transfers(operand, transfers);
+        }
+        mir::IntegerExpression::Binary { left, right, .. } => {
+            collect_integer_class_local_transfers(left, transfers);
+            collect_integer_class_local_transfers(right, transfers);
+        }
+        mir::IntegerExpression::FloatToInt { value } => {
+            collect_float_class_local_transfers(value, transfers);
+        }
+        mir::IntegerExpression::Call { args, .. } => {
+            collect_rvalue_args_class_local_transfers(args, transfers);
+        }
+    }
+}
+
+fn collect_float_class_local_transfers(
+    value: &mir::FloatExpression,
+    transfers: &mut Vec<mir::LocalId>,
+) {
+    match value {
+        mir::FloatExpression::Use { .. } => {}
+        mir::FloatExpression::Negate { operand, .. } => {
+            collect_float_class_local_transfers(operand, transfers);
+        }
+        mir::FloatExpression::Binary { left, right, .. } => {
+            collect_float_class_local_transfers(left, transfers);
+            collect_float_class_local_transfers(right, transfers);
+        }
+        mir::FloatExpression::IntToFloat { value } => {
+            collect_integer_class_local_transfers(value, transfers);
+        }
+        mir::FloatExpression::Call { args, .. } => {
+            collect_rvalue_args_class_local_transfers(args, transfers);
+        }
+    }
+}
+
+fn collect_string_class_local_transfers(
+    value: &mir::StringExpression,
+    transfers: &mut Vec<mir::LocalId>,
+) {
+    match value {
+        mir::StringExpression::Concat(parts) => {
+            for part in parts {
+                collect_string_class_local_transfers(part, transfers);
+            }
+        }
+        mir::StringExpression::Display(value) => {
+            collect_value_class_local_transfers(value, transfers);
+        }
+        mir::StringExpression::Call { args, .. } => {
+            collect_rvalue_args_class_local_transfers(args, transfers);
+        }
+        mir::StringExpression::ReadFile(path) => {
+            collect_string_class_local_transfers(path, transfers);
+        }
+        mir::StringExpression::Format(format) => {
+            collect_format_class_local_transfers(format, transfers);
+        }
+        mir::StringExpression::Literal(_)
+        | mir::StringExpression::Local(_)
+        | mir::StringExpression::NullableLocalAssumeNonNull(_)
+        | mir::StringExpression::Property { .. } => {}
+    }
+}
+
+fn collect_nullable_string_class_local_transfers(
+    value: &mir::NullableStringExpression,
+    transfers: &mut Vec<mir::LocalId>,
+) {
+    match value {
+        mir::NullableStringExpression::String(value) => {
+            collect_string_class_local_transfers(value, transfers);
+        }
+        mir::NullableStringExpression::Call { args, .. } => {
+            collect_rvalue_args_class_local_transfers(args, transfers);
+        }
+        mir::NullableStringExpression::Null
+        | mir::NullableStringExpression::Local(_)
+        | mir::NullableStringExpression::Property { .. }
+        | mir::NullableStringExpression::ReadLine => {}
+    }
+}
+
+fn collect_class_expression_local_transfers(
+    value: &mir::ClassExpression,
+    transfers: &mut Vec<mir::LocalId>,
+) {
+    match value {
+        mir::ClassExpression::Local {
+            local,
+            transfer: true,
+            ..
+        } => transfers.push(*local),
+        mir::ClassExpression::Local {
+            transfer: false, ..
+        }
+        | mir::ClassExpression::Property { .. } => {}
+        mir::ClassExpression::Call { args, .. } => {
+            collect_rvalue_args_class_local_transfers(args, transfers);
+        }
+        mir::ClassExpression::New {
+            properties, args, ..
+        } => {
+            for property in properties {
+                if let mir::PropertyValueSource::Expression(value) = &property.source {
+                    collect_rvalue_class_local_transfers(value, transfers);
+                }
+            }
+            collect_rvalue_args_class_local_transfers(args, transfers);
+        }
+    }
+}
+
+fn collect_bool_class_local_transfers(
+    value: &mir::BoolExpression,
+    transfers: &mut Vec<mir::LocalId>,
+) {
+    match value {
+        mir::BoolExpression::Use { .. } => {}
+        mir::BoolExpression::Compare { left, right, .. } => {
+            collect_value_class_local_transfers(left, transfers);
+            collect_value_class_local_transfers(right, transfers);
+        }
+        mir::BoolExpression::StringCompare { left, right, .. } => {
+            collect_string_class_local_transfers(left, transfers);
+            collect_string_class_local_transfers(right, transfers);
+        }
+        mir::BoolExpression::NullableStringCompare { left, right, .. } => {
+            collect_nullable_string_class_local_transfers(left, transfers);
+            collect_nullable_string_class_local_transfers(right, transfers);
+        }
+        mir::BoolExpression::Not(value) => {
+            collect_bool_class_local_transfers(value, transfers);
+        }
+        mir::BoolExpression::Binary { left, right, .. } => {
+            collect_bool_class_local_transfers(left, transfers);
+            collect_bool_class_local_transfers(right, transfers);
+        }
+        mir::BoolExpression::Call { args, .. } => {
+            collect_rvalue_args_class_local_transfers(args, transfers);
+        }
+    }
+}
+
+fn collect_format_class_local_transfers(
+    format: &mir::FormatExpression,
+    transfers: &mut Vec<mir::LocalId>,
+) {
+    for argument in &format.arguments {
+        match argument {
+            mir::FormatArgument::Value(value) => {
+                collect_value_class_local_transfers(value, transfers)
+            }
+            mir::FormatArgument::String(value) => {
+                collect_string_class_local_transfers(value, transfers)
+            }
+        }
     }
 }
 
@@ -1286,32 +1519,30 @@ fn validate_call_args_for_params(
             )));
         }
         validate_rvalue(program, caller, argument)?;
-        if let mir::Rvalue::Class(mir::ClassExpression::Local {
-            local, transfer, ..
-        }) = argument
-        {
-            if *transfer {
-                if borrowed_class_locals.contains(local) {
-                    return Err(malformed_mir(format!(
-                        "call to {} both borrows and transfers class local local{}",
-                        callee.name, local.0
-                    )));
-                }
-                if !transferred_class_locals.insert(*local) {
-                    return Err(malformed_mir(format!(
-                        "call to {} transfers class local local{} more than once",
-                        callee.name, local.0
-                    )));
-                }
-            } else {
-                if transferred_class_locals.contains(local) {
-                    return Err(malformed_mir(format!(
-                        "call to {} both borrows and transfers class local local{}",
-                        callee.name, local.0
-                    )));
-                }
-                borrowed_class_locals.insert(*local);
+        let mut argument_transfers = Vec::new();
+        collect_rvalue_class_local_transfers(argument, &mut argument_transfers);
+        for local in argument_transfers {
+            if borrowed_class_locals.contains(&local) {
+                return Err(malformed_mir(format!(
+                    "call to {} both borrows and transfers class local local{}",
+                    callee.name, local.0
+                )));
             }
+            if !transferred_class_locals.insert(local) {
+                return Err(malformed_mir(format!(
+                    "call to {} transfers class local local{} more than once",
+                    callee.name, local.0
+                )));
+            }
+        }
+        if let Some(local) = persistent_class_borrow(argument) {
+            if transferred_class_locals.contains(&local) {
+                return Err(malformed_mir(format!(
+                    "call to {} both borrows and transfers class local local{}",
+                    callee.name, local.0
+                )));
+            }
+            borrowed_class_locals.insert(local);
         }
         if matches!(parameter_type, mir::Type::Class(_)) {
             let promoted_transfer =
