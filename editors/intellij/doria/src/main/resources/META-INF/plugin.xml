@@ -46,4 +46,26 @@
       displayName="Doria" />
 
   </extensions>
+
+  <actions>
+    <action
+      id="dev.doria.intellij.actions.DoriaCreateFileAction"
+      class="dev.doria.intellij.actions.DoriaCreateFileAction"
+      text="Doria File"
+      description="Create a Doria file with a main function"
+      icon="/icons/doria.svg">
+      <add-to-group group-id="NewGroup" anchor="before" relative-to-action="NewFile" />
+    </action>
+    <action
+      id="dev.doria.intellij.actions.DoriaCreateClassAction"
+      class="dev.doria.intellij.actions.DoriaCreateClassAction"
+      text="Doria Class"
+      description="Create a Doria class"
+      icon="/icons/doria.svg">
+      <add-to-group
+        group-id="NewGroup"
+        anchor="after"
+        relative-to-action="dev.doria.intellij.actions.DoriaCreateFileAction" />
+    </action>
+  </actions>
 </idea-plugin>

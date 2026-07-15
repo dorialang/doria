@@ -7,6 +7,7 @@ Plugin releases track the Doria toolchain CalVer. The target release is `2026.03
 It provides:
 
 - `.doria` file recognition.
+- Separate `New -> Doria File` and `New -> Doria Class` workflows.
 - Basic syntax highlighting for Doria keywords, variables, types, attributes, strings, string interpolation, comments, numbers, operators, punctuation, accepted OOP declaration vocabulary, namespace/import/include/directive vocabulary, and rejected strict-comparison/preprocessor spellings.
 - A Doria settings page for configuring the language server path.
 - `doria-lsp` integration through the IntelliJ Platform LSP API.
@@ -56,6 +57,8 @@ Settings/Preferences -> Plugins -> gear icon -> Install Plugin from Disk...
 ```
 
 Select the ZIP from `build/distributions/`, then restart the IDE when prompted. After restart, `.doria` files should be associated with the Doria file type and use the Doria syntax highlighter automatically.
+
+Right-click a project directory and select `New -> Doria File` for the compact name-only workflow that creates an empty `main(): void` function. Select `New -> Doria Class` for the dedicated class workflow with class name, optional namespace, editable file name, target directory, optional parent class, and an add/remove interface list. Both actions create a `.doria` file and use the Doria file icon.
 
 If a `.doria` file still opens without highlighting, check:
 
