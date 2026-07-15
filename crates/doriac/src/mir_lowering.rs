@@ -876,6 +876,7 @@ fn lower_range_foreach_in_scope(
         break_block: exit_block,
         cleanup_depth: context.local_scopes.len(),
     });
+    context.push_scope();
     context.current_block = Some(body_block);
     context.push_statement(mir::Statement::AssignLocal {
         target: binding_local,
@@ -886,6 +887,7 @@ fn lower_range_foreach_in_scope(
     });
     let body_result = lower_statement_sequence(&foreach.body.statements, return_type, context);
     let body_fallthrough = context.current_block;
+    context.pop_scope();
     context.pop_loop_targets();
     body_result?;
 
@@ -1601,6 +1603,8 @@ fn is_nullable_string_initializer(expr: &hir::Expr, context: &LoweringContext) -
         hir::Expr::Variable { name, span } => context
             .lookup_local(name, *span)
             .is_ok_and(|local| context.local_type(local) == mir::Type::NullableString),
+        hir::Expr::PropertyAccess { .. } => lower_property_place(expr, context)
+            .is_ok_and(|(_, _, ty)| ty == mir::Type::NullableString),
         hir::Expr::FunctionCall { name, span, .. } if name == "read_line" => true,
         hir::Expr::FunctionCall { name, span, .. } => {
             context.lookup_function(name, *span).is_ok_and(|signature| {

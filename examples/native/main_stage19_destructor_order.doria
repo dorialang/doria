@@ -54,6 +54,13 @@ function scenario(): void
     consume(new Token("temporary"));
     inspect(new Token("borrowed temporary"));
 
+    foreach (0..<2 as $index) {
+        let $foreach = new Token("foreach");
+        if ($index == 0) {
+            continue;
+        }
+    }
+
     while (true) {
         let $inner = new Token("inner");
         break;

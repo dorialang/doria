@@ -1,6 +1,8 @@
 drop token old
 drop token temporary
 drop token borrowed temporary
+drop token foreach
+drop token foreach
 drop token inner
 drop token continued
 drop token continued

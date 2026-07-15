@@ -645,9 +645,15 @@ fn validate_class_expression(
                                 )
                             })
                             .count();
-                        if assignments != 1 {
+                        if assignments == 0 {
                             return Err(malformed_mir(format!(
-                                "class#{} property{} requires exactly one direct constructor-body initializer, found {assignments}",
+                                "class#{} property{} requires a direct constructor-body initializer",
+                                class.0, property.property.index
+                            )));
+                        }
+                        if assignments > 1 && !definition.writable {
+                            return Err(malformed_mir(format!(
+                                "class#{} readonly property{} is assigned more than once in its constructor body",
                                 class.0, property.property.index
                             )));
                         }

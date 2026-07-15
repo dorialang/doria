@@ -3478,6 +3478,62 @@ function main(): void
 }
 
 #[test]
+fn stage_19_infers_nullable_string_property_loads_and_comparisons() {
+    let source = r#"class Box
+{
+    ?string $value = null;
+}
+
+function main(): void
+{
+    let $left = new Box();
+    let $right = new Box();
+    let $copy = $left->value;
+    if ($left->value == $right->value && $copy == null) {
+        echo "null";
+    }
+}
+"#;
+
+    let output = interpret(source);
+    assert_eq!(output.exit_status, 0);
+    assert_eq!(output.stdout, b"null");
+    assert!(output.stderr.is_empty());
+    assert!(!lower_object(source).is_empty());
+}
+
+#[test]
+fn stage_19_allows_writable_property_mutation_after_constructor_initialization() {
+    let source = r#"class Message
+{
+    writable string $text;
+
+    function __construct(string $first, string $second)
+    {
+        $this->text = $first;
+        $this->text = $second;
+    }
+
+    function __destruct()
+    {
+        echo $this->text;
+    }
+}
+
+function main(): void
+{
+    let $message = new Message("first", "second");
+}
+"#;
+
+    let output = interpret(source);
+    assert_eq!(output.exit_status, 0);
+    assert_eq!(output.stdout, b"second");
+    assert!(output.stderr.is_empty());
+    assert!(!lower_object(source).is_empty());
+}
+
+#[test]
 fn stage_19_mir_drops_a_temporary_passed_to_a_borrowed_constructor_parameter() {
     let mut program = lower(
         r#"class Child
