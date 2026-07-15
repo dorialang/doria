@@ -181,7 +181,7 @@ fn validate_function(program: &mir::Program, function: &mir::Function) -> Result
         }
         validate_terminator(program, function, &block.terminator)?;
     }
-    Ok(())
+    validate_class_local_lifetimes(function)
 }
 
 fn validate_type(program: &mir::Program, ty: mir::Type) -> Result<(), BackendError> {
@@ -313,6 +313,20 @@ fn validate_statement(
             if rvalue_transfers_class_local(value, object.id) {
                 return Err(malformed_mir(format!(
                     "assignment to property{} consumes its receiver local{}",
+                    property.index, object.id.0
+                )));
+            }
+            let constructor_receiver = class_in(program, class)?.constructor == Some(function.id)
+                && function.params.first() == Some(&object.id);
+            if !constructor_receiver && !property_definition.writable {
+                return Err(malformed_mir(format!(
+                    "assignment mutates readonly property{} outside its constructor initializer",
+                    property.index
+                )));
+            }
+            if !constructor_receiver && !object.writable {
+                return Err(malformed_mir(format!(
+                    "assignment to property{} uses readonly receiver local{}",
                     property.index, object.id.0
                 )));
             }
@@ -510,16 +524,50 @@ fn require_owned_class_expression(
     }
 }
 
+#[derive(Clone, Copy)]
+enum ClassLocalAccess {
+    Borrow(mir::LocalId),
+    Transfer(mir::LocalId),
+}
+
 #[derive(Default)]
-struct ClassLocalAccesses {
-    borrowed: Vec<mir::LocalId>,
-    transferred: Vec<mir::LocalId>,
+struct ClassLocalAccesses(Vec<ClassLocalAccess>);
+
+impl ClassLocalAccesses {
+    fn borrow(&mut self, local: mir::LocalId) {
+        self.0.push(ClassLocalAccess::Borrow(local));
+    }
+
+    fn transfer(&mut self, local: mir::LocalId) {
+        self.0.push(ClassLocalAccess::Transfer(local));
+    }
+
+    fn iter(&self) -> impl Iterator<Item = ClassLocalAccess> + '_ {
+        self.0.iter().copied()
+    }
+
+    fn borrowed(&self) -> impl Iterator<Item = mir::LocalId> + '_ {
+        self.iter().filter_map(|access| match access {
+            ClassLocalAccess::Borrow(local) => Some(local),
+            ClassLocalAccess::Transfer(_) => None,
+        })
+    }
+
+    fn transferred(&self) -> impl Iterator<Item = mir::LocalId> + '_ {
+        self.iter().filter_map(|access| match access {
+            ClassLocalAccess::Transfer(local) => Some(local),
+            ClassLocalAccess::Borrow(_) => None,
+        })
+    }
 }
 
 fn rvalue_transfers_class_local(value: &mir::Rvalue, local: mir::LocalId) -> bool {
     let mut accesses = ClassLocalAccesses::default();
     collect_rvalue_class_local_accesses(value, &mut accesses);
-    accesses.transferred.contains(&local)
+    let transfers_local = accesses
+        .transferred()
+        .any(|transferred| transferred == local);
+    transfers_local
 }
 
 fn collect_rvalue_class_local_accesses(value: &mir::Rvalue, accesses: &mut ClassLocalAccesses) {
@@ -557,7 +605,7 @@ fn collect_value_class_local_accesses(
 
 fn collect_operand_class_local_accesses(operand: &mir::Operand, accesses: &mut ClassLocalAccesses) {
     if let mir::Operand::Property { object, .. } = operand {
-        accesses.borrowed.push(*object);
+        accesses.borrow(*object);
     }
 }
 
@@ -635,7 +683,7 @@ fn collect_string_class_local_accesses(
         mir::StringExpression::Literal(_)
         | mir::StringExpression::Local(_)
         | mir::StringExpression::NullableLocalAssumeNonNull(_) => {}
-        mir::StringExpression::Property { object, .. } => accesses.borrowed.push(*object),
+        mir::StringExpression::Property { object, .. } => accesses.borrow(*object),
     }
 }
 
@@ -654,7 +702,7 @@ fn collect_nullable_string_class_local_accesses(
         | mir::NullableStringExpression::Local(_)
         | mir::NullableStringExpression::ReadLine => {}
         mir::NullableStringExpression::Property { object, .. } => {
-            accesses.borrowed.push(*object);
+            accesses.borrow(*object);
         }
     }
 }
@@ -668,13 +716,13 @@ fn collect_class_expression_local_accesses(
             local,
             transfer: true,
             ..
-        } => accesses.transferred.push(*local),
+        } => accesses.transfer(*local),
         mir::ClassExpression::Local {
             local,
             transfer: false,
             ..
-        } => accesses.borrowed.push(*local),
-        mir::ClassExpression::Property { object, .. } => accesses.borrowed.push(*object),
+        } => accesses.borrow(*local),
+        mir::ClassExpression::Property { object, .. } => accesses.borrow(*object),
         mir::ClassExpression::Call { args, .. } => {
             collect_rvalue_args_class_local_accesses(args, accesses);
         }
@@ -738,6 +786,179 @@ fn collect_format_class_local_accesses(
             }
         }
     }
+}
+
+fn collect_statement_class_local_accesses(statement: &mir::Statement) -> ClassLocalAccesses {
+    let mut accesses = ClassLocalAccesses::default();
+    match statement {
+        mir::Statement::AssignLocal { value, .. } => {
+            collect_rvalue_class_local_accesses(value, &mut accesses);
+        }
+        mir::Statement::EchoString(value) | mir::Statement::WriteStderr(value) => {
+            collect_string_class_local_accesses(value, &mut accesses);
+        }
+        mir::Statement::CallVoid { args, .. } => {
+            collect_rvalue_args_class_local_accesses(args, &mut accesses);
+        }
+        mir::Statement::Printf(format) => {
+            collect_format_class_local_accesses(format, &mut accesses);
+        }
+        mir::Statement::WriteFile { path, contents } => {
+            collect_string_class_local_accesses(path, &mut accesses);
+            collect_string_class_local_accesses(contents, &mut accesses);
+        }
+        mir::Statement::AssignProperty { object, value, .. } => {
+            collect_rvalue_class_local_accesses(value, &mut accesses);
+            accesses.borrow(*object);
+        }
+        mir::Statement::EchoStringLiteral(_) | mir::Statement::DropClass { .. } => {}
+    }
+    accesses
+}
+
+fn collect_terminator_class_local_accesses(terminator: &mir::Terminator) -> ClassLocalAccesses {
+    let mut accesses = ClassLocalAccesses::default();
+    match terminator {
+        mir::Terminator::Return(value) => {
+            collect_rvalue_class_local_accesses(value, &mut accesses);
+        }
+        mir::Terminator::Panic(value) => {
+            collect_string_class_local_accesses(value, &mut accesses);
+        }
+        mir::Terminator::Branch { condition, .. } => {
+            collect_bool_class_local_accesses(condition, &mut accesses);
+        }
+        mir::Terminator::ReturnVoid | mir::Terminator::Unreachable | mir::Terminator::Jump(_) => {}
+    }
+    accesses
+}
+
+fn reachable_blocks_and_predecessors(
+    function: &mir::Function,
+) -> Result<(Vec<bool>, Vec<Vec<mir::BlockId>>), BackendError> {
+    let mut reachable = vec![false; function.blocks.len()];
+    let mut pending = vec![function.entry_block];
+    while let Some(block_id) = pending.pop() {
+        let block = block_in(function, block_id)?;
+        if std::mem::replace(&mut reachable[block_id.0], true) {
+            continue;
+        }
+        pending.extend(terminator_targets(&block.terminator));
+    }
+
+    let mut predecessors = vec![Vec::new(); function.blocks.len()];
+    for block in function.blocks.iter().filter(|block| reachable[block.id.0]) {
+        for target in terminator_targets(&block.terminator) {
+            block_in(function, target)?;
+            predecessors[target.0].push(block.id);
+        }
+    }
+    Ok((reachable, predecessors))
+}
+
+fn apply_class_local_state(
+    function: &mir::Function,
+    statement: &mir::Statement,
+    moved: &mut HashSet<mir::LocalId>,
+    validate: bool,
+) -> Result<(), BackendError> {
+    let accesses = collect_statement_class_local_accesses(statement);
+    if validate {
+        if let mir::Statement::AssignLocal { target, .. } = statement {
+            if accesses
+                .transferred()
+                .any(|transferred| transferred == *target)
+            {
+                return Err(malformed_mir(format!(
+                    "function {} assigns class local local{} from an overlapping transfer",
+                    function.name, target.0
+                )));
+            }
+        }
+    }
+    apply_class_local_accesses(function, &accesses, moved, validate)?;
+    match statement {
+        mir::Statement::AssignLocal { target, .. }
+            if matches!(local_in(function, *target)?.ty, mir::Type::Class(_)) =>
+        {
+            moved.remove(target);
+        }
+        mir::Statement::DropClass { local, .. } => {
+            moved.insert(*local);
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn apply_class_local_accesses(
+    function: &mir::Function,
+    accesses: &ClassLocalAccesses,
+    moved: &mut HashSet<mir::LocalId>,
+    validate: bool,
+) -> Result<(), BackendError> {
+    for access in accesses.iter() {
+        let (local, action) = match access {
+            ClassLocalAccess::Borrow(local) => (local, "uses"),
+            ClassLocalAccess::Transfer(local) => (local, "transfers"),
+        };
+        if validate && moved.contains(&local) {
+            return Err(malformed_mir(format!(
+                "function {} {action} class local local{} after its ownership ended",
+                function.name, local.0
+            )));
+        }
+        if matches!(access, ClassLocalAccess::Transfer(_)) {
+            moved.insert(local);
+        }
+    }
+    Ok(())
+}
+
+fn validate_class_local_lifetimes(function: &mir::Function) -> Result<(), BackendError> {
+    let (reachable, predecessors) = reachable_blocks_and_predecessors(function)?;
+    let mut moved_on_entry = vec![HashSet::new(); function.blocks.len()];
+    let mut moved_on_exit = vec![HashSet::new(); function.blocks.len()];
+
+    loop {
+        let mut changed = false;
+        for block in function.blocks.iter().filter(|block| reachable[block.id.0]) {
+            let moved_at_entry = predecessors[block.id.0]
+                .iter()
+                .flat_map(|predecessor| moved_on_exit[predecessor.0].iter().copied())
+                .collect::<HashSet<_>>();
+            let mut moved_at_exit = moved_at_entry.clone();
+            for statement in &block.statements {
+                apply_class_local_state(function, statement, &mut moved_at_exit, false)?;
+            }
+            apply_class_local_accesses(
+                function,
+                &collect_terminator_class_local_accesses(&block.terminator),
+                &mut moved_at_exit,
+                false,
+            )?;
+            if moved_on_entry[block.id.0] != moved_at_entry
+                || moved_on_exit[block.id.0] != moved_at_exit
+            {
+                moved_on_entry[block.id.0] = moved_at_entry;
+                moved_on_exit[block.id.0] = moved_at_exit;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    for block in function.blocks.iter().filter(|block| reachable[block.id.0]) {
+        let mut moved = moved_on_entry[block.id.0].clone();
+        for statement in &block.statements {
+            apply_class_local_state(function, statement, &mut moved, true)?;
+        }
+        let accesses = collect_terminator_class_local_accesses(&block.terminator);
+        apply_class_local_accesses(function, &accesses, &mut moved, true)?;
+    }
+    Ok(())
 }
 
 fn validate_class_expression(
@@ -916,21 +1137,11 @@ fn validate_class_expression(
                                 constructor.name
                             ))
                         })?;
-                        let assignments = constructor
-                            .blocks
-                            .iter()
-                            .flat_map(|block| block.statements.iter())
-                            .filter(|statement| {
-                                matches!(
-                                    statement,
-                                    mir::Statement::AssignProperty {
-                                        object,
-                                        property: assigned,
-                                        ..
-                                    } if *object == receiver && *assigned == property.property
-                                )
-                            })
-                            .count();
+                        let assignments = constructor_property_assignment_count(
+                            constructor,
+                            receiver,
+                            property.property,
+                        );
                         if assignments == 0 {
                             return Err(malformed_mir(format!(
                                 "class#{} property{} requires a direct constructor-body initializer",
@@ -951,6 +1162,21 @@ fn validate_class_expression(
                         definition.ty
                     }
                 };
+                if !definition.writable
+                    && !matches!(property.source, mir::PropertyValueSource::ConstructorBody)
+                    && constructor.is_some_and(|constructor| {
+                        constructor_property_assignment_count(
+                            constructor,
+                            constructor.params[0],
+                            property.property,
+                        ) > 0
+                    })
+                {
+                    return Err(malformed_mir(format!(
+                        "class#{} readonly property{} is initialized before its constructor assigns it",
+                        class.0, property.property.index
+                    )));
+                }
                 if source_type != definition.ty {
                     return Err(malformed_mir(format!(
                         "class#{} property{} has type {} but its initializer has type {}",
@@ -971,7 +1197,7 @@ fn validate_class_expression(
             }
             collect_rvalue_args_class_local_accesses(args, &mut construction_accesses);
             let mut transferred_class_locals = HashSet::new();
-            for local in construction_accesses.transferred {
+            for local in construction_accesses.transferred() {
                 if !transferred_class_locals.insert(local) {
                     return Err(malformed_mir(format!(
                         "class#{} new expression transfers class local local{} more than once",
@@ -1028,27 +1254,7 @@ fn validate_constructor_body_initializer(
     receiver: mir::LocalId,
     property: crate::class_layout::PropertyId,
 ) -> Result<(), BackendError> {
-    let mut reachable = vec![false; constructor.blocks.len()];
-    let mut pending = vec![constructor.entry_block];
-    while let Some(block_id) = pending.pop() {
-        let block = block_in(constructor, block_id)?;
-        if std::mem::replace(&mut reachable[block_id.0], true) {
-            continue;
-        }
-        pending.extend(terminator_targets(&block.terminator));
-    }
-
-    let mut predecessors = vec![Vec::new(); constructor.blocks.len()];
-    for block in constructor
-        .blocks
-        .iter()
-        .filter(|block| reachable[block.id.0])
-    {
-        for target in terminator_targets(&block.terminator) {
-            block_in(constructor, target)?;
-            predecessors[target.0].push(block.id);
-        }
-    }
+    let (reachable, predecessors) = reachable_blocks_and_predecessors(constructor)?;
 
     let assigns_property = constructor
         .blocks
@@ -1142,6 +1348,28 @@ fn validate_constructor_body_initializer(
         }
     }
     Ok(())
+}
+
+fn constructor_property_assignment_count(
+    constructor: &mir::Function,
+    receiver: mir::LocalId,
+    property: crate::class_layout::PropertyId,
+) -> usize {
+    constructor
+        .blocks
+        .iter()
+        .flat_map(|block| block.statements.iter())
+        .filter(|statement| {
+            matches!(
+                statement,
+                mir::Statement::AssignProperty {
+                    object,
+                    property: assigned,
+                    ..
+                } if *object == receiver && *assigned == property
+            )
+        })
+        .count()
 }
 
 fn terminator_targets(terminator: &mir::Terminator) -> Vec<mir::BlockId> {
@@ -1497,6 +1725,16 @@ fn validate_call_args(
     callee: &mir::Function,
     args: &[mir::Rvalue],
 ) -> Result<(), BackendError> {
+    if program
+        .classes
+        .iter()
+        .any(|class| class.constructor == Some(callee.id) || class.destructor == Some(callee.id))
+    {
+        return Err(malformed_mir(format!(
+            "ordinary call targets lifecycle function {}",
+            callee.name
+        )));
+    }
     validate_call_args_for_params(program, caller, callee, &callee.params, args, None)
 }
 
@@ -1533,7 +1771,7 @@ fn validate_call_args_for_params(
         validate_rvalue(program, caller, argument)?;
         let mut accesses = ClassLocalAccesses::default();
         collect_rvalue_class_local_accesses(argument, &mut accesses);
-        for local in accesses.borrowed {
+        for local in accesses.borrowed() {
             if transferred_class_locals.contains(&local) {
                 return Err(malformed_mir(format!(
                     "call to {} both borrows and transfers class local local{}",
@@ -1542,7 +1780,7 @@ fn validate_call_args_for_params(
             }
             borrowed_class_locals.insert(local);
         }
-        for local in accesses.transferred {
+        for local in accesses.transferred() {
             if borrowed_class_locals.contains(&local) {
                 return Err(malformed_mir(format!(
                     "call to {} both borrows and transfers class local local{}",
