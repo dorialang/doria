@@ -1006,7 +1006,7 @@ fn lower_class_expression(
                 builder.ins().call(callee, &constructor_args);
 
                 let constructor_definition = function_in(resources.program, *constructor)?;
-                for (index, argument) in args.iter().enumerate().rev() {
+                for (index, argument) in args.iter().enumerate() {
                     let mir::Rvalue::Class(
                         mir::ClassExpression::New { class, .. }
                         | mir::ClassExpression::Call { class, .. },
@@ -2051,7 +2051,7 @@ fn lower_function_call(
         release_string(builder, string, resources)?;
     }
     let callee_definition = function_in(resources.program, function)?;
-    for (index, argument) in args.iter().enumerate().rev() {
+    for (index, argument) in args.iter().enumerate() {
         let mir::Rvalue::Class(
             mir::ClassExpression::New { class, .. } | mir::ClassExpression::Call { class, .. },
         ) = argument

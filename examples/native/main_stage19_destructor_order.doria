@@ -32,6 +32,10 @@ function inspect(Token $token): void
 {
 }
 
+function inspectPair(Token $first, Token $second): void
+{
+}
+
 function label(Token $token): string
 {
     return $token->name;
@@ -63,6 +67,7 @@ function scenario(): void
     $slot = makeToken("replacement");
     consume(new Token("temporary"));
     echo label(new Token("borrowed temporary")) . " output\n";
+    inspectPair(new Token("borrowed first"), new Token("borrowed second"));
     if (false || ready(new Token("condition temporary"))) {
         echo "condition ready\n";
     }

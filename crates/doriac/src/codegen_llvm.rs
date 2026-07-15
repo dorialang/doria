@@ -766,7 +766,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     )?;
 
                     let constructor_definition = function_in(self.program, *constructor)?;
-                    for (index, argument) in args.iter().enumerate().rev() {
+                    for (index, argument) in args.iter().enumerate() {
                         let mir::Rvalue::Class(
                             mir::ClassExpression::New { class, .. }
                             | mir::ClassExpression::Call { class, .. },
@@ -2059,7 +2059,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             self.release_string(string)?;
         }
         let callee_definition = function_in(self.program, function)?;
-        for (index, argument) in args.iter().enumerate().rev() {
+        for (index, argument) in args.iter().enumerate() {
             let mir::Rvalue::Class(
                 mir::ClassExpression::New { class, .. } | mir::ClassExpression::Call { class, .. },
             ) = argument

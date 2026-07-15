@@ -3564,7 +3564,7 @@ function main(): void
 }
 
 #[test]
-fn stage_19_mir_drops_a_temporary_passed_to_a_borrowed_constructor_parameter() {
+fn stage_19_mir_drops_borrowed_constructor_temporaries_in_reverse_order() {
     let mut program = lower(
         r#"class Child
 {
@@ -3576,19 +3576,20 @@ fn stage_19_mir_drops_a_temporary_passed_to_a_borrowed_constructor_parameter() {
     {
         echo "drop ";
         echo $this->name;
+        echo "\n";
     }
 }
 
 class Parent
 {
-    function __construct(take Child $child)
+    function __construct(take Child $first, take Child $second)
     {
     }
 }
 
 function main(): void
 {
-    let $parent = new Parent(new Child("borrowed"));
+    let $parent = new Parent(new Child("first"), new Child("second"));
 }
 "#,
     );
@@ -3627,9 +3628,13 @@ function main(): void
     doriac::mir_validation::validate_program(&program)
         .expect("borrowed unpromoted constructor MIR should remain well formed");
     let output = doriac::mir_interpreter::interpret(&program).expect("MIR should interpret");
-    assert_eq!(output.stdout, b"drop borrowed");
+    assert_eq!(output.stdout, b"drop second\ndrop first\n");
     assert!(!doriac::codegen_cranelift::lower_mir_to_object(&program)
         .expect("MIR should lower to Cranelift")
+        .is_empty());
+    #[cfg(feature = "llvm-backend")]
+    assert!(!doriac::codegen_llvm::lower_mir_to_object(&program)
+        .expect("MIR should lower to LLVM")
         .is_empty());
 }
 
