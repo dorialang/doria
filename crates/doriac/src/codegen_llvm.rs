@@ -22,11 +22,11 @@ use crate::format_string::{FormatConversion, FormatPiece};
 use crate::mir;
 use crate::mir_validation;
 use crate::native_abi::{
-    function_symbol, FORMAT_F32, FORMAT_F64, FORMAT_I64, FORMAT_STRING, FORMAT_U64,
-    NULLABLE_STRING_EQUAL, READ_FILE, READ_STDIN_LINE, STRING_COMPARE, STRING_CONCAT, STRING_DATA,
-    STRING_FROM_BOOL, STRING_FROM_F32, STRING_FROM_F64, STRING_FROM_I64, STRING_FROM_U64,
-    STRING_FROM_UTF8, STRING_LENGTH, STRING_RELEASE, STRING_RETAIN, STRING_WRITE_STDERR,
-    STRING_WRITE_STDOUT, WRITE_FILE,
+    function_symbol, CLASS_ALLOCATE, CLASS_FREE, FORMAT_F32, FORMAT_F64, FORMAT_I64, FORMAT_STRING,
+    FORMAT_U64, NULLABLE_STRING_EQUAL, READ_FILE, READ_STDIN_LINE, STRING_COMPARE, STRING_CONCAT,
+    STRING_DATA, STRING_FROM_BOOL, STRING_FROM_F32, STRING_FROM_F64, STRING_FROM_I64,
+    STRING_FROM_U64, STRING_FROM_UTF8, STRING_LENGTH, STRING_RELEASE, STRING_RETAIN,
+    STRING_WRITE_STDERR, STRING_WRITE_STDOUT, WRITE_FILE,
 };
 use crate::numeric::{FloatType, FloatValue, IntegerPanic, IntegerType, IntegerValue};
 
@@ -386,10 +386,20 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                         self.release_string(old)?;
                         build(self.builder.build_store(slot, value))?;
                     }
-                    mir::Type::Class(_) => {
-                        return Err(malformed_mir(
-                            "class assignment reached LLVM before class lowering completed",
-                        ));
+                    mir::Type::Class(class) => {
+                        let mir::Rvalue::Class(expression) = value else {
+                            return Err(malformed_mir(format!(
+                                "class local local{} has a non-class assignment",
+                                target.0
+                            )));
+                        };
+                        let value = self.lower_class_expression(expression)?;
+                        let pointer = self.context.ptr_type(AddressSpace::default());
+                        let slot = local_slot(&self.local_slots, *target)?;
+                        let old = build(self.builder.build_load(pointer, slot, "class.old"))?
+                            .into_pointer_value();
+                        build(self.builder.build_store(slot, value))?;
+                        self.drop_class_value_checked(old, class)?;
                     }
                 }
             }
@@ -443,10 +453,49 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 self.release_string(path)?;
                 self.release_string(contents)?;
             }
-            mir::Statement::AssignProperty { .. } | mir::Statement::DropClass { .. } => {
-                return Err(malformed_mir(
-                    "class operation reached LLVM before class lowering completed",
-                ));
+            mir::Statement::AssignProperty {
+                object,
+                property,
+                value,
+            } => {
+                let property_ty = property_definition(self.program, *property)?.ty;
+                let value = self.lower_rvalue(value)?;
+                let address = self.lower_property_address(*object, *property)?;
+                let old = match property_ty {
+                    mir::Type::String | mir::Type::NullableString | mir::Type::Class(_) => Some(
+                        build(self.builder.build_load(
+                            self.context.ptr_type(AddressSpace::default()),
+                            address,
+                            "property.old",
+                        ))?
+                        .into_pointer_value(),
+                    ),
+                    mir::Type::Scalar(_) => None,
+                };
+                build(self.builder.build_store(address, value))?;
+                match (property_ty, old) {
+                    (mir::Type::String | mir::Type::NullableString, Some(value)) => {
+                        self.release_string(value)?;
+                    }
+                    (mir::Type::Class(class), Some(value)) => {
+                        self.drop_class_value_checked(value, class)?;
+                    }
+                    _ => {}
+                }
+            }
+            mir::Statement::DropClass { local, .. } => {
+                let mir::Type::Class(class) = local_in(self.function, *local)?.ty else {
+                    return Err(malformed_mir(format!(
+                        "drop local{} did not target a class local",
+                        local.0
+                    )));
+                };
+                let pointer = self.context.ptr_type(AddressSpace::default());
+                let slot = local_slot(&self.local_slots, *local)?;
+                let value = build(self.builder.build_load(pointer, slot, "class.drop"))?
+                    .into_pointer_value();
+                build(self.builder.build_store(slot, pointer.const_null()))?;
+                self.drop_class_value_checked(value, class)?;
             }
         }
         Ok(())
@@ -456,10 +505,12 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         match terminator {
             mir::Terminator::Return(expression) => {
                 let value = self.lower_rvalue(expression)?;
+                self.cleanup_class_locals()?;
                 self.cleanup_string_locals()?;
                 build(self.builder.build_return(Some(&value)))?;
             }
             mir::Terminator::ReturnVoid => {
+                self.cleanup_class_locals()?;
                 self.cleanup_string_locals()?;
                 build(self.builder.build_return(None))?;
             }
@@ -537,9 +588,174 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             mir::Rvalue::NullableString(value) => {
                 Ok(self.lower_nullable_string_expression(value)?.into())
             }
-            mir::Rvalue::Class(_) => Err(malformed_mir(
-                "class value reached LLVM before class lowering completed",
-            )),
+            mir::Rvalue::Class(value) => Ok(self.lower_class_expression(value)?.into()),
+        }
+    }
+
+    fn lower_class_expression(
+        &mut self,
+        expression: &mir::ClassExpression,
+    ) -> Result<PointerValue<'ctx>, BackendError> {
+        let pointer = self.context.ptr_type(AddressSpace::default());
+        let usize_type = self.context.ptr_sized_int_type(self.target_data, None);
+        match expression {
+            mir::ClassExpression::Local {
+                local, transfer, ..
+            } => {
+                let slot = local_slot(&self.local_slots, *local)?;
+                let value = build(self.builder.build_load(pointer, slot, "class.local"))?
+                    .into_pointer_value();
+                if *transfer {
+                    build(self.builder.build_store(slot, pointer.const_null()))?;
+                }
+                Ok(value)
+            }
+            mir::ClassExpression::Property {
+                object, property, ..
+            } => Ok(build(self.builder.build_load(
+                pointer,
+                self.lower_property_address(*object, *property)?,
+                "class.property",
+            ))?
+            .into_pointer_value()),
+            mir::ClassExpression::Call { function, args, .. } => Ok(self
+                .lower_call(*function, args, true)?
+                .ok_or_else(|| malformed_mir("class call produced no result"))?
+                .into_pointer_value()),
+            mir::ClassExpression::New {
+                class,
+                properties,
+                constructor,
+                args,
+            } => {
+                // Evaluate source arguments once, then share those values between
+                // promoted-property initialization and the lifecycle call.
+                let mut lowered_args = Vec::with_capacity(args.len());
+                let mut owned_strings = Vec::new();
+                for (index, argument) in args.iter().enumerate() {
+                    let value = self.lower_rvalue(argument)?;
+                    if matches!(argument.ty(), mir::Type::String | mir::Type::NullableString) {
+                        owned_strings.push((index, value.into_pointer_value()));
+                    }
+                    lowered_args.push(value);
+                }
+                let class_definition = class_definition(self.program, *class)?;
+                let size = class_definition.layout.size;
+                let align = class_definition.layout.align;
+                let object = self
+                    .call_runtime(
+                        CLASS_ALLOCATE,
+                        &[pointer.into(), usize_type.into(), usize_type.into()],
+                        Some(pointer.into()),
+                        &[
+                            self.current_frame.into(),
+                            usize_type.const_int(u64::from(size), false).into(),
+                            usize_type.const_int(u64::from(align), false).into(),
+                        ],
+                    )?
+                    .ok_or_else(|| backend_failure("class allocation produced no result"))?
+                    .into_pointer_value();
+                for property in properties {
+                    let value = match &property.source {
+                        mir::PropertyValueSource::Expression(value) => {
+                            Some(self.lower_rvalue(value)?)
+                        }
+                        mir::PropertyValueSource::ConstructorArgument(index) => {
+                            Some(*lowered_args.get(*index).ok_or_else(|| {
+                                malformed_mir(format!(
+                                    "constructor argument {index} does not exist"
+                                ))
+                            })?)
+                        }
+                        mir::PropertyValueSource::ConstructorBody => None,
+                    };
+                    let Some(value) = value else {
+                        continue;
+                    };
+                    let address =
+                        self.lower_property_address_from_value(object, property.property)?;
+                    build(self.builder.build_store(address, value))?;
+                }
+                if let Some(constructor) = constructor {
+                    let callee = *self.functions.get(constructor.0).ok_or_else(|| {
+                        malformed_mir(format!("function{} does not exist", constructor.0))
+                    })?;
+                    let mut constructor_args =
+                        Vec::<BasicMetadataValueEnum<'ctx>>::with_capacity(lowered_args.len() + 2);
+                    constructor_args.push(self.current_frame.into());
+                    constructor_args.push(object.into());
+                    constructor_args.extend(
+                        lowered_args
+                            .iter()
+                            .copied()
+                            .map(BasicMetadataValueEnum::from),
+                    );
+                    let call = build(self.builder.build_call(
+                        callee,
+                        &constructor_args,
+                        "constructor.call",
+                    ))?;
+                    apply_call_abi_attributes(
+                        self.context,
+                        call,
+                        function_in(self.program, *constructor)?,
+                    )?;
+                }
+                for (index, string) in owned_strings {
+                    let promoted = properties.iter().any(|property| {
+                        matches!(
+                            property.source,
+                            mir::PropertyValueSource::ConstructorArgument(argument)
+                                if argument == index
+                        )
+                    });
+                    if !promoted {
+                        self.release_string(string)?;
+                    }
+                }
+                Ok(object)
+            }
+        }
+    }
+
+    fn lower_property_address(
+        &self,
+        object: mir::LocalId,
+        property: crate::class_layout::PropertyId,
+    ) -> Result<PointerValue<'ctx>, BackendError> {
+        let pointer = self.context.ptr_type(AddressSpace::default());
+        let object = build(self.builder.build_load(
+            pointer,
+            local_slot(&self.local_slots, object)?,
+            "property.object",
+        ))?
+        .into_pointer_value();
+        self.lower_property_address_from_value(object, property)
+    }
+
+    fn lower_property_address_from_value(
+        &self,
+        object: PointerValue<'ctx>,
+        property: crate::class_layout::PropertyId,
+    ) -> Result<PointerValue<'ctx>, BackendError> {
+        let class = class_definition(self.program, property.class)?;
+        let layout = class
+            .layout
+            .properties
+            .iter()
+            .find(|layout| layout.id == property)
+            .ok_or_else(|| malformed_mir(format!("property{} has no layout", property.index)))?;
+        let offset = self
+            .context
+            .ptr_sized_int_type(self.target_data, None)
+            .const_int(u64::from(layout.offset), false);
+        unsafe {
+            build(self.builder.build_in_bounds_gep(
+                self.context.i8_type(),
+                object,
+                &[offset],
+                "property.address",
+            ))
         }
     }
 
@@ -556,6 +772,16 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     pointer,
                     local_slot(&self.local_slots, *local)?,
                     "nullable-string.local",
+                ))?
+                .into_pointer_value();
+                self.retain_string(value)
+            }
+            mir::NullableStringExpression::Property { object, property } => {
+                let address = self.lower_property_address(*object, *property)?;
+                let value = build(self.builder.build_load(
+                    pointer,
+                    address,
+                    "nullable-string.property",
                 ))?
                 .into_pointer_value();
                 self.retain_string(value)
@@ -638,6 +864,92 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         Ok(())
     }
 
+    fn cleanup_class_locals(&mut self) -> Result<(), BackendError> {
+        let pointer = self.context.ptr_type(AddressSpace::default());
+        let class_locals = self
+            .function
+            .locals
+            .iter()
+            .rev()
+            .filter_map(|local| match (local.owned, local.ty) {
+                (true, mir::Type::Class(class)) => Some((local.id, class)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        for (local, class) in class_locals {
+            let slot = local_slot(&self.local_slots, local)?;
+            let value = build(self.builder.build_load(pointer, slot, "class.cleanup"))?
+                .into_pointer_value();
+            build(self.builder.build_store(slot, pointer.const_null()))?;
+            self.drop_class_value_checked(value, class)?;
+        }
+        Ok(())
+    }
+
+    fn drop_class_value_checked(
+        &mut self,
+        object: PointerValue<'ctx>,
+        class: crate::class_layout::ClassId,
+    ) -> Result<(), BackendError> {
+        let function = current_function(&self.builder)?;
+        let drop_block = self.context.append_basic_block(function, "class.drop");
+        let continue_block = self
+            .context
+            .append_basic_block(function, "class.drop.continue");
+        let condition = build(self.builder.build_is_not_null(object, "class.has_object"))?;
+        build(
+            self.builder
+                .build_conditional_branch(condition, drop_block, continue_block),
+        )?;
+        self.builder.position_at_end(drop_block);
+        self.drop_class_value(object, class)?;
+        build(self.builder.build_unconditional_branch(continue_block))?;
+        self.builder.position_at_end(continue_block);
+        Ok(())
+    }
+
+    fn drop_class_value(
+        &mut self,
+        object: PointerValue<'ctx>,
+        class: crate::class_layout::ClassId,
+    ) -> Result<(), BackendError> {
+        let pointer = self.context.ptr_type(AddressSpace::default());
+        let class_definition = class_definition(self.program, class)?;
+        let destructor = class_definition.destructor;
+        let properties = class_definition.properties.clone();
+        if let Some(destructor) = destructor {
+            let callee = *self
+                .functions
+                .get(destructor.0)
+                .ok_or_else(|| malformed_mir(format!("function{} does not exist", destructor.0)))?;
+            let call = build(self.builder.build_call(
+                callee,
+                &[self.current_frame.into(), object.into()],
+                "class.destruct",
+            ))?;
+            apply_call_abi_attributes(self.context, call, function_in(self.program, destructor)?)?;
+        }
+        for property in properties.iter().rev() {
+            let address = self.lower_property_address_from_value(object, property.id)?;
+            match property.ty {
+                mir::Type::String | mir::Type::NullableString => {
+                    let value =
+                        build(self.builder.build_load(pointer, address, "property.string"))?
+                            .into_pointer_value();
+                    self.release_string(value)?;
+                }
+                mir::Type::Class(class) => {
+                    let value = build(self.builder.build_load(pointer, address, "property.class"))?
+                        .into_pointer_value();
+                    self.drop_class_value_checked(value, class)?;
+                }
+                mir::Type::Scalar(_) => {}
+            }
+        }
+        let _ = self.call_runtime(CLASS_FREE, &[pointer.into()], None, &[object.into()])?;
+        Ok(())
+    }
+
     fn retain_string_parameters(&self) -> Result<(), BackendError> {
         let pointer = self.context.ptr_type(AddressSpace::default());
         for parameter in &self.function.params {
@@ -694,6 +1006,12 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     "string.local",
                 ))?
                 .into_pointer_value();
+                self.retain_string(value)
+            }
+            mir::StringExpression::Property { object, property } => {
+                let address = self.lower_property_address(*object, *property)?;
+                let value = build(self.builder.build_load(pointer, address, "string.property"))?
+                    .into_pointer_value();
                 self.retain_string(value)
             }
             mir::StringExpression::Concat(parts) => {
@@ -1447,6 +1765,12 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 "integer.local",
             ))?
             .into_int_value()),
+            mir::Operand::Property { object, property } => Ok(build(self.builder.build_load(
+                integer_type(self.context, ty),
+                self.lower_property_address(*object, *property)?,
+                "integer.property",
+            ))?
+            .into_int_value()),
             _ => Err(malformed_mir(
                 "integer expression has an incompatible operand",
             )),
@@ -1469,6 +1793,15 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     },
                     local_slot(&self.local_slots, *local)?,
                     "float.local",
+                ))?
+                .into_float_value()),
+                mir::Operand::Property { object, property } => Ok(build(self.builder.build_load(
+                    match ty {
+                        FloatType::Float32 => self.context.f32_type(),
+                        FloatType::Float64 => self.context.f64_type(),
+                    },
+                    self.lower_property_address(*object, *property)?,
+                    "float.property",
                 ))?
                 .into_float_value()),
                 _ => Err(malformed_mir(
@@ -1567,6 +1900,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             .ok_or_else(|| malformed_mir(format!("function{} does not exist", function.0)))?;
         let mut values = Vec::<BasicMetadataValueEnum<'ctx>>::with_capacity(args.len() + 1);
         values.push(self.current_frame.into());
+        let mut lowered_args = Vec::with_capacity(args.len());
         let mut owned_strings = Vec::new();
         for argument in args {
             let value = self.lower_rvalue(argument)?;
@@ -1574,6 +1908,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 owned_strings.push(value.into_pointer_value());
             }
             values.push(value.into());
+            lowered_args.push(value);
         }
         let call = build(self.builder.build_call(callee, &values, "call"))?;
         apply_call_abi_attributes(self.context, call, function_in(self.program, function)?)?;
@@ -1586,6 +1921,24 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         };
         for string in owned_strings {
             self.release_string(string)?;
+        }
+        let callee_definition = function_in(self.program, function)?;
+        for (index, argument) in args.iter().enumerate().rev() {
+            let mir::Rvalue::Class(
+                mir::ClassExpression::New { class, .. } | mir::ClassExpression::Call { class, .. },
+            ) = argument
+            else {
+                continue;
+            };
+            let parameter = *callee_definition.params.get(index).ok_or_else(|| {
+                malformed_mir(format!(
+                    "function{} is missing parameter {index}",
+                    function.0
+                ))
+            })?;
+            if !local_in(callee_definition, parameter)?.owned {
+                self.drop_class_value_checked(lowered_args[index].into_pointer_value(), *class)?;
+            }
         }
         Ok(result)
     }
@@ -1860,6 +2213,12 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 "bool.local",
             ))?
             .into_int_value()),
+            mir::Operand::Property { object, property } => Ok(build(self.builder.build_load(
+                self.context.i8_type(),
+                self.lower_property_address(*object, *property)?,
+                "bool.property",
+            ))?
+            .into_int_value()),
             _ => Err(malformed_mir("bool expression has an incompatible operand")),
         }
     }
@@ -2074,6 +2433,28 @@ fn function_in(
         .ok_or_else(|| malformed_mir(format!("FunctionId function{} does not exist", id.0)))
 }
 
+fn class_definition(
+    program: &mir::Program,
+    class: crate::class_layout::ClassId,
+) -> Result<&mir::Class, BackendError> {
+    program
+        .classes
+        .get(class.0)
+        .filter(|definition| definition.id == class)
+        .ok_or_else(|| malformed_mir(format!("class#{} does not exist", class.0)))
+}
+
+fn property_definition(
+    program: &mir::Program,
+    property: crate::class_layout::PropertyId,
+) -> Result<&mir::Property, BackendError> {
+    class_definition(program, property.class)?
+        .properties
+        .get(property.index)
+        .filter(|definition| definition.id == property)
+        .ok_or_else(|| malformed_mir(format!("property{} does not exist", property.index)))
+}
+
 fn local_slot<'ctx>(
     slots: &[Option<PointerValue<'ctx>>],
     id: mir::LocalId,
@@ -2198,6 +2579,7 @@ fn resolve_string_expression_from_definitions(
         }
         mir::StringExpression::Display(_)
         | mir::StringExpression::Call { .. }
+        | mir::StringExpression::Property { .. }
         | mir::StringExpression::NullableLocalAssumeNonNull(_)
         | mir::StringExpression::ReadFile(_)
         | mir::StringExpression::Format(_) => {
@@ -2228,6 +2610,7 @@ fn resolve_string_expression(
         }
         mir::StringExpression::Display(_)
         | mir::StringExpression::Call { .. }
+        | mir::StringExpression::Property { .. }
         | mir::StringExpression::NullableLocalAssumeNonNull(_)
         | mir::StringExpression::ReadFile(_)
         | mir::StringExpression::Format(_) => {

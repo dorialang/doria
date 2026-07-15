@@ -1,0 +1,33 @@
+function initializeLabel(): string
+{
+    echo "property initializer\n";
+    return "ready";
+}
+
+class Message
+{
+    string $label = initializeLabel();
+    string $state;
+
+    function __construct(string $text)
+    {
+        echo "constructor ";
+        echo $this->label;
+        echo " ";
+        echo $this->text;
+        echo "\n";
+        $this->state = "initialized";
+    }
+
+    function __destruct()
+    {
+        echo "destructor ";
+        echo $this->state;
+        echo "\n";
+    }
+}
+
+function main(): void
+{
+    let $message = new Message("message");
+}

@@ -1,0 +1,12 @@
+drop token old
+drop token temporary
+drop token borrowed temporary
+drop token inner
+drop token continued
+drop token continued
+drop token early
+leaving scenario
+drop token replacement
+drop pair
+drop token second
+drop token first

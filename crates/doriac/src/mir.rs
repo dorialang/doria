@@ -92,6 +92,7 @@ pub struct Local {
     pub name: String,
     pub ty: Type,
     pub writable: bool,
+    pub owned: bool,
     pub synthetic: bool,
 }
 
@@ -120,6 +121,10 @@ pub struct BasicBlock {
 pub enum Operand {
     Scalar(ScalarValue),
     Local(LocalId),
+    Property {
+        object: LocalId,
+        property: PropertyId,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -146,6 +151,12 @@ pub enum ClassExpression {
     Local {
         class: ClassId,
         local: LocalId,
+        transfer: bool,
+    },
+    Property {
+        class: ClassId,
+        object: LocalId,
+        property: PropertyId,
     },
     Call {
         class: ClassId,
@@ -163,9 +174,10 @@ pub enum ClassExpression {
 impl ClassExpression {
     pub const fn class(&self) -> ClassId {
         match self {
-            Self::Local { class, .. } | Self::Call { class, .. } | Self::New { class, .. } => {
-                *class
-            }
+            Self::Local { class, .. }
+            | Self::Property { class, .. }
+            | Self::Call { class, .. }
+            | Self::New { class, .. } => *class,
         }
     }
 }
@@ -180,6 +192,7 @@ pub struct PropertyValue {
 pub enum PropertyValueSource {
     Expression(Rvalue),
     ConstructorArgument(usize),
+    ConstructorBody,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -332,6 +345,10 @@ pub enum StringExpression {
     Literal(String),
     Local(LocalId),
     NullableLocalAssumeNonNull(LocalId),
+    Property {
+        object: LocalId,
+        property: PropertyId,
+    },
     Concat(Vec<StringExpression>),
     Display(ValueExpression),
     Call {
@@ -347,6 +364,10 @@ pub enum NullableStringExpression {
     Null,
     String(StringExpression),
     Local(LocalId),
+    Property {
+        object: LocalId,
+        property: PropertyId,
+    },
     ReadLine,
     Call {
         function: FunctionId,
@@ -558,6 +579,13 @@ impl fmt::Display for Operand {
         match self {
             Operand::Scalar(value) => write!(formatter, "{value}"),
             Operand::Local(id) => write!(formatter, "local{}", id.0),
+            Operand::Property { object, property } => {
+                write!(
+                    formatter,
+                    "local{}->property#{}:{}",
+                    object.0, property.class.0, property.index
+                )
+            }
         }
     }
 }
@@ -576,7 +604,23 @@ impl fmt::Display for Rvalue {
 impl fmt::Display for ClassExpression {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Local { local, .. } => write!(formatter, "move local{}", local.0),
+            Self::Local {
+                local,
+                transfer: true,
+                ..
+            } => write!(formatter, "move local{}", local.0),
+            Self::Local {
+                local,
+                transfer: false,
+                ..
+            } => write!(formatter, "borrow local{}", local.0),
+            Self::Property {
+                object, property, ..
+            } => write!(
+                formatter,
+                "borrow local{}->property#{}:{}",
+                object.0, property.class.0, property.index
+            ),
             Self::Call {
                 class, function, ..
             } => {
@@ -652,6 +696,11 @@ impl fmt::Display for IntegerExpression {
             IntegerExpression::Use { ty, operand } => match operand {
                 Operand::Scalar(ScalarValue::Integer(value)) => write!(formatter, "{value}: {ty}"),
                 Operand::Local(id) => write!(formatter, "local{}: {ty}", id.0),
+                Operand::Property { object, property } => write!(
+                    formatter,
+                    "local{}->property{}: {ty}",
+                    object.0, property.index
+                ),
                 Operand::Scalar(_) => write!(formatter, "<malformed scalar>: {ty}"),
             },
             IntegerExpression::Unary { ty, op, operand } => {
@@ -694,6 +743,11 @@ impl fmt::Display for FloatExpression {
             Self::Use { ty, operand } => match operand {
                 Operand::Scalar(ScalarValue::Float(value)) => write!(formatter, "{value}: {ty}"),
                 Operand::Local(id) => write!(formatter, "local{}: {ty}", id.0),
+                Operand::Property { object, property } => write!(
+                    formatter,
+                    "local{}->property{}: {ty}",
+                    object.0, property.index
+                ),
                 Operand::Scalar(_) => write!(formatter, "<malformed scalar>: {ty}"),
             },
             Self::Negate { ty, operand } => write!(formatter, "(-{operand}): {ty}"),
@@ -722,6 +776,9 @@ impl fmt::Display for StringExpression {
             StringExpression::NullableLocalAssumeNonNull(id) => {
                 write!(formatter, "nonnull(local{})", id.0)
             }
+            StringExpression::Property { object, property } => {
+                write!(formatter, "local{}->property{}", object.0, property.index)
+            }
             StringExpression::Concat(parts) => {
                 write!(formatter, "(")?;
                 for (index, part) in parts.iter().enumerate() {
@@ -746,6 +803,9 @@ impl fmt::Display for NullableStringExpression {
             Self::Null => formatter.write_str("null"),
             Self::String(value) => write!(formatter, "some({value})"),
             Self::Local(local) => write!(formatter, "local{}", local.0),
+            Self::Property { object, property } => {
+                write!(formatter, "local{}->property{}", object.0, property.index)
+            }
             Self::ReadLine => formatter.write_str("read_line()"),
             Self::Call { function, args } => write_call(formatter, *function, args),
         }
@@ -781,6 +841,13 @@ impl fmt::Display for BoolExpression {
             Self::Use { operand } => match operand {
                 Operand::Scalar(ScalarValue::Bool(value)) => write!(formatter, "{value}: bool"),
                 Operand::Local(id) => write!(formatter, "local{}: bool", id.0),
+                Operand::Property { object, property } => {
+                    write!(
+                        formatter,
+                        "local{}->property{}: bool",
+                        object.0, property.index
+                    )
+                }
                 Operand::Scalar(_) => formatter.write_str("<malformed scalar>: bool"),
             },
             Self::Compare { op, left, right } => write!(formatter, "{left} {op} {right}"),

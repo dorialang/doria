@@ -67,6 +67,11 @@ pub unsafe extern "C" fn dr_v1_class_allocate(
         static MESSAGE: &[u8] = b"class allocation failed";
         dr_v1_panic(current_frame, MESSAGE.as_ptr(), MESSAGE.len());
     }
+    // Stage 19 constructors may initialize a proven subset of fields in their
+    // body. Zeroing the private payload keeps replacement-style stores safe
+    // before those slots acquire their first owned value; no zeroed slot is
+    // observable as a Doria value before construction completes.
+    ptr::write_bytes(payload, 0, byte_length.max(1));
     payload
 }
 
@@ -1132,6 +1137,9 @@ mod tests {
                 let payload = dr_v1_class_allocate(ptr::null(), size, 8);
                 assert!(!payload.is_null());
                 if size > 0 {
+                    assert!(core::slice::from_raw_parts(payload, size)
+                        .iter()
+                        .all(|byte| *byte == 0));
                     ptr::write_bytes(payload, 0xa5, size);
                 }
                 dr_v1_class_free(payload);

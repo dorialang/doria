@@ -83,6 +83,7 @@ fn shared_validator_rejects_scalar_string_assignment_mixing() {
         ty: Type::String,
         writable: true,
         synthetic: false,
+        owned: false,
     });
     program.functions[0].blocks[0]
         .statements
@@ -124,6 +125,7 @@ fn shared_validator_rejects_nullable_rvalue_assigned_to_plain_string() {
         ty: Type::String,
         writable: true,
         synthetic: false,
+        owned: false,
     });
     program.functions[0].blocks[0]
         .statements
@@ -192,6 +194,7 @@ fn shared_validator_requires_class_calls_to_return_the_declared_class() {
             terminator: Terminator::Return(Rvalue::Class(ClassExpression::Local {
                 class: ClassId(1),
                 local: LocalId(0),
+                transfer: true,
             })),
         }],
         entry_block: BlockId(0),
@@ -235,6 +238,7 @@ fn shared_validator_skips_the_implicit_constructor_receiver() {
                 ty: Type::String,
                 writable: false,
                 synthetic: false,
+                owned: false,
             },
         ],
         blocks: vec![BasicBlock {
@@ -344,6 +348,7 @@ fn shared_validator_requires_class_properties_in_construction_order() {
         ty: Type::String,
         writable: false,
         synthetic: false,
+        owned: false,
     });
     let Statement::AssignLocal {
         value: Rvalue::Class(ClassExpression::New {
@@ -466,6 +471,114 @@ fn shared_validator_checks_lifecycle_metadata_even_when_unused() {
     assert!(error.message.contains("does not return void"));
 }
 
+#[test]
+fn shared_validator_rejects_transfers_into_borrowed_class_parameters() {
+    let mut program = class_program();
+    program.functions[0].locals.push(class_local(0, ClassId(0)));
+    program.functions[0].blocks[0]
+        .statements
+        .push(Statement::CallVoid {
+            function: FunctionId(1),
+            args: vec![Rvalue::Class(ClassExpression::Local {
+                class: ClassId(0),
+                local: LocalId(0),
+                transfer: true,
+            })],
+        });
+    let mut borrowed = class_local(0, ClassId(0));
+    borrowed.owned = false;
+    program.functions.push(Function {
+        id: FunctionId(1),
+        name: "inspect".to_string(),
+        params: vec![LocalId(0)],
+        return_type: ReturnType::Void,
+        locals: vec![borrowed],
+        blocks: vec![BasicBlock {
+            id: BlockId(0),
+            statements: vec![],
+            terminator: Terminator::ReturnVoid,
+        }],
+        entry_block: BlockId(0),
+    });
+
+    let error = doriac::mir_validation::validate_program(&program)
+        .expect_err("a transfer cannot masquerade as a borrowed call argument");
+    assert!(error
+        .message
+        .contains("transfers argument 1 into a borrowed parameter"));
+}
+
+#[test]
+fn shared_validator_rejects_borrows_into_owned_class_parameters() {
+    let mut program = class_program();
+    program.functions[0].locals.push(class_local(0, ClassId(0)));
+    program.functions[0].blocks[0]
+        .statements
+        .push(Statement::CallVoid {
+            function: FunctionId(1),
+            args: vec![Rvalue::Class(ClassExpression::Local {
+                class: ClassId(0),
+                local: LocalId(0),
+                transfer: false,
+            })],
+        });
+    program.functions.push(Function {
+        id: FunctionId(1),
+        name: "consume".to_string(),
+        params: vec![LocalId(0)],
+        return_type: ReturnType::Void,
+        locals: vec![class_local(0, ClassId(0))],
+        blocks: vec![BasicBlock {
+            id: BlockId(0),
+            statements: vec![],
+            terminator: Terminator::ReturnVoid,
+        }],
+        entry_block: BlockId(0),
+    });
+
+    let error = doriac::mir_validation::validate_program(&program)
+        .expect_err("an owned call parameter cannot receive a borrowed class value");
+    assert!(error
+        .message
+        .contains("borrows argument 1 for an owned parameter"));
+}
+
+#[test]
+fn shared_validator_rejects_cleanup_and_assignment_of_borrowed_class_locals() {
+    let mut drop_program = class_program();
+    let mut borrowed = class_local(0, ClassId(0));
+    borrowed.owned = false;
+    drop_program.functions[0].locals.push(borrowed.clone());
+    drop_program.functions[0].blocks[0]
+        .statements
+        .push(Statement::DropClass {
+            local: LocalId(0),
+            class: ClassId(0),
+        });
+    let error = doriac::mir_validation::validate_program(&drop_program)
+        .expect_err("borrowed locals have no cleanup obligation");
+    assert!(error.message.contains("references borrowed local0"));
+
+    let mut assign_program = class_program();
+    assign_program.functions[0].locals.push(borrowed);
+    assign_program.functions[0].blocks[0]
+        .statements
+        .push(Statement::AssignLocal {
+            target: LocalId(0),
+            value: Rvalue::Class(ClassExpression::New {
+                class: ClassId(0),
+                properties: vec![],
+                constructor: None,
+                args: vec![],
+            }),
+        });
+    let error = doriac::mir_validation::validate_program(&assign_program)
+        .expect_err("borrowed class slots cannot become owners through assignment");
+    assert!(error
+        .message
+        .contains("assignment targets borrowed local local0"));
+}
+
 fn decimal_spec() -> FormatSpec {
     FormatSpec {
         conversion: FormatConversion::Decimal,
@@ -519,6 +632,7 @@ fn class_local(index: usize, class: ClassId) -> Local {
         ty: Type::Class(class),
         writable: false,
         synthetic: false,
+        owned: true,
     }
 }
 
@@ -565,6 +679,7 @@ fn class_new_program() -> Program {
                 ty: Type::String,
                 writable: false,
                 synthetic: false,
+                owned: false,
             },
         ],
         blocks: vec![BasicBlock {

@@ -136,6 +136,13 @@ jobs:
           (cd "$work" && valgrind --leak-check=full --show-leak-kinds=all --errors-for-leak-kinds=definite,indirect --error-exitcode=1 ./program < "$GITHUB_WORKSPACE/crates/doriac/tests/fixtures/native_io/main_stage17_io_stress/stdin")
           rm -rf "$work"
 
+      - name: Leak-check Stage 19 Cranelift class ownership and destruction
+        run: |
+          for name in main_stage19_destructor_order main_stage19_initialization_order main_stage19_raii_guard main_stage19_playground_message; do
+            cargo run -p doriac -- compile "examples/native/${name}.doria" --out "build/native/${name}"
+            valgrind --leak-check=full --show-leak-kinds=all --errors-for-leak-kinds=definite,indirect --track-origins=yes --error-exitcode=1 "build/native/${name}"
+          done
+
       - name: Smoke signed and unsigned narrow-width native fixtures
         run: |
           cargo run -p doriac -- compile examples/native/main_integer_div_mod_42.doria --target native --out build/native/main_integer_div_mod_42
@@ -334,6 +341,15 @@ jobs:
           cp build/native/main_stage17_io_stress_release "$work/program"
           (cd "$work" && valgrind --leak-check=full --show-leak-kinds=all --errors-for-leak-kinds=definite,indirect --error-exitcode=1 ./program < "$GITHUB_WORKSPACE/crates/doriac/tests/fixtures/native_io/main_stage17_io_stress/stdin")
           rm -rf "$work"
+
+      - name: Leak-check Stage 19 LLVM class ownership and destruction
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          for name in main_stage19_destructor_order main_stage19_initialization_order main_stage19_raii_guard main_stage19_playground_message; do
+            cargo run -p doriac --features llvm-backend -- compile "examples/native/${name}.doria" --release --out "build/native/${name}_release"
+            valgrind --leak-check=full --show-leak-kinds=all --errors-for-leak-kinds=definite,indirect --track-origins=yes --error-exitcode=1 "build/native/${name}_release"
+          done
 
       - name: Smoke LLVM release profile and panic parity on Unix
         if: runner.os != 'Windows'

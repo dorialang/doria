@@ -1,0 +1,22 @@
+class Message
+{
+    function __construct(string $text)
+    {
+    }
+
+    function __destruct()
+    {
+        echo "message released\n";
+    }
+}
+
+function deliver(take Message $message): void
+{
+    echo $message->text . "\n";
+}
+
+function main(): void
+{
+    let $message = new Message("Welcome to Doria");
+    deliver($message);
+}

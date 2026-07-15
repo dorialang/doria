@@ -1,0 +1,28 @@
+class RawModeGuard
+{
+    function __construct(string $label)
+    {
+        echo "enable ";
+        echo $this->label;
+        echo " raw mode\n";
+    }
+
+    function __destruct()
+    {
+        echo "restore ";
+        echo $this->label;
+        echo "\n";
+    }
+}
+
+function run_screen(): void
+{
+    let $guard = new RawModeGuard("terminal");
+    echo "screen work\n";
+    return;
+}
+
+function main(): void
+{
+    run_screen();
+}

@@ -1,5 +1,5 @@
 # Durable executable source of truth for accepted native behavior.
-# Highest completed stage: Stage 17
+# Highest completed stage: Stage 19
 examples/native/main_add_overflow_panic.doria
 examples/native/main_arithmetic_42.doria
 examples/native/main_bitwise_42.doria
@@ -78,6 +78,10 @@ examples/native/main_signed_division_overflow_panic.doria
 examples/native/main_signed_shift_42.doria
 examples/native/main_sprintf_matrix.doria
 examples/native/main_stage17_io_stress.doria
+examples/native/main_stage19_destructor_order.doria
+examples/native/main_stage19_initialization_order.doria
+examples/native/main_stage19_playground_message.doria
+examples/native/main_stage19_raii_guard.doria
 examples/native/main_string_concat_hello.doria
 examples/native/main_string_comparison_42.doria
 examples/native/main_string_local_hello.doria

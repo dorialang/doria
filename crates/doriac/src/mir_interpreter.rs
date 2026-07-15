@@ -49,6 +49,10 @@ enum LocalValue {
     Scalar(mir::ScalarValue),
     String(String),
     NullableString(Option<String>),
+    Class {
+        object: usize,
+        class: crate::class_layout::ClassId,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -56,6 +60,16 @@ enum EvaluationValue {
     Scalar(mir::ScalarValue),
     String(String),
     NullableString(Option<String>),
+    Class {
+        object: usize,
+        class: crate::class_layout::ClassId,
+    },
+}
+
+#[derive(Debug, Clone)]
+struct ObjectValue {
+    class: crate::class_layout::ClassId,
+    properties: Vec<Option<LocalValue>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,6 +84,18 @@ enum EvaluationTask {
     Value(mir::ValueExpression),
     String(mir::StringExpression),
     NullableString(mir::NullableStringExpression),
+    Class(mir::ClassExpression),
+    BuildClassNew {
+        class: crate::class_layout::ClassId,
+        properties: Vec<mir::PropertyValue>,
+        constructor: Option<mir::FunctionId>,
+        argument_count: usize,
+        property_expression_count: usize,
+    },
+    FinishClassNew {
+        object: usize,
+        class: crate::class_layout::ClassId,
+    },
     BuildNullableSome,
     NullableStringCompare(mir::CompareOp),
     Format(mir::FormatExpression),
@@ -101,9 +127,30 @@ enum EvaluationTask {
         function: mir::FunctionId,
         argument_count: usize,
         expectation: ReturnExpectation,
+        temporary_class_args: Vec<bool>,
     },
+    DropTemporaryClasses(Vec<(usize, crate::class_layout::ClassId)>),
     Assign(mir::LocalId),
+    AssignProperty {
+        object: mir::LocalId,
+        property: crate::class_layout::PropertyId,
+    },
+    DropClass(mir::LocalId),
+    DropObject {
+        object: usize,
+        class: crate::class_layout::ClassId,
+    },
+    DropObjectProperties {
+        object: usize,
+        class: crate::class_layout::ClassId,
+    },
+    FreeObject {
+        object: usize,
+        class: crate::class_layout::ClassId,
+    },
+    CleanupFrame,
     ReturnValue(mir::Type),
+    ReturnVoid,
     Branch {
         then_block: mir::BlockId,
         else_block: mir::BlockId,
@@ -128,6 +175,8 @@ struct Interpreter<'program> {
     stdin: Vec<u8>,
     stdin_cursor: usize,
     files: BTreeMap<String, Vec<u8>>,
+    heap: BTreeMap<usize, ObjectValue>,
+    next_object: usize,
     frames: Vec<CallFrame>,
     limits: InterpreterLimits,
     executed_blocks: usize,
@@ -188,6 +237,8 @@ fn interpret_internal(
         stdin: io.stdin,
         stdin_cursor: 0,
         files: io.files,
+        heap: BTreeMap::new(),
+        next_object: 1,
         frames: Vec::new(),
         limits,
         executed_blocks: 0,
@@ -301,9 +352,16 @@ impl Interpreter<'_> {
                             target.0
                         )));
                     }
+                    (mir::Type::Class(expected), mir::Rvalue::Class(expression))
+                        if expression.class() == expected =>
+                    {
+                        let frame = self.current_frame_mut()?;
+                        frame.tasks.push(EvaluationTask::Assign(target));
+                        frame.tasks.push(EvaluationTask::Class(expression));
+                    }
                     (mir::Type::Class(_), _) => {
                         return Err(InterpreterError::new(
-                            "class assignment reached the interpreter before class lowering completed",
+                            "MIR class local received a non-class value",
                         ));
                     }
                 }
@@ -335,10 +393,21 @@ impl Interpreter<'_> {
                 frame.tasks.push(EvaluationTask::WriteStderr);
                 frame.tasks.push(EvaluationTask::String(value));
             }
-            mir::Statement::AssignProperty { .. } | mir::Statement::DropClass { .. } => {
-                return Err(InterpreterError::new(
-                    "class operation reached the interpreter before class lowering completed",
-                ));
+            mir::Statement::AssignProperty {
+                object,
+                property,
+                value,
+            } => {
+                let frame = self.current_frame_mut()?;
+                frame
+                    .tasks
+                    .push(EvaluationTask::AssignProperty { object, property });
+                frame.tasks.push(EvaluationTask::Rvalue(value));
+            }
+            mir::Statement::DropClass { local, .. } => {
+                self.current_frame_mut()?
+                    .tasks
+                    .push(EvaluationTask::DropClass(local));
             }
         }
         Ok(StepOutcome::Continue)
@@ -366,6 +435,7 @@ impl Interpreter<'_> {
                 }
                 let frame = self.current_frame_mut()?;
                 frame.tasks.push(EvaluationTask::ReturnValue(expected));
+                frame.tasks.push(EvaluationTask::CleanupFrame);
                 frame.tasks.push(EvaluationTask::Rvalue(operand));
                 Ok(StepOutcome::Continue)
             }
@@ -376,7 +446,10 @@ impl Interpreter<'_> {
                         function.name
                     )));
                 }
-                self.complete_frame(FunctionOutcome::Void)
+                let frame = self.current_frame_mut()?;
+                frame.tasks.push(EvaluationTask::ReturnVoid);
+                frame.tasks.push(EvaluationTask::CleanupFrame);
+                Ok(StepOutcome::Continue)
             }
             mir::Terminator::Panic(message) => {
                 let frame = self.current_frame_mut()?;
@@ -423,11 +496,10 @@ impl Interpreter<'_> {
                     .current_frame_mut()?
                     .tasks
                     .push(EvaluationTask::NullableString(value)),
-                mir::Rvalue::Class(_) => {
-                    return Err(InterpreterError::new(
-                        "class value reached the interpreter before class lowering completed",
-                    ));
-                }
+                mir::Rvalue::Class(value) => self
+                    .current_frame_mut()?
+                    .tasks
+                    .push(EvaluationTask::Class(value)),
             },
             EvaluationTask::Value(expression) => match expression {
                 mir::ValueExpression::Integer(value) => {
@@ -449,6 +521,88 @@ impl Interpreter<'_> {
             EvaluationTask::String(expression) => self.expand_string_expression(expression)?,
             EvaluationTask::NullableString(expression) => {
                 self.expand_nullable_string_expression(expression)?
+            }
+            EvaluationTask::Class(expression) => self.expand_class_expression(expression)?,
+            EvaluationTask::BuildClassNew {
+                class,
+                properties,
+                constructor,
+                argument_count,
+                property_expression_count,
+            } => {
+                let property_expressions = self.take_call_arguments(property_expression_count)?;
+                let arguments = self.take_call_arguments(argument_count)?;
+                let object_id = self.next_object;
+                self.next_object += 1;
+                let class_definition = self.program.classes.get(class.0).ok_or_else(|| {
+                    InterpreterError::new(format!("MIR class#{} does not exist", class.0))
+                })?;
+                let mut slots = vec![None; class_definition.properties.len()];
+                let mut expression_values = property_expressions.into_iter();
+                for property in properties {
+                    let value = match property.source {
+                        mir::PropertyValueSource::Expression(_) => {
+                            expression_values.next().ok_or_else(|| {
+                                InterpreterError::new(
+                                    "MIR class construction produced too few property values",
+                                )
+                            })?
+                        }
+                        mir::PropertyValueSource::ConstructorArgument(index) => {
+                            arguments.get(index).cloned().ok_or_else(|| {
+                                InterpreterError::new(format!(
+                                    "MIR constructor argument {index} does not exist"
+                                ))
+                            })?
+                        }
+                        mir::PropertyValueSource::ConstructorBody => continue,
+                    };
+                    let slot = slots.get_mut(property.property.index).ok_or_else(|| {
+                        InterpreterError::new(format!(
+                            "MIR property{} does not exist",
+                            property.property.index
+                        ))
+                    })?;
+                    *slot = Some(value);
+                }
+                self.heap.insert(
+                    object_id,
+                    ObjectValue {
+                        class,
+                        properties: slots,
+                    },
+                );
+                if let Some(constructor) = constructor {
+                    let mut constructor_arguments = Vec::with_capacity(arguments.len() + 1);
+                    constructor_arguments.push(LocalValue::Class {
+                        object: object_id,
+                        class,
+                    });
+                    constructor_arguments.extend(arguments);
+                    self.current_frame_mut()?
+                        .tasks
+                        .push(EvaluationTask::FinishClassNew {
+                            object: object_id,
+                            class,
+                        });
+                    self.push_frame(
+                        constructor,
+                        &constructor_arguments,
+                        Some(ReturnExpectation::Void),
+                    )?;
+                } else {
+                    self.current_frame_mut()?
+                        .values
+                        .push(EvaluationValue::Class {
+                            object: object_id,
+                            class,
+                        });
+                }
+            }
+            EvaluationTask::FinishClassNew { object, class } => {
+                self.current_frame_mut()?
+                    .values
+                    .push(EvaluationValue::Class { object, class });
             }
             EvaluationTask::BuildNullableSome => {
                 let value = self.pop_string()?;
@@ -660,19 +814,75 @@ impl Interpreter<'_> {
                 function,
                 argument_count,
                 expectation,
+                temporary_class_args,
             } => {
                 let args = self.take_call_arguments(argument_count)?;
+                let mut drops = Vec::new();
+                for (argument, temporary) in args.iter().zip(temporary_class_args) {
+                    if !temporary {
+                        continue;
+                    }
+                    let LocalValue::Class { object, class } = argument else {
+                        return Err(InterpreterError::new(
+                            "MIR temporary-class call argument produced another value type",
+                        ));
+                    };
+                    drops.push((*object, *class));
+                }
+                if !drops.is_empty() {
+                    self.current_frame_mut()?
+                        .tasks
+                        .push(EvaluationTask::DropTemporaryClasses(drops));
+                }
                 self.push_frame(function, &args, Some(expectation))?;
+            }
+            EvaluationTask::DropTemporaryClasses(drops) => {
+                let frame = self.current_frame_mut()?;
+                for (object, class) in drops {
+                    frame
+                        .tasks
+                        .push(EvaluationTask::DropObject { object, class });
+                }
             }
             EvaluationTask::Assign(target) => {
                 let value = self.pop_local_value()?;
                 let function = function_in(self.program, self.current_frame()?.function)?;
-                assign_local(
+                let old = assign_local(
                     &function.locals,
                     &mut self.current_frame_mut()?.locals,
                     target,
                     value,
                 )?;
+                if let Some(LocalValue::Class { object, class }) = old {
+                    self.current_frame_mut()?
+                        .tasks
+                        .push(EvaluationTask::DropObject { object, class });
+                }
+            }
+            EvaluationTask::AssignProperty { object, property } => {
+                let value = self.pop_local_value()?;
+                if let Some(LocalValue::Class { object, class }) =
+                    self.assign_property(object, property, value)?
+                {
+                    self.current_frame_mut()?
+                        .tasks
+                        .push(EvaluationTask::DropObject { object, class });
+                }
+            }
+            EvaluationTask::DropClass(local) => {
+                self.drop_class_local(local)?;
+            }
+            EvaluationTask::DropObject { object, class } => {
+                self.queue_object_drop(object, class)?;
+            }
+            EvaluationTask::DropObjectProperties { object, class } => {
+                self.queue_object_property_drops(object, class)?;
+            }
+            EvaluationTask::FreeObject { object, class } => {
+                self.free_object(object, class)?;
+            }
+            EvaluationTask::CleanupFrame => {
+                self.cleanup_current_frame()?;
             }
             EvaluationTask::ReturnValue(expected) => {
                 let value = self.pop_local_value()?;
@@ -683,6 +893,9 @@ impl Interpreter<'_> {
                     )));
                 }
                 return self.complete_frame(FunctionOutcome::Value(value));
+            }
+            EvaluationTask::ReturnVoid => {
+                return self.complete_frame(FunctionOutcome::Void);
             }
             EvaluationTask::Branch {
                 then_block,
@@ -706,7 +919,7 @@ impl Interpreter<'_> {
     ) -> Result<(), InterpreterError> {
         match expression {
             mir::IntegerExpression::Use { ty, operand } => {
-                let value = eval_operand(&operand, &self.current_frame()?.locals)?;
+                let value = self.eval_operand(&operand)?;
                 let mir::ScalarValue::Integer(value) = value else {
                     return Err(InterpreterError::new(
                         "MIR integer operand produced another scalar type",
@@ -783,7 +996,7 @@ impl Interpreter<'_> {
     ) -> Result<(), InterpreterError> {
         match expression {
             mir::FloatExpression::Use { ty, operand } => {
-                let value = eval_operand(&operand, &self.current_frame()?.locals)?;
+                let value = self.eval_operand(&operand)?;
                 let mir::ScalarValue::Float(value) = value else {
                     return Err(InterpreterError::new(
                         "MIR float operand produced another scalar type",
@@ -832,7 +1045,7 @@ impl Interpreter<'_> {
     ) -> Result<(), InterpreterError> {
         match condition {
             mir::BoolExpression::Use { operand } => {
-                let value = eval_operand(&operand, &self.current_frame()?.locals)?;
+                let value = self.eval_operand(&operand)?;
                 if !matches!(value, mir::ScalarValue::Bool(_)) {
                     return Err(InterpreterError::new(
                         "MIR bool operand produced another scalar type",
@@ -930,6 +1143,12 @@ impl Interpreter<'_> {
                             id.0
                         )))
                     }
+                    LocalValue::Class { .. } => {
+                        return Err(InterpreterError::new(format!(
+                            "MIR class local local{} was used as a string value",
+                            id.0
+                        )))
+                    }
                 }
             }
             mir::StringExpression::NullableLocalAssumeNonNull(id) => {
@@ -944,6 +1163,17 @@ impl Interpreter<'_> {
                         return Err(InterpreterError::new(
                             "MIR nonnull string expression references another local type",
                         ))
+                    }
+                }
+            }
+            mir::StringExpression::Property { object, property } => {
+                match self.read_property(object, property)? {
+                    LocalValue::String(value) => self.push_string(value)?,
+                    _ => {
+                        return Err(InterpreterError::new(format!(
+                            "MIR property{} was used as a string value",
+                            property.index
+                        )))
                     }
                 }
             }
@@ -1001,6 +1231,17 @@ impl Interpreter<'_> {
                     }
                 }
             }
+            mir::NullableStringExpression::Property { object, property } => {
+                match self.read_property(object, property)? {
+                    LocalValue::NullableString(value) => self.push_nullable_string(value)?,
+                    _ => {
+                        return Err(InterpreterError::new(format!(
+                            "MIR property{} was used as a nullable string value",
+                            property.index
+                        )))
+                    }
+                }
+            }
             mir::NullableStringExpression::ReadLine => {
                 if self.stdin_cursor == self.stdin.len() {
                     self.push_nullable_string(None)?;
@@ -1030,6 +1271,123 @@ impl Interpreter<'_> {
         Ok(())
     }
 
+    fn expand_class_expression(
+        &mut self,
+        expression: mir::ClassExpression,
+    ) -> Result<(), InterpreterError> {
+        match expression {
+            mir::ClassExpression::Local {
+                class,
+                local,
+                transfer,
+            } => {
+                let value = if transfer {
+                    self.current_frame_mut()?
+                        .locals
+                        .get_mut(local.0)
+                        .ok_or_else(|| {
+                            InterpreterError::new(format!(
+                                "MIR local local{} does not exist",
+                                local.0
+                            ))
+                        })?
+                        .take()
+                        .ok_or_else(|| {
+                            InterpreterError::new(format!(
+                                "MIR local local{} was moved before use",
+                                local.0
+                            ))
+                        })?
+                } else {
+                    read_local(&self.current_frame()?.locals, local)?.clone()
+                };
+                if local_value_type(&value) != mir::Type::Class(class) {
+                    return Err(InterpreterError::new(format!(
+                        "MIR class expression expected class#{}, got {}",
+                        class.0,
+                        local_value_type(&value)
+                    )));
+                }
+                let LocalValue::Class { object, class } = value else {
+                    unreachable!("checked class local value")
+                };
+                self.current_frame_mut()?
+                    .values
+                    .push(EvaluationValue::Class { object, class });
+            }
+            mir::ClassExpression::Property {
+                class,
+                object,
+                property,
+            } => {
+                let value = self.read_property(object, property)?;
+                let LocalValue::Class {
+                    object,
+                    class: actual,
+                } = value
+                else {
+                    return Err(InterpreterError::new(format!(
+                        "MIR property{} was used as a class value",
+                        property.index
+                    )));
+                };
+                if actual != class {
+                    return Err(InterpreterError::new(format!(
+                        "MIR class property produced class#{}, expected class#{}",
+                        actual.0, class.0
+                    )));
+                }
+                self.current_frame_mut()?
+                    .values
+                    .push(EvaluationValue::Class {
+                        object,
+                        class: actual,
+                    });
+            }
+            mir::ClassExpression::Call {
+                class,
+                function,
+                args,
+            } => {
+                self.queue_call(
+                    function,
+                    args,
+                    ReturnExpectation::Value(mir::Type::Class(class)),
+                )?;
+            }
+            mir::ClassExpression::New {
+                class,
+                properties,
+                constructor,
+                args,
+            } => {
+                let property_expression_count = properties
+                    .iter()
+                    .filter(|property| {
+                        matches!(property.source, mir::PropertyValueSource::Expression(_))
+                    })
+                    .count();
+                let frame = self.current_frame_mut()?;
+                frame.tasks.push(EvaluationTask::BuildClassNew {
+                    class,
+                    properties: properties.clone(),
+                    constructor,
+                    argument_count: args.len(),
+                    property_expression_count,
+                });
+                for property in properties.into_iter().rev() {
+                    if let mir::PropertyValueSource::Expression(value) = property.source {
+                        frame.tasks.push(EvaluationTask::Rvalue(value));
+                    }
+                }
+                for argument in args.into_iter().rev() {
+                    frame.tasks.push(EvaluationTask::Rvalue(argument));
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn queue_value_assignment(
         &mut self,
         target: mir::LocalId,
@@ -1047,11 +1405,25 @@ impl Interpreter<'_> {
         args: Vec<mir::Rvalue>,
         expectation: ReturnExpectation,
     ) -> Result<(), InterpreterError> {
+        let callee = function_in(self.program, function)?;
+        let temporary_class_args = args
+            .iter()
+            .zip(&callee.params)
+            .map(|(argument, parameter)| {
+                matches!(
+                    argument,
+                    mir::Rvalue::Class(
+                        mir::ClassExpression::New { .. } | mir::ClassExpression::Call { .. }
+                    )
+                ) && !local_in(callee, *parameter).is_ok_and(|local| local.owned)
+            })
+            .collect();
         let frame = self.current_frame_mut()?;
         frame.tasks.push(EvaluationTask::Invoke {
             function,
             argument_count: args.len(),
             expectation,
+            temporary_class_args,
         });
         for argument in args.into_iter().rev() {
             frame.tasks.push(EvaluationTask::Rvalue(argument));
@@ -1102,7 +1474,7 @@ impl Interpreter<'_> {
                     local_value_type(&value)
                 )));
             }
-            assign_local(&function.locals, &mut locals, *parameter, value)?;
+            let _ = assign_local(&function.locals, &mut locals, *parameter, value)?;
         }
         block_in(function, function.entry_block)?;
         self.frames.push(CallFrame {
@@ -1141,6 +1513,7 @@ impl Interpreter<'_> {
                     LocalValue::Scalar(value) => EvaluationValue::Scalar(value),
                     LocalValue::String(value) => EvaluationValue::String(value),
                     LocalValue::NullableString(value) => EvaluationValue::NullableString(value),
+                    LocalValue::Class { object, class } => EvaluationValue::Class { object, class },
                 });
             }
             (ReturnExpectation::Void, FunctionOutcome::Void) => {}
@@ -1186,6 +1559,7 @@ impl Interpreter<'_> {
                 EvaluationValue::Scalar(value) => Ok(LocalValue::Scalar(value)),
                 EvaluationValue::String(value) => Ok(LocalValue::String(value)),
                 EvaluationValue::NullableString(value) => Ok(LocalValue::NullableString(value)),
+                EvaluationValue::Class { object, class } => Ok(LocalValue::Class { object, class }),
             })
             .collect()
     }
@@ -1205,6 +1579,9 @@ impl Interpreter<'_> {
             )),
             Some(EvaluationValue::NullableString(_)) => Err(InterpreterError::new(
                 "MIR scalar evaluation produced a nullable string",
+            )),
+            Some(EvaluationValue::Class { .. }) => Err(InterpreterError::new(
+                "MIR scalar evaluation produced a class",
             )),
             None => Err(InterpreterError::new(
                 "MIR scalar evaluation produced no value",
@@ -1227,6 +1604,9 @@ impl Interpreter<'_> {
             )),
             Some(EvaluationValue::NullableString(_)) => Err(InterpreterError::new(
                 "MIR string evaluation produced a nullable string",
+            )),
+            Some(EvaluationValue::Class { .. }) => Err(InterpreterError::new(
+                "MIR string evaluation produced a class",
             )),
             None => Err(InterpreterError::new(
                 "MIR string evaluation produced no value",
@@ -1271,6 +1651,9 @@ impl Interpreter<'_> {
             Some(EvaluationValue::Scalar(value)) => Ok(LocalValue::Scalar(value)),
             Some(EvaluationValue::String(value)) => Ok(LocalValue::String(value)),
             Some(EvaluationValue::NullableString(value)) => Ok(LocalValue::NullableString(value)),
+            Some(EvaluationValue::Class { object, class }) => {
+                Ok(LocalValue::Class { object, class })
+            }
             None => Err(InterpreterError::new("MIR evaluation produced no value")),
         }
     }
@@ -1300,6 +1683,222 @@ impl Interpreter<'_> {
                 "MIR bool evaluation produced another scalar type",
             )),
         }
+    }
+
+    fn eval_operand(&self, operand: &mir::Operand) -> Result<mir::ScalarValue, InterpreterError> {
+        match operand {
+            mir::Operand::Scalar(value) => Ok(*value),
+            mir::Operand::Local(id) => match read_local(&self.current_frame()?.locals, *id)? {
+                LocalValue::Scalar(value) => Ok(*value),
+                LocalValue::String(_) => Err(InterpreterError::new(format!(
+                    "MIR string local local{} was used as a scalar value",
+                    id.0
+                ))),
+                LocalValue::NullableString(_) => Err(InterpreterError::new(format!(
+                    "MIR nullable-string local local{} was used as a scalar value",
+                    id.0
+                ))),
+                LocalValue::Class { .. } => Err(InterpreterError::new(format!(
+                    "MIR class local local{} was used as a scalar value",
+                    id.0
+                ))),
+            },
+            mir::Operand::Property { object, property } => {
+                match self.read_property(*object, *property)? {
+                    LocalValue::Scalar(value) => Ok(value),
+                    _ => Err(InterpreterError::new(format!(
+                        "MIR property{} was used as a scalar value",
+                        property.index
+                    ))),
+                }
+            }
+        }
+    }
+
+    fn read_property(
+        &self,
+        object: mir::LocalId,
+        property: crate::class_layout::PropertyId,
+    ) -> Result<LocalValue, InterpreterError> {
+        let object_id = match read_local(&self.current_frame()?.locals, object)? {
+            LocalValue::Class { object, .. } => *object,
+            _ => {
+                return Err(InterpreterError::new(format!(
+                    "MIR property access uses non-class local local{}",
+                    object.0
+                )))
+            }
+        };
+        let object_value = self.heap.get(&object_id).ok_or_else(|| {
+            InterpreterError::new(format!("MIR object {object_id} is not allocated"))
+        })?;
+        if object_value.class != property.class {
+            return Err(InterpreterError::new(format!(
+                "MIR property access expected class#{} but object has class#{}",
+                property.class.0, object_value.class.0
+            )));
+        }
+        object_value
+            .properties
+            .get(property.index)
+            .and_then(|value| value.clone())
+            .ok_or_else(|| {
+                InterpreterError::new(format!(
+                    "MIR property{} was read before assignment",
+                    property.index
+                ))
+            })
+    }
+
+    fn assign_property(
+        &mut self,
+        object: mir::LocalId,
+        property: crate::class_layout::PropertyId,
+        value: LocalValue,
+    ) -> Result<Option<LocalValue>, InterpreterError> {
+        let object_id = match read_local(&self.current_frame()?.locals, object)? {
+            LocalValue::Class { object, .. } => *object,
+            _ => {
+                return Err(InterpreterError::new(format!(
+                    "MIR property assignment uses non-class local local{}",
+                    object.0
+                )))
+            }
+        };
+        let object_value = self.heap.get_mut(&object_id).ok_or_else(|| {
+            InterpreterError::new(format!("MIR object {object_id} is not allocated"))
+        })?;
+        if object_value.class != property.class {
+            return Err(InterpreterError::new(format!(
+                "MIR property assignment expected class#{} but object has class#{}",
+                property.class.0, object_value.class.0
+            )));
+        }
+        let slot = object_value
+            .properties
+            .get_mut(property.index)
+            .ok_or_else(|| {
+                InterpreterError::new(format!("MIR property{} does not exist", property.index))
+            })?;
+        Ok(slot.replace(value))
+    }
+
+    fn drop_class_local(&mut self, local: mir::LocalId) -> Result<(), InterpreterError> {
+        let Some(value) = self
+            .current_frame_mut()?
+            .locals
+            .get_mut(local.0)
+            .ok_or_else(|| {
+                InterpreterError::new(format!("MIR local local{} does not exist", local.0))
+            })?
+            .take()
+        else {
+            return Ok(());
+        };
+        let LocalValue::Class { object, class } = value else {
+            return Err(InterpreterError::new(format!(
+                "MIR drop local{} did not contain a class value",
+                local.0
+            )));
+        };
+        self.current_frame_mut()?
+            .tasks
+            .push(EvaluationTask::DropObject { object, class });
+        Ok(())
+    }
+
+    fn queue_object_drop(
+        &mut self,
+        object: usize,
+        class: crate::class_layout::ClassId,
+    ) -> Result<(), InterpreterError> {
+        let value = self.heap.get(&object).ok_or_else(|| {
+            InterpreterError::new(format!("MIR object {object} is not allocated"))
+        })?;
+        if value.class != class {
+            return Err(InterpreterError::new(format!(
+                "MIR drop expected class#{} but object has class#{}",
+                class.0, value.class.0
+            )));
+        }
+        let destructor = class_in(self.program, class)?.destructor;
+        let frame = self.current_frame_mut()?;
+        frame
+            .tasks
+            .push(EvaluationTask::FreeObject { object, class });
+        frame
+            .tasks
+            .push(EvaluationTask::DropObjectProperties { object, class });
+        if let Some(function) = destructor {
+            self.push_frame(
+                function,
+                &[LocalValue::Class { object, class }],
+                Some(ReturnExpectation::Void),
+            )?;
+        }
+        Ok(())
+    }
+
+    fn queue_object_property_drops(
+        &mut self,
+        object: usize,
+        class: crate::class_layout::ClassId,
+    ) -> Result<(), InterpreterError> {
+        let object_value = self.heap.get_mut(&object).ok_or_else(|| {
+            InterpreterError::new(format!("MIR object {object} is not allocated"))
+        })?;
+        if object_value.class != class {
+            return Err(InterpreterError::new(format!(
+                "MIR property drop expected class#{} but object has class#{}",
+                class.0, object_value.class.0
+            )));
+        }
+        let mut drops = Vec::new();
+        for property in object_value.properties.iter_mut().rev() {
+            if let Some(LocalValue::Class { object, class }) = property.take() {
+                drops.push((object, class));
+            }
+        }
+        let frame = self.current_frame_mut()?;
+        for (object, class) in drops.into_iter().rev() {
+            frame
+                .tasks
+                .push(EvaluationTask::DropObject { object, class });
+        }
+        Ok(())
+    }
+
+    fn free_object(
+        &mut self,
+        object: usize,
+        class: crate::class_layout::ClassId,
+    ) -> Result<(), InterpreterError> {
+        let Some(value) = self.heap.remove(&object) else {
+            return Ok(());
+        };
+        if value.class != class {
+            return Err(InterpreterError::new(format!(
+                "MIR free expected class#{} but object has class#{}",
+                class.0, value.class.0
+            )));
+        }
+        Ok(())
+    }
+
+    fn cleanup_current_frame(&mut self) -> Result<(), InterpreterError> {
+        let function = function_in(self.program, self.current_frame()?.function)?;
+        let owned_classes = function
+            .locals
+            .iter()
+            .filter_map(|local| match (local.owned, local.ty) {
+                (true, mir::Type::Class(_)) => Some(local.id),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        for local in owned_classes {
+            self.drop_class_local(local)?;
+        }
+        Ok(())
     }
 
     fn current_frame(&self) -> Result<&CallFrame, InterpreterError> {
@@ -1487,31 +2086,12 @@ fn eval_binary(
     }
 }
 
-fn eval_operand(
-    operand: &mir::Operand,
-    locals: &[Option<LocalValue>],
-) -> Result<mir::ScalarValue, InterpreterError> {
-    match operand {
-        mir::Operand::Scalar(value) => Ok(*value),
-        mir::Operand::Local(id) => match read_local(locals, *id)? {
-            LocalValue::Scalar(value) => Ok(*value),
-            LocalValue::String(_) => Err(InterpreterError::new(format!(
-                "MIR string local local{} was used as a scalar value",
-                id.0
-            ))),
-            LocalValue::NullableString(_) => Err(InterpreterError::new(format!(
-                "MIR nullable-string local local{} was used as a scalar value",
-                id.0
-            ))),
-        },
-    }
-}
-
 fn local_value_type(value: &LocalValue) -> mir::Type {
     match value {
         LocalValue::Scalar(value) => mir::Type::Scalar(value.ty()),
         LocalValue::String(_) => mir::Type::String,
         LocalValue::NullableString(_) => mir::Type::NullableString,
+        LocalValue::Class { class, .. } => mir::Type::Class(*class),
     }
 }
 
@@ -1711,7 +2291,7 @@ fn assign_local(
     locals: &mut [Option<LocalValue>],
     id: mir::LocalId,
     value: LocalValue,
-) -> Result<(), InterpreterError> {
+) -> Result<Option<LocalValue>, InterpreterError> {
     let definition = definitions
         .get(id.0)
         .filter(|local| local.id == id)
@@ -1723,6 +2303,9 @@ fn assign_local(
         (definition.ty, &value),
         (mir::Type::String, LocalValue::String(_))
             | (mir::Type::NullableString, LocalValue::NullableString(_))
+    ) || matches!(
+        (definition.ty, &value),
+        (mir::Type::Class(expected), LocalValue::Class { class, .. }) if expected == *class
     );
     if !compatible {
         let actual = match &value {
@@ -1733,6 +2316,7 @@ fn assign_local(
             },
             LocalValue::String(_) => "string",
             LocalValue::NullableString(_) => "?string",
+            LocalValue::Class { .. } => "class",
         };
         return Err(InterpreterError::new(format!(
             "MIR local local{} has type {}, but assignment produced {actual}",
@@ -1742,8 +2326,7 @@ fn assign_local(
     let slot = locals
         .get_mut(id.0)
         .ok_or_else(|| InterpreterError::new(format!("MIR local local{} does not exist", id.0)))?;
-    *slot = Some(value);
-    Ok(())
+    Ok(slot.replace(value))
 }
 
 fn function_in(
@@ -1757,6 +2340,17 @@ fn function_in(
         .ok_or_else(|| {
             InterpreterError::new(format!("MIR FunctionId function{} does not exist", id.0))
         })
+}
+
+fn class_in(
+    program: &mir::Program,
+    id: crate::class_layout::ClassId,
+) -> Result<&mir::Class, InterpreterError> {
+    program
+        .classes
+        .get(id.0)
+        .filter(|class| class.id == id)
+        .ok_or_else(|| InterpreterError::new(format!("MIR ClassId class{} does not exist", id.0)))
 }
 
 fn local_in(function: &mir::Function, id: mir::LocalId) -> Result<&mir::Local, InterpreterError> {

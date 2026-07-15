@@ -16,11 +16,11 @@ use crate::format_string::{FormatConversion, FormatPiece};
 use crate::mir;
 use crate::mir_validation;
 use crate::native_abi::{
-    function_symbol, FORMAT_F32, FORMAT_F64, FORMAT_I64, FORMAT_STRING, FORMAT_U64,
-    NULLABLE_STRING_EQUAL, READ_FILE, READ_STDIN_LINE, STRING_COMPARE, STRING_CONCAT, STRING_DATA,
-    STRING_FROM_BOOL, STRING_FROM_F32, STRING_FROM_F64, STRING_FROM_I64, STRING_FROM_U64,
-    STRING_FROM_UTF8, STRING_LENGTH, STRING_RELEASE, STRING_RETAIN, STRING_WRITE_STDERR,
-    STRING_WRITE_STDOUT, WRITE_FILE,
+    function_symbol, CLASS_ALLOCATE, CLASS_FREE, FORMAT_F32, FORMAT_F64, FORMAT_I64, FORMAT_STRING,
+    FORMAT_U64, NULLABLE_STRING_EQUAL, READ_FILE, READ_STDIN_LINE, STRING_COMPARE, STRING_CONCAT,
+    STRING_DATA, STRING_FROM_BOOL, STRING_FROM_F32, STRING_FROM_F64, STRING_FROM_I64,
+    STRING_FROM_U64, STRING_FROM_UTF8, STRING_LENGTH, STRING_RELEASE, STRING_RETAIN,
+    STRING_WRITE_STDERR, STRING_WRITE_STDOUT, WRITE_FILE,
 };
 use crate::numeric::{FloatType, FloatValue, IntegerPanic, IntegerType, IntegerValue};
 
@@ -344,6 +344,31 @@ fn cleanup_string_locals(
     Ok(())
 }
 
+fn cleanup_class_locals(
+    builder: &mut FunctionBuilder,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<(), BackendError> {
+    let pointer_type = resources.module.target_config().pointer_type();
+    let function = function_in(resources.program, resources.function_id)?;
+    let class_locals = function
+        .locals
+        .iter()
+        .rev()
+        .filter_map(|local| match (local.owned, local.ty) {
+            (true, mir::Type::Class(class)) => Some((local.id, class)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    for (local, class) in class_locals {
+        let slot = local_slot(resources.local_slots, local)?;
+        let value = builder.ins().stack_load(pointer_type, slot, 0);
+        let zero = builder.ins().iconst(pointer_type, 0);
+        builder.ins().stack_store(zero, slot, 0);
+        lower_drop_class_value_checked(builder, value, class, resources)?;
+    }
+    Ok(())
+}
+
 fn define_process_main(
     module: &mut ObjectModule,
     program: &mir::Program,
@@ -559,9 +584,20 @@ fn lower_statement(
                     builder.ins().stack_store(new_value, slot, 0);
                 }
                 mir::Type::Class(_) => {
-                    return Err(malformed_mir(
-                        "class assignment reached Cranelift before class lowering completed",
-                    ));
+                    let mir::Rvalue::Class(expression) = value else {
+                        return Err(malformed_mir(format!(
+                            "class local local{} has a non-class assignment",
+                            target.0
+                        )));
+                    };
+                    let new_value = lower_class_expression(builder, expression, resources)?;
+                    let slot = local_slot(resources.local_slots, *target)?;
+                    let pointer_type = resources.module.target_config().pointer_type();
+                    let old_value = builder.ins().stack_load(pointer_type, slot, 0);
+                    builder.ins().stack_store(new_value, slot, 0);
+                    if let mir::Type::Class(class) = definition.ty {
+                        lower_drop_class_value_checked(builder, old_value, class, resources)?;
+                    }
                 }
             }
         }
@@ -628,10 +664,57 @@ fn lower_statement(
             release_string(builder, path, resources)?;
             release_string(builder, contents, resources)?;
         }
-        mir::Statement::AssignProperty { .. } | mir::Statement::DropClass { .. } => {
-            return Err(malformed_mir(
-                "class operation reached Cranelift before class lowering completed",
-            ));
+        mir::Statement::AssignProperty {
+            object,
+            property,
+            value,
+        } => {
+            let property_definition = property_definition(resources.program, *property)?;
+            let value = lower_rvalue(builder, value, resources)?;
+            let address = lower_property_address(builder, *object, *property, resources)?;
+            let pointer_type = resources.module.target_config().pointer_type();
+            let old_value = match property_definition.ty {
+                mir::Type::String | mir::Type::NullableString | mir::Type::Class(_) => {
+                    Some(builder.ins().load(
+                        pointer_type,
+                        cranelift_codegen::ir::MachMemFlags::trusted(),
+                        address,
+                        0,
+                    ))
+                }
+                mir::Type::Scalar(_) => None,
+            };
+            builder.ins().store(
+                cranelift_codegen::ir::MachMemFlags::trusted(),
+                value,
+                address,
+                0,
+            );
+            match (property_definition.ty, old_value) {
+                (mir::Type::String | mir::Type::NullableString, Some(old_value)) => {
+                    release_string(builder, old_value, resources)?;
+                }
+                (mir::Type::Class(class), Some(old_value)) => {
+                    lower_drop_class_value_checked(builder, old_value, class, resources)?;
+                }
+                _ => {}
+            }
+        }
+        mir::Statement::DropClass { local, .. } => {
+            let pointer_type = resources.module.target_config().pointer_type();
+            let slot = local_slot(resources.local_slots, *local)?;
+            let value = builder.ins().stack_load(pointer_type, slot, 0);
+            let zero = builder.ins().iconst(pointer_type, 0);
+            builder.ins().stack_store(zero, slot, 0);
+            let mir::Type::Class(class) =
+                local_definition(resources.program, resources.function_id, *local)?.ty
+            else {
+                return Err(malformed_mir(format!(
+                    "drop local{} did not target a class local",
+                    local.0
+                )));
+            };
+            lower_drop_class_value_checked(builder, value, class, resources)?;
         }
     }
     Ok(())
@@ -646,10 +729,12 @@ fn lower_terminator(
     match terminator {
         mir::Terminator::Return(expression) => {
             let value = lower_rvalue(builder, expression, resources)?;
+            cleanup_class_locals(builder, resources)?;
             cleanup_string_locals(builder, resources)?;
             builder.ins().return_(&[value]);
         }
         mir::Terminator::ReturnVoid => {
+            cleanup_class_locals(builder, resources)?;
             cleanup_string_locals(builder, resources)?;
             builder.ins().return_(&[]);
         }
@@ -723,10 +808,188 @@ fn lower_rvalue(
         mir::Rvalue::NullableString(value) => {
             lower_nullable_string_expression(builder, value, resources)
         }
-        mir::Rvalue::Class(_) => Err(malformed_mir(
-            "class value reached Cranelift before class lowering completed",
-        )),
+        mir::Rvalue::Class(value) => lower_class_expression(builder, value, resources),
     }
+}
+
+fn lower_class_expression(
+    builder: &mut FunctionBuilder,
+    expression: &mir::ClassExpression,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<Value, BackendError> {
+    let pointer_type = resources.module.target_config().pointer_type();
+    match expression {
+        mir::ClassExpression::Local {
+            local, transfer, ..
+        } => {
+            let slot = local_slot(resources.local_slots, *local)?;
+            let value = builder.ins().stack_load(pointer_type, slot, 0);
+            if *transfer {
+                let zero = builder.ins().iconst(pointer_type, 0);
+                builder.ins().stack_store(zero, slot, 0);
+            }
+            Ok(value)
+        }
+        mir::ClassExpression::Property {
+            object, property, ..
+        } => {
+            let address = lower_property_address(builder, *object, *property, resources)?;
+            Ok(builder.ins().load(
+                pointer_type,
+                cranelift_codegen::ir::MachMemFlags::trusted(),
+                address,
+                0,
+            ))
+        }
+        mir::ClassExpression::Call { function, args, .. } => {
+            lower_function_call(builder, *function, args, resources)?
+                .ok_or_else(|| malformed_mir("class call produced no result"))
+        }
+        mir::ClassExpression::New {
+            class,
+            properties,
+            constructor,
+            args,
+        } => {
+            // Constructor arguments are source expressions and must be evaluated
+            // exactly once. Promoted properties and the lifecycle call share the
+            // resulting values instead of lowering either expression twice.
+            let lowered_args = lower_call_args(builder, args, resources)?;
+            let class_definition = class_definition(resources.program, *class)?;
+            let size = builder
+                .ins()
+                .iconst(pointer_type, i64::from(class_definition.layout.size));
+            let align = builder
+                .ins()
+                .iconst(pointer_type, i64::from(class_definition.layout.align));
+            let object = runtime_call(
+                builder,
+                CLASS_ALLOCATE,
+                &[pointer_type, pointer_type, pointer_type],
+                Some(pointer_type),
+                &[resources.current_frame, size, align],
+                resources,
+            )?
+            .ok_or_else(|| backend_failure("class allocation produced no result"))?;
+            for property in properties {
+                let value = match &property.source {
+                    mir::PropertyValueSource::Expression(value) => {
+                        Some(lower_rvalue(builder, value, resources)?)
+                    }
+                    mir::PropertyValueSource::ConstructorArgument(index) => {
+                        Some(*lowered_args.values.get(*index).ok_or_else(|| {
+                            malformed_mir(format!("constructor argument {index} does not exist"))
+                        })?)
+                    }
+                    mir::PropertyValueSource::ConstructorBody => None,
+                };
+                let Some(value) = value else {
+                    continue;
+                };
+                let address = lower_property_address_from_value(
+                    builder,
+                    object,
+                    property.property,
+                    resources,
+                )?;
+                builder.ins().store(
+                    cranelift_codegen::ir::MachMemFlags::trusted(),
+                    value,
+                    address,
+                    0,
+                );
+            }
+            if let Some(constructor) = constructor {
+                let mut constructor_args = vec![resources.current_frame, object];
+                constructor_args.extend(lowered_args.values.iter().copied());
+                let callee = declared_function(builder, resources, *constructor)?;
+                builder.ins().call(callee, &constructor_args);
+            }
+            for (index, string) in lowered_args.owned_strings {
+                let promoted = properties.iter().any(|property| {
+                    matches!(
+                        property.source,
+                        mir::PropertyValueSource::ConstructorArgument(argument)
+                            if argument == index
+                    )
+                });
+                if !promoted {
+                    release_string(builder, string, resources)?;
+                }
+            }
+            Ok(object)
+        }
+    }
+}
+
+fn lower_drop_class_value_checked(
+    builder: &mut FunctionBuilder,
+    object: Value,
+    class: crate::class_layout::ClassId,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<(), BackendError> {
+    let pointer_type = resources.module.target_config().pointer_type();
+    let zero = builder.ins().iconst(pointer_type, 0);
+    let has_object = builder.ins().icmp(IntCC::NotEqual, object, zero);
+    let drop_block = builder.create_block();
+    let continue_block = builder.create_block();
+    builder
+        .ins()
+        .brif(has_object, drop_block, &[], continue_block, &[]);
+    builder.switch_to_block(drop_block);
+    lower_drop_class_value(builder, object, class, resources)?;
+    builder.ins().jump(continue_block, &[]);
+    builder.switch_to_block(continue_block);
+    Ok(())
+}
+
+fn lower_drop_class_value(
+    builder: &mut FunctionBuilder,
+    object: Value,
+    class: crate::class_layout::ClassId,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<(), BackendError> {
+    let pointer_type = resources.module.target_config().pointer_type();
+    let class_definition = class_definition(resources.program, class)?;
+    if let Some(destructor) = class_definition.destructor {
+        let callee = declared_function(builder, resources, destructor)?;
+        builder
+            .ins()
+            .call(callee, &[resources.current_frame, object]);
+    }
+    for property in class_definition.properties.iter().rev() {
+        let address = lower_property_address_from_value(builder, object, property.id, resources)?;
+        match property.ty {
+            mir::Type::String | mir::Type::NullableString => {
+                let value = builder.ins().load(
+                    pointer_type,
+                    cranelift_codegen::ir::MachMemFlags::trusted(),
+                    address,
+                    0,
+                );
+                release_string(builder, value, resources)?;
+            }
+            mir::Type::Class(class) => {
+                let value = builder.ins().load(
+                    pointer_type,
+                    cranelift_codegen::ir::MachMemFlags::trusted(),
+                    address,
+                    0,
+                );
+                lower_drop_class_value_checked(builder, value, class, resources)?;
+            }
+            mir::Type::Scalar(_) => {}
+        }
+    }
+    let _ = runtime_call(
+        builder,
+        CLASS_FREE,
+        &[pointer_type],
+        None,
+        &[object],
+        resources,
+    )?;
+    Ok(())
 }
 
 fn runtime_call(
@@ -810,6 +1073,16 @@ fn lower_string_expression(
                 builder
                     .ins()
                     .stack_load(pointer, local_slot(resources.local_slots, *local)?, 0);
+            retain_string(builder, value, resources)
+        }
+        mir::StringExpression::Property { object, property } => {
+            let address = lower_property_address(builder, *object, *property, resources)?;
+            let value = builder.ins().load(
+                pointer,
+                cranelift_codegen::ir::MachMemFlags::trusted(),
+                address,
+                0,
+            );
             retain_string(builder, value, resources)
         }
         mir::StringExpression::Concat(parts) => {
@@ -913,6 +1186,16 @@ fn lower_nullable_string_expression(
                 builder
                     .ins()
                     .stack_load(pointer, local_slot(resources.local_slots, *local)?, 0);
+            retain_string(builder, value, resources)
+        }
+        mir::NullableStringExpression::Property { object, property } => {
+            let address = lower_property_address(builder, *object, *property, resources)?;
+            let value = builder.ins().load(
+                pointer,
+                cranelift_codegen::ir::MachMemFlags::trusted(),
+                address,
+                0,
+            );
             retain_string(builder, value, resources)
         }
         mir::NullableStringExpression::ReadLine => runtime_call(
@@ -1464,6 +1747,15 @@ fn lower_integer_operand(
             let slot = local_slot(resources.local_slots, *id)?;
             Ok(builder.ins().stack_load(clif_integer_type(ty), slot, 0))
         }
+        mir::Operand::Property { object, property } => {
+            let address = lower_property_address(builder, *object, *property, resources)?;
+            Ok(builder.ins().load(
+                clif_integer_type(ty),
+                cranelift_codegen::ir::MachMemFlags::trusted(),
+                address,
+                0,
+            ))
+        }
         mir::Operand::Scalar(_) => Err(malformed_mir(
             "integer expression contains non-integer constant",
         )),
@@ -1499,6 +1791,15 @@ fn lower_float_expression(
                 Ok(builder.ins().stack_load(
                     clif_scalar_type(mir::ScalarType::Float(*ty)),
                     local_slot(resources.local_slots, *id)?,
+                    0,
+                ))
+            }
+            mir::Operand::Property { object, property } => {
+                let address = lower_property_address(builder, *object, *property, resources)?;
+                Ok(builder.ins().load(
+                    clif_scalar_type(mir::ScalarType::Float(*ty)),
+                    cranelift_codegen::ir::MachMemFlags::trusted(),
+                    address,
                     0,
                 ))
             }
@@ -1579,7 +1880,7 @@ fn lower_integer_call(
 
 struct LoweredCallArgs {
     values: Vec<Value>,
-    owned_strings: Vec<Value>,
+    owned_strings: Vec<(usize, Value)>,
 }
 
 fn lower_call_args(
@@ -1589,10 +1890,10 @@ fn lower_call_args(
 ) -> Result<LoweredCallArgs, BackendError> {
     let mut values = Vec::with_capacity(args.len());
     let mut owned_strings = Vec::new();
-    for argument in args {
+    for (index, argument) in args.iter().enumerate() {
         let value = lower_rvalue(builder, argument, resources)?;
         if matches!(argument.ty(), mir::Type::String | mir::Type::NullableString) {
-            owned_strings.push(value);
+            owned_strings.push((index, value));
         }
         values.push(value);
     }
@@ -1610,12 +1911,30 @@ fn lower_function_call(
 ) -> Result<Option<Value>, BackendError> {
     let lowered = lower_call_args(builder, args, resources)?;
     let mut values = vec![resources.current_frame];
-    values.extend(lowered.values);
+    values.extend(lowered.values.iter().copied());
     let callee = declared_function(builder, resources, function)?;
     let call = builder.ins().call(callee, &values);
     let result = builder.inst_results(call).first().copied();
-    for string in lowered.owned_strings {
+    for (_, string) in lowered.owned_strings {
         release_string(builder, string, resources)?;
+    }
+    let callee_definition = function_in(resources.program, function)?;
+    for (index, argument) in args.iter().enumerate().rev() {
+        let mir::Rvalue::Class(
+            mir::ClassExpression::New { class, .. } | mir::ClassExpression::Call { class, .. },
+        ) = argument
+        else {
+            continue;
+        };
+        let parameter = *callee_definition.params.get(index).ok_or_else(|| {
+            malformed_mir(format!(
+                "function{} is missing parameter {index}",
+                function.0
+            ))
+        })?;
+        if !local_in(callee_definition, parameter)?.owned {
+            lower_drop_class_value_checked(builder, lowered.values[index], *class, resources)?;
+        }
     }
     Ok(result)
 }
@@ -1843,6 +2162,15 @@ fn lower_bool_operand(
                 .ins()
                 .stack_load(types::I8, local_slot(resources.local_slots, *id)?, 0))
         }
+        mir::Operand::Property { object, property } => {
+            let address = lower_property_address(builder, *object, *property, resources)?;
+            Ok(builder.ins().load(
+                types::I8,
+                cranelift_codegen::ir::MachMemFlags::trusted(),
+                address,
+                0,
+            ))
+        }
         _ => Err(malformed_mir("bool expression contains non-bool constant")),
     }
 }
@@ -1924,6 +2252,9 @@ fn resolve_string_expression_from_definitions(
         mir::StringExpression::NullableLocalAssumeNonNull(_) => {
             Err(malformed_mir("runtime string expression is not a constant"))
         }
+        mir::StringExpression::Property { .. } => {
+            Err(malformed_mir("runtime string expression is not a constant"))
+        }
         mir::StringExpression::Concat(parts) => {
             let mut value = Vec::new();
             for part in parts {
@@ -1959,6 +2290,9 @@ fn resolve_string_expression(
             ))
         }),
         mir::StringExpression::NullableLocalAssumeNonNull(_) => {
+            Err(malformed_mir("runtime string expression is not a constant"))
+        }
+        mir::StringExpression::Property { .. } => {
             Err(malformed_mir("runtime string expression is not a constant"))
         }
         mir::StringExpression::Concat(parts) => {
@@ -2088,6 +2422,58 @@ fn local_definition(
     local: mir::LocalId,
 ) -> Result<&mir::Local, BackendError> {
     local_in(function_in(program, function)?, local)
+}
+
+fn class_definition(
+    program: &mir::Program,
+    class: crate::class_layout::ClassId,
+) -> Result<&mir::Class, BackendError> {
+    program
+        .classes
+        .get(class.0)
+        .filter(|definition| definition.id == class)
+        .ok_or_else(|| malformed_mir(format!("class#{} does not exist", class.0)))
+}
+
+fn property_definition(
+    program: &mir::Program,
+    property: crate::class_layout::PropertyId,
+) -> Result<&mir::Property, BackendError> {
+    class_definition(program, property.class)?
+        .properties
+        .get(property.index)
+        .filter(|definition| definition.id == property)
+        .ok_or_else(|| malformed_mir(format!("property{} does not exist", property.index)))
+}
+
+fn lower_property_address(
+    builder: &mut FunctionBuilder,
+    object: mir::LocalId,
+    property: crate::class_layout::PropertyId,
+    resources: &LoweringResources<'_, '_>,
+) -> Result<Value, BackendError> {
+    let pointer_type = resources.module.target_config().pointer_type();
+    let slot = local_slot(resources.local_slots, object)?;
+    let object = builder.ins().stack_load(pointer_type, slot, 0);
+    lower_property_address_from_value(builder, object, property, resources)
+}
+
+fn lower_property_address_from_value(
+    builder: &mut FunctionBuilder,
+    object: Value,
+    property: crate::class_layout::PropertyId,
+    resources: &LoweringResources<'_, '_>,
+) -> Result<Value, BackendError> {
+    let pointer_type = resources.module.target_config().pointer_type();
+    let class = class_definition(resources.program, property.class)?;
+    let layout = class
+        .layout
+        .properties
+        .iter()
+        .find(|layout| layout.id == property)
+        .ok_or_else(|| malformed_mir(format!("property{} has no layout", property.index)))?;
+    let offset = builder.ins().iconst(pointer_type, i64::from(layout.offset));
+    Ok(builder.ins().iadd(object, offset))
 }
 
 fn block_for(blocks: &[Block], id: mir::BlockId) -> Result<Block, BackendError> {

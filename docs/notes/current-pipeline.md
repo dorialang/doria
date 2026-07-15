@@ -10,11 +10,12 @@ Documentation role: working note. This file prevents duplicated in-flight work. 
 ## Active
 
 - Stage 18 full expression interpolation and compiler-known `Displayable` is merged.
-- Stage 19 ownership, moves, destruction, and native class layout is active on `feature/stage-19-ownership-moves-destruction`.
+- Stage 19 ownership, moves, destruction, and native class layout is complete on the current branch.
 - Native remains one target: direct compile/run uses the Cranelift fast profile, while `--release` selects LLVM 18 over the same validated typed MIR.
 - Ordinary expression interpolation of primitive/string values lowers through the existing ordered MIR string and display operations consumed by all three execution paths.
-- `Displayable` conformance is checked by the frontend and executable through the PHP compatibility subset. Native class layout and method dispatch remain Stages 19 and 20.
-- The durable manifest supports raw stdin, isolated seeded files, and exact interpreter/Cranelift/LLVM stdout, stderr, status, and generated-file comparison.
+- Native classes now cover construction, property initialization/access, class-valued locals/arguments/returns, `take` transfer, lifecycle bodies, recursive destruction, and deterministic normal structured-exit cleanup through the interpreter, Cranelift, and LLVM.
+- `Displayable` conformance is checked by the frontend and executable through the PHP compatibility subset. Native `Displayable` dispatch remains Stage 20 method work.
+- The durable manifest supports raw stdin, isolated seeded files, and exact interpreter/Cranelift/LLVM stdout, stderr, status, generated-file, and class-lifetime comparison.
 
 ## Next
 
@@ -27,6 +28,6 @@ Documentation role: working note. This file prevents duplicated in-flight work. 
 
 ## Deferred
 
-- Native `Displayable` class execution until Stages 19 and 20.
+- Native `Displayable` method dispatch until Stage 20.
 - General interface declarations and conformance until Stage 35.
 - `Bytes` until Stage 23.

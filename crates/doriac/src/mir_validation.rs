@@ -225,6 +225,12 @@ fn validate_statement(
                 (mir::Type::Class(expected), mir::Rvalue::Class(expression))
                     if expression.class() == expected =>
                 {
+                    if !local.owned {
+                        return Err(malformed_mir(format!(
+                            "class assignment targets borrowed local local{}",
+                            target.0
+                        )));
+                    }
                     validate_class_expression(program, function, expression)
                 }
                 (mir::Type::Class(expected), _) => Err(malformed_mir(format!(
@@ -262,8 +268,43 @@ fn validate_statement(
             validate_string_expression(program, function, contents)
         }
         mir::Statement::WriteStderr(value) => validate_string_expression(program, function, value),
-        mir::Statement::AssignProperty { .. } | mir::Statement::DropClass { .. } => {
-            Err(malformed_mir("class operation is not fully validated yet"))
+        mir::Statement::AssignProperty {
+            object,
+            property,
+            value,
+        } => {
+            let object = local_in(function, *object)?;
+            let mir::Type::Class(class) = object.ty else {
+                return Err(malformed_mir(
+                    "property assignment targets a non-class local",
+                ));
+            };
+            let property_definition = property_in(program, class, *property)?;
+            if value.ty() != property_definition.ty {
+                return Err(malformed_mir(format!(
+                    "property{} receives {} but has type {}",
+                    property.index,
+                    value.ty(),
+                    property_definition.ty
+                )));
+            }
+            validate_rvalue(program, function, value)
+        }
+        mir::Statement::DropClass { local, class } => {
+            let definition = local_in(function, *local)?;
+            if definition.ty != mir::Type::Class(*class) {
+                return Err(malformed_mir(format!(
+                    "drop class#{} references local{} with type {}",
+                    class.0, local.0, definition.ty
+                )));
+            }
+            if !definition.owned {
+                return Err(malformed_mir(format!(
+                    "drop class#{} references borrowed local{}",
+                    class.0, local.0
+                )));
+            }
+            class_in(program, *class).map(|_| ())
         }
     }
 }
@@ -322,7 +363,7 @@ fn validate_integer_expression(
 ) -> Result<(), BackendError> {
     match expression {
         mir::IntegerExpression::Use { ty, operand } => {
-            validate_integer_operand(function, *ty, operand)
+            validate_integer_operand(program, function, *ty, operand)
         }
         mir::IntegerExpression::Unary { ty, op, operand } => {
             if operand.ty() != *ty {
@@ -419,17 +460,33 @@ fn validate_class_expression(
         return Err(malformed_mir(format!("unknown class#{}", class.0)));
     };
     match expression {
-        mir::ClassExpression::Local { local, .. } => {
+        mir::ClassExpression::Local {
+            local, transfer, ..
+        } => {
             let definition = local_in(function, *local)?;
-            if definition.ty == mir::Type::Class(class) {
-                Ok(())
-            } else {
-                Err(malformed_mir(format!(
+            if definition.ty != mir::Type::Class(class) {
+                return Err(malformed_mir(format!(
                     "class rvalue uses non-class local local{}",
                     local.0
-                )))
+                )));
             }
+            if *transfer && !definition.owned {
+                return Err(malformed_mir(format!(
+                    "class rvalue transfers borrowed local local{}",
+                    local.0
+                )));
+            }
+            Ok(())
         }
+        mir::ClassExpression::Property {
+            object, property, ..
+        } => validate_property_operand(
+            program,
+            function,
+            *object,
+            *property,
+            mir::Type::Class(class),
+        ),
         mir::ClassExpression::Call {
             function: callee,
             args,
@@ -530,6 +587,42 @@ fn validate_class_expression(
                             ))
                         })?
                         .ty(),
+                    mir::PropertyValueSource::ConstructorBody => {
+                        let Some(constructor) = constructor else {
+                            return Err(malformed_mir(format!(
+                                "class#{} property{} relies on a missing constructor body",
+                                class.0, property.property.index
+                            )));
+                        };
+                        let receiver = *constructor.params.first().ok_or_else(|| {
+                            malformed_mir(format!(
+                                "constructor {} has no implicit receiver",
+                                constructor.name
+                            ))
+                        })?;
+                        let assignments = constructor
+                            .blocks
+                            .iter()
+                            .flat_map(|block| block.statements.iter())
+                            .filter(|statement| {
+                                matches!(
+                                    statement,
+                                    mir::Statement::AssignProperty {
+                                        object,
+                                        property: assigned,
+                                        ..
+                                    } if *object == receiver && *assigned == property.property
+                                )
+                            })
+                            .count();
+                        if assignments != 1 {
+                            return Err(malformed_mir(format!(
+                                "class#{} property{} requires exactly one direct constructor-body initializer, found {assignments}",
+                                class.0, property.property.index
+                            )));
+                        }
+                        definition.ty
+                    }
                 };
                 if source_type != definition.ty {
                     return Err(malformed_mir(format!(
@@ -556,6 +649,22 @@ fn validate_class_expression(
                     constructor,
                     constructor_parameters,
                     args,
+                    Some(
+                        &properties
+                            .iter()
+                            .filter_map(|property| match property.source {
+                                mir::PropertyValueSource::ConstructorArgument(index)
+                                    if matches!(
+                                        class_definition.properties[property.property.index].ty,
+                                        mir::Type::Class(_)
+                                    ) =>
+                                {
+                                    Some(index)
+                                }
+                                _ => None,
+                            })
+                            .collect(),
+                    ),
                 )?;
             }
             Ok(())
@@ -577,6 +686,13 @@ fn validate_float_expression(
             {
                 Ok(())
             }
+            mir::Operand::Property { object, property } => validate_property_operand(
+                program,
+                function,
+                *object,
+                *property,
+                mir::Type::Scalar(mir::ScalarType::Float(*ty)),
+            ),
             _ => Err(malformed_mir(
                 "float expression has an incompatible operand",
             )),
@@ -633,7 +749,7 @@ fn validate_call_args(
     callee: &mir::Function,
     args: &[mir::Rvalue],
 ) -> Result<(), BackendError> {
-    validate_call_args_for_params(program, caller, callee, &callee.params, args)
+    validate_call_args_for_params(program, caller, callee, &callee.params, args, None)
 }
 
 fn validate_call_args_for_params(
@@ -642,6 +758,7 @@ fn validate_call_args_for_params(
     callee: &mir::Function,
     params: &[mir::LocalId],
     args: &[mir::Rvalue],
+    promoted_transfers: Option<&HashSet<usize>>,
 ) -> Result<(), BackendError> {
     if args.len() != params.len() {
         return Err(malformed_mir(format!(
@@ -652,7 +769,8 @@ fn validate_call_args_for_params(
         )));
     }
     for (index, (argument, parameter)) in args.iter().zip(params).enumerate() {
-        let parameter_type = local_in(callee, *parameter)?.ty;
+        let parameter_definition = local_in(callee, *parameter)?;
+        let parameter_type = parameter_definition.ty;
         if argument.ty() != parameter_type {
             return Err(malformed_mir(format!(
                 "call to {} passes {} argument {} to {} parameter",
@@ -663,6 +781,33 @@ fn validate_call_args_for_params(
             )));
         }
         validate_rvalue(program, caller, argument)?;
+        if matches!(parameter_type, mir::Type::Class(_)) {
+            match argument {
+                mir::Rvalue::Class(mir::ClassExpression::Local { transfer: true, .. })
+                    if !parameter_definition.owned
+                        && !promoted_transfers.is_some_and(|indices| indices.contains(&index)) =>
+                {
+                    return Err(malformed_mir(format!(
+                        "call to {} transfers argument {} into a borrowed parameter",
+                        callee.name,
+                        index + 1
+                    )));
+                }
+                mir::Rvalue::Class(
+                    mir::ClassExpression::Local {
+                        transfer: false, ..
+                    }
+                    | mir::ClassExpression::Property { .. },
+                ) if parameter_definition.owned => {
+                    return Err(malformed_mir(format!(
+                        "call to {} borrows argument {} for an owned parameter",
+                        callee.name,
+                        index + 1
+                    )));
+                }
+                _ => {}
+            }
+        }
     }
     Ok(())
 }
@@ -680,6 +825,13 @@ fn validate_condition(
             {
                 Ok(())
             }
+            mir::Operand::Property { object, property } => validate_property_operand(
+                program,
+                function,
+                *object,
+                *property,
+                mir::Type::Scalar(mir::ScalarType::Bool),
+            ),
             _ => Err(malformed_mir("bool expression has an incompatible operand")),
         },
         mir::BoolExpression::Compare { op, left, right } => {
@@ -732,6 +884,7 @@ fn validate_condition(
 }
 
 fn validate_integer_operand(
+    program: &mir::Program,
     function: &mir::Function,
     ty: IntegerType,
     operand: &mir::Operand,
@@ -751,6 +904,13 @@ fn validate_integer_operand(
             }
             Ok(())
         }
+        mir::Operand::Property { object, property } => validate_property_operand(
+            program,
+            function,
+            *object,
+            *property,
+            mir::Type::Scalar(mir::ScalarType::Integer(ty)),
+        ),
         mir::Operand::Scalar(_) => Err(malformed_mir(
             "integer expression contains non-integer constant",
         )),
@@ -773,6 +933,9 @@ fn validate_string_expression(
                 )));
             }
             Ok(())
+        }
+        mir::StringExpression::Property { object, property } => {
+            validate_property_operand(program, function, *object, *property, mir::Type::String)
         }
         mir::StringExpression::NullableLocalAssumeNonNull(local) => {
             if local_in(function, *local)?.ty != mir::Type::NullableString {
@@ -828,6 +991,13 @@ fn validate_nullable_string_expression(
             }
             Ok(())
         }
+        mir::NullableStringExpression::Property { object, property } => validate_property_operand(
+            program,
+            function,
+            *object,
+            *property,
+            mir::Type::NullableString,
+        ),
         mir::NullableStringExpression::Call {
             function: callee,
             args,
@@ -910,6 +1080,49 @@ fn class_in(program: &mir::Program, id: ClassId) -> Result<&mir::Class, BackendE
         .get(id.0)
         .filter(|class| class.id == id)
         .ok_or_else(|| malformed_mir(format!("ClassId class#{} does not exist", id.0)))
+}
+
+fn property_in(
+    program: &mir::Program,
+    class: ClassId,
+    id: crate::class_layout::PropertyId,
+) -> Result<&mir::Property, BackendError> {
+    let class_definition = class_in(program, class)?;
+    if id.class != class {
+        return Err(malformed_mir(format!(
+            "property#{}:{} does not belong to class#{}",
+            id.class.0, id.index, class.0
+        )));
+    }
+    class_definition
+        .properties
+        .get(id.index)
+        .filter(|property| property.id == id)
+        .ok_or_else(|| malformed_mir(format!("property{} does not exist", id.index)))
+}
+
+fn validate_property_operand(
+    program: &mir::Program,
+    function: &mir::Function,
+    object: mir::LocalId,
+    property: crate::class_layout::PropertyId,
+    expected: mir::Type,
+) -> Result<(), BackendError> {
+    let object_definition = local_in(function, object)?;
+    let mir::Type::Class(class) = object_definition.ty else {
+        return Err(malformed_mir(format!(
+            "property operand uses non-class local local{}",
+            object.0
+        )));
+    };
+    let property_definition = property_in(program, class, property)?;
+    if property_definition.ty != expected {
+        return Err(malformed_mir(format!(
+            "property{} has type {} but expression expects {}",
+            property.index, property_definition.ty, expected
+        )));
+    }
+    Ok(())
 }
 
 fn local_in(function: &mir::Function, id: mir::LocalId) -> Result<&mir::Local, BackendError> {

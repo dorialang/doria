@@ -29,17 +29,21 @@ fn native_and_debug_share_remaining_post_stage16_mir_coverage_diagnostics() {
             "supports `foreach` only over integer ranges",
         ),
         (
-            "executable class construction",
+            "general instance method call",
             r#"class Person
 {
+    function greet(): void
+    {
+    }
 }
 
 function main(): void
 {
     let $person = new Person();
+    $person->greet();
 }
 "#,
-            "class rvalue lowering is not available",
+            "only calls to void free functions can be used as expression statements",
         ),
     ] {
         let native = compile_error(source, BackendTarget::Native);

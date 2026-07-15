@@ -120,6 +120,7 @@ fn conditional_program(condition: Condition, then_status: i64, else_status: i64)
                 ty: Type::Scalar(ScalarType::Integer(DEFAULT_INT)),
                 writable: false,
                 synthetic: true,
+                owned: false,
             }],
             blocks: vec![
                 BasicBlock {
@@ -781,6 +782,7 @@ fn interpreter_reports_arithmetic_overflow_as_runtime_panic() {
                 ty: Type::Scalar(ScalarType::Integer(DEFAULT_INT)),
                 writable: false,
                 synthetic: true,
+                owned: false,
             }],
             blocks: vec![BasicBlock {
                 id: BlockId(0),
@@ -2890,6 +2892,7 @@ fn explicitly_limited_interpreter_can_bound_call_frames() {
                 ty: Type::Scalar(ScalarType::Integer(DEFAULT_INT)),
                 writable: false,
                 synthetic: true,
+                owned: false,
             }],
             blocks: vec![BasicBlock {
                 id: BlockId(0),
@@ -3320,7 +3323,7 @@ fn stage_19_class_metadata_precedes_top_level_execution_lowering() {
 }
 
 #[test]
-fn native_class_property_gap_has_a_source_level_stage_neutral_diagnostic() {
+fn stage_19_class_property_access_and_destructor_execute_in_debug_mir() {
     let source = r#"class Message
 {
     function __construct(string $text)
@@ -3345,18 +3348,148 @@ function main(): void
 }
 "#;
 
-    let diagnostics = doriac::lower_source_to_mir("main.doria", source)
-        .expect_err("class property execution is not supported yet");
-    let diagnostic = diagnostics
-        .iter()
-        .find(|diagnostic| diagnostic.code == "M1101")
-        .expect("native coverage diagnostic");
-
+    let output = interpret(source);
+    assert_eq!(output.exit_status, 0);
     assert_eq!(
-        diagnostic.message,
-        "class property access is not supported by native compilation"
+        String::from_utf8(output.stdout).expect("stdout is UTF-8"),
+        "Welcome to Doria\nmessage released\n"
     );
-    assert!(!diagnostic.message.contains("Stage "));
-    assert!(!diagnostic.message.contains("MIR"));
-    assert!(!diagnostic.message.contains("condition"));
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn stage_19_constructor_body_executes_after_promoted_properties_are_initialized() {
+    let source = r#"class Message
+{
+    function __construct(string $text)
+    {
+        echo "constructed ";
+        echo $this->text;
+        echo "\n";
+    }
+
+    function __destruct()
+    {
+        echo "released ";
+        echo $this->text;
+        echo "\n";
+    }
+}
+
+function main(): void
+{
+    let $message = new Message("once");
+}
+"#;
+
+    let output = interpret(source);
+    assert_eq!(output.exit_status, 0);
+    assert_eq!(output.stdout, b"constructed once\nreleased once\n");
+    assert!(output.stderr.is_empty());
+    assert!(!lower_object(source).is_empty());
+}
+
+#[test]
+fn stage_19_constructor_body_can_directly_initialize_a_proven_property() {
+    let source = r#"class Message
+{
+    string $text;
+
+    function __construct(string $value)
+    {
+        $this->text = $value;
+    }
+
+    function __destruct()
+    {
+        echo $this->text;
+        echo " released\n";
+    }
+}
+
+function main(): void
+{
+    let $message = new Message("direct");
+}
+"#;
+
+    let output = interpret(source);
+    assert_eq!(output.exit_status, 0);
+    assert_eq!(output.stdout, b"direct released\n");
+    assert!(output.stderr.is_empty());
+    assert!(!lower_object(source).is_empty());
+}
+
+#[test]
+fn stage_19_property_initializers_run_before_the_constructor_body() {
+    let source = r#"function initializeText(): string
+{
+    echo "property initializer\n";
+    return "ready";
+}
+
+class Message
+{
+    string $text = initializeText();
+
+    function __construct(string $label)
+    {
+        echo "constructor ";
+        echo $this->text;
+        echo "\n";
+    }
+}
+
+function main(): void
+{
+    let $message = new Message("message");
+}
+"#;
+
+    let output = interpret(source);
+    assert_eq!(output.exit_status, 0);
+    assert_eq!(output.stdout, b"property initializer\nconstructor ready\n");
+    assert!(output.stderr.is_empty());
+    assert!(!lower_object(source).is_empty());
+}
+
+#[test]
+fn stage_19_class_values_move_through_arguments_and_returns() {
+    let source = r#"class Token
+{
+    function __construct(string $name)
+    {
+    }
+
+    function __destruct()
+    {
+        echo "drop ";
+        echo $this->name;
+        echo "\n";
+    }
+}
+
+function makeToken(): Token
+{
+    return new Token("returned");
+}
+
+function relay(take Token $token): Token
+{
+    return $token;
+}
+
+function main(): void
+{
+    let $token = relay(makeToken());
+    echo $token->name;
+    echo "\n";
+}
+"#;
+
+    let output = interpret(source);
+    assert_eq!(output.exit_status, 0);
+    assert_eq!(output.stdout, b"returned\ndrop returned\n");
+    assert!(output.stderr.is_empty());
+    assert!(!lower_object(source).is_empty());
 }

@@ -54,7 +54,17 @@ Source of truth for sequencing remains `docs/doria-end-to-end-plan.md`. The dura
 | Malformed literal-brace diagnostic | Frontend | Frontend | Frontend | Covered | P0002 carries a machine-applicable replacement of `{` with `\{`. |
 | Non-Displayable diagnostics | Frontend | Frontend | Frontend | Covered | Every display context names the class and exact `Displayable::toString` contract. |
 | `Displayable` frontend conformance | Frontend | Frontend | Frontend | Covered | Explicit nominal conformance and exact method shape are checked before MIR. |
-| `Displayable` native execution | Deferred | Deferred | Deferred | Stage 19/20 | No class placeholder enters MIR before class layout and method dispatch. |
+| Native class allocation and construction | Covered | Covered | Covered | Covered | Headerless payloads use shared layout; property initializers and promotions run before the lifecycle body. |
+| Narrow direct constructor initialization | Covered | Covered | Covered | Covered | The temporary soundness gate accepts only proven direct initialization shapes until Stage 21. |
+| Class-valued locals, calls, and returns | Covered | Covered | Covered | Covered | Pointer-sized move values preserve ownership through free-function ABI boundaries. |
+| `take` ownership transfer | Covered | Covered | Covered | Covered | Transfer invalidates the caller slot and cleanup becomes the callee's obligation. |
+| Property loads and Stage 19 assignments | Covered | Covered | Covered | Covered | Shared class metadata supplies checked types and compiler-known offsets. |
+| Deterministic class destruction | Covered | Covered | Covered | Covered | Lifecycle body runs first, owned properties drop in reverse order, allocation frees last. |
+| Structured-exit cleanup | Covered | Covered | Covered | Covered | Fallthrough, return, break, and continue drop still-owned locals; panic intentionally does not unwind. |
+| Statement class temporaries | Covered | Covered | Covered | Covered | Borrowed and transferred temporaries are released exactly once at their accepted ownership boundary. |
+| Replacement-before-drop assignment | Covered | Covered | Covered | Covered | Replacement is acquired before the previous destination owner is destroyed. |
+| Stage 19 native memory safety | N/A | Linux CI | Linux CI | Covered | Valgrind executes the class acceptance fixtures under both native profiles; ordinary parity remains cross-platform. |
+| `Displayable` native execution | Deferred | Deferred | Deferred | Stage 20 | Class layout exists; general instance-method dispatch remains Stage 20. |
 | PHP `Displayable` subset | N/A | N/A | N/A | Covered | Generated private interface invokes Doria `toString` exactly once and never relies on `__toString`. |
 | Parser fuzzing | Frontend | Frontend | Frontend | Covered | Bounded CI fuzzing seeds nested strings, braces, malformed expressions, and UTF-8 offsets. |
 | String equality and ordering | Covered | Covered | Covered | Covered | Equality is exact-byte and ordering is unsigned byte-lexicographic. |
@@ -107,6 +117,6 @@ Source of truth for sequencing remains `docs/doria-end-to-end-plan.md`. The dura
 
 ## Retirement Gate
 
-Status: Passed through Stage 18 after this branch's full validation gates pass.
+Status: Passed through Stage 19 after this branch's full validation gates pass.
 
-All accepted Stage <=18 scalar, string, interpolation, checked-format, and text-I/O lowering passes through typed MIR and shared MIR validation. The interpreter, Cranelift fast profile, and LLVM release profile consume that same MIR; every finite native example is required in the executable manifest with deterministic sidecars where needed; and the Stage 7-10 native smoke module remains retired and deleted. Stage 19 ownership, moves, destruction, and native class layout is next.
+All accepted Stage <=19 scalar, string, interpolation, checked-format, text-I/O, ownership, and native-class lowering passes through typed MIR and shared MIR validation. The interpreter, Cranelift fast profile, and LLVM release profile consume that same MIR; every finite native example is required in the executable manifest with deterministic sidecars where needed; Linux CI memory-checks the Stage 19 native fixtures; and the Stage 7-10 native smoke module remains retired and deleted. Stage 20 methods, statics, and `internal` native lowering is next.

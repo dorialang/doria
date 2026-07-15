@@ -1,0 +1,3 @@
+property initializer
+constructor ready message
+destructor initialized

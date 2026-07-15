@@ -1,0 +1,77 @@
+class Token
+{
+    function __construct(string $name)
+    {
+    }
+
+    function __destruct()
+    {
+        echo "drop token ";
+        echo $this->name;
+        echo "\n";
+    }
+}
+
+class Pair
+{
+    function __construct(take Token $first, take Token $second)
+    {
+    }
+
+    function __destruct()
+    {
+        echo "drop pair\n";
+    }
+}
+
+function consume(take Token $token): void
+{
+}
+
+function inspect(Token $token): void
+{
+}
+
+function makeToken(string $name): Token
+{
+    return new Token($name);
+}
+
+function leaveEarly(): void
+{
+    let $early = new Token("early");
+    return;
+}
+
+function scenario(): void
+{
+    let $first = new Token("first");
+    let $second = new Token("second");
+    let $pair = new Pair($first, $second);
+    inspect($pair->first);
+    let writable $slot = new Token("old");
+    $slot = makeToken("replacement");
+    consume(new Token("temporary"));
+    inspect(new Token("borrowed temporary"));
+
+    while (true) {
+        let $inner = new Token("inner");
+        break;
+    }
+
+    let writable $iterations = 0;
+    while ($iterations < 2) {
+        let $continued = new Token("continued");
+        $iterations++;
+        continue;
+    }
+
+    leaveEarly();
+    echo "leaving scenario\n";
+    return;
+}
+
+function main(): void
+{
+    scenario();
+}

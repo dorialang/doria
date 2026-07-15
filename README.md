@@ -63,9 +63,9 @@ Doria was created by a PHP developer who wanted compile-time safety and native p
 
 🚧 **Doria is in early, active development and is not yet ready for use.** The compiler is being built stage by stage against a comprehensive language specification, with a native-first architecture and differential testing at every step. Expect rapid change, breaking changes, and honest roadmaps rather than promises.
 
-Stages 11–18 are implemented on the current compiler branch. Double-quoted strings accept ordinary Doria expressions inside interpolation braces, and primitive expression interpolation runs through the interpreter, Cranelift, and LLVM. Stage 18 also adds the compiler-known nominal `Displayable` contract for class display conversion; native class execution remains staged for the class layout and dispatch work that follows.
+Stages 11–19 are implemented on the current compiler branch. Double-quoted strings accept ordinary Doria expressions inside interpolation braces, and primitive expression interpolation runs through the interpreter, Cranelift, and LLVM. Stage 19 adds native class construction, properties, class-valued moves, `take` transfer, deterministic normal-scope destruction, and compiler-invoked `__construct`/`__destruct` lifecycle bodies. General method dispatch remains Stage 20 work.
 
-The interpreter, Cranelift fast profile, and LLVM release profile consume the same validated MIR and the durable parity suite compares exact stdin-driven output, panic text, status, and file side effects. Stage 19 ownership, moves, destruction, and native class layout is next.
+The interpreter, Cranelift fast profile, and LLVM release profile consume the same validated MIR and the durable parity suite compares exact stdin-driven output, panic text, status, file side effects, and Stage 19 class lifetime behavior. Stage 20 methods, statics, and `internal` native lowering is next.
 
 Watch this organization to follow along as the language, the `doriac` compiler, the `baton` build tool, and the standard library take shape.
 
