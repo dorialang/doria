@@ -863,6 +863,68 @@ fn shared_validator_rejects_a_promoted_class_owner_also_owned_by_the_constructor
 }
 
 #[test]
+fn shared_validator_invalidates_promoted_class_aliases_after_property_replacement() {
+    let (mut program, child) = promoted_class_alias_program();
+    program.functions[1].blocks[0].statements = vec![
+        Statement::AssignProperty {
+            object: LocalId(0),
+            property: child,
+            value: Rvalue::Class(ClassExpression::New {
+                class: ClassId(1),
+                properties: vec![],
+                constructor: None,
+                args: vec![],
+            }),
+        },
+        Statement::CallVoid {
+            function: FunctionId(2),
+            args: vec![Rvalue::Class(ClassExpression::Local {
+                class: ClassId(1),
+                local: LocalId(1),
+                transfer: false,
+            })],
+        },
+    ];
+
+    let error = doriac::mir_validation::validate_program(&program)
+        .expect_err("replacing a promoted class property must invalidate its parameter alias");
+    assert!(error
+        .message
+        .contains("uses class local local1 after its ownership ended"));
+}
+
+#[test]
+fn shared_validator_rejects_construction_borrows_after_transfers() {
+    let (mut program, _) = promoted_class_alias_program();
+    program.classes[0].properties[0].promoted = false;
+    let Statement::AssignLocal {
+        value: Rvalue::Class(ClassExpression::New {
+            properties, args, ..
+        }),
+        ..
+    } = &mut program.functions[0].blocks[0].statements[0]
+    else {
+        panic!("class new fixture");
+    };
+    properties[0].source = PropertyValueSource::Expression(Rvalue::Class(ClassExpression::Local {
+        class: ClassId(1),
+        local: LocalId(1),
+        transfer: true,
+    }));
+    args[0] = Rvalue::Class(ClassExpression::Local {
+        class: ClassId(1),
+        local: LocalId(1),
+        transfer: false,
+    });
+
+    let error = doriac::mir_validation::validate_program(&program)
+        .expect_err("construction cannot borrow an owner after an earlier initializer moved it");
+    assert!(error
+        .message
+        .contains("uses class local local1 after transferring it"));
+}
+
+#[test]
 fn shared_validator_rejects_class_new_with_missing_properties() {
     let program = class_new_program();
     let error = doriac::mir_validation::validate_program(&program)
@@ -1642,4 +1704,71 @@ fn class_new_program() -> Program {
         entry_block: BlockId(0),
     });
     program
+}
+
+fn promoted_class_alias_program() -> (Program, PropertyId) {
+    let mut program = class_program();
+    let child = PropertyId {
+        class: ClassId(0),
+        index: 0,
+    };
+    program.classes[0].properties.push(Property {
+        id: child,
+        name: "child".to_string(),
+        ty: Type::Class(ClassId(1)),
+        writable: true,
+        promoted: true,
+    });
+    program.classes[0].layout =
+        compute_class_layout(ClassId(0), [(child, FieldType::Class(ClassId(1)))], 8);
+    program.classes[0].constructor = Some(FunctionId(1));
+    program.functions[0].locals = vec![class_local(0, ClassId(0)), class_local(1, ClassId(1))];
+    program.functions[0].blocks[0]
+        .statements
+        .push(Statement::AssignLocal {
+            target: LocalId(0),
+            value: Rvalue::Class(ClassExpression::New {
+                class: ClassId(0),
+                properties: vec![PropertyValue {
+                    property: child,
+                    source: PropertyValueSource::ConstructorArgument(0),
+                }],
+                constructor: Some(FunctionId(1)),
+                args: vec![Rvalue::Class(ClassExpression::Local {
+                    class: ClassId(1),
+                    local: LocalId(1),
+                    transfer: true,
+                })],
+            }),
+        });
+    program.functions.push(Function {
+        id: FunctionId(1),
+        name: "Parent::__construct".to_string(),
+        params: vec![LocalId(0), LocalId(1)],
+        return_type: ReturnType::Void,
+        locals: vec![
+            borrowed_class_local(0, ClassId(0)),
+            borrowed_class_local(1, ClassId(1)),
+        ],
+        blocks: vec![BasicBlock {
+            id: BlockId(0),
+            statements: vec![],
+            terminator: Terminator::ReturnVoid,
+        }],
+        entry_block: BlockId(0),
+    });
+    program.functions.push(Function {
+        id: FunctionId(2),
+        name: "inspect".to_string(),
+        params: vec![LocalId(0)],
+        return_type: ReturnType::Void,
+        locals: vec![borrowed_class_local(0, ClassId(1))],
+        blocks: vec![BasicBlock {
+            id: BlockId(0),
+            statements: vec![],
+            terminator: Terminator::ReturnVoid,
+        }],
+        entry_block: BlockId(0),
+    });
+    (program, child)
 }

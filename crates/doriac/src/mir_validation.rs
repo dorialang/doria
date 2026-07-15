@@ -561,6 +561,13 @@ impl ClassLocalAccesses {
     }
 }
 
+#[derive(Clone, Copy)]
+struct PropertyAliasInvalidation {
+    receiver: mir::LocalId,
+    property: crate::class_layout::PropertyId,
+    alias: mir::LocalId,
+}
+
 fn rvalue_transfers_class_local(value: &mir::Rvalue, local: mir::LocalId) -> bool {
     let mut accesses = ClassLocalAccesses::default();
     collect_rvalue_class_local_accesses(value, &mut accesses);
@@ -860,6 +867,7 @@ fn apply_class_local_state(
     function: &mir::Function,
     statement: &mir::Statement,
     moved: &mut HashSet<mir::LocalId>,
+    alias_invalidations: &[PropertyAliasInvalidation],
     validate: bool,
 ) -> Result<(), BackendError> {
     let accesses = collect_statement_class_local_accesses(statement);
@@ -877,6 +885,16 @@ fn apply_class_local_state(
         }
     }
     apply_class_local_accesses(function, &accesses, moved, validate)?;
+    if let mir::Statement::AssignProperty {
+        object, property, ..
+    } = statement
+    {
+        for invalidation in alias_invalidations {
+            if invalidation.receiver == *object && invalidation.property == *property {
+                moved.insert(invalidation.alias);
+            }
+        }
+    }
     match statement {
         mir::Statement::AssignLocal { target, .. }
             if matches!(local_in(function, *target)?.ty, mir::Type::Class(_)) =>
@@ -916,6 +934,13 @@ fn apply_class_local_accesses(
 }
 
 fn validate_class_local_lifetimes(function: &mir::Function) -> Result<(), BackendError> {
+    validate_class_local_lifetimes_with_aliases(function, &[])
+}
+
+fn validate_class_local_lifetimes_with_aliases(
+    function: &mir::Function,
+    alias_invalidations: &[PropertyAliasInvalidation],
+) -> Result<(), BackendError> {
     let (reachable, predecessors) = reachable_blocks_and_predecessors(function)?;
     let mut moved_on_entry = vec![HashSet::new(); function.blocks.len()];
     let mut moved_on_exit = vec![HashSet::new(); function.blocks.len()];
@@ -929,7 +954,13 @@ fn validate_class_local_lifetimes(function: &mir::Function) -> Result<(), Backen
                 .collect::<HashSet<_>>();
             let mut moved_at_exit = moved_at_entry.clone();
             for statement in &block.statements {
-                apply_class_local_state(function, statement, &mut moved_at_exit, false)?;
+                apply_class_local_state(
+                    function,
+                    statement,
+                    &mut moved_at_exit,
+                    alias_invalidations,
+                    false,
+                )?;
             }
             apply_class_local_accesses(
                 function,
@@ -953,7 +984,7 @@ fn validate_class_local_lifetimes(function: &mir::Function) -> Result<(), Backen
     for block in function.blocks.iter().filter(|block| reachable[block.id.0]) {
         let mut moved = moved_on_entry[block.id.0].clone();
         for statement in &block.statements {
-            apply_class_local_state(function, statement, &mut moved, true)?;
+            apply_class_local_state(function, statement, &mut moved, alias_invalidations, true)?;
         }
         let accesses = collect_terminator_class_local_accesses(&block.terminator);
         apply_class_local_accesses(function, &accesses, &mut moved, true)?;
@@ -1196,15 +1227,7 @@ fn validate_class_expression(
                 )));
             }
             collect_rvalue_args_class_local_accesses(args, &mut construction_accesses);
-            let mut transferred_class_locals = HashSet::new();
-            for local in construction_accesses.transferred() {
-                if !transferred_class_locals.insert(local) {
-                    return Err(malformed_mir(format!(
-                        "class#{} new expression transfers class local local{} more than once",
-                        class.0, local.0
-                    )));
-                }
-            }
+            validate_construction_class_local_accesses(class, &construction_accesses)?;
             if let Some(constructor) = constructor {
                 validate_call_args_for_params(
                     program,
@@ -1243,10 +1266,54 @@ fn validate_class_expression(
                         )));
                     }
                 }
+                let alias_invalidations = properties
+                    .iter()
+                    .filter_map(|property| {
+                        let mir::PropertyValueSource::ConstructorArgument(index) = property.source
+                        else {
+                            return None;
+                        };
+                        let definition = &class_definition.properties[property.property.index];
+                        if !matches!(definition.ty, mir::Type::Class(_)) {
+                            return None;
+                        }
+                        Some(PropertyAliasInvalidation {
+                            receiver: constructor.params[0],
+                            property: property.property,
+                            alias: constructor_parameters[index],
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                validate_class_local_lifetimes_with_aliases(constructor, &alias_invalidations)?;
             }
             Ok(())
         }
     }
+}
+
+fn validate_construction_class_local_accesses(
+    class: ClassId,
+    accesses: &ClassLocalAccesses,
+) -> Result<(), BackendError> {
+    let mut transferred = HashSet::new();
+    for access in accesses.iter() {
+        match access {
+            ClassLocalAccess::Borrow(local) if transferred.contains(&local) => {
+                return Err(malformed_mir(format!(
+                    "class#{} new expression uses class local local{} after transferring it",
+                    class.0, local.0
+                )));
+            }
+            ClassLocalAccess::Transfer(local) if !transferred.insert(local) => {
+                return Err(malformed_mir(format!(
+                    "class#{} new expression transfers class local local{} more than once",
+                    class.0, local.0
+                )));
+            }
+            ClassLocalAccess::Borrow(_) | ClassLocalAccess::Transfer(_) => {}
+        }
+    }
+    Ok(())
 }
 
 fn validate_constructor_body_initializer(
