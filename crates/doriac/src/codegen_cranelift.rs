@@ -904,6 +904,42 @@ fn lower_class_expression(
                 constructor_args.extend(lowered_args.values.iter().copied());
                 let callee = declared_function(builder, resources, *constructor)?;
                 builder.ins().call(callee, &constructor_args);
+
+                let constructor_definition = function_in(resources.program, *constructor)?;
+                for (index, argument) in args.iter().enumerate().rev() {
+                    let mir::Rvalue::Class(
+                        mir::ClassExpression::New { class, .. }
+                        | mir::ClassExpression::Call { class, .. },
+                    ) = argument
+                    else {
+                        continue;
+                    };
+                    let promoted = properties.iter().any(|property| {
+                        matches!(
+                            property.source,
+                            mir::PropertyValueSource::ConstructorArgument(argument)
+                                if argument == index
+                        )
+                    });
+                    let parameter =
+                        *constructor_definition
+                            .params
+                            .get(index + 1)
+                            .ok_or_else(|| {
+                                malformed_mir(format!(
+                                    "constructor function{} is missing parameter {index}",
+                                    constructor.0
+                                ))
+                            })?;
+                    if !promoted && !local_in(constructor_definition, parameter)?.owned {
+                        lower_drop_class_value_checked(
+                            builder,
+                            lowered_args.values[index],
+                            *class,
+                            resources,
+                        )?;
+                    }
+                }
             }
             for (index, string) in lowered_args.owned_strings {
                 let promoted = properties.iter().any(|property| {

@@ -700,6 +700,40 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                         call,
                         function_in(self.program, *constructor)?,
                     )?;
+
+                    let constructor_definition = function_in(self.program, *constructor)?;
+                    for (index, argument) in args.iter().enumerate().rev() {
+                        let mir::Rvalue::Class(
+                            mir::ClassExpression::New { class, .. }
+                            | mir::ClassExpression::Call { class, .. },
+                        ) = argument
+                        else {
+                            continue;
+                        };
+                        let promoted = properties.iter().any(|property| {
+                            matches!(
+                                property.source,
+                                mir::PropertyValueSource::ConstructorArgument(argument)
+                                    if argument == index
+                            )
+                        });
+                        let parameter =
+                            *constructor_definition
+                                .params
+                                .get(index + 1)
+                                .ok_or_else(|| {
+                                    malformed_mir(format!(
+                                        "constructor function{} is missing parameter {index}",
+                                        constructor.0
+                                    ))
+                                })?;
+                        if !promoted && !local_in(constructor_definition, parameter)?.owned {
+                            self.drop_class_value_checked(
+                                lowered_args[index].into_pointer_value(),
+                                *class,
+                            )?;
+                        }
+                    }
                 }
                 for (index, string) in owned_strings {
                     let promoted = properties.iter().any(|property| {

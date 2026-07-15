@@ -91,6 +91,7 @@ enum EvaluationTask {
         constructor: Option<mir::FunctionId>,
         argument_count: usize,
         property_expression_count: usize,
+        temporary_class_args: Vec<Option<crate::class_layout::ClassId>>,
     },
     FinishClassNew {
         object: usize,
@@ -529,6 +530,7 @@ impl Interpreter<'_> {
                 constructor,
                 argument_count,
                 property_expression_count,
+                temporary_class_args,
             } => {
                 let property_expressions = self.take_call_arguments(property_expression_count)?;
                 let arguments = self.take_call_arguments(argument_count)?;
@@ -539,8 +541,8 @@ impl Interpreter<'_> {
                 })?;
                 let mut slots = vec![None; class_definition.properties.len()];
                 let mut expression_values = property_expressions.into_iter();
-                for property in properties {
-                    let value = match property.source {
+                for property in &properties {
+                    let value = match &property.source {
                         mir::PropertyValueSource::Expression(_) => {
                             expression_values.next().ok_or_else(|| {
                                 InterpreterError::new(
@@ -549,7 +551,7 @@ impl Interpreter<'_> {
                             })?
                         }
                         mir::PropertyValueSource::ConstructorArgument(index) => {
-                            arguments.get(index).cloned().ok_or_else(|| {
+                            arguments.get(*index).cloned().ok_or_else(|| {
                                 InterpreterError::new(format!(
                                     "MIR constructor argument {index} does not exist"
                                 ))
@@ -573,6 +575,48 @@ impl Interpreter<'_> {
                     },
                 );
                 if let Some(constructor) = constructor {
+                    let constructor_definition = function_in(self.program, constructor)?;
+                    let mut temporary_drops = Vec::new();
+                    for (index, temporary_class) in temporary_class_args.iter().enumerate() {
+                        let Some(class) = temporary_class else {
+                            continue;
+                        };
+                        let promoted = properties.iter().any(|property| {
+                            matches!(
+                                property.source,
+                                mir::PropertyValueSource::ConstructorArgument(argument)
+                                    if argument == index
+                            )
+                        });
+                        let parameter =
+                            *constructor_definition
+                                .params
+                                .get(index + 1)
+                                .ok_or_else(|| {
+                                    InterpreterError::new(format!(
+                                        "MIR constructor function{} is missing parameter {index}",
+                                        constructor.0
+                                    ))
+                                })?;
+                        if promoted || local_in(constructor_definition, parameter)?.owned {
+                            continue;
+                        }
+                        let LocalValue::Class {
+                            object,
+                            class: actual,
+                        } = &arguments[index]
+                        else {
+                            return Err(InterpreterError::new(
+                                "MIR temporary constructor argument produced another value type",
+                            ));
+                        };
+                        if actual != class {
+                            return Err(InterpreterError::new(
+                                "MIR temporary constructor argument produced the wrong class",
+                            ));
+                        }
+                        temporary_drops.push((*object, *class));
+                    }
                     let mut constructor_arguments = Vec::with_capacity(arguments.len() + 1);
                     constructor_arguments.push(LocalValue::Class {
                         object: object_id,
@@ -585,6 +629,11 @@ impl Interpreter<'_> {
                             object: object_id,
                             class,
                         });
+                    if !temporary_drops.is_empty() {
+                        self.current_frame_mut()?
+                            .tasks
+                            .push(EvaluationTask::DropTemporaryClasses(temporary_drops));
+                    }
                     self.push_frame(
                         constructor,
                         &constructor_arguments,
@@ -1361,6 +1410,16 @@ impl Interpreter<'_> {
                 constructor,
                 args,
             } => {
+                let temporary_class_args = args
+                    .iter()
+                    .map(|argument| match argument {
+                        mir::Rvalue::Class(
+                            mir::ClassExpression::New { class, .. }
+                            | mir::ClassExpression::Call { class, .. },
+                        ) => Some(*class),
+                        _ => None,
+                    })
+                    .collect();
                 let property_expression_count = properties
                     .iter()
                     .filter(|property| {
@@ -1374,6 +1433,7 @@ impl Interpreter<'_> {
                     constructor,
                     argument_count: args.len(),
                     property_expression_count,
+                    temporary_class_args,
                 });
                 for property in properties.into_iter().rev() {
                     if let mir::PropertyValueSource::Expression(value) = property.source {

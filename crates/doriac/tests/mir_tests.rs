@@ -1,9 +1,10 @@
 use doriac::backend::{BackendOutput, BackendTarget};
+use doriac::class_layout::compute_class_layout;
 use doriac::mir::{
-    BasicBlock, BlockId, BoolBinaryOp as ConditionBinaryOp, BoolExpression as Condition, CompareOp,
-    Function, FunctionId, IntegerBinaryOp, IntegerExpression, Local, LocalId, Operand, Program,
-    ReturnType, Rvalue, ScalarType, ScalarValue, Statement, StringExpression, Terminator, Type,
-    ValueExpression,
+    BasicBlock, BlockId, BoolBinaryOp as ConditionBinaryOp, BoolExpression as Condition,
+    ClassExpression, CompareOp, Function, FunctionId, IntegerBinaryOp, IntegerExpression, Local,
+    LocalId, Operand, Program, ReturnType, Rvalue, ScalarType, ScalarValue, Statement,
+    StringExpression, Terminator, Type, ValueExpression,
 };
 use doriac::numeric::{IntegerType, IntegerValue};
 
@@ -3418,6 +3419,132 @@ function main(): void
     assert_eq!(output.stdout, b"direct released\n");
     assert!(output.stderr.is_empty());
     assert!(!lower_object(source).is_empty());
+}
+
+#[test]
+fn stage_19_rejects_constructor_reads_before_direct_property_initialization() {
+    let diagnostics = doriac::lower_source_to_mir(
+        "constructor-read-before-init.doria",
+        r#"class Message
+{
+    string $text;
+
+    function __construct(string $value)
+    {
+        echo $this->text;
+        $this->text = $value;
+    }
+}
+
+function main(): void
+{
+    let $message = new Message("late");
+}
+"#,
+    )
+    .expect_err("the Stage 19 soundness gate must reject a read before initialization");
+
+    assert!(diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == "M1101"
+            && diagnostic.message.contains("property `$text`")
+            && diagnostic.message.contains("initialized")
+    }));
+}
+
+#[test]
+fn stage_19_infers_string_property_loads_and_comparisons() {
+    let source = r#"class Message
+{
+    function __construct(string $text)
+    {
+    }
+}
+
+function main(): void
+{
+    let $message = new Message("ready");
+    let $copy = $message->text;
+    if ($message->text == "ready") {
+        echo $copy;
+    }
+}
+"#;
+
+    let output = interpret(source);
+    assert_eq!(output.exit_status, 0);
+    assert_eq!(output.stdout, b"ready");
+    assert!(output.stderr.is_empty());
+    assert!(!lower_object(source).is_empty());
+}
+
+#[test]
+fn stage_19_mir_drops_a_temporary_passed_to_a_borrowed_constructor_parameter() {
+    let mut program = lower(
+        r#"class Child
+{
+    function __construct(string $name)
+    {
+    }
+
+    function __destruct()
+    {
+        echo "drop ";
+        echo $this->name;
+    }
+}
+
+class Parent
+{
+    function __construct(take Child $child)
+    {
+    }
+}
+
+function main(): void
+{
+    let $parent = new Parent(new Child("borrowed"));
+}
+"#,
+    );
+
+    // Source constructors promote every parameter, so a borrowed, unpromoted
+    // class parameter is not source-reachable today. Keep the shared MIR and
+    // all consumers sound for hand-built MIR and future constructor shapes by
+    // removing the promotion while retaining the borrowed lifecycle parameter.
+    let parent = program
+        .classes
+        .iter_mut()
+        .find(|class| class.name == "Parent")
+        .expect("Parent metadata");
+    let parent_id = parent.id;
+    parent.properties.clear();
+    parent.layout = compute_class_layout(parent_id, [], std::mem::size_of::<usize>() as u32);
+    for function in &mut program.functions {
+        for block in &mut function.blocks {
+            for statement in &mut block.statements {
+                if let Statement::AssignLocal {
+                    value:
+                        Rvalue::Class(ClassExpression::New {
+                            class, properties, ..
+                        }),
+                    ..
+                } = statement
+                {
+                    if *class == parent_id {
+                        properties.clear();
+                    }
+                }
+            }
+        }
+    }
+
+    doriac::mir_validation::validate_program(&program)
+        .expect("borrowed unpromoted constructor MIR should remain well formed");
+    let output = doriac::mir_interpreter::interpret(&program).expect("MIR should interpret");
+    assert_eq!(output.stdout, b"drop borrowed");
+    assert!(!doriac::codegen_cranelift::lower_mir_to_object(&program)
+        .expect("MIR should lower to Cranelift")
+        .is_empty());
 }
 
 #[test]

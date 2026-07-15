@@ -206,6 +206,40 @@ fn borrowed_class_parameters_and_this_cannot_be_given_away() {
 }
 
 #[test]
+fn property_assignment_receiver_cannot_be_given_away_by_the_value() {
+    let diagnostics = doriac::check_source(
+        "property-assignment-overlap.doria",
+        r#"class Box
+{
+    writable string $value = "old";
+}
+
+function consume(take Box $box): string
+{
+    return "replacement";
+}
+
+function main(): void
+{
+    let writable $box = new Box();
+    $box->value = consume($box);
+}
+"#,
+    )
+    .expect_err("the property destination must remain borrowed while its value is evaluated");
+
+    assert!(
+        diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "E0471"
+                && diagnostic
+                    .message
+                    .contains("destination of a property assignment")
+        }),
+        "unexpected diagnostics: {diagnostics:#?}"
+    );
+}
+
+#[test]
 fn method_and_static_take_parameters_move_their_arguments() {
     for source in [
         "class Guard {} class Box { function consume(take Guard $guard): void {} } function test(Box $box, take Guard $guard): void { $box->consume($guard); $box->consume($guard); }",

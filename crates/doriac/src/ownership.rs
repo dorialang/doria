@@ -210,6 +210,7 @@ pub(crate) fn check_program_with_inferred_move_returns(
         properties,
         inferred_move_returns: inferred_move_returns.clone(),
         receiver_class: None,
+        active_assignment_receivers: HashSet::new(),
         diagnostics: Vec::new(),
     };
     let mut top_level_scopes = Scopes::new();
@@ -318,6 +319,7 @@ struct Checker {
     properties: HashMap<(String, String), PropertyInfo>,
     inferred_move_returns: HashSet<usize>,
     receiver_class: Option<String>,
+    active_assignment_receivers: HashSet<String>,
     diagnostics: Vec<Diagnostic>,
 }
 
@@ -516,7 +518,17 @@ impl Checker {
                         );
                     }
                     self.use_expr(&assignment.target, scopes, UseMode::Borrow);
+                    let receiver = ownership_root_name(&assignment.target)
+                        .filter(|name| scopes.get(name).is_some())
+                        .map(str::to_owned);
+                    let inserted = receiver
+                        .as_ref()
+                        .is_some_and(|name| self.active_assignment_receivers.insert(name.clone()));
                     self.use_expr(&assignment.value, scopes, UseMode::Borrow);
+                    if inserted {
+                        self.active_assignment_receivers
+                            .remove(receiver.as_deref().expect("inserted receiver"));
+                    }
                 }
                 Flow::fallthrough()
             }
@@ -845,6 +857,21 @@ impl Checker {
     fn use_expr(&mut self, expr: &Expr, scopes: &mut Scopes, mode: UseMode) {
         match expr {
             Expr::Variable { name, span } => {
+                if mode == UseMode::Give && self.active_assignment_receivers.contains(name) {
+                    self.diagnostics.push(
+                        Diagnostic::new(
+                            "E0471",
+                            format!(
+                                "`${name}` cannot be given away while it is the destination of a property assignment"
+                            ),
+                            *span,
+                        )
+                        .with_help(
+                            "compute the replacement without giving away the object being assigned",
+                        ),
+                    );
+                    return;
+                }
                 let Some(binding) = scopes.get_mut(name) else {
                     return;
                 };

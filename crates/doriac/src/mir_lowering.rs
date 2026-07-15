@@ -59,48 +59,58 @@ pub fn lower_program(program: &hir::Program) -> DiagnosticResult<mir::Program> {
             })
         })
         .collect::<HashMap<_, _>>();
-    let constructor_body_initializers = program
-        .items
-        .iter()
-        .filter_map(|item| match item {
-            hir::Item::Class(class) => Some(class),
+    let mut constructor_body_initializers = HashSet::new();
+    for class in program.items.iter().filter_map(|item| match item {
+        hir::Item::Class(class) => Some(class),
+        _ => None,
+    }) {
+        let class_id = class_ids[&class.name];
+        let Some(statements) = class.members.iter().find_map(|member| match member {
+            hir::ClassMember::Method(method) if method.name == "__construct" => {
+                Some(&method.body.statements)
+            }
             _ => None,
-        })
-        .flat_map(|class| {
-            let class_id = class_ids[&class.name];
-            class
-                .members
+        }) else {
+            continue;
+        };
+
+        // Until Stage 21 supplies full definite-initialization dataflow, the
+        // native soundness gate accepts only top-level direct writes that are
+        // not preceded by a read/escape of that property or by control flow
+        // that can bypass the write.
+        for (index, statement) in statements.iter().enumerate() {
+            let hir::Stmt::Assignment(assignment) = statement else {
+                continue;
+            };
+            if assignment.op != hir::AssignOp::Assign {
+                continue;
+            }
+            let Some(property_name) = direct_this_property_name(&assignment.target) else {
+                continue;
+            };
+            if expression_may_observe_this_property(&assignment.value, property_name)
+                || statements[..index].iter().any(|statement| {
+                    statement_prevents_direct_property_init(statement, property_name)
+                })
+            {
+                continue;
+            };
+            let Some(property) = program
+                .semantic_info
+                .classes
                 .iter()
-                .find_map(|member| match member {
-                    hir::ClassMember::Method(method) if method.name == "__construct" => {
-                        Some(&method.body.statements)
-                    }
-                    _ => None,
-                })
-                .into_iter()
-                .flatten()
-                .filter_map(move |statement| {
-                    let hir::Stmt::Assignment(assignment) = statement else {
-                        return None;
-                    };
-                    if assignment.op != hir::AssignOp::Assign {
-                        return None;
-                    }
-                    let property_name = direct_this_property_name(&assignment.target)?;
-                    program
-                        .semantic_info
-                        .classes
+                .find(|info| info.id == class_id)
+                .and_then(|info| {
+                    info.properties
                         .iter()
-                        .find(|info| info.id == class_id)
-                        .and_then(|info| {
-                            info.properties
-                                .iter()
-                                .find(|property| property.name == property_name)
-                        })
-                        .map(|property| property.id)
+                        .find(|property| property.name == property_name)
                 })
-        })
-        .collect::<HashSet<_>>();
+            else {
+                continue;
+            };
+            constructor_body_initializers.insert(property.id);
+        }
+    }
     let mut declarations = Vec::new();
 
     for item in &program.items {
@@ -943,6 +953,98 @@ fn direct_this_property_name(expr: &hir::Expr) -> Option<&str> {
     }
 }
 
+fn statement_prevents_direct_property_init(statement: &hir::Stmt, property: &str) -> bool {
+    match statement {
+        hir::Stmt::VarDecl(decl) => {
+            expression_may_observe_this_property(&decl.initializer, property)
+        }
+        hir::Stmt::Assignment(assignment) => {
+            let target_reads_property =
+                if let Some(target_property) = direct_this_property_name(&assignment.target) {
+                    assignment.op != hir::AssignOp::Assign && target_property == property
+                } else {
+                    expression_may_observe_this_property(&assignment.target, property)
+                };
+            target_reads_property
+                || expression_may_observe_this_property(&assignment.value, property)
+        }
+        hir::Stmt::Echo { expr, .. } | hir::Stmt::Expr { expr, .. } => {
+            expression_may_observe_this_property(expr, property)
+        }
+        hir::Stmt::Increment(increment) => {
+            expression_may_observe_this_property(&increment.target, property)
+        }
+        hir::Stmt::Return { .. }
+        | hir::Stmt::If(_)
+        | hir::Stmt::While(_)
+        | hir::Stmt::For(_)
+        | hir::Stmt::Break { .. }
+        | hir::Stmt::Continue { .. }
+        | hir::Stmt::Foreach(_) => true,
+    }
+}
+
+fn expression_may_observe_this_property(expr: &hir::Expr, property: &str) -> bool {
+    match expr {
+        hir::Expr::This { .. } => true,
+        hir::Expr::InterpolatedString { parts, .. } => parts.iter().any(|part| {
+            matches!(part, hir::InterpolatedStringPart::Expr(expr) if expression_may_observe_this_property(expr, property))
+        }),
+        hir::Expr::Array { elements, .. } => elements.iter().any(|element| {
+            element
+                .key
+                .as_ref()
+                .is_some_and(|key| expression_may_observe_this_property(key, property))
+                || expression_may_observe_this_property(&element.value, property)
+        }),
+        hir::Expr::PropertyAccess {
+            object,
+            property: accessed,
+            ..
+        } if expression_is_this(object) => accessed == property,
+        hir::Expr::PropertyAccess { object, .. }
+        | hir::Expr::Grouped { expr: object, .. }
+        | hir::Expr::Unary { expr: object, .. } => {
+            expression_may_observe_this_property(object, property)
+        }
+        hir::Expr::MethodCall { object, args, .. } => {
+            expression_may_observe_this_property(object, property)
+                || args
+                    .iter()
+                    .any(|arg| expression_may_observe_this_property(arg, property))
+        }
+        hir::Expr::FunctionCall { args, .. }
+        | hir::Expr::StaticCall { args, .. }
+        | hir::Expr::New { args, .. } => args
+            .iter()
+            .any(|arg| expression_may_observe_this_property(arg, property)),
+        hir::Expr::Binary { left, right, .. }
+        | hir::Expr::Range {
+            start: left,
+            end: right,
+            ..
+        } => {
+            expression_may_observe_this_property(left, property)
+                || expression_may_observe_this_property(right, property)
+        }
+        hir::Expr::Variable { .. }
+        | hir::Expr::Identifier { .. }
+        | hir::Expr::String { .. }
+        | hir::Expr::Int { .. }
+        | hir::Expr::Float { .. }
+        | hir::Expr::Bool { .. }
+        | hir::Expr::Null { .. } => false,
+    }
+}
+
+fn expression_is_this(expr: &hir::Expr) -> bool {
+    match expr {
+        hir::Expr::This { .. } => true,
+        hir::Expr::Grouped { expr, .. } => expression_is_this(expr),
+        _ => false,
+    }
+}
+
 #[derive(Clone, Copy)]
 enum LoopControl {
     Break,
@@ -1520,6 +1622,9 @@ fn is_string_local_initializer(expr: &hir::Expr, context: &LoweringContext) -> b
         hir::Expr::Variable { name, span } => context
             .lookup_local(name, *span)
             .is_ok_and(|local| context.local_type(local) == mir::Type::String),
+        hir::Expr::PropertyAccess { .. } => {
+            lower_property_place(expr, context).is_ok_and(|(_, _, ty)| ty == mir::Type::String)
+        }
         hir::Expr::FunctionCall { name, .. }
             if matches!(name.as_str(), "sprintf" | "read_file") =>
         {
@@ -2575,7 +2680,7 @@ fn lower_new_property_values(
             Err(vec![unsupported(
                 Span::default(),
                 format!(
-                    "class property `${}` is unsupported until Stage 21 unless initialized or promoted",
+                    "class property `${}` is not definitely initialized before construction completes",
                     property.name
                 ),
             )])
