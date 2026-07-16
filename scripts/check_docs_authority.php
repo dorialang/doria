@@ -298,6 +298,13 @@ foreach ($namingFiles as $path) {
  * Strict charter checks over Doria source. No contextual exemption: prose may
  * name a rejected spelling, code may not.
  */
+$forbiddenVisibilityPattern = '/^\s*(public|private|protected)\b/';
+foreach (['public Person $owner;', 'private List<int> $items;'] as $visibilityExample) {
+    if (preg_match($forbiddenVisibilityPattern, $visibilityExample) !== 1) {
+        $failures[] = "internal docs-authority error: visibility guard does not cover {$visibilityExample}";
+    }
+}
+
 $forbiddenCodeSpellings = [
     ['/\binstanceof\b/', 'instanceof is rejected permanently; the type-test and narrowing operator is `is` (record 0085)'],
     ['/\breadline\s*\(/', 'readline is rejected as a fused name; the stdin built-in is read_line'],
@@ -305,7 +312,7 @@ $forbiddenCodeSpellings = [
     ['/\bprint\s*[\($"\']/', 'print is rejected; echo is the spelling'],
     ['/\bstd::/', 'Doria stdlib modules are namespaces (Doria\\Std\\Term), never std:: paths'],
     [
-        '/\b(public|private|protected)\s+(static\s+|writable\s+|readonly\s+|internal\s+)*(function|const|string|int|int8|int16|int32|int64|uint8|uint16|uint32|uint64|float|float32|float64|bool|mixed)\b/',
+        $forbiddenVisibilityPattern,
         'Doria has no public/private/protected; members are accessible by default and internal marks implementation details',
     ],
 ];

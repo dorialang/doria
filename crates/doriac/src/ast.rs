@@ -3,7 +3,14 @@ use crate::types::TypeRef;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Program {
+    pub namespace: Option<NamespaceDecl>,
     pub items: Vec<Item>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct NamespaceDecl {
+    pub name: String,
+    pub span: Span,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -16,6 +23,8 @@ pub enum Item {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ClassDecl {
     pub name: String,
+    pub parent: Option<String>,
+    pub parent_span: Option<Span>,
     pub implements: Vec<String>,
     pub members: Vec<ClassMember>,
     pub span: Span,

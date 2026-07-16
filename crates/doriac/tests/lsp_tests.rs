@@ -164,3 +164,24 @@ fn accepts_builtin_panic_without_lsp_diagnostics() {
 
     assert_eq!(diagnostics, Vec::<Value>::new());
 }
+
+#[test]
+fn publishes_stable_semantic_diagnostics_for_class_workflow_syntax() {
+    let diagnostics = diagnostics_for_document(
+        "file:///Child.doria",
+        r#"namespace Vendor\App;
+class Child extends Vendor\Base implements Vendor\Contracts\Printable {}
+"#,
+    );
+
+    assert!(diagnostics.iter().all(|diagnostic| {
+        !diagnostic["code"]
+            .as_str()
+            .is_some_and(|code| code.starts_with('P'))
+    }));
+    for code in ["E0475", "E0476", "E0464"] {
+        assert!(diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic["code"] == code));
+    }
+}

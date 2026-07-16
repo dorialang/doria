@@ -26,6 +26,27 @@ Dictionary<string, int> $items = ["apples" => 5];"#,
 }
 
 #[test]
+fn lexes_namespace_and_inheritance_grammar() {
+    let kinds = token_kinds(
+        r#"namespace Vendor\App;
+class Child extends Vendor\Base implements Vendor\Contracts\Printable {}"#,
+    );
+
+    assert!(matches!(kinds[0], TokenKind::Namespace));
+    assert!(kinds.iter().any(|kind| matches!(kind, TokenKind::Extends)));
+    assert!(kinds
+        .iter()
+        .any(|kind| matches!(kind, TokenKind::Implements)));
+    assert_eq!(
+        kinds
+            .iter()
+            .filter(|kind| matches!(kind, TokenKind::Backslash))
+            .count(),
+        4
+    );
+}
+
+#[test]
 fn lexes_string_quote_kinds() {
     let kinds = token_kinds(r#"'{}' "{}""#);
     assert!(matches!(

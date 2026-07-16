@@ -9,6 +9,13 @@ pub fn lower_program_with_semantics(
     semantic_info: crate::semantics::SemanticInfo,
 ) -> hir::Program {
     hir::Program {
+        namespace: program
+            .namespace
+            .as_ref()
+            .map(|namespace| hir::NamespaceDecl {
+                name: namespace.name.clone(),
+                span: namespace.span,
+            }),
         items: program.items.iter().map(lower_item).collect(),
         semantic_info,
     }
@@ -25,6 +32,8 @@ fn lower_item(item: &ast::Item) -> hir::Item {
 fn lower_class(class_decl: &ast::ClassDecl) -> hir::ClassDecl {
     hir::ClassDecl {
         name: class_decl.name.clone(),
+        parent: class_decl.parent.clone(),
+        parent_span: class_decl.parent_span,
         implements: class_decl.implements.clone(),
         members: class_decl.members.iter().map(lower_class_member).collect(),
         span: class_decl.span,

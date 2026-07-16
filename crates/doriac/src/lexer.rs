@@ -19,6 +19,8 @@ pub enum TokenKind {
     Class,
     Interface,
     Implements,
+    Namespace,
+    Extends,
     Function,
     Internal,
     Static,
@@ -72,6 +74,7 @@ pub enum TokenKind {
     Minus,
     Star,
     Slash,
+    Backslash,
     Percent,
     Dot,
     DotDot,
@@ -210,6 +213,7 @@ impl<'source> Lexer<'source> {
                         self.token(TokenKind::Slash, start)
                     }
                 }
+                b'\\' => self.token(TokenKind::Backslash, start),
                 b'%' => {
                     if self.match_byte(b'=') {
                         self.token(TokenKind::PercentEquals, start)
@@ -375,6 +379,8 @@ impl<'source> Lexer<'source> {
             "class" => TokenKind::Class,
             "interface" => TokenKind::Interface,
             "implements" => TokenKind::Implements,
+            "namespace" => TokenKind::Namespace,
+            "extends" => TokenKind::Extends,
             "function" => TokenKind::Function,
             "internal" => TokenKind::Internal,
             "static" => TokenKind::Static,

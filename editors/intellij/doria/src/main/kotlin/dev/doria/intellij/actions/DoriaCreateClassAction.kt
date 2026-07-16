@@ -196,7 +196,7 @@ private class DoriaCreateClassDialog(
     override fun getInitialSize(): Dimension = Dimension(720, 500)
 
     override fun doValidate(): ValidationInfo? {
-        if (!DORIA_IDENTIFIER.matches(className)) {
+        if (!isDoriaClassName(className)) {
             return ValidationInfo("Enter a valid Doria class name.", classNameField)
         }
         if (fileBaseName.isEmpty() || !PathUtilRt.isValidFileName("$fileBaseName.doria", true)) {
@@ -207,11 +207,11 @@ private class DoriaCreateClassDialog(
         }
 
         val namespace = namespaceField.text.trim()
-        if (namespace.isNotEmpty() && !DORIA_QUALIFIED_NAME.matches(namespace)) {
+        if (namespace.isNotEmpty() && !isDoriaQualifiedName(namespace)) {
             return ValidationInfo("Enter a valid Doria namespace.", namespaceField)
         }
         val parent = parentField.text.trim()
-        if (parent.isNotEmpty() && !DORIA_TYPE_NAME.matches(parent)) {
+        if (parent.isNotEmpty() && !isDoriaQualifiedName(parent)) {
             return ValidationInfo("Enter one valid Doria parent type.", parentField)
         }
         return null
@@ -241,7 +241,7 @@ private class DoriaCreateClassDialog(
             "Add Doria Interface",
             DoriaIcons.FILE,
         )?.trim() ?: return
-        if (!DORIA_TYPE_NAME.matches(interfaceName)) {
+        if (!isDoriaQualifiedName(interfaceName)) {
             Messages.showErrorDialog(
                 project,
                 "Enter a valid Doria interface type.",
@@ -319,6 +319,30 @@ private class DoriaCreateClassDialog(
     private companion object {
         val DORIA_IDENTIFIER = Regex("[A-Za-z_][A-Za-z0-9_]*")
         val DORIA_QUALIFIED_NAME = Regex("""[A-Za-z_][A-Za-z0-9_]*(?:\\[A-Za-z_][A-Za-z0-9_]*)*""")
-        val DORIA_TYPE_NAME = Regex("""\\?[A-Za-z_][A-Za-z0-9_]*(?:\\[A-Za-z_][A-Za-z0-9_]*)*""")
+        val DORIA_RESERVED_NAME_SEGMENTS = setOf(
+            "class", "interface", "implements", "namespace", "extends", "function",
+            "internal", "static", "let", "take", "writable", "readonly", "return", "echo",
+            "new", "foreach", "as", "if", "else", "while", "for", "break", "continue",
+            "throw", "throws", "true", "false", "null", "void", "int", "int8", "int16",
+            "int32", "int64", "uint8", "uint16", "uint32", "uint64", "float", "float32",
+            "float64", "string", "bool", "not", "and", "or", "xor", "async", "await",
+            "spawn", "scope", "trait", "enum", "match", "try", "catch", "mixed", "never",
+            "resource", "array", "object",
+        )
+        val DORIA_RESERVED_CLASS_NAMES = setOf(
+            "Int", "Int8", "Int16", "Int32", "UInt8", "UInt16", "UInt32", "UInt64",
+            "Float", "Float32", "Float64", "Bool", "Displayable",
+        )
+
+        fun isDoriaIdentifier(value: String): Boolean =
+            DORIA_IDENTIFIER.matches(value) && value !in DORIA_RESERVED_NAME_SEGMENTS
+
+        fun isDoriaClassName(value: String): Boolean =
+            isDoriaIdentifier(value) &&
+                value !in DORIA_RESERVED_CLASS_NAMES &&
+                !value.equals("__DoriaDisplayable", ignoreCase = true)
+
+        fun isDoriaQualifiedName(value: String): Boolean =
+            DORIA_QUALIFIED_NAME.matches(value) && value.split('\\').all(::isDoriaIdentifier)
     }
 }

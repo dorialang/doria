@@ -301,6 +301,13 @@ impl<'program> Checker<'program> {
     }
 
     fn check(&mut self) {
+        if let Some(namespace) = &self.program.namespace {
+            self.diagnostics.push(Diagnostic::new(
+                "E0475",
+                "namespace declarations are accepted syntax but namespace resolution is not available in this compiler version",
+                namespace.span,
+            ));
+        }
         self.collect_classes();
         self.collect_functions();
         self.infer_unannotated_move_return_signatures();
@@ -451,7 +458,7 @@ impl<'program> Checker<'program> {
                 self.diagnostics.push(Diagnostic::new(
                     "E0464",
                     format!(
-                        "general interface conformance for `{interface}` is not supported by this compiler"
+                        "general interface conformance for `{interface}` is accepted syntax but is not available in this compiler version"
                     ),
                     class_decl.span,
                 ));
@@ -1333,6 +1340,13 @@ impl<'program> Checker<'program> {
     }
 
     fn check_class(&mut self, class_decl: &ClassDecl) {
+        if class_decl.parent.is_some() {
+            self.diagnostics.push(Diagnostic::new(
+                "E0476",
+                "class inheritance is accepted syntax but `extends` semantics are not available in this compiler version",
+                class_decl.parent_span.unwrap_or(class_decl.span),
+            ));
+        }
         for member in &class_decl.members {
             match member {
                 ClassMember::Property(property) => {
@@ -2530,8 +2544,11 @@ impl<'program> Checker<'program> {
                 args,
                 span,
             } => {
-                let class_exists = self.classes.contains_key(class_name);
-                if !class_exists {
+                let qualified = class_name.contains('\\');
+                let class_exists = !qualified && self.classes.contains_key(class_name);
+                if qualified {
+                    self.report_deferred_qualified_name(class_name, *span);
+                } else if !class_exists {
                     self.diagnostics.push(Diagnostic::new(
                         "E0305",
                         format!("unknown class `{class_name}`"),
@@ -3724,6 +3741,10 @@ impl<'program> Checker<'program> {
         scopes: &ScopeStack,
         method_context: Option<&MethodContext>,
     ) {
+        if name.contains('\\') {
+            self.report_deferred_qualified_name(name, span);
+            return;
+        }
         if name == "print" {
             self.diagnostics.push(
                 Diagnostic::new("E0462", "Doria does not support `print`; use `echo`", span)
@@ -4039,6 +4060,10 @@ impl<'program> Checker<'program> {
         scopes: &ScopeStack,
         method_context: Option<&MethodContext>,
     ) {
+        if class_name.contains('\\') {
+            self.report_deferred_qualified_name(class_name, span);
+            return;
+        }
         if class_name == "Int" && method == "toFloat" {
             self.check_cross_kind_intrinsic_argument(
                 "Int::toFloat",
@@ -4437,6 +4462,16 @@ impl<'program> Checker<'program> {
             .unwrap_or(false)
     }
 
+    fn report_deferred_qualified_name(&mut self, name: &str, span: Span) {
+        self.diagnostics.push(Diagnostic::new(
+            "E0475",
+            format!(
+                "qualified name `{name}` is accepted syntax but namespace resolution is not available in this compiler version"
+            ),
+            span,
+        ));
+    }
+
     fn resolve_type_ref(&mut self, ty: &TypeRef, span: Span) -> TypeId {
         self.resolve_type_ref_in_position(ty, span, TypePosition::Value)
     }
@@ -4447,6 +4482,13 @@ impl<'program> Checker<'program> {
         span: Span,
         position: TypePosition,
     ) -> TypeId {
+        if ty.name.contains('\\') {
+            for arg in &ty.args {
+                self.resolve_type_ref_in_position(arg, span, TypePosition::Value);
+            }
+            self.report_deferred_qualified_name(&ty.name, span);
+            return self.types.unknown();
+        }
         if ty.nullable {
             if ty.name == "string" && ty.args.is_empty() {
                 return self.types.intern(TypeKind::NullableString);

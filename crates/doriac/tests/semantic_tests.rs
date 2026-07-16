@@ -2325,6 +2325,47 @@ fn reserves_displayable_and_defers_general_interfaces() {
 }
 
 #[test]
+fn reports_stable_semantic_gaps_for_accepted_class_workflow_syntax() {
+    let diagnostics = doriac::check_source(
+        "test.doria",
+        r#"
+namespace Vendor\App;
+class Child extends Vendor\Base implements Vendor\Contracts\Printable {}
+"#,
+    )
+    .expect_err("namespace, inheritance, and general conformance are not implemented yet");
+
+    assert!(diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == "E0475" && diagnostic.message.contains("namespace")));
+    assert!(diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == "E0476" && diagnostic.message.contains("extends")));
+    assert!(diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == "E0464" && diagnostic.message.contains("interface")));
+    assert!(diagnostics
+        .iter()
+        .all(|diagnostic| !diagnostic.code.starts_with('P')));
+}
+
+#[test]
+fn reports_qualified_type_names_as_semantic_coverage() {
+    let diagnostics = doriac::check_source(
+        "test.doria",
+        "function accept(Vendor\\Contracts\\Input $input): void {}",
+    )
+    .expect_err("qualified-name resolution is not implemented yet");
+
+    assert!(diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == "E0475" && diagnostic.message.contains("namespace")));
+    assert!(diagnostics
+        .iter()
+        .all(|diagnostic| !diagnostic.code.starts_with('P')));
+}
+
+#[test]
 fn allows_property_initializer_accessing_own_internal_static_method() {
     doriac::check_source(
         "test.doria",

@@ -4,6 +4,46 @@ use doriac::ast::{
 };
 
 #[test]
+fn parses_class_workflow_and_qualified_type_syntax_before_semantics_land() {
+    let program = doriac::parse_source(
+        "test.doria",
+        r#"
+namespace Vendor\App;
+
+class Child extends Vendor\Base implements Vendor\Contracts\Printable
+{
+    function convert(Vendor\Input $input): Vendor\Output
+    {
+        return new Vendor\Output();
+    }
+}
+"#,
+    )
+    .expect("accepted namespace and inheritance syntax should parse");
+
+    assert_eq!(
+        program
+            .namespace
+            .as_ref()
+            .map(|namespace| namespace.name.as_str()),
+        Some("Vendor\\App")
+    );
+    let Item::Class(class) = &program.items[0] else {
+        panic!("expected class declaration");
+    };
+    assert_eq!(class.parent.as_deref(), Some("Vendor\\Base"));
+    assert_eq!(class.implements, ["Vendor\\Contracts\\Printable"]);
+    let ClassMember::Method(method) = &class.members[0] else {
+        panic!("expected method declaration");
+    };
+    assert_eq!(method.params[0].ty.name, "Vendor\\Input");
+    assert_eq!(
+        method.return_type.as_ref().map(|ty| ty.name.as_str()),
+        Some("Vendor\\Output")
+    );
+}
+
+#[test]
 fn parses_variable_declarations() {
     let program = doriac::parse_source(
         "test.doria",
