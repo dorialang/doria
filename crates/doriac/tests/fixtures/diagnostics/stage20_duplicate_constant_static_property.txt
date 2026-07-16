@@ -1,0 +1,5 @@
+code: E0481
+message: class `Example` cannot declare static property `FOO` because that name is already used by a previous class constant
+help: 
+span: 38..51
+related: 16..30: original class constant `FOO` is declared here

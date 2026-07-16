@@ -343,6 +343,47 @@ Counter::value = 42;
 
 Static properties are readonly unless marked `writable`. Their initializers must be accepted by the bounded constant evaluator, and the current implementation admits Copy types only. There is no runtime, lazy, or once static initialization. Owned statics and their lifetime, destruction, and concurrency rules require future accepted design work.
 
+Static member access is always sigil-free:
+
+```doria
+Message::age
+Message::create()
+self::MAX_DEPTH
+self::age
+self::create()
+```
+
+Declarations carry `$`; accesses do not. This is the same law used by instance
+properties: `string $name` is accessed as `$this->name`, not `$this->$name`.
+`Foo::$prop` is permanently rejected with a fix that removes `$`. PHP needs that
+sigil to distinguish across separate member namespaces and dynamic names; Doria
+has neither ambiguity.
+
+Each class has one member namespace across constants, static properties,
+instance properties, static methods, and instance methods. A name represents
+data or an action, never both, and collisions are errors regardless of source
+order.
+
+`self` is reserved and denotes the declaring class. It is valid as a static
+qualifier and as a type, including a return type such as:
+
+```doria
+function withName(string $name): self
+{
+    return new Message($name);
+}
+```
+
+`parent::member()` is accepted grammar, but parent lookup and dispatch are Stage
+34 semantics and are currently diagnosed as unsupported before Doria IR.
+Trait-local `self::member` also parses under the accepted-language clock, while
+trait composition remains Stage 35. `static::` is permanently rejected with a
+fix to `self::`; Doria has no late static binding.
+
+Writing a writable static inside `__construct` is ordinary static mutation.
+Constructor init access applies only to `$this` and the instance under
+construction; it neither grants nor removes permission for class statics.
+
 Top-level and class constants use `SCREAMING_SNAKE_CASE` and may infer their type or declare it explicitly:
 
 ```doria
@@ -783,7 +824,7 @@ interface Renderable
 
 Interfaces may declare method requirements and may extend one or more interfaces. Interface members do not define instance storage. Default methods, static interface methods, constants, generic interfaces, variance, and interface property requirements remain future design work.
 
-Doria will support `trait` for reusable class-body members:
+Doria accepts `trait` declaration grammar for reusable class-body members:
 
 ```doria
 trait HasSlug
@@ -792,7 +833,7 @@ trait HasSlug
 }
 ```
 
-Traits may be composed into classes or other traits with `uses`. Trait conflict-resolution rules, aliasing, visibility changes through trait composition, trait property rules, trait static member rules, trait abstract method requirements, and whether PHP-style `insteadof` / `as` are accepted exactly remain future design work.
+Current semantic checking reports trait declarations as unsupported until Stage 35. The accepted grammar preserves member bodies such as `self::MAX_DEPTH` without false parser errors. Traits may eventually be composed into classes or other traits with `uses`. Trait conflict-resolution rules, aliasing, access changes through trait composition, trait property rules, trait static member rules, trait abstract method requirements, and whether PHP-style `insteadof` / `as` are accepted exactly remain future design work.
 
 Doria will support `extends` for inheritance:
 

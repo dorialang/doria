@@ -35,6 +35,9 @@
       language="doria"
       implementationClass="dev.doria.intellij.DoriaCommenter" />
 
+    <langCodeStyleSettingsProvider
+      implementation="dev.doria.intellij.codestyle.DoriaLanguageCodeStyleSettingsProvider" />
+
     <annotator
       language="doria"
       implementationClass="dev.doria.intellij.highlighting.DoriaVariableUsageAnnotator" />

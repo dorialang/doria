@@ -126,6 +126,17 @@
         {
           "name": "invalid.illegal.keyword.rejected.doria",
           "match": "\\b(?:goto|require|require_once|include_once|print)\\b|\\buse\\b(?=\\s*\\()"
+        },
+        {
+          "match": "(::)(\\s*)(\\$)(?=[A-Za-z_][A-Za-z0-9_]*)",
+          "captures": {
+            "1": {
+              "name": "punctuation.accessor.static.doria"
+            },
+            "3": {
+              "name": "invalid.illegal.sigil.static-access.doria"
+            }
+          }
         }
       ]
     },
@@ -635,6 +646,10 @@
         {
           "name": "storage.modifier.static.doria",
           "match": "\\b(?:static)\\b"
+        },
+        {
+          "name": "variable.language.class-context.doria",
+          "match": "\\b(?:self|parent)\\b"
         },
         {
           "name": "keyword.other.reserved.doria",

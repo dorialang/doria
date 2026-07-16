@@ -14,9 +14,11 @@ $vscodeGrammar = $root . '/editors/vscode/doria/syntaxes/doria.tmLanguage.json';
 $vscodeLanguageConfiguration = $root . '/editors/vscode/doria/language-configuration.json';
 $vscodeExtension = $root . '/editors/vscode/doria/extension.js';
 $intellijLexer = $root . '/editors/intellij/doria/src/main/kotlin/dev/doria/intellij/highlighting/DoriaLexer.kt';
+$intellijLanguage = $root . '/editors/intellij/doria/src/main/kotlin/dev/doria/intellij/DoriaLanguage.kt';
 $intellijBuildGradle = $root . '/editors/intellij/doria/build.gradle';
 $intellijTokenTypes = $root . '/editors/intellij/doria/src/main/kotlin/dev/doria/intellij/highlighting/DoriaTokenTypes.kt';
 $intellijSyntaxHighlighter = $root . '/editors/intellij/doria/src/main/kotlin/dev/doria/intellij/highlighting/DoriaSyntaxHighlighter.kt';
+$intellijCodeStyleProvider = $root . '/editors/intellij/doria/src/main/kotlin/dev/doria/intellij/codestyle/DoriaLanguageCodeStyleSettingsProvider.kt';
 $intellijLspFiles = $root . '/editors/intellij/doria/src/main/kotlin/dev/doria/intellij/lsp/DoriaLspFiles.kt';
 $intellijPluginXml = $root . '/editors/intellij/doria/src/main/resources/META-INF/plugin.xml';
 $intellijPluginIcon = $root . '/editors/intellij/doria/src/main/resources/META-INF/pluginIcon.svg';
@@ -35,6 +37,8 @@ $acceptedKeywords = [
     'function',
     'const',
     'static',
+    'self',
+    'parent',
     'let',
     'take',
     'writable',
@@ -339,6 +343,15 @@ function check_vscode_package(): void
         ),
         'VS Code package.json must map doria/source.doria to ./syntaxes/doria.tmLanguage.json'
     );
+
+    $defaults = $package['contributes']['configurationDefaults']['[doria]'] ?? [];
+    require_check(
+        ($defaults['editor.insertSpaces'] ?? null) === true &&
+            ($defaults['editor.tabSize'] ?? null) === 4 &&
+            ($defaults['editor.detectIndentation'] ?? null) === true &&
+            ($defaults['editor.wordWrapColumn'] ?? null) === 120,
+        'VS Code must provide the PHP-shaped Doria editor defaults without overriding user or workspace settings'
+    );
 }
 
 function check_vscode_language_configuration(): void
@@ -350,6 +363,19 @@ function check_vscode_language_configuration(): void
         $json = json_encode($config[$key] ?? null, JSON_THROW_ON_ERROR);
         require_check(str_contains($json, '#[') && str_contains($json, ']'), 'VS Code language configuration must include #[...] behavior in ' . $key);
     }
+
+    require_check(
+        isset($config['indentationRules']['increaseIndentPattern'], $config['indentationRules']['decreaseIndentPattern']),
+        'VS Code language configuration must define Doria indentation rules'
+    );
+    require_check(
+        any_match(
+            $config['onEnterRules'] ?? [],
+            static fn (mixed $rule): bool => is_array($rule) &&
+                ($rule['action']['appendText'] ?? null) === ' * '
+        ),
+        'VS Code language configuration must continue PHP-style documentation comments'
+    );
 }
 
 function check_vscode_grammar(): void
@@ -384,8 +410,10 @@ function check_vscode_grammar(): void
         'constant.other.doria',
         'constant.other.class.doria',
         'storage.modifier.static.doria',
+        'variable.language.class-context.doria',
         'variable.other.property.static.doria',
         'entity.name.function.static.doria',
+        'invalid.illegal.sigil.static-access.doria',
     ] as $scope) {
         require_check(str_contains($grammarText, $scope), "VS Code grammar is missing Stage 20 scope '{$scope}'");
     }
@@ -414,8 +442,21 @@ function check_vscode_grammar(): void
     );
     require_check(
         any_match($staticPropertyPatterns, static fn (string $match): bool => regex_matches($match, '::next')) &&
-            !any_match($staticPropertyPatterns, static fn (string $match): bool => regex_matches($match, '::MAX_DEPTH')),
+            any_match($staticPropertyPatterns, static fn (string $match): bool => regex_matches($match, '::age')) &&
+            !any_match($staticPropertyPatterns, static fn (string $match): bool => regex_matches($match, '::MAX_DEPTH')) &&
+            !any_match($staticPropertyPatterns, static fn (string $match): bool => regex_matches($match, '::$age')),
         'VS Code must classify lowercase ::name as static-property access without swallowing class constants'
+    );
+
+    $invalidStaticSigilMatches = [];
+    foreach ($patterns as $pattern) {
+        if (($pattern['captures']['3']['name'] ?? null) === 'invalid.illegal.sigil.static-access.doria') {
+            $invalidStaticSigilMatches[] = (string) ($pattern['match'] ?? '');
+        }
+    }
+    require_check(
+        any_match($invalidStaticSigilMatches, static fn (string $match): bool => regex_matches($match, '::$age')),
+        'VS Code must mark only the PHP-style static-property sigil invalid'
     );
 
     $tokens = array_unique([...$acceptedKeywords, ...$primitiveTypes, ...$reservedTypes, ...$plannedTypes, ...$wordOperators]);
@@ -637,7 +678,7 @@ function check_intellij_lexer(): void
 {
     global $acceptedKeywords, $primitiveTypes, $reservedTypes, $plannedTypes, $wordOperators, $stage13SymbolOperators, $booleanSymbolOperators;
     global $notKeywords, $strictComparison, $rejectedPreprocessor, $rejectedKeywords, $rejectedTypes;
-    global $intellijLexer, $intellijBuildGradle, $intellijTokenTypes, $intellijSyntaxHighlighter, $intellijPluginXml, $intellijPluginIcon, $doriaLogo;
+    global $intellijLexer, $intellijLanguage, $intellijBuildGradle, $intellijTokenTypes, $intellijSyntaxHighlighter, $intellijCodeStyleProvider, $intellijPluginXml, $intellijPluginIcon, $doriaLogo;
 
     require_check(
         str_contains(read_text($intellijBuildGradle), "version = '2026.03.1-canary'"),
@@ -784,6 +825,10 @@ function check_intellij_lexer(): void
         'IntelliJ lexer must distinguish static properties from ordinary variables'
     );
     require_check(
+        str_contains($lexerText, 'previousAccessor() == "::" -> DoriaTokenTypes.INVALID'),
+        'IntelliJ lexer must mark the PHP static-access sigil invalid'
+    );
+    require_check(
         str_contains($lexerText, "private fun isCallName(): Boolean = nextNonWhitespace(tokenEnd) == '('") &&
             str_contains($lexerText, 'isCallName() -> callableTokenType()') &&
             str_contains($lexerText, 'callableTokenType()') &&
@@ -817,6 +862,36 @@ function check_intellij_lexer(): void
         str_contains($pluginXml, 'language=' . chr(34) . 'doria' . chr(34)),
         'IntelliJ plugin must register the lowercase doria language id for Markdown fences'
     );
+    $languageText = read_text($intellijLanguage);
+    require_check(
+        str_contains($languageText, 'Language("doria")') &&
+            str_contains($languageText, 'getDisplayName(): String = "Doria"'),
+        'IntelliJ must keep the lowercase doria language id while presenting the Doria display name'
+    );
+    require_check(
+        str_contains($pluginXml, '<langCodeStyleSettingsProvider') &&
+            str_contains($pluginXml, 'dev.doria.intellij.codestyle.DoriaLanguageCodeStyleSettingsProvider'),
+        'IntelliJ plugin must register the Doria code-style settings provider'
+    );
+    $codeStyleText = read_text($intellijCodeStyleProvider);
+    foreach ([
+        'getLanguageName(): String = "Doria"',
+        'getIndentOptionsEditor(): IndentOptionsEditor = SmartIndentOptionsEditor()',
+        'override fun createConfigurable(',
+        'TabbedLanguageCodeStylePanel(',
+        'INDENT_SIZE = 4',
+        'CONTINUATION_INDENT_SIZE = 4',
+        'TAB_SIZE = 4',
+        'USE_TAB_CHARACTER = false',
+        'RIGHT_MARGIN = 120',
+        'CLASS_BRACE_STYLE = CommonCodeStyleSettings.NEXT_LINE',
+        'METHOD_BRACE_STYLE = CommonCodeStyleSettings.NEXT_LINE',
+    ] as $default) {
+        require_check(
+            str_contains($codeStyleText, $default),
+            "IntelliJ Doria code-style defaults are missing '{$default}'"
+        );
+    }
     require_check(is_file($intellijPluginIcon), 'IntelliJ plugin must package META-INF/pluginIcon.svg');
     require_check(
         rtrim(read_text($intellijPluginIcon)) === rtrim(read_text($doriaLogo)),
@@ -1038,8 +1113,9 @@ function check_fixture(): void
         'static int $initial = 0;',
         'static writable int $next = 1;',
         'internal static string $label = "parser";',
-        'ParserLimits::next += 1;',
+        'self::next += self::MAX_DEPTH;',
         'ParserLimits::nextId()',
+        'ParserLimits::next;',
         'ParserLimits::MAX_DEPTH',
         'uses HasSlug, TracksChanges;',
         'with ($base)',

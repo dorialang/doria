@@ -1,0 +1,5 @@
+code: E0494
+message: Doria static member access is sigil-free; remove `$`
+help: declarations carry `$`; member accesses do not
+span: 69..70
+fix: 69..70 -> ""

@@ -46,6 +46,13 @@
       "close": ")"
     },
     {
+      "open": "/**",
+      "close": " */",
+      "notIn": [
+        "string"
+      ]
+    },
+    {
       "open": "\"",
       "close": "\"",
       "notIn": [
@@ -86,5 +93,83 @@
       "'",
       "'"
     ]
+  ],
+  "wordPattern": "(-?\\d*\\.\\d\\w*)|([^\\-\\`\\~\\!\\@\\#\\%\\^\\&\\*\\(\\)\\=\\+\\[\\{\\]\\}\\\\\\|\\;\\:\\'\\\"\\,\\.\\<\\>\\/\\?\\s]+)",
+  "indentationRules": {
+    "decreaseIndentPattern": "^\\s*[\\}\\]\\)].*$",
+    "increaseIndentPattern": "^.*(\\{[^}]*|\\([^)]*|\\[[^\\]]*)$",
+    "unIndentedLinePattern": "^(\\t|[ ])*[ ]\\*[^/]*\\*/\\s*$|^(\\t|[ ])*[ ]\\*/\\s*$|^(\\t|[ ])*\\*([ ]([^\\*]|\\*(?!/))*)?$",
+    "indentNextLinePattern": "^\\s*((if|while|for|foreach|when|given)\\s*\\(.*\\)\\s*|else\\s*)$"
+  },
+  "onEnterRules": [
+    {
+      "beforeText": "^\\s*/\\*\\*(?!/)([^\\*]|\\*(?!/))*$",
+      "afterText": "^\\s*\\*/$",
+      "action": {
+        "indent": "indentOutdent",
+        "appendText": " * "
+      }
+    },
+    {
+      "beforeText": "^\\s*/\\*\\*(?!/)([^\\*]|\\*(?!/))*$",
+      "action": {
+        "indent": "none",
+        "appendText": " * "
+      }
+    },
+    {
+      "beforeText": "^(\\t|[ ])*\\*([ ]([^\\*]|\\*(?!/))*)?$",
+      "previousLineText": "(?=^(\\s*(/\\*\\*|\\*)).*)(?=(?!(\\s*\\*/)))",
+      "action": {
+        "indent": "none",
+        "appendText": "* "
+      }
+    },
+    {
+      "beforeText": "^(\\t|[ ])*[ ]\\*/\\s*$",
+      "action": {
+        "indent": "none",
+        "removeText": 1
+      }
+    },
+    {
+      "beforeText": "^(\\t|[ ])*[ ]\\*[^/]*\\*/\\s*$",
+      "action": {
+        "indent": "none",
+        "removeText": 1
+      }
+    },
+    {
+      "beforeText": "^.*\\([^\\)]*$",
+      "afterText": "^\\s*\\).*$",
+      "action": {
+        "indent": "indentOutdent",
+        "appendText": "\\t"
+      }
+    },
+    {
+      "beforeText": "^.*\\{[^\\}]*$",
+      "afterText": "^\\s*\\}.*$",
+      "action": {
+        "indent": "indentOutdent",
+        "appendText": "\\t"
+      }
+    },
+    {
+      "beforeText": "^.*\\[[^\\]]*$",
+      "afterText": "^\\s*\\].*$",
+      "action": {
+        "indent": "indentOutdent",
+        "appendText": "\\t"
+      }
+    },
+    {
+      "beforeText": "^\\s*//|\\s//\\s",
+      "afterText": "^(?!\\s*$)",
+      "action": {
+        "indent": "none",
+        "appendText": "// "
+      }
+    }
   ]
 }

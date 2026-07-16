@@ -1,0 +1,54 @@
+class Counter
+{
+    const START = 1;
+    static writable int $current = 1;
+
+    static function next(): int
+    {
+        self::current = self::current + self::START;
+        return self::current;
+    }
+
+    static function create(): int
+    {
+        return self::next();
+    }
+
+    function read(): int
+    {
+        return self::create();
+    }
+}
+
+class Message
+{
+    string $text;
+
+    function __construct(internal string $givenText)
+    {
+        $this->text = $givenText;
+    }
+
+    function withName(string $name): self
+    {
+        return new Message($name);
+    }
+
+    function __destruct()
+    {
+        echo "released:" . $this->text . "\n";
+    }
+}
+
+function main(): void
+{
+    echo Counter::next();
+    echo ":";
+    let $counter = new Counter();
+    echo $counter->read();
+    echo ":";
+    let $first = new Message("first");
+    let $second = $first->withName("second");
+    echo $second->text;
+    echo "\n";
+}

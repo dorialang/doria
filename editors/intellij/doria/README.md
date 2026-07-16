@@ -9,12 +9,13 @@ It provides:
 - `.doria` file recognition.
 - Separate `New -> Doria File` and `New -> Doria Class` workflows.
 - Basic syntax highlighting for Doria keywords, variables, types, attributes, strings, string interpolation, comments, numbers, operators, punctuation, accepted OOP declaration vocabulary, namespace/import/include/directive vocabulary, and rejected strict-comparison/preprocessor spellings.
+- A dedicated `Editor -> Code Style -> Doria` page with PHP-shaped defaults: four-space indents, four-space continuation indents, spaces instead of tabs, a 120-column margin, next-line class/function braces, and same-line control-flow braces.
 - A Doria settings page for configuring the language server path.
 - `doria-lsp` integration through the IntelliJ Platform LSP API.
 
 The initial plugin targets IntelliJ Platform `2025.2.1+`, where JetBrains exposes the LSP module as `com.intellij.modules.lsp`.
 
-This is first-pass Doria support for IntelliJ / JetBrains IDEs. The local IntelliJ highlighter is syntax highlighting only: it does not provide a semantic PSI tree, formatter, inspections, refactors, or compiler diagnostics. Compiler-backed diagnostics, completion, and hover remain separate and come from `doria-lsp` when the language server is configured and available.
+This is first-pass Doria support for IntelliJ / JetBrains IDEs. The local IntelliJ highlighter is syntax highlighting only: it does not provide a semantic PSI tree, formatter, inspections, refactors, or compiler diagnostics. The code-style provider supplies editor indentation defaults and exposes the future formatter profile, but `Reformat Code` will require a Doria formatting model before every style option can be applied automatically. Compiler-backed diagnostics, completion, and hover remain separate and come from `doria-lsp` when the language server is configured and available.
 
 The plugin registers the lower-case `doria` language id so Markdown fenced blocks using the `doria` info string can resolve to the Doria highlighter where the JetBrains Markdown plugin performs language injection. Planned keywords are highlighted for documentation readability only; compiler support still follows the staged plan.
 
@@ -57,6 +58,8 @@ Settings/Preferences -> Plugins -> gear icon -> Install Plugin from Disk...
 ```
 
 Select the ZIP from `build/distributions/`, then restart the IDE when prompted. After restart, `.doria` files should be associated with the Doria file type and use the Doria syntax highlighter automatically.
+
+The installed plugin also adds Doria under `Settings/Preferences -> Editor -> Code Style`. These are language defaults: IDE, project, and EditorConfig overrides continue to take precedence, and indent detection can still adopt an existing file's style.
 
 Right-click a project directory and select `New -> Doria File` for the compact name-only workflow that creates an empty `main(): void` function. Select `New -> Doria Class` for the dedicated class workflow with class name, optional namespace, editable file name, target directory, optional parent class, and an add/remove interface list. Both actions create a `.doria` file and use the Doria file icon.
 

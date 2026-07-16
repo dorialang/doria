@@ -103,6 +103,10 @@ At completion, report assumptions made and critical decisions encountered. If no
 - Treat Stage 17 `?string` as the first supported position for the Stage 22 nullable model, not as an I/O-only type. Binary `read_file_bytes`/`write_file_bytes` remain Stage 23 with `Bytes`; `File` and stream objects remain planned after Stage 29.
 - Stage 18 double-quoted interpolation uses the ordinary Doria expression grammar. Literal `{` uses `\{`; bare `}` is literal, `\}` is accepted, and brace doubling is rejected. Preserve left-to-right exactly-once evaluation and one canonical display conversion for interpolation, `.`, `echo`, and `%s`.
 - `Displayable` is a compiler-known nominal contract requiring explicit `implements Displayable` and exactly `function toString(): string`. Do not accept `__toString`, structural conformance, or general interfaces early. Concrete native classes dispatch `toString()` directly through ordinary Stage 20 method MIR; interface values and general dispatch remain Stage 35.
+- Preserve Stage 20's static identity law: declarations carry `$`, while class/static access is sigil-free (`Foo::prop`, `Foo::method()`, `self::prop`, `self::method()`). Never accept PHP-style `Foo::$prop` or late static binding through `static::`; their fixes are `Foo::prop` and `self::` respectively.
+- Treat `self` as reserved compiler vocabulary that denotes the declaring class in scope and type positions. Parse generalized `parent::member()` now but keep its semantics at Stage 34; parse trait-local `self::member` while keeping trait semantics at Stage 35.
+- Enforce one member namespace per class across constants, static/instance properties, and static/instance methods. Do not use punctuation or call syntax to select among conflicting declarations.
+- A constructor write to a writable static is ordinary mutation, not constructor init access. Constructor init access governs `$this` and the instance under construction only.
 - Treat panic as fatal, non-catchable, and non-unwinding. Explicit `panic("message")`, checked-integer failures, invalid `Float::toInt`, and an invalid `main(): int` process status use the abort-only status-101 path defined by decisions 0040, 0041, 0042, 0044, and 0074.
 - Do not reintroduce `public`, `protected`, or `private` as Doria member visibility modifiers. Doria class members are externally accessible by default; use `internal` for implementation details.
 - Keep `writable` and `internal` separate: `writable` controls mutation, while `internal` controls API surface.
@@ -121,6 +125,7 @@ At completion, report assumptions made and critical decisions encountered. If no
 - Do not assume PHP magic methods, autoloading, reflection, dynamic properties, or trait conflict rules without accepted decisions.
 - Do not confuse namespace/file-scope import `use` with trait-composition `uses`.
 - Do not make PHP output the semantic oracle for Doria OOP behavior.
+- Apply "PHP's spelling is an artifact, not a decision" before importing PHP syntax. The accepted `read_line`/`is`/sigil-free-static choices are deliberate Doria spellings, not compatibility gaps.
 - Do not make Doria editor support VS Code-only. Keep VS Code and IntelliJ / JetBrains syntax highlighting aligned.
 - Treat TextMate/editor highlighting as editor UX only, not lexer, parser, compiler, or LSP semantic-token support.
 - Use `doria` fences for Doria Markdown examples. Keep `php` fences only for generated PHP, PHP interop, or PHP migration input/output.

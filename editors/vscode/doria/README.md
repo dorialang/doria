@@ -2,9 +2,13 @@
 
 This extension provides `.doria` language registration, TextMate syntax highlighting, attribute highlighting, editor bracket/comment behavior, and diagnostics from `doria-lsp`.
 
+When installed, it contributes PHP-shaped defaults for Doria files: spaces, a four-space tab size, indentation detection, and a 120-column wrapping boundary. It also provides brace/parenthesis indentation and PHPDoc-style comment continuation. Language-specific user settings, workspace settings, and EditorConfig remain authoritative and can override these defaults.
+
 Editor releases track the Doria toolchain CalVer. The target toolchain release is `2026.03.1-canary`; the VS Code Marketplace manifest encodes it as the SemVer-compatible `2026.3.1-canary` because its required `version` field does not permit a zero-padded numeric month.
 
 Syntax colors depend on the active VS Code theme. This extension improves Doria's TextMate scopes for cleaner highlighting, but it does not ship a custom color theme yet.
+
+The extension does not yet ship a document formatter, so the coding-style defaults guide editing but do not make `Format Document` rewrite an existing file.
 
 The TextMate grammar is editor support only. It highlights accepted and planned Doria vocabulary from the master plan so `.doria` files and Markdown `doria` fences stay readable, but highlighting does not mean the compiler implements every highlighted planned construct.
 

@@ -138,7 +138,7 @@ jobs:
 
       - name: Leak-check Stage 19/20 Cranelift class ownership and method paths
         run: |
-          for name in main_stage19_destructor_order main_stage19_initialization_order main_stage19_raii_guard main_stage19_playground_message main_stage20_parser main_stage20_displayable main_stage20_method_ownership; do
+          for name in main_stage19_destructor_order main_stage19_initialization_order main_stage19_raii_guard main_stage19_playground_message main_stage20_parser main_stage20_displayable main_stage20_method_ownership main_stage20_static_constructor main_stage20_self; do
             cargo run -p doriac -- compile "examples/native/${name}.doria" --out "build/native/${name}"
             valgrind --leak-check=full --show-leak-kinds=all --errors-for-leak-kinds=definite,indirect --track-origins=yes --error-exitcode=1 "build/native/${name}"
           done
@@ -346,7 +346,7 @@ jobs:
         if: runner.os == 'Linux'
         shell: bash
         run: |
-          for name in main_stage19_destructor_order main_stage19_initialization_order main_stage19_raii_guard main_stage19_playground_message main_stage20_parser main_stage20_displayable main_stage20_method_ownership; do
+          for name in main_stage19_destructor_order main_stage19_initialization_order main_stage19_raii_guard main_stage19_playground_message main_stage20_parser main_stage20_displayable main_stage20_method_ownership main_stage20_static_constructor main_stage20_self; do
             cargo run -p doriac --features llvm-backend -- compile "examples/native/${name}.doria" --release --out "build/native/${name}_release"
             valgrind --leak-check=full --show-leak-kinds=all --errors-for-leak-kinds=definite,indirect --track-origins=yes --error-exitcode=1 "build/native/${name}_release"
           done

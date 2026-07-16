@@ -20,6 +20,36 @@ pub struct ClassInfo {
     pub static_properties: HashMap<String, StaticPropertyInfo>,
     pub constants: HashMap<String, ConstantInfo>,
     pub methods: HashMap<String, MethodInfo>,
+    pub members: HashMap<String, MemberDeclaration>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MemberDeclaration {
+    pub kind: MemberKind,
+    pub span: crate::source::Span,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemberKind {
+    InstanceProperty,
+    StaticProperty,
+    Constant,
+    InstanceMethod,
+    StaticMethod,
+    PromotedProperty,
+}
+
+impl MemberKind {
+    pub const fn description(self) -> &'static str {
+        match self {
+            Self::InstanceProperty => "instance property",
+            Self::StaticProperty => "static property",
+            Self::Constant => "class constant",
+            Self::InstanceMethod => "instance method",
+            Self::StaticMethod => "static method",
+            Self::PromotedProperty => "promoted property",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

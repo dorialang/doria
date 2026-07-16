@@ -40,9 +40,12 @@ fn lower_item(item: &ast::Item) -> Result<hir::Item, Diagnostic> {
         ast::Item::Interface(interface_decl) => Err(
             crate::semantics::interface_declaration_diagnostic(interface_decl),
         ),
-        ast::Item::Function(function) => Ok(hir::Item::Function(lower_function(function))),
-        ast::Item::Constant(constant) => Ok(hir::Item::Constant(lower_constant(constant))),
-        ast::Item::Statement(statement) => Ok(hir::Item::Statement(lower_stmt(statement))),
+        ast::Item::Trait(trait_decl) => {
+            Err(crate::semantics::trait_declaration_diagnostic(trait_decl))
+        }
+        ast::Item::Function(function) => Ok(hir::Item::Function(lower_function(function, None))),
+        ast::Item::Constant(constant) => Ok(hir::Item::Constant(lower_constant(constant, None))),
+        ast::Item::Statement(statement) => Ok(hir::Item::Statement(lower_stmt(statement, None))),
     }
 }
 
@@ -52,160 +55,204 @@ fn lower_class(class_decl: &ast::ClassDecl) -> hir::ClassDecl {
         parent: class_decl.parent.clone(),
         parent_span: class_decl.parent_span,
         implements: class_decl.implements.clone(),
-        members: class_decl.members.iter().map(lower_class_member).collect(),
+        members: class_decl
+            .members
+            .iter()
+            .map(|member| lower_class_member(member, &class_decl.name))
+            .collect(),
         span: class_decl.span,
     }
 }
 
-fn lower_class_member(member: &ast::ClassMember) -> hir::ClassMember {
+fn lower_class_member(member: &ast::ClassMember, class_name: &str) -> hir::ClassMember {
     match member {
         ast::ClassMember::Property(property) => {
-            hir::ClassMember::Property(lower_property(property))
+            hir::ClassMember::Property(lower_property(property, Some(class_name)))
         }
-        ast::ClassMember::Method(method) => hir::ClassMember::Method(lower_function(method)),
+        ast::ClassMember::Method(method) => {
+            hir::ClassMember::Method(lower_function(method, Some(class_name)))
+        }
         ast::ClassMember::Constant(constant) => {
-            hir::ClassMember::Constant(lower_constant(constant))
+            hir::ClassMember::Constant(lower_constant(constant, Some(class_name)))
         }
     }
 }
 
-fn lower_property(property: &ast::PropertyDecl) -> hir::PropertyDecl {
+fn lower_property(property: &ast::PropertyDecl, class_name: Option<&str>) -> hir::PropertyDecl {
     hir::PropertyDecl {
         access: property.access.clone(),
         is_static: property.is_static,
         writable: property.writable,
-        ty: property.ty.clone(),
+        ty: lower_type_ref(&property.ty, class_name),
         name: property.name.clone(),
-        initializer: property.initializer.as_ref().map(lower_expr),
+        initializer: property
+            .initializer
+            .as_ref()
+            .map(|expr| lower_expr(expr, class_name)),
         span: property.span,
     }
 }
 
-fn lower_constant(constant: &ast::ConstDecl) -> hir::ConstDecl {
+fn lower_constant(constant: &ast::ConstDecl, class_name: Option<&str>) -> hir::ConstDecl {
     hir::ConstDecl {
         access: constant.access.clone(),
-        ty: constant.ty.clone(),
+        ty: constant
+            .ty
+            .as_ref()
+            .map(|ty| lower_type_ref(ty, class_name)),
         name: constant.name.clone(),
-        initializer: lower_expr(&constant.initializer),
+        initializer: lower_expr(&constant.initializer, class_name),
         span: constant.span,
     }
 }
 
-fn lower_function(function: &ast::FunctionDecl) -> hir::FunctionDecl {
+fn lower_function(function: &ast::FunctionDecl, class_name: Option<&str>) -> hir::FunctionDecl {
     hir::FunctionDecl {
         access: function.access.clone(),
         writable_this: function.writable_this,
         is_static: function.is_static,
         name: function.name.clone(),
-        params: function.params.iter().map(lower_param).collect(),
-        return_type: function.return_type.clone(),
-        body: lower_block(&function.body),
+        params: function
+            .params
+            .iter()
+            .map(|param| lower_param(param, class_name))
+            .collect(),
+        return_type: function
+            .return_type
+            .as_ref()
+            .map(|ty| lower_type_ref(ty, class_name)),
+        body: lower_block(&function.body, class_name),
         span: function.span,
     }
 }
 
-fn lower_param(param: &ast::Param) -> hir::Param {
+fn lower_param(param: &ast::Param, class_name: Option<&str>) -> hir::Param {
     hir::Param {
         promoted_access: param.promoted_access.clone(),
         take: param.take,
         writable: param.writable,
-        ty: param.ty.clone(),
+        ty: lower_type_ref(&param.ty, class_name),
         name: param.name.clone(),
-        default: param.default.as_ref().map(lower_expr),
+        default: param
+            .default
+            .as_ref()
+            .map(|expr| lower_expr(expr, class_name)),
         span: param.span,
     }
 }
 
-fn lower_block(block: &ast::Block) -> hir::Block {
+fn lower_block(block: &ast::Block, class_name: Option<&str>) -> hir::Block {
     hir::Block {
-        statements: block.statements.iter().map(lower_stmt).collect(),
+        statements: block
+            .statements
+            .iter()
+            .map(|statement| lower_stmt(statement, class_name))
+            .collect(),
         span: block.span,
     }
 }
 
-fn lower_stmt(statement: &ast::Stmt) -> hir::Stmt {
+fn lower_stmt(statement: &ast::Stmt, class_name: Option<&str>) -> hir::Stmt {
     match statement {
         ast::Stmt::VarDecl(decl) => hir::Stmt::VarDecl(hir::VarDecl {
             writable: decl.writable,
-            ty: decl.ty.clone(),
+            ty: decl.ty.as_ref().map(|ty| lower_type_ref(ty, class_name)),
             name: decl.name.clone(),
-            initializer: lower_expr(&decl.initializer),
+            initializer: lower_expr(&decl.initializer, class_name),
             span: decl.span,
         }),
         ast::Stmt::Assignment(assignment) => hir::Stmt::Assignment(hir::Assignment {
-            target: lower_expr(&assignment.target),
+            target: lower_expr(&assignment.target, class_name),
             op: assignment.op.clone(),
-            value: lower_expr(&assignment.value),
+            value: lower_expr(&assignment.value, class_name),
             span: assignment.span,
         }),
         ast::Stmt::Echo { expr, span } => hir::Stmt::Echo {
-            expr: lower_expr(expr),
+            expr: lower_expr(expr, class_name),
             span: *span,
         },
         ast::Stmt::Return { expr, span } => hir::Stmt::Return {
-            expr: expr.as_ref().map(lower_expr),
+            expr: expr.as_ref().map(|expr| lower_expr(expr, class_name)),
             span: *span,
         },
-        ast::Stmt::If(if_stmt) => hir::Stmt::If(lower_if_stmt(if_stmt)),
+        ast::Stmt::If(if_stmt) => hir::Stmt::If(lower_if_stmt(if_stmt, class_name)),
         ast::Stmt::While(while_stmt) => hir::Stmt::While(hir::WhileStmt {
-            condition: lower_expr(&while_stmt.condition),
-            body: lower_block(&while_stmt.body),
+            condition: lower_expr(&while_stmt.condition, class_name),
+            body: lower_block(&while_stmt.body, class_name),
             span: while_stmt.span,
         }),
         ast::Stmt::For(for_stmt) => hir::Stmt::For(Box::new(hir::ForStmt {
-            initializer: for_stmt.initializer.as_ref().map(lower_for_initializer),
-            condition: for_stmt.condition.as_ref().map(lower_expr),
-            increment: for_stmt.increment.as_ref().map(lower_for_increment),
-            body: lower_block(&for_stmt.body),
+            initializer: for_stmt
+                .initializer
+                .as_ref()
+                .map(|initializer| lower_for_initializer(initializer, class_name)),
+            condition: for_stmt
+                .condition
+                .as_ref()
+                .map(|expr| lower_expr(expr, class_name)),
+            increment: for_stmt
+                .increment
+                .as_ref()
+                .map(|increment| lower_for_increment(increment, class_name)),
+            body: lower_block(&for_stmt.body, class_name),
             span: for_stmt.span,
         })),
         ast::Stmt::Break { span } => hir::Stmt::Break { span: *span },
         ast::Stmt::Continue { span } => hir::Stmt::Continue { span: *span },
         ast::Stmt::Foreach(foreach) => hir::Stmt::Foreach(hir::ForeachStmt {
-            iterable: lower_expr(&foreach.iterable),
-            key: foreach.key.as_ref().map(lower_foreach_binding),
-            value: lower_foreach_binding(&foreach.value),
-            body: lower_block(&foreach.body),
+            iterable: lower_expr(&foreach.iterable, class_name),
+            key: foreach
+                .key
+                .as_ref()
+                .map(|binding| lower_foreach_binding(binding, class_name)),
+            value: lower_foreach_binding(&foreach.value, class_name),
+            body: lower_block(&foreach.body, class_name),
             span: foreach.span,
         }),
         ast::Stmt::Increment(increment) => hir::Stmt::Increment(hir::IncrementStmt {
-            target: lower_expr(&increment.target),
+            target: lower_expr(&increment.target, class_name),
             op: increment.op.clone(),
             position: increment.position.clone(),
             span: increment.span,
         }),
         ast::Stmt::Expr { expr, span } => hir::Stmt::Expr {
-            expr: lower_expr(expr),
+            expr: lower_expr(expr, class_name),
             span: *span,
         },
     }
 }
 
-fn lower_for_initializer(initializer: &ast::ForInitializer) -> hir::ForInitializer {
+fn lower_for_initializer(
+    initializer: &ast::ForInitializer,
+    class_name: Option<&str>,
+) -> hir::ForInitializer {
     match initializer {
         ast::ForInitializer::VarDecl(decl) => hir::ForInitializer::VarDecl(hir::VarDecl {
             writable: decl.writable,
-            ty: decl.ty.clone(),
+            ty: decl.ty.as_ref().map(|ty| lower_type_ref(ty, class_name)),
             name: decl.name.clone(),
-            initializer: lower_expr(&decl.initializer),
+            initializer: lower_expr(&decl.initializer, class_name),
             span: decl.span,
         }),
         ast::ForInitializer::Assignment(assignment) => {
             hir::ForInitializer::Assignment(hir::Assignment {
-                target: lower_expr(&assignment.target),
+                target: lower_expr(&assignment.target, class_name),
                 op: assignment.op.clone(),
-                value: lower_expr(&assignment.value),
+                value: lower_expr(&assignment.value, class_name),
                 span: assignment.span,
             })
         }
     }
 }
 
-fn lower_for_increment(increment: &ast::ForIncrement) -> hir::ForIncrement {
+fn lower_for_increment(
+    increment: &ast::ForIncrement,
+    class_name: Option<&str>,
+) -> hir::ForIncrement {
     match increment {
         ast::ForIncrement::Increment(increment) => {
             hir::ForIncrement::Increment(hir::IncrementStmt {
-                target: lower_expr(&increment.target),
+                target: lower_expr(&increment.target, class_name),
                 op: increment.op.clone(),
                 position: increment.position.clone(),
                 span: increment.span,
@@ -213,39 +260,47 @@ fn lower_for_increment(increment: &ast::ForIncrement) -> hir::ForIncrement {
         }
         ast::ForIncrement::Assignment(assignment) => {
             hir::ForIncrement::Assignment(hir::Assignment {
-                target: lower_expr(&assignment.target),
+                target: lower_expr(&assignment.target, class_name),
                 op: assignment.op.clone(),
-                value: lower_expr(&assignment.value),
+                value: lower_expr(&assignment.value, class_name),
                 span: assignment.span,
             })
         }
     }
 }
 
-fn lower_if_stmt(if_stmt: &ast::IfStmt) -> hir::IfStmt {
+fn lower_if_stmt(if_stmt: &ast::IfStmt, class_name: Option<&str>) -> hir::IfStmt {
     hir::IfStmt {
-        condition: lower_expr(&if_stmt.condition),
-        then_block: lower_block(&if_stmt.then_block),
-        else_branch: if_stmt.else_branch.as_ref().map(lower_else_branch),
+        condition: lower_expr(&if_stmt.condition, class_name),
+        then_block: lower_block(&if_stmt.then_block, class_name),
+        else_branch: if_stmt
+            .else_branch
+            .as_ref()
+            .map(|branch| lower_else_branch(branch, class_name)),
         span: if_stmt.span,
     }
 }
 
-fn lower_else_branch(branch: &ast::ElseBranch) -> hir::ElseBranch {
+fn lower_else_branch(branch: &ast::ElseBranch, class_name: Option<&str>) -> hir::ElseBranch {
     match branch {
-        ast::ElseBranch::If(if_stmt) => hir::ElseBranch::If(Box::new(lower_if_stmt(if_stmt))),
-        ast::ElseBranch::Block(block) => hir::ElseBranch::Block(lower_block(block)),
+        ast::ElseBranch::If(if_stmt) => {
+            hir::ElseBranch::If(Box::new(lower_if_stmt(if_stmt, class_name)))
+        }
+        ast::ElseBranch::Block(block) => hir::ElseBranch::Block(lower_block(block, class_name)),
     }
 }
 
-fn lower_foreach_binding(binding: &ast::ForeachBinding) -> hir::ForeachBinding {
+fn lower_foreach_binding(
+    binding: &ast::ForeachBinding,
+    class_name: Option<&str>,
+) -> hir::ForeachBinding {
     hir::ForeachBinding {
-        ty: binding.ty.clone(),
+        ty: binding.ty.as_ref().map(|ty| lower_type_ref(ty, class_name)),
         name: binding.name.clone(),
     }
 }
 
-fn lower_expr(expr: &ast::Expr) -> hir::Expr {
+fn lower_expr(expr: &ast::Expr, class_name: Option<&str>) -> hir::Expr {
     match expr {
         ast::Expr::Variable { name, span } => hir::Expr::Variable {
             name: name.clone(),
@@ -261,7 +316,10 @@ fn lower_expr(expr: &ast::Expr) -> hir::Expr {
             span: *span,
         },
         ast::Expr::InterpolatedString { parts, span } => hir::Expr::InterpolatedString {
-            parts: parts.iter().map(lower_interpolated_string_part).collect(),
+            parts: parts
+                .iter()
+                .map(|part| lower_interpolated_string_part(part, class_name))
+                .collect(),
             span: *span,
         },
         ast::Expr::Int { value, span } => hir::Expr::Int {
@@ -278,7 +336,10 @@ fn lower_expr(expr: &ast::Expr) -> hir::Expr {
         },
         ast::Expr::Null { span } => hir::Expr::Null { span: *span },
         ast::Expr::Array { elements, span } => hir::Expr::Array {
-            elements: elements.iter().map(lower_array_element).collect(),
+            elements: elements
+                .iter()
+                .map(|element| lower_array_element(element, class_name))
+                .collect(),
             span: *span,
         },
         ast::Expr::PropertyAccess {
@@ -286,7 +347,7 @@ fn lower_expr(expr: &ast::Expr) -> hir::Expr {
             property,
             span,
         } => hir::Expr::PropertyAccess {
-            object: Box::new(lower_expr(object)),
+            object: Box::new(lower_expr(object, class_name)),
             property: property.clone(),
             span: *span,
         },
@@ -296,52 +357,54 @@ fn lower_expr(expr: &ast::Expr) -> hir::Expr {
             args,
             span,
         } => hir::Expr::MethodCall {
-            object: Box::new(lower_expr(object)),
+            object: Box::new(lower_expr(object, class_name)),
             method: method.clone(),
-            args: args.iter().map(lower_expr).collect(),
+            args: args.iter().map(|arg| lower_expr(arg, class_name)).collect(),
             span: *span,
         },
         ast::Expr::FunctionCall { name, args, span } => hir::Expr::FunctionCall {
             name: name.clone(),
-            args: args.iter().map(lower_expr).collect(),
+            args: args.iter().map(|arg| lower_expr(arg, class_name)).collect(),
             span: *span,
         },
         ast::Expr::StaticCall {
-            class_name,
+            qualifier,
             method,
             args,
             span,
+            ..
         } => hir::Expr::StaticCall {
-            class_name: class_name.clone(),
+            class_name: resolved_qualifier_name(qualifier, class_name),
             method: method.clone(),
-            args: args.iter().map(lower_expr).collect(),
+            args: args.iter().map(|arg| lower_expr(arg, class_name)).collect(),
             span: *span,
         },
         ast::Expr::StaticMember {
-            class_name,
+            qualifier,
             member,
             span,
+            ..
         } => hir::Expr::StaticMember {
-            class_name: class_name.clone(),
+            class_name: resolved_qualifier_name(qualifier, class_name),
             member: member.clone(),
             span: *span,
         },
         ast::Expr::New {
-            class_name,
+            class_name: constructed_class,
             args,
             span,
         } => hir::Expr::New {
-            class_name: class_name.clone(),
-            args: args.iter().map(lower_expr).collect(),
+            class_name: constructed_class.clone(),
+            args: args.iter().map(|arg| lower_expr(arg, class_name)).collect(),
             span: *span,
         },
         ast::Expr::Grouped { expr, span } => hir::Expr::Grouped {
-            expr: Box::new(lower_expr(expr)),
+            expr: Box::new(lower_expr(expr, class_name)),
             span: *span,
         },
         ast::Expr::Unary { op, expr, span } => hir::Expr::Unary {
             op: op.clone(),
-            expr: Box::new(lower_expr(expr)),
+            expr: Box::new(lower_expr(expr, class_name)),
             span: *span,
         },
         ast::Expr::Binary {
@@ -350,9 +413,9 @@ fn lower_expr(expr: &ast::Expr) -> hir::Expr {
             right,
             span,
         } => hir::Expr::Binary {
-            left: Box::new(lower_expr(left)),
+            left: Box::new(lower_expr(left, class_name)),
             op: op.clone(),
-            right: Box::new(lower_expr(right)),
+            right: Box::new(lower_expr(right, class_name)),
             span: *span,
         },
         ast::Expr::Range {
@@ -361,8 +424,8 @@ fn lower_expr(expr: &ast::Expr) -> hir::Expr {
             inclusive,
             span,
         } => hir::Expr::Range {
-            start: Box::new(lower_expr(start)),
-            end: Box::new(lower_expr(end)),
+            start: Box::new(lower_expr(start, class_name)),
+            end: Box::new(lower_expr(end, class_name)),
             inclusive: *inclusive,
             span: *span,
         },
@@ -371,6 +434,7 @@ fn lower_expr(expr: &ast::Expr) -> hir::Expr {
 
 fn lower_interpolated_string_part(
     part: &ast::InterpolatedStringPart,
+    class_name: Option<&str>,
 ) -> hir::InterpolatedStringPart {
     match part {
         ast::InterpolatedStringPart::Text { value, span } => hir::InterpolatedStringPart::Text {
@@ -378,14 +442,41 @@ fn lower_interpolated_string_part(
             span: *span,
         },
         ast::InterpolatedStringPart::Expr(expr) => {
-            hir::InterpolatedStringPart::Expr(lower_expr(expr))
+            hir::InterpolatedStringPart::Expr(lower_expr(expr, class_name))
         }
     }
 }
 
-fn lower_array_element(element: &ast::ArrayElement) -> hir::ArrayElement {
+fn lower_array_element(element: &ast::ArrayElement, class_name: Option<&str>) -> hir::ArrayElement {
     hir::ArrayElement {
-        key: element.key.as_ref().map(lower_expr),
-        value: lower_expr(&element.value),
+        key: element.key.as_ref().map(|key| lower_expr(key, class_name)),
+        value: lower_expr(&element.value, class_name),
     }
+}
+
+fn resolved_qualifier_name(qualifier: &ast::StaticQualifier, class_name: Option<&str>) -> String {
+    match qualifier {
+        ast::StaticQualifier::Class(name) => name.clone(),
+        ast::StaticQualifier::SelfType => class_name
+            .expect("checked `self::` access has a declaring class")
+            .to_string(),
+        ast::StaticQualifier::Parent | ast::StaticQualifier::InvalidStatic => {
+            unreachable!("rejected or unsupported qualifier must not reach Doria IR lowering")
+        }
+    }
+}
+
+fn lower_type_ref(ty: &crate::types::TypeRef, class_name: Option<&str>) -> crate::types::TypeRef {
+    let mut lowered = ty.clone();
+    if lowered.name == "self" {
+        lowered.name = class_name
+            .expect("checked `self` type has a declaring class")
+            .to_string();
+    }
+    lowered.args = lowered
+        .args
+        .iter()
+        .map(|argument| lower_type_ref(argument, class_name))
+        .collect();
+    lowered
 }

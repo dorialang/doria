@@ -17,9 +17,17 @@ pub struct NamespaceDecl {
 pub enum Item {
     Class(ClassDecl),
     Interface(InterfaceDecl),
+    Trait(TraitDecl),
     Function(FunctionDecl),
     Constant(ConstDecl),
     Statement(Stmt),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TraitDecl {
+    pub name: String,
+    pub members: Vec<ClassMember>,
+    pub span: Span,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -296,14 +304,18 @@ pub enum Expr {
         span: Span,
     },
     StaticCall {
-        class_name: String,
+        qualifier: StaticQualifier,
+        qualifier_span: Span,
         method: String,
+        member_sigil_span: Option<Span>,
         args: Vec<Expr>,
         span: Span,
     },
     StaticMember {
-        class_name: String,
+        qualifier: StaticQualifier,
+        qualifier_span: Span,
         member: String,
+        member_sigil_span: Option<Span>,
         span: Span,
     },
     New {
@@ -332,6 +344,14 @@ pub enum Expr {
         inclusive: bool,
         span: Span,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StaticQualifier {
+    Class(String),
+    SelfType,
+    Parent,
+    InvalidStatic,
 }
 
 #[derive(Debug, Clone, PartialEq)]

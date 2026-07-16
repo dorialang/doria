@@ -11,7 +11,8 @@ Documentation role: working note. This file prevents duplicated in-flight work. 
 
 - Stage 18 full expression interpolation and compiler-known `Displayable` is merged.
 - Stage 19 ownership, moves, destruction, and native class layout is complete on the current branch.
-- Stage 20 statically resolved instance/static methods, Copy-type static properties, class/top-level constants, `internal` enforcement, and concrete native `Displayable` execution are complete on the current branch.
+- Stage 20 statically resolved instance/static methods, Copy-type static properties, class/top-level constants, `internal` enforcement, and concrete native `Displayable` execution are complete on the current branch. Static access is sigil-free, `self` resolves to the declaring class, and one class-level index rejects cross-kind member-name collisions.
+- The parser accepts generalized `parent::member()` and trait-local `self::member` under the two-clocks rule; semantic checking names Stage 34 and Stage 35 respectively and stops those forms before MIR. `Foo::$prop` and `static::` are permanent errors with precise fixes.
 - Native remains one target: direct compile/run uses the Cranelift fast profile, while `--release` selects LLVM 18 over the same validated typed MIR.
 - Ordinary expression interpolation of primitive/string values lowers through the existing ordered MIR string and display operations consumed by all three execution paths.
 - Native classes now cover construction, property initialization/access, class-valued locals/arguments/returns, `take` transfer, lifecycle bodies, recursive destruction, and deterministic normal structured-exit cleanup through the interpreter, Cranelift, and LLVM.
@@ -31,4 +32,5 @@ Documentation role: working note. This file prevents duplicated in-flight work. 
 
 - General interface declarations and conformance until Stage 35.
 - Runtime-initialized and owned statics until separately accepted lifetime/concurrency decisions.
+- Parent lookup/dispatch until Stage 34 and trait composition until Stage 35; their accepted grammar is already represented.
 - `Bytes` until Stage 23.

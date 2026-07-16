@@ -65,6 +65,8 @@ impl Parser {
             self.parse_class().map(Item::Class)
         } else if self.match_kind(&TokenKind::Interface) {
             self.parse_interface().map(Item::Interface)
+        } else if self.match_kind(&TokenKind::Trait) {
+            self.parse_trait().map(Item::Trait)
         } else if self.match_kind(&TokenKind::Function) {
             self.parse_function(MemberAccess::External, None, None, self.previous().span)
                 .map(Item::Function)
@@ -79,7 +81,7 @@ impl Parser {
 
     fn parse_class(&mut self) -> Option<ClassDecl> {
         let start = self.previous().span.start;
-        let name = self.expect_identifier("expected class name")?;
+        let name = self.expect_type_declaration_name("expected class name")?;
         let (parent, parent_span) = if self.match_kind(&TokenKind::Extends) {
             let parent_start = self.previous().span.start;
             let parent = self.expect_qualified_name("expected parent class after `extends`")?;
@@ -122,6 +124,31 @@ impl Parser {
             parent,
             parent_span,
             implements,
+            members,
+            span: Span::new(start, end),
+        })
+    }
+
+    fn parse_trait(&mut self) -> Option<TraitDecl> {
+        let start = self.previous().span.start;
+        let name = self.expect_type_declaration_name("expected trait name")?;
+        self.expect(TokenKind::LeftBrace, "expected `{` after trait name")?;
+
+        let mut members = Vec::new();
+        while !self.check(&TokenKind::RightBrace) && !self.is_at_end() {
+            if let Some(member) = self.parse_class_member() {
+                members.push(member);
+            } else {
+                self.synchronize();
+            }
+        }
+
+        let end = self
+            .expect(TokenKind::RightBrace, "expected `}` after trait body")?
+            .span
+            .end;
+        Some(TraitDecl {
+            name,
             members,
             span: Span::new(start, end),
         })
@@ -997,23 +1024,11 @@ impl Parser {
                 )?;
                 let name_span = Span::new(token.span.start, self.previous().span.end);
                 if self.match_kind(&TokenKind::DoubleColon) {
-                    let member = self.expect_identifier("expected member name after `::`")?;
-                    if self.match_kind(&TokenKind::LeftParen) {
-                        let args = self.parse_argument_list_after_open()?;
-                        let span = Span::new(token.span.start, self.previous().span.end);
-                        Some(Expr::StaticCall {
-                            class_name: name,
-                            method: member,
-                            args,
-                            span,
-                        })
-                    } else {
-                        Some(Expr::StaticMember {
-                            class_name: name,
-                            member,
-                            span: Span::new(token.span.start, self.previous().span.end),
-                        })
-                    }
+                    self.parse_scoped_access(
+                        StaticQualifier::Class(name),
+                        name_span,
+                        token.span.start,
+                    )
                 } else {
                     Some(Expr::Identifier {
                         name,
@@ -1021,6 +1036,14 @@ impl Parser {
                     })
                 }
             }
+            TokenKind::SelfType if self.match_kind(&TokenKind::DoubleColon) => {
+                self.parse_scoped_access(StaticQualifier::SelfType, token.span, token.span.start)
+            }
+            TokenKind::Parent if self.match_kind(&TokenKind::DoubleColon) => {
+                self.parse_scoped_access(StaticQualifier::Parent, token.span, token.span.start)
+            }
+            TokenKind::Static if self.match_kind(&TokenKind::DoubleColon) => self
+                .parse_scoped_access(StaticQualifier::InvalidStatic, token.span, token.span.start),
             TokenKind::StringLiteral { value, raw, quote } => {
                 self.parse_string_literal(value, raw, quote, token.span)
             }
@@ -1059,6 +1082,46 @@ impl Parser {
                 self.error("expected expression", token.span);
                 None
             }
+        }
+    }
+
+    fn parse_scoped_access(
+        &mut self,
+        qualifier: StaticQualifier,
+        qualifier_span: Span,
+        start: usize,
+    ) -> Option<Expr> {
+        let token = self.advance().clone();
+        let (member, member_sigil_span) = match token.kind {
+            TokenKind::Identifier(name) => (name, None),
+            TokenKind::Variable(name) => (
+                name,
+                Some(Span::new(token.span.start, token.span.start + 1)),
+            ),
+            _ => {
+                self.error("expected member name after `::`", token.span);
+                return None;
+            }
+        };
+
+        if self.match_kind(&TokenKind::LeftParen) {
+            let args = self.parse_argument_list_after_open()?;
+            Some(Expr::StaticCall {
+                qualifier,
+                qualifier_span,
+                method: member,
+                member_sigil_span,
+                args,
+                span: Span::new(start, self.previous().span.end),
+            })
+        } else {
+            Some(Expr::StaticMember {
+                qualifier,
+                qualifier_span,
+                member,
+                member_sigil_span,
+                span: Span::new(start, token.span.end),
+            })
         }
     }
 
@@ -1368,6 +1431,7 @@ impl Parser {
             TokenKind::StringType => "string".to_string(),
             TokenKind::BoolType => "bool".to_string(),
             TokenKind::Null => "null".to_string(),
+            TokenKind::SelfType => "self".to_string(),
             TokenKind::Identifier(name) => self.finish_qualified_name(
                 name,
                 "expected type-name segment after namespace separator",
@@ -1517,6 +1581,7 @@ impl Parser {
                 | TokenKind::StringType
                 | TokenKind::BoolType
                 | TokenKind::Null
+                | TokenKind::SelfType
                 | TokenKind::Identifier(_)
         )
     }
@@ -1525,6 +1590,18 @@ impl Parser {
         let token = self.advance().clone();
         match token.kind {
             TokenKind::Identifier(name) => Some(name),
+            _ => {
+                self.error(message, token.span);
+                None
+            }
+        }
+    }
+
+    fn expect_type_declaration_name(&mut self, message: &str) -> Option<String> {
+        let token = self.advance().clone();
+        match token.kind {
+            TokenKind::Identifier(name) => Some(name),
+            TokenKind::SelfType => Some("self".to_string()),
             _ => {
                 self.error(message, token.span);
                 None
@@ -1622,6 +1699,7 @@ impl Parser {
             match self.peek().kind {
                 TokenKind::Class
                 | TokenKind::Interface
+                | TokenKind::Trait
                 | TokenKind::Namespace
                 | TokenKind::Function
                 | TokenKind::Const
@@ -1647,6 +1725,7 @@ fn token_name(kind: &TokenKind) -> &'static str {
     match kind {
         TokenKind::Class => "class",
         TokenKind::Interface => "interface",
+        TokenKind::Trait => "trait",
         TokenKind::Implements => "implements",
         TokenKind::Namespace => "namespace",
         TokenKind::Extends => "extends",
@@ -1654,6 +1733,8 @@ fn token_name(kind: &TokenKind) -> &'static str {
         TokenKind::Const => "const",
         TokenKind::Internal => "internal",
         TokenKind::Static => "static",
+        TokenKind::SelfType => "self",
+        TokenKind::Parent => "parent",
         TokenKind::Let => "let",
         TokenKind::Take => "take",
         TokenKind::Writable => "writable",

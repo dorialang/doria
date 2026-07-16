@@ -52,7 +52,7 @@ Explicit `writable` on either lifecycle name is a declaration-site error. The fi
 
 ### Invocation
 
-Ordinary instance and static calls to either lifecycle name are rejected. Construction is expressed with `new Class(...)`, and destruction is compiler/runtime-invoked. The parent-first construction rule in the end-to-end plan reserves `parent::__construct(...)` as the parent-chain protocol form when inheritance is implemented. The current compiler has no inheritance grammar, so this decision neither adds an early parent-call form nor broadens any existing direct-call behavior.
+Ordinary instance and static calls to either lifecycle name are rejected. Construction is expressed with `new Class(...)`, and destruction is compiler/runtime-invoked. The parent-first construction rule in the end-to-end plan reserves `parent::__construct(...)` as the parent-chain protocol form when inheritance is implemented. Stage 20 accepts generalized `parent::member()` grammar under the two-clocks rule, but parent lookup, constructor chaining, and direct parent-call semantics remain unsupported until Stage 34.
 
 The PHP backend treats a lifecycle declaration with either rejected modifier reaching emission as a compiler-invariant violation. User source is rejected during semantic analysis before backend emission.
 

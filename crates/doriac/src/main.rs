@@ -33,12 +33,25 @@ fn run() -> Result<ExitCode, String> {
             let input = args
                 .get(1)
                 .ok_or_else(|| "missing input file".to_string())?;
+            let json = match args.get(2).map(String::as_str) {
+                None => false,
+                Some("--json") => true,
+                Some(option) => return Err(format!("unknown check option `{option}`")),
+            };
+            if let Some(option) = args.get(3) {
+                return Err(format!("unknown check option `{option}`"));
+            }
             let (path, text) = read_source(input)?;
             match doriac::check_source(path.clone(), text.clone()) {
                 Ok(_) => {
-                    println!("OK");
+                    if json {
+                        println!("[]");
+                    } else {
+                        println!("OK");
+                    }
                     Ok(ExitCode::SUCCESS)
                 }
+                Err(diagnostics) if json => Err(doriac::diagnostics_json(&diagnostics)),
                 Err(diagnostics) => Err(doriac::render_diagnostics(path, text, &diagnostics)),
             }
         }
@@ -335,7 +348,7 @@ fn direct_executable_hint(path: &Path) -> String {
 
 fn print_help() {
     println!(
-        "doriac {}\n\nUSAGE:\n    doriac check <source.doria>\n    doriac ast <source.doria>\n    doriac hir <source.doria>\n    doriac mir <source.doria>\n    doriac compile <source.doria> [--release] [--out <file>]\n    doriac compile <source.doria> --target php [--out <file>]\n    doriac run <source.doria> [--release]\n\nNATIVE PROFILES:\n    fast       default Cranelift profile for rapid local feedback\n    release    LLVM optimized profile selected with --release\n\nTARGETS:\n    native    default target for standalone executables\n    php       compatibility and inspection backend\n    debug     MIR interpreter debug artifact\n    wasm      planned WebAssembly backend",
+        "doriac {}\n\nUSAGE:\n    doriac check <source.doria> [--json]\n    doriac ast <source.doria>\n    doriac hir <source.doria>\n    doriac mir <source.doria>\n    doriac compile <source.doria> [--release] [--out <file>]\n    doriac compile <source.doria> --target php [--out <file>]\n    doriac run <source.doria> [--release]\n\nNATIVE PROFILES:\n    fast       default Cranelift profile for rapid local feedback\n    release    LLVM optimized profile selected with --release\n\nTARGETS:\n    native    default target for standalone executables\n    php       compatibility and inspection backend\n    debug     MIR interpreter debug artifact\n    wasm      planned WebAssembly backend",
         doriac::TOOLCHAIN_VERSION
     );
 }

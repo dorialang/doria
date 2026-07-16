@@ -411,6 +411,7 @@ class DoriaLexer : LexerBase() {
             }
             tokenType = when {
                 sliceEquals("\$this") -> DoriaTokenTypes.THIS
+                previousAccessor() == "::" -> DoriaTokenTypes.INVALID
                 isStaticPropertyDeclaration() -> DoriaTokenTypes.STATIC_PROPERTY
                 else -> DoriaTokenTypes.VARIABLE
             }
@@ -914,6 +915,8 @@ class DoriaLexer : LexerBase() {
             "include",
             "declare",
             "const",
+            "self",
+            "parent",
             "async",
             "await",
             "spawn",

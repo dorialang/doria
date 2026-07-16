@@ -1,4 +1,4 @@
-use doriac::ast::{ClassMember, Item, MemberAccess};
+use doriac::ast::{ClassMember, Item, MemberAccess, StaticQualifier};
 use doriac::const_eval::{ConstKey, ConstValue};
 use doriac::mir;
 
@@ -6,6 +6,9 @@ const PARSER_EXAMPLE: &str = include_str!("../../../examples/native/main_stage20
 const DISPLAYABLE_EXAMPLE: &str =
     include_str!("../../../examples/native/main_stage20_displayable.doria");
 const STATICS_EXAMPLE: &str = include_str!("../../../examples/native/main_stage20_statics.doria");
+const SELF_EXAMPLE: &str = include_str!("../../../examples/native/main_stage20_self.doria");
+const STATIC_CONSTRUCTOR_EXAMPLE: &str =
+    include_str!("../../../examples/native/main_stage20_static_constructor.doria");
 
 fn diagnostics(source: &str) -> Vec<doriac::diagnostics::Diagnostic> {
     doriac::check_source("stage20.doria", source).expect_err("source should be rejected")
@@ -17,6 +20,34 @@ fn assert_diagnostic(source: &str, code: &str) {
         found.iter().any(|diagnostic| diagnostic.code == code),
         "expected {code}, got {found:#?}"
     );
+}
+
+fn diagnostic_snapshot(source: &str, code: &str) -> String {
+    let diagnostic = diagnostics(source)
+        .into_iter()
+        .find(|diagnostic| diagnostic.code == code)
+        .unwrap_or_else(|| panic!("expected {code}"));
+    let mut snapshot = format!(
+        "code: {}\nmessage: {}\nhelp: {}\nspan: {}..{}\n",
+        diagnostic.code,
+        diagnostic.message,
+        diagnostic.help.as_deref().unwrap_or(""),
+        diagnostic.span.start,
+        diagnostic.span.end,
+    );
+    if let Some(fix) = diagnostic.fix {
+        snapshot.push_str(&format!(
+            "fix: {}..{} -> {:?}\n",
+            fix.span.start, fix.span.end, fix.replacement
+        ));
+    }
+    for related in diagnostic.related {
+        snapshot.push_str(&format!(
+            "related: {}..{}: {}\n",
+            related.span.start, related.span.end, related.message
+        ));
+    }
+    snapshot
 }
 
 fn lower(source: &str) -> mir::Program {
@@ -514,4 +545,328 @@ fn stage20_acceptance_examples_run_through_the_shared_interpreter() {
         assert!(output.stderr.is_empty());
         assert_eq!(output.exit_status, 0);
     }
+}
+
+#[test]
+fn self_scope_and_type_forms_resolve_before_mir() {
+    let ast = doriac::parse_source("self.doria", SELF_EXAMPLE).expect("self forms should parse");
+    let counter = ast
+        .items
+        .iter()
+        .find_map(|item| match item {
+            Item::Class(class) if class.name == "Counter" => Some(class),
+            _ => None,
+        })
+        .expect("Counter class");
+    let next = counter
+        .members
+        .iter()
+        .find_map(|member| match member {
+            ClassMember::Method(method) if method.name == "next" => Some(method),
+            _ => None,
+        })
+        .expect("next method");
+    assert!(matches!(
+        &next.body.statements[0],
+        doriac::ast::Stmt::Assignment(doriac::ast::Assignment {
+            target: doriac::ast::Expr::StaticMember {
+                qualifier: StaticQualifier::SelfType,
+                ..
+            },
+            ..
+        })
+    ));
+
+    let hir = doriac::lower_source("self.doria", SELF_EXAMPLE).expect("self should lower");
+    let message = hir
+        .items
+        .iter()
+        .find_map(|item| match item {
+            doriac::hir::Item::Class(class) if class.name == "Message" => Some(class),
+            _ => None,
+        })
+        .expect("Message class");
+    let with_name = message
+        .members
+        .iter()
+        .find_map(|member| match member {
+            doriac::hir::ClassMember::Method(method) if method.name == "withName" => Some(method),
+            _ => None,
+        })
+        .expect("withName method");
+    assert_eq!(
+        with_name.return_type.as_ref().map(|ty| ty.name.as_str()),
+        Some("Message")
+    );
+
+    let output = doriac::mir_interpreter::interpret(
+        &doriac::mir_lowering::lower_program(&hir).expect("self should lower to MIR"),
+    )
+    .expect("self fixture should run");
+    assert_eq!(
+        output.stdout,
+        b"2:3:second\nreleased:second\nreleased:first\n"
+    );
+    assert!(output.stderr.is_empty());
+    assert_eq!(output.exit_status, 0);
+
+    assert_diagnostic(
+        "class Other {} class Message { function replace(): self { return new Other(); } }",
+        "E0404",
+    );
+}
+
+#[test]
+fn self_access_preserves_internal_and_writable_rules() {
+    doriac::check_source(
+        "self-internal.doria",
+        r#"
+class Vault
+{
+    internal const STEP = 1;
+    internal static writable int $value = 0;
+    internal static function advance(): int
+    {
+        self::value = self::value + self::STEP;
+        return self::value;
+    }
+    static function reveal(): int { return self::advance(); }
+}
+function main(): void { echo Vault::reveal(); }
+"#,
+    )
+    .expect("self access inside the declaring class should reach internal members");
+
+    assert_diagnostic(
+        "class Counter { static int $value = 1; static function change(): void { self::value = 2; } }",
+        "E0202",
+    );
+    assert_diagnostic(
+        "class Vault { internal static function secret(): int { return 1; } } function main(): void { echo Vault::secret(); }",
+        "E0307",
+    );
+}
+
+#[test]
+fn constructor_static_mutation_is_ordinary_mutation() {
+    let output = interpret(STATIC_CONSTRUCTOR_EXAMPLE);
+    assert_eq!(output.stdout, b"37\nmessage released\n");
+    assert!(output.stderr.is_empty());
+    assert_eq!(output.exit_status, 0);
+    assert_diagnostic(
+        "class Counter { static int $value = 1; function __construct() { Counter::value = 2; } }",
+        "E0202",
+    );
+}
+
+#[test]
+fn static_access_identity_nevers_have_precise_machine_fixes() {
+    let sigil_source = r#"
+class Foo
+{
+    static int $prop = 1;
+    function read(): int { return Foo::$prop; }
+}
+"#;
+    let sigil = diagnostics(sigil_source)
+        .into_iter()
+        .find(|diagnostic| diagnostic.code == "E0494")
+        .expect("sigil-carrying access diagnostic");
+    let dollar = sigil_source.rfind("$prop").expect("access sigil");
+    assert_eq!(sigil.span, doriac::source::Span::new(dollar, dollar + 1));
+    assert_eq!(sigil.fix.as_ref().map(|fix| fix.span), Some(sigil.span));
+    assert_eq!(
+        sigil.fix.as_ref().map(|fix| fix.replacement.as_str()),
+        Some("")
+    );
+
+    let static_source = r#"
+class Foo
+{
+    static function create(): int { return 1; }
+    function read(): int { return static::create(); }
+}
+"#;
+    let late_static = diagnostics(static_source)
+        .into_iter()
+        .find(|diagnostic| diagnostic.code == "E0495")
+        .expect("late-static-binding diagnostic");
+    let qualifier = static_source.rfind("static::").expect("static qualifier");
+    assert_eq!(
+        late_static.fix.as_ref().map(|fix| fix.span),
+        Some(doriac::source::Span::new(qualifier, qualifier + 6))
+    );
+    assert_eq!(
+        late_static.fix.as_ref().map(|fix| fix.replacement.as_str()),
+        Some("self")
+    );
+    assert!(!late_static.message.contains("Stage"));
+}
+
+#[test]
+fn static_identity_diagnostics_match_snapshots() {
+    let sigil = "class Foo { static int $prop = 1; function read(): int { return Foo::$prop; } }";
+    assert_eq!(
+        diagnostic_snapshot(sigil, "E0494"),
+        include_str!("fixtures/diagnostics/stage20_static_property_sigil_fix.txt")
+            .replace("\r\n", "\n")
+    );
+
+    let late_static = "class Foo { static function create(): int { return 1; } function read(): int { return static::create(); } }";
+    assert_eq!(
+        diagnostic_snapshot(late_static, "E0495"),
+        include_str!("fixtures/diagnostics/stage20_late_static_binding_fix.txt")
+            .replace("\r\n", "\n")
+    );
+}
+
+#[test]
+fn class_members_share_one_namespace_with_both_declaration_spans() {
+    for (source, first_kind, second_kind) in [
+        (
+            "class Example { const FOO = 1; static int $FOO = 2; }",
+            "class constant",
+            "static property",
+        ),
+        (
+            "class Example { string $bar = \"\"; function bar(): string { return $this->bar; } }",
+            "instance property",
+            "instance method",
+        ),
+        (
+            "class Example { function bar(): string { return \"\"; } string $bar = \"\"; }",
+            "instance method",
+            "instance property",
+        ),
+        (
+            "class Example { static int $value = 1; static function value(): int { return 1; } }",
+            "static property",
+            "static method",
+        ),
+        (
+            "class Example { static function value(): int { return 1; } int $value = 1; }",
+            "static method",
+            "instance property",
+        ),
+        (
+            "class Example { function value(): int { return 1; } const value = 1; }",
+            "instance method",
+            "class constant",
+        ),
+        (
+            "class Example { string $__construct = \"\"; function __construct() {} }",
+            "instance property",
+            "instance method",
+        ),
+    ] {
+        let duplicate = diagnostics(source)
+            .into_iter()
+            .find(|diagnostic| diagnostic.code == "E0481")
+            .expect("duplicate member diagnostic");
+        assert!(duplicate.message.contains(first_kind));
+        assert!(duplicate.message.contains(second_kind));
+        assert_eq!(duplicate.related.len(), 1);
+        assert_ne!(duplicate.span, duplicate.related[0].span);
+    }
+
+    assert_eq!(
+        diagnostic_snapshot(
+            "class Example { const FOO = 1; static int $FOO = 2; }",
+            "E0481"
+        ),
+        include_str!("fixtures/diagnostics/stage20_duplicate_constant_static_property.txt")
+            .replace("\r\n", "\n")
+    );
+    assert_eq!(
+        diagnostic_snapshot(
+            "class Example { string $bar = \"\"; function bar(): string { return $this->bar; } }",
+            "E0481"
+        ),
+        include_str!("fixtures/diagnostics/stage20_duplicate_property_method.txt")
+            .replace("\r\n", "\n")
+    );
+}
+
+#[test]
+fn reserved_and_two_clock_qualifiers_are_structural_not_parser_errors() {
+    let reserved_source = "class self {}";
+    let reserved = diagnostics(reserved_source);
+    assert!(reserved.iter().any(|diagnostic| {
+        diagnostic.code == "E0309" && diagnostic.message.contains("reserved")
+    }));
+    assert_eq!(
+        diagnostic_snapshot(reserved_source, "E0309"),
+        include_str!("fixtures/diagnostics/stage20_reserved_self_class.txt").replace("\r\n", "\n")
+    );
+
+    let parent_source = "class Child { function save(): void { parent::save(); } }";
+    let parsed_parent = doriac::parse_source("parent.doria", parent_source)
+        .expect("generalized parent calls should parse");
+    assert!(matches!(
+        &parsed_parent.items[0],
+        Item::Class(class)
+            if matches!(
+                &class.members[0],
+                ClassMember::Method(method)
+                    if matches!(
+                        &method.body.statements[0],
+                        doriac::ast::Stmt::Expr {
+                            expr: doriac::ast::Expr::StaticCall {
+                                qualifier: StaticQualifier::Parent,
+                                ..
+                            },
+                            ..
+                        }
+                    )
+            )
+    ));
+    let parent = diagnostics(parent_source);
+    assert_eq!(
+        parent
+            .iter()
+            .filter(|diagnostic| diagnostic.code == "P0001")
+            .count(),
+        0
+    );
+    assert!(parent.iter().any(|diagnostic| {
+        diagnostic.code == "E0496" && diagnostic.message.contains("Stage 34")
+    }));
+
+    let trait_source = r#"
+trait UsesLimit
+{
+    function limit(): int { return self::MAX_DEPTH; }
+}
+"#;
+    let parsed = doriac::parse_source("trait.doria", trait_source)
+        .expect("trait self access should parse structurally");
+    assert!(matches!(
+        parsed.items.first(),
+        Some(Item::Trait(trait_decl))
+            if matches!(
+                &trait_decl.members[0],
+                ClassMember::Method(method)
+                    if matches!(
+                        &method.body.statements[0],
+                        doriac::ast::Stmt::Return {
+                            expr: Some(doriac::ast::Expr::StaticMember {
+                                qualifier: StaticQualifier::SelfType,
+                                ..
+                            }),
+                            ..
+                        }
+                    )
+            )
+    ));
+    let trait_diagnostics = diagnostics(trait_source);
+    assert_eq!(
+        trait_diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == "P0001")
+            .count(),
+        0
+    );
+    assert!(trait_diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == "E0493" && diagnostic.message.contains("Stage 35")
+    }));
 }

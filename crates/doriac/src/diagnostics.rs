@@ -9,12 +9,19 @@ pub struct FixIt {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelatedSpan {
+    pub span: Span,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Diagnostic {
     pub code: &'static str,
     pub message: String,
     pub span: Span,
     pub help: Option<String>,
-    pub fix: Option<FixIt>,
+    pub fix: Option<Box<FixIt>>,
+    pub related: Vec<RelatedSpan>,
 }
 
 impl Diagnostic {
@@ -30,6 +37,18 @@ impl Diagnostic {
             span,
             help: None,
             fix: None,
+            related: Vec::new(),
+        }
+    }
+
+    pub fn unsupported_stage(code: &'static str, message: impl Into<String>, span: Span) -> Self {
+        Self {
+            code,
+            message: message.into(),
+            span,
+            help: None,
+            fix: None,
+            related: Vec::new(),
         }
     }
 
@@ -45,9 +64,17 @@ impl Diagnostic {
     }
 
     pub fn with_fix(mut self, span: Span, replacement: impl Into<String>) -> Self {
-        self.fix = Some(FixIt {
+        self.fix = Some(Box::new(FixIt {
             span,
             replacement: replacement.into(),
+        }));
+        self
+    }
+
+    pub fn with_related(mut self, span: Span, message: impl Into<String>) -> Self {
+        self.related.push(RelatedSpan {
+            span,
+            message: message.into(),
         });
         self
     }
@@ -70,6 +97,14 @@ impl Diagnostic {
         if let Some(help) = &self.help {
             rendered.push_str("\nHelp: ");
             rendered.push_str(help);
+        }
+
+        for related in &self.related {
+            let (related_line, related_col) = source.line_col(related.span.start);
+            rendered.push_str(&format!(
+                "\n  = related: {}:{}:{}: {}",
+                source.path, related_line, related_col, related.message
+            ));
         }
 
         rendered

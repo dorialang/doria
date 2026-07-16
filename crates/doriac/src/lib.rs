@@ -129,3 +129,29 @@ pub fn render_diagnostics(
         .collect::<Vec<_>>()
         .join("\n")
 }
+
+pub fn diagnostics_json(diagnostics: &[Diagnostic]) -> String {
+    let values = diagnostics
+        .iter()
+        .map(|diagnostic| {
+            serde_json::json!({
+                "code": diagnostic.code,
+                "message": diagnostic.message,
+                "help": diagnostic.help,
+                "span": {
+                    "start": diagnostic.span.start,
+                    "end": diagnostic.span.end,
+                },
+                "fix": diagnostic.fix.as_ref().map(|fix| serde_json::json!({
+                    "span": { "start": fix.span.start, "end": fix.span.end },
+                    "replacement": fix.replacement,
+                })),
+                "related": diagnostic.related.iter().map(|related| serde_json::json!({
+                    "span": { "start": related.span.start, "end": related.span.end },
+                    "message": related.message,
+                })).collect::<Vec<_>>(),
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::to_string_pretty(&values).expect("diagnostics are JSON serializable")
+}

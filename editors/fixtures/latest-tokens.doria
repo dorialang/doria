@@ -21,12 +21,13 @@ class ParserLimits
 
     static function nextId(): int
     {
-        ParserLimits::next += 1;
-        return ParserLimits::next;
+        self::next += self::MAX_DEPTH;
+        return self::next;
     }
 }
 
 let $nextParserId = ParserLimits::nextId();
+echo ParserLimits::next;
 echo ParserLimits::MAX_DEPTH;
 echo HARD_LIMIT;
 
@@ -55,8 +56,11 @@ class Parser
 
 trait HasSlug
 {
+    const MAX_DEPTH = 10;
+
     function slug(): string
     {
+        echo self::MAX_DEPTH;
         return "post";
     }
 }

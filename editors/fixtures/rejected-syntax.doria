@@ -28,3 +28,6 @@ include_once "x.doria";
 goto done;
 
 print("use echo");
+
+BadVisibility::$name;
+static::create();

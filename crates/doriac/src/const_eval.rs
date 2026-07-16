@@ -1,7 +1,7 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
 
-use crate::ast::{self, BinaryOp, Expr, Item, MemberAccess, UnaryOp};
+use crate::ast::{self, BinaryOp, Expr, Item, MemberAccess, StaticQualifier, UnaryOp};
 use crate::diagnostics::{Diagnostic, DiagnosticResult};
 use crate::numeric::{parse_decimal_magnitude, FloatType, FloatValue, IntegerType, IntegerValue};
 use crate::source::Span;
@@ -163,7 +163,7 @@ impl Evaluator {
                         }
                     }
                 }
-                Item::Interface(_) | Item::Function(_) | Item::Statement(_) => {}
+                Item::Interface(_) | Item::Trait(_) | Item::Function(_) | Item::Statement(_) => {}
             }
         }
         evaluator
@@ -324,10 +324,12 @@ impl Evaluator {
                 self.reference(&ConstKey::TopLevel(name.clone()), *span, requester)
             }
             Expr::StaticMember {
-                class_name,
+                qualifier,
                 member,
                 span,
+                ..
             } => {
+                let class_name = self.qualifier_class_name(qualifier, requester)?;
                 let constant = ConstKey::Class {
                     class_name: class_name.clone(),
                     name: member.clone(),
@@ -363,15 +365,36 @@ impl Evaluator {
                 self.binary(op, left, right, *span)
             }
             Expr::StaticCall {
-                class_name,
+                qualifier,
                 method,
                 args,
                 span,
-            } => self.convert(class_name, method, args, *span, requester),
+                ..
+            } => {
+                let class_name = self.qualifier_class_name(qualifier, requester)?;
+                self.convert(&class_name, method, args, *span, requester)
+            }
             _ => {
                 self.unavailable(requester, expr.span(), "expression");
                 None
             }
+        }
+    }
+
+    fn qualifier_class_name(
+        &self,
+        qualifier: &StaticQualifier,
+        requester: &ConstKey,
+    ) -> Option<String> {
+        match qualifier {
+            StaticQualifier::Class(name) => Some(name.clone()),
+            StaticQualifier::SelfType => match requester {
+                ConstKey::Class { class_name, .. } | ConstKey::Static { class_name, .. } => {
+                    Some(class_name.clone())
+                }
+                ConstKey::TopLevel(_) => None,
+            },
+            StaticQualifier::Parent | StaticQualifier::InvalidStatic => None,
         }
     }
 

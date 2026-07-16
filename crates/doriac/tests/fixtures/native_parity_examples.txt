@@ -88,6 +88,8 @@ examples/native/main_stage20_displayable.doria
 examples/native/main_stage20_method_ownership.doria
 examples/native/main_stage20_parser.doria
 examples/native/main_stage20_statics.doria
+examples/native/main_stage20_static_constructor.doria
+examples/native/main_stage20_self.doria
 examples/native/main_string_concat_hello.doria
 examples/native/main_string_comparison_42.doria
 examples/native/main_string_local_hello.doria

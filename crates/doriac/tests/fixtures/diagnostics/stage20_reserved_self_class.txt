@@ -1,0 +1,4 @@
+code: E0309
+message: `self` is reserved for the declaring or composing class context and cannot be used as a class name
+help: 
+span: 0..13

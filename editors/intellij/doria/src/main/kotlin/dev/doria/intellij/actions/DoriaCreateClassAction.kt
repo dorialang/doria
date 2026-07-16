@@ -321,7 +321,7 @@ private class DoriaCreateClassDialog(
         val DORIA_QUALIFIED_NAME = Regex("""[A-Za-z_][A-Za-z0-9_]*(?:\\[A-Za-z_][A-Za-z0-9_]*)*""")
         val DORIA_RESERVED_NAME_SEGMENTS = setOf(
             "class", "interface", "implements", "namespace", "extends", "function",
-            "internal", "static", "const", "let", "take", "writable", "readonly", "return", "echo",
+            "internal", "static", "self", "parent", "const", "let", "take", "writable", "readonly", "return", "echo",
             "new", "foreach", "as", "if", "else", "while", "for", "break", "continue",
             "throw", "throws", "true", "false", "null", "void", "int", "int8", "int16",
             "int32", "int64", "uint8", "uint16", "uint32", "uint64", "float", "float32",

@@ -1,0 +1,5 @@
+code: E0481
+message: class `Example` cannot declare instance method `bar` because that name is already used by a previous instance property
+help: 
+span: 34..79
+related: 16..33: original instance property `bar` is declared here

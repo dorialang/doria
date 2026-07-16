@@ -29,9 +29,52 @@ writable `$this`. The compiler represents receiver mode as an extensible enum
 with readonly and writable modes plus a reserved unsupported consuming mode.
 Stage 20 adds no consuming-receiver syntax or behavior.
 
-Static access uses the qualified `ClassName::member` form. A following argument
-list selects a static method call. Otherwise semantic resolution selects a class
-constant or static property. Namespace-qualified names remain deferred.
+Static access is sigil-free for every member kind:
+
+```doria
+Message::age
+Message::create()
+self::MAX_DEPTH
+self::age
+self::create()
+```
+
+Declarations still carry `$`, as in `static writable int $age = 0`, but access
+does not. This follows the same law as instance properties: `string $name`
+becomes `$this->name`, never `$this->$name`. `Foo::$prop` is permanently invalid
+and receives a machine-applicable fix that removes only `$`.
+
+Each class has one member namespace across constants, static properties,
+instance properties, static methods, and instance methods. One name denotes
+data or an action, never both. A collision is rejected independently of source
+order, and its diagnostic identifies both declaration kinds and both source
+locations. Parentheses and sigils do not select between conflicting declarations.
+Existing case-sensitivity and constant-casing rules remain unchanged.
+
+`self` is compiler-reserved before ordinary name resolution. In member scope it
+denotes the declaring class for constants, static properties, and static methods;
+in a method return or other type position it denotes that same concrete class.
+Stage 20 adds no inheritance covariance or late binding to `self`.
+
+The grammar accepts generalized `parent::member()` in Stage 20 so editor and LSP
+parsing follow the accepted language clock. Its inheritance lookup and dispatch
+semantics land in Stage 34, so current checking produces a Stage 34 unsupported
+diagnostic before MIR. Trait methods likewise preserve `self::member`
+structurally, while trait composition remains a Stage 35 semantic feature.
+
+`static::` is permanently invalid and receives a machine-applicable fix that
+replaces only `static` with `self`. Doria has no late static binding: `static` is
+the declaration modifier, `self` is the declaring-class qualifier, and statics
+are not virtual. Future instance virtuality remains explicit through
+`open`/`override`.
+
+These spellings apply the project's "PHP's spelling is an artifact, not a
+decision" test, already used to choose `read_line` over `readline` and `is` over
+`instanceof`. PHP's static-property sigil compensates for PHP's separate member
+namespaces, unenforced constant casing, and dynamic member names. Doria has one
+statically resolved member namespace, enforced constant casing, and no dynamic
+member names, so that ambiguity does not exist. Sigil-free static access and the
+rejection of `static::` are deliberate divergences from PHP.
 
 Members are externally accessible by default. `internal` instance methods,
 static methods, properties, static properties, constructors, and class constants
@@ -59,6 +102,11 @@ Stage 20 emits no pre-main initialization, lazy initialization, once machinery,
 or other runtime static initialization. An initializer outside the accepted
 constant tier is rejected and points to the future runtime-initialized-statics
 decision requirement.
+
+Writing a writable static from `__construct` is ordinary static mutation. Stage
+19 constructor init access applies only to `$this` and the instance under
+construction; it grants no special static permission and imposes no additional
+static restriction. Readonly statics remain readonly in constructors.
 
 ### Constants
 
@@ -140,6 +188,14 @@ define them.
   termination, capability, and reproducibility questions outside this tier.
 - **Dynamic method dispatch:** deferred to inheritance and interface stages;
   Stage 20 uses statically known concrete classes.
+- **PHP `Foo::$prop` access:** rejected because the sigil solves ambiguities Doria
+  deliberately does not have and would make declaration and access laws
+  inconsistent.
+- **PHP late static binding through `static::`:** rejected because it gives
+  `static` two unrelated meanings, makes static identity virtual, and works
+  against explicit virtuality and devirtualization.
+- **Separate constant/property/method namespaces:** rejected because member
+  meaning must not depend on punctuation at a use site.
 
 ## Consequences
 
@@ -148,6 +204,11 @@ define them.
 - Constant overflow is caught before MIR and cannot vary by execution profile.
 - Copy static state is useful now without prematurely defining owned-global or
   concurrent mutation semantics.
+- Qualified static access is unambiguous without PHP's access-site `$`.
+- `self` resolves to a concrete declaring class before MIR and backend ABI
+  lowering.
+- Accepted future `parent::` and trait `self::` syntax can power correct editor
+  behavior without implementing Stage 34 or Stage 35 semantics early.
 - The same method machinery can execute compiler-known concrete `Displayable`
   conversion without introducing interface dispatch early.
 
@@ -163,3 +224,8 @@ editor grammars, examples, parity fixtures, tests, and language documentation.
   or native concrete `Displayable` execution as deferred.
 - Parser diagnostics that reject static properties or qualified constant access.
 - Native lowering restrictions that collect only lifecycle class methods.
+- Documentation or editor fixtures that teach `Foo::$prop`, `static::`, separate
+  member namespaces, or ordinary-identifier resolution for `self`.
+- Parser diagnostics that treat generalized `parent::member()` or trait-local
+  `self::member` as malformed syntax rather than accepted-but-unsupported
+  semantics.

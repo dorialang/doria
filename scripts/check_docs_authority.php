@@ -324,6 +324,8 @@ $forbiddenCodeSpellings = [
     ['/\breadline\s*\(/', 'readline is rejected as a fused name; the stdin built-in is read_line'],
     ['/__toString/', 'Doria has no __toString magic method; display conversion is Displayable::toString'],
     [$forbiddenPrintStatementPattern, 'print is rejected; echo is the spelling'],
+    ['/::\s*\$/', 'Doria static access is sigil-free; use Foo::prop rather than Foo::$prop'],
+    ['/\bstatic\s*::/', 'Doria has no late static binding; use the reserved self:: qualifier'],
     ['/\bstd::/', 'Doria stdlib modules are namespaces (Doria\\Std\\Term), never std:: paths'],
     [
         $forbiddenVisibilityPattern,
@@ -356,6 +358,12 @@ if ($namingAuthority === false) {
     foreach (['Int::wrappingAdd', '->isEmpty', '->retryAfter', '->findById', '->tenantId'] as $example) {
         if (!str_contains($namingAuthority, $example)) {
             $failures[] = "{$namingAuthorityPath}: missing required corrected naming example {$example}";
+        }
+    }
+
+    foreach (['ClassName::member', 'Foo::prop', 'self::age', 'self::create()', 'Foo::$prop', 'static::'] as $spelling) {
+        if (!str_contains($namingAuthority, $spelling)) {
+            $failures[] = "{$namingAuthorityPath}: missing required static-access authority spelling {$spelling}";
         }
     }
 

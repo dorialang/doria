@@ -1,0 +1,5 @@
+code: E0495
+message: Doria does not support late static binding; use `self::`
+help: replace the qualifier with `self` and keep the member access unchanged
+span: 86..92
+fix: 86..92 -> "self"

@@ -3425,7 +3425,11 @@ class Person
     )
     .expect_err("semantic check should fail");
 
-    assert!(err.iter().any(|diagnostic| diagnostic.code == "E0301"));
+    let duplicate = err
+        .iter()
+        .find(|diagnostic| diagnostic.code == "E0481")
+        .expect("duplicate member diagnostic");
+    assert_eq!(duplicate.related.len(), 1);
 }
 
 #[test]
@@ -3442,7 +3446,11 @@ class Person
     )
     .expect_err("semantic check should fail");
 
-    assert!(err.iter().any(|diagnostic| diagnostic.code == "E0302"));
+    let duplicate = err
+        .iter()
+        .find(|diagnostic| diagnostic.code == "E0481")
+        .expect("duplicate member diagnostic");
+    assert_eq!(duplicate.related.len(), 1);
 }
 
 #[test]

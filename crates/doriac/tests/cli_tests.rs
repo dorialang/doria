@@ -18,6 +18,59 @@ fn version_uses_canonical_toolchain_calver() {
 }
 
 #[test]
+fn check_json_exposes_static_identity_fix_ranges() {
+    let temp_dir = temp_dir_path("check-json-static-fix");
+    fs::create_dir_all(&temp_dir).expect("temp directory should be created");
+    let source = "class Foo { static int $prop = 1; function read(): int { return Foo::$prop; } }";
+    fs::write(temp_dir.join("main.doria"), source).expect("source should be writable");
+
+    let output = Command::new(doriac_bin())
+        .current_dir(&temp_dir)
+        .arg("check")
+        .arg("main.doria")
+        .arg("--json")
+        .output()
+        .expect("doriac binary should run");
+    assert!(!output.status.success());
+    let diagnostics: serde_json::Value =
+        serde_json::from_slice(&output.stderr).expect("check --json stderr should be valid JSON");
+    let diagnostic = diagnostics
+        .as_array()
+        .and_then(|diagnostics| diagnostics.iter().find(|item| item["code"] == "E0494"))
+        .expect("E0494 JSON diagnostic");
+    let dollar = source.rfind("$prop").expect("access sigil");
+    assert_eq!(diagnostic["fix"]["span"]["start"], dollar);
+    assert_eq!(diagnostic["fix"]["span"]["end"], dollar + 1);
+    assert_eq!(diagnostic["fix"]["replacement"], "");
+
+    let late_static_source = "class Foo { static function create(): int { return 1; } function read(): int { return static::create(); } }";
+    fs::write(temp_dir.join("main.doria"), late_static_source)
+        .expect("late-static source should be writable");
+    let late_static_output = Command::new(doriac_bin())
+        .current_dir(&temp_dir)
+        .arg("check")
+        .arg("main.doria")
+        .arg("--json")
+        .output()
+        .expect("doriac binary should run");
+    assert!(!late_static_output.status.success());
+    let diagnostics: serde_json::Value = serde_json::from_slice(&late_static_output.stderr)
+        .expect("late-static check --json stderr should be valid JSON");
+    let diagnostic = diagnostics
+        .as_array()
+        .and_then(|diagnostics| diagnostics.iter().find(|item| item["code"] == "E0495"))
+        .expect("E0495 JSON diagnostic");
+    let qualifier = late_static_source
+        .rfind("static::")
+        .expect("late-static qualifier");
+    assert_eq!(diagnostic["fix"]["span"]["start"], qualifier);
+    assert_eq!(diagnostic["fix"]["span"]["end"], qualifier + 6);
+    assert_eq!(diagnostic["fix"]["replacement"], "self");
+
+    let _ = fs::remove_dir_all(temp_dir);
+}
+
+#[test]
 fn compile_defaults_to_native_executable() {
     if !host_linker_is_available() {
         eprintln!(

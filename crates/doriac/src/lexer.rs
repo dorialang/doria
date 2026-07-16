@@ -18,6 +18,7 @@ pub enum StringQuoteKind {
 pub enum TokenKind {
     Class,
     Interface,
+    Trait,
     Implements,
     Namespace,
     Extends,
@@ -25,6 +26,8 @@ pub enum TokenKind {
     Const,
     Internal,
     Static,
+    SelfType,
+    Parent,
     Let,
     Take,
     Writable,
@@ -379,6 +382,7 @@ impl<'source> Lexer<'source> {
         let kind = match text {
             "class" => TokenKind::Class,
             "interface" => TokenKind::Interface,
+            "trait" => TokenKind::Trait,
             "implements" => TokenKind::Implements,
             "namespace" => TokenKind::Namespace,
             "extends" => TokenKind::Extends,
@@ -386,6 +390,8 @@ impl<'source> Lexer<'source> {
             "const" => TokenKind::Const,
             "internal" => TokenKind::Internal,
             "static" => TokenKind::Static,
+            "self" => TokenKind::SelfType,
+            "parent" => TokenKind::Parent,
             "let" => TokenKind::Let,
             "take" => TokenKind::Take,
             "writable" => TokenKind::Writable,
@@ -425,8 +431,9 @@ impl<'source> Lexer<'source> {
             "and" => TokenKind::And,
             "or" => TokenKind::Or,
             "xor" => TokenKind::Xor,
-            "async" | "await" | "spawn" | "scope" | "trait" | "enum" | "match" | "try"
-            | "catch" => TokenKind::Reserved(text.to_string()),
+            "async" | "await" | "spawn" | "scope" | "enum" | "match" | "try" | "catch" => {
+                TokenKind::Reserved(text.to_string())
+            }
             _ => TokenKind::Identifier(text.to_string()),
         };
 
