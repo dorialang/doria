@@ -2,12 +2,14 @@
 
 Status: Accepted
 
+> Terminology note (added post-acceptance). This record predates record 0085, which settled stdlib namespace spelling. Forward references to the terminal and I/O modules originally read std::term / std::io — an informal Rust-shaped shorthand that was never a decided spelling — and have been corrected to Doria\Std\Term / Doria\Std\Io. The decision this record makes is unchanged.
+
 ## Context
 
 Stage 16 established immutable UTF-8 runtime strings and canonical primitive display conversion
 across the interpreter, Cranelift, LLVM, and `doria-rt`. Stage 17 needs synchronous text I/O and
 compile-time-checked formatting without exposing platform handles or prematurely designing the
-future `std::term` API. Existing accepted decisions already occupy 0071 through 0073, so this
+future `Doria\Std\Term` API. Existing accepted decisions already occupy 0071 through 0073, so this
 record uses the next unused repository number. The future terminal decision receives its number
 when it is authored.
 
@@ -24,7 +26,7 @@ Stage 17 adds compiler-known free functions that cannot be redeclared:
 - `write_file(string $path, string $contents): void`
 - `write_stderr(string $value): void`
 
-These are a narrow v0 text-I/O facade, not the final `std::io` object API. `print` is permanently
+These are a narrow v0 text-I/O facade, not the final `Doria\Std\Io` object API. `print` is permanently
 rejected with guidance to use `echo`. `printf` writes exact bytes, adds no newline, and returns
 void. Format arguments evaluate left-to-right exactly once. Stage 17 requires a direct string
 literal format; interpolated and local formats are rejected.
@@ -117,7 +119,7 @@ interpreter, Cranelift, and LLVM.
 
 ### Future terminal boundary
 
-Stage 17 does not implement `Console`. The future canonical API is the static `std::term Console`
+Stage 17 does not implement `Console`. The future canonical API is the static `Doria\Std\Term Console`
 facade, and its decision number is assigned when authored. Stage 17 exposes no public TTY query,
 handles, descriptors, terminal encodings, ANSI semantic values, raw-mode API, key events, cursor
 or styling operations, terminal screen cache, `Grid`, or `ScreenBuffer`. Raw ANSI may be a private
