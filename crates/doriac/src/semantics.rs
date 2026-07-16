@@ -148,6 +148,24 @@ pub fn check_program(program: &Program) -> DiagnosticResult<()> {
     analyze_program(program).map(|_| ())
 }
 
+pub(crate) fn interface_declaration_diagnostic(interface_decl: &InterfaceDecl) -> Diagnostic {
+    let (code, message) = if interface_decl.name == "Displayable" {
+        (
+            "E0309",
+            "`Displayable` is a compiler-known interface and cannot be redeclared".to_string(),
+        )
+    } else {
+        (
+            "E0464",
+            format!(
+                "interface declaration `{}` is accepted syntax but is not available in this compiler version",
+                interface_decl.name
+            ),
+        )
+    };
+    Diagnostic::new(code, message, interface_decl.span)
+}
+
 struct Checker<'program> {
     program: &'program Program,
     classes: HashMap<String, ClassInfo>,
@@ -321,23 +339,8 @@ impl<'program> Checker<'program> {
                 Item::Function(function) => self.check_function(function, None),
                 Item::Class(class_decl) => self.check_class(class_decl),
                 Item::Interface(interface_decl) => {
-                    let (code, message) = if interface_decl.name == "Displayable" {
-                        (
-                            "E0309",
-                            "`Displayable` is a compiler-known interface and cannot be redeclared"
-                                .to_string(),
-                        )
-                    } else {
-                        (
-                            "E0464",
-                            format!(
-                                "interface declaration `{}` is accepted syntax but is not available in this compiler version",
-                                interface_decl.name
-                            ),
-                        )
-                    };
                     self.diagnostics
-                        .push(Diagnostic::new(code, message, interface_decl.span));
+                        .push(interface_declaration_diagnostic(interface_decl));
                 }
             }
         }

@@ -73,7 +73,8 @@ fn lower_object(source: &str) -> Vec<u8> {
 
 fn unsupported_after_parsing(source: &str) -> Vec<doriac::diagnostics::Diagnostic> {
     let ast = doriac::parse_source("test.doria", source).expect("source should parse");
-    let hir = doriac::lowering::lower_program(&ast);
+    let hir = doriac::lowering::lower_program(&ast)
+        .expect("AST without interface declarations should lower structurally");
     doriac::mir_lowering::lower_program(&hir)
         .expect_err("HIR should be outside native compilation coverage")
 }

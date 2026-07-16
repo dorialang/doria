@@ -343,7 +343,8 @@ fn structural_lowering_preserves_stage_13_operator_variants() {
         "$value <<= 1; echo ~-$value | $mask ^ $other & 1;",
     )
     .expect("parse should succeed");
-    let hir = doriac::lowering::lower_program(&ast);
+    let hir = doriac::lowering::lower_program(&ast)
+        .expect("AST without interface declarations should lower structurally");
 
     assert!(matches!(
         &hir.items[0],
@@ -360,6 +361,20 @@ fn structural_lowering_preserves_stage_13_operator_variants() {
             ..
         })
     ));
+}
+
+#[test]
+fn direct_lowering_reports_accepted_interface_declarations() {
+    let ast = doriac::parse_source("test.doria", "interface Printable {}")
+        .expect("accepted interface declaration should parse");
+    let diagnostics = doriac::lowering::lower_program(&ast)
+        .expect_err("unsupported interface declaration should not reach Doria IR");
+
+    assert_eq!(diagnostics.len(), 1);
+    assert_eq!(diagnostics[0].code, "E0464");
+    assert!(diagnostics[0]
+        .message
+        .contains("interface declaration `Printable`"));
 }
 
 #[test]
