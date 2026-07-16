@@ -304,12 +304,18 @@ foreach (['public Person $owner;', 'private List<int> $items;'] as $visibilityEx
         $failures[] = "internal docs-authority error: visibility guard does not cover {$visibilityExample}";
     }
 }
+$forbiddenPrintStatementPattern = '/^\s*print\b/';
+foreach (['print "text";', 'print 1;', 'print true;', 'print getName();'] as $printExample) {
+    if (preg_match($forbiddenPrintStatementPattern, $printExample) !== 1) {
+        $failures[] = "internal docs-authority error: print guard does not cover {$printExample}";
+    }
+}
 
 $forbiddenCodeSpellings = [
     ['/\binstanceof\b/', 'instanceof is rejected permanently; the type-test and narrowing operator is `is` (record 0085)'],
     ['/\breadline\s*\(/', 'readline is rejected as a fused name; the stdin built-in is read_line'],
     ['/__toString/', 'Doria has no __toString magic method; display conversion is Displayable::toString'],
-    ['/\bprint\s*[\($"\']/', 'print is rejected; echo is the spelling'],
+    [$forbiddenPrintStatementPattern, 'print is rejected; echo is the spelling'],
     ['/\bstd::/', 'Doria stdlib modules are namespaces (Doria\\Std\\Term), never std:: paths'],
     [
         $forbiddenVisibilityPattern,

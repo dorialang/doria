@@ -170,6 +170,7 @@ fn publishes_stable_semantic_diagnostics_for_class_workflow_syntax() {
     let diagnostics = diagnostics_for_document(
         "file:///Child.doria",
         r#"namespace Vendor\App;
+interface Printable {}
 class Child extends Vendor\Base implements Vendor\Contracts\Printable {}
 "#,
     );

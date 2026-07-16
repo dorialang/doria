@@ -44,6 +44,25 @@ class Child extends Vendor\Base implements Vendor\Contracts\Printable
 }
 
 #[test]
+fn parses_interface_declarations_before_semantics_land() {
+    let program = doriac::parse_source(
+        "test.doria",
+        r#"
+interface Printable
+{
+    function render(): string;
+}
+"#,
+    )
+    .expect("accepted interface syntax should parse");
+
+    let Item::Interface(interface) = &program.items[0] else {
+        panic!("expected interface declaration");
+    };
+    assert_eq!(interface.name, "Printable");
+}
+
+#[test]
 fn parses_variable_declarations() {
     let program = doriac::parse_source(
         "test.doria",

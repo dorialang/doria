@@ -207,11 +207,11 @@ private class DoriaCreateClassDialog(
         }
 
         val namespace = namespaceField.text.trim()
-        if (namespace.isNotEmpty() && !isDoriaQualifiedName(namespace)) {
+        if (namespace.isNotEmpty() && !isDoriaNamespaceName(namespace)) {
             return ValidationInfo("Enter a valid Doria namespace.", namespaceField)
         }
         val parent = parentField.text.trim()
-        if (parent.isNotEmpty() && !isDoriaQualifiedName(parent)) {
+        if (parent.isNotEmpty() && !isDoriaQualifiedTypeName(parent)) {
             return ValidationInfo("Enter one valid Doria parent type.", parentField)
         }
         return null
@@ -241,7 +241,7 @@ private class DoriaCreateClassDialog(
             "Add Doria Interface",
             DoriaIcons.FILE,
         )?.trim() ?: return
-        if (!isDoriaQualifiedName(interfaceName)) {
+        if (!isDoriaQualifiedTypeName(interfaceName)) {
             Messages.showErrorDialog(
                 project,
                 "Enter a valid Doria interface type.",
@@ -327,10 +327,12 @@ private class DoriaCreateClassDialog(
             "int32", "int64", "uint8", "uint16", "uint32", "uint64", "float", "float32",
             "float64", "string", "bool", "not", "and", "or", "xor", "async", "await",
             "spawn", "scope", "trait", "enum", "match", "try", "catch", "mixed", "never",
-            "resource", "array", "object",
+            "resource", "array", "object", "use", "uses", "include", "declare", "with",
+            "case", "when", "given", "finally", "unsafe", "extern", "open", "override", "is",
+            "goto", "require", "require_once", "include_once", "print",
         )
         val DORIA_RESERVED_CLASS_NAMES = setOf(
-            "Int", "Int8", "Int16", "Int32", "UInt8", "UInt16", "UInt32", "UInt64",
+            "Int", "Int8", "Int16", "Int32", "Int64", "UInt8", "UInt16", "UInt32", "UInt64",
             "Float", "Float32", "Float64", "Bool", "Displayable",
         )
 
@@ -342,7 +344,13 @@ private class DoriaCreateClassDialog(
                 value !in DORIA_RESERVED_CLASS_NAMES &&
                 !value.equals("__DoriaDisplayable", ignoreCase = true)
 
-        fun isDoriaQualifiedName(value: String): Boolean =
+        fun isDoriaNamespaceName(value: String): Boolean =
             DORIA_QUALIFIED_NAME.matches(value) && value.split('\\').all(::isDoriaIdentifier)
+
+        fun isDoriaQualifiedTypeName(value: String): Boolean {
+            if (!DORIA_QUALIFIED_NAME.matches(value)) return false
+            val segments = value.split('\\')
+            return segments.dropLast(1).all(::isDoriaIdentifier) && isDoriaClassName(segments.last())
+        }
     }
 }

@@ -20,6 +20,7 @@ $intellijSyntaxHighlighter = $root . '/editors/intellij/doria/src/main/kotlin/de
 $intellijLspFiles = $root . '/editors/intellij/doria/src/main/kotlin/dev/doria/intellij/lsp/DoriaLspFiles.kt';
 $intellijPluginXml = $root . '/editors/intellij/doria/src/main/resources/META-INF/plugin.xml';
 $intellijPluginIcon = $root . '/editors/intellij/doria/src/main/resources/META-INF/pluginIcon.svg';
+$intellijCreateClassAction = $root . '/editors/intellij/doria/src/main/kotlin/dev/doria/intellij/actions/DoriaCreateClassAction.kt';
 $doriaLogo = $root . '/res/images/doria-app-icon-warm.svg';
 $lspServer = $root . '/crates/doriac/src/lsp.rs';
 $fixture = $root . '/editors/fixtures/latest-tokens.doria';
@@ -894,6 +895,58 @@ function check_lsp_completion_vocabulary(): void
     }
 }
 
+function check_intellij_class_name_vocabulary(): void
+{
+    global $acceptedKeywords, $plannedKeywords, $primitiveTypes, $reservedTypes, $wordOperators, $rejectedKeywords;
+    global $intellijCreateClassAction;
+
+    $actionText = read_text($intellijCreateClassAction);
+    require_check(
+        preg_match('/DORIA_RESERVED_NAME_SEGMENTS = setOf\((.*?)\n\s*\)/s', $actionText, $segmentMatches) === 1,
+        'IntelliJ class workflow reserved-name vocabulary could not be found'
+    );
+    require_check(
+        preg_match('/DORIA_RESERVED_CLASS_NAMES = setOf\((.*?)\n\s*\)/s', $actionText, $classMatches) === 1,
+        'IntelliJ class workflow reserved class-name vocabulary could not be found'
+    );
+
+    $reservedSegments = array_unique([
+        ...$acceptedKeywords,
+        ...$plannedKeywords,
+        ...$primitiveTypes,
+        ...$reservedTypes,
+        ...$wordOperators,
+        ...$rejectedKeywords,
+        'static',
+        'spawn',
+        'scope',
+        'is',
+        'array',
+        'object',
+    ]);
+    foreach ($reservedSegments as $name) {
+        require_check(
+            str_contains($segmentMatches[1], '"' . $name . '"'),
+            'IntelliJ class workflow must reject reserved Doria name ' . $name
+        );
+    }
+
+    foreach ([
+        'Int', 'Int8', 'Int16', 'Int32', 'Int64',
+        'UInt8', 'UInt16', 'UInt32', 'UInt64',
+        'Float', 'Float32', 'Float64', 'Bool', 'Displayable',
+    ] as $name) {
+        require_check(
+            str_contains($classMatches[1], '"' . $name . '"'),
+            'IntelliJ class workflow must reject compiler-reserved class name ' . $name
+        );
+    }
+    require_check(
+        str_contains($actionText, "isDoriaClassName(segments.last())"),
+        'IntelliJ class workflow must validate the terminal qualified type-name segment as a class name'
+    );
+}
+
 function check_editor_fixture_diagnostics_are_skipped(): void
 {
     global $vscodeExtension, $intellijLspFiles;
@@ -1047,6 +1100,7 @@ function main(): int
     check_vscode_language_configuration();
     check_vscode_grammar();
     check_intellij_lexer();
+    check_intellij_class_name_vocabulary();
     check_lsp_completion_vocabulary();
     check_editor_fixture_diagnostics_are_skipped();
     check_fixture();

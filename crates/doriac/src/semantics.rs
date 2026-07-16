@@ -320,6 +320,25 @@ impl<'program> Checker<'program> {
                 }
                 Item::Function(function) => self.check_function(function, None),
                 Item::Class(class_decl) => self.check_class(class_decl),
+                Item::Interface(interface_decl) => {
+                    let (code, message) = if interface_decl.name == "Displayable" {
+                        (
+                            "E0309",
+                            "`Displayable` is a compiler-known interface and cannot be redeclared"
+                                .to_string(),
+                        )
+                    } else {
+                        (
+                            "E0464",
+                            format!(
+                                "interface declaration `{}` is accepted syntax but is not available in this compiler version",
+                                interface_decl.name
+                            ),
+                        )
+                    };
+                    self.diagnostics
+                        .push(Diagnostic::new(code, message, interface_decl.span));
+                }
             }
         }
         self.check_pending_integer_literal_ranges();
@@ -801,7 +820,7 @@ impl<'program> Checker<'program> {
                                 self.update_method_move_return_signature(&class_decl.name, method);
                         }
                     }
-                    Item::Statement(_) => {}
+                    Item::Interface(_) | Item::Statement(_) => {}
                 }
             }
 

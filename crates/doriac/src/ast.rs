@@ -16,8 +16,15 @@ pub struct NamespaceDecl {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Item {
     Class(ClassDecl),
+    Interface(InterfaceDecl),
     Function(FunctionDecl),
     Statement(Stmt),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct InterfaceDecl {
+    pub name: String,
+    pub span: Span,
 }
 
 #[derive(Debug, Clone, PartialEq)]

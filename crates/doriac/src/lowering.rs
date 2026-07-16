@@ -24,6 +24,9 @@ pub fn lower_program_with_semantics(
 fn lower_item(item: &ast::Item) -> hir::Item {
     match item {
         ast::Item::Class(class_decl) => hir::Item::Class(lower_class(class_decl)),
+        ast::Item::Interface(_) => {
+            unreachable!("unsupported interface declarations do not reach Doria IR lowering")
+        }
         ast::Item::Function(function) => hir::Item::Function(lower_function(function)),
         ast::Item::Statement(statement) => hir::Item::Statement(lower_stmt(statement)),
     }

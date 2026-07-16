@@ -198,7 +198,7 @@ pub(crate) fn check_program_with_inferred_move_returns(
                     }
                 }
             }
-            Item::Statement(_) => {}
+            Item::Interface(_) | Item::Statement(_) => {}
         }
     }
 
@@ -233,6 +233,7 @@ pub(crate) fn check_program_with_inferred_move_returns(
                     }
                 }
             }
+            Item::Interface(_) => {}
             Item::Statement(statement) => {
                 if top_level_falls_through {
                     top_level_falls_through = checker

@@ -64,8 +64,7 @@ impl Parser {
         if self.match_kind(&TokenKind::Class) {
             self.parse_class().map(Item::Class)
         } else if self.match_kind(&TokenKind::Interface) {
-            self.parse_unsupported_interface();
-            None
+            self.parse_interface().map(Item::Interface)
         } else if self.match_kind(&TokenKind::Function) {
             self.parse_function(MemberAccess::External, None, None, self.previous().span)
                 .map(Item::Function)
@@ -222,30 +221,31 @@ impl Parser {
         })
     }
 
-    fn parse_unsupported_interface(&mut self) {
+    fn parse_interface(&mut self) -> Option<InterfaceDecl> {
         let start = self.previous().span.start;
-        let name = self.expect_identifier("expected interface name");
-        let message = if matches!(name.as_deref(), Some("Displayable")) {
-            "`Displayable` is a compiler-known interface and cannot be redeclared"
-        } else {
-            "general interface declarations are not supported by this compiler"
-        };
+        let name = self.expect_identifier("expected interface name")?;
+        self.expect(TokenKind::LeftBrace, "expected `{` after interface name")?;
 
+        let mut depth = 1_usize;
         let mut end = self.previous().span.end;
-        if self.match_kind(&TokenKind::LeftBrace) {
-            let mut depth = 1_usize;
-            while depth > 0 && !self.is_at_end() {
-                let token = self.advance();
-                end = token.span.end;
-                match token.kind {
-                    TokenKind::LeftBrace => depth += 1,
-                    TokenKind::RightBrace => depth -= 1,
-                    _ => {}
-                }
+        while depth > 0 {
+            if self.is_at_end() {
+                self.error("expected `}` after interface body", self.peek().span);
+                return None;
+            }
+            let token = self.advance();
+            end = token.span.end;
+            match token.kind {
+                TokenKind::LeftBrace => depth += 1,
+                TokenKind::RightBrace => depth -= 1,
+                _ => {}
             }
         }
-        self.diagnostics
-            .push(Diagnostic::new("P0003", message, Span::new(start, end)));
+
+        Some(InterfaceDecl {
+            name,
+            span: Span::new(start, end),
+        })
     }
 
     fn parse_param(&mut self, is_constructor: bool) -> Option<Param> {

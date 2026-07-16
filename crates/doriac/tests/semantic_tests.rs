@@ -2315,12 +2315,18 @@ fn reserves_displayable_and_defers_general_interfaces() {
     assert_diagnostic_code("class Displayable {}", "E0309");
     assert_diagnostic_code("class Label implements Other {}", "E0464");
 
-    for source in ["interface Displayable {}", "interface Other {}"] {
-        let diagnostics = doriac::parse_source("test.doria", source)
-            .expect_err("interface declarations remain outside the Stage 18 subset");
+    for (source, code) in [
+        ("interface Displayable {}", "E0309"),
+        ("interface Other {}", "E0464"),
+    ] {
+        doriac::parse_source("test.doria", source)
+            .expect("accepted interface declarations should parse");
+        let diagnostics = doriac::check_source("test.doria", source)
+            .expect_err("interface semantics are not implemented yet");
+        assert!(diagnostics.iter().any(|diagnostic| diagnostic.code == code));
         assert!(diagnostics
             .iter()
-            .any(|diagnostic| diagnostic.code == "P0003"));
+            .all(|diagnostic| !diagnostic.code.starts_with('P')));
     }
 }
 
