@@ -148,17 +148,17 @@ pub(crate) fn check_program_with_inferred_move_returns(
             Item::Function(function) => {
                 signatures.insert(
                     function.name.clone(),
-                    signature(function, &classes, inferred_move_returns),
+                    signature(function, &classes, inferred_move_returns, None),
                 );
             }
             Item::Class(class) => {
                 for member in &class.members {
                     match member {
                         ClassMember::Property(property) if !property.is_static => {
-                            let property_class = classes
-                                .contains(&property.ty.name)
-                                .then(|| property.ty.name.clone());
-                            let move_type = type_ref_is_move_type(&property.ty, &classes);
+                            let property_class =
+                                type_ref_class_name(&property.ty, &classes, Some(&class.name));
+                            let move_type =
+                                type_ref_is_move_type(&property.ty, &classes, Some(&class.name));
                             if move_type {
                                 properties.insert(
                                     (class.name.clone(), property.name.clone()),
@@ -171,8 +171,12 @@ pub(crate) fn check_program_with_inferred_move_returns(
                         }
                         ClassMember::Property(_) | ClassMember::Constant(_) => {}
                         ClassMember::Method(method) => {
-                            let method_signature =
-                                signature(method, &classes, inferred_move_returns);
+                            let method_signature = signature(
+                                method,
+                                &classes,
+                                inferred_move_returns,
+                                Some(&class.name),
+                            );
                             methods.insert(
                                 (class.name.clone(), method.name.clone()),
                                 method_signature.clone(),
@@ -180,10 +184,13 @@ pub(crate) fn check_program_with_inferred_move_returns(
                             if method.name == "__construct" {
                                 constructors.insert(class.name.clone(), method_signature);
                                 for param in &method.params {
-                                    let property_class = classes
-                                        .contains(&param.ty.name)
-                                        .then(|| param.ty.name.clone());
-                                    let move_type = type_ref_is_move_type(&param.ty, &classes);
+                                    let property_class =
+                                        type_ref_class_name(&param.ty, &classes, Some(&class.name));
+                                    let move_type = type_ref_is_move_type(
+                                        &param.ty,
+                                        &classes,
+                                        Some(&class.name),
+                                    );
                                     if param.promoted_access.is_some() && move_type {
                                         properties.insert(
                                             (class.name.clone(), param.name.clone()),
@@ -252,25 +259,25 @@ fn signature(
     function: &ast::FunctionDecl,
     classes: &HashSet<String>,
     inferred_move_returns: &HashSet<usize>,
+    receiver_class: Option<&str>,
 ) -> Signature {
     Signature {
         params: function
             .params
             .iter()
             .map(|param| Parameter {
-                move_type: type_ref_is_move_type(&param.ty, classes),
+                move_type: type_ref_is_move_type(&param.ty, classes, receiver_class),
                 take: param.take,
             })
             .collect(),
         returns: function
             .return_type
             .as_ref()
-            .filter(|ty| classes.contains(&ty.name))
-            .map(|ty| ty.name.clone()),
+            .and_then(|ty| type_ref_class_name(ty, classes, receiver_class)),
         returns_move_type: function
             .return_type
             .as_ref()
-            .is_some_and(|ty| type_ref_is_move_type(ty, classes))
+            .is_some_and(|ty| type_ref_is_move_type(ty, classes, receiver_class))
             || inferred_move_returns.contains(&function.span.start),
     }
 }
@@ -332,12 +339,10 @@ impl Checker {
             std::mem::replace(&mut self.receiver_class, receiver_class.map(str::to_owned));
         let mut scopes = Scopes::new();
         for param in &function.params {
-            let class = self
-                .classes
-                .contains(&param.ty.name)
-                .then(|| param.ty.name.clone());
+            let class =
+                type_ref_class_name(&param.ty, &self.classes, self.receiver_class.as_deref());
             let mixed = param.ty.name == "mixed";
-            if type_ref_is_move_type(&param.ty, &self.classes) {
+            if type_ref_is_move_type(&param.ty, &self.classes, self.receiver_class.as_deref()) {
                 scopes.declare(
                     param.name.clone(),
                     Binding {
@@ -356,11 +361,9 @@ impl Checker {
                 );
             }
         }
-        let return_move_type = function
-            .return_type
-            .as_ref()
-            .is_some_and(|ty| type_ref_is_move_type(ty, &self.classes))
-            || self.inferred_move_returns.contains(&function.span.start);
+        let return_move_type = function.return_type.as_ref().is_some_and(|ty| {
+            type_ref_is_move_type(ty, &self.classes, self.receiver_class.as_deref())
+        }) || self.inferred_move_returns.contains(&function.span.start);
         self.check_block(&function.body, &mut scopes, return_move_type, false);
         self.receiver_class = previous_receiver;
     }
@@ -405,19 +408,16 @@ impl Checker {
     ) -> Flow {
         match statement {
             Stmt::VarDecl(decl) => {
-                let declared_class = decl
-                    .ty
-                    .as_ref()
-                    .filter(|ty| self.classes.contains(&ty.name))
-                    .map(|ty| ty.name.clone());
+                let declared_class = decl.ty.as_ref().and_then(|ty| {
+                    type_ref_class_name(ty, &self.classes, self.receiver_class.as_deref())
+                });
                 let class = declared_class.or_else(|| self.expr_class(&decl.initializer, scopes));
                 let initializer_moves = self.expr_is_move_value(&decl.initializer, scopes);
                 let mixed = decl.ty.as_ref().is_some_and(|ty| ty.name == "mixed")
                     || (decl.ty.is_none() && class.is_none() && initializer_moves);
-                let declared_move_type = decl
-                    .ty
-                    .as_ref()
-                    .is_some_and(|ty| type_ref_is_move_type(ty, &self.classes));
+                let declared_move_type = decl.ty.as_ref().is_some_and(|ty| {
+                    type_ref_is_move_type(ty, &self.classes, self.receiver_class.as_deref())
+                });
                 self.use_expr(
                     &decl.initializer,
                     scopes,
@@ -751,13 +751,13 @@ impl Checker {
         let Some(ty) = &binding.ty else {
             return;
         };
-        if !type_ref_is_move_type(ty, &self.classes) {
+        if !type_ref_is_move_type(ty, &self.classes, self.receiver_class.as_deref()) {
             return;
         }
         scopes.declare(
             binding.name.clone(),
             Binding {
-                class: self.classes.contains(&ty.name).then(|| ty.name.clone()),
+                class: type_ref_class_name(ty, &self.classes, self.receiver_class.as_deref()),
                 mixed: ty.name == "mixed",
                 borrowed_place: true,
                 writable: false,
@@ -1203,8 +1203,25 @@ fn ownership_root_name(expr: &Expr) -> Option<&str> {
     }
 }
 
-fn type_ref_is_move_type(ty: &crate::types::TypeRef, classes: &HashSet<String>) -> bool {
-    classes.contains(&ty.name)
+fn type_ref_class_name(
+    ty: &crate::types::TypeRef,
+    classes: &HashSet<String>,
+    receiver_class: Option<&str>,
+) -> Option<String> {
+    let name = if ty.name == "self" {
+        receiver_class?
+    } else {
+        &ty.name
+    };
+    classes.contains(name).then(|| name.to_string())
+}
+
+fn type_ref_is_move_type(
+    ty: &crate::types::TypeRef,
+    classes: &HashSet<String>,
+    receiver_class: Option<&str>,
+) -> bool {
+    type_ref_class_name(ty, classes, receiver_class).is_some()
         || matches!(
             ty.name.as_str(),
             "mixed" | "[]" | "List" | "Dictionary" | "Set"

@@ -1,5 +1,6 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::fmt;
 
 use crate::ast::{self, BinaryOp, Expr, Item, MemberAccess, StaticQualifier, UnaryOp};
 use crate::diagnostics::{Diagnostic, DiagnosticResult};
@@ -17,16 +18,6 @@ pub enum ConstValue {
 }
 
 impl ConstValue {
-    pub fn type_ref(&self) -> TypeRef {
-        match self {
-            Self::Integer(value) => TypeRef::named(value.ty.source_name()),
-            Self::Float(value) => TypeRef::named(value.ty.source_name()),
-            Self::String(_) => TypeRef::named("string"),
-            Self::Bool(_) => TypeRef::named("bool"),
-            Self::Null => TypeRef::named("null"),
-        }
-    }
-
     fn display(&self) -> Option<String> {
         match self {
             Self::Integer(value) => Some(value.display()),
@@ -59,10 +50,23 @@ impl ConstKey {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EvaluatedDecl {
     pub value: ConstValue,
-    pub ty: TypeRef,
+    pub ty: ConstType,
     pub access: MemberAccess,
     pub writable: bool,
     pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TypedValue {
+    value: ConstValue,
+    ty: ConstType,
+}
+
+impl TypedValue {
+    fn new(value: ConstValue) -> Self {
+        let ty = ConstType::of(&value);
+        Self { value, ty }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -263,20 +267,21 @@ impl Evaluator {
                 ));
             }
         }
-        let evaluated = expected
-            .or_else(|| node.annotation.is_none().then_some(ConstType::Infer))
-            .and_then(|expected| self.evaluate_expr(&node.initializer, expected, &node.key));
+        let evaluated = if node.annotation.is_some() && expected.is_none() {
+            None
+        } else {
+            self.evaluate_expr(&node.initializer, expected, &node.key)
+        };
         self.stack.pop();
 
-        let result = evaluated.and_then(|value| {
-            let actual = ConstType::of(&value);
-            if expected.is_some_and(|expected| !expected.accepts(actual)) {
+        let result = evaluated.and_then(|evaluated| {
+            if expected.is_some_and(|expected| !expected.accepts(evaluated.ty)) {
                 self.diagnostics.push(Diagnostic::new(
                     "E0484",
                     format!(
                         "initializer for `{}` has type `{}`, expected `{}`",
                         key.display(),
-                        value.type_ref(),
+                        evaluated.ty,
                         node.annotation
                             .as_ref()
                             .expect("expected type came from annotation")
@@ -286,8 +291,8 @@ impl Evaluator {
                 return None;
             }
             Some(EvaluatedDecl {
-                ty: node.annotation.clone().unwrap_or_else(|| value.type_ref()),
-                value,
+                ty: expected.unwrap_or(evaluated.ty),
+                value: evaluated.value,
                 access: node.access,
                 writable: node.writable,
                 span: node.span,
@@ -303,23 +308,26 @@ impl Evaluator {
     fn evaluate_expr(
         &mut self,
         expr: &Expr,
-        expected: ConstType,
+        expected: Option<ConstType>,
         requester: &ConstKey,
-    ) -> Option<ConstValue> {
+    ) -> Option<TypedValue> {
         match expr {
             Expr::Int { value, span } => self.integer_literal(value, false, expected, *span),
             Expr::Float { value, span } => {
-                let ty = expected.float().unwrap_or(FloatType::Float64);
+                let ty = expected
+                    .and_then(ConstType::float)
+                    .unwrap_or(FloatType::Float64);
                 FloatValue::parse_decimal(ty, value)
                     .map(ConstValue::Float)
+                    .map(TypedValue::new)
                     .or_else(|| {
                         self.invalid(*span, format!("invalid `{ty}` constant literal"));
                         None
                     })
             }
-            Expr::String { value, .. } => Some(ConstValue::String(value.clone())),
-            Expr::Bool { value, .. } => Some(ConstValue::Bool(*value)),
-            Expr::Null { .. } => Some(ConstValue::Null),
+            Expr::String { value, .. } => Some(TypedValue::new(ConstValue::String(value.clone()))),
+            Expr::Bool { value, .. } => Some(TypedValue::new(ConstValue::Bool(*value))),
+            Expr::Null { .. } => Some(TypedValue::new(ConstValue::Null)),
             Expr::Grouped { expr, .. } => self.evaluate_expr(expr, expected, requester),
             Expr::Identifier { name, span } => {
                 self.reference(&ConstKey::TopLevel(name.clone()), *span, requester)
@@ -360,7 +368,7 @@ impl Evaluator {
             }
             Expr::Unary { op, expr, span } => {
                 let value = self.evaluate_expr(expr, expected, requester)?;
-                self.unary(op, value, *span)
+                self.unary(op, value.value, *span).map(TypedValue::new)
             }
             Expr::Binary {
                 left,
@@ -369,18 +377,18 @@ impl Evaluator {
                 span,
             } => {
                 let left = self.evaluate_expr(left, expected, requester)?;
-                match (op, &left) {
+                match (op, &left.value) {
                     (BinaryOp::And, ConstValue::Bool(false)) => {
-                        return Some(ConstValue::Bool(false));
+                        return Some(TypedValue::new(ConstValue::Bool(false)));
                     }
                     (BinaryOp::Or, ConstValue::Bool(true)) => {
-                        return Some(ConstValue::Bool(true));
+                        return Some(TypedValue::new(ConstValue::Bool(true)));
                     }
                     _ => {}
                 }
-                let right_expected = ConstType::of(&left);
-                let right = self.evaluate_expr(right, right_expected, requester)?;
-                self.binary(op, left, right, *span)
+                let right = self.evaluate_expr(right, Some(left.ty), requester)?;
+                self.binary(op, left.value, right.value, *span)
+                    .map(TypedValue::new)
             }
             Expr::StaticCall {
                 qualifier,
@@ -403,16 +411,21 @@ impl Evaluator {
         &mut self,
         text: &str,
         negative: bool,
-        expected: ConstType,
+        expected: Option<ConstType>,
         span: Span,
-    ) -> Option<ConstValue> {
-        let ty = expected.integer().unwrap_or(IntegerType::Int64);
+    ) -> Option<TypedValue> {
+        let ty = expected
+            .and_then(ConstType::integer)
+            .unwrap_or(IntegerType::Int64);
         let value = parse_decimal_magnitude(text)
             .and_then(|magnitude| IntegerValue::from_literal(ty, magnitude, negative));
-        value.map(ConstValue::Integer).or_else(|| {
-            self.integer_literal_out_of_range(span, ty);
-            None
-        })
+        value
+            .map(ConstValue::Integer)
+            .map(TypedValue::new)
+            .or_else(|| {
+                self.integer_literal_out_of_range(span, ty);
+                None
+            })
     }
 
     fn integer_literal_text(expr: &Expr) -> Option<&str> {
@@ -462,7 +475,7 @@ impl Evaluator {
         key: &ConstKey,
         span: Span,
         requester: &ConstKey,
-    ) -> Option<ConstValue> {
+    ) -> Option<TypedValue> {
         let Some(node) = self.nodes.get(key) else {
             self.invalid(
                 span,
@@ -501,7 +514,10 @@ impl Evaluator {
             );
             return None;
         }
-        self.evaluate_key(key).map(|value| value.value)
+        self.evaluate_key(key).map(|value| TypedValue {
+            value: value.value,
+            ty: value.ty,
+        })
     }
 
     fn unary(&mut self, op: &UnaryOp, value: ConstValue, span: Span) -> Option<ConstValue> {
@@ -650,7 +666,7 @@ impl Evaluator {
         args: &[Expr],
         span: Span,
         requester: &ConstKey,
-    ) -> Option<ConstValue> {
+    ) -> Option<TypedValue> {
         let [argument] = args else {
             self.invalid(span, "constant conversion expects exactly one argument");
             return None;
@@ -658,7 +674,7 @@ impl Evaluator {
         if method == "from" {
             if let Some(target) = IntegerType::from_companion_name(class_name) {
                 let ConstValue::Integer(value) =
-                    self.evaluate_expr(argument, ConstType::Infer, requester)?
+                    self.evaluate_expr(argument, None, requester)?.value
                 else {
                     self.invalid(span, "integer conversion requires an integer constant");
                     return None;
@@ -666,6 +682,7 @@ impl Evaluator {
                 return value
                     .convert(target)
                     .map(ConstValue::Integer)
+                    .map(TypedValue::new)
                     .ok()
                     .or_else(|| {
                         self.invalid(span, "integer conversion is out of range");
@@ -674,19 +691,29 @@ impl Evaluator {
             }
         }
         if class_name == "Int" && method == "toFloat" {
-            let ConstValue::Integer(value) =
-                self.evaluate_expr(argument, ConstType::Integer(IntegerType::Int64), requester)?
+            let ConstValue::Integer(value) = self
+                .evaluate_expr(
+                    argument,
+                    Some(ConstType::Integer(IntegerType::Int64)),
+                    requester,
+                )?
+                .value
             else {
                 self.invalid(span, "Int::toFloat requires an int constant");
                 return None;
             };
-            return Some(ConstValue::Float(FloatValue::from_f64(
+            return Some(TypedValue::new(ConstValue::Float(FloatValue::from_f64(
                 value.signed_value() as f64,
-            )));
+            ))));
         }
         if class_name == "Float" && method == "toInt" {
-            let ConstValue::Float(value) =
-                self.evaluate_expr(argument, ConstType::Float(FloatType::Float64), requester)?
+            let ConstValue::Float(value) = self
+                .evaluate_expr(
+                    argument,
+                    Some(ConstType::Float(FloatType::Float64)),
+                    requester,
+                )?
+                .value
             else {
                 self.invalid(span, "Float::toInt requires a float constant");
                 return None;
@@ -694,10 +721,10 @@ impl Evaluator {
             return value
                 .to_i64_checked()
                 .map(|value| {
-                    ConstValue::Integer(
+                    TypedValue::new(ConstValue::Integer(
                         IntegerValue::from_i128(IntegerType::Int64, value as i128)
                             .expect("i64 fits int"),
-                    )
+                    ))
                 })
                 .or_else(|| {
                     self.invalid(span, "float-to-int constant conversion is out of range");
@@ -735,8 +762,7 @@ impl Evaluator {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ConstType {
-    Infer,
+pub enum ConstType {
     Integer(IntegerType),
     Float(FloatType),
     String,
@@ -779,6 +805,19 @@ impl ConstType {
     }
 }
 
+impl fmt::Display for ConstType {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Integer(ty) => formatter.write_str(ty.source_name()),
+            Self::Float(ty) => formatter.write_str(ty.source_name()),
+            Self::String => formatter.write_str("string"),
+            Self::Bool => formatter.write_str("bool"),
+            Self::Null => formatter.write_str("null"),
+            Self::NullableString => formatter.write_str("?string"),
+        }
+    }
+}
+
 fn const_type(ty: &TypeRef) -> Option<ConstType> {
     if ty.args.is_empty() {
         if let Some(integer) = IntegerType::from_source_name(&ty.name) {
@@ -792,7 +831,6 @@ fn const_type(ty: &TypeRef) -> Option<ConstType> {
         (false, "string", true) => Some(ConstType::String),
         (true, "string", true) => Some(ConstType::NullableString),
         (false, "bool", true) => Some(ConstType::Bool),
-        (false, "null", true) => Some(ConstType::Null),
         _ => None,
     }
 }

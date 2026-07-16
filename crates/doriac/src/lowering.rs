@@ -467,16 +467,5 @@ fn resolved_qualifier_name(qualifier: &ast::StaticQualifier, class_name: Option<
 }
 
 fn lower_type_ref(ty: &crate::types::TypeRef, class_name: Option<&str>) -> crate::types::TypeRef {
-    let mut lowered = ty.clone();
-    if lowered.name == "self" {
-        lowered.name = class_name
-            .expect("checked `self` type has a declaring class")
-            .to_string();
-    }
-    lowered.args = lowered
-        .args
-        .iter()
-        .map(|argument| lower_type_ref(argument, class_name))
-        .collect();
-    lowered
+    class_name.map_or_else(|| ty.clone(), |class_name| ty.resolve_self_in(class_name))
 }

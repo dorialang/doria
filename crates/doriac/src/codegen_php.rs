@@ -12,6 +12,7 @@ use crate::types::TypeRef;
 
 const PHP_INTEGER_UNSUPPORTED_CODE: &str = "B1301";
 const PHP_OWNERSHIP_UNSUPPORTED_CODE: &str = "B1901";
+const PHP_CONSTANT_UNSUPPORTED_CODE: &str = "B2001";
 
 pub fn generate(program: &Program) -> Result<String, BackendError> {
     validate_program(program)?;
@@ -160,6 +161,12 @@ fn validate_item(item: &Item, semantic_info: &SemanticInfo) -> Result<(), Backen
                             )?;
                         } else if let Some(initializer) = &property.initializer {
                             validate_expr(initializer, semantic_info)?;
+                            if let Some(span) = static_property_read(initializer, semantic_info) {
+                                return Err(unsupported_constant_shape(
+                                    span,
+                                    "instance property initializers that read static properties",
+                                ));
+                            }
                         }
                     }
                     ClassMember::Method(method) => validate_function(method, semantic_info, true)?,
@@ -182,6 +189,18 @@ fn validate_item(item: &Item, semantic_info: &SemanticInfo) -> Result<(), Backen
         }
         Item::Function(function) => validate_function(function, semantic_info, false),
         Item::Constant(constant) => {
+            if matches!(
+                constant.name.to_ascii_lowercase().as_str(),
+                "true" | "false" | "null"
+            ) {
+                return Err(unsupported_constant_shape(
+                    constant.span,
+                    format!(
+                        "top-level constant `{}` because PHP reserves that name case-insensitively",
+                        constant.name
+                    ),
+                ));
+            }
             if let Some(ty) = &constant.ty {
                 validate_type(ty, constant.span)?;
             }
@@ -633,6 +652,66 @@ fn validate_exprs(expressions: &[Expr], semantic_info: &SemanticInfo) -> Result<
     Ok(())
 }
 
+fn static_property_read(expr: &Expr, semantic_info: &SemanticInfo) -> Option<Span> {
+    match expr {
+        Expr::StaticMember {
+            class_name,
+            member,
+            span,
+        } if semantic_info
+            .const_evaluation
+            .values
+            .contains_key(&ConstKey::Static {
+                class_name: class_name.clone(),
+                name: member.clone(),
+            }) =>
+        {
+            Some(*span)
+        }
+        Expr::InterpolatedString { parts, .. } => parts.iter().find_map(|part| match part {
+            InterpolatedStringPart::Expr(expr) => static_property_read(expr, semantic_info),
+            InterpolatedStringPart::Text { .. } => None,
+        }),
+        Expr::Array { elements, .. } => elements.iter().find_map(|element| {
+            element
+                .key
+                .as_ref()
+                .and_then(|key| static_property_read(key, semantic_info))
+                .or_else(|| static_property_read(&element.value, semantic_info))
+        }),
+        Expr::PropertyAccess { object, .. } | Expr::Grouped { expr: object, .. } => {
+            static_property_read(object, semantic_info)
+        }
+        Expr::MethodCall { object, args, .. } => static_property_read(object, semantic_info)
+            .or_else(|| {
+                args.iter()
+                    .find_map(|arg| static_property_read(arg, semantic_info))
+            }),
+        Expr::FunctionCall { args, .. }
+        | Expr::StaticCall { args, .. }
+        | Expr::New { args, .. } => args
+            .iter()
+            .find_map(|arg| static_property_read(arg, semantic_info)),
+        Expr::Unary { expr, .. } => static_property_read(expr, semantic_info),
+        Expr::Binary { left, right, .. }
+        | Expr::Range {
+            start: left,
+            end: right,
+            ..
+        } => static_property_read(left, semantic_info)
+            .or_else(|| static_property_read(right, semantic_info)),
+        Expr::Variable { .. }
+        | Expr::This { .. }
+        | Expr::Identifier { .. }
+        | Expr::String { .. }
+        | Expr::Int { .. }
+        | Expr::Float { .. }
+        | Expr::Bool { .. }
+        | Expr::Null { .. }
+        | Expr::StaticMember { .. } => None,
+    }
+}
+
 fn integer_literal_magnitude(expr: &Expr) -> Option<u128> {
     match expr {
         Expr::Int { value, .. } => parse_decimal_magnitude(value),
@@ -659,6 +738,17 @@ fn unsupported_numeric_shape(span: Span, feature: impl Into<String>) -> BackendE
 fn unsupported_ownership_shape(span: Span, feature: impl Into<String>) -> BackendError {
     BackendError::from_diagnostics(vec![Diagnostic::new(
         PHP_OWNERSHIP_UNSUPPORTED_CODE,
+        format!(
+            "PHP compatibility backend cannot preserve {} exactly; use the `native` or `debug` target for this valid Doria program",
+            feature.into()
+        ),
+        span,
+    )])
+}
+
+fn unsupported_constant_shape(span: Span, feature: impl Into<String>) -> BackendError {
+    BackendError::from_diagnostics(vec![Diagnostic::new(
+        PHP_CONSTANT_UNSUPPORTED_CODE,
         format!(
             "PHP compatibility backend cannot preserve {} exactly; use the `native` or `debug` target for this valid Doria program",
             feature.into()
@@ -898,6 +988,11 @@ fn evaluated_value<'a>(evaluation: &'a Evaluation, key: &ConstKey) -> &'a ConstV
 
 fn emit_const_value(value: &ConstValue) -> String {
     match value {
+        ConstValue::Integer(value)
+            if value.ty.is_default_int() && value.mathematical_value() == i64::MIN as i128 =>
+        {
+            "(-9223372036854775807 - 1)".to_string()
+        }
         ConstValue::Integer(value) => value.display(),
         ConstValue::Float(value) => {
             let value = value.display();

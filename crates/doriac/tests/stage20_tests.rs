@@ -220,6 +220,49 @@ fn rejects_invalid_constant_dependencies_operations_and_names() {
 }
 
 #[test]
+fn inferred_null_constants_keep_a_value_type_without_making_null_a_type_name() {
+    doriac::check_source(
+        "inferred-null.doria",
+        "const NONE = null; function value(): ?string { return NONE; }",
+    )
+    .expect("an inferred null constant should assign to ?string");
+
+    assert_diagnostic("const null NONE = null;", "E0483");
+}
+
+#[test]
+fn constant_references_preserve_the_declared_nullable_type() {
+    let found = diagnostics(
+        r#"
+const ?string MAYBE = "value";
+const string TEXT = MAYBE;
+"#,
+    );
+    assert!(found.iter().any(|diagnostic| {
+        diagnostic.code == "E0484"
+            && diagnostic
+                .message
+                .contains("type `?string`, expected `string`")
+    }));
+}
+
+#[test]
+fn class_callables_do_not_collide_with_top_level_entry_or_function_names() {
+    lower(
+        r#"
+class Worker
+{
+    static function main(int $value): int { return $value; }
+    static function answer(): int { return 41; }
+}
+
+function answer(): int { return 42; }
+function main(): int { return answer(); }
+"#,
+    );
+}
+
+#[test]
 fn constant_initializers_use_normal_static_access_diagnostics() {
     let cases = [
         ("const VALUE = self::OTHER;", "E0492"),
@@ -745,6 +788,53 @@ fn self_scope_and_type_forms_resolve_before_mir() {
         "class Other {} class Message { function replace(): self { return new Other(); } }",
         "E0404",
     );
+}
+
+#[test]
+fn self_is_canonicalized_for_property_layout_and_ownership() {
+    let hir = doriac::lower_source(
+        "self-ownership.doria",
+        r#"
+class Node
+{
+    function consume(take self $other): void { return; }
+
+    function demonstrate(take self $other): void
+    {
+        $this->consume($other);
+        $this->consume($other);
+    }
+}
+"#,
+    )
+    .expect_err("the second call must observe the first self-typed move");
+    assert!(
+        hir.iter().any(|diagnostic| diagnostic.code == "E0470"),
+        "{hir:#?}"
+    );
+
+    let hir = doriac::lower_source(
+        "self-layout.doria",
+        r#"
+class Node
+{
+    function __construct(take self $given) {}
+}
+function main(): void {}
+"#,
+    )
+    .expect("self-typed properties should lower");
+    let node = hir
+        .semantic_info
+        .classes
+        .iter()
+        .find(|class| class.name == "Node")
+        .expect("Node semantic layout");
+    assert!(node
+        .properties
+        .iter()
+        .all(|property| property.ty.name == "Node"));
+    doriac::mir_lowering::lower_program(&hir).expect("canonical self properties should reach MIR");
 }
 
 #[test]

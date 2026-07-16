@@ -111,7 +111,7 @@ fn collect_ordered_class_semantics(program: &Program) -> Vec<ClassSemanticInfo> 
             let explicit = class.members.iter().filter_map(|member| match member {
                 ClassMember::Property(property) if !property.is_static => Some((
                     property.name.clone(),
-                    property.ty.clone(),
+                    property.ty.resolve_self_in(&class.name),
                     property.writable,
                     false,
                 )),
@@ -122,10 +122,14 @@ fn collect_ordered_class_semantics(program: &Program) -> Vec<ClassSemanticInfo> 
             let promoted = class.members.iter().find_map(|member| match member {
                 ClassMember::Method(method) if method.name == "__construct" => {
                     Some(method.params.iter().filter_map(|param| {
-                        param
-                            .promoted_access
-                            .as_ref()
-                            .map(|_| (param.name.clone(), param.ty.clone(), param.writable, true))
+                        param.promoted_access.as_ref().map(|_| {
+                            (
+                                param.name.clone(),
+                                param.ty.resolve_self_in(&class.name),
+                                param.writable,
+                                true,
+                            )
+                        })
                     }))
                 }
                 _ => None,
@@ -1645,14 +1649,12 @@ impl<'program> Checker<'program> {
             class_name: class_name.to_string(),
             name: constant.name.clone(),
         };
-        let ty_ref = self
-            .const_evaluation
-            .values
-            .get(&key)
-            .map(|value| value.ty.clone())
-            .or_else(|| constant.ty.clone())
-            .unwrap_or_else(TypeRef::unknown);
-        let ty = self.resolve_type_ref_with_class(&ty_ref, constant.span, Some(class_name));
+        let ty = if let Some(value) = self.const_evaluation.values.get(&key) {
+            self.const_type_id(value.ty)
+        } else {
+            let ty_ref = constant.ty.clone().unwrap_or_else(TypeRef::unknown);
+            self.resolve_type_ref_with_class(&ty_ref, constant.span, Some(class_name))
+        };
         info.constants.insert(
             constant.name.clone(),
             ConstantInfo {
@@ -4981,6 +4983,18 @@ impl<'program> Checker<'program> {
         self.resolve_type_ref_in_position(ty, span, TypePosition::Value, None)
     }
 
+    fn const_type_id(&mut self, ty: crate::const_eval::ConstType) -> TypeId {
+        let kind = match ty {
+            crate::const_eval::ConstType::Integer(ty) => TypeKind::Integer(ty),
+            crate::const_eval::ConstType::Float(ty) => TypeKind::Float(ty),
+            crate::const_eval::ConstType::String => TypeKind::String,
+            crate::const_eval::ConstType::Bool => TypeKind::Bool,
+            crate::const_eval::ConstType::Null => TypeKind::Null,
+            crate::const_eval::ConstType::NullableString => TypeKind::NullableString,
+        };
+        self.types.intern(kind)
+    }
+
     fn resolve_type_ref_with_class(
         &mut self,
         ty: &TypeRef,
@@ -5536,14 +5550,10 @@ impl<'program> Checker<'program> {
                 .lookup(name)
                 .map(|binding| binding.ty)
                 .unwrap_or_else(|| self.types.unknown()),
-            Expr::Identifier { name, span } => {
+            Expr::Identifier { name, .. } => {
                 let key = crate::const_eval::ConstKey::TopLevel(name.clone());
-                let ty = self
-                    .const_evaluation
-                    .values
-                    .get(&key)
-                    .map(|value| value.ty.clone());
-                ty.map(|ty| self.resolve_type_ref(&ty, *span))
+                let ty = self.const_evaluation.values.get(&key).map(|value| value.ty);
+                ty.map(|ty| self.const_type_id(ty))
                     .unwrap_or_else(|| self.types.unknown())
             }
             Expr::This { .. } => method_context
@@ -5617,10 +5627,7 @@ impl<'program> Checker<'program> {
                     .unwrap_or_else(|| self.types.unknown())
             }
             Expr::StaticMember {
-                qualifier,
-                member,
-                span,
-                ..
+                qualifier, member, ..
             } => {
                 let Some(class_name) = Self::static_qualifier_class_name(qualifier, method_context)
                 else {
@@ -5643,12 +5650,8 @@ impl<'program> Checker<'program> {
                         class_name,
                         name: member.clone(),
                     };
-                    let ty = self
-                        .const_evaluation
-                        .values
-                        .get(&key)
-                        .map(|value| value.ty.clone());
-                    ty.map(|ty| self.resolve_type_ref(&ty, *span))
+                    let ty = self.const_evaluation.values.get(&key).map(|value| value.ty);
+                    ty.map(|ty| self.const_type_id(ty))
                         .unwrap_or_else(|| self.types.unknown())
                 })
             }

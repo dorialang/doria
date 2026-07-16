@@ -40,6 +40,22 @@ impl TypeRef {
         self
     }
 
+    pub fn resolve_self_in(&self, class_name: &str) -> Self {
+        Self {
+            name: if self.name == "self" {
+                class_name.to_string()
+            } else {
+                self.name.clone()
+            },
+            args: self
+                .args
+                .iter()
+                .map(|argument| argument.resolve_self_in(class_name))
+                .collect(),
+            nullable: self.nullable,
+        }
+    }
+
     pub fn as_class_name(&self) -> Option<&str> {
         if IntegerType::from_source_name(&self.name).is_some() {
             return None;

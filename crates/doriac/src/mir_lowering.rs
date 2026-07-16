@@ -26,6 +26,12 @@ struct CallableDecl<'a> {
     receiver: Option<ClassId>,
 }
 
+impl CallableDecl<'_> {
+    fn is_top_level(self) -> bool {
+        self.class.is_none()
+    }
+}
+
 pub fn lower_program(program: &hir::Program) -> DiagnosticResult<mir::Program> {
     let class_ids = program
         .semantic_info
@@ -206,7 +212,7 @@ pub fn lower_program(program: &hir::Program) -> DiagnosticResult<mir::Program> {
         .iter()
         .enumerate()
         .filter_map(|(index, declaration)| {
-            (declaration.receiver.is_none() && declaration.function.name == "main").then_some(index)
+            (declaration.is_top_level() && declaration.function.name == "main").then_some(index)
         })
         .collect::<Vec<_>>();
     if main_indices.len() != 1 {
@@ -223,7 +229,7 @@ pub fn lower_program(program: &hir::Program) -> DiagnosticResult<mir::Program> {
     let mut callable_signatures = Vec::new();
     for (index, declaration) in declarations.iter().enumerate() {
         let function = declaration.function;
-        if declaration.receiver.is_none() && signatures.contains_key(&function.name) {
+        if declaration.is_top_level() && signatures.contains_key(&function.name) {
             return Err(vec![unsupported(
                 function.span,
                 format!(
@@ -237,6 +243,7 @@ pub fn lower_program(program: &hir::Program) -> DiagnosticResult<mir::Program> {
             mir::FunctionId(index),
             &class_ids,
             matches!(function.name.as_str(), "__construct" | "__destruct"),
+            declaration.is_top_level() && function.name == "main",
         )?;
         signature.method_class = declaration.class;
         signature.receiver_mode = declaration.receiver.map(|_| {
@@ -246,7 +253,7 @@ pub fn lower_program(program: &hir::Program) -> DiagnosticResult<mir::Program> {
                 mir::ReceiverMode::Readonly
             }
         });
-        if declaration.receiver.is_none() {
+        if declaration.is_top_level() {
             signatures.insert(function.name.clone(), signature.clone());
         }
         callable_signatures.push(signature);
@@ -378,6 +385,7 @@ fn collect_function_signature(
     id: mir::FunctionId,
     class_ids: &HashMap<String, ClassId>,
     lifecycle: bool,
+    is_entry: bool,
 ) -> DiagnosticResult<FunctionSignature> {
     let return_type = match function.return_type.as_ref() {
         Some(ty) if scalar_type_ref(ty).is_some() => mir::ReturnType::Value(mir::Type::Scalar(
@@ -412,14 +420,14 @@ fn collect_function_signature(
         }
     };
 
-    if function.name == "main" && !function.params.is_empty() {
+    if is_entry && !function.params.is_empty() {
         return Err(vec![unsupported(
             function.params[0].span,
             "the native entry function `main` cannot declare parameters",
         )]);
     }
 
-    if function.name == "main"
+    if is_entry
         && !matches!(
             return_type,
             mir::ReturnType::Value(mir::Type::Scalar(mir::ScalarType::Integer(
@@ -1652,16 +1660,14 @@ impl<'semantic> LoweringContext<'semantic> {
             class_name: class_name.to_string(),
             name: member.to_string(),
         };
-        let ty_ref = &self
+        let const_ty = self
             .semantic_info
             .const_evaluation
             .values
             .get(&key)
             .expect("checked static has evaluated metadata")
             .ty;
-        let ty = self
-            .native_type_ref(ty_ref)
-            .expect("checked static has a native type");
+        let ty = native_const_type(const_ty).expect("checked static has a native type");
         Ok((id, ty))
     }
 
@@ -1751,6 +1757,21 @@ impl<'semantic> LoweringContext<'semantic> {
                 )])
             }
         }
+    }
+}
+
+fn native_const_type(ty: crate::const_eval::ConstType) -> Option<mir::Type> {
+    match ty {
+        crate::const_eval::ConstType::Integer(ty) => {
+            Some(mir::Type::Scalar(mir::ScalarType::Integer(ty)))
+        }
+        crate::const_eval::ConstType::Float(ty) => {
+            Some(mir::Type::Scalar(mir::ScalarType::Float(ty)))
+        }
+        crate::const_eval::ConstType::String => Some(mir::Type::String),
+        crate::const_eval::ConstType::Bool => Some(mir::Type::Scalar(mir::ScalarType::Bool)),
+        crate::const_eval::ConstType::NullableString => Some(mir::Type::NullableString),
+        crate::const_eval::ConstType::Null => None,
     }
 }
 

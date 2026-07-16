@@ -1587,3 +1587,81 @@ echo Counter::value;
     assert_eq!(run.stdout, b"4243");
     assert!(run.stderr.is_empty());
 }
+
+#[test]
+fn php_backend_rejects_case_variants_of_predefined_top_level_constants() {
+    for name in ["TRUE", "FALSE", "NULL"] {
+        let diagnostics = doriac::compile_source_to_php(
+            "predefined-constant.doria",
+            format!("const {name} = 1;"),
+        )
+        .expect_err("PHP predefined constant names must not be emitted");
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "B2001"
+                && diagnostic
+                    .message
+                    .contains("reserves that name case-insensitively")
+        }));
+    }
+}
+
+#[test]
+fn php_backend_rejects_instance_initializers_that_read_static_properties() {
+    let source = r#"
+class Counter
+{
+    static int $seed = 41;
+    int $value = Counter::seed;
+}
+"#;
+    doriac::check_source("static-read-in-property.doria", source)
+        .expect("the Doria initializer is valid independently of PHP restrictions");
+    let diagnostics = doriac::compile_source_to_php("static-read-in-property.doria", source)
+        .expect_err("PHP cannot emit a static property read in an instance default");
+    assert!(diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == "B2001"
+            && diagnostic
+                .message
+                .contains("instance property initializers that read static properties")
+    }));
+}
+
+#[test]
+fn php_backend_emits_int_min_constants_without_php_literal_overflow() {
+    let php = doriac::compile_source_to_php(
+        "int-min-constant.doria",
+        r#"
+const int MINIMUM = -9223372036854775808;
+class Limits { static int $minimum = MINIMUM; }
+"#,
+    )
+    .expect("the full signed int range should lower to PHP");
+
+    assert!(php.contains("const MINIMUM = (-9223372036854775807 - 1);"));
+    assert!(php.contains("public static int $minimum = (-9223372036854775807 - 1);"));
+
+    if let Ok(version) = Command::new("php").arg("--version").output() {
+        if version.status.success() {
+            let mut child = Command::new("php")
+                .arg("-l")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("PHP lint should start");
+            use std::io::Write;
+            child
+                .stdin
+                .take()
+                .expect("PHP stdin")
+                .write_all(php.as_bytes())
+                .expect("generated PHP should be written");
+            let output = child.wait_with_output().expect("PHP lint should finish");
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+}
