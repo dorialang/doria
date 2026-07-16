@@ -2038,10 +2038,96 @@ fn lower_string_var_decl(
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+enum ScalarPlace {
+    Local(mir::LocalId),
+    Property {
+        object: mir::LocalId,
+        property: crate::class_layout::PropertyId,
+    },
+    Static(mir::StaticId),
+}
+
+impl ScalarPlace {
+    fn operand(self) -> mir::Operand {
+        match self {
+            Self::Local(local) => mir::Operand::Local(local),
+            Self::Property { object, property } => mir::Operand::Property { object, property },
+            Self::Static(id) => mir::Operand::Static(id),
+        }
+    }
+
+    fn assignment(self, value: mir::Rvalue) -> mir::Statement {
+        match self {
+            Self::Local(target) => mir::Statement::AssignLocal { target, value },
+            Self::Property { object, property } => mir::Statement::AssignProperty {
+                object,
+                property,
+                value,
+            },
+            Self::Static(target) => mir::Statement::AssignStatic { target, value },
+        }
+    }
+}
+
+fn lower_scalar_place(
+    expr: &hir::Expr,
+    context: &LoweringContext,
+) -> DiagnosticResult<(ScalarPlace, mir::ScalarType)> {
+    match expr {
+        hir::Expr::Grouped { expr, .. } => lower_scalar_place(expr, context),
+        hir::Expr::Variable { name, span } => {
+            let local = context.lookup_local(name, *span)?;
+            Ok((ScalarPlace::Local(local), context.local_scalar_type(local)?))
+        }
+        hir::Expr::PropertyAccess { .. } => {
+            let (object, property, ty) = lower_property_place(expr, context)?;
+            let mir::Type::Scalar(scalar) = ty else {
+                return Err(vec![unsupported(
+                    expr.span(),
+                    "class property is not a scalar mutation place",
+                )]);
+            };
+            Ok((ScalarPlace::Property { object, property }, scalar))
+        }
+        hir::Expr::StaticMember {
+            class_name,
+            member,
+            span,
+        } => {
+            let (id, ty) = context.static_property(class_name, member, *span)?;
+            let mir::Type::Scalar(scalar) = ty else {
+                return Err(vec![unsupported(
+                    *span,
+                    "static property is not a scalar mutation place",
+                )]);
+            };
+            Ok((ScalarPlace::Static(id), scalar))
+        }
+        _ => Err(vec![unsupported(
+            expr.span(),
+            "this scalar mutation place is not supported by native compilation",
+        )]),
+    }
+}
+
 fn lower_assignment(
     assignment: &hir::Assignment,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<()> {
+    if assignment.op != hir::AssignOp::Assign {
+        let (place, scalar_type) = lower_scalar_place(&assignment.target, context)?;
+        let value = lower_compound_value(
+            place.operand(),
+            scalar_type,
+            &assignment.op,
+            &assignment.value,
+            context,
+        )?;
+        context.push_statement(place.assignment(mir::Rvalue::Value(value)));
+        return Ok(());
+    }
+
     if let hir::Expr::StaticMember {
         class_name,
         member,
@@ -2049,22 +2135,7 @@ fn lower_assignment(
     } = &assignment.target
     {
         let (target, ty) = context.static_property(class_name, member, *span)?;
-        let value = match (assignment.op.clone(), ty) {
-            (hir::AssignOp::Assign, _) => lower_rvalue_as_expected(&assignment.value, ty, context)?,
-            (op, mir::Type::Scalar(scalar)) => mir::Rvalue::Value(lower_static_compound_value(
-                target,
-                scalar,
-                &op,
-                &assignment.value,
-                context,
-            )?),
-            _ => {
-                return Err(vec![unsupported(
-                    assignment.span,
-                    "compound assignment is invalid for this static property type",
-                )])
-            }
-        };
+        let value = lower_rvalue_as_expected(&assignment.value, ty, context)?;
         context.push_statement(mir::Statement::AssignStatic { target, value });
         return Ok(());
     }
@@ -2075,12 +2146,6 @@ fn lower_assignment(
         if let Ok((object, property, property_type)) =
             lower_property_place(&assignment.target, context)
         {
-            if assignment.op != hir::AssignOp::Assign {
-                return Err(vec![unsupported(
-                    assignment.span,
-                    "compound assignment to a class property is not supported by native compilation",
-                )]);
-            }
             let value = lower_rvalue_as_expected(&assignment.value, property_type, context)?;
             context.push_statement(mir::Statement::AssignProperty {
                 object,
@@ -2092,12 +2157,6 @@ fn lower_assignment(
     }
     let target = lower_assignment_target(&assignment.target, context)?;
     if context.local_type(target) == mir::Type::String {
-        if assignment.op != hir::AssignOp::Assign {
-            return Err(vec![unsupported(
-                assignment.span,
-                "string compound assignment is invalid",
-            )]);
-        }
         context.push_statement(mir::Statement::AssignLocal {
             target,
             value: mir::Rvalue::String(lower_string_expression(&assignment.value, context)?),
@@ -2105,12 +2164,6 @@ fn lower_assignment(
         return Ok(());
     }
     if context.local_type(target) == mir::Type::NullableString {
-        if assignment.op != hir::AssignOp::Assign {
-            return Err(vec![unsupported(
-                assignment.span,
-                "nullable-string compound assignment is invalid",
-            )]);
-        }
         context.push_statement(mir::Statement::AssignLocal {
             target,
             value: mir::Rvalue::NullableString(lower_nullable_string_expression(
@@ -2121,12 +2174,6 @@ fn lower_assignment(
         return Ok(());
     }
     if let mir::Type::Class(class) = context.local_type(target) {
-        if assignment.op != hir::AssignOp::Assign {
-            return Err(vec![unsupported(
-                assignment.span,
-                "class compound assignment is invalid",
-            )]);
-        }
         if !context.local_owns(target) {
             return Err(vec![unsupported(
                 assignment.span,
@@ -2146,10 +2193,7 @@ fn lower_assignment(
     }
 
     let scalar_type = context.local_scalar_type(target)?;
-    let value = match assignment.op {
-        hir::AssignOp::Assign => lower_value_expression(&assignment.value, context)?,
-        ref op => lower_compound_value(target, scalar_type, op, &assignment.value, context)?,
-    };
+    let value = lower_value_expression(&assignment.value, context)?;
     ensure_value_type(&value, scalar_type, assignment.value.span())?;
     context.push_statement(mir::Statement::AssignLocal {
         target,
@@ -2162,32 +2206,37 @@ fn lower_increment(
     increment: &hir::IncrementStmt,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<()> {
-    let target = lower_assignment_target(&increment.target, context)?;
-    if context.local_type(target) == mir::Type::String {
-        return Err(vec![unsupported(
-            increment.span,
-            "string values cannot be incremented or decremented",
-        )]);
-    }
+    let (place, scalar_type) = lower_scalar_place(&increment.target, context)?;
+    let value = lower_increment_value(place.operand(), scalar_type, &increment.op, increment.span)?;
+    context.push_statement(place.assignment(mir::Rvalue::Value(value)));
+    Ok(())
+}
 
-    let scalar_type = context.local_scalar_type(target)?;
-    let value = match scalar_type {
+fn lower_increment_value(
+    target: mir::Operand,
+    scalar_type: mir::ScalarType,
+    op: &hir::IncrementOp,
+    span: Span,
+) -> DiagnosticResult<mir::ValueExpression> {
+    match scalar_type {
         mir::ScalarType::Integer(integer_type) => {
-            let op = match increment.op {
+            let op = match op {
                 hir::IncrementOp::Increment => mir::IntegerBinaryOp::Add,
                 hir::IncrementOp::Decrement => mir::IntegerBinaryOp::Subtract,
             };
-            mir::ValueExpression::Integer(mir::IntegerExpression::Binary {
-                ty: integer_type,
-                op,
-                left: Box::new(local_integer_expression(target, integer_type)),
-                right: Box::new(mir::IntegerExpression::constant(IntegerValue::one(
-                    integer_type,
-                ))),
-            })
+            Ok(mir::ValueExpression::Integer(
+                mir::IntegerExpression::Binary {
+                    ty: integer_type,
+                    op,
+                    left: Box::new(mir::IntegerExpression::use_operand(integer_type, target)),
+                    right: Box::new(mir::IntegerExpression::constant(IntegerValue::one(
+                        integer_type,
+                    ))),
+                },
+            ))
         }
         mir::ScalarType::Float(float_type) => {
-            let op = match increment.op {
+            let op = match op {
                 hir::IncrementOp::Increment => mir::FloatBinaryOp::Add,
                 hir::IncrementOp::Decrement => mir::FloatBinaryOp::Subtract,
             };
@@ -2195,25 +2244,18 @@ fn lower_increment(
                 FloatType::Float32 => FloatValue::from_f32(1.0),
                 FloatType::Float64 => FloatValue::from_f64(1.0),
             };
-            mir::ValueExpression::Float(mir::FloatExpression::Binary {
+            Ok(mir::ValueExpression::Float(mir::FloatExpression::Binary {
                 ty: float_type,
                 op,
-                left: Box::new(local_float_expression(target, float_type)),
+                left: Box::new(mir::FloatExpression::Use {
+                    ty: float_type,
+                    operand: target,
+                }),
                 right: Box::new(mir::FloatExpression::constant(one)),
-            })
+            }))
         }
-        mir::ScalarType::Bool => {
-            return Err(vec![unsupported(
-                increment.span,
-                "bool increment is invalid",
-            )])
-        }
-    };
-    context.push_statement(mir::Statement::AssignLocal {
-        target,
-        value: mir::Rvalue::Value(value),
-    });
-    Ok(())
+        mir::ScalarType::Bool => Err(vec![unsupported(span, "bool increment is invalid")]),
+    }
 }
 
 fn lower_assignment_target(
@@ -3858,7 +3900,7 @@ fn lower_compound_assignment_op(op: &hir::AssignOp) -> mir::IntegerBinaryOp {
 }
 
 fn lower_compound_value(
-    target: mir::LocalId,
+    target: mir::Operand,
     ty: mir::ScalarType,
     op: &hir::AssignOp,
     right: &hir::Expr,
@@ -3873,7 +3915,7 @@ fn lower_compound_value(
                 mir::IntegerExpression::Binary {
                     ty: integer,
                     op: lower_compound_assignment_op(op),
-                    left: Box::new(local_integer_expression(target, integer)),
+                    left: Box::new(mir::IntegerExpression::use_operand(integer, target)),
                     right: Box::new(right),
                 },
             ))
@@ -3895,68 +3937,15 @@ fn lower_compound_value(
             Ok(mir::ValueExpression::Float(mir::FloatExpression::Binary {
                 ty: float,
                 op,
-                left: Box::new(local_float_expression(target, float)),
-                right: Box::new(right),
-            }))
-        }
-        mir::ScalarType::Bool => Err(vec![unsupported(
-            Span::default(),
-            "bool compound assignment is invalid",
-        )]),
-    }
-}
-
-fn lower_static_compound_value(
-    target: mir::StaticId,
-    ty: mir::ScalarType,
-    op: &hir::AssignOp,
-    right: &hir::Expr,
-    context: &LoweringContext,
-) -> DiagnosticResult<mir::ValueExpression> {
-    match ty {
-        mir::ScalarType::Integer(integer) => {
-            let right_span = right.span();
-            let right = lower_integer_expression(right, context)?;
-            ensure_expression_type(&right, integer, right_span)?;
-            Ok(mir::ValueExpression::Integer(
-                mir::IntegerExpression::Binary {
-                    ty: integer,
-                    op: lower_compound_assignment_op(op),
-                    left: Box::new(mir::IntegerExpression::use_operand(
-                        integer,
-                        mir::Operand::Static(target),
-                    )),
-                    right: Box::new(right),
-                },
-            ))
-        }
-        mir::ScalarType::Float(float) => {
-            let right_span = right.span();
-            let right = lower_float_expression(right, context)?;
-            let op = match op {
-                hir::AssignOp::AddAssign => mir::FloatBinaryOp::Add,
-                hir::AssignOp::SubAssign => mir::FloatBinaryOp::Subtract,
-                hir::AssignOp::MulAssign => mir::FloatBinaryOp::Multiply,
-                hir::AssignOp::DivAssign => mir::FloatBinaryOp::Divide,
-                _ => {
-                    return Err(vec![unsupported(
-                        right_span,
-                        "invalid float compound assignment",
-                    )])
-                }
-            };
-            Ok(mir::ValueExpression::Float(mir::FloatExpression::Binary {
-                ty: float,
-                op,
                 left: Box::new(mir::FloatExpression::Use {
                     ty: float,
-                    operand: mir::Operand::Static(target),
+                    operand: target,
                 }),
                 right: Box::new(right),
             }))
         }
         mir::ScalarType::Bool => Err(vec![unsupported(
-            right.span(),
+            Span::default(),
             "bool compound assignment is invalid",
         )]),
     }

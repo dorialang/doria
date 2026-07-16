@@ -109,7 +109,7 @@ These are identity, not scope deferral. They do not become available later, and 
 
 - Tracing garbage collection, and pervasive reference counting as the default memory model.
 - Rust-spelled borrow sigils and lifetime annotations. Inference and elision only.
-- `public`, `protected`, and `private` as member visibility modifiers. Members are externally accessible by default; `internal` is the only access-surface keyword.
+- Doria does not use `public`, `protected`, or `private` as member visibility modifiers. Members are externally accessible by default; `internal` is the only access-surface keyword.
 - A broad PHP-style `array` type. Sequences are `T[]` typed arrays and named collections.
 - `Vec` as a collection alias.
 - PHP loose comparison, `===`, and `!==`.

@@ -1964,7 +1964,7 @@ impl<'program> Checker<'program> {
             }
             Stmt::Assignment(assignment) => {
                 self.check_expr(&assignment.value, scopes, method_context);
-                if let Some(target) = self.check_assignment_target(
+                if let Some(target) = self.check_writable_place(
                     &assignment.target,
                     &assignment.op,
                     scopes,
@@ -2300,7 +2300,7 @@ impl<'program> Checker<'program> {
             }
             ForInitializer::Assignment(assignment) => {
                 self.check_expr(&assignment.value, scopes, method_context);
-                if let Some(target) = self.check_assignment_target(
+                if let Some(target) = self.check_writable_place(
                     &assignment.target,
                     &assignment.op,
                     scopes,
@@ -2325,7 +2325,7 @@ impl<'program> Checker<'program> {
             }
             ForIncrement::Assignment(assignment) => {
                 self.check_expr(&assignment.value, scopes, method_context);
-                if let Some(target) = self.check_assignment_target(
+                if let Some(target) = self.check_writable_place(
                     &assignment.target,
                     &assignment.op,
                     scopes,
@@ -2452,72 +2452,36 @@ impl<'program> Checker<'program> {
         scopes: &ScopeStack,
         method_context: Option<&MethodContext>,
     ) {
-        self.check_increment_target(
-            &increment.target,
-            Self::increment_operator_name(&increment.op),
-            scopes,
-            method_context,
-        );
+        self.check_increment_target(&increment.target, &increment.op, scopes, method_context);
     }
 
     fn check_increment_target(
         &mut self,
         target: &Expr,
-        op_name: &'static str,
+        op: &IncrementOp,
         scopes: &ScopeStack,
         method_context: Option<&MethodContext>,
     ) {
-        match target {
-            Expr::Grouped { expr, .. } => {
-                self.check_increment_target(expr, op_name, scopes, method_context);
-            }
-            Expr::Variable { name, span } => {
-                let Some(binding) = scopes.lookup(name) else {
-                    self.undeclared_variable(name, *span);
-                    return;
-                };
+        let (op_name, assignment_op) = match op {
+            IncrementOp::Increment => ("++", AssignOp::AddAssign),
+            IncrementOp::Decrement => ("--", AssignOp::SubAssign),
+        };
+        let target_span = target.span();
+        let Some(place) =
+            self.check_writable_place(target, &assignment_op, scopes, method_context, None)
+        else {
+            return;
+        };
 
-                if !binding.writable {
-                    self.diagnostics.push(
-                        Diagnostic::new(
-                            "E0201",
-                            format!("cannot increment readonly local `${name}`"),
-                            *span,
-                        )
-                        .with_help(format!(
-                            "declare it as `let writable ${name} = ...` if mutation is intended"
-                        )),
-                    );
-                }
-
-                if matches!(
-                    self.types.kind(binding.ty),
-                    TypeKind::Integer(_) | TypeKind::Float(_) | TypeKind::Unknown
-                ) {
-                    return;
-                }
-
-                self.diagnostics.push(Diagnostic::new(
-                    "E0423",
-                    format!("{op_name} requires a writable integer or float target"),
-                    *span,
-                ));
-            }
-            _ => {
-                self.check_expr(target, scopes, method_context);
-                self.diagnostics.push(Diagnostic::new(
-                    "E0204",
-                    "unsupported increment target",
-                    target.span(),
-                ));
-            }
-        }
-    }
-
-    fn increment_operator_name(op: &IncrementOp) -> &'static str {
-        match op {
-            IncrementOp::Increment => "++",
-            IncrementOp::Decrement => "--",
+        if !matches!(
+            self.types.kind(place.ty),
+            TypeKind::Integer(_) | TypeKind::Float(_) | TypeKind::Unknown
+        ) {
+            self.diagnostics.push(Diagnostic::new(
+                "E0423",
+                format!("{op_name} requires a writable integer or float target"),
+                target_span,
+            ));
         }
     }
 
@@ -3825,7 +3789,7 @@ impl<'program> Checker<'program> {
         }
     }
 
-    fn check_assignment_target(
+    fn check_writable_place(
         &mut self,
         target: &Expr,
         op: &AssignOp,
@@ -3834,7 +3798,7 @@ impl<'program> Checker<'program> {
         constructor_init_context: Option<&mut ConstructorInitContext>,
     ) -> Option<AssignmentTarget> {
         match target {
-            Expr::Grouped { expr, .. } => self.check_assignment_target(
+            Expr::Grouped { expr, .. } => self.check_writable_place(
                 expr,
                 op,
                 scopes,
@@ -3962,7 +3926,7 @@ impl<'program> Checker<'program> {
             _ => {
                 self.diagnostics.push(Diagnostic::new(
                     "E0204",
-                    "unsupported assignment target",
+                    "unsupported mutation target",
                     target.span(),
                 ));
                 None

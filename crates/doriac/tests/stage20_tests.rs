@@ -9,6 +9,8 @@ const STATICS_EXAMPLE: &str = include_str!("../../../examples/native/main_stage2
 const SELF_EXAMPLE: &str = include_str!("../../../examples/native/main_stage20_self.doria");
 const STATIC_CONSTRUCTOR_EXAMPLE: &str =
     include_str!("../../../examples/native/main_stage20_static_constructor.doria");
+const PROPERTY_READ_MODIFY_WRITE_EXAMPLE: &str =
+    include_str!("../../../examples/native/main_stage20_property_read_modify_write.doria");
 
 fn diagnostics(source: &str) -> Vec<doriac::diagnostics::Diagnostic> {
     doriac::check_source("stage20.doria", source).expect_err("source should be rejected")
@@ -530,6 +532,69 @@ function main(): void
 }
 "#;
     assert_diagnostic(source, "E0203");
+}
+
+#[test]
+fn property_read_modify_write_requires_a_writable_numeric_place() {
+    doriac::check_source(
+        "property-read-modify-write.doria",
+        PROPERTY_READ_MODIFY_WRITE_EXAMPLE,
+    )
+    .expect("writable numeric property and static places should be accepted");
+
+    let cases = [
+        (
+            r#"
+class Counter
+{
+    int $value = 0;
+    writable function increment(): void { $this->value++; }
+}
+"#,
+            "E0202",
+        ),
+        (
+            r#"
+class Counter
+{
+    writable int $value = 0;
+    function increment(): void { $this->value++; }
+}
+"#,
+            "E0201",
+        ),
+        (
+            r#"
+class Counter
+{
+    static int $value = 0;
+    static function increment(): void { Counter::value++; }
+}
+"#,
+            "E0202",
+        ),
+        (
+            r#"
+class Counter
+{
+    writable string $value = "zero";
+    writable function increment(): void { $this->value++; }
+}
+"#,
+            "E0423",
+        ),
+    ];
+    for (source, code) in cases {
+        assert_diagnostic(source, code);
+    }
+}
+
+#[test]
+fn property_read_modify_write_runs_in_the_mir_interpreter() {
+    let output = interpret(PROPERTY_READ_MODIFY_WRITE_EXAMPLE);
+    assert_eq!(output.stdout, b"3:2.5:3\n");
+    assert!(output.stderr.is_empty());
+    assert_eq!(output.exit_status, 0);
 }
 
 #[test]

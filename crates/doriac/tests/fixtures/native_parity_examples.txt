@@ -87,6 +87,7 @@ examples/native/main_stage20_constants.doria
 examples/native/main_stage20_displayable.doria
 examples/native/main_stage20_method_ownership.doria
 examples/native/main_stage20_parser.doria
+examples/native/main_stage20_property_read_modify_write.doria
 examples/native/main_stage20_statics.doria
 examples/native/main_stage20_static_constructor.doria
 examples/native/main_stage20_self.doria

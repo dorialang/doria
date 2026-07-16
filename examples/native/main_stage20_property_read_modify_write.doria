@@ -1,0 +1,46 @@
+class Counter
+{
+    function __construct(
+        writable int $value,
+        writable float $ratio,
+    )
+    {
+    }
+
+    writable function increment(): void
+    {
+        $this->value++;
+        $this->value += 2;
+        $this->ratio++;
+    }
+}
+
+class Totals
+{
+    static writable int $value = 0;
+
+    static function increment(): void
+    {
+        Totals::value++;
+        Totals::value += 2;
+    }
+}
+
+function advance(writable Counter $counter): void
+{
+    $counter->increment();
+}
+
+function main(): void
+{
+    let writable $counter = new Counter(0, 1.5);
+    advance($counter);
+    Totals::increment();
+
+    echo $counter->value;
+    echo ":";
+    echo $counter->ratio;
+    echo ":";
+    echo Totals::value;
+    echo "\n";
+}
