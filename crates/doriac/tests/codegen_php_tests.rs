@@ -25,14 +25,17 @@ fn php_backend_emits_folded_copy_scalar_parameter_defaults() {
     let php = doriac::compile_source_to_php(
         "folded-defaults.doria",
         r#"
-function sample(float $ratio = 1.0 / 2.0, bool $ordered = 1 < 2): void
+function sample(int $count = 1 + 2, float $ratio = 1.0 / 2.0, bool $ordered = 1 < 2): void
 {
 }
 "#,
     )
     .expect("const-evaluable Copy-scalar defaults should lower to PHP literals");
 
-    assert!(php.contains("function sample(float $ratio = 0.5, bool $ordered = true): void"));
+    assert!(php.contains(
+        "function sample(int $count = 3, float $ratio = 0.5, bool $ordered = true): void"
+    ));
+    assert!(!php.contains("$count = 1 + 2"));
     assert!(!php.contains("$ratio = fdiv("));
     assert!(!php.contains("$ordered = __doria_less("));
 }

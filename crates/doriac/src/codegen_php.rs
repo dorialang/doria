@@ -214,7 +214,10 @@ fn validate_evaluated_value(
     key: &ConstKey,
     span: Span,
 ) -> Result<(), BackendError> {
-    let value = evaluated_value(&semantic_info.const_evaluation, key);
+    validate_const_value(evaluated_value(&semantic_info.const_evaluation, key), span)
+}
+
+fn validate_const_value(value: &ConstValue, span: Span) -> Result<(), BackendError> {
     match value {
         ConstValue::Integer(value) if !value.ty.is_default_int() => Err(unsupported_integer_shape(
             span,
@@ -257,7 +260,7 @@ fn validate_function(
             function.name
         )));
     }
-    for param in &function.params {
+    for (parameter_index, param) in function.params.iter().enumerate() {
         if param.take && is_move_type(&param.ty, semantic_info) {
             return Err(unsupported_ownership_shape(
                 param.span,
@@ -265,8 +268,20 @@ fn validate_function(
             ));
         }
         validate_type(&param.ty, param.span)?;
-        if let Some(default) = &param.default {
-            validate_expr(default, semantic_info)?;
+        if param.default.is_some() {
+            let default = semantic_info
+                .parameter_defaults
+                .get(&ParameterDefaultKey {
+                    function_start: function.span.start,
+                    parameter_index,
+                })
+                .ok_or_else(|| {
+                    BackendError::new(format!(
+                        "compiler invariant violated: checked default for parameter `${}` has no folded value",
+                        param.name
+                    ))
+                })?;
+            validate_const_value(default, param.span)?;
         }
     }
     if let Some(return_type) = &function.return_type {
