@@ -2,7 +2,7 @@
 
 Status: Accepted
 
-> Terminology note (added post-acceptance). This record predates record 0085, which settled stdlib namespace spelling. Forward references to the terminal and I/O modules originally read std::term / std::io — an informal Rust-shaped shorthand that was never a decided spelling — and have been corrected to Doria\Std\Term / Doria\Std\Io. The decision this record makes is unchanged.
+> Terminology note (added post-acceptance). This record predates the namespace-model decision, which settled stdlib namespace spelling. Forward references to the terminal and I/O modules originally read std::term / std::io — an informal Rust-shaped shorthand that was never a decided spelling — and have been corrected to Doria\Std\Term / Doria\Std\Io. The decision this record makes is unchanged.
 
 ## Context
 
