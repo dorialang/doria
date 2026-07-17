@@ -1847,10 +1847,28 @@ impl<'program> Checker<'program> {
             .expect("parameter-default validation requires a default");
         let kind = self.types.kind(ty).clone();
 
-        if matches!(kind, TypeKind::String | TypeKind::NullableString) {
+        if matches!(kind, TypeKind::String) && param.take {
             self.diagnostics.push(Diagnostic::new(
                 "E0498",
-                "default values for string parameters are not yet supported",
+                "default values for `take string` parameters are not yet supported",
+                default.span(),
+            ));
+            return;
+        }
+
+        if matches!(kind, TypeKind::String) && param.writable {
+            self.diagnostics.push(Diagnostic::new(
+                "E0498",
+                "default values for `writable string` parameters are not yet supported",
+                default.span(),
+            ));
+            return;
+        }
+
+        if matches!(kind, TypeKind::NullableString) {
+            self.diagnostics.push(Diagnostic::new(
+                "E0498",
+                "default values for nullable string parameters are not yet supported",
                 default.span(),
             ));
             return;
@@ -1867,7 +1885,7 @@ impl<'program> Checker<'program> {
 
         if !matches!(
             kind,
-            TypeKind::Integer(_) | TypeKind::Float(_) | TypeKind::Bool
+            TypeKind::Integer(_) | TypeKind::Float(_) | TypeKind::Bool | TypeKind::String
         ) {
             self.diagnostics.push(Diagnostic::new(
                 "E0498",

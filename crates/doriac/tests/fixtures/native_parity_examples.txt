@@ -92,6 +92,7 @@ examples/native/main_stage20_statics.doria
 examples/native/main_stage20_static_constructor.doria
 examples/native/main_stage20_self.doria
 examples/native/main_stage20a_copy_scalar_defaults.doria
+examples/native/main_stage20b_const_string_defaults.doria
 examples/native/main_string_concat_hello.doria
 examples/native/main_string_comparison_42.doria
 examples/native/main_string_local_hello.doria

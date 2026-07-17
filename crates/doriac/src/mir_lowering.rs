@@ -2866,7 +2866,7 @@ fn append_omitted_trailing_defaults(
                     span,
                 )]
             })?;
-        args.push(lower_copy_scalar_default(
+        args.push(lower_const_parameter_default(
             value,
             signature.parameter_types[index],
             span,
@@ -2875,11 +2875,17 @@ fn append_omitted_trailing_defaults(
     Ok(())
 }
 
-fn lower_copy_scalar_default(
+fn lower_const_parameter_default(
     value: &crate::const_eval::ConstValue,
     expected: mir::Type,
     span: Span,
 ) -> DiagnosticResult<mir::Rvalue> {
+    if let (crate::const_eval::ConstValue::String(value), mir::Type::String) = (value, expected) {
+        return Ok(mir::Rvalue::String(mir::StringExpression::Literal(
+            value.clone(),
+        )));
+    }
+
     let value = match (value, expected) {
         (
             crate::const_eval::ConstValue::Integer(value),
@@ -2901,7 +2907,7 @@ fn lower_copy_scalar_default(
         _ => {
             return Err(vec![Diagnostic::new(
                 "I2003",
-                "checked parameter default does not match its Copy-scalar MIR type",
+                "checked parameter default does not match its MIR parameter type",
                 span,
             )]);
         }

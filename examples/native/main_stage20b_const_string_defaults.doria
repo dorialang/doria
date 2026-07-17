@@ -1,0 +1,54 @@
+class Labels
+{
+    const string GREETING = "hi";
+}
+
+class Greeter
+{
+    function __construct(string $prefix = Labels::GREETING)
+    {
+    }
+
+    function instanceLabel(string $label = "instance"): string
+    {
+        return $label;
+    }
+
+    static function staticLabel(string $label = Labels::GREETING): string
+    {
+        return $label;
+    }
+
+    function __destruct()
+    {
+        echo "drop:" . $this->prefix . "\n";
+    }
+}
+
+function greeting(string $label = "hi"): string
+{
+    return $label;
+}
+
+function scalarThenString(int $count = 2, string $label = "items"): string
+{
+    return $count . ":" . $label;
+}
+
+function stringThenScalar(string $label = "items", int $count = 2): string
+{
+    return $label . ":" . $count;
+}
+
+function main(): void
+{
+    let $defaultGreeter = new Greeter();
+    let $explicitGreeter = new Greeter("hello");
+
+    echo $defaultGreeter->prefix . ":" . $explicitGreeter->prefix;
+    echo ":" . greeting() . ":" . greeting("yo");
+    echo ":" . $defaultGreeter->instanceLabel() . ":" . $defaultGreeter->instanceLabel("custom");
+    echo ":" . Greeter::staticLabel() . ":" . Greeter::staticLabel("static");
+    echo ":" . scalarThenString() . ":" . scalarThenString(3) . ":" . scalarThenString(3, "things");
+    echo ":" . stringThenScalar("units") . "\n";
+}

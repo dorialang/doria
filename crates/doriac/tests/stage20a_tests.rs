@@ -64,14 +64,24 @@ function main(): int
 
 #[test]
 fn deferred_default_categories_have_stable_semantic_diagnostics() {
-    let string = default_diagnostic(
+    let writable_string = default_diagnostic(
         r#"
-function label(string $value = "guest"): string { return $value; }
+function label(writable string $value = "guest"): string { return $value; }
 "#,
     );
     assert_eq!(
-        string.message,
-        "default values for string parameters are not yet supported"
+        writable_string.message,
+        "default values for `writable string` parameters are not yet supported"
+    );
+
+    let take_string = default_diagnostic(
+        r#"
+function label(take string $value = "guest"): string { return $value; }
+"#,
+    );
+    assert_eq!(
+        take_string.message,
+        "default values for `take string` parameters are not yet supported"
     );
 
     let move_type = default_diagnostic(

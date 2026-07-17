@@ -17,8 +17,8 @@ presence flags, multiple native ABIs, or backend-specific behavior.
 
 ### Supported defaults
 
-The current native slice supports const-evaluable defaults for Copy scalar
-parameters:
+The native default-argument slice supports const-evaluable defaults for Copy
+scalar parameters:
 
 - `int`, `int8`, `int16`, `int32`, and `int64`;
 - `uint8`, `uint16`, `uint32`, and `uint64`;
@@ -47,6 +47,27 @@ class Counter
 }
 ```
 
+Const-evaluable `string` defaults are also supported for readonly parameters.
+The accepted value may be a string literal or a const string expression from the
+Stage 20 constant-evaluation tier, including an accessible class constant:
+
+```doria
+class Labels
+{
+    const string GREETING = "Hello";
+}
+
+function greet(string $message = Labels::GREETING): void
+{
+    echo $message;
+}
+```
+
+At an omitted call position, the caller materializes the folded value exactly as
+it materializes an explicit string-literal argument. The callee borrows that
+caller-owned temporary through the existing string parameter ABI, and the caller
+releases it after the call. This adds no new MIR node or backend primitive.
+
 ### Caller-side splice
 
 Every native callable retains one full-arity MIR and backend ABI. At each call,
@@ -64,12 +85,13 @@ future work.
 
 ### Deferred defaults
 
-Const-literal `string` defaults are a committed near-future addition, not a
-permanent rejection. Until their per-call runtime-string materialization is
-implemented, semantic checking reports:
+Defaults on `writable string` and `take string` parameters remain deferred until
+their mutation and ownership obligations are settled. They use distinct
+temporary diagnostics:
 
 ```text
-default values for string parameters are not yet supported
+default values for `writable string` parameters are not yet supported
+default values for `take string` parameters are not yet supported
 ```
 
 Defaults for move types and `take` parameters remain deferred to ownership work
@@ -90,9 +112,10 @@ default values for move-type or `take` parameters are not yet supported
 - **Reject all writable defaults:** rejected because writable Copy scalars have
   no ownership or destruction obligation; doing so would also break writable
   constructor promotion for scalar properties.
-- **Implement string and move defaults together:** deferred because strings need
-  runtime value materialization and move values need ownership accounting. Neither
-  should weaken or complicate the scalar slice.
+- **Implement writable/take string and move defaults with readonly strings:**
+  rejected because readonly string defaults reuse the established borrowed
+  string-argument lifetime, while the other forms still require mutation or
+  ownership decisions.
 
 ## Consequences
 
@@ -103,8 +126,8 @@ default values for move-type or `take` parameters are not yet supported
   corresponding defaults.
 - Default values are folded once into compiler semantic data and carried through
   callable signatures; MIR lowering does not reimplement constant evaluation.
-- Adding string defaults later extends value materialization without changing
-  arity handling or native callable ABI.
+- Const string defaults extend value materialization without changing arity
+  handling or the native callable ABI.
 
 ## Affected components
 
@@ -118,5 +141,7 @@ tests, the language specification, status documentation, and the master plan.
   parameters.
 - Status documentation that described Stage 20 as the highest completed native
   compiler slice.
-- Tests that treated string and runtime-expression defaults as currently accepted
-  by semantic checking.
+- Tests that treated readonly string defaults as unsupported by semantic
+  checking.
+- The temporary E0498 message that rejected every string default without
+  distinguishing readonly borrowing from writable or consuming parameters.
