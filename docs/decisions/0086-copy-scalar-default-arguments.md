@@ -13,6 +13,12 @@ Stage 20's bounded constant evaluator and full native callable signatures make a
 narrow first executable slice possible without defining move-value construction,
 presence flags, multiple native ABIs, or backend-specific behavior.
 
+Provenance note. This record was briefly authored as 0085 before renumbering to
+0086. The number 0085 was already reserved for the namespace-model decision (plan
+§12) and cross-referenced by record 0074 a day before this record existed, so the
+0085 assignment was a collision rather than a durable citation. 0085 belongs to
+the namespace model; this record is 0086.
+
 ## Decision
 
 ### Supported defaults
