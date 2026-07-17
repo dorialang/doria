@@ -434,6 +434,35 @@ if ($namingAuthority !== false) {
 
 }
 
+// Keep the human-facing and executable native status claims synchronized
+// without hard-coding the current stage into this guard.
+$readmeStatusPath = 'README.md';
+$parityStatusPath = 'crates/doriac/tests/fixtures/native_parity_examples.txt';
+$readmeStatus = file_get_contents($root . '/' . $readmeStatusPath);
+$parityStatus = file_get_contents($root . '/' . $parityStatusPath);
+$readmeStage = null;
+$parityStage = null;
+
+if ($readmeStatus === false) {
+    $failures[] = "{$readmeStatusPath}: unable to read native status claim";
+} elseif (preg_match('/Stages\s+\d+(?:–|-)\s*([0-9]+[a-z]?)\s+are implemented/iu', $readmeStatus, $matches) !== 1) {
+    $failures[] = "{$readmeStatusPath}: missing implemented native stage range";
+} else {
+    $readmeStage = strtolower($matches[1]);
+}
+
+if ($parityStatus === false) {
+    $failures[] = "{$parityStatusPath}: unable to read native status claim";
+} elseif (preg_match('/Highest completed stage:\s*Stage\s+([0-9]+[a-z]?)/i', $parityStatus, $matches) !== 1) {
+    $failures[] = "{$parityStatusPath}: missing highest completed stage header";
+} else {
+    $parityStage = strtolower($matches[1]);
+}
+
+if ($readmeStage !== null && $parityStage !== null && $readmeStage !== $parityStage) {
+    $failures[] = "native status claims disagree: {$readmeStatusPath} ends at Stage {$readmeStage}, but {$parityStatusPath} names Stage {$parityStage}";
+}
+
 if ($failures !== []) {
     fwrite(STDERR, "docs authority check failed:\n");
     foreach ($failures as $failure) {

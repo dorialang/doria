@@ -65,8 +65,10 @@ function greet(string $message = Labels::GREETING): void
 
 At an omitted call position, the caller materializes the folded value exactly as
 it materializes an explicit string-literal argument. The callee borrows that
-caller-owned temporary through the existing string parameter ABI, and the caller
-releases it after the call. This adds no new MIR node or backend primitive.
+caller-owned value through the existing string parameter ABI. An ordinary call
+releases the caller-owned temporary after the call; constructor promotion instead
+transfers that value into the promoted property, which releases it with the
+object. This adds no new MIR node or backend primitive.
 
 ### Caller-side splice
 
@@ -85,11 +87,12 @@ future work.
 
 ### Deferred defaults
 
-Defaults on `writable string` and `take string` parameters remain deferred until
-their mutation and ownership obligations are settled. They use distinct
-temporary diagnostics:
+Defaults on `?string`, `writable string`, and `take string` parameters
+remain deferred until their representation, mutation, and ownership obligations
+are settled. They use distinct temporary diagnostics:
 
 ```text
+default values for nullable string parameters are not yet supported
 default values for `writable string` parameters are not yet supported
 default values for `take string` parameters are not yet supported
 ```

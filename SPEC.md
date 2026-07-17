@@ -977,9 +977,9 @@ greet(123);           // error
 
 Only positional arguments are supported in the current slice. Required parameters cannot follow optional parameters until named arguments exist.
 
-Native execution currently supports omitted trailing defaults when the parameter is a fixed-width integer, float, bool, or readonly string and the default is accepted by the Stage 20 constant-evaluation tier. This applies uniformly to free functions, instance methods, static methods, and constructors. A writable Copy-scalar parameter may use such a default because writability does not change its ownership classification. For a readonly string parameter, the caller materializes the folded value as an ordinary string-literal argument and releases the temporary after the call. The compiler inserts each folded value at its omitted call position before MIR execution.
+Native execution currently supports omitted trailing defaults when the parameter is a fixed-width integer, float, bool, or readonly string and the default is accepted by the Stage 20 constant-evaluation tier. This applies uniformly to free functions, instance methods, static methods, and constructors. A writable Copy-scalar parameter may use such a default because writability does not change its ownership classification. For a readonly string parameter, the caller materializes the folded value as an ordinary string-literal argument. Ordinary call temporaries are released after the call; a constructor-promoted value is retained by the property and released with the object. The compiler inserts each folded value at its omitted call position before MIR execution.
 
-Defaults for `writable string`, `take string`, other move types, and `take` parameters remain deferred until their mutation, construction, and destruction obligations are implemented. Non-constant defaults are rejected before MIR. Named arguments remain separate future work.
+Defaults for `?string`, `writable string`, `take string`, other move types, and `take` parameters remain deferred until their representation, mutation, construction, and destruction obligations are implemented. Non-constant defaults are rejected before MIR. Named arguments remain separate future work.
 
 ## 10. Collection aliases
 

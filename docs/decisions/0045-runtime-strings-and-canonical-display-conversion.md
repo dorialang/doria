@@ -54,7 +54,9 @@ Stage 16 intentionally deferred full arbitrary-expression interpolation and clas
 - Evaluating a literal, local copy, call result, concatenation, or display conversion produces an owned temporary.
 - Rebinding acquires the new value before releasing the old local value.
 - Normal returns preserve the returned reference, then release owned string locals.
-- Call argument temporaries are released after the call.
+- Ordinary call argument temporaries are released after the call. A constructor
+  argument promoted into a property transfers that value to the property and is
+  released with the object instead.
 - Panic is abort-only and does not unwind or run cleanup.
 
 The runtime checks allocation size, allocation failure, and reference-count overflow/underflow. Fatal failures use the existing status-101 panic path.

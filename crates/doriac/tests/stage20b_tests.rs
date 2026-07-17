@@ -83,6 +83,16 @@ fn every_call_kind_materializes_omitted_string_defaults_before_mir_execution() {
 
 #[test]
 fn deferred_string_ownership_modes_have_distinct_diagnostics() {
+    let nullable = default_diagnostic(
+        r#"
+function label(?string $value = null): ?string { return $value; }
+"#,
+    );
+    assert_eq!(
+        nullable.message,
+        "default values for nullable string parameters are not yet supported"
+    );
+
     let writable = default_diagnostic(
         r#"
 function label(writable string $value = "guest"): string { return $value; }
