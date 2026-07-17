@@ -28,9 +28,14 @@ conventions build on. Stage 21 is implementing borrow-returning accessors now.
 
 ## Decision
 
-Fluent chaining is supported, in **three explicit return conventions**. The
-convention is written in the return type; there is no implicit `self` return
-(the explicit-typing discipline).
+Fluent chaining is supported in **three conventions, distinguished by the
+receiver mode — not by a return annotation**. The return type is uniformly
+`: self`; whether a call yields a readonly borrow, a writable borrow, or an owned
+value is inferred from the receiver mode together with the §3.2 elision rule — a
+`self` return that derives from `$this` is a borrow under a `readonly`/`writable`
+receiver and owned only under a consuming receiver. This keeps borrow returns
+inferred rather than annotated, exactly as §3.2 requires; there is no return-side
+spelling to add.
 
 ### 1. Readonly self-return — accessor/query chains
 
@@ -46,11 +51,15 @@ is sequential, so the one-writer rule holds. Belongs with Stage 21.
 
 ### 3. Consuming self-return — ownership-transfer builders
 
-Receiver `take` (owned); returns the owned `self`. Ownership flows through the
-chain, so it works on temporaries and the **result is bindable**:
+Receiver consuming `$this` (owned); returns the owned `self`. Ownership flows
+through the chain, so it works on temporaries and the **result is bindable**:
 `let $store = new UserStore()->add($a)->add($b);`. This is the deferred third
 receiver mode reserved by the Stage 20 receiver-mode note; it is also what the
-DDO decision's consuming `Transaction::commit` (record 0084) needs.
+DDO decision's consuming `Transaction::commit` needs. **Its declaration spelling
+is deliberately not fixed here**: it must reuse the existing `take` ownership
+vocabulary for consistency, but the exact surface form is decided with the
+receiver-mode work, not this record — so convention 3 stays a semantic
+reservation until then.
 
 ### Owned temporaries are exclusive places
 
@@ -121,9 +130,9 @@ belong with Stage 21**, which is already implementing borrow-returning accessors
 and lifting the temporary native-eligibility gate (record 0083). Deciding them
 now avoids building the borrow checker on a "readonly getters only, temporaries
 stay readonly" assumption and reworking it later. Convention 3 (the consuming
-`take` receiver) is the deferred third receiver mode; it lands with the
-builder-finalizer / DDO consuming-commit work, and the receiver-mode
-representation already reserves room for it.
+receiver) is the deferred third receiver mode; it lands with the
+builder-finalizer / DDO consuming-commit work, which also fixes its declaration
+spelling, and the receiver-mode representation already reserves room for it.
 
 ## Affected components
 
