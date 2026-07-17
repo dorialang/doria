@@ -67,7 +67,9 @@ Stages 11–20a are implemented on the current compiler branch. Double-quoted st
 
 The interpreter, Cranelift fast profile, and LLVM release profile consume the same validated MIR. The durable parity suite compares exact stdin-driven output, panic text, status, file side effects, class lifetime behavior, method execution, statics, constants, and display conversion across all three paths. Stage 21 borrowing and full definite initialization remain future work.
 
-Watch this organization to follow along as the language, the `doriac` compiler, the `baton` build tool, and the standard library take shape.
+Official language-server and editor integrations are developed separately in [`dorialang/doria-language-server`](https://github.com/dorialang/doria-language-server), which consumes reusable `doriac` frontend services without duplicating compiler semantics.
+
+Watch this organization to follow along as the language, the `doriac` compiler, the language server, the `baton` build tool, and the standard library take shape.
 
 ---
 

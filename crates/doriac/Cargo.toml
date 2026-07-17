@@ -31,7 +31,3 @@ ryu.workspace = true
 [[bin]]
 name = "doriac"
 path = "src/main.rs"
-
-[[bin]]
-name = "doria-lsp"
-path = "src/bin/doria-lsp.rs"

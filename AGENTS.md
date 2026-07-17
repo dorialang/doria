@@ -89,7 +89,7 @@ The procedure is deliberately mechanical, because judgment is what fails here. G
 - After an edit, grep for what the edit just made false.
 - Before accepting a new rule, name what the rule invalidates. A rule with no listed casualties has not been checked.
 - When writing a guard, a lint, or a CI check, enumerate the forms the fact takes rather than the form in front of you. A pattern matched against one example is an example, not a pattern.
-- Sweep the whole tree, not the file being edited: `docs/`, `docs/decisions/`, `SPEC.md`, `README.md`, `AGENTS.md`, `examples/**`, `editors/**`, tests, fixtures, and diagnostic snapshots.
+- Sweep the whole tree, not the file being edited: `docs/`, `docs/decisions/`, `SPEC.md`, `README.md`, `AGENTS.md`, `examples/**`, tests, fixtures, and diagnostic snapshots. For editor-visible language changes, coordinate the corresponding work in `dorialang/doria-language-server`.
 - Fix what is in scope, report what is not, and never leave a falsified claim standing because it was outside the diff.
 
 Locally-correct fixes are this project's dominant defect source. Every recorded instance was caught late — by review or by acceptance testing — at the most expensive moment available.
@@ -237,7 +237,8 @@ These are identity, not scope deferral. They do not become available later, and 
 
 ### Tooling and ecosystem
 
-- Do not make Doria editor support VS Code-only. Keep VS Code and IntelliJ / JetBrains syntax highlighting aligned.
+- Language-server transport, syntax highlighting, shared editor fixtures, and IDE clients live in `dorialang/doria-language-server`; do not add them back to this compiler repository.
+- Keep compiler frontend services reusable by `doria-language-server`, and coordinate protocol/editor updates when language behavior changes.
 - Treat TextMate/editor highlighting as editor UX only, not lexer, parser, compiler, or LSP semantic-token support.
 - Use `doria` fences for Doria Markdown examples. Keep `php` fences only for generated PHP, PHP interop, or PHP migration input/output.
 - Planned Doria keywords may be highlighted in editor tooling to keep docs readable, but highlighting must never be described as compiler implementation.
@@ -309,11 +310,10 @@ cargo run -p doriac -- compile examples/native/main_return_42.doria --target nat
 cargo run -p doriac -- compile examples/native/main_void_hello.doria --target native --out build/native/main_void_hello
 ```
 
-Run documentation and editor guardrails for docs/editor changes:
+Run documentation guardrails for documentation changes:
 
 ```bash
 php scripts/check_docs_authority.php
-php scripts/check_editor_highlighting.php
 ```
 
 Run backend-specific checks only when the touched task depends on that backend. For the current PHP compatibility backend:

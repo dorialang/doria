@@ -4,17 +4,12 @@
 **/.gradle/
 **/.kotlin/
 **/out/
-editors/intellij/doria/bin/
 /.DS_Store
 **/.DS_Store
 *.php
 !examples/**/*.php
 !scripts/*.php
-node_modules/
 vendor/
 *.log
-*.vsix
 .idea
-.intellijPlatform
-.vscode
 /bin/

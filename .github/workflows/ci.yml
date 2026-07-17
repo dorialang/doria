@@ -107,12 +107,11 @@ jobs:
           cargo test -p doriac --test mir_validation_tests --locked --verbose
           cargo test -p doriac --test cranelift_mir_tests --locked --verbose
 
-      - name: Run focused Stage 18 parser, semantic, diagnostic, and LSP tests
+      - name: Run focused Stage 18 parser, semantic, and diagnostic tests
         run: |
           cargo test -p doriac --test parser_tests --locked --verbose
           cargo test -p doriac --test semantic_tests --locked --verbose
           cargo test -p doriac --test stage18_tests --locked --verbose
-          cargo test -p doriac --test lsp_tests --locked --verbose
 
       - name: Run focused MIR and linker-independent Cranelift tests
         run: |
@@ -186,9 +185,6 @@ jobs:
             find scripts -type f -name '*.py' -print
             exit 1
           fi
-
-      - name: Check editor highlighting
-        run: php scripts/check_editor_highlighting.php
 
       - name: Check documentation authority
         run: php scripts/check_docs_authority.php

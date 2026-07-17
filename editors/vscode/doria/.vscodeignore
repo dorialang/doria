@@ -1,5 +1,0 @@
-.node-version
-.vscode/**
-.vscode-test/**
-node_modules/**
-*.vsix

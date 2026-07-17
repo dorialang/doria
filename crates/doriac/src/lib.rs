@@ -15,7 +15,6 @@ pub mod format_string;
 pub mod hir;
 pub mod lexer;
 pub mod lowering;
-pub mod lsp;
 pub mod mir;
 pub mod mir_interpreter;
 pub mod mir_lowering;
