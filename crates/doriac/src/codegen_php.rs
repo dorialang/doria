@@ -161,11 +161,10 @@ fn validate_item(item: &Item, semantic_info: &SemanticInfo) -> Result<(), Backen
                             )?;
                         } else if let Some(initializer) = &property.initializer {
                             validate_expr(initializer, semantic_info)?;
-                            if let Some(span) = static_property_read(initializer, semantic_info) {
-                                return Err(unsupported_constant_shape(
-                                    span,
-                                    "instance property initializers that read static properties",
-                                ));
+                            if let Some((span, feature)) =
+                                unsupported_property_default(initializer, semantic_info)
+                            {
+                                return Err(unsupported_constant_shape(span, feature));
                             }
                         }
                     }
@@ -652,7 +651,10 @@ fn validate_exprs(expressions: &[Expr], semantic_info: &SemanticInfo) -> Result<
     Ok(())
 }
 
-fn static_property_read(expr: &Expr, semantic_info: &SemanticInfo) -> Option<Span> {
+fn unsupported_property_default(
+    expr: &Expr,
+    semantic_info: &SemanticInfo,
+) -> Option<(Span, &'static str)> {
     match expr {
         Expr::StaticMember {
             class_name,
@@ -666,40 +668,46 @@ fn static_property_read(expr: &Expr, semantic_info: &SemanticInfo) -> Option<Spa
                 name: member.clone(),
             }) =>
         {
-            Some(*span)
+            Some((
+                *span,
+                "instance property initializers that read static properties",
+            ))
         }
         Expr::InterpolatedString { parts, .. } => parts.iter().find_map(|part| match part {
-            InterpolatedStringPart::Expr(expr) => static_property_read(expr, semantic_info),
+            InterpolatedStringPart::Expr(expr) => unsupported_property_default(expr, semantic_info),
             InterpolatedStringPart::Text { .. } => None,
         }),
         Expr::Array { elements, .. } => elements.iter().find_map(|element| {
             element
                 .key
                 .as_ref()
-                .and_then(|key| static_property_read(key, semantic_info))
-                .or_else(|| static_property_read(&element.value, semantic_info))
+                .and_then(|key| unsupported_property_default(key, semantic_info))
+                .or_else(|| unsupported_property_default(&element.value, semantic_info))
         }),
         Expr::PropertyAccess { object, .. } | Expr::Grouped { expr: object, .. } => {
-            static_property_read(object, semantic_info)
+            unsupported_property_default(object, semantic_info)
         }
-        Expr::MethodCall { object, args, .. } => static_property_read(object, semantic_info)
-            .or_else(|| {
+        Expr::MethodCall { object, args, .. } => {
+            unsupported_property_default(object, semantic_info).or_else(|| {
                 args.iter()
-                    .find_map(|arg| static_property_read(arg, semantic_info))
-            }),
-        Expr::FunctionCall { args, .. }
-        | Expr::StaticCall { args, .. }
-        | Expr::New { args, .. } => args
+                    .find_map(|arg| unsupported_property_default(arg, semantic_info))
+            })
+        }
+        Expr::StaticCall { span, .. } => Some((
+            *span,
+            "instance property initializers that call static methods",
+        )),
+        Expr::FunctionCall { args, .. } | Expr::New { args, .. } => args
             .iter()
-            .find_map(|arg| static_property_read(arg, semantic_info)),
-        Expr::Unary { expr, .. } => static_property_read(expr, semantic_info),
+            .find_map(|arg| unsupported_property_default(arg, semantic_info)),
+        Expr::Unary { expr, .. } => unsupported_property_default(expr, semantic_info),
         Expr::Binary { left, right, .. }
         | Expr::Range {
             start: left,
             end: right,
             ..
-        } => static_property_read(left, semantic_info)
-            .or_else(|| static_property_read(right, semantic_info)),
+        } => unsupported_property_default(left, semantic_info)
+            .or_else(|| unsupported_property_default(right, semantic_info)),
         Expr::Variable { .. }
         | Expr::This { .. }
         | Expr::Identifier { .. }

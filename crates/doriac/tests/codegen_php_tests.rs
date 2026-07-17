@@ -1627,6 +1627,27 @@ class Counter
 }
 
 #[test]
+fn php_backend_rejects_static_calls_in_instance_property_defaults() {
+    let source = r#"
+class Factory
+{
+    int $value = Factory::seed();
+    internal static function seed(): int { return 42; }
+}
+"#;
+    doriac::check_source("static-call-in-property.doria", source)
+        .expect("Doria property initializers may call declaring-class static methods");
+    let diagnostics = doriac::compile_source_to_php("static-call-in-property.doria", source)
+        .expect_err("PHP cannot emit a static call in an instance property default");
+    assert!(diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == "B2001"
+            && diagnostic
+                .message
+                .contains("instance property initializers that call static methods")
+    }));
+}
+
+#[test]
 fn php_backend_emits_int_min_constants_without_php_literal_overflow() {
     let php = doriac::compile_source_to_php(
         "int-min-constant.doria",

@@ -629,6 +629,29 @@ fn property_read_modify_write_requires_a_writable_numeric_place() {
     )
     .expect("writable numeric property and static places should be accepted");
 
+    for source in [
+        r#"
+class Counter
+{
+    writable int $value = 0;
+    function __construct() { $this->value++; }
+}
+"#,
+        r#"
+class Counter
+{
+    writable int $value = 0;
+    function __construct()
+    {
+        for (let writable $index = 0; $index < 1; $this->value++) { $index++; }
+    }
+}
+"#,
+    ] {
+        doriac::check_source("constructor-property-increment.doria", source)
+            .expect("constructor init access should cover property increments");
+    }
+
     let cases = [
         (
             r#"

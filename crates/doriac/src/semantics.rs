@@ -2163,7 +2163,12 @@ impl<'program> Checker<'program> {
                     loop_depth + 1,
                 );
                 if let Some(increment) = &for_stmt.increment {
-                    self.check_for_increment(increment, scopes, method_context);
+                    self.check_for_increment(
+                        increment,
+                        scopes,
+                        method_context,
+                        loop_constructor_init_context.as_mut(),
+                    );
                 }
                 scopes.pop();
             }
@@ -2303,7 +2308,12 @@ impl<'program> Checker<'program> {
                 scopes.pop();
             }
             Stmt::Increment(increment) => {
-                self.check_increment_statement(increment, scopes, method_context);
+                self.check_increment_statement(
+                    increment,
+                    scopes,
+                    method_context,
+                    constructor_init_context,
+                );
             }
         }
     }
@@ -2407,10 +2417,16 @@ impl<'program> Checker<'program> {
         increment: &ForIncrement,
         scopes: &mut ScopeStack,
         method_context: Option<&MethodContext>,
+        constructor_init_context: Option<&mut ConstructorInitContext>,
     ) {
         match increment {
             ForIncrement::Increment(increment) => {
-                self.check_increment_statement(increment, scopes, method_context);
+                self.check_increment_statement(
+                    increment,
+                    scopes,
+                    method_context,
+                    constructor_init_context,
+                );
             }
             ForIncrement::Assignment(assignment) => {
                 self.check_expr(&assignment.value, scopes, method_context);
@@ -2419,7 +2435,7 @@ impl<'program> Checker<'program> {
                     &assignment.op,
                     scopes,
                     method_context,
-                    None,
+                    constructor_init_context,
                 ) {
                     self.check_assignment_value(assignment, target, scopes, method_context);
                 }
@@ -2540,8 +2556,15 @@ impl<'program> Checker<'program> {
         increment: &IncrementStmt,
         scopes: &ScopeStack,
         method_context: Option<&MethodContext>,
+        constructor_init_context: Option<&mut ConstructorInitContext>,
     ) {
-        self.check_increment_target(&increment.target, &increment.op, scopes, method_context);
+        self.check_increment_target(
+            &increment.target,
+            &increment.op,
+            scopes,
+            method_context,
+            constructor_init_context,
+        );
     }
 
     fn check_increment_target(
@@ -2550,15 +2573,20 @@ impl<'program> Checker<'program> {
         op: &IncrementOp,
         scopes: &ScopeStack,
         method_context: Option<&MethodContext>,
+        constructor_init_context: Option<&mut ConstructorInitContext>,
     ) {
         let (op_name, assignment_op) = match op {
             IncrementOp::Increment => ("++", AssignOp::AddAssign),
             IncrementOp::Decrement => ("--", AssignOp::SubAssign),
         };
         let target_span = target.span();
-        let Some(place) =
-            self.check_writable_place(target, &assignment_op, scopes, method_context, None)
-        else {
+        let Some(place) = self.check_writable_place(
+            target,
+            &assignment_op,
+            scopes,
+            method_context,
+            constructor_init_context,
+        ) else {
             return;
         };
 
