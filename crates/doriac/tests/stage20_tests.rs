@@ -247,6 +247,29 @@ const string TEXT = MAYBE;
 }
 
 #[test]
+fn constant_comparisons_preserve_nullable_types_and_bidirectional_literal_context() {
+    let hir = doriac::lower_source(
+        "typed-constant-comparisons.doria",
+        r#"
+const ?string MAYBE = "value";
+const ?string NONE = null;
+const bool IS_SET = MAYBE != null;
+const bool IS_EMPTY = null == NONE;
+const int8 NARROW = 1;
+const bool NARROW_MATCHES = 1 == NARROW;
+"#,
+    )
+    .expect("constant comparisons should use declared operand types");
+    let values = &hir.semantic_info.const_evaluation.values;
+    for name in ["IS_SET", "IS_EMPTY", "NARROW_MATCHES"] {
+        assert!(matches!(
+            values[&ConstKey::TopLevel(name.to_string())].value,
+            ConstValue::Bool(true)
+        ));
+    }
+}
+
+#[test]
 fn class_callables_do_not_collide_with_top_level_entry_or_function_names() {
     lower(
         r#"
@@ -355,6 +378,27 @@ function main(): void
                 .message
                 .contains("constant evaluation cannot read writable static `Store::source`")
     }));
+}
+
+#[test]
+fn nullable_static_comparisons_use_nullable_mir_lowering() {
+    let output = interpret(
+        r#"
+class Config
+{
+    static ?string $maybe = null;
+}
+
+function main(): void
+{
+    if (Config::maybe == "value") { echo "wrong"; }
+    if (Config::maybe == null) { echo "ok"; }
+}
+"#,
+    );
+    assert_eq!(output.stdout, b"ok");
+    assert!(output.stderr.is_empty());
+    assert_eq!(output.exit_status, 0);
 }
 
 #[test]

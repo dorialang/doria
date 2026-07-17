@@ -1636,7 +1636,7 @@ impl<'semantic> LoweringContext<'semantic> {
             })
     }
 
-    fn constant_value(&self, expr: &hir::Expr) -> Option<&crate::const_eval::ConstValue> {
+    fn constant_decl(&self, expr: &hir::Expr) -> Option<&crate::const_eval::EvaluatedDecl> {
         let key = match expr {
             hir::Expr::Identifier { name, .. } => {
                 crate::const_eval::ConstKey::TopLevel(name.clone())
@@ -1647,14 +1647,18 @@ impl<'semantic> LoweringContext<'semantic> {
                 class_name: class_name.clone(),
                 name: member.clone(),
             },
-            hir::Expr::Grouped { expr, .. } => return self.constant_value(expr),
+            hir::Expr::Grouped { expr, .. } => return self.constant_decl(expr),
             _ => return None,
         };
-        self.semantic_info
-            .const_evaluation
-            .values
-            .get(&key)
-            .map(|value| &value.value)
+        self.semantic_info.const_evaluation.values.get(&key)
+    }
+
+    fn constant_value(&self, expr: &hir::Expr) -> Option<&crate::const_eval::ConstValue> {
+        self.constant_decl(expr).map(|decl| &decl.value)
+    }
+
+    fn constant_type(&self, expr: &hir::Expr) -> Option<crate::const_eval::ConstType> {
+        self.constant_decl(expr).map(|decl| decl.ty)
     }
 
     fn static_property(
@@ -1948,8 +1952,8 @@ fn is_nullable_string_initializer(expr: &hir::Expr, context: &LoweringContext) -
         hir::Expr::Null { .. } => true,
         hir::Expr::Grouped { expr, .. } => is_nullable_string_initializer(expr, context),
         _ if matches!(
-            context.constant_value(expr),
-            Some(crate::const_eval::ConstValue::String(_) | crate::const_eval::ConstValue::Null)
+            context.constant_type(expr),
+            Some(crate::const_eval::ConstType::NullableString | crate::const_eval::ConstType::Null)
         ) =>
         {
             true
@@ -3090,21 +3094,21 @@ fn lower_condition(
             | hir::BinaryOp::LessEqual
             | hir::BinaryOp::Greater
             | hir::BinaryOp::GreaterEqual => {
-                if is_string_local_initializer(left, context)
-                    || is_string_local_initializer(right, context)
-                {
-                    Ok(mir::BoolExpression::StringCompare {
-                        op: lower_compare_op(op),
-                        left: Box::new(lower_string_expression(left, context)?),
-                        right: Box::new(lower_string_expression(right, context)?),
-                    })
-                } else if is_nullable_string_initializer(left, context)
+                if is_nullable_string_initializer(left, context)
                     || is_nullable_string_initializer(right, context)
                 {
                     Ok(mir::BoolExpression::NullableStringCompare {
                         op: lower_compare_op(op),
                         left: Box::new(lower_nullable_string_expression(left, context)?),
                         right: Box::new(lower_nullable_string_expression(right, context)?),
+                    })
+                } else if is_string_local_initializer(left, context)
+                    || is_string_local_initializer(right, context)
+                {
+                    Ok(mir::BoolExpression::StringCompare {
+                        op: lower_compare_op(op),
+                        left: Box::new(lower_string_expression(left, context)?),
+                        right: Box::new(lower_string_expression(right, context)?),
                     })
                 } else {
                     Ok(mir::BoolExpression::Compare {

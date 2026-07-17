@@ -432,6 +432,11 @@ impl Evaluator {
                 right,
                 span,
             } => {
+                if Self::is_contextual_numeric_literal(left) {
+                    let right = self.evaluate_expr(right, expected, requester)?;
+                    let left = self.evaluate_expr(left, Some(right.ty), requester)?;
+                    return self.binary(op, left, right, *span).map(TypedValue::new);
+                }
                 let left = self.evaluate_expr(left, expected, requester)?;
                 match (op, &left.value) {
                     (BinaryOp::And, ConstValue::Bool(false)) => {
@@ -443,8 +448,7 @@ impl Evaluator {
                     _ => {}
                 }
                 let right = self.evaluate_expr(right, Some(left.ty), requester)?;
-                self.binary(op, left.value, right.value, *span)
-                    .map(TypedValue::new)
+                self.binary(op, left, right, *span).map(TypedValue::new)
             }
             Expr::StaticCall {
                 qualifier,
@@ -489,6 +493,19 @@ impl Evaluator {
             Expr::Int { value, .. } => Some(value),
             Expr::Grouped { expr, .. } => Self::integer_literal_text(expr),
             _ => None,
+        }
+    }
+
+    fn is_contextual_numeric_literal(expr: &Expr) -> bool {
+        match expr {
+            Expr::Int { .. } | Expr::Float { .. } => true,
+            Expr::Grouped { expr, .. }
+            | Expr::Unary {
+                op: UnaryOp::Negate,
+                expr,
+                ..
+            } => Self::is_contextual_numeric_literal(expr),
+            _ => false,
         }
     }
 
@@ -597,10 +614,37 @@ impl Evaluator {
     fn binary(
         &mut self,
         op: &BinaryOp,
-        left: ConstValue,
-        right: ConstValue,
+        left: TypedValue,
+        right: TypedValue,
         span: Span,
     ) -> Option<ConstValue> {
+        if matches!(op, BinaryOp::Equal | BinaryOp::NotEqual)
+            && (matches!(left.ty, ConstType::NullableString)
+                || matches!(right.ty, ConstType::NullableString))
+        {
+            let nullable_operand = |ty: ConstType| {
+                matches!(
+                    ty,
+                    ConstType::String | ConstType::Null | ConstType::NullableString
+                )
+            };
+            if nullable_operand(left.ty) && nullable_operand(right.ty) {
+                let equal = match (&left.value, &right.value) {
+                    (ConstValue::String(left), ConstValue::String(right)) => left == right,
+                    (ConstValue::Null, ConstValue::Null) => true,
+                    (ConstValue::String(_), ConstValue::Null)
+                    | (ConstValue::Null, ConstValue::String(_)) => false,
+                    _ => unreachable!("nullable string types carry only string or null values"),
+                };
+                return Some(ConstValue::Bool(if *op == BinaryOp::Equal {
+                    equal
+                } else {
+                    !equal
+                }));
+            }
+        }
+
+        let (left, right) = (left.value, right.value);
         if *op == BinaryOp::Concat
             && (matches!(&left, ConstValue::String(_)) || matches!(&right, ConstValue::String(_)))
         {
