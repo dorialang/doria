@@ -352,6 +352,72 @@ function main(): void
 }
 
 #[test]
+fn temporary_sources_of_returned_borrows_live_through_the_enclosing_statement() {
+    let source = r#"
+class Guard
+{
+    function __destruct() { echo "drop\n"; }
+}
+
+function identity(Guard $guard): Guard { return $guard; }
+function observe(Guard $guard): void { echo "observe\n"; }
+
+function main(): void
+{
+    observe(identity(new Guard()));
+    echo "after\n";
+}
+"#;
+    let program = doriac::lower_source_to_mir("stage21-temporary-borrow-source.doria", source)
+        .expect("a borrowed temporary source should lower to MIR");
+    doriac::mir_validation::validate_program(&program).expect("MIR should validate");
+    let output = doriac::mir_interpreter::interpret(&program).expect("MIR should interpret");
+    assert_eq!(output.stdout, b"observe\ndrop\nafter\n");
+    assert!(!doriac::codegen_cranelift::lower_mir_to_object(&program)
+        .expect("a borrowed temporary source should lower through Cranelift")
+        .is_empty());
+}
+
+#[test]
+fn borrowed_results_cannot_be_stored_in_owning_collection_literals() {
+    assert_diagnostic(
+        r#"
+class Guard
+{
+    function inspect(): self { return $this; }
+}
+
+function route(Guard $guard): void
+{
+    Guard[] $items = [$guard->inspect()];
+}
+"#,
+        "E0478",
+    );
+}
+
+#[test]
+fn shadowed_parameters_do_not_define_returned_borrow_provenance() {
+    assert_valid_mir(
+        r#"
+class Guard {}
+
+function make(Guard $guard): Guard
+{
+    let $guard = new Guard();
+    return $guard;
+}
+
+function main(): void
+{
+    let $input = new Guard();
+    let $output = make($input);
+}
+"#,
+    );
+}
+
+#[test]
 fn property_assignment_rejects_overlapping_direct_rhs_reads() {
     assert_diagnostic(
         r#"

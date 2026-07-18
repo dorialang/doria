@@ -267,7 +267,7 @@ pub(crate) fn check_program_with_inferred_move_returns(
 
 pub(crate) fn function_return_borrow(function: &ast::FunctionDecl) -> Option<ReturnBorrow> {
     let mut borrow = None;
-    if block_return_borrow(&function.body, function, &mut borrow).is_some() {
+    if block_return_borrow(&function.body, function, &HashSet::new(), &mut borrow).is_some() {
         borrow
     } else {
         None
@@ -277,14 +277,16 @@ pub(crate) fn function_return_borrow(function: &ast::FunctionDecl) -> Option<Ret
 fn block_return_borrow(
     block: &ast::Block,
     function: &ast::FunctionDecl,
+    inherited_shadowed: &HashSet<String>,
     borrow: &mut Option<ReturnBorrow>,
 ) -> Option<bool> {
+    let mut shadowed = inherited_shadowed.clone();
     let mut falls_through = true;
     for statement in &block.statements {
         if !falls_through {
             break;
         }
-        falls_through = statement_return_borrow(statement, function, borrow)?;
+        falls_through = statement_return_borrow(statement, function, &mut shadowed, borrow)?;
     }
     Some(falls_through)
 }
@@ -292,13 +294,14 @@ fn block_return_borrow(
 fn statement_return_borrow(
     statement: &Stmt,
     function: &ast::FunctionDecl,
+    shadowed: &mut HashSet<String>,
     borrow: &mut Option<ReturnBorrow>,
 ) -> Option<bool> {
     match statement {
         Stmt::Return {
             expr: Some(expr), ..
         } => {
-            let candidate = expr_return_borrow(expr, function)?;
+            let candidate = expr_return_borrow(expr, function, shadowed)?;
             match borrow {
                 Some(existing) if existing.source != candidate.source => None,
                 Some(existing) => {
@@ -312,67 +315,95 @@ fn statement_return_borrow(
             }
         }
         Stmt::Return { expr: None, .. } => None,
-        Stmt::If(statement) => {
-            let branch_return_borrow =
-                |branch: &ast::ElseBranch, borrow: &mut Option<ReturnBorrow>| match branch {
-                    ast::ElseBranch::If(statement) => {
-                        statement_return_borrow(&Stmt::If((**statement).clone()), function, borrow)
-                    }
-                    ast::ElseBranch::Block(block) => block_return_borrow(block, function, borrow),
-                };
-            match constant_bool(&statement.condition) {
-                Some(true) => block_return_borrow(&statement.then_block, function, borrow),
-                Some(false) => statement
+        Stmt::If(statement) => match constant_bool(&statement.condition) {
+            Some(true) => block_return_borrow(&statement.then_block, function, shadowed, borrow),
+            Some(false) => statement.else_branch.as_ref().map_or(Some(true), |branch| {
+                else_branch_return_borrow(branch, function, shadowed, borrow)
+            }),
+            None => {
+                let then_falls =
+                    block_return_borrow(&statement.then_block, function, shadowed, borrow)?;
+                let else_falls = statement
                     .else_branch
                     .as_ref()
-                    .map_or(Some(true), |branch| branch_return_borrow(branch, borrow)),
-                None => {
-                    let then_falls = block_return_borrow(&statement.then_block, function, borrow)?;
-                    let else_falls = statement
-                        .else_branch
-                        .as_ref()
-                        .map_or(Some(true), |branch| branch_return_borrow(branch, borrow))?;
-                    Some(then_falls || else_falls)
-                }
+                    .map_or(Some(true), |branch| {
+                        else_branch_return_borrow(branch, function, shadowed, borrow)
+                    })?;
+                Some(then_falls || else_falls)
             }
-        }
+        },
         Stmt::While(statement) => {
             if constant_bool(&statement.condition) != Some(false) {
-                block_return_borrow(&statement.body, function, borrow)?;
+                block_return_borrow(&statement.body, function, shadowed, borrow)?;
             }
             Some(true)
         }
         Stmt::For(statement) => {
+            let mut loop_shadowed = shadowed.clone();
+            if let Some(ast::ForInitializer::VarDecl(decl)) = &statement.initializer {
+                loop_shadowed.insert(decl.name.clone());
+            }
             if statement
                 .condition
                 .as_ref()
                 .is_none_or(|condition| constant_bool(condition) != Some(false))
             {
-                block_return_borrow(&statement.body, function, borrow)?;
+                block_return_borrow(&statement.body, function, &loop_shadowed, borrow)?;
             }
             Some(true)
         }
         Stmt::Foreach(statement) => {
-            block_return_borrow(&statement.body, function, borrow)?;
+            let mut loop_shadowed = shadowed.clone();
+            if let Some(key) = &statement.key {
+                loop_shadowed.insert(key.name.clone());
+            }
+            loop_shadowed.insert(statement.value.name.clone());
+            block_return_borrow(&statement.body, function, &loop_shadowed, borrow)?;
+            Some(true)
+        }
+        Stmt::VarDecl(decl) => {
+            shadowed.insert(decl.name.clone());
             Some(true)
         }
         Stmt::Break { .. } | Stmt::Continue { .. } => Some(false),
         Stmt::Expr { expr, .. } if is_panic_expr(expr) => Some(false),
-        Stmt::VarDecl(_)
-        | Stmt::Assignment(_)
-        | Stmt::Echo { .. }
-        | Stmt::Increment(_)
-        | Stmt::Expr { .. } => Some(true),
+        Stmt::Assignment(_) | Stmt::Echo { .. } | Stmt::Increment(_) | Stmt::Expr { .. } => {
+            Some(true)
+        }
     }
 }
 
-fn expr_return_borrow(expr: &Expr, function: &ast::FunctionDecl) -> Option<ReturnBorrow> {
+fn else_branch_return_borrow(
+    branch: &ast::ElseBranch,
+    function: &ast::FunctionDecl,
+    shadowed: &HashSet<String>,
+    borrow: &mut Option<ReturnBorrow>,
+) -> Option<bool> {
+    match branch {
+        ast::ElseBranch::If(statement) => {
+            let mut branch_shadowed = shadowed.clone();
+            statement_return_borrow(
+                &Stmt::If((**statement).clone()),
+                function,
+                &mut branch_shadowed,
+                borrow,
+            )
+        }
+        ast::ElseBranch::Block(block) => block_return_borrow(block, function, shadowed, borrow),
+    }
+}
+
+fn expr_return_borrow(
+    expr: &Expr,
+    function: &ast::FunctionDecl,
+    shadowed: &HashSet<String>,
+) -> Option<ReturnBorrow> {
     match expr {
         Expr::This { .. } if !function.is_static => Some(ReturnBorrow {
             source: BorrowSource::Receiver,
             writable: function.writable_this,
         }),
-        Expr::Variable { name, .. } => function
+        Expr::Variable { name, .. } if !shadowed.contains(name) => function
             .params
             .iter()
             .enumerate()
@@ -381,9 +412,9 @@ fn expr_return_borrow(expr: &Expr, function: &ast::FunctionDecl) -> Option<Retur
                 source: BorrowSource::Parameter(index),
                 writable: param.writable,
             }),
-        Expr::Grouped { expr, .. } => expr_return_borrow(expr, function),
+        Expr::Grouped { expr, .. } => expr_return_borrow(expr, function, shadowed),
         Expr::PropertyAccess { object, .. } => {
-            expr_return_borrow(object, function).map(|borrow| ReturnBorrow {
+            expr_return_borrow(object, function, shadowed).map(|borrow| ReturnBorrow {
                 writable: false,
                 ..borrow
             })
@@ -1596,6 +1627,18 @@ impl Checker {
     }
 
     fn use_owned_expression(&mut self, expr: &Expr, scopes: &mut Scopes) {
+        if self.expr_returns_borrow(expr, scopes) {
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "E0478",
+                    "borrowed result cannot be stored in an owning collection",
+                    expr.span(),
+                )
+                .with_help("store an independently owned value in the collection"),
+            );
+            self.use_expr(expr, scopes, UseMode::Read);
+            return;
+        }
         let mode = if self.expr_is_move_value(expr, scopes) {
             UseMode::Give
         } else {
