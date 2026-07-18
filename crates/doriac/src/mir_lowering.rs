@@ -760,16 +760,8 @@ fn lower_statement_sequence(
                 {
                     let (signature, args) =
                         lower_instance_method_call(object, method, args, *call_span, context)?;
-                    if signature.return_type != mir::ReturnType::Void {
-                        return Err(vec![unsupported(
-                            *span,
-                            "only void method calls can be used as expression statements",
-                        )]);
-                    }
-                    context.push_statement(mir::Statement::CallVoid {
-                        function: signature.id,
-                        args,
-                    });
+                    let statement = discarded_call_statement("method", signature, args, *span)?;
+                    context.push_statement(statement);
                     continue;
                 }
                 if let hir::Expr::StaticCall {
@@ -781,16 +773,9 @@ fn lower_statement_sequence(
                 {
                     let (signature, args) =
                         lower_static_method_call(class_name, method, args, *call_span, context)?;
-                    if signature.return_type != mir::ReturnType::Void {
-                        return Err(vec![unsupported(
-                            *span,
-                            "only void static calls can be used as expression statements",
-                        )]);
-                    }
-                    context.push_statement(mir::Statement::CallVoid {
-                        function: signature.id,
-                        args,
-                    });
+                    let statement =
+                        discarded_call_statement("static method", signature, args, *span)?;
+                    context.push_statement(statement);
                     continue;
                 }
                 if let hir::Expr::FunctionCall {
@@ -828,7 +813,7 @@ fn lower_statement_sequence(
                             lower_string_expression(value, context)?,
                         ));
                     } else {
-                        let call = lower_void_call(name, args, *call_span, context)?;
+                        let call = lower_statement_call(name, args, *call_span, context)?;
                         context.push_statement(call);
                     }
                 } else {
@@ -2764,24 +2749,42 @@ fn append_string_concat_parts(
     }
 }
 
-fn lower_void_call(
+fn lower_statement_call(
     name: &str,
     args: &[hir::Expr],
     span: Span,
     context: &LoweringContext,
 ) -> DiagnosticResult<mir::Statement> {
     let signature = context.lookup_function(name, span)?;
-    if signature.return_type != mir::ReturnType::Void {
-        return Err(vec![unsupported(
-            span,
-            format!("non-void function `{name}` cannot be used as a statement"),
-        )]);
-    }
+    let args = lower_call_args(name, args, signature.clone(), span, context)?;
+    discarded_call_statement("function", signature, args, span)
+}
 
-    Ok(mir::Statement::CallVoid {
-        function: signature.id,
-        args: lower_call_args(name, args, signature, span, context)?,
-    })
+fn discarded_call_statement(
+    kind: &str,
+    signature: FunctionSignature,
+    args: Vec<mir::Rvalue>,
+    span: Span,
+) -> DiagnosticResult<mir::Statement> {
+    let statement = match signature.return_type {
+        mir::ReturnType::Void => mir::Statement::CallVoid {
+            function: signature.id,
+            args,
+        },
+        mir::ReturnType::Value(mir::Type::Class(_)) if signature.return_borrow.is_some() => {
+            mir::Statement::CallBorrowed {
+                function: signature.id,
+                args,
+            }
+        }
+        mir::ReturnType::Value(_) => {
+            return Err(vec![unsupported(
+                span,
+                format!("non-void {kind} call cannot be used as a statement"),
+            )]);
+        }
+    };
+    Ok(statement)
 }
 
 fn lower_integer_call(

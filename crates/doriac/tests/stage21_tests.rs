@@ -322,3 +322,166 @@ function route(mixed $value): void { update($value); }
         "E0479",
     );
 }
+
+#[test]
+fn borrowed_call_arguments_are_never_dropped_as_owned_temporaries() {
+    let source = r#"
+class Guard
+{
+    function inspect(): self { return $this; }
+    function __destruct() { echo "drop\n"; }
+}
+
+function observe(Guard $guard): void {}
+
+function main(): void
+{
+    let $guard = new Guard();
+    observe($guard->inspect());
+    echo "alive\n";
+}
+"#;
+    let program = doriac::lower_source_to_mir("stage21-borrowed-temporary.doria", source)
+        .expect("borrowed arguments should lower to MIR");
+    doriac::mir_validation::validate_program(&program).expect("MIR should validate");
+    let output = doriac::mir_interpreter::interpret(&program).expect("MIR should interpret");
+    assert_eq!(output.stdout, b"alive\ndrop\n");
+    assert!(!doriac::codegen_cranelift::lower_mir_to_object(&program)
+        .expect("borrowed arguments should lower through Cranelift")
+        .is_empty());
+}
+
+#[test]
+fn property_assignment_rejects_overlapping_direct_rhs_reads() {
+    assert_diagnostic(
+        r#"
+class Box
+{
+    writable int $value = 0;
+    int $other = 1;
+}
+
+function route(writable Box $box): void
+{
+    $box->value = $box->other;
+}
+"#,
+        "E0477",
+    );
+}
+
+#[test]
+fn static_borrow_returns_preserve_parameter_numbering_in_mir() {
+    assert_valid_mir(
+        r#"
+class Guard
+{
+    static function identity(Guard $guard): Guard { return $guard; }
+}
+
+function observe(Guard $guard): void {}
+
+function main(): void
+{
+    let $guard = new Guard();
+    observe(Guard::identity($guard));
+}
+"#,
+    );
+}
+
+#[test]
+fn borrowed_results_cannot_be_stored_in_owned_properties() {
+    assert_diagnostic(
+        r#"
+class Child {}
+class Box
+{
+    writable Child $child = new Child();
+}
+
+function identity(Child $child): Child { return $child; }
+
+function route(writable Box $box, Child $child): void
+{
+    $box->child = identity($child);
+}
+"#,
+        "E0478",
+    );
+}
+
+#[test]
+fn owned_returns_reject_borrowed_call_results_without_provenance_elision() {
+    assert_diagnostic(
+        r#"
+class Guard
+{
+    function inspect(): self { return $this; }
+}
+
+function alias(Guard $guard): Guard
+{
+    return $guard->inspect();
+}
+"#,
+        "E0478",
+    );
+}
+
+#[test]
+fn unreachable_returns_do_not_change_returned_borrow_inference() {
+    assert_valid_mir(
+        r#"
+class Guard
+{
+    function direct(): self
+    {
+        return $this;
+        return new Guard();
+    }
+
+    function conditional(): self
+    {
+        if (false) { return new Guard(); }
+        return $this;
+    }
+}
+
+function observe(Guard $guard): void {}
+
+function main(): void
+{
+    let $guard = new Guard();
+    observe($guard->direct());
+    observe($guard->conditional());
+}
+"#,
+    );
+}
+
+#[test]
+fn discarded_fluent_borrow_calls_lower_and_run_without_dropping_the_owner() {
+    let source = r#"
+class Guard
+{
+    writable function add(): self { return $this; }
+    function __destruct() { echo "drop\n"; }
+}
+
+function main(): void
+{
+    let writable $guard = new Guard();
+    $guard->add()->add();
+    echo "alive\n";
+}
+"#;
+    let program = doriac::lower_source_to_mir("stage21-discarded-borrow.doria", source)
+        .expect("discarded returned borrows should lower to MIR");
+    doriac::mir_validation::validate_program(&program).expect("MIR should validate");
+    let output = doriac::mir_interpreter::interpret(&program).expect("MIR should interpret");
+    assert_eq!(output.stdout, b"alive\ndrop\n");
+    assert!(!doriac::codegen_cranelift::lower_mir_to_object(&program)
+        .expect("discarded returned borrows should lower through Cranelift")
+        .is_empty());
+}

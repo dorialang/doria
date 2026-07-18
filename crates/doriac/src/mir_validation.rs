@@ -241,10 +241,13 @@ fn validate_function(program: &mir::Program, function: &mir::Function) -> Result
                 function.name, block.id.0
             )));
         }
+    }
+    let (reachable, _) = reachable_blocks_and_predecessors(function, true)?;
+    for block in &function.blocks {
         for statement in &block.statements {
             validate_statement(program, function, statement)?;
         }
-        validate_terminator(program, function, &block.terminator)?;
+        validate_terminator(program, function, &block.terminator, reachable[block.id.0])?;
     }
     validate_class_local_lifetimes(function)
 }
@@ -349,6 +352,23 @@ fn validate_statement(
             }
             validate_call_args(program, function, callee, args)
         }
+        mir::Statement::CallBorrowed {
+            function: callee,
+            args,
+        } => {
+            let callee = function_in(program, *callee)?;
+            if !matches!(
+                callee.return_type,
+                mir::ReturnType::Value(mir::Type::Class(_))
+            ) || infer_function_return_borrow(program, callee)?.is_none()
+            {
+                return Err(malformed_mir(format!(
+                    "borrowed call targets function {} without a borrowed class return",
+                    callee.name
+                )));
+            }
+            validate_call_args(program, function, callee, args)
+        }
         mir::Statement::Printf(format) => validate_format_expression(program, function, format),
         mir::Statement::WriteFile { path, contents } => {
             validate_string_expression(program, function, path)?;
@@ -447,6 +467,7 @@ fn validate_terminator(
     program: &mir::Program,
     function: &mir::Function,
     terminator: &mir::Terminator,
+    validate_return_ownership: bool,
 ) -> Result<(), BackendError> {
     match terminator {
         mir::Terminator::Return(expression) => {
@@ -465,20 +486,23 @@ fn validate_terminator(
                 )));
             }
             validate_rvalue(program, function, expression)?;
-            if let (mir::Type::Class(_), mir::Rvalue::Class(class)) = (return_type, expression) {
-                let expected = infer_function_return_borrow(program, function)?;
-                let actual = infer_expression_return_borrow(program, function, class)?;
-                if actual != expected {
-                    return Err(malformed_mir(format!(
-                        "return from {} has inconsistent class ownership",
-                        function.name
-                    )));
-                }
-                if expected.is_none() {
-                    require_owned_class_expression(
-                        class,
-                        &format!("return from {}", function.name),
-                    )?;
+            if validate_return_ownership {
+                if let (mir::Type::Class(_), mir::Rvalue::Class(class)) = (return_type, expression)
+                {
+                    let expected = infer_function_return_borrow(program, function)?;
+                    let actual = infer_expression_return_borrow(program, function, class)?;
+                    if actual != expected {
+                        return Err(malformed_mir(format!(
+                            "return from {} has inconsistent class ownership",
+                            function.name
+                        )));
+                    }
+                    if expected.is_none() {
+                        require_owned_class_expression(
+                            class,
+                            &format!("return from {}", function.name),
+                        )?;
+                    }
                 }
             }
             Ok(())
@@ -634,7 +658,8 @@ fn infer_function_return_borrow(
     function: &mir::Function,
 ) -> Result<Option<mir::ReturnBorrow>, BackendError> {
     let mut inferred = None;
-    for block in &function.blocks {
+    let (reachable, _) = reachable_blocks_and_predecessors(function, true)?;
+    for block in function.blocks.iter().filter(|block| reachable[block.id.0]) {
         let mir::Terminator::Return(mir::Rvalue::Class(expression)) = &block.terminator else {
             continue;
         };
@@ -680,7 +705,9 @@ fn infer_expression_return_borrow(
             let callee = function_in(program, *callee)?;
             let index = match return_borrow.source {
                 mir::BorrowSource::Receiver => 0,
-                mir::BorrowSource::Parameter(index) => index + usize::from(callee.method.is_some()),
+                mir::BorrowSource::Parameter(index) => {
+                    index + usize::from(callee.receiver_mode.is_some())
+                }
             };
             let Some(mir::Rvalue::Class(source)) = args.get(index) else {
                 return Err(malformed_mir(format!(
@@ -715,10 +742,11 @@ fn borrow_from_parameter(
         .iter()
         .position(|parameter| *parameter == local)?;
     let definition = function.locals.get(local.0)?;
-    let source = if function.method.is_some() && position == 0 {
+    let has_receiver = function.receiver_mode.is_some();
+    let source = if has_receiver && position == 0 {
         mir::BorrowSource::Receiver
     } else {
-        mir::BorrowSource::Parameter(position - usize::from(function.method.is_some()))
+        mir::BorrowSource::Parameter(position - usize::from(has_receiver))
     };
     Some(mir::ReturnBorrow {
         source,
@@ -1052,7 +1080,7 @@ fn collect_statement_class_local_accesses(statement: &mir::Statement) -> ClassLo
         mir::Statement::EchoString(value) | mir::Statement::WriteStderr(value) => {
             collect_string_class_local_accesses(value, &mut accesses);
         }
-        mir::Statement::CallVoid { args, .. } => {
+        mir::Statement::CallVoid { args, .. } | mir::Statement::CallBorrowed { args, .. } => {
             collect_rvalue_args_class_local_accesses(args, &mut accesses);
         }
         mir::Statement::Printf(format) => {
@@ -1778,7 +1806,7 @@ fn statement_observes_property(
         mir::Statement::EchoString(value) | mir::Statement::WriteStderr(value) => {
             string_observes_property(value, receiver, property)
         }
-        mir::Statement::CallVoid { args, .. } => args
+        mir::Statement::CallVoid { args, .. } | mir::Statement::CallBorrowed { args, .. } => args
             .iter()
             .any(|value| rvalue_observes_property(value, receiver, property)),
         mir::Statement::Printf(format) => format_observes_property(format, receiver, property),

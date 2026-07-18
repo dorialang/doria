@@ -231,6 +231,23 @@ impl ClassExpression {
             | Self::New { class, .. } => *class,
         }
     }
+
+    pub const fn owned_temporary_class(&self) -> Option<ClassId> {
+        match self {
+            Self::New { class, .. }
+            | Self::Call {
+                class,
+                return_borrow: None,
+                ..
+            } => Some(*class),
+            Self::Local { .. }
+            | Self::Property { .. }
+            | Self::Call {
+                return_borrow: Some(_),
+                ..
+            } => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -501,6 +518,10 @@ pub enum Statement {
         function: FunctionId,
         args: Vec<Rvalue>,
     },
+    CallBorrowed {
+        function: FunctionId,
+        args: Vec<Rvalue>,
+    },
     Printf(FormatExpression),
     WriteFile {
         path: StringExpression,
@@ -560,7 +581,9 @@ fn statement_class_temporary_capacity(statement: &Statement) -> usize {
         Statement::EchoString(value) | Statement::WriteStderr(value) => {
             string_class_temporary_capacity(value)
         }
-        Statement::CallVoid { args, .. } => args.iter().map(rvalue_class_temporary_capacity).sum(),
+        Statement::CallVoid { args, .. } | Statement::CallBorrowed { args, .. } => {
+            args.iter().map(rvalue_class_temporary_capacity).sum()
+        }
         Statement::Printf(format) => format_class_temporary_capacity(format),
         Statement::WriteFile { path, contents } => {
             string_class_temporary_capacity(path) + string_class_temporary_capacity(contents)
@@ -660,10 +683,11 @@ fn class_expression_temporary_capacity(value: &ClassExpression) -> usize {
     match value {
         ClassExpression::Local { .. } | ClassExpression::Property { .. } => 0,
         ClassExpression::Call { args, .. } => {
-            1 + args
-                .iter()
-                .map(rvalue_class_temporary_capacity)
-                .sum::<usize>()
+            usize::from(value.owned_temporary_class().is_some())
+                + args
+                    .iter()
+                    .map(rvalue_class_temporary_capacity)
+                    .sum::<usize>()
         }
         ClassExpression::New {
             properties, args, ..
@@ -1142,7 +1166,9 @@ impl fmt::Display for Statement {
                 write!(formatter, "echo \"{}\"", escape_debug_string(value))
             }
             Statement::EchoString(value) => write!(formatter, "echo {value}"),
-            Statement::CallVoid { function, args } => write_call(formatter, *function, args),
+            Statement::CallVoid { function, args } | Statement::CallBorrowed { function, args } => {
+                write_call(formatter, *function, args)
+            }
             Statement::Printf(format) => write!(formatter, "printf {format}"),
             Statement::WriteFile { path, contents } => {
                 write!(formatter, "write_file({path}, {contents})")

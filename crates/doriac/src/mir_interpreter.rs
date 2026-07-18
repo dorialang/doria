@@ -75,6 +75,7 @@ struct ObjectValue {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReturnExpectation {
     Value(mir::Type),
+    Discard(mir::Type),
     Void,
 }
 
@@ -396,6 +397,15 @@ impl Interpreter<'_> {
             }
             mir::Statement::CallVoid { function, args } => {
                 self.queue_call(function, args, ReturnExpectation::Void)?;
+            }
+            mir::Statement::CallBorrowed { function, args } => {
+                let callee = function_in(self.program, function)?;
+                let mir::ReturnType::Value(return_type) = callee.return_type else {
+                    return Err(InterpreterError::new(
+                        "MIR borrowed call targeted a void function",
+                    ));
+                };
+                self.queue_call(function, args, ReturnExpectation::Discard(return_type))?;
             }
             mir::Statement::Printf(format) => {
                 let frame = self.current_frame_mut()?;
@@ -1476,10 +1486,7 @@ impl Interpreter<'_> {
                 let temporary_class_args = args
                     .iter()
                     .map(|argument| match argument {
-                        mir::Rvalue::Class(
-                            mir::ClassExpression::New { class, .. }
-                            | mir::ClassExpression::Call { class, .. },
-                        ) => Some(*class),
+                        mir::Rvalue::Class(expression) => expression.owned_temporary_class(),
                         _ => None,
                     })
                     .collect();
@@ -1533,12 +1540,8 @@ impl Interpreter<'_> {
             .iter()
             .zip(&callee.params)
             .map(|(argument, parameter)| {
-                matches!(
-                    argument,
-                    mir::Rvalue::Class(
-                        mir::ClassExpression::New { .. } | mir::ClassExpression::Call { .. }
-                    )
-                ) && !local_in(callee, *parameter).is_ok_and(|local| local.owned)
+                matches!(argument, mir::Rvalue::Class(expression) if expression.owned_temporary_class().is_some())
+                    && !local_in(callee, *parameter).is_ok_and(|local| local.owned)
             })
             .collect();
         let frame = self.current_frame_mut()?;
@@ -1640,8 +1643,19 @@ impl Interpreter<'_> {
                     LocalValue::Class { object, class } => EvaluationValue::Class { object, class },
                 });
             }
+            (ReturnExpectation::Discard(expected), FunctionOutcome::Value(value)) => {
+                if local_value_type(&value) != expected {
+                    return Err(InterpreterError::new(format!(
+                        "MIR discarded call expected {expected}, returned {}",
+                        local_value_type(&value)
+                    )));
+                }
+            }
             (ReturnExpectation::Void, FunctionOutcome::Void) => {}
-            (ReturnExpectation::Value(_), FunctionOutcome::Void) => {
+            (
+                ReturnExpectation::Value(_) | ReturnExpectation::Discard(_),
+                FunctionOutcome::Void,
+            ) => {
                 return Err(InterpreterError::new(
                     "MIR scalar call returned a void value",
                 ));

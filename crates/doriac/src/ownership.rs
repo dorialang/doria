@@ -263,7 +263,7 @@ pub(crate) fn check_program_with_inferred_move_returns(
 
 pub(crate) fn function_return_borrow(function: &ast::FunctionDecl) -> Option<ReturnBorrow> {
     let mut borrow = None;
-    if block_return_borrow(&function.body, function, &mut borrow) {
+    if block_return_borrow(&function.body, function, &mut borrow).is_some() {
         borrow
     } else {
         None
@@ -274,64 +274,91 @@ fn block_return_borrow(
     block: &ast::Block,
     function: &ast::FunctionDecl,
     borrow: &mut Option<ReturnBorrow>,
-) -> bool {
-    block
-        .statements
-        .iter()
-        .all(|statement| statement_return_borrow(statement, function, borrow))
+) -> Option<bool> {
+    let mut falls_through = true;
+    for statement in &block.statements {
+        if !falls_through {
+            break;
+        }
+        falls_through = statement_return_borrow(statement, function, borrow)?;
+    }
+    Some(falls_through)
 }
 
 fn statement_return_borrow(
     statement: &Stmt,
     function: &ast::FunctionDecl,
     borrow: &mut Option<ReturnBorrow>,
-) -> bool {
+) -> Option<bool> {
     match statement {
         Stmt::Return {
             expr: Some(expr), ..
         } => {
-            let Some(candidate) = expr_return_borrow(expr, function) else {
-                return false;
-            };
+            let candidate = expr_return_borrow(expr, function)?;
             match borrow {
-                Some(existing) if existing.source != candidate.source => false,
+                Some(existing) if existing.source != candidate.source => None,
                 Some(existing) => {
                     existing.writable &= candidate.writable;
-                    true
+                    Some(false)
                 }
                 slot @ None => {
                     *slot = Some(candidate);
-                    true
+                    Some(false)
                 }
             }
         }
-        Stmt::Return { expr: None, .. } => false,
+        Stmt::Return { expr: None, .. } => None,
         Stmt::If(statement) => {
-            block_return_borrow(&statement.then_block, function, borrow)
-                && statement
+            let branch_return_borrow =
+                |branch: &ast::ElseBranch, borrow: &mut Option<ReturnBorrow>| match branch {
+                    ast::ElseBranch::If(statement) => {
+                        statement_return_borrow(&Stmt::If((**statement).clone()), function, borrow)
+                    }
+                    ast::ElseBranch::Block(block) => block_return_borrow(block, function, borrow),
+                };
+            match constant_bool(&statement.condition) {
+                Some(true) => block_return_borrow(&statement.then_block, function, borrow),
+                Some(false) => statement
                     .else_branch
                     .as_ref()
-                    .is_none_or(|branch| match branch {
-                        ast::ElseBranch::If(statement) => statement_return_borrow(
-                            &Stmt::If((**statement).clone()),
-                            function,
-                            borrow,
-                        ),
-                        ast::ElseBranch::Block(block) => {
-                            block_return_borrow(block, function, borrow)
-                        }
-                    })
+                    .map_or(Some(true), |branch| branch_return_borrow(branch, borrow)),
+                None => {
+                    let then_falls = block_return_borrow(&statement.then_block, function, borrow)?;
+                    let else_falls = statement
+                        .else_branch
+                        .as_ref()
+                        .map_or(Some(true), |branch| branch_return_borrow(branch, borrow))?;
+                    Some(then_falls || else_falls)
+                }
+            }
         }
-        Stmt::While(statement) => block_return_borrow(&statement.body, function, borrow),
-        Stmt::For(statement) => block_return_borrow(&statement.body, function, borrow),
-        Stmt::Foreach(statement) => block_return_borrow(&statement.body, function, borrow),
+        Stmt::While(statement) => {
+            if constant_bool(&statement.condition) != Some(false) {
+                block_return_borrow(&statement.body, function, borrow)?;
+            }
+            Some(true)
+        }
+        Stmt::For(statement) => {
+            if statement
+                .condition
+                .as_ref()
+                .is_none_or(|condition| constant_bool(condition) != Some(false))
+            {
+                block_return_borrow(&statement.body, function, borrow)?;
+            }
+            Some(true)
+        }
+        Stmt::Foreach(statement) => {
+            block_return_borrow(&statement.body, function, borrow)?;
+            Some(true)
+        }
+        Stmt::Break { .. } | Stmt::Continue { .. } => Some(false),
+        Stmt::Expr { expr, .. } if is_panic_expr(expr) => Some(false),
         Stmt::VarDecl(_)
         | Stmt::Assignment(_)
         | Stmt::Echo { .. }
-        | Stmt::Break { .. }
-        | Stmt::Continue { .. }
         | Stmt::Increment(_)
-        | Stmt::Expr { .. } => true,
+        | Stmt::Expr { .. } => Some(true),
     }
 }
 
@@ -686,7 +713,18 @@ impl Checker {
                         self.use_expr(&assignment.value, scopes, UseMode::Read);
                     }
                 } else {
-                    if self.expr_is_move_value(&assignment.value, scopes) {
+                    if self.expr_returns_borrow(&assignment.value, scopes) {
+                        self.diagnostics.push(
+                            Diagnostic::new(
+                                "E0478",
+                                "borrowed result cannot be stored in an owning property",
+                                assignment.value.span(),
+                            )
+                            .with_help(
+                                "assign an independently owned value to the property instead",
+                            ),
+                        );
+                    } else if self.expr_is_move_value(&assignment.value, scopes) {
                         self.diagnostics.push(
                             Diagnostic::new(
                                 "E0472",
@@ -716,6 +754,23 @@ impl Checker {
             }
             Stmt::Return { expr, .. } => {
                 if let Some(expr) = expr {
+                    if return_move_type
+                        && self.current_return_borrow.is_none()
+                        && self.expr_returns_borrow(expr, scopes)
+                    {
+                        self.diagnostics.push(
+                            Diagnostic::new(
+                                "E0478",
+                                "borrowed result cannot satisfy an owning return",
+                                expr.span(),
+                            )
+                            .with_help(
+                                "return an independently owned value or return the borrowed source directly",
+                            ),
+                        );
+                        self.use_expr(expr, scopes, UseMode::Read);
+                        return Flow::stops();
+                    }
                     self.use_expr(
                         expr,
                         scopes,
@@ -1045,19 +1100,8 @@ impl Checker {
                 } else if mode == UseMode::Give {
                     self.check_give_against_active_borrows(name, *span);
                 }
-                if mode == UseMode::Give && self.active_assignment_writes.contains(name) {
-                    self.diagnostics.push(
-                        Diagnostic::new(
-                            "E0471",
-                            format!(
-                                "`${name}` cannot be given away while it is the destination of a property assignment"
-                            ),
-                            *span,
-                        )
-                        .with_help(
-                            "compute the replacement without giving away the object being assigned",
-                        ),
-                    );
+                if self.check_assignment_write_conflict(name, mode, *span) && mode == UseMode::Give
+                {
                     return;
                 }
                 let Some(binding) = scopes.get_mut(name) else {
@@ -1314,30 +1358,54 @@ impl Checker {
         let Some(root) = self.borrow_root_key(expr, scopes) else {
             return;
         };
-        if self.active_assignment_writes.contains(&root) {
-            let requested = match mode {
-                UseMode::Read => "readonly",
-                UseMode::Write => "writable",
-                UseMode::Give => unreachable!("a call borrow cannot transfer ownership"),
-            };
-            self.diagnostics.push(
-                Diagnostic::new(
-                    "E0477",
-                    format!(
-                        "`{}` cannot be used as {requested} while it is the destination of a property assignment",
-                        display_borrow_root(&root)
-                    ),
-                    expr.span(),
-                )
-                .with_help("finish computing the property value before starting another call through the same owner"),
-            );
-        }
         self.check_active_borrow_conflict(&root, mode, expr.span());
         self.active_borrows.push(ActiveBorrow {
             root,
             mode,
             span: expr.span(),
         });
+    }
+
+    fn check_assignment_write_conflict(&mut self, root: &str, mode: UseMode, span: Span) -> bool {
+        if !self.active_assignment_writes.contains(root) {
+            return false;
+        }
+        match mode {
+            UseMode::Give => self.diagnostics.push(
+                Diagnostic::new(
+                    "E0471",
+                    format!(
+                        "`{}` cannot be given away while it is the destination of a property assignment",
+                        display_borrow_root(root)
+                    ),
+                    span,
+                )
+                .with_help(
+                    "compute the replacement without giving away the object being assigned",
+                ),
+            ),
+            UseMode::Read | UseMode::Write => {
+                let requested = if mode == UseMode::Read {
+                    "readonly"
+                } else {
+                    "writable"
+                };
+                self.diagnostics.push(
+                    Diagnostic::new(
+                        "E0477",
+                        format!(
+                            "`{}` cannot be used as {requested} while it is the destination of a property assignment",
+                            display_borrow_root(root)
+                        ),
+                        span,
+                    )
+                    .with_help(
+                        "finish computing the property value before using the same owner again",
+                    ),
+                );
+            }
+        }
+        true
     }
 
     fn borrow_root_key(&self, expr: &Expr, scopes: &Scopes) -> Option<String> {
