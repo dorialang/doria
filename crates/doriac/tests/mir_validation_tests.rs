@@ -758,6 +758,38 @@ fn shared_validator_tracks_property_borrows_across_outer_call_arguments() {
     assert!(error
         .message
         .contains("both borrows and transfers class local local0"));
+
+    program.functions[0].locals[0].writable = true;
+    let Statement::CallVoid { args, .. } = &mut program.functions[0].blocks[0].statements[0] else {
+        unreachable!("the fixture contains a call")
+    };
+    args.reverse();
+    let Rvalue::Class(ClassExpression::Local { transfer, .. }) = &mut args[1] else {
+        unreachable!("the fixture's second argument is the class local")
+    };
+    *transfer = false;
+    program.functions[1].locals = vec![
+        Local {
+            id: LocalId(0),
+            name: "label".to_string(),
+            ty: Type::String,
+            writable: false,
+            synthetic: false,
+            owned: false,
+        },
+        borrowed_class_local(1, ClassId(0)),
+    ];
+    program.functions[1].locals[1].writable = true;
+
+    let error = doriac::mir_validation::validate_program(&program)
+        .expect_err("a property read cannot overlap a later writable borrow");
+    assert!(error
+        .message
+        .contains("takes overlapping writable borrows of class local local0"));
+
+    program.functions[1].locals[1].writable = false;
+    doriac::mir_validation::validate_program(&program)
+        .expect("a property read may overlap a later readonly borrow");
 }
 
 #[test]

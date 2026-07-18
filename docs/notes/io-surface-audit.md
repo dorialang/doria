@@ -148,7 +148,7 @@ Empty cells: **binary stdin read (Q2), binary stdout write (Q1), binary stderr w
 - **plan §9** formatted-I/O / three-tier bullets — `append_file`, byte std streams, the `Io`/`Fs` line, EPIPE behavior.
 - **`doria-rt`** — device write path: EPIPE/`ERROR_BROKEN_PIPE` → clean exit (D1, code); verify EINTR-retry / short-write loops (D4).
 - **`write_file` signature — explicitly UNCHANGED** (append is additive; no breaking change). Recorded so no later pass "adds a mode."
-- **Examples / fixtures / website & playground** — any example that pipes into `head` or asserts write-failure panics; the parity manifest's broken-pipe handling already treats `BrokenPipe` as ok in the harness (`native_mir_parity_tests.rs:255`) — reconcile with the chosen D1 semantics. No current playground example uses append or binary std streams (confirm before amending).
+- **Examples / fixtures / website & playground** — any example that pipes into `head` or asserts write-failure panics; the parity manifest's broken-pipe handling already treats `BrokenPipe` as ok in the harness (`native_mir_parity_tests.rs:255`) — reconcile with the chosen D1 semantics. Verify playground coverage in the separate `doria-website` repository before amending it; this compiler-repository audit makes no claim about that coverage.
 
 ## Proposed deliverable path
 

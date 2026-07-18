@@ -807,19 +807,27 @@ enum ClassLocalAccess {
 }
 
 #[derive(Default)]
-struct ClassLocalAccesses(Vec<ClassLocalAccess>);
+struct ClassLocalAccesses {
+    accesses: Vec<ClassLocalAccess>,
+    property_borrows: Vec<mir::LocalId>,
+}
 
 impl ClassLocalAccesses {
     fn borrow(&mut self, local: mir::LocalId) {
-        self.0.push(ClassLocalAccess::Borrow(local));
+        self.accesses.push(ClassLocalAccess::Borrow(local));
+    }
+
+    fn borrow_property(&mut self, local: mir::LocalId) {
+        self.borrow(local);
+        self.property_borrows.push(local);
     }
 
     fn transfer(&mut self, local: mir::LocalId) {
-        self.0.push(ClassLocalAccess::Transfer(local));
+        self.accesses.push(ClassLocalAccess::Transfer(local));
     }
 
     fn iter(&self) -> impl Iterator<Item = ClassLocalAccess> + '_ {
-        self.0.iter().copied()
+        self.accesses.iter().copied()
     }
 
     fn borrowed(&self) -> impl Iterator<Item = mir::LocalId> + '_ {
@@ -834,6 +842,10 @@ impl ClassLocalAccesses {
             ClassLocalAccess::Transfer(local) => Some(local),
             ClassLocalAccess::Borrow(_) => None,
         })
+    }
+
+    fn property_borrowed(&self) -> impl Iterator<Item = mir::LocalId> + '_ {
+        self.property_borrows.iter().copied()
     }
 }
 
@@ -888,7 +900,7 @@ fn collect_value_class_local_accesses(
 
 fn collect_operand_class_local_accesses(operand: &mir::Operand, accesses: &mut ClassLocalAccesses) {
     if let mir::Operand::Property { object, .. } = operand {
-        accesses.borrow(*object);
+        accesses.borrow_property(*object);
     }
 }
 
@@ -967,7 +979,7 @@ fn collect_string_class_local_accesses(
         | mir::StringExpression::Local(_)
         | mir::StringExpression::Static(_)
         | mir::StringExpression::NullableLocalAssumeNonNull(_) => {}
-        mir::StringExpression::Property { object, .. } => accesses.borrow(*object),
+        mir::StringExpression::Property { object, .. } => accesses.borrow_property(*object),
     }
 }
 
@@ -987,7 +999,7 @@ fn collect_nullable_string_class_local_accesses(
         | mir::NullableStringExpression::Static(_)
         | mir::NullableStringExpression::ReadLine => {}
         mir::NullableStringExpression::Property { object, .. } => {
-            accesses.borrow(*object);
+            accesses.borrow_property(*object);
         }
     }
 }
@@ -1007,7 +1019,7 @@ fn collect_class_expression_local_accesses(
             transfer: false,
             ..
         } => accesses.borrow(*local),
-        mir::ClassExpression::Property { object, .. } => accesses.borrow(*object),
+        mir::ClassExpression::Property { object, .. } => accesses.borrow_property(*object),
         mir::ClassExpression::Call { args, .. } => {
             collect_rvalue_args_class_local_accesses(args, accesses);
         }
@@ -2216,6 +2228,15 @@ fn validate_call_args_for_params(
         validate_rvalue(program, caller, argument)?;
         let mut accesses = ClassLocalAccesses::default();
         collect_rvalue_class_local_accesses(argument, &mut accesses);
+        let mut argument_borrows = Vec::new();
+        for local in accesses.property_borrowed() {
+            if !argument_borrows
+                .iter()
+                .any(|(borrowed, _)| *borrowed == local)
+            {
+                argument_borrows.push((local, ClassBorrowMode::Readonly));
+            }
+        }
         for local in accesses.borrowed() {
             if transferred_class_locals.contains(&local) {
                 return Err(malformed_mir(format!(
@@ -2282,31 +2303,40 @@ fn validate_call_args_for_params(
                 )?;
             }
             if !parameter_definition.owned && !promoted_transfer {
-                let Some(local) = escaping_class_local_borrow(program, argument)? else {
-                    continue;
-                };
-                if transferred_class_locals.contains(&local) {
-                    return Err(malformed_mir(format!(
-                        "call to {} both borrows and transfers class local local{}",
-                        callee.name, local.0
-                    )));
+                if let Some(local) = escaping_class_local_borrow(program, argument)? {
+                    let mode = if parameter_definition.writable {
+                        ClassBorrowMode::Writable
+                    } else {
+                        ClassBorrowMode::Readonly
+                    };
+                    if let Some((_, existing)) = argument_borrows
+                        .iter_mut()
+                        .find(|(borrowed, _)| *borrowed == local)
+                    {
+                        *existing = mode;
+                    } else {
+                        argument_borrows.push((local, mode));
+                    }
                 }
-                let mode = if parameter_definition.writable {
-                    ClassBorrowMode::Writable
-                } else {
-                    ClassBorrowMode::Readonly
-                };
-                if borrowed_class_locals
-                    .get(&local)
-                    .is_some_and(|previous| previous.conflicts_with(mode))
-                {
-                    return Err(malformed_mir(format!(
-                        "call to {} takes overlapping writable borrows of class local local{}",
-                        callee.name, local.0
-                    )));
-                }
-                borrowed_class_locals.insert(local, mode);
             }
+        }
+        for (local, mode) in argument_borrows {
+            if transferred_class_locals.contains(&local) {
+                return Err(malformed_mir(format!(
+                    "call to {} both borrows and transfers class local local{}",
+                    callee.name, local.0
+                )));
+            }
+            if borrowed_class_locals
+                .get(&local)
+                .is_some_and(|previous| previous.conflicts_with(mode))
+            {
+                return Err(malformed_mir(format!(
+                    "call to {} takes overlapping writable borrows of class local local{}",
+                    callee.name, local.0
+                )));
+            }
+            borrowed_class_locals.insert(local, mode);
         }
     }
     Ok(())
