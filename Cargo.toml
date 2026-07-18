@@ -9,7 +9,7 @@ repository = "https://github.com/dorialang/doria"
 version = "2026.3.1-canary"
 
 [workspace.dependencies]
-ryu = { version = "=1.0.20", default-features = false }
+ryu = { version = "=1.0.23", default-features = false }
 
 [profile.dev]
 panic = "abort"
