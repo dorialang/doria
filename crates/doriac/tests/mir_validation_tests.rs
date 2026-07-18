@@ -371,7 +371,7 @@ fn shared_validator_rejects_borrowing_and_transferring_one_class_local_in_a_call
 }
 
 #[test]
-fn shared_validator_requires_writable_class_arguments_for_writable_parameters() {
+fn shared_validator_enforces_writable_class_argument_rules() {
     let mut program = class_program();
     program.functions[0].locals.push(class_local(0, ClassId(0)));
     program.functions[0].blocks[0]
@@ -409,6 +409,33 @@ fn shared_validator_requires_writable_class_arguments_for_writable_parameters() 
     program.functions[0].locals[0].writable = true;
     doriac::mir_validation::validate_program(&program)
         .expect("a writable class argument should satisfy a writable parameter");
+
+    let Statement::CallVoid { args, .. } = &mut program.functions[0].blocks[0].statements[0] else {
+        unreachable!("the fixture contains a call")
+    };
+    args.push(Rvalue::Class(ClassExpression::Local {
+        class: ClassId(0),
+        local: LocalId(0),
+        transfer: false,
+    }));
+    program.functions[1].params.push(LocalId(1));
+    program.functions[1]
+        .locals
+        .push(borrowed_class_local(1, ClassId(0)));
+    for (left_writable, right_writable) in [(true, true), (true, false), (false, true)] {
+        program.functions[1].locals[0].writable = left_writable;
+        program.functions[1].locals[1].writable = right_writable;
+        let error = doriac::mir_validation::validate_program(&program)
+            .expect_err("a writable borrow cannot overlap another borrow in one call");
+        assert!(error
+            .message
+            .contains("takes overlapping writable borrows of class local local0"));
+    }
+
+    program.functions[1].locals[0].writable = false;
+    program.functions[1].locals[1].writable = false;
+    doriac::mir_validation::validate_program(&program)
+        .expect("multiple readonly borrows of one class local should remain valid");
 }
 
 #[test]

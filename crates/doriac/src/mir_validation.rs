@@ -1,6 +1,6 @@
 //! Backend-independent structural and type validation for native MIR.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::backend::BackendError;
 use crate::class_layout::{compute_class_layout, ClassId, FieldType};
@@ -2199,7 +2199,7 @@ fn validate_call_args_for_params(
             args.len()
         )));
     }
-    let mut borrowed_class_locals = HashSet::new();
+    let mut borrowed_class_locals: HashMap<mir::LocalId, ClassBorrowMode> = HashMap::new();
     let mut transferred_class_locals = HashSet::new();
     for (index, (argument, parameter)) in args.iter().zip(params).enumerate() {
         let parameter_definition = local_in(callee, *parameter)?;
@@ -2225,7 +2225,7 @@ fn validate_call_args_for_params(
             }
         }
         for local in accesses.transferred() {
-            if borrowed_class_locals.contains(&local) {
+            if borrowed_class_locals.contains_key(&local) {
                 return Err(malformed_mir(format!(
                     "call to {} both borrows and transfers class local local{}",
                     callee.name, local.0
@@ -2237,15 +2237,6 @@ fn validate_call_args_for_params(
                     callee.name, local.0
                 )));
             }
-        }
-        if let Some(local) = escaping_class_local_borrow(program, argument)? {
-            if transferred_class_locals.contains(&local) {
-                return Err(malformed_mir(format!(
-                    "call to {} both borrows and transfers class local local{}",
-                    callee.name, local.0
-                )));
-            }
-            borrowed_class_locals.insert(local);
         }
         if matches!(parameter_type, mir::Type::Class(_)) {
             let promoted_transfer =
@@ -2290,9 +2281,47 @@ fn validate_call_args_for_params(
                     &format!("call to {} argument {}", callee.name, index + 1),
                 )?;
             }
+            if !parameter_definition.owned && !promoted_transfer {
+                let Some(local) = escaping_class_local_borrow(program, argument)? else {
+                    continue;
+                };
+                if transferred_class_locals.contains(&local) {
+                    return Err(malformed_mir(format!(
+                        "call to {} both borrows and transfers class local local{}",
+                        callee.name, local.0
+                    )));
+                }
+                let mode = if parameter_definition.writable {
+                    ClassBorrowMode::Writable
+                } else {
+                    ClassBorrowMode::Readonly
+                };
+                if borrowed_class_locals
+                    .get(&local)
+                    .is_some_and(|previous| previous.conflicts_with(mode))
+                {
+                    return Err(malformed_mir(format!(
+                        "call to {} takes overlapping writable borrows of class local local{}",
+                        callee.name, local.0
+                    )));
+                }
+                borrowed_class_locals.insert(local, mode);
+            }
         }
     }
     Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum ClassBorrowMode {
+    Readonly,
+    Writable,
+}
+
+impl ClassBorrowMode {
+    fn conflicts_with(self, other: Self) -> bool {
+        matches!(self, Self::Writable) || matches!(other, Self::Writable)
+    }
 }
 
 fn escaping_class_local_borrow(
