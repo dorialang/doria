@@ -523,6 +523,8 @@ impl<'program> Checker<'program> {
                                             ReceiverMode::Readonly
                                         },
                                     ),
+                                    returns_receiver_borrow:
+                                        crate::ownership::function_returns_receiver_borrow(method),
                                     is_static: method.is_static,
                                     params: signature.params,
                                     return_ty: signature.return_ty,
@@ -5015,6 +5017,7 @@ impl<'program> Checker<'program> {
             Expr::Grouped { expr, .. } => {
                 self.is_writable_object_path(expr, scopes, method_context)
             }
+            Expr::New { .. } => true,
             Expr::Variable { name, .. } => scopes
                 .lookup(name)
                 .map(|binding| binding.writable)
@@ -5039,6 +5042,24 @@ impl<'program> Checker<'program> {
                     .and_then(|class_info| class_info.properties.get(property))
                     .map(|property| property.writable)
                     .unwrap_or(false)
+            }
+            Expr::MethodCall { object, method, .. } => {
+                let Some(class_name) = self.expr_class_name(object, scopes, method_context) else {
+                    return false;
+                };
+                let Some(method_info) = self
+                    .classes
+                    .get(&class_name)
+                    .and_then(|class_info| class_info.methods.get(method))
+                    .cloned()
+                else {
+                    return false;
+                };
+                method_info.returns_receiver_borrow
+                    && method_info
+                        .receiver_mode
+                        .is_some_and(ReceiverMode::is_writable)
+                    && self.is_writable_object_path(object, scopes, method_context)
             }
             _ => false,
         }

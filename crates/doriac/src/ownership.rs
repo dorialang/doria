@@ -22,6 +22,7 @@ struct Signature {
     params: Vec<Parameter>,
     returns: Option<String>,
     returns_move_type: bool,
+    return_borrow: Option<UseMode>,
     receiver: Option<UseMode>,
 }
 
@@ -220,7 +221,8 @@ pub(crate) fn check_program_with_inferred_move_returns(
         properties,
         inferred_move_returns: inferred_move_returns.clone(),
         receiver_class: None,
-        active_assignment_receivers: HashSet::new(),
+        current_return_borrow: None,
+        active_assignment_writes: HashSet::new(),
         active_borrows: Vec::new(),
         diagnostics: Vec::new(),
     };
@@ -258,12 +260,81 @@ pub(crate) fn check_program_with_inferred_move_returns(
     checker.diagnostics
 }
 
+pub(crate) fn function_returns_receiver_borrow(function: &ast::FunctionDecl) -> bool {
+    if function.is_static
+        || function
+            .return_type
+            .as_ref()
+            .is_none_or(|ty| ty.name != "self")
+    {
+        return false;
+    }
+
+    let mut found = false;
+    block_returns_only_receiver_borrows(&function.body, &mut found) && found
+}
+
+fn block_returns_only_receiver_borrows(block: &ast::Block, found: &mut bool) -> bool {
+    block
+        .statements
+        .iter()
+        .all(|statement| statement_returns_only_receiver_borrows(statement, found))
+}
+
+fn statement_returns_only_receiver_borrows(statement: &Stmt, found: &mut bool) -> bool {
+    match statement {
+        Stmt::Return {
+            expr: Some(expr), ..
+        } => {
+            *found = true;
+            expr_derives_from_this(expr)
+        }
+        Stmt::Return { expr: None, .. } => false,
+        Stmt::If(statement) => {
+            block_returns_only_receiver_borrows(&statement.then_block, found)
+                && statement
+                    .else_branch
+                    .as_ref()
+                    .is_none_or(|branch| match branch {
+                        ast::ElseBranch::If(statement) => statement_returns_only_receiver_borrows(
+                            &Stmt::If((**statement).clone()),
+                            found,
+                        ),
+                        ast::ElseBranch::Block(block) => {
+                            block_returns_only_receiver_borrows(block, found)
+                        }
+                    })
+        }
+        Stmt::While(statement) => block_returns_only_receiver_borrows(&statement.body, found),
+        Stmt::For(statement) => block_returns_only_receiver_borrows(&statement.body, found),
+        Stmt::Foreach(statement) => block_returns_only_receiver_borrows(&statement.body, found),
+        Stmt::VarDecl(_)
+        | Stmt::Assignment(_)
+        | Stmt::Echo { .. }
+        | Stmt::Break { .. }
+        | Stmt::Continue { .. }
+        | Stmt::Increment(_)
+        | Stmt::Expr { .. } => true,
+    }
+}
+
+fn expr_derives_from_this(expr: &Expr) -> bool {
+    match expr {
+        Expr::This { .. } => true,
+        Expr::Grouped { expr, .. } | Expr::PropertyAccess { object: expr, .. } => {
+            expr_derives_from_this(expr)
+        }
+        _ => false,
+    }
+}
+
 fn signature(
     function: &ast::FunctionDecl,
     classes: &HashSet<String>,
     inferred_move_returns: &HashSet<usize>,
     receiver_class: Option<&str>,
 ) -> Signature {
+    let returns_receiver_borrow = function_returns_receiver_borrow(function);
     Signature {
         params: function
             .params
@@ -278,11 +349,17 @@ fn signature(
             .return_type
             .as_ref()
             .and_then(|ty| type_ref_class_name(ty, classes, receiver_class)),
-        returns_move_type: function
-            .return_type
-            .as_ref()
-            .is_some_and(|ty| type_ref_is_move_type(ty, classes, receiver_class))
-            || inferred_move_returns.contains(&function.span.start),
+        returns_move_type: function.return_type.as_ref().is_some_and(|ty| {
+            type_ref_is_move_type(ty, classes, receiver_class) && !returns_receiver_borrow
+        }) || (function.return_type.is_none()
+            && inferred_move_returns.contains(&function.span.start)),
+        return_borrow: returns_receiver_borrow.then_some({
+            if function.writable_this {
+                UseMode::Write
+            } else {
+                UseMode::Read
+            }
+        }),
         receiver: receiver_class.map(|_| {
             if function.writable_this {
                 UseMode::Write
@@ -348,7 +425,8 @@ struct Checker {
     properties: HashMap<(String, String), PropertyInfo>,
     inferred_move_returns: HashSet<usize>,
     receiver_class: Option<String>,
-    active_assignment_receivers: HashSet<String>,
+    current_return_borrow: Option<UseMode>,
+    active_assignment_writes: HashSet<String>,
     active_borrows: Vec<ActiveBorrow>,
     diagnostics: Vec<Diagnostic>,
 }
@@ -357,6 +435,15 @@ impl Checker {
     fn check_function(&mut self, function: &ast::FunctionDecl, receiver_class: Option<&str>) {
         let previous_receiver =
             std::mem::replace(&mut self.receiver_class, receiver_class.map(str::to_owned));
+        let previous_return_borrow = self.current_return_borrow;
+        self.current_return_borrow =
+            (receiver_class.is_some() && function_returns_receiver_borrow(function)).then_some({
+                if function.writable_this {
+                    UseMode::Write
+                } else {
+                    UseMode::Read
+                }
+            });
         let mut scopes = Scopes::new();
         for param in &function.params {
             let class =
@@ -383,8 +470,11 @@ impl Checker {
         }
         let return_move_type = function.return_type.as_ref().is_some_and(|ty| {
             type_ref_is_move_type(ty, &self.classes, self.receiver_class.as_deref())
-        }) || self.inferred_move_returns.contains(&function.span.start);
+                && self.current_return_borrow.is_none()
+        }) || (function.return_type.is_none()
+            && self.inferred_move_returns.contains(&function.span.start));
         self.check_block(&function.body, &mut scopes, return_move_type, false);
+        self.current_return_borrow = previous_return_borrow;
         self.receiver_class = previous_receiver;
     }
 
@@ -432,6 +522,21 @@ impl Checker {
                     type_ref_class_name(ty, &self.classes, self.receiver_class.as_deref())
                 });
                 let class = declared_class.or_else(|| self.expr_class(&decl.initializer, scopes));
+                if self.expr_returns_borrow(&decl.initializer, scopes) {
+                    self.diagnostics.push(
+                        Diagnostic::new(
+                            "E0478",
+                            format!(
+                                "borrowed result cannot initialize owning `${}`",
+                                decl.name
+                            ),
+                            decl.initializer.span(),
+                        )
+                        .with_help(
+                            "keep using the result in the current expression, or bind an independently owned value",
+                        ),
+                    );
+                }
                 let initializer_moves = self.expr_is_move_value(&decl.initializer, scopes);
                 let mixed = decl.ty.as_ref().is_some_and(|ty| ty.name == "mixed")
                     || (decl.ty.is_none() && class.is_none() && initializer_moves);
@@ -468,6 +573,21 @@ impl Checker {
                     return Flow::fallthrough();
                 }
                 if let Expr::Variable { name, span } = &assignment.target {
+                    if self.expr_returns_borrow(&assignment.value, scopes)
+                        && scopes.get(name).is_some()
+                    {
+                        self.diagnostics.push(
+                            Diagnostic::new(
+                                "E0478",
+                                format!("borrowed result cannot replace owning `${name}`"),
+                                assignment.value.span(),
+                            )
+                            .with_help(
+                                "keep using the result in the current expression, or assign an independently owned value",
+                            ),
+                        );
+                        return Flow::fallthrough();
+                    }
                     let value_class = self.expr_class(&assignment.value, scopes);
                     let value_moves = self.expr_is_move_value(&assignment.value, scopes);
                     let target = scopes.get(name).cloned();
@@ -540,17 +660,15 @@ impl Checker {
                             ),
                         );
                     }
-                    self.use_expr(&assignment.target, scopes, UseMode::Read);
-                    let receiver = ownership_root_name(&assignment.target)
-                        .filter(|name| scopes.get(name).is_some())
-                        .map(str::to_owned);
-                    let inserted = receiver
+                    self.use_expr(&assignment.target, scopes, UseMode::Write);
+                    let assignment_root = self.borrow_root_key(&assignment.target, scopes);
+                    let inserted = assignment_root
                         .as_ref()
-                        .is_some_and(|name| self.active_assignment_receivers.insert(name.clone()));
+                        .is_some_and(|root| self.active_assignment_writes.insert(root.clone()));
                     self.use_expr(&assignment.value, scopes, UseMode::Read);
                     if inserted {
-                        self.active_assignment_receivers
-                            .remove(receiver.as_deref().expect("inserted receiver"));
+                        self.active_assignment_writes
+                            .remove(assignment_root.as_deref().expect("inserted root"));
                     }
                 }
                 Flow::fallthrough()
@@ -575,7 +693,7 @@ impl Checker {
                         if return_move_type {
                             UseMode::Give
                         } else {
-                            UseMode::Read
+                            self.current_return_borrow.unwrap_or(UseMode::Read)
                         },
                     );
                 }
@@ -885,7 +1003,7 @@ impl Checker {
                 } else if mode == UseMode::Give {
                     self.check_give_against_active_borrows(name, *span);
                 }
-                if mode == UseMode::Give && self.active_assignment_receivers.contains(name) {
+                if mode == UseMode::Give && self.active_assignment_writes.contains(name) {
                     self.diagnostics.push(
                         Diagnostic::new(
                             "E0471",
@@ -963,7 +1081,15 @@ impl Checker {
                         ),
                     );
                 }
-                self.use_expr(object, scopes, UseMode::Read);
+                self.use_expr(
+                    object,
+                    scopes,
+                    if mode == UseMode::Write {
+                        UseMode::Write
+                    } else {
+                        UseMode::Read
+                    },
+                );
             }
             Expr::FunctionCall { name, args, .. } => {
                 let signature = self.signatures.get(name).cloned().unwrap_or_default();
@@ -1119,15 +1245,51 @@ impl Checker {
     }
 
     fn activate_call_borrow(&mut self, expr: &Expr, mode: UseMode, scopes: &Scopes) {
-        let Some(root) = borrow_root_key(expr, scopes, self.receiver_class.is_some()) else {
+        let Some(root) = self.borrow_root_key(expr, scopes) else {
             return;
         };
+        if self.active_assignment_writes.contains(&root) {
+            let requested = match mode {
+                UseMode::Read => "readonly",
+                UseMode::Write => "writable",
+                UseMode::Give => unreachable!("a call borrow cannot transfer ownership"),
+            };
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "E0477",
+                    format!(
+                        "`{}` cannot be used as {requested} while it is the destination of a property assignment",
+                        display_borrow_root(&root)
+                    ),
+                    expr.span(),
+                )
+                .with_help("finish computing the property value before starting another call through the same owner"),
+            );
+        }
         self.check_active_borrow_conflict(&root, mode, expr.span());
         self.active_borrows.push(ActiveBorrow {
             root,
             mode,
             span: expr.span(),
         });
+    }
+
+    fn borrow_root_key(&self, expr: &Expr, scopes: &Scopes) -> Option<String> {
+        match expr {
+            Expr::This { .. } if self.receiver_class.is_some() => Some("$this".to_string()),
+            Expr::Variable { name, .. } if scopes.get(name).is_some() => Some(name.clone()),
+            Expr::PropertyAccess { object, .. } | Expr::Grouped { expr: object, .. } => {
+                self.borrow_root_key(object, scopes)
+            }
+            Expr::MethodCall { object, method, .. } => {
+                let class = self.expr_class(object, scopes)?;
+                self.methods
+                    .get(&(class, method.clone()))
+                    .and_then(|signature| signature.return_borrow)
+                    .and_then(|_| self.borrow_root_key(object, scopes))
+            }
+            _ => None,
+        }
     }
 
     fn check_active_borrow_conflict(&mut self, root: &str, mode: UseMode, span: Span) {
@@ -1245,6 +1407,21 @@ impl Checker {
         }
     }
 
+    fn expr_returns_borrow(&self, expr: &Expr, scopes: &Scopes) -> bool {
+        match expr {
+            Expr::Grouped { expr, .. } => self.expr_returns_borrow(expr, scopes),
+            Expr::MethodCall { object, method, .. } => {
+                let Some(class) = self.expr_class(object, scopes) else {
+                    return false;
+                };
+                self.methods
+                    .get(&(class, method.clone()))
+                    .is_some_and(|signature| signature.return_borrow.is_some())
+            }
+            _ => false,
+        }
+    }
+
     fn expr_class(&self, expr: &Expr, scopes: &Scopes) -> Option<String> {
         match expr {
             Expr::Variable { name, .. } => {
@@ -1305,17 +1482,6 @@ fn ownership_root_name(expr: &Expr) -> Option<&str> {
         Expr::Variable { name, .. } => Some(name),
         Expr::PropertyAccess { object, .. } | Expr::Grouped { expr: object, .. } => {
             ownership_root_name(object)
-        }
-        _ => None,
-    }
-}
-
-fn borrow_root_key(expr: &Expr, scopes: &Scopes, this_available: bool) -> Option<String> {
-    match expr {
-        Expr::This { .. } if this_available => Some("$this".to_string()),
-        Expr::Variable { name, .. } if scopes.get(name).is_some() => Some(name.clone()),
-        Expr::PropertyAccess { object, .. } | Expr::Grouped { expr: object, .. } => {
-            borrow_root_key(object, scopes, this_available)
         }
         _ => None,
     }

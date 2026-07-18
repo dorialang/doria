@@ -118,3 +118,81 @@ function route(writable Guard $guard): void
     )
     .expect("non-lexical call borrows end after their last use");
 }
+
+#[test]
+fn self_returns_elide_to_the_receiver_borrow_and_support_chaining() {
+    doriac::check_source(
+        "stage21-self-return.doria",
+        r#"
+class Guard
+{
+    function inspect(): self { return $this; }
+    writable function touch(): self { return $this; }
+}
+
+function route(writable Guard $guard): void
+{
+    $guard->inspect()->inspect();
+    $guard->touch()->touch();
+}
+"#,
+    )
+    .expect("self returns should preserve the receiver borrow through a chain");
+}
+
+#[test]
+fn owned_temporary_is_a_valid_writable_receiver() {
+    doriac::check_source(
+        "stage21-owned-temporary.doria",
+        r#"
+class Guard
+{
+    writable function touch(): void {}
+}
+
+function main(): void
+{
+    (new Guard())->touch();
+}
+"#,
+    )
+    .expect("a freshly owned temporary is an exclusive writable place");
+}
+
+#[test]
+fn borrow_return_cannot_initialize_an_owning_let() {
+    assert_diagnostic(
+        r#"
+class Guard
+{
+    function inspect(): self { return $this; }
+}
+
+function route(Guard $guard): void
+{
+    let $alias = $guard->inspect();
+}
+"#,
+        "E0478",
+    );
+}
+
+#[test]
+fn property_assignment_holds_writable_access_while_evaluating_the_value() {
+    assert_diagnostic(
+        r#"
+class Box
+{
+    writable int $value = 0;
+}
+
+function update(writable Box $box): int { return 1; }
+
+function route(writable Box $box): void
+{
+    $box->value = update($box);
+}
+"#,
+        "E0477",
+    );
+}

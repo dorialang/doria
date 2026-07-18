@@ -99,6 +99,7 @@ pub struct FunctionInfo {
 pub struct MethodInfo {
     pub access: MemberAccess,
     pub receiver_mode: Option<ReceiverMode>,
+    pub returns_receiver_borrow: bool,
     pub is_static: bool,
     pub params: Vec<ParamInfo>,
     pub return_ty: TypeId,
