@@ -5060,6 +5060,9 @@ impl<'program> Checker<'program> {
             Expr::PropertyAccess {
                 object, property, ..
             } => {
+                if !Self::is_property_write_object_path(object) {
+                    return false;
+                }
                 if !self.is_writable_object_path(object, scopes, method_context) {
                     return false;
                 }

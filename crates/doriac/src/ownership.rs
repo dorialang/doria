@@ -1146,11 +1146,20 @@ impl Checker {
 
     fn use_assignment_operands(&mut self, target: &Expr, value: &Expr, scopes: &mut Scopes) {
         self.use_expr(target, scopes, UseMode::Write);
-        let assignment_root = self.borrow_root_key(target, scopes);
+        let mut ungrouped_target = target;
+        while let Expr::Grouped { expr, .. } = ungrouped_target {
+            ungrouped_target = expr;
+        }
+        let property_target = matches!(ungrouped_target, Expr::PropertyAccess { .. });
+        let assignment_root = property_target
+            .then(|| self.borrow_root_key(target, scopes))
+            .flatten();
         let inserted = assignment_root
             .as_ref()
             .is_some_and(|root| self.active_assignment_writes.insert(root.clone()));
-        let assignment_target = self.assignment_place_key(target, scopes);
+        let assignment_target = property_target
+            .then(|| self.assignment_place_key(target, scopes))
+            .flatten();
         let target_inserted = assignment_target
             .as_ref()
             .is_some_and(|target| self.active_assignment_targets.insert(target.clone()));
@@ -1326,11 +1335,11 @@ impl Checker {
                 for element in elements {
                     if let Some(key) = &element.key {
                         if self.use_owned_expression(key, scopes) == UseMode::Read {
-                            self.activate_property_place_borrows(key, scopes);
+                            self.activate_enclosing_read_borrows(key, scopes);
                         }
                     }
                     if self.use_owned_expression(&element.value, scopes) == UseMode::Read {
-                        self.activate_property_place_borrows(&element.value, scopes);
+                        self.activate_enclosing_read_borrows(&element.value, scopes);
                     }
                 }
                 self.active_borrows.truncate(borrow_depth);
@@ -1460,11 +1469,7 @@ impl Checker {
             self.use_expr(arg, scopes, mode);
             if matches!(mode, UseMode::Read | UseMode::Write) {
                 if mode == UseMode::Read {
-                    let borrow_count = self.active_borrows.len();
-                    self.activate_property_place_borrows(arg, scopes);
-                    if self.active_borrows.len() == borrow_count {
-                        self.activate_call_borrow(arg, mode, scopes);
-                    }
+                    self.activate_enclosing_read_borrows(arg, scopes);
                 } else {
                     self.activate_call_borrow(arg, mode, scopes);
                 }
@@ -1485,49 +1490,124 @@ impl Checker {
         });
     }
 
-    fn activate_property_place_borrows(&mut self, expr: &Expr, scopes: &Scopes) {
+    fn activate_enclosing_read_borrows(&mut self, expr: &Expr, scopes: &Scopes) {
+        self.activate_nested_property_borrows(expr, scopes);
+        self.activate_call_borrow(expr, UseMode::Read, scopes);
+    }
+
+    fn activate_nested_property_borrows(&mut self, expr: &Expr, scopes: &Scopes) {
         match expr {
-            Expr::PropertyAccess { .. } => {
+            Expr::PropertyAccess { object, .. } => {
                 if self
                     .borrow_root_key(expr, scopes)
                     .is_some_and(|root| !self.active_assignment_writes.contains(&root))
                 {
                     self.activate_call_borrow(expr, UseMode::Read, scopes);
                 }
+                self.activate_nested_property_borrows(object, scopes);
             }
             Expr::Grouped { expr, .. } | Expr::Unary { expr, .. } => {
-                self.activate_property_place_borrows(expr, scopes);
+                self.activate_nested_property_borrows(expr, scopes);
+            }
+            Expr::Binary {
+                left,
+                op: op @ (BinaryOp::And | BinaryOp::Or),
+                right,
+                ..
+            } => {
+                self.activate_nested_property_borrows(left, scopes);
+                if !matches!(
+                    (op, constant_bool(left)),
+                    (BinaryOp::And, Some(false)) | (BinaryOp::Or, Some(true))
+                ) {
+                    self.activate_nested_property_borrows(right, scopes);
+                }
             }
             Expr::Binary { left, right, .. } => {
-                self.activate_property_place_borrows(left, scopes);
-                self.activate_property_place_borrows(right, scopes);
+                self.activate_nested_property_borrows(left, scopes);
+                self.activate_nested_property_borrows(right, scopes);
             }
             Expr::Range { start, end, .. } => {
-                self.activate_property_place_borrows(start, scopes);
-                self.activate_property_place_borrows(end, scopes);
+                self.activate_nested_property_borrows(start, scopes);
+                self.activate_nested_property_borrows(end, scopes);
             }
             Expr::InterpolatedString { parts, .. } => {
                 for part in parts {
                     if let ast::InterpolatedStringPart::Expr(expr) = part {
-                        self.activate_property_place_borrows(expr, scopes);
+                        self.activate_nested_property_borrows(expr, scopes);
                     }
                 }
             }
             Expr::Array { elements, .. } => {
                 for element in elements {
                     if let Some(key) = &element.key {
-                        self.activate_property_place_borrows(key, scopes);
+                        self.activate_nested_property_borrows(key, scopes);
                     }
-                    self.activate_property_place_borrows(&element.value, scopes);
+                    self.activate_nested_property_borrows(&element.value, scopes);
                 }
+            }
+            Expr::FunctionCall { name, args, .. } => {
+                let signature = self.signatures.get(name).cloned().unwrap_or_default();
+                self.activate_nested_call_property_borrows(None, args, &signature, scopes);
+            }
+            Expr::New {
+                class_name, args, ..
+            } => {
+                let signature = self
+                    .constructors
+                    .get(class_name)
+                    .cloned()
+                    .unwrap_or_default();
+                self.activate_nested_call_property_borrows(None, args, &signature, scopes);
+            }
+            Expr::MethodCall {
+                object,
+                method,
+                args,
+                ..
+            } => {
+                let signature = self
+                    .expr_class(object, scopes)
+                    .and_then(|class| self.methods.get(&(class, method.clone())).cloned())
+                    .unwrap_or_default();
+                self.activate_nested_call_property_borrows(Some(object), args, &signature, scopes);
+            }
+            Expr::StaticCall {
+                qualifier,
+                method,
+                args,
+                ..
+            } => {
+                let signature = self
+                    .qualifier_class(qualifier)
+                    .and_then(|class| self.methods.get(&(class, method.clone())).cloned())
+                    .unwrap_or_default();
+                self.activate_nested_call_property_borrows(None, args, &signature, scopes);
             }
             _ => {}
         }
     }
 
+    fn activate_nested_call_property_borrows(
+        &mut self,
+        receiver: Option<&Expr>,
+        args: &[Expr],
+        signature: &Signature,
+        scopes: &Scopes,
+    ) {
+        if let Some(receiver) = receiver.filter(|_| signature.receiver == Some(UseMode::Read)) {
+            self.activate_nested_property_borrows(receiver, scopes);
+        }
+        for (index, arg) in args.iter().enumerate() {
+            if call_arg_mode(signature, index) == UseMode::Read {
+                self.activate_nested_property_borrows(arg, scopes);
+            }
+        }
+    }
+
     fn use_read_with_place_borrow(&mut self, expr: &Expr, scopes: &mut Scopes) {
         self.use_expr(expr, scopes, UseMode::Read);
-        self.activate_property_place_borrows(expr, scopes);
+        self.activate_enclosing_read_borrows(expr, scopes);
     }
 
     fn check_writable_move_argument(&mut self, expr: &Expr, scopes: &Scopes) {

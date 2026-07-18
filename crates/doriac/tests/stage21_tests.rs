@@ -879,3 +879,113 @@ function choose(Guard $guard, bool $alternate): Guard { return $guard; }
     )
     .expect("copy-scalar parameters should not count as borrowed return sources");
 }
+
+#[test]
+fn enclosing_borrow_reactivation_respects_constant_short_circuiting() {
+    for condition in ["false && $box->flag", "true || $box->flag"] {
+        doriac::check_source(
+            "stage21-dead-short-circuit-borrow.doria",
+            format!(
+                r#"
+class Box {{ bool $flag = false; }}
+function update(writable Box $box): int {{ return 1; }}
+function observe(bool $condition, int $value): void {{}}
+function route(writable Box $box): void {{ observe({condition}, update($box)); }}
+"#
+            ),
+        )
+        .expect("a property in a dead short-circuit operand is not borrowed");
+    }
+
+    assert_diagnostic(
+        r#"
+class Box { bool $flag = false; }
+function update(writable Box $box): int { return 1; }
+function observe(bool $condition, int $value): void {}
+function route(writable Box $box): void
+{
+    observe(true && $box->flag, update($box));
+}
+"#,
+        "E0477",
+    );
+}
+
+#[test]
+fn nested_call_and_constructor_arguments_preserve_property_borrows() {
+    for source in [
+        r#"
+class Box { int $value = 1; }
+function copy(int $value): int { return $value; }
+function update(writable Box $box): int { return 1; }
+function observe(int $left, int $right): void {}
+function route(writable Box $box): void
+{
+    observe(copy($box->value), update($box));
+}
+"#,
+        r#"
+class Box { int $value = 1; }
+class Wrapper { function __construct(int $value) {} }
+function update(writable Box $box): int { return 1; }
+function observe(Wrapper $left, int $right): void {}
+function route(writable Box $box): void
+{
+    observe(new Wrapper($box->value), update($box));
+}
+"#,
+    ] {
+        assert_diagnostic(source, "E0477");
+    }
+}
+
+#[test]
+fn writable_property_paths_require_stable_roots() {
+    assert_diagnostic(
+        r#"
+class Child {}
+class Box { writable Child $child = new Child(); }
+function make(): Box { return new Box(); }
+function update(writable Child $child): void {}
+function route(): void { update(make()->child); }
+"#,
+        "E0204",
+    );
+}
+
+#[test]
+fn display_borrows_remain_live_across_interpolation_parts() {
+    for displayed in ["$guard", "$guard->inspect()"] {
+        assert_diagnostic(
+            &format!(
+                r#"
+class Guard implements Displayable
+{{
+    function inspect(): self {{ return $this; }}
+    function toString(): string {{ return "guard"; }}
+}}
+function update(writable Guard $guard): string {{ return "updated"; }}
+function route(writable Guard $guard): string
+{{
+    return "{{{displayed}}}{{update($guard)}}";
+}}
+"#
+            ),
+            "E0477",
+        );
+    }
+}
+
+#[test]
+fn local_compound_assignments_may_read_their_own_value() {
+    assert_valid_mir(
+        r#"
+function main(): int
+{
+    let writable $value = 1;
+    $value += $value;
+    return $value;
+}
+"#,
+    );
+}
