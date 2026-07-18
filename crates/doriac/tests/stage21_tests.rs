@@ -989,3 +989,19 @@ function main(): int
 "#,
     );
 }
+
+#[test]
+fn nested_property_returns_stop_before_unlowerable_mir_places() {
+    assert_diagnostic(
+        r#"
+class Leaf {}
+class Child { Leaf $leaf = new Leaf(); }
+class Parent
+{
+    Child $child = new Child();
+    function leaf(): Leaf { return $this->child->leaf; }
+}
+"#,
+        "E0472",
+    );
+}

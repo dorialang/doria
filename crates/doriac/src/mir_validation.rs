@@ -718,19 +718,7 @@ fn infer_expression_return_borrow(
             return_borrow: Some(return_borrow),
             ..
         } => {
-            let callee = function_in(program, *callee)?;
-            let index = match return_borrow.source {
-                mir::BorrowSource::Receiver => 0,
-                mir::BorrowSource::Parameter(index) => {
-                    index + usize::from(callee.receiver_mode.is_some())
-                }
-            };
-            let Some(mir::Rvalue::Class(source)) = args.get(index) else {
-                return Err(malformed_mir(format!(
-                    "borrowed class call to {} has no class source argument",
-                    callee.name
-                )));
-            };
+            let source = borrowed_call_source(program, *callee, args, *return_borrow)?;
             Ok(
                 infer_expression_return_borrow(program, function, source)?.map(|borrow| {
                     mir::ReturnBorrow {
@@ -758,6 +746,9 @@ fn borrow_from_parameter(
         .iter()
         .position(|parameter| *parameter == local)?;
     let definition = function.locals.get(local.0)?;
+    if definition.owned {
+        return None;
+    }
     let has_receiver = function.receiver_mode.is_some();
     let source = if has_receiver && position == 0 {
         mir::BorrowSource::Receiver
@@ -2247,7 +2238,7 @@ fn validate_call_args_for_params(
                 )));
             }
         }
-        if let Some(local) = escaping_class_local_borrow(argument) {
+        if let Some(local) = escaping_class_local_borrow(program, argument)? {
             if transferred_class_locals.contains(&local) {
                 return Err(malformed_mir(format!(
                     "call to {} both borrows and transfers class local local{}",
@@ -2304,16 +2295,63 @@ fn validate_call_args_for_params(
     Ok(())
 }
 
-fn escaping_class_local_borrow(argument: &mir::Rvalue) -> Option<mir::LocalId> {
-    match argument {
-        mir::Rvalue::Class(mir::ClassExpression::Local {
+fn escaping_class_local_borrow(
+    program: &mir::Program,
+    argument: &mir::Rvalue,
+) -> Result<Option<mir::LocalId>, BackendError> {
+    let mir::Rvalue::Class(expression) = argument else {
+        return Ok(None);
+    };
+    escaping_class_expression_local_borrow(program, expression)
+}
+
+fn escaping_class_expression_local_borrow(
+    program: &mir::Program,
+    expression: &mir::ClassExpression,
+) -> Result<Option<mir::LocalId>, BackendError> {
+    match expression {
+        mir::ClassExpression::Local {
             local,
             transfer: false,
             ..
-        })
-        | mir::Rvalue::Class(mir::ClassExpression::Property { object: local, .. }) => Some(*local),
-        _ => None,
+        }
+        | mir::ClassExpression::Property { object: local, .. } => Ok(Some(*local)),
+        mir::ClassExpression::Call {
+            function,
+            args,
+            return_borrow: Some(return_borrow),
+            ..
+        } => escaping_class_expression_local_borrow(
+            program,
+            borrowed_call_source(program, *function, args, *return_borrow)?,
+        ),
+        mir::ClassExpression::Local { transfer: true, .. }
+        | mir::ClassExpression::Call {
+            return_borrow: None,
+            ..
+        }
+        | mir::ClassExpression::New { .. } => Ok(None),
     }
+}
+
+fn borrowed_call_source<'a>(
+    program: &mir::Program,
+    function: mir::FunctionId,
+    args: &'a [mir::Rvalue],
+    return_borrow: mir::ReturnBorrow,
+) -> Result<&'a mir::ClassExpression, BackendError> {
+    let callee = function_in(program, function)?;
+    let index = match return_borrow.source {
+        mir::BorrowSource::Receiver => 0,
+        mir::BorrowSource::Parameter(index) => index + usize::from(callee.receiver_mode.is_some()),
+    };
+    let Some(mir::Rvalue::Class(source)) = args.get(index) else {
+        return Err(malformed_mir(format!(
+            "borrowed class call to {} has no class source argument",
+            callee.name
+        )));
+    };
+    Ok(source)
 }
 
 fn validate_condition(

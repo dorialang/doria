@@ -1661,6 +1661,110 @@ fn shared_validator_rejects_borrows_into_owned_class_parameters() {
 }
 
 #[test]
+fn shared_validator_rejects_owned_parameters_as_return_borrow_sources() {
+    let mut program = class_program();
+    program.functions.push(Function {
+        id: FunctionId(1),
+        name: "invalidBorrowReturn".to_string(),
+        method: None,
+        receiver_mode: None,
+        params: vec![LocalId(0)],
+        return_type: ReturnType::Value(Type::Class(ClassId(0))),
+        locals: vec![class_local(0, ClassId(0))],
+        blocks: vec![BasicBlock {
+            id: BlockId(0),
+            statements: vec![],
+            terminator: Terminator::Return(Rvalue::Class(ClassExpression::Local {
+                class: ClassId(0),
+                local: LocalId(0),
+                transfer: false,
+            })),
+        }],
+        entry_block: BlockId(0),
+    });
+
+    let error = doriac::mir_validation::validate_program(&program)
+        .expect_err("an owned parameter cannot escape as a borrowed return");
+    assert!(error
+        .message
+        .contains("receives borrowed class local local0"));
+}
+
+#[test]
+fn shared_validator_tracks_borrow_returning_outer_call_arguments() {
+    let mut program = class_program();
+    program.functions[0].locals.push(class_local(0, ClassId(0)));
+    program.functions[0].blocks[0]
+        .statements
+        .push(Statement::CallVoid {
+            function: FunctionId(2),
+            args: vec![
+                Rvalue::Class(ClassExpression::Call {
+                    class: ClassId(0),
+                    function: FunctionId(1),
+                    args: vec![Rvalue::Class(ClassExpression::Local {
+                        class: ClassId(0),
+                        local: LocalId(0),
+                        transfer: false,
+                    })],
+                    return_borrow: Some(doriac::mir::ReturnBorrow {
+                        source: doriac::mir::BorrowSource::Parameter(0),
+                        writable: false,
+                    }),
+                }),
+                Rvalue::Class(ClassExpression::Local {
+                    class: ClassId(0),
+                    local: LocalId(0),
+                    transfer: true,
+                }),
+            ],
+        });
+    program.functions.push(Function {
+        id: FunctionId(1),
+        name: "identity".to_string(),
+        method: None,
+        receiver_mode: None,
+        params: vec![LocalId(0)],
+        return_type: ReturnType::Value(Type::Class(ClassId(0))),
+        locals: vec![borrowed_class_local(0, ClassId(0))],
+        blocks: vec![BasicBlock {
+            id: BlockId(0),
+            statements: vec![],
+            terminator: Terminator::Return(Rvalue::Class(ClassExpression::Local {
+                class: ClassId(0),
+                local: LocalId(0),
+                transfer: false,
+            })),
+        }],
+        entry_block: BlockId(0),
+    });
+    program.functions.push(Function {
+        id: FunctionId(2),
+        name: "observeThenConsume".to_string(),
+        method: None,
+        receiver_mode: None,
+        params: vec![LocalId(0), LocalId(1)],
+        return_type: ReturnType::Void,
+        locals: vec![
+            borrowed_class_local(0, ClassId(0)),
+            class_local(1, ClassId(0)),
+        ],
+        blocks: vec![BasicBlock {
+            id: BlockId(0),
+            statements: vec![],
+            terminator: Terminator::ReturnVoid,
+        }],
+        entry_block: BlockId(0),
+    });
+
+    let error = doriac::mir_validation::validate_program(&program)
+        .expect_err("a returned borrow must conflict with a later transfer in the outer call");
+    assert!(error
+        .message
+        .contains("both borrows and transfers class local local0"));
+}
+
+#[test]
 fn shared_validator_rejects_duplicate_class_local_transfers_in_one_call() {
     let mut program = class_program();
     program.functions[0].locals.push(class_local(0, ClassId(0)));

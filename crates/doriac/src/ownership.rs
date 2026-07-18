@@ -438,6 +438,13 @@ fn expr_return_borrow(
         }
         Expr::Grouped { expr, .. } => expr_return_borrow(expr, function, shadowed),
         Expr::PropertyAccess { object, .. } => {
+            let mut direct_object = object.as_ref();
+            while let Expr::Grouped { expr, .. } = direct_object {
+                direct_object = expr;
+            }
+            if !matches!(direct_object, Expr::Variable { .. } | Expr::This { .. }) {
+                return None;
+            }
             expr_return_borrow(object, function, shadowed).map(|borrow| ReturnBorrow {
                 writable: false,
                 ..borrow
