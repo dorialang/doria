@@ -10,6 +10,8 @@
 
 ### 1.1 DDO contradicts accepted record 0007
 
+> **Resolved (PR #85).** Andrew superseded 0007 rather than reconcile it: the plan's §9 DDO charter is authoritative, `0007` is marked **Superseded**, and the modern DDO decision takes a fresh record number when DDO is scheduled (post-Stage-29). The recommendations below are historical — the supersession kept §9's typed connection config over 0007's DSN (a DSN-as-additional-path is deferred to DDO authoring), kept the decomposed API, **carried streaming result sets into the §9 charter**, and mooted `DDO`-vs-`Ddo` (`DDO` is a brand, not a class). The `foreach ($users as UserRow $user)` binding is a pre-SPEC sketch, not adopted.
+
 `docs/decisions/0007-ddo-database-abstraction.md` (accepted, 18 Jun) predates the plan's §9 DDO paragraph, which was written without reading it. Three conflicts:
 
 | 0007 (accepted) | Plan §9 | Recommendation |
@@ -47,7 +49,7 @@ Both came from reading `PlaygroundService.php::getExamples()` as specifications.
 | 0073 release versioning | `0073-stage-15-llvm-release-backend` |
 | 0074 `Doria\Std\Math` geometry | `0074-stage-17-stdio-and-formatted-io` |
 
-Only 0075 matches. **Recommendation:** §12 carries **no numbers** for unauthored records — subjects only; numbers appear when the file does. This also removes the `0071 [assigned 0074 in-repo]` wart. Console and DDO entries should point at 0006/0007 as parents.
+Only 0075 matches. **Recommendation:** §12 carries **no numbers** for unauthored records — subjects only; numbers appear when the file does. This also removes the `0071 [assigned 0074 in-repo]` wart. Console's entry points at 0006; DDO's 0007 is now superseded (§1.1), so its §12 entry is a subject label.
 
 ---
 
@@ -95,7 +97,7 @@ These were repeatedly violated and repeatedly re-taught. Make them mechanical.
 | Blast-radius additions for ChatGPT + Codex prompts | Written, **not distributed** — `blast-radius-requirement.md`. |
 | Namespace grammar slice prompt | Written, **not sent** — `codex-grammar-slice-namespaces.md`. Should land before Stage 20 completes; PR #80's IntelliJ action generates `namespace`/`extends` the parser rejects. |
 | Formatting pass on the plan | **Not started.** §12 compaction + drop speculative numbers, DDO/Console → lead-in + bullets, two §0 monsters trimmed, headings renumbered. Formatting only, no decision changes. |
-| DDO rewired to elaborate 0007 | **Blocked** on §1.1's two rulings. |
+| DDO rewired to elaborate 0007 | **Resolved (PR #85):** 0007 superseded by the §9 charter, not elaborated; the modern DDO record is authored fresh when scheduled. |
 | `check_docs_authority.php` | Updated with `std::` guard, acronym-casing guard, strict `.doria` code checks, citation-integrity check. ⚠ Never linted with `php -l` or run against the tree — regexes verified only by Python simulation. |
 | ChatGPT standing context | **Stale.** Predates the §12 numbering policy (its Stage 20 prompt got it backwards), the `Doria\Std\*` sweep, the two-clocks rule, and blast radius. Needs a full refresh. |
 
@@ -107,4 +109,4 @@ These were repeatedly violated and repeatedly re-taught. Make them mechanical.
 2. Run `php scripts/check_docs_authority.php` and `php -l scripts/check_docs_authority.php`. Both are unverified.
 3. `grep -rn 'std::' docs/ examples/ editors/` — the sweep covered the plan; decision records and prompts were fixed by hand and `docs/notes/` is exempt by design.
 4. Open `doria-language/` (both repos), not `doria/`. Two of the last three gaps lived in the website.
-5. Read `docs/decisions/0006` and `0007` before touching Console or DDO in the plan.
+5. Read `docs/decisions/0006` (Console) and the §9 DDO charter before touching Console or DDO; `0007` is superseded history.

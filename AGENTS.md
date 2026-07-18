@@ -101,7 +101,7 @@ Locally-correct fixes are this project's dominant defect source. Every recorded 
 - Early records are snapshots, not law. A record that says "writable locals" may say so because locals were all that existed when it was written, not because anything else is prohibited. Before citing an old record as a constraint, ask whether it decided something or merely described what existed at the time.
 - Record numbers listed in the end-to-end plan's decision-record section are subject labels, not assignments. Assign real numbers at authoring time from the next free slot in `docs/decisions/`, and verify the slot is unused.
 - Prose cites a record subject ("the Console/terminal decision") until `docs/decisions/NNNN-*.md` exists, and a number only afterwards. `scripts/check_docs_authority.php` enforces this.
-- Console and DDO have accepted direction records that predate the end-to-end plan. Read them before designing either; later work elaborates them and must not silently contradict them.
+- Console has an accepted direction record (0006) that predates the end-to-end plan; read it before designing Console, and later work elaborates it without silently contradicting it. DDO's early record (0007) is **superseded** by the plan's §9 DDO charter — treat §9 as authoritative and do not build on 0007.
 
 ## Language identity — permanent nevers
 
