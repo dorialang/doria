@@ -5,6 +5,11 @@ declare(strict_types=1);
 $root = dirname(__DIR__);
 $failures = [];
 
+// Keys are "path:line:number". Keep this empty unless the repository contains
+// a verified decision-shaped token that is not a citation. Every entry requires
+// an inline rationale.
+const DECISION_CITATION_ALLOWLIST = [];
+
 function normalize_path(string $path): string
 {
     return str_replace('\\', '/', $path);
@@ -126,6 +131,144 @@ function add_failure(array &$failures, string $path, int $lineNumber, string $me
     $failures[] = "{$path}:{$lineNumber}: {$message}\n    {$line}";
 }
 
+/**
+ * Return decision-shaped tokens outside Markdown code fences.
+ *
+ * @return list<array{line: int, number: string, text: string}>
+ */
+function find_decision_citations(string $contents): array
+{
+    $citations = [];
+    $seen = [];
+    $fenceMarker = null;
+    $lines = preg_split('/\R/', $contents) ?: [];
+
+    foreach ($lines as $index => $line) {
+        if (preg_match('/^\s*(`{3,}|~{3,})/', $line, $fence) === 1) {
+            $marker = $fence[1][0];
+            if ($fenceMarker === null) {
+                $fenceMarker = $marker;
+            } elseif ($fenceMarker === $marker) {
+                $fenceMarker = null;
+            }
+            continue;
+        }
+
+        if ($fenceMarker !== null) {
+            continue;
+        }
+
+        if (preg_match_all('/\b(?:record|decision)s?\s+(\d{4})\b|\b(0\d{3})\b/i', $line, $matches, PREG_SET_ORDER) === 0) {
+            continue;
+        }
+
+        foreach ($matches as $match) {
+            $number = $match[1] !== '' ? $match[1] : $match[2];
+            $key = ($index + 1) . ':' . $number;
+            if (isset($seen[$key])) {
+                continue;
+            }
+
+            $seen[$key] = true;
+            $citations[] = [
+                'line' => $index + 1,
+                'number' => $number,
+                'text' => $line,
+            ];
+        }
+    }
+
+    return $citations;
+}
+
+/**
+ * @param array<string, list<string>> $recordFilesByNumber
+ * @param array<string, string> $allowlist
+ * @return list<string>
+ */
+function validate_decision_citations(
+    string $path,
+    string $contents,
+    array $recordFilesByNumber,
+    array $allowlist
+): array {
+    $citationFailures = [];
+
+    foreach (find_decision_citations($contents) as $citation) {
+        $allowlistKey = "{$path}:{$citation['line']}:{$citation['number']}";
+        if (array_key_exists($allowlistKey, $allowlist)) {
+            continue;
+        }
+
+        $matches = $recordFilesByNumber[$citation['number']] ?? [];
+        if (count($matches) !== 1) {
+            $count = count($matches);
+            $citationFailures[] = "{$path}:{$citation['line']}: decision citation {$citation['number']} resolves to {$count} authored records; expected exactly one docs/decisions/{$citation['number']}-*.md — cite the subject until authored (§12 numbering policy)\n    {$citation['text']}";
+        }
+    }
+
+    return $citationFailures;
+}
+
+/** @return list<string> */
+function decision_citation_self_test_failures(): array
+{
+    $authored = ['0040' => ['docs/decisions/0040-panics-and-overflow-policy.md']];
+    $tests = [
+        'unauthored citation fails' => validate_decision_citations(
+            'docs/decisions/fixture.md',
+            'See decision 9999.',
+            $authored,
+            []
+        ) !== [],
+        'authored citation passes' => validate_decision_citations(
+            'docs/decisions/fixture.md',
+            'See record 0040.',
+            $authored,
+            []
+        ) === [],
+        'duplicate authored number fails' => validate_decision_citations(
+            'docs/decisions/fixture.md',
+            'See record 0040.',
+            ['0040' => ['first.md', 'second.md']],
+            []
+        ) !== [],
+        'plural citations pass' => validate_decision_citations(
+            'docs/decisions/fixture.md',
+            'Decisions 0040 and records 0040.',
+            $authored,
+            []
+        ) === [],
+        'bare unauthored token fails' => validate_decision_citations(
+            'docs/decisions/fixture.md',
+            'Legacy token 0999.',
+            $authored,
+            []
+        ) !== [],
+        'fenced citation is ignored' => validate_decision_citations(
+            'docs/decisions/fixture.md',
+            "```text\ndecision 9999\n```",
+            $authored,
+            []
+        ) === [],
+        'allowlisted citation passes' => validate_decision_citations(
+            'docs/decisions/fixture.md',
+            'Legacy token 0999.',
+            $authored,
+            ['docs/decisions/fixture.md:1:0999' => 'synthetic self-test']
+        ) === [],
+    ];
+
+    $selfTestFailures = [];
+    foreach ($tests as $name => $passed) {
+        if (!$passed) {
+            $selfTestFailures[] = "internal docs-authority error: decision citation self-test failed: {$name}";
+        }
+    }
+
+    return $selfTestFailures;
+}
+
 $iterator = new RecursiveIteratorIterator(
     new RecursiveDirectoryIterator($root, FilesystemIterator::SKIP_DOTS)
 );
@@ -159,6 +302,37 @@ foreach ($iterator as $file) {
 sort($markdownFiles);
 sort($namingFiles);
 sort($doriaCodeFiles);
+
+array_push($failures, ...decision_citation_self_test_failures());
+
+$recordFilesByNumber = [];
+foreach (glob($root . '/docs/decisions/[0-9][0-9][0-9][0-9]-*.md') ?: [] as $recordPath) {
+    $filename = basename($recordPath);
+    $number = substr($filename, 0, 4);
+    $recordFilesByNumber[$number][] = relative_path($root, $recordPath);
+}
+
+$decisionCitationFiles = ['AGENTS.md', 'docs/doria-end-to-end-plan.md'];
+foreach ($markdownFiles as $path) {
+    if (is_decision_path($path) && !is_historical_path($path) && !is_redirect_path($path)) {
+        $decisionCitationFiles[] = $path;
+    }
+}
+$decisionCitationFiles = array_values(array_unique($decisionCitationFiles));
+sort($decisionCitationFiles);
+
+foreach ($decisionCitationFiles as $path) {
+    $contents = file_get_contents($root . '/' . $path);
+    if ($contents === false) {
+        $failures[] = "{$path}: unable to read file for decision citation checks";
+        continue;
+    }
+
+    array_push(
+        $failures,
+        ...validate_decision_citations($path, $contents, $recordFilesByNumber, DECISION_CITATION_ALLOWLIST)
+    );
+}
 
 if (array_filter($namingFiles, 'is_decision_path') === []) {
     $failures[] = 'internal docs-authority error: decision records are missing from naming checks';
@@ -275,7 +449,7 @@ foreach ($namingFiles as $path) {
             }
         }
 
-        // Record 0085: stdlib modules are namespaces under the reserved Doria\Std
+        // The namespace-model direction: stdlib modules are namespaces under the reserved Doria\Std
         // root. `std::term` and friends were a Rust-shaped spelling that leaked
         // through the plan, decision records, and agent prompts before it was
         // caught; this guard prevents the regression.
@@ -320,7 +494,7 @@ foreach (['print "text";', 'print 1;', 'print true;', 'print getName();'] as $pr
 }
 
 $forbiddenCodeSpellings = [
-    ['/\binstanceof\b/', 'instanceof is rejected permanently; the type-test and narrowing operator is `is` (record 0085)'],
+    ['/\binstanceof\b/', 'instanceof is rejected permanently; the namespace-model decision uses the type-test and narrowing operator `is`'],
     ['/\breadline\s*\(/', 'readline is rejected as a fused name; the stdin built-in is read_line'],
     ['/__toString/', 'Doria has no __toString magic method; display conversion is Displayable::toString'],
     [$forbiddenPrintStatementPattern, 'print is rejected; echo is the spelling'],
@@ -394,12 +568,12 @@ if ($namingAuthority !== false) {
     }
 
     // ---------------------------------------------------------------------
-    // Namespace-model authority (record 0085).
+    // Namespace-model authority.
     //
     // PAIRING NOTE: these assertions land WITH the plan commit that performs
-    // the Doria\Std sweep and adds record 0085. Enabling them against a plan
-    // that still carries `std::term` spellings will fail CI. Land both, or
-    // neither.
+    // the Doria\Std sweep and records the namespace-model direction. Enabling
+    // them against a plan that still carries `std::term` spellings will fail
+    // CI. Land both, or neither.
     // ---------------------------------------------------------------------
     $requiredNamespaceGuidance = [
         'Doria\Std\Term',
@@ -411,27 +585,6 @@ if ($namingAuthority !== false) {
             $failures[] = "{$namingAuthorityPath}: missing required namespace/naming authority guidance {$guidance}";
         }
     }
-    // Record-citation integrity (section 12 numbering policy).
-    //
-    // The plan's section 12 list holds record SUBJECTS, not assignments: real
-    // numbers are taken from the next free slot at authoring time. Prose must
-    // therefore cite a subject ("the Console/terminal decision") until the
-    // record exists, and a number only once docs/decisions/NNNN-*.md is real.
-    //
-    // Without this guard the plan silently points implementers at unrelated
-    // accepted decisions. It has already happened twice: the plan claimed 0074
-    // for both formatted I/O (real) and geometry math (speculative), and cited
-    // 0072 for Console when in-repo 0072 is floats/bools.
-    // ---------------------------------------------------------------------
-    if (preg_match_all('/\brecord\s+(\d{4})\b/i', $namingAuthority, $citations) > 0) {
-        foreach (array_unique($citations[1]) as $number) {
-            $matches = glob($root . '/docs/decisions/' . $number . '-*.md');
-            if ($matches === false || $matches === []) {
-                $failures[] = "{$namingAuthorityPath}: cites \"record {$number}\" but docs/decisions/{$number}-*.md does not exist — plan prose cites a record subject until the record is authored (section 12 numbering policy)";
-            }
-        }
-    }
-
 }
 
 // Keep the human-facing and executable native status claims synchronized
