@@ -491,7 +491,7 @@ fn validate_terminator(
                 {
                     let expected = infer_function_return_borrow(program, function)?;
                     let actual = infer_expression_return_borrow(program, function, class)?;
-                    if actual != expected {
+                    if !return_borrow_is_compatible(actual, expected) {
                         return Err(malformed_mir(format!(
                             "return from {} has inconsistent class ownership",
                             function.name
@@ -657,25 +657,41 @@ fn infer_function_return_borrow(
     program: &mir::Program,
     function: &mir::Function,
 ) -> Result<Option<mir::ReturnBorrow>, BackendError> {
-    let mut inferred = None;
+    let mut inferred: Option<Option<mir::ReturnBorrow>> = None;
     let (reachable, _) = reachable_blocks_and_predecessors(function, true)?;
     for block in function.blocks.iter().filter(|block| reachable[block.id.0]) {
         let mir::Terminator::Return(mir::Rvalue::Class(expression)) = &block.terminator else {
             continue;
         };
         let candidate = infer_expression_return_borrow(program, function, expression)?;
-        if let Some(existing) = inferred {
-            if existing != candidate {
+        match (inferred.as_mut(), candidate) {
+            (None, candidate) => inferred = Some(candidate),
+            (Some(Some(existing)), Some(candidate)) if existing.source == candidate.source => {
+                existing.writable &= candidate.writable;
+            }
+            (Some(None), None) => {}
+            _ => {
                 return Err(malformed_mir(format!(
                     "function {} mixes owned and borrowed class returns",
                     function.name
                 )));
             }
-        } else {
-            inferred = Some(candidate);
         }
     }
     Ok(inferred.flatten())
+}
+
+fn return_borrow_is_compatible(
+    actual: Option<mir::ReturnBorrow>,
+    expected: Option<mir::ReturnBorrow>,
+) -> bool {
+    match (actual, expected) {
+        (Some(actual), Some(expected)) => {
+            actual.source == expected.source && (!expected.writable || actual.writable)
+        }
+        (None, None) => true,
+        _ => false,
+    }
 }
 
 fn infer_expression_return_borrow(

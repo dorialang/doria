@@ -49,6 +49,7 @@ struct Binding {
 struct PropertyInfo {
     class: Option<String>,
     move_type: bool,
+    writable: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -169,6 +170,7 @@ pub(crate) fn check_program_with_inferred_move_returns(
                                     PropertyInfo {
                                         class: property_class,
                                         move_type,
+                                        writable: property.writable,
                                     },
                                 );
                             }
@@ -201,6 +203,7 @@ pub(crate) fn check_program_with_inferred_move_returns(
                                             PropertyInfo {
                                                 class: property_class,
                                                 move_type,
+                                                writable: param.writable,
                                             },
                                         );
                                     }
@@ -224,6 +227,7 @@ pub(crate) fn check_program_with_inferred_move_returns(
         receiver_class: None,
         current_return_borrow: None,
         active_assignment_writes: HashSet::new(),
+        active_assignment_targets: HashSet::new(),
         active_borrows: Vec::new(),
         diagnostics: Vec::new(),
     };
@@ -486,6 +490,7 @@ struct Checker {
     receiver_class: Option<String>,
     current_return_borrow: Option<UseMode>,
     active_assignment_writes: HashSet<String>,
+    active_assignment_targets: HashSet<String>,
     active_borrows: Vec<ActiveBorrow>,
     diagnostics: Vec<Diagnostic>,
 }
@@ -1085,7 +1090,15 @@ impl Checker {
         let inserted = assignment_root
             .as_ref()
             .is_some_and(|root| self.active_assignment_writes.insert(root.clone()));
+        let assignment_target = self.assignment_place_key(target, scopes);
+        let target_inserted = assignment_target
+            .as_ref()
+            .is_some_and(|target| self.active_assignment_targets.insert(target.clone()));
         self.use_expr(value, scopes, UseMode::Read);
+        if target_inserted {
+            self.active_assignment_targets
+                .remove(assignment_target.as_deref().expect("inserted target"));
+        }
         if inserted {
             self.active_assignment_writes
                 .remove(assignment_root.as_deref().expect("inserted root"));
@@ -1164,7 +1177,11 @@ impl Checker {
                 }
             }
             Expr::Grouped { expr, .. } => self.use_expr(expr, scopes, mode),
-            Expr::PropertyAccess { object, span, .. } => {
+            Expr::PropertyAccess {
+                object,
+                property,
+                span,
+            } => {
                 if mode == UseMode::Give && self.expr_is_move_value(expr, scopes) {
                     self.diagnostics.push(
                         Diagnostic::new(
@@ -1177,6 +1194,35 @@ impl Checker {
                         ),
                     );
                 }
+                if mode == UseMode::Write {
+                    let readonly_move_property = self
+                        .expr_class(object, scopes)
+                        .and_then(|class| self.properties.get(&(class, property.clone())))
+                        .is_some_and(|property| property.class.is_none() && !property.writable);
+                    if readonly_move_property {
+                        self.diagnostics.push(
+                            Diagnostic::new(
+                                "E0479",
+                                format!(
+                                    "readonly property `${property}` cannot be used as writable"
+                                ),
+                                *span,
+                            )
+                            .with_help(
+                                "declare the property `writable` before passing it for mutation",
+                            ),
+                        );
+                    }
+                }
+                let assignment_root = (mode == UseMode::Read
+                    && self
+                        .assignment_place_key(expr, scopes)
+                        .is_some_and(|target| self.active_assignment_targets.contains(&target)))
+                .then(|| self.borrow_root_key(object, scopes))
+                .flatten();
+                let suspended_assignment_write = assignment_root
+                    .as_ref()
+                    .is_some_and(|root| self.active_assignment_writes.remove(root));
                 self.use_expr(
                     object,
                     scopes,
@@ -1186,6 +1232,10 @@ impl Checker {
                         UseMode::Read
                     },
                 );
+                if suspended_assignment_write {
+                    self.active_assignment_writes
+                        .insert(assignment_root.expect("suspended assignment root"));
+                }
             }
             Expr::FunctionCall { name, args, .. } => {
                 let signature = self.signatures.get(name).cloned().unwrap_or_default();
@@ -1276,6 +1326,11 @@ impl Checker {
                     self.check_active_borrow_conflict("$this", mode, *span);
                 } else if mode == UseMode::Give {
                     self.check_give_against_active_borrows("$this", *span);
+                }
+                if self.check_assignment_write_conflict("$this", mode, *span)
+                    && mode == UseMode::Give
+                {
+                    return;
                 }
                 if mode == UseMode::Give {
                     self.diagnostics.push(
@@ -1442,6 +1497,20 @@ impl Checker {
                 .and_then(|class| self.methods.get(&(class, method.clone())))
                 .and_then(|signature| signature.return_borrow)
                 .and_then(|borrow| self.call_borrow_root(borrow, None, args, scopes)),
+            _ => None,
+        }
+    }
+
+    fn assignment_place_key(&self, expr: &Expr, scopes: &Scopes) -> Option<String> {
+        match expr {
+            Expr::This { .. } if self.receiver_class.is_some() => Some("$this".to_string()),
+            Expr::Variable { name, .. } if scopes.get(name).is_some() => Some(name.clone()),
+            Expr::Grouped { expr, .. } => self.assignment_place_key(expr, scopes),
+            Expr::PropertyAccess {
+                object, property, ..
+            } => self
+                .assignment_place_key(object, scopes)
+                .map(|object| format!("{object}->{property}")),
             _ => None,
         }
     }

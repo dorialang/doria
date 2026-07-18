@@ -485,3 +485,102 @@ function main(): void
         .expect("discarded returned borrows should lower through Cranelift")
         .is_empty());
 }
+
+#[test]
+fn this_property_assignment_holds_writable_access_during_rhs_evaluation() {
+    for source in [
+        r#"
+class Box
+{
+    writable int $value = 0;
+    int $other = 1;
+
+    writable function copy(): void
+    {
+        $this->value = $this->other;
+    }
+}
+"#,
+        r#"
+class Box
+{
+    writable int $value = 0;
+
+    writable function update(): void
+    {
+        $this->value = replace($this);
+    }
+}
+
+function replace(writable Box $box): int { return 1; }
+"#,
+    ] {
+        assert_diagnostic(source, "E0477");
+    }
+
+    doriac::check_source(
+        "stage21-self-read-modify-write.doria",
+        r#"
+class Counter
+{
+    writable int $value = 0;
+    writable function advance(): void { $this->value = $this->value + 1; }
+}
+"#,
+    )
+    .expect("an assignment may read the exact property it is replacing");
+}
+
+#[test]
+fn readonly_move_properties_cannot_be_passed_as_writable() {
+    assert_diagnostic(
+        r#"
+class Box
+{
+    mixed $payload = 1;
+}
+
+function update(writable mixed $payload): void {}
+
+function route(writable Box $box): void
+{
+    update($box->payload);
+}
+"#,
+        "E0479",
+    );
+
+    doriac::check_source(
+        "stage21-writable-move-property.doria",
+        r#"
+class Box
+{
+    writable mixed $payload = 1;
+}
+
+function update(writable mixed $payload): void {}
+function route(writable Box $box): void { update($box->payload); }
+"#,
+    )
+    .expect("a writable move property remains a valid writable argument");
+}
+
+#[test]
+fn returned_borrow_writability_is_downgraded_across_reachable_paths() {
+    assert_valid_mir(
+        r#"
+class Node
+{
+    function __construct(take Node $child) {}
+}
+
+function choose(writable Node $node, bool $direct): Node
+{
+    if ($direct) { return $node; }
+    return $node->child;
+}
+
+function main(): void {}
+"#,
+    );
+}
