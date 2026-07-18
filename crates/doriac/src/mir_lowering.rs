@@ -12,6 +12,7 @@ use crate::{hir, mir};
 struct FunctionSignature {
     id: mir::FunctionId,
     return_type: mir::ReturnType,
+    return_borrow: Option<mir::ReturnBorrow>,
     parameter_types: Vec<mir::Type>,
     parameter_defaults: Vec<Option<crate::const_eval::ConstValue>>,
     parameter_transfers: Vec<bool>,
@@ -494,6 +495,11 @@ fn collect_function_signature(
     Ok(FunctionSignature {
         id,
         return_type,
+        return_borrow: semantic_info
+            .return_borrows
+            .get(&function.span.start)
+            .copied()
+            .map(mir_return_borrow),
         parameter_types,
         parameter_defaults,
         parameter_transfers,
@@ -501,6 +507,16 @@ fn collect_function_signature(
         method_class: None,
         receiver_mode: None,
     })
+}
+
+fn mir_return_borrow(borrow: crate::symbols::ReturnBorrow) -> mir::ReturnBorrow {
+    mir::ReturnBorrow {
+        source: match borrow.source {
+            crate::symbols::BorrowSource::Receiver => mir::BorrowSource::Receiver,
+            crate::symbols::BorrowSource::Parameter(index) => mir::BorrowSource::Parameter(index),
+        },
+        writable: borrow.writable,
+    }
 }
 
 fn callable_signatures_by_method(
@@ -600,6 +616,7 @@ fn lower_function(
         inputs.constructor_body_initializers.clone(),
         inputs.static_ids.clone(),
     );
+    context.return_borrow = signature.return_borrow;
     let mut params = Vec::new();
     if let Some(class) = receiver {
         let writable = matches!(signature.receiver_mode, Some(mir::ReceiverMode::Writable));
@@ -1330,6 +1347,7 @@ struct LoweringContext<'semantic> {
     reachable_blocks: Vec<bool>,
     current_block: Option<mir::BlockId>,
     loop_targets: Vec<LoopTargets>,
+    return_borrow: Option<mir::ReturnBorrow>,
 }
 
 impl<'semantic> LoweringContext<'semantic> {
@@ -1360,6 +1378,7 @@ impl<'semantic> LoweringContext<'semantic> {
             reachable_blocks: vec![true],
             current_block: Some(mir::BlockId(0)),
             loop_targets: Vec::new(),
+            return_borrow: None,
         }
     }
 
@@ -1543,7 +1562,7 @@ impl<'semantic> LoweringContext<'semantic> {
         id
     }
 
-    fn declare_return_temp(&mut self, ty: mir::Type) -> mir::LocalId {
+    fn declare_return_temp(&mut self, ty: mir::Type, owned: bool) -> mir::LocalId {
         let id = mir::LocalId(self.locals.len());
         let name = format!("_return{}", self.temp_counter);
         self.temp_counter += 1;
@@ -1552,7 +1571,7 @@ impl<'semantic> LoweringContext<'semantic> {
             name,
             ty,
             writable: false,
-            owned: matches!(ty, mir::Type::Class(_)),
+            owned,
             synthetic: true,
         });
         id
@@ -2980,7 +2999,15 @@ fn lower_return(
             Ok(mir::Terminator::ReturnVoid)
         }
         (mir::ReturnType::Value(expected), Some(expr)) => {
-            let value = lower_rvalue_as_expected(expr, expected, context)?;
+            let borrowed_class =
+                matches!(expected, mir::Type::Class(_)) && context.return_borrow.is_some();
+            let value = match expected {
+                mir::Type::Class(class) => {
+                    lower_class_expression(expr, class, !borrowed_class, context)
+                        .map(mir::Rvalue::Class)?
+                }
+                _ => lower_rvalue_as_expected(expr, expected, context)?,
+            };
             if value.ty() != expected {
                 return Err(vec![Diagnostic::new(
                     "I1301",
@@ -2992,13 +3019,24 @@ fn lower_return(
                 )]);
             }
             if context.has_cleanup_obligations() {
-                let result = context.declare_return_temp(expected);
+                if borrowed_class {
+                    context.cleanup_scopes_from(0);
+                    return Ok(mir::Terminator::Return(value));
+                }
+                let result = context.declare_return_temp(
+                    expected,
+                    matches!(expected, mir::Type::Class(_)) && !borrowed_class,
+                );
                 context.push_statement(mir::Statement::AssignLocal {
                     target: result,
                     value,
                 });
                 context.cleanup_scopes_from(0);
-                Ok(mir::Terminator::Return(local_rvalue(result, expected)))
+                Ok(mir::Terminator::Return(local_rvalue(
+                    result,
+                    expected,
+                    !borrowed_class,
+                )))
             } else {
                 Ok(mir::Terminator::Return(value))
             }
@@ -3014,7 +3052,7 @@ fn lower_return(
     }
 }
 
-fn local_rvalue(local: mir::LocalId, ty: mir::Type) -> mir::Rvalue {
+fn local_rvalue(local: mir::LocalId, ty: mir::Type, transfer: bool) -> mir::Rvalue {
     match ty {
         mir::Type::Scalar(mir::ScalarType::Integer(ty)) => mir::Rvalue::Value(
             mir::ValueExpression::Integer(local_integer_expression(local, ty)),
@@ -3034,7 +3072,7 @@ fn local_rvalue(local: mir::LocalId, ty: mir::Type) -> mir::Rvalue {
         mir::Type::Class(class) => mir::Rvalue::Class(mir::ClassExpression::Local {
             class,
             local,
-            transfer: true,
+            transfer,
         }),
     }
 }
@@ -3373,6 +3411,7 @@ fn lower_class_expression(
             Ok(mir::ClassExpression::Call {
                 class: expected,
                 function: signature.id,
+                return_borrow: signature.return_borrow,
                 args: lower_call_args_with_ownership(name, args, signature, *span, context)?,
             })
         }
@@ -3393,6 +3432,7 @@ fn lower_class_expression(
             Ok(mir::ClassExpression::Call {
                 class: expected,
                 function: signature.id,
+                return_borrow: signature.return_borrow,
                 args,
             })
         }
@@ -3413,6 +3453,7 @@ fn lower_class_expression(
             Ok(mir::ClassExpression::Call {
                 class: expected,
                 function: signature.id,
+                return_borrow: signature.return_borrow,
                 args,
             })
         }

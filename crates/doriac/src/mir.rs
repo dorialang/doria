@@ -94,6 +94,18 @@ pub enum ReceiverMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReturnBorrow {
+    pub source: BorrowSource,
+    pub writable: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BorrowSource {
+    Receiver,
+    Parameter(usize),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReturnType {
     Value(Type),
     Void,
@@ -200,6 +212,7 @@ pub enum ClassExpression {
         class: ClassId,
         function: FunctionId,
         args: Vec<Rvalue>,
+        return_borrow: Option<ReturnBorrow>,
     },
     New {
         class: ClassId,

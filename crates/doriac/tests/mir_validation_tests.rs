@@ -182,6 +182,7 @@ fn shared_validator_requires_class_calls_to_return_the_declared_class() {
                 class: ClassId(0),
                 function: FunctionId(1),
                 args: vec![],
+                return_borrow: None,
             }),
         });
     program.functions.push(Function {
@@ -1007,6 +1008,7 @@ fn shared_validator_tracks_nested_transfers_across_property_initializers() {
                                     local: LocalId(1),
                                     transfer: true,
                                 })],
+                                return_borrow: None,
                             },
                         )),
                     })

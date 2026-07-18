@@ -466,7 +466,20 @@ fn validate_terminator(
             }
             validate_rvalue(program, function, expression)?;
             if let (mir::Type::Class(_), mir::Rvalue::Class(class)) = (return_type, expression) {
-                require_owned_class_expression(class, &format!("return from {}", function.name))?;
+                let expected = infer_function_return_borrow(program, function)?;
+                let actual = infer_expression_return_borrow(program, function, class)?;
+                if actual != expected {
+                    return Err(malformed_mir(format!(
+                        "return from {} has inconsistent class ownership",
+                        function.name
+                    )));
+                }
+                if expected.is_none() {
+                    require_owned_class_expression(
+                        class,
+                        &format!("return from {}", function.name),
+                    )?;
+                }
             }
             Ok(())
         }
@@ -590,7 +603,10 @@ fn require_owned_class_expression(
 ) -> Result<(), BackendError> {
     match expression {
         mir::ClassExpression::Local { transfer: true, .. }
-        | mir::ClassExpression::Call { .. }
+        | mir::ClassExpression::Call {
+            return_borrow: None,
+            ..
+        }
         | mir::ClassExpression::New { .. } => Ok(()),
         mir::ClassExpression::Local {
             local,
@@ -604,7 +620,110 @@ fn require_owned_class_expression(
             "{destination} receives borrowed class property{}",
             property.index
         ))),
+        mir::ClassExpression::Call {
+            return_borrow: Some(_),
+            ..
+        } => Err(malformed_mir(format!(
+            "{destination} receives a borrowed class call result"
+        ))),
     }
+}
+
+fn infer_function_return_borrow(
+    program: &mir::Program,
+    function: &mir::Function,
+) -> Result<Option<mir::ReturnBorrow>, BackendError> {
+    let mut inferred = None;
+    for block in &function.blocks {
+        let mir::Terminator::Return(mir::Rvalue::Class(expression)) = &block.terminator else {
+            continue;
+        };
+        let candidate = infer_expression_return_borrow(program, function, expression)?;
+        if let Some(existing) = inferred {
+            if existing != candidate {
+                return Err(malformed_mir(format!(
+                    "function {} mixes owned and borrowed class returns",
+                    function.name
+                )));
+            }
+        } else {
+            inferred = Some(candidate);
+        }
+    }
+    Ok(inferred.flatten())
+}
+
+fn infer_expression_return_borrow(
+    program: &mir::Program,
+    function: &mir::Function,
+    expression: &mir::ClassExpression,
+) -> Result<Option<mir::ReturnBorrow>, BackendError> {
+    match expression {
+        mir::ClassExpression::Local {
+            local,
+            transfer: false,
+            ..
+        } => Ok(borrow_from_parameter(function, *local)),
+        mir::ClassExpression::Property { object, .. } => Ok(borrow_from_parameter(
+            function, *object,
+        )
+        .map(|borrow| mir::ReturnBorrow {
+            writable: false,
+            ..borrow
+        })),
+        mir::ClassExpression::Call {
+            function: callee,
+            args,
+            return_borrow: Some(return_borrow),
+            ..
+        } => {
+            let callee = function_in(program, *callee)?;
+            let index = match return_borrow.source {
+                mir::BorrowSource::Receiver => 0,
+                mir::BorrowSource::Parameter(index) => index + usize::from(callee.method.is_some()),
+            };
+            let Some(mir::Rvalue::Class(source)) = args.get(index) else {
+                return Err(malformed_mir(format!(
+                    "borrowed class call to {} has no class source argument",
+                    callee.name
+                )));
+            };
+            Ok(
+                infer_expression_return_borrow(program, function, source)?.map(|borrow| {
+                    mir::ReturnBorrow {
+                        writable: borrow.writable && return_borrow.writable,
+                        ..borrow
+                    }
+                }),
+            )
+        }
+        mir::ClassExpression::Local { transfer: true, .. }
+        | mir::ClassExpression::Call {
+            return_borrow: None,
+            ..
+        }
+        | mir::ClassExpression::New { .. } => Ok(None),
+    }
+}
+
+fn borrow_from_parameter(
+    function: &mir::Function,
+    local: mir::LocalId,
+) -> Option<mir::ReturnBorrow> {
+    let position = function
+        .params
+        .iter()
+        .position(|parameter| *parameter == local)?;
+    let definition = function.locals.get(local.0)?;
+    let source = if function.method.is_some() && position == 0 {
+        mir::BorrowSource::Receiver
+    } else {
+        mir::BorrowSource::Parameter(position - usize::from(function.method.is_some()))
+    };
+    Some(mir::ReturnBorrow {
+        source,
+        writable: definition.writable,
+    })
 }
 
 fn require_writable_class_expression(
@@ -631,9 +750,11 @@ fn require_writable_class_expression(
             };
             object.writable && property_in(program, class, *property)?.writable
         }
-        mir::ClassExpression::Local { transfer: true, .. }
-        | mir::ClassExpression::Call { .. }
-        | mir::ClassExpression::New { .. } => false,
+        mir::ClassExpression::Local { transfer: true, .. } => false,
+        mir::ClassExpression::Call { return_borrow, .. } => {
+            return_borrow.is_none_or(|borrow| borrow.writable)
+        }
+        mir::ClassExpression::New { .. } => true,
     };
     if writable {
         Ok(())
@@ -1167,6 +1288,7 @@ fn validate_class_expression(
         mir::ClassExpression::Call {
             function: callee,
             args,
+            return_borrow,
             ..
         } => {
             let callee = function_in(program, *callee)?;
@@ -1174,6 +1296,13 @@ fn validate_class_expression(
                 return Err(malformed_mir(format!(
                     "class#{} call targets a function with another return type",
                     class.0
+                )));
+            }
+            let expected_return_borrow = infer_function_return_borrow(program, callee)?;
+            if *return_borrow != expected_return_borrow {
+                return Err(malformed_mir(format!(
+                    "class#{} call disagrees with function {} return ownership",
+                    class.0, callee.name
                 )));
             }
             validate_call_args(program, function, callee, args)

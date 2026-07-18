@@ -1459,6 +1459,7 @@ impl Interpreter<'_> {
                 class,
                 function,
                 args,
+                ..
             } => {
                 self.queue_call(
                     function,

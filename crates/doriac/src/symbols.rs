@@ -93,16 +93,29 @@ pub struct ParamInfo {
 pub struct FunctionInfo {
     pub params: Vec<ParamInfo>,
     pub return_ty: TypeId,
+    pub return_borrow: Option<ReturnBorrow>,
 }
 
 #[derive(Debug, Clone)]
 pub struct MethodInfo {
     pub access: MemberAccess,
     pub receiver_mode: Option<ReceiverMode>,
-    pub returns_receiver_borrow: bool,
+    pub return_borrow: Option<ReturnBorrow>,
     pub is_static: bool,
     pub params: Vec<ParamInfo>,
     pub return_ty: TypeId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReturnBorrow {
+    pub source: BorrowSource,
+    pub writable: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BorrowSource {
+    Receiver,
+    Parameter(usize),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

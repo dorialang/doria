@@ -8,8 +8,9 @@ use crate::format_string::{self, FormatConversion, FormatPiece};
 use crate::numeric::{parse_decimal_magnitude, FloatType, FloatValue, IntegerType, IntegerValue};
 use crate::source::Span;
 use crate::symbols::{
-    Binding, ClassInfo, ConstantInfo, FunctionInfo, MemberDeclaration, MemberKind, MethodInfo,
-    ParamInfo, PropertyInfo, PropertyInitState, ReceiverMode, ScopeStack, StaticPropertyInfo,
+    Binding, BorrowSource, ClassInfo, ConstantInfo, FunctionInfo, MemberDeclaration, MemberKind,
+    MethodInfo, ParamInfo, PropertyInfo, PropertyInitState, ReceiverMode, ReturnBorrow, ScopeStack,
+    StaticPropertyInfo,
 };
 use crate::types::{TypeId, TypeKind, TypeRef, TypeRegistry};
 
@@ -30,6 +31,8 @@ pub struct SemanticInfo {
     /// Const-folded Copy-scalar defaults keyed by callable and parameter identity.
     pub parameter_defaults:
         HashMap<crate::const_eval::ParameterDefaultKey, crate::const_eval::ConstValue>,
+    /// Elided class-result borrows keyed by callable source span.
+    pub return_borrows: HashMap<usize, ReturnBorrow>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -95,6 +98,13 @@ pub fn analyze_program(program: &Program) -> DiagnosticResult<SemanticInfo> {
             classes: collect_ordered_class_semantics(program),
             const_evaluation: checker.const_evaluation,
             parameter_defaults: checker.parameter_defaults,
+            return_borrows: checker
+                .function_signatures
+                .iter()
+                .filter_map(|(span, signature)| {
+                    signature.return_borrow.map(|borrow| (*span, borrow))
+                })
+                .collect(),
         })
     } else {
         Err(checker.diagnostics)
@@ -523,8 +533,7 @@ impl<'program> Checker<'program> {
                                             ReceiverMode::Readonly
                                         },
                                     ),
-                                    returns_receiver_borrow:
-                                        crate::ownership::function_returns_receiver_borrow(method),
+                                    return_borrow: signature.return_borrow,
                                     is_static: method.is_static,
                                     params: signature.params,
                                     return_ty: signature.return_ty,
@@ -810,8 +819,15 @@ impl<'program> Checker<'program> {
     ) -> FunctionInfo {
         let params = self.resolve_param_infos(function, declaring_class);
         let return_ty = self.resolve_function_return_type(function, declaring_class);
+        let return_borrow = matches!(self.types.kind(return_ty), TypeKind::Class(_))
+            .then(|| crate::ownership::function_return_borrow(function))
+            .flatten();
 
-        FunctionInfo { params, return_ty }
+        FunctionInfo {
+            params,
+            return_ty,
+            return_borrow,
+        }
     }
 
     fn resolve_param_infos(
@@ -5043,7 +5059,24 @@ impl<'program> Checker<'program> {
                     .map(|property| property.writable)
                     .unwrap_or(false)
             }
-            Expr::MethodCall { object, method, .. } => {
+            Expr::FunctionCall { name, args, .. } => {
+                self.functions.get(name).cloned().is_some_and(|function| {
+                    self.call_result_is_writable(
+                        function.return_ty,
+                        function.return_borrow,
+                        None,
+                        args,
+                        scopes,
+                        method_context,
+                    )
+                })
+            }
+            Expr::MethodCall {
+                object,
+                method,
+                args,
+                ..
+            } => {
                 let Some(class_name) = self.expr_class_name(object, scopes, method_context) else {
                     return false;
                 };
@@ -5055,13 +5088,73 @@ impl<'program> Checker<'program> {
                 else {
                     return false;
                 };
-                method_info.returns_receiver_borrow
-                    && method_info
-                        .receiver_mode
-                        .is_some_and(ReceiverMode::is_writable)
-                    && self.is_writable_object_path(object, scopes, method_context)
+                self.call_result_is_writable(
+                    method_info.return_ty,
+                    method_info.return_borrow,
+                    Some(object),
+                    args,
+                    scopes,
+                    method_context,
+                )
+            }
+            Expr::StaticCall {
+                qualifier,
+                method,
+                args,
+                ..
+            } => {
+                let class_name = match qualifier {
+                    StaticQualifier::Class(name) => Some(name.as_str()),
+                    StaticQualifier::SelfType => {
+                        method_context.map(|context| context.class_name.as_str())
+                    }
+                    StaticQualifier::Parent | StaticQualifier::InvalidStatic => None,
+                };
+                let Some(method_info) = class_name
+                    .and_then(|class| self.classes.get(class))
+                    .and_then(|class| class.methods.get(method))
+                    .cloned()
+                else {
+                    return false;
+                };
+                self.call_result_is_writable(
+                    method_info.return_ty,
+                    method_info.return_borrow,
+                    None,
+                    args,
+                    scopes,
+                    method_context,
+                )
             }
             _ => false,
+        }
+    }
+
+    fn call_result_is_writable(
+        &mut self,
+        return_ty: TypeId,
+        return_borrow: Option<ReturnBorrow>,
+        receiver: Option<&Expr>,
+        args: &[Expr],
+        scopes: &ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) -> bool {
+        if !matches!(self.types.kind(return_ty), TypeKind::Class(_)) {
+            return false;
+        }
+        let Some(return_borrow) = return_borrow else {
+            return true;
+        };
+        if !return_borrow.writable {
+            return false;
+        }
+        match return_borrow.source {
+            BorrowSource::Receiver => receiver.is_some_and(|receiver| {
+                self.is_writable_object_path(receiver, scopes, method_context)
+            }),
+            BorrowSource::Parameter(index) => args.get(index).is_some_and(|argument| {
+                self.is_writable_object_path(argument, scopes, method_context)
+            }),
         }
     }
 

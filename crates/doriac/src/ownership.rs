@@ -9,6 +9,7 @@ use std::collections::{HashMap, HashSet};
 use crate::ast::{self, AssignOp, BinaryOp, ClassMember, Expr, Item, Stmt};
 use crate::diagnostics::Diagnostic;
 use crate::source::Span;
+use crate::symbols::{BorrowSource, ReturnBorrow};
 
 #[derive(Debug, Clone)]
 struct Parameter {
@@ -22,7 +23,7 @@ struct Signature {
     params: Vec<Parameter>,
     returns: Option<String>,
     returns_move_type: bool,
-    return_borrow: Option<UseMode>,
+    return_borrow: Option<ReturnBorrow>,
     receiver: Option<UseMode>,
 }
 
@@ -260,54 +261,70 @@ pub(crate) fn check_program_with_inferred_move_returns(
     checker.diagnostics
 }
 
-pub(crate) fn function_returns_receiver_borrow(function: &ast::FunctionDecl) -> bool {
-    if function.is_static
-        || function
-            .return_type
-            .as_ref()
-            .is_none_or(|ty| ty.name != "self")
-    {
-        return false;
+pub(crate) fn function_return_borrow(function: &ast::FunctionDecl) -> Option<ReturnBorrow> {
+    let mut borrow = None;
+    if block_return_borrow(&function.body, function, &mut borrow) {
+        borrow
+    } else {
+        None
     }
-
-    let mut found = false;
-    block_returns_only_receiver_borrows(&function.body, &mut found) && found
 }
 
-fn block_returns_only_receiver_borrows(block: &ast::Block, found: &mut bool) -> bool {
+fn block_return_borrow(
+    block: &ast::Block,
+    function: &ast::FunctionDecl,
+    borrow: &mut Option<ReturnBorrow>,
+) -> bool {
     block
         .statements
         .iter()
-        .all(|statement| statement_returns_only_receiver_borrows(statement, found))
+        .all(|statement| statement_return_borrow(statement, function, borrow))
 }
 
-fn statement_returns_only_receiver_borrows(statement: &Stmt, found: &mut bool) -> bool {
+fn statement_return_borrow(
+    statement: &Stmt,
+    function: &ast::FunctionDecl,
+    borrow: &mut Option<ReturnBorrow>,
+) -> bool {
     match statement {
         Stmt::Return {
             expr: Some(expr), ..
         } => {
-            *found = true;
-            expr_derives_from_this(expr)
+            let Some(candidate) = expr_return_borrow(expr, function) else {
+                return false;
+            };
+            match borrow {
+                Some(existing) if existing.source != candidate.source => false,
+                Some(existing) => {
+                    existing.writable &= candidate.writable;
+                    true
+                }
+                slot @ None => {
+                    *slot = Some(candidate);
+                    true
+                }
+            }
         }
         Stmt::Return { expr: None, .. } => false,
         Stmt::If(statement) => {
-            block_returns_only_receiver_borrows(&statement.then_block, found)
+            block_return_borrow(&statement.then_block, function, borrow)
                 && statement
                     .else_branch
                     .as_ref()
                     .is_none_or(|branch| match branch {
-                        ast::ElseBranch::If(statement) => statement_returns_only_receiver_borrows(
+                        ast::ElseBranch::If(statement) => statement_return_borrow(
                             &Stmt::If((**statement).clone()),
-                            found,
+                            function,
+                            borrow,
                         ),
                         ast::ElseBranch::Block(block) => {
-                            block_returns_only_receiver_borrows(block, found)
+                            block_return_borrow(block, function, borrow)
                         }
                     })
         }
-        Stmt::While(statement) => block_returns_only_receiver_borrows(&statement.body, found),
-        Stmt::For(statement) => block_returns_only_receiver_borrows(&statement.body, found),
-        Stmt::Foreach(statement) => block_returns_only_receiver_borrows(&statement.body, found),
+        Stmt::While(statement) => block_return_borrow(&statement.body, function, borrow),
+        Stmt::For(statement) => block_return_borrow(&statement.body, function, borrow),
+        Stmt::Foreach(statement) => block_return_borrow(&statement.body, function, borrow),
         Stmt::VarDecl(_)
         | Stmt::Assignment(_)
         | Stmt::Echo { .. }
@@ -318,13 +335,29 @@ fn statement_returns_only_receiver_borrows(statement: &Stmt, found: &mut bool) -
     }
 }
 
-fn expr_derives_from_this(expr: &Expr) -> bool {
+fn expr_return_borrow(expr: &Expr, function: &ast::FunctionDecl) -> Option<ReturnBorrow> {
     match expr {
-        Expr::This { .. } => true,
-        Expr::Grouped { expr, .. } | Expr::PropertyAccess { object: expr, .. } => {
-            expr_derives_from_this(expr)
+        Expr::This { .. } if !function.is_static => Some(ReturnBorrow {
+            source: BorrowSource::Receiver,
+            writable: function.writable_this,
+        }),
+        Expr::Variable { name, .. } => function
+            .params
+            .iter()
+            .enumerate()
+            .find(|(_, param)| param.name == *name && !param.take)
+            .map(|(index, param)| ReturnBorrow {
+                source: BorrowSource::Parameter(index),
+                writable: param.writable,
+            }),
+        Expr::Grouped { expr, .. } => expr_return_borrow(expr, function),
+        Expr::PropertyAccess { object, .. } => {
+            expr_return_borrow(object, function).map(|borrow| ReturnBorrow {
+                writable: false,
+                ..borrow
+            })
         }
-        _ => false,
+        _ => None,
     }
 }
 
@@ -334,7 +367,12 @@ fn signature(
     inferred_move_returns: &HashSet<usize>,
     receiver_class: Option<&str>,
 ) -> Signature {
-    let returns_receiver_borrow = function_returns_receiver_borrow(function);
+    let return_borrow = function_return_borrow(function).filter(|_| {
+        function
+            .return_type
+            .as_ref()
+            .is_some_and(|ty| type_ref_class_name(ty, classes, receiver_class).is_some())
+    });
     Signature {
         params: function
             .params
@@ -350,16 +388,10 @@ fn signature(
             .as_ref()
             .and_then(|ty| type_ref_class_name(ty, classes, receiver_class)),
         returns_move_type: function.return_type.as_ref().is_some_and(|ty| {
-            type_ref_is_move_type(ty, classes, receiver_class) && !returns_receiver_borrow
+            type_ref_is_move_type(ty, classes, receiver_class) && return_borrow.is_none()
         }) || (function.return_type.is_none()
             && inferred_move_returns.contains(&function.span.start)),
-        return_borrow: returns_receiver_borrow.then_some({
-            if function.writable_this {
-                UseMode::Write
-            } else {
-                UseMode::Read
-            }
-        }),
+        return_borrow,
         receiver: receiver_class.map(|_| {
             if function.writable_this {
                 UseMode::Write
@@ -436,9 +468,16 @@ impl Checker {
         let previous_receiver =
             std::mem::replace(&mut self.receiver_class, receiver_class.map(str::to_owned));
         let previous_return_borrow = self.current_return_borrow;
-        self.current_return_borrow =
-            (receiver_class.is_some() && function_returns_receiver_borrow(function)).then_some({
-                if function.writable_this {
+        self.current_return_borrow = function
+            .return_type
+            .as_ref()
+            .is_some_and(|ty| {
+                type_ref_class_name(ty, &self.classes, self.receiver_class.as_deref()).is_some()
+            })
+            .then(|| function_return_borrow(function))
+            .flatten()
+            .map(|borrow| {
+                if borrow.writable {
                     UseMode::Write
                 } else {
                     UseMode::Read
@@ -568,8 +607,7 @@ impl Checker {
             }
             Stmt::Assignment(assignment) => {
                 if assignment.op != AssignOp::Assign {
-                    self.use_expr(&assignment.target, scopes, UseMode::Read);
-                    self.use_expr(&assignment.value, scopes, UseMode::Read);
+                    self.use_assignment_operands(&assignment.target, &assignment.value, scopes);
                     return Flow::fallthrough();
                 }
                 if let Expr::Variable { name, span } = &assignment.target {
@@ -660,16 +698,7 @@ impl Checker {
                             ),
                         );
                     }
-                    self.use_expr(&assignment.target, scopes, UseMode::Write);
-                    let assignment_root = self.borrow_root_key(&assignment.target, scopes);
-                    let inserted = assignment_root
-                        .as_ref()
-                        .is_some_and(|root| self.active_assignment_writes.insert(root.clone()));
-                    self.use_expr(&assignment.value, scopes, UseMode::Read);
-                    if inserted {
-                        self.active_assignment_writes
-                            .remove(assignment_root.as_deref().expect("inserted root"));
-                    }
+                    self.use_assignment_operands(&assignment.target, &assignment.value, scopes);
                 }
                 Flow::fallthrough()
             }
@@ -995,6 +1024,19 @@ impl Checker {
         self.diagnostics.extend(additions);
     }
 
+    fn use_assignment_operands(&mut self, target: &Expr, value: &Expr, scopes: &mut Scopes) {
+        self.use_expr(target, scopes, UseMode::Write);
+        let assignment_root = self.borrow_root_key(target, scopes);
+        let inserted = assignment_root
+            .as_ref()
+            .is_some_and(|root| self.active_assignment_writes.insert(root.clone()));
+        self.use_expr(value, scopes, UseMode::Read);
+        if inserted {
+            self.active_assignment_writes
+                .remove(assignment_root.as_deref().expect("inserted root"));
+        }
+    }
+
     fn use_expr(&mut self, expr: &Expr, scopes: &mut Scopes, mode: UseMode) {
         match expr {
             Expr::Variable { name, span } => {
@@ -1021,6 +1063,16 @@ impl Checker {
                 let Some(binding) = scopes.get_mut(name) else {
                     return;
                 };
+                if mode == UseMode::Write && !binding.writable {
+                    self.diagnostics.push(
+                        Diagnostic::new(
+                            "E0479",
+                            format!("readonly `${name}` cannot be used as writable"),
+                            *span,
+                        )
+                        .with_help("declare the binding `writable` before passing it for mutation"),
+                    );
+                }
                 match binding.state {
                     State::Borrowed if mode == UseMode::Give => {
                         self.diagnostics.push(
@@ -1217,6 +1269,20 @@ impl Checker {
         for (index, arg) in args.iter().enumerate() {
             let mode = call_arg_mode(signature, index);
             if mode == UseMode::Give {
+                if self.expr_returns_borrow(arg, scopes) {
+                    self.diagnostics.push(
+                        Diagnostic::new(
+                            "E0474",
+                            "borrowed call result cannot be given away",
+                            arg.span(),
+                        )
+                        .with_help(
+                            "pass an independently owned value to an ownership-taking parameter",
+                        ),
+                    );
+                    self.use_expr(arg, scopes, UseMode::Read);
+                    continue;
+                }
                 if let Some(name) = ownership_root_name(arg).filter(|name| {
                     self.active_borrows
                         .iter()
@@ -1281,14 +1347,47 @@ impl Checker {
             Expr::PropertyAccess { object, .. } | Expr::Grouped { expr: object, .. } => {
                 self.borrow_root_key(object, scopes)
             }
-            Expr::MethodCall { object, method, .. } => {
+            Expr::FunctionCall { name, args, .. } => self
+                .signatures
+                .get(name)
+                .and_then(|signature| signature.return_borrow)
+                .and_then(|borrow| self.call_borrow_root(borrow, None, args, scopes)),
+            Expr::MethodCall {
+                object,
+                method,
+                args,
+                ..
+            } => {
                 let class = self.expr_class(object, scopes)?;
                 self.methods
                     .get(&(class, method.clone()))
                     .and_then(|signature| signature.return_borrow)
-                    .and_then(|_| self.borrow_root_key(object, scopes))
+                    .and_then(|borrow| self.call_borrow_root(borrow, Some(object), args, scopes))
             }
+            Expr::StaticCall {
+                qualifier,
+                method,
+                args,
+                ..
+            } => self
+                .qualifier_class(qualifier)
+                .and_then(|class| self.methods.get(&(class, method.clone())))
+                .and_then(|signature| signature.return_borrow)
+                .and_then(|borrow| self.call_borrow_root(borrow, None, args, scopes)),
             _ => None,
+        }
+    }
+
+    fn call_borrow_root(
+        &self,
+        borrow: ReturnBorrow,
+        receiver: Option<&Expr>,
+        args: &[Expr],
+        scopes: &Scopes,
+    ) -> Option<String> {
+        match borrow.source {
+            BorrowSource::Receiver => self.borrow_root_key(receiver?, scopes),
+            BorrowSource::Parameter(index) => self.borrow_root_key(args.get(index)?, scopes),
         }
     }
 
@@ -1410,6 +1509,10 @@ impl Checker {
     fn expr_returns_borrow(&self, expr: &Expr, scopes: &Scopes) -> bool {
         match expr {
             Expr::Grouped { expr, .. } => self.expr_returns_borrow(expr, scopes),
+            Expr::FunctionCall { name, .. } => self
+                .signatures
+                .get(name)
+                .is_some_and(|signature| signature.return_borrow.is_some()),
             Expr::MethodCall { object, method, .. } => {
                 let Some(class) = self.expr_class(object, scopes) else {
                     return false;
@@ -1418,6 +1521,12 @@ impl Checker {
                     .get(&(class, method.clone()))
                     .is_some_and(|signature| signature.return_borrow.is_some())
             }
+            Expr::StaticCall {
+                qualifier, method, ..
+            } => self
+                .qualifier_class(qualifier)
+                .and_then(|class| self.methods.get(&(class, method.clone())))
+                .is_some_and(|signature| signature.return_borrow.is_some()),
             _ => false,
         }
     }
