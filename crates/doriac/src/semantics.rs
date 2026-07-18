@@ -3996,6 +3996,19 @@ impl<'program> Checker<'program> {
             } => {
                 self.check_expr(object, scopes, method_context);
                 self.check_mixed_operation(object, "property write", scopes, method_context);
+                if !Self::is_property_write_object_path(object) {
+                    self.diagnostics.push(
+                        Diagnostic::new(
+                            "E0204",
+                            "property assignment requires a stable object path",
+                            object.span(),
+                        )
+                        .with_help(
+                            "bind the object to a writable local before assigning its property",
+                        ),
+                    );
+                    return None;
+                }
                 if let Some((class_name, property_info)) =
                     self.lookup_property(object, property, *span, scopes, method_context)
                 {
@@ -5126,6 +5139,15 @@ impl<'program> Checker<'program> {
                     method_context,
                 )
             }
+            _ => false,
+        }
+    }
+
+    fn is_property_write_object_path(expr: &Expr) -> bool {
+        match expr {
+            Expr::Grouped { expr, .. } => Self::is_property_write_object_path(expr),
+            Expr::Variable { .. } | Expr::This { .. } => true,
+            Expr::PropertyAccess { object, .. } => Self::is_property_write_object_path(object),
             _ => false,
         }
     }

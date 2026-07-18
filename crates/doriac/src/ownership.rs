@@ -1329,7 +1329,9 @@ impl Checker {
                 right,
                 ..
             } => {
+                let borrow_depth = self.active_borrows.len();
                 self.use_expr(left, scopes, UseMode::Read);
+                self.activate_property_place_borrow(left, scopes);
                 match (op, constant_bool(left)) {
                     (BinaryOp::And, Some(false)) | (BinaryOp::Or, Some(true)) => {}
                     (BinaryOp::And, Some(true)) | (BinaryOp::Or, Some(false)) => {
@@ -1342,6 +1344,7 @@ impl Checker {
                         scopes.merge_from(&without_right, &with_right);
                     }
                 }
+                self.active_borrows.truncate(borrow_depth);
             }
             Expr::Binary { left, right, .. }
             | Expr::Range {
@@ -1349,8 +1352,11 @@ impl Checker {
                 end: right,
                 ..
             } => {
+                let borrow_depth = self.active_borrows.len();
                 self.use_expr(left, scopes, UseMode::Read);
+                self.activate_property_place_borrow(left, scopes);
                 self.use_expr(right, scopes, UseMode::Read);
+                self.active_borrows.truncate(borrow_depth);
             }
             Expr::This { span } => {
                 if matches!(mode, UseMode::Read | UseMode::Write) {
@@ -1450,6 +1456,20 @@ impl Checker {
             mode,
             span: expr.span(),
         });
+    }
+
+    fn activate_property_place_borrow(&mut self, expr: &Expr, scopes: &Scopes) {
+        let mut expr = expr;
+        while let Expr::Grouped { expr: inner, .. } = expr {
+            expr = inner;
+        }
+        if matches!(expr, Expr::PropertyAccess { .. })
+            && self
+                .borrow_root_key(expr, scopes)
+                .is_some_and(|root| !self.active_assignment_writes.contains(&root))
+        {
+            self.activate_call_borrow(expr, UseMode::Read, scopes);
+        }
     }
 
     fn check_assignment_write_conflict(&mut self, root: &str, mode: UseMode, span: Span) -> bool {

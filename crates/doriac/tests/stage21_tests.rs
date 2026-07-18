@@ -598,6 +598,61 @@ class Counter
 }
 
 #[test]
+fn property_place_reads_remain_live_across_binary_operands() {
+    assert_diagnostic(
+        r#"
+class Box { writable int $value = 0; }
+function update(writable Box $box): int { return 1; }
+function route(writable Box $box): int { return $box->value + update($box); }
+"#,
+        "E0477",
+    );
+
+    assert_diagnostic(
+        r#"
+class Box { writable int $value = 0; }
+function consume(take Box $box): int { return 1; }
+function route(take Box $box): int { return $box->value + consume($box); }
+"#,
+        "E0471",
+    );
+}
+
+#[test]
+fn nested_exact_assignment_target_reads_remain_accepted() {
+    doriac::check_source(
+        "stage21-nested-exact-target.doria",
+        r#"
+class Child { writable int $value = 0; }
+class Box { writable Child $child = new Child(); }
+
+function update(writable Box $box): void
+{
+    $box->child->value = $box->child->value + 1;
+}
+"#,
+    )
+    .expect("an assignment may read its exact nested property target");
+}
+
+#[test]
+fn property_writes_through_owned_rvalues_require_a_stable_object_path() {
+    for source in [
+        r#"
+class Box { writable int $value = 0; }
+function main(): void { (new Box())->value = 1; }
+"#,
+        r#"
+class Box { writable int $value = 0; }
+function make(): Box { return new Box(); }
+function main(): void { make()->value = 1; }
+"#,
+    ] {
+        assert_diagnostic(source, "E0204");
+    }
+}
+
+#[test]
 fn readonly_move_properties_cannot_be_passed_as_writable() {
     assert_diagnostic(
         r#"
