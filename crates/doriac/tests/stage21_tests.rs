@@ -777,6 +777,40 @@ function route(writable Box $box): void { update($box->value); }
 }
 
 #[test]
+fn writable_mixed_requires_writable_scalar_storage() {
+    for source in [
+        r#"
+function update(writable mixed $value): void {}
+function main(): void { let $value = 1; update($value); }
+"#,
+        r#"
+function update(writable mixed $value): void {}
+function route(int $value): void { update($value); }
+"#,
+        r#"
+function update(writable mixed $value): void {}
+function main(): void { update(1); }
+"#,
+        r#"
+function update(writable mixed $value): void {}
+function main(): void { let $value = 1; update($value + 1); }
+"#,
+    ] {
+        assert_diagnostic(source, "E0204");
+    }
+
+    doriac::check_source(
+        "stage21-writable-scalar-storage.doria",
+        r#"
+function update(writable mixed $value): void {}
+function route(writable int $value): void { update($value); }
+function main(): void { writable int $value = 1; update($value); }
+"#,
+    )
+    .expect("writable scalar bindings remain valid writable mixed arguments");
+}
+
+#[test]
 fn property_initializers_resolve_self_qualified_borrow_returns() {
     assert_diagnostic(
         r#"

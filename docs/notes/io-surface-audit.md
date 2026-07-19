@@ -65,8 +65,8 @@ Format per item: **Status · Options · Tradeoffs · Recommendation (marked) · 
 ### Q5 — buffering and flush + stdout/stderr ordering [PARTIALLY SETTLED — unbuffered now; public flush + ordering OPEN]
 - **Status.** Raw device writes are **unbuffered** today; the raw-layer flush "may be an intentional no-op … not `fsync`" (0074). The stream tier is described as "buffered." There is **no public flush** and **no stated stdout/stderr ordering guarantee**.
 - **Options.** (a) Keep the free-function tier unbuffered; put buffering + an explicit `flush()` **method** on the post-Stage-29 stream objects (where `__destruct` flushes). (b) Buffer stdout now (line-buffered on a TTY, block-buffered when piped, C-stdio style) + a public `flush` free function.
-- **Tradeoffs.** (a) no lost-output surprises, simplest, matches current behavior; interleaving is naturally in write order. (b) throughput for chatty output, but reintroduces flush bugs and the abort-panic data-loss surface (D6) at the free-function tier.
-- **Recommendation → (a).** Keep free-function output unbuffered; buffering + `flush()` are stream-tier object methods. **State the ordering guarantee explicitly:** because free-function output is unbuffered, stdout and stderr appear in exact write order with no reordering. Do not add a public flush free function (nothing to flush while unbuffered). **Reopen trigger:** stream-tier design.
+- **Tradeoffs.** (a) no lost-output surprises, simplest, matches current behavior, and preserves issue order within each stream. (b) throughput for chatty output, but reintroduces flush bugs and the abort-panic data-loss surface (D6) at the free-function tier.
+- **Recommendation → (a).** Keep free-function output unbuffered; buffering + `flush()` are stream-tier object methods. **State the ordering guarantee precisely:** writes retain exact program order within stdout and within stderr. Cross-stream order is observable only when both streams target the same underlying handle (including explicit shell merging); separate pipes/descriptors have no single reconstructable order that Doria can guarantee. Do not add a public flush free function (nothing to flush while unbuffered). **Reopen trigger:** stream-tier design.
 - **Blast radius.** Mostly documenting an existing guarantee (0074/SPEC); stream-tier flush is post-Stage-29.
 
 ### Q6 — standard streams as first-class values [OPEN — post-Stage-29]
@@ -133,7 +133,7 @@ Empty cells: **binary stdin read (Q2), binary stdout write (Q1), binary stderr w
 
 - **Byte std-stream I/O** (Q1/Q2/D2) — deferred to the **Stage 23 `Bytes` tier**; names reserved now. *Reopen:* Stage 23.
 - **`Path` type** (Q4) — deferred to **`Doria\Std\Fs`** design; portability cost recorded now. *Reopen:* authoring `Fs`.
-- **Public flush + stream buffering** (Q5) — deferred to the **stream tier**; unbuffered + write-order guarantee stated now. *Reopen:* `Io` stream design.
+- **Public flush + stream buffering** (Q5) — deferred to the **stream tier**; unbuffered + per-stream write-order guarantee stated now. *Reopen:* `Io` stream design.
 - **First-class standard streams** (Q6) — deferred to **post-Stage-29**; unify-direction recommended. *Reopen:* `Io` stream design.
 - **Stream concurrency / `Sendable`** (D7) — deferred to the **async decision**; three design cases flagged. *Reopen:* async authoring.
 - **`Io`/`Fs` operation placement** (D8) — the *line* is recommended now; the *operations* land `Io` (post-29) / `Fs` (unscheduled).
@@ -142,7 +142,7 @@ Empty cells: **binary stdin read (Q2), binary stdout write (Q1), binary stderr w
 
 ## Invalidated elsewhere (if the recommendations are approved)
 
-- **0074** — add: byte std-stream writers (Stage 23); `append_file` as the append spelling; broken-pipe carve-out from the write-panic (D1); no-BOM-strip and no-newline-normalization stated (D5); unbuffered + stdout/stderr write-order guarantee (Q5). Panic-message set changes for the stdout-broken-pipe case.
+- **0074** — add: byte std-stream writers (Stage 23); `append_file` as the append spelling; broken-pipe carve-out from the write-panic (D1); no-BOM-strip and no-newline-normalization stated (D5); unbuffered + per-stream/same-handle write-order guarantee (Q5). Panic-message set changes for the stdout-broken-pipe case.
 - **0075** — add byte stdin/stdout/stderr to tier-2; state the byte-tier failure model (D3); note append across tiers.
 - **SPEC.md** "Stage 17 text I/O" — mirror the 0074 clarifications; state closed-stdout behavior.
 - **plan §9** formatted-I/O / three-tier bullets — `append_file`, byte std streams, the `Io`/`Fs` line, EPIPE behavior.

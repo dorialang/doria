@@ -4974,22 +4974,26 @@ impl<'program> Checker<'program> {
                 || self.is_assignable(param.ty, got)
             {
                 if param.writable
-                    && matches!(self.types.kind(param.ty), TypeKind::Class(_))
+                    && (matches!(self.types.kind(param.ty), TypeKind::Class(_))
+                        || matches!(self.types.kind(param.ty), TypeKind::Mixed)
+                            && self.writable_mixed_requires_semantic_check(got, arg))
                     && !self.is_writable_object_path(arg, scopes, method_context)
                 {
-                    self.diagnostics.push(
-                        Diagnostic::new(
-                            "E0204",
-                            format!(
-                                "argument {} of {callee} must be a writable class value",
-                                index + 1
-                            ),
-                            arg.span(),
+                    let message = if matches!(self.types.kind(param.ty), TypeKind::Class(_)) {
+                        format!(
+                            "argument {} of {callee} must be a writable class value",
+                            index + 1
                         )
-                        .with_help(
-                            "declare the argument binding `writable` before passing it for mutation",
-                        ),
-                    );
+                    } else {
+                        format!(
+                            "argument {} of {callee} must reference writable storage",
+                            index + 1
+                        )
+                    };
+                    self.diagnostics
+                        .push(Diagnostic::new("E0204", message, arg.span()).with_help(
+                            "pass a `writable` binding or property that the callee can mutate",
+                        ));
                 }
                 continue;
             }
@@ -5143,6 +5147,19 @@ impl<'program> Checker<'program> {
                 )
             }
             _ => false,
+        }
+    }
+
+    fn writable_mixed_requires_semantic_check(&self, argument_ty: TypeId, argument: &Expr) -> bool {
+        if self.type_is_move_type(argument_ty) {
+            return false;
+        }
+        match argument {
+            Expr::Grouped { expr, .. } => {
+                self.writable_mixed_requires_semantic_check(argument_ty, expr)
+            }
+            Expr::This { .. } | Expr::PropertyAccess { .. } | Expr::StaticMember { .. } => false,
+            _ => true,
         }
     }
 
