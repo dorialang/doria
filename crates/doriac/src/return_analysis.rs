@@ -2,7 +2,7 @@ use crate::ast::{Block, ElseBranch, FunctionDecl, Stmt};
 use crate::control_flow::{build_function_cfg, ControlFlowGraph, Node};
 use crate::dataflow::{solve_forward, ForwardAnalysis};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ReturnAnalysis {
     pub graph: ControlFlowGraph,
     pub fallthrough_reachable: bool,

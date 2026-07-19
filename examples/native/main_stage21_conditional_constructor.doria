@@ -1,0 +1,34 @@
+class Message
+{
+    string $text;
+    int $code;
+
+    function __construct(bool $formal, string $name)
+    {
+        if ($formal) {
+            $this->text = "Hello, " . $name;
+            $this->code = 200;
+        } else {
+            $this->text = "Hi, " . $name;
+            $this->code = 201;
+        }
+    }
+
+    function show(): void
+    {
+        echo $this->text . " [" . $this->code . "]\n";
+    }
+
+    function __destruct()
+    {
+        echo "released " . $this->code . "\n";
+    }
+}
+
+function main(): void
+{
+    let $formal = new Message(true, "Doria");
+    let $casual = new Message(false, "Andrew");
+    $formal->show();
+    $casual->show();
+}

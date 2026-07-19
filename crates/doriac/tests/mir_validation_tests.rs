@@ -1606,26 +1606,38 @@ fn shared_validator_requires_constructor_body_initializers_on_every_return_path(
                     source: PropertyValueSource::ConstructorBody,
                 }],
                 constructor: Some(FunctionId(1)),
-                args: vec![],
+                args: vec![Rvalue::Value(ValueExpression::Bool(
+                    doriac::mir::BoolExpression::Use {
+                        operand: Operand::Scalar(ScalarValue::Bool(true)),
+                    },
+                ))],
             }),
         });
     let mut receiver = class_local(0, ClassId(0));
     receiver.owned = false;
+    let condition = Local {
+        id: LocalId(1),
+        name: "condition".to_string(),
+        ty: Type::Scalar(ScalarType::Bool),
+        writable: false,
+        owned: false,
+        synthetic: false,
+    };
     program.functions.push(Function {
         id: FunctionId(1),
         name: "Message::__construct".to_string(),
         method: None,
         receiver_mode: None,
-        params: vec![LocalId(0)],
+        params: vec![LocalId(0), LocalId(1)],
         return_type: ReturnType::Void,
-        locals: vec![receiver],
+        locals: vec![receiver, condition],
         blocks: vec![
             BasicBlock {
                 id: BlockId(0),
                 statements: vec![],
                 terminator: Terminator::Branch {
                     condition: doriac::mir::BoolExpression::Use {
-                        operand: Operand::Scalar(ScalarValue::Bool(true)),
+                        operand: Operand::Local(LocalId(1)),
                     },
                     then_block: BlockId(1),
                     else_block: BlockId(2),
@@ -1659,6 +1671,55 @@ fn shared_validator_requires_constructor_body_initializers_on_every_return_path(
     assert!(error
         .message
         .contains("can return without initializing property0"));
+
+    program.functions[1].blocks[2]
+        .statements
+        .push(Statement::AssignProperty {
+            object: LocalId(0),
+            property,
+            value: Rvalue::String(StringExpression::Literal("fallback".to_string())),
+        });
+    doriac::mir_validation::validate_program(&program)
+        .expect("mutually exclusive readonly initialization paths are valid");
+
+    let mut duplicate = program.clone();
+    duplicate.functions[1].blocks[1]
+        .statements
+        .push(Statement::AssignProperty {
+            object: LocalId(0),
+            property,
+            value: Rvalue::String(StringExpression::Literal("twice".to_string())),
+        });
+    let error = doriac::mir_validation::validate_program(&duplicate)
+        .expect_err("readonly initialization twice on one path must be rejected");
+    assert!(error.message.contains("more than once on one path"));
+
+    let mut read_before_init = program.clone();
+    read_before_init.functions[1].blocks[0]
+        .statements
+        .push(Statement::EchoString(StringExpression::Property {
+            object: LocalId(0),
+            property,
+        }));
+    let error = doriac::mir_validation::validate_program(&read_before_init)
+        .expect_err("constructor MIR cannot read an uninitialized property");
+    assert!(error.message.contains("reads or exposes property0"));
+
+    let mut unreachable_write = program;
+    unreachable_write.functions[1].blocks[2].statements.clear();
+    unreachable_write.functions[1].blocks[2].terminator =
+        Terminator::Panic(StringExpression::Literal("stop".to_string()));
+    unreachable_write.functions[1].blocks.push(BasicBlock {
+        id: BlockId(4),
+        statements: vec![Statement::AssignProperty {
+            object: LocalId(0),
+            property,
+            value: Rvalue::String(StringExpression::Literal("unreachable".to_string())),
+        }],
+        terminator: Terminator::ReturnVoid,
+    });
+    doriac::mir_validation::validate_program(&unreachable_write)
+        .expect("an unreachable write neither establishes nor invalidates initialization");
 }
 
 #[test]

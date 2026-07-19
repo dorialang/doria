@@ -1,4 +1,4 @@
-use crate::ast::{Block, ElseBranch, Expr, ForStmt, Stmt};
+use crate::ast::{Block, ElseBranch, Expr, ForIncrement, ForInitializer, ForStmt, Stmt};
 use crate::source::Span;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -17,16 +17,27 @@ pub enum NodeKind {
     FallthroughExit,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
+pub enum NodeAction {
+    None,
+    Statement(Stmt),
+    Expression(Expr),
+    ForInitializer(ForInitializer),
+    ForIncrement(ForIncrement),
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct Node {
     pub id: NodeId,
     pub kind: NodeKind,
     pub span: Span,
+    pub action: NodeAction,
+    pub repeatable: bool,
     pub predecessors: Vec<NodeId>,
     pub successors: Vec<NodeId>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ControlFlowGraph {
     pub nodes: Vec<Node>,
     pub entry: NodeId,
@@ -41,6 +52,8 @@ impl ControlFlowGraph {
                 id: entry,
                 kind: NodeKind::Entry,
                 span,
+                action: NodeAction::None,
+                repeatable: false,
                 predecessors: Vec::new(),
                 successors: Vec::new(),
             }],
@@ -49,12 +62,20 @@ impl ControlFlowGraph {
         }
     }
 
-    fn add_node(&mut self, kind: NodeKind, span: Span) -> NodeId {
+    fn add_node(
+        &mut self,
+        kind: NodeKind,
+        span: Span,
+        action: NodeAction,
+        repeatable: bool,
+    ) -> NodeId {
         let id = NodeId(self.nodes.len());
         self.nodes.push(Node {
             id,
             kind,
             span,
+            action,
+            repeatable,
             predecessors: Vec::new(),
             successors: Vec::new(),
         });
@@ -87,7 +108,7 @@ impl ControlFlowGraph {
 
     #[cfg(test)]
     pub(crate) fn add_node_for_test(&mut self, kind: NodeKind, span: Span) -> NodeId {
-        self.add_node(kind, span)
+        self.add_node(kind, span, NodeAction::None, false)
     }
 
     #[cfg(test)]
@@ -121,7 +142,12 @@ pub fn build_function_cfg(body: &Block, function_span: Span) -> ControlFlowGraph
         loops: Vec::new(),
     };
     let outgoing = builder.build_statements(&body.statements, vec![entry]);
-    let fallthrough = builder.graph.add_node(NodeKind::FallthroughExit, body.span);
+    let fallthrough = builder.graph.add_node(
+        NodeKind::FallthroughExit,
+        body.span,
+        NodeAction::None,
+        false,
+    );
     builder.graph.connect_all(&outgoing, fallthrough);
     builder.graph.fallthrough_exit = fallthrough;
     builder.graph
@@ -138,18 +164,31 @@ impl Builder {
     fn build_statement(&mut self, statement: &Stmt, incoming: Vec<NodeId>) -> Vec<NodeId> {
         match statement {
             Stmt::Return { span, .. } => {
-                self.terminal(NodeKind::ReturnExit, *span, incoming);
+                self.terminal(
+                    NodeKind::ReturnExit,
+                    *span,
+                    NodeAction::Statement(statement.clone()),
+                    incoming,
+                );
                 Vec::new()
             }
             Stmt::Expr { expr, span } if is_panic_call(expr) => {
-                self.terminal(NodeKind::DivergeExit, *span, incoming);
+                self.terminal(
+                    NodeKind::DivergeExit,
+                    *span,
+                    NodeAction::Statement(statement.clone()),
+                    incoming,
+                );
                 Vec::new()
             }
             Stmt::If(if_stmt) => self.build_if(if_stmt, incoming),
             Stmt::While(while_stmt) => {
-                let header = self
-                    .graph
-                    .add_node(NodeKind::LoopHeader, while_stmt.condition.span());
+                let header = self.graph.add_node(
+                    NodeKind::LoopHeader,
+                    while_stmt.condition.span(),
+                    NodeAction::Expression(while_stmt.condition.clone()),
+                    true,
+                );
                 self.graph.connect_all(&incoming, header);
                 let condition = constant_condition(&while_stmt.condition);
                 self.loops.push(LoopContext {
@@ -173,9 +212,12 @@ impl Builder {
             }
             Stmt::For(for_stmt) => self.build_for(for_stmt, incoming),
             Stmt::Foreach(foreach) => {
-                let header = self
-                    .graph
-                    .add_node(NodeKind::LoopHeader, foreach.iterable.span());
+                let header = self.graph.add_node(
+                    NodeKind::LoopHeader,
+                    foreach.iterable.span(),
+                    NodeAction::Expression(foreach.iterable.clone()),
+                    true,
+                );
                 self.graph.connect_all(&incoming, header);
                 self.loops.push(LoopContext {
                     continue_target: header,
@@ -188,25 +230,35 @@ impl Builder {
                 deduplicate(outgoing)
             }
             Stmt::Break { span } => {
-                let node = self.normal(NodeKind::Break, *span, incoming);
+                let node = self.normal(NodeKind::Break, *span, NodeAction::None, incoming);
                 if let Some(loop_context) = self.loops.last_mut() {
                     loop_context.breaks.push(node);
                 }
                 Vec::new()
             }
             Stmt::Continue { span } => {
-                let node = self.normal(NodeKind::Continue, *span, incoming);
+                let node = self.normal(NodeKind::Continue, *span, NodeAction::None, incoming);
                 if let Some(loop_context) = self.loops.last() {
                     self.graph.add_edge(node, loop_context.continue_target);
                 }
                 Vec::new()
             }
-            _ => vec![self.normal(NodeKind::Statement, statement_span(statement), incoming)],
+            _ => vec![self.normal(
+                NodeKind::Statement,
+                statement_span(statement),
+                NodeAction::Statement(statement.clone()),
+                incoming,
+            )],
         }
     }
 
     fn build_if(&mut self, if_stmt: &crate::ast::IfStmt, incoming: Vec<NodeId>) -> Vec<NodeId> {
-        let branch = self.normal(NodeKind::Branch, if_stmt.condition.span(), incoming);
+        let branch = self.normal(
+            NodeKind::Branch,
+            if_stmt.condition.span(),
+            NodeAction::Expression(if_stmt.condition.clone()),
+            incoming,
+        );
         let condition = constant_condition(&if_stmt.condition);
         let then_incoming = if condition == ConstantCondition::AlwaysFalse {
             Vec::new()
@@ -234,8 +286,13 @@ impl Builder {
 
     fn build_for(&mut self, for_stmt: &ForStmt, incoming: Vec<NodeId>) -> Vec<NodeId> {
         let mut incoming = incoming;
-        if for_stmt.initializer.is_some() {
-            incoming = vec![self.normal(NodeKind::Statement, for_stmt.span, incoming)];
+        if let Some(initializer) = &for_stmt.initializer {
+            incoming = vec![self.normal(
+                NodeKind::Statement,
+                for_initializer_span(initializer),
+                NodeAction::ForInitializer(initializer.clone()),
+                incoming,
+            )];
         }
 
         let header_span = for_stmt
@@ -243,12 +300,25 @@ impl Builder {
             .as_ref()
             .map(Expr::span)
             .unwrap_or(for_stmt.span);
-        let header = self.graph.add_node(NodeKind::LoopHeader, header_span);
+        let header = self.graph.add_node(
+            NodeKind::LoopHeader,
+            header_span,
+            for_stmt
+                .condition
+                .clone()
+                .map(NodeAction::Expression)
+                .unwrap_or(NodeAction::None),
+            true,
+        );
         self.graph.connect_all(&incoming, header);
-        let increment = for_stmt
-            .increment
-            .as_ref()
-            .map(|_| self.graph.add_node(NodeKind::Statement, for_stmt.span));
+        let increment = for_stmt.increment.as_ref().map(|increment| {
+            self.graph.add_node(
+                NodeKind::Statement,
+                for_increment_span(increment),
+                NodeAction::ForIncrement(increment.clone()),
+                true,
+            )
+        });
         if let Some(increment) = increment {
             self.graph.add_edge(increment, header);
         }
@@ -279,14 +349,22 @@ impl Builder {
         deduplicate(outgoing)
     }
 
-    fn normal(&mut self, kind: NodeKind, span: Span, incoming: Vec<NodeId>) -> NodeId {
-        let node = self.graph.add_node(kind, span);
+    fn normal(
+        &mut self,
+        kind: NodeKind,
+        span: Span,
+        action: NodeAction,
+        incoming: Vec<NodeId>,
+    ) -> NodeId {
+        let node = self
+            .graph
+            .add_node(kind, span, action, !self.loops.is_empty());
         self.graph.connect_all(&incoming, node);
         node
     }
 
-    fn terminal(&mut self, kind: NodeKind, span: Span, incoming: Vec<NodeId>) {
-        self.normal(kind, span, incoming);
+    fn terminal(&mut self, kind: NodeKind, span: Span, action: NodeAction, incoming: Vec<NodeId>) {
+        self.normal(kind, span, action, incoming);
     }
 }
 
@@ -314,6 +392,20 @@ fn statement_span(statement: &Stmt) -> Span {
         Stmt::Break { span } | Stmt::Continue { span } => *span,
         Stmt::Foreach(foreach) => foreach.span,
         Stmt::Increment(increment) => increment.span,
+    }
+}
+
+fn for_initializer_span(initializer: &ForInitializer) -> Span {
+    match initializer {
+        ForInitializer::VarDecl(declaration) => declaration.span,
+        ForInitializer::Assignment(assignment) => assignment.span,
+    }
+}
+
+fn for_increment_span(increment: &ForIncrement) -> Span {
+    match increment {
+        ForIncrement::Increment(increment) => increment.span,
+        ForIncrement::Assignment(assignment) => assignment.span,
     }
 }
 

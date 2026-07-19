@@ -131,50 +131,23 @@ pub fn lower_program(program: &hir::Program) -> DiagnosticResult<mir::Program> {
         _ => None,
     }) {
         let class_id = class_ids[&class.name];
-        let Some(statements) = class.members.iter().find_map(|member| match member {
-            hir::ClassMember::Method(method) if method.name == "__construct" => {
-                Some(&method.body.statements)
-            }
-            _ => None,
-        }) else {
+        if !class.members.iter().any(|member| {
+            matches!(member, hir::ClassMember::Method(method) if method.name == "__construct")
+        }) {
             continue;
-        };
+        }
 
-        // Until Stage 21 supplies full definite-initialization dataflow, the
-        // native soundness gate accepts only top-level direct writes that are
-        // not preceded by a read/escape of that property or by control flow
-        // that can bypass the write.
-        for (index, statement) in statements.iter().enumerate() {
-            let hir::Stmt::Assignment(assignment) = statement else {
-                continue;
-            };
-            if assignment.op != hir::AssignOp::Assign {
-                continue;
+        if let Some(class_info) = program
+            .semantic_info
+            .classes
+            .iter()
+            .find(|info| info.id == class_id)
+        {
+            for property in &class_info.properties {
+                if !property.promoted && !property_initializers.contains_key(&property.id) {
+                    constructor_body_initializers.insert(property.id);
+                }
             }
-            let Some(property_name) = direct_this_property_name(&assignment.target) else {
-                continue;
-            };
-            if expression_may_observe_this_property(&assignment.value, property_name)
-                || statements[..index].iter().any(|statement| {
-                    statement_prevents_direct_property_init(statement, property_name)
-                })
-            {
-                continue;
-            };
-            let Some(property) = program
-                .semantic_info
-                .classes
-                .iter()
-                .find(|info| info.id == class_id)
-                .and_then(|info| {
-                    info.properties
-                        .iter()
-                        .find(|property| property.name == property_name)
-                })
-            else {
-                continue;
-            };
-            constructor_body_initializers.insert(property.id);
         }
     }
     let mut declarations = Vec::new();
@@ -1152,113 +1125,6 @@ fn grouped_range_parts(expr: &hir::Expr) -> Option<(&hir::Expr, &hir::Expr, bool
     }
 }
 
-fn direct_this_property_name(expr: &hir::Expr) -> Option<&str> {
-    match expr {
-        hir::Expr::Grouped { expr, .. } => direct_this_property_name(expr),
-        hir::Expr::PropertyAccess {
-            object, property, ..
-        } if matches!(object.as_ref(), hir::Expr::This { .. }) => Some(property),
-        _ => None,
-    }
-}
-
-fn statement_prevents_direct_property_init(statement: &hir::Stmt, property: &str) -> bool {
-    match statement {
-        hir::Stmt::VarDecl(decl) => {
-            expression_may_observe_this_property(&decl.initializer, property)
-        }
-        hir::Stmt::Assignment(assignment) => {
-            let target_reads_property =
-                if let Some(target_property) = direct_this_property_name(&assignment.target) {
-                    assignment.op != hir::AssignOp::Assign && target_property == property
-                } else {
-                    expression_may_observe_this_property(&assignment.target, property)
-                };
-            target_reads_property
-                || expression_may_observe_this_property(&assignment.value, property)
-        }
-        hir::Stmt::Expr {
-            expr: hir::Expr::FunctionCall { name, .. },
-            ..
-        } if name == "panic" => true,
-        hir::Stmt::Echo { expr, .. } | hir::Stmt::Expr { expr, .. } => {
-            expression_may_observe_this_property(expr, property)
-        }
-        hir::Stmt::Increment(increment) => {
-            expression_may_observe_this_property(&increment.target, property)
-        }
-        hir::Stmt::Return { .. }
-        | hir::Stmt::If(_)
-        | hir::Stmt::While(_)
-        | hir::Stmt::For(_)
-        | hir::Stmt::Break { .. }
-        | hir::Stmt::Continue { .. }
-        | hir::Stmt::Foreach(_) => true,
-    }
-}
-
-fn expression_may_observe_this_property(expr: &hir::Expr, property: &str) -> bool {
-    match expr {
-        hir::Expr::This { .. } => true,
-        hir::Expr::InterpolatedString { parts, .. } => parts.iter().any(|part| {
-            matches!(part, hir::InterpolatedStringPart::Expr(expr) if expression_may_observe_this_property(expr, property))
-        }),
-        hir::Expr::Array { elements, .. } => elements.iter().any(|element| {
-            element
-                .key
-                .as_ref()
-                .is_some_and(|key| expression_may_observe_this_property(key, property))
-                || expression_may_observe_this_property(&element.value, property)
-        }),
-        hir::Expr::PropertyAccess {
-            object,
-            property: accessed,
-            ..
-        } if expression_is_this(object) => accessed == property,
-        hir::Expr::PropertyAccess { object, .. }
-        | hir::Expr::Grouped { expr: object, .. }
-        | hir::Expr::Unary { expr: object, .. } => {
-            expression_may_observe_this_property(object, property)
-        }
-        hir::Expr::MethodCall { object, args, .. } => {
-            expression_may_observe_this_property(object, property)
-                || args
-                    .iter()
-                    .any(|arg| expression_may_observe_this_property(arg, property))
-        }
-        hir::Expr::FunctionCall { args, .. }
-        | hir::Expr::StaticCall { args, .. }
-        | hir::Expr::New { args, .. } => args
-            .iter()
-            .any(|arg| expression_may_observe_this_property(arg, property)),
-        hir::Expr::Binary { left, right, .. }
-        | hir::Expr::Range {
-            start: left,
-            end: right,
-            ..
-        } => {
-            expression_may_observe_this_property(left, property)
-                || expression_may_observe_this_property(right, property)
-        }
-        hir::Expr::Variable { .. }
-        | hir::Expr::Identifier { .. }
-        | hir::Expr::StaticMember { .. }
-        | hir::Expr::String { .. }
-        | hir::Expr::Int { .. }
-        | hir::Expr::Float { .. }
-        | hir::Expr::Bool { .. }
-        | hir::Expr::Null { .. } => false,
-    }
-}
-
-fn expression_is_this(expr: &hir::Expr) -> bool {
-    match expr {
-        hir::Expr::This { .. } => true,
-        hir::Expr::Grouped { expr, .. } => expression_is_this(expr),
-        _ => false,
-    }
-}
-
 #[derive(Clone, Copy)]
 enum LoopControl {
     Break,
@@ -2226,10 +2092,14 @@ fn lower_assignment(
     }
     if let mir::Type::Class(class) = context.local_type(target) {
         if !context.local_owns(target) {
-            return Err(vec![unsupported(
-                assignment.span,
-                "replacing a class through a borrowed parameter is unsupported until Stage 21",
-            )]);
+            return Err(vec![
+                Diagnostic::new(
+                    "E0505",
+                    "this compiler version cannot replace the class value held through a borrowed parameter",
+                    assignment.span,
+                )
+                .with_help("mutate the object's writable properties, or use a `take` parameter when the callee should own a replacement"),
+            ]);
         }
         context.push_statement(mir::Statement::AssignLocal {
             target,

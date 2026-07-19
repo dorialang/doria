@@ -40,6 +40,12 @@ There are no annotations to sprinkle, no sigils to memorize, and no jargon in th
 
 Use-after-free, data races, double-frees, null surprises: these are compile errors in Doria, not production incidents.
 
+Construction follows the same rule: every property must be initialized on every
+normal constructor path before the new object can be observed. Readonly
+properties are initialized exactly once, writable properties may be changed
+after their first initialization, and a branch that ends in a fatal panic does
+not produce a partially initialized object.
+
 ## Design principles
 
 - **Contracts are written down.** Every parameter is explicitly typed — always. Nothing silently defaults to a dynamic type, and nullability is spelled `?T` and enforced.

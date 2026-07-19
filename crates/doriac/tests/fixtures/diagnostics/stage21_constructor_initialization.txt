@@ -1,0 +1,45 @@
+[missing on one branch]
+code: E0500
+message: property `A::x` is not initialized on every path before constructor fallthrough completes
+help:
+span: 51..82
+[missing on every path]
+code: E0500
+message: property `A::x` is not initialized before constructor fallthrough completes
+help:
+span: 44..46
+[early return]
+code: E0500
+message: property `A::x` is not initialized before explicit return completes
+help:
+span: 46..53
+[read before initialization]
+code: E0501
+message: property `A::x` is read before it is initialized
+help:
+span: 51..59
+[incomplete this]
+code: E0503
+message: `$this` cannot be observed or passed from `A::__construct` before `$x` is initialized
+help: initialize every property before exposing the object under construction
+span: 53..58
+[duplicate readonly initialization]
+code: E0412
+message: readonly property `A::x` is already initialized on this constructor path
+help:
+span: 62..70
+[partial readonly repair]
+code: E0502
+message: readonly property `A::x` is initialized on only some incoming paths, so this assignment would initialize it twice on another path
+help: initialize the readonly property exactly once in every branch
+span: 81..89
+[readonly loop initialization]
+code: E0504
+message: readonly property `A::x` cannot be initialized inside a repeatable constructor body
+help: initialize the property on each non-repeating constructor path
+span: 66..74
+[writable loop initialization]
+code: E0500
+message: property `A::x` is not initialized on every path before constructor fallthrough completes
+help:
+span: 60..94

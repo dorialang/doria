@@ -13,7 +13,8 @@ Documentation role: working note. This file prevents duplicated in-flight work. 
 - Stage 19 ownership, moves, destruction, and native class layout is complete on the current branch.
 - Stage 20 statically resolved instance/static methods, Copy-type static properties, class/top-level constants, `internal` enforcement, and concrete native `Displayable` execution are complete on the current branch. Static access is sigil-free, `self` resolves to the declaring class, and one class-level index rejects cross-kind member-name collisions.
 - Stage 20a/20b const-evaluable defaults are complete for Copy scalars and readonly strings across free functions, instance methods, static methods, and constructors through one caller-side MIR splice. Writable Copy scalars remain supported; `?string`, `writable string`, `take string`, and other move/`take` defaults retain explicit temporary diagnostics.
-- Stage 21 non-lexical borrowing and returned-borrow elision are complete on the current branch. Full constructor definite initialization remains the unfinished Stage 21 slice.
+- Stage 21 non-lexical borrowing, returned-borrow elision, and constructor definite initialization are complete on the current branch. Constructor paths use decision 0090's uninitialized/initialized/maybe-initialized lattice, and shared MIR validation independently enforces the normal-exit and readonly exactly-once invariants.
+- `Shared<T>`/`Weak<T>`/`SharedMut<T>` remain an unresolved Stage 21 authority and implementation gap: decision 0005 accepts `shared new` syntax but does not define their wrapper API or runtime semantics, while the master acceptance criterion requires explicit `SharedMut<T>` dynamic checks.
 - The parser accepts generalized `parent::member()` and trait-local `self::member` under the two-clocks rule; semantic checking names Stage 34 and Stage 35 respectively and stops those forms before MIR. `Foo::$prop` and `static::` are permanent errors with precise fixes.
 - Native remains one target: direct compile/run uses the Cranelift fast profile, while `--release` selects LLVM 18 over the same validated typed MIR.
 - Ordinary expression interpolation of primitive/string values lowers through the existing ordered MIR string and display operations consumed by all three execution paths.
@@ -23,7 +24,7 @@ Documentation role: working note. This file prevents duplicated in-flight work. 
 
 ## Next
 
-- Stage 21: full constructor definite initialization.
+- Stage 21 shared-ownership decision authority: Andrew must approve the API and implementation or amend the master plan to assign it elsewhere.
 
 ## Do not duplicate
 

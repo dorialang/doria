@@ -1062,6 +1062,8 @@ class Person
 {
     writable string $name;
 
+    function __construct() { $this->name = ""; }
+
     writable function rename(string $name): void
     {
         $this->name = $name;
@@ -1084,6 +1086,8 @@ fn emits_internal_members_as_private_php_members() {
 class Person
 {
     internal string $secret;
+
+    function __construct() { $this->secret = ""; }
 
     function reveal(): string
     {

@@ -2444,7 +2444,7 @@ fn checks_property_assignment_compatibility() {
         r#"
 class Person
 {
-    writable string $name;
+    writable string $name = "";
 }
 
 let writable $person = new Person();
@@ -2457,7 +2457,7 @@ $person->name = "Lucy";
         r#"
 class Person
 {
-    writable string $name;
+    writable string $name = "";
 }
 
 let writable $person = new Person();
@@ -2806,7 +2806,7 @@ fn checks_property_mutation_rules_inside_control_flow() {
         r#"
 class Counter
 {
-    writable int $count;
+    writable int $count = 0;
 
     function __construct(int $start)
     {
@@ -2842,25 +2842,26 @@ class Counter
 }
 
 #[test]
-fn rejects_constructor_readonly_init_inside_control_flow() {
-    assert_diagnostic_code(
+fn checks_constructor_readonly_init_inside_control_flow() {
+    doriac::check_source(
+        "test.doria",
         r#"
 class Person
 {
     string $id;
 
-    function __construct(string $id)
+    function __construct(string $input)
     {
-        if ($id == "") {
+        if ($input == "") {
             $this->id = "unknown";
         } else {
-            $this->id = $id;
+            $this->id = $input;
         }
     }
 }
 "#,
-        "E0202",
-    );
+    )
+    .expect("every reachable branch initializes the readonly property");
 
     assert_diagnostic_code(
         r#"
@@ -2868,15 +2869,15 @@ class Person
 {
     string $id;
 
-    function __construct(string $id)
+    function __construct(string $input)
     {
-        while ($id == "") {
+        while ($input == "") {
             $this->id = "unknown";
         }
     }
 }
 "#,
-        "E0202",
+        "E0504",
     );
 }
 #[test]
@@ -3150,7 +3151,7 @@ class Person
 {
     string $id;
 
-    function __construct(List<string> $ids)
+    function __construct(take List<string> $ids)
     {
         foreach ($ids as string $id) {
             $this->id = $id;
@@ -3158,7 +3159,7 @@ class Person
     }
 }
 "#,
-            "E0202",
+            "E0504",
         ),
     ] {
         assert_diagnostic_code(source, code);
@@ -3543,7 +3544,7 @@ fn allows_method_accessing_own_internal_property() {
         r#"
 class Parser
 {
-    internal int $position;
+    internal int $position = 0;
 
     function parse(): void
     {
@@ -4070,7 +4071,7 @@ class Person {}
 
 class Office
 {
-    Person $manager;
+    Person $manager = new Person();
 
     function __construct(take Person $owner)
     {

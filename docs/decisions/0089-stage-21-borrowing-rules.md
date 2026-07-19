@@ -98,10 +98,10 @@ MIR and native validation remain backend-independent consumers of the same
 checked ownership facts. Backends must not emit dynamic guards for ordinary
 borrowing; `SharedMut<T>` is the named dynamic-check exception.
 
-Decision 0083's temporary native-eligibility gate is invalidated by the full
-constructor definite-initialization slice of Stage 21, not by this borrow-rule
-record alone. Decision 0088 feeds this record and remains authoritative for the
-deferred consuming self-return convention.
+Decision 0090's full constructor definite-initialization slice invalidated and
+removed decision 0083's temporary native-eligibility gate. Decision 0088 feeds
+this record and remains authoritative for the deferred consuming self-return
+convention.
 
 ## Invalidated elsewhere
 
@@ -112,5 +112,4 @@ deferred consuming self-return convention.
   unsupported.
 - `docs/notes/current-pipeline.md` status text that lists non-lexical borrowing
   as future Stage 21 work.
-- The Stage 19 temporary native-eligibility gate once constructor
-  definite-initialization analysis lands.
+- The Stage 19 temporary native-eligibility gate, now removed by decision 0090.
