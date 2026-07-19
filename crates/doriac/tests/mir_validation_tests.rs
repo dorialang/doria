@@ -171,6 +171,143 @@ fn shared_validator_rejects_invalid_format_index_and_argument_type() {
 }
 
 #[test]
+fn shared_validator_preserves_implicit_display_borrows_across_format_arguments() {
+    let mut program = class_program();
+    let label = PropertyId {
+        class: ClassId(0),
+        index: 0,
+    };
+    program.classes[0].properties.push(Property {
+        id: label,
+        name: "label".to_string(),
+        ty: Type::String,
+        writable: false,
+        promoted: false,
+    });
+    program.classes[0].layout = compute_class_layout(ClassId(0), [(label, FieldType::String)], 8);
+    let mut receiver = class_local(0, ClassId(0));
+    receiver.writable = true;
+    program.functions[0].locals.push(receiver);
+    let receiver_argument = || {
+        Rvalue::Class(ClassExpression::Local {
+            class: ClassId(0),
+            local: LocalId(0),
+            transfer: false,
+        })
+    };
+    let display_call = StringExpression::Call {
+        function: FunctionId(1),
+        args: vec![receiver_argument()],
+    };
+    let update_call = StringExpression::Call {
+        function: FunctionId(2),
+        args: vec![receiver_argument()],
+    };
+    program.functions[0].blocks[0]
+        .statements
+        .push(Statement::Printf(FormatExpression {
+            pieces: vec![
+                FormatPiece::Argument {
+                    index: 0,
+                    spec: display_spec(),
+                },
+                FormatPiece::Argument {
+                    index: 1,
+                    spec: display_spec(),
+                },
+            ],
+            arguments: vec![
+                FormatArgument::ClassDisplay(display_call.clone()),
+                FormatArgument::String(update_call),
+            ],
+        }));
+    for (id, name, writable) in [
+        (FunctionId(1), "display", false),
+        (FunctionId(2), "update", true),
+    ] {
+        let mut parameter = borrowed_class_local(0, ClassId(0));
+        parameter.writable = writable;
+        program.functions.push(Function {
+            id,
+            name: name.to_string(),
+            method: None,
+            receiver_mode: None,
+            params: vec![LocalId(0)],
+            return_type: ReturnType::Value(Type::String),
+            locals: vec![parameter],
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                statements: vec![],
+                terminator: Terminator::Return(Rvalue::String(StringExpression::Literal(
+                    name.to_string(),
+                ))),
+            }],
+            entry_block: BlockId(0),
+        });
+    }
+
+    let error = doriac::mir_validation::validate_program(&program)
+        .expect_err("class display must remain borrowed through later format arguments");
+    assert!(error
+        .message
+        .contains("takes overlapping writable borrows of class local local0"));
+
+    program.functions[2].locals[0].writable = false;
+    doriac::mir_validation::validate_program(&program)
+        .expect("multiple readonly format borrows do not conflict");
+
+    program.functions[2].locals[0].writable = true;
+    let Statement::Printf(format) = &mut program.functions[0].blocks[0].statements[0] else {
+        unreachable!()
+    };
+    format.arguments[0] = FormatArgument::String(display_call);
+    doriac::mir_validation::validate_program(&program).expect(
+        "an explicit string-producing call ends its receiver borrow before the next argument",
+    );
+
+    let Statement::Printf(format) = &mut program.functions[0].blocks[0].statements[0] else {
+        unreachable!()
+    };
+    format.arguments[0] = FormatArgument::ClassDisplay(StringExpression::Call {
+        function: FunctionId(1),
+        args: vec![Rvalue::Class(ClassExpression::New {
+            class: ClassId(0),
+            properties: vec![PropertyValue {
+                property: label,
+                source: PropertyValueSource::Expression(Rvalue::String(StringExpression::Literal(
+                    "temporary".to_string(),
+                ))),
+            }],
+            constructor: None,
+            args: vec![],
+        })],
+    });
+    doriac::mir_validation::validate_program(&program)
+        .expect("displaying an owned temporary does not borrow the later argument's owner");
+
+    let Statement::Printf(format) = &mut program.functions[0].blocks[0].statements[0] else {
+        unreachable!()
+    };
+    format.arguments[0] = FormatArgument::String(StringExpression::Property {
+        object: LocalId(0),
+        property: label,
+    });
+    let error = doriac::mir_validation::validate_program(&program)
+        .expect_err("a format property read must remain live through later arguments");
+    assert!(error
+        .message
+        .contains("takes overlapping writable borrows of class local local0"));
+
+    let Statement::Printf(format) = &mut program.functions[0].blocks[0].statements[0] else {
+        unreachable!()
+    };
+    format.pieces.swap(0, 1);
+    let error = doriac::mir_validation::validate_program(&program)
+        .expect_err("noncanonical format evaluation order must be rejected");
+    assert!(error.message.contains("canonical evaluation order"));
+}
+
+#[test]
 fn shared_validator_requires_class_calls_to_return_the_declared_class() {
     let mut program = class_program();
     program.functions[0].locals.push(class_local(0, ClassId(0)));
@@ -182,6 +319,7 @@ fn shared_validator_requires_class_calls_to_return_the_declared_class() {
                 class: ClassId(0),
                 function: FunctionId(1),
                 args: vec![],
+                return_borrow: None,
             }),
         });
     program.functions.push(Function {
@@ -370,7 +508,7 @@ fn shared_validator_rejects_borrowing_and_transferring_one_class_local_in_a_call
 }
 
 #[test]
-fn shared_validator_requires_writable_class_arguments_for_writable_parameters() {
+fn shared_validator_enforces_writable_class_argument_rules() {
     let mut program = class_program();
     program.functions[0].locals.push(class_local(0, ClassId(0)));
     program.functions[0].blocks[0]
@@ -408,6 +546,33 @@ fn shared_validator_requires_writable_class_arguments_for_writable_parameters() 
     program.functions[0].locals[0].writable = true;
     doriac::mir_validation::validate_program(&program)
         .expect("a writable class argument should satisfy a writable parameter");
+
+    let Statement::CallVoid { args, .. } = &mut program.functions[0].blocks[0].statements[0] else {
+        unreachable!("the fixture contains a call")
+    };
+    args.push(Rvalue::Class(ClassExpression::Local {
+        class: ClassId(0),
+        local: LocalId(0),
+        transfer: false,
+    }));
+    program.functions[1].params.push(LocalId(1));
+    program.functions[1]
+        .locals
+        .push(borrowed_class_local(1, ClassId(0)));
+    for (left_writable, right_writable) in [(true, true), (true, false), (false, true)] {
+        program.functions[1].locals[0].writable = left_writable;
+        program.functions[1].locals[1].writable = right_writable;
+        let error = doriac::mir_validation::validate_program(&program)
+            .expect_err("a writable borrow cannot overlap another borrow in one call");
+        assert!(error
+            .message
+            .contains("takes overlapping writable borrows of class local local0"));
+    }
+
+    program.functions[1].locals[0].writable = false;
+    program.functions[1].locals[1].writable = false;
+    doriac::mir_validation::validate_program(&program)
+        .expect("multiple readonly borrows of one class local should remain valid");
 }
 
 #[test]
@@ -677,11 +842,15 @@ fn shared_validator_tracks_property_borrows_across_outer_call_arguments() {
     program.classes[0].properties.push(Property {
         id: label,
         name: "label".to_string(),
-        ty: Type::String,
+        ty: Type::Scalar(ScalarType::Integer(IntegerType::Int64)),
         writable: false,
         promoted: false,
     });
-    program.classes[0].layout = compute_class_layout(ClassId(0), [(label, FieldType::String)], 8);
+    program.classes[0].layout = compute_class_layout(
+        ClassId(0),
+        [(label, FieldType::Integer(IntegerType::Int64))],
+        8,
+    );
     program.functions[0].locals.push(class_local(0, ClassId(0)));
     program.functions[0].blocks[0]
         .statements
@@ -693,10 +862,15 @@ fn shared_validator_tracks_property_borrows_across_outer_call_arguments() {
                     local: LocalId(0),
                     transfer: true,
                 }),
-                Rvalue::String(StringExpression::Property {
-                    object: LocalId(0),
-                    property: label,
-                }),
+                Rvalue::Value(ValueExpression::Integer(
+                    doriac::mir::IntegerExpression::Use {
+                        ty: IntegerType::Int64,
+                        operand: Operand::Property {
+                            object: LocalId(0),
+                            property: label,
+                        },
+                    },
+                )),
             ],
         });
     program.functions.push(Function {
@@ -711,7 +885,7 @@ fn shared_validator_tracks_property_borrows_across_outer_call_arguments() {
             Local {
                 id: LocalId(1),
                 name: "label".to_string(),
-                ty: Type::String,
+                ty: Type::Scalar(ScalarType::Integer(IntegerType::Int64)),
                 writable: false,
                 synthetic: false,
                 owned: false,
@@ -730,6 +904,96 @@ fn shared_validator_tracks_property_borrows_across_outer_call_arguments() {
     assert!(error
         .message
         .contains("both borrows and transfers class local local0"));
+
+    program.functions[0].locals[0].writable = true;
+    let Statement::CallVoid { args, .. } = &mut program.functions[0].blocks[0].statements[0] else {
+        unreachable!("the fixture contains a call")
+    };
+    args.reverse();
+    let Rvalue::Class(ClassExpression::Local { transfer, .. }) = &mut args[1] else {
+        unreachable!("the fixture's second argument is the class local")
+    };
+    *transfer = false;
+    program.functions[1].locals = vec![
+        Local {
+            id: LocalId(0),
+            name: "label".to_string(),
+            ty: Type::Scalar(ScalarType::Integer(IntegerType::Int64)),
+            writable: false,
+            synthetic: false,
+            owned: false,
+        },
+        borrowed_class_local(1, ClassId(0)),
+    ];
+    program.functions[1].locals[1].writable = true;
+
+    let error = doriac::mir_validation::validate_program(&program)
+        .expect_err("a property read cannot overlap a later writable borrow");
+    assert!(error
+        .message
+        .contains("takes overlapping writable borrows of class local local0"));
+
+    program.functions[1].locals[1].writable = false;
+    doriac::mir_validation::validate_program(&program)
+        .expect("a property read may overlap a later readonly borrow");
+
+    let property_read = doriac::mir::IntegerExpression::Use {
+        ty: IntegerType::Int64,
+        operand: Operand::Property {
+            object: LocalId(0),
+            property: label,
+        },
+    };
+    let writable_call = doriac::mir::IntegerExpression::Call {
+        ty: IntegerType::Int64,
+        function: FunctionId(2),
+        args: vec![Rvalue::Class(ClassExpression::Local {
+            class: ClassId(0),
+            local: LocalId(0),
+            transfer: false,
+        })],
+    };
+    program.functions[0].blocks[0].statements[0] = Statement::CallVoid {
+        function: FunctionId(1),
+        args: vec![Rvalue::Value(ValueExpression::Integer(
+            doriac::mir::IntegerExpression::Binary {
+                ty: IntegerType::Int64,
+                op: doriac::mir::IntegerBinaryOp::Add,
+                left: Box::new(property_read),
+                right: Box::new(writable_call),
+            },
+        ))],
+    };
+    program.functions[1].params = vec![LocalId(0)];
+    program.functions[1].locals.truncate(1);
+    let mut writable = borrowed_class_local(0, ClassId(0));
+    writable.writable = true;
+    program.functions.push(Function {
+        id: FunctionId(2),
+        name: "update".to_string(),
+        method: None,
+        receiver_mode: None,
+        params: vec![LocalId(0)],
+        return_type: ReturnType::Value(Type::Scalar(ScalarType::Integer(IntegerType::Int64))),
+        locals: vec![writable],
+        blocks: vec![BasicBlock {
+            id: BlockId(0),
+            statements: vec![],
+            terminator: Terminator::Return(Rvalue::Value(ValueExpression::Integer(
+                doriac::mir::IntegerExpression::constant(IntegerValue::from_bits(
+                    IntegerType::Int64,
+                    1,
+                )),
+            ))),
+        }],
+        entry_block: BlockId(0),
+    });
+
+    let error = doriac::mir_validation::validate_program(&program)
+        .expect_err("a nested writable call cannot overlap an earlier property read");
+    assert!(error
+        .message
+        .contains("takes overlapping writable borrows of class local local0"));
 }
 
 #[test]
@@ -1007,6 +1271,7 @@ fn shared_validator_tracks_nested_transfers_across_property_initializers() {
                                     local: LocalId(1),
                                     transfer: true,
                                 })],
+                                return_borrow: None,
                             },
                         )),
                     })
@@ -1166,7 +1431,79 @@ fn shared_validator_rejects_construction_borrows_after_transfers() {
         .expect_err("construction cannot borrow an owner after an earlier initializer moved it");
     assert!(error
         .message
-        .contains("uses class local local1 after transferring it"));
+        .contains("both borrows and transfers class local local1"));
+}
+
+#[test]
+fn shared_validator_keeps_initializer_borrows_live_through_constructor_arguments() {
+    let mut program = class_new_program();
+    let target = PropertyId {
+        class: ClassId(0),
+        index: 0,
+    };
+    let source = PropertyId {
+        class: ClassId(1),
+        index: 0,
+    };
+    program.classes[0].properties[0].promoted = false;
+    program.classes[1].properties = vec![Property {
+        id: source,
+        name: "value".to_string(),
+        ty: Type::String,
+        writable: false,
+        promoted: false,
+    }];
+    program.classes[1].layout = compute_class_layout(ClassId(1), [(source, FieldType::String)], 8);
+    program.functions[0].locals.push(class_local(1, ClassId(1)));
+    let Statement::AssignLocal {
+        value: Rvalue::Class(ClassExpression::New {
+            properties, args, ..
+        }),
+        ..
+    } = &mut program.functions[0].blocks[0].statements[0]
+    else {
+        panic!("class new fixture");
+    };
+    *properties = vec![PropertyValue {
+        property: target,
+        source: PropertyValueSource::Expression(Rvalue::String(StringExpression::Property {
+            object: LocalId(1),
+            property: source,
+        })),
+    }];
+    *args = vec![Rvalue::Class(ClassExpression::Local {
+        class: ClassId(1),
+        local: LocalId(1),
+        transfer: true,
+    })];
+    program.functions[1].locals[1] = class_local(1, ClassId(1));
+
+    let error = doriac::mir_validation::validate_program(&program)
+        .expect_err("an initializer borrow must prevent a later constructor transfer");
+    assert!(error
+        .message
+        .contains("both borrows and transfers class local local1"));
+
+    let Statement::AssignLocal {
+        value: Rvalue::Class(ClassExpression::New { args, .. }),
+        ..
+    } = &mut program.functions[0].blocks[0].statements[0]
+    else {
+        panic!("class new fixture");
+    };
+    let Rvalue::Class(ClassExpression::Local { transfer, .. }) = &mut args[0] else {
+        panic!("class argument fixture");
+    };
+    *transfer = false;
+    program.functions[0].locals[1].writable = true;
+    program.functions[1].locals[1].owned = false;
+    program.functions[1].locals[1].writable = true;
+
+    let error = doriac::mir_validation::validate_program(&program)
+        .expect_err("an initializer borrow must prevent a later writable constructor borrow");
+    assert!(error
+        .message
+        .contains("takes overlapping writable borrows of class local local1"));
 }
 
 #[test]
@@ -1361,6 +1698,104 @@ fn shared_validator_rejects_property_assignments_that_transfer_the_receiver() {
     assert!(error
         .message
         .contains("assignment to property0 consumes its receiver local0"));
+}
+
+#[test]
+fn shared_validator_rejects_property_assignment_receiver_borrows_except_the_target() {
+    let mut program = class_program();
+    let target = PropertyId {
+        class: ClassId(0),
+        index: 0,
+    };
+    let other = PropertyId {
+        class: ClassId(0),
+        index: 1,
+    };
+    program.classes[0].properties = vec![
+        Property {
+            id: target,
+            name: "target".to_string(),
+            ty: Type::String,
+            writable: true,
+            promoted: false,
+        },
+        Property {
+            id: other,
+            name: "other".to_string(),
+            ty: Type::String,
+            writable: false,
+            promoted: false,
+        },
+    ];
+    program.classes[0].layout = compute_class_layout(
+        ClassId(0),
+        [(target, FieldType::String), (other, FieldType::String)],
+        8,
+    );
+    let mut receiver = class_local(0, ClassId(0));
+    receiver.writable = true;
+    program.functions[0].locals.push(receiver);
+    program.functions[0].blocks[0]
+        .statements
+        .push(Statement::AssignProperty {
+            object: LocalId(0),
+            property: target,
+            value: Rvalue::String(StringExpression::Property {
+                object: LocalId(0),
+                property: other,
+            }),
+        });
+
+    let error = doriac::mir_validation::validate_program(&program)
+        .expect_err("a property write cannot read another property on its receiver");
+    assert!(error.message.contains("borrows its receiver local0"));
+
+    let Statement::AssignProperty { value, .. } = &mut program.functions[0].blocks[0].statements[0]
+    else {
+        unreachable!("the fixture contains a property assignment")
+    };
+    *value = Rvalue::String(StringExpression::Property {
+        object: LocalId(0),
+        property: target,
+    });
+    doriac::mir_validation::validate_program(&program)
+        .expect("an exact-target read remains valid for read-modify-write lowering");
+
+    let mut parameter = borrowed_class_local(0, ClassId(0));
+    parameter.writable = true;
+    program.functions.push(Function {
+        id: FunctionId(1),
+        name: "update".to_string(),
+        method: None,
+        receiver_mode: None,
+        params: vec![LocalId(0)],
+        return_type: ReturnType::Value(Type::String),
+        locals: vec![parameter],
+        blocks: vec![BasicBlock {
+            id: BlockId(0),
+            statements: vec![],
+            terminator: Terminator::Return(Rvalue::String(StringExpression::Literal(
+                "updated".to_string(),
+            ))),
+        }],
+        entry_block: BlockId(0),
+    });
+    let Statement::AssignProperty { value, .. } = &mut program.functions[0].blocks[0].statements[0]
+    else {
+        unreachable!("the fixture contains a property assignment")
+    };
+    *value = Rvalue::String(StringExpression::Call {
+        function: FunctionId(1),
+        args: vec![Rvalue::Class(ClassExpression::Local {
+            class: ClassId(0),
+            local: LocalId(0),
+            transfer: false,
+        })],
+    });
+
+    let error = doriac::mir_validation::validate_program(&program)
+        .expect_err("a property write cannot borrow its receiver through a call");
+    assert!(error.message.contains("borrows its receiver local0"));
 }
 
 #[test]
@@ -1659,6 +2094,110 @@ fn shared_validator_rejects_borrows_into_owned_class_parameters() {
 }
 
 #[test]
+fn shared_validator_rejects_owned_parameters_as_return_borrow_sources() {
+    let mut program = class_program();
+    program.functions.push(Function {
+        id: FunctionId(1),
+        name: "invalidBorrowReturn".to_string(),
+        method: None,
+        receiver_mode: None,
+        params: vec![LocalId(0)],
+        return_type: ReturnType::Value(Type::Class(ClassId(0))),
+        locals: vec![class_local(0, ClassId(0))],
+        blocks: vec![BasicBlock {
+            id: BlockId(0),
+            statements: vec![],
+            terminator: Terminator::Return(Rvalue::Class(ClassExpression::Local {
+                class: ClassId(0),
+                local: LocalId(0),
+                transfer: false,
+            })),
+        }],
+        entry_block: BlockId(0),
+    });
+
+    let error = doriac::mir_validation::validate_program(&program)
+        .expect_err("an owned parameter cannot escape as a borrowed return");
+    assert!(error
+        .message
+        .contains("receives borrowed class local local0"));
+}
+
+#[test]
+fn shared_validator_tracks_borrow_returning_outer_call_arguments() {
+    let mut program = class_program();
+    program.functions[0].locals.push(class_local(0, ClassId(0)));
+    program.functions[0].blocks[0]
+        .statements
+        .push(Statement::CallVoid {
+            function: FunctionId(2),
+            args: vec![
+                Rvalue::Class(ClassExpression::Call {
+                    class: ClassId(0),
+                    function: FunctionId(1),
+                    args: vec![Rvalue::Class(ClassExpression::Local {
+                        class: ClassId(0),
+                        local: LocalId(0),
+                        transfer: false,
+                    })],
+                    return_borrow: Some(doriac::mir::ReturnBorrow {
+                        source: doriac::mir::BorrowSource::Parameter(0),
+                        writable: false,
+                    }),
+                }),
+                Rvalue::Class(ClassExpression::Local {
+                    class: ClassId(0),
+                    local: LocalId(0),
+                    transfer: true,
+                }),
+            ],
+        });
+    program.functions.push(Function {
+        id: FunctionId(1),
+        name: "identity".to_string(),
+        method: None,
+        receiver_mode: None,
+        params: vec![LocalId(0)],
+        return_type: ReturnType::Value(Type::Class(ClassId(0))),
+        locals: vec![borrowed_class_local(0, ClassId(0))],
+        blocks: vec![BasicBlock {
+            id: BlockId(0),
+            statements: vec![],
+            terminator: Terminator::Return(Rvalue::Class(ClassExpression::Local {
+                class: ClassId(0),
+                local: LocalId(0),
+                transfer: false,
+            })),
+        }],
+        entry_block: BlockId(0),
+    });
+    program.functions.push(Function {
+        id: FunctionId(2),
+        name: "observeThenConsume".to_string(),
+        method: None,
+        receiver_mode: None,
+        params: vec![LocalId(0), LocalId(1)],
+        return_type: ReturnType::Void,
+        locals: vec![
+            borrowed_class_local(0, ClassId(0)),
+            class_local(1, ClassId(0)),
+        ],
+        blocks: vec![BasicBlock {
+            id: BlockId(0),
+            statements: vec![],
+            terminator: Terminator::ReturnVoid,
+        }],
+        entry_block: BlockId(0),
+    });
+
+    let error = doriac::mir_validation::validate_program(&program)
+        .expect_err("a returned borrow must conflict with a later transfer in the outer call");
+    assert!(error
+        .message
+        .contains("both borrows and transfers class local local0"));
+}
+
+#[test]
 fn shared_validator_rejects_duplicate_class_local_transfers_in_one_call() {
     let mut program = class_program();
     program.functions[0].locals.push(class_local(0, ClassId(0)));
@@ -1851,6 +2390,16 @@ fn shared_validator_rejects_cleanup_and_assignment_of_borrowed_class_locals() {
 fn decimal_spec() -> FormatSpec {
     FormatSpec {
         conversion: FormatConversion::Decimal,
+        width: None,
+        precision: None,
+        left_align: false,
+        zero_pad: false,
+    }
+}
+
+fn display_spec() -> FormatSpec {
+    FormatSpec {
+        conversion: FormatConversion::Display,
         width: None,
         precision: None,
         left_align: false,

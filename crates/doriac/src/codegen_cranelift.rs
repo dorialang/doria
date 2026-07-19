@@ -749,7 +749,8 @@ fn lower_statement(
                 .call(write, &[resources.current_frame, string]);
             release_string(builder, string, resources)?;
         }
-        mir::Statement::CallVoid { function, args } => {
+        mir::Statement::CallVoid { function, args }
+        | mir::Statement::CallBorrowed { function, args } => {
             let _ = lower_function_call(builder, *function, args, resources)?;
         }
         mir::Statement::WriteStderr(value) => {
@@ -1113,11 +1114,10 @@ fn lower_class_expression(
 
                 let constructor_definition = function_in(resources.program, *constructor)?;
                 for (index, argument) in args.iter().enumerate() {
-                    let mir::Rvalue::Class(
-                        mir::ClassExpression::New { class, .. }
-                        | mir::ClassExpression::Call { class, .. },
-                    ) = argument
-                    else {
+                    let mir::Rvalue::Class(expression) = argument else {
+                        continue;
+                    };
+                    let Some(class) = expression.owned_temporary_class() else {
                         continue;
                     };
                     let promoted = properties.iter().any(|property| {
@@ -1139,7 +1139,7 @@ fn lower_class_expression(
                             })?;
                     if !promoted && !local_in(constructor_definition, parameter)?.owned {
                         let value = lowered_args.values[index];
-                        defer_or_drop_class_temporary(builder, value, *class, resources)?;
+                        defer_or_drop_class_temporary(builder, value, class, resources)?;
                     }
                 }
             }
@@ -1528,7 +1528,7 @@ fn lower_format_argument(
     let flags = builder.ins().iconst(types::I8, i64::from(flags_value));
     if spec.conversion == FormatConversion::Display {
         let string = match argument {
-            mir::FormatArgument::String(value) => {
+            mir::FormatArgument::String(value) | mir::FormatArgument::ClassDisplay(value) => {
                 lower_string_expression(builder, value, resources)?
             }
             mir::FormatArgument::Value(value) => lower_string_expression(
@@ -2196,10 +2196,10 @@ fn lower_function_call(
     }
     let callee_definition = function_in(resources.program, function)?;
     for (index, argument) in args.iter().enumerate() {
-        let mir::Rvalue::Class(
-            mir::ClassExpression::New { class, .. } | mir::ClassExpression::Call { class, .. },
-        ) = argument
-        else {
+        let mir::Rvalue::Class(expression) = argument else {
+            continue;
+        };
+        let Some(class) = expression.owned_temporary_class() else {
             continue;
         };
         let parameter = *callee_definition.params.get(index).ok_or_else(|| {
@@ -2210,7 +2210,7 @@ fn lower_function_call(
         })?;
         if !local_in(callee_definition, parameter)?.owned {
             let value = lowered.values[index];
-            defer_or_drop_class_temporary(builder, value, *class, resources)?;
+            defer_or_drop_class_temporary(builder, value, class, resources)?;
         }
     }
     Ok(result)

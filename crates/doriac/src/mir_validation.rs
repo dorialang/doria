@@ -1,6 +1,6 @@
 //! Backend-independent structural and type validation for native MIR.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::backend::BackendError;
 use crate::class_layout::{compute_class_layout, ClassId, FieldType};
@@ -241,10 +241,13 @@ fn validate_function(program: &mir::Program, function: &mir::Function) -> Result
                 function.name, block.id.0
             )));
         }
+    }
+    let (reachable, _) = reachable_blocks_and_predecessors(function, true)?;
+    for block in &function.blocks {
         for statement in &block.statements {
             validate_statement(program, function, statement)?;
         }
-        validate_terminator(program, function, &block.terminator)?;
+        validate_terminator(program, function, &block.terminator, reachable[block.id.0])?;
     }
     validate_class_local_lifetimes(function)
 }
@@ -309,10 +312,27 @@ fn validate_statement(
                     if expression.class() == expected =>
                 {
                     if !local.owned {
-                        return Err(malformed_mir(format!(
-                            "class assignment targets borrowed local local{}",
-                            target.0
-                        )));
+                        if !local.synthetic {
+                            return Err(malformed_mir(format!(
+                                "class assignment targets borrowed local local{}",
+                                target.0
+                            )));
+                        }
+                        if class_expression_accesses_local(expression, *target) {
+                            return Err(malformed_mir(format!(
+                                "borrowed class temporary local{} reads its own uninitialized value",
+                                target.0
+                            )));
+                        }
+                        validate_class_expression(program, function, expression)?;
+                        if infer_expression_return_borrow(program, function, expression)?.is_none()
+                        {
+                            return Err(malformed_mir(format!(
+                                "borrowed class temporary local{} receives an owning value",
+                                target.0
+                            )));
+                        }
+                        return Ok(());
                     }
                     validate_class_expression(program, function, expression)?;
                     require_owned_class_expression(
@@ -349,6 +369,23 @@ fn validate_statement(
             }
             validate_call_args(program, function, callee, args)
         }
+        mir::Statement::CallBorrowed {
+            function: callee,
+            args,
+        } => {
+            let callee = function_in(program, *callee)?;
+            if !matches!(
+                callee.return_type,
+                mir::ReturnType::Value(mir::Type::Class(_))
+            ) || infer_function_return_borrow(program, callee)?.is_none()
+            {
+                return Err(malformed_mir(format!(
+                    "borrowed call targets function {} without a borrowed class return",
+                    callee.name
+                )));
+            }
+            validate_call_args(program, function, callee, args)
+        }
         mir::Statement::Printf(format) => validate_format_expression(program, function, format),
         mir::Statement::WriteFile { path, contents } => {
             validate_string_expression(program, function, path)?;
@@ -378,6 +415,12 @@ fn validate_statement(
             if rvalue_transfers_class_local(value, object.id) {
                 return Err(malformed_mir(format!(
                     "assignment to property{} consumes its receiver local{}",
+                    property.index, object.id.0
+                )));
+            }
+            if rvalue_borrows_class_local_outside_property(value, object.id, *property) {
+                return Err(malformed_mir(format!(
+                    "assignment to property{} borrows its receiver local{} through another access",
                     property.index, object.id.0
                 )));
             }
@@ -447,6 +490,7 @@ fn validate_terminator(
     program: &mir::Program,
     function: &mir::Function,
     terminator: &mir::Terminator,
+    validate_return_ownership: bool,
 ) -> Result<(), BackendError> {
     match terminator {
         mir::Terminator::Return(expression) => {
@@ -465,8 +509,24 @@ fn validate_terminator(
                 )));
             }
             validate_rvalue(program, function, expression)?;
-            if let (mir::Type::Class(_), mir::Rvalue::Class(class)) = (return_type, expression) {
-                require_owned_class_expression(class, &format!("return from {}", function.name))?;
+            if validate_return_ownership {
+                if let (mir::Type::Class(_), mir::Rvalue::Class(class)) = (return_type, expression)
+                {
+                    let expected = infer_function_return_borrow(program, function)?;
+                    let actual = infer_expression_return_borrow(program, function, class)?;
+                    if !return_borrow_is_compatible(actual, expected) {
+                        return Err(malformed_mir(format!(
+                            "return from {} has inconsistent class ownership",
+                            function.name
+                        )));
+                    }
+                    if expected.is_none() {
+                        require_owned_class_expression(
+                            class,
+                            &format!("return from {}", function.name),
+                        )?;
+                    }
+                }
             }
             Ok(())
         }
@@ -581,7 +641,17 @@ fn validate_rvalue(
             validate_nullable_string_expression(program, function, value)
         }
         mir::Rvalue::Class(value) => validate_class_expression(program, function, value),
-    }
+    }?;
+    let mut accesses = ClassLocalAccesses::default();
+    collect_rvalue_class_local_accesses(expression, &mut accesses);
+    validate_ordered_class_accesses(
+        program,
+        "rvalue",
+        &accesses,
+        &HashMap::new(),
+        &mut HashSet::new(),
+    )?;
+    Ok(())
 }
 
 fn require_owned_class_expression(
@@ -590,7 +660,10 @@ fn require_owned_class_expression(
 ) -> Result<(), BackendError> {
     match expression {
         mir::ClassExpression::Local { transfer: true, .. }
-        | mir::ClassExpression::Call { .. }
+        | mir::ClassExpression::Call {
+            return_borrow: None,
+            ..
+        }
         | mir::ClassExpression::New { .. } => Ok(()),
         mir::ClassExpression::Local {
             local,
@@ -604,7 +677,169 @@ fn require_owned_class_expression(
             "{destination} receives borrowed class property{}",
             property.index
         ))),
+        mir::ClassExpression::Call {
+            return_borrow: Some(_),
+            ..
+        } => Err(malformed_mir(format!(
+            "{destination} receives a borrowed class call result"
+        ))),
     }
+}
+
+fn infer_function_return_borrow(
+    program: &mir::Program,
+    function: &mir::Function,
+) -> Result<Option<mir::ReturnBorrow>, BackendError> {
+    let mut inferred: Option<Option<mir::ReturnBorrow>> = None;
+    let (reachable, _) = reachable_blocks_and_predecessors(function, true)?;
+    for block in function.blocks.iter().filter(|block| reachable[block.id.0]) {
+        let mir::Terminator::Return(mir::Rvalue::Class(expression)) = &block.terminator else {
+            continue;
+        };
+        let candidate = infer_expression_return_borrow(program, function, expression)?;
+        match (inferred.as_mut(), candidate) {
+            (None, candidate) => inferred = Some(candidate),
+            (Some(Some(existing)), Some(candidate)) if existing.source == candidate.source => {
+                existing.writable &= candidate.writable;
+            }
+            (Some(None), None) => {}
+            _ => {
+                return Err(malformed_mir(format!(
+                    "function {} mixes owned and borrowed class returns",
+                    function.name
+                )));
+            }
+        }
+    }
+    Ok(inferred.flatten())
+}
+
+fn return_borrow_is_compatible(
+    actual: Option<mir::ReturnBorrow>,
+    expected: Option<mir::ReturnBorrow>,
+) -> bool {
+    match (actual, expected) {
+        (Some(actual), Some(expected)) => {
+            actual.source == expected.source && (!expected.writable || actual.writable)
+        }
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+fn infer_expression_return_borrow(
+    program: &mir::Program,
+    function: &mir::Function,
+    expression: &mir::ClassExpression,
+) -> Result<Option<mir::ReturnBorrow>, BackendError> {
+    match expression {
+        mir::ClassExpression::Local {
+            local,
+            transfer: false,
+            ..
+        } => match borrow_from_parameter(function, *local) {
+            Some(borrow) => Ok(Some(borrow)),
+            None => infer_synthetic_local_return_borrow(program, function, *local),
+        },
+        mir::ClassExpression::Property { object, .. } => Ok(borrow_from_parameter(
+            function, *object,
+        )
+        .map(|borrow| mir::ReturnBorrow {
+            writable: false,
+            ..borrow
+        })),
+        mir::ClassExpression::Call {
+            function: callee,
+            args,
+            return_borrow: Some(return_borrow),
+            ..
+        } => {
+            let source = borrowed_call_source(program, *callee, args, *return_borrow)?;
+            Ok(
+                infer_expression_return_borrow(program, function, source)?.map(|borrow| {
+                    mir::ReturnBorrow {
+                        writable: borrow.writable && return_borrow.writable,
+                        ..borrow
+                    }
+                }),
+            )
+        }
+        mir::ClassExpression::Local { transfer: true, .. }
+        | mir::ClassExpression::Call {
+            return_borrow: None,
+            ..
+        }
+        | mir::ClassExpression::New { .. } => Ok(None),
+    }
+}
+
+fn infer_synthetic_local_return_borrow(
+    program: &mir::Program,
+    function: &mir::Function,
+    local: mir::LocalId,
+) -> Result<Option<mir::ReturnBorrow>, BackendError> {
+    let definition = local_in(function, local)?;
+    if definition.owned || !definition.synthetic {
+        return Ok(None);
+    }
+
+    let (reachable, _) = reachable_blocks_and_predecessors(function, true)?;
+    let mut inferred = None;
+    for block in function.blocks.iter().filter(|block| reachable[block.id.0]) {
+        for statement in &block.statements {
+            let mir::Statement::AssignLocal {
+                target,
+                value: mir::Rvalue::Class(expression),
+            } = statement
+            else {
+                continue;
+            };
+            if *target != local {
+                continue;
+            }
+            if inferred.is_some() || class_expression_accesses_local(expression, local) {
+                return Err(malformed_mir(format!(
+                    "borrowed class temporary local{} must have one non-recursive assignment",
+                    local.0
+                )));
+            }
+            inferred = Some(infer_expression_return_borrow(
+                program, function, expression,
+            )?);
+        }
+    }
+    match inferred {
+        Some(Some(borrow)) => Ok(Some(borrow)),
+        Some(None) => Err(malformed_mir(format!(
+            "borrowed class temporary local{} receives an owning value",
+            local.0
+        ))),
+        None => Ok(None),
+    }
+}
+
+fn borrow_from_parameter(
+    function: &mir::Function,
+    local: mir::LocalId,
+) -> Option<mir::ReturnBorrow> {
+    let position = function
+        .params
+        .iter()
+        .position(|parameter| *parameter == local)?;
+    let definition = function.locals.get(local.0)?;
+    if definition.owned {
+        return None;
+    }
+    let has_receiver = function.receiver_mode.is_some();
+    let source = if has_receiver && position == 0 {
+        mir::BorrowSource::Receiver
+    } else {
+        mir::BorrowSource::Parameter(position - usize::from(has_receiver))
+    };
+    Some(mir::ReturnBorrow {
+        source,
+        writable: definition.writable,
+    })
 }
 
 fn require_writable_class_expression(
@@ -631,9 +866,11 @@ fn require_writable_class_expression(
             };
             object.writable && property_in(program, class, *property)?.writable
         }
-        mir::ClassExpression::Local { transfer: true, .. }
-        | mir::ClassExpression::Call { .. }
-        | mir::ClassExpression::New { .. } => false,
+        mir::ClassExpression::Local { transfer: true, .. } => false,
+        mir::ClassExpression::Call { return_borrow, .. } => {
+            return_borrow.is_none_or(|borrow| borrow.writable)
+        }
+        mir::ClassExpression::New { .. } => true,
     };
     if writable {
         Ok(())
@@ -645,38 +882,81 @@ fn require_writable_class_expression(
 }
 
 #[derive(Clone, Copy)]
-enum ClassLocalAccess {
+enum ClassLocalAccess<'a> {
     Borrow(mir::LocalId),
+    PropertyBorrow(mir::LocalId, crate::class_layout::PropertyId),
     Transfer(mir::LocalId),
+    BeginCall,
+    Call(mir::FunctionId, &'a [mir::Rvalue], usize),
 }
 
 #[derive(Default)]
-struct ClassLocalAccesses(Vec<ClassLocalAccess>);
+struct ClassLocalAccesses<'a> {
+    accesses: Vec<ClassLocalAccess<'a>>,
+}
 
-impl ClassLocalAccesses {
+impl<'a> ClassLocalAccesses<'a> {
     fn borrow(&mut self, local: mir::LocalId) {
-        self.0.push(ClassLocalAccess::Borrow(local));
+        self.accesses.push(ClassLocalAccess::Borrow(local));
+    }
+
+    fn borrow_property(&mut self, local: mir::LocalId, property: crate::class_layout::PropertyId) {
+        self.accesses
+            .push(ClassLocalAccess::PropertyBorrow(local, property));
     }
 
     fn transfer(&mut self, local: mir::LocalId) {
-        self.0.push(ClassLocalAccess::Transfer(local));
+        self.accesses.push(ClassLocalAccess::Transfer(local));
     }
 
-    fn iter(&self) -> impl Iterator<Item = ClassLocalAccess> + '_ {
-        self.0.iter().copied()
+    fn call(&mut self, function: mir::FunctionId, args: &'a [mir::Rvalue]) {
+        self.accesses
+            .push(ClassLocalAccess::Call(function, args, 0));
+    }
+
+    fn constructor_call(&mut self, function: mir::FunctionId, args: &'a [mir::Rvalue]) {
+        self.accesses
+            .push(ClassLocalAccess::Call(function, args, 1));
+    }
+
+    fn begin_call(&mut self) {
+        self.accesses.push(ClassLocalAccess::BeginCall);
+    }
+
+    fn iter(&self) -> impl Iterator<Item = ClassLocalAccess<'a>> + '_ {
+        self.accesses.iter().copied()
     }
 
     fn borrowed(&self) -> impl Iterator<Item = mir::LocalId> + '_ {
         self.iter().filter_map(|access| match access {
-            ClassLocalAccess::Borrow(local) => Some(local),
-            ClassLocalAccess::Transfer(_) => None,
+            ClassLocalAccess::Borrow(local) | ClassLocalAccess::PropertyBorrow(local, _) => {
+                Some(local)
+            }
+            ClassLocalAccess::Transfer(_)
+            | ClassLocalAccess::BeginCall
+            | ClassLocalAccess::Call(_, _, _) => None,
         })
     }
 
     fn transferred(&self) -> impl Iterator<Item = mir::LocalId> + '_ {
         self.iter().filter_map(|access| match access {
             ClassLocalAccess::Transfer(local) => Some(local),
-            ClassLocalAccess::Borrow(_) => None,
+            ClassLocalAccess::Borrow(_)
+            | ClassLocalAccess::PropertyBorrow(_, _)
+            | ClassLocalAccess::BeginCall
+            | ClassLocalAccess::Call(_, _, _) => None,
+        })
+    }
+
+    fn property_borrowed(
+        &self,
+    ) -> impl Iterator<Item = (mir::LocalId, crate::class_layout::PropertyId)> + '_ {
+        self.iter().filter_map(|access| match access {
+            ClassLocalAccess::PropertyBorrow(local, property) => Some((local, property)),
+            ClassLocalAccess::Borrow(_)
+            | ClassLocalAccess::Transfer(_)
+            | ClassLocalAccess::BeginCall
+            | ClassLocalAccess::Call(_, _, _) => None,
         })
     }
 }
@@ -697,7 +977,28 @@ fn rvalue_transfers_class_local(value: &mir::Rvalue, local: mir::LocalId) -> boo
     transfers_local
 }
 
-fn collect_rvalue_class_local_accesses(value: &mir::Rvalue, accesses: &mut ClassLocalAccesses) {
+fn rvalue_borrows_class_local_outside_property(
+    value: &mir::Rvalue,
+    local: mir::LocalId,
+    property: crate::class_layout::PropertyId,
+) -> bool {
+    let mut accesses = ClassLocalAccesses::default();
+    collect_rvalue_class_local_accesses(value, &mut accesses);
+    let receiver_borrows = accesses
+        .borrowed()
+        .filter(|borrowed| *borrowed == local)
+        .count();
+    let exact_target_borrows = accesses
+        .property_borrowed()
+        .filter(|borrowed| *borrowed == (local, property))
+        .count();
+    receiver_borrows != exact_target_borrows
+}
+
+fn collect_rvalue_class_local_accesses<'a>(
+    value: &'a mir::Rvalue,
+    accesses: &mut ClassLocalAccesses<'a>,
+) {
     match value {
         mir::Rvalue::Value(value) => collect_value_class_local_accesses(value, accesses),
         mir::Rvalue::String(value) => collect_string_class_local_accesses(value, accesses),
@@ -708,18 +1009,18 @@ fn collect_rvalue_class_local_accesses(value: &mir::Rvalue, accesses: &mut Class
     }
 }
 
-fn collect_rvalue_args_class_local_accesses(
-    args: &[mir::Rvalue],
-    accesses: &mut ClassLocalAccesses,
+fn collect_rvalue_args_class_local_accesses<'a>(
+    args: &'a [mir::Rvalue],
+    accesses: &mut ClassLocalAccesses<'a>,
 ) {
     for value in args {
         collect_rvalue_class_local_accesses(value, accesses);
     }
 }
 
-fn collect_value_class_local_accesses(
-    value: &mir::ValueExpression,
-    accesses: &mut ClassLocalAccesses,
+fn collect_value_class_local_accesses<'a>(
+    value: &'a mir::ValueExpression,
+    accesses: &mut ClassLocalAccesses<'a>,
 ) {
     match value {
         mir::ValueExpression::Integer(value) => {
@@ -730,15 +1031,18 @@ fn collect_value_class_local_accesses(
     }
 }
 
-fn collect_operand_class_local_accesses(operand: &mir::Operand, accesses: &mut ClassLocalAccesses) {
-    if let mir::Operand::Property { object, .. } = operand {
-        accesses.borrow(*object);
+fn collect_operand_class_local_accesses<'a>(
+    operand: &'a mir::Operand,
+    accesses: &mut ClassLocalAccesses<'a>,
+) {
+    if let mir::Operand::Property { object, property } = operand {
+        accesses.borrow_property(*object, *property);
     }
 }
 
-fn collect_integer_class_local_accesses(
-    value: &mir::IntegerExpression,
-    accesses: &mut ClassLocalAccesses,
+fn collect_integer_class_local_accesses<'a>(
+    value: &'a mir::IntegerExpression,
+    accesses: &mut ClassLocalAccesses<'a>,
 ) {
     match value {
         mir::IntegerExpression::Use { operand, .. } => {
@@ -755,15 +1059,17 @@ fn collect_integer_class_local_accesses(
         mir::IntegerExpression::FloatToInt { value } => {
             collect_float_class_local_accesses(value, accesses);
         }
-        mir::IntegerExpression::Call { args, .. } => {
+        mir::IntegerExpression::Call { function, args, .. } => {
+            accesses.begin_call();
             collect_rvalue_args_class_local_accesses(args, accesses);
+            accesses.call(*function, args);
         }
     }
 }
 
-fn collect_float_class_local_accesses(
-    value: &mir::FloatExpression,
-    accesses: &mut ClassLocalAccesses,
+fn collect_float_class_local_accesses<'a>(
+    value: &'a mir::FloatExpression,
+    accesses: &mut ClassLocalAccesses<'a>,
 ) {
     match value {
         mir::FloatExpression::Use { operand, .. } => {
@@ -779,15 +1085,17 @@ fn collect_float_class_local_accesses(
         mir::FloatExpression::IntToFloat { value } => {
             collect_integer_class_local_accesses(value, accesses);
         }
-        mir::FloatExpression::Call { args, .. } => {
+        mir::FloatExpression::Call { function, args, .. } => {
+            accesses.begin_call();
             collect_rvalue_args_class_local_accesses(args, accesses);
+            accesses.call(*function, args);
         }
     }
 }
 
-fn collect_string_class_local_accesses(
-    value: &mir::StringExpression,
-    accesses: &mut ClassLocalAccesses,
+fn collect_string_class_local_accesses<'a>(
+    value: &'a mir::StringExpression,
+    accesses: &mut ClassLocalAccesses<'a>,
 ) {
     match value {
         mir::StringExpression::Concat(parts) => {
@@ -798,8 +1106,10 @@ fn collect_string_class_local_accesses(
         mir::StringExpression::Display(value) => {
             collect_value_class_local_accesses(value, accesses);
         }
-        mir::StringExpression::Call { args, .. } => {
+        mir::StringExpression::Call { function, args } => {
+            accesses.begin_call();
             collect_rvalue_args_class_local_accesses(args, accesses);
+            accesses.call(*function, args);
         }
         mir::StringExpression::ReadFile(path) => {
             collect_string_class_local_accesses(path, accesses);
@@ -811,34 +1121,38 @@ fn collect_string_class_local_accesses(
         | mir::StringExpression::Local(_)
         | mir::StringExpression::Static(_)
         | mir::StringExpression::NullableLocalAssumeNonNull(_) => {}
-        mir::StringExpression::Property { object, .. } => accesses.borrow(*object),
+        mir::StringExpression::Property { object, property } => {
+            accesses.borrow_property(*object, *property)
+        }
     }
 }
 
-fn collect_nullable_string_class_local_accesses(
-    value: &mir::NullableStringExpression,
-    accesses: &mut ClassLocalAccesses,
+fn collect_nullable_string_class_local_accesses<'a>(
+    value: &'a mir::NullableStringExpression,
+    accesses: &mut ClassLocalAccesses<'a>,
 ) {
     match value {
         mir::NullableStringExpression::String(value) => {
             collect_string_class_local_accesses(value, accesses);
         }
-        mir::NullableStringExpression::Call { args, .. } => {
+        mir::NullableStringExpression::Call { function, args } => {
+            accesses.begin_call();
             collect_rvalue_args_class_local_accesses(args, accesses);
+            accesses.call(*function, args);
         }
         mir::NullableStringExpression::Null
         | mir::NullableStringExpression::Local(_)
         | mir::NullableStringExpression::Static(_)
         | mir::NullableStringExpression::ReadLine => {}
-        mir::NullableStringExpression::Property { object, .. } => {
-            accesses.borrow(*object);
+        mir::NullableStringExpression::Property { object, property } => {
+            accesses.borrow_property(*object, *property);
         }
     }
 }
 
-fn collect_class_expression_local_accesses(
-    value: &mir::ClassExpression,
-    accesses: &mut ClassLocalAccesses,
+fn collect_class_expression_local_accesses<'a>(
+    value: &'a mir::ClassExpression,
+    accesses: &mut ClassLocalAccesses<'a>,
 ) {
     match value {
         mir::ClassExpression::Local {
@@ -851,26 +1165,51 @@ fn collect_class_expression_local_accesses(
             transfer: false,
             ..
         } => accesses.borrow(*local),
-        mir::ClassExpression::Property { object, .. } => accesses.borrow(*object),
-        mir::ClassExpression::Call { args, .. } => {
+        mir::ClassExpression::Property {
+            object, property, ..
+        } => accesses.borrow_property(*object, *property),
+        mir::ClassExpression::Call { function, args, .. } => {
+            accesses.begin_call();
             collect_rvalue_args_class_local_accesses(args, accesses);
+            accesses.call(*function, args);
         }
         mir::ClassExpression::New {
-            properties, args, ..
+            properties,
+            constructor,
+            args,
+            ..
         } => {
             for property in properties {
                 if let mir::PropertyValueSource::Expression(value) = &property.source {
                     collect_rvalue_class_local_accesses(value, accesses);
                 }
             }
+            if constructor.is_some() {
+                accesses.begin_call();
+            }
             collect_rvalue_args_class_local_accesses(args, accesses);
+            if let Some(function) = constructor {
+                accesses.constructor_call(*function, args);
+            }
         }
     }
 }
 
-fn collect_bool_class_local_accesses(
-    value: &mir::BoolExpression,
-    accesses: &mut ClassLocalAccesses,
+fn class_expression_accesses_local(expression: &mir::ClassExpression, local: mir::LocalId) -> bool {
+    let mut accesses = ClassLocalAccesses::default();
+    collect_class_expression_local_accesses(expression, &mut accesses);
+    let accesses_local = accesses.iter().any(|access| match access {
+        ClassLocalAccess::Borrow(accessed)
+        | ClassLocalAccess::Transfer(accessed)
+        | ClassLocalAccess::PropertyBorrow(accessed, _) => accessed == local,
+        ClassLocalAccess::BeginCall | ClassLocalAccess::Call(_, _, _) => false,
+    });
+    accesses_local
+}
+
+fn collect_bool_class_local_accesses<'a>(
+    value: &'a mir::BoolExpression,
+    accesses: &mut ClassLocalAccesses<'a>,
 ) {
     match value {
         mir::BoolExpression::Use { operand } => {
@@ -900,29 +1239,36 @@ fn collect_bool_class_local_accesses(
                 collect_bool_class_local_accesses(right, accesses);
             }
         }
-        mir::BoolExpression::Call { args, .. } => {
+        mir::BoolExpression::Call { function, args } => {
+            accesses.begin_call();
             collect_rvalue_args_class_local_accesses(args, accesses);
+            accesses.call(*function, args);
         }
     }
 }
 
-fn collect_format_class_local_accesses(
-    format: &mir::FormatExpression,
-    accesses: &mut ClassLocalAccesses,
+fn collect_format_class_local_accesses<'a>(
+    format: &'a mir::FormatExpression,
+    accesses: &mut ClassLocalAccesses<'a>,
 ) {
-    for argument in &format.arguments {
+    for argument in format.pieces.iter().filter_map(|piece| match piece {
+        crate::format_string::FormatPiece::Argument { index, .. } => {
+            format.arguments.get(*index as usize)
+        }
+        crate::format_string::FormatPiece::Literal(_) => None,
+    }) {
         match argument {
             mir::FormatArgument::Value(value) => {
                 collect_value_class_local_accesses(value, accesses)
             }
-            mir::FormatArgument::String(value) => {
+            mir::FormatArgument::String(value) | mir::FormatArgument::ClassDisplay(value) => {
                 collect_string_class_local_accesses(value, accesses)
             }
         }
     }
 }
 
-fn collect_statement_class_local_accesses(statement: &mir::Statement) -> ClassLocalAccesses {
+fn collect_statement_class_local_accesses(statement: &mir::Statement) -> ClassLocalAccesses<'_> {
     let mut accesses = ClassLocalAccesses::default();
     match statement {
         mir::Statement::AssignLocal { value, .. } | mir::Statement::AssignStatic { value, .. } => {
@@ -931,7 +1277,7 @@ fn collect_statement_class_local_accesses(statement: &mir::Statement) -> ClassLo
         mir::Statement::EchoString(value) | mir::Statement::WriteStderr(value) => {
             collect_string_class_local_accesses(value, &mut accesses);
         }
-        mir::Statement::CallVoid { args, .. } => {
+        mir::Statement::CallVoid { args, .. } | mir::Statement::CallBorrowed { args, .. } => {
             collect_rvalue_args_class_local_accesses(args, &mut accesses);
         }
         mir::Statement::Printf(format) => {
@@ -950,7 +1296,7 @@ fn collect_statement_class_local_accesses(statement: &mir::Statement) -> ClassLo
     accesses
 }
 
-fn collect_terminator_class_local_accesses(terminator: &mir::Terminator) -> ClassLocalAccesses {
+fn collect_terminator_class_local_accesses(terminator: &mir::Terminator) -> ClassLocalAccesses<'_> {
     let mut accesses = ClassLocalAccesses::default();
     match terminator {
         mir::Terminator::Return(value) => {
@@ -1048,8 +1394,11 @@ fn apply_class_local_accesses(
 ) -> Result<(), BackendError> {
     for access in accesses.iter() {
         let (local, action) = match access {
-            ClassLocalAccess::Borrow(local) => (local, "uses"),
+            ClassLocalAccess::Borrow(local) | ClassLocalAccess::PropertyBorrow(local, _) => {
+                (local, "uses")
+            }
             ClassLocalAccess::Transfer(local) => (local, "transfers"),
+            ClassLocalAccess::BeginCall | ClassLocalAccess::Call(_, _, _) => continue,
         };
         if validate && moved.contains(&local) {
             return Err(malformed_mir(format!(
@@ -1167,6 +1516,7 @@ fn validate_class_expression(
         mir::ClassExpression::Call {
             function: callee,
             args,
+            return_borrow,
             ..
         } => {
             let callee = function_in(program, *callee)?;
@@ -1174,6 +1524,13 @@ fn validate_class_expression(
                 return Err(malformed_mir(format!(
                     "class#{} call targets a function with another return type",
                     class.0
+                )));
+            }
+            let expected_return_borrow = infer_function_return_borrow(program, callee)?;
+            if *return_borrow != expected_return_borrow {
+                return Err(malformed_mir(format!(
+                    "class#{} call disagrees with function {} return ownership",
+                    class.0, callee.name
                 )));
             }
             validate_call_args(program, function, callee, args)
@@ -1357,8 +1714,20 @@ fn validate_class_expression(
                     class.0, missing.id.index
                 )));
             }
+            if constructor.is_some() {
+                construction_accesses.begin_call();
+            }
             collect_rvalue_args_class_local_accesses(args, &mut construction_accesses);
-            validate_construction_class_local_accesses(class, &construction_accesses)?;
+            if let Some(constructor) = constructor {
+                construction_accesses.constructor_call(constructor.id, args);
+            }
+            validate_ordered_class_accesses(
+                program,
+                &format!("class#{} new expression", class.0),
+                &construction_accesses,
+                &HashMap::new(),
+                &mut HashSet::new(),
+            )?;
             if let Some(constructor) = constructor {
                 validate_call_args_for_params(
                     program,
@@ -1420,31 +1789,6 @@ fn validate_class_expression(
             Ok(())
         }
     }
-}
-
-fn validate_construction_class_local_accesses(
-    class: ClassId,
-    accesses: &ClassLocalAccesses,
-) -> Result<(), BackendError> {
-    let mut transferred = HashSet::new();
-    for access in accesses.iter() {
-        match access {
-            ClassLocalAccess::Borrow(local) if transferred.contains(&local) => {
-                return Err(malformed_mir(format!(
-                    "class#{} new expression uses class local local{} after transferring it",
-                    class.0, local.0
-                )));
-            }
-            ClassLocalAccess::Transfer(local) if !transferred.insert(local) => {
-                return Err(malformed_mir(format!(
-                    "class#{} new expression transfers class local local{} more than once",
-                    class.0, local.0
-                )));
-            }
-            ClassLocalAccess::Borrow(_) | ClassLocalAccess::Transfer(_) => {}
-        }
-    }
-    Ok(())
 }
 
 fn validate_constructor_body_initializer(
@@ -1649,7 +1993,7 @@ fn statement_observes_property(
         mir::Statement::EchoString(value) | mir::Statement::WriteStderr(value) => {
             string_observes_property(value, receiver, property)
         }
-        mir::Statement::CallVoid { args, .. } => args
+        mir::Statement::CallVoid { args, .. } | mir::Statement::CallBorrowed { args, .. } => args
             .iter()
             .any(|value| rvalue_observes_property(value, receiver, property)),
         mir::Statement::Printf(format) => format_observes_property(format, receiver, property),
@@ -1895,7 +2239,9 @@ fn format_observes_property(
 ) -> bool {
     format.arguments.iter().any(|argument| match argument {
         mir::FormatArgument::Value(value) => value_observes_property(value, receiver, property),
-        mir::FormatArgument::String(value) => string_observes_property(value, receiver, property),
+        mir::FormatArgument::String(value) | mir::FormatArgument::ClassDisplay(value) => {
+            string_observes_property(value, receiver, property)
+        }
     })
 }
 
@@ -2035,8 +2381,9 @@ fn validate_call_args_for_params(
             args.len()
         )));
     }
-    let mut borrowed_class_locals = HashSet::new();
+    let mut borrowed_class_locals: HashMap<mir::LocalId, ClassBorrowMode> = HashMap::new();
     let mut transferred_class_locals = HashSet::new();
+    let operation = format!("call to {}", callee.name);
     for (index, (argument, parameter)) in args.iter().zip(params).enumerate() {
         let parameter_definition = local_in(callee, *parameter)?;
         let parameter_type = parameter_definition.ty;
@@ -2052,37 +2399,13 @@ fn validate_call_args_for_params(
         validate_rvalue(program, caller, argument)?;
         let mut accesses = ClassLocalAccesses::default();
         collect_rvalue_class_local_accesses(argument, &mut accesses);
-        for local in accesses.borrowed() {
-            if transferred_class_locals.contains(&local) {
-                return Err(malformed_mir(format!(
-                    "call to {} both borrows and transfers class local local{}",
-                    callee.name, local.0
-                )));
-            }
-        }
-        for local in accesses.transferred() {
-            if borrowed_class_locals.contains(&local) {
-                return Err(malformed_mir(format!(
-                    "call to {} both borrows and transfers class local local{}",
-                    callee.name, local.0
-                )));
-            }
-            if !transferred_class_locals.insert(local) {
-                return Err(malformed_mir(format!(
-                    "call to {} transfers class local local{} more than once",
-                    callee.name, local.0
-                )));
-            }
-        }
-        if let Some(local) = escaping_class_local_borrow(argument) {
-            if transferred_class_locals.contains(&local) {
-                return Err(malformed_mir(format!(
-                    "call to {} both borrows and transfers class local local{}",
-                    callee.name, local.0
-                )));
-            }
-            borrowed_class_locals.insert(local);
-        }
+        let mut argument_borrows = validate_ordered_class_accesses(
+            program,
+            &operation,
+            &accesses,
+            &borrowed_class_locals,
+            &mut transferred_class_locals,
+        )?;
         if matches!(parameter_type, mir::Type::Class(_)) {
             let promoted_transfer =
                 promoted_transfers.is_some_and(|indices| indices.contains(&index));
@@ -2126,21 +2449,201 @@ fn validate_call_args_for_params(
                     &format!("call to {} argument {}", callee.name, index + 1),
                 )?;
             }
+            if !parameter_definition.owned && !promoted_transfer {
+                if let Some(local) = escaping_class_local_borrow(program, argument)? {
+                    let mode = if parameter_definition.writable {
+                        ClassBorrowMode::Writable
+                    } else {
+                        ClassBorrowMode::Readonly
+                    };
+                    argument_borrows.insert(local, mode);
+                }
+            }
+        }
+        for (local, mode) in argument_borrows {
+            if transferred_class_locals.contains(&local) {
+                return Err(class_access_error(
+                    &operation,
+                    "both borrows and transfers",
+                    local,
+                ));
+            }
+            if borrowed_class_locals
+                .get(&local)
+                .is_some_and(|previous| previous.conflicts_with(mode))
+            {
+                return Err(class_access_error(
+                    &operation,
+                    "takes overlapping writable borrows of",
+                    local,
+                ));
+            }
+            borrowed_class_locals.insert(local, mode);
         }
     }
     Ok(())
 }
 
-fn escaping_class_local_borrow(argument: &mir::Rvalue) -> Option<mir::LocalId> {
-    match argument {
-        mir::Rvalue::Class(mir::ClassExpression::Local {
+#[derive(Clone, Copy)]
+enum ClassBorrowMode {
+    Readonly,
+    Writable,
+}
+
+impl ClassBorrowMode {
+    fn conflicts_with(self, other: Self) -> bool {
+        matches!(self, Self::Writable) || matches!(other, Self::Writable)
+    }
+}
+
+fn validate_ordered_class_accesses(
+    program: &mir::Program,
+    operation: &str,
+    accesses: &ClassLocalAccesses<'_>,
+    active_borrows: &HashMap<mir::LocalId, ClassBorrowMode>,
+    transfers: &mut HashSet<mir::LocalId>,
+) -> Result<HashMap<mir::LocalId, ClassBorrowMode>, BackendError> {
+    let mut property_borrows = HashMap::new();
+    let mut call_entry_borrows = Vec::new();
+    for access in accesses.iter() {
+        match access {
+            ClassLocalAccess::Borrow(local) => {
+                if transfers.contains(&local) {
+                    return Err(class_access_error(
+                        operation,
+                        "both borrows and transfers",
+                        local,
+                    ));
+                }
+            }
+            ClassLocalAccess::PropertyBorrow(local, _) => {
+                if transfers.contains(&local) {
+                    return Err(class_access_error(
+                        operation,
+                        "both borrows and transfers",
+                        local,
+                    ));
+                }
+                property_borrows.insert(local, ClassBorrowMode::Readonly);
+            }
+            ClassLocalAccess::Transfer(local) => {
+                if active_borrows.contains_key(&local) || property_borrows.contains_key(&local) {
+                    return Err(class_access_error(
+                        operation,
+                        "both borrows and transfers",
+                        local,
+                    ));
+                }
+                if !transfers.insert(local) {
+                    return Err(duplicate_class_transfer_error(operation, local));
+                }
+            }
+            ClassLocalAccess::BeginCall => {
+                call_entry_borrows.push(property_borrows.clone());
+            }
+            ClassLocalAccess::Call(function, args, parameter_offset) => {
+                let entry_borrows = call_entry_borrows
+                    .pop()
+                    .ok_or_else(|| malformed_mir("class access call marker is unbalanced"))?;
+                for (local, mode) in
+                    borrowed_class_call_locals(program, function, args, parameter_offset)?
+                {
+                    if transfers.contains(&local) {
+                        return Err(class_access_error(
+                            operation,
+                            "both borrows and transfers",
+                            local,
+                        ));
+                    }
+                    let conflicts = active_borrows
+                        .get(&local)
+                        .or_else(|| entry_borrows.get(&local))
+                        .is_some_and(|previous| previous.conflicts_with(mode));
+                    if conflicts {
+                        return Err(class_access_error(
+                            operation,
+                            "takes overlapping writable borrows of",
+                            local,
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    if !call_entry_borrows.is_empty() {
+        return Err(malformed_mir("class access call marker is unbalanced"));
+    }
+    Ok(property_borrows)
+}
+
+fn class_access_error(operation: &str, action: &str, local: mir::LocalId) -> BackendError {
+    malformed_mir(format!("{operation} {action} class local local{}", local.0))
+}
+
+fn duplicate_class_transfer_error(operation: &str, local: mir::LocalId) -> BackendError {
+    malformed_mir(format!(
+        "{operation} transfers class local local{} more than once",
+        local.0
+    ))
+}
+
+fn escaping_class_local_borrow(
+    program: &mir::Program,
+    argument: &mir::Rvalue,
+) -> Result<Option<mir::LocalId>, BackendError> {
+    let mir::Rvalue::Class(expression) = argument else {
+        return Ok(None);
+    };
+    escaping_class_expression_local_borrow(program, expression)
+}
+
+fn escaping_class_expression_local_borrow(
+    program: &mir::Program,
+    expression: &mir::ClassExpression,
+) -> Result<Option<mir::LocalId>, BackendError> {
+    match expression {
+        mir::ClassExpression::Local {
             local,
             transfer: false,
             ..
-        })
-        | mir::Rvalue::Class(mir::ClassExpression::Property { object: local, .. }) => Some(*local),
-        _ => None,
+        }
+        | mir::ClassExpression::Property { object: local, .. } => Ok(Some(*local)),
+        mir::ClassExpression::Call {
+            function,
+            args,
+            return_borrow: Some(return_borrow),
+            ..
+        } => escaping_class_expression_local_borrow(
+            program,
+            borrowed_call_source(program, *function, args, *return_borrow)?,
+        ),
+        mir::ClassExpression::Local { transfer: true, .. }
+        | mir::ClassExpression::Call {
+            return_borrow: None,
+            ..
+        }
+        | mir::ClassExpression::New { .. } => Ok(None),
     }
+}
+
+fn borrowed_call_source<'a>(
+    program: &mir::Program,
+    function: mir::FunctionId,
+    args: &'a [mir::Rvalue],
+    return_borrow: mir::ReturnBorrow,
+) -> Result<&'a mir::ClassExpression, BackendError> {
+    let callee = function_in(program, function)?;
+    let index = match return_borrow.source {
+        mir::BorrowSource::Receiver => 0,
+        mir::BorrowSource::Parameter(index) => index + usize::from(callee.receiver_mode.is_some()),
+    };
+    let Some(mir::Rvalue::Class(source)) = args.get(index) else {
+        return Err(malformed_mir(format!(
+            "borrowed class call to {} has no class source argument",
+            callee.name
+        )));
+    };
+    Ok(source)
 }
 
 fn validate_condition(
@@ -2361,28 +2864,31 @@ fn validate_format_expression(
     format: &mir::FormatExpression,
 ) -> Result<(), BackendError> {
     use crate::format_string::{FormatConversion, FormatPiece};
-    for argument in &format.arguments {
-        match argument {
-            mir::FormatArgument::Value(value) => {
-                validate_value_expression(program, function, value)?
-            }
-            mir::FormatArgument::String(value) => {
-                validate_string_expression(program, function, value)?
-            }
-        }
-    }
+    let mut borrowed_class_locals: HashMap<mir::LocalId, ClassBorrowMode> = HashMap::new();
+    let mut transferred_class_locals = HashSet::new();
+    let mut expected_index = 0_usize;
     for piece in &format.pieces {
         let FormatPiece::Argument { index, spec } = piece else {
             continue;
         };
+        if *index as usize != expected_index {
+            return Err(malformed_mir(
+                "format argument indices are not in canonical evaluation order",
+            ));
+        }
         let argument = format
             .arguments
-            .get(*index as usize)
+            .get(expected_index)
             .ok_or_else(|| malformed_mir("format argument index is out of bounds"))?;
+        expected_index += 1;
         let valid = matches!(
             (spec.conversion, argument),
             (FormatConversion::Display, mir::FormatArgument::Value(_))
                 | (FormatConversion::Display, mir::FormatArgument::String(_))
+                | (
+                    FormatConversion::Display,
+                    mir::FormatArgument::ClassDisplay(_),
+                )
                 | (
                     FormatConversion::Decimal
                         | FormatConversion::HexLower
@@ -2401,8 +2907,133 @@ fn validate_format_expression(
                 "format conversion and argument type disagree",
             ));
         }
+        match argument {
+            mir::FormatArgument::Value(value) => {
+                validate_value_expression(program, function, value)?
+            }
+            mir::FormatArgument::String(value) | mir::FormatArgument::ClassDisplay(value) => {
+                validate_string_expression(program, function, value)?
+            }
+        }
+        let mut accesses = ClassLocalAccesses::default();
+        collect_format_argument_class_local_accesses(argument, &mut accesses);
+        let mut argument_borrows = validate_ordered_class_accesses(
+            program,
+            "format expression",
+            &accesses,
+            &borrowed_class_locals,
+            &mut transferred_class_locals,
+        )?;
+        let call = format_argument_call(argument);
+        if matches!(argument, mir::FormatArgument::ClassDisplay(_)) && call.is_none() {
+            return Err(malformed_mir(
+                "class display argument is not lowered through a string call",
+            ));
+        }
+        let call_borrows = call
+            .map(|(callee, args)| borrowed_class_call_locals(program, callee, args, 0))
+            .transpose()?
+            .unwrap_or_default();
+        if matches!(argument, mir::FormatArgument::ClassDisplay(_)) {
+            for (local, mode) in call_borrows {
+                argument_borrows.insert(local, mode);
+            }
+        }
+        for (local, mode) in argument_borrows {
+            if transferred_class_locals.contains(&local) {
+                return Err(class_access_error(
+                    "format expression",
+                    "both borrows and transfers",
+                    local,
+                ));
+            }
+            if borrowed_class_locals
+                .get(&local)
+                .is_some_and(|previous| previous.conflicts_with(mode))
+            {
+                return Err(class_access_error(
+                    "format expression",
+                    "takes overlapping writable borrows of",
+                    local,
+                ));
+            }
+            borrowed_class_locals.insert(local, mode);
+        }
+    }
+    if expected_index != format.arguments.len() {
+        return Err(malformed_mir(
+            "format expression contains unreferenced arguments",
+        ));
     }
     Ok(())
+}
+
+fn collect_format_argument_class_local_accesses<'a>(
+    argument: &'a mir::FormatArgument,
+    accesses: &mut ClassLocalAccesses<'a>,
+) {
+    match argument {
+        mir::FormatArgument::Value(value) => collect_value_class_local_accesses(value, accesses),
+        mir::FormatArgument::String(value) | mir::FormatArgument::ClassDisplay(value) => {
+            collect_string_class_local_accesses(value, accesses)
+        }
+    }
+}
+
+fn format_argument_call(
+    argument: &mir::FormatArgument,
+) -> Option<(mir::FunctionId, &[mir::Rvalue])> {
+    match argument {
+        mir::FormatArgument::Value(mir::ValueExpression::Integer(
+            mir::IntegerExpression::Call { function, args, .. },
+        ))
+        | mir::FormatArgument::Value(mir::ValueExpression::Float(mir::FloatExpression::Call {
+            function,
+            args,
+            ..
+        }))
+        | mir::FormatArgument::Value(mir::ValueExpression::Bool(mir::BoolExpression::Call {
+            function,
+            args,
+        }))
+        | mir::FormatArgument::String(mir::StringExpression::Call { function, args })
+        | mir::FormatArgument::ClassDisplay(mir::StringExpression::Call { function, args }) => {
+            Some((*function, args))
+        }
+        _ => None,
+    }
+}
+
+fn borrowed_class_call_locals(
+    program: &mir::Program,
+    callee: mir::FunctionId,
+    args: &[mir::Rvalue],
+    parameter_offset: usize,
+) -> Result<Vec<(mir::LocalId, ClassBorrowMode)>, BackendError> {
+    let callee = function_in(program, callee)?;
+    let mut borrows = Vec::new();
+    for (argument, parameter) in args.iter().zip(callee.params.iter().skip(parameter_offset)) {
+        let parameter = local_in(callee, *parameter)?;
+        if !matches!(parameter.ty, mir::Type::Class(_)) || parameter.owned {
+            continue;
+        }
+        let Some(local) = escaping_class_local_borrow(program, argument)? else {
+            continue;
+        };
+        let mode = if parameter.writable {
+            ClassBorrowMode::Writable
+        } else {
+            ClassBorrowMode::Readonly
+        };
+        if let Some((_, existing)) = borrows.iter_mut().find(|(borrowed, _)| *borrowed == local) {
+            if mode.conflicts_with(*existing) {
+                *existing = ClassBorrowMode::Writable;
+            }
+        } else {
+            borrows.push((local, mode));
+        }
+    }
+    Ok(borrows)
 }
 
 fn function_in(

@@ -12,6 +12,7 @@ use crate::{hir, mir};
 struct FunctionSignature {
     id: mir::FunctionId,
     return_type: mir::ReturnType,
+    return_borrow: Option<mir::ReturnBorrow>,
     parameter_types: Vec<mir::Type>,
     parameter_defaults: Vec<Option<crate::const_eval::ConstValue>>,
     parameter_transfers: Vec<bool>,
@@ -494,6 +495,11 @@ fn collect_function_signature(
     Ok(FunctionSignature {
         id,
         return_type,
+        return_borrow: semantic_info
+            .return_borrows
+            .get(&function.span.start)
+            .copied()
+            .map(mir_return_borrow),
         parameter_types,
         parameter_defaults,
         parameter_transfers,
@@ -501,6 +507,16 @@ fn collect_function_signature(
         method_class: None,
         receiver_mode: None,
     })
+}
+
+fn mir_return_borrow(borrow: crate::symbols::ReturnBorrow) -> mir::ReturnBorrow {
+    mir::ReturnBorrow {
+        source: match borrow.source {
+            crate::symbols::BorrowSource::Receiver => mir::BorrowSource::Receiver,
+            crate::symbols::BorrowSource::Parameter(index) => mir::BorrowSource::Parameter(index),
+        },
+        writable: borrow.writable,
+    }
 }
 
 fn callable_signatures_by_method(
@@ -600,6 +616,7 @@ fn lower_function(
         inputs.constructor_body_initializers.clone(),
         inputs.static_ids.clone(),
     );
+    context.return_borrow = signature.return_borrow;
     let mut params = Vec::new();
     if let Some(class) = receiver {
         let writable = matches!(signature.receiver_mode, Some(mir::ReceiverMode::Writable));
@@ -743,16 +760,8 @@ fn lower_statement_sequence(
                 {
                     let (signature, args) =
                         lower_instance_method_call(object, method, args, *call_span, context)?;
-                    if signature.return_type != mir::ReturnType::Void {
-                        return Err(vec![unsupported(
-                            *span,
-                            "only void method calls can be used as expression statements",
-                        )]);
-                    }
-                    context.push_statement(mir::Statement::CallVoid {
-                        function: signature.id,
-                        args,
-                    });
+                    let statement = discarded_call_statement("method", signature, args, *span)?;
+                    context.push_statement(statement);
                     continue;
                 }
                 if let hir::Expr::StaticCall {
@@ -764,16 +773,9 @@ fn lower_statement_sequence(
                 {
                     let (signature, args) =
                         lower_static_method_call(class_name, method, args, *call_span, context)?;
-                    if signature.return_type != mir::ReturnType::Void {
-                        return Err(vec![unsupported(
-                            *span,
-                            "only void static calls can be used as expression statements",
-                        )]);
-                    }
-                    context.push_statement(mir::Statement::CallVoid {
-                        function: signature.id,
-                        args,
-                    });
+                    let statement =
+                        discarded_call_statement("static method", signature, args, *span)?;
+                    context.push_statement(statement);
                     continue;
                 }
                 if let hir::Expr::FunctionCall {
@@ -811,7 +813,7 @@ fn lower_statement_sequence(
                             lower_string_expression(value, context)?,
                         ));
                     } else {
-                        let call = lower_void_call(name, args, *call_span, context)?;
+                        let call = lower_statement_call(name, args, *call_span, context)?;
                         context.push_statement(call);
                     }
                 } else {
@@ -1330,6 +1332,7 @@ struct LoweringContext<'semantic> {
     reachable_blocks: Vec<bool>,
     current_block: Option<mir::BlockId>,
     loop_targets: Vec<LoopTargets>,
+    return_borrow: Option<mir::ReturnBorrow>,
 }
 
 impl<'semantic> LoweringContext<'semantic> {
@@ -1360,6 +1363,7 @@ impl<'semantic> LoweringContext<'semantic> {
             reachable_blocks: vec![true],
             current_block: Some(mir::BlockId(0)),
             loop_targets: Vec::new(),
+            return_borrow: None,
         }
     }
 
@@ -1543,7 +1547,7 @@ impl<'semantic> LoweringContext<'semantic> {
         id
     }
 
-    fn declare_return_temp(&mut self, ty: mir::Type) -> mir::LocalId {
+    fn declare_return_temp(&mut self, ty: mir::Type, owned: bool) -> mir::LocalId {
         let id = mir::LocalId(self.locals.len());
         let name = format!("_return{}", self.temp_counter);
         self.temp_counter += 1;
@@ -1552,7 +1556,7 @@ impl<'semantic> LoweringContext<'semantic> {
             name,
             ty,
             writable: false,
-            owned: matches!(ty, mir::Type::Class(_)),
+            owned,
             synthetic: true,
         });
         id
@@ -2606,7 +2610,12 @@ fn lower_format_expression(
         .zip(specs)
         .map(|(argument, spec)| {
             if spec.conversion == FormatConversion::Display {
-                lower_display_string_expression(argument, context).map(mir::FormatArgument::String)
+                let lowered = lower_display_string_expression(argument, context)?;
+                if inferred_class_type(argument, context).is_some() {
+                    Ok(mir::FormatArgument::ClassDisplay(lowered))
+                } else {
+                    Ok(mir::FormatArgument::String(lowered))
+                }
             } else if is_string_local_initializer(argument, context) {
                 lower_string_expression(argument, context).map(mir::FormatArgument::String)
             } else {
@@ -2745,24 +2754,42 @@ fn append_string_concat_parts(
     }
 }
 
-fn lower_void_call(
+fn lower_statement_call(
     name: &str,
     args: &[hir::Expr],
     span: Span,
     context: &LoweringContext,
 ) -> DiagnosticResult<mir::Statement> {
     let signature = context.lookup_function(name, span)?;
-    if signature.return_type != mir::ReturnType::Void {
-        return Err(vec![unsupported(
-            span,
-            format!("non-void function `{name}` cannot be used as a statement"),
-        )]);
-    }
+    let args = lower_call_args(name, args, signature.clone(), span, context)?;
+    discarded_call_statement("function", signature, args, span)
+}
 
-    Ok(mir::Statement::CallVoid {
-        function: signature.id,
-        args: lower_call_args(name, args, signature, span, context)?,
-    })
+fn discarded_call_statement(
+    kind: &str,
+    signature: FunctionSignature,
+    args: Vec<mir::Rvalue>,
+    span: Span,
+) -> DiagnosticResult<mir::Statement> {
+    let statement = match signature.return_type {
+        mir::ReturnType::Void => mir::Statement::CallVoid {
+            function: signature.id,
+            args,
+        },
+        mir::ReturnType::Value(mir::Type::Class(_)) if signature.return_borrow.is_some() => {
+            mir::Statement::CallBorrowed {
+                function: signature.id,
+                args,
+            }
+        }
+        mir::ReturnType::Value(_) => {
+            return Err(vec![unsupported(
+                span,
+                format!("non-void {kind} call cannot be used as a statement"),
+            )]);
+        }
+    };
+    Ok(statement)
 }
 
 fn lower_integer_call(
@@ -2980,7 +3007,15 @@ fn lower_return(
             Ok(mir::Terminator::ReturnVoid)
         }
         (mir::ReturnType::Value(expected), Some(expr)) => {
-            let value = lower_rvalue_as_expected(expr, expected, context)?;
+            let borrowed_class =
+                matches!(expected, mir::Type::Class(_)) && context.return_borrow.is_some();
+            let value = match expected {
+                mir::Type::Class(class) => {
+                    lower_class_expression(expr, class, !borrowed_class, context)
+                        .map(mir::Rvalue::Class)?
+                }
+                _ => lower_rvalue_as_expected(expr, expected, context)?,
+            };
             if value.ty() != expected {
                 return Err(vec![Diagnostic::new(
                     "I1301",
@@ -2992,13 +3027,32 @@ fn lower_return(
                 )]);
             }
             if context.has_cleanup_obligations() {
-                let result = context.declare_return_temp(expected);
+                let borrowed_call = borrowed_class
+                    && matches!(
+                        &value,
+                        mir::Rvalue::Class(mir::ClassExpression::Call {
+                            return_borrow: Some(_),
+                            ..
+                        })
+                    );
+                if borrowed_class && !borrowed_call {
+                    context.cleanup_scopes_from(0);
+                    return Ok(mir::Terminator::Return(value));
+                }
+                let result = context.declare_return_temp(
+                    expected,
+                    matches!(expected, mir::Type::Class(_)) && !borrowed_class,
+                );
                 context.push_statement(mir::Statement::AssignLocal {
                     target: result,
                     value,
                 });
                 context.cleanup_scopes_from(0);
-                Ok(mir::Terminator::Return(local_rvalue(result, expected)))
+                Ok(mir::Terminator::Return(local_rvalue(
+                    result,
+                    expected,
+                    !borrowed_class,
+                )))
             } else {
                 Ok(mir::Terminator::Return(value))
             }
@@ -3014,7 +3068,7 @@ fn lower_return(
     }
 }
 
-fn local_rvalue(local: mir::LocalId, ty: mir::Type) -> mir::Rvalue {
+fn local_rvalue(local: mir::LocalId, ty: mir::Type, transfer: bool) -> mir::Rvalue {
     match ty {
         mir::Type::Scalar(mir::ScalarType::Integer(ty)) => mir::Rvalue::Value(
             mir::ValueExpression::Integer(local_integer_expression(local, ty)),
@@ -3034,7 +3088,7 @@ fn local_rvalue(local: mir::LocalId, ty: mir::Type) -> mir::Rvalue {
         mir::Type::Class(class) => mir::Rvalue::Class(mir::ClassExpression::Local {
             class,
             local,
-            transfer: true,
+            transfer,
         }),
     }
 }
@@ -3373,6 +3427,7 @@ fn lower_class_expression(
             Ok(mir::ClassExpression::Call {
                 class: expected,
                 function: signature.id,
+                return_borrow: signature.return_borrow,
                 args: lower_call_args_with_ownership(name, args, signature, *span, context)?,
             })
         }
@@ -3393,6 +3448,7 @@ fn lower_class_expression(
             Ok(mir::ClassExpression::Call {
                 class: expected,
                 function: signature.id,
+                return_borrow: signature.return_borrow,
                 args,
             })
         }
@@ -3413,6 +3469,7 @@ fn lower_class_expression(
             Ok(mir::ClassExpression::Call {
                 class: expected,
                 function: signature.id,
+                return_borrow: signature.return_borrow,
                 args,
             })
         }

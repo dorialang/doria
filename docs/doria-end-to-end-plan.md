@@ -717,11 +717,11 @@ Authored subjects cite their actual record numbers:
 - Decision 0086: copy-scalar default arguments — const-evaluable Copy-scalar and readonly-string defaults via caller-side splice (Stage 20a).
 - Decision 0087: data classes, value objects, and the DTO boundary — class remains the record type, structural behavior uses opt-in derives, and DTOs remain a framework concern.
 - Decision 0088: fluent method chaining — three self-return conventions, owned temporaries become exclusive places, and consuming builders remain deferred.
+- Decision 0089: Stage 21 borrowing rules — readonly/writable/`take` become non-lexical borrows and ownership transfer, one-writer-XOR-many-readers is enforced, returned-borrow elision is inferred, and owned temporaries become exclusive places.
 
 Subjects awaiting decision records are deliberately unnumbered:
 
 - Ownership and move semantics (D1, D3).
-- Borrowing rules, elision, and the borrow checker (D2).
 - Nullable types and narrowing (D5).
 - Enums and payload cases (D6).
 - `match` (D7).

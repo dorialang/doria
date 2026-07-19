@@ -500,7 +500,8 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 )?;
                 self.release_string(value)?;
             }
-            mir::Statement::CallVoid { function, args } => {
+            mir::Statement::CallVoid { function, args }
+            | mir::Statement::CallBorrowed { function, args } => {
                 let _ = self.lower_call(*function, args, false)?;
             }
             mir::Statement::WriteStderr(value) => {
@@ -856,11 +857,10 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
 
                     let constructor_definition = function_in(self.program, *constructor)?;
                     for (index, argument) in args.iter().enumerate() {
-                        let mir::Rvalue::Class(
-                            mir::ClassExpression::New { class, .. }
-                            | mir::ClassExpression::Call { class, .. },
-                        ) = argument
-                        else {
+                        let mir::Rvalue::Class(expression) = argument else {
+                            continue;
+                        };
+                        let Some(class) = expression.owned_temporary_class() else {
                             continue;
                         };
                         let promoted = properties.iter().any(|property| {
@@ -882,7 +882,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                                 })?;
                         if !promoted && !local_in(constructor_definition, parameter)?.owned {
                             let value = lowered_args[index].into_pointer_value();
-                            self.defer_or_drop_class_temporary(value, *class)?;
+                            self.defer_or_drop_class_temporary(value, class)?;
                         }
                     }
                 }
@@ -1423,7 +1423,9 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
 
         if spec.conversion == FormatConversion::Display {
             let string = match argument {
-                mir::FormatArgument::String(value) => self.lower_string_expression(value)?,
+                mir::FormatArgument::String(value) | mir::FormatArgument::ClassDisplay(value) => {
+                    self.lower_string_expression(value)?
+                }
                 mir::FormatArgument::Value(value) => {
                     self.lower_string_expression(&mir::StringExpression::Display(value.clone()))?
                 }
@@ -2190,10 +2192,10 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         }
         let callee_definition = function_in(self.program, function)?;
         for (index, argument) in args.iter().enumerate() {
-            let mir::Rvalue::Class(
-                mir::ClassExpression::New { class, .. } | mir::ClassExpression::Call { class, .. },
-            ) = argument
-            else {
+            let mir::Rvalue::Class(expression) = argument else {
+                continue;
+            };
+            let Some(class) = expression.owned_temporary_class() else {
                 continue;
             };
             let parameter = *callee_definition.params.get(index).ok_or_else(|| {
@@ -2204,7 +2206,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             })?;
             if !local_in(callee_definition, parameter)?.owned {
                 let value = lowered_args[index].into_pointer_value();
-                self.defer_or_drop_class_temporary(value, *class)?;
+                self.defer_or_drop_class_temporary(value, class)?;
             }
         }
         Ok(result)

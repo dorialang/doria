@@ -56,7 +56,7 @@ Source of truth for sequencing remains `docs/doria-end-to-end-plan.md`. The dura
 | `Displayable` frontend conformance | Frontend | Frontend | Frontend | Covered | Explicit nominal conformance and exact method shape are checked before MIR. |
 | Native class allocation and construction | Covered | Covered | Covered | Covered | Headerless payloads use shared layout; property initializers and promotions run before the lifecycle body. |
 | Narrow direct constructor initialization | Covered | Covered | Covered | Covered | The temporary soundness gate accepts only proven direct initialization shapes until Stage 21. |
-| Class-valued locals, calls, and returns | Covered | Covered | Covered | Covered | Pointer-sized move values preserve ownership through free-function ABI boundaries. |
+| Class-valued locals, calls, and returns | Covered | Covered | Covered | Covered | Pointer-sized values preserve owning transfers and inferred returned borrows through free-function ABI boundaries. |
 | `take` ownership transfer | Covered | Covered | Covered | Covered | Transfer invalidates the caller slot and cleanup becomes the callee's obligation. |
 | Property loads and Stage 19 assignments | Covered | Covered | Covered | Covered | Shared class metadata supplies checked types and compiler-known offsets. |
 | Deterministic class destruction | Covered | Covered | Covered | Covered | Lifecycle body runs first, owned properties drop in reverse order, allocation frees last. |
