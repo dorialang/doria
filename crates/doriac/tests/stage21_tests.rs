@@ -274,6 +274,36 @@ function route(Guard $guard): void { let $alias = identity($guard); }
 }
 
 #[test]
+fn returned_borrow_provenance_flows_through_calls() {
+    assert_valid_mir(
+        r#"
+class Guard
+{
+    function inspect(): self { return $this; }
+    function wrappedInspect(): self { return $this->inspect(); }
+    static function identity(Guard $guard): Guard { return $guard; }
+    static function wrappedIdentity(Guard $guard): Guard
+    {
+        return self::identity($guard);
+    }
+}
+
+function wrap(Guard $guard): Guard { return identity($guard); }
+function identity(Guard $guard): Guard { return $guard; }
+function observe(Guard $guard): void {}
+
+function main(): void
+{
+    let $guard = new Guard();
+    observe(wrap($guard));
+    observe($guard->wrappedInspect());
+    observe(Guard::wrappedIdentity($guard));
+}
+"#,
+    );
+}
+
+#[test]
 fn returned_self_borrows_lower_and_validate_in_native_mir() {
     assert_valid_mir(
         r#"
@@ -490,8 +520,8 @@ function route(writable Box $box, Child $child): void
 }
 
 #[test]
-fn owned_returns_reject_borrowed_call_results_without_provenance_elision() {
-    assert_diagnostic(
+fn method_call_results_preserve_parameter_borrow_provenance() {
+    assert_valid_mir(
         r#"
 class Guard
 {
@@ -502,8 +532,13 @@ function alias(Guard $guard): Guard
 {
     return $guard->inspect();
 }
+
+function main(): void
+{
+    let $guard = new Guard();
+    alias($guard);
+}
 "#,
-        "E0478",
     );
 }
 
@@ -752,6 +787,43 @@ function main(): void { update(Store::payload); }
 "#,
     )
     .expect("a writable static property remains a valid writable argument");
+}
+
+#[test]
+fn class_constants_are_not_writable_mixed_storage() {
+    assert_diagnostic(
+        r#"
+class Store { const VALUE = 1; }
+function update(writable mixed $value): void {}
+function main(): void { update(Store::VALUE); }
+"#,
+        "E0204",
+    );
+}
+
+#[test]
+fn static_properties_are_stable_borrow_roots() {
+    assert_diagnostic(
+        r#"
+class Store { static writable int $payload = 1; }
+function update(writable mixed $value): int { return 0; }
+function observe(int $value, int $result): void {}
+function main(): void { observe(Store::payload, update(Store::payload)); }
+"#,
+        "E0477",
+    );
+
+    doriac::check_source(
+        "stage21-static-read-modify-write.doria",
+        r#"
+class Store
+{
+    static writable int $payload = 1;
+    static function update(): void { self::payload = self::payload + 1; }
+}
+"#,
+    )
+    .expect("an assignment may read the exact static property it replaces");
 }
 
 #[test]

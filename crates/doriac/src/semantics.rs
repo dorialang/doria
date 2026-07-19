@@ -84,11 +84,17 @@ pub fn analyze_program(program: &Program) -> DiagnosticResult<SemanticInfo> {
                     .then_some(*span_start)
             })
             .collect();
+        let return_borrows = checker
+            .function_signatures
+            .iter()
+            .filter_map(|(span, signature)| signature.return_borrow.map(|borrow| (*span, borrow)))
+            .collect();
         checker
             .diagnostics
             .extend(crate::ownership::check_program_with_inferred_move_returns(
                 program,
                 &inferred_move_returns,
+                &return_borrows,
             ));
     }
     if checker.diagnostics.is_empty() {
@@ -386,6 +392,7 @@ impl<'program> Checker<'program> {
         }
         self.collect_classes();
         self.collect_functions();
+        self.infer_return_borrow_signatures();
         self.infer_unannotated_move_return_signatures();
 
         let mut scopes = ScopeStack::new();
@@ -827,6 +834,123 @@ impl<'program> Checker<'program> {
             params,
             return_ty,
             return_borrow,
+        }
+    }
+
+    fn infer_return_borrow_signatures(&mut self) {
+        let callables = self
+            .program
+            .items
+            .iter()
+            .flat_map(|item| match item {
+                Item::Function(function) => vec![(function.clone(), None)],
+                Item::Class(class) => class
+                    .members
+                    .iter()
+                    .filter_map(|member| match member {
+                        ClassMember::Method(method) => {
+                            Some((method.clone(), Some(class.name.clone())))
+                        }
+                        ClassMember::Property(_) | ClassMember::Constant(_) => None,
+                    })
+                    .collect(),
+                Item::Interface(_) | Item::Trait(_) | Item::Constant(_) | Item::Statement(_) => {
+                    Vec::new()
+                }
+            })
+            .collect::<Vec<_>>();
+
+        for _ in 0..callables.len().max(1) {
+            let mut changed = false;
+            for (function, declaring_class) in &callables {
+                let Some(signature) = self.function_signatures.get(&function.span.start).cloned()
+                else {
+                    continue;
+                };
+                if !matches!(self.types.kind(signature.return_ty), TypeKind::Class(_)) {
+                    continue;
+                }
+                let mut scopes = ScopeStack::new();
+                for param in &signature.params {
+                    let _ = scopes.declare(
+                        param.name.clone(),
+                        Binding {
+                            writable: param.writable,
+                            ty: param.ty,
+                            declared_ty: param.ty,
+                            int_constant: None,
+                            string_constant: None,
+                        },
+                    );
+                }
+                let method_context = declaring_class.as_ref().map(|class_name| MethodContext {
+                    class_name: class_name.clone(),
+                    receiver_mode: (!function.is_static).then_some(if function.writable_this {
+                        ReceiverMode::Writable
+                    } else {
+                        ReceiverMode::Readonly
+                    }),
+                    this_available: !function.is_static,
+                });
+                let inferred =
+                    crate::ownership::function_return_borrow_with_calls(function, &mut |call| {
+                        self.call_return_borrow(call, &scopes, method_context.as_ref())
+                    });
+                if inferred.is_some() && inferred != signature.return_borrow {
+                    self.set_return_borrow(function, declaring_class.as_deref(), inferred);
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+    }
+
+    fn call_return_borrow(
+        &mut self,
+        call: &Expr,
+        scopes: &ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) -> Option<ReturnBorrow> {
+        match call {
+            Expr::FunctionCall { name, .. } => {
+                self.functions.get(name).and_then(|info| info.return_borrow)
+            }
+            Expr::MethodCall { object, method, .. } => self
+                .expr_class_name(object, scopes, method_context)
+                .and_then(|class_name| self.classes.get(&class_name))
+                .and_then(|class| class.methods.get(method))
+                .and_then(|info| info.return_borrow),
+            Expr::StaticCall {
+                qualifier, method, ..
+            } => Self::static_qualifier_class_name(qualifier, method_context)
+                .and_then(|class_name| self.classes.get(&class_name))
+                .and_then(|class| class.methods.get(method))
+                .and_then(|info| info.return_borrow),
+            _ => None,
+        }
+    }
+
+    fn set_return_borrow(
+        &mut self,
+        function: &FunctionDecl,
+        declaring_class: Option<&str>,
+        borrow: Option<ReturnBorrow>,
+    ) {
+        if let Some(signature) = self.function_signatures.get_mut(&function.span.start) {
+            signature.return_borrow = borrow;
+        }
+        if let Some(class_name) = declaring_class {
+            if let Some(signature) = self
+                .classes
+                .get_mut(class_name)
+                .and_then(|class| class.methods.get_mut(&function.name))
+            {
+                signature.return_borrow = borrow;
+            }
+        } else if let Some(signature) = self.functions.get_mut(&function.name) {
+            signature.return_borrow = borrow;
         }
     }
 
@@ -4976,7 +5100,11 @@ impl<'program> Checker<'program> {
                 if param.writable
                     && (matches!(self.types.kind(param.ty), TypeKind::Class(_))
                         || matches!(self.types.kind(param.ty), TypeKind::Mixed)
-                            && self.writable_mixed_requires_semantic_check(got, arg))
+                            && self.writable_mixed_requires_semantic_check(
+                                got,
+                                arg,
+                                method_context,
+                            ))
                     && !self.is_writable_object_path(arg, scopes, method_context)
                 {
                     let message = if matches!(self.types.kind(param.ty), TypeKind::Class(_)) {
@@ -5150,15 +5278,25 @@ impl<'program> Checker<'program> {
         }
     }
 
-    fn writable_mixed_requires_semantic_check(&self, argument_ty: TypeId, argument: &Expr) -> bool {
+    fn writable_mixed_requires_semantic_check(
+        &self,
+        argument_ty: TypeId,
+        argument: &Expr,
+        method_context: Option<&MethodContext>,
+    ) -> bool {
         if self.type_is_move_type(argument_ty) {
             return false;
         }
         match argument {
             Expr::Grouped { expr, .. } => {
-                self.writable_mixed_requires_semantic_check(argument_ty, expr)
+                self.writable_mixed_requires_semantic_check(argument_ty, expr, method_context)
             }
-            Expr::This { .. } | Expr::PropertyAccess { .. } | Expr::StaticMember { .. } => false,
+            Expr::This { .. } | Expr::PropertyAccess { .. } => false,
+            Expr::StaticMember {
+                qualifier, member, ..
+            } => Self::static_qualifier_class_name(qualifier, method_context)
+                .and_then(|class_name| self.classes.get(&class_name))
+                .is_none_or(|class| !class.static_properties.contains_key(member)),
             _ => true,
         }
     }
