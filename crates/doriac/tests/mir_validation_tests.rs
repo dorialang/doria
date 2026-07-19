@@ -1431,7 +1431,79 @@ fn shared_validator_rejects_construction_borrows_after_transfers() {
         .expect_err("construction cannot borrow an owner after an earlier initializer moved it");
     assert!(error
         .message
-        .contains("uses class local local1 after transferring it"));
+        .contains("both borrows and transfers class local local1"));
+}
+
+#[test]
+fn shared_validator_keeps_initializer_borrows_live_through_constructor_arguments() {
+    let mut program = class_new_program();
+    let target = PropertyId {
+        class: ClassId(0),
+        index: 0,
+    };
+    let source = PropertyId {
+        class: ClassId(1),
+        index: 0,
+    };
+    program.classes[0].properties[0].promoted = false;
+    program.classes[1].properties = vec![Property {
+        id: source,
+        name: "value".to_string(),
+        ty: Type::String,
+        writable: false,
+        promoted: false,
+    }];
+    program.classes[1].layout = compute_class_layout(ClassId(1), [(source, FieldType::String)], 8);
+    program.functions[0].locals.push(class_local(1, ClassId(1)));
+    let Statement::AssignLocal {
+        value: Rvalue::Class(ClassExpression::New {
+            properties, args, ..
+        }),
+        ..
+    } = &mut program.functions[0].blocks[0].statements[0]
+    else {
+        panic!("class new fixture");
+    };
+    *properties = vec![PropertyValue {
+        property: target,
+        source: PropertyValueSource::Expression(Rvalue::String(StringExpression::Property {
+            object: LocalId(1),
+            property: source,
+        })),
+    }];
+    *args = vec![Rvalue::Class(ClassExpression::Local {
+        class: ClassId(1),
+        local: LocalId(1),
+        transfer: true,
+    })];
+    program.functions[1].locals[1] = class_local(1, ClassId(1));
+
+    let error = doriac::mir_validation::validate_program(&program)
+        .expect_err("an initializer borrow must prevent a later constructor transfer");
+    assert!(error
+        .message
+        .contains("both borrows and transfers class local local1"));
+
+    let Statement::AssignLocal {
+        value: Rvalue::Class(ClassExpression::New { args, .. }),
+        ..
+    } = &mut program.functions[0].blocks[0].statements[0]
+    else {
+        panic!("class new fixture");
+    };
+    let Rvalue::Class(ClassExpression::Local { transfer, .. }) = &mut args[0] else {
+        panic!("class argument fixture");
+    };
+    *transfer = false;
+    program.functions[0].locals[1].writable = true;
+    program.functions[1].locals[1].owned = false;
+    program.functions[1].locals[1].writable = true;
+
+    let error = doriac::mir_validation::validate_program(&program)
+        .expect_err("an initializer borrow must prevent a later writable constructor borrow");
+    assert!(error
+        .message
+        .contains("takes overlapping writable borrows of class local local1"));
 }
 
 #[test]

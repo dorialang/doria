@@ -822,7 +822,7 @@ enum ClassLocalAccess<'a> {
     PropertyBorrow(mir::LocalId, crate::class_layout::PropertyId),
     Transfer(mir::LocalId),
     BeginCall,
-    Call(mir::FunctionId, &'a [mir::Rvalue]),
+    Call(mir::FunctionId, &'a [mir::Rvalue], usize),
 }
 
 #[derive(Default)]
@@ -845,7 +845,13 @@ impl<'a> ClassLocalAccesses<'a> {
     }
 
     fn call(&mut self, function: mir::FunctionId, args: &'a [mir::Rvalue]) {
-        self.accesses.push(ClassLocalAccess::Call(function, args));
+        self.accesses
+            .push(ClassLocalAccess::Call(function, args, 0));
+    }
+
+    fn constructor_call(&mut self, function: mir::FunctionId, args: &'a [mir::Rvalue]) {
+        self.accesses
+            .push(ClassLocalAccess::Call(function, args, 1));
     }
 
     fn begin_call(&mut self) {
@@ -863,7 +869,7 @@ impl<'a> ClassLocalAccesses<'a> {
             }
             ClassLocalAccess::Transfer(_)
             | ClassLocalAccess::BeginCall
-            | ClassLocalAccess::Call(_, _) => None,
+            | ClassLocalAccess::Call(_, _, _) => None,
         })
     }
 
@@ -873,7 +879,7 @@ impl<'a> ClassLocalAccesses<'a> {
             ClassLocalAccess::Borrow(_)
             | ClassLocalAccess::PropertyBorrow(_, _)
             | ClassLocalAccess::BeginCall
-            | ClassLocalAccess::Call(_, _) => None,
+            | ClassLocalAccess::Call(_, _, _) => None,
         })
     }
 
@@ -885,7 +891,7 @@ impl<'a> ClassLocalAccesses<'a> {
             ClassLocalAccess::Borrow(_)
             | ClassLocalAccess::Transfer(_)
             | ClassLocalAccess::BeginCall
-            | ClassLocalAccess::Call(_, _) => None,
+            | ClassLocalAccess::Call(_, _, _) => None,
         })
     }
 }
@@ -1118,7 +1124,7 @@ fn collect_class_expression_local_accesses<'a>(
             }
             collect_rvalue_args_class_local_accesses(args, accesses);
             if let Some(function) = constructor {
-                accesses.call(*function, args);
+                accesses.constructor_call(*function, args);
             }
         }
     }
@@ -1315,7 +1321,7 @@ fn apply_class_local_accesses(
                 (local, "uses")
             }
             ClassLocalAccess::Transfer(local) => (local, "transfers"),
-            ClassLocalAccess::BeginCall | ClassLocalAccess::Call(_, _) => continue,
+            ClassLocalAccess::BeginCall | ClassLocalAccess::Call(_, _, _) => continue,
         };
         if validate && moved.contains(&local) {
             return Err(malformed_mir(format!(
@@ -1631,8 +1637,20 @@ fn validate_class_expression(
                     class.0, missing.id.index
                 )));
             }
+            if constructor.is_some() {
+                construction_accesses.begin_call();
+            }
             collect_rvalue_args_class_local_accesses(args, &mut construction_accesses);
-            validate_construction_class_local_accesses(class, &construction_accesses)?;
+            if let Some(constructor) = constructor {
+                construction_accesses.constructor_call(constructor.id, args);
+            }
+            validate_ordered_class_accesses(
+                program,
+                &format!("class#{} new expression", class.0),
+                &construction_accesses,
+                &HashMap::new(),
+                &mut HashSet::new(),
+            )?;
             if let Some(constructor) = constructor {
                 validate_call_args_for_params(
                     program,
@@ -1694,37 +1712,6 @@ fn validate_class_expression(
             Ok(())
         }
     }
-}
-
-fn validate_construction_class_local_accesses(
-    class: ClassId,
-    accesses: &ClassLocalAccesses,
-) -> Result<(), BackendError> {
-    let mut transferred = HashSet::new();
-    for access in accesses.iter() {
-        match access {
-            ClassLocalAccess::Borrow(local) | ClassLocalAccess::PropertyBorrow(local, _)
-                if transferred.contains(&local) =>
-            {
-                return Err(malformed_mir(format!(
-                    "class#{} new expression uses class local local{} after transferring it",
-                    class.0, local.0
-                )));
-            }
-            ClassLocalAccess::Transfer(local) if !transferred.insert(local) => {
-                return Err(malformed_mir(format!(
-                    "class#{} new expression transfers class local local{} more than once",
-                    class.0, local.0
-                )));
-            }
-            ClassLocalAccess::Borrow(_)
-            | ClassLocalAccess::PropertyBorrow(_, _)
-            | ClassLocalAccess::Transfer(_)
-            | ClassLocalAccess::BeginCall
-            | ClassLocalAccess::Call(_, _) => {}
-        }
-    }
-    Ok(())
 }
 
 fn validate_constructor_body_initializer(
@@ -2477,11 +2464,13 @@ fn validate_ordered_class_accesses(
             ClassLocalAccess::BeginCall => {
                 call_entry_borrows.push(property_borrows.clone());
             }
-            ClassLocalAccess::Call(function, args) => {
+            ClassLocalAccess::Call(function, args, parameter_offset) => {
                 let entry_borrows = call_entry_borrows
                     .pop()
                     .ok_or_else(|| malformed_mir("class access call marker is unbalanced"))?;
-                for (local, mode) in borrowed_class_call_locals(program, function, args)? {
+                for (local, mode) in
+                    borrowed_class_call_locals(program, function, args, parameter_offset)?
+                {
                     if transfers.contains(&local) {
                         return Err(class_access_error(
                             operation,
@@ -2865,7 +2854,7 @@ fn validate_format_expression(
             ));
         }
         let call_borrows = call
-            .map(|(callee, args)| borrowed_class_call_locals(program, callee, args))
+            .map(|(callee, args)| borrowed_class_call_locals(program, callee, args, 0))
             .transpose()?
             .unwrap_or_default();
         if matches!(argument, mir::FormatArgument::ClassDisplay(_)) {
@@ -2942,10 +2931,11 @@ fn borrowed_class_call_locals(
     program: &mir::Program,
     callee: mir::FunctionId,
     args: &[mir::Rvalue],
+    parameter_offset: usize,
 ) -> Result<Vec<(mir::LocalId, ClassBorrowMode)>, BackendError> {
     let callee = function_in(program, callee)?;
     let mut borrows = Vec::new();
-    for (argument, parameter) in args.iter().zip(&callee.params) {
+    for (argument, parameter) in args.iter().zip(callee.params.iter().skip(parameter_offset)) {
         let parameter = local_in(callee, *parameter)?;
         if !matches!(parameter.ty, mir::Type::Class(_)) || parameter.owned {
             continue;

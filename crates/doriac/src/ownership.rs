@@ -1357,12 +1357,16 @@ impl Checker {
                 let borrow_depth = self.active_borrows.len();
                 for element in elements {
                     if let Some(key) = &element.key {
-                        if self.use_owned_expression(key, scopes) == UseMode::Read {
-                            self.activate_enclosing_read_borrows(key, scopes);
+                        let mode = self.use_owned_expression(key, scopes);
+                        self.activate_place_input_borrows(key, scopes);
+                        if mode == UseMode::Read {
+                            self.activate_call_borrow(key, mode, scopes);
                         }
                     }
-                    if self.use_owned_expression(&element.value, scopes) == UseMode::Read {
-                        self.activate_enclosing_read_borrows(&element.value, scopes);
+                    let mode = self.use_owned_expression(&element.value, scopes);
+                    self.activate_place_input_borrows(&element.value, scopes);
+                    if mode == UseMode::Read {
+                        self.activate_call_borrow(&element.value, mode, scopes);
                     }
                 }
                 self.active_borrows.truncate(borrow_depth);
@@ -1441,6 +1445,7 @@ impl Checker {
         let borrow_depth = self.active_borrows.len();
         if let Some(receiver) = receiver {
             self.use_expr(receiver, scopes, UseMode::Read);
+            self.activate_place_input_borrows(receiver, scopes);
             if let Some(mode) = signature.receiver {
                 self.activate_call_borrow(receiver, mode, scopes);
             }
@@ -1490,12 +1495,9 @@ impl Checker {
                 }
             }
             self.use_expr(arg, scopes, mode);
+            self.activate_place_input_borrows(arg, scopes);
             if matches!(mode, UseMode::Read | UseMode::Write) {
-                if mode == UseMode::Read {
-                    self.activate_enclosing_read_borrows(arg, scopes);
-                } else {
-                    self.activate_call_borrow(arg, mode, scopes);
-                }
+                self.activate_call_borrow(arg, mode, scopes);
             }
         }
         self.active_borrows.truncate(borrow_depth);
@@ -1513,9 +1515,13 @@ impl Checker {
         });
     }
 
-    fn activate_enclosing_read_borrows(&mut self, expr: &Expr, scopes: &Scopes) {
-        self.activate_nested_property_borrows(expr, scopes);
-        self.activate_call_borrow(expr, UseMode::Read, scopes);
+    fn activate_place_input_borrows(&mut self, expr: &Expr, scopes: &Scopes) {
+        match expr {
+            Expr::Grouped { expr, .. } | Expr::PropertyAccess { object: expr, .. } => {
+                self.activate_place_input_borrows(expr, scopes);
+            }
+            _ => self.activate_nested_property_borrows(expr, scopes),
+        }
     }
 
     fn activate_nested_property_borrows(&mut self, expr: &Expr, scopes: &Scopes) {
@@ -1618,19 +1624,25 @@ impl Checker {
         signature: &Signature,
         scopes: &Scopes,
     ) {
-        if let Some(receiver) = receiver.filter(|_| signature.receiver == Some(UseMode::Read)) {
-            self.activate_nested_property_borrows(receiver, scopes);
+        if let Some(receiver) = receiver {
+            self.activate_place_input_borrows(receiver, scopes);
+            if signature.receiver == Some(UseMode::Read) {
+                self.activate_call_borrow(receiver, UseMode::Read, scopes);
+            }
         }
         for (index, arg) in args.iter().enumerate() {
-            if call_arg_mode(signature, index) == UseMode::Read {
-                self.activate_nested_property_borrows(arg, scopes);
+            let mode = call_arg_mode(signature, index);
+            self.activate_place_input_borrows(arg, scopes);
+            if mode == UseMode::Read {
+                self.activate_call_borrow(arg, mode, scopes);
             }
         }
     }
 
     fn use_read_with_place_borrow(&mut self, expr: &Expr, scopes: &mut Scopes) {
         self.use_expr(expr, scopes, UseMode::Read);
-        self.activate_enclosing_read_borrows(expr, scopes);
+        self.activate_place_input_borrows(expr, scopes);
+        self.activate_call_borrow(expr, UseMode::Read, scopes);
     }
 
     fn check_writable_move_argument(&mut self, expr: &Expr, scopes: &Scopes) {

@@ -110,5 +110,7 @@ deferred consuming self-return convention.
   self-return chaining is permanently unsupported.
 - `SPEC.md` supported-subset descriptions that list non-lexical borrowing as
   unsupported.
+- `docs/notes/current-pipeline.md` status text that lists non-lexical borrowing
+  as future Stage 21 work.
 - The Stage 19 temporary native-eligibility gate once constructor
   definite-initialization analysis lands.

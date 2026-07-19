@@ -997,9 +997,52 @@ function route(writable Box $box): void
     observe(new Wrapper($box->value), update($box));
 }
 "#,
+        r#"
+class Box { int $value = 1; }
+class Wrapper { function __construct(int $value) {} }
+function update(writable Box $box): int { return 1; }
+function observe(take Wrapper $left, int $right): void {}
+function route(writable Box $box): void
+{
+    observe(new Wrapper($box->value), update($box));
+}
+"#,
     ] {
         assert_diagnostic(source, "E0477");
     }
+}
+
+#[test]
+fn owned_array_elements_preserve_nested_property_borrows() {
+    assert_diagnostic(
+        r#"
+class Box { int $value = 1; }
+class Wrapper { function __construct(int $value) {} }
+function update(writable Box $box): Wrapper { return new Wrapper(1); }
+function route(writable Box $box): void
+{
+    let $values = [new Wrapper($box->value), update($box)];
+}
+"#,
+        "E0477",
+    );
+}
+
+#[test]
+fn method_receiver_inputs_remain_borrowed_across_arguments() {
+    assert_diagnostic(
+        r#"
+class Box { int $value = 1; }
+class Target { function touch(int $value): void {} }
+function make(int $value): Target { return new Target(); }
+function update(writable Box $box): int { return 1; }
+function route(writable Box $box): void
+{
+    make($box->value)->touch(update($box));
+}
+"#,
+        "E0477",
+    );
 }
 
 #[test]
