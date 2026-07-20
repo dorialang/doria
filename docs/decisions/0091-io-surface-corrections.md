@@ -20,17 +20,23 @@ migration.
 
 ### Closed standard-stream pipes
 
-A stdout or stderr write that reports a closed pipe terminates the process
-immediately and cleanly with status 0. It emits no panic and no stack trace.
+An ordinary Doria program write to stdout or stderr that reports a closed pipe
+terminates the process immediately and cleanly with status 0. It emits no panic
+and no stack trace.
 Native Unix recognizes `EPIPE`; native Windows recognizes
 `ERROR_BROKEN_PIPE` and `ERROR_NO_DATA`. Unix continues to ignore `SIGPIPE` so
 the write operation can report `EPIPE` instead of terminating by signal.
 
-This rule is limited to standard streams. A non-broken-pipe stdout failure keeps
-the existing status-101 panic path, a non-broken-pipe raw stderr failure keeps
-its existing status-101 exit, and file-write failures remain status-101 panics.
-The device layer reports success, broken pipe, or another failure; process policy
-belongs to its callers.
+This rule is limited to ordinary program output on standard streams. Panic
+diagnostic writes are best effort and never replace the fatal panic status: if
+stderr is closed while a panic is being reported, diagnostic bytes may be absent
+but the process still exits with status 101. A non-broken-pipe stdout failure
+keeps the existing status-101 panic path, a non-broken-pipe raw stderr failure
+keeps its existing status-101 exit, and file-write failures remain status-101
+panics. The device layer reports success, broken pipe, or another failure;
+process policy belongs to its callers. Compatibility backends must preserve the
+same distinction rather than inheriting their host language's default pipe
+behavior.
 
 The clean exit is a permanent carve-out, not a recoverable checked error. Stage
 29 must not turn a closed standard-stream pipe into a `throw`.
@@ -76,9 +82,9 @@ after Stage 29 even though the free-function shape is small and coherent.
 
 ## Consequences
 
-Closed stdout and stderr pipes behave identically across Linux, macOS, and
-Windows and across the native backends. The immediate status-0 exit runs no
-RAII `__destruct` cleanup, consistent with both default SIGPIPE termination and
+Closed stdout and stderr pipes for ordinary program output behave identically
+across Linux, macOS, and Windows and across backends. The immediate status-0
+exit runs no RAII `__destruct` cleanup, consistent with both default SIGPIPE termination and
 decision 0081's abort-only model. Current free-function writes are unbuffered,
 so no runtime buffer is abandoned. When buffered streams are designed after
 Stage 29, the audit's D6 buffered-write/abort question must revisit this
@@ -90,10 +96,11 @@ reopen triggers.
 
 ## Affected components
 
-`doria-rt` standard-device writes and callers, native broken-pipe and file-failure
-tests, the interpreter/Cranelift/LLVM parity harness, Linux/macOS/Windows CI,
-decisions 0074 and 0075, `SPEC.md`, the end-to-end plan, and the I/O audit note.
-No new diagnostic requires a language-server change.
+`doria-rt` standard-device writes and callers, PHP compatibility output helpers,
+native and PHP broken-pipe and panic-sink tests, the interpreter/Cranelift/LLVM
+parity harness, Linux/macOS/Windows CI, decisions 0074 and 0075, `SPEC.md`, the
+end-to-end plan, and the I/O audit note. No new diagnostic requires a
+language-server change.
 
 ## Invalidated elsewhere
 

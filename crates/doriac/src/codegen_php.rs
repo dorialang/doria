@@ -23,13 +23,15 @@ pub fn generate(program: &Program) -> Result<String, BackendError> {
     output.push_str(
         r#"function __doria_io_panic(string $message)
 {
-    fwrite(STDERR, "Panic: " . $message . "\nStack Trace:\n");
+    @fwrite(STDERR, "Panic: " . $message . "\nStack Trace:\n");
     $helperFunctions = [
         "__doria_io_panic",
         "__doria_read_line",
         "__doria_read_file",
         "__doria_write_file",
+        "__doria_is_broken_pipe",
         "__doria_write_all",
+        "__doria_write_stdout",
         "__doria_write_stderr",
         "__doria_sprintf",
         "__doria_printf",
@@ -37,7 +39,7 @@ pub fn generate(program: &Program) -> Result<String, BackendError> {
     foreach (debug_backtrace(DEBUG_BACKTRACE_IGNORE_ARGS) as $frame) {
         if (isset($frame["function"]) &&
             (isset($frame["class"]) || !in_array($frame["function"], $helperFunctions, true))) {
-            fwrite(STDERR, "  at " . $frame["function"] . "\n");
+            @fwrite(STDERR, "  at " . $frame["function"] . "\n");
         }
     }
     exit(101);
@@ -74,15 +76,35 @@ function __doria_write_file(string $path, string $contents): void
     if ($written === false || $written !== strlen($contents)) { __doria_io_panic("failed to write file"); }
 }
 
+function __doria_is_broken_pipe(?array $error): bool
+{
+    if ($error === null || !isset($error["message"])) { return false; }
+    $message = $error["message"];
+    if (preg_match('/\berrno=32\b/', $message) === 1) { return true; }
+    if (PHP_OS_FAMILY === "Windows" && preg_match('/\berrno=(?:109|232)\b/', $message) === 1) {
+        return true;
+    }
+    return stripos($message, "broken pipe") !== false;
+}
+
 function __doria_write_all(mixed $stream, string $value, string $failure): void
 {
     $offset = 0;
     $length = strlen($value);
     while ($offset < $length) {
+        error_clear_last();
         $written = @fwrite($stream, substr($value, $offset));
-        if ($written === false || $written === 0) { __doria_io_panic($failure); }
+        if ($written === false || $written === 0) {
+            if (__doria_is_broken_pipe(error_get_last())) { exit(0); }
+            __doria_io_panic($failure);
+        }
         $offset += $written;
     }
+}
+
+function __doria_write_stdout(string $value): void
+{
+    __doria_write_all(STDOUT, $value, "failed to write stdout");
 }
 
 function __doria_write_stderr(string $value): void
@@ -1208,7 +1230,10 @@ fn emit_statement(
             writeln(
                 output,
                 indent,
-                &format!("echo __doria_display({});", emit_expr(expr, scopes)),
+                &format!(
+                    "__doria_write_stdout(__doria_display({}));",
+                    emit_expr(expr, scopes)
+                ),
             );
         }
         Stmt::Return { expr, .. } => {
@@ -1263,7 +1288,7 @@ fn emit_panic(message: &Expr, output: &mut String, indent: usize, scopes: &mut P
         output,
         indent,
         &format!(
-            "fwrite(STDERR, \"Panic: \" . {} . \"\\nStack Trace:\\n\");",
+            "@fwrite(STDERR, \"Panic: \" . {} . \"\\nStack Trace:\\n\");",
             emit_expr(message, scopes)
         ),
     );
@@ -1282,7 +1307,7 @@ fn emit_panic(message: &Expr, output: &mut String, indent: usize, scopes: &mut P
     writeln(
         output,
         indent + 2,
-        &format!("fwrite(STDERR, \"  at \" . ${frame_name}[\"function\"] . \"\\n\");"),
+        &format!("@fwrite(STDERR, \"  at \" . ${frame_name}[\"function\"] . \"\\n\");"),
     );
     writeln(output, indent + 1, "}");
     writeln(output, indent, "}");

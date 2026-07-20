@@ -1,5 +1,5 @@
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::process::{Command, Output};
@@ -1308,6 +1308,54 @@ function main(): void
         .expect("native executable should exit");
 
     assert_eq!(run.status.code(), Some(0));
+    assert!(run.stdout.is_empty());
+    assert!(run.stderr.is_empty());
+
+    let _ = fs::remove_file(output);
+}
+
+#[test]
+fn native_panic_stays_fatal_when_stderr_is_closed() {
+    if !host_linker_is_available() {
+        eprintln!(
+            "native panic integration test unavailable: host linker {} was not found",
+            host_linker()
+        );
+        return;
+    }
+
+    let output = temp_executable_path("main_panic_closed_stderr");
+    compile_native_source(
+        r#"
+function main(): void
+{
+    let $line = read_line();
+    panic("boom");
+}
+"#,
+        &output,
+    );
+
+    let mut child = retry_transient_executable_busy(|| {
+        Command::new(&output)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+    })
+    .expect("native executable should start");
+    drop(child.stderr.take());
+    child
+        .stdin
+        .take()
+        .expect("native stdin should be piped")
+        .write_all(b"\n")
+        .expect("native input should unblock the fixture");
+    let run = child
+        .wait_with_output()
+        .expect("native executable should exit");
+
+    assert_eq!(run.status.code(), Some(101));
     assert!(run.stdout.is_empty());
     assert!(run.stderr.is_empty());
 

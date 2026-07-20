@@ -955,11 +955,8 @@ unsafe fn write_panic_fragment(bytes: &[u8]) {
 }
 
 unsafe fn write_panic_bytes(bytes: *const u8, byte_length: usize) {
-    match write_standard_stream(StandardStream::Stderr, bytes, byte_length) {
-        WriteOutcome::Success => {}
-        WriteOutcome::BrokenPipe => exit_process(0),
-        WriteOutcome::OtherFailure => exit_process(PANIC_STATUS),
-    }
+    // Panic diagnostics are best effort; their sink must not replace the fatal status.
+    let _ = write_standard_stream(StandardStream::Stderr, bytes, byte_length);
 }
 
 unsafe fn write_standard_stream(

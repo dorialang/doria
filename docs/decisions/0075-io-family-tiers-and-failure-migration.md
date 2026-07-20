@@ -28,9 +28,10 @@ Until checked errors land, Stage 17 free-function I/O failures panic with a clea
 101. `read_line(): ?string` returns `null` only for EOF; it does not encode failures as null. At
 Stage 29 the I/O free functions migrate to declared `throws` signatures. That planned signature
 change does not alter successful text behavior or the meaning of EOF. A closed stdout or stderr
-pipe is the permanent decision-0091 exception: it exits cleanly with status 0 and is never a
-Stage-29 throw. File failures and non-broken-pipe standard-stream failures remain on the migration
-path.
+pipe during ordinary program output is the permanent decision-0091 exception: it exits cleanly
+with status 0 and is never a Stage-29 throw. Panic diagnostics remain fatal with status 101 if
+stderr is unavailable. File failures and non-broken-pipe standard-stream failures remain on the
+migration path.
 
 Stage 17 `?string` is the first supported position for the nullable model generalized at Stage 22.
 It is not a special I/O-only type and is not replaced by the later general implementation.
