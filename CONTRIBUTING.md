@@ -1,6 +1,6 @@
 # Contributing
 
-Doria is experimental and pre-1.0. Contributions should keep the compiler architecture honest: PHP is a backend, while the core compiler should remain ready for native code generation.
+Contributions should keep the compiler architecture honest: PHP is a backend, while the core compiler should remain ready for native code generation.
 
 Language-server transport and editor integrations live in [`dorialang/doria-language-server`](https://github.com/dorialang/doria-language-server). Compiler changes should expose reusable frontend services and coordinate editor-visible follow-up there rather than adding IDE clients to this repository.
 

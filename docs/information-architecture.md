@@ -40,9 +40,9 @@ Role:
 Role:
 
 - Repository entrypoint.
-- Current quickstart.
-- Current implementation snapshot.
+- Public product overview and quickstart.
 - Links to the plan, specification, decisions, historical notes, and this information architecture.
+- Written from the completed-release perspective; interim stage completion and implementation-status caveats stay in internal planning and pipeline documents.
 - Not a roadmap replacement.
 
 ### AGENTS.md

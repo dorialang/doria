@@ -55,7 +55,8 @@ Source of truth for sequencing remains `docs/doria-end-to-end-plan.md`. The dura
 | Non-Displayable diagnostics | Frontend | Frontend | Frontend | Covered | Every display context names the class and exact `Displayable::toString` contract. |
 | `Displayable` frontend conformance | Frontend | Frontend | Frontend | Covered | Explicit nominal conformance and exact method shape are checked before MIR. |
 | Native class allocation and construction | Covered | Covered | Covered | Covered | Headerless payloads use shared layout; property initializers and promotions run before the lifecycle body. |
-| Narrow direct constructor initialization | Covered | Covered | Covered | Covered | The temporary soundness gate accepts only proven direct initialization shapes until Stage 21. |
+| Constructor definite initialization | Covered | Covered | Covered | Covered | Decision 0090 merges reachable per-property states, excludes panic-only paths, and rejects incomplete normal exits before MIR execution. |
+| Conditional constructor execution | Covered | Covered | Covered | Covered | `main_stage21_conditional_constructor.doria` initializes multiple readonly properties on both branches and compares exact method/destructor output. |
 | Class-valued locals, calls, and returns | Covered | Covered | Covered | Covered | Pointer-sized values preserve owning transfers and inferred returned borrows through free-function ABI boundaries. |
 | `take` ownership transfer | Covered | Covered | Covered | Covered | Transfer invalidates the caller slot and cleanup becomes the callee's obligation. |
 | Property loads and Stage 19 assignments | Covered | Covered | Covered | Covered | Shared class metadata supplies checked types and compiler-known offsets. |
@@ -126,6 +127,6 @@ Source of truth for sequencing remains `docs/doria-end-to-end-plan.md`. The dura
 
 ## Retirement Gate
 
-Status: Passed through Stage 20 after this branch's full validation gates pass.
+Status: Passed through Stage 21 after this branch's full validation gates pass.
 
-All accepted Stage <=20 scalar, string, interpolation, checked-format, text-I/O, ownership, native-class, method, static, constant, and concrete-display lowering passes through typed MIR and shared MIR validation. The interpreter, Cranelift fast profile, and LLVM release profile consume that same MIR; every finite native example is required in the executable manifest with deterministic sidecars where needed; Linux CI memory-checks the ownership-bearing native fixtures, including the static-constructor and `self` paths; and the Stage 7-10 native smoke module remains retired and deleted. Stage 21 borrowing and full definite initialization are next.
+All accepted Stage <=20 scalar, string, interpolation, checked-format, text-I/O, ownership, native-class, method, static, constant, and concrete-display lowering passes through typed MIR and shared MIR validation. The interpreter, Cranelift fast profile, and LLVM release profile consume that same MIR; every finite native example is required in the executable manifest with deterministic sidecars where needed; Linux CI memory-checks the ownership-bearing native fixtures, including the static-constructor and `self` paths; and the Stage 7-10 native smoke module remains retired and deleted. Stage 21 ordinary borrowing and constructor definite initialization now use the same backend-independent path and satisfy their acceptance criterion; the separately unauthored shared-ownership types are scheduled for Stage 25a.

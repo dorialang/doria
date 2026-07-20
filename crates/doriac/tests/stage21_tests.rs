@@ -18,6 +18,24 @@ fn assert_valid_mir(source: &str) {
     assert!(!object.is_empty());
 }
 
+fn constructor_diagnostic_snapshot(source: &str, code: &str) -> String {
+    let diagnostics =
+        doriac::check_source("stage21-constructor.doria", source).expect_err("invalid constructor");
+    let diagnostic = diagnostics
+        .into_iter()
+        .find(|diagnostic| diagnostic.code == code)
+        .unwrap_or_else(|| panic!("expected {code}"));
+    let help = diagnostic
+        .help
+        .as_deref()
+        .map(|help| format!(" {help}"))
+        .unwrap_or_default();
+    format!(
+        "code: {}\nmessage: {}\nhelp:{}\nspan: {}..{}\n",
+        diagnostic.code, diagnostic.message, help, diagnostic.span.start, diagnostic.span.end,
+    )
+}
+
 #[test]
 fn readonly_borrows_of_one_owner_can_overlap_in_a_call() {
     doriac::check_source(
@@ -975,6 +993,364 @@ function choose(writable Node $node, bool $direct): Node
 
 function main(): void {}
 "#,
+    );
+}
+
+#[test]
+fn constructor_initialization_merges_every_reachable_branch() {
+    assert_valid_mir(
+        r#"
+class Label
+{
+    string $text;
+
+    function __construct(bool $formal, string $input)
+    {
+        if ($formal) {
+            $this->text = "Hello " . $input;
+        } else {
+            $this->text = $input;
+        }
+    }
+
+    function show(): void { echo $this->text . "\n"; }
+}
+
+function main(): void
+{
+    let $formal = new Label(true, "Doria");
+    let $plain = new Label(false, "Welcome");
+    $formal->show();
+    $plain->show();
+}
+"#,
+    );
+}
+
+#[test]
+fn panic_terminated_constructor_paths_do_not_require_initialization() {
+    assert_valid_mir(
+        r#"
+class Token
+{
+    string $value;
+    function __construct(bool $valid, string $input)
+    {
+        if ($valid) {
+            $this->value = $input;
+        } else {
+            panic("invalid token");
+        }
+    }
+}
+function main(): void { let $token = new Token(true, "ok"); }
+"#,
+    );
+
+    assert_valid_mir(
+        r#"
+class Token
+{
+    string $value;
+    function __construct(bool $short, bool $alternate)
+    {
+        if ($short) {
+            $this->value = "short";
+            return;
+        }
+        if ($alternate) {
+            if (true) { $this->value = "alternate"; }
+        } else {
+            $this->value = "ordinary";
+        }
+    }
+}
+function main(): void { let $token = new Token(false, true); }
+"#,
+    );
+}
+
+#[test]
+fn writable_constructor_assignment_can_establish_and_then_mutate_state() {
+    assert_valid_mir(
+        r#"
+class Counter
+{
+    writable int $value;
+    function __construct(bool $seeded)
+    {
+        if ($seeded) { $this->value = 40; }
+        $this->value = 41;
+        $this->value += 1;
+    }
+}
+function main(): void { let $counter = new Counter(false); echo $counter->value; }
+"#,
+    );
+
+    assert_valid_mir(
+        r#"
+class Pair
+{
+    writable int $left;
+    writable int $right;
+    function __construct(bool $chooseLeft)
+    {
+        if ($chooseLeft) { $this->left = 1; }
+        else { $this->right = 2; }
+        $this->left = 3;
+        $this->right = 4;
+    }
+}
+function main(): void { let $pair = new Pair(true); echo $pair->left + $pair->right; }
+"#,
+    );
+}
+
+#[test]
+fn non_repeating_for_initializer_can_establish_constructor_initialization() {
+    assert_valid_mir(
+        r#"
+class Token
+{
+    string $value;
+    function __construct()
+    {
+        for ($this->value = "ready"; false;) {}
+    }
+}
+function main(): void { let $token = new Token(); echo $token->value; }
+"#,
+    );
+}
+
+#[test]
+fn constructor_rejects_missing_and_partial_initialization() {
+    for source in [
+        r#"
+class Token
+{
+    string $value;
+    function __construct(bool $set)
+    {
+        if ($set) { $this->value = "set"; }
+    }
+}
+"#,
+        r#"
+class Token
+{
+    string $value;
+    function __construct() {}
+}
+"#,
+        r#"class Token { string $value; }"#,
+        r#"
+class Token
+{
+    string $value;
+    function __construct(bool $set)
+    {
+        if ($set) { $this->value = "set"; }
+        return;
+    }
+}
+"#,
+    ] {
+        assert_diagnostic(source, "E0500");
+    }
+}
+
+#[test]
+fn readonly_partial_merge_cannot_be_repaired_by_an_unconditional_assignment() {
+    assert_diagnostic(
+        r#"
+class Token
+{
+    string $value;
+    function __construct(bool $set)
+    {
+        if ($set) { $this->value = "first"; }
+        $this->value = "fallback";
+    }
+}
+"#,
+        "E0502",
+    );
+}
+
+#[test]
+fn constructor_rejects_property_reads_and_incomplete_this_exposure() {
+    for (source, code) in [
+        (
+            r#"
+class Token
+{
+    string $value;
+    function __construct() { echo $this->value; }
+}
+"#,
+            "E0501",
+        ),
+        (
+            r#"
+class Token
+{
+    string $value;
+    function __construct() { expose($this); }
+}
+function expose(Token $token): void {}
+"#,
+            "E0503",
+        ),
+        (
+            r#"
+class Token
+{
+    string $value;
+    function __construct() { $this->inspect(); }
+    function inspect(): void {}
+}
+"#,
+            "E0503",
+        ),
+    ] {
+        assert_diagnostic(source, code);
+    }
+}
+
+#[test]
+fn repeatable_bodies_do_not_establish_constructor_initialization() {
+    for source in [
+        r#"
+class Token
+{
+    string $value;
+    function __construct(bool $set)
+    {
+        while ($set) { $this->value = "set"; }
+    }
+}
+"#,
+        r#"
+class Token
+{
+    string $value;
+    function __construct(bool $set)
+    {
+        for (let $i = 0; $i < 1; $i++) { $this->value = "set"; }
+    }
+}
+"#,
+        r#"
+class Token
+{
+    string $value;
+    function __construct(take List<int> $items)
+    {
+        foreach ($items as int $item) { $this->value = "set"; }
+    }
+}
+"#,
+    ] {
+        assert_diagnostic(source, "E0504");
+    }
+
+    assert_diagnostic(
+        r#"
+class Counter
+{
+    writable int $value;
+    function __construct(bool $set)
+    {
+        while ($set) { $this->value = 1; }
+    }
+}
+"#,
+        "E0500",
+    );
+
+    assert_diagnostic(
+        r#"
+class Counter
+{
+    writable int $value;
+    function __construct(bool $set)
+    {
+        while ($set) {
+            echo $this->value;
+            $this->value = 1;
+        }
+        $this->value = 2;
+    }
+}
+"#,
+        "E0501",
+    );
+}
+
+#[test]
+fn constructor_initialization_diagnostics_match_snapshots() {
+    let cases = [
+        (
+            "missing on one branch",
+            r#"class A { string $x; function __construct(bool $b) { if ($b) { $this->x = "x"; } } }"#,
+            "E0500",
+        ),
+        (
+            "missing on every path",
+            r#"class A { string $x; function __construct() {} }"#,
+            "E0500",
+        ),
+        (
+            "early return",
+            r#"class A { string $x; function __construct() { return; } }"#,
+            "E0500",
+        ),
+        (
+            "read before initialization",
+            r#"class A { string $x; function __construct() { echo $this->x; } }"#,
+            "E0501",
+        ),
+        (
+            "incomplete this",
+            r#"class A { string $x; function __construct() { expose($this); } } function expose(A $a): void {}"#,
+            "E0503",
+        ),
+        (
+            "duplicate readonly initialization",
+            r#"class A { string $x; function __construct() { $this->x = "a"; $this->x = "b"; } }"#,
+            "E0412",
+        ),
+        (
+            "partial readonly repair",
+            r#"class A { string $x; function __construct(bool $b) { if ($b) { $this->x = "a"; } $this->x = "b"; } }"#,
+            "E0502",
+        ),
+        (
+            "readonly loop initialization",
+            r#"class A { string $x; function __construct(bool $b) { while ($b) { $this->x = "a"; } } }"#,
+            "E0504",
+        ),
+        (
+            "writable loop initialization",
+            r#"class A { writable string $x; function __construct(bool $b) { while ($b) { $this->x = "a"; } } }"#,
+            "E0500",
+        ),
+    ];
+    let actual = cases
+        .into_iter()
+        .map(|(label, source, code)| {
+            format!(
+                "[{label}]\n{}",
+                constructor_diagnostic_snapshot(source, code)
+            )
+        })
+        .collect::<String>();
+    assert_eq!(
+        actual,
+        include_str!("fixtures/diagnostics/stage21_constructor_initialization.txt")
+            .replace("\r\n", "\n")
     );
 }
 

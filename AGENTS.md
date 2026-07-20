@@ -256,6 +256,7 @@ These are identity, not scope deferral. They do not become available later, and 
 ## Global planning and documentation hygiene
 
 - The end-to-end plan is the skeleton.
+- The compiler, language server, editor integrations, and website remain unreleased until the end-to-end plan is complete. Public READMEs and product-facing copy describe the completed language and toolchain; never expose interim stage completion, implementation drift, or "planned/not yet supported" caveats there. Keep those facts in the end-to-end plan, current-pipeline notes, tests, and agent guidance.
 - Implementation prompts must start from the skeleton, not from local file edits.
 - Before generating or executing a prompt, check whether an open PR already covers the work.
 - Before adding docs, check `docs/information-architecture.md`.

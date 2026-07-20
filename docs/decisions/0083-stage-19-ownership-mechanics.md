@@ -44,9 +44,9 @@ Self-moves such as `$value = $value` and overlapping source/destination moves ar
 
 ### Temporary native-eligibility soundness gate
 
-**This gate is temporary and is lifted when Stage 21 definite initialization lands.**
+**This gate was temporary and was lifted by decision 0090's Stage 21 definite-initialization analysis.**
 
-Stage 19 may natively construct only a class for which every property is provably initialized by a property initializer, promotion, or the existing narrow direct constructor-initialization form. If initialization cannot be proven, compilation emits a clear "unsupported until Stage 21" diagnostic.
+Stage 19 originally permitted native construction only when every property was provably initialized by a property initializer, promotion, or the narrow direct constructor-initialization form. Decision 0090 replaced that gate with full reachable-path analysis; the old unsupported diagnostic and unconditional-assignment restriction are no longer active.
 
 This is a soundness gate, not a permanent language limitation. Stage 19 emits native code and must never return a class pointer containing uninitialized property storage. Uninitialized memory is never the fallback.
 
@@ -82,4 +82,4 @@ Decision 0081 remains authoritative for panic: panic performs no cleanup. Stage 
 
 The Stage 19 acceptance criterion remains exactly: `AC: destructor-order example; use-after-move diagnostic snapshots; RAII resource-guard example; leak CI clean.` Explanatory resource-guard and diagnostic details belong in roadmap prose, not inside that criterion.
 
-The temporary native-eligibility gate must be removed, rather than normalized into permanent behavior, when Stage 21 definite initialization is implemented.
+Decision 0090 removed the temporary native-eligibility gate rather than normalizing it into permanent behavior.

@@ -40,6 +40,12 @@ There are no annotations to sprinkle, no sigils to memorize, and no jargon in th
 
 Use-after-free, data races, double-frees, null surprises: these are compile errors in Doria, not production incidents.
 
+Construction follows the same rule: every property must be initialized on every
+normal constructor path before the new object can be observed. Readonly
+properties are initialized exactly once, writable properties may be changed
+after their first initialization, and a branch that ends in a fatal panic does
+not produce a partially initialized object.
+
 ## Design principles
 
 - **Contracts are written down.** Every parameter is explicitly typed — always. Nothing silently defaults to a dynamic type, and nullability is spelled `?T` and enforced.
@@ -59,17 +65,9 @@ Use-after-free, data races, double-frees, null surprises: these are compile erro
 
 Doria was created by a PHP developer who wanted compile-time safety and native performance without giving up readable syntax, and it doesn't hide that. If you know PHP, you'll feel at home in minutes; the `$variables`, the class shapes, the pragmatism all carry over. But familiarity is a doorway, not the destination: Doria is its own language, with its own type system, its own memory model, and its own opinions about what a language owes the people who read code as often as they write it.
 
-## Status
-
-🚧 **Doria is in early, active development and is not yet ready for use.** The compiler is being built stage by stage against a comprehensive language specification, with a native-first architecture and differential testing at every step. Expect rapid change, breaking changes, and honest roadmaps rather than promises.
-
-Stages 11–20b are implemented on the current compiler branch. Double-quoted strings accept ordinary Doria expressions inside interpolation braces. Native classes support construction, properties, class-valued moves, `take` transfer, deterministic normal-scope destruction, and compiler-invoked lifecycle bodies. Stage 20 adds statically resolved instance and static methods, default-accessible plus `internal` enforcement, class and top-level constants, Copy-type static properties, and concrete `Displayable::toString()` execution. Stages 20a and 20b add const-evaluable fixed-width integer, float, bool, and readonly-string defaults across free functions, methods, statics, and constructors. Static access is sigil-free (`Message::age`, `Message::create()`), `self` names the declaring class, and each class has one member namespace.
-
-The interpreter, Cranelift fast profile, and LLVM release profile consume the same validated MIR. The durable parity suite compares exact stdin-driven output, panic text, status, file side effects, class lifetime behavior, method execution, statics, constants, and display conversion across all three paths. Stage 21 borrowing and full definite initialization remain future work.
+## Tooling
 
 Official language-server and editor integrations are developed separately in [`dorialang/doria-language-server`](https://github.com/dorialang/doria-language-server), which consumes reusable `doriac` frontend services without duplicating compiler semantics.
-
-Watch this organization to follow along as the language, the `doriac` compiler, the language server, the `baton` build tool, and the standard library take shape.
 
 ---
 

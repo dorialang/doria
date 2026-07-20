@@ -8,6 +8,7 @@ pub mod codegen_llvm;
 pub mod codegen_native;
 pub mod codegen_php;
 pub mod const_eval;
+mod constructor_init;
 pub mod control_flow;
 pub mod dataflow;
 pub mod diagnostics;

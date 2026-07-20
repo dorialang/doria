@@ -13,7 +13,8 @@ memory model.
 The surface must remain Doria-shaped. Users do not write borrow sigils or
 lifetimes, diagnostics do not teach Rust vocabulary, and ordinary borrow checks
 must not emit runtime guards. The explicit `SharedMut<T>` pressure valve is a
-separate shared-ownership decision.
+separate shared-ownership decision delivered with `Shared<T>` and `Weak<T>` at
+Stage 25a, not by Stage 21.
 
 ## Decision
 
@@ -80,7 +81,8 @@ after the compiler can prove the earlier use is finished.
 ### Runtime checks for ordinary borrowing
 
 Rejected. Ordinary `readonly`/`writable`/`take` checking is fully static and has
-zero runtime cost. Runtime access checks belong only to explicit `SharedMut<T>`.
+zero runtime cost. Runtime access checks belong only to explicit `SharedMut<T>`
+when that type lands at Stage 25a.
 
 ### Treat owned temporaries as readonly
 
@@ -96,12 +98,12 @@ lifetimes or Rust borrow terms.
 
 MIR and native validation remain backend-independent consumers of the same
 checked ownership facts. Backends must not emit dynamic guards for ordinary
-borrowing; `SharedMut<T>` is the named dynamic-check exception.
+borrowing; Stage 25a's `SharedMut<T>` is the named dynamic-check exception.
 
-Decision 0083's temporary native-eligibility gate is invalidated by the full
-constructor definite-initialization slice of Stage 21, not by this borrow-rule
-record alone. Decision 0088 feeds this record and remains authoritative for the
-deferred consuming self-return convention.
+Decision 0090's full constructor definite-initialization slice invalidated and
+removed decision 0083's temporary native-eligibility gate. Decision 0088 feeds
+this record and remains authoritative for the deferred consuming self-return
+convention.
 
 ## Invalidated elsewhere
 
@@ -112,5 +114,4 @@ deferred consuming self-return convention.
   unsupported.
 - `docs/notes/current-pipeline.md` status text that lists non-lexical borrowing
   as future Stage 21 work.
-- The Stage 19 temporary native-eligibility gate once constructor
-  definite-initialization analysis lands.
+- The Stage 19 temporary native-eligibility gate, now removed by decision 0090.

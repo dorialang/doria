@@ -1656,45 +1656,31 @@ fn validate_class_expression(
                                 constructor.name
                             ))
                         })?;
-                        let assignments = constructor_property_assignment_count(
-                            constructor,
-                            receiver,
-                            property.property,
-                        );
-                        if assignments == 0 {
-                            return Err(malformed_mir(format!(
-                                "class#{} property{} requires a direct constructor-body initializer",
-                                class.0, property.property.index
-                            )));
-                        }
-                        if assignments > 1 && !definition.writable {
-                            return Err(malformed_mir(format!(
-                                "class#{} readonly property{} is assigned more than once in its constructor body",
-                                class.0, property.property.index
-                            )));
-                        }
                         validate_constructor_body_initializer(
                             constructor,
                             receiver,
                             property.property,
+                            definition.writable,
                         )?;
                         definition.ty
                     }
                 };
                 if !definition.writable
                     && !matches!(property.source, mir::PropertyValueSource::ConstructorBody)
-                    && constructor.is_some_and(|constructor| {
-                        constructor_property_assignment_count(
+                {
+                    if let Some(constructor) = constructor {
+                        if constructor_property_assignment_count(
                             constructor,
                             constructor.params[0],
                             property.property,
-                        ) > 0
-                    })
-                {
-                    return Err(malformed_mir(format!(
-                        "class#{} readonly property{} is initialized before its constructor assigns it",
-                        class.0, property.property.index
-                    )));
+                        )? > 0
+                        {
+                            return Err(malformed_mir(format!(
+                                "class#{} readonly property{} is initialized before its constructor assigns it",
+                                class.0, property.property.index
+                            )));
+                        }
+                    }
                 }
                 if source_type != definition.ty {
                     return Err(malformed_mir(format!(
@@ -1795,66 +1781,96 @@ fn validate_constructor_body_initializer(
     constructor: &mir::Function,
     receiver: mir::LocalId,
     property: crate::class_layout::PropertyId,
+    writable: bool,
 ) -> Result<(), BackendError> {
-    let (reachable, predecessors) = reachable_blocks_and_predecessors(constructor, false)?;
-
-    let assigns_property = constructor
-        .blocks
-        .iter()
-        .map(|block| {
-            block.statements.iter().any(|statement| {
-                matches!(
-                    statement,
-                    mir::Statement::AssignProperty {
-                        object,
-                        property: assigned,
-                        ..
-                    } if *object == receiver && *assigned == property
-                )
-            })
-        })
-        .collect::<Vec<_>>();
-    let mut initialized_on_entry = vec![true; constructor.blocks.len()];
-    let mut initialized_on_exit = vec![true; constructor.blocks.len()];
-    initialized_on_entry[constructor.entry_block.0] = false;
-
-    loop {
-        let mut changed = false;
-        for block in constructor
-            .blocks
-            .iter()
-            .filter(|block| reachable[block.id.0])
-        {
-            let initialized = if block.id == constructor.entry_block {
-                false
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum State {
+        Uninitialized,
+        Initialized,
+        MaybeInitialized,
+    }
+    impl State {
+        fn join(self, incoming: Self) -> Self {
+            if self == incoming {
+                self
             } else {
-                predecessors[block.id.0]
-                    .iter()
-                    .filter(|predecessor| reachable[predecessor.0])
-                    .all(|predecessor| initialized_on_exit[predecessor.0])
-            };
-            let exits_initialized = initialized || assigns_property[block.id.0];
-            if initialized_on_entry[block.id.0] != initialized
-                || initialized_on_exit[block.id.0] != exits_initialized
-            {
-                initialized_on_entry[block.id.0] = initialized;
-                initialized_on_exit[block.id.0] = exits_initialized;
-                changed = true;
+                Self::MaybeInitialized
             }
         }
-        if !changed {
-            break;
+    }
+
+    let (reachable, _) = reachable_blocks_and_predecessors(constructor, true)?;
+    let mut inputs = vec![None; constructor.blocks.len()];
+    let mut outputs = vec![None; constructor.blocks.len()];
+    inputs[constructor.entry_block.0] = Some(State::Uninitialized);
+    let mut pending = std::collections::VecDeque::from([constructor.entry_block]);
+    let mut queued = vec![false; constructor.blocks.len()];
+    queued[constructor.entry_block.0] = true;
+    while let Some(block_id) = pending.pop_front() {
+        queued[block_id.0] = false;
+        let block = block_in(constructor, block_id)?;
+        let mut state = inputs[block_id.0].expect("queued constructor block has input state");
+        for statement in &block.statements {
+            if matches!(
+                statement,
+                mir::Statement::AssignProperty {
+                    object,
+                    property: assigned,
+                    ..
+                } if *object == receiver && *assigned == property
+            ) {
+                state = if writable {
+                    State::Initialized
+                } else {
+                    match state {
+                        State::Uninitialized => State::Initialized,
+                        State::Initialized | State::MaybeInitialized => {
+                            return Err(malformed_mir(format!(
+                                "constructor {} initializes readonly property{} more than once on one path",
+                                constructor.name, property.index
+                            )));
+                        }
+                    }
+                };
+            }
+        }
+        outputs[block_id.0] = Some(state);
+        for successor in analysis_terminator_targets(&block.terminator, true) {
+            if !reachable[successor.0] {
+                continue;
+            }
+            let changed = match inputs[successor.0] {
+                Some(current) => {
+                    let joined = current.join(state);
+                    if joined == current {
+                        false
+                    } else {
+                        inputs[successor.0] = Some(joined);
+                        true
+                    }
+                }
+                None => {
+                    inputs[successor.0] = Some(state);
+                    true
+                }
+            };
+            if changed && !queued[successor.0] {
+                queued[successor.0] = true;
+                pending.push_back(successor);
+            }
         }
     }
 
     for block in constructor
         .blocks
         .iter()
-        .filter(|block| reachable[block.id.0])
+        .filter(|block| inputs[block.id.0].is_some())
     {
-        let mut initialized = initialized_on_entry[block.id.0];
+        let mut state = inputs[block.id.0].expect("reachable constructor block state");
         for statement in &block.statements {
-            if !initialized && statement_observes_property(statement, receiver, property) {
+            if state != State::Initialized
+                && statement_observes_property(statement, receiver, property)
+            {
                 return Err(malformed_mir(format!(
                     "constructor {} reads or exposes property{} before it is initialized",
                     constructor.name, property.index
@@ -1868,16 +1884,18 @@ fn validate_constructor_body_initializer(
                     ..
                 } if *object == receiver && *assigned == property
             ) {
-                initialized = true;
+                state = State::Initialized;
             }
         }
-        if !initialized && terminator_observes_property(&block.terminator, receiver, property) {
+        if state != State::Initialized
+            && terminator_observes_property(&block.terminator, receiver, property)
+        {
             return Err(malformed_mir(format!(
                 "constructor {} reads or exposes property{} before it is initialized",
                 constructor.name, property.index
             )));
         }
-        if !initialized
+        if state != State::Initialized
             && matches!(
                 block.terminator,
                 mir::Terminator::Return(_) | mir::Terminator::ReturnVoid
@@ -1896,10 +1914,12 @@ fn constructor_property_assignment_count(
     constructor: &mir::Function,
     receiver: mir::LocalId,
     property: crate::class_layout::PropertyId,
-) -> usize {
-    constructor
+) -> Result<usize, BackendError> {
+    let (reachable, _) = reachable_blocks_and_predecessors(constructor, true)?;
+    Ok(constructor
         .blocks
         .iter()
+        .filter(|block| reachable[block.id.0])
         .flat_map(|block| block.statements.iter())
         .filter(|statement| {
             matches!(
@@ -1911,7 +1931,7 @@ fn constructor_property_assignment_count(
                 } if *object == receiver && *assigned == property
             )
         })
-        .count()
+        .count())
 }
 
 fn terminator_targets(terminator: &mir::Terminator) -> Vec<mir::BlockId> {

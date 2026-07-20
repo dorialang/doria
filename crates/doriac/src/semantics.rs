@@ -75,6 +75,11 @@ pub fn analyze_program(program: &Program) -> DiagnosticResult<SemanticInfo> {
     checker.diagnostics.extend(const_diagnostics);
     checker.check();
     if checker.diagnostics.is_empty() {
+        checker
+            .diagnostics
+            .extend(crate::constructor_init::check_program(program));
+    }
+    if checker.diagnostics.is_empty() {
         let inferred_move_returns = checker
             .function_signatures
             .iter()
@@ -243,16 +248,21 @@ struct MethodContext {
 #[derive(Debug, Clone)]
 struct ConstructorInitContext {
     class_name: String,
-    readonly_init_allowed: bool,
-    initialized: HashSet<String>,
+    repeatable_body: bool,
 }
 
 impl ConstructorInitContext {
-    fn without_readonly_init(&self) -> Self {
+    fn nested(&self) -> Self {
         Self {
             class_name: self.class_name.clone(),
-            readonly_init_allowed: false,
-            initialized: HashSet::new(),
+            repeatable_body: self.repeatable_body,
+        }
+    }
+
+    fn repeatable(&self) -> Self {
+        Self {
+            class_name: self.class_name.clone(),
+            repeatable_body: true,
         }
     }
 }
@@ -1959,8 +1969,7 @@ impl<'program> Checker<'program> {
         let mut constructor_init_context = method_context.as_ref().and_then(|context| {
             (function.name == "__construct").then(|| ConstructorInitContext {
                 class_name: context.class_name.clone(),
-                readonly_init_allowed: true,
-                initialized: HashSet::new(),
+                repeatable_body: false,
             })
         });
 
@@ -2161,7 +2170,7 @@ impl<'program> Checker<'program> {
         statement: &Stmt,
         scopes: &mut ScopeStack,
         method_context: Option<&MethodContext>,
-        constructor_init_context: Option<&mut ConstructorInitContext>,
+        mut constructor_init_context: Option<&mut ConstructorInitContext>,
         return_context: Option<&ReturnContext>,
         loop_depth: usize,
     ) {
@@ -2267,7 +2276,7 @@ impl<'program> Checker<'program> {
                 self.apply_non_null_narrowing(&if_stmt.condition, &mut then_scopes);
                 let mut then_constructor_init_context = constructor_init_context
                     .as_deref()
-                    .map(ConstructorInitContext::without_readonly_init);
+                    .map(ConstructorInitContext::nested);
                 self.check_block(
                     &if_stmt.then_block,
                     &mut then_scopes,
@@ -2293,7 +2302,7 @@ impl<'program> Checker<'program> {
                 self.apply_non_null_narrowing(&while_stmt.condition, &mut body_scopes);
                 let mut loop_constructor_init_context = constructor_init_context
                     .as_deref()
-                    .map(ConstructorInitContext::without_readonly_init);
+                    .map(ConstructorInitContext::repeatable);
                 self.check_block(
                     &while_stmt.body,
                     &mut body_scopes,
@@ -2306,14 +2315,19 @@ impl<'program> Checker<'program> {
             Stmt::For(for_stmt) => {
                 scopes.push();
                 if let Some(initializer) = &for_stmt.initializer {
-                    self.check_for_initializer(initializer, scopes, method_context, None);
+                    self.check_for_initializer(
+                        initializer,
+                        scopes,
+                        method_context,
+                        constructor_init_context.as_deref_mut(),
+                    );
                 }
                 if let Some(condition) = &for_stmt.condition {
                     self.check_condition(condition, scopes, method_context);
                 }
                 let mut loop_constructor_init_context = constructor_init_context
                     .as_deref()
-                    .map(ConstructorInitContext::without_readonly_init);
+                    .map(ConstructorInitContext::repeatable);
                 self.check_block(
                     &for_stmt.body,
                     scopes,
@@ -2454,7 +2468,7 @@ impl<'program> Checker<'program> {
                 );
                 let mut loop_constructor_init_context = constructor_init_context
                     .as_deref()
-                    .map(ConstructorInitContext::without_readonly_init);
+                    .map(ConstructorInitContext::repeatable);
                 for statement in &foreach.body.statements {
                     self.check_statement(
                         statement,
@@ -2775,7 +2789,7 @@ impl<'program> Checker<'program> {
             ElseBranch::If(if_stmt) => {
                 self.check_condition(&if_stmt.condition, scopes, method_context);
                 let mut then_constructor_init_context =
-                    constructor_init_context.map(ConstructorInitContext::without_readonly_init);
+                    constructor_init_context.map(ConstructorInitContext::nested);
                 self.check_block(
                     &if_stmt.then_block,
                     scopes,
@@ -2797,7 +2811,7 @@ impl<'program> Checker<'program> {
             }
             ElseBranch::Block(block) => {
                 let mut block_constructor_init_context =
-                    constructor_init_context.map(ConstructorInitContext::without_readonly_init);
+                    constructor_init_context.map(ConstructorInitContext::nested);
                 self.check_block(
                     block,
                     scopes,
@@ -4245,10 +4259,6 @@ impl<'program> Checker<'program> {
             return ConstructorInitDecision::Allowed;
         }
 
-        if !context.readonly_init_allowed {
-            return ConstructorInitDecision::NotApplicable;
-        }
-
         if !matches!(op, AssignOp::Assign) {
             self.diagnostics.push(Diagnostic::new(
                 "E0413",
@@ -4258,53 +4268,21 @@ impl<'program> Checker<'program> {
             return ConstructorInitDecision::Rejected;
         }
 
-        match property_info.init_state {
-            PropertyInitState::HasInitializer => {
-                self.report_readonly_property_already_initialized(
-                    class_name,
-                    property,
-                    "is already initialized by its property initializer",
+        if context.repeatable_body {
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "E0504",
+                    format!(
+                        "readonly property `{class_name}::{property}` cannot be initialized inside a repeatable constructor body"
+                    ),
                     span,
-                );
-                ConstructorInitDecision::Rejected
-            }
-            PropertyInitState::PromotedParameter => {
-                self.report_readonly_property_already_initialized(
-                    class_name,
-                    property,
-                    "is already initialized by constructor promotion",
-                    span,
-                );
-                ConstructorInitDecision::Rejected
-            }
-            PropertyInitState::Uninitialized => {
-                if !context.initialized.insert(property.to_string()) {
-                    self.report_readonly_property_already_initialized(
-                        class_name,
-                        property,
-                        "has already been initialized in this constructor",
-                        span,
-                    );
-                    return ConstructorInitDecision::Rejected;
-                }
-
-                ConstructorInitDecision::Allowed
-            }
+                )
+                .with_help("initialize the property on each non-repeating constructor path"),
+            );
+            return ConstructorInitDecision::Rejected;
         }
-    }
 
-    fn report_readonly_property_already_initialized(
-        &mut self,
-        class_name: &str,
-        property: &str,
-        reason: &str,
-        span: Span,
-    ) {
-        self.diagnostics.push(Diagnostic::new(
-            "E0412",
-            format!("readonly property `{class_name}::{property}` {reason}"),
-            span,
-        ));
+        ConstructorInitDecision::Allowed
     }
 
     fn check_function_call(

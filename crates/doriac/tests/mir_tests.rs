@@ -3435,7 +3435,7 @@ function main(): void
 }
 
 #[test]
-fn stage_19_rejects_constructor_reads_before_direct_property_initialization() {
+fn stage_21_rejects_constructor_reads_before_property_initialization() {
     let diagnostics = doriac::lower_source_to_mir(
         "constructor-read-before-init.doria",
         r#"class Message
@@ -3455,18 +3455,18 @@ function main(): void
 }
 "#,
     )
-    .expect_err("the Stage 19 soundness gate must reject a read before initialization");
+    .expect_err("semantic definite initialization must reject an early read");
 
     assert!(diagnostics.iter().any(|diagnostic| {
-        diagnostic.code == "M1101"
-            && diagnostic.message.contains("property `$text`")
+        diagnostic.code == "E0501"
+            && diagnostic.message.contains("Message::text")
             && diagnostic.message.contains("initialized")
     }));
 }
 
 #[test]
-fn stage_19_rejects_constructor_initialization_after_unconditional_panic() {
-    let diagnostics = doriac::lower_source_to_mir(
+fn stage_21_ignores_unreachable_initialization_after_unconditional_panic() {
+    let program = doriac::lower_source_to_mir(
         "constructor-panic-before-init.doria",
         r#"class Message
 {
@@ -3485,13 +3485,41 @@ function main(): void
 }
 "#,
     )
-    .expect_err("an unreachable write cannot establish definite initialization");
+    .expect("a constructor that always panics never exposes an incomplete object");
+    doriac::mir_validation::validate_program(&program)
+        .expect("unreachable initialization must not be required by MIR validation");
+    let constructor = &program.functions[0];
+    assert!(constructor.blocks.iter().all(|block| block
+        .statements
+        .iter()
+        .all(|statement| !matches!(statement, doriac::mir::Statement::AssignProperty { .. }))));
+}
 
-    assert!(diagnostics.iter().any(|diagnostic| {
-        diagnostic.code == "M1101"
-            && diagnostic.message.contains("property `$text`")
-            && diagnostic.message.contains("not definitely initialized")
-    }));
+#[test]
+fn stage_21_ignores_unreachable_readonly_reassignment_in_a_constant_branch() {
+    let program = doriac::lower_source_to_mir(
+        "constructor-unreachable-reassignment.doria",
+        r#"class Message
+{
+    string $text = "ready";
+
+    function __construct()
+    {
+        if (false) {
+            $this->text = "unreachable";
+        }
+    }
+}
+
+function main(): void
+{
+    let $message = new Message();
+}
+"#,
+    )
+    .expect("an unreachable assignment cannot reinitialize a readonly property");
+    doriac::mir_validation::validate_program(&program)
+        .expect("source and MIR reachability must agree for readonly initialization");
 }
 
 #[test]

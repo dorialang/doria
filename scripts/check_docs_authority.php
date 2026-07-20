@@ -587,33 +587,30 @@ if ($namingAuthority !== false) {
     }
 }
 
-// Keep the human-facing and executable native status claims synchronized
-// without hard-coding the current stage into this guard.
-$readmeStatusPath = 'README.md';
-$parityStatusPath = 'crates/doriac/tests/fixtures/native_parity_examples.txt';
-$readmeStatus = file_get_contents($root . '/' . $readmeStatusPath);
-$parityStatus = file_get_contents($root . '/' . $parityStatusPath);
-$readmeStage = null;
-$parityStage = null;
+// The repository is not published until the end-to-end plan is complete.
+// Public entry documents therefore describe the released product instead of
+// exposing the compiler's interim stage or implementation status.
+$publicEntryPaths = ['README.md', 'CONTRIBUTING.md'];
+$forbiddenPublicStatusPatterns = [
+    '/^##\s+Status\s*$/mi' => 'public entry documents must not contain an interim status section',
+    '/\b(?:stage|phase)\s+[A-Z0-9]+/i' => 'public entry documents must not expose internal stage or phase labels',
+    '/\b(?:planned|not yet|coming soon|work in progress|prototype|current compiler branch|current slice|supported today|available today|future work)\b/i' => 'public entry documents must not expose interim implementation status',
+    '/\bearly(?:,\s+active)?\s+development\b/i' => 'public entry documents must not carry a pre-release development disclaimer',
+    '/\bsyntax highlighting is editor UX\b|\bnot a language implementation\b|\bhighlighting (?:does not|doesn\'t) mean\b|\bcompiler correctly reports it as unsupported\b/i' => 'public entry documents must not explain interim highlighting/compiler drift',
+];
 
-if ($readmeStatus === false) {
-    $failures[] = "{$readmeStatusPath}: unable to read native status claim";
-} elseif (preg_match('/Stages\s+\d+(?:–|-)\s*([0-9]+[a-z]?)\s+are implemented/iu', $readmeStatus, $matches) !== 1) {
-    $failures[] = "{$readmeStatusPath}: missing implemented native stage range";
-} else {
-    $readmeStage = strtolower($matches[1]);
-}
+foreach ($publicEntryPaths as $path) {
+    $contents = file_get_contents($root . '/' . $path);
+    if ($contents === false) {
+        $failures[] = "{$path}: unable to read public entry document";
+        continue;
+    }
 
-if ($parityStatus === false) {
-    $failures[] = "{$parityStatusPath}: unable to read native status claim";
-} elseif (preg_match('/Highest completed stage:\s*Stage\s+([0-9]+[a-z]?)/i', $parityStatus, $matches) !== 1) {
-    $failures[] = "{$parityStatusPath}: missing highest completed stage header";
-} else {
-    $parityStage = strtolower($matches[1]);
-}
-
-if ($readmeStage !== null && $parityStage !== null && $readmeStage !== $parityStage) {
-    $failures[] = "native status claims disagree: {$readmeStatusPath} ends at Stage {$readmeStage}, but {$parityStatusPath} names Stage {$parityStage}";
+    foreach ($forbiddenPublicStatusPatterns as $pattern => $message) {
+        if (preg_match($pattern, $contents) === 1) {
+            $failures[] = "{$path}: {$message}";
+        }
+    }
 }
 
 // Editor and language-server ownership is external to this compiler repository.
