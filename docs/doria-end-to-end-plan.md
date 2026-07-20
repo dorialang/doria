@@ -726,6 +726,7 @@ Authored subjects cite their actual record numbers:
 - Decision 0092: collection type family and naming — the complete named family, default insertion ordering, sorted variants, priority queue, and deque names.
 - Decision 0093: nullable types and narrowing — general `?T`, `??`, `?->`, exact `is`, shared forward dataflow facts, nullable runtime representation, and payload-derived ownership classification.
 - Decision 0094: ternary and compound-assignment operators — full `? :` (strict-`bool` condition, no Elvis, desugars to a two-arm `match`), plus `.=` (string concat-assign) and `??=` (null-coalescing assign) completing the compound-assignment family.
+- Decision 0095: operator surface completeness — `**`/`**=` and `<=>` are rejected as operators in favor of `Int::pow`/`Float::pow` and `Comparable::compare(): Ordering` (a core `Ordering { Less, Equal, Greater }` enum); `@`, backtick execution, and PHP `&`-references are rejected with fixits; spread/variadic user parameters defer to the named-arguments slice.
 
 Subjects awaiting decision records are deliberately unnumbered:
 
