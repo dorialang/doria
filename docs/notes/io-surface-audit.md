@@ -20,13 +20,13 @@
 ## Already settled (item → citation)
 
 - **Three-tier file family** (text now / `Bytes` Stage 23 / `File`+stream post-Stage-29) — 0075 §Decision; plan §9.
-- **`write_file` truncates** ("creates or truncates and writes exact bytes") — 0074 §Text files; SPEC "Stage 17" (`write_file creates or truncates`). *Truncate is defined and shipped; only append is open (Q3).*
+- **`write_file` truncates** ("creates or truncates and writes exact bytes") — 0074 §Text files; SPEC "Stage 17" (`write_file creates or truncates`). *At audit time truncate was defined and shipped while append was open (Q3); Decision 0091 has since settled the additive `append_file` spelling for Stage 23.*
 - **Text tier does no newline normalization; byte-exact read & write** — 0074 ("preserves its bytes without newline normalization"; "writes exact bytes"). `read_line` strips exactly one LF or one CRLF at the line boundary — 0074 §Line input; SPEC.
 - **Invalid UTF-8 on read → panic, no lossy/replacement path** ("file contained invalid UTF-8" / "stdin contained invalid UTF-8") — 0074. Raw/undecoded bytes are the `Bytes` tier's job (Stage 23), not a lossy string path.
 - **Text-tier failure model:** panic + status 101 until Stage 29, then declared `throws`; `read_line` `null` = EOF only, never error — 0074, 0075.
 - **Terminal layer deferred and bounded:** capability-based `Console` static facade, no escape sequences/handles/ANSI in any public value, Stage 46 build-out, decision number assigned when authored — 0074 §Future terminal boundary; plan §9; 0006.
 - **RAII flush/close on normal exit and on `throws` propagation** (drop elaboration runs `__destruct` at every scope boundary) — plan §3.1, §5. **Abort-only panic runs no cleanup** — 0081 (this is the root of D6).
-- **SIGPIPE is ignored at the runtime** so a closed-pipe write reports EPIPE instead of killing by signal — `doria-rt/src/lib.rs:940` (impl). *The language-level contract for what happens to that EPIPE is not specified — that is D1.*
+- **SIGPIPE is ignored at the runtime** so a closed-pipe write reports EPIPE instead of killing by signal — `doria-rt/src/lib.rs:940` (impl). *The language-level contract was the audit's D1 gap and is now settled by Decision 0091.*
 - **Binary-tier parameters beyond the path are a Stage 23 decision** — 0075; SPEC.
 - **Windows:** redirected stdout/stderr write exact length-delimited UTF-8; interactive console validates UTF-8 → UTF-16 → `WriteConsoleW`; all three OSes land together — 0074 §Runtime I/O layering.
 
@@ -48,7 +48,7 @@ Format per item: **Status · Options · Tradeoffs · Recommendation (marked) · 
 - **Recommendation → (a),** with chunked/incremental byte reads deferred to the stream tier. The binary tier should cover stdin the moment it covers files.
 - **Blast radius.** Stage 23 scope; 0075 tier-2, plan §9, SPEC.
 
-### Q3 — `write_file` append vs truncate [PARTIALLY SETTLED — truncate done; append OPEN · HIGH PRIORITY]
+### Q3 — `write_file` append vs truncate [ACCEPTED — Decision 0091; implementation Stage 23]
 - **Status.** Truncate is **already decided and shipped** (0074/SPEC: "creates or truncates"). The gap is append, and how to spell a mode without an options bag.
 - **Options.** (a) A distinct free function `append_file(string $path, string $contents): void` (verb_noun charter, no flag). (b) A mode enum arg on `write_file` (`write_file(path, contents, WriteMode::Append)`). (c) Defer append to the stream tier (open a `File` in append mode, post-Stage-29).
 - **Tradeoffs.** (a) matches the `read_file`/`write_file` naming family, no options bag, and **requires no change to `write_file` — so no breaking change**. (b) changes a shipped signature (breaking) and starts the options-bag slide. (c) leaves the common "append a line to a log" case with no free-function answer until post-Stage-29.
@@ -76,12 +76,12 @@ Format per item: **Status · Options · Tradeoffs · Recommendation (marked) · 
 - **Recommendation → (a) unify,** designed so the intrinsics and the stream accessors sit on the same doria-rt substrate. **Reopen trigger:** `Doria\Std\Io` stream-tier design.
 - **Blast radius.** Post-Stage-29 stream tier; the stream type and standard-stream accessors must be designed together.
 
-### D1 — closed stdout / EPIPE / SIGPIPE (the `head` case) [OPEN · IMPORTANT · touches shipped behavior]
-- **Status.** Derived, not in the six. SIGPIPE is ignored (verified), so a closed-pipe write yields EPIPE. Today an EPIPE surfaces as an OS write failure → the text-tier **panic path → status 101 + a stderr stack trace**. For a filter piped into `head`, that turns a *normal* early-close into a crash dump. No document specifies this.
+### D1 — closed stdout / EPIPE / SIGPIPE (the `head` case) [ACCEPTED AND IMPLEMENTED — Decision 0091]
+- **Status at audit time.** Derived, not in the six. SIGPIPE was ignored (verified), so a closed-pipe write yielded EPIPE, which then followed the text-tier **panic path → status 101 + a stderr stack trace**. For a filter piped into `head`, that turned a *normal* early-close into a crash dump. Decision 0091 now specifies and implements the clean-exit correction.
 - **Options.** (a) Broken-pipe/EPIPE on a **standard stream** → **clean exit** (status 0, no panic trace) — the Unix-filter convention (coreutils, Go, Rust-with-reset-handler). (b) Keep the current panic (status 101 + trace). (c) Exit 141 (128+SIGPIPE), no trace.
 - **Tradeoffs.** (a) correct for the CLI-filter product; a program piping into `head`/`less` behaves. (b) treats a normal scenario as a crash — unacceptable for product 1. (c) preserves the "signal" convention but still noisy for scripts expecting 0.
-- **Recommendation → (a).** A write failing with broken-pipe/EPIPE on `stdout`/`stderr` terminates the program cleanly, no panic trace. Keep genuine file write failures on the panic→`throws` path; broken-pipe on a standard stream is a *carve-out*, not a throw the user must handle. This is a **must** for the CLI-filter use case and, like Q3, touches shipped behavior — so it needs an early decision even though the code is a separate prompt.
-- **Blast radius.** `doria-rt` device write path (EPIPE / `ERROR_BROKEN_PIPE` → clean exit); 0074/0075 failure model (carve broken-pipe out of the generic write-panic); the 0074 panic-message set; SPEC; any example/fixture asserting write-failure panics. **Code follow-up required** (second such item alongside Q3).
+- **Recommendation → (a).** An ordinary program write failing with broken-pipe/EPIPE on `stdout`/`stderr` terminates the program cleanly, no panic trace. Panic diagnostics remain fatal if stderr is unavailable. Keep genuine file write failures on the panic→`throws` path; broken-pipe on a standard stream is a *carve-out*, not a throw the user must handle. This is a **must** for the CLI-filter use case and, like Q3, touches shipped behavior — so it needs an early decision even though the code is a separate prompt.
+- **Blast radius.** `doria-rt` device write path (EPIPE / `ERROR_BROKEN_PIPE` → clean exit); 0074/0075 failure model (carve broken-pipe out of the generic write-panic); the 0074 panic-message set; SPEC; any example/fixture asserting write-failure panics. **Completed under Decision 0091; Q3 code remains scheduled for Stage 23.**
 
 ### D2 — binary stderr write [OPEN — empty cell]
 - **Status.** `write_stderr` is string-only; no `Bytes` path to stderr.
@@ -138,18 +138,21 @@ Empty cells: **binary stdin read (Q2), binary stdout write (Q1), binary stderr w
 - **Stream concurrency / `Sendable`** (D7) — deferred to the **async decision**; three design cases flagged. *Reopen:* async authoring.
 - **`Io`/`Fs` operation placement** (D8) — the *line* is recommended now; the *operations* land `Io` (post-29) / `Fs` (unscheduled).
 
-**Not deferrable (decide soon — touch shipped behavior):** **Q3** (`append_file` name — additive, non-breaking) and **D1** (closed-stdout/EPIPE clean-exit — changes the shipped write-panic behavior). Both need decisions now; both have a *separate* implementation prompt.
+**Accepted in Decision 0091:** **Q3** (`append_file` name — additive, non-breaking, implementation Stage 23) and **D1** (closed-stdout/stderr broken-pipe clean exit). Every other item keeps the deferral and reopen trigger recorded above.
 
-## Invalidated elsewhere (if the recommendations are approved)
+## Invalidated elsewhere (recommendation map)
 
-- **0074** — add: byte std-stream writers (Stage 23); `append_file` as the append spelling; broken-pipe carve-out from the write-panic (D1); no-BOM-strip and no-newline-normalization stated (D5); unbuffered + per-stream/same-handle write-order guarantee (Q5). Panic-message set changes for the stdout-broken-pipe case.
-- **0075** — add byte stdin/stdout/stderr to tier-2; state the byte-tier failure model (D3); note append across tiers.
-- **SPEC.md** "Stage 17 text I/O" — mirror the 0074 clarifications; state closed-stdout behavior.
-- **plan §9** formatted-I/O / three-tier bullets — `append_file`, byte std streams, the `Io`/`Fs` line, EPIPE behavior.
-- **`doria-rt`** — device write path: EPIPE/`ERROR_BROKEN_PIPE` → clean exit (D1, code); verify EINTR-retry / short-write loops (D4).
-- **`write_file` signature — explicitly UNCHANGED** (append is additive; no breaking change). Recorded so no later pass "adds a mode."
-- **Examples / fixtures / website & playground** — any example that pipes into `head` or asserts write-failure panics; the parity manifest's broken-pipe handling already treats `BrokenPipe` as ok in the harness (`native_mir_parity_tests.rs:255`) — reconcile with the chosen D1 semantics. Verify playground coverage in the separate `doria-website` repository before amending it; this compiler-repository audit makes no claim about that coverage.
+Decision 0091 accepts only D1 and Q3 from this list. Their corresponding clauses below are now
+amended; every unrelated recommendation remains historical analysis rather than accepted authority.
+
+- **0074** — add: byte std-stream writers (Stage 23); `append_file` as the append spelling; broken-pipe carve-out from the write-panic (D1); no-BOM-strip and no-newline-normalization stated (D5); unbuffered + per-stream/same-handle write-order guarantee (Q5). Panic-message set changes for the stdout-broken-pipe case. **D1/Q3 clauses amended in 0091; other clauses remain deferred.**
+- **0075** — add byte stdin/stdout/stderr to tier-2; state the byte-tier failure model (D3); note append across tiers. **Q3 clause amended in 0091; other clauses remain deferred.**
+- **SPEC.md** "Stage 17 text I/O" — mirror the 0074 clarifications; state closed-stdout behavior. **D1/Q3 clauses amended in 0091.**
+- **plan §9** formatted-I/O / three-tier bullets — `append_file`, byte std streams, the `Io`/`Fs` line, EPIPE behavior. **D1/Q3 clauses amended in 0091; other clauses remain deferred.**
+- **`doria-rt`** — device write path: EPIPE/`ERROR_BROKEN_PIPE` → clean exit (D1, code); verify EINTR-retry / short-write loops (D4). **D1 implemented under 0091; D4 remains a preserved runtime invariant, not a newly accepted audit item.**
+- **`write_file` signature — explicitly UNCHANGED** (append is additive; no breaking change). **Recorded in 0091 so no later pass adds a mode.**
+- **Examples / fixtures / website & playground** — any example that pipes into `head` or asserts write-failure panics; the parity manifest's broken-pipe handling already treats `BrokenPipe` as ok in the harness (`native_mir_parity_tests.rs:255`) — reconcile with the chosen D1 semantics. Verify playground coverage in the separate `doria-website` repository before amending it; this compiler-repository audit makes no claim about that coverage. **Compiler fixtures are reconciled under 0091; website verification remains external follow-up.**
 
 ## Proposed deliverable path
 
-`docs/notes/io-surface-audit.md` (this file) — a findings note under "supporting context" per `docs/information-architecture.md`. It is **not** a decision record: records are for settled decisions, and every item here is a stop-and-ask. On Andrew's approval, the subset he accepts becomes plan/SPEC amendments and one or more decision records (next free number, subject-cited until authored, `scripts/check_docs_authority.php` green), and the two code items (Q3 append, D1 EPIPE) become a separate implementation prompt.
+`docs/notes/io-surface-audit.md` (this file) — a findings note under "supporting context" per `docs/information-architecture.md`. It is **not** a decision record: records are for settled decisions. Decision 0091 promotes the approved D1/Q3 subset into authority; every other item here remains a stop-and-ask with its recorded reopen trigger. Q3 implementation remains a Stage 23 task.

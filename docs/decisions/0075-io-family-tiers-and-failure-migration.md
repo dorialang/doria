@@ -14,17 +14,24 @@ Doria's file I/O family has three deliberate tiers:
 
 1. Stage 17 text functions: `read_file(string $path): string` and
    `write_file(string $path, string $contents): void`. Reads validate UTF-8 before constructing a
-   string. Invalid bytes never enter `string`.
+   string. Invalid bytes never enter `string`. Decision 0091 specifies the additive
+   `append_file(string $path, string $contents): void` spelling without changing truncate-only
+   `write_file`; its implementation lands at Stage 23.
 2. Stage 23 binary functions: `read_file_bytes(string $path, ...)` and
-   `write_file_bytes(string $path, ...)`, introduced with the `Bytes` move type. A file operation
-   always requires its path; any additional parameters and their complete contracts are settled
-   in Stage 23 rather than inferred early from the text API.
+   `write_file_bytes(string $path, ...)`, plus the reserved `append_file_bytes` sibling,
+   introduced with the `Bytes` move type. A file operation always requires its path; any
+   additional parameters and their complete contracts are settled in Stage 23 rather than
+   inferred early from the text API.
 3. Post-Stage 29 `File` and stream objects: owned RAII resources with buffered and seekable access.
 
 Until checked errors land, Stage 17 free-function I/O failures panic with a clear message and status
 101. `read_line(): ?string` returns `null` only for EOF; it does not encode failures as null. At
 Stage 29 the I/O free functions migrate to declared `throws` signatures. That planned signature
-change does not alter successful text behavior or the meaning of EOF.
+change does not alter successful text behavior or the meaning of EOF. A closed stdout or stderr
+pipe during ordinary program output is the permanent decision-0091 exception: it exits cleanly
+with status 0 and is never a Stage-29 throw. Panic diagnostics remain fatal with status 101 if
+stderr is unavailable. File failures and non-broken-pipe standard-stream failures remain on the
+migration path.
 
 Stage 17 `?string` is the first supported position for the nullable model generalized at Stage 22.
 It is not a special I/O-only type and is not replaced by the later general implementation.

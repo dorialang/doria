@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::ast::*;
-use crate::builtins::{php_function_suggestion, Builtin};
+use crate::builtins::{is_reserved_intrinsic_name, php_function_suggestion, Builtin};
 use crate::class_layout::{ClassId, PropertyId};
 use crate::diagnostics::{Diagnostic, DiagnosticResult};
 use crate::format_string::{self, FormatConversion, FormatPiece};
@@ -751,8 +751,8 @@ impl<'program> Checker<'program> {
             name if php_function_suggestion(name) == Some("read_line") => Some(format!(
                 "Doria uses `read_line`; the PHP spelling `{name}` cannot be declared"
             )),
-            name if Builtin::from_name(name).is_some() => Some(format!(
-                "`{name}` is a compiler-known Doria built-in and cannot be redeclared"
+            name if is_reserved_intrinsic_name(name) => Some(format!(
+                "`{name}` is a compiler-known Doria intrinsic name and cannot be redeclared"
             )),
             "array" => Some(
                 "`array` is not a Doria callable name; use typed arrays like `T[]` or collection aliases"

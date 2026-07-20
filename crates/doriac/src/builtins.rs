@@ -9,6 +9,13 @@ pub enum Builtin {
     WriteStderr,
 }
 
+const RESERVED_FUTURE_INTRINSIC_NAMES: &[&str] = &[
+    "append_file",
+    "read_file_bytes",
+    "write_file_bytes",
+    "append_file_bytes",
+];
+
 /// A PHP free-function spelling and its Doria naming-charter replacement.
 ///
 /// This table is compiler-owned data so diagnostics and the future PHP
@@ -37,6 +44,10 @@ pub fn php_function_suggestion(name: &str) -> Option<&'static str> {
     PHP_FUNCTION_SUGGESTIONS
         .iter()
         .find_map(|(php, doria)| (*php == name).then_some(*doria))
+}
+
+pub fn is_reserved_intrinsic_name(name: &str) -> bool {
+    Builtin::from_name(name).is_some() || RESERVED_FUTURE_INTRINSIC_NAMES.contains(&name)
 }
 
 impl Builtin {
@@ -77,5 +88,15 @@ mod tests {
         assert_eq!(string_policy.literal_open_brace, '{');
         assert_eq!(string_policy.doria_literal_open_brace, "\\{");
         assert!(!string_policy.rewrite_bare_close_brace);
+    }
+
+    #[test]
+    fn reserves_future_intrinsics_without_implementing_them() {
+        for name in RESERVED_FUTURE_INTRINSIC_NAMES {
+            assert!(is_reserved_intrinsic_name(name));
+            assert_eq!(Builtin::from_name(name), None);
+        }
+        assert!(is_reserved_intrinsic_name("read_file"));
+        assert!(!is_reserved_intrinsic_name("user_function"));
     }
 }

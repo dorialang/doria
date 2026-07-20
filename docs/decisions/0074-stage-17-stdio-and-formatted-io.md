@@ -61,10 +61,18 @@ one newline remain available for the next call.
 normalization. `write_file` creates or truncates and writes exact bytes. Paths reject embedded
 NUL. Failures panic with stable messages: `failed to read file`, `file contained invalid UTF-8`,
 `failed to write file`, or `file path contained an embedded NUL`. `write_stderr` writes exact bytes
-without a newline. I/O errors are fatal status-101 panics until checked errors land at Stage 29.
-At that stage these free functions migrate to declared `throws` signatures; `null` from
-`read_line` remains EOF only. The text/binary/stream tiers and migration are recorded separately
-in Decision 0075.
+without a newline. An ordinary program write to a standard stream that reports a closed pipe exits
+immediately with status 0 and no panic or stack trace; this decision-0091 carve-out does not apply
+to panic diagnostics, file writes, or other standard-stream errors. A panic remains fatal with
+status 101 even if its diagnostic sink is unavailable. Other I/O errors are fatal status-101
+panics until checked errors land at Stage 29. At that stage these free functions migrate to
+declared `throws` signatures,
+except that a closed standard-stream pipe during ordinary program output remains a clean exit and
+is never thrown; `null` from
+`read_line` remains EOF only. The additive text spelling is
+`append_file(string $path, string $contents): void`; `write_file` remains truncate-only, and
+implementation of append is scheduled with its `append_file_bytes` sibling for Stage 23. The
+text/binary/stream tiers and migration are recorded separately in Decisions 0075 and 0091.
 
 ### Checked formatting
 

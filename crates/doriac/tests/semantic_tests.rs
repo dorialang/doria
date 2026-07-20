@@ -3353,6 +3353,41 @@ function main(): void {}
 }
 
 #[test]
+fn reserves_future_intrinsic_names_without_implementing_them() {
+    for name in [
+        "append_file",
+        "read_file_bytes",
+        "write_file_bytes",
+        "append_file_bytes",
+    ] {
+        let declarations = format!(
+            "function {name}(): void {{}}\nclass Example {{ function {name}(): void {{}} }}"
+        );
+        let diagnostics = doriac::check_source("test.doria", declarations)
+            .expect_err("future intrinsic declarations must be reserved");
+        assert_eq!(
+            diagnostics
+                .iter()
+                .filter(|diagnostic| {
+                    diagnostic.code == "E0310"
+                        && diagnostic.message.contains("intrinsic name")
+                        && diagnostic.message.contains(name)
+                })
+                .count(),
+            2,
+            "{name} must be reserved globally and as a method name"
+        );
+
+        let call = format!("function main(): void {{ {name}(); }}");
+        let diagnostics = doriac::check_source("test.doria", call)
+            .expect_err("future intrinsic calls must remain unsupported");
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "E0309" && diagnostic.message == format!("unknown function `{name}`")
+        }));
+    }
+}
+
+#[test]
 fn reserves_top_level_print_with_echo_guidance() {
     let err = doriac::check_source(
         "test.doria",

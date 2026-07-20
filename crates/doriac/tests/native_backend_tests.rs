@@ -1,9 +1,6 @@
 use std::fs;
-use std::io;
-#[cfg(unix)]
-use std::io::Read;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-#[cfg(unix)]
 use std::process::Stdio;
 use std::process::{Command, Output};
 use std::thread;
@@ -1243,9 +1240,8 @@ function main(): void
     let _ = fs::remove_file(output);
 }
 
-#[cfg(unix)]
 #[test]
-fn native_stdout_broken_pipe_uses_panic_status_and_trace() {
+fn native_stdout_broken_pipe_exits_cleanly() {
     if !host_linker_is_available() {
         eprintln!(
             "native broken-pipe integration test unavailable: host linker `{}` was not found",
@@ -1270,22 +1266,131 @@ function main(): void
         spawn_native_executable_with_piped_output(&output).expect("native executable should start");
     drop(child.stdout.take());
 
-    let mut stderr = Vec::new();
-    child
-        .stderr
-        .take()
-        .expect("stderr should be piped")
-        .read_to_end(&mut stderr)
-        .expect("panic stderr should be readable");
-    let status = child.wait().expect("native executable should exit");
+    let run = child
+        .wait_with_output()
+        .expect("native executable should exit");
 
-    assert_eq!(status.code(), Some(101));
+    assert_eq!(run.status.code(), Some(0));
+    assert!(run.stdout.is_empty());
+    assert!(run.stderr.is_empty());
+
+    let _ = fs::remove_file(output);
+}
+
+#[test]
+fn native_stderr_broken_pipe_exits_cleanly() {
+    if !host_linker_is_available() {
+        eprintln!(
+            "native broken-pipe integration test unavailable: host linker `{}` was not found",
+            host_linker()
+        );
+        return;
+    }
+
+    let message = "Doria".repeat(64 * 1024);
+    let source = format!(
+        r#"
+function main(): void
+{{
+    write_stderr("{message}");
+}}
+"#
+    );
+    let output = temp_executable_path("main_stderr_broken_pipe");
+    compile_native_source(&source, &output);
+
+    let mut child =
+        spawn_native_executable_with_piped_output(&output).expect("native executable should start");
+    drop(child.stderr.take());
+
+    let run = child
+        .wait_with_output()
+        .expect("native executable should exit");
+
+    assert_eq!(run.status.code(), Some(0));
+    assert!(run.stdout.is_empty());
+    assert!(run.stderr.is_empty());
+
+    let _ = fs::remove_file(output);
+}
+
+#[test]
+fn native_panic_stays_fatal_when_stderr_is_closed() {
+    if !host_linker_is_available() {
+        eprintln!(
+            "native panic integration test unavailable: host linker {} was not found",
+            host_linker()
+        );
+        return;
+    }
+
+    let output = temp_executable_path("main_panic_closed_stderr");
+    compile_native_source(
+        r#"
+function main(): void
+{
+    let $line = read_line();
+    panic("boom");
+}
+"#,
+        &output,
+    );
+
+    let mut child = retry_transient_executable_busy(|| {
+        Command::new(&output)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+    })
+    .expect("native executable should start");
+    drop(child.stderr.take());
+    child
+        .stdin
+        .take()
+        .expect("native stdin should be piped")
+        .write_all(b"\n")
+        .expect("native input should unblock the fixture");
+    let run = child
+        .wait_with_output()
+        .expect("native executable should exit");
+
+    assert_eq!(run.status.code(), Some(101));
+    assert!(run.stdout.is_empty());
+    assert!(run.stderr.is_empty());
+
+    let _ = fs::remove_file(output);
+}
+
+#[test]
+fn native_file_write_failure_still_panics() {
+    if !host_linker_is_available() {
+        eprintln!(
+            "native file-write integration test unavailable: host linker `{}` was not found",
+            host_linker()
+        );
+        return;
+    }
+
+    let output = temp_executable_path("main_file_write_failure");
+    compile_native_source(
+        include_str!("fixtures/native_io/file_write_failure.doria"),
+        &output,
+    );
+    let directory = temp_working_directory("main_file_write_failure");
+    fs::create_dir_all(&directory).expect("working directory should be created");
+
+    let run = run_native_executable_in_directory(&output, &directory)
+        .expect("native executable should run");
+    assert_eq!(run.status.code(), Some(101));
+    assert!(run.stdout.is_empty());
     assert_eq!(
-        stderr,
-        b"Panic: failed to write stdout\nStack Trace:\n  at main\n"
+        run.stderr,
+        b"Panic: failed to write file\nStack Trace:\n  at main\n"
     );
 
     let _ = fs::remove_file(output);
+    let _ = fs::remove_dir_all(directory);
 }
 
 fn inline_native_source(stem: &str) -> &'static str {
@@ -3973,7 +4078,6 @@ fn run_native_executable_in_directory(output: &Path, directory: &Path) -> io::Re
     retry_transient_executable_busy(|| Command::new(output).current_dir(directory).output())
 }
 
-#[cfg(unix)]
 fn spawn_native_executable_with_piped_output(output: &Path) -> io::Result<std::process::Child> {
     retry_transient_executable_busy(|| {
         Command::new(output)

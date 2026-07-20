@@ -10,8 +10,26 @@ pub(crate) enum StandardStream {
     Stderr = 2,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WriteOutcome {
+    Success,
+    BrokenPipe,
+    OtherFailure,
+}
+
 #[cfg(unix)]
 const EINTR: i32 = 4;
+#[cfg(unix)]
+const EPIPE: i32 = 32;
+
+#[cfg(unix)]
+const fn classify_unix_write_error(error: Option<i32>) -> WriteOutcome {
+    match error {
+        None => WriteOutcome::Success,
+        Some(EPIPE) => WriteOutcome::BrokenPipe,
+        Some(_) => WriteOutcome::OtherFailure,
+    }
+}
 
 #[cfg(unix)]
 const fn descriptor(stream: StandardStream) -> i32 {
@@ -47,9 +65,13 @@ pub(crate) unsafe fn read(
 
 /// Writes raw bytes without adding text or line semantics.
 #[cfg(unix)]
-pub(crate) unsafe fn write(stream: StandardStream, bytes: *const u8, byte_length: usize) -> bool {
+pub(crate) unsafe fn write(
+    stream: StandardStream,
+    bytes: *const u8,
+    byte_length: usize,
+) -> WriteOutcome {
     if stream == StandardStream::Stdin {
-        return false;
+        return WriteOutcome::OtherFailure;
     }
     let mut offset = 0;
     while offset < byte_length {
@@ -63,10 +85,14 @@ pub(crate) unsafe fn write(stream: StandardStream, bytes: *const u8, byte_length
         } else if result < 0 && last_errno() == EINTR {
             continue;
         } else {
-            return false;
+            return if result < 0 {
+                classify_unix_write_error(Some(last_errno()))
+            } else {
+                WriteOutcome::OtherFailure
+            };
         }
     }
-    true
+    WriteOutcome::Success
 }
 
 /// Raw writes are currently unbuffered, so flushing is intentionally a successful no-op.
@@ -94,6 +120,17 @@ const STD_ERROR_HANDLE: u32 = -12_i32 as u32;
 const INVALID_HANDLE_VALUE: *mut c_void = -1_isize as *mut c_void;
 #[cfg(windows)]
 const ERROR_BROKEN_PIPE: u32 = 109;
+#[cfg(windows)]
+const ERROR_NO_DATA: u32 = 232;
+
+#[cfg(windows)]
+const fn classify_windows_write_error(error: Option<u32>) -> WriteOutcome {
+    match error {
+        None => WriteOutcome::Success,
+        Some(ERROR_BROKEN_PIPE) | Some(ERROR_NO_DATA) => WriteOutcome::BrokenPipe,
+        Some(_) => WriteOutcome::OtherFailure,
+    }
+}
 
 #[cfg(windows)]
 fn is_pipe_eof(error: u32) -> bool {
@@ -131,12 +168,16 @@ unsafe fn is_console_handle(handle: *mut c_void) -> bool {
 }
 
 #[cfg(windows)]
-pub(crate) unsafe fn write(stream: StandardStream, bytes: *const u8, byte_length: usize) -> bool {
+pub(crate) unsafe fn write(
+    stream: StandardStream,
+    bytes: *const u8,
+    byte_length: usize,
+) -> WriteOutcome {
     if stream == StandardStream::Stdin {
-        return false;
+        return WriteOutcome::OtherFailure;
     }
     let Some(handle) = valid_handle(stream) else {
-        return false;
+        return WriteOutcome::OtherFailure;
     };
     if is_interactive(stream) {
         return write_console_utf8(handle, bytes, byte_length);
@@ -145,32 +186,42 @@ pub(crate) unsafe fn write(stream: StandardStream, bytes: *const u8, byte_length
 }
 
 #[cfg(windows)]
-unsafe fn write_file_bytes(handle: *mut c_void, bytes: *const u8, byte_length: usize) -> bool {
+unsafe fn write_file_bytes(
+    handle: *mut c_void,
+    bytes: *const u8,
+    byte_length: usize,
+) -> WriteOutcome {
     let mut offset = 0;
     while offset < byte_length {
         let request = core::cmp::min(byte_length - offset, u32::MAX as usize) as u32;
         let mut written = 0_u32;
-        if WriteFile(
+        let result = WriteFile(
             handle,
             bytes.add(offset).cast::<c_void>(),
             request,
             &mut written,
             ptr::null_mut(),
-        ) == 0
-            || written == 0
-        {
-            return false;
+        );
+        if result == 0 {
+            return classify_windows_write_error(Some(GetLastError()));
+        }
+        if written == 0 {
+            return WriteOutcome::OtherFailure;
         }
         offset += written as usize;
     }
-    true
+    WriteOutcome::Success
 }
 
 #[cfg(windows)]
-unsafe fn write_console_utf8(handle: *mut c_void, bytes: *const u8, byte_length: usize) -> bool {
+unsafe fn write_console_utf8(
+    handle: *mut c_void,
+    bytes: *const u8,
+    byte_length: usize,
+) -> WriteOutcome {
     let input = core::slice::from_raw_parts(bytes, byte_length);
     let Ok(text) = core::str::from_utf8(input) else {
-        return false;
+        return WriteOutcome::OtherFailure;
     };
     let mut wide = [0_u16; 1024];
     let mut length = 0_usize;
@@ -178,37 +229,48 @@ unsafe fn write_console_utf8(handle: *mut c_void, bytes: *const u8, byte_length:
         let mut encoded = [0_u16; 2];
         let units = character.encode_utf16(&mut encoded);
         if length + units.len() > wide.len() {
-            if !write_console_units(handle, wide.as_ptr(), length) {
-                return false;
+            let outcome = write_console_units(handle, wide.as_ptr(), length);
+            if outcome != WriteOutcome::Success {
+                return outcome;
             }
             length = 0;
         }
         wide[length..length + units.len()].copy_from_slice(units);
         length += units.len();
     }
-    length == 0 || write_console_units(handle, wide.as_ptr(), length)
+    if length == 0 {
+        WriteOutcome::Success
+    } else {
+        write_console_units(handle, wide.as_ptr(), length)
+    }
 }
 
 #[cfg(windows)]
-unsafe fn write_console_units(handle: *mut c_void, units: *const u16, length: usize) -> bool {
+unsafe fn write_console_units(
+    handle: *mut c_void,
+    units: *const u16,
+    length: usize,
+) -> WriteOutcome {
     let mut offset = 0;
     while offset < length {
         let request = core::cmp::min(length - offset, u32::MAX as usize) as u32;
         let mut written = 0_u32;
-        if WriteConsoleW(
+        let result = WriteConsoleW(
             handle,
             units.add(offset).cast::<c_void>(),
             request,
             &mut written,
             ptr::null_mut(),
-        ) == 0
-            || written == 0
-        {
-            return false;
+        );
+        if result == 0 {
+            return classify_windows_write_error(Some(GetLastError()));
+        }
+        if written == 0 {
+            return WriteOutcome::OtherFailure;
         }
         offset += written as usize;
     }
-    true
+    WriteOutcome::Success
 }
 
 #[cfg(windows)]
@@ -317,8 +379,8 @@ pub(crate) unsafe fn write(
     _stream: StandardStream,
     _bytes: *const u8,
     _byte_length: usize,
-) -> bool {
-    false
+) -> WriteOutcome {
+    WriteOutcome::OtherFailure
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -436,6 +498,38 @@ mod tests {
         assert_eq!(StandardStream::Stdin as u8, 0);
         assert_eq!(StandardStream::Stdout as u8, 1);
         assert_eq!(StandardStream::Stderr as u8, 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_write_outcomes_distinguish_broken_pipes() {
+        assert_eq!(classify_unix_write_error(None), WriteOutcome::Success);
+        assert_eq!(
+            classify_unix_write_error(Some(EPIPE)),
+            WriteOutcome::BrokenPipe
+        );
+        assert_eq!(
+            classify_unix_write_error(Some(5)),
+            WriteOutcome::OtherFailure
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_write_outcomes_distinguish_broken_pipes() {
+        assert_eq!(classify_windows_write_error(None), WriteOutcome::Success);
+        assert_eq!(
+            classify_windows_write_error(Some(ERROR_BROKEN_PIPE)),
+            WriteOutcome::BrokenPipe
+        );
+        assert_eq!(
+            classify_windows_write_error(Some(ERROR_NO_DATA)),
+            WriteOutcome::BrokenPipe
+        );
+        assert_eq!(
+            classify_windows_write_error(Some(5)),
+            WriteOutcome::OtherFailure
+        );
     }
 
     #[cfg(windows)]
