@@ -83,6 +83,35 @@ impl MutationCatalog {
         }
         catalog
     }
+
+    fn function_modes(&self, name: &str) -> Option<&[bool]> {
+        self.functions.get(name).map(Vec::as_slice)
+    }
+
+    fn method_modes(&self, method: &str) -> Option<&[bool]> {
+        self.methods.get(method).map(Vec::as_slice)
+    }
+
+    fn static_method_modes(
+        &self,
+        qualifier: &crate::ast::StaticQualifier,
+        method: &str,
+    ) -> Option<&[bool]> {
+        match qualifier {
+            crate::ast::StaticQualifier::Class(class) => self
+                .qualified_methods
+                .get(&(class.clone(), method.to_string()))
+                .or_else(|| self.methods.get(method))
+                .map(Vec::as_slice),
+            crate::ast::StaticQualifier::SelfType
+            | crate::ast::StaticQualifier::Parent
+            | crate::ast::StaticQualifier::InvalidStatic => self.method_modes(method),
+        }
+    }
+
+    fn constructor_modes(&self, class: &str) -> Option<&[bool]> {
+        self.constructors.get(class).map(Vec::as_slice)
+    }
 }
 
 fn merge_parameter_modes(target: &mut Vec<bool>, parameters: &[Param]) {
@@ -192,7 +221,13 @@ fn analyze_body(
         if !input.reachable {
             continue;
         }
-        collect_action_facts(&graph.nodes[node_id.0].action, input, &resolution, facts);
+        collect_action_facts(
+            &graph.nodes[node_id.0].action,
+            input,
+            &resolution,
+            mutations,
+            facts,
+        );
     }
 }
 
@@ -437,21 +472,11 @@ fn kill_mutated_call_arguments(
         } => {
             kill_mutated_call_arguments(object, state, resolution, mutations);
             kill_calls_in_arguments(args, state, resolution, mutations);
-            kill_arguments_for_modes(
-                args,
-                mutations.methods.get(method).map(Vec::as_slice),
-                state,
-                resolution,
-            );
+            kill_arguments_for_modes(args, mutations.method_modes(method), state, resolution);
         }
         Expr::FunctionCall { name, args, .. } => {
             kill_calls_in_arguments(args, state, resolution, mutations);
-            kill_arguments_for_modes(
-                args,
-                mutations.functions.get(name).map(Vec::as_slice),
-                state,
-                resolution,
-            );
+            kill_arguments_for_modes(args, mutations.function_modes(name), state, resolution);
         }
         Expr::StaticCall {
             qualifier,
@@ -460,16 +485,12 @@ fn kill_mutated_call_arguments(
             ..
         } => {
             kill_calls_in_arguments(args, state, resolution, mutations);
-            let modes = match qualifier {
-                crate::ast::StaticQualifier::Class(class) => mutations
-                    .qualified_methods
-                    .get(&(class.clone(), method.clone()))
-                    .or_else(|| mutations.methods.get(method)),
-                crate::ast::StaticQualifier::SelfType
-                | crate::ast::StaticQualifier::Parent
-                | crate::ast::StaticQualifier::InvalidStatic => mutations.methods.get(method),
-            };
-            kill_arguments_for_modes(args, modes.map(Vec::as_slice), state, resolution);
+            kill_arguments_for_modes(
+                args,
+                mutations.static_method_modes(qualifier, method),
+                state,
+                resolution,
+            );
         }
         Expr::New {
             class_name, args, ..
@@ -477,7 +498,7 @@ fn kill_mutated_call_arguments(
             kill_calls_in_arguments(args, state, resolution, mutations);
             kill_arguments_for_modes(
                 args,
-                mutations.constructors.get(class_name).map(Vec::as_slice),
+                mutations.constructor_modes(class_name),
                 state,
                 resolution,
             );
@@ -625,31 +646,42 @@ fn collect_action_facts(
     action: &NodeAction,
     state: &State,
     resolution: &Resolution,
+    mutations: &MutationCatalog,
     facts: &mut FactsByUse,
 ) {
     match action {
-        NodeAction::Statement(statement) => collect_statement(statement, state, resolution, facts),
+        NodeAction::Statement(statement) => {
+            collect_statement(statement, state, resolution, mutations, facts)
+        }
         NodeAction::Expression(expression)
         | NodeAction::Assume {
             condition: expression,
             ..
-        } => collect_expr(expression, state, resolution, facts),
+        } => {
+            collect_expr(expression, state, resolution, mutations, facts);
+        }
         NodeAction::ForInitializer(initializer) => match initializer {
             ForInitializer::VarDecl(declaration) => {
-                collect_expr(&declaration.initializer, state, resolution, facts)
+                collect_expr(
+                    &declaration.initializer,
+                    state,
+                    resolution,
+                    mutations,
+                    facts,
+                );
             }
             ForInitializer::Assignment(assignment) => {
-                collect_expr(&assignment.target, state, resolution, facts);
-                collect_expr(&assignment.value, state, resolution, facts);
+                let state = collect_expr(&assignment.target, state, resolution, mutations, facts);
+                collect_expr(&assignment.value, &state, resolution, mutations, facts);
             }
         },
         NodeAction::ForIncrement(increment) => match increment {
             ForIncrement::Increment(increment) => {
-                collect_expr(&increment.target, state, resolution, facts)
+                collect_expr(&increment.target, state, resolution, mutations, facts);
             }
             ForIncrement::Assignment(assignment) => {
-                collect_expr(&assignment.target, state, resolution, facts);
-                collect_expr(&assignment.value, state, resolution, facts);
+                let state = collect_expr(&assignment.target, state, resolution, mutations, facts);
+                collect_expr(&assignment.value, &state, resolution, mutations, facts);
             }
         },
         NodeAction::None => {}
@@ -660,25 +692,34 @@ fn collect_statement(
     statement: &Stmt,
     state: &State,
     resolution: &Resolution,
+    mutations: &MutationCatalog,
     facts: &mut FactsByUse,
 ) {
     match statement {
         Stmt::VarDecl(declaration) => {
-            collect_expr(&declaration.initializer, state, resolution, facts)
+            collect_expr(
+                &declaration.initializer,
+                state,
+                resolution,
+                mutations,
+                facts,
+            );
         }
         Stmt::Assignment(assignment) => {
-            collect_expr(&assignment.target, state, resolution, facts);
-            collect_expr(&assignment.value, state, resolution, facts);
+            let state = collect_expr(&assignment.target, state, resolution, mutations, facts);
+            collect_expr(&assignment.value, &state, resolution, mutations, facts);
         }
         Stmt::Echo { expr, .. } | Stmt::Expr { expr, .. } => {
-            collect_expr(expr, state, resolution, facts)
+            collect_expr(expr, state, resolution, mutations, facts);
         }
         Stmt::Return { expr, .. } => {
             if let Some(expr) = expr {
-                collect_expr(expr, state, resolution, facts);
+                collect_expr(expr, state, resolution, mutations, facts);
             }
         }
-        Stmt::Increment(increment) => collect_expr(&increment.target, state, resolution, facts),
+        Stmt::Increment(increment) => {
+            collect_expr(&increment.target, state, resolution, mutations, facts);
+        }
         Stmt::If(_)
         | Stmt::While(_)
         | Stmt::For(_)
@@ -688,48 +729,90 @@ fn collect_statement(
     }
 }
 
-fn collect_expr(expr: &Expr, state: &State, resolution: &Resolution, facts: &mut FactsByUse) {
+fn collect_expr(
+    expr: &Expr,
+    state: &State,
+    resolution: &Resolution,
+    mutations: &MutationCatalog,
+    facts: &mut FactsByUse,
+) -> State {
     if let Expr::Variable { span, .. } = expr {
         if let Some(binding) = resolution.uses.get(&(span.start, span.end)) {
             if let Some(fact) = state.facts.get(binding) {
                 facts.insert((span.start, span.end), fact.clone());
             }
         }
-        return;
+        return state.clone();
     }
 
     match expr {
         Expr::PropertyAccess { object, .. }
         | Expr::Grouped { expr: object, .. }
         | Expr::Unary { expr: object, .. }
-        | Expr::IsType { expr: object, .. } => collect_expr(object, state, resolution, facts),
-        Expr::MethodCall { object, args, .. } => {
-            collect_expr(object, state, resolution, facts);
-            for argument in args {
-                collect_expr(argument, state, resolution, facts);
-            }
+        | Expr::IsType { expr: object, .. } => {
+            collect_expr(object, state, resolution, mutations, facts)
         }
-        Expr::FunctionCall { args, .. }
-        | Expr::StaticCall { args, .. }
-        | Expr::New { args, .. } => {
-            for argument in args {
-                collect_expr(argument, state, resolution, facts);
-            }
+        Expr::MethodCall {
+            object,
+            method,
+            args,
+            ..
+        } => {
+            let state = collect_expr(object, state, resolution, mutations, facts);
+            let mut state = collect_expr_sequence(args, &state, resolution, mutations, facts);
+            kill_arguments_for_modes(args, mutations.method_modes(method), &mut state, resolution);
+            state
+        }
+        Expr::FunctionCall { name, args, .. } => {
+            let mut state = collect_expr_sequence(args, state, resolution, mutations, facts);
+            kill_arguments_for_modes(args, mutations.function_modes(name), &mut state, resolution);
+            state
+        }
+        Expr::StaticCall {
+            qualifier,
+            method,
+            args,
+            ..
+        } => {
+            let mut state = collect_expr_sequence(args, state, resolution, mutations, facts);
+            kill_arguments_for_modes(
+                args,
+                mutations.static_method_modes(qualifier, method),
+                &mut state,
+                resolution,
+            );
+            state
+        }
+        Expr::New {
+            class_name, args, ..
+        } => {
+            let mut state = collect_expr_sequence(args, state, resolution, mutations, facts);
+            kill_arguments_for_modes(
+                args,
+                mutations.constructor_modes(class_name),
+                &mut state,
+                resolution,
+            );
+            state
         }
         Expr::InterpolatedString { parts, .. } => {
+            let mut state = state.clone();
             for part in parts {
                 if let crate::ast::InterpolatedStringPart::Expr(expr) = part {
-                    collect_expr(expr, state, resolution, facts);
+                    state = collect_expr(expr, &state, resolution, mutations, facts);
                 }
             }
+            state
         }
         Expr::Array { elements, .. } => {
+            let mut state = state.clone();
             for element in elements {
                 if let Some(key) = &element.key {
-                    collect_expr(key, state, resolution, facts);
+                    state = collect_expr(key, &state, resolution, mutations, facts);
                 }
-                collect_expr(&element.value, state, resolution, facts);
+                state = collect_expr(&element.value, &state, resolution, mutations, facts);
             }
+            state
         }
         Expr::Binary {
             left,
@@ -737,10 +820,13 @@ fn collect_expr(expr: &Expr, state: &State, resolution: &Resolution, facts: &mut
             right,
             ..
         } => {
-            collect_expr(left, state, resolution, facts);
+            collect_expr(left, state, resolution, mutations, facts);
             let mut right_state = state.clone();
-            apply_condition(left, true, &mut right_state, resolution);
-            collect_expr(right, &right_state, resolution, facts);
+            apply_condition_with_effects(left, true, &mut right_state, resolution, mutations);
+            collect_expr(right, &right_state, resolution, mutations, facts);
+            let mut result = state.clone();
+            kill_mutated_call_arguments(expr, &mut result, resolution, mutations);
+            result
         }
         Expr::Binary {
             left,
@@ -748,10 +834,13 @@ fn collect_expr(expr: &Expr, state: &State, resolution: &Resolution, facts: &mut
             right,
             ..
         } => {
-            collect_expr(left, state, resolution, facts);
+            collect_expr(left, state, resolution, mutations, facts);
             let mut right_state = state.clone();
-            apply_condition(left, false, &mut right_state, resolution);
-            collect_expr(right, &right_state, resolution, facts);
+            apply_condition_with_effects(left, false, &mut right_state, resolution, mutations);
+            collect_expr(right, &right_state, resolution, mutations, facts);
+            let mut result = state.clone();
+            kill_mutated_call_arguments(expr, &mut result, resolution, mutations);
+            result
         }
         Expr::Binary { left, right, .. }
         | Expr::Range {
@@ -759,8 +848,8 @@ fn collect_expr(expr: &Expr, state: &State, resolution: &Resolution, facts: &mut
             end: right,
             ..
         } => {
-            collect_expr(left, state, resolution, facts);
-            collect_expr(right, state, resolution, facts);
+            let state = collect_expr(left, state, resolution, mutations, facts);
+            collect_expr(right, &state, resolution, mutations, facts)
         }
         Expr::This { .. }
         | Expr::Identifier { .. }
@@ -770,8 +859,20 @@ fn collect_expr(expr: &Expr, state: &State, resolution: &Resolution, facts: &mut
         | Expr::Bool { .. }
         | Expr::Null { .. }
         | Expr::StaticMember { .. }
-        | Expr::Variable { .. } => {}
+        | Expr::Variable { .. } => state.clone(),
     }
+}
+
+fn collect_expr_sequence(
+    expressions: &[Expr],
+    state: &State,
+    resolution: &Resolution,
+    mutations: &MutationCatalog,
+    facts: &mut FactsByUse,
+) -> State {
+    expressions.iter().fold(state.clone(), |state, expression| {
+        collect_expr(expression, &state, resolution, mutations, facts)
+    })
 }
 
 fn variable_binding(expr: &Expr, resolution: &Resolution) -> Option<BindingId> {

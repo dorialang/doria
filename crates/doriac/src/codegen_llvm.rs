@@ -1050,8 +1050,9 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             mir::NullableClassExpression::NullSafeProperty {
                 object, property, ..
             } => {
+                let owned_receiver = object.owned_temporary_class();
                 let object = self.lower_nullable_class_expression(object)?;
-                self.lower_null_safe_pointer(object, |lowerer| {
+                self.lower_null_safe_pointer(object, owned_receiver, |lowerer| {
                     Ok(build(lowerer.builder.build_load(
                         pointer,
                         lowerer.lower_property_address_from_value(object, *property)?,
@@ -1066,8 +1067,9 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 args,
                 ..
             } => {
+                let owned_receiver = object.owned_temporary_class();
                 let object = self.lower_nullable_class_expression(object)?;
-                self.lower_null_safe_pointer(object, |lowerer| {
+                self.lower_null_safe_pointer(object, owned_receiver, |lowerer| {
                     Ok(lowerer
                         .lower_method_call(object, *function, args, true)?
                         .ok_or_else(|| malformed_mir("null-safe class call produced no result"))?
@@ -1080,6 +1082,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
     fn lower_null_safe_pointer(
         &mut self,
         object: PointerValue<'ctx>,
+        owned_receiver: Option<crate::class_layout::ClassId>,
         present_value: impl FnOnce(&mut Self) -> Result<PointerValue<'ctx>, BackendError>,
     ) -> Result<PointerValue<'ctx>, BackendError> {
         let function = current_function(&self.builder)?;
@@ -1106,7 +1109,11 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         let null = pointer.const_null();
         let phi = build(self.builder.build_phi(pointer, "null-safe.pointer"))?;
         phi.add_incoming(&[(&value, some_end), (&null, none_end)]);
-        Ok(phi.as_basic_value().into_pointer_value())
+        let result = phi.as_basic_value().into_pointer_value();
+        if let Some(class) = owned_receiver {
+            self.defer_or_drop_class_temporary(object, class)?;
+        }
+        Ok(result)
     }
 
     fn lower_property_address(
@@ -1234,8 +1241,9 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 .ok_or_else(|| malformed_mir("nullable-string call produced no result"))?
                 .into_struct_value()),
             mir::NullableStringExpression::NullSafeProperty { object, property } => {
+                let owned_receiver = object.owned_temporary_class();
                 let object = self.lower_nullable_class_expression(object)?;
-                self.lower_null_safe_nullable(pointer.into(), object, |lowerer| {
+                self.lower_null_safe_nullable(pointer.into(), object, owned_receiver, |lowerer| {
                     let property = property_definition(lowerer.program, *property)?;
                     let value = build(lowerer.builder.build_load(
                         llvm_type(lowerer.context, lowerer.target_data, property.ty),
@@ -1261,8 +1269,9 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 function,
                 args,
             } => {
+                let owned_receiver = object.owned_temporary_class();
                 let object = self.lower_nullable_class_expression(object)?;
-                self.lower_null_safe_nullable(pointer.into(), object, |lowerer| {
+                self.lower_null_safe_nullable(pointer.into(), object, owned_receiver, |lowerer| {
                     lowerer
                         .lower_method_call(object, *function, args, true)?
                         .ok_or_else(|| malformed_mir("null-safe string call produced no result"))
@@ -1328,8 +1337,9 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             mir::NullableScalarExpression::NullSafeProperty {
                 object, property, ..
             } => {
+                let owned_receiver = object.owned_temporary_class();
                 let object = self.lower_nullable_class_expression(object)?;
-                self.lower_null_safe_nullable(payload_type, object, |lowerer| {
+                self.lower_null_safe_nullable(payload_type, object, owned_receiver, |lowerer| {
                     let property = property_definition(lowerer.program, *property)?;
                     build(lowerer.builder.build_load(
                         llvm_type(lowerer.context, lowerer.target_data, property.ty),
@@ -1344,8 +1354,9 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 args,
                 ..
             } => {
+                let owned_receiver = object.owned_temporary_class();
                 let object = self.lower_nullable_class_expression(object)?;
-                self.lower_null_safe_nullable(payload_type, object, |lowerer| {
+                self.lower_null_safe_nullable(payload_type, object, owned_receiver, |lowerer| {
                     lowerer
                         .lower_method_call(object, *function, args, true)?
                         .ok_or_else(|| malformed_mir("null-safe scalar call produced no result"))
@@ -1358,6 +1369,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         &mut self,
         payload_type: BasicTypeEnum<'ctx>,
         object: PointerValue<'ctx>,
+        owned_receiver: Option<crate::class_layout::ClassId>,
         present_value: impl FnOnce(&mut Self) -> Result<BasicValueEnum<'ctx>, BackendError>,
     ) -> Result<StructValue<'ctx>, BackendError> {
         let function = current_function(&self.builder)?;
@@ -1394,7 +1406,11 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 .build_phi(self.nullable_type(payload_type), "null-safe.nullable"),
         )?;
         phi.add_incoming(&[(&value, some_end), (&absent, none_end)]);
-        Ok(phi.as_basic_value().into_struct_value())
+        let result = phi.as_basic_value().into_struct_value();
+        if let Some(class) = owned_receiver {
+            self.defer_or_drop_class_temporary(object, class)?;
+        }
+        Ok(result)
     }
 
     fn lower_null_safe_statement_call(

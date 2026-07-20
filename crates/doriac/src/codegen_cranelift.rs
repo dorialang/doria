@@ -1464,17 +1464,25 @@ fn lower_nullable_class_expression(
         mir::NullableClassExpression::NullSafeProperty {
             object, property, ..
         } => {
+            let owned_receiver = object.owned_temporary_class();
             let object = lower_nullable_class_expression(builder, object, resources)?;
-            lower_null_safe_single(builder, object, pointer, resources, |builder, resources| {
-                let address =
-                    lower_property_address_from_value(builder, object, *property, resources)?;
-                Ok(builder.ins().load(
-                    pointer,
-                    cranelift_codegen::ir::MachMemFlags::trusted(),
-                    address,
-                    0,
-                ))
-            })
+            lower_null_safe_single(
+                builder,
+                object,
+                pointer,
+                owned_receiver,
+                resources,
+                |builder, resources| {
+                    let address =
+                        lower_property_address_from_value(builder, object, *property, resources)?;
+                    Ok(builder.ins().load(
+                        pointer,
+                        cranelift_codegen::ir::MachMemFlags::trusted(),
+                        address,
+                        0,
+                    ))
+                },
+            )
         }
         mir::NullableClassExpression::NullSafeCall {
             object,
@@ -1482,12 +1490,20 @@ fn lower_nullable_class_expression(
             args,
             ..
         } => {
+            let owned_receiver = object.owned_temporary_class();
             let object = lower_nullable_class_expression(builder, object, resources)?;
-            lower_null_safe_single(builder, object, pointer, resources, |builder, resources| {
-                lower_method_call_with_receiver(builder, object, *function, args, resources)?
-                    .ok_or_else(|| malformed_mir("null-safe class call produced no result"))?
-                    .single()
-            })
+            lower_null_safe_single(
+                builder,
+                object,
+                pointer,
+                owned_receiver,
+                resources,
+                |builder, resources| {
+                    lower_method_call_with_receiver(builder, object, *function, args, resources)?
+                        .ok_or_else(|| malformed_mir("null-safe class call produced no result"))?
+                        .single()
+                },
+            )
         }
     }
 }
@@ -1496,6 +1512,7 @@ fn lower_null_safe_single(
     builder: &mut FunctionBuilder,
     object: Value,
     result_type: ClifType,
+    owned_receiver: Option<crate::class_layout::ClassId>,
     resources: &mut LoweringResources<'_, '_>,
     present_value: impl FnOnce(
         &mut FunctionBuilder,
@@ -1518,7 +1535,11 @@ fn lower_null_safe_single(
     let zero = builder.ins().iconst(result_type, 0);
     builder.ins().jump(done, &[BlockArg::Value(zero)]);
     builder.switch_to_block(done);
-    Ok(builder.block_params(done)[0])
+    let result = builder.block_params(done)[0];
+    if let Some(class) = owned_receiver {
+        defer_or_drop_class_temporary(builder, object, class, resources)?;
+    }
+    Ok(result)
 }
 
 fn lower_drop_class_value_checked(
@@ -1860,33 +1881,49 @@ fn lower_nullable_string_expression(
                 .ok_or_else(|| malformed_mir("nullable-string call produced no result"))
         }
         mir::NullableStringExpression::NullSafeProperty { object, property } => {
+            let owned_receiver = object.owned_temporary_class();
             let object = lower_nullable_class_expression(builder, object, resources)?;
-            lower_null_safe_nullable(builder, object, pointer, resources, |builder, resources| {
-                let address =
-                    lower_property_address_from_value(builder, object, *property, resources)?;
-                let ty = property_definition(resources.program, *property)?.ty;
-                let value = load_lowered_from_address(builder, ty, address, pointer);
-                match value {
-                    LoweredValue::Single(payload) => Ok(LoweredValue::Single(retain_string(
-                        builder, payload, resources,
-                    )?)),
-                    LoweredValue::Nullable { present, payload } => Ok(LoweredValue::Nullable {
-                        present,
-                        payload: retain_string(builder, payload, resources)?,
-                    }),
-                }
-            })
+            lower_null_safe_nullable(
+                builder,
+                object,
+                pointer,
+                owned_receiver,
+                resources,
+                |builder, resources| {
+                    let address =
+                        lower_property_address_from_value(builder, object, *property, resources)?;
+                    let ty = property_definition(resources.program, *property)?.ty;
+                    let value = load_lowered_from_address(builder, ty, address, pointer);
+                    match value {
+                        LoweredValue::Single(payload) => Ok(LoweredValue::Single(retain_string(
+                            builder, payload, resources,
+                        )?)),
+                        LoweredValue::Nullable { present, payload } => Ok(LoweredValue::Nullable {
+                            present,
+                            payload: retain_string(builder, payload, resources)?,
+                        }),
+                    }
+                },
+            )
         }
         mir::NullableStringExpression::NullSafeCall {
             object,
             function,
             args,
         } => {
+            let owned_receiver = object.owned_temporary_class();
             let object = lower_nullable_class_expression(builder, object, resources)?;
-            lower_null_safe_nullable(builder, object, pointer, resources, |builder, resources| {
-                lower_method_call_with_receiver(builder, object, *function, args, resources)?
-                    .ok_or_else(|| malformed_mir("null-safe string call produced no result"))
-            })
+            lower_null_safe_nullable(
+                builder,
+                object,
+                pointer,
+                owned_receiver,
+                resources,
+                |builder, resources| {
+                    lower_method_call_with_receiver(builder, object, *function, args, resources)?
+                        .ok_or_else(|| malformed_mir("null-safe string call produced no result"))
+                },
+            )
         }
     }
 }
@@ -1942,11 +1979,13 @@ fn lower_nullable_scalar_expression(
         mir::NullableScalarExpression::NullSafeProperty {
             object, property, ..
         } => {
+            let owned_receiver = object.owned_temporary_class();
             let object = lower_nullable_class_expression(builder, object, resources)?;
             lower_null_safe_nullable(
                 builder,
                 object,
                 clif_scalar_type(ty),
+                owned_receiver,
                 resources,
                 |builder, resources| {
                     let address =
@@ -1967,11 +2006,13 @@ fn lower_nullable_scalar_expression(
             args,
             ..
         } => {
+            let owned_receiver = object.owned_temporary_class();
             let object = lower_nullable_class_expression(builder, object, resources)?;
             lower_null_safe_nullable(
                 builder,
                 object,
                 clif_scalar_type(ty),
+                owned_receiver,
                 resources,
                 |builder, resources| {
                     lower_method_call_with_receiver(builder, object, *function, args, resources)?
@@ -1995,6 +2036,7 @@ fn lower_null_safe_nullable(
     builder: &mut FunctionBuilder,
     object: Value,
     payload_type: ClifType,
+    owned_receiver: Option<crate::class_layout::ClassId>,
     resources: &mut LoweringResources<'_, '_>,
     present_value: impl FnOnce(
         &mut FunctionBuilder,
@@ -2035,10 +2077,14 @@ fn lower_null_safe_nullable(
         .ins()
         .jump(done, &[BlockArg::Value(absent), BlockArg::Value(payload)]);
     builder.switch_to_block(done);
-    Ok(LoweredValue::Nullable {
+    let result = LoweredValue::Nullable {
         present: builder.block_params(done)[0],
         payload: builder.block_params(done)[1],
-    })
+    };
+    if let Some(class) = owned_receiver {
+        defer_or_drop_class_temporary(builder, object, class, resources)?;
+    }
+    Ok(result)
 }
 
 fn lower_null_safe_statement_call(

@@ -965,10 +965,15 @@ fn nullable_class_temporary_capacity(value: &NullableClassExpression) -> usize {
     match value {
         NullableClassExpression::Class(value) => class_expression_temporary_capacity(value),
         NullableClassExpression::Call { args, .. } => {
-            args.iter().map(rvalue_class_temporary_capacity).sum()
+            usize::from(value.owned_temporary_class().is_some())
+                + args
+                    .iter()
+                    .map(rvalue_class_temporary_capacity)
+                    .sum::<usize>()
         }
         NullableClassExpression::NullSafeCall { object, args, .. } => {
-            nullable_class_temporary_capacity(object)
+            usize::from(value.owned_temporary_class().is_some())
+                + nullable_class_temporary_capacity(object)
                 + args
                     .iter()
                     .map(rvalue_class_temporary_capacity)

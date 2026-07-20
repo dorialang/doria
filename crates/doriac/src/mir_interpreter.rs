@@ -130,11 +130,13 @@ enum EvaluationTask {
     AfterNullSafeProperty {
         property: crate::class_layout::PropertyId,
         result: mir::Type,
+        owned_receiver: Option<crate::class_layout::ClassId>,
     },
     AfterNullSafeCall {
         function: mir::FunctionId,
         args: Vec<mir::Rvalue>,
         result: mir::Type,
+        owned_receiver: Option<crate::class_layout::ClassId>,
     },
     AfterNullSafeStatementCall {
         function: mir::FunctionId,
@@ -898,9 +900,18 @@ impl Interpreter<'_> {
                         .push(EvaluationTask::Class(right));
                 }
             }
-            EvaluationTask::AfterNullSafeProperty { property, result } => {
-                let (_, object) = self.pop_nullable_class()?;
+            EvaluationTask::AfterNullSafeProperty {
+                property,
+                result,
+                owned_receiver,
+            } => {
+                let (class, object) = self.pop_nullable_class()?;
                 if let Some(object) = object {
+                    if owned_receiver.is_some() {
+                        self.current_frame_mut()?
+                            .statement_temporary_drops
+                            .push((object, class));
+                    }
                     let value = self.read_object_property(object, property)?;
                     self.push_nullable_from_value(result, value)?;
                 } else {
@@ -911,9 +922,15 @@ impl Interpreter<'_> {
                 function,
                 args,
                 result,
+                owned_receiver,
             } => {
                 let (class, object) = self.pop_nullable_class()?;
                 if let Some(object) = object {
+                    if owned_receiver.is_some() {
+                        self.current_frame_mut()?
+                            .statement_temporary_drops
+                            .push((object, class));
+                    }
                     self.queue_null_safe_call(object, class, function, args, result)?;
                 } else {
                     self.push_null(result)?;
@@ -1664,10 +1681,12 @@ impl Interpreter<'_> {
             mir::NullableScalarExpression::NullSafeProperty {
                 object, property, ..
             } => {
+                let owned_receiver = object.owned_temporary_class();
                 let frame = self.current_frame_mut()?;
                 frame.tasks.push(EvaluationTask::AfterNullSafeProperty {
                     property,
                     result: mir::Type::NullableScalar(ty),
+                    owned_receiver,
                 });
                 frame.tasks.push(EvaluationTask::NullableClass(*object));
             }
@@ -1677,11 +1696,13 @@ impl Interpreter<'_> {
                 args,
                 ..
             } => {
+                let owned_receiver = object.owned_temporary_class();
                 let frame = self.current_frame_mut()?;
                 frame.tasks.push(EvaluationTask::AfterNullSafeCall {
                     function,
                     args,
                     result: mir::Type::NullableScalar(ty),
+                    owned_receiver,
                 });
                 frame.tasks.push(EvaluationTask::NullableClass(*object));
             }
@@ -1761,10 +1782,12 @@ impl Interpreter<'_> {
                 )?;
             }
             mir::NullableStringExpression::NullSafeProperty { object, property } => {
+                let owned_receiver = object.owned_temporary_class();
                 let frame = self.current_frame_mut()?;
                 frame.tasks.push(EvaluationTask::AfterNullSafeProperty {
                     property,
                     result: mir::Type::NullableString,
+                    owned_receiver,
                 });
                 frame.tasks.push(EvaluationTask::NullableClass(*object));
             }
@@ -1773,11 +1796,13 @@ impl Interpreter<'_> {
                 function,
                 args,
             } => {
+                let owned_receiver = object.owned_temporary_class();
                 let frame = self.current_frame_mut()?;
                 frame.tasks.push(EvaluationTask::AfterNullSafeCall {
                     function,
                     args,
                     result: mir::Type::NullableString,
+                    owned_receiver,
                 });
                 frame.tasks.push(EvaluationTask::NullableClass(*object));
             }
@@ -2020,10 +2045,12 @@ impl Interpreter<'_> {
             mir::NullableClassExpression::NullSafeProperty {
                 object, property, ..
             } => {
+                let owned_receiver = object.owned_temporary_class();
                 let frame = self.current_frame_mut()?;
                 frame.tasks.push(EvaluationTask::AfterNullSafeProperty {
                     property,
                     result: mir::Type::NullableClass(class),
+                    owned_receiver,
                 });
                 frame.tasks.push(EvaluationTask::NullableClass(*object));
             }
@@ -2033,11 +2060,13 @@ impl Interpreter<'_> {
                 args,
                 ..
             } => {
+                let owned_receiver = object.owned_temporary_class();
                 let frame = self.current_frame_mut()?;
                 frame.tasks.push(EvaluationTask::AfterNullSafeCall {
                     function,
                     args,
                     result: mir::Type::NullableClass(class),
+                    owned_receiver,
                 });
                 frame.tasks.push(EvaluationTask::NullableClass(*object));
             }

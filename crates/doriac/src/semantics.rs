@@ -2772,7 +2772,7 @@ impl<'program> Checker<'program> {
     fn check_else_branch(
         &mut self,
         branch: &ElseBranch,
-        scopes: &mut ScopeStack,
+        scopes: &ScopeStack,
         method_context: Option<&MethodContext>,
         constructor_init_context: Option<&ConstructorInitContext>,
         return_context: Option<&ReturnContext>,
@@ -2781,11 +2781,12 @@ impl<'program> Checker<'program> {
         match branch {
             ElseBranch::If(if_stmt) => {
                 self.check_condition(&if_stmt.condition, scopes, method_context);
+                let mut then_scopes = scopes.clone();
                 let mut then_constructor_init_context =
                     constructor_init_context.map(ConstructorInitContext::nested);
                 self.check_block(
                     &if_stmt.then_block,
-                    scopes,
+                    &mut then_scopes,
                     method_context,
                     then_constructor_init_context.as_mut(),
                     return_context,
@@ -2803,11 +2804,12 @@ impl<'program> Checker<'program> {
                 }
             }
             ElseBranch::Block(block) => {
+                let mut block_scopes = scopes.clone();
                 let mut block_constructor_init_context =
                     constructor_init_context.map(ConstructorInitContext::nested);
                 self.check_block(
                     block,
-                    scopes,
+                    &mut block_scopes,
                     method_context,
                     block_constructor_init_context.as_mut(),
                     return_context,
@@ -3700,7 +3702,9 @@ impl<'program> Checker<'program> {
     ) {
         let (left_ty, right_ty) =
             self.infer_contextual_binary_operand_types(left, right, scopes, method_context);
-        if self.is_equality_compatible(left_ty, right_ty) {
+        if self.is_supported_nullable_equality(left, left_ty, right, right_ty)
+            || self.is_equality_compatible(left_ty, right_ty)
+        {
             return;
         }
 
@@ -3825,7 +3829,55 @@ impl<'program> Checker<'program> {
             return false;
         }
 
+        if matches!(
+            self.types.kind(left),
+            TypeKind::Nullable(_) | TypeKind::Null
+        ) || matches!(
+            self.types.kind(right),
+            TypeKind::Nullable(_) | TypeKind::Null
+        ) {
+            return false;
+        }
+
         self.is_assignable(left, right) || self.is_assignable(right, left)
+    }
+
+    fn is_supported_nullable_equality(
+        &self,
+        left: &Expr,
+        left_ty: TypeId,
+        right: &Expr,
+        right_ty: TypeId,
+    ) -> bool {
+        let left_is_null = Self::is_null_literal(left);
+        let right_is_null = Self::is_null_literal(right);
+        if left_is_null || right_is_null {
+            if left_is_null && right_is_null {
+                return false;
+            }
+            let other = if left_is_null { right_ty } else { left_ty };
+            return matches!(self.types.kind(other), TypeKind::Nullable(_));
+        }
+
+        matches!(
+            (self.types.kind(left_ty), self.types.kind(right_ty)),
+            (TypeKind::String, TypeKind::Nullable(inner))
+                | (TypeKind::Nullable(inner), TypeKind::String)
+                if matches!(self.types.kind(*inner), TypeKind::String)
+        ) || matches!(
+            (self.types.kind(left_ty), self.types.kind(right_ty)),
+            (TypeKind::Nullable(left), TypeKind::Nullable(right))
+                if matches!(self.types.kind(*left), TypeKind::String)
+                    && matches!(self.types.kind(*right), TypeKind::String)
+        )
+    }
+
+    fn is_null_literal(expr: &Expr) -> bool {
+        match expr {
+            Expr::Grouped { expr, .. } => Self::is_null_literal(expr),
+            Expr::Null { .. } => true,
+            _ => false,
+        }
     }
 
     fn logical_operator_name(op: &BinaryOp) -> &'static str {
@@ -6021,11 +6073,18 @@ impl<'program> Checker<'program> {
                         }
                     }
                     Some(crate::narrowing::Fact::Null) => self.types.intern(TypeKind::Null),
-                    Some(crate::narrowing::Fact::Exact(ty)) => self.resolve_type_ref_with_class(
-                        &ty,
-                        *span,
-                        method_context.map(|context| context.class_name.as_str()),
-                    ),
+                    Some(crate::narrowing::Fact::Exact(ty)) => {
+                        let tested = self.resolve_type_ref_with_class(
+                            &ty,
+                            *span,
+                            method_context.map(|context| context.class_name.as_str()),
+                        );
+                        if self.exact_type_test_can_match(binding.declared_ty, tested) {
+                            tested
+                        } else {
+                            binding.ty
+                        }
+                    }
                     None => binding.ty,
                 }
             }
@@ -6507,6 +6566,14 @@ impl<'program> Checker<'program> {
             .collect()
     }
 
+    fn exact_type_test_can_match(&self, value: TypeId, tested: TypeId) -> bool {
+        match self.types.kind(value).clone() {
+            TypeKind::Mixed | TypeKind::Unknown => true,
+            TypeKind::Nullable(inner) => inner == tested,
+            _ => value == tested,
+        }
+    }
+
     fn common_clear_type(&mut self, types: Vec<TypeId>) -> TypeId {
         let mut common = None;
         let mut saw_empty_collection = false;
@@ -6685,7 +6752,11 @@ impl<'program> Checker<'program> {
             return;
         }
 
-        let tested = self.resolve_type_ref(ty, span);
+        let tested = self.resolve_type_ref_with_class(
+            ty,
+            span,
+            method_context.map(|context| context.class_name.as_str()),
+        );
         if ty.nullable
             || !matches!(
                 self.types.kind(tested),

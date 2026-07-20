@@ -130,6 +130,135 @@ function read(?Label $label): string
 }
 
 #[test]
+fn branch_assignments_join_without_leaking_sibling_scope_facts() {
+    let invalid = diagnostics(
+        r#"
+function read(bool $condition): int
+{
+    writable ?int $value = null;
+    if ($condition) {} else { $value = 1; }
+    return $value + 1;
+}
+"#,
+    );
+    assert!(
+        invalid
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("nullable")
+                || diagnostic.message.contains("?int")),
+        "one branch must not narrow the post-if value: {invalid:#?}"
+    );
+
+    doriac::check_source(
+        "stage22-branch-join.doria",
+        r#"
+function read(bool $condition): int
+{
+    writable ?int $value = null;
+    if ($condition) { $value = 1; } else { $value = 2; }
+    return $value + 1;
+}
+"#,
+    )
+    .expect("matching non-null assignments on every path should narrow after the join");
+}
+
+#[test]
+fn short_circuit_rhs_uses_see_prior_call_mutations() {
+    let invalid = diagnostics(
+        r#"
+function clear(writable ?int $value): bool { $value = null; return true; }
+function read(?int $value): bool
+{
+    return $value != null && clear($value) && $value > 0;
+}
+"#,
+    );
+    assert!(
+        invalid
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("nullable")
+                || diagnostic.message.contains("?int")),
+        "the final operand must observe the writable call's invalidation: {invalid:#?}"
+    );
+}
+
+#[test]
+fn impossible_is_tests_do_not_change_variable_types() {
+    let invalid = diagnostics(
+        r#"
+function read(?int $value): string
+{
+    if ($value is string) { return $value; }
+    return "none";
+}
+"#,
+    );
+    assert!(
+        invalid
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("return")
+                || diagnostic.message.contains("string")),
+        "an impossible test must not retag the source binding: {invalid:#?}"
+    );
+
+    let program = doriac::lower_source_to_mir(
+        "stage22-impossible-is.doria",
+        r#"
+function main(): void
+{
+    ?int $value = 1;
+    if ($value is string) { echo "wrong"; }
+    echo "ok";
+}
+"#,
+    )
+    .expect("an impossible exact test with a valid body should lower as false");
+    let output = doriac::mir_interpreter::interpret(&program)
+        .expect("the impossible exact test should execute");
+    assert_eq!(output.stdout, b"ok");
+}
+
+#[test]
+fn self_resolves_in_exact_type_tests() {
+    doriac::check_source(
+        "stage22-self-is.doria",
+        r#"
+class Label
+{
+    function matches(?Label $value): bool { return $value is self; }
+}
+"#,
+    )
+    .expect("self should resolve to the declaring class in an exact type test");
+}
+
+#[test]
+fn nullable_equality_matches_the_native_lowering_boundary() {
+    for source in [
+        "function equal(?int $left, ?int $right): bool { return $left == $right; }",
+        "function equal(): bool { return null == null; }",
+        r#"
+class Label {}
+function equal(?Label $left, ?Label $right): bool { return $left == $right; }
+"#,
+    ] {
+        assert_code(source, "E0420");
+    }
+
+    doriac::check_source(
+        "stage22-nullable-string-equality.doria",
+        "function equal(?string $left, ?string $right): bool { return $left == $right; }",
+    )
+    .expect("nullable string equality has native lowering support");
+    doriac::check_source(
+        "stage22-null-equality.doria",
+        "function empty(?int $value): bool { return $value == null; }",
+    )
+    .expect("literal null checks remain supported for every nullable payload");
+}
+
+#[test]
 fn mixed_rejects_operations_until_is_narrows_the_value() {
     for (operation, expected_code) in [
         ("let $result = $value->name;", "E0433"),
@@ -470,6 +599,46 @@ function main(): void
         output.stdout,
         b"<method><static><temp>:value:empty:code:none:none:called<present>:value<chosen><owner>"
     );
+    assert!(output.stderr.is_empty());
+    assert_eq!(output.exit_status, 0);
+}
+
+#[test]
+fn owned_nullable_call_results_live_through_their_statement() {
+    let source = r#"
+class Tracked
+{
+    ?string $label = "property";
+    function __construct(string $name) {}
+    function __destruct() { echo "<" . $this->name . ">"; }
+    function maybeLabel(): ?string { return "method"; }
+}
+
+function make(string $name): ?Tracked { return new Tracked($name); }
+function inspect(?Tracked $value): void {}
+
+function main(): void
+{
+    echo make("call")?->maybeLabel() ?? "none";
+    echo ":";
+    echo make("property")?->label ?? "none";
+    inspect(make("argument"));
+}
+"#;
+    let program = doriac::lower_source_to_mir("stage22-nullable-temporaries.doria", source)
+        .expect("owned nullable call results should lower in receiver and argument positions");
+    doriac::mir_validation::validate_program(&program)
+        .expect("nullable temporary MIR should validate");
+    assert!(!doriac::codegen_cranelift::lower_mir_to_object(&program)
+        .expect("Cranelift should reserve and consume nullable temporary slots")
+        .is_empty());
+    #[cfg(feature = "llvm-backend")]
+    assert!(!doriac::codegen_llvm::lower_mir_to_object(&program)
+        .expect("LLVM should reserve and consume nullable temporary slots")
+        .is_empty());
+    let output = doriac::mir_interpreter::interpret(&program)
+        .expect("nullable receivers and arguments should drop after their statement");
+    assert_eq!(output.stdout, b"method<call>:property<property><argument>");
     assert!(output.stderr.is_empty());
     assert_eq!(output.exit_status, 0);
 }
