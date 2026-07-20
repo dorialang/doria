@@ -10,7 +10,7 @@ mod device_io;
 mod file_io;
 mod line_io;
 
-use device_io::StandardStream;
+use device_io::{StandardStream, WriteOutcome};
 
 const PANIC_STATUS: i32 = 101;
 #[cfg(unix)]
@@ -124,7 +124,9 @@ pub unsafe extern "C" fn dr_v1_main_void(entry: DrMainVoidV1) -> i32 {
     0
 }
 
-/// Writes an exact byte sequence to stdout or panics when the write fails.
+/// Writes an exact byte sequence to stdout.
+///
+/// A closed downstream pipe exits cleanly with status 0. Other write failures panic.
 ///
 /// # Safety
 ///
@@ -136,11 +138,10 @@ pub unsafe extern "C" fn dr_v1_write_stdout(
     bytes: *const u8,
     byte_length: usize,
 ) {
-    #[cfg(unix)]
-    ignore_sigpipe();
-
-    if device_io::write(StandardStream::Stdout, bytes, byte_length) {
-        return;
+    match write_standard_stream(StandardStream::Stdout, bytes, byte_length) {
+        WriteOutcome::Success => return,
+        WriteOutcome::BrokenPipe => exit_process(0),
+        WriteOutcome::OtherFailure => {}
     }
     static MESSAGE: &[u8] = b"failed to write stdout";
     dr_v1_panic(current_frame, MESSAGE.as_ptr(), MESSAGE.len())
@@ -148,13 +149,17 @@ pub unsafe extern "C" fn dr_v1_write_stdout(
 
 /// Writes an exact byte sequence to stderr.
 ///
+/// A closed downstream pipe exits cleanly with status 0. Other failures exit with status 101.
+///
 /// # Safety
 ///
 /// `bytes` must be readable for `byte_length` bytes.
 #[no_mangle]
 pub unsafe extern "C" fn dr_v1_write_stderr(bytes: *const u8, byte_length: usize) {
-    if !device_io::write(StandardStream::Stderr, bytes, byte_length) {
-        exit_process(PANIC_STATUS);
+    match write_standard_stream(StandardStream::Stderr, bytes, byte_length) {
+        WriteOutcome::Success => {}
+        WriteOutcome::BrokenPipe => exit_process(0),
+        WriteOutcome::OtherFailure => exit_process(PANIC_STATUS),
     }
 }
 
@@ -497,14 +502,17 @@ pub unsafe extern "C" fn dr_v1_write_string_stderr(
     current_frame: *const DrStackFrameV1,
     string: *const DrStringV1,
 ) {
-    if !device_io::write(
+    match write_standard_stream(
         StandardStream::Stderr,
         string_bytes(string),
         (*string).byte_length,
     ) {
-        static MESSAGE: &[u8] = b"failed to write stderr";
-        dr_v1_panic(current_frame, MESSAGE.as_ptr(), MESSAGE.len());
+        WriteOutcome::Success => return,
+        WriteOutcome::BrokenPipe => exit_process(0),
+        WriteOutcome::OtherFailure => {}
     }
+    static MESSAGE: &[u8] = b"failed to write stderr";
+    dr_v1_panic(current_frame, MESSAGE.as_ptr(), MESSAGE.len());
 }
 
 #[no_mangle]
@@ -947,9 +955,22 @@ unsafe fn write_panic_fragment(bytes: &[u8]) {
 }
 
 unsafe fn write_panic_bytes(bytes: *const u8, byte_length: usize) {
-    if !device_io::write(StandardStream::Stderr, bytes, byte_length) {
-        exit_process(PANIC_STATUS);
+    match write_standard_stream(StandardStream::Stderr, bytes, byte_length) {
+        WriteOutcome::Success => {}
+        WriteOutcome::BrokenPipe => exit_process(0),
+        WriteOutcome::OtherFailure => exit_process(PANIC_STATUS),
     }
+}
+
+unsafe fn write_standard_stream(
+    stream: StandardStream,
+    bytes: *const u8,
+    byte_length: usize,
+) -> WriteOutcome {
+    #[cfg(unix)]
+    ignore_sigpipe();
+
+    device_io::write(stream, bytes, byte_length)
 }
 
 #[cfg(unix)]

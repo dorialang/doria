@@ -1,0 +1,8 @@
+function main(): void
+{
+    let writable $index = 0;
+    while ($index < 10000) {
+        echo "Doria output deliberately exceeds the native pipe buffer.\n";
+        $index += 1;
+    }
+}

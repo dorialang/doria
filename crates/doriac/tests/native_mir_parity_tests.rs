@@ -9,6 +9,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use doriac::backend::NativeProfile;
 
 const MANIFEST: &str = include_str!("fixtures/native_parity_examples.txt");
+const BROKEN_PIPE_STDOUT: &str = include_str!("fixtures/native_io/broken_pipe_stdout.doria");
+const BROKEN_PIPE_STDERR: &str = include_str!("fixtures/native_io/broken_pipe_stderr.doria");
 
 #[test]
 fn manifest_covers_every_native_example() {
@@ -96,6 +98,99 @@ fn interpreter_cranelift_and_enabled_llvm_match_for_the_durable_native_manifest(
             assert_matches_interpreter(&relative_path, "LLVM release", &interpreted, &release);
         }
     }
+}
+
+#[test]
+fn enabled_native_backends_exit_cleanly_when_an_output_pipe_closes() {
+    if !host_linker_is_available() {
+        let message = format!("native parity requires host linker {}", host_linker());
+        if std::env::var_os("CI").is_some() {
+            panic!("{message}; CI must not skip the parity matrix");
+        }
+        eprintln!("{message}; skipping local executable parity");
+        return;
+    }
+
+    for (name, source, closed_stream) in [
+        ("stdout", BROKEN_PIPE_STDOUT, ClosedStream::Stdout),
+        ("stderr", BROKEN_PIPE_STDERR, ClosedStream::Stderr),
+    ] {
+        let hir = doriac::lower_source(format!("broken_pipe_{name}.doria"), source.to_string())
+            .unwrap_or_else(|diagnostics| {
+                panic!("frontend rejected broken-pipe {name} fixture: {diagnostics:#?}")
+            });
+        let mir = doriac::mir_lowering::lower_program(&hir).unwrap_or_else(|diagnostics| {
+            panic!("MIR rejected broken-pipe {name} fixture: {diagnostics:#?}")
+        });
+        let interpreted = doriac::mir_interpreter::interpret(&mir).unwrap_or_else(|error| {
+            panic!("interpreter rejected broken-pipe {name} fixture: {error}")
+        });
+        assert_eq!(interpreted.exit_status, 0);
+        let emitted = match closed_stream {
+            ClosedStream::Stdout => &interpreted.stdout,
+            ClosedStream::Stderr => &interpreted.stderr,
+        };
+        assert!(
+            emitted.len() > 64 * 1024,
+            "{name} fixture must exceed a typical pipe buffer"
+        );
+
+        assert_closed_output_pipe(&mir, NativeProfile::Fast, name, closed_stream);
+        #[cfg(feature = "llvm-backend")]
+        assert_closed_output_pipe(&mir, NativeProfile::Release, name, closed_stream);
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ClosedStream {
+    Stdout,
+    Stderr,
+}
+
+fn assert_closed_output_pipe(
+    mir: &doriac::mir::Program,
+    profile: NativeProfile,
+    name: &str,
+    closed_stream: ClosedStream,
+) {
+    let backend = match profile {
+        NativeProfile::Fast => "Cranelift",
+        NativeProfile::Release => "LLVM",
+    };
+    let bytes = doriac::codegen_native::generate_executable(mir, profile)
+        .unwrap_or_else(|error| panic!("{backend} rejected broken-pipe {name} fixture: {error:?}"));
+    let directory = temp_working_directory(&format!("broken-pipe-{backend}-{name}"));
+    fs::create_dir_all(&directory).expect("broken-pipe working directory should be created");
+    let executable = directory.join(if cfg!(windows) {
+        "program.exe"
+    } else {
+        "program"
+    });
+    fs::write(&executable, bytes).expect("broken-pipe executable should be writable");
+    make_executable(&executable);
+
+    let mut child = Command::new(&executable)
+        .current_dir(&directory)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|error| panic!("failed to start {backend} {name} fixture: {error}"));
+    match closed_stream {
+        ClosedStream::Stdout => drop(child.stdout.take()),
+        ClosedStream::Stderr => drop(child.stderr.take()),
+    }
+    let output = child
+        .wait_with_output()
+        .unwrap_or_else(|error| panic!("failed to wait for {backend} {name} fixture: {error}"));
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{backend} {name} broken pipe must be a clean exit"
+    );
+    assert!(output.stdout.is_empty(), "{backend} {name} wrote stdout");
+    assert!(output.stderr.is_empty(), "{backend} {name} wrote stderr");
+    fs::remove_dir_all(directory).expect("broken-pipe working directory should be removed");
 }
 
 fn compile_and_run(
