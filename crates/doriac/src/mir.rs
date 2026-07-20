@@ -201,6 +201,17 @@ impl Rvalue {
             Self::NullableClass(value) => Type::NullableClass(value.class()),
         }
     }
+
+    pub const fn owned_temporary_class(&self) -> Option<ClassId> {
+        match self {
+            Self::Class(value) => value.owned_temporary_class(),
+            Self::NullableClass(value) => value.owned_temporary_class(),
+            Self::Value(_)
+            | Self::String(_)
+            | Self::NullableScalar(_)
+            | Self::NullableString(_) => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -587,6 +598,34 @@ impl NullableClassExpression {
             Self::Class(value) => value.class(),
         }
     }
+
+    pub const fn owned_temporary_class(&self) -> Option<ClassId> {
+        match self {
+            Self::Class(value) => value.owned_temporary_class(),
+            Self::Call {
+                class,
+                return_borrow: None,
+                ..
+            }
+            | Self::NullSafeCall {
+                class,
+                return_borrow: None,
+                ..
+            } => Some(*class),
+            Self::Null(_)
+            | Self::Local { .. }
+            | Self::Property { .. }
+            | Self::Call {
+                return_borrow: Some(_),
+                ..
+            }
+            | Self::NullSafeProperty { .. }
+            | Self::NullSafeCall {
+                return_borrow: Some(_),
+                ..
+            } => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -673,6 +712,11 @@ pub enum Statement {
         function: FunctionId,
         args: Vec<Rvalue>,
     },
+    CallNullSafe {
+        object: NullableClassExpression,
+        function: FunctionId,
+        args: Vec<Rvalue>,
+    },
     Printf(FormatExpression),
     WriteFile {
         path: StringExpression,
@@ -734,6 +778,13 @@ fn statement_class_temporary_capacity(statement: &Statement) -> usize {
         }
         Statement::CallVoid { args, .. } | Statement::CallBorrowed { args, .. } => {
             args.iter().map(rvalue_class_temporary_capacity).sum()
+        }
+        Statement::CallNullSafe { object, args, .. } => {
+            nullable_class_temporary_capacity(object)
+                + args
+                    .iter()
+                    .map(rvalue_class_temporary_capacity)
+                    .sum::<usize>()
         }
         Statement::Printf(format) => format_class_temporary_capacity(format),
         Statement::WriteFile { path, contents } => {
@@ -1509,6 +1560,14 @@ impl fmt::Display for Statement {
             }
             Statement::EchoString(value) => write!(formatter, "echo {value}"),
             Statement::CallVoid { function, args } | Statement::CallBorrowed { function, args } => {
+                write_call(formatter, *function, args)
+            }
+            Statement::CallNullSafe {
+                object,
+                function,
+                args,
+            } => {
+                write!(formatter, "null_safe {object} -> ")?;
                 write_call(formatter, *function, args)
             }
             Statement::Printf(format) => write!(formatter, "printf {format}"),

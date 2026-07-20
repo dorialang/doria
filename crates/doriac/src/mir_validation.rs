@@ -20,9 +20,17 @@ pub fn validate_program(program: &mir::Program) -> Result<(), BackendError> {
         }
         class_in(program, property.class)?;
         let valid = match (&property.initializer, property.ty) {
-            (mir::StaticValue::Scalar(value), mir::Type::Scalar(ty)) => value.ty() == ty,
+            (
+                mir::StaticValue::Scalar(value),
+                mir::Type::Scalar(ty) | mir::Type::NullableScalar(ty),
+            ) => value.ty() == ty,
             (mir::StaticValue::String(_), mir::Type::String | mir::Type::NullableString)
-            | (mir::StaticValue::Null, mir::Type::NullableString) => true,
+            | (
+                mir::StaticValue::Null,
+                mir::Type::NullableScalar(_)
+                | mir::Type::NullableString
+                | mir::Type::NullableClass(_),
+            ) => true,
             _ => false,
         };
         if !valid {
@@ -405,7 +413,7 @@ fn validate_statement(
             let callee = function_in(program, *callee)?;
             if !matches!(
                 callee.return_type,
-                mir::ReturnType::Value(mir::Type::Class(_))
+                mir::ReturnType::Value(mir::Type::Class(_) | mir::Type::NullableClass(_))
             ) || infer_function_return_borrow(program, callee)?.is_none()
             {
                 return Err(malformed_mir(format!(
@@ -415,6 +423,11 @@ fn validate_statement(
             }
             validate_call_args(program, function, callee, args)
         }
+        mir::Statement::CallNullSafe {
+            object,
+            function: callee,
+            args,
+        } => validate_null_safe_statement_call(program, function, object, *callee, args),
         mir::Statement::Printf(format) => validate_format_expression(program, function, format),
         mir::Statement::WriteFile { path, contents } => {
             validate_string_expression(program, function, path)?;
@@ -554,6 +567,23 @@ fn validate_terminator(
                     }
                     if expected.is_none() {
                         require_owned_class_expression(
+                            class,
+                            &format!("return from {}", function.name),
+                        )?;
+                    }
+                } else if let (mir::Type::NullableClass(_), mir::Rvalue::NullableClass(class)) =
+                    (return_type, expression)
+                {
+                    let expected = infer_function_return_borrow(program, function)?;
+                    let actual = infer_nullable_expression_return_borrow(program, function, class)?;
+                    if !return_borrow_is_compatible(actual, expected) {
+                        return Err(malformed_mir(format!(
+                            "return from {} has inconsistent nullable class ownership",
+                            function.name
+                        )));
+                    }
+                    if expected.is_none() {
+                        require_owned_nullable_class_expression(
                             class,
                             &format!("return from {}", function.name),
                         )?;
@@ -797,10 +827,21 @@ fn infer_function_return_borrow(
     let mut inferred: Option<Option<mir::ReturnBorrow>> = None;
     let (reachable, _) = reachable_blocks_and_predecessors(function, true)?;
     for block in function.blocks.iter().filter(|block| reachable[block.id.0]) {
-        let mir::Terminator::Return(mir::Rvalue::Class(expression)) = &block.terminator else {
+        let candidate = match &block.terminator {
+            mir::Terminator::Return(mir::Rvalue::Class(expression)) => Some(
+                infer_expression_return_borrow(program, function, expression)?,
+            ),
+            mir::Terminator::Return(mir::Rvalue::NullableClass(
+                mir::NullableClassExpression::Null(_),
+            )) => None,
+            mir::Terminator::Return(mir::Rvalue::NullableClass(expression)) => Some(
+                infer_nullable_expression_return_borrow(program, function, expression)?,
+            ),
+            _ => continue,
+        };
+        let Some(candidate) = candidate else {
             continue;
         };
-        let candidate = infer_expression_return_borrow(program, function, expression)?;
         match (inferred.as_mut(), candidate) {
             (None, candidate) => inferred = Some(candidate),
             (Some(Some(existing)), Some(candidate)) if existing.source == candidate.source => {
@@ -816,6 +857,130 @@ fn infer_function_return_borrow(
         }
     }
     Ok(inferred.flatten())
+}
+
+fn infer_nullable_expression_return_borrow(
+    program: &mir::Program,
+    function: &mir::Function,
+    expression: &mir::NullableClassExpression,
+) -> Result<Option<mir::ReturnBorrow>, BackendError> {
+    match expression {
+        mir::NullableClassExpression::Null(_) => Ok(None),
+        mir::NullableClassExpression::Class(expression) => {
+            infer_expression_return_borrow(program, function, expression)
+        }
+        mir::NullableClassExpression::Local {
+            local,
+            transfer: false,
+            ..
+        } => Ok(borrow_from_parameter(function, *local)),
+        mir::NullableClassExpression::Property { object, .. } => Ok(borrow_from_parameter(
+            function, *object,
+        )
+        .map(|borrow| mir::ReturnBorrow {
+            writable: false,
+            ..borrow
+        })),
+        mir::NullableClassExpression::Call {
+            function: callee,
+            args,
+            return_borrow: Some(return_borrow),
+            ..
+        } => infer_borrowed_rvalue_source(program, function, *callee, args, *return_borrow),
+        mir::NullableClassExpression::NullSafeProperty { object, .. } => Ok(
+            infer_nullable_expression_return_borrow(program, function, object)?.map(|borrow| {
+                mir::ReturnBorrow {
+                    writable: false,
+                    ..borrow
+                }
+            }),
+        ),
+        mir::NullableClassExpression::NullSafeCall {
+            object,
+            function: _,
+            args,
+            return_borrow: Some(return_borrow),
+            ..
+        } => {
+            let source = match return_borrow.source {
+                mir::BorrowSource::Receiver => {
+                    return infer_nullable_expression_return_borrow(program, function, object).map(
+                        |borrow| {
+                            borrow.map(|borrow| mir::ReturnBorrow {
+                                writable: borrow.writable && return_borrow.writable,
+                                ..borrow
+                            })
+                        },
+                    );
+                }
+                mir::BorrowSource::Parameter(index) => args.get(index),
+            };
+            let Some(source) = source else {
+                return Err(malformed_mir(
+                    "null-safe borrowed call has no source argument",
+                ));
+            };
+            infer_rvalue_return_borrow(program, function, source).map(|borrow| {
+                borrow.map(|borrow| mir::ReturnBorrow {
+                    writable: borrow.writable && return_borrow.writable,
+                    ..borrow
+                })
+            })
+        }
+        mir::NullableClassExpression::Local { transfer: true, .. }
+        | mir::NullableClassExpression::Call {
+            return_borrow: None,
+            ..
+        }
+        | mir::NullableClassExpression::NullSafeCall {
+            return_borrow: None,
+            ..
+        } => Ok(None),
+    }
+}
+
+fn infer_borrowed_rvalue_source(
+    program: &mir::Program,
+    function: &mir::Function,
+    callee: mir::FunctionId,
+    args: &[mir::Rvalue],
+    return_borrow: mir::ReturnBorrow,
+) -> Result<Option<mir::ReturnBorrow>, BackendError> {
+    let callee_definition = function_in(program, callee)?;
+    let index = match return_borrow.source {
+        mir::BorrowSource::Receiver => 0,
+        mir::BorrowSource::Parameter(index) => {
+            index + usize::from(callee_definition.receiver_mode.is_some())
+        }
+    };
+    let source = args.get(index).ok_or_else(|| {
+        malformed_mir(format!(
+            "borrowed class call to {} has no source argument",
+            callee_definition.name
+        ))
+    })?;
+    infer_rvalue_return_borrow(program, function, source).map(|borrow| {
+        borrow.map(|borrow| mir::ReturnBorrow {
+            writable: borrow.writable && return_borrow.writable,
+            ..borrow
+        })
+    })
+}
+
+fn infer_rvalue_return_borrow(
+    program: &mir::Program,
+    function: &mir::Function,
+    source: &mir::Rvalue,
+) -> Result<Option<mir::ReturnBorrow>, BackendError> {
+    match source {
+        mir::Rvalue::Class(source) => infer_expression_return_borrow(program, function, source),
+        mir::Rvalue::NullableClass(source) => {
+            infer_nullable_expression_return_borrow(program, function, source)
+        }
+        _ => Err(malformed_mir(
+            "borrowed class call source is not a class value",
+        )),
+    }
 }
 
 fn return_borrow_is_compatible(
@@ -1534,6 +1699,11 @@ fn collect_statement_class_local_accesses(statement: &mir::Statement) -> ClassLo
             collect_string_class_local_accesses(value, &mut accesses);
         }
         mir::Statement::CallVoid { args, .. } | mir::Statement::CallBorrowed { args, .. } => {
+            collect_rvalue_args_class_local_accesses(args, &mut accesses);
+        }
+        mir::Statement::CallNullSafe { object, args, .. } => {
+            collect_nullable_class_local_accesses(object, &mut accesses);
+            accesses.begin_call();
             collect_rvalue_args_class_local_accesses(args, &mut accesses);
         }
         mir::Statement::Printf(format) => {
@@ -2298,6 +2468,12 @@ fn statement_observes_property(
         mir::Statement::CallVoid { args, .. } | mir::Statement::CallBorrowed { args, .. } => args
             .iter()
             .any(|value| rvalue_observes_property(value, receiver, property)),
+        mir::Statement::CallNullSafe { object, args, .. } => {
+            nullable_class_observes_property(object, receiver, property)
+                || args
+                    .iter()
+                    .any(|value| rvalue_observes_property(value, receiver, property))
+        }
         mir::Statement::Printf(format) => format_observes_property(format, receiver, property),
         mir::Statement::WriteFile { path, contents } => {
             string_observes_property(path, receiver, property)
@@ -3319,7 +3495,7 @@ fn validate_nullable_string_expression(
             let class = object.class();
             validate_nullable_class_expression(program, function, object)?;
             property_in(program, class, *property).and_then(|definition| {
-                (definition.ty == mir::Type::String)
+                (matches!(definition.ty, mir::Type::String | mir::Type::NullableString))
                     .then_some(())
                     .ok_or_else(|| malformed_mir("null-safe property has another type"))
             })
@@ -3378,9 +3554,13 @@ fn validate_nullable_scalar_expression(
             let class = object.class();
             validate_nullable_class_expression(program, function, object)?;
             property_in(program, class, *property).and_then(|definition| {
-                (definition.ty == mir::Type::Scalar(ty))
-                    .then_some(())
-                    .ok_or_else(|| malformed_mir("null-safe property has another scalar type"))
+                (matches!(
+                    definition.ty,
+                    mir::Type::Scalar(actual) | mir::Type::NullableScalar(actual)
+                        if actual == ty
+                ))
+                .then_some(())
+                .ok_or_else(|| malformed_mir("null-safe property has another scalar type"))
             })
         }
         mir::NullableScalarExpression::NullSafeCall {
@@ -3460,9 +3640,13 @@ fn validate_nullable_class_expression(
             let receiver = object.class();
             validate_nullable_class_expression(program, function, object)?;
             property_in(program, receiver, *property).and_then(|definition| {
-                (definition.ty == mir::Type::Class(class))
-                    .then_some(())
-                    .ok_or_else(|| malformed_mir("null-safe property has another class type"))
+                (matches!(
+                    definition.ty,
+                    mir::Type::Class(actual) | mir::Type::NullableClass(actual)
+                        if actual == class
+                ))
+                .then_some(())
+                .ok_or_else(|| malformed_mir("null-safe property has another class type"))
             })
         }
         mir::NullableClassExpression::NullSafeCall {
@@ -3506,7 +3690,23 @@ fn validate_null_safe_call(
     let Some(method) = &callee.method else {
         return Err(malformed_mir("null-safe call targets a free function"));
     };
-    if method.class != object.class() || callee.return_type != mir::ReturnType::Value(return_type) {
+    let nullable_return_type = match return_type {
+        mir::Type::Scalar(ty) => mir::Type::NullableScalar(ty),
+        mir::Type::String => mir::Type::NullableString,
+        mir::Type::Class(class) => mir::Type::NullableClass(class),
+        mir::Type::NullableScalar(_) | mir::Type::NullableString | mir::Type::NullableClass(_) => {
+            return Err(malformed_mir(
+                "null-safe call validator requires a non-null result type",
+            ))
+        }
+    };
+    if method.class != object.class()
+        || !matches!(
+            callee.return_type,
+            mir::ReturnType::Value(actual)
+                if actual == return_type || actual == nullable_return_type
+        )
+    {
         return Err(malformed_mir(
             "null-safe call has an incompatible signature",
         ));
@@ -3516,6 +3716,42 @@ fn validate_null_safe_call(
     };
     if local_in(callee, *receiver)?.ty != mir::Type::Class(object.class()) {
         return Err(malformed_mir("null-safe method has another receiver type"));
+    }
+    validate_call_args_for_params(program, caller, callee, parameters, args, None)
+}
+
+fn validate_null_safe_statement_call(
+    program: &mir::Program,
+    caller: &mir::Function,
+    object: &mir::NullableClassExpression,
+    callee: mir::FunctionId,
+    args: &[mir::Rvalue],
+) -> Result<(), BackendError> {
+    validate_nullable_class_expression(program, caller, object)?;
+    let callee = function_in(program, callee)?;
+    let Some(method) = &callee.method else {
+        return Err(malformed_mir(
+            "null-safe statement call targets a free function",
+        ));
+    };
+    let discards_borrow = matches!(
+        callee.return_type,
+        mir::ReturnType::Value(mir::Type::Class(_) | mir::Type::NullableClass(_))
+    ) && infer_function_return_borrow(program, callee)?.is_some();
+    if method.class != object.class()
+        || (!matches!(callee.return_type, mir::ReturnType::Void) && !discards_borrow)
+    {
+        return Err(malformed_mir(
+            "null-safe statement call has an incompatible signature",
+        ));
+    }
+    let Some((receiver, parameters)) = callee.params.split_first() else {
+        return Err(malformed_mir("null-safe statement method has no receiver"));
+    };
+    if local_in(callee, *receiver)?.ty != mir::Type::Class(object.class()) {
+        return Err(malformed_mir(
+            "null-safe statement method has another receiver type",
+        ));
     }
     validate_call_args_for_params(program, caller, callee, parameters, args, None)
 }

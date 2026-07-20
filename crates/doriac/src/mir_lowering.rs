@@ -333,24 +333,29 @@ fn lower_static_value(
     match (value, ty) {
         (
             crate::const_eval::ConstValue::Integer(value),
-            mir::Type::Scalar(mir::ScalarType::Integer(expected)),
+            mir::Type::Scalar(mir::ScalarType::Integer(expected))
+            | mir::Type::NullableScalar(mir::ScalarType::Integer(expected)),
         ) if value.ty == expected => {
             Ok(mir::StaticValue::Scalar(mir::ScalarValue::Integer(*value)))
         }
         (
             crate::const_eval::ConstValue::Float(value),
-            mir::Type::Scalar(mir::ScalarType::Float(expected)),
+            mir::Type::Scalar(mir::ScalarType::Float(expected))
+            | mir::Type::NullableScalar(mir::ScalarType::Float(expected)),
         ) if value.ty == expected => Ok(mir::StaticValue::Scalar(mir::ScalarValue::Float(*value))),
-        (crate::const_eval::ConstValue::Bool(value), mir::Type::Scalar(mir::ScalarType::Bool)) => {
-            Ok(mir::StaticValue::Scalar(mir::ScalarValue::Bool(*value)))
-        }
+        (
+            crate::const_eval::ConstValue::Bool(value),
+            mir::Type::Scalar(mir::ScalarType::Bool)
+            | mir::Type::NullableScalar(mir::ScalarType::Bool),
+        ) => Ok(mir::StaticValue::Scalar(mir::ScalarValue::Bool(*value))),
         (
             crate::const_eval::ConstValue::String(value),
             mir::Type::String | mir::Type::NullableString,
         ) => Ok(mir::StaticValue::String(value.clone())),
-        (crate::const_eval::ConstValue::Null, mir::Type::NullableString) => {
-            Ok(mir::StaticValue::Null)
-        }
+        (
+            crate::const_eval::ConstValue::Null,
+            mir::Type::NullableScalar(_) | mir::Type::NullableString | mir::Type::NullableClass(_),
+        ) => Ok(mir::StaticValue::Null),
         _ => Err(vec![unsupported(
             span,
             "evaluated static initializer does not match its native type",
@@ -760,12 +765,18 @@ fn lower_statement_sequence(
                     method,
                     args,
                     span: call_span,
-                    ..
+                    null_safe,
                 } = expr
                 {
-                    let (signature, args) =
-                        lower_instance_method_call(object, method, args, *call_span, context)?;
-                    let statement = discarded_call_statement("method", signature, args, *span)?;
+                    let statement = if *null_safe {
+                        let (object, signature, args) =
+                            lower_null_safe_method_call(object, method, args, *call_span, context)?;
+                        discarded_null_safe_call_statement(object, signature, args, *span)?
+                    } else {
+                        let (signature, args) =
+                            lower_instance_method_call(object, method, args, *call_span, context)?;
+                        discarded_call_statement("method", signature, args, *span)?
+                    };
                     context.push_statement(statement);
                     continue;
                 }
@@ -1719,11 +1730,20 @@ fn native_const_type(ty: crate::const_eval::ConstType) -> Option<mir::Type> {
         crate::const_eval::ConstType::Integer(ty) => {
             Some(mir::Type::Scalar(mir::ScalarType::Integer(ty)))
         }
+        crate::const_eval::ConstType::NullableInteger(ty) => {
+            Some(mir::Type::NullableScalar(mir::ScalarType::Integer(ty)))
+        }
         crate::const_eval::ConstType::Float(ty) => {
             Some(mir::Type::Scalar(mir::ScalarType::Float(ty)))
         }
+        crate::const_eval::ConstType::NullableFloat(ty) => {
+            Some(mir::Type::NullableScalar(mir::ScalarType::Float(ty)))
+        }
         crate::const_eval::ConstType::String => Some(mir::Type::String),
         crate::const_eval::ConstType::Bool => Some(mir::Type::Scalar(mir::ScalarType::Bool)),
+        crate::const_eval::ConstType::NullableBool => {
+            Some(mir::Type::NullableScalar(mir::ScalarType::Bool))
+        }
         crate::const_eval::ConstType::NullableString => Some(mir::Type::NullableString),
         crate::const_eval::ConstType::Null => None,
     }
@@ -2412,7 +2432,7 @@ fn lower_nullable_string_expression(
         } => {
             let (object, property, ty) =
                 lower_null_safe_property(object, property, *span, context)?;
-            if ty != mir::Type::String {
+            if !matches!(ty, mir::Type::String | mir::Type::NullableString) {
                 return Err(vec![unsupported(
                     *span,
                     "null-safe property does not produce ?string",
@@ -2480,7 +2500,10 @@ fn lower_nullable_string_expression(
         } => {
             let (object, signature, args) =
                 lower_null_safe_method_call(object, method, args, *span, context)?;
-            if signature.return_type != mir::ReturnType::Value(mir::Type::String) {
+            if !matches!(
+                signature.return_type,
+                mir::ReturnType::Value(mir::Type::String | mir::Type::NullableString)
+            ) {
                 return Err(vec![unsupported(
                     *span,
                     "null-safe method does not produce ?string",
@@ -2571,7 +2594,11 @@ fn lower_nullable_scalar_expression(
         } => {
             let (object, property, ty) =
                 lower_null_safe_property(object, property, *span, context)?;
-            if ty != mir::Type::Scalar(expected) {
+            if !matches!(
+                ty,
+                mir::Type::Scalar(actual) | mir::Type::NullableScalar(actual)
+                    if actual == expected
+            ) {
                 return Err(vec![unsupported(
                     *span,
                     "null-safe property has another scalar type",
@@ -2630,7 +2657,12 @@ fn lower_nullable_scalar_expression(
         } => {
             let (object, signature, args) =
                 lower_null_safe_method_call(object, method, args, *span, context)?;
-            if signature.return_type != mir::ReturnType::Value(mir::Type::Scalar(expected)) {
+            if !matches!(
+                signature.return_type,
+                mir::ReturnType::Value(
+                    mir::Type::Scalar(actual) | mir::Type::NullableScalar(actual)
+                ) if actual == expected
+            ) {
                 return Err(vec![unsupported(
                     *span,
                     "null-safe method has another scalar return type",
@@ -2740,7 +2772,11 @@ fn lower_nullable_class_expression(
         } => {
             let (object, property, ty) =
                 lower_null_safe_property(object, property, *span, context)?;
-            if ty != mir::Type::Class(expected) {
+            if !matches!(
+                ty,
+                mir::Type::Class(actual) | mir::Type::NullableClass(actual)
+                    if actual == expected
+            ) {
                 return Err(vec![unsupported(
                     *span,
                     "null-safe property has another class type",
@@ -2796,7 +2832,12 @@ fn lower_nullable_class_expression(
         } => {
             let (object, signature, args) =
                 lower_null_safe_method_call(object, method, args, *span, context)?;
-            if signature.return_type != mir::ReturnType::Value(mir::Type::Class(expected)) {
+            if !matches!(
+                signature.return_type,
+                mir::ReturnType::Value(
+                    mir::Type::Class(actual) | mir::Type::NullableClass(actual)
+                ) if actual == expected
+            ) {
                 return Err(vec![unsupported(
                     *span,
                     "null-safe method has another class return type",
@@ -3072,7 +3113,9 @@ fn discarded_call_statement(
             function: signature.id,
             args,
         },
-        mir::ReturnType::Value(mir::Type::Class(_)) if signature.return_borrow.is_some() => {
+        mir::ReturnType::Value(mir::Type::Class(_) | mir::Type::NullableClass(_))
+            if signature.return_borrow.is_some() =>
+        {
             mir::Statement::CallBorrowed {
                 function: signature.id,
                 args,
@@ -3086,6 +3129,30 @@ fn discarded_call_statement(
         }
     };
     Ok(statement)
+}
+
+fn discarded_null_safe_call_statement(
+    object: mir::NullableClassExpression,
+    signature: FunctionSignature,
+    args: Vec<mir::Rvalue>,
+    span: Span,
+) -> DiagnosticResult<mir::Statement> {
+    let supported = matches!(signature.return_type, mir::ReturnType::Void)
+        || matches!(
+            signature.return_type,
+            mir::ReturnType::Value(mir::Type::Class(_) | mir::Type::NullableClass(_))
+        ) && signature.return_borrow.is_some();
+    if !supported {
+        return Err(vec![unsupported(
+            span,
+            "non-void method call cannot be used as a statement",
+        )]);
+    }
+    Ok(mir::Statement::CallNullSafe {
+        object,
+        function: signature.id,
+        args,
+    })
 }
 
 fn lower_integer_call(
@@ -3150,6 +3217,9 @@ fn lower_call_args_with_ownership(
             mir::Type::Class(class) => {
                 mir::Rvalue::Class(lower_class_expression(arg, class, transfers, context)?)
             }
+            mir::Type::NullableClass(class) => mir::Rvalue::NullableClass(
+                lower_nullable_class_expression(arg, class, transfers, context)?,
+            ),
             _ => lower_rvalue_as_expected(arg, expected, context)?,
         };
         if lowered.ty() != expected {
@@ -3310,6 +3380,10 @@ fn lower_return(
                 mir::Type::Class(class) => {
                     lower_class_expression(expr, class, !borrowed_class, context)
                         .map(mir::Rvalue::Class)?
+                }
+                mir::Type::NullableClass(class) => {
+                    lower_nullable_class_expression(expr, class, !borrowed_class, context)
+                        .map(mir::Rvalue::NullableClass)?
                 }
                 _ => lower_rvalue_as_expected(expr, expected, context)?,
             };
@@ -3922,7 +3996,7 @@ fn lower_class_expression(
         } => Ok(mir::ClassExpression::Coalesce {
             class: expected,
             left: Box::new(lower_nullable_class_expression(
-                left, expected, false, context,
+                left, expected, transfer, context,
             )?),
             right: Box::new(lower_class_expression(right, expected, transfer, context)?),
         }),

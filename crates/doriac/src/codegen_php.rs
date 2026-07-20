@@ -553,7 +553,10 @@ fn validate_expr(expr: &Expr, semantic_info: &SemanticInfo) -> Result<(), Backen
         }
         Expr::StaticMember { .. } => Ok(()),
         Expr::Grouped { expr, .. } => validate_expr(expr, semantic_info),
-        Expr::IsType { expr, .. } => validate_expr(expr, semantic_info),
+        Expr::IsType { expr, ty, span } => {
+            validate_expr(expr, semantic_info)?;
+            validate_type(ty, *span)
+        }
         Expr::Unary { op, expr, span } => {
             if *op == UnaryOp::Negate {
                 if let Some(magnitude) = integer_literal_magnitude(expr) {

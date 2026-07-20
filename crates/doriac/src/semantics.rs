@@ -888,7 +888,14 @@ impl<'program> Checker<'program> {
                 else {
                     continue;
                 };
-                if !matches!(self.types.kind(signature.return_ty), TypeKind::Class(_)) {
+                let class_return = match self.types.kind(signature.return_ty) {
+                    TypeKind::Class(_) => true,
+                    TypeKind::Nullable(inner) => {
+                        matches!(self.types.kind(*inner), TypeKind::Class(_))
+                    }
+                    _ => false,
+                };
+                if !class_return {
                     continue;
                 }
                 let mut scopes = ScopeStack::new();
@@ -4134,9 +4141,22 @@ impl<'program> Checker<'program> {
             Expr::PropertyAccess {
                 object,
                 property,
+                null_safe,
                 span,
-                ..
             } => {
+                if *null_safe {
+                    self.diagnostics.push(
+                        Diagnostic::new(
+                            "E0511",
+                            "null-safe property access cannot be used as a write target",
+                            *span,
+                        )
+                        .with_help(
+                            "narrow the receiver to a non-null value, then write through `->`",
+                        ),
+                    );
+                    return None;
+                }
                 self.check_expr(object, scopes, method_context);
                 self.check_mixed_operation(object, "property write", scopes, method_context);
                 if !Self::is_property_write_object_path(object) {
@@ -5396,9 +5416,21 @@ impl<'program> Checker<'program> {
     fn const_type_id(&mut self, ty: crate::const_eval::ConstType) -> TypeId {
         let kind = match ty {
             crate::const_eval::ConstType::Integer(ty) => TypeKind::Integer(ty),
+            crate::const_eval::ConstType::NullableInteger(ty) => {
+                let inner = self.types.intern(TypeKind::Integer(ty));
+                TypeKind::Nullable(inner)
+            }
             crate::const_eval::ConstType::Float(ty) => TypeKind::Float(ty),
+            crate::const_eval::ConstType::NullableFloat(ty) => {
+                let inner = self.types.intern(TypeKind::Float(ty));
+                TypeKind::Nullable(inner)
+            }
             crate::const_eval::ConstType::String => TypeKind::String,
             crate::const_eval::ConstType::Bool => TypeKind::Bool,
+            crate::const_eval::ConstType::NullableBool => {
+                let inner = self.types.intern(TypeKind::Bool);
+                TypeKind::Nullable(inner)
+            }
             crate::const_eval::ConstType::Null => TypeKind::Null,
             crate::const_eval::ConstType::NullableString => {
                 let string = self.types.intern(TypeKind::String);
@@ -5691,15 +5723,8 @@ impl<'program> Checker<'program> {
         method_context: Option<&MethodContext>,
         destination: AssignmentDestination,
     ) -> bool {
-        match *self.types.kind(target) {
-            TypeKind::Integer(integer) => {
-                if let Some(fits) = self.check_contextual_integer_literal(value_expr, integer) {
-                    return fits;
-                }
-                self.contextualize_integer_literals(value_expr, integer);
-            }
-            TypeKind::Float(float) => self.contextualize_float_literals(value_expr, float),
-            _ => {}
+        if let Some(fits) = self.contextualize_scalar_literals(target, value_expr) {
+            return fits;
         }
 
         let value = self.infer_expr_type(value_expr, scopes, method_context);
@@ -5768,15 +5793,8 @@ impl<'program> Checker<'program> {
         scopes: &ScopeStack,
         method_context: Option<&MethodContext>,
     ) -> bool {
-        match *self.types.kind(target) {
-            TypeKind::Integer(integer) => {
-                if let Some(fits) = self.check_contextual_integer_literal(value_expr, integer) {
-                    return fits;
-                }
-                self.contextualize_integer_literals(value_expr, integer);
-            }
-            TypeKind::Float(float) => self.contextualize_float_literals(value_expr, float),
-            _ => {}
+        if let Some(fits) = self.contextualize_scalar_literals(target, value_expr) {
+            return fits;
         }
 
         match value_expr {
@@ -5791,6 +5809,24 @@ impl<'program> Checker<'program> {
                 self.is_assignable(target, value)
             }
         }
+    }
+
+    fn contextualize_scalar_literals(&mut self, target: TypeId, value_expr: &Expr) -> Option<bool> {
+        let target = match *self.types.kind(target) {
+            TypeKind::Nullable(inner) => inner,
+            _ => target,
+        };
+        match *self.types.kind(target) {
+            TypeKind::Integer(integer) => {
+                if let Some(fits) = self.check_contextual_integer_literal(value_expr, integer) {
+                    return Some(fits);
+                }
+                self.contextualize_integer_literals(value_expr, integer);
+            }
+            TypeKind::Float(float) => self.contextualize_float_literals(value_expr, float),
+            _ => {}
+        }
+        None
     }
 
     fn is_array_literal_assignable(

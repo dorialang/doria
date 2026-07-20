@@ -32,8 +32,79 @@ struct Resolution {
     declarations: HashMap<usize, BindingId>,
 }
 
+#[derive(Default)]
+struct MutationCatalog {
+    functions: HashMap<String, Vec<bool>>,
+    methods: HashMap<String, Vec<bool>>,
+    qualified_methods: HashMap<(String, String), Vec<bool>>,
+    constructors: HashMap<String, Vec<bool>>,
+}
+
+impl MutationCatalog {
+    fn from_program(program: &Program) -> Self {
+        let mut catalog = Self::default();
+        for item in &program.items {
+            match item {
+                Item::Function(function) => merge_parameter_modes(
+                    catalog.functions.entry(function.name.clone()).or_default(),
+                    &function.params,
+                ),
+                Item::Class(class) => {
+                    for member in &class.members {
+                        let crate::ast::ClassMember::Method(method) = member else {
+                            continue;
+                        };
+                        let modes = method
+                            .params
+                            .iter()
+                            .map(|parameter| parameter.writable || parameter.take)
+                            .collect::<Vec<_>>();
+                        merge_modes(
+                            catalog.methods.entry(method.name.clone()).or_default(),
+                            &modes,
+                        );
+                        merge_modes(
+                            catalog
+                                .qualified_methods
+                                .entry((class.name.clone(), method.name.clone()))
+                                .or_default(),
+                            &modes,
+                        );
+                        if method.name == "__construct" {
+                            merge_modes(
+                                catalog.constructors.entry(class.name.clone()).or_default(),
+                                &modes,
+                            );
+                        }
+                    }
+                }
+                Item::Interface(_) | Item::Trait(_) | Item::Constant(_) | Item::Statement(_) => {}
+            }
+        }
+        catalog
+    }
+}
+
+fn merge_parameter_modes(target: &mut Vec<bool>, parameters: &[Param]) {
+    let modes = parameters
+        .iter()
+        .map(|parameter| parameter.writable || parameter.take)
+        .collect::<Vec<_>>();
+    merge_modes(target, &modes);
+}
+
+fn merge_modes(target: &mut Vec<bool>, incoming: &[bool]) {
+    if target.len() < incoming.len() {
+        target.resize(incoming.len(), false);
+    }
+    for (index, mutable) in incoming.iter().enumerate() {
+        target[index] |= mutable;
+    }
+}
+
 pub fn analyze_program(program: &Program) -> FactsByUse {
     let mut facts = HashMap::new();
+    let mutations = MutationCatalog::from_program(program);
     let top_level_span = program
         .items
         .iter()
@@ -55,16 +126,16 @@ pub fn analyze_program(program: &Program) -> FactsByUse {
         span: top_level_span,
     };
     if !top_level.statements.is_empty() {
-        analyze_body(&top_level, &[], top_level_span, &mut facts);
+        analyze_body(&top_level, &[], top_level_span, &mut facts, &mutations);
     }
 
     for item in &program.items {
         match item {
-            Item::Function(function) => analyze_function(function, &mut facts),
+            Item::Function(function) => analyze_function(function, &mut facts, &mutations),
             Item::Class(class) => {
                 for member in &class.members {
                     if let crate::ast::ClassMember::Method(method) = member {
-                        analyze_function(method, &mut facts);
+                        analyze_function(method, &mut facts, &mutations);
                     }
                 }
             }
@@ -91,15 +162,28 @@ fn statement_span(statement: &Stmt) -> Span {
     }
 }
 
-fn analyze_function(function: &FunctionDecl, facts: &mut FactsByUse) {
-    analyze_body(&function.body, &function.params, function.span, facts);
+fn analyze_function(function: &FunctionDecl, facts: &mut FactsByUse, mutations: &MutationCatalog) {
+    analyze_body(
+        &function.body,
+        &function.params,
+        function.span,
+        facts,
+        mutations,
+    );
 }
 
-fn analyze_body(body: &Block, params: &[Param], span: Span, facts: &mut FactsByUse) {
+fn analyze_body(
+    body: &Block,
+    params: &[Param],
+    span: Span,
+    facts: &mut FactsByUse,
+    mutations: &MutationCatalog,
+) {
     let resolution = Resolver::resolve(body, params);
     let graph = build_function_cfg(body, span);
     let analysis = NarrowingAnalysis {
         resolution: &resolution,
+        mutations,
     };
     let result = solve_forward(&graph, &analysis);
 
@@ -114,6 +198,7 @@ fn analyze_body(body: &Block, params: &[Param], span: Span, facts: &mut FactsByU
 
 struct NarrowingAnalysis<'a> {
     resolution: &'a Resolution,
+    mutations: &'a MutationCatalog,
 }
 
 impl ForwardAnalysis for NarrowingAnalysis<'_> {
@@ -139,11 +224,15 @@ impl ForwardAnalysis for NarrowingAnalysis<'_> {
         }
         let mut output = input.clone();
         match &node.action {
-            NodeAction::Assume { condition, truth } => {
-                apply_condition(condition, *truth, &mut output, self.resolution)
-            }
+            NodeAction::Assume { condition, truth } => apply_condition_with_effects(
+                condition,
+                *truth,
+                &mut output,
+                self.resolution,
+                self.mutations,
+            ),
             NodeAction::Statement(statement) => {
-                transfer_statement(statement, &mut output, self.resolution)
+                transfer_statement(statement, &mut output, self.resolution, self.mutations)
             }
             NodeAction::ForInitializer(initializer) => match initializer {
                 ForInitializer::VarDecl(declaration) => transfer_declaration(
@@ -151,12 +240,14 @@ impl ForwardAnalysis for NarrowingAnalysis<'_> {
                     &declaration.initializer,
                     &mut output,
                     self.resolution,
+                    self.mutations,
                 ),
                 ForInitializer::Assignment(assignment) => transfer_assignment(
                     &assignment.target,
                     &assignment.value,
                     &mut output,
                     self.resolution,
+                    self.mutations,
                 ),
             },
             NodeAction::ForIncrement(increment) => match increment {
@@ -165,12 +256,25 @@ impl ForwardAnalysis for NarrowingAnalysis<'_> {
                     &assignment.value,
                     &mut output,
                     self.resolution,
+                    self.mutations,
                 ),
                 ForIncrement::Increment(increment) => {
+                    kill_mutated_call_arguments(
+                        &increment.target,
+                        &mut output,
+                        self.resolution,
+                        self.mutations,
+                    );
                     kill_target(&increment.target, &mut output, self.resolution)
                 }
             },
-            NodeAction::None | NodeAction::Expression(_) => {}
+            NodeAction::Expression(expression) => kill_mutated_call_arguments(
+                expression,
+                &mut output,
+                self.resolution,
+                self.mutations,
+            ),
+            NodeAction::None => {}
         }
         output
     }
@@ -199,22 +303,40 @@ impl ForwardAnalysis for NarrowingAnalysis<'_> {
     }
 }
 
-fn transfer_statement(statement: &Stmt, state: &mut State, resolution: &Resolution) {
+fn transfer_statement(
+    statement: &Stmt,
+    state: &mut State,
+    resolution: &Resolution,
+    mutations: &MutationCatalog,
+) {
     match statement {
         Stmt::VarDecl(declaration) => transfer_declaration(
             declaration.span,
             &declaration.initializer,
             state,
             resolution,
+            mutations,
         ),
-        Stmt::Assignment(assignment) => {
-            transfer_assignment(&assignment.target, &assignment.value, state, resolution)
+        Stmt::Assignment(assignment) => transfer_assignment(
+            &assignment.target,
+            &assignment.value,
+            state,
+            resolution,
+            mutations,
+        ),
+        Stmt::Increment(increment) => {
+            kill_mutated_call_arguments(&increment.target, state, resolution, mutations);
+            kill_target(&increment.target, state, resolution);
         }
-        Stmt::Increment(increment) => kill_target(&increment.target, state, resolution),
-        Stmt::Echo { .. }
-        | Stmt::Return { .. }
-        | Stmt::Expr { .. }
-        | Stmt::If(_)
+        Stmt::Echo { expr, .. } | Stmt::Expr { expr, .. } => {
+            kill_mutated_call_arguments(expr, state, resolution, mutations);
+        }
+        Stmt::Return { expr, .. } => {
+            if let Some(expr) = expr {
+                kill_mutated_call_arguments(expr, state, resolution, mutations);
+            }
+        }
+        Stmt::If(_)
         | Stmt::While(_)
         | Stmt::For(_)
         | Stmt::Foreach(_)
@@ -228,13 +350,23 @@ fn transfer_declaration(
     initializer: &Expr,
     state: &mut State,
     resolution: &Resolution,
+    mutations: &MutationCatalog,
 ) {
+    kill_mutated_call_arguments(initializer, state, resolution, mutations);
     if let Some(binding) = resolution.declarations.get(&span.start) {
         set_from_value(*binding, initializer, state);
     }
 }
 
-fn transfer_assignment(target: &Expr, value: &Expr, state: &mut State, resolution: &Resolution) {
+fn transfer_assignment(
+    target: &Expr,
+    value: &Expr,
+    state: &mut State,
+    resolution: &Resolution,
+    mutations: &MutationCatalog,
+) {
+    kill_mutated_call_arguments(target, state, resolution, mutations);
+    kill_mutated_call_arguments(value, state, resolution, mutations);
     if let Some(binding) = variable_binding(target, resolution) {
         set_from_value(binding, value, state);
     }
@@ -243,6 +375,173 @@ fn transfer_assignment(target: &Expr, value: &Expr, state: &mut State, resolutio
 fn kill_target(target: &Expr, state: &mut State, resolution: &Resolution) {
     if let Some(binding) = variable_binding(target, resolution) {
         state.facts.remove(&binding);
+    }
+}
+
+fn apply_condition_with_effects(
+    condition: &Expr,
+    truth: bool,
+    state: &mut State,
+    resolution: &Resolution,
+    mutations: &MutationCatalog,
+) {
+    match ungroup(condition) {
+        Expr::Unary {
+            op: crate::ast::UnaryOp::Not,
+            expr,
+            ..
+        } => apply_condition_with_effects(expr, !truth, state, resolution, mutations),
+        Expr::Binary {
+            left,
+            op: crate::ast::BinaryOp::And,
+            right,
+            ..
+        } if truth => {
+            apply_condition_with_effects(left, true, state, resolution, mutations);
+            apply_condition_with_effects(right, true, state, resolution, mutations);
+        }
+        Expr::Binary {
+            left,
+            op: crate::ast::BinaryOp::Or,
+            right,
+            ..
+        } if !truth => {
+            apply_condition_with_effects(left, false, state, resolution, mutations);
+            apply_condition_with_effects(right, false, state, resolution, mutations);
+        }
+        _ => {
+            kill_mutated_call_arguments(condition, state, resolution, mutations);
+            apply_condition(condition, truth, state, resolution);
+        }
+    }
+}
+
+fn kill_mutated_call_arguments(
+    expr: &Expr,
+    state: &mut State,
+    resolution: &Resolution,
+    mutations: &MutationCatalog,
+) {
+    match expr {
+        Expr::PropertyAccess { object, .. }
+        | Expr::Grouped { expr: object, .. }
+        | Expr::Unary { expr: object, .. }
+        | Expr::IsType { expr: object, .. } => {
+            kill_mutated_call_arguments(object, state, resolution, mutations)
+        }
+        Expr::MethodCall {
+            object,
+            method,
+            args,
+            ..
+        } => {
+            kill_mutated_call_arguments(object, state, resolution, mutations);
+            kill_calls_in_arguments(args, state, resolution, mutations);
+            kill_arguments_for_modes(
+                args,
+                mutations.methods.get(method).map(Vec::as_slice),
+                state,
+                resolution,
+            );
+        }
+        Expr::FunctionCall { name, args, .. } => {
+            kill_calls_in_arguments(args, state, resolution, mutations);
+            kill_arguments_for_modes(
+                args,
+                mutations.functions.get(name).map(Vec::as_slice),
+                state,
+                resolution,
+            );
+        }
+        Expr::StaticCall {
+            qualifier,
+            method,
+            args,
+            ..
+        } => {
+            kill_calls_in_arguments(args, state, resolution, mutations);
+            let modes = match qualifier {
+                crate::ast::StaticQualifier::Class(class) => mutations
+                    .qualified_methods
+                    .get(&(class.clone(), method.clone()))
+                    .or_else(|| mutations.methods.get(method)),
+                crate::ast::StaticQualifier::SelfType
+                | crate::ast::StaticQualifier::Parent
+                | crate::ast::StaticQualifier::InvalidStatic => mutations.methods.get(method),
+            };
+            kill_arguments_for_modes(args, modes.map(Vec::as_slice), state, resolution);
+        }
+        Expr::New {
+            class_name, args, ..
+        } => {
+            kill_calls_in_arguments(args, state, resolution, mutations);
+            kill_arguments_for_modes(
+                args,
+                mutations.constructors.get(class_name).map(Vec::as_slice),
+                state,
+                resolution,
+            );
+        }
+        Expr::InterpolatedString { parts, .. } => {
+            for part in parts {
+                if let crate::ast::InterpolatedStringPart::Expr(expr) = part {
+                    kill_mutated_call_arguments(expr, state, resolution, mutations);
+                }
+            }
+        }
+        Expr::Array { elements, .. } => {
+            for element in elements {
+                if let Some(key) = &element.key {
+                    kill_mutated_call_arguments(key, state, resolution, mutations);
+                }
+                kill_mutated_call_arguments(&element.value, state, resolution, mutations);
+            }
+        }
+        Expr::Binary { left, right, .. }
+        | Expr::Range {
+            start: left,
+            end: right,
+            ..
+        } => {
+            kill_mutated_call_arguments(left, state, resolution, mutations);
+            kill_mutated_call_arguments(right, state, resolution, mutations);
+        }
+        Expr::Variable { .. }
+        | Expr::This { .. }
+        | Expr::Identifier { .. }
+        | Expr::String { .. }
+        | Expr::Int { .. }
+        | Expr::Float { .. }
+        | Expr::Bool { .. }
+        | Expr::Null { .. }
+        | Expr::StaticMember { .. } => {}
+    }
+}
+
+fn kill_calls_in_arguments(
+    args: &[Expr],
+    state: &mut State,
+    resolution: &Resolution,
+    mutations: &MutationCatalog,
+) {
+    for argument in args {
+        kill_mutated_call_arguments(argument, state, resolution, mutations);
+    }
+}
+
+fn kill_arguments_for_modes(
+    args: &[Expr],
+    modes: Option<&[bool]>,
+    state: &mut State,
+    resolution: &Resolution,
+) {
+    let Some(modes) = modes else {
+        return;
+    };
+    for (argument, mutable) in args.iter().zip(modes) {
+        if *mutable {
+            kill_target(argument, state, resolution);
+        }
     }
 }
 

@@ -530,6 +530,11 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             | mir::Statement::CallBorrowed { function, args } => {
                 let _ = self.lower_call(*function, args, false)?;
             }
+            mir::Statement::CallNullSafe {
+                object,
+                function,
+                args,
+            } => self.lower_null_safe_statement_call(object, *function, args)?,
             mir::Statement::WriteStderr(value) => {
                 let value = self.lower_string_expression(value)?;
                 let pointer = self.context.ptr_type(AddressSpace::default());
@@ -930,10 +935,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
 
                     let constructor_definition = function_in(self.program, *constructor)?;
                     for (index, argument) in args.iter().enumerate() {
-                        let mir::Rvalue::Class(expression) = argument else {
-                            continue;
-                        };
-                        let Some(class) = expression.owned_temporary_class() else {
+                        let Some(class) = argument.owned_temporary_class() else {
                             continue;
                         };
                         let promoted = properties.iter().any(|property| {
@@ -1234,13 +1236,24 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             mir::NullableStringExpression::NullSafeProperty { object, property } => {
                 let object = self.lower_nullable_class_expression(object)?;
                 self.lower_null_safe_nullable(pointer.into(), object, |lowerer| {
+                    let property = property_definition(lowerer.program, *property)?;
                     let value = build(lowerer.builder.build_load(
-                        pointer,
-                        lowerer.lower_property_address_from_value(object, *property)?,
+                        llvm_type(lowerer.context, lowerer.target_data, property.ty),
+                        lowerer.lower_property_address_from_value(object, property.id)?,
                         "null-safe.string.property",
-                    ))?
-                    .into_pointer_value();
-                    Ok(lowerer.retain_string(value)?.into())
+                    ))?;
+                    if property.ty == mir::Type::NullableString {
+                        let (present, payload) =
+                            lowerer.nullable_parts(value.into_struct_value())?;
+                        Ok(lowerer
+                            .nullable_value(
+                                present,
+                                lowerer.retain_string(payload.into_pointer_value())?.into(),
+                            )?
+                            .into())
+                    } else {
+                        Ok(lowerer.retain_string(value.into_pointer_value())?.into())
+                    }
                 })
             }
             mir::NullableStringExpression::NullSafeCall {
@@ -1317,9 +1330,10 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             } => {
                 let object = self.lower_nullable_class_expression(object)?;
                 self.lower_null_safe_nullable(payload_type, object, |lowerer| {
+                    let property = property_definition(lowerer.program, *property)?;
                     build(lowerer.builder.build_load(
-                        payload_type,
-                        lowerer.lower_property_address_from_value(object, *property)?,
+                        llvm_type(lowerer.context, lowerer.target_data, property.ty),
+                        lowerer.lower_property_address_from_value(object, property.id)?,
                         "null-safe.scalar.property",
                     ))
                 })
@@ -1354,7 +1368,14 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         build(self.builder.build_conditional_branch(present, some, none))?;
         self.builder.position_at_end(some);
         let payload = present_value(self)?;
-        let value = self.nullable_value(self.present_word(true), payload)?;
+        let value = match payload {
+            BasicValueEnum::StructValue(value)
+                if value.get_type() == self.nullable_type(payload_type) =>
+            {
+                value
+            }
+            payload => self.nullable_value(self.present_word(true), payload)?,
+        };
         build(self.builder.build_unconditional_branch(done))?;
         let some_end = self
             .builder
@@ -1374,6 +1395,38 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         )?;
         phi.add_incoming(&[(&value, some_end), (&absent, none_end)]);
         Ok(phi.as_basic_value().into_struct_value())
+    }
+
+    fn lower_null_safe_statement_call(
+        &mut self,
+        object: &mir::NullableClassExpression,
+        function: mir::FunctionId,
+        args: &[mir::Rvalue],
+    ) -> Result<(), BackendError> {
+        let receiver = self.lower_nullable_class_expression(object)?;
+        let current = current_function(&self.builder)?;
+        let call_block = self.context.append_basic_block(current, "null-safe.call");
+        let done = self.context.append_basic_block(current, "null-safe.done");
+        let present = build(
+            self.builder
+                .build_is_not_null(receiver, "null-safe.present"),
+        )?;
+        build(
+            self.builder
+                .build_conditional_branch(present, call_block, done),
+        )?;
+        self.builder.position_at_end(call_block);
+        let expects_result = !matches!(
+            function_in(self.program, function)?.return_type,
+            mir::ReturnType::Void
+        );
+        let _ = self.lower_method_call(receiver, function, args, expects_result)?;
+        build(self.builder.build_unconditional_branch(done))?;
+        self.builder.position_at_end(done);
+        if let Some(class) = object.owned_temporary_class() {
+            self.defer_or_drop_class_temporary(receiver, class)?;
+        }
+        Ok(())
     }
 
     fn runtime_function(
@@ -2718,10 +2771,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         }
         let callee_definition = function_in(self.program, function)?;
         for (index, argument) in args.iter().enumerate() {
-            let mir::Rvalue::Class(expression) = argument else {
-                continue;
-            };
-            let Some(class) = expression.owned_temporary_class() else {
+            let Some(class) = argument.owned_temporary_class() else {
                 continue;
             };
             let parameter_index = index + usize::from(receiver.is_some());

@@ -860,9 +860,12 @@ impl Evaluator {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConstType {
     Integer(IntegerType),
+    NullableInteger(IntegerType),
     Float(FloatType),
+    NullableFloat(FloatType),
     String,
     Bool,
+    NullableBool,
     Null,
     NullableString,
 }
@@ -880,22 +883,27 @@ impl ConstType {
 
     fn accepts(self, actual: Self) -> bool {
         self == actual
-            || matches!(
-                (self, actual),
+            || match (self, actual) {
                 (Self::NullableString, Self::String | Self::Null)
-            )
+                | (Self::NullableInteger(_), Self::Null)
+                | (Self::NullableFloat(_), Self::Null)
+                | (Self::NullableBool, Self::Bool | Self::Null) => true,
+                (Self::NullableInteger(expected), Self::Integer(actual)) => expected == actual,
+                (Self::NullableFloat(expected), Self::Float(actual)) => expected == actual,
+                _ => false,
+            }
     }
 
     fn integer(self) -> Option<IntegerType> {
         match self {
-            Self::Integer(ty) => Some(ty),
+            Self::Integer(ty) | Self::NullableInteger(ty) => Some(ty),
             _ => None,
         }
     }
 
     fn float(self) -> Option<FloatType> {
         match self {
-            Self::Float(ty) => Some(ty),
+            Self::Float(ty) | Self::NullableFloat(ty) => Some(ty),
             _ => None,
         }
     }
@@ -905,9 +913,12 @@ impl fmt::Display for ConstType {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Integer(ty) => formatter.write_str(ty.source_name()),
+            Self::NullableInteger(ty) => write!(formatter, "?{}", ty.source_name()),
             Self::Float(ty) => formatter.write_str(ty.source_name()),
+            Self::NullableFloat(ty) => write!(formatter, "?{}", ty.source_name()),
             Self::String => formatter.write_str("string"),
             Self::Bool => formatter.write_str("bool"),
+            Self::NullableBool => formatter.write_str("?bool"),
             Self::Null => formatter.write_str("null"),
             Self::NullableString => formatter.write_str("?string"),
         }
@@ -917,16 +928,25 @@ impl fmt::Display for ConstType {
 fn const_type(ty: &TypeRef) -> Option<ConstType> {
     if ty.args.is_empty() {
         if let Some(integer) = IntegerType::from_source_name(&ty.name) {
-            return (!ty.nullable).then_some(ConstType::Integer(integer));
+            return Some(if ty.nullable {
+                ConstType::NullableInteger(integer)
+            } else {
+                ConstType::Integer(integer)
+            });
         }
         if let Some(float) = FloatType::from_source_name(&ty.name) {
-            return (!ty.nullable).then_some(ConstType::Float(float));
+            return Some(if ty.nullable {
+                ConstType::NullableFloat(float)
+            } else {
+                ConstType::Float(float)
+            });
         }
     }
     match (ty.nullable, ty.name.as_str(), ty.args.is_empty()) {
         (false, "string", true) => Some(ConstType::String),
         (true, "string", true) => Some(ConstType::NullableString),
         (false, "bool", true) => Some(ConstType::Bool),
+        (true, "bool", true) => Some(ConstType::NullableBool),
         _ => None,
     }
 }

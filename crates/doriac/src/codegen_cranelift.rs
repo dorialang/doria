@@ -841,6 +841,11 @@ fn lower_statement(
         | mir::Statement::CallBorrowed { function, args } => {
             let _ = lower_function_call(builder, *function, args, resources)?;
         }
+        mir::Statement::CallNullSafe {
+            object,
+            function,
+            args,
+        } => lower_null_safe_statement_call(builder, object, *function, args, resources)?,
         mir::Statement::WriteStderr(value) => {
             let string = lower_string_expression(builder, value, resources)?;
             let pointer = resources.module.target_config().pointer_type();
@@ -1350,10 +1355,7 @@ fn lower_class_expression(
 
                 let constructor_definition = function_in(resources.program, *constructor)?;
                 for (index, argument) in args.iter().enumerate() {
-                    let mir::Rvalue::Class(expression) = argument else {
-                        continue;
-                    };
-                    let Some(class) = expression.owned_temporary_class() else {
+                    let Some(class) = argument.owned_temporary_class() else {
                         continue;
                     };
                     let promoted = properties.iter().any(|property| {
@@ -1483,6 +1485,7 @@ fn lower_nullable_class_expression(
             let object = lower_nullable_class_expression(builder, object, resources)?;
             lower_null_safe_single(builder, object, pointer, resources, |builder, resources| {
                 lower_method_call_with_receiver(builder, object, *function, args, resources)?
+                    .ok_or_else(|| malformed_mir("null-safe class call produced no result"))?
                     .single()
             })
         }
@@ -1861,13 +1864,17 @@ fn lower_nullable_string_expression(
             lower_null_safe_nullable(builder, object, pointer, resources, |builder, resources| {
                 let address =
                     lower_property_address_from_value(builder, object, *property, resources)?;
-                let value = builder.ins().load(
-                    pointer,
-                    cranelift_codegen::ir::MachMemFlags::trusted(),
-                    address,
-                    0,
-                );
-                retain_string(builder, value, resources)
+                let ty = property_definition(resources.program, *property)?.ty;
+                let value = load_lowered_from_address(builder, ty, address, pointer);
+                match value {
+                    LoweredValue::Single(payload) => Ok(LoweredValue::Single(retain_string(
+                        builder, payload, resources,
+                    )?)),
+                    LoweredValue::Nullable { present, payload } => Ok(LoweredValue::Nullable {
+                        present,
+                        payload: retain_string(builder, payload, resources)?,
+                    }),
+                }
             })
         }
         mir::NullableStringExpression::NullSafeCall {
@@ -1878,7 +1885,7 @@ fn lower_nullable_string_expression(
             let object = lower_nullable_class_expression(builder, object, resources)?;
             lower_null_safe_nullable(builder, object, pointer, resources, |builder, resources| {
                 lower_method_call_with_receiver(builder, object, *function, args, resources)?
-                    .single()
+                    .ok_or_else(|| malformed_mir("null-safe string call produced no result"))
             })
         }
     }
@@ -1944,11 +1951,12 @@ fn lower_nullable_scalar_expression(
                 |builder, resources| {
                     let address =
                         lower_property_address_from_value(builder, object, *property, resources)?;
-                    Ok(builder.ins().load(
-                        clif_scalar_type(ty),
-                        cranelift_codegen::ir::MachMemFlags::trusted(),
+                    let property_ty = property_definition(resources.program, *property)?.ty;
+                    Ok(load_lowered_from_address(
+                        builder,
+                        property_ty,
                         address,
-                        0,
+                        pointer,
                     ))
                 },
             )
@@ -1967,7 +1975,7 @@ fn lower_nullable_scalar_expression(
                 resources,
                 |builder, resources| {
                     lower_method_call_with_receiver(builder, object, *function, args, resources)?
-                        .single()
+                        .ok_or_else(|| malformed_mir("null-safe scalar call produced no result"))
                 },
             )
         }
@@ -1991,7 +1999,7 @@ fn lower_null_safe_nullable(
     present_value: impl FnOnce(
         &mut FunctionBuilder,
         &mut LoweringResources<'_, '_>,
-    ) -> Result<Value, BackendError>,
+    ) -> Result<LoweredValue, BackendError>,
 ) -> Result<LoweredValue, BackendError> {
     let pointer = resources.module.target_config().pointer_type();
     let present = presence_word(builder, object, pointer);
@@ -2004,11 +2012,14 @@ fn lower_null_safe_nullable(
     builder.append_block_param(done, payload_type);
     builder.ins().brif(is_present, some, &[], none, &[]);
     builder.switch_to_block(some);
-    let payload = present_value(builder, resources)?;
-    let one = builder.ins().iconst(pointer, 1);
+    let value = present_value(builder, resources)?;
+    let (present, payload) = match value {
+        LoweredValue::Single(payload) => (builder.ins().iconst(pointer, 1), payload),
+        LoweredValue::Nullable { present, payload } => (present, payload),
+    };
     builder
         .ins()
-        .jump(done, &[BlockArg::Value(one), BlockArg::Value(payload)]);
+        .jump(done, &[BlockArg::Value(present), BlockArg::Value(payload)]);
     builder.switch_to_block(none);
     let absent = builder.ins().iconst(pointer, 0);
     let payload = if payload_type.is_float() {
@@ -2028,6 +2039,30 @@ fn lower_null_safe_nullable(
         present: builder.block_params(done)[0],
         payload: builder.block_params(done)[1],
     })
+}
+
+fn lower_null_safe_statement_call(
+    builder: &mut FunctionBuilder,
+    object: &mir::NullableClassExpression,
+    function: mir::FunctionId,
+    args: &[mir::Rvalue],
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<(), BackendError> {
+    let receiver = lower_nullable_class_expression(builder, object, resources)?;
+    let pointer = resources.module.target_config().pointer_type();
+    let zero = builder.ins().iconst(pointer, 0);
+    let present = builder.ins().icmp(IntCC::NotEqual, receiver, zero);
+    let call_block = builder.create_block();
+    let done = builder.create_block();
+    builder.ins().brif(present, call_block, &[], done, &[]);
+    builder.switch_to_block(call_block);
+    let _ = lower_method_call_with_receiver(builder, receiver, function, args, resources)?;
+    builder.ins().jump(done, &[]);
+    builder.switch_to_block(done);
+    if let Some(class) = object.owned_temporary_class() {
+        defer_or_drop_class_temporary(builder, receiver, class, resources)?;
+    }
+    Ok(())
 }
 
 fn lower_coalesce_value(
@@ -2865,10 +2900,7 @@ fn lower_function_call(
         release_string(builder, string, resources)?;
     }
     for (index, argument) in args.iter().enumerate() {
-        let mir::Rvalue::Class(expression) = argument else {
-            continue;
-        };
-        let Some(class) = expression.owned_temporary_class() else {
+        let Some(class) = argument.owned_temporary_class() else {
             continue;
         };
         let parameter = *callee_definition.params.get(index).ok_or_else(|| {
@@ -2891,7 +2923,7 @@ fn lower_method_call_with_receiver(
     function: mir::FunctionId,
     args: &[mir::Rvalue],
     resources: &mut LoweringResources<'_, '_>,
-) -> Result<LoweredValue, BackendError> {
+) -> Result<Option<LoweredValue>, BackendError> {
     let lowered = lower_call_args(builder, args, resources)?;
     let mut values = vec![resources.current_frame, receiver];
     values.extend(lowered.abi_values.iter().copied());
@@ -2900,33 +2932,28 @@ fn lower_method_call_with_receiver(
     let definition = function_in(resources.program, function)?;
     let results = builder.inst_results(call);
     let result = match definition.return_type {
-        mir::ReturnType::Void => {
-            return Err(malformed_mir("null-safe value call has no return value"));
-        }
+        mir::ReturnType::Void => None,
         mir::ReturnType::Value(mir::Type::NullableScalar(_) | mir::Type::NullableString) => {
-            LoweredValue::Nullable {
+            Some(LoweredValue::Nullable {
                 present: *results
                     .first()
                     .ok_or_else(|| malformed_mir("nullable method call has no presence result"))?,
                 payload: *results
                     .get(1)
                     .ok_or_else(|| malformed_mir("nullable method call has no payload result"))?,
-            }
+            })
         }
-        mir::ReturnType::Value(_) => LoweredValue::Single(
+        mir::ReturnType::Value(_) => Some(LoweredValue::Single(
             *results
                 .first()
                 .ok_or_else(|| malformed_mir("method call has no result"))?,
-        ),
+        )),
     };
     for (_, string) in lowered.owned_strings {
         release_string(builder, string, resources)?;
     }
     for (index, argument) in args.iter().enumerate() {
-        let mir::Rvalue::Class(expression) = argument else {
-            continue;
-        };
-        let Some(class) = expression.owned_temporary_class() else {
+        let Some(class) = argument.owned_temporary_class() else {
             continue;
         };
         let parameter = *definition.params.get(index + 1).ok_or_else(|| {

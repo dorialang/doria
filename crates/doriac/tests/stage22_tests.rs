@@ -302,3 +302,174 @@ fn nullable_native_fixture_lowers_to_valid_mir_and_interprets_exactly() {
     assert!(output.stderr.is_empty());
     assert_eq!(output.exit_status, 0);
 }
+
+#[test]
+fn nullable_scalar_destinations_contextualize_literals_and_static_initializers() {
+    let source = r#"
+class Limits
+{
+    static ?int8 $small = 1;
+    static ?float32 $ratio = 1.5;
+    static ?bool $enabled = null;
+    writable ?uint8 $count = 2;
+}
+
+function accept(?int16 $value): void {}
+
+function main(): void
+{
+    ?int8 $small = 1;
+    writable ?float32 $ratio = 1.5;
+    $ratio = 2.5;
+    accept(3);
+    echo "ok";
+}
+"#;
+    let program = doriac::lower_source_to_mir("stage22-nullable-scalars.doria", source)
+        .expect("nullable scalar literals and statics should lower with their payload context");
+    doriac::mir_validation::validate_program(&program)
+        .expect("nullable scalar literal and static MIR should validate");
+    assert!(!doriac::codegen_cranelift::lower_mir_to_object(&program)
+        .expect("Cranelift should lower nullable scalar statics")
+        .is_empty());
+    #[cfg(feature = "llvm-backend")]
+    assert!(!doriac::codegen_llvm::lower_mir_to_object(&program)
+        .expect("LLVM should lower nullable scalar statics")
+        .is_empty());
+    let output = doriac::mir_interpreter::interpret(&program)
+        .expect("nullable scalar statics should execute");
+    assert_eq!(output.stdout, b"ok");
+}
+
+#[test]
+fn null_safe_property_access_is_never_a_write_place() {
+    for statement in [
+        "$value?->count = 1;",
+        "$value?->count += 1;",
+        "$value?->count++;",
+    ] {
+        let source = format!(
+            "class Counter {{ writable int $count = 0; }} function update(?Counter $value): void {{ {statement} }}"
+        );
+        let diagnostic = assert_code(&source, "E0511");
+        assert!(diagnostic.message.contains("write target"));
+    }
+}
+
+#[test]
+fn writable_call_arguments_invalidate_narrowing_facts() {
+    let invalid = diagnostics(
+        r#"
+function clear(writable ?int $value): void { $value = null; }
+function read(writable ?int $value): int
+{
+    if ($value == null) { return 0; }
+    clear($value);
+    return $value + 1;
+}
+"#,
+    );
+    assert!(
+        invalid
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("nullable")
+                || diagnostic.message.contains("?int")),
+        "the nullable use after a writable call should be rejected: {invalid:#?}"
+    );
+
+    doriac::check_source(
+        "stage22-readonly-call-fact.doria",
+        r#"
+function inspect(?int $value): void {}
+function read(?int $value): int
+{
+    if ($value == null) { return 0; }
+    inspect($value);
+    return $value + 1;
+}
+"#,
+    )
+    .expect("a readonly call must preserve the caller's narrowing fact");
+}
+
+#[test]
+fn nullable_class_ownership_and_null_safe_calls_execute_consistently() {
+    let source = r#"
+class Other {}
+
+class Tracked
+{
+    ?string $alias = null;
+    ?int8 $code = 7;
+    ?Other $other = null;
+    function __construct(string $name) {}
+    function __destruct() { echo "<" . $this->name . ">"; }
+    function maybeName(bool $present): ?string
+    {
+        if ($present) { return "value"; }
+        return null;
+    }
+    function maybeOther(): ?Tracked { return null; }
+    function announce(string $message): void { echo $message; }
+}
+
+class Holder
+{
+    function __construct() {}
+    function inspect(?Tracked $value): void {}
+    static function inspectStatic(?Tracked $value): void {}
+}
+
+function make(bool $present, string $name): ?Tracked
+{
+    if ($present) { return new Tracked($name); }
+    return null;
+}
+
+function inspect(?Tracked $value): void {}
+function forward(?Tracked $value): ?Tracked { return $value; }
+function sideEffect(): string { echo "wrong"; return "wrong"; }
+
+function main(): void
+{
+    let $owner = new Tracked("owner");
+    let $holder = new Holder();
+    $holder->inspect(new Tracked("method"));
+    Holder::inspectStatic(new Tracked("static"));
+    inspect($owner);
+    inspect(new Tracked("temp"));
+    echo ":" . (forward($owner)?->maybeName(true) ?? "none");
+    echo ":" . (forward($owner)?->alias ?? "empty");
+    echo ":";
+    if (forward($owner)?->code != null) { echo "code"; }
+    if (forward($owner)?->maybeOther() == null) { echo ":none"; }
+    if (forward($owner)?->other == null) { echo ":none"; }
+
+    make(false, "missing")?->announce(sideEffect());
+    make(true, "present")?->announce(":called");
+
+    let $maybe = make(true, "chosen");
+    let $chosen = $maybe ?? new Tracked("fallback");
+    echo ":" . ($chosen->maybeName(true) ?? "none");
+}
+"#;
+    let program = doriac::lower_source_to_mir("stage22-nullable-ownership.doria", source)
+        .expect("nullable ownership and null-safe statement calls should lower");
+    doriac::mir_validation::validate_program(&program)
+        .expect("nullable ownership MIR should validate");
+    assert!(!doriac::codegen_cranelift::lower_mir_to_object(&program)
+        .expect("Cranelift should lower nullable ownership paths")
+        .is_empty());
+    #[cfg(feature = "llvm-backend")]
+    assert!(!doriac::codegen_llvm::lower_mir_to_object(&program)
+        .expect("LLVM should lower nullable ownership paths")
+        .is_empty());
+    let output = doriac::mir_interpreter::interpret(&program)
+        .expect("nullable ownership paths should execute");
+    assert_eq!(
+        output.stdout,
+        b"<method><static><temp>:value:empty:code:none:none:called<present>:value<chosen><owner>"
+    );
+    assert!(output.stderr.is_empty());
+    assert_eq!(output.exit_status, 0);
+}
