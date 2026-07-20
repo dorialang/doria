@@ -121,12 +121,23 @@ enum EvaluationTask {
     BuildNullableClassSome(crate::class_layout::ClassId),
     WrapNullable(mir::Type),
     NullableScalarIsPresent,
-    NullableClassIsPresent,
+    NullableClassIsPresent(Option<crate::class_layout::ClassId>),
     AfterIntegerCoalesce(mir::IntegerExpression),
     AfterFloatCoalesce(mir::FloatExpression),
     AfterBoolCoalesce(mir::BoolExpression),
     AfterStringCoalesce(mir::StringExpression),
-    AfterClassCoalesce(mir::ClassExpression),
+    AfterNullableScalarCoalesce(mir::NullableScalarExpression),
+    AfterNullableStringCoalesce(mir::NullableStringExpression),
+    AfterClassCoalesce {
+        right: mir::ClassExpression,
+        left_owned: bool,
+    },
+    FinishClassCoalesceRight(Option<crate::class_layout::ClassId>),
+    AfterNullableClassCoalesce {
+        right: mir::NullableClassExpression,
+        left_owned: bool,
+    },
+    FinishNullableClassCoalesceRight(Option<crate::class_layout::ClassId>),
     AfterNullSafeProperty {
         property: crate::class_layout::PropertyId,
         result: mir::Type,
@@ -845,8 +856,13 @@ impl Interpreter<'_> {
                 let (_, value) = self.pop_nullable_scalar()?;
                 self.push_scalar(mir::ScalarValue::Bool(value.is_some()))?;
             }
-            EvaluationTask::NullableClassIsPresent => {
-                let (_, object) = self.pop_nullable_class()?;
+            EvaluationTask::NullableClassIsPresent(owned) => {
+                let (class, object) = self.pop_nullable_class()?;
+                if let (Some(object), Some(_)) = (object, owned) {
+                    self.current_frame_mut()?
+                        .statement_temporary_drops
+                        .push((object, class));
+                }
                 self.push_scalar(mir::ScalarValue::Bool(object.is_some()))?;
             }
             EvaluationTask::AfterIntegerCoalesce(right) => {
@@ -888,17 +904,86 @@ impl Interpreter<'_> {
                         .push(EvaluationTask::String(right));
                 }
             }
-            EvaluationTask::AfterClassCoalesce(right) => {
+            EvaluationTask::AfterNullableScalarCoalesce(right) => {
+                let (ty, value) = self.pop_nullable_scalar()?;
+                if value.is_some() {
+                    self.push_nullable_scalar(ty, value)?;
+                } else {
+                    self.current_frame_mut()?
+                        .tasks
+                        .push(EvaluationTask::NullableScalar(right));
+                }
+            }
+            EvaluationTask::AfterNullableStringCoalesce(right) => {
+                if let Some(value) = self.pop_nullable_string()? {
+                    self.push_nullable_string(Some(value))?;
+                } else {
+                    self.current_frame_mut()?
+                        .tasks
+                        .push(EvaluationTask::NullableString(right));
+                }
+            }
+            EvaluationTask::AfterClassCoalesce { right, left_owned } => {
                 let (class, object) = self.pop_nullable_class()?;
                 if let Some(object) = object {
+                    if left_owned {
+                        self.current_frame_mut()?
+                            .statement_temporary_drops
+                            .push((object, class));
+                    }
                     self.current_frame_mut()?
                         .values
                         .push(EvaluationValue::Class { object, class });
                 } else {
-                    self.current_frame_mut()?
+                    let owned = right.owned_temporary_class();
+                    let frame = self.current_frame_mut()?;
+                    frame
                         .tasks
-                        .push(EvaluationTask::Class(right));
+                        .push(EvaluationTask::FinishClassCoalesceRight(owned));
+                    frame.tasks.push(EvaluationTask::Class(right));
                 }
+            }
+            EvaluationTask::FinishClassCoalesceRight(owned) => {
+                let LocalValue::Class { object, class } = self.pop_local_value()? else {
+                    return Err(InterpreterError::new(
+                        "class coalesce fallback produced another value type",
+                    ));
+                };
+                if owned.is_some() {
+                    self.current_frame_mut()?
+                        .statement_temporary_drops
+                        .push((object, class));
+                }
+                self.current_frame_mut()?
+                    .values
+                    .push(EvaluationValue::Class { object, class });
+            }
+            EvaluationTask::AfterNullableClassCoalesce { right, left_owned } => {
+                let (class, object) = self.pop_nullable_class()?;
+                if let Some(object) = object {
+                    if left_owned {
+                        self.current_frame_mut()?
+                            .statement_temporary_drops
+                            .push((object, class));
+                    }
+                    self.push_nullable_class(class, Some(object))?;
+                } else {
+                    let owned = right.owned_temporary_class();
+                    let frame = self.current_frame_mut()?;
+                    frame
+                        .tasks
+                        .push(EvaluationTask::FinishNullableClassCoalesceRight(owned));
+                    frame.tasks.push(EvaluationTask::NullableClass(right));
+                }
+            }
+            EvaluationTask::FinishNullableClassCoalesceRight(owned) => {
+                let (class, object) = self.pop_nullable_class()?;
+                if let (Some(object), Some(_)) = (object, owned) {
+                    self.current_frame_mut()?
+                        .statement_temporary_drops
+                        .push((object, class));
+                }
+                self.push_nullable_class(class, object)?;
             }
             EvaluationTask::AfterNullSafeProperty {
                 property,
@@ -1465,8 +1550,11 @@ impl Interpreter<'_> {
                 frame.tasks.push(EvaluationTask::NullableScalar(*value));
             }
             mir::BoolExpression::NullableClassIsPresent(value) => {
+                let owned = value.owned_temporary_class();
                 let frame = self.current_frame_mut()?;
-                frame.tasks.push(EvaluationTask::NullableClassIsPresent);
+                frame
+                    .tasks
+                    .push(EvaluationTask::NullableClassIsPresent(owned));
                 frame.tasks.push(EvaluationTask::NullableClass(*value));
             }
             mir::BoolExpression::Not(condition) => {
@@ -1706,6 +1794,13 @@ impl Interpreter<'_> {
                 });
                 frame.tasks.push(EvaluationTask::NullableClass(*object));
             }
+            mir::NullableScalarExpression::Coalesce { left, right, .. } => {
+                let frame = self.current_frame_mut()?;
+                frame
+                    .tasks
+                    .push(EvaluationTask::AfterNullableScalarCoalesce(*right));
+                frame.tasks.push(EvaluationTask::NullableScalar(*left));
+            }
         }
         Ok(())
     }
@@ -1805,6 +1900,13 @@ impl Interpreter<'_> {
                     owned_receiver,
                 });
                 frame.tasks.push(EvaluationTask::NullableClass(*object));
+            }
+            mir::NullableStringExpression::Coalesce { left, right } => {
+                let frame = self.current_frame_mut()?;
+                frame
+                    .tasks
+                    .push(EvaluationTask::AfterNullableStringCoalesce(*right));
+                frame.tasks.push(EvaluationTask::NullableString(*left));
             }
         }
         Ok(())
@@ -1964,8 +2066,12 @@ impl Interpreter<'_> {
                     .push(EvaluationValue::Class { object, class });
             }
             mir::ClassExpression::Coalesce { left, right, .. } => {
+                let left_owned = left.owned_temporary_class().is_some();
                 let frame = self.current_frame_mut()?;
-                frame.tasks.push(EvaluationTask::AfterClassCoalesce(*right));
+                frame.tasks.push(EvaluationTask::AfterClassCoalesce {
+                    right: *right,
+                    left_owned,
+                });
                 frame.tasks.push(EvaluationTask::NullableClass(*left));
             }
         }
@@ -2069,6 +2175,17 @@ impl Interpreter<'_> {
                     owned_receiver,
                 });
                 frame.tasks.push(EvaluationTask::NullableClass(*object));
+            }
+            mir::NullableClassExpression::Coalesce { left, right, .. } => {
+                let left_owned = left.owned_temporary_class().is_some();
+                let frame = self.current_frame_mut()?;
+                frame
+                    .tasks
+                    .push(EvaluationTask::AfterNullableClassCoalesce {
+                        right: *right,
+                        left_owned,
+                    });
+                frame.tasks.push(EvaluationTask::NullableClass(*left));
             }
         }
         Ok(())

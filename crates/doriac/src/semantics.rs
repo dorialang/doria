@@ -2332,24 +2332,25 @@ impl<'program> Checker<'program> {
                 );
             }
             Stmt::For(for_stmt) => {
-                scopes.push();
+                let mut loop_scopes = scopes.clone();
+                loop_scopes.push();
                 if let Some(initializer) = &for_stmt.initializer {
                     self.check_for_initializer(
                         initializer,
-                        scopes,
+                        &mut loop_scopes,
                         method_context,
                         constructor_init_context.as_deref_mut(),
                     );
                 }
                 if let Some(condition) = &for_stmt.condition {
-                    self.check_condition(condition, scopes, method_context);
+                    self.check_condition(condition, &loop_scopes, method_context);
                 }
                 let mut loop_constructor_init_context = constructor_init_context
                     .as_deref()
                     .map(ConstructorInitContext::repeatable);
                 self.check_block(
                     &for_stmt.body,
-                    scopes,
+                    &mut loop_scopes,
                     method_context,
                     loop_constructor_init_context.as_mut(),
                     return_context,
@@ -2358,12 +2359,11 @@ impl<'program> Checker<'program> {
                 if let Some(increment) = &for_stmt.increment {
                     self.check_for_increment(
                         increment,
-                        scopes,
+                        &mut loop_scopes,
                         method_context,
                         loop_constructor_init_context.as_mut(),
                     );
                 }
-                scopes.pop();
             }
             Stmt::Break { span } => {
                 if loop_depth == 0 {
@@ -2423,7 +2423,8 @@ impl<'program> Checker<'program> {
                         method_context,
                     );
                 }
-                scopes.push();
+                let mut loop_scopes = scopes.clone();
+                loop_scopes.push();
                 if let Some(key) = &foreach.key {
                     let ty = if range_iterable {
                         self.diagnostics.push(Diagnostic::new(
@@ -2444,7 +2445,7 @@ impl<'program> Checker<'program> {
                         })
                     };
                     self.declare_binding(
-                        scopes,
+                        &mut loop_scopes,
                         key.name.clone(),
                         Binding {
                             writable: false,
@@ -2474,7 +2475,7 @@ impl<'program> Checker<'program> {
                     })
                 };
                 self.declare_binding(
-                    scopes,
+                    &mut loop_scopes,
                     foreach.value.name.clone(),
                     Binding {
                         writable: false,
@@ -2491,14 +2492,13 @@ impl<'program> Checker<'program> {
                 for statement in &foreach.body.statements {
                     self.check_statement(
                         statement,
-                        scopes,
+                        &mut loop_scopes,
                         method_context,
                         loop_constructor_init_context.as_mut(),
                         return_context,
                         loop_depth + 1,
                     );
                 }
-                scopes.pop();
             }
             Stmt::Increment(increment) => {
                 self.check_increment_statement(
@@ -6072,7 +6072,13 @@ impl<'program> Checker<'program> {
                             _ => binding.ty,
                         }
                     }
-                    Some(crate::narrowing::Fact::Null) => self.types.intern(TypeKind::Null),
+                    Some(crate::narrowing::Fact::Null) => {
+                        if matches!(self.types.kind(binding.declared_ty), TypeKind::Nullable(_)) {
+                            binding.declared_ty
+                        } else {
+                            self.types.intern(TypeKind::Null)
+                        }
+                    }
                     Some(crate::narrowing::Fact::Exact(ty)) => {
                         let tested = self.resolve_type_ref_with_class(
                             &ty,

@@ -976,6 +976,8 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 Ok(object)
             }
             mir::ClassExpression::Coalesce { left, right, .. } => {
+                let left_owned = left.owned_temporary_class().is_some();
+                let right_owned = right.owned_temporary_class().is_some();
                 let left = self.lower_nullable_class_expression(left)?;
                 let function = current_function(&self.builder)?;
                 let some = self
@@ -1008,7 +1010,21 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 self.builder.position_at_end(done);
                 let phi = build(self.builder.build_phi(pointer, "class.coalesce"))?;
                 phi.add_incoming(&[(&left, some_end), (&right, none_end)]);
-                Ok(phi.as_basic_value().into_pointer_value())
+                let result = phi.as_basic_value().into_pointer_value();
+                if left_owned || right_owned {
+                    let temporary =
+                        build(self.builder.build_phi(pointer, "class.coalesce.temporary"))?;
+                    let null = pointer.const_null();
+                    let left_temporary = if left_owned { left } else { null };
+                    let right_temporary = if right_owned { right } else { null };
+                    temporary
+                        .add_incoming(&[(&left_temporary, some_end), (&right_temporary, none_end)]);
+                    self.defer_or_drop_class_temporary(
+                        temporary.as_basic_value().into_pointer_value(),
+                        expression.class(),
+                    )?;
+                }
+                Ok(result)
             }
         }
     }
@@ -1076,6 +1092,60 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                         .into_pointer_value())
                 })
             }
+            mir::NullableClassExpression::Coalesce {
+                class, left, right, ..
+            } => {
+                let left_owned = left.owned_temporary_class().is_some();
+                let right_owned = right.owned_temporary_class().is_some();
+                let left = self.lower_nullable_class_expression(left)?;
+                let function = current_function(&self.builder)?;
+                let some = self
+                    .context
+                    .append_basic_block(function, "nullable-class.coalesce.some");
+                let none = self
+                    .context
+                    .append_basic_block(function, "nullable-class.coalesce.none");
+                let done = self
+                    .context
+                    .append_basic_block(function, "nullable-class.coalesce.done");
+                let present = build(
+                    self.builder
+                        .build_is_not_null(left, "nullable-class.coalesce.present"),
+                )?;
+                build(self.builder.build_conditional_branch(present, some, none))?;
+                self.builder.position_at_end(some);
+                build(self.builder.build_unconditional_branch(done))?;
+                let some_end = self
+                    .builder
+                    .get_insert_block()
+                    .expect("nullable coalesce some block");
+                self.builder.position_at_end(none);
+                let right = self.lower_nullable_class_expression(right)?;
+                build(self.builder.build_unconditional_branch(done))?;
+                let none_end = self
+                    .builder
+                    .get_insert_block()
+                    .expect("nullable coalesce none block");
+                self.builder.position_at_end(done);
+                let result = build(self.builder.build_phi(pointer, "nullable-class.coalesce"))?;
+                result.add_incoming(&[(&left, some_end), (&right, none_end)]);
+                if left_owned || right_owned {
+                    let temporary = build(
+                        self.builder
+                            .build_phi(pointer, "nullable-class.coalesce.temporary"),
+                    )?;
+                    let null = pointer.const_null();
+                    let left_temporary = if left_owned { left } else { null };
+                    let right_temporary = if right_owned { right } else { null };
+                    temporary
+                        .add_incoming(&[(&left_temporary, some_end), (&right_temporary, none_end)]);
+                    self.defer_or_drop_class_temporary(
+                        temporary.as_basic_value().into_pointer_value(),
+                        *class,
+                    )?;
+                }
+                Ok(result.as_basic_value().into_pointer_value())
+            }
         }
     }
 
@@ -1085,6 +1155,9 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         owned_receiver: Option<crate::class_layout::ClassId>,
         present_value: impl FnOnce(&mut Self) -> Result<PointerValue<'ctx>, BackendError>,
     ) -> Result<PointerValue<'ctx>, BackendError> {
+        if let Some(class) = owned_receiver {
+            self.defer_or_drop_class_temporary(object, class)?;
+        }
         let function = current_function(&self.builder)?;
         let some = self.context.append_basic_block(function, "null-safe.some");
         let none = self.context.append_basic_block(function, "null-safe.none");
@@ -1110,9 +1183,6 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         let phi = build(self.builder.build_phi(pointer, "null-safe.pointer"))?;
         phi.add_incoming(&[(&value, some_end), (&null, none_end)]);
         let result = phi.as_basic_value().into_pointer_value();
-        if let Some(class) = owned_receiver {
-            self.defer_or_drop_class_temporary(object, class)?;
-        }
         Ok(result)
     }
 
@@ -1277,6 +1347,14 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                         .ok_or_else(|| malformed_mir("null-safe string call produced no result"))
                 })
             }
+            mir::NullableStringExpression::Coalesce { left, right } => {
+                let left = self.lower_nullable_string_expression(left)?;
+                self.lower_nullable_coalesce(left, |lowerer| {
+                    lowerer
+                        .lower_nullable_string_expression(right)
+                        .map(BasicValueEnum::from)
+                })
+            }
         }
     }
 
@@ -1362,6 +1440,14 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                         .ok_or_else(|| malformed_mir("null-safe scalar call produced no result"))
                 })
             }
+            mir::NullableScalarExpression::Coalesce { left, right, .. } => {
+                let left = self.lower_nullable_scalar_expression(left)?;
+                self.lower_nullable_coalesce(left, |lowerer| {
+                    lowerer
+                        .lower_nullable_scalar_expression(right)
+                        .map(BasicValueEnum::from)
+                })
+            }
         }
     }
 
@@ -1372,6 +1458,9 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         owned_receiver: Option<crate::class_layout::ClassId>,
         present_value: impl FnOnce(&mut Self) -> Result<BasicValueEnum<'ctx>, BackendError>,
     ) -> Result<StructValue<'ctx>, BackendError> {
+        if let Some(class) = owned_receiver {
+            self.defer_or_drop_class_temporary(object, class)?;
+        }
         let function = current_function(&self.builder)?;
         let some = self.context.append_basic_block(function, "null-safe.some");
         let none = self.context.append_basic_block(function, "null-safe.none");
@@ -1407,9 +1496,6 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         )?;
         phi.add_incoming(&[(&value, some_end), (&absent, none_end)]);
         let result = phi.as_basic_value().into_struct_value();
-        if let Some(class) = owned_receiver {
-            self.defer_or_drop_class_temporary(object, class)?;
-        }
         Ok(result)
     }
 
@@ -1420,6 +1506,9 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         args: &[mir::Rvalue],
     ) -> Result<(), BackendError> {
         let receiver = self.lower_nullable_class_expression(object)?;
+        if let Some(class) = object.owned_temporary_class() {
+            self.defer_or_drop_class_temporary(receiver, class)?;
+        }
         let current = current_function(&self.builder)?;
         let call_block = self.context.append_basic_block(current, "null-safe.call");
         let done = self.context.append_basic_block(current, "null-safe.done");
@@ -1439,9 +1528,6 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         let _ = self.lower_method_call(receiver, function, args, expects_result)?;
         build(self.builder.build_unconditional_branch(done))?;
         self.builder.position_at_end(done);
-        if let Some(class) = object.owned_temporary_class() {
-            self.defer_or_drop_class_temporary(receiver, class)?;
-        }
         Ok(())
     }
 
@@ -1895,6 +1981,53 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         let phi = build(self.builder.build_phi(payload.get_type(), "coalesce.value"))?;
         phi.add_incoming(&[(&payload, some_end), (&fallback, none_end)]);
         Ok(phi.as_basic_value())
+    }
+
+    fn lower_nullable_coalesce(
+        &mut self,
+        left: StructValue<'ctx>,
+        fallback: impl FnOnce(&mut Self) -> Result<BasicValueEnum<'ctx>, BackendError>,
+    ) -> Result<StructValue<'ctx>, BackendError> {
+        let (present, _) = self.nullable_parts(left)?;
+        let function = current_function(&self.builder)?;
+        let some = self
+            .context
+            .append_basic_block(function, "nullable.coalesce.some");
+        let none = self
+            .context
+            .append_basic_block(function, "nullable.coalesce.none");
+        let done = self
+            .context
+            .append_basic_block(function, "nullable.coalesce.done");
+        let present = build(self.builder.build_int_compare(
+            IntPredicate::NE,
+            present,
+            self.present_word(false),
+            "nullable.coalesce.present",
+        ))?;
+        build(self.builder.build_conditional_branch(present, some, none))?;
+        self.builder.position_at_end(some);
+        build(self.builder.build_unconditional_branch(done))?;
+        let some_end = self
+            .builder
+            .get_insert_block()
+            .expect("nullable coalesce some block");
+        self.builder.position_at_end(none);
+        let fallback = fallback(self)?.into_struct_value();
+        if fallback.get_type() != left.get_type() {
+            return Err(malformed_mir(
+                "nullable coalesce operands have different MIR types",
+            ));
+        }
+        build(self.builder.build_unconditional_branch(done))?;
+        let none_end = self
+            .builder
+            .get_insert_block()
+            .expect("nullable coalesce none block");
+        self.builder.position_at_end(done);
+        let phi = build(self.builder.build_phi(left.get_type(), "nullable.coalesce"))?;
+        phi.add_incoming(&[(&left, some_end), (&fallback, none_end)]);
+        Ok(phi.as_basic_value().into_struct_value())
     }
 
     fn lower_format_expression(
@@ -3056,7 +3189,11 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 )?;
             }
             mir::BoolExpression::NullableClassIsPresent(value) => {
+                let owned = value.owned_temporary_class();
                 let value = self.lower_nullable_class_expression(value)?;
+                if let Some(class) = owned {
+                    self.defer_or_drop_class_temporary(value, class)?;
+                }
                 let condition = build(
                     self.builder
                         .build_is_not_null(value, "nullable-class.present"),

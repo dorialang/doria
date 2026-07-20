@@ -1396,6 +1396,8 @@ fn lower_class_expression(
             Ok(object)
         }
         mir::ClassExpression::Coalesce { left, right, .. } => {
+            let left_owned = left.owned_temporary_class().is_some();
+            let right_owned = right.owned_temporary_class().is_some();
             let left = lower_nullable_class_expression(builder, left, resources)?;
             let zero = builder.ins().iconst(pointer_type, 0);
             let present = builder.ins().icmp(IntCC::NotEqual, left, zero);
@@ -1403,16 +1405,34 @@ fn lower_class_expression(
             let right_block = builder.create_block();
             let done = builder.create_block();
             builder.append_block_param(done, pointer_type);
+            builder.append_block_param(done, pointer_type);
             builder
                 .ins()
                 .brif(present, left_block, &[], right_block, &[]);
             builder.switch_to_block(left_block);
-            builder.ins().jump(done, &[BlockArg::Value(left)]);
+            let left_temporary = if left_owned { left } else { zero };
+            builder.ins().jump(
+                done,
+                &[BlockArg::Value(left), BlockArg::Value(left_temporary)],
+            );
             builder.switch_to_block(right_block);
             let right = lower_class_expression(builder, right, resources)?;
-            builder.ins().jump(done, &[BlockArg::Value(right)]);
+            let right_temporary = if right_owned { right } else { zero };
+            builder.ins().jump(
+                done,
+                &[BlockArg::Value(right), BlockArg::Value(right_temporary)],
+            );
             builder.switch_to_block(done);
-            Ok(builder.block_params(done)[0])
+            let result = builder.block_params(done)[0];
+            if left_owned || right_owned {
+                defer_or_drop_class_temporary(
+                    builder,
+                    builder.block_params(done)[1],
+                    expression.class(),
+                    resources,
+                )?;
+            }
+            Ok(result)
         }
     }
 }
@@ -1505,6 +1525,47 @@ fn lower_nullable_class_expression(
                 },
             )
         }
+        mir::NullableClassExpression::Coalesce {
+            class, left, right, ..
+        } => {
+            let left_owned = left.owned_temporary_class().is_some();
+            let right_owned = right.owned_temporary_class().is_some();
+            let left = lower_nullable_class_expression(builder, left, resources)?;
+            let zero = builder.ins().iconst(pointer, 0);
+            let present = builder.ins().icmp(IntCC::NotEqual, left, zero);
+            let left_block = builder.create_block();
+            let right_block = builder.create_block();
+            let done = builder.create_block();
+            builder.append_block_param(done, pointer);
+            builder.append_block_param(done, pointer);
+            builder
+                .ins()
+                .brif(present, left_block, &[], right_block, &[]);
+            builder.switch_to_block(left_block);
+            let left_temporary = if left_owned { left } else { zero };
+            builder.ins().jump(
+                done,
+                &[BlockArg::Value(left), BlockArg::Value(left_temporary)],
+            );
+            builder.switch_to_block(right_block);
+            let right = lower_nullable_class_expression(builder, right, resources)?;
+            let right_temporary = if right_owned { right } else { zero };
+            builder.ins().jump(
+                done,
+                &[BlockArg::Value(right), BlockArg::Value(right_temporary)],
+            );
+            builder.switch_to_block(done);
+            let result = builder.block_params(done)[0];
+            if left_owned || right_owned {
+                defer_or_drop_class_temporary(
+                    builder,
+                    builder.block_params(done)[1],
+                    *class,
+                    resources,
+                )?;
+            }
+            Ok(result)
+        }
     }
 }
 
@@ -1520,6 +1581,9 @@ fn lower_null_safe_single(
     ) -> Result<Value, BackendError>,
 ) -> Result<Value, BackendError> {
     let pointer = resources.module.target_config().pointer_type();
+    if let Some(class) = owned_receiver {
+        defer_or_drop_class_temporary(builder, object, class, resources)?;
+    }
     let present = presence_word(builder, object, pointer);
     let zero = builder.ins().iconst(pointer, 0);
     let is_present = builder.ins().icmp(IntCC::NotEqual, present, zero);
@@ -1536,9 +1600,6 @@ fn lower_null_safe_single(
     builder.ins().jump(done, &[BlockArg::Value(zero)]);
     builder.switch_to_block(done);
     let result = builder.block_params(done)[0];
-    if let Some(class) = owned_receiver {
-        defer_or_drop_class_temporary(builder, object, class, resources)?;
-    }
     Ok(result)
 }
 
@@ -1925,6 +1986,12 @@ fn lower_nullable_string_expression(
                 },
             )
         }
+        mir::NullableStringExpression::Coalesce { left, right } => {
+            let left = lower_nullable_string_expression(builder, left, resources)?;
+            lower_nullable_coalesce(builder, left, pointer, resources, |builder, resources| {
+                lower_nullable_string_expression(builder, right, resources)
+            })
+        }
     }
 }
 
@@ -2020,6 +2087,16 @@ fn lower_nullable_scalar_expression(
                 },
             )
         }
+        mir::NullableScalarExpression::Coalesce { left, right, .. } => {
+            let left = lower_nullable_scalar_expression(builder, left, resources)?;
+            lower_nullable_coalesce(
+                builder,
+                left,
+                clif_scalar_type(ty),
+                resources,
+                |builder, resources| lower_nullable_scalar_expression(builder, right, resources),
+            )
+        }
     }
 }
 
@@ -2044,6 +2121,9 @@ fn lower_null_safe_nullable(
     ) -> Result<LoweredValue, BackendError>,
 ) -> Result<LoweredValue, BackendError> {
     let pointer = resources.module.target_config().pointer_type();
+    if let Some(class) = owned_receiver {
+        defer_or_drop_class_temporary(builder, object, class, resources)?;
+    }
     let present = presence_word(builder, object, pointer);
     let zero = builder.ins().iconst(pointer, 0);
     let is_present = builder.ins().icmp(IntCC::NotEqual, present, zero);
@@ -2081,9 +2161,6 @@ fn lower_null_safe_nullable(
         present: builder.block_params(done)[0],
         payload: builder.block_params(done)[1],
     };
-    if let Some(class) = owned_receiver {
-        defer_or_drop_class_temporary(builder, object, class, resources)?;
-    }
     Ok(result)
 }
 
@@ -2095,6 +2172,9 @@ fn lower_null_safe_statement_call(
     resources: &mut LoweringResources<'_, '_>,
 ) -> Result<(), BackendError> {
     let receiver = lower_nullable_class_expression(builder, object, resources)?;
+    if let Some(class) = object.owned_temporary_class() {
+        defer_or_drop_class_temporary(builder, receiver, class, resources)?;
+    }
     let pointer = resources.module.target_config().pointer_type();
     let zero = builder.ins().iconst(pointer, 0);
     let present = builder.ins().icmp(IntCC::NotEqual, receiver, zero);
@@ -2105,9 +2185,6 @@ fn lower_null_safe_statement_call(
     let _ = lower_method_call_with_receiver(builder, receiver, function, args, resources)?;
     builder.ins().jump(done, &[]);
     builder.switch_to_block(done);
-    if let Some(class) = object.owned_temporary_class() {
-        defer_or_drop_class_temporary(builder, receiver, class, resources)?;
-    }
     Ok(())
 }
 
@@ -2137,6 +2214,46 @@ fn lower_coalesce_value(
     builder.ins().jump(done, &[BlockArg::Value(fallback)]);
     builder.switch_to_block(done);
     Ok(builder.block_params(done)[0])
+}
+
+fn lower_nullable_coalesce(
+    builder: &mut FunctionBuilder,
+    left: LoweredValue,
+    payload_type: ClifType,
+    resources: &mut LoweringResources<'_, '_>,
+    fallback: impl FnOnce(
+        &mut FunctionBuilder,
+        &mut LoweringResources<'_, '_>,
+    ) -> Result<LoweredValue, BackendError>,
+) -> Result<LoweredValue, BackendError> {
+    let pointer = resources.module.target_config().pointer_type();
+    let (present, payload) = left.nullable()?;
+    let zero = builder.ins().iconst(pointer, 0);
+    let has_value = builder.ins().icmp(IntCC::NotEqual, present, zero);
+    let some = builder.create_block();
+    let none = builder.create_block();
+    let done = builder.create_block();
+    builder.append_block_param(done, pointer);
+    builder.append_block_param(done, payload_type);
+    builder.ins().brif(has_value, some, &[], none, &[]);
+    builder.switch_to_block(some);
+    builder
+        .ins()
+        .jump(done, &[BlockArg::Value(present), BlockArg::Value(payload)]);
+    builder.switch_to_block(none);
+    let (fallback_present, fallback_payload) = fallback(builder, resources)?.nullable()?;
+    builder.ins().jump(
+        done,
+        &[
+            BlockArg::Value(fallback_present),
+            BlockArg::Value(fallback_payload),
+        ],
+    );
+    builder.switch_to_block(done);
+    Ok(LoweredValue::Nullable {
+        present: builder.block_params(done)[0],
+        payload: builder.block_params(done)[1],
+    })
 }
 
 fn lower_format_expression(
@@ -3179,7 +3296,11 @@ fn lower_condition_to_branch(
                 .brif(present, then_block, &[], else_block, &[]);
         }
         mir::BoolExpression::NullableClassIsPresent(value) => {
+            let owned = value.owned_temporary_class();
             let value = lower_nullable_class_expression(builder, value, resources)?;
+            if let Some(class) = owned {
+                defer_or_drop_class_temporary(builder, value, class, resources)?;
+            }
             let pointer = resources.module.target_config().pointer_type();
             let zero = builder.ins().iconst(pointer, 0);
             let present = builder.ins().icmp(IntCC::NotEqual, value, zero);

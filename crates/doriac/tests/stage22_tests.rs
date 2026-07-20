@@ -642,3 +642,282 @@ function main(): void
     assert!(output.stderr.is_empty());
     assert_eq!(output.exit_status, 0);
 }
+
+#[test]
+fn typed_non_null_expressions_establish_nullable_flow_facts() {
+    doriac::check_source(
+        "stage22-typed-flow-facts.doria",
+        r#"
+function one(): int { return 1; }
+function add(bool $condition, int $input): int
+{
+    ?int $fromParameter = $input;
+    ?int $fromCall = one();
+    writable ?int $joined = null;
+    if ($condition) { $joined = $input; } else { $joined = one(); }
+    return $fromParameter + $fromCall + $joined;
+}
+"#,
+    )
+    .expect("known non-null expression types should establish flow facts at every assignment");
+}
+
+#[test]
+fn non_null_call_results_wrap_at_nullable_destinations() {
+    let source = r#"
+class Item
+{
+    function __construct(string $name) {}
+    function label(): string { return $this->name; }
+}
+
+class Factory
+{
+    function number(): int { return 2; }
+    function text(): string { return "method"; }
+    function item(): Item { return new Item("method-item"); }
+    static function staticNumber(): int { return 3; }
+    static function staticText(): string { return "static"; }
+    static function staticItem(): Item { return new Item("static-item"); }
+}
+
+function number(): int { return 1; }
+function text(): string { return "free"; }
+function item(): Item { return new Item("free-item"); }
+
+function main(): void
+{
+    let $factory = new Factory();
+    ?int $freeNumber = number();
+    ?int $methodNumber = $factory->number();
+    ?int $staticNumber = Factory::staticNumber();
+    ?string $freeText = text();
+    ?string $methodText = $factory->text();
+    ?string $staticText = Factory::staticText();
+    ?Item $freeItem = item();
+    ?Item $methodItem = $factory->item();
+    ?Item $staticItem = Factory::staticItem();
+    echo $freeText . ":" . $methodText . ":" . $staticText;
+    echo ":{$freeNumber}:{$methodNumber}:{$staticNumber}";
+    echo ":" . $freeItem->label() . ":" . $methodItem->label() . ":" . $staticItem->label();
+}
+"#;
+    let program = doriac::lower_source_to_mir("stage22-call-wrapping.doria", source)
+        .expect("non-null call results should wrap at nullable destinations");
+    doriac::mir_validation::validate_program(&program).expect("wrapped-call MIR should validate");
+    assert!(!doriac::codegen_cranelift::lower_mir_to_object(&program)
+        .expect("Cranelift should lower wrapped call results")
+        .is_empty());
+    #[cfg(feature = "llvm-backend")]
+    assert!(!doriac::codegen_llvm::lower_mir_to_object(&program)
+        .expect("LLVM should lower wrapped call results")
+        .is_empty());
+    let output =
+        doriac::mir_interpreter::interpret(&program).expect("wrapped call results should execute");
+    assert_eq!(
+        output.stdout,
+        b"free:method:static:1:2:3:free-item:method-item:static-item"
+    );
+}
+
+#[test]
+fn nullable_coalesce_preserves_nullable_results_across_payload_kinds() {
+    let source = r#"
+class Item
+{
+    function __construct(string $name) {}
+    function label(): string { return $this->name; }
+}
+
+function chooseInt(?int $left, ?int $right): ?int { return $left ?? $right; }
+function chooseString(?string $left, ?string $right): ?string { return $left ?? $right; }
+function inspect(?Item $value): void { echo $value?->label() ?? "none"; }
+
+function main(): void
+{
+    ?int $emptyInt = null;
+    ?int $number = 7;
+    ?string $emptyString = null;
+    ?string $text = "text";
+    ?Item $emptyItem = null;
+    ?Item $item = new Item("item");
+    let $selectedInt = chooseInt($emptyInt, $number);
+    let $selectedText = chooseString($emptyString, $text);
+    if ($selectedInt != null) { echo "7:"; }
+    echo ($selectedText ?? "none") . ":";
+    inspect($emptyItem ?? $item);
+}
+"#;
+    let program = doriac::lower_source_to_mir("stage22-nullable-coalesce.doria", source)
+        .expect("nullable coalesce should lower for scalar, string, and class payloads");
+    doriac::mir_validation::validate_program(&program)
+        .expect("nullable coalesce MIR should validate");
+    assert!(!doriac::codegen_cranelift::lower_mir_to_object(&program)
+        .expect("Cranelift should lower nullable coalesce")
+        .is_empty());
+    #[cfg(feature = "llvm-backend")]
+    assert!(!doriac::codegen_llvm::lower_mir_to_object(&program)
+        .expect("LLVM should lower nullable coalesce")
+        .is_empty());
+    let output =
+        doriac::mir_interpreter::interpret(&program).expect("nullable coalesce should execute");
+    assert_eq!(output.stdout, b"7:text:item");
+}
+
+#[test]
+fn conditional_class_temporaries_and_borrowed_returns_keep_lifetime_order() {
+    let source = r#"
+class Tracked
+{
+    function __construct(string $name) {}
+    function __destruct() { echo "<" . $this->name . ">"; }
+    function use(Tracked $value): void { echo "use"; }
+}
+
+function make(string $name): ?Tracked { return new Tracked($name); }
+function inspect(?Tracked $value): void { echo "inspect"; }
+function identity(?Tracked $value): ?Tracked { echo "call"; return $value; }
+function forward(?Tracked $value): ?Tracked
+{
+    let $temporary = new Tracked("local");
+    return identity($value);
+}
+
+function main(): void
+{
+    ?Tracked $empty = null;
+    inspect($empty ?? new Tracked("fallback"));
+    make("receiver")?->use(new Tracked("argument"));
+    let $owner = new Tracked("owner");
+    inspect(forward($owner));
+}
+"#;
+    let program = doriac::lower_source_to_mir("stage22-lifetime-order.doria", source)
+        .expect("conditional temporaries and borrowed nullable calls should lower");
+    doriac::mir_validation::validate_program(&program)
+        .expect("conditional temporary MIR should validate");
+    assert!(!doriac::codegen_cranelift::lower_mir_to_object(&program)
+        .expect("Cranelift should preserve conditional temporary order")
+        .is_empty());
+    #[cfg(feature = "llvm-backend")]
+    assert!(!doriac::codegen_llvm::lower_mir_to_object(&program)
+        .expect("LLVM should preserve conditional temporary order")
+        .is_empty());
+    let output = doriac::mir_interpreter::interpret(&program)
+        .expect("conditional temporary lifetimes should execute");
+    assert_eq!(
+        output.stdout,
+        b"inspect<fallback>use<argument><receiver>call<local>inspect<owner>"
+    );
+}
+
+#[test]
+fn repeatable_loop_assignments_do_not_escape_their_flow_paths() {
+    let diagnostics = doriac::check_source(
+        "stage22-loop-facts.doria",
+        r#"
+function fromFor(bool $condition): int
+{
+    writable ?int $value = null;
+    for (; $condition;) { $value = 1; break; }
+    return $value + 1;
+}
+
+function fromForeach(List<int> $items): int
+{
+    writable ?int $value = null;
+    foreach ($items as int $item) { $value = $item; }
+    return $value + 1;
+}
+"#,
+    )
+    .expect_err("zero-iteration loop paths must keep nullable bindings nullable");
+    assert_eq!(
+        diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == "E0441")
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn known_null_facts_preserve_the_declared_nullable_container() {
+    doriac::check_source(
+        "stage22-known-null-container.doria",
+        r#"
+class Label { function text(): string { return "label"; } }
+function read(): string
+{
+    ?Label $label = null;
+    return $label?->text() ?? "none";
+}
+"#,
+    )
+    .expect("known-null values should retain their declared nullable class for null-safe access");
+}
+
+#[test]
+fn receiver_types_select_their_own_method_flow_contracts() {
+    doriac::check_source(
+        "stage22-qualified-method-flow.doria",
+        r#"
+class Reader
+{
+    function touch(?int $value): void {}
+    function number(): int { return 1; }
+}
+
+class Writer
+{
+    function touch(writable ?int $value): void { $value = null; }
+    function number(): ?int { return null; }
+}
+
+function keep(?int $value): int
+{
+    let $reader = new Reader();
+    if ($value != null) {
+        $reader->touch($value);
+        ?int $number = $reader->number();
+        return $value + $number;
+    }
+    return 0;
+}
+"#,
+    )
+    .expect("method mutation and nullability facts should use the receiver's static class");
+}
+
+#[test]
+fn concrete_is_tests_evaluate_their_operands_once() {
+    let source = r#"
+class Tracked
+{
+    function __destruct() { echo "<drop>"; }
+}
+
+function make(): Tracked { echo "make"; return new Tracked(); }
+function maybe(): ?Tracked { echo "maybe"; return null; }
+
+function main(): void
+{
+    if (make() is Tracked) { echo "true"; }
+    if (make() is string) { echo "bad"; } else { echo "false"; }
+    if (maybe() is string) { echo "bad"; } else { echo "false"; }
+}
+"#;
+    let program = doriac::lower_source_to_mir("stage22-is-effects.doria", source)
+        .expect("concrete and impossible type tests should preserve operand evaluation");
+    doriac::mir_validation::validate_program(&program).expect("type-test MIR should validate");
+    assert!(!doriac::codegen_cranelift::lower_mir_to_object(&program)
+        .expect("Cranelift should lower effectful type tests")
+        .is_empty());
+    #[cfg(feature = "llvm-backend")]
+    assert!(!doriac::codegen_llvm::lower_mir_to_object(&program)
+        .expect("LLVM should lower effectful type tests")
+        .is_empty());
+    let output = doriac::mir_interpreter::interpret(&program)
+        .expect("effectful type tests should execute exactly once");
+    assert_eq!(output.stdout, b"make<drop>truemake<drop>falsemaybefalse");
+}

@@ -247,6 +247,11 @@ pub enum NullableScalarExpression {
         function: FunctionId,
         args: Vec<Rvalue>,
     },
+    Coalesce {
+        ty: ScalarType,
+        left: Box<NullableScalarExpression>,
+        right: Box<NullableScalarExpression>,
+    },
 }
 
 impl NullableScalarExpression {
@@ -258,7 +263,8 @@ impl NullableScalarExpression {
             | Self::Static { ty, .. }
             | Self::Call { ty, .. }
             | Self::NullSafeProperty { ty, .. }
-            | Self::NullSafeCall { ty, .. } => *ty,
+            | Self::NullSafeCall { ty, .. }
+            | Self::Coalesce { ty, .. } => *ty,
             Self::Value(value) => value.ty(),
         }
     }
@@ -550,6 +556,10 @@ pub enum NullableStringExpression {
         function: FunctionId,
         args: Vec<Rvalue>,
     },
+    Coalesce {
+        left: Box<NullableStringExpression>,
+        right: Box<NullableStringExpression>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -584,6 +594,11 @@ pub enum NullableClassExpression {
         args: Vec<Rvalue>,
         return_borrow: Option<ReturnBorrow>,
     },
+    Coalesce {
+        class: ClassId,
+        left: Box<NullableClassExpression>,
+        right: Box<NullableClassExpression>,
+    },
 }
 
 impl NullableClassExpression {
@@ -594,7 +609,8 @@ impl NullableClassExpression {
             | Self::Property { class, .. }
             | Self::Call { class, .. }
             | Self::NullSafeProperty { class, .. }
-            | Self::NullSafeCall { class, .. } => *class,
+            | Self::NullSafeCall { class, .. }
+            | Self::Coalesce { class, .. } => *class,
             Self::Class(value) => value.class(),
         }
     }
@@ -620,6 +636,7 @@ impl NullableClassExpression {
                 ..
             }
             | Self::NullSafeProperty { .. }
+            | Self::Coalesce { .. }
             | Self::NullSafeCall {
                 return_borrow: Some(_),
                 ..
@@ -894,6 +911,10 @@ fn nullable_string_class_temporary_capacity(value: &NullableStringExpression) ->
                     .map(rvalue_class_temporary_capacity)
                     .sum::<usize>()
         }
+        NullableStringExpression::Coalesce { left, right } => {
+            nullable_string_class_temporary_capacity(left)
+                + nullable_string_class_temporary_capacity(right)
+        }
         NullableStringExpression::Null
         | NullableStringExpression::Local(_)
         | NullableStringExpression::Static(_)
@@ -954,6 +975,10 @@ fn nullable_scalar_class_temporary_capacity(value: &NullableScalarExpression) ->
                     .map(rvalue_class_temporary_capacity)
                     .sum::<usize>()
         }
+        NullableScalarExpression::Coalesce { left, right, .. } => {
+            nullable_scalar_class_temporary_capacity(left)
+                + nullable_scalar_class_temporary_capacity(right)
+        }
         NullableScalarExpression::Null(_)
         | NullableScalarExpression::Local { .. }
         | NullableScalarExpression::Property { .. }
@@ -981,6 +1006,9 @@ fn nullable_class_temporary_capacity(value: &NullableClassExpression) -> usize {
         }
         NullableClassExpression::NullSafeProperty { object, .. } => {
             nullable_class_temporary_capacity(object)
+        }
+        NullableClassExpression::Coalesce { left, right, .. } => {
+            nullable_class_temporary_capacity(left) + nullable_class_temporary_capacity(right)
         }
         NullableClassExpression::Null(_)
         | NullableClassExpression::Local { .. }
@@ -1406,6 +1434,7 @@ impl fmt::Display for NullableStringExpression {
                 write!(formatter, "{object}?->")?;
                 write_call(formatter, *function, args)
             }
+            Self::Coalesce { left, right } => write!(formatter, "({left} ?? {right})"),
         }
     }
 }
@@ -1497,6 +1526,7 @@ impl fmt::Display for NullableScalarExpression {
                 write!(formatter, "{object}?->")?;
                 write_call(formatter, *function, args)
             }
+            Self::Coalesce { left, right, .. } => write!(formatter, "({left} ?? {right})"),
         }
     }
 }
@@ -1527,6 +1557,7 @@ impl fmt::Display for NullableClassExpression {
                 write!(formatter, "{object}?->")?;
                 write_call(formatter, *function, args)
             }
+            Self::Coalesce { left, right, .. } => write!(formatter, "({left} ?? {right})"),
         }
     }
 }
