@@ -3116,9 +3116,12 @@ fn validate_call_args_for_params(
             &borrowed_class_locals,
             &mut transferred_class_locals,
         )?;
+        let class_like_parameter = matches!(
+            parameter_type,
+            mir::Type::Class(_) | mir::Type::NullableClass(_)
+        );
+        let promoted_transfer = promoted_transfers.is_some_and(|indices| indices.contains(&index));
         if matches!(parameter_type, mir::Type::Class(_)) {
-            let promoted_transfer =
-                promoted_transfers.is_some_and(|indices| indices.contains(&index));
             let mir::Rvalue::Class(expression) = argument else {
                 unreachable!("class parameter type was checked against its argument")
             };
@@ -3159,15 +3162,15 @@ fn validate_call_args_for_params(
                     &format!("call to {} argument {}", callee.name, index + 1),
                 )?;
             }
-            if !parameter_definition.owned && !promoted_transfer {
-                if let Some(local) = escaping_class_local_borrow(program, argument)? {
-                    let mode = if parameter_definition.writable {
-                        ClassBorrowMode::Writable
-                    } else {
-                        ClassBorrowMode::Readonly
-                    };
-                    argument_borrows.insert(local, mode);
-                }
+        }
+        if class_like_parameter && !parameter_definition.owned && !promoted_transfer {
+            let mode = if parameter_definition.writable {
+                ClassBorrowMode::Writable
+            } else {
+                ClassBorrowMode::Readonly
+            };
+            for local in escaping_class_local_borrows(program, argument)? {
+                argument_borrows.insert(local, mode);
             }
         }
         for (local, mode) in argument_borrows {
@@ -3297,20 +3300,25 @@ fn duplicate_class_transfer_error(operation: &str, local: mir::LocalId) -> Backe
     ))
 }
 
-fn escaping_class_local_borrow(
+fn escaping_class_local_borrows(
     program: &mir::Program,
     argument: &mir::Rvalue,
-) -> Result<Option<mir::LocalId>, BackendError> {
-    let mir::Rvalue::Class(expression) = argument else {
-        return Ok(None);
-    };
-    escaping_class_expression_local_borrow(program, expression)
+) -> Result<Vec<mir::LocalId>, BackendError> {
+    match argument {
+        mir::Rvalue::Class(expression) => {
+            escaping_class_expression_local_borrows(program, expression)
+        }
+        mir::Rvalue::NullableClass(expression) => {
+            escaping_nullable_class_expression_local_borrows(program, expression)
+        }
+        _ => Ok(Vec::new()),
+    }
 }
 
-fn escaping_class_expression_local_borrow(
+fn escaping_class_expression_local_borrows(
     program: &mir::Program,
     expression: &mir::ClassExpression,
-) -> Result<Option<mir::LocalId>, BackendError> {
+) -> Result<Vec<mir::LocalId>, BackendError> {
     match expression {
         mir::ClassExpression::Local {
             local,
@@ -3322,16 +3330,29 @@ fn escaping_class_expression_local_borrow(
             transfer: false,
             ..
         }
-        | mir::ClassExpression::Property { object: local, .. } => Ok(Some(*local)),
+        | mir::ClassExpression::Property { object: local, .. } => Ok(vec![*local]),
         mir::ClassExpression::Call {
             function,
             args,
             return_borrow: Some(return_borrow),
             ..
-        } => escaping_class_expression_local_borrow(
+        } => escaping_class_expression_local_borrows(
             program,
             borrowed_call_source(program, *function, args, *return_borrow)?,
         ),
+        mir::ClassExpression::Coalesce {
+            left,
+            right,
+            transfer: false,
+            ..
+        } => {
+            let mut locals = escaping_nullable_class_expression_local_borrows(program, left)?;
+            extend_unique_locals(
+                &mut locals,
+                escaping_class_expression_local_borrows(program, right)?,
+            );
+            Ok(locals)
+        }
         mir::ClassExpression::Local { transfer: true, .. }
         | mir::ClassExpression::NullableLocalAssumeNonNull { transfer: true, .. }
         | mir::ClassExpression::Call {
@@ -3339,7 +3360,84 @@ fn escaping_class_expression_local_borrow(
             ..
         }
         | mir::ClassExpression::New { .. }
-        | mir::ClassExpression::Coalesce { .. } => Ok(None),
+        | mir::ClassExpression::Coalesce { transfer: true, .. } => Ok(Vec::new()),
+    }
+}
+
+fn escaping_nullable_class_expression_local_borrows(
+    program: &mir::Program,
+    expression: &mir::NullableClassExpression,
+) -> Result<Vec<mir::LocalId>, BackendError> {
+    match expression {
+        mir::NullableClassExpression::Null(_) => Ok(Vec::new()),
+        mir::NullableClassExpression::Class(expression) => {
+            escaping_class_expression_local_borrows(program, expression)
+        }
+        mir::NullableClassExpression::Local {
+            local,
+            transfer: false,
+            ..
+        }
+        | mir::NullableClassExpression::Property { object: local, .. } => Ok(vec![*local]),
+        mir::NullableClassExpression::Call {
+            function,
+            args,
+            return_borrow: Some(return_borrow),
+            ..
+        } => escaping_class_local_borrows(
+            program,
+            borrowed_call_rvalue_source(program, *function, args, *return_borrow)?,
+        ),
+        mir::NullableClassExpression::NullSafeProperty { object, .. } => {
+            escaping_nullable_class_expression_local_borrows(program, object)
+        }
+        mir::NullableClassExpression::NullSafeCall {
+            object,
+            args,
+            return_borrow: Some(return_borrow),
+            ..
+        } => match return_borrow.source {
+            mir::BorrowSource::Receiver => {
+                escaping_nullable_class_expression_local_borrows(program, object)
+            }
+            mir::BorrowSource::Parameter(index) => {
+                let source = args.get(index).ok_or_else(|| {
+                    malformed_mir("null-safe borrowed call has no source argument")
+                })?;
+                escaping_class_local_borrows(program, source)
+            }
+        },
+        mir::NullableClassExpression::Coalesce {
+            left,
+            right,
+            transfer: false,
+            ..
+        } => {
+            let mut locals = escaping_nullable_class_expression_local_borrows(program, left)?;
+            extend_unique_locals(
+                &mut locals,
+                escaping_nullable_class_expression_local_borrows(program, right)?,
+            );
+            Ok(locals)
+        }
+        mir::NullableClassExpression::Local { transfer: true, .. }
+        | mir::NullableClassExpression::Call {
+            return_borrow: None,
+            ..
+        }
+        | mir::NullableClassExpression::NullSafeCall {
+            return_borrow: None,
+            ..
+        }
+        | mir::NullableClassExpression::Coalesce { transfer: true, .. } => Ok(Vec::new()),
+    }
+}
+
+fn extend_unique_locals(target: &mut Vec<mir::LocalId>, incoming: Vec<mir::LocalId>) {
+    for local in incoming {
+        if !target.contains(&local) {
+            target.push(local);
+        }
     }
 }
 
@@ -3349,18 +3447,34 @@ fn borrowed_call_source<'a>(
     args: &'a [mir::Rvalue],
     return_borrow: mir::ReturnBorrow,
 ) -> Result<&'a mir::ClassExpression, BackendError> {
-    let callee = function_in(program, function)?;
-    let index = match return_borrow.source {
-        mir::BorrowSource::Receiver => 0,
-        mir::BorrowSource::Parameter(index) => index + usize::from(callee.receiver_mode.is_some()),
-    };
-    let Some(mir::Rvalue::Class(source)) = args.get(index) else {
+    let source = borrowed_call_rvalue_source(program, function, args, return_borrow)?;
+    let mir::Rvalue::Class(source) = source else {
+        let callee = function_in(program, function)?;
         return Err(malformed_mir(format!(
             "borrowed class call to {} has no class source argument",
             callee.name
         )));
     };
     Ok(source)
+}
+
+fn borrowed_call_rvalue_source<'a>(
+    program: &mir::Program,
+    function: mir::FunctionId,
+    args: &'a [mir::Rvalue],
+    return_borrow: mir::ReturnBorrow,
+) -> Result<&'a mir::Rvalue, BackendError> {
+    let callee = function_in(program, function)?;
+    let index = match return_borrow.source {
+        mir::BorrowSource::Receiver => 0,
+        mir::BorrowSource::Parameter(index) => index + usize::from(callee.receiver_mode.is_some()),
+    };
+    args.get(index).ok_or_else(|| {
+        malformed_mir(format!(
+            "borrowed class call to {} has no class source argument",
+            callee.name
+        ))
+    })
 }
 
 fn validate_condition(
@@ -4051,23 +4165,27 @@ fn borrowed_class_call_locals(
     let mut borrows = Vec::new();
     for (argument, parameter) in args.iter().zip(callee.params.iter().skip(parameter_offset)) {
         let parameter = local_in(callee, *parameter)?;
-        if !matches!(parameter.ty, mir::Type::Class(_)) || parameter.owned {
+        if !matches!(
+            parameter.ty,
+            mir::Type::Class(_) | mir::Type::NullableClass(_)
+        ) || parameter.owned
+        {
             continue;
         }
-        let Some(local) = escaping_class_local_borrow(program, argument)? else {
-            continue;
-        };
         let mode = if parameter.writable {
             ClassBorrowMode::Writable
         } else {
             ClassBorrowMode::Readonly
         };
-        if let Some((_, existing)) = borrows.iter_mut().find(|(borrowed, _)| *borrowed == local) {
-            if mode.conflicts_with(*existing) {
-                *existing = ClassBorrowMode::Writable;
+        for local in escaping_class_local_borrows(program, argument)? {
+            if let Some((_, existing)) = borrows.iter_mut().find(|(borrowed, _)| *borrowed == local)
+            {
+                if mode.conflicts_with(*existing) {
+                    *existing = ClassBorrowMode::Writable;
+                }
+            } else {
+                borrows.push((local, mode));
             }
-        } else {
-            borrows.push((local, mode));
         }
     }
     Ok(borrows)

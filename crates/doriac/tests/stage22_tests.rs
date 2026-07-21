@@ -621,6 +621,48 @@ function main(): void
 }
 
 #[test]
+fn coalesce_borrows_all_possible_arms_across_call_arguments() {
+    for (file, source) in [
+        (
+            "stage22-coalesce-call-borrow.doria",
+            r#"
+class Box {}
+
+function pair(Box $borrowed, take Box $owned): void {}
+
+function main(): void
+{
+    ?Box $maybe = null;
+    let $box = new Box();
+    pair($maybe ?? $box, $box);
+}
+"#,
+        ),
+        (
+            "stage22-nullable-coalesce-call-borrow.doria",
+            r#"
+class Box {}
+
+function pair(?Box $borrowed, take Box $owned): void {}
+
+function main(): void
+{
+    ?Box $maybe = null;
+    let $box = new Box();
+    pair($maybe ?? $box, $box);
+}
+"#,
+        ),
+    ] {
+        let program = doriac::lower_source_to_mir(file, source)
+            .expect("coalesce call arguments should reach shared MIR ownership validation");
+        let error = doriac::mir_validation::validate_program(&program)
+            .expect_err("a possible coalesce borrow must conflict with a later transfer");
+        assert!(error.message.contains("both borrows and transfers"));
+    }
+}
+
+#[test]
 fn null_safe_property_access_is_never_a_write_place() {
     for statement in [
         "$value?->count = 1;",

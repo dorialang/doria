@@ -1648,7 +1648,7 @@ fn emit_expr(expr: &Expr, scopes: &PhpNameScopes) -> String {
         Expr::Grouped { expr, .. } => format!("({})", emit_expr(expr, scopes)),
         Expr::IsType { expr, ty, .. } => {
             let value = emit_expr(expr, scopes);
-            match ty.name.as_str() {
+            let test = match ty.name.as_str() {
                 "int" | "int8" | "int16" | "int32" | "int64" | "uint8" | "uint16" | "uint32"
                 | "uint64" => format!("get_debug_type({value}) === 'int'"),
                 "float" | "float32" | "float64" => {
@@ -1657,7 +1657,8 @@ fn emit_expr(expr: &Expr, scopes: &PhpNameScopes) -> String {
                 "string" => format!("get_debug_type({value}) === 'string'"),
                 "bool" => format!("get_debug_type({value}) === 'bool'"),
                 class_name => format!("get_debug_type({value}) === {class_name}::class"),
-            }
+            };
+            format!("({test})")
         }
         Expr::Unary { op, expr, .. } => match op {
             UnaryOp::Not => format!("!({})", emit_expr(expr, scopes)),
