@@ -27,8 +27,15 @@ No `**` or `**=` operator. Exponentiation is `Int::pow(int): int` (checked;
 overflow panics; a negative exponent panics, since integer exponentiation is
 non-negative) and `Float::pow(float): float`, on the numeric companion APIs.
 
-Rationale: every systems language uses a method, not an operator (Rust `.pow`,
-C# `Math.Pow`, Go/Java the same); it routes through the companion-API surface
+Rationale: no C-family language exposes exponentiation as an operator — C
+(`pow` in `<math.h>`), C++ (`std::pow`), Rust (`.pow`/`.powi`/`.powf`), C#
+(`Math.Pow`), Go (`math.Pow`), and Java (`Math.pow`) all spell it as a free
+function or method. This is a C-family convention, **not** a universal one:
+`**` does exist in Fortran, Ada, Python, PHP, Ruby, and JavaScript, so choosing
+the method form is a deliberate divergence from PHP, not an appeal to unanimity.
+(In C++ the token is additionally unavailable, since `*` is dereference and
+`a ** b` already reads as `a * (*b)`.) The method form also routes through the
+companion-API surface
 Doria already uses (`Int::wrappingAdd`, `Int::toFloat`); and it avoids `**`'s
 precedence footgun (`-2 ** 2` binds as `-(2 ** 2)` in operator languages) and the
 integer/float/negative-exponent ambiguity, which a typed method contract states
@@ -72,9 +79,11 @@ reopen with the named-arguments/variadic work.
 ## Alternatives considered
 
 - **Add `**`/`**=` as operators (PHP/Python parity):** rejected — the precedence
-  footgun, the integer/float/negative-exponent ambiguity, and inconsistency with
-  every systems language outweigh the ergonomic win; `Int::pow`/`Float::pow` are
-  clear and typed.
+  footgun, the integer/float/negative-exponent ambiguity, and divergence from the
+  C-family spelling outweigh the ergonomic win; `Int::pow`/`Float::pow` are clear
+  and typed. This is the weakest-supported of the rejections, since `**` is
+  well-established in PHP, Python, Fortran, and Ada; it rests on the footgun and
+  the typed contract, not on a claim that nobody has the operator.
 - **`<=>` returning `int` (-1/0/1):** rejected — magic-number return; `Ordering`
   is the typed, match-friendly form.
 - **`<=>` returning `Ordering` (operator, but typed):** rejected — a spaceship
