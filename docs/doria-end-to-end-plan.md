@@ -281,9 +281,9 @@ class History<T>   // deliberately not Deque<T>: that name is reserved for a fut
 
 function max<T implements Comparable<T>>(T $a, T $b): T
 {
-    return match (true) {
-        $a->compareTo($b) >= 0 => $a,
-        default => $b,
+    return match ($a->compare($b)) {
+        Ordering::Less => $b,
+        default => $a,
     };
 }
 ```
@@ -622,7 +622,7 @@ PHP's standard library is the cautionary tale this charter exists to prevent: `s
 
 **The free-function boundary — and why it lives only there.** A member never needs casing to declare its provenance: the receiver already does that work. In `Int::wrappingAdd(...)` or `$s->isEmpty`, the `Int::` / string-typed receiver *is* the tell that this belongs to the standard library, so members are simply camelCase on both sides — one rule, no historical camelCase/snake_case mish-mash inside any codebase. A free function has no such prefix, so for free functions casing carries the provenance instead: snake_case is Doria's built-in signature (`str_case_compare($a, $b)` is the language), and **userland free functions are camelCase by convention** (`normalizeTitle($post)` is the application). Userland remains free to choose its own style — but Doria's docs, examples, and tooling never teach snake_case for userland free functions and subtly, consistently encourage camelCase. Enforcement:
 
-- All documentation, SPEC examples, `baton new` templates, LSP snippets, and generated code (`#[Derive(...)]` members) write userland declarations in camelCase; this plan's own examples model it (`loadUser`, `findById`), and conformances to built-in interfaces always keep the interface's member spelling (`compareTo`, `toString`).
+- All documentation, SPEC examples, `baton new` templates, LSP snippets, and generated code (`#[Derive(...)]` members) write userland declarations in camelCase; this plan's own examples model it (`loadUser`, `findById`), and conformances to built-in interfaces always keep the interface's member spelling (`compare`, `toString`).
 - A default-on lint gives a gentle, silenceable hint when userland declares a snake_case **free function** ("this reads as a Doria built-in; camelCase is the userland convention") — encouragement, not an error, silenceable per-declaration and per-module. Methods are exempt: the receiver already carries provenance, so there is no member boundary to protect.
 - `function_exists("name")` is a compile-time predicate usable in top-level `if` to conditionally declare a function. This is the sanctioned collision/polyfill mechanism: guarded declarations may adopt the built-in's snake_case name because they deliberately stand in for one (e.g. back-filling a newer stdlib function on an older Doria); outside such a guard, userland free functions stay camelCase. `function_exists` is const-evaluated — there is no runtime symbol table.
 - The generated PHP FFI stubs mirror the exported Doria class's own casing, so a `#[PHPExport]` class written in charter-compliant userland camelCase lands in PHP looking like idiomatic PSR code — a free win for the bridge.
