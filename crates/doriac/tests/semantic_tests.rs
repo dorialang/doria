@@ -3936,7 +3936,6 @@ Dictionary<int, int> $indexedCounts = [
     1 => 20,
 ];
 Dictionary<string, int> $emptyCounts = [];
-Set<string> $names = [];
 
 class Inventory
 {
@@ -4018,6 +4017,11 @@ let $values = [
     "second" => 1,
 ];
 Dictionary<string, int> $numbers = $values;
+"#,
+        r#"Set<string> $names = [];"#,
+        r#"
+let $empty = [];
+Set<string> $names = $empty;
 "#,
     ] {
         assert_type_mismatch(source);

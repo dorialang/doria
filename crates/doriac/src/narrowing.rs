@@ -523,8 +523,13 @@ impl ForwardAnalysis for NarrowingAnalysis<'_> {
         let merged = state
             .facts
             .iter()
-            .filter(|(binding, fact)| incoming.facts.get(binding) == Some(*fact))
-            .map(|(binding, fact)| (*binding, fact.clone()))
+            .filter_map(|(binding, fact)| {
+                incoming
+                    .facts
+                    .get(binding)
+                    .and_then(|incoming| join_fact(fact, incoming))
+                    .map(|fact| (*binding, fact))
+            })
             .collect();
         if state.facts == merged {
             false
@@ -532,6 +537,19 @@ impl ForwardAnalysis for NarrowingAnalysis<'_> {
             state.facts = merged;
             true
         }
+    }
+}
+
+fn join_fact(left: &Fact, right: &Fact) -> Option<Fact> {
+    if left == right {
+        return Some(left.clone());
+    }
+
+    match (left, right) {
+        (Fact::Exact(_), Fact::Exact(_))
+        | (Fact::Exact(_), Fact::NonNull)
+        | (Fact::NonNull, Fact::Exact(_)) => Some(Fact::NonNull),
+        _ => None,
     }
 }
 
@@ -820,20 +838,16 @@ fn expression_fact(
         | Expr::This { .. }
         | Expr::Unary { .. }
         | Expr::IsType { .. } => Some(Fact::NonNull),
-        Expr::Variable { .. } => {
-            variable_binding(value, resolution).and_then(|binding| {
-                match state.facts.get(&binding) {
-                    Some(Fact::Null) => Some(Fact::Null),
-                    Some(Fact::NonNull | Fact::Exact(_)) => Some(Fact::NonNull),
-                    None => resolution
-                        .declaration_types
-                        .get(&binding)
-                        .and_then(Option::as_ref)
-                        .filter(|ty| !ty.nullable)
-                        .map(|_| Fact::NonNull),
-                }
+        Expr::Variable { .. } => variable_binding(value, resolution).and_then(|binding| {
+            state.facts.get(&binding).cloned().or_else(|| {
+                resolution
+                    .declaration_types
+                    .get(&binding)
+                    .and_then(Option::as_ref)
+                    .filter(|ty| !ty.nullable)
+                    .map(|_| Fact::NonNull)
             })
-        }
+        }),
         Expr::FunctionCall { name, .. } => nullability
             .function_is_non_null(name)
             .filter(|non_null| *non_null)

@@ -5971,10 +5971,7 @@ impl<'program> Checker<'program> {
             }
             (TypeKind::Nullable(target), _) => self.is_assignable(target, value),
             (
-                TypeKind::TypedArray(_)
-                | TypeKind::List(_)
-                | TypeKind::Dictionary(_, _)
-                | TypeKind::Set(_),
+                TypeKind::TypedArray(_) | TypeKind::List(_) | TypeKind::Dictionary(_, _),
                 TypeKind::EmptyCollection,
             ) => true,
             (

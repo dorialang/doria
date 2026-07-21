@@ -164,6 +164,43 @@ function read(bool $condition): int
 }
 
 #[test]
+fn flow_joins_preserve_the_common_non_null_refinement() {
+    doriac::check_source(
+        "stage22-refinement-join.doria",
+        r#"
+function read(bool $condition, ?int $value): int
+{
+    if ($condition) {
+        if (!($value is int)) { return 0; }
+    } else {
+        if ($value == null) { return 0; }
+    }
+    return $value + 1;
+}
+"#,
+    )
+    .expect("exact and non-null paths should join at the shared non-null refinement");
+}
+
+#[test]
+fn copying_a_narrowed_variable_preserves_its_exact_type() {
+    doriac::check_source(
+        "stage22-exact-copy.doria",
+        r#"
+function read(take mixed $value): int
+{
+    if ($value is int) {
+        mixed $copy = $value;
+        return $copy + 1;
+    }
+    return 0;
+}
+"#,
+    )
+    .expect("copying an exact-narrowed value should preserve the exact fact");
+}
+
+#[test]
 fn short_circuit_rhs_uses_see_prior_call_mutations() {
     let invalid = diagnostics(
         r#"
