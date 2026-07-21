@@ -143,26 +143,32 @@ impl NullabilityCatalog {
                     for member in &class.members {
                         match member {
                             crate::ast::ClassMember::Method(method) => {
-                                let Some(non_null) = declared_return_is_non_null(method) else {
-                                    continue;
-                                };
-                                merge_guarantee(
-                                    catalog.methods.entry(method.name.clone()),
-                                    non_null,
-                                );
-                                catalog
-                                    .qualified_methods
-                                    .insert((class.name.clone(), method.name.clone()), non_null);
+                                if let Some(non_null) = declared_return_is_non_null(method) {
+                                    merge_guarantee(
+                                        catalog.methods.entry(method.name.clone()),
+                                        non_null,
+                                    );
+                                    catalog.qualified_methods.insert(
+                                        (class.name.clone(), method.name.clone()),
+                                        non_null,
+                                    );
+                                }
+                                if method.name == "__construct" {
+                                    for parameter in &method.params {
+                                        catalog.record_property(
+                                            &class.name,
+                                            &parameter.name,
+                                            !parameter.ty.nullable,
+                                        );
+                                    }
+                                }
                             }
                             crate::ast::ClassMember::Property(property) => {
-                                let non_null = !property.ty.nullable;
-                                merge_guarantee(
-                                    catalog.properties.entry(property.name.clone()),
-                                    non_null,
+                                catalog.record_property(
+                                    &class.name,
+                                    &property.name,
+                                    !property.ty.nullable,
                                 );
-                                catalog
-                                    .qualified_properties
-                                    .insert((class.name.clone(), property.name.clone()), non_null);
                             }
                             crate::ast::ClassMember::Constant(_) => {}
                         }
@@ -172,6 +178,12 @@ impl NullabilityCatalog {
             }
         }
         catalog
+    }
+
+    fn record_property(&mut self, class: &str, property: &str, non_null: bool) {
+        merge_guarantee(self.properties.entry(property.to_string()), non_null);
+        self.qualified_properties
+            .insert((class.to_string(), property.to_string()), non_null);
     }
 
     fn function_is_non_null(&self, name: &str) -> Option<bool> {
@@ -264,22 +276,28 @@ fn merge_guarantee(entry: std::collections::hash_map::Entry<'_, String, bool>, i
 impl MutationCatalog {
     fn from_program(program: &Program) -> Self {
         let mut catalog = Self::default();
+        let classes = program
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Class(class) => Some(class.name.clone()),
+                _ => None,
+            })
+            .collect();
         for item in &program.items {
             match item {
                 Item::Function(function) => merge_parameter_modes(
                     catalog.functions.entry(function.name.clone()).or_default(),
                     &function.params,
+                    &classes,
+                    None,
                 ),
                 Item::Class(class) => {
                     for member in &class.members {
                         let crate::ast::ClassMember::Method(method) = member else {
                             continue;
                         };
-                        let modes = method
-                            .params
-                            .iter()
-                            .map(|parameter| parameter.writable || parameter.take)
-                            .collect::<Vec<_>>();
+                        let modes = parameter_modes(&method.params, &classes, Some(&class.name));
                         merge_modes(
                             catalog.methods.entry(method.name.clone()).or_default(),
                             &modes,
@@ -350,12 +368,33 @@ impl MutationCatalog {
     }
 }
 
-fn merge_parameter_modes(target: &mut Vec<bool>, parameters: &[Param]) {
-    let modes = parameters
-        .iter()
-        .map(|parameter| parameter.writable || parameter.take)
-        .collect::<Vec<_>>();
+fn merge_parameter_modes(
+    target: &mut Vec<bool>,
+    parameters: &[Param],
+    classes: &std::collections::HashSet<String>,
+    declaring_class: Option<&str>,
+) {
+    let modes = parameter_modes(parameters, classes, declaring_class);
     merge_modes(target, &modes);
+}
+
+fn parameter_modes(
+    parameters: &[Param],
+    classes: &std::collections::HashSet<String>,
+    declaring_class: Option<&str>,
+) -> Vec<bool> {
+    parameters
+        .iter()
+        .map(|parameter| {
+            parameter.writable
+                || (parameter.take
+                    && crate::ownership::type_ref_is_move_type(
+                        &parameter.ty,
+                        classes,
+                        declaring_class,
+                    ))
+        })
+        .collect()
 }
 
 fn merge_modes(target: &mut Vec<bool>, incoming: &[bool]) {
@@ -607,6 +646,13 @@ fn joined_facts(
         .collect()
 }
 
+fn joined_state(left: &State, right: &State) -> State {
+    State {
+        reachable: left.reachable || right.reachable,
+        facts: joined_facts(&left.facts, &right.facts),
+    }
+}
+
 fn join_fact(left: &Fact, right: &Fact) -> Option<Fact> {
     if left == right {
         return Some(left.clone());
@@ -824,6 +870,18 @@ fn kill_mutated_call_arguments(
         }
         Expr::Binary {
             left,
+            op: crate::ast::BinaryOp::And,
+            right,
+            ..
+        } => kill_short_circuit_effects(left, right, true, state, resolution, mutations),
+        Expr::Binary {
+            left,
+            op: crate::ast::BinaryOp::Or,
+            right,
+            ..
+        } => kill_short_circuit_effects(left, right, false, state, resolution, mutations),
+        Expr::Binary {
+            left,
             op: crate::ast::BinaryOp::Coalesce,
             right,
             ..
@@ -863,6 +921,32 @@ fn kill_mutated_call_arguments(
         | Expr::Bool { .. }
         | Expr::Null { .. }
         | Expr::StaticMember { .. } => {}
+    }
+}
+
+fn kill_short_circuit_effects(
+    left: &Expr,
+    right: &Expr,
+    continue_when: bool,
+    state: &mut State,
+    resolution: &Resolution,
+    mutations: &MutationCatalog,
+) {
+    kill_mutated_call_arguments(left, state, resolution, mutations);
+    let left_constant = crate::ownership::constant_bool(left);
+
+    let mut evaluated = state.clone();
+    apply_condition(left, continue_when, &mut evaluated, resolution);
+    kill_mutated_call_arguments(right, &mut evaluated, resolution, mutations);
+
+    match left_constant {
+        Some(value) if value == continue_when => *state = evaluated,
+        Some(_) => {}
+        None => {
+            let mut skipped = state.clone();
+            apply_condition(left, !continue_when, &mut skipped, resolution);
+            *state = joined_state(&skipped, &evaluated);
+        }
     }
 }
 
@@ -1231,29 +1315,13 @@ fn collect_expr(
             op: crate::ast::BinaryOp::And,
             right,
             ..
-        } => {
-            collect_expr(left, state, resolution, mutations, facts);
-            let mut right_state = state.clone();
-            apply_condition_with_effects(left, true, &mut right_state, resolution, mutations);
-            collect_expr(right, &right_state, resolution, mutations, facts);
-            let mut result = state.clone();
-            kill_mutated_call_arguments(expr, &mut result, resolution, mutations);
-            result
-        }
+        } => collect_short_circuit(left, right, true, state, resolution, mutations, facts),
         Expr::Binary {
             left,
             op: crate::ast::BinaryOp::Or,
             right,
             ..
-        } => {
-            collect_expr(left, state, resolution, mutations, facts);
-            let mut right_state = state.clone();
-            apply_condition_with_effects(left, false, &mut right_state, resolution, mutations);
-            collect_expr(right, &right_state, resolution, mutations, facts);
-            let mut result = state.clone();
-            kill_mutated_call_arguments(expr, &mut result, resolution, mutations);
-            result
-        }
+        } => collect_short_circuit(left, right, false, state, resolution, mutations, facts),
         Expr::Binary {
             left,
             op: crate::ast::BinaryOp::Coalesce,
@@ -1297,6 +1365,32 @@ fn collect_expr(
         | Expr::StaticMember { .. }
         | Expr::Variable { .. } => state.clone(),
     }
+}
+
+fn collect_short_circuit(
+    left: &Expr,
+    right: &Expr,
+    continue_when: bool,
+    state: &State,
+    resolution: &Resolution,
+    mutations: &MutationCatalog,
+    facts: &mut FactsByUse,
+) -> State {
+    collect_expr(left, state, resolution, mutations, facts);
+    let mut evaluated = state.clone();
+    apply_condition_with_effects(left, continue_when, &mut evaluated, resolution, mutations);
+    collect_expr(right, &evaluated, resolution, mutations, facts);
+
+    let mut result = state.clone();
+    kill_short_circuit_effects(
+        left,
+        right,
+        continue_when,
+        &mut result,
+        resolution,
+        mutations,
+    );
+    result
 }
 
 fn collect_expr_sequence(

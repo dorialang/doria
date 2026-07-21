@@ -507,6 +507,12 @@ fn expr_return_borrow(
                 })
         }
         Expr::Grouped { expr, .. } => expr_return_borrow(expr, function, resolve_call, shadowed),
+        Expr::Binary {
+            left,
+            op: BinaryOp::Coalesce,
+            right,
+            ..
+        } => coalesced_return_borrow(left, right, function, resolve_call, shadowed),
         Expr::PropertyAccess { object, .. } => {
             let mut direct_object = object.as_ref();
             while let Expr::Grouped { expr, .. } = direct_object {
@@ -530,6 +536,39 @@ fn expr_return_borrow(
         }
         _ => None,
     }
+}
+
+fn coalesced_return_borrow(
+    left: &Expr,
+    right: &Expr,
+    function: &ast::FunctionDecl,
+    resolve_call: &mut dyn FnMut(&Expr) -> Option<ReturnBorrow>,
+    shadowed: &HashSet<String>,
+) -> Option<ReturnBorrow> {
+    let left_null = matches!(ungroup_expr(left), Expr::Null { .. });
+    let right_null = matches!(ungroup_expr(right), Expr::Null { .. });
+    let left = (!left_null)
+        .then(|| expr_return_borrow(left, function, resolve_call, shadowed))
+        .flatten();
+    let right = (!right_null)
+        .then(|| expr_return_borrow(right, function, resolve_call, shadowed))
+        .flatten();
+
+    match (left, right, left_null, right_null) {
+        (Some(borrow), None, _, true) | (None, Some(borrow), true, _) => Some(borrow),
+        (Some(mut left), Some(right), _, _) if left.source == right.source => {
+            left.writable &= right.writable;
+            Some(left)
+        }
+        _ => None,
+    }
+}
+
+fn ungroup_expr(mut expr: &Expr) -> &Expr {
+    while let Expr::Grouped { expr: inner, .. } = expr {
+        expr = inner;
+    }
+    expr
 }
 
 fn returned_call_borrow(
@@ -2223,7 +2262,7 @@ fn type_ref_class_name(
     classes.contains(name).then(|| name.to_string())
 }
 
-fn type_ref_is_move_type(
+pub(crate) fn type_ref_is_move_type(
     ty: &crate::types::TypeRef,
     classes: &HashSet<String>,
     receiver_class: Option<&str>,
@@ -2248,7 +2287,7 @@ fn call_arg_mode(signature: &Signature, index: usize) -> UseMode {
     }
 }
 
-fn constant_bool(expr: &Expr) -> Option<bool> {
+pub(crate) fn constant_bool(expr: &Expr) -> Option<bool> {
     match expr {
         Expr::Bool { value, .. } => Some(*value),
         Expr::Grouped { expr, .. } => constant_bool(expr),

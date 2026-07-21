@@ -297,6 +297,24 @@ function read(?int $value): bool
 }
 
 #[test]
+fn skipped_short_circuit_calls_preserve_narrowing_facts() {
+    doriac::check_source(
+        "stage22-skipped-short-circuit-call.doria",
+        r#"
+function clear(writable ?int $value): bool { $value = null; return true; }
+function read(?int $value): int
+{
+    if ($value == null) { return 0; }
+    false && clear($value);
+    true || clear($value);
+    return $value + 1;
+}
+"#,
+    )
+    .expect("calls in skipped short-circuit operands must not invalidate flow facts");
+}
+
+#[test]
 fn impossible_is_tests_do_not_change_variable_types() {
     let invalid = diagnostics(
         r#"
@@ -621,6 +639,23 @@ function main(): void
 }
 
 #[test]
+fn nullable_coalesce_returns_preserve_borrow_provenance() {
+    let program = doriac::lower_source_to_mir(
+        "stage22-borrowed-coalesce-return.doria",
+        r#"
+class Box {}
+
+function maybe(?Box $box): ?Box { return $box ?? null; }
+function relay(?Box $box): ?Box { return maybe($box); }
+function main(): void {}
+"#,
+    )
+    .expect("a nullable coalesce with null should preserve its borrowed source");
+    doriac::mir_validation::validate_program(&program)
+        .expect("the borrowed nullable coalesce return should validate");
+}
+
+#[test]
 fn nullable_class_call_arguments_enforce_ownership_and_writability() {
     let owned = doriac::lower_source_to_mir(
         "stage22-borrowed-nullable-take.doria",
@@ -788,6 +823,42 @@ function read(?int $value): int
 "#,
     )
     .expect("a readonly call must preserve the caller's narrowing fact");
+}
+
+#[test]
+fn copy_take_arguments_preserve_narrowing_facts() {
+    doriac::check_source(
+        "stage22-copy-take-flow.doria",
+        r#"
+function inspect(take int $value): void {}
+function read(?int $value): int
+{
+    if ($value == null) { return 0; }
+    inspect($value);
+    return $value + 1;
+}
+"#,
+    )
+    .expect("take is a semantic no-op for Copy arguments");
+}
+
+#[test]
+fn promoted_properties_contribute_declared_nullability_facts() {
+    doriac::check_source(
+        "stage22-promoted-property-flow.doria",
+        r#"
+class Counter
+{
+    function __construct(int $count) {}
+    function next(): int
+    {
+        ?int $copy = $this->count;
+        return $copy + 1;
+    }
+}
+"#,
+    )
+    .expect("a promoted non-null property should establish a non-null assignment fact");
 }
 
 #[test]
