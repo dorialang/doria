@@ -78,8 +78,9 @@ write over the same place rule.
   addition — a near stage.
 - **`.=`** lands with string read-modify-write (string concat exists; the
   compound-assign place machinery is §3.2 / the property-RMW work).
-- **`??=`** lands with the Stage 22 nullable model (decision 0093) — it needs
-  `??`.
+- **`??=`** follows Stage 22 in a compound-assignment implementation slice once
+  its lexer, parser, semantic, and lowering support can land together. Stage 22
+  provides the prerequisite `??` semantics but does not expose `??=` syntax.
 - SPEC's grammar and the lexer (`.=` and `??=` tokens, a ternary production) are
   amended as each lands; SPEC tracks the implemented surface, so this record does
   not amend it now. This record does not open a broader operator sweep (`<=>` and

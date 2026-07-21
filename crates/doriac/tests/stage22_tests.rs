@@ -96,6 +96,82 @@ function safe(?Label $label): string
 }
 
 #[test]
+fn narrowing_resolves_non_null_members_against_the_flow_class() {
+    doriac::check_source(
+        "stage22-flow-class-members.doria",
+        r#"
+class A
+{
+    static int $setting = 1;
+    static function value(): int { return 1; }
+    static function inspect(?int $value): void {}
+    function read(): int
+    {
+        ?int $value = self::value();
+        ?int $setting = self::setting;
+        return $value + $setting;
+    }
+    function preserve(?int $value): int
+    {
+        if ($value == null) { return 0; }
+        self::inspect($value);
+        return $value + 1;
+    }
+}
+
+class B
+{
+    static ?int $setting = null;
+    static function value(): ?int { return null; }
+    static function inspect(writable ?int $value): void { $value = null; }
+}
+
+class Reader
+{
+    int $count = 1;
+    function number(): int { return 1; }
+    function inspect(?int $value): void {}
+}
+
+class Writer
+{
+    ?int $count = null;
+    function number(): ?int { return null; }
+    function inspect(writable ?int $value): void { $value = null; }
+}
+
+function read(mixed $reader, ?int $value): int
+{
+    if ($reader is Reader) {
+        ?int $number = $reader->number();
+        ?int $count = $reader->count;
+        if ($value == null) { return 0; }
+        $reader->inspect($value);
+        return $number + $count + $value;
+    }
+    return 0;
+}
+"#,
+    )
+    .expect("self-qualified and exact-class receivers should use their qualified member facts");
+}
+
+#[test]
+fn incompatible_coalesce_operands_are_rejected_before_lowering() {
+    let diagnostic = assert_code(
+        r#"
+function reject(?int $value): void
+{
+    let $result = $value ?? "bad";
+}
+"#,
+        "E0512",
+    );
+    assert!(diagnostic.message.contains("`?int`"));
+    assert!(diagnostic.message.contains("`string`"));
+}
+
+#[test]
 fn narrowing_is_lexical_path_sensitive_and_short_circuit_aware() {
     doriac::check_source(
         "stage22-flow.doria",

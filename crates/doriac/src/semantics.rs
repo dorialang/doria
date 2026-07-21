@@ -3609,7 +3609,25 @@ impl<'program> Checker<'program> {
                 }
                 self.report_integer_operand_mismatch(left_ty, right_ty, span, "comparison");
             }
-            BinaryOp::Coalesce => {}
+            BinaryOp::Coalesce => {
+                let result = self.infer_binary_type(left, op, right, scopes, method_context);
+                if matches!(self.types.kind(result), TypeKind::Heterogeneous) {
+                    let left_ty = self.infer_expr_type(left, scopes, method_context);
+                    let right_ty = self.infer_expr_type(right, scopes, method_context);
+                    self.diagnostics.push(
+                        Diagnostic::new(
+                            "E0512",
+                            format!(
+                                "null-coalescing operands are incompatible: `{}` cannot fall back to `{}`",
+                                self.types.display(left_ty),
+                                self.types.display(right_ty)
+                            ),
+                            span,
+                        )
+                        .with_help("use a fallback assignable to the nullable payload type"),
+                    );
+                }
+            }
         }
     }
 

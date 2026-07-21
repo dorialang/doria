@@ -110,8 +110,9 @@ impl NullabilityCatalog {
         object: &Expr,
         method: &str,
         resolution: &Resolution,
+        state: &State,
     ) -> Option<bool> {
-        if let Some(class) = expression_class_name(object, resolution) {
+        if let Some(class) = expression_class_name(object, resolution, Some(state)) {
             return self
                 .qualified_methods
                 .get(&(class, method.to_string()))
@@ -124,16 +125,15 @@ impl NullabilityCatalog {
         &self,
         qualifier: &crate::ast::StaticQualifier,
         method: &str,
+        resolution: &Resolution,
     ) -> Option<bool> {
-        match qualifier {
-            crate::ast::StaticQualifier::Class(class) => self
-                .qualified_methods
-                .get(&(class.clone(), method.to_string()))
+        if let Some(class) = static_qualifier_class_name(qualifier, resolution) {
+            self.qualified_methods
+                .get(&(class, method.to_string()))
                 .copied()
-                .or_else(|| self.method_is_non_null(method)),
-            crate::ast::StaticQualifier::SelfType
-            | crate::ast::StaticQualifier::Parent
-            | crate::ast::StaticQualifier::InvalidStatic => self.method_is_non_null(method),
+                .or_else(|| self.method_is_non_null(method))
+        } else {
+            self.method_is_non_null(method)
         }
     }
 
@@ -146,8 +146,9 @@ impl NullabilityCatalog {
         object: &Expr,
         property: &str,
         resolution: &Resolution,
+        state: &State,
     ) -> Option<bool> {
-        if let Some(class) = expression_class_name(object, resolution) {
+        if let Some(class) = expression_class_name(object, resolution, Some(state)) {
             return self
                 .qualified_properties
                 .get(&(class, property.to_string()))
@@ -160,16 +161,15 @@ impl NullabilityCatalog {
         &self,
         qualifier: &crate::ast::StaticQualifier,
         property: &str,
+        resolution: &Resolution,
     ) -> Option<bool> {
-        match qualifier {
-            crate::ast::StaticQualifier::Class(class) => self
-                .qualified_properties
-                .get(&(class.clone(), property.to_string()))
+        if let Some(class) = static_qualifier_class_name(qualifier, resolution) {
+            self.qualified_properties
+                .get(&(class, property.to_string()))
                 .copied()
-                .or_else(|| self.property_is_non_null(property)),
-            crate::ast::StaticQualifier::SelfType
-            | crate::ast::StaticQualifier::Parent
-            | crate::ast::StaticQualifier::InvalidStatic => self.property_is_non_null(property),
+                .or_else(|| self.property_is_non_null(property))
+        } else {
+            self.property_is_non_null(property)
         }
     }
 }
@@ -241,8 +241,9 @@ impl MutationCatalog {
         object: &Expr,
         method: &str,
         resolution: &Resolution,
+        state: &State,
     ) -> Option<&[bool]> {
-        if let Some(class) = expression_class_name(object, resolution) {
+        if let Some(class) = expression_class_name(object, resolution, Some(state)) {
             return self
                 .qualified_methods
                 .get(&(class, method.to_string()))
@@ -255,16 +256,15 @@ impl MutationCatalog {
         &self,
         qualifier: &crate::ast::StaticQualifier,
         method: &str,
+        resolution: &Resolution,
     ) -> Option<&[bool]> {
-        match qualifier {
-            crate::ast::StaticQualifier::Class(class) => self
-                .qualified_methods
-                .get(&(class.clone(), method.to_string()))
+        if let Some(class) = static_qualifier_class_name(qualifier, resolution) {
+            self.qualified_methods
+                .get(&(class, method.to_string()))
                 .or_else(|| self.methods.get(method))
-                .map(Vec::as_slice),
-            crate::ast::StaticQualifier::SelfType
-            | crate::ast::StaticQualifier::Parent
-            | crate::ast::StaticQualifier::InvalidStatic => self.method_modes(method),
+                .map(Vec::as_slice)
+        } else {
+            self.method_modes(method)
         }
     }
 
@@ -706,7 +706,7 @@ fn kill_mutated_call_arguments(
             kill_calls_in_arguments(args, state, resolution, mutations);
             kill_arguments_for_modes(
                 args,
-                mutations.instance_method_modes(object, method, resolution),
+                mutations.instance_method_modes(object, method, resolution, state),
                 state,
                 resolution,
             );
@@ -724,7 +724,7 @@ fn kill_mutated_call_arguments(
             kill_calls_in_arguments(args, state, resolution, mutations);
             kill_arguments_for_modes(
                 args,
-                mutations.static_method_modes(qualifier, method),
+                mutations.static_method_modes(qualifier, method, resolution),
                 state,
                 resolution,
             );
@@ -858,14 +858,14 @@ fn expression_fact(
             null_safe,
             ..
         } => (!null_safe)
-            .then(|| nullability.instance_method_is_non_null(object, method, resolution))
+            .then(|| nullability.instance_method_is_non_null(object, method, resolution, state))
             .flatten()
             .filter(|non_null| *non_null)
             .map(|_| Fact::NonNull),
         Expr::StaticCall {
             qualifier, method, ..
         } => nullability
-            .static_method_is_non_null(qualifier, method)
+            .static_method_is_non_null(qualifier, method, resolution)
             .filter(|non_null| *non_null)
             .map(|_| Fact::NonNull),
         Expr::PropertyAccess {
@@ -874,14 +874,14 @@ fn expression_fact(
             null_safe,
             ..
         } => (!null_safe)
-            .then(|| nullability.instance_property_is_non_null(object, property, resolution))
+            .then(|| nullability.instance_property_is_non_null(object, property, resolution, state))
             .flatten()
             .filter(|non_null| *non_null)
             .map(|_| Fact::NonNull),
         Expr::StaticMember {
             qualifier, member, ..
         } => nullability
-            .static_property_is_non_null(qualifier, member)
+            .static_property_is_non_null(qualifier, member, resolution)
             .filter(|non_null| *non_null)
             .map(|_| Fact::NonNull),
         Expr::Binary {
@@ -1081,7 +1081,8 @@ fn collect_expr(
         } => {
             let state = collect_expr(object, state, resolution, mutations, facts);
             let mut state = collect_expr_sequence(args, &state, resolution, mutations, facts);
-            kill_arguments_for_modes(args, mutations.method_modes(method), &mut state, resolution);
+            let modes = mutations.instance_method_modes(object, method, resolution, &state);
+            kill_arguments_for_modes(args, modes, &mut state, resolution);
             state
         }
         Expr::FunctionCall { name, args, .. } => {
@@ -1098,7 +1099,7 @@ fn collect_expr(
             let mut state = collect_expr_sequence(args, state, resolution, mutations, facts);
             kill_arguments_for_modes(
                 args,
-                mutations.static_method_modes(qualifier, method),
+                mutations.static_method_modes(qualifier, method, resolution),
                 &mut state,
                 resolution,
             );
@@ -1203,14 +1204,33 @@ fn variable_binding(expr: &Expr, resolution: &Resolution) -> Option<BindingId> {
     resolution.uses.get(&(span.start, span.end)).copied()
 }
 
-fn expression_class_name(expr: &Expr, resolution: &Resolution) -> Option<String> {
+fn expression_class_name(
+    expr: &Expr,
+    resolution: &Resolution,
+    state: Option<&State>,
+) -> Option<String> {
     match ungroup(expr) {
         Expr::New { class_name, .. } => Some(class_name.clone()),
         Expr::This { .. } => resolution.current_class.clone(),
-        Expr::Variable { .. } => variable_binding(expr, resolution)
-            .and_then(|binding| resolution.declaration_classes.get(&binding))
-            .cloned(),
+        Expr::Variable { .. } => {
+            let binding = variable_binding(expr, resolution)?;
+            if let Some(Fact::Exact(ty)) = state.and_then(|state| state.facts.get(&binding)) {
+                return Some(ty.name.clone());
+            }
+            resolution.declaration_classes.get(&binding).cloned()
+        }
         _ => None,
+    }
+}
+
+fn static_qualifier_class_name(
+    qualifier: &crate::ast::StaticQualifier,
+    resolution: &Resolution,
+) -> Option<String> {
+    match qualifier {
+        crate::ast::StaticQualifier::Class(class) => Some(class.clone()),
+        crate::ast::StaticQualifier::SelfType => resolution.current_class.clone(),
+        crate::ast::StaticQualifier::Parent | crate::ast::StaticQualifier::InvalidStatic => None,
     }
 }
 
