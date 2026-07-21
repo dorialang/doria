@@ -33,6 +33,8 @@ struct Resolution {
     declaration_types: HashMap<BindingId, Option<TypeRef>>,
     declaration_classes: HashMap<BindingId, String>,
     current_class: Option<String>,
+    nullability: NullabilityCatalog,
+    member_classes: MemberClassCatalog,
 }
 
 #[derive(Default)]
@@ -43,13 +45,88 @@ struct MutationCatalog {
     constructors: HashMap<String, Vec<bool>>,
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct NullabilityCatalog {
     functions: HashMap<String, bool>,
     methods: HashMap<String, bool>,
     qualified_methods: HashMap<(String, String), bool>,
     properties: HashMap<String, bool>,
     qualified_properties: HashMap<(String, String), bool>,
+}
+
+#[derive(Default, Clone)]
+struct MemberClassCatalog {
+    methods: HashMap<(String, String), String>,
+    properties: HashMap<(String, String), String>,
+}
+
+struct FlowCatalog {
+    mutations: MutationCatalog,
+    nullability: NullabilityCatalog,
+    member_classes: MemberClassCatalog,
+}
+
+impl FlowCatalog {
+    fn from_program(program: &Program) -> Self {
+        Self {
+            mutations: MutationCatalog::from_program(program),
+            nullability: NullabilityCatalog::from_program(program),
+            member_classes: MemberClassCatalog::from_program(program),
+        }
+    }
+}
+
+impl MemberClassCatalog {
+    fn from_program(program: &Program) -> Self {
+        let mut catalog = Self::default();
+        for item in &program.items {
+            let Item::Class(class) = item else {
+                continue;
+            };
+            for member in &class.members {
+                match member {
+                    crate::ast::ClassMember::Method(method) => {
+                        if let Some(return_type) = &method.return_type {
+                            if let Some(result) = class_name_in(return_type, &class.name) {
+                                catalog
+                                    .methods
+                                    .insert((class.name.clone(), method.name.clone()), result);
+                            }
+                        }
+                        if method.name == "__construct" {
+                            for parameter in &method.params {
+                                if let Some(result) = class_name_in(&parameter.ty, &class.name) {
+                                    catalog.properties.insert(
+                                        (class.name.clone(), parameter.name.clone()),
+                                        result,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    crate::ast::ClassMember::Property(property) => {
+                        if let Some(result) = class_name_in(&property.ty, &class.name) {
+                            catalog
+                                .properties
+                                .insert((class.name.clone(), property.name.clone()), result);
+                        }
+                    }
+                    crate::ast::ClassMember::Constant(_) => {}
+                }
+            }
+        }
+        catalog
+    }
+}
+
+fn class_name_in(ty: &TypeRef, declaring_class: &str) -> Option<String> {
+    ty.as_class_name().map(|name| {
+        if name == "self" {
+            declaring_class.to_string()
+        } else {
+            name.to_string()
+        }
+    })
 }
 
 impl NullabilityCatalog {
@@ -292,8 +369,7 @@ fn merge_modes(target: &mut Vec<bool>, incoming: &[bool]) {
 
 pub fn analyze_program(program: &Program) -> FactsByUse {
     let mut facts = HashMap::new();
-    let mutations = MutationCatalog::from_program(program);
-    let nullability = NullabilityCatalog::from_program(program);
+    let catalog = FlowCatalog::from_program(program);
     let top_level_span = program
         .items
         .iter()
@@ -315,32 +391,16 @@ pub fn analyze_program(program: &Program) -> FactsByUse {
         span: top_level_span,
     };
     if !top_level.statements.is_empty() {
-        analyze_body(
-            &top_level,
-            &[],
-            top_level_span,
-            None,
-            &mut facts,
-            &mutations,
-            &nullability,
-        );
+        analyze_body(&top_level, &[], top_level_span, None, &mut facts, &catalog);
     }
 
     for item in &program.items {
         match item {
-            Item::Function(function) => {
-                analyze_function(function, None, &mut facts, &mutations, &nullability)
-            }
+            Item::Function(function) => analyze_function(function, None, &mut facts, &catalog),
             Item::Class(class) => {
                 for member in &class.members {
                     if let crate::ast::ClassMember::Method(method) = member {
-                        analyze_function(
-                            method,
-                            Some(&class.name),
-                            &mut facts,
-                            &mutations,
-                            &nullability,
-                        );
+                        analyze_function(method, Some(&class.name), &mut facts, &catalog);
                     }
                 }
             }
@@ -371,8 +431,7 @@ fn analyze_function(
     function: &FunctionDecl,
     current_class: Option<&str>,
     facts: &mut FactsByUse,
-    mutations: &MutationCatalog,
-    nullability: &NullabilityCatalog,
+    catalog: &FlowCatalog,
 ) {
     analyze_body(
         &function.body,
@@ -380,8 +439,7 @@ fn analyze_function(
         function.span,
         current_class,
         facts,
-        mutations,
-        nullability,
+        catalog,
     );
 }
 
@@ -391,15 +449,20 @@ fn analyze_body(
     span: Span,
     current_class: Option<&str>,
     facts: &mut FactsByUse,
-    mutations: &MutationCatalog,
-    nullability: &NullabilityCatalog,
+    catalog: &FlowCatalog,
 ) {
-    let resolution = Resolver::resolve(body, params, current_class);
+    let resolution = Resolver::resolve(
+        body,
+        params,
+        current_class,
+        &catalog.nullability,
+        &catalog.member_classes,
+    );
     let graph = build_function_cfg(body, span);
     let analysis = NarrowingAnalysis {
         resolution: &resolution,
-        mutations,
-        nullability,
+        mutations: &catalog.mutations,
+        nullability: &catalog.nullability,
     };
     let result = solve_forward(&graph, &analysis);
 
@@ -412,7 +475,7 @@ fn analyze_body(
             &graph.nodes[node_id.0].action,
             input,
             &resolution,
-            mutations,
+            &catalog.mutations,
             facts,
         );
     }
@@ -520,17 +583,7 @@ impl ForwardAnalysis for NarrowingAnalysis<'_> {
             return true;
         }
 
-        let merged = state
-            .facts
-            .iter()
-            .filter_map(|(binding, fact)| {
-                incoming
-                    .facts
-                    .get(binding)
-                    .and_then(|incoming| join_fact(fact, incoming))
-                    .map(|fact| (*binding, fact))
-            })
-            .collect();
+        let merged = joined_facts(&state.facts, &incoming.facts);
         if state.facts == merged {
             false
         } else {
@@ -538,6 +591,20 @@ impl ForwardAnalysis for NarrowingAnalysis<'_> {
             true
         }
     }
+}
+
+fn joined_facts(
+    left: &BTreeMap<BindingId, Fact>,
+    right: &BTreeMap<BindingId, Fact>,
+) -> BTreeMap<BindingId, Fact> {
+    left.iter()
+        .filter_map(|(binding, fact)| {
+            right
+                .get(binding)
+                .and_then(|right| join_fact(fact, right))
+                .map(|fact| (*binding, fact))
+        })
+        .collect()
 }
 
 fn join_fact(left: &Fact, right: &Fact) -> Option<Fact> {
@@ -754,6 +821,29 @@ fn kill_mutated_call_arguments(
                 }
                 kill_mutated_call_arguments(&element.value, state, resolution, mutations);
             }
+        }
+        Expr::Binary {
+            left,
+            op: crate::ast::BinaryOp::Coalesce,
+            right,
+            ..
+        } => {
+            kill_mutated_call_arguments(left, state, resolution, mutations);
+            let left_fact = expression_fact(left, state, resolution, &resolution.nullability);
+            if matches!(left_fact, Some(Fact::NonNull | Fact::Exact(_))) {
+                return;
+            }
+            if matches!(left_fact, Some(Fact::Null)) {
+                kill_mutated_call_arguments(right, state, resolution, mutations);
+                return;
+            }
+
+            let mut fallback = state.clone();
+            if let Some(binding) = variable_binding(left, resolution) {
+                fallback.facts.insert(binding, Fact::Null);
+            }
+            kill_mutated_call_arguments(right, &mut fallback, resolution, mutations);
+            state.facts = joined_facts(&state.facts, &fallback.facts);
         }
         Expr::Binary { left, right, .. }
         | Expr::Range {
@@ -1164,6 +1254,30 @@ fn collect_expr(
             kill_mutated_call_arguments(expr, &mut result, resolution, mutations);
             result
         }
+        Expr::Binary {
+            left,
+            op: crate::ast::BinaryOp::Coalesce,
+            right,
+            ..
+        } => {
+            let left_state = collect_expr(left, state, resolution, mutations, facts);
+            let left_fact = expression_fact(left, &left_state, resolution, &resolution.nullability);
+            let mut fallback_input = left_state.clone();
+            if !matches!(left_fact, Some(Fact::NonNull | Fact::Exact(_))) {
+                if let Some(binding) = variable_binding(left, resolution) {
+                    fallback_input.facts.insert(binding, Fact::Null);
+                }
+            }
+            let fallback = collect_expr(right, &fallback_input, resolution, mutations, facts);
+            match left_fact {
+                Some(Fact::NonNull | Fact::Exact(_)) => left_state,
+                Some(Fact::Null) => fallback,
+                None => State {
+                    reachable: left_state.reachable || fallback.reachable,
+                    facts: joined_facts(&left_state.facts, &fallback.facts),
+                },
+            }
+        }
         Expr::Binary { left, right, .. }
         | Expr::Range {
             start: left,
@@ -1215,9 +1329,47 @@ fn expression_class_name(
         Expr::Variable { .. } => {
             let binding = variable_binding(expr, resolution)?;
             if let Some(Fact::Exact(ty)) = state.and_then(|state| state.facts.get(&binding)) {
-                return Some(ty.name.clone());
+                return class_name_in(ty, resolution.current_class.as_deref().unwrap_or(&ty.name));
             }
             resolution.declaration_classes.get(&binding).cloned()
+        }
+        Expr::PropertyAccess {
+            object, property, ..
+        } => {
+            let class = expression_class_name(object, resolution, state)?;
+            resolution
+                .member_classes
+                .properties
+                .get(&(class, property.clone()))
+                .cloned()
+        }
+        Expr::MethodCall { object, method, .. } => {
+            let class = expression_class_name(object, resolution, state)?;
+            resolution
+                .member_classes
+                .methods
+                .get(&(class, method.clone()))
+                .cloned()
+        }
+        Expr::StaticMember {
+            qualifier, member, ..
+        } => {
+            let class = static_qualifier_class_name(qualifier, resolution)?;
+            resolution
+                .member_classes
+                .properties
+                .get(&(class, member.clone()))
+                .cloned()
+        }
+        Expr::StaticCall {
+            qualifier, method, ..
+        } => {
+            let class = static_qualifier_class_name(qualifier, resolution)?;
+            resolution
+                .member_classes
+                .methods
+                .get(&(class, method.clone()))
+                .cloned()
         }
         _ => None,
     }
@@ -1248,12 +1400,20 @@ struct Resolver {
 }
 
 impl Resolver {
-    fn resolve(body: &Block, params: &[Param], current_class: Option<&str>) -> Resolution {
+    fn resolve(
+        body: &Block,
+        params: &[Param],
+        current_class: Option<&str>,
+        nullability: &NullabilityCatalog,
+        member_classes: &MemberClassCatalog,
+    ) -> Resolution {
         let mut resolver = Self {
             next_binding: 0,
             scopes: vec![HashMap::new()],
             resolution: Resolution {
                 current_class: current_class.map(str::to_string),
+                nullability: nullability.clone(),
+                member_classes: member_classes.clone(),
                 ..Resolution::default()
             },
         };
@@ -1471,16 +1631,6 @@ impl Resolver {
     }
 
     fn resolved_expr_class(&self, expr: &Expr) -> Option<String> {
-        match ungroup(expr) {
-            Expr::New { class_name, .. } => Some(class_name.clone()),
-            Expr::This { .. } => self.resolution.current_class.clone(),
-            Expr::Variable { span, .. } => self
-                .resolution
-                .uses
-                .get(&(span.start, span.end))
-                .and_then(|binding| self.resolution.declaration_classes.get(binding))
-                .cloned(),
-            _ => None,
-        }
+        expression_class_name(expr, &self.resolution, None)
     }
 }

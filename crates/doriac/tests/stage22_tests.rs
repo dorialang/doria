@@ -1189,6 +1189,151 @@ class Writer
 }
 
 #[test]
+fn exact_self_property_receivers_and_coalesce_use_precise_flow_contracts() {
+    let self_diagnostics = doriac::check_source(
+        "stage22-exact-self-method-flow.doria",
+        r#"
+class Writer
+{
+    function clear(writable ?int $value): void { $value = null; }
+
+    function read(mixed $other, writable ?int $value): int
+    {
+        if ($value != null && $other is self) {
+            $other->clear($value);
+            return $value + 1;
+        }
+        return 0;
+    }
+}
+"#,
+    )
+    .expect_err("an exact self receiver must use the declaring class mutation contract");
+    assert!(
+        self_diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E0441"),
+        "the nullable use after the exact-self call should be rejected: {self_diagnostics:#?}"
+    );
+
+    doriac::check_source(
+        "stage22-property-receiver-and-coalesce-flow.doria",
+        r#"
+class Reader { function number(): int { return 1; } }
+class Writer { function number(): ?int { return null; } }
+class Holder
+{
+    function __construct(take Reader $reader) {}
+    function read(): int
+    {
+        ?int $number = $this->reader->number();
+        return $number + 1;
+    }
+}
+
+function clear(writable ?int $value): int { $value = null; return 0; }
+function keep(writable ?int $value): int
+{
+    ?int $present = 1;
+    if ($value == null) { return 0; }
+    let $ignored = $present ?? clear($value);
+    return $value + 1;
+}
+"#,
+    )
+    .expect("property receiver types and skipped coalesce fallbacks should preserve exact facts");
+
+    let fallback_diagnostics = diagnostics(
+        r#"
+function clear(writable ?int $value): int { $value = null; return 0; }
+function read(?int $maybe, writable ?int $value): int
+{
+    if ($value == null) { return 0; }
+    let $ignored = $maybe ?? clear($value);
+    return $value + 1;
+}
+"#,
+    );
+    assert!(
+        fallback_diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E0441"),
+        "a reachable coalesce fallback must still invalidate facts: {fallback_diagnostics:#?}"
+    );
+}
+
+#[test]
+fn shared_validation_checks_null_safe_method_receivers() {
+    let program = doriac::lower_source_to_mir(
+        "stage22-null-safe-receiver-validation.doria",
+        r#"
+class Box { writable function number(): int { return 1; } }
+function make(): ?Box { return new Box(); }
+function main(): void
+{
+    writable ?Box $value = make();
+    let $number = $value?->number();
+}
+"#,
+    )
+    .expect("a writable nullable receiver should lower");
+    doriac::mir_validation::validate_program(&program)
+        .expect("the valid nullable receiver should pass shared validation");
+
+    let mut readonly = program.clone();
+    readonly
+        .functions
+        .iter_mut()
+        .find(|function| function.name == "main")
+        .and_then(|function| {
+            function
+                .locals
+                .iter_mut()
+                .find(|local| local.name == "value")
+        })
+        .expect("fixture should contain the nullable receiver")
+        .writable = false;
+    let error = doriac::mir_validation::validate_program(&readonly)
+        .expect_err("a readonly nullable receiver cannot call a writable method");
+    assert!(error
+        .message
+        .contains("requires a writable nullable class value"));
+
+    let mut transferred = program;
+    let object = transferred
+        .functions
+        .iter_mut()
+        .find(|function| function.name == "main")
+        .and_then(|function| {
+            function.blocks.iter_mut().find_map(|block| {
+                block.statements.iter_mut().find_map(|statement| {
+                    let doriac::mir::Statement::AssignLocal {
+                        value:
+                            doriac::mir::Rvalue::NullableScalar(
+                                doriac::mir::NullableScalarExpression::NullSafeCall {
+                                    object, ..
+                                },
+                            ),
+                        ..
+                    } = statement
+                    else {
+                        return None;
+                    };
+                    Some(object.as_mut())
+                })
+            })
+        })
+        .expect("fixture should contain a null-safe call");
+    let doriac::mir::NullableClassExpression::Local { transfer, .. } = object else {
+        panic!("fixture should lower its receiver as a nullable local")
+    };
+    *transfer = true;
+    let error = doriac::mir_validation::validate_program(&transferred)
+        .expect_err("a null-safe method receiver cannot be transferred");
+    assert!(error.message.contains("transfers its receiver"));
+}
+
+#[test]
 fn narrowed_nullable_scalars_support_read_modify_write() {
     let source = r#"
 function initialValue(): ?int { return 40; }

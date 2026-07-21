@@ -1304,6 +1304,53 @@ fn require_writable_nullable_class_expression(
     }
 }
 
+fn class_expression_transfers_receiver(expression: &mir::ClassExpression) -> bool {
+    match expression {
+        mir::ClassExpression::Local { transfer, .. }
+        | mir::ClassExpression::NullableLocalAssumeNonNull { transfer, .. }
+        | mir::ClassExpression::Coalesce { transfer, .. } => *transfer,
+        mir::ClassExpression::Property { .. }
+        | mir::ClassExpression::Call { .. }
+        | mir::ClassExpression::New { .. } => false,
+    }
+}
+
+fn nullable_class_expression_transfers_receiver(expression: &mir::NullableClassExpression) -> bool {
+    match expression {
+        mir::NullableClassExpression::Class(value) => class_expression_transfers_receiver(value),
+        mir::NullableClassExpression::Local { transfer, .. }
+        | mir::NullableClassExpression::Coalesce { transfer, .. } => *transfer,
+        mir::NullableClassExpression::Null(_)
+        | mir::NullableClassExpression::Property { .. }
+        | mir::NullableClassExpression::Call { .. }
+        | mir::NullableClassExpression::NullSafeProperty { .. }
+        | mir::NullableClassExpression::NullSafeCall { .. } => false,
+    }
+}
+
+fn validate_null_safe_method_receiver(
+    program: &mir::Program,
+    caller: &mir::Function,
+    callee: &mir::Function,
+    object: &mir::NullableClassExpression,
+) -> Result<(), BackendError> {
+    if nullable_class_expression_transfers_receiver(object) {
+        return Err(malformed_mir(format!(
+            "null-safe call to {} transfers its receiver",
+            callee.name
+        )));
+    }
+    if callee.receiver_mode == Some(mir::ReceiverMode::Writable) {
+        require_writable_nullable_class_expression(
+            program,
+            caller,
+            object,
+            &format!("null-safe call to {}", callee.name),
+        )?;
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy)]
 enum ClassLocalAccess<'a> {
     Borrow(mir::LocalId),
@@ -3109,7 +3156,7 @@ fn validate_call_args(
                 method.class.0, method.name
             )));
         };
-        if matches!(receiver, mir::ClassExpression::Local { transfer: true, .. }) {
+        if class_expression_transfers_receiver(receiver) {
             return Err(malformed_mir(format!(
                 "call to method class#{}::{} transfers its receiver",
                 method.class.0, method.name
@@ -4048,6 +4095,7 @@ fn validate_null_safe_call(
     if local_in(callee, *receiver)?.ty != mir::Type::Class(object.class()) {
         return Err(malformed_mir("null-safe method has another receiver type"));
     }
+    validate_null_safe_method_receiver(program, caller, callee, object)?;
     validate_call_args_for_params(program, caller, callee, parameters, args, None)
 }
 
@@ -4084,6 +4132,7 @@ fn validate_null_safe_statement_call(
             "null-safe statement method has another receiver type",
         ));
     }
+    validate_null_safe_method_receiver(program, caller, callee, object)?;
     validate_call_args_for_params(program, caller, callee, parameters, args, None)
 }
 
