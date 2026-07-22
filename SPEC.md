@@ -1154,7 +1154,6 @@ Backend-specific tests are useful, but the PHP backend must not be the required 
 Future work includes:
 
 - Better diagnostics with suggestions.
-- Nullable types.
 - Full type inference for lists and dictionaries.
 - Interfaces, traits, and namespaces.
 - Class inheritance through `extends`, interface conformance through `implements`, and class-body/trait-body `uses` trait composition.

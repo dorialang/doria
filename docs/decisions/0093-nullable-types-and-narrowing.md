@@ -106,9 +106,12 @@ belong to Stage 28. Pulling them forward would blur their owning decisions.
 ## Consequences
 
 General nullable scalar, string, and concrete-class values now cross locals,
-properties, statics, parameters, calls, and returns through typed MIR. The debug
-interpreter, Cranelift fast profile, and LLVM release profile execute one durable
-fixture with exact output parity.
+properties, parameters, calls, and returns through typed MIR. Copy nullable
+scalar and string values also cross static properties. Nullable concrete-class
+statics remain deferred with other owned static properties because `?Class`
+retains its payload's move ownership. The debug interpreter, Cranelift fast
+profile, and LLVM release profile execute one durable fixture with exact output
+parity.
 
 The semantic checker now records resolved expression types for backend-independent
 lowering and consults shared dataflow facts at each variable use. Backends consume
