@@ -6,7 +6,7 @@ Status: Accepted
 
 `when` was accepted as design direction in records 0009 (control-flow direction) and 0020 (boolean operators and `given` predicates), but its grammar was deferred to "a later decision record" and 0009 left open questions — whether `when` is an expression or a statement, and how a branch produces its value. In the absence of that record the website control-flow guide and the `value-returning-when` playground example demonstrated a concrete syntax, and the end-to-end plan contradicted itself on where `when` lands (§4.4 said "Phase E"; the §13 Stage 36 entry scheduled it). This record closes the grammar.
 
-The ruling: **`when` is the value-returning form of `if`.** It has exactly the structure of `given / if / else if / else / finally`; the single difference is that it always produces a value. This is non-negotiable and settles the open questions below.
+The ruling: **`when` is the value-returning form of `if`.** It has exactly the shape of the `if` family — an optional `given` prelude, a conditional head, zero or more chained conditionals, an `else`, and an optional `finally` — with `when` / `else when` in place of `if` / `else if`; the single difference is that it always produces a value. This is non-negotiable and settles the open questions below.
 
 ## Decision
 
@@ -16,7 +16,7 @@ A `when` construct has the same shape as the `if` family:
 
 - an optional `given { ... }` prelude — scoped declarations, void setup statements, and `bool` predicates, per record 0020;
 - `when (cond): T { ... }`;
-- zero or more `else if (cond) { ... }`;
+- zero or more `else when (cond) { ... }` — the chained conditional branch; the head's `: T` governs the whole construct, so it is not repeated here;
 - an `else { ... }`;
 - an optional `finally { ... }`.
 
@@ -34,7 +34,7 @@ Conditions are `bool`. Doria applies no truthiness, exactly as for `if`.
 
 ### `given ... when` routes a false predicate to `else`
 
-The `given` prelude behaves exactly as with `if` (record 0020): scoped declarations, void setup actions, and `bool` predicates implicitly AND-ed in source order with the head condition. The single adaptation forced by "always yields a value": when a `given` predicate — or the head condition — is false, control falls to the next `else if` / `else`, never skipping the construct. A `when` can never be short-circuited away, because a value is owed. So `given ... if` skips its body on a false predicate; `given ... when` selects its `else`.
+The `given` prelude behaves exactly as with `if` (record 0020): scoped declarations, void setup actions, and `bool` predicates implicitly AND-ed in source order with the head condition. The single adaptation forced by "always yields a value": when a `given` predicate — or the head condition — is false, control falls to the next `else when` / `else`, never skipping the construct. A `when` can never be short-circuited away, because a value is owed. So `given ... if` skips its body on a false predicate; `given ... when` selects its `else`.
 
 ### `finally`
 
