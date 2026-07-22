@@ -799,7 +799,7 @@ Each `if`, `else if`, `else`, and `while` body has its own block scope. Variable
 
 `if` is statement control flow and does not return a value. `if` without `else` is valid Doria. `else`, `else if`, `given`, and `finally` are optional. A base `if`, `while`, `foreach`, or future control construct does not require `given` or `finally`.
 
-`when` is the planned value-returning conditional/control construct. `when`, `given`, and `finally` are accepted design direction but are not implemented in the current compiler slice.
+`when` is the value-returning form of `if`: the same `given` / `else if` / `else` / `finally` structure, differing only in that it always yields a value. It declares a result type (`when (cond): T`), requires a total `else`, and each branch produces the value with a block-scoped `return` that completes the `when` rather than returning from the enclosing function. `when` is an expression, used where a value of its result type is expected. A false `given` predicate or head condition routes to `else` rather than skipping the construct. The grammar is settled in decision 0097; `when`, `given`, and `finally` parse as accepted syntax but are not yet implemented in the current compiler slice, so they produce a stage-named unsupported-feature diagnostic per §0.
 
 ### Checked errors
 
