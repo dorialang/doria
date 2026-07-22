@@ -154,3 +154,7 @@ It does not decide anything, does not amend the plan, and does not assume PHP
 ships this RFC or any successor. If PHP's concurrency direction settles later,
 re-read Part B — B1 and B3 are the items whose answers would change most with the
 details. Items A1 and A5 stand on Doria's own model regardless of what PHP does.
+
+## Invalidated elsewhere
+
+None.

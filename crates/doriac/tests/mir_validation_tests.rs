@@ -2,9 +2,10 @@ use doriac::class_layout::{compute_class_layout, ClassId, FieldType, PropertyId}
 use doriac::format_string::{FormatConversion, FormatPiece, FormatSpec};
 use doriac::mir::{
     BasicBlock, BlockId, Class, ClassExpression, FloatBinaryOp, FloatExpression, FormatArgument,
-    FormatExpression, Function, FunctionId, Local, LocalId, NullableStringExpression, Operand,
-    Program, Property, PropertyValue, PropertyValueSource, ReturnType, Rvalue, ScalarType,
-    ScalarValue, Statement, StringExpression, Terminator, Type, ValueExpression,
+    FormatExpression, Function, FunctionId, Local, LocalId, NullableClassExpression,
+    NullableStringExpression, Operand, Program, Property, PropertyValue, PropertyValueSource,
+    ReturnType, Rvalue, ScalarType, ScalarValue, Statement, StringExpression, Terminator, Type,
+    ValueExpression,
 };
 use doriac::numeric::{FloatType, FloatValue, IntegerType, IntegerValue};
 
@@ -2432,6 +2433,146 @@ fn shared_validator_rejects_borrowed_class_rvalues_in_owning_slots() {
     assert!(error
         .message
         .contains("return from borrowedReturn receives borrowed class local local0"));
+}
+
+#[test]
+fn shared_validator_requires_owned_nullable_class_property_values() {
+    let mut program = class_program();
+    let property = PropertyId {
+        class: ClassId(0),
+        index: 0,
+    };
+    program.classes[0].properties.push(Property {
+        id: property,
+        name: "box".to_string(),
+        ty: Type::NullableClass(ClassId(1)),
+        writable: true,
+        promoted: false,
+    });
+    program.classes[0].layout = compute_class_layout(
+        ClassId(0),
+        [(property, FieldType::NullableClass(ClassId(1)))],
+        8,
+    );
+    let mut receiver = class_local(0, ClassId(0));
+    receiver.writable = true;
+    program.functions[0].locals = vec![receiver, class_local(1, ClassId(1))];
+    program.functions[0].blocks[0]
+        .statements
+        .push(Statement::AssignProperty {
+            object: LocalId(0),
+            property,
+            value: Rvalue::NullableClass(NullableClassExpression::Class(ClassExpression::Local {
+                class: ClassId(1),
+                local: LocalId(1),
+                transfer: false,
+            })),
+        });
+
+    let error = doriac::mir_validation::validate_program(&program)
+        .expect_err("an owning nullable-class property cannot store a borrowed value");
+    assert!(error
+        .message
+        .contains("assignment to property0 receives borrowed class local local1"));
+}
+
+#[test]
+fn shared_validator_treats_promoted_nullable_class_arguments_as_transfers() {
+    let mut program = class_program();
+    let property = PropertyId {
+        class: ClassId(0),
+        index: 0,
+    };
+    program.classes[0].properties.push(Property {
+        id: property,
+        name: "box".to_string(),
+        ty: Type::NullableClass(ClassId(1)),
+        writable: false,
+        promoted: true,
+    });
+    program.classes[0].layout = compute_class_layout(
+        ClassId(0),
+        [(property, FieldType::NullableClass(ClassId(1)))],
+        8,
+    );
+    program.classes[0].constructor = Some(FunctionId(1));
+    program.functions[0].locals = vec![class_local(0, ClassId(0)), class_local(1, ClassId(1))];
+    program.functions[0].blocks[0]
+        .statements
+        .push(Statement::AssignLocal {
+            target: LocalId(0),
+            value: Rvalue::Class(ClassExpression::New {
+                class: ClassId(0),
+                properties: vec![PropertyValue {
+                    property,
+                    source: PropertyValueSource::ConstructorArgument(0),
+                }],
+                constructor: Some(FunctionId(1)),
+                args: vec![Rvalue::NullableClass(NullableClassExpression::Class(
+                    ClassExpression::Local {
+                        class: ClassId(1),
+                        local: LocalId(1),
+                        transfer: false,
+                    },
+                ))],
+            }),
+        });
+    program.functions.push(Function {
+        id: FunctionId(1),
+        name: "Holder::__construct".to_string(),
+        method: None,
+        receiver_mode: None,
+        params: vec![LocalId(0), LocalId(1)],
+        return_type: ReturnType::Void,
+        locals: vec![
+            borrowed_class_local(0, ClassId(0)),
+            Local {
+                id: LocalId(1),
+                name: "box".to_string(),
+                ty: Type::NullableClass(ClassId(1)),
+                writable: false,
+                synthetic: false,
+                owned: false,
+            },
+        ],
+        blocks: vec![BasicBlock {
+            id: BlockId(0),
+            statements: vec![],
+            terminator: Terminator::ReturnVoid,
+        }],
+        entry_block: BlockId(0),
+    });
+
+    let error = doriac::mir_validation::validate_program(&program)
+        .expect_err("a promoted nullable-class property requires an owned argument");
+    assert!(error
+        .message
+        .contains("call to Holder::__construct argument 1 receives borrowed class local local1"));
+}
+
+#[test]
+fn shared_validator_checks_nullable_class_property_references() {
+    let mut program = class_program();
+    let property = PropertyId {
+        class: ClassId(0),
+        index: 0,
+    };
+    program.classes[0].properties.push(Property {
+        id: property,
+        name: "missing".to_string(),
+        ty: Type::NullableClass(ClassId(99)),
+        writable: false,
+        promoted: false,
+    });
+    program.classes[0].layout = compute_class_layout(
+        ClassId(0),
+        [(property, FieldType::NullableClass(ClassId(99)))],
+        8,
+    );
+
+    let error = doriac::mir_validation::validate_program(&program)
+        .expect_err("nullable-class properties must reference declared classes");
+    assert!(error.message.contains("class#99 does not exist"));
 }
 
 #[test]

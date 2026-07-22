@@ -277,6 +277,24 @@ function read(take mixed $value): int
 }
 
 #[test]
+fn coalesce_preserves_the_exact_fact_of_a_selected_mixed_value() {
+    doriac::check_source(
+        "stage22-exact-coalesce.doria",
+        r#"
+function read(take mixed $value): int
+{
+    if ($value is int) {
+        mixed $selected = $value ?? 0;
+        return $selected + 1;
+    }
+    return 0;
+}
+"#,
+    )
+    .expect("a proven-present coalesce arm should retain its exact narrowed type");
+}
+
+#[test]
 fn short_circuit_rhs_uses_see_prior_call_mutations() {
     let invalid = diagnostics(
         r#"
@@ -629,13 +647,11 @@ function main(): void
     ?Box $saved = alias($owner) ?? null;
 }
 "#;
-    let program = doriac::lower_source_to_mir("stage22-borrowed-coalesce.doria", source)
-        .expect("the source ownership pass leaves final ownership enforcement to MIR validation");
-    let error = doriac::mir_validation::validate_program(&program)
+    let diagnostics = doriac::check_source("stage22-borrowed-coalesce.doria", source)
         .expect_err("a borrowed nullable coalesce must not initialize an owning local");
-    assert!(error
-        .message
-        .contains("receives a borrowed nullable class call result"));
+    assert!(diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == "E0478"));
 }
 
 #[test]
@@ -657,7 +673,7 @@ function main(): void {}
 
 #[test]
 fn nullable_class_call_arguments_enforce_ownership_and_writability() {
-    let owned = doriac::lower_source_to_mir(
+    let owned = doriac::check_source(
         "stage22-borrowed-nullable-take.doria",
         r#"
 class Box {}
@@ -672,12 +688,8 @@ function main(): void
 }
 "#,
     )
-    .expect("borrowed nullable calls should reach defensive MIR ownership validation");
-    let error = doriac::mir_validation::validate_program(&owned)
-        .expect_err("a borrowed nullable call cannot satisfy a take parameter");
-    assert!(error
-        .message
-        .contains("receives a borrowed nullable class call result"));
+    .expect_err("a borrowed nullable call cannot satisfy a take parameter");
+    assert!(owned.iter().any(|diagnostic| diagnostic.code == "E0474"));
 
     let diagnostics = diagnostics(
         r#"

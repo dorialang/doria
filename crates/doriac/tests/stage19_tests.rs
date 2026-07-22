@@ -804,3 +804,44 @@ fn constant_boolean_expressions_drive_ownership_reachability() {
             .expect("constant boolean reachability must exclude impossible ownership transfers");
     }
 }
+
+#[test]
+fn inferred_class_coalesces_are_tracked_as_move_values() {
+    let diagnostics = doriac::check_source(
+        "coalesced-class-owner.doria",
+        r#"
+class Box {}
+function consume(take Box $box): void {}
+function main(): void
+{
+    ?Box $maybe = new Box();
+    let $box = $maybe ?? new Box();
+    consume($box);
+    consume($box);
+}
+"#,
+    )
+    .expect_err("an inferred coalesced class owner cannot be given away twice");
+    assert!(diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == "E0470"));
+}
+
+#[test]
+fn owning_coalesces_reject_borrowed_possible_arms() {
+    let diagnostics = doriac::check_source(
+        "borrowed-coalesce-arm.doria",
+        r#"
+class Box {}
+function choose(?Box $maybe): Box
+{
+    let $box = $maybe ?? new Box();
+    return $box;
+}
+"#,
+    )
+    .expect_err("a possible borrowed arm cannot initialize a coalesced owner");
+    assert!(diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == "E0474"));
+}

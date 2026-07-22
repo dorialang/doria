@@ -154,7 +154,11 @@ impl NullabilityCatalog {
                                     );
                                 }
                                 if method.name == "__construct" {
-                                    for parameter in &method.params {
+                                    for parameter in method
+                                        .params
+                                        .iter()
+                                        .filter(|parameter| parameter.promoted_access.is_some())
+                                    {
                                         catalog.record_property(
                                             &class.name,
                                             &parameter.name,
@@ -1067,9 +1071,10 @@ fn expression_fact(
             let left = expression_fact(left, state, resolution, nullability);
             let right = expression_fact(right, state, resolution, nullability);
             match (left, right) {
-                (Some(Fact::NonNull | Fact::Exact(_)), _)
-                | (_, Some(Fact::NonNull | Fact::Exact(_))) => Some(Fact::NonNull),
-                (Some(Fact::Null), Some(Fact::Null)) => Some(Fact::Null),
+                (Some(exact @ Fact::Exact(_)), _) => Some(exact),
+                (Some(Fact::NonNull), _) => Some(Fact::NonNull),
+                (Some(Fact::Null), selected) => selected,
+                (None, Some(Fact::NonNull | Fact::Exact(_))) => Some(Fact::NonNull),
                 _ => None,
             }
         }

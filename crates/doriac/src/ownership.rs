@@ -1530,6 +1530,25 @@ impl Checker {
                 }
                 self.active_borrows.truncate(borrow_depth);
             }
+            Expr::Binary {
+                left,
+                op: BinaryOp::Coalesce,
+                right,
+                ..
+            } => {
+                if matches!(ungroup_expr(left), Expr::Null { .. }) {
+                    self.use_expr(left, scopes, UseMode::Read);
+                    self.use_expr(right, scopes, mode);
+                    return;
+                }
+                let before = scopes.clone();
+                let mut selected = before.clone();
+                self.use_expr(left, &mut selected, mode);
+                let mut fallback = before;
+                self.use_expr(left, &mut fallback, UseMode::Read);
+                self.use_expr(right, &mut fallback, mode);
+                scopes.merge_from(&selected, &fallback);
+            }
             Expr::Binary { left, right, .. }
             | Expr::Range {
                 start: left,
@@ -2136,6 +2155,12 @@ impl Checker {
                     .is_some_and(|property| property.move_type)
             }
             Expr::This { .. } => self.receiver_class.is_some(),
+            Expr::Binary {
+                left,
+                op: BinaryOp::Coalesce,
+                right,
+                ..
+            } => self.expr_is_move_value(left, scopes) || self.expr_is_move_value(right, scopes),
             _ => false,
         }
     }
@@ -2161,6 +2186,12 @@ impl Checker {
                 .qualifier_class(qualifier)
                 .and_then(|class| self.methods.get(&(class, method.clone())))
                 .is_some_and(|signature| signature.return_borrow.is_some()),
+            Expr::Binary {
+                left,
+                op: BinaryOp::Coalesce,
+                right,
+                ..
+            } => self.expr_returns_borrow(left, scopes) || self.expr_returns_borrow(right, scopes),
             _ => false,
         }
     }
@@ -2199,6 +2230,19 @@ impl Checker {
                 .and_then(|signature| signature.returns.clone()),
             Expr::This { .. } => self.receiver_class.clone(),
             Expr::Grouped { expr, .. } => self.expr_class(expr, scopes),
+            Expr::Binary {
+                left,
+                op: BinaryOp::Coalesce,
+                right,
+                ..
+            } => match (
+                self.expr_class(left, scopes),
+                self.expr_class(right, scopes),
+            ) {
+                (Some(left), Some(right)) if left == right => Some(left),
+                (Some(class), None) | (None, Some(class)) => Some(class),
+                _ => None,
+            },
             _ => None,
         }
     }

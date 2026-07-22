@@ -19,6 +19,7 @@ pub fn validate_program(program: &mir::Program) -> Result<(), BackendError> {
             )));
         }
         class_in(program, property.class)?;
+        validate_type(program, property.ty)?;
         let valid = match (&property.initializer, property.ty) {
             (
                 mir::StaticValue::Scalar(value),
@@ -141,9 +142,7 @@ fn validate_class(
                 class.id.0, property.id.class.0, property.id.index
             )));
         }
-        if let mir::Type::Class(referenced) = property.ty {
-            class_in(program, referenced)?;
-        }
+        validate_type(program, property.ty)?;
     }
 
     let pointer_size = std::mem::size_of::<usize>() as u32;
@@ -512,6 +511,13 @@ fn validate_statement(
                 (property_definition.ty, value)
             {
                 require_owned_class_expression(
+                    expression,
+                    &format!("assignment to property{}", property.index),
+                )?;
+            } else if let (mir::Type::NullableClass(_), mir::Rvalue::NullableClass(expression)) =
+                (property_definition.ty, value)
+            {
+                require_owned_nullable_class_expression(
                     expression,
                     &format!("assignment to property{}", property.index),
                 )?;
@@ -2382,7 +2388,7 @@ fn validate_class_expression(
                                 mir::PropertyValueSource::ConstructorArgument(index)
                                     if matches!(
                                         class_definition.properties[property.property.index].ty,
-                                        mir::Type::Class(_)
+                                        mir::Type::Class(_) | mir::Type::NullableClass(_)
                                     ) =>
                                 {
                                     Some(index)
