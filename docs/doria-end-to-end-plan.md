@@ -261,7 +261,7 @@ let $label = match (true) {
 - Arms: enum case patterns with payload destructuring, literal patterns, `null` pattern, `default`. Guards (`Shape::Circle($r) if $r > 1.0 =>`) are a fast-follow stage.
 - Non-exhaustive `match` over an enum or `bool` without `default` is a compile error.
 - The ternary `cond ? a : b` is sugar for a two-arm `match` over a strict `bool` (`match ($cond) { true => a, false => b }`); the condition is never truthy, and PHP's short ternary `?:` is rejected in favor of `??` (decision 0094).
-- `when` is the value-returning form of `if` — the same `given` / `else when` / `else` / `finally` structure (`when`/`else when` in place of `if`/`else if`), always yielding a value (one result type on the head only or inferred, never on `else when`; mandatory `else`; every branch `return`s the value). Its grammar is settled in decision 0097 (records 0009/0020 are its ancestors). It lands at Stage 28a (control-flow completion), right after `match`.
+- `when` is the value-returning form of `if` — the same `given` / `else when` / `else` / `finally` structure (`when`/`else when` in place of `if`/`else if`), always yielding a value (one result type — on the head only, or inferred from the first block — never on `else when`; every other branch is checked against it; mandatory `else`; every branch `return`s the value). Its grammar is settled in decision 0097 (records 0009/0020 are its ancestors). It lands at Stage 28a (control-flow completion), right after `match`.
 
 ### 4.5 Generics (D9)
 
@@ -728,7 +728,7 @@ Authored subjects cite their actual record numbers:
 - Decision 0094: ternary and compound-assignment operators — full `? :` (strict-`bool` condition, no Elvis, desugars to a two-arm `match`), plus `.=` (string concat-assign) and `??=` (null-coalescing assign) completing the compound-assignment family.
 - Decision 0095: operator surface completeness — `**`/`**=` and `<=>` are rejected as operators in favor of `Int::pow`/`Float::pow` and `Comparable::compare(): Ordering` (a core `Ordering { Less, Equal, Greater }` enum); `@`, backtick execution, and PHP `&`-references are rejected with fixits; spread/variadic user parameters defer to the named-arguments slice.
 - Decision 0096: primitives and interface conformance — primitives conform to the core value interfaces (`Equatable`/`Comparable`/`Hashable`) by compiler-known conformance and satisfy generic constraints with no boxing, `float` is neither `Hashable` nor totally `Comparable`, interface-typed slots stay class-only (a dynamically held primitive goes through `mixed`), and retroactive user-interface conformance for primitives is out of scope for v1.0.
-- Decision 0097: the `when` value-returning control construct — `when` is the value-returning form of `if` (same `given`/`else when`/`else`/`finally` structure), differing only in that it always yields a value: one result type on the head only (or inferred), mandatory total `else`, block-scoped `return`-to-yield per branch, expression position, and a false `given` predicate routing to `else`.
+- Decision 0097: the `when` value-returning control construct — `when` is the value-returning form of `if` (same `given`/`else when`/`else`/`finally` structure), differing only in that it always yields a value: one result type on the head only (or inferred from the first block, all branches checked against it), mandatory total `else`, block-scoped `return`-to-yield per branch, expression position, and a false `given` predicate routing to `else`.
 
 Subjects awaiting decision records are deliberately unnumbered:
 

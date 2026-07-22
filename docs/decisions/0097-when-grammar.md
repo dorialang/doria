@@ -15,7 +15,7 @@ The ruling: **`when` is the value-returning form of `if`.** It has exactly the s
 A `when` construct has the same shape as the `if` family:
 
 - an optional `given { ... }` prelude — scoped declarations, void setup statements, and `bool` predicates, per record 0020;
-- `when (cond): T { ... }` — the head; `: T` is the result type and is written **only here**. It may be omitted where the type is inferable from the branch values or the surrounding context, exactly like a `let` initializer;
+- `when (cond): T { ... }` — the head; `: T` is the result type and is written **only here**. It may be omitted, in which case the type is inferred from the value the first (head) block returns;
 - zero or more `else when (cond) { ... }` — the chained conditional branch. It never carries a result type; the head (or inference) governs the whole construct;
 - an `else { ... }`;
 - an optional `finally { ... }`.
@@ -24,7 +24,25 @@ Conditions are `bool`. Doria applies no truthiness, exactly as for `if`.
 
 ### The one difference: `when` always yields a value
 
-- **One result type governs the whole construct.** It is written on the head only (`when (cond): T`) or inferred from the branch values / binding context (like a `let` initializer). It is never repeated on an `else when` or written on `else`; every branch yields that one type. So `let $v = when ($c) { ... } else when ($d) { ... } else { ... };` (type inferred) and `let $r = given { ... } when ($c): int { ... } else when ($d) { ... } else { ... } finally { ... };` (type on the head only) are both well-formed.
+- **One result type governs every branch**, established one of two ways and never written on an `else when` or `else`:
+  - **Head-annotated** (`when (cond): T`) — `T` is the annotation, and **every** branch, including the head's own body, must `return` a `T`.
+  - **Inferred** (no head annotation) — `T` is the type the **first (head) block** returns, and every subsequent branch must match it.
+
+  Either way, the first branch that disagrees is a compile error:
+
+  ```doria
+  let $result = when ($condition) {
+      return 4;              // inferred T = int
+  } else when ($otherCondition) {
+      return "hello";        // error: string, not int
+  };
+
+  let $result = when ($condition): string {
+      return 4;              // error: 4 is an int, not string
+  } else when ($otherCondition) {
+      return "hello";
+  };
+  ```
 - **`else` is mandatory.** Because every evaluation must produce a value, a `when` with no total `else` is a compile error. (Contrast `if`, which permits no `else`.) This is `when`'s exhaustiveness rule and is what makes "always returns a value" true.
 - **Branches yield with `return`.** Inside a `when` branch, `return <expr>;` yields that branch's value and completes the `when` — it does **not** return from the enclosing function. This is a block-scoped return: a `when` branch is an `if` block that produces a value. Every reachable path within a branch must yield.
 
