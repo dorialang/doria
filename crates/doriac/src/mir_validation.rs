@@ -268,7 +268,7 @@ fn validate_function(program: &mir::Program, function: &mir::Function) -> Result
         }
         validate_terminator(program, function, &block.terminator, reachable[block.id.0])?;
     }
-    validate_nullable_class_presence(function)?;
+    validate_nullable_class_presence(program, function)?;
     validate_class_local_lifetimes(function)
 }
 
@@ -1403,6 +1403,11 @@ impl<'a> ClassLocalAccesses<'a> {
             .push(ClassLocalAccess::Call(function, args, 1));
     }
 
+    fn method_call(&mut self, function: mir::FunctionId, args: &'a [mir::Rvalue]) {
+        self.accesses
+            .push(ClassLocalAccess::Call(function, args, 1));
+    }
+
     fn begin_call(&mut self) {
         self.accesses.push(ClassLocalAccess::BeginCall);
     }
@@ -1664,9 +1669,11 @@ fn collect_nullable_string_class_local_accesses<'a>(
             args,
         } => {
             collect_nullable_class_local_accesses(object, accesses);
-            accesses.begin_call();
-            collect_rvalue_args_class_local_accesses(args, accesses);
-            accesses.call(*function, args);
+            if !nullable_class_expression_is_definitely_null(object) {
+                accesses.begin_call();
+                collect_rvalue_args_class_local_accesses(args, accesses);
+                accesses.method_call(*function, args);
+            }
         }
         mir::NullableStringExpression::Coalesce { left, right } => {
             collect_nullable_string_class_local_accesses(left, accesses);
@@ -1843,9 +1850,11 @@ fn collect_nullable_scalar_class_local_accesses<'a>(
             ..
         } => {
             collect_nullable_class_local_accesses(object, accesses);
-            accesses.begin_call();
-            collect_rvalue_args_class_local_accesses(args, accesses);
-            accesses.call(*function, args);
+            if !nullable_class_expression_is_definitely_null(object) {
+                accesses.begin_call();
+                collect_rvalue_args_class_local_accesses(args, accesses);
+                accesses.method_call(*function, args);
+            }
         }
         mir::NullableScalarExpression::Coalesce { left, right, .. } => {
             collect_nullable_scalar_class_local_accesses(left, accesses);
@@ -1893,9 +1902,11 @@ fn collect_nullable_class_local_accesses<'a>(
             ..
         } => {
             collect_nullable_class_local_accesses(object, accesses);
-            accesses.begin_call();
-            collect_rvalue_args_class_local_accesses(args, accesses);
-            accesses.call(*function, args);
+            if !nullable_class_expression_is_definitely_null(object) {
+                accesses.begin_call();
+                collect_rvalue_args_class_local_accesses(args, accesses);
+                accesses.method_call(*function, args);
+            }
         }
         mir::NullableClassExpression::Coalesce { left, right, .. } => {
             collect_nullable_class_local_accesses(left, accesses);
@@ -1935,13 +1946,23 @@ fn collect_statement_class_local_accesses(statement: &mir::Statement) -> ClassLo
         mir::Statement::EchoString(value) | mir::Statement::WriteStderr(value) => {
             collect_string_class_local_accesses(value, &mut accesses);
         }
-        mir::Statement::CallVoid { args, .. } | mir::Statement::CallBorrowed { args, .. } => {
-            collect_rvalue_args_class_local_accesses(args, &mut accesses);
-        }
-        mir::Statement::CallNullSafe { object, args, .. } => {
-            collect_nullable_class_local_accesses(object, &mut accesses);
+        mir::Statement::CallVoid { function, args }
+        | mir::Statement::CallBorrowed { function, args } => {
             accesses.begin_call();
             collect_rvalue_args_class_local_accesses(args, &mut accesses);
+            accesses.call(*function, args);
+        }
+        mir::Statement::CallNullSafe {
+            object,
+            function,
+            args,
+        } => {
+            collect_nullable_class_local_accesses(object, &mut accesses);
+            if !nullable_class_expression_is_definitely_null(object) {
+                accesses.begin_call();
+                collect_rvalue_args_class_local_accesses(args, &mut accesses);
+                accesses.method_call(*function, args);
+            }
         }
         mir::Statement::Printf(format) => {
             collect_format_class_local_accesses(format, &mut accesses);
@@ -2079,7 +2100,10 @@ fn apply_class_local_accesses(
     Ok(())
 }
 
-fn validate_nullable_class_presence(function: &mir::Function) -> Result<(), BackendError> {
+fn validate_nullable_class_presence(
+    program: &mir::Program,
+    function: &mir::Function,
+) -> Result<(), BackendError> {
     let mut entries = vec![None; function.blocks.len()];
     entries[function.entry_block.0] = Some(HashSet::new());
     let mut pending = VecDeque::from([function.entry_block]);
@@ -2090,8 +2114,15 @@ fn validate_nullable_class_presence(function: &mir::Function) -> Result<(), Back
             continue;
         };
         for statement in &block.statements {
-            apply_nullable_class_presence_statement(function, statement, &mut present)?;
+            apply_nullable_class_presence_statement(program, function, statement, &mut present)?;
         }
+
+        apply_nullable_class_call_effects(
+            program,
+            function,
+            &collect_terminator_class_local_accesses(&block.terminator),
+            &mut present,
+        )?;
 
         match &block.terminator {
             mir::Terminator::Jump(target) => {
@@ -2137,7 +2168,7 @@ fn validate_nullable_class_presence(function: &mir::Function) -> Result<(), Back
                 &collect_statement_class_local_accesses(statement),
                 &present,
             )?;
-            apply_nullable_class_presence_statement(function, statement, &mut present)?;
+            apply_nullable_class_presence_statement(program, function, statement, &mut present)?;
         }
         validate_nullable_class_assumptions(
             &collect_terminator_class_local_accesses(&block.terminator),
@@ -2173,10 +2204,17 @@ fn merge_definitely_present(
 }
 
 fn apply_nullable_class_presence_statement(
+    program: &mir::Program,
     function: &mir::Function,
     statement: &mir::Statement,
     present: &mut HashSet<mir::LocalId>,
 ) -> Result<(), BackendError> {
+    apply_nullable_class_call_effects(
+        program,
+        function,
+        &collect_statement_class_local_accesses(statement),
+        present,
+    )?;
     match statement {
         mir::Statement::AssignLocal { target, value }
             if matches!(local_in(function, *target)?.ty, mir::Type::NullableClass(_)) =>
@@ -2199,6 +2237,31 @@ fn apply_nullable_class_presence_statement(
         _ => {}
     }
     Ok(())
+}
+
+fn apply_nullable_class_call_effects(
+    program: &mir::Program,
+    function: &mir::Function,
+    accesses: &ClassLocalAccesses<'_>,
+    present: &mut HashSet<mir::LocalId>,
+) -> Result<(), BackendError> {
+    for access in accesses.iter() {
+        let ClassLocalAccess::Call(callee, args, parameter_offset) = access else {
+            continue;
+        };
+        for (local, mode) in borrowed_class_call_locals(program, callee, args, parameter_offset)? {
+            if matches!(mode, ClassBorrowMode::Writable)
+                && matches!(local_in(function, local)?.ty, mir::Type::NullableClass(_))
+            {
+                present.remove(&local);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn nullable_class_expression_is_definitely_null(expression: &mir::NullableClassExpression) -> bool {
+    matches!(expression, mir::NullableClassExpression::Null(_))
 }
 
 fn nullable_class_expression_is_present(

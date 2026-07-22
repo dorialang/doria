@@ -3566,7 +3566,7 @@ fn lower_condition(
             )?),
             right: Box::new(lower_condition(right, context)?),
         }),
-        hir::Expr::IsType { expr, ty, .. } => lower_is_condition(expr, ty, context),
+        hir::Expr::IsType { expr, span, .. } => lower_is_condition(expr, *span, context),
         hir::Expr::Bool { value, .. } => Ok(mir::BoolExpression::Use {
             operand: mir::Operand::Scalar(mir::ScalarValue::Bool(*value)),
         }),
@@ -3769,10 +3769,14 @@ fn lower_null_comparison(
 
 fn lower_is_condition(
     expr: &hir::Expr,
-    tested_type: &crate::types::TypeRef,
+    type_test_span: Span,
     context: &LoweringContext,
 ) -> DiagnosticResult<mir::BoolExpression> {
-    let Some(tested_type) = context.native_type_ref(tested_type) else {
+    let tested_type = context
+        .semantic_info
+        .type_test_type(type_test_span)
+        .and_then(|resolved| context.mir_resolved_type(resolved));
+    let Some(tested_type) = tested_type else {
         return Err(vec![unsupported(
             expr.span(),
             "type test does not name a native concrete type",

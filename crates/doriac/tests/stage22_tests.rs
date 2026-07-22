@@ -370,16 +370,34 @@ function main(): void
 
 #[test]
 fn self_resolves_in_exact_type_tests() {
-    doriac::check_source(
-        "stage22-self-is.doria",
-        r#"
+    let source = r#"
 class Label
 {
     function matches(?Label $value): bool { return $value is self; }
 }
-"#,
-    )
-    .expect("self should resolve to the declaring class in an exact type test");
+function main(): void
+{
+    let $label = new Label();
+    if ($label->matches($label)) { echo "match"; }
+}
+"#;
+    doriac::check_source("stage22-self-is.doria", source)
+        .expect("self should resolve to the declaring class in an exact type test");
+
+    let program = doriac::lower_source_to_mir("stage22-self-is.doria", source)
+        .expect("the semantically resolved self type test should lower to MIR");
+    doriac::mir_validation::validate_program(&program)
+        .expect("the self type-test MIR should validate");
+    assert!(!doriac::codegen_cranelift::lower_mir_to_object(&program)
+        .expect("Cranelift should lower exact self tests")
+        .is_empty());
+    #[cfg(feature = "llvm-backend")]
+    assert!(!doriac::codegen_llvm::lower_mir_to_object(&program)
+        .expect("LLVM should lower exact self tests")
+        .is_empty());
+    let output =
+        doriac::mir_interpreter::interpret(&program).expect("the self type test should execute");
+    assert_eq!(output.stdout, b"match");
 }
 
 #[test]
@@ -835,6 +853,45 @@ function read(?int $value): int
 "#,
     )
     .expect("a readonly call must preserve the caller's narrowing fact");
+
+    doriac::check_source(
+        "stage22-skipped-null-safe-call-fact.doria",
+        r#"
+class Holder
+{
+    function clear(writable ?int $value): void { $value = null; }
+}
+function read(writable ?int $value): int
+{
+    if ($value == null) { return 0; }
+    ?Holder $holder = null;
+    $holder?->clear($value);
+    return $value + 1;
+}
+"#,
+    )
+    .expect("a proven-null null-safe receiver must skip writable argument effects");
+
+    let conditional = diagnostics(
+        r#"
+class Holder
+{
+    function clear(writable ?int $value): void { $value = null; }
+}
+function read(?Holder $holder, writable ?int $value): int
+{
+    if ($value == null) { return 0; }
+    $holder?->clear($value);
+    return $value + 1;
+}
+"#,
+    );
+    assert!(
+        conditional
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E0441"),
+        "a possibly-executed null-safe call must invalidate writable arguments: {conditional:#?}"
+    );
 }
 
 #[test]
@@ -1429,6 +1486,45 @@ function main(): void
     let error = doriac::mir_validation::validate_program(&transferred)
         .expect_err("a null-safe method receiver cannot be transferred");
     assert!(error.message.contains("transfers its receiver"));
+}
+
+#[test]
+fn shared_validation_invalidates_nullable_class_presence_after_writable_calls() {
+    let mut program = doriac::lower_source_to_mir(
+        "stage22-writable-nullable-class-presence.doria",
+        r#"
+class Box { int $value = 1; }
+function inspect(?Box $box): void {}
+function consume(Box $box): void {}
+function read(writable ?Box $box): void
+{
+    if ($box == null) { return; }
+    inspect($box);
+    consume($box);
+}
+function main(): void {}
+"#,
+    )
+    .expect("the readonly-call control fixture should lower");
+    doriac::mir_validation::validate_program(&program)
+        .expect("a readonly nullable class call preserves presence");
+
+    let inspect = program
+        .functions
+        .iter_mut()
+        .find(|function| function.name == "inspect")
+        .expect("fixture should contain inspect");
+    let parameter = inspect.params[0];
+    inspect.locals[parameter.0].writable = true;
+
+    let error = doriac::mir_validation::validate_program(&program)
+        .expect_err("a writable nullable class call must invalidate later assumptions");
+    assert!(
+        error
+            .message
+            .contains("without a dominating presence proof"),
+        "unexpected shared-validation error: {error:?}"
+    );
 }
 
 #[test]

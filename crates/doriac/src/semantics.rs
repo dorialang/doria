@@ -26,6 +26,8 @@ pub struct SemanticInfo {
     pub float_expression_types: HashMap<(usize, usize), FloatType>,
     /// Resolved semantic type for checked expressions, independent of backend layout.
     pub expression_types: HashMap<(usize, usize), ResolvedType>,
+    /// Resolved concrete target for each checked `is` expression.
+    pub type_test_types: HashMap<(usize, usize), ResolvedType>,
     /// Stable nominal class identities and the total Stage 19 property order.
     pub classes: Vec<ClassSemanticInfo>,
     /// Values produced by the bounded Stage 20 constant evaluator.
@@ -70,6 +72,10 @@ impl SemanticInfo {
     pub fn expression_type(&self, span: Span) -> Option<&ResolvedType> {
         self.expression_types.get(&(span.start, span.end))
     }
+
+    pub fn type_test_type(&self, span: Span) -> Option<&ResolvedType> {
+        self.type_test_types.get(&(span.start, span.end))
+    }
 }
 
 pub fn analyze_program(program: &Program) -> DiagnosticResult<SemanticInfo> {
@@ -113,6 +119,7 @@ pub fn analyze_program(program: &Program) -> DiagnosticResult<SemanticInfo> {
             integer_expression_types: checker.integer_expression_types,
             float_expression_types: checker.float_expression_types,
             expression_types: checker.expression_types,
+            type_test_types: checker.type_test_types,
             classes: collect_ordered_class_semantics(program),
             const_evaluation: checker.const_evaluation,
             parameter_defaults: checker.parameter_defaults,
@@ -238,6 +245,7 @@ struct Checker<'program> {
     integer_expression_types: HashMap<(usize, usize), IntegerType>,
     float_expression_types: HashMap<(usize, usize), FloatType>,
     expression_types: HashMap<(usize, usize), ResolvedType>,
+    type_test_types: HashMap<(usize, usize), ResolvedType>,
     integer_literals: HashMap<(usize, usize), u128>,
     negative_integer_literals: HashMap<(usize, usize), u128>,
     negated_integer_literal_operands: HashSet<(usize, usize)>,
@@ -394,6 +402,7 @@ impl<'program> Checker<'program> {
             integer_expression_types: HashMap::new(),
             float_expression_types: HashMap::new(),
             expression_types: HashMap::new(),
+            type_test_types: HashMap::new(),
             integer_literals: HashMap::new(),
             negative_integer_literals: HashMap::new(),
             negated_integer_literal_operands: HashSet::new(),
@@ -6800,6 +6809,8 @@ impl<'program> Checker<'program> {
             span,
             method_context.map(|context| context.class_name.as_str()),
         );
+        self.type_test_types
+            .insert((span.start, span.end), self.types.resolved(tested));
         if ty.nullable
             || !matches!(
                 self.types.kind(tested),

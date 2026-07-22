@@ -26,6 +26,13 @@ struct State {
     facts: BTreeMap<BindingId, Fact>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CallExecution {
+    Always,
+    Never,
+    Maybe,
+}
+
 #[derive(Default)]
 struct Resolution {
     uses: HashMap<(usize, usize), BindingId>,
@@ -821,16 +828,29 @@ fn kill_mutated_call_arguments(
             object,
             method,
             args,
+            null_safe,
             ..
         } => {
             kill_mutated_call_arguments(object, state, resolution, mutations);
-            kill_calls_in_arguments(args, state, resolution, mutations);
-            kill_arguments_for_modes(
-                args,
-                mutations.instance_method_modes(object, method, resolution, state),
-                state,
-                resolution,
-            );
+            let apply_arguments = |state: &mut State| {
+                kill_calls_in_arguments(args, state, resolution, mutations);
+                kill_arguments_for_modes(
+                    args,
+                    mutations.instance_method_modes(object, method, resolution, state),
+                    state,
+                    resolution,
+                );
+            };
+            match call_execution(*null_safe, object, state, resolution) {
+                CallExecution::Never => {}
+                CallExecution::Maybe => {
+                    let mut evaluated = state.clone();
+                    assume_non_null(object, &mut evaluated, resolution);
+                    apply_arguments(&mut evaluated);
+                    *state = joined_state(state, &evaluated);
+                }
+                CallExecution::Always => apply_arguments(state),
+            }
         }
         Expr::FunctionCall { name, args, .. } => {
             kill_calls_in_arguments(args, state, resolution, mutations);
@@ -982,6 +1002,30 @@ fn kill_arguments_for_modes(
         if *mutable {
             kill_target(argument, state, resolution);
         }
+    }
+}
+
+fn assume_non_null(expr: &Expr, state: &mut State, resolution: &Resolution) {
+    if let Some(binding) = variable_binding(expr, resolution) {
+        if !matches!(state.facts.get(&binding), Some(Fact::Exact(_))) {
+            state.facts.insert(binding, Fact::NonNull);
+        }
+    }
+}
+
+fn call_execution(
+    null_safe: bool,
+    receiver: &Expr,
+    state: &State,
+    resolution: &Resolution,
+) -> CallExecution {
+    if !null_safe {
+        return CallExecution::Always;
+    }
+    match expression_fact(receiver, state, resolution, &resolution.nullability) {
+        Some(Fact::Null) => CallExecution::Never,
+        Some(Fact::NonNull | Fact::Exact(_)) => CallExecution::Always,
+        None => CallExecution::Maybe,
     }
 }
 
@@ -1260,13 +1304,26 @@ fn collect_expr(
             object,
             method,
             args,
+            null_safe,
             ..
         } => {
             let state = collect_expr(object, state, resolution, mutations, facts);
-            let mut state = collect_expr_sequence(args, &state, resolution, mutations, facts);
-            let modes = mutations.instance_method_modes(object, method, resolution, &state);
-            kill_arguments_for_modes(args, modes, &mut state, resolution);
-            state
+            let collect_arguments = |state: &State, facts: &mut FactsByUse| {
+                let mut state = collect_expr_sequence(args, state, resolution, mutations, facts);
+                let modes = mutations.instance_method_modes(object, method, resolution, &state);
+                kill_arguments_for_modes(args, modes, &mut state, resolution);
+                state
+            };
+            match call_execution(*null_safe, object, &state, resolution) {
+                CallExecution::Never => state,
+                CallExecution::Maybe => {
+                    let mut evaluated = state.clone();
+                    assume_non_null(object, &mut evaluated, resolution);
+                    let evaluated = collect_arguments(&evaluated, facts);
+                    joined_state(&state, &evaluated)
+                }
+                CallExecution::Always => collect_arguments(&state, facts),
+            }
         }
         Expr::FunctionCall { name, args, .. } => {
             let mut state = collect_expr_sequence(args, state, resolution, mutations, facts);
