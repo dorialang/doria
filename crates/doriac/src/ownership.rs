@@ -7,6 +7,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::ast::{self, AssignOp, BinaryOp, ClassMember, Expr, Item, Stmt};
+use crate::builtins::Builtin;
 use crate::diagnostics::Diagnostic;
 use crate::narrowing::{Fact, FactsByUse};
 use crate::source::Span;
@@ -70,6 +71,7 @@ enum CollectionFamily {
     List,
     Dictionary,
     Set,
+    Bytes,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1271,7 +1273,7 @@ impl Checker<'_> {
                 ),
                 mixed: ty.name == "mixed",
                 borrowed_place: true,
-                writable: false,
+                writable: binding.writable,
                 state: State::Borrowed,
             },
         );
@@ -2263,10 +2265,13 @@ impl Checker<'_> {
             Expr::Grouped { expr, .. } => self.expr_is_move_value(expr, scopes),
             Expr::Array { .. } => true,
             Expr::New { class_name, .. } => self.classes.contains(class_name),
-            Expr::FunctionCall { name, .. } => self
-                .signatures
-                .get(name)
-                .is_some_and(|signature| signature.returns_move_type),
+            Expr::FunctionCall { name, .. } => {
+                Builtin::from_name(name).is_some_and(Builtin::returns_owned_bytes)
+                    || self
+                        .signatures
+                        .get(name)
+                        .is_some_and(|signature| signature.returns_move_type)
+            }
             Expr::MethodCall { object, method, .. } => {
                 if let Some(collection) = self.expr_collection_info(object, scopes) {
                     return matches!(
@@ -2274,6 +2279,10 @@ impl Checker<'_> {
                         (CollectionFamily::List, "removeAt" | "pop")
                             | (CollectionFamily::Dictionary, "remove")
                     ) && collection.value_move
+                        || matches!(
+                            (collection.family, method.as_str()),
+                            (CollectionFamily::Bytes, "toArray")
+                        )
                         || matches!(
                             (collection.family, method.as_str()),
                             (CollectionFamily::Set, "union" | "intersect" | "difference")
@@ -2475,10 +2484,14 @@ impl Checker<'_> {
                         .map(|info| info.family),
                 })
             }
-            Expr::FunctionCall { name, .. } => self
-                .signatures
-                .get(name)
-                .and_then(|signature| signature.returns_collection.clone()),
+            Expr::FunctionCall { name, .. } => {
+                if Builtin::from_name(name).is_some_and(Builtin::returns_owned_bytes) {
+                    return Some(bytes_collection_info());
+                }
+                self.signatures
+                    .get(name)
+                    .and_then(|signature| signature.returns_collection.clone())
+            }
             Expr::PropertyAccess {
                 object, property, ..
             } => {
@@ -2492,6 +2505,10 @@ impl Checker<'_> {
             {
                 let info = self.expr_collection_info(object, scopes)?;
                 (info.family == CollectionFamily::Set).then_some(info)
+            }
+            Expr::MethodCall { object, method, .. } if method == "toArray" => {
+                let info = self.expr_collection_info(object, scopes)?;
+                (info.family == CollectionFamily::Bytes).then_some(byte_array_collection_info())
             }
             Expr::StaticCall {
                 qualifier: ast::StaticQualifier::Class(class_name),
@@ -2509,6 +2526,11 @@ impl Checker<'_> {
                     value_collection: source.and_then(|info| info.value_collection),
                 })
             }
+            Expr::StaticCall {
+                qualifier: ast::StaticQualifier::Class(class_name),
+                method,
+                ..
+            } if class_name == "Bytes" && method == "fromArray" => Some(bytes_collection_info()),
             Expr::Grouped { expr, .. } => self.expr_collection_info(expr, scopes),
             Expr::Binary {
                 left,
@@ -2630,6 +2652,9 @@ fn type_ref_collection_info(
     classes: &HashSet<String>,
     receiver_class: Option<&str>,
 ) -> Option<CollectionInfo> {
+    if ty.name == "Bytes" && ty.args.is_empty() {
+        return Some(bytes_collection_info());
+    }
     let (family, value) = match ty.name.as_str() {
         "[]" if ty.args.len() == 1 => (CollectionFamily::TypedArray, &ty.args[0]),
         "List" if ty.args.len() == 1 => (CollectionFamily::List, &ty.args[0]),
@@ -2644,6 +2669,24 @@ fn type_ref_collection_info(
         value_collection: type_ref_collection_info(value, classes, receiver_class)
             .map(|info| info.family),
     })
+}
+
+fn bytes_collection_info() -> CollectionInfo {
+    CollectionInfo {
+        family: CollectionFamily::Bytes,
+        value_move: false,
+        value_class: None,
+        value_collection: None,
+    }
+}
+
+fn byte_array_collection_info() -> CollectionInfo {
+    CollectionInfo {
+        family: CollectionFamily::TypedArray,
+        value_move: false,
+        value_class: None,
+        value_collection: None,
+    }
 }
 
 pub(crate) fn type_ref_is_move_type(

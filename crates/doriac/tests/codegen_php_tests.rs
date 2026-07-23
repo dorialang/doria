@@ -1389,6 +1389,7 @@ function main(): void
     if ($line != null) { write_stderr($line); }
     let $contents = read_file("input.txt");
     write_file("copy.txt", $contents);
+    append_file("copy.txt", $contents);
     printf("enabled=%s", false);
     echo sprintf("%05d", 42);
 }
@@ -1410,6 +1411,9 @@ function main(): void
     assert!(php.contains("__doria_read_file(\"input.txt\")"));
     assert!(php.contains("$contents === false"));
     assert!(php.contains("__doria_write_file(\"copy.txt\", $contents)"));
+    assert!(php.contains("__doria_append_file(\"copy.txt\", $contents)"));
+    assert!(php.contains("file_put_contents($path, $contents, FILE_APPEND)"));
+    assert!(php.contains("__doria_io_panic(\"failed to append file\")"));
     assert!(php.contains("$written === false || $written !== strlen($contents)"));
     assert!(php.contains("__doria_write_stderr($line)"));
     assert!(php.contains("__doria_printf(\"enabled=%s\", __doria_display(false))"));

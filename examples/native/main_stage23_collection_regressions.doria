@@ -1,0 +1,69 @@
+class Token
+{
+    function __construct(int $id)
+    {
+    }
+
+    function __destruct()
+    {
+        echo "drop {$this->id}\n";
+    }
+}
+
+class Counter
+{
+    function __construct(writable int $value)
+    {
+    }
+
+    writable function increment(): void
+    {
+        $this->value++;
+    }
+}
+
+class Holder
+{
+    function __construct(take List<Token> $tokens)
+    {
+    }
+}
+
+function main(): void
+{
+    writable List<List<int>> $matrix = [[1]];
+    $matrix[0]->add(2);
+    echo "nested {$matrix[0][1]}\n";
+
+    writable List<Counter> $counters = [new Counter(1)];
+    foreach ($counters as writable Counter $counter) {
+        $counter->increment();
+    }
+    foreach ($counters as Counter $counter) {
+        echo "counter {$counter->value}\n";
+    }
+
+    writable List<Token> $removed = [new Token(1), new Token(2)];
+    $removed->removeAt(0);
+    $removed->pop();
+
+    writable Dictionary<string, Token> $named = ["three" => new Token(3)];
+    $named->remove("three");
+
+    Dictionary<string, Token> $duplicates = [
+        "same" => new Token(4),
+        "same" => new Token(5),
+    ];
+
+    let $holder = new Holder([new Token(6)]);
+
+    List<float> $zeros = [0.0];
+    if ($zeros->contains(-0.0)) {
+        echo "signed-zero\n";
+    }
+    float $nan = 0.0 / 0.0;
+    List<float> $nans = [$nan];
+    if (!$nans->contains($nan)) {
+        echo "nan\n";
+    }
+}

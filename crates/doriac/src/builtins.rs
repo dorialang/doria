@@ -109,6 +109,10 @@ impl Builtin {
             | Self::WriteStderrBytes => None,
         }
     }
+
+    pub const fn returns_owned_bytes(self) -> bool {
+        matches!(self, Self::ReadFileBytes | Self::ReadStdinBytes)
+    }
 }
 
 #[cfg(test)]

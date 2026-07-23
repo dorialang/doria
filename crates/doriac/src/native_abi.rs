@@ -62,6 +62,11 @@ pub const COLLECTION_KEYED_REMOVE: &str = "dr_v1_collection_keyed_remove";
 pub const COLLECTION_NULLABLE_ACCESS: &str = "dr_v1_collection_nullable_access";
 pub const COLLECTION_CONTAINS: &str = "dr_v1_collection_contains";
 
+pub const COLLECTION_COMPARE_WORD: u8 = 0;
+pub const COLLECTION_COMPARE_STRING: u8 = 1;
+pub const COLLECTION_COMPARE_FLOAT32: u8 = 2;
+pub const COLLECTION_COMPARE_FLOAT64: u8 = 3;
+
 pub fn function_symbol(function: &mir::Function) -> String {
     let sanitized = function
         .name

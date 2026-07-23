@@ -29,6 +29,7 @@ pub fn generate(program: &Program) -> Result<String, BackendError> {
         "__doria_read_line",
         "__doria_read_file",
         "__doria_write_file",
+        "__doria_append_file",
         "__doria_is_broken_pipe",
         "__doria_write_all",
         "__doria_write_stdout",
@@ -74,6 +75,13 @@ function __doria_write_file(string $path, string $contents): void
     if (str_contains($path, "\0")) { __doria_io_panic("file path contained an embedded NUL"); }
     $written = @file_put_contents($path, $contents);
     if ($written === false || $written !== strlen($contents)) { __doria_io_panic("failed to write file"); }
+}
+
+function __doria_append_file(string $path, string $contents): void
+{
+    if (str_contains($path, "\0")) { __doria_io_panic("file path contained an embedded NUL"); }
+    $written = @file_put_contents($path, $contents, FILE_APPEND);
+    if ($written === false || $written !== strlen($contents)) { __doria_io_panic("failed to append file"); }
 }
 
 function __doria_is_broken_pipe(?array $error): bool
@@ -1874,6 +1882,7 @@ fn emit_function_call(name: &str, args: &[Expr], scopes: &PhpNameScopes) -> Stri
         "read_line" => "__doria_read_line",
         "read_file" => "__doria_read_file",
         "write_file" => "__doria_write_file",
+        "append_file" => "__doria_append_file",
         "write_stderr" => "__doria_write_stderr",
         "sprintf" => "__doria_sprintf",
         "printf" => "__doria_printf",

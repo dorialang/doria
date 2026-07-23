@@ -2607,11 +2607,20 @@ impl<'program> Checker<'program> {
                         foreach.span,
                     ));
                 }
+                if range_iterable && foreach.value.writable {
+                    self.diagnostics.push(Diagnostic::new(
+                        "E0425",
+                        "foreach over integer ranges produces readonly value bindings",
+                        foreach.span,
+                    ));
+                }
                 self.declare_binding(
                     &mut loop_scopes,
                     foreach.value.name.clone(),
                     Binding {
-                        writable: foreach.value.writable && dictionary_projection.is_none(),
+                        writable: foreach.value.writable
+                            && dictionary_projection.is_none()
+                            && !range_iterable,
                         ty: value_ty,
                         declared_ty: value_ty,
                         int_constant: None,

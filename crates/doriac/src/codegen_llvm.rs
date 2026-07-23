@@ -24,16 +24,17 @@ use crate::mir_validation;
 use crate::native_abi::{
     function_symbol, APPEND_FILE, APPEND_FILE_BYTES, BYTES_EQUAL, BYTES_FREE,
     BYTES_FROM_COLLECTION, BYTES_GET, BYTES_LENGTH, BYTES_SET, BYTES_TO_COLLECTION, CLASS_ALLOCATE,
-    CLASS_FREE, COLLECTION_CONTAINS, COLLECTION_FREE, COLLECTION_INSERT_AT, COLLECTION_KEYED_GET,
-    COLLECTION_KEYED_HAS, COLLECTION_KEYED_SET, COLLECTION_KEY_AT, COLLECTION_LENGTH,
-    COLLECTION_NEW, COLLECTION_NULLABLE_ACCESS, COLLECTION_PUSH, COLLECTION_PUSH_UNIQUE,
-    COLLECTION_REMOVE_AT, COLLECTION_REMOVE_VALUE, COLLECTION_SET_ALGEBRA, COLLECTION_SET_AT,
-    COLLECTION_VALUE_AT, FORMAT_F32, FORMAT_F64, FORMAT_I64, FORMAT_STRING, FORMAT_U64,
-    NULLABLE_STRING_EQUAL, READ_FILE, READ_FILE_BYTES, READ_STDIN_BYTES, READ_STDIN_LINE,
-    STRING_COMPARE, STRING_CONCAT, STRING_DATA, STRING_FROM_BOOL, STRING_FROM_F32, STRING_FROM_F64,
-    STRING_FROM_I64, STRING_FROM_U64, STRING_FROM_UTF8, STRING_LENGTH, STRING_RELEASE,
-    STRING_RETAIN, STRING_WRITE_STDERR, STRING_WRITE_STDOUT, WRITE_FILE, WRITE_FILE_BYTES,
-    WRITE_STDERR_BYTES, WRITE_STDOUT_BYTES,
+    CLASS_FREE, COLLECTION_COMPARE_FLOAT32, COLLECTION_COMPARE_FLOAT64, COLLECTION_COMPARE_STRING,
+    COLLECTION_COMPARE_WORD, COLLECTION_CONTAINS, COLLECTION_FREE, COLLECTION_INSERT_AT,
+    COLLECTION_KEYED_GET, COLLECTION_KEYED_HAS, COLLECTION_KEYED_SET, COLLECTION_KEY_AT,
+    COLLECTION_LENGTH, COLLECTION_NEW, COLLECTION_NULLABLE_ACCESS, COLLECTION_PUSH,
+    COLLECTION_PUSH_UNIQUE, COLLECTION_REMOVE_AT, COLLECTION_REMOVE_VALUE, COLLECTION_SET_ALGEBRA,
+    COLLECTION_SET_AT, COLLECTION_VALUE_AT, FORMAT_F32, FORMAT_F64, FORMAT_I64, FORMAT_STRING,
+    FORMAT_U64, NULLABLE_STRING_EQUAL, READ_FILE, READ_FILE_BYTES, READ_STDIN_BYTES,
+    READ_STDIN_LINE, STRING_COMPARE, STRING_CONCAT, STRING_DATA, STRING_FROM_BOOL, STRING_FROM_F32,
+    STRING_FROM_F64, STRING_FROM_I64, STRING_FROM_U64, STRING_FROM_UTF8, STRING_LENGTH,
+    STRING_RELEASE, STRING_RETAIN, STRING_WRITE_STDERR, STRING_WRITE_STDOUT, WRITE_FILE,
+    WRITE_FILE_BYTES, WRITE_STDERR_BYTES, WRITE_STDOUT_BYTES,
 };
 use crate::numeric::{FloatType, FloatValue, IntegerPanic, IntegerType, IntegerValue};
 
@@ -898,8 +899,16 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
 
     fn collection_compare_kind(&self, ty: mir::Type) -> Result<IntValue<'ctx>, BackendError> {
         let kind = match ty {
-            mir::Type::String => 1,
-            mir::Type::Scalar(_) | mir::Type::Class(_) | mir::Type::Collection(_) => 0,
+            mir::Type::String => COLLECTION_COMPARE_STRING,
+            mir::Type::Scalar(mir::ScalarType::Float(FloatType::Float32)) => {
+                COLLECTION_COMPARE_FLOAT32
+            }
+            mir::Type::Scalar(mir::ScalarType::Float(FloatType::Float64)) => {
+                COLLECTION_COMPARE_FLOAT64
+            }
+            mir::Type::Scalar(_) | mir::Type::Class(_) | mir::Type::Collection(_) => {
+                COLLECTION_COMPARE_WORD
+            }
             mir::Type::NullableScalar(_)
             | mir::Type::NullableString
             | mir::Type::NullableClass(_) => {
@@ -908,7 +917,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 ))
             }
         };
-        Ok(self.context.i8_type().const_int(kind, false))
+        Ok(self.context.i8_type().const_int(u64::from(kind), false))
     }
 
     fn value_to_collection_word(
@@ -1081,33 +1090,17 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     .into_pointer_value();
                 for (index, entry) in entries.iter().enumerate() {
                     let value = self.lower_rvalue(&entry.value)?;
-                    let value_word = self.value_to_collection_word(value, definition.value)?;
                     if let (Some(key_type), Some(key)) = (definition.key, &entry.key) {
                         let key = self.lower_rvalue(key)?;
-                        let key_word = self.value_to_collection_word(key, key_type)?;
-                        let replaced = build(
-                            self.builder
-                                .build_alloca(self.context.i8_type(), "dictionary.replaced"),
-                        )?;
-                        let _ = self.call_runtime(
-                            COLLECTION_KEYED_SET,
-                            &[
-                                pointer.into(),
-                                self.context.i64_type().into(),
-                                self.context.i64_type().into(),
-                                self.context.i8_type().into(),
-                                pointer.into(),
-                            ],
-                            Some(self.context.i64_type().into()),
-                            &[
-                                result.into(),
-                                key_word.into(),
-                                value_word.into(),
-                                self.collection_compare_kind(key_type)?.into(),
-                                replaced.into(),
-                            ],
+                        self.lower_dictionary_set_value(
+                            result,
+                            key,
+                            key_type,
+                            value,
+                            definition.value,
                         )?;
                     } else if fixed {
+                        let value_word = self.value_to_collection_word(value, definition.value)?;
                         let _ = self.call_runtime(
                             COLLECTION_SET_AT,
                             &[
@@ -1125,6 +1118,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                             ],
                         )?;
                     } else if definition.kind == mir::CollectionKind::Set {
+                        let value_word = self.value_to_collection_word(value, definition.value)?;
                         let inserted = self
                             .call_runtime(
                                 COLLECTION_PUSH_UNIQUE,
@@ -1144,6 +1138,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                             .into_int_value();
                         self.drop_value_unless(inserted, value, definition.value)?;
                     } else {
+                        let value_word = self.value_to_collection_word(value, definition.value)?;
                         let _ = self.call_runtime(
                             COLLECTION_PUSH,
                             &[pointer.into(), self.context.i64_type().into()],
@@ -1611,41 +1606,13 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         let value_word = self.value_to_collection_word(value, definition.value)?;
         if let Some(key_type) = definition.key {
             let key = self.lower_rvalue(index)?;
-            let key_word = self.value_to_collection_word(key, key_type)?;
-            let replaced_slot = build(
-                self.builder
-                    .build_alloca(self.context.i8_type(), "dictionary.replaced"),
+            self.lower_dictionary_set_value(
+                collection_value,
+                key,
+                key_type,
+                value,
+                definition.value,
             )?;
-            let old_word = self
-                .call_runtime(
-                    COLLECTION_KEYED_SET,
-                    &[
-                        pointer.into(),
-                        self.context.i64_type().into(),
-                        self.context.i64_type().into(),
-                        self.context.i8_type().into(),
-                        pointer.into(),
-                    ],
-                    Some(self.context.i64_type().into()),
-                    &[
-                        collection_value.into(),
-                        key_word.into(),
-                        value_word.into(),
-                        self.collection_compare_kind(key_type)?.into(),
-                        replaced_slot.into(),
-                    ],
-                )?
-                .ok_or_else(|| backend_failure("dictionary write produced no result"))?
-                .into_int_value();
-            let replaced = build(self.builder.build_load(
-                self.context.i8_type(),
-                replaced_slot,
-                "dictionary.replaced",
-            ))?
-            .into_int_value();
-            let old_value = self.collection_word_to_value(old_word, definition.value)?;
-            self.drop_value_if(replaced, old_value, definition.value)?;
-            self.drop_value_if(replaced, key, key_type)?;
         } else {
             let index = self.lower_rvalue(index)?.into_int_value();
             let old_word = self
@@ -1671,6 +1638,53 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             self.drop_stored_value(old_value, definition.value)?;
         }
         Ok(())
+    }
+
+    fn lower_dictionary_set_value(
+        &mut self,
+        collection: PointerValue<'ctx>,
+        key: BasicValueEnum<'ctx>,
+        key_type: mir::Type,
+        value: BasicValueEnum<'ctx>,
+        value_type: mir::Type,
+    ) -> Result<(), BackendError> {
+        let pointer = self.context.ptr_type(AddressSpace::default());
+        let key_word = self.value_to_collection_word(key, key_type)?;
+        let value_word = self.value_to_collection_word(value, value_type)?;
+        let replaced_slot = build(
+            self.builder
+                .build_alloca(self.context.i8_type(), "dictionary.replaced"),
+        )?;
+        let old_word = self
+            .call_runtime(
+                COLLECTION_KEYED_SET,
+                &[
+                    pointer.into(),
+                    self.context.i64_type().into(),
+                    self.context.i64_type().into(),
+                    self.context.i8_type().into(),
+                    pointer.into(),
+                ],
+                Some(self.context.i64_type().into()),
+                &[
+                    collection.into(),
+                    key_word.into(),
+                    value_word.into(),
+                    self.collection_compare_kind(key_type)?.into(),
+                    replaced_slot.into(),
+                ],
+            )?
+            .ok_or_else(|| backend_failure("dictionary write produced no result"))?
+            .into_int_value();
+        let replaced = build(self.builder.build_load(
+            self.context.i8_type(),
+            replaced_slot,
+            "dictionary.replaced",
+        ))?
+        .into_int_value();
+        let old_value = self.collection_word_to_value(old_word, value_type)?;
+        self.drop_value_if(replaced, old_value, value_type)?;
+        self.drop_value_if(replaced, key, key_type)
     }
 
     fn lower_set_from(

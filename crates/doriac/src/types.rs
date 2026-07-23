@@ -62,7 +62,7 @@ impl TypeRef {
         }
         match self.name.as_str() {
             "void" | "float" | "float32" | "float64" | "string" | "bool" | "mixed" | "null"
-            | "resource" | "List" | "Dictionary" | "Set" | "[]" | "Unknown" => None,
+            | "resource" | "Bytes" | "List" | "Dictionary" | "Set" | "[]" | "Unknown" => None,
             _ => Some(&self.name),
         }
     }

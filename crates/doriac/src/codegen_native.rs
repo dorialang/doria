@@ -164,8 +164,9 @@ fn linker_arguments(
         // For the current generated process wrapper, make Doria's main the executable
         // entrypoint instead of relying on CRT startup to discover and call it.
         // LLVM may emit __chkstk for any function whose frame crosses the Windows
-        // stack-probe threshold. Link MSVC's static compiler-support library
-        // explicitly because generated objects carry no /DEFAULTLIB directives.
+        // stack-probe threshold. Link the static CRT archive that owns the
+        // stack-probe support object because generated objects carry no
+        // /DEFAULTLIB directives.
         return vec![
             OsString::from("/nologo"),
             object_path.as_os_str().to_os_string(),
@@ -174,7 +175,7 @@ fn linker_arguments(
             OsString::from("/link"),
             OsString::from("/ENTRY:main"),
             OsString::from("/SUBSYSTEM:CONSOLE"),
-            OsString::from("libvcruntime.lib"),
+            OsString::from("libcmt.lib"),
             OsString::from("kernel32.lib"),
         ];
     }
@@ -223,7 +224,7 @@ mod tests {
                 OsString::from("/link"),
                 OsString::from("/ENTRY:main"),
                 OsString::from("/SUBSYSTEM:CONSOLE"),
-                OsString::from("libvcruntime.lib"),
+                OsString::from("libcmt.lib"),
                 OsString::from("kernel32.lib"),
             ]
         );
@@ -251,7 +252,7 @@ mod tests {
                 OsString::from("/link"),
                 OsString::from("/ENTRY:main"),
                 OsString::from("/SUBSYSTEM:CONSOLE"),
-                OsString::from("libvcruntime.lib"),
+                OsString::from("libcmt.lib"),
                 OsString::from("kernel32.lib"),
             ]
         );

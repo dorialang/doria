@@ -18,16 +18,17 @@ use crate::mir_validation;
 use crate::native_abi::{
     function_symbol, APPEND_FILE, APPEND_FILE_BYTES, BYTES_EQUAL, BYTES_FREE,
     BYTES_FROM_COLLECTION, BYTES_GET, BYTES_LENGTH, BYTES_SET, BYTES_TO_COLLECTION, CLASS_ALLOCATE,
-    CLASS_FREE, COLLECTION_CONTAINS, COLLECTION_FREE, COLLECTION_INSERT_AT, COLLECTION_KEYED_GET,
-    COLLECTION_KEYED_HAS, COLLECTION_KEYED_SET, COLLECTION_KEY_AT, COLLECTION_LENGTH,
-    COLLECTION_NEW, COLLECTION_NULLABLE_ACCESS, COLLECTION_PUSH, COLLECTION_PUSH_UNIQUE,
-    COLLECTION_REMOVE_AT, COLLECTION_REMOVE_VALUE, COLLECTION_SET_ALGEBRA, COLLECTION_SET_AT,
-    COLLECTION_VALUE_AT, FORMAT_F32, FORMAT_F64, FORMAT_I64, FORMAT_STRING, FORMAT_U64,
-    NULLABLE_STRING_EQUAL, READ_FILE, READ_FILE_BYTES, READ_STDIN_BYTES, READ_STDIN_LINE,
-    STRING_COMPARE, STRING_CONCAT, STRING_DATA, STRING_FROM_BOOL, STRING_FROM_F32, STRING_FROM_F64,
-    STRING_FROM_I64, STRING_FROM_U64, STRING_FROM_UTF8, STRING_LENGTH, STRING_RELEASE,
-    STRING_RETAIN, STRING_WRITE_STDERR, STRING_WRITE_STDOUT, WRITE_FILE, WRITE_FILE_BYTES,
-    WRITE_STDERR_BYTES, WRITE_STDOUT_BYTES,
+    CLASS_FREE, COLLECTION_COMPARE_FLOAT32, COLLECTION_COMPARE_FLOAT64, COLLECTION_COMPARE_STRING,
+    COLLECTION_COMPARE_WORD, COLLECTION_CONTAINS, COLLECTION_FREE, COLLECTION_INSERT_AT,
+    COLLECTION_KEYED_GET, COLLECTION_KEYED_HAS, COLLECTION_KEYED_SET, COLLECTION_KEY_AT,
+    COLLECTION_LENGTH, COLLECTION_NEW, COLLECTION_NULLABLE_ACCESS, COLLECTION_PUSH,
+    COLLECTION_PUSH_UNIQUE, COLLECTION_REMOVE_AT, COLLECTION_REMOVE_VALUE, COLLECTION_SET_ALGEBRA,
+    COLLECTION_SET_AT, COLLECTION_VALUE_AT, FORMAT_F32, FORMAT_F64, FORMAT_I64, FORMAT_STRING,
+    FORMAT_U64, NULLABLE_STRING_EQUAL, READ_FILE, READ_FILE_BYTES, READ_STDIN_BYTES,
+    READ_STDIN_LINE, STRING_COMPARE, STRING_CONCAT, STRING_DATA, STRING_FROM_BOOL, STRING_FROM_F32,
+    STRING_FROM_F64, STRING_FROM_I64, STRING_FROM_U64, STRING_FROM_UTF8, STRING_LENGTH,
+    STRING_RELEASE, STRING_RETAIN, STRING_WRITE_STDERR, STRING_WRITE_STDOUT, WRITE_FILE,
+    WRITE_FILE_BYTES, WRITE_STDERR_BYTES, WRITE_STDOUT_BYTES,
 };
 use crate::numeric::{FloatType, FloatValue, IntegerPanic, IntegerType, IntegerValue};
 
@@ -1356,8 +1357,16 @@ fn collection_definition(
 
 fn collection_compare_kind(ty: mir::Type) -> Result<i64, BackendError> {
     match ty {
-        mir::Type::String => Ok(1),
-        mir::Type::Scalar(_) | mir::Type::Class(_) | mir::Type::Collection(_) => Ok(0),
+        mir::Type::String => Ok(i64::from(COLLECTION_COMPARE_STRING)),
+        mir::Type::Scalar(mir::ScalarType::Float(FloatType::Float32)) => {
+            Ok(i64::from(COLLECTION_COMPARE_FLOAT32))
+        }
+        mir::Type::Scalar(mir::ScalarType::Float(FloatType::Float64)) => {
+            Ok(i64::from(COLLECTION_COMPARE_FLOAT64))
+        }
+        mir::Type::Scalar(_) | mir::Type::Class(_) | mir::Type::Collection(_) => {
+            Ok(i64::from(COLLECTION_COMPARE_WORD))
+        }
         mir::Type::NullableScalar(_) | mir::Type::NullableString | mir::Type::NullableClass(_) => {
             Err(malformed_mir(
                 "nullable collection elements are not supported by Stage 23 Slice 1",
@@ -1485,28 +1494,20 @@ fn lower_collection_expression(
             .ok_or_else(|| backend_failure("collection allocation produced no result"))?;
             for (index, entry) in entries.iter().enumerate() {
                 let value = lower_rvalue(builder, &entry.value, resources)?.single()?;
-                let value = value_to_collection_word(builder, value, definition.value, pointer)?;
                 if let (Some(key_ty), Some(key)) = (definition.key, &entry.key) {
                     let key_value = lower_rvalue(builder, key, resources)?.single()?;
-                    let key_word = value_to_collection_word(builder, key_value, key_ty, pointer)?;
-                    let replaced_slot = builder.create_sized_stack_slot(StackSlotData::new(
-                        StackSlotKind::ExplicitSlot,
-                        1,
-                        0,
-                    ));
-                    let replaced = builder.ins().stack_addr(pointer, replaced_slot, 0);
-                    let key_kind = builder
-                        .ins()
-                        .iconst(types::I8, collection_compare_kind(key_ty)?);
-                    let _ = runtime_call(
+                    lower_dictionary_set_value(
                         builder,
-                        COLLECTION_KEYED_SET,
-                        &[pointer, types::I64, types::I64, types::I8, pointer],
-                        Some(types::I64),
-                        &[result, key_word, value, key_kind, replaced],
+                        result,
+                        key_value,
+                        key_ty,
+                        value,
+                        definition.value,
                         resources,
                     )?;
                 } else if fixed {
+                    let value =
+                        value_to_collection_word(builder, value, definition.value, pointer)?;
                     let index = builder.ins().iconst(pointer, index as i64);
                     let _ = runtime_call(
                         builder,
@@ -1517,6 +1518,8 @@ fn lower_collection_expression(
                         resources,
                     )?;
                 } else if definition.kind == mir::CollectionKind::Set {
+                    let value =
+                        value_to_collection_word(builder, value, definition.value, pointer)?;
                     let value_kind = builder
                         .ins()
                         .iconst(types::I8, collection_compare_kind(definition.value)?);
@@ -1539,6 +1542,8 @@ fn lower_collection_expression(
                         resources,
                     )?;
                 } else {
+                    let value =
+                        value_to_collection_word(builder, value, definition.value, pointer)?;
                     let _ = runtime_call(
                         builder,
                         COLLECTION_PUSH,
@@ -1942,32 +1947,15 @@ fn lower_collection_set(
     let value_word = value_to_collection_word(builder, value, definition.value, pointer)?;
     if let Some(key_type) = definition.key {
         let key = lower_rvalue(builder, index, resources)?.single()?;
-        let key_word = value_to_collection_word(builder, key, key_type, pointer)?;
-        let replaced_slot =
-            builder.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 1, 0));
-        let replaced_pointer = builder.ins().stack_addr(pointer, replaced_slot, 0);
-        let key_kind = builder
-            .ins()
-            .iconst(types::I8, collection_compare_kind(key_type)?);
-        let old_word = runtime_call(
+        lower_dictionary_set_value(
             builder,
-            COLLECTION_KEYED_SET,
-            &[pointer, types::I64, types::I64, types::I8, pointer],
-            Some(types::I64),
-            &[
-                collection_value,
-                key_word,
-                value_word,
-                key_kind,
-                replaced_pointer,
-            ],
+            collection_value,
+            key,
+            key_type,
+            value,
+            definition.value,
             resources,
-        )?
-        .ok_or_else(|| backend_failure("dictionary write produced no result"))?;
-        let replaced = builder.ins().stack_load(types::I8, replaced_slot, 0);
-        let old_value = collection_word_to_value(builder, old_word, definition.value, pointer)?;
-        lower_drop_value_if(builder, replaced, old_value, definition.value, resources)?;
-        lower_drop_value_if(builder, replaced, key, key_type, resources)?;
+        )?;
     } else {
         let index = lower_rvalue(builder, index, resources)?.single()?;
         let old_word = runtime_call(
@@ -1983,6 +1971,39 @@ fn lower_collection_set(
         lower_drop_stored_value(builder, old_value, definition.value, resources)?;
     }
     Ok(())
+}
+
+fn lower_dictionary_set_value(
+    builder: &mut FunctionBuilder,
+    collection: Value,
+    key: Value,
+    key_type: mir::Type,
+    value: Value,
+    value_type: mir::Type,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<(), BackendError> {
+    let pointer = resources.module.target_config().pointer_type();
+    let key_word = value_to_collection_word(builder, key, key_type, pointer)?;
+    let value_word = value_to_collection_word(builder, value, value_type, pointer)?;
+    let replaced_slot =
+        builder.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 1, 0));
+    let replaced_pointer = builder.ins().stack_addr(pointer, replaced_slot, 0);
+    let key_kind = builder
+        .ins()
+        .iconst(types::I8, collection_compare_kind(key_type)?);
+    let old_word = runtime_call(
+        builder,
+        COLLECTION_KEYED_SET,
+        &[pointer, types::I64, types::I64, types::I8, pointer],
+        Some(types::I64),
+        &[collection, key_word, value_word, key_kind, replaced_pointer],
+        resources,
+    )?
+    .ok_or_else(|| backend_failure("dictionary write produced no result"))?;
+    let replaced = builder.ins().stack_load(types::I8, replaced_slot, 0);
+    let old_value = collection_word_to_value(builder, old_word, value_type, pointer)?;
+    lower_drop_value_if(builder, replaced, old_value, value_type, resources)?;
+    lower_drop_value_if(builder, replaced, key, key_type, resources)
 }
 
 fn lower_set_from(

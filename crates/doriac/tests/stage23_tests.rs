@@ -314,6 +314,99 @@ function main(): void
 }
 
 #[test]
+fn builtin_bytes_results_and_byte_arrays_preserve_move_ownership() {
+    for source in [
+        r#"
+function consume(take Bytes $contents): void {}
+function main(): void
+{
+    let $contents = read_stdin_bytes();
+    consume($contents);
+    echo "{$contents->length}";
+}
+"#,
+        r#"
+function consume(take Bytes $contents): void {}
+function main(): void
+{
+    let $contents = read_file_bytes("data.bin");
+    consume($contents);
+    echo "{$contents->length}";
+}
+"#,
+        r#"
+function consume(take uint8[] $contents): void {}
+function main(): void
+{
+    Bytes $bytes = Bytes::fromArray([1]);
+    let $contents = $bytes->toArray();
+    consume($contents);
+    echo "{$contents->length}";
+}
+"#,
+    ] {
+        assert!(diagnostics(source)
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("given away")));
+    }
+}
+
+#[test]
+fn writable_foreach_borrows_collection_elements_but_ranges_remain_readonly() {
+    doriac::lower_source_to_mir(
+        "stage23-writable-foreach.doria",
+        r#"
+class Counter
+{
+    function __construct(writable int $value) {}
+    writable function increment(): void { $this->value++; }
+}
+function main(): void
+{
+    writable List<Counter> $counters = [new Counter(1)];
+    foreach ($counters as writable Counter $counter) {
+        $counter->increment();
+    }
+}
+"#,
+    )
+    .expect("writable collection foreach bindings should preserve writable borrows");
+
+    let range = diagnostic(
+        r#"
+function main(): void
+{
+    foreach (0..<2 as writable int $value) {
+        $value++;
+    }
+}
+"#,
+        "E0425",
+    );
+    assert!(range.message.contains("readonly"));
+}
+
+#[test]
+fn discarded_collection_removals_lower_and_drop_their_results() {
+    doriac::lower_source_to_mir(
+        "stage23-discarded-removals.doria",
+        r#"
+class Token { function __construct(int $id) {} }
+function main(): void
+{
+    writable List<Token> $tokens = [new Token(1), new Token(2)];
+    $tokens->removeAt(0);
+    $tokens->pop();
+
+    writable Dictionary<string, Token> $named = ["three" => new Token(3)];
+    $named->remove("three");
+}
+"#,
+    )
+    .expect("discarded owned and nullable removal results should lower");
+}
+
+#[test]
 fn intrinsic_collection_type_names_cannot_be_redeclared_as_classes() {
     for name in ["Bytes", "List", "Dictionary", "Set"] {
         let errors = diagnostics(&format!("class {name} {{}}"));

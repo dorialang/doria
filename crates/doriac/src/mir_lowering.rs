@@ -980,13 +980,10 @@ fn lower_statement_sequence(
                     null_safe,
                 } = expr
                 {
-                    if !*null_safe {
-                        if let Some(statement) =
-                            lower_collection_method_statement(object, method, args, context)?
-                        {
-                            context.push_statement(statement);
-                            continue;
-                        }
+                    if !*null_safe
+                        && lower_collection_method_statement(object, method, args, context)?
+                    {
+                        continue;
                     }
                     let statement = if *null_safe {
                         let (object, signature, args) =
@@ -5698,8 +5695,14 @@ fn materialize_nested_collection_places(
         hir::Expr::PropertyAccess { object, .. } => {
             materialize_nested_collection_places(object, false, context)?;
         }
-        hir::Expr::MethodCall { object, args, .. } => {
-            materialize_nested_collection_places(object, false, context)?;
+        hir::Expr::MethodCall {
+            object,
+            method,
+            args,
+            ..
+        } => {
+            let receiver_writable = collection_method_mutates(method);
+            materialize_nested_collection_places(object, receiver_writable, context)?;
             for arg in args {
                 materialize_nested_collection_places(arg, false, context)?;
             }
@@ -5707,7 +5710,7 @@ fn materialize_nested_collection_places(
                 context.expression_type(object),
                 Ok(mir::Type::Collection(_))
             ) {
-                materialize_collection_place(object, context)?;
+                materialize_collection_place(object, receiver_writable, context)?;
             }
         }
         hir::Expr::IsType { expr, .. }
@@ -5725,7 +5728,7 @@ fn materialize_nested_collection_places(
                 _ => None,
             };
             if let Some(bytes) = byte_argument {
-                materialize_collection_place(bytes, context)?;
+                materialize_collection_place(bytes, false, context)?;
             }
         }
         hir::Expr::StaticCall {
@@ -5749,7 +5752,7 @@ fn materialize_nested_collection_places(
                         ))
                         .copied()
                         .expect("Bytes requires the canonical uint8[] MIR type");
-                    materialize_collection_place_as(source, byte_array, context)?;
+                    materialize_collection_place_as(source, byte_array, false, context)?;
                 }
             }
         }
@@ -5767,8 +5770,8 @@ fn materialize_nested_collection_places(
                 && expression_is_bytes(left, context)
                 && expression_is_bytes(right, context)
             {
-                materialize_collection_place(left, context)?;
-                materialize_collection_place(right, context)?;
+                materialize_collection_place(left, false, context)?;
+                materialize_collection_place(right, false, context)?;
             }
         }
         hir::Expr::Range { start, end, .. } => {
@@ -5834,6 +5837,7 @@ fn lower_bytes_local(
 
 fn materialize_collection_place(
     expr: &hir::Expr,
+    writable: bool,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<()> {
     if lower_collection_local(expr, context).is_ok() {
@@ -5842,12 +5846,13 @@ fn materialize_collection_place(
     let mir::Type::Collection(collection) = context.expression_type(expr)? else {
         return Ok(());
     };
-    materialize_collection_place_as(expr, collection, context)
+    materialize_collection_place_as(expr, collection, writable, context)
 }
 
 fn materialize_collection_place_as(
     expr: &hir::Expr,
     collection: mir::CollectionTypeId,
+    writable: bool,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<()> {
     if lower_collection_local(expr, context).is_ok() {
@@ -5856,7 +5861,7 @@ fn materialize_collection_place_as(
     let borrowed = matches!(unparenthesized_place(expr), hir::Expr::Index { .. });
     let value = lower_collection_expression(expr, collection, !borrowed, context)?;
     let local = if borrowed {
-        context.declare_borrowed_temp(mir::Type::Collection(collection), false)
+        context.declare_borrowed_temp(mir::Type::Collection(collection), writable)
     } else {
         context.declare_owned_temp(mir::Type::Collection(collection))
     };
@@ -5868,6 +5873,13 @@ fn materialize_collection_place_as(
         .materialized_collection_places
         .insert((expr.span().start, expr.span().end), local);
     Ok(())
+}
+
+fn collection_method_mutates(method: &str) -> bool {
+    matches!(
+        method,
+        "add" | "insertAt" | "removeAt" | "pop" | "set" | "remove"
+    )
 }
 
 fn expression_is_bytes(expr: &hir::Expr, context: &LoweringContext) -> bool {
@@ -5910,23 +5922,24 @@ fn lower_collection_method_statement(
     object: &hir::Expr,
     method: &str,
     args: &[hir::Expr],
-    context: &LoweringContext,
-) -> DiagnosticResult<Option<mir::Statement>> {
+    context: &mut LoweringContext,
+) -> DiagnosticResult<bool> {
     let Ok((collection, collection_type)) = lower_collection_local(object, context) else {
-        return Ok(None);
+        return Ok(false);
     };
-    let info = context.collection_type(collection_type);
+    let info = context.collection_type(collection_type).clone();
     match (info.kind, method, args) {
         (mir::CollectionKind::List | mir::CollectionKind::Set, "add", [value]) => {
-            Ok(Some(mir::Statement::CollectionAdd {
+            let statement = mir::Statement::CollectionAdd {
                 collection,
                 value: lower_rvalue_as_expected(value, info.value, context)?,
                 index: None,
                 op: mir::CollectionMutationOp::Add,
-            }))
+            };
+            context.push_statement(statement);
         }
         (mir::CollectionKind::List, "insertAt", [index, value]) => {
-            Ok(Some(mir::Statement::CollectionAdd {
+            let statement = mir::Statement::CollectionAdd {
                 collection,
                 value: lower_rvalue_as_expected(value, info.value, context)?,
                 index: Some(lower_rvalue_as_expected(
@@ -5935,23 +5948,116 @@ fn lower_collection_method_statement(
                     context,
                 )?),
                 op: mir::CollectionMutationOp::InsertAt,
-            }))
+            };
+            context.push_statement(statement);
         }
-        (mir::CollectionKind::Set, "remove", [value]) => Ok(Some(mir::Statement::CollectionAdd {
-            collection,
-            value: lower_rvalue_as_borrowed(value, info.value, context)?,
-            index: None,
-            op: mir::CollectionMutationOp::Remove,
-        })),
+        (mir::CollectionKind::Set, "remove", [value]) => {
+            let statement = mir::Statement::CollectionAdd {
+                collection,
+                value: lower_rvalue_as_borrowed(value, info.value, context)?,
+                index: None,
+                op: mir::CollectionMutationOp::Remove,
+            };
+            context.push_statement(statement);
+        }
         (mir::CollectionKind::Dictionary, "set", [key, value]) => {
             let key_type = info.key.expect("dictionary collection has a key type");
-            Ok(Some(mir::Statement::CollectionSet {
+            let statement = mir::Statement::CollectionSet {
                 collection,
                 key: lower_rvalue_as_expected(key, key_type, context)?,
                 value: lower_rvalue_as_expected(value, info.value, context)?,
-            }))
+            };
+            context.push_statement(statement);
         }
-        _ => Ok(None),
+        (mir::CollectionKind::List, "removeAt", [index]) => {
+            let index = lower_rvalue_as_expected(
+                index,
+                mir::Type::Scalar(mir::ScalarType::Integer(IntegerType::Int64)),
+                context,
+            )?;
+            let value = collection_remove_at_rvalue(collection, index, info.value)?;
+            lower_discarded_rvalue(value, context);
+        }
+        (mir::CollectionKind::List, "pop", [])
+        | (mir::CollectionKind::Dictionary, "remove", [_]) => {
+            let Some((collection, key, value_type, access)) =
+                lower_dictionary_get(object, method, args, context)?
+            else {
+                return Ok(false);
+            };
+            let value =
+                nullable_collection_access_rvalue(collection, key, value_type, access, object)?;
+            lower_discarded_rvalue(value, context);
+        }
+        _ => return Ok(false),
+    }
+    Ok(true)
+}
+
+fn nullable_collection_access_rvalue(
+    collection: mir::LocalId,
+    key: mir::Rvalue,
+    value_type: mir::Type,
+    access: mir::NullableCollectionAccess,
+    object: &hir::Expr,
+) -> DiagnosticResult<mir::Rvalue> {
+    let key = Box::new(key);
+    match value_type {
+        mir::Type::Scalar(ty) => Ok(mir::Rvalue::NullableScalar(
+            mir::NullableScalarExpression::DictionaryGet {
+                ty,
+                collection,
+                key,
+                access,
+            },
+        )),
+        mir::Type::String => Ok(mir::Rvalue::NullableString(
+            mir::NullableStringExpression::DictionaryGet {
+                collection,
+                key,
+                access,
+            },
+        )),
+        mir::Type::Class(class) => Ok(mir::Rvalue::NullableClass(
+            mir::NullableClassExpression::DictionaryGet {
+                class,
+                collection,
+                key,
+                access,
+            },
+        )),
+        mir::Type::Collection(_)
+        | mir::Type::NullableScalar(_)
+        | mir::Type::NullableString
+        | mir::Type::NullableClass(_) => Err(vec![unsupported(
+            object.span(),
+            "discarding this nullable collection element type is not yet supported",
+        )]),
+    }
+}
+
+fn lower_discarded_rvalue(value: mir::Rvalue, context: &mut LoweringContext) {
+    let ty = value.ty();
+    let owned = matches!(
+        ty,
+        mir::Type::Class(_) | mir::Type::NullableClass(_) | mir::Type::Collection(_)
+    );
+    let local = context.declare_return_temp(ty, owned);
+    context.push_statement(mir::Statement::AssignLocal {
+        target: local,
+        value,
+    });
+    match ty {
+        mir::Type::Class(class) | mir::Type::NullableClass(class) => {
+            context.push_statement(mir::Statement::DropClass { local, class });
+        }
+        mir::Type::Collection(collection) => {
+            context.push_statement(mir::Statement::DropCollection { local, collection });
+        }
+        mir::Type::Scalar(_)
+        | mir::Type::String
+        | mir::Type::NullableScalar(_)
+        | mir::Type::NullableString => {}
     }
 }
 

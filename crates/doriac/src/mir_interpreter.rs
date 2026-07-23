@@ -4,7 +4,7 @@ use std::fmt;
 use std::rc::Rc;
 
 use crate::mir;
-use crate::numeric::{FloatValue, IntegerPanic, IntegerType, IntegerValue};
+use crate::numeric::{FloatType, FloatValue, IntegerPanic, IntegerType, IntegerValue};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InterpreterOutput {
@@ -853,6 +853,13 @@ impl Interpreter<'_> {
                 self.expand_collection_expression(expression)?
             }
             EvaluationTask::BuildCollection { collection, keyed } => {
+                let definition = self
+                    .program
+                    .collection_types
+                    .get(collection.0)
+                    .ok_or_else(|| InterpreterError::new("collection type does not exist"))?;
+                let key_type = definition.key;
+                let value_type = definition.value;
                 let value_count = keyed.len() + keyed.iter().filter(|keyed| **keyed).count();
                 let values = self.take_call_arguments(value_count)?;
                 let mut values = values.into_iter();
@@ -866,15 +873,21 @@ impl Interpreter<'_> {
                     let value = values.next().ok_or_else(|| {
                         InterpreterError::new("MIR collection literal produced too few values")
                     })?;
-                    if unique && entries.iter().any(|(_, current)| current == &value) {
+                    if unique
+                        && entries.iter().any(|(_, current)| {
+                            collection_values_equal(value_type, current, &value)
+                        })
+                    {
                         if let Some(key) = key {
                             collect_owned_objects_from_value(key, &mut drops);
                         }
                         collect_owned_objects_from_value(value, &mut drops);
                     } else if let Some(position) = key.as_ref().and_then(|key| {
-                        entries
-                            .iter()
-                            .position(|(current, _)| current.as_ref() == Some(key))
+                        entries.iter().position(|(current, _)| {
+                            current.as_ref().is_some_and(|current| {
+                                key_type.is_some_and(|ty| collection_values_equal(ty, current, key))
+                            })
+                        })
                     }) {
                         let (old_key, old_value) =
                             std::mem::replace(&mut entries[position], (key, value));
@@ -1004,19 +1017,26 @@ impl Interpreter<'_> {
             }
             EvaluationTask::CollectionHas { collection, op } => {
                 let needle = self.pop_local_value()?;
-                let found = {
+                let (found, needle_type) = {
                     let collection = self.collection_local(collection)?;
                     let definition = &self.program.collection_types[collection.ty.0];
+                    let needle_type = definition.key.unwrap_or(definition.value);
                     if definition.key.is_some() {
-                        collection
-                            .entries()
-                            .iter()
-                            .any(|(key, _)| key.as_ref() == Some(&needle))
+                        (
+                            collection.entries().iter().any(|(key, _)| {
+                                key.as_ref().is_some_and(|key| {
+                                    collection_values_equal(needle_type, key, &needle)
+                                })
+                            }),
+                            needle_type,
+                        )
                     } else {
-                        collection
-                            .entries()
-                            .iter()
-                            .any(|(_, value)| value == &needle)
+                        (
+                            collection.entries().iter().any(|(_, value)| {
+                                collection_values_equal(needle_type, value, &needle)
+                            }),
+                            needle_type,
+                        )
                     }
                 };
                 if op == mir::CollectionMembershipOp::Add {
@@ -1035,10 +1055,9 @@ impl Interpreter<'_> {
                     mir::CollectionMembershipOp::Remove => {
                         let position = {
                             let collection = self.collection_local(collection)?;
-                            collection
-                                .entries()
-                                .iter()
-                                .position(|(_, value)| value == &needle)
+                            collection.entries().iter().position(|(_, value)| {
+                                collection_values_equal(needle_type, value, &needle)
+                            })
                         };
                         if let Some(position) = position {
                             let (_, removed) = self
@@ -2856,18 +2875,23 @@ impl Interpreter<'_> {
                 if let Some((op, right)) = algebra {
                     let left = self.collection_local(source)?.clone();
                     let right = self.collection_local(right)?.clone();
+                    let value_type = self.program.collection_types[left.ty.0].value;
                     let left_entries = left.entries();
                     let right_entries = right.entries();
                     let mut entries = Vec::new();
                     for (_, value) in left_entries.iter() {
                         let include = match op {
                             mir::SetAlgebraOp::Union => true,
-                            mir::SetAlgebraOp::Intersect => right_entries
-                                .iter()
-                                .any(|(_, candidate)| candidate == value),
-                            mir::SetAlgebraOp::Difference => !right_entries
-                                .iter()
-                                .any(|(_, candidate)| candidate == value),
+                            mir::SetAlgebraOp::Intersect => {
+                                right_entries.iter().any(|(_, candidate)| {
+                                    collection_values_equal(value_type, candidate, value)
+                                })
+                            }
+                            mir::SetAlgebraOp::Difference => {
+                                !right_entries.iter().any(|(_, candidate)| {
+                                    collection_values_equal(value_type, candidate, value)
+                                })
+                            }
                         };
                         if include {
                             entries.push((None, value.clone()));
@@ -2877,7 +2901,7 @@ impl Interpreter<'_> {
                         for (_, value) in right_entries.iter() {
                             if !entries.iter().any(
                                 |(_, candidate): &(Option<LocalValue>, LocalValue)| {
-                                    candidate == value
+                                    collection_values_equal(value_type, candidate, value)
                                 },
                             ) {
                                 entries.push((None, value.clone()));
@@ -3907,15 +3931,8 @@ impl Interpreter<'_> {
         }
         let mut drops = Vec::new();
         for property in object_value.properties.iter_mut().rev() {
-            if let Some(
-                LocalValue::Class { object, class }
-                | LocalValue::NullableClass {
-                    object: Some(object),
-                    class,
-                },
-            ) = property.take()
-            {
-                drops.push((object, class));
+            if let Some(value) = property.take() {
+                collect_owned_objects_from_value(value, &mut drops);
             }
         }
         let frame = self.current_frame_mut()?;
@@ -4380,6 +4397,22 @@ fn collect_owned_objects_from_value(
         drops.push(object);
     } else if let LocalValue::Collection(collection) = value {
         collect_owned_objects_from_collection(collection, drops);
+    }
+}
+
+fn collection_values_equal(ty: mir::Type, left: &LocalValue, right: &LocalValue) -> bool {
+    match (ty, left, right) {
+        (
+            mir::Type::Scalar(mir::ScalarType::Float(FloatType::Float32)),
+            LocalValue::Scalar(mir::ScalarValue::Float(left)),
+            LocalValue::Scalar(mir::ScalarValue::Float(right)),
+        ) => left.as_f32() == right.as_f32(),
+        (
+            mir::Type::Scalar(mir::ScalarType::Float(FloatType::Float64)),
+            LocalValue::Scalar(mir::ScalarValue::Float(left)),
+            LocalValue::Scalar(mir::ScalarValue::Float(right)),
+        ) => left.as_f64() == right.as_f64(),
+        _ => left == right,
     }
 }
 

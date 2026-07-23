@@ -3,6 +3,10 @@ use core::ptr;
 
 use crate::{allocate, deallocate, dr_v1_panic, DrStackFrameV1, DrStringV1};
 
+const COMPARE_STRING: u8 = 1;
+const COMPARE_FLOAT32: u8 = 2;
+const COMPARE_FLOAT64: u8 = 3;
+
 #[repr(C)]
 pub struct DrCollectionV1 {
     length: usize,
@@ -213,11 +217,13 @@ pub unsafe fn set_at(
 
 unsafe fn keys_equal(left: u64, right: u64, key_kind: u8) -> bool {
     match key_kind {
-        1 => {
+        COMPARE_STRING => {
             let left = left as *const DrStringV1;
             let right = right as *const DrStringV1;
             crate::string_equal(left, right)
         }
+        COMPARE_FLOAT32 => f32::from_bits(left as u32) == f32::from_bits(right as u32),
+        COMPARE_FLOAT64 => f64::from_bits(left) == f64::from_bits(right),
         _ => left == right,
     }
 }
@@ -408,7 +414,7 @@ pub unsafe fn set_algebra(
 }
 
 unsafe fn push_retained(collection: *mut DrCollectionV1, value: u64, value_kind: u8) {
-    if value_kind == 1 {
+    if value_kind == COMPARE_STRING {
         crate::dr_v1_string_retain(value as *mut DrStringV1);
     }
     push(collection, value);
