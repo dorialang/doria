@@ -685,7 +685,7 @@ fn collection_reassignment_moves_the_source_owner() {
         "Set<Guard>",
     ] {
         let source = format!(
-            "class Guard {{}} function sink(take {collection} $items): void {{}} function route(take {collection} $src): void {{ writable {collection} $dst = []; $dst = $src; sink($src); }}"
+            "class Guard {{}} function sink(take {collection} $items): void {{}} function route(take {collection} $src, take {collection} $initial): void {{ let writable $dst = $initial; $dst = $src; sink($src); }}"
         );
         let diagnostics = doriac::check_source("collection-reassignment.doria", source)
             .expect_err("assigning the collection transfers its owner");
@@ -743,7 +743,7 @@ fn collection_properties_are_move_values() {
         "Set<Guard>",
     ] {
         let source = format!(
-            "class Guard {{}} function sink(take {collection} $items): void {{}} class Box {{ {collection} $items = []; function release(): void {{ sink($this->items); }} }}"
+            "class Guard {{}} function sink(take {collection} $items): void {{}} class Box {{ function __construct(take {collection} $items) {{}} function release(): void {{ sink($this->items); }} }}"
         );
         let diagnostics = doriac::check_source("collection-property-move.doria", source)
             .expect_err("direct collection-property moves remain unsupported");
@@ -803,4 +803,45 @@ fn constant_boolean_expressions_drive_ownership_reachability() {
         doriac::check_source("constant-reachability.doria", source)
             .expect("constant boolean reachability must exclude impossible ownership transfers");
     }
+}
+
+#[test]
+fn inferred_class_coalesces_are_tracked_as_move_values() {
+    let diagnostics = doriac::check_source(
+        "coalesced-class-owner.doria",
+        r#"
+class Box {}
+function consume(take Box $box): void {}
+function main(): void
+{
+    ?Box $maybe = new Box();
+    let $box = $maybe ?? new Box();
+    consume($box);
+    consume($box);
+}
+"#,
+    )
+    .expect_err("an inferred coalesced class owner cannot be given away twice");
+    assert!(diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == "E0470"));
+}
+
+#[test]
+fn owning_coalesces_reject_borrowed_possible_arms() {
+    let diagnostics = doriac::check_source(
+        "borrowed-coalesce-arm.doria",
+        r#"
+class Box {}
+function choose(?Box $maybe): Box
+{
+    let $box = $maybe ?? new Box();
+    return $box;
+}
+"#,
+    )
+    .expect_err("a possible borrowed arm cannot initialize a coalesced owner");
+    assert!(diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == "E0474"));
 }

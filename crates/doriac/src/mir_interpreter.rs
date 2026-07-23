@@ -48,9 +48,17 @@ enum FunctionOutcome {
 enum LocalValue {
     Scalar(mir::ScalarValue),
     String(String),
+    NullableScalar {
+        ty: mir::ScalarType,
+        value: Option<mir::ScalarValue>,
+    },
     NullableString(Option<String>),
     Class {
         object: usize,
+        class: crate::class_layout::ClassId,
+    },
+    NullableClass {
+        object: Option<usize>,
         class: crate::class_layout::ClassId,
     },
 }
@@ -59,9 +67,17 @@ enum LocalValue {
 enum EvaluationValue {
     Scalar(mir::ScalarValue),
     String(String),
+    NullableScalar {
+        ty: mir::ScalarType,
+        value: Option<mir::ScalarValue>,
+    },
     NullableString(Option<String>),
     Class {
         object: usize,
+        class: crate::class_layout::ClassId,
+    },
+    NullableClass {
+        object: Option<usize>,
         class: crate::class_layout::ClassId,
     },
 }
@@ -84,8 +100,10 @@ enum EvaluationTask {
     Rvalue(mir::Rvalue),
     Value(mir::ValueExpression),
     String(mir::StringExpression),
+    NullableScalar(mir::NullableScalarExpression),
     NullableString(mir::NullableStringExpression),
     Class(mir::ClassExpression),
+    NullableClass(mir::NullableClassExpression),
     BuildClassNew {
         class: crate::class_layout::ClassId,
         properties: Vec<mir::PropertyValue>,
@@ -99,6 +117,45 @@ enum EvaluationTask {
         class: crate::class_layout::ClassId,
     },
     BuildNullableSome,
+    BuildNullableScalarSome(mir::ScalarType),
+    BuildNullableClassSome(crate::class_layout::ClassId),
+    WrapNullable(mir::Type),
+    NullableScalarIsPresent,
+    NullableClassIsPresent(Option<crate::class_layout::ClassId>),
+    AfterIntegerCoalesce(mir::IntegerExpression),
+    AfterFloatCoalesce(mir::FloatExpression),
+    AfterBoolCoalesce(mir::BoolExpression),
+    AfterStringCoalesce(mir::StringExpression),
+    AfterNullableScalarCoalesce(mir::NullableScalarExpression),
+    AfterNullableStringCoalesce(mir::NullableStringExpression),
+    AfterClassCoalesce {
+        right: mir::ClassExpression,
+        left_owned: bool,
+        transfer: bool,
+    },
+    FinishClassCoalesceRight(Option<crate::class_layout::ClassId>),
+    AfterNullableClassCoalesce {
+        right: mir::NullableClassExpression,
+        left_owned: bool,
+        transfer: bool,
+    },
+    FinishNullableClassCoalesceRight(Option<crate::class_layout::ClassId>),
+    AfterNullSafeProperty {
+        property: crate::class_layout::PropertyId,
+        result: mir::Type,
+        owned_receiver: Option<crate::class_layout::ClassId>,
+    },
+    AfterNullSafeCall {
+        function: mir::FunctionId,
+        args: Vec<mir::Rvalue>,
+        result: mir::Type,
+        owned_receiver: Option<crate::class_layout::ClassId>,
+    },
+    AfterNullSafeStatementCall {
+        function: mir::FunctionId,
+        args: Vec<mir::Rvalue>,
+        owned_receiver: Option<crate::class_layout::ClassId>,
+    },
     NullableStringCompare(mir::CompareOp),
     Format(mir::FormatExpression),
     BuildFormat(mir::FormatExpression),
@@ -248,12 +305,28 @@ fn interpret_internal(
             .statics
             .iter()
             .map(|property| match &property.initializer {
+                mir::StaticValue::Scalar(value)
+                    if property.ty == mir::Type::NullableScalar(value.ty()) =>
+                {
+                    LocalValue::NullableScalar {
+                        ty: value.ty(),
+                        value: Some(*value),
+                    }
+                }
                 mir::StaticValue::Scalar(value) => LocalValue::Scalar(*value),
                 mir::StaticValue::String(value) if property.ty == mir::Type::String => {
                     LocalValue::String(value.clone())
                 }
                 mir::StaticValue::String(value) => LocalValue::NullableString(Some(value.clone())),
-                mir::StaticValue::Null => LocalValue::NullableString(None),
+                mir::StaticValue::Null => match property.ty {
+                    mir::Type::NullableScalar(ty) => LocalValue::NullableScalar { ty, value: None },
+                    mir::Type::NullableString => LocalValue::NullableString(None),
+                    mir::Type::NullableClass(class) => LocalValue::NullableClass {
+                        object: None,
+                        class,
+                    },
+                    _ => LocalValue::NullableString(None),
+                },
             })
             .collect(),
         next_object: 1,
@@ -357,6 +430,20 @@ impl Interpreter<'_> {
                             target.0
                         )));
                     }
+                    (
+                        mir::Type::NullableScalar(expected),
+                        mir::Rvalue::NullableScalar(expression),
+                    ) if expression.ty() == expected => {
+                        let frame = self.current_frame_mut()?;
+                        frame.tasks.push(EvaluationTask::Assign(target));
+                        frame.tasks.push(EvaluationTask::NullableScalar(expression));
+                    }
+                    (mir::Type::NullableScalar(_), _) => {
+                        return Err(InterpreterError::new(format!(
+                            "MIR nullable scalar local local{} received another value type",
+                            target.0
+                        )));
+                    }
                     (mir::Type::Scalar(expected), mir::Rvalue::Value(expression)) => {
                         if expression.ty() != expected {
                             return Err(InterpreterError::new(format!(
@@ -379,6 +466,20 @@ impl Interpreter<'_> {
                         let frame = self.current_frame_mut()?;
                         frame.tasks.push(EvaluationTask::Assign(target));
                         frame.tasks.push(EvaluationTask::Class(expression));
+                    }
+                    (
+                        mir::Type::NullableClass(expected),
+                        mir::Rvalue::NullableClass(expression),
+                    ) if expression.class() == expected => {
+                        let frame = self.current_frame_mut()?;
+                        frame.tasks.push(EvaluationTask::Assign(target));
+                        frame.tasks.push(EvaluationTask::NullableClass(expression));
+                    }
+                    (mir::Type::NullableClass(_), _) => {
+                        return Err(InterpreterError::new(format!(
+                            "MIR nullable class local local{} received another value type",
+                            target.0
+                        )));
                     }
                     (mir::Type::Class(_), _) => {
                         return Err(InterpreterError::new(
@@ -406,6 +507,22 @@ impl Interpreter<'_> {
                     ));
                 };
                 self.queue_call(function, args, ReturnExpectation::Discard(return_type))?;
+            }
+            mir::Statement::CallNullSafe {
+                object,
+                function,
+                args,
+            } => {
+                let owned_receiver = object.owned_temporary_class();
+                let frame = self.current_frame_mut()?;
+                frame
+                    .tasks
+                    .push(EvaluationTask::AfterNullSafeStatementCall {
+                        function,
+                        args,
+                        owned_receiver,
+                    });
+                frame.tasks.push(EvaluationTask::NullableClass(object));
             }
             mir::Statement::Printf(format) => {
                 let frame = self.current_frame_mut()?;
@@ -529,6 +646,10 @@ impl Interpreter<'_> {
                     .current_frame_mut()?
                     .tasks
                     .push(EvaluationTask::String(value)),
+                mir::Rvalue::NullableScalar(value) => self
+                    .current_frame_mut()?
+                    .tasks
+                    .push(EvaluationTask::NullableScalar(value)),
                 mir::Rvalue::NullableString(value) => self
                     .current_frame_mut()?
                     .tasks
@@ -537,6 +658,10 @@ impl Interpreter<'_> {
                     .current_frame_mut()?
                     .tasks
                     .push(EvaluationTask::Class(value)),
+                mir::Rvalue::NullableClass(value) => self
+                    .current_frame_mut()?
+                    .tasks
+                    .push(EvaluationTask::NullableClass(value)),
             },
             EvaluationTask::Value(expression) => match expression {
                 mir::ValueExpression::Integer(value) => {
@@ -556,10 +681,16 @@ impl Interpreter<'_> {
                 }
             },
             EvaluationTask::String(expression) => self.expand_string_expression(expression)?,
+            EvaluationTask::NullableScalar(expression) => {
+                self.expand_nullable_scalar_expression(expression)?
+            }
             EvaluationTask::NullableString(expression) => {
                 self.expand_nullable_string_expression(expression)?
             }
             EvaluationTask::Class(expression) => self.expand_class_expression(expression)?,
+            EvaluationTask::NullableClass(expression) => {
+                self.expand_nullable_class_expression(expression)?
+            }
             EvaluationTask::BuildClassNew {
                 class,
                 properties,
@@ -692,6 +823,228 @@ impl Interpreter<'_> {
             EvaluationTask::BuildNullableSome => {
                 let value = self.pop_string()?;
                 self.push_nullable_string(Some(value))?;
+            }
+            EvaluationTask::BuildNullableScalarSome(ty) => {
+                let value = self.pop_scalar()?;
+                if value.ty() != ty {
+                    return Err(InterpreterError::new(
+                        "nullable scalar payload type mismatch",
+                    ));
+                }
+                self.push_nullable_scalar(ty, Some(value))?;
+            }
+            EvaluationTask::BuildNullableClassSome(class) => {
+                let LocalValue::Class {
+                    object,
+                    class: actual,
+                } = self.pop_local_value()?
+                else {
+                    return Err(InterpreterError::new(
+                        "nullable class payload is not a class",
+                    ));
+                };
+                if actual != class {
+                    return Err(InterpreterError::new(
+                        "nullable class payload type mismatch",
+                    ));
+                }
+                self.push_nullable_class(class, Some(object))?;
+            }
+            EvaluationTask::WrapNullable(ty) => {
+                let value = self.pop_local_value()?;
+                self.push_nullable_from_value(ty, value)?;
+            }
+            EvaluationTask::NullableScalarIsPresent => {
+                let (_, value) = self.pop_nullable_scalar()?;
+                self.push_scalar(mir::ScalarValue::Bool(value.is_some()))?;
+            }
+            EvaluationTask::NullableClassIsPresent(owned) => {
+                let (class, object) = self.pop_nullable_class()?;
+                if let (Some(object), Some(_)) = (object, owned) {
+                    self.current_frame_mut()?
+                        .statement_temporary_drops
+                        .push((object, class));
+                }
+                self.push_scalar(mir::ScalarValue::Bool(object.is_some()))?;
+            }
+            EvaluationTask::AfterIntegerCoalesce(right) => {
+                let (_, value) = self.pop_nullable_scalar()?;
+                if let Some(mir::ScalarValue::Integer(value)) = value {
+                    self.push_scalar(mir::ScalarValue::Integer(value))?;
+                } else {
+                    self.current_frame_mut()?
+                        .tasks
+                        .push(EvaluationTask::Integer(right));
+                }
+            }
+            EvaluationTask::AfterFloatCoalesce(right) => {
+                let (_, value) = self.pop_nullable_scalar()?;
+                if let Some(mir::ScalarValue::Float(value)) = value {
+                    self.push_scalar(mir::ScalarValue::Float(value))?;
+                } else {
+                    self.current_frame_mut()?
+                        .tasks
+                        .push(EvaluationTask::Float(right));
+                }
+            }
+            EvaluationTask::AfterBoolCoalesce(right) => {
+                let (_, value) = self.pop_nullable_scalar()?;
+                if let Some(mir::ScalarValue::Bool(value)) = value {
+                    self.push_scalar(mir::ScalarValue::Bool(value))?;
+                } else {
+                    self.current_frame_mut()?
+                        .tasks
+                        .push(EvaluationTask::Bool(right));
+                }
+            }
+            EvaluationTask::AfterStringCoalesce(right) => {
+                if let Some(value) = self.pop_nullable_string()? {
+                    self.push_string(value)?;
+                } else {
+                    self.current_frame_mut()?
+                        .tasks
+                        .push(EvaluationTask::String(right));
+                }
+            }
+            EvaluationTask::AfterNullableScalarCoalesce(right) => {
+                let (ty, value) = self.pop_nullable_scalar()?;
+                if value.is_some() {
+                    self.push_nullable_scalar(ty, value)?;
+                } else {
+                    self.current_frame_mut()?
+                        .tasks
+                        .push(EvaluationTask::NullableScalar(right));
+                }
+            }
+            EvaluationTask::AfterNullableStringCoalesce(right) => {
+                if let Some(value) = self.pop_nullable_string()? {
+                    self.push_nullable_string(Some(value))?;
+                } else {
+                    self.current_frame_mut()?
+                        .tasks
+                        .push(EvaluationTask::NullableString(right));
+                }
+            }
+            EvaluationTask::AfterClassCoalesce {
+                right,
+                left_owned,
+                transfer,
+            } => {
+                let (class, object) = self.pop_nullable_class()?;
+                if let Some(object) = object {
+                    if left_owned && !transfer {
+                        self.current_frame_mut()?
+                            .statement_temporary_drops
+                            .push((object, class));
+                    }
+                    self.current_frame_mut()?
+                        .values
+                        .push(EvaluationValue::Class { object, class });
+                } else {
+                    let owned = (!transfer).then(|| right.owned_temporary_class()).flatten();
+                    let frame = self.current_frame_mut()?;
+                    frame
+                        .tasks
+                        .push(EvaluationTask::FinishClassCoalesceRight(owned));
+                    frame.tasks.push(EvaluationTask::Class(right));
+                }
+            }
+            EvaluationTask::FinishClassCoalesceRight(owned) => {
+                let LocalValue::Class { object, class } = self.pop_local_value()? else {
+                    return Err(InterpreterError::new(
+                        "class coalesce fallback produced another value type",
+                    ));
+                };
+                if owned.is_some() {
+                    self.current_frame_mut()?
+                        .statement_temporary_drops
+                        .push((object, class));
+                }
+                self.current_frame_mut()?
+                    .values
+                    .push(EvaluationValue::Class { object, class });
+            }
+            EvaluationTask::AfterNullableClassCoalesce {
+                right,
+                left_owned,
+                transfer,
+            } => {
+                let (class, object) = self.pop_nullable_class()?;
+                if let Some(object) = object {
+                    if left_owned && !transfer {
+                        self.current_frame_mut()?
+                            .statement_temporary_drops
+                            .push((object, class));
+                    }
+                    self.push_nullable_class(class, Some(object))?;
+                } else {
+                    let owned = (!transfer).then(|| right.owned_temporary_class()).flatten();
+                    let frame = self.current_frame_mut()?;
+                    frame
+                        .tasks
+                        .push(EvaluationTask::FinishNullableClassCoalesceRight(owned));
+                    frame.tasks.push(EvaluationTask::NullableClass(right));
+                }
+            }
+            EvaluationTask::FinishNullableClassCoalesceRight(owned) => {
+                let (class, object) = self.pop_nullable_class()?;
+                if let (Some(object), Some(_)) = (object, owned) {
+                    self.current_frame_mut()?
+                        .statement_temporary_drops
+                        .push((object, class));
+                }
+                self.push_nullable_class(class, object)?;
+            }
+            EvaluationTask::AfterNullSafeProperty {
+                property,
+                result,
+                owned_receiver,
+            } => {
+                let (class, object) = self.pop_nullable_class()?;
+                if let Some(object) = object {
+                    if owned_receiver.is_some() {
+                        self.current_frame_mut()?
+                            .statement_temporary_drops
+                            .push((object, class));
+                    }
+                    let value = self.read_object_property(object, property)?;
+                    self.push_nullable_from_value(result, value)?;
+                } else {
+                    self.push_null(result)?;
+                }
+            }
+            EvaluationTask::AfterNullSafeCall {
+                function,
+                args,
+                result,
+                owned_receiver,
+            } => {
+                let (class, object) = self.pop_nullable_class()?;
+                if let Some(object) = object {
+                    if owned_receiver.is_some() {
+                        self.current_frame_mut()?
+                            .statement_temporary_drops
+                            .push((object, class));
+                    }
+                    self.queue_null_safe_call(object, class, function, args, result)?;
+                } else {
+                    self.push_null(result)?;
+                }
+            }
+            EvaluationTask::AfterNullSafeStatementCall {
+                function,
+                args,
+                owned_receiver,
+            } => {
+                let (class, object) = self.pop_nullable_class()?;
+                if let Some(object) = object {
+                    if owned_receiver.is_some() {
+                        self.current_frame_mut()?
+                            .statement_temporary_drops
+                            .push((object, class));
+                    }
+                    self.queue_null_safe_statement_call(object, class, function, args)?;
+                }
             }
             EvaluationTask::NullableStringCompare(op) => {
                 let right = self.pop_nullable_string()?;
@@ -908,12 +1261,19 @@ impl Interpreter<'_> {
                     if !temporary {
                         continue;
                     }
-                    let LocalValue::Class { object, class } = argument else {
-                        return Err(InterpreterError::new(
-                            "MIR temporary-class call argument produced another value type",
-                        ));
-                    };
-                    drops.push((*object, *class));
+                    match argument {
+                        LocalValue::Class { object, class } => drops.push((*object, *class)),
+                        LocalValue::NullableClass {
+                            object: Some(object),
+                            class,
+                        } => drops.push((*object, *class)),
+                        LocalValue::NullableClass { object: None, .. } => {}
+                        _ => {
+                            return Err(InterpreterError::new(
+                                "MIR temporary-class call argument produced another value type",
+                            ))
+                        }
+                    }
                 }
                 if !drops.is_empty() {
                     self.current_frame_mut()?
@@ -948,10 +1308,12 @@ impl Interpreter<'_> {
                     target,
                     value,
                 )?;
-                if let Some(LocalValue::Class { object, class }) = old {
-                    self.current_frame_mut()?
-                        .tasks
-                        .push(EvaluationTask::DropObject { object, class });
+                if let Some(value) = old {
+                    if let Some((object, class)) = owned_object(&value) {
+                        self.current_frame_mut()?
+                            .tasks
+                            .push(EvaluationTask::DropObject { object, class });
+                    }
                 }
             }
             EvaluationTask::AssignStatic(target) => {
@@ -963,12 +1325,12 @@ impl Interpreter<'_> {
             }
             EvaluationTask::AssignProperty { object, property } => {
                 let value = self.pop_local_value()?;
-                if let Some(LocalValue::Class { object, class }) =
-                    self.assign_property(object, property, value)?
-                {
-                    self.current_frame_mut()?
-                        .tasks
-                        .push(EvaluationTask::DropObject { object, class });
+                if let Some(old) = self.assign_property(object, property, value)? {
+                    if let Some((object, class)) = owned_object(&old) {
+                        self.current_frame_mut()?
+                            .tasks
+                            .push(EvaluationTask::DropObject { object, class });
+                    }
                 }
             }
             EvaluationTask::DropClass(local) => {
@@ -1088,6 +1450,13 @@ impl Interpreter<'_> {
                     ReturnExpectation::Value(mir::Type::Scalar(mir::ScalarType::Integer(ty))),
                 )?;
             }
+            mir::IntegerExpression::Coalesce { left, right, .. } => {
+                let frame = self.current_frame_mut()?;
+                frame
+                    .tasks
+                    .push(EvaluationTask::AfterIntegerCoalesce(*right));
+                frame.tasks.push(EvaluationTask::NullableScalar(*left));
+            }
         }
         Ok(())
     }
@@ -1137,6 +1506,11 @@ impl Interpreter<'_> {
                     ReturnExpectation::Value(mir::Type::Scalar(mir::ScalarType::Float(ty))),
                 )?;
             }
+            mir::FloatExpression::Coalesce { left, right, .. } => {
+                let frame = self.current_frame_mut()?;
+                frame.tasks.push(EvaluationTask::AfterFloatCoalesce(*right));
+                frame.tasks.push(EvaluationTask::NullableScalar(*left));
+            }
         }
         Ok(())
     }
@@ -1180,6 +1554,19 @@ impl Interpreter<'_> {
                 frame.tasks.push(EvaluationTask::NullableString(*right));
                 frame.tasks.push(EvaluationTask::NullableString(*left));
             }
+            mir::BoolExpression::NullableScalarIsPresent(value) => {
+                let frame = self.current_frame_mut()?;
+                frame.tasks.push(EvaluationTask::NullableScalarIsPresent);
+                frame.tasks.push(EvaluationTask::NullableScalar(*value));
+            }
+            mir::BoolExpression::NullableClassIsPresent(value) => {
+                let owned = value.owned_temporary_class();
+                let frame = self.current_frame_mut()?;
+                frame
+                    .tasks
+                    .push(EvaluationTask::NullableClassIsPresent(owned));
+                frame.tasks.push(EvaluationTask::NullableClass(*value));
+            }
             mir::BoolExpression::Not(condition) => {
                 let frame = self.current_frame_mut()?;
                 frame.tasks.push(EvaluationTask::Not);
@@ -1220,6 +1607,11 @@ impl Interpreter<'_> {
                     ReturnExpectation::Value(mir::Type::Scalar(mir::ScalarType::Bool)),
                 )?;
             }
+            mir::BoolExpression::Coalesce { left, right } => {
+                let frame = self.current_frame_mut()?;
+                frame.tasks.push(EvaluationTask::AfterBoolCoalesce(*right));
+                frame.tasks.push(EvaluationTask::NullableScalar(*left));
+            }
         }
         Ok(())
     }
@@ -1248,6 +1640,12 @@ impl Interpreter<'_> {
                     LocalValue::Class { .. } => {
                         return Err(InterpreterError::new(format!(
                             "MIR class local local{} was used as a string value",
+                            id.0
+                        )))
+                    }
+                    LocalValue::NullableScalar { .. } | LocalValue::NullableClass { .. } => {
+                        return Err(InterpreterError::new(format!(
+                            "MIR nullable local local{} was used as a string value",
                             id.0
                         )))
                     }
@@ -1313,6 +1711,105 @@ impl Interpreter<'_> {
                 self.current_frame_mut()?
                     .tasks
                     .push(EvaluationTask::Format(*format));
+            }
+            mir::StringExpression::Coalesce { left, right } => {
+                let frame = self.current_frame_mut()?;
+                frame
+                    .tasks
+                    .push(EvaluationTask::AfterStringCoalesce(*right));
+                frame.tasks.push(EvaluationTask::NullableString(*left));
+            }
+        }
+        Ok(())
+    }
+
+    fn expand_nullable_scalar_expression(
+        &mut self,
+        expression: mir::NullableScalarExpression,
+    ) -> Result<(), InterpreterError> {
+        let ty = expression.ty();
+        match expression {
+            mir::NullableScalarExpression::Null(_) => self.push_nullable_scalar(ty, None)?,
+            mir::NullableScalarExpression::Value(value) => {
+                let frame = self.current_frame_mut()?;
+                frame
+                    .tasks
+                    .push(EvaluationTask::BuildNullableScalarSome(ty));
+                frame.tasks.push(EvaluationTask::Value(value));
+            }
+            mir::NullableScalarExpression::Local { local, .. } => {
+                let LocalValue::NullableScalar { ty, value } =
+                    read_local(&self.current_frame()?.locals, local)?.clone()
+                else {
+                    return Err(InterpreterError::new(
+                        "nullable scalar references another local type",
+                    ));
+                };
+                self.push_nullable_scalar(ty, value)?;
+            }
+            mir::NullableScalarExpression::Property {
+                object, property, ..
+            } => {
+                let LocalValue::NullableScalar { ty, value } =
+                    self.read_property(object, property)?
+                else {
+                    return Err(InterpreterError::new(
+                        "nullable scalar property has another type",
+                    ));
+                };
+                self.push_nullable_scalar(ty, value)?;
+            }
+            mir::NullableScalarExpression::Static { id, .. } => {
+                let Some(LocalValue::NullableScalar { ty, value }) =
+                    self.statics.get(id.0).cloned()
+                else {
+                    return Err(InterpreterError::new(
+                        "nullable scalar static has another type",
+                    ));
+                };
+                self.push_nullable_scalar(ty, value)?;
+            }
+            mir::NullableScalarExpression::Call { function, args, .. } => {
+                self.queue_call(
+                    function,
+                    args,
+                    ReturnExpectation::Value(mir::Type::NullableScalar(ty)),
+                )?;
+            }
+            mir::NullableScalarExpression::NullSafeProperty {
+                object, property, ..
+            } => {
+                let owned_receiver = object.owned_temporary_class();
+                let frame = self.current_frame_mut()?;
+                frame.tasks.push(EvaluationTask::AfterNullSafeProperty {
+                    property,
+                    result: mir::Type::NullableScalar(ty),
+                    owned_receiver,
+                });
+                frame.tasks.push(EvaluationTask::NullableClass(*object));
+            }
+            mir::NullableScalarExpression::NullSafeCall {
+                object,
+                function,
+                args,
+                ..
+            } => {
+                let owned_receiver = object.owned_temporary_class();
+                let frame = self.current_frame_mut()?;
+                frame.tasks.push(EvaluationTask::AfterNullSafeCall {
+                    function,
+                    args,
+                    result: mir::Type::NullableScalar(ty),
+                    owned_receiver,
+                });
+                frame.tasks.push(EvaluationTask::NullableClass(*object));
+            }
+            mir::NullableScalarExpression::Coalesce { left, right, .. } => {
+                let frame = self.current_frame_mut()?;
+                frame
+                    .tasks
+                    .push(EvaluationTask::AfterNullableScalarCoalesce(*right));
+                frame.tasks.push(EvaluationTask::NullableScalar(*left));
             }
         }
         Ok(())
@@ -1388,6 +1885,38 @@ impl Interpreter<'_> {
                     args,
                     ReturnExpectation::Value(mir::Type::NullableString),
                 )?;
+            }
+            mir::NullableStringExpression::NullSafeProperty { object, property } => {
+                let owned_receiver = object.owned_temporary_class();
+                let frame = self.current_frame_mut()?;
+                frame.tasks.push(EvaluationTask::AfterNullSafeProperty {
+                    property,
+                    result: mir::Type::NullableString,
+                    owned_receiver,
+                });
+                frame.tasks.push(EvaluationTask::NullableClass(*object));
+            }
+            mir::NullableStringExpression::NullSafeCall {
+                object,
+                function,
+                args,
+            } => {
+                let owned_receiver = object.owned_temporary_class();
+                let frame = self.current_frame_mut()?;
+                frame.tasks.push(EvaluationTask::AfterNullSafeCall {
+                    function,
+                    args,
+                    result: mir::Type::NullableString,
+                    owned_receiver,
+                });
+                frame.tasks.push(EvaluationTask::NullableClass(*object));
+            }
+            mir::NullableStringExpression::Coalesce { left, right } => {
+                let frame = self.current_frame_mut()?;
+                frame
+                    .tasks
+                    .push(EvaluationTask::AfterNullableStringCoalesce(*right));
+                frame.tasks.push(EvaluationTask::NullableString(*left));
             }
         }
         Ok(())
@@ -1486,10 +2015,7 @@ impl Interpreter<'_> {
             } => {
                 let temporary_class_args = args
                     .iter()
-                    .map(|argument| match argument {
-                        mir::Rvalue::Class(expression) => expression.owned_temporary_class(),
-                        _ => None,
-                    })
+                    .map(mir::Rvalue::owned_temporary_class)
                     .collect();
                 let property_expression_count = properties
                     .iter()
@@ -1514,6 +2040,174 @@ impl Interpreter<'_> {
                         frame.tasks.push(EvaluationTask::Rvalue(value));
                     }
                 }
+            }
+            mir::ClassExpression::NullableLocalAssumeNonNull {
+                class,
+                local,
+                transfer,
+            } => {
+                let value = if transfer {
+                    self.current_frame_mut()?
+                        .locals
+                        .get_mut(local.0)
+                        .and_then(Option::take)
+                        .ok_or_else(|| {
+                            InterpreterError::new("nullable class was moved before use")
+                        })?
+                } else {
+                    read_local(&self.current_frame()?.locals, local)?.clone()
+                };
+                let LocalValue::NullableClass {
+                    object: Some(object),
+                    class: actual,
+                } = value
+                else {
+                    return Err(InterpreterError::new(
+                        "nonnull class expression observed null",
+                    ));
+                };
+                if actual != class {
+                    return Err(InterpreterError::new(
+                        "nonnull class expression has another class",
+                    ));
+                }
+                self.current_frame_mut()?
+                    .values
+                    .push(EvaluationValue::Class { object, class });
+            }
+            mir::ClassExpression::Coalesce {
+                left,
+                right,
+                transfer,
+                ..
+            } => {
+                let left_owned = left.owned_temporary_class().is_some();
+                let frame = self.current_frame_mut()?;
+                frame.tasks.push(EvaluationTask::AfterClassCoalesce {
+                    right: *right,
+                    left_owned,
+                    transfer,
+                });
+                frame.tasks.push(EvaluationTask::NullableClass(*left));
+            }
+        }
+        Ok(())
+    }
+
+    fn expand_nullable_class_expression(
+        &mut self,
+        expression: mir::NullableClassExpression,
+    ) -> Result<(), InterpreterError> {
+        let class = expression.class();
+        match expression {
+            mir::NullableClassExpression::Null(_) => self.push_nullable_class(class, None)?,
+            mir::NullableClassExpression::Class(value) => {
+                let frame = self.current_frame_mut()?;
+                frame
+                    .tasks
+                    .push(EvaluationTask::BuildNullableClassSome(class));
+                frame.tasks.push(EvaluationTask::Class(value));
+            }
+            mir::NullableClassExpression::Local {
+                local, transfer, ..
+            } => {
+                let value = if transfer {
+                    self.current_frame_mut()?
+                        .locals
+                        .get_mut(local.0)
+                        .and_then(Option::take)
+                        .ok_or_else(|| {
+                            InterpreterError::new("nullable class was moved before use")
+                        })?
+                } else {
+                    read_local(&self.current_frame()?.locals, local)?.clone()
+                };
+                let LocalValue::NullableClass {
+                    object,
+                    class: actual,
+                } = value
+                else {
+                    return Err(InterpreterError::new(
+                        "nullable class local has another type",
+                    ));
+                };
+                if actual != class {
+                    return Err(InterpreterError::new(
+                        "nullable class local has another class",
+                    ));
+                }
+                self.push_nullable_class(class, object)?;
+            }
+            mir::NullableClassExpression::Property {
+                object, property, ..
+            } => {
+                let LocalValue::NullableClass {
+                    object,
+                    class: actual,
+                } = self.read_property(object, property)?
+                else {
+                    return Err(InterpreterError::new(
+                        "nullable class property has another type",
+                    ));
+                };
+                if actual != class {
+                    return Err(InterpreterError::new(
+                        "nullable class property has another class",
+                    ));
+                }
+                self.push_nullable_class(class, object)?;
+            }
+            mir::NullableClassExpression::Call { function, args, .. } => {
+                self.queue_call(
+                    function,
+                    args,
+                    ReturnExpectation::Value(mir::Type::NullableClass(class)),
+                )?;
+            }
+            mir::NullableClassExpression::NullSafeProperty {
+                object, property, ..
+            } => {
+                let owned_receiver = object.owned_temporary_class();
+                let frame = self.current_frame_mut()?;
+                frame.tasks.push(EvaluationTask::AfterNullSafeProperty {
+                    property,
+                    result: mir::Type::NullableClass(class),
+                    owned_receiver,
+                });
+                frame.tasks.push(EvaluationTask::NullableClass(*object));
+            }
+            mir::NullableClassExpression::NullSafeCall {
+                object,
+                function,
+                args,
+                ..
+            } => {
+                let owned_receiver = object.owned_temporary_class();
+                let frame = self.current_frame_mut()?;
+                frame.tasks.push(EvaluationTask::AfterNullSafeCall {
+                    function,
+                    args,
+                    result: mir::Type::NullableClass(class),
+                    owned_receiver,
+                });
+                frame.tasks.push(EvaluationTask::NullableClass(*object));
+            }
+            mir::NullableClassExpression::Coalesce {
+                left,
+                right,
+                transfer,
+                ..
+            } => {
+                let left_owned = left.owned_temporary_class().is_some();
+                let frame = self.current_frame_mut()?;
+                frame
+                    .tasks
+                    .push(EvaluationTask::AfterNullableClassCoalesce {
+                        right: *right,
+                        left_owned,
+                        transfer,
+                    });
+                frame.tasks.push(EvaluationTask::NullableClass(*left));
             }
         }
         Ok(())
@@ -1541,7 +2235,7 @@ impl Interpreter<'_> {
             .iter()
             .zip(&callee.params)
             .map(|(argument, parameter)| {
-                matches!(argument, mir::Rvalue::Class(expression) if expression.owned_temporary_class().is_some())
+                argument.owned_temporary_class().is_some()
                     && !local_in(callee, *parameter).is_ok_and(|local| local.owned)
             })
             .collect();
@@ -1549,6 +2243,88 @@ impl Interpreter<'_> {
         frame.tasks.push(EvaluationTask::Invoke {
             function,
             argument_count: args.len(),
+            expectation,
+            temporary_class_args,
+        });
+        for argument in args.into_iter().rev() {
+            frame.tasks.push(EvaluationTask::Rvalue(argument));
+        }
+        Ok(())
+    }
+
+    fn queue_null_safe_call(
+        &mut self,
+        object: usize,
+        class: crate::class_layout::ClassId,
+        function: mir::FunctionId,
+        args: Vec<mir::Rvalue>,
+        nullable_result: mir::Type,
+    ) -> Result<(), InterpreterError> {
+        let callee = function_in(self.program, function)?;
+        let non_nullable_result = non_nullable_type(nullable_result)
+            .ok_or_else(|| InterpreterError::new("null-safe call result is not nullable"))?;
+        let mir::ReturnType::Value(result) = callee.return_type else {
+            return Err(InterpreterError::new(
+                "null-safe value call targeted a void method",
+            ));
+        };
+        if result != non_nullable_result && result != nullable_result {
+            return Err(InterpreterError::new(
+                "null-safe call result does not match the requested nullable type",
+            ));
+        }
+        let mut temporary_class_args = Vec::with_capacity(args.len() + 1);
+        temporary_class_args.push(false);
+        temporary_class_args.extend(args.iter().zip(callee.params.iter().skip(1)).map(
+            |(argument, parameter)| {
+                argument.owned_temporary_class().is_some()
+                    && !local_in(callee, *parameter).is_ok_and(|local| local.owned)
+            },
+        ));
+        let frame = self.current_frame_mut()?;
+        frame.values.push(EvaluationValue::Class { object, class });
+        if result == non_nullable_result {
+            frame
+                .tasks
+                .push(EvaluationTask::WrapNullable(nullable_result));
+        }
+        frame.tasks.push(EvaluationTask::Invoke {
+            function,
+            argument_count: args.len() + 1,
+            expectation: ReturnExpectation::Value(result),
+            temporary_class_args,
+        });
+        for argument in args.into_iter().rev() {
+            frame.tasks.push(EvaluationTask::Rvalue(argument));
+        }
+        Ok(())
+    }
+
+    fn queue_null_safe_statement_call(
+        &mut self,
+        object: usize,
+        class: crate::class_layout::ClassId,
+        function: mir::FunctionId,
+        args: Vec<mir::Rvalue>,
+    ) -> Result<(), InterpreterError> {
+        let callee = function_in(self.program, function)?;
+        let expectation = match callee.return_type {
+            mir::ReturnType::Void => ReturnExpectation::Void,
+            mir::ReturnType::Value(ty) => ReturnExpectation::Discard(ty),
+        };
+        let mut temporary_class_args = Vec::with_capacity(args.len() + 1);
+        temporary_class_args.push(false);
+        temporary_class_args.extend(args.iter().zip(callee.params.iter().skip(1)).map(
+            |(argument, parameter)| {
+                argument.owned_temporary_class().is_some()
+                    && !local_in(callee, *parameter).is_ok_and(|local| local.owned)
+            },
+        ));
+        let frame = self.current_frame_mut()?;
+        frame.values.push(EvaluationValue::Class { object, class });
+        frame.tasks.push(EvaluationTask::Invoke {
+            function,
+            argument_count: args.len() + 1,
             expectation,
             temporary_class_args,
         });
@@ -1640,8 +2416,14 @@ impl Interpreter<'_> {
                 self.current_frame_mut()?.values.push(match value {
                     LocalValue::Scalar(value) => EvaluationValue::Scalar(value),
                     LocalValue::String(value) => EvaluationValue::String(value),
+                    LocalValue::NullableScalar { ty, value } => {
+                        EvaluationValue::NullableScalar { ty, value }
+                    }
                     LocalValue::NullableString(value) => EvaluationValue::NullableString(value),
                     LocalValue::Class { object, class } => EvaluationValue::Class { object, class },
+                    LocalValue::NullableClass { object, class } => {
+                        EvaluationValue::NullableClass { object, class }
+                    }
                 });
             }
             (ReturnExpectation::Discard(expected), FunctionOutcome::Value(value)) => {
@@ -1697,8 +2479,14 @@ impl Interpreter<'_> {
             .map(|value| match value {
                 EvaluationValue::Scalar(value) => Ok(LocalValue::Scalar(value)),
                 EvaluationValue::String(value) => Ok(LocalValue::String(value)),
+                EvaluationValue::NullableScalar { ty, value } => {
+                    Ok(LocalValue::NullableScalar { ty, value })
+                }
                 EvaluationValue::NullableString(value) => Ok(LocalValue::NullableString(value)),
                 EvaluationValue::Class { object, class } => Ok(LocalValue::Class { object, class }),
+                EvaluationValue::NullableClass { object, class } => {
+                    Ok(LocalValue::NullableClass { object, class })
+                }
             })
             .collect()
     }
@@ -1718,6 +2506,10 @@ impl Interpreter<'_> {
             )),
             Some(EvaluationValue::NullableString(_)) => Err(InterpreterError::new(
                 "MIR scalar evaluation produced a nullable string",
+            )),
+            Some(EvaluationValue::NullableScalar { .. })
+            | Some(EvaluationValue::NullableClass { .. }) => Err(InterpreterError::new(
+                "MIR scalar evaluation produced a nullable value",
             )),
             Some(EvaluationValue::Class { .. }) => Err(InterpreterError::new(
                 "MIR scalar evaluation produced a class",
@@ -1743,6 +2535,10 @@ impl Interpreter<'_> {
             )),
             Some(EvaluationValue::NullableString(_)) => Err(InterpreterError::new(
                 "MIR string evaluation produced a nullable string",
+            )),
+            Some(EvaluationValue::NullableScalar { .. })
+            | Some(EvaluationValue::NullableClass { .. }) => Err(InterpreterError::new(
+                "MIR string evaluation produced a nullable value",
             )),
             Some(EvaluationValue::Class { .. }) => Err(InterpreterError::new(
                 "MIR string evaluation produced a class",
@@ -1772,6 +2568,104 @@ impl Interpreter<'_> {
         }
     }
 
+    fn push_nullable_scalar(
+        &mut self,
+        ty: mir::ScalarType,
+        value: Option<mir::ScalarValue>,
+    ) -> Result<(), InterpreterError> {
+        if value.is_some_and(|value| value.ty() != ty) {
+            return Err(InterpreterError::new(
+                "nullable scalar payload type mismatch",
+            ));
+        }
+        self.current_frame_mut()?
+            .values
+            .push(EvaluationValue::NullableScalar { ty, value });
+        Ok(())
+    }
+
+    fn pop_nullable_scalar(
+        &mut self,
+    ) -> Result<(mir::ScalarType, Option<mir::ScalarValue>), InterpreterError> {
+        match self.current_frame_mut()?.values.pop() {
+            Some(EvaluationValue::NullableScalar { ty, value }) => Ok((ty, value)),
+            Some(_) => Err(InterpreterError::new(
+                "nullable scalar produced another value type",
+            )),
+            None => Err(InterpreterError::new("nullable scalar produced no value")),
+        }
+    }
+
+    fn push_nullable_class(
+        &mut self,
+        class: crate::class_layout::ClassId,
+        object: Option<usize>,
+    ) -> Result<(), InterpreterError> {
+        self.current_frame_mut()?
+            .values
+            .push(EvaluationValue::NullableClass { object, class });
+        Ok(())
+    }
+
+    fn pop_nullable_class(
+        &mut self,
+    ) -> Result<(crate::class_layout::ClassId, Option<usize>), InterpreterError> {
+        match self.current_frame_mut()?.values.pop() {
+            Some(EvaluationValue::NullableClass { object, class }) => Ok((class, object)),
+            Some(_) => Err(InterpreterError::new(
+                "nullable class produced another value type",
+            )),
+            None => Err(InterpreterError::new("nullable class produced no value")),
+        }
+    }
+
+    fn push_null(&mut self, ty: mir::Type) -> Result<(), InterpreterError> {
+        match ty {
+            mir::Type::NullableScalar(ty) => self.push_nullable_scalar(ty, None),
+            mir::Type::NullableString => self.push_nullable_string(None),
+            mir::Type::NullableClass(class) => self.push_nullable_class(class, None),
+            _ => Err(InterpreterError::new(
+                "null result does not have nullable type",
+            )),
+        }
+    }
+
+    fn push_nullable_from_value(
+        &mut self,
+        nullable: mir::Type,
+        value: LocalValue,
+    ) -> Result<(), InterpreterError> {
+        match (nullable, value) {
+            (mir::Type::NullableScalar(ty), LocalValue::Scalar(value)) if value.ty() == ty => {
+                self.push_nullable_scalar(ty, Some(value))
+            }
+            (mir::Type::NullableScalar(expected), LocalValue::NullableScalar { ty, value })
+                if expected == ty =>
+            {
+                self.push_nullable_scalar(ty, value)
+            }
+            (mir::Type::NullableString, LocalValue::String(value)) => {
+                self.push_nullable_string(Some(value))
+            }
+            (mir::Type::NullableString, LocalValue::NullableString(value)) => {
+                self.push_nullable_string(value)
+            }
+            (mir::Type::NullableClass(expected), LocalValue::Class { object, class })
+                if expected == class =>
+            {
+                self.push_nullable_class(class, Some(object))
+            }
+            (mir::Type::NullableClass(expected), LocalValue::NullableClass { object, class })
+                if expected == class =>
+            {
+                self.push_nullable_class(class, object)
+            }
+            _ => Err(InterpreterError::new(
+                "cannot wrap value in requested nullable type",
+            )),
+        }
+    }
+
     fn take_evaluation_values(
         &mut self,
         count: usize,
@@ -1789,9 +2683,15 @@ impl Interpreter<'_> {
         match self.current_frame_mut()?.values.pop() {
             Some(EvaluationValue::Scalar(value)) => Ok(LocalValue::Scalar(value)),
             Some(EvaluationValue::String(value)) => Ok(LocalValue::String(value)),
+            Some(EvaluationValue::NullableScalar { ty, value }) => {
+                Ok(LocalValue::NullableScalar { ty, value })
+            }
             Some(EvaluationValue::NullableString(value)) => Ok(LocalValue::NullableString(value)),
             Some(EvaluationValue::Class { object, class }) => {
                 Ok(LocalValue::Class { object, class })
+            }
+            Some(EvaluationValue::NullableClass { object, class }) => {
+                Ok(LocalValue::NullableClass { object, class })
             }
             None => Err(InterpreterError::new("MIR evaluation produced no value")),
         }
@@ -1837,11 +2737,30 @@ impl Interpreter<'_> {
                     "MIR nullable-string local local{} was used as a scalar value",
                     id.0
                 ))),
+                LocalValue::NullableScalar { .. } | LocalValue::NullableClass { .. } => {
+                    Err(InterpreterError::new(format!(
+                        "MIR nullable local local{} was used as a scalar value",
+                        id.0
+                    )))
+                }
                 LocalValue::Class { .. } => Err(InterpreterError::new(format!(
                     "MIR class local local{} was used as a scalar value",
                     id.0
                 ))),
             },
+            mir::Operand::NullablePayload(id) => {
+                match read_local(&self.current_frame()?.locals, *id)? {
+                    LocalValue::NullableScalar {
+                        value: Some(value), ..
+                    } => Ok(*value),
+                    LocalValue::NullableScalar { value: None, .. } => Err(InterpreterError::new(
+                        "MIR nullable payload was read while null",
+                    )),
+                    _ => Err(InterpreterError::new(
+                        "MIR nullable payload has another type",
+                    )),
+                }
+            }
             mir::Operand::Static(id) => match self.statics.get(id.0) {
                 Some(LocalValue::Scalar(value)) => Ok(*value),
                 _ => Err(InterpreterError::new(format!(
@@ -1868,6 +2787,10 @@ impl Interpreter<'_> {
     ) -> Result<LocalValue, InterpreterError> {
         let object_id = match read_local(&self.current_frame()?.locals, object)? {
             LocalValue::Class { object, .. } => *object,
+            LocalValue::NullableClass {
+                object: Some(object),
+                ..
+            } => *object,
             _ => {
                 return Err(InterpreterError::new(format!(
                     "MIR property access uses non-class local local{}",
@@ -1875,6 +2798,14 @@ impl Interpreter<'_> {
                 )))
             }
         };
+        self.read_object_property(object_id, property)
+    }
+
+    fn read_object_property(
+        &self,
+        object_id: usize,
+        property: crate::class_layout::PropertyId,
+    ) -> Result<LocalValue, InterpreterError> {
         let object_value = self.heap.get(&object_id).ok_or_else(|| {
             InterpreterError::new(format!("MIR object {object_id} is not allocated"))
         })?;
@@ -1904,6 +2835,10 @@ impl Interpreter<'_> {
     ) -> Result<Option<LocalValue>, InterpreterError> {
         let object_id = match read_local(&self.current_frame()?.locals, object)? {
             LocalValue::Class { object, .. } => *object,
+            LocalValue::NullableClass {
+                object: Some(object),
+                ..
+            } => *object,
             _ => {
                 return Err(InterpreterError::new(format!(
                     "MIR property assignment uses non-class local local{}",
@@ -1941,15 +2876,23 @@ impl Interpreter<'_> {
         else {
             return Ok(());
         };
-        let LocalValue::Class { object, class } = value else {
-            return Err(InterpreterError::new(format!(
-                "MIR drop local{} did not contain a class value",
-                local.0
-            )));
-        };
-        self.current_frame_mut()?
-            .tasks
-            .push(EvaluationTask::DropObject { object, class });
+        match value {
+            LocalValue::Class { object, class }
+            | LocalValue::NullableClass {
+                object: Some(object),
+                class,
+            } => self
+                .current_frame_mut()?
+                .tasks
+                .push(EvaluationTask::DropObject { object, class }),
+            LocalValue::NullableClass { object: None, .. } => {}
+            _ => {
+                return Err(InterpreterError::new(format!(
+                    "MIR drop local{} did not contain a class value",
+                    local.0
+                )))
+            }
+        }
         Ok(())
     }
 
@@ -2001,7 +2944,14 @@ impl Interpreter<'_> {
         }
         let mut drops = Vec::new();
         for property in object_value.properties.iter_mut().rev() {
-            if let Some(LocalValue::Class { object, class }) = property.take() {
+            if let Some(
+                LocalValue::Class { object, class }
+                | LocalValue::NullableClass {
+                    object: Some(object),
+                    class,
+                },
+            ) = property.take()
+            {
                 drops.push((object, class));
             }
         }
@@ -2236,8 +3186,30 @@ fn local_value_type(value: &LocalValue) -> mir::Type {
     match value {
         LocalValue::Scalar(value) => mir::Type::Scalar(value.ty()),
         LocalValue::String(_) => mir::Type::String,
+        LocalValue::NullableScalar { ty, .. } => mir::Type::NullableScalar(*ty),
         LocalValue::NullableString(_) => mir::Type::NullableString,
         LocalValue::Class { class, .. } => mir::Type::Class(*class),
+        LocalValue::NullableClass { class, .. } => mir::Type::NullableClass(*class),
+    }
+}
+
+fn non_nullable_type(ty: mir::Type) -> Option<mir::Type> {
+    match ty {
+        mir::Type::NullableScalar(ty) => Some(mir::Type::Scalar(ty)),
+        mir::Type::NullableString => Some(mir::Type::String),
+        mir::Type::NullableClass(class) => Some(mir::Type::Class(class)),
+        _ => None,
+    }
+}
+
+fn owned_object(value: &LocalValue) -> Option<(usize, crate::class_layout::ClassId)> {
+    match value {
+        LocalValue::Class { object, class }
+        | LocalValue::NullableClass {
+            object: Some(object),
+            class,
+        } => Some((*object, *class)),
+        _ => None,
     }
 }
 
@@ -2408,7 +3380,13 @@ fn assign_local(
             | (mir::Type::NullableString, LocalValue::NullableString(_))
     ) || matches!(
         (definition.ty, &value),
+        (mir::Type::NullableScalar(expected), LocalValue::NullableScalar { ty, .. }) if expected == *ty
+    ) || matches!(
+        (definition.ty, &value),
         (mir::Type::Class(expected), LocalValue::Class { class, .. }) if expected == *class
+    ) || matches!(
+        (definition.ty, &value),
+        (mir::Type::NullableClass(expected), LocalValue::NullableClass { class, .. }) if expected == *class
     );
     if !compatible {
         let actual = match &value {
@@ -2418,8 +3396,10 @@ fn assign_local(
                 mir::ScalarType::Bool => "bool",
             },
             LocalValue::String(_) => "string",
+            LocalValue::NullableScalar { .. } => "nullable scalar",
             LocalValue::NullableString(_) => "?string",
             LocalValue::Class { .. } => "class",
+            LocalValue::NullableClass { .. } => "nullable class",
         };
         return Err(InterpreterError::new(format!(
             "MIR local local{} has type {}, but assignment produced {actual}",

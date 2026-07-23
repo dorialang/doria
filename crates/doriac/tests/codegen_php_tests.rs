@@ -402,6 +402,36 @@ function identity(float32 $value): float32
 }
 
 #[test]
+fn php_backend_rejects_exact_type_tests_for_unrepresentable_numeric_widths() {
+    for tested_type in [
+        "int8", "int16", "int32", "uint8", "uint16", "uint32", "uint64", "float32",
+    ] {
+        let source =
+            format!("function test(int $value): bool {{ return $value is {tested_type}; }}");
+        let diagnostics = doriac::compile_source_to_php("test.doria", &source)
+            .expect_err("PHP must not erase the width of an exact Doria type test");
+        assert_eq!(diagnostics[0].code, "B1301");
+    }
+
+    doriac::compile_source_to_php(
+        "test.doria",
+        "function test(mixed $value): bool { return $value is int64; }",
+    )
+    .expect("PHP can preserve the exact default signed integer test");
+}
+
+#[test]
+fn php_backend_parenthesizes_type_tests_as_expression_atoms() {
+    let php = doriac::compile_source_to_php(
+        "test.doria",
+        "function test(mixed $value): bool { return $value is int == true; }",
+    )
+    .expect("PHP should preserve nested type-test precedence");
+
+    assert!(php.contains("return (get_debug_type($value) === 'int') === true;"));
+}
+
+#[test]
 fn php_backend_allows_negative_integer_literals_but_rejects_runtime_negation() {
     let php = doriac::compile_source_to_php(
         "test.doria",
@@ -1886,4 +1916,25 @@ class Limits { static int $minimum = MINIMUM; }
             );
         }
     }
+}
+
+#[test]
+fn php_backend_parenthesizes_composite_member_receivers() {
+    let php = doriac::compile_source_to_php(
+        "coalesced-receiver.doria",
+        r#"
+class Label
+{
+    function text(): string { return "label"; }
+}
+
+function read(?Label $left, ?Label $right): ?string
+{
+    return ($left ?? $right)?->text();
+}
+"#,
+    )
+    .expect("coalesced member receivers should lower to PHP");
+
+    assert!(php.contains("($left ?? $right)?->text()"), "{php}");
 }

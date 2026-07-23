@@ -50,7 +50,11 @@ Docs and editor token lists must stop presenting `object`, `null`, or `resource`
 
 The semantic checker must reject `object`, `null`, `resource`, and non-return-position `void` wherever current parsing and type resolution can see them.
 
-Future Stage 22 work owns static narrowing for `mixed` through `is` and `match`. Future Stage 23 work owns the boxed runtime representation. This decision must not be used as permission to implement those stages early.
+Stage 22 implements static narrowing for `mixed` through `is` on the shared
+dataflow framework. Stage 28 owns `match` and its narrowing integration. Stage
+23 owns the boxed runtime representation. Static acceptance must not be used as
+permission to invent placeholder runtime behavior before that representation
+exists.
 
 The PHP backend must not lower Doria `resource` to PHP `mixed` as a source-level Doria feature. Any eventual PHP resource bridge behavior must be introduced through the Phase I bridge design.
 

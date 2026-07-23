@@ -1,0 +1,98 @@
+class Label
+{
+    function __construct(string $text)
+    {
+    }
+
+    function read(): string
+    {
+        return $this->text;
+    }
+
+    function use(Label $other): void
+    {
+        echo ":used:" . $other->read();
+    }
+
+    function __destruct()
+    {
+        echo "<" . $this->text . ">";
+        if ($this->text == "label") {
+            echo "\n";
+        }
+    }
+}
+
+function maybeInt(bool $present): ?int
+{
+    if ($present) {
+        return 42;
+    }
+
+    return null;
+}
+
+function maybeString(bool $present): ?string
+{
+    if ($present) {
+        return "text";
+    }
+
+    return null;
+}
+
+function maybeLabel(bool $present): ?Label
+{
+    if ($present) {
+        return new Label("label");
+    }
+
+    return null;
+}
+
+function inspectLabel(Label $label): bool
+{
+    echo ":inspected:" . $label->read();
+    return true;
+}
+
+function main(): void
+{
+    let $number = maybeInt(true);
+    let $missingNumber = maybeInt(false);
+    echo $number ?? 0;
+    echo ":";
+    echo $missingNumber ?? 7;
+    if ($number is int) {
+        echo ":typed";
+    }
+    if ($number is string) {
+        echo ":wrong";
+    }
+
+    let $text = maybeString(true);
+    let $missingText = maybeString(false);
+    if ($text != null) {
+        echo ":" . $text;
+    }
+    if ($missingText == null) {
+        echo ":empty";
+    }
+
+    let $label = maybeLabel(true);
+    let $missingLabel = maybeLabel(false);
+    echo ":" . ($label?->read() ?? "none");
+    echo ":" . ($missingLabel?->read() ?? "none");
+
+    if ($label != null) {
+        echo ":" . $label->read();
+    }
+    let $fallbackLabel = maybeLabel(false) ?? new Label("fallback");
+    echo ":" . $fallbackLabel->read();
+    ?bool $ready = true;
+    if ($ready ?? inspectLabel(new Label("skipped-fallback"))) {
+        echo ":ready";
+    }
+    $missingLabel?->use(new Label("skipped-argument"));
+    echo "\n";
+}

@@ -20,11 +20,14 @@ when it is authored.
 Stage 17 adds compiler-known free functions that cannot be redeclared:
 
 - `read_line(): ?string`
-- `sprintf(string-literal-format, ...arguments): string`
-- `printf(string-literal-format, ...arguments): void`
 - `read_file(string $path): string`
 - `write_file(string $path, string $contents): void`
 - `write_stderr(string $value): void`
+
+The compiler-known `sprintf` returns `string` and `printf` returns `void`. Each
+takes a literal `string $format` first, followed by typed operands checked
+against that format. This intrinsic-only tail is not an untyped userland
+variadic declaration.
 
 These are a narrow v0 text-I/O facade, not the final `Doria\Std\Io` object API. `print` is permanently
 rejected with guidance to use `echo`. `printf` writes exact bytes, adds no newline, and returns
@@ -39,13 +42,15 @@ data is intended for the future `doriac migrate php` command.
 
 Stage 17 introduces the Stage 22 nullable model early in this one return position and implements
 `?string` through declarations, inference, parameters, returns, assignments,
-arguments, calls, MIR, and native ABI. Native null is a null runtime-string pointer; a non-null
-value is a normal `DrStringV1` pointer, and the existing retain/release ABI remains null-safe. An
+arguments, calls, MIR, and native ABI. Stage 17 initially used a null runtime-string pointer for
+absence. Decision 0093 supersedes that seed layout with the general non-class nullable
+presence-word-plus-payload representation; its payload remains a normal `DrStringV1` pointer and
+the retain/release ABI remains null-safe. An
 empty string is never null. `string` and `null` assign to `?string`; a possibly-null string does
 not assign to `string` and is not display-convertible. Equality and inequality with null are
 supported. A `$value != null` true edge narrows the binding to string until assignment invalidates
-the fact. This is not an I/O-only optional type and will not be replaced; Stage 22 generalizes the
-same model. Ordered nullable comparison and the remaining Stage 22 feature set remain deferred.
+the fact. This is not an I/O-only optional type and was not replaced; Decision 0093 generalized
+the same model. Ordered nullable comparison remains outside the accepted nullable operator set.
 
 ### Line input
 
@@ -140,8 +145,10 @@ and the stateless-versus-ScreenBuffer choice remain deferred.
 
 - Stage 17 is one end-to-end checked-HIR-to-MIR-to-runtime capability across all native profiles.
 - PHP compatibility may implement exact subsets but must diagnose shapes it cannot preserve.
-- `Bytes`, binary I/O, handles, async I/O, `sscanf`, dynamic formats, full expression
-  interpolation/`Displayable`, and general nullable types remain deferred.
+- At Stage 17, `Bytes`, binary I/O, handles, async I/O, `sscanf`, dynamic formats,
+  full expression interpolation/`Displayable`, and general nullable types remained
+  deferred. Decision 0093 now implements general nullable types without changing
+  this record's EOF contract.
 - The internal runtime ABI grows but remains private and versioned with `dr_v1_*` symbols.
 
 ## Affected components

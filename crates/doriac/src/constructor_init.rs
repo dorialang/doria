@@ -252,7 +252,7 @@ fn inspect_action(
 ) {
     let mut state = input.clone();
     match &node.action {
-        NodeAction::None => {}
+        NodeAction::None | NodeAction::Assume { .. } => {}
         NodeAction::Expression(expression) => {
             inspect_expr(class, properties, &state, expression, diagnostics)
         }
@@ -462,6 +462,7 @@ fn inspect_expr(
             object,
             property,
             span,
+            ..
         } if is_this(object) => {
             if let Some(index) = property_index(properties, property) {
                 observe_property(class, properties, state, index, *span, diagnostics);
@@ -506,6 +507,7 @@ fn inspect_expr(
                 inspect_expr(class, properties, state, &element.value, diagnostics);
             }
         }
+        Expr::IsType { expr, .. } => inspect_expr(class, properties, state, expr, diagnostics),
         Expr::Binary {
             left,
             op: crate::ast::BinaryOp::And,
@@ -639,6 +641,7 @@ fn direct_this_property(expression: &Expr) -> Option<(&str, Span)> {
             object,
             property,
             span,
+            ..
         } if is_this(object) => Some((property, *span)),
         _ => None,
     }

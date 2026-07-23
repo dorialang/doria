@@ -75,6 +75,14 @@ impl Builtin {
             Self::WriteStderr => "write_stderr",
         }
     }
+
+    pub const fn return_is_non_null(self) -> Option<bool> {
+        match self {
+            Self::Sprintf | Self::ReadFile => Some(true),
+            Self::ReadLine => Some(false),
+            Self::Panic | Self::Printf | Self::WriteFile | Self::WriteStderr => None,
+        }
+    }
 }
 
 #[cfg(test)]

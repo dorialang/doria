@@ -1,0 +1,1838 @@
+use std::collections::{BTreeMap, HashMap};
+
+use crate::ast::{
+    Block, ElseBranch, Expr, ForIncrement, ForInitializer, FunctionDecl, Item, Param, Program, Stmt,
+};
+use crate::builtins::Builtin;
+use crate::control_flow::{build_function_cfg, Node, NodeAction};
+use crate::dataflow::{solve_forward, ForwardAnalysis};
+use crate::source::Span;
+use crate::types::TypeRef;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Fact {
+    NonNull,
+    Null,
+    Exact(TypeRef),
+}
+
+pub type FactsByUse = HashMap<(usize, usize), Fact>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct BindingId(usize);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct State {
+    reachable: bool,
+    facts: BTreeMap<BindingId, Fact>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CallExecution {
+    Always,
+    Never,
+    Maybe,
+}
+
+#[derive(Default)]
+struct Resolution {
+    uses: HashMap<(usize, usize), BindingId>,
+    declarations: HashMap<usize, BindingId>,
+    declaration_types: HashMap<BindingId, Option<TypeRef>>,
+    declaration_classes: HashMap<BindingId, String>,
+    current_class: Option<String>,
+    nullability: NullabilityCatalog,
+    member_classes: MemberClassCatalog,
+}
+
+#[derive(Default)]
+struct MutationCatalog {
+    functions: HashMap<String, Vec<bool>>,
+    methods: HashMap<String, Vec<bool>>,
+    qualified_methods: HashMap<(String, String), Vec<bool>>,
+    constructors: HashMap<String, Vec<bool>>,
+}
+
+#[derive(Default, Clone)]
+struct NullabilityCatalog {
+    functions: HashMap<String, bool>,
+    methods: HashMap<String, bool>,
+    qualified_methods: HashMap<(String, String), bool>,
+    properties: HashMap<String, bool>,
+    qualified_properties: HashMap<(String, String), bool>,
+}
+
+#[derive(Default, Clone)]
+struct MemberClassCatalog {
+    methods: HashMap<(String, String), String>,
+    properties: HashMap<(String, String), String>,
+}
+
+struct FlowCatalog {
+    mutations: MutationCatalog,
+    nullability: NullabilityCatalog,
+    member_classes: MemberClassCatalog,
+}
+
+impl FlowCatalog {
+    fn from_program(program: &Program) -> Self {
+        Self {
+            mutations: MutationCatalog::from_program(program),
+            nullability: NullabilityCatalog::from_program(program),
+            member_classes: MemberClassCatalog::from_program(program),
+        }
+    }
+}
+
+impl MemberClassCatalog {
+    fn from_program(program: &Program) -> Self {
+        let mut catalog = Self::default();
+        for item in &program.items {
+            let Item::Class(class) = item else {
+                continue;
+            };
+            for member in &class.members {
+                match member {
+                    crate::ast::ClassMember::Method(method) => {
+                        if let Some(return_type) = &method.return_type {
+                            if let Some(result) = class_name_in(return_type, &class.name) {
+                                catalog
+                                    .methods
+                                    .insert((class.name.clone(), method.name.clone()), result);
+                            }
+                        }
+                        if method.name == "__construct" {
+                            for parameter in method
+                                .params
+                                .iter()
+                                .filter(|parameter| parameter.promoted_access.is_some())
+                            {
+                                if let Some(result) = class_name_in(&parameter.ty, &class.name) {
+                                    catalog.properties.insert(
+                                        (class.name.clone(), parameter.name.clone()),
+                                        result,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    crate::ast::ClassMember::Property(property) => {
+                        if let Some(result) = class_name_in(&property.ty, &class.name) {
+                            catalog
+                                .properties
+                                .insert((class.name.clone(), property.name.clone()), result);
+                        }
+                    }
+                    crate::ast::ClassMember::Constant(_) => {}
+                }
+            }
+        }
+        catalog
+    }
+}
+
+fn class_name_in(ty: &TypeRef, declaring_class: &str) -> Option<String> {
+    ty.as_class_name().map(|name| {
+        if name == "self" {
+            declaring_class.to_string()
+        } else {
+            name.to_string()
+        }
+    })
+}
+
+impl NullabilityCatalog {
+    fn from_program(program: &Program) -> Self {
+        let mut catalog = Self::default();
+        for item in &program.items {
+            match item {
+                Item::Function(function) => {
+                    if let Some(non_null) = declared_return_is_non_null(function) {
+                        catalog.functions.insert(function.name.clone(), non_null);
+                    }
+                }
+                Item::Class(class) => {
+                    for member in &class.members {
+                        match member {
+                            crate::ast::ClassMember::Method(method) => {
+                                if let Some(non_null) = declared_return_is_non_null(method) {
+                                    merge_guarantee(
+                                        catalog.methods.entry(method.name.clone()),
+                                        non_null,
+                                    );
+                                    catalog.qualified_methods.insert(
+                                        (class.name.clone(), method.name.clone()),
+                                        non_null,
+                                    );
+                                }
+                                if method.name == "__construct" {
+                                    for parameter in method
+                                        .params
+                                        .iter()
+                                        .filter(|parameter| parameter.promoted_access.is_some())
+                                    {
+                                        catalog.record_property(
+                                            &class.name,
+                                            &parameter.name,
+                                            !parameter.ty.nullable,
+                                        );
+                                    }
+                                }
+                            }
+                            crate::ast::ClassMember::Property(property) => {
+                                catalog.record_property(
+                                    &class.name,
+                                    &property.name,
+                                    !property.ty.nullable,
+                                );
+                            }
+                            crate::ast::ClassMember::Constant(_) => {}
+                        }
+                    }
+                }
+                Item::Interface(_) | Item::Trait(_) | Item::Constant(_) | Item::Statement(_) => {}
+            }
+        }
+        catalog
+    }
+
+    fn record_property(&mut self, class: &str, property: &str, non_null: bool) {
+        merge_guarantee(self.properties.entry(property.to_string()), non_null);
+        self.qualified_properties
+            .insert((class.to_string(), property.to_string()), non_null);
+    }
+
+    fn function_is_non_null(&self, name: &str) -> Option<bool> {
+        Builtin::from_name(name)
+            .and_then(Builtin::return_is_non_null)
+            .or_else(|| self.functions.get(name).copied())
+    }
+
+    fn method_is_non_null(&self, method: &str) -> Option<bool> {
+        self.methods.get(method).copied()
+    }
+
+    fn instance_method_is_non_null(
+        &self,
+        object: &Expr,
+        method: &str,
+        resolution: &Resolution,
+        state: &State,
+    ) -> Option<bool> {
+        if let Some(class) = expression_class_name(object, resolution, Some(state)) {
+            return self
+                .qualified_methods
+                .get(&(class, method.to_string()))
+                .copied();
+        }
+        self.method_is_non_null(method)
+    }
+
+    fn static_method_is_non_null(
+        &self,
+        qualifier: &crate::ast::StaticQualifier,
+        method: &str,
+        resolution: &Resolution,
+    ) -> Option<bool> {
+        if let Some(class) = static_qualifier_class_name(qualifier, resolution) {
+            self.qualified_methods
+                .get(&(class, method.to_string()))
+                .copied()
+                .or_else(|| self.method_is_non_null(method))
+        } else {
+            self.method_is_non_null(method)
+        }
+    }
+
+    fn property_is_non_null(&self, property: &str) -> Option<bool> {
+        self.properties.get(property).copied()
+    }
+
+    fn instance_property_is_non_null(
+        &self,
+        object: &Expr,
+        property: &str,
+        resolution: &Resolution,
+        state: &State,
+    ) -> Option<bool> {
+        if let Some(class) = expression_class_name(object, resolution, Some(state)) {
+            return self
+                .qualified_properties
+                .get(&(class, property.to_string()))
+                .copied();
+        }
+        self.property_is_non_null(property)
+    }
+
+    fn static_property_is_non_null(
+        &self,
+        qualifier: &crate::ast::StaticQualifier,
+        property: &str,
+        resolution: &Resolution,
+    ) -> Option<bool> {
+        if let Some(class) = static_qualifier_class_name(qualifier, resolution) {
+            self.qualified_properties
+                .get(&(class, property.to_string()))
+                .copied()
+                .or_else(|| self.property_is_non_null(property))
+        } else {
+            self.property_is_non_null(property)
+        }
+    }
+}
+
+fn declared_return_is_non_null(function: &FunctionDecl) -> Option<bool> {
+    function.return_type.as_ref().map(|ty| !ty.nullable)
+}
+
+fn merge_guarantee(entry: std::collections::hash_map::Entry<'_, String, bool>, incoming: bool) {
+    entry
+        .and_modify(|existing| *existing &= incoming)
+        .or_insert(incoming);
+}
+
+impl MutationCatalog {
+    fn from_program(program: &Program) -> Self {
+        let mut catalog = Self::default();
+        let classes = program
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Class(class) => Some(class.name.clone()),
+                _ => None,
+            })
+            .collect();
+        for item in &program.items {
+            match item {
+                Item::Function(function) => merge_parameter_modes(
+                    catalog.functions.entry(function.name.clone()).or_default(),
+                    &function.params,
+                    &classes,
+                    None,
+                ),
+                Item::Class(class) => {
+                    for member in &class.members {
+                        let crate::ast::ClassMember::Method(method) = member else {
+                            continue;
+                        };
+                        let modes = parameter_modes(&method.params, &classes, Some(&class.name));
+                        merge_modes(
+                            catalog.methods.entry(method.name.clone()).or_default(),
+                            &modes,
+                        );
+                        merge_modes(
+                            catalog
+                                .qualified_methods
+                                .entry((class.name.clone(), method.name.clone()))
+                                .or_default(),
+                            &modes,
+                        );
+                        if method.name == "__construct" {
+                            merge_modes(
+                                catalog.constructors.entry(class.name.clone()).or_default(),
+                                &modes,
+                            );
+                        }
+                    }
+                }
+                Item::Interface(_) | Item::Trait(_) | Item::Constant(_) | Item::Statement(_) => {}
+            }
+        }
+        catalog
+    }
+
+    fn function_modes(&self, name: &str) -> Option<&[bool]> {
+        self.functions.get(name).map(Vec::as_slice)
+    }
+
+    fn method_modes(&self, method: &str) -> Option<&[bool]> {
+        self.methods.get(method).map(Vec::as_slice)
+    }
+
+    fn instance_method_modes(
+        &self,
+        object: &Expr,
+        method: &str,
+        resolution: &Resolution,
+        state: &State,
+    ) -> Option<&[bool]> {
+        if let Some(class) = expression_class_name(object, resolution, Some(state)) {
+            return self
+                .qualified_methods
+                .get(&(class, method.to_string()))
+                .map(Vec::as_slice);
+        }
+        self.method_modes(method)
+    }
+
+    fn static_method_modes(
+        &self,
+        qualifier: &crate::ast::StaticQualifier,
+        method: &str,
+        resolution: &Resolution,
+    ) -> Option<&[bool]> {
+        if let Some(class) = static_qualifier_class_name(qualifier, resolution) {
+            self.qualified_methods
+                .get(&(class, method.to_string()))
+                .or_else(|| self.methods.get(method))
+                .map(Vec::as_slice)
+        } else {
+            self.method_modes(method)
+        }
+    }
+
+    fn constructor_modes(&self, class: &str) -> Option<&[bool]> {
+        self.constructors.get(class).map(Vec::as_slice)
+    }
+}
+
+fn merge_parameter_modes(
+    target: &mut Vec<bool>,
+    parameters: &[Param],
+    classes: &std::collections::HashSet<String>,
+    declaring_class: Option<&str>,
+) {
+    let modes = parameter_modes(parameters, classes, declaring_class);
+    merge_modes(target, &modes);
+}
+
+fn parameter_modes(
+    parameters: &[Param],
+    classes: &std::collections::HashSet<String>,
+    declaring_class: Option<&str>,
+) -> Vec<bool> {
+    parameters
+        .iter()
+        .map(|parameter| {
+            parameter.writable
+                || (parameter.take
+                    && crate::ownership::type_ref_is_move_type(
+                        &parameter.ty,
+                        classes,
+                        declaring_class,
+                    ))
+        })
+        .collect()
+}
+
+fn merge_modes(target: &mut Vec<bool>, incoming: &[bool]) {
+    if target.len() < incoming.len() {
+        target.resize(incoming.len(), false);
+    }
+    for (index, mutable) in incoming.iter().enumerate() {
+        target[index] |= mutable;
+    }
+}
+
+pub fn analyze_program(program: &Program) -> FactsByUse {
+    let mut facts = HashMap::new();
+    let catalog = FlowCatalog::from_program(program);
+    let top_level_span = program
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            Item::Statement(statement) => Some(statement_span(statement)),
+            _ => None,
+        })
+        .reduce(Span::merge)
+        .unwrap_or_default();
+    let top_level = Block {
+        statements: program
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Statement(statement) => Some(statement.clone()),
+                _ => None,
+            })
+            .collect(),
+        span: top_level_span,
+    };
+    if !top_level.statements.is_empty() {
+        analyze_body(&top_level, &[], top_level_span, None, &mut facts, &catalog);
+    }
+
+    for item in &program.items {
+        match item {
+            Item::Function(function) => analyze_function(function, None, &mut facts, &catalog),
+            Item::Class(class) => {
+                for member in &class.members {
+                    if let crate::ast::ClassMember::Method(method) = member {
+                        analyze_function(method, Some(&class.name), &mut facts, &catalog);
+                    }
+                }
+            }
+            Item::Interface(_) | Item::Trait(_) | Item::Constant(_) | Item::Statement(_) => {}
+        }
+    }
+    facts
+}
+
+fn statement_span(statement: &Stmt) -> Span {
+    match statement {
+        Stmt::VarDecl(declaration) => declaration.span,
+        Stmt::Assignment(assignment) => assignment.span,
+        Stmt::Echo { span, .. }
+        | Stmt::Return { span, .. }
+        | Stmt::Break { span }
+        | Stmt::Continue { span }
+        | Stmt::Expr { span, .. } => *span,
+        Stmt::If(statement) => statement.span,
+        Stmt::While(statement) => statement.span,
+        Stmt::For(statement) => statement.span,
+        Stmt::Foreach(statement) => statement.span,
+        Stmt::Increment(statement) => statement.span,
+    }
+}
+
+fn analyze_function(
+    function: &FunctionDecl,
+    current_class: Option<&str>,
+    facts: &mut FactsByUse,
+    catalog: &FlowCatalog,
+) {
+    analyze_body(
+        &function.body,
+        &function.params,
+        function.span,
+        current_class,
+        facts,
+        catalog,
+    );
+}
+
+fn analyze_body(
+    body: &Block,
+    params: &[Param],
+    span: Span,
+    current_class: Option<&str>,
+    facts: &mut FactsByUse,
+    catalog: &FlowCatalog,
+) {
+    let resolution = Resolver::resolve(
+        body,
+        params,
+        current_class,
+        &catalog.nullability,
+        &catalog.member_classes,
+    );
+    let graph = build_function_cfg(body, span);
+    let analysis = NarrowingAnalysis {
+        resolution: &resolution,
+        mutations: &catalog.mutations,
+        nullability: &catalog.nullability,
+    };
+    let result = solve_forward(&graph, &analysis);
+
+    for node_id in result.traversal_order {
+        let input = &result.inputs[node_id.0];
+        if !input.reachable {
+            continue;
+        }
+        collect_action_facts(
+            &graph.nodes[node_id.0].action,
+            input,
+            &resolution,
+            &catalog.mutations,
+            facts,
+        );
+    }
+}
+
+struct NarrowingAnalysis<'a> {
+    resolution: &'a Resolution,
+    mutations: &'a MutationCatalog,
+    nullability: &'a NullabilityCatalog,
+}
+
+impl ForwardAnalysis for NarrowingAnalysis<'_> {
+    type State = State;
+
+    fn bottom(&self) -> Self::State {
+        State {
+            reachable: false,
+            facts: BTreeMap::new(),
+        }
+    }
+
+    fn entry_state(&self) -> Self::State {
+        State {
+            reachable: true,
+            facts: BTreeMap::new(),
+        }
+    }
+
+    fn transfer(&self, node: &Node, input: &Self::State) -> Self::State {
+        if !input.reachable {
+            return input.clone();
+        }
+        let mut output = input.clone();
+        match &node.action {
+            NodeAction::Assume { condition, truth } => apply_condition_with_effects(
+                condition,
+                *truth,
+                &mut output,
+                self.resolution,
+                self.mutations,
+            ),
+            NodeAction::Statement(statement) => transfer_statement(
+                statement,
+                &mut output,
+                self.resolution,
+                self.mutations,
+                self.nullability,
+            ),
+            NodeAction::ForInitializer(initializer) => match initializer {
+                ForInitializer::VarDecl(declaration) => transfer_declaration(
+                    declaration.span,
+                    &declaration.initializer,
+                    &mut output,
+                    self.resolution,
+                    self.mutations,
+                    self.nullability,
+                ),
+                ForInitializer::Assignment(assignment) => transfer_assignment(
+                    &assignment.target,
+                    &assignment.op,
+                    &assignment.value,
+                    &mut output,
+                    self.resolution,
+                    self.mutations,
+                    self.nullability,
+                ),
+            },
+            NodeAction::ForIncrement(increment) => match increment {
+                ForIncrement::Assignment(assignment) => transfer_assignment(
+                    &assignment.target,
+                    &assignment.op,
+                    &assignment.value,
+                    &mut output,
+                    self.resolution,
+                    self.mutations,
+                    self.nullability,
+                ),
+                ForIncrement::Increment(increment) => {
+                    kill_mutated_call_arguments(
+                        &increment.target,
+                        &mut output,
+                        self.resolution,
+                        self.mutations,
+                    );
+                    mark_mutated_scalar_non_null(&increment.target, &mut output, self.resolution)
+                }
+            },
+            NodeAction::Expression(expression) => kill_mutated_call_arguments(
+                expression,
+                &mut output,
+                self.resolution,
+                self.mutations,
+            ),
+            NodeAction::None => {}
+        }
+        output
+    }
+
+    fn join(&self, state: &mut Self::State, incoming: &Self::State) -> bool {
+        if !incoming.reachable {
+            return false;
+        }
+        if !state.reachable {
+            *state = incoming.clone();
+            return true;
+        }
+
+        let merged = joined_facts(&state.facts, &incoming.facts);
+        if state.facts == merged {
+            false
+        } else {
+            state.facts = merged;
+            true
+        }
+    }
+}
+
+fn joined_facts(
+    left: &BTreeMap<BindingId, Fact>,
+    right: &BTreeMap<BindingId, Fact>,
+) -> BTreeMap<BindingId, Fact> {
+    left.iter()
+        .filter_map(|(binding, fact)| {
+            right
+                .get(binding)
+                .and_then(|right| join_fact(fact, right))
+                .map(|fact| (*binding, fact))
+        })
+        .collect()
+}
+
+fn joined_state(left: &State, right: &State) -> State {
+    State {
+        reachable: left.reachable || right.reachable,
+        facts: joined_facts(&left.facts, &right.facts),
+    }
+}
+
+fn join_fact(left: &Fact, right: &Fact) -> Option<Fact> {
+    if left == right {
+        return Some(left.clone());
+    }
+
+    match (left, right) {
+        (Fact::Exact(_), Fact::Exact(_))
+        | (Fact::Exact(_), Fact::NonNull)
+        | (Fact::NonNull, Fact::Exact(_)) => Some(Fact::NonNull),
+        _ => None,
+    }
+}
+
+fn transfer_statement(
+    statement: &Stmt,
+    state: &mut State,
+    resolution: &Resolution,
+    mutations: &MutationCatalog,
+    nullability: &NullabilityCatalog,
+) {
+    match statement {
+        Stmt::VarDecl(declaration) => transfer_declaration(
+            declaration.span,
+            &declaration.initializer,
+            state,
+            resolution,
+            mutations,
+            nullability,
+        ),
+        Stmt::Assignment(assignment) => transfer_assignment(
+            &assignment.target,
+            &assignment.op,
+            &assignment.value,
+            state,
+            resolution,
+            mutations,
+            nullability,
+        ),
+        Stmt::Increment(increment) => {
+            kill_mutated_call_arguments(&increment.target, state, resolution, mutations);
+            mark_mutated_scalar_non_null(&increment.target, state, resolution);
+        }
+        Stmt::Echo { expr, .. } | Stmt::Expr { expr, .. } => {
+            kill_mutated_call_arguments(expr, state, resolution, mutations);
+        }
+        Stmt::Return { expr, .. } => {
+            if let Some(expr) = expr {
+                kill_mutated_call_arguments(expr, state, resolution, mutations);
+            }
+        }
+        Stmt::If(_)
+        | Stmt::While(_)
+        | Stmt::For(_)
+        | Stmt::Foreach(_)
+        | Stmt::Break { .. }
+        | Stmt::Continue { .. } => {}
+    }
+}
+
+fn transfer_declaration(
+    span: Span,
+    initializer: &Expr,
+    state: &mut State,
+    resolution: &Resolution,
+    mutations: &MutationCatalog,
+    nullability: &NullabilityCatalog,
+) {
+    kill_mutated_call_arguments(initializer, state, resolution, mutations);
+    if let Some(binding) = resolution.declarations.get(&span.start) {
+        set_from_value(*binding, initializer, state, resolution, nullability);
+    }
+}
+
+fn transfer_assignment(
+    target: &Expr,
+    op: &crate::ast::AssignOp,
+    value: &Expr,
+    state: &mut State,
+    resolution: &Resolution,
+    mutations: &MutationCatalog,
+    nullability: &NullabilityCatalog,
+) {
+    kill_mutated_call_arguments(target, state, resolution, mutations);
+    kill_mutated_call_arguments(value, state, resolution, mutations);
+    if let Some(binding) = variable_binding(target, resolution) {
+        if matches!(op, crate::ast::AssignOp::Assign) {
+            set_from_value(binding, value, state, resolution, nullability);
+        } else {
+            state.facts.insert(binding, Fact::NonNull);
+        }
+    }
+}
+
+fn mark_mutated_scalar_non_null(target: &Expr, state: &mut State, resolution: &Resolution) {
+    if let Some(binding) = variable_binding(target, resolution) {
+        state.facts.insert(binding, Fact::NonNull);
+    }
+}
+
+fn kill_target(target: &Expr, state: &mut State, resolution: &Resolution) {
+    if let Some(binding) = variable_binding(target, resolution) {
+        state.facts.remove(&binding);
+    }
+}
+
+fn apply_condition_with_effects(
+    condition: &Expr,
+    truth: bool,
+    state: &mut State,
+    resolution: &Resolution,
+    mutations: &MutationCatalog,
+) {
+    match ungroup(condition) {
+        Expr::Unary {
+            op: crate::ast::UnaryOp::Not,
+            expr,
+            ..
+        } => apply_condition_with_effects(expr, !truth, state, resolution, mutations),
+        Expr::Binary {
+            left,
+            op: crate::ast::BinaryOp::And,
+            right,
+            ..
+        } if truth => {
+            apply_condition_with_effects(left, true, state, resolution, mutations);
+            apply_condition_with_effects(right, true, state, resolution, mutations);
+        }
+        Expr::Binary {
+            left,
+            op: crate::ast::BinaryOp::Or,
+            right,
+            ..
+        } if !truth => {
+            apply_condition_with_effects(left, false, state, resolution, mutations);
+            apply_condition_with_effects(right, false, state, resolution, mutations);
+        }
+        _ => {
+            kill_mutated_call_arguments(condition, state, resolution, mutations);
+            apply_condition(condition, truth, state, resolution);
+        }
+    }
+}
+
+fn kill_mutated_call_arguments(
+    expr: &Expr,
+    state: &mut State,
+    resolution: &Resolution,
+    mutations: &MutationCatalog,
+) {
+    match expr {
+        Expr::PropertyAccess { object, .. }
+        | Expr::Grouped { expr: object, .. }
+        | Expr::Unary { expr: object, .. }
+        | Expr::IsType { expr: object, .. } => {
+            kill_mutated_call_arguments(object, state, resolution, mutations)
+        }
+        Expr::MethodCall {
+            object,
+            method,
+            args,
+            null_safe,
+            ..
+        } => {
+            kill_mutated_call_arguments(object, state, resolution, mutations);
+            let apply_arguments = |state: &mut State| {
+                kill_calls_in_arguments(args, state, resolution, mutations);
+                kill_arguments_for_modes(
+                    args,
+                    mutations.instance_method_modes(object, method, resolution, state),
+                    state,
+                    resolution,
+                );
+            };
+            match call_execution(*null_safe, object, state, resolution) {
+                CallExecution::Never => {}
+                CallExecution::Maybe => {
+                    let mut evaluated = state.clone();
+                    assume_non_null(object, &mut evaluated, resolution);
+                    apply_arguments(&mut evaluated);
+                    *state = joined_state(state, &evaluated);
+                }
+                CallExecution::Always => apply_arguments(state),
+            }
+        }
+        Expr::FunctionCall { name, args, .. } => {
+            kill_calls_in_arguments(args, state, resolution, mutations);
+            kill_arguments_for_modes(args, mutations.function_modes(name), state, resolution);
+        }
+        Expr::StaticCall {
+            qualifier,
+            method,
+            args,
+            ..
+        } => {
+            kill_calls_in_arguments(args, state, resolution, mutations);
+            kill_arguments_for_modes(
+                args,
+                mutations.static_method_modes(qualifier, method, resolution),
+                state,
+                resolution,
+            );
+        }
+        Expr::New {
+            class_name, args, ..
+        } => {
+            kill_calls_in_arguments(args, state, resolution, mutations);
+            kill_arguments_for_modes(
+                args,
+                mutations.constructor_modes(class_name),
+                state,
+                resolution,
+            );
+        }
+        Expr::InterpolatedString { parts, .. } => {
+            for part in parts {
+                if let crate::ast::InterpolatedStringPart::Expr(expr) = part {
+                    kill_mutated_call_arguments(expr, state, resolution, mutations);
+                }
+            }
+        }
+        Expr::Array { elements, .. } => {
+            for element in elements {
+                if let Some(key) = &element.key {
+                    kill_mutated_call_arguments(key, state, resolution, mutations);
+                }
+                kill_mutated_call_arguments(&element.value, state, resolution, mutations);
+            }
+        }
+        Expr::Binary {
+            left,
+            op: crate::ast::BinaryOp::And,
+            right,
+            ..
+        } => kill_short_circuit_effects(left, right, true, state, resolution, mutations),
+        Expr::Binary {
+            left,
+            op: crate::ast::BinaryOp::Or,
+            right,
+            ..
+        } => kill_short_circuit_effects(left, right, false, state, resolution, mutations),
+        Expr::Binary {
+            left,
+            op: crate::ast::BinaryOp::Coalesce,
+            right,
+            ..
+        } => {
+            kill_mutated_call_arguments(left, state, resolution, mutations);
+            let left_fact = expression_fact(left, state, resolution, &resolution.nullability);
+            if matches!(left_fact, Some(Fact::NonNull | Fact::Exact(_))) {
+                return;
+            }
+            if matches!(left_fact, Some(Fact::Null)) {
+                kill_mutated_call_arguments(right, state, resolution, mutations);
+                return;
+            }
+
+            let mut fallback = state.clone();
+            if let Some(binding) = variable_binding(left, resolution) {
+                fallback.facts.insert(binding, Fact::Null);
+            }
+            kill_mutated_call_arguments(right, &mut fallback, resolution, mutations);
+            state.facts = joined_facts(&state.facts, &fallback.facts);
+        }
+        Expr::Binary { left, right, .. }
+        | Expr::Range {
+            start: left,
+            end: right,
+            ..
+        } => {
+            kill_mutated_call_arguments(left, state, resolution, mutations);
+            kill_mutated_call_arguments(right, state, resolution, mutations);
+        }
+        Expr::Variable { .. }
+        | Expr::This { .. }
+        | Expr::Identifier { .. }
+        | Expr::String { .. }
+        | Expr::Int { .. }
+        | Expr::Float { .. }
+        | Expr::Bool { .. }
+        | Expr::Null { .. }
+        | Expr::StaticMember { .. } => {}
+    }
+}
+
+fn kill_short_circuit_effects(
+    left: &Expr,
+    right: &Expr,
+    continue_when: bool,
+    state: &mut State,
+    resolution: &Resolution,
+    mutations: &MutationCatalog,
+) {
+    kill_mutated_call_arguments(left, state, resolution, mutations);
+    let left_constant = crate::ownership::constant_bool(left);
+
+    let mut evaluated = state.clone();
+    apply_condition(left, continue_when, &mut evaluated, resolution);
+    kill_mutated_call_arguments(right, &mut evaluated, resolution, mutations);
+
+    match left_constant {
+        Some(value) if value == continue_when => *state = evaluated,
+        Some(_) => {}
+        None => {
+            let mut skipped = state.clone();
+            apply_condition(left, !continue_when, &mut skipped, resolution);
+            *state = joined_state(&skipped, &evaluated);
+        }
+    }
+}
+
+fn kill_calls_in_arguments(
+    args: &[Expr],
+    state: &mut State,
+    resolution: &Resolution,
+    mutations: &MutationCatalog,
+) {
+    for argument in args {
+        kill_mutated_call_arguments(argument, state, resolution, mutations);
+    }
+}
+
+fn kill_arguments_for_modes(
+    args: &[Expr],
+    modes: Option<&[bool]>,
+    state: &mut State,
+    resolution: &Resolution,
+) {
+    let Some(modes) = modes else {
+        return;
+    };
+    for (argument, mutable) in args.iter().zip(modes) {
+        if *mutable {
+            kill_target(argument, state, resolution);
+        }
+    }
+}
+
+fn assume_non_null(expr: &Expr, state: &mut State, resolution: &Resolution) {
+    if let Some(binding) = variable_binding(expr, resolution) {
+        if !matches!(state.facts.get(&binding), Some(Fact::Exact(_))) {
+            state.facts.insert(binding, Fact::NonNull);
+        }
+    }
+}
+
+fn call_execution(
+    null_safe: bool,
+    receiver: &Expr,
+    state: &State,
+    resolution: &Resolution,
+) -> CallExecution {
+    if !null_safe {
+        return CallExecution::Always;
+    }
+    match expression_fact(receiver, state, resolution, &resolution.nullability) {
+        Some(Fact::Null) => CallExecution::Never,
+        Some(Fact::NonNull | Fact::Exact(_)) => CallExecution::Always,
+        None => CallExecution::Maybe,
+    }
+}
+
+fn set_from_value(
+    binding: BindingId,
+    value: &Expr,
+    state: &mut State,
+    resolution: &Resolution,
+    nullability: &NullabilityCatalog,
+) {
+    let fact = expression_fact(value, state, resolution, nullability);
+    if let Some(fact) = fact {
+        state.facts.insert(binding, fact);
+    } else {
+        state.facts.remove(&binding);
+    }
+}
+
+fn expression_fact(
+    value: &Expr,
+    state: &State,
+    resolution: &Resolution,
+    nullability: &NullabilityCatalog,
+) -> Option<Fact> {
+    let value = ungroup(value);
+    match value {
+        Expr::Null { .. } => Some(Fact::Null),
+        Expr::String { .. }
+        | Expr::InterpolatedString { .. }
+        | Expr::Int { .. }
+        | Expr::Float { .. }
+        | Expr::Bool { .. }
+        | Expr::Array { .. }
+        | Expr::Range { .. }
+        | Expr::New { .. }
+        | Expr::This { .. }
+        | Expr::Unary { .. }
+        | Expr::IsType { .. } => Some(Fact::NonNull),
+        Expr::Variable { .. } => variable_binding(value, resolution).and_then(|binding| {
+            state.facts.get(&binding).cloned().or_else(|| {
+                resolution
+                    .declaration_types
+                    .get(&binding)
+                    .and_then(Option::as_ref)
+                    .filter(|ty| !ty.nullable)
+                    .map(|_| Fact::NonNull)
+            })
+        }),
+        Expr::FunctionCall { name, .. } => nullability
+            .function_is_non_null(name)
+            .filter(|non_null| *non_null)
+            .map(|_| Fact::NonNull),
+        Expr::MethodCall {
+            object,
+            method,
+            null_safe,
+            ..
+        } => (!null_safe)
+            .then(|| nullability.instance_method_is_non_null(object, method, resolution, state))
+            .flatten()
+            .filter(|non_null| *non_null)
+            .map(|_| Fact::NonNull),
+        Expr::StaticCall {
+            qualifier, method, ..
+        } => nullability
+            .static_method_is_non_null(qualifier, method, resolution)
+            .filter(|non_null| *non_null)
+            .map(|_| Fact::NonNull),
+        Expr::PropertyAccess {
+            object,
+            property,
+            null_safe,
+            ..
+        } => (!null_safe)
+            .then(|| nullability.instance_property_is_non_null(object, property, resolution, state))
+            .flatten()
+            .filter(|non_null| *non_null)
+            .map(|_| Fact::NonNull),
+        Expr::StaticMember {
+            qualifier, member, ..
+        } => nullability
+            .static_property_is_non_null(qualifier, member, resolution)
+            .filter(|non_null| *non_null)
+            .map(|_| Fact::NonNull),
+        Expr::Binary {
+            left,
+            op: crate::ast::BinaryOp::Coalesce,
+            right,
+            ..
+        } => {
+            let left = expression_fact(left, state, resolution, nullability);
+            let right = expression_fact(right, state, resolution, nullability);
+            match (left, right) {
+                (Some(exact @ Fact::Exact(_)), _) => Some(exact),
+                (Some(Fact::NonNull), _) => Some(Fact::NonNull),
+                (Some(Fact::Null), selected) => selected,
+                (None, Some(Fact::NonNull | Fact::Exact(_))) => Some(Fact::NonNull),
+                _ => None,
+            }
+        }
+        Expr::Binary { .. } => Some(Fact::NonNull),
+        Expr::Identifier { .. } | Expr::Grouped { .. } => None,
+    }
+}
+
+fn apply_condition(condition: &Expr, truth: bool, state: &mut State, resolution: &Resolution) {
+    match ungroup(condition) {
+        Expr::Unary {
+            op: crate::ast::UnaryOp::Not,
+            expr,
+            ..
+        } => apply_condition(expr, !truth, state, resolution),
+        Expr::Binary {
+            left,
+            op: crate::ast::BinaryOp::And,
+            right,
+            ..
+        } if truth => {
+            apply_condition(left, true, state, resolution);
+            apply_condition(right, true, state, resolution);
+        }
+        Expr::Binary {
+            left,
+            op: crate::ast::BinaryOp::Or,
+            right,
+            ..
+        } if !truth => {
+            apply_condition(left, false, state, resolution);
+            apply_condition(right, false, state, resolution);
+        }
+        Expr::Binary {
+            left,
+            op: crate::ast::BinaryOp::Equal | crate::ast::BinaryOp::NotEqual,
+            right,
+            ..
+        } => {
+            let equality = matches!(
+                ungroup(condition),
+                Expr::Binary {
+                    op: crate::ast::BinaryOp::Equal,
+                    ..
+                }
+            );
+            let non_null = truth != equality;
+            let variable = match (ungroup(left), ungroup(right)) {
+                (Expr::Variable { .. }, Expr::Null { .. }) => variable_binding(left, resolution),
+                (Expr::Null { .. }, Expr::Variable { .. }) => variable_binding(right, resolution),
+                _ => None,
+            };
+            if let Some(variable) = variable {
+                state
+                    .facts
+                    .insert(variable, if non_null { Fact::NonNull } else { Fact::Null });
+            }
+        }
+        Expr::IsType { expr, ty, .. } if truth => {
+            if let Some(variable) = variable_binding(expr, resolution) {
+                state.facts.insert(variable, Fact::Exact(ty.clone()));
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_action_facts(
+    action: &NodeAction,
+    state: &State,
+    resolution: &Resolution,
+    mutations: &MutationCatalog,
+    facts: &mut FactsByUse,
+) {
+    match action {
+        NodeAction::Statement(statement) => {
+            collect_statement(statement, state, resolution, mutations, facts)
+        }
+        NodeAction::Expression(expression)
+        | NodeAction::Assume {
+            condition: expression,
+            ..
+        } => {
+            collect_expr(expression, state, resolution, mutations, facts);
+        }
+        NodeAction::ForInitializer(initializer) => match initializer {
+            ForInitializer::VarDecl(declaration) => {
+                collect_expr(
+                    &declaration.initializer,
+                    state,
+                    resolution,
+                    mutations,
+                    facts,
+                );
+            }
+            ForInitializer::Assignment(assignment) => {
+                let state = collect_expr(&assignment.target, state, resolution, mutations, facts);
+                collect_expr(&assignment.value, &state, resolution, mutations, facts);
+            }
+        },
+        NodeAction::ForIncrement(increment) => match increment {
+            ForIncrement::Increment(increment) => {
+                collect_expr(&increment.target, state, resolution, mutations, facts);
+            }
+            ForIncrement::Assignment(assignment) => {
+                let state = collect_expr(&assignment.target, state, resolution, mutations, facts);
+                collect_expr(&assignment.value, &state, resolution, mutations, facts);
+            }
+        },
+        NodeAction::None => {}
+    }
+}
+
+fn collect_statement(
+    statement: &Stmt,
+    state: &State,
+    resolution: &Resolution,
+    mutations: &MutationCatalog,
+    facts: &mut FactsByUse,
+) {
+    match statement {
+        Stmt::VarDecl(declaration) => {
+            collect_expr(
+                &declaration.initializer,
+                state,
+                resolution,
+                mutations,
+                facts,
+            );
+        }
+        Stmt::Assignment(assignment) => {
+            let state = collect_expr(&assignment.target, state, resolution, mutations, facts);
+            collect_expr(&assignment.value, &state, resolution, mutations, facts);
+        }
+        Stmt::Echo { expr, .. } | Stmt::Expr { expr, .. } => {
+            collect_expr(expr, state, resolution, mutations, facts);
+        }
+        Stmt::Return { expr, .. } => {
+            if let Some(expr) = expr {
+                collect_expr(expr, state, resolution, mutations, facts);
+            }
+        }
+        Stmt::Increment(increment) => {
+            collect_expr(&increment.target, state, resolution, mutations, facts);
+        }
+        Stmt::If(_)
+        | Stmt::While(_)
+        | Stmt::For(_)
+        | Stmt::Foreach(_)
+        | Stmt::Break { .. }
+        | Stmt::Continue { .. } => {}
+    }
+}
+
+fn collect_expr(
+    expr: &Expr,
+    state: &State,
+    resolution: &Resolution,
+    mutations: &MutationCatalog,
+    facts: &mut FactsByUse,
+) -> State {
+    if let Expr::Variable { span, .. } = expr {
+        if let Some(binding) = resolution.uses.get(&(span.start, span.end)) {
+            if let Some(fact) = state.facts.get(binding) {
+                facts.insert((span.start, span.end), fact.clone());
+            }
+        }
+        return state.clone();
+    }
+
+    match expr {
+        Expr::PropertyAccess { object, .. }
+        | Expr::Grouped { expr: object, .. }
+        | Expr::Unary { expr: object, .. }
+        | Expr::IsType { expr: object, .. } => {
+            collect_expr(object, state, resolution, mutations, facts)
+        }
+        Expr::MethodCall {
+            object,
+            method,
+            args,
+            null_safe,
+            ..
+        } => {
+            let state = collect_expr(object, state, resolution, mutations, facts);
+            let collect_arguments = |state: &State, facts: &mut FactsByUse| {
+                let mut state = collect_expr_sequence(args, state, resolution, mutations, facts);
+                let modes = mutations.instance_method_modes(object, method, resolution, &state);
+                kill_arguments_for_modes(args, modes, &mut state, resolution);
+                state
+            };
+            match call_execution(*null_safe, object, &state, resolution) {
+                CallExecution::Never => state,
+                CallExecution::Maybe => {
+                    let mut evaluated = state.clone();
+                    assume_non_null(object, &mut evaluated, resolution);
+                    let evaluated = collect_arguments(&evaluated, facts);
+                    joined_state(&state, &evaluated)
+                }
+                CallExecution::Always => collect_arguments(&state, facts),
+            }
+        }
+        Expr::FunctionCall { name, args, .. } => {
+            let mut state = collect_expr_sequence(args, state, resolution, mutations, facts);
+            kill_arguments_for_modes(args, mutations.function_modes(name), &mut state, resolution);
+            state
+        }
+        Expr::StaticCall {
+            qualifier,
+            method,
+            args,
+            ..
+        } => {
+            let mut state = collect_expr_sequence(args, state, resolution, mutations, facts);
+            kill_arguments_for_modes(
+                args,
+                mutations.static_method_modes(qualifier, method, resolution),
+                &mut state,
+                resolution,
+            );
+            state
+        }
+        Expr::New {
+            class_name, args, ..
+        } => {
+            let mut state = collect_expr_sequence(args, state, resolution, mutations, facts);
+            kill_arguments_for_modes(
+                args,
+                mutations.constructor_modes(class_name),
+                &mut state,
+                resolution,
+            );
+            state
+        }
+        Expr::InterpolatedString { parts, .. } => {
+            let mut state = state.clone();
+            for part in parts {
+                if let crate::ast::InterpolatedStringPart::Expr(expr) = part {
+                    state = collect_expr(expr, &state, resolution, mutations, facts);
+                }
+            }
+            state
+        }
+        Expr::Array { elements, .. } => {
+            let mut state = state.clone();
+            for element in elements {
+                if let Some(key) = &element.key {
+                    state = collect_expr(key, &state, resolution, mutations, facts);
+                }
+                state = collect_expr(&element.value, &state, resolution, mutations, facts);
+            }
+            state
+        }
+        Expr::Binary {
+            left,
+            op: crate::ast::BinaryOp::And,
+            right,
+            ..
+        } => collect_short_circuit(left, right, true, state, resolution, mutations, facts),
+        Expr::Binary {
+            left,
+            op: crate::ast::BinaryOp::Or,
+            right,
+            ..
+        } => collect_short_circuit(left, right, false, state, resolution, mutations, facts),
+        Expr::Binary {
+            left,
+            op: crate::ast::BinaryOp::Coalesce,
+            right,
+            ..
+        } => {
+            let left_state = collect_expr(left, state, resolution, mutations, facts);
+            let left_fact = expression_fact(left, &left_state, resolution, &resolution.nullability);
+            let mut fallback_input = left_state.clone();
+            if !matches!(left_fact, Some(Fact::NonNull | Fact::Exact(_))) {
+                if let Some(binding) = variable_binding(left, resolution) {
+                    fallback_input.facts.insert(binding, Fact::Null);
+                }
+            }
+            let fallback = collect_expr(right, &fallback_input, resolution, mutations, facts);
+            match left_fact {
+                Some(Fact::NonNull | Fact::Exact(_)) => left_state,
+                Some(Fact::Null) => fallback,
+                None => State {
+                    reachable: left_state.reachable || fallback.reachable,
+                    facts: joined_facts(&left_state.facts, &fallback.facts),
+                },
+            }
+        }
+        Expr::Binary { left, right, .. }
+        | Expr::Range {
+            start: left,
+            end: right,
+            ..
+        } => {
+            let state = collect_expr(left, state, resolution, mutations, facts);
+            collect_expr(right, &state, resolution, mutations, facts)
+        }
+        Expr::This { .. }
+        | Expr::Identifier { .. }
+        | Expr::String { .. }
+        | Expr::Int { .. }
+        | Expr::Float { .. }
+        | Expr::Bool { .. }
+        | Expr::Null { .. }
+        | Expr::StaticMember { .. }
+        | Expr::Variable { .. } => state.clone(),
+    }
+}
+
+fn collect_short_circuit(
+    left: &Expr,
+    right: &Expr,
+    continue_when: bool,
+    state: &State,
+    resolution: &Resolution,
+    mutations: &MutationCatalog,
+    facts: &mut FactsByUse,
+) -> State {
+    collect_expr(left, state, resolution, mutations, facts);
+    let mut evaluated = state.clone();
+    apply_condition_with_effects(left, continue_when, &mut evaluated, resolution, mutations);
+    collect_expr(right, &evaluated, resolution, mutations, facts);
+
+    let mut result = state.clone();
+    kill_short_circuit_effects(
+        left,
+        right,
+        continue_when,
+        &mut result,
+        resolution,
+        mutations,
+    );
+    result
+}
+
+fn collect_expr_sequence(
+    expressions: &[Expr],
+    state: &State,
+    resolution: &Resolution,
+    mutations: &MutationCatalog,
+    facts: &mut FactsByUse,
+) -> State {
+    expressions.iter().fold(state.clone(), |state, expression| {
+        collect_expr(expression, &state, resolution, mutations, facts)
+    })
+}
+
+fn variable_binding(expr: &Expr, resolution: &Resolution) -> Option<BindingId> {
+    let Expr::Variable { span, .. } = ungroup(expr) else {
+        return None;
+    };
+    resolution.uses.get(&(span.start, span.end)).copied()
+}
+
+fn expression_class_name(
+    expr: &Expr,
+    resolution: &Resolution,
+    state: Option<&State>,
+) -> Option<String> {
+    match ungroup(expr) {
+        Expr::New { class_name, .. } => Some(class_name.clone()),
+        Expr::This { .. } => resolution.current_class.clone(),
+        Expr::Variable { .. } => {
+            let binding = variable_binding(expr, resolution)?;
+            if let Some(Fact::Exact(ty)) = state.and_then(|state| state.facts.get(&binding)) {
+                return class_name_in(ty, resolution.current_class.as_deref().unwrap_or(&ty.name));
+            }
+            resolution.declaration_classes.get(&binding).cloned()
+        }
+        Expr::PropertyAccess {
+            object, property, ..
+        } => {
+            let class = expression_class_name(object, resolution, state)?;
+            resolution
+                .member_classes
+                .properties
+                .get(&(class, property.clone()))
+                .cloned()
+        }
+        Expr::MethodCall { object, method, .. } => {
+            let class = expression_class_name(object, resolution, state)?;
+            resolution
+                .member_classes
+                .methods
+                .get(&(class, method.clone()))
+                .cloned()
+        }
+        Expr::StaticMember {
+            qualifier, member, ..
+        } => {
+            let class = static_qualifier_class_name(qualifier, resolution)?;
+            resolution
+                .member_classes
+                .properties
+                .get(&(class, member.clone()))
+                .cloned()
+        }
+        Expr::StaticCall {
+            qualifier, method, ..
+        } => {
+            let class = static_qualifier_class_name(qualifier, resolution)?;
+            resolution
+                .member_classes
+                .methods
+                .get(&(class, method.clone()))
+                .cloned()
+        }
+        _ => None,
+    }
+}
+
+fn static_qualifier_class_name(
+    qualifier: &crate::ast::StaticQualifier,
+    resolution: &Resolution,
+) -> Option<String> {
+    match qualifier {
+        crate::ast::StaticQualifier::Class(class) => Some(class.clone()),
+        crate::ast::StaticQualifier::SelfType => resolution.current_class.clone(),
+        crate::ast::StaticQualifier::Parent | crate::ast::StaticQualifier::InvalidStatic => None,
+    }
+}
+
+fn ungroup(mut expr: &Expr) -> &Expr {
+    while let Expr::Grouped { expr: inner, .. } = expr {
+        expr = inner;
+    }
+    expr
+}
+
+struct Resolver {
+    next_binding: usize,
+    scopes: Vec<HashMap<String, BindingId>>,
+    resolution: Resolution,
+}
+
+impl Resolver {
+    fn resolve(
+        body: &Block,
+        params: &[Param],
+        current_class: Option<&str>,
+        nullability: &NullabilityCatalog,
+        member_classes: &MemberClassCatalog,
+    ) -> Resolution {
+        let mut resolver = Self {
+            next_binding: 0,
+            scopes: vec![HashMap::new()],
+            resolution: Resolution {
+                current_class: current_class.map(str::to_string),
+                nullability: nullability.clone(),
+                member_classes: member_classes.clone(),
+                ..Resolution::default()
+            },
+        };
+        for parameter in params {
+            resolver.declare(
+                &parameter.name,
+                parameter.span.start,
+                Some(parameter.ty.clone()),
+            );
+        }
+        resolver.resolve_statements(&body.statements);
+        resolver.resolution
+    }
+
+    fn declare(&mut self, name: &str, span_start: usize, ty: Option<TypeRef>) -> BindingId {
+        let id = BindingId(self.next_binding);
+        self.next_binding += 1;
+        self.scopes
+            .last_mut()
+            .expect("scope")
+            .insert(name.to_string(), id);
+        self.resolution.declarations.insert(span_start, id);
+        if let Some(ty) = ty.as_ref().filter(|ty| ty.args.is_empty()) {
+            let class_name = if ty.name == "self" {
+                self.resolution
+                    .current_class
+                    .clone()
+                    .unwrap_or_else(|| ty.name.clone())
+            } else {
+                ty.name.clone()
+            };
+            self.resolution.declaration_classes.insert(id, class_name);
+        }
+        self.resolution.declaration_types.insert(id, ty);
+        id
+    }
+
+    fn resolve_statements(&mut self, statements: &[Stmt]) {
+        for statement in statements {
+            self.resolve_statement(statement);
+        }
+    }
+
+    fn resolve_block(&mut self, block: &Block) {
+        self.scopes.push(HashMap::new());
+        self.resolve_statements(&block.statements);
+        self.scopes.pop();
+    }
+
+    fn resolve_statement(&mut self, statement: &Stmt) {
+        match statement {
+            Stmt::VarDecl(declaration) => {
+                self.resolve_expr(&declaration.initializer);
+                let inferred_class = self.resolved_expr_class(&declaration.initializer);
+                let binding = self.declare(
+                    &declaration.name,
+                    declaration.span.start,
+                    declaration.ty.clone(),
+                );
+                if declaration.ty.is_none() {
+                    if let Some(class) = inferred_class {
+                        self.resolution.declaration_classes.insert(binding, class);
+                    }
+                }
+            }
+            Stmt::Assignment(assignment) => {
+                self.resolve_expr(&assignment.target);
+                self.resolve_expr(&assignment.value);
+            }
+            Stmt::Echo { expr, .. } | Stmt::Expr { expr, .. } => self.resolve_expr(expr),
+            Stmt::Return { expr, .. } => {
+                if let Some(expr) = expr {
+                    self.resolve_expr(expr);
+                }
+            }
+            Stmt::If(statement) => {
+                self.resolve_expr(&statement.condition);
+                self.resolve_block(&statement.then_block);
+                if let Some(branch) = &statement.else_branch {
+                    match branch {
+                        ElseBranch::If(statement) => {
+                            self.resolve_statement(&Stmt::If((**statement).clone()))
+                        }
+                        ElseBranch::Block(block) => self.resolve_block(block),
+                    }
+                }
+            }
+            Stmt::While(statement) => {
+                self.resolve_expr(&statement.condition);
+                self.resolve_block(&statement.body);
+            }
+            Stmt::For(statement) => {
+                self.scopes.push(HashMap::new());
+                if let Some(initializer) = &statement.initializer {
+                    match initializer {
+                        ForInitializer::VarDecl(declaration) => {
+                            self.resolve_expr(&declaration.initializer);
+                            let inferred_class = self.resolved_expr_class(&declaration.initializer);
+                            let binding = self.declare(
+                                &declaration.name,
+                                declaration.span.start,
+                                declaration.ty.clone(),
+                            );
+                            if declaration.ty.is_none() {
+                                if let Some(class) = inferred_class {
+                                    self.resolution.declaration_classes.insert(binding, class);
+                                }
+                            }
+                        }
+                        ForInitializer::Assignment(assignment) => {
+                            self.resolve_expr(&assignment.target);
+                            self.resolve_expr(&assignment.value);
+                        }
+                    }
+                }
+                if let Some(condition) = &statement.condition {
+                    self.resolve_expr(condition);
+                }
+                self.resolve_block(&statement.body);
+                if let Some(increment) = &statement.increment {
+                    match increment {
+                        ForIncrement::Increment(increment) => self.resolve_expr(&increment.target),
+                        ForIncrement::Assignment(assignment) => {
+                            self.resolve_expr(&assignment.target);
+                            self.resolve_expr(&assignment.value);
+                        }
+                    }
+                }
+                self.scopes.pop();
+            }
+            Stmt::Foreach(statement) => {
+                self.resolve_expr(&statement.iterable);
+                self.scopes.push(HashMap::new());
+                if let Some(key) = &statement.key {
+                    self.declare(&key.name, statement.span.start, key.ty.clone());
+                }
+                self.declare(
+                    &statement.value.name,
+                    statement.span.start.saturating_add(1),
+                    statement.value.ty.clone(),
+                );
+                self.resolve_statements(&statement.body.statements);
+                self.scopes.pop();
+            }
+            Stmt::Increment(increment) => self.resolve_expr(&increment.target),
+            Stmt::Break { .. } | Stmt::Continue { .. } => {}
+        }
+    }
+
+    fn resolve_expr(&mut self, expr: &Expr) {
+        if let Expr::Variable { name, span } = expr {
+            if let Some(binding) = self
+                .scopes
+                .iter()
+                .rev()
+                .find_map(|scope| scope.get(name))
+                .copied()
+            {
+                self.resolution.uses.insert((span.start, span.end), binding);
+            }
+            return;
+        }
+        match expr {
+            Expr::PropertyAccess { object, .. }
+            | Expr::Grouped { expr: object, .. }
+            | Expr::Unary { expr: object, .. }
+            | Expr::IsType { expr: object, .. } => self.resolve_expr(object),
+            Expr::MethodCall { object, args, .. } => {
+                self.resolve_expr(object);
+                for argument in args {
+                    self.resolve_expr(argument);
+                }
+            }
+            Expr::FunctionCall { args, .. }
+            | Expr::StaticCall { args, .. }
+            | Expr::New { args, .. } => {
+                for argument in args {
+                    self.resolve_expr(argument);
+                }
+            }
+            Expr::InterpolatedString { parts, .. } => {
+                for part in parts {
+                    if let crate::ast::InterpolatedStringPart::Expr(expr) = part {
+                        self.resolve_expr(expr);
+                    }
+                }
+            }
+            Expr::Array { elements, .. } => {
+                for element in elements {
+                    if let Some(key) = &element.key {
+                        self.resolve_expr(key);
+                    }
+                    self.resolve_expr(&element.value);
+                }
+            }
+            Expr::Binary { left, right, .. }
+            | Expr::Range {
+                start: left,
+                end: right,
+                ..
+            } => {
+                self.resolve_expr(left);
+                self.resolve_expr(right);
+            }
+            Expr::This { .. }
+            | Expr::Identifier { .. }
+            | Expr::String { .. }
+            | Expr::Int { .. }
+            | Expr::Float { .. }
+            | Expr::Bool { .. }
+            | Expr::Null { .. }
+            | Expr::StaticMember { .. }
+            | Expr::Variable { .. } => {}
+        }
+    }
+
+    fn resolved_expr_class(&self, expr: &Expr) -> Option<String> {
+        expression_class_name(expr, &self.resolution, None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ordinary_constructor_parameters_do_not_become_property_type_facts() {
+        let mut program = crate::parse_source(
+            "constructor-parameter-facts.doria",
+            r#"
+class Right {}
+class Wrong {}
+class Owner
+{
+    Right $item;
+    function __construct(Wrong $item) {}
+}
+"#,
+        )
+        .expect("fixture should parse");
+
+        let Item::Class(owner) = &mut program.items[2] else {
+            panic!("expected Owner class");
+        };
+        let crate::ast::ClassMember::Method(constructor) = &mut owner.members[1] else {
+            panic!("expected constructor");
+        };
+        constructor.params[0].promoted_access = None;
+
+        let catalog = MemberClassCatalog::from_program(&program);
+        assert_eq!(
+            catalog
+                .properties
+                .get(&("Owner".to_string(), "item".to_string()))
+                .map(String::as_str),
+            Some("Right")
+        );
+    }
+}

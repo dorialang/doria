@@ -149,8 +149,10 @@ pub struct Local {
 pub enum Type {
     Scalar(ScalarType),
     String,
+    NullableScalar(ScalarType),
     NullableString,
     Class(ClassId),
+    NullableClass(ClassId),
 }
 
 impl From<ScalarType> for Type {
@@ -170,6 +172,7 @@ pub struct BasicBlock {
 pub enum Operand {
     Scalar(ScalarValue),
     Local(LocalId),
+    NullablePayload(LocalId),
     Static(StaticId),
     Property {
         object: LocalId,
@@ -181,8 +184,10 @@ pub enum Operand {
 pub enum Rvalue {
     Value(ValueExpression),
     String(StringExpression),
+    NullableScalar(NullableScalarExpression),
     NullableString(NullableStringExpression),
     Class(ClassExpression),
+    NullableClass(NullableClassExpression),
 }
 
 impl Rvalue {
@@ -190,8 +195,77 @@ impl Rvalue {
         match self {
             Self::Value(value) => Type::Scalar(value.ty()),
             Self::String(_) => Type::String,
+            Self::NullableScalar(value) => Type::NullableScalar(value.ty()),
             Self::NullableString(_) => Type::NullableString,
             Self::Class(value) => Type::Class(value.class()),
+            Self::NullableClass(value) => Type::NullableClass(value.class()),
+        }
+    }
+
+    pub const fn owned_temporary_class(&self) -> Option<ClassId> {
+        match self {
+            Self::Class(value) => value.owned_temporary_class(),
+            Self::NullableClass(value) => value.owned_temporary_class(),
+            Self::Value(_)
+            | Self::String(_)
+            | Self::NullableScalar(_)
+            | Self::NullableString(_) => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NullableScalarExpression {
+    Null(ScalarType),
+    Value(ValueExpression),
+    Local {
+        ty: ScalarType,
+        local: LocalId,
+    },
+    Property {
+        ty: ScalarType,
+        object: LocalId,
+        property: PropertyId,
+    },
+    Static {
+        ty: ScalarType,
+        id: StaticId,
+    },
+    Call {
+        ty: ScalarType,
+        function: FunctionId,
+        args: Vec<Rvalue>,
+    },
+    NullSafeProperty {
+        ty: ScalarType,
+        object: Box<NullableClassExpression>,
+        property: PropertyId,
+    },
+    NullSafeCall {
+        ty: ScalarType,
+        object: Box<NullableClassExpression>,
+        function: FunctionId,
+        args: Vec<Rvalue>,
+    },
+    Coalesce {
+        ty: ScalarType,
+        left: Box<NullableScalarExpression>,
+        right: Box<NullableScalarExpression>,
+    },
+}
+
+impl NullableScalarExpression {
+    pub const fn ty(&self) -> ScalarType {
+        match self {
+            Self::Null(ty)
+            | Self::Local { ty, .. }
+            | Self::Property { ty, .. }
+            | Self::Static { ty, .. }
+            | Self::Call { ty, .. }
+            | Self::NullSafeProperty { ty, .. }
+            | Self::NullSafeCall { ty, .. }
+            | Self::Coalesce { ty, .. } => *ty,
+            Self::Value(value) => value.ty(),
         }
     }
 }
@@ -220,6 +294,17 @@ pub enum ClassExpression {
         constructor: Option<FunctionId>,
         args: Vec<Rvalue>,
     },
+    NullableLocalAssumeNonNull {
+        class: ClassId,
+        local: LocalId,
+        transfer: bool,
+    },
+    Coalesce {
+        class: ClassId,
+        left: Box<NullableClassExpression>,
+        right: Box<ClassExpression>,
+        transfer: bool,
+    },
 }
 
 impl ClassExpression {
@@ -228,7 +313,9 @@ impl ClassExpression {
             Self::Local { class, .. }
             | Self::Property { class, .. }
             | Self::Call { class, .. }
-            | Self::New { class, .. } => *class,
+            | Self::New { class, .. }
+            | Self::NullableLocalAssumeNonNull { class, .. }
+            | Self::Coalesce { class, .. } => *class,
         }
     }
 
@@ -242,6 +329,8 @@ impl ClassExpression {
             } => Some(*class),
             Self::Local { .. }
             | Self::Property { .. }
+            | Self::NullableLocalAssumeNonNull { .. }
+            | Self::Coalesce { .. }
             | Self::Call {
                 return_borrow: Some(_),
                 ..
@@ -329,6 +418,11 @@ pub enum IntegerExpression {
         function: FunctionId,
         args: Vec<Rvalue>,
     },
+    Coalesce {
+        ty: IntegerType,
+        left: Box<NullableScalarExpression>,
+        right: Box<IntegerExpression>,
+    },
 }
 
 impl IntegerExpression {
@@ -338,7 +432,8 @@ impl IntegerExpression {
             | Self::Unary { ty, .. }
             | Self::Binary { ty, .. }
             | Self::Convert { ty, .. }
-            | Self::Call { ty, .. } => *ty,
+            | Self::Call { ty, .. }
+            | Self::Coalesce { ty, .. } => *ty,
             Self::FloatToInt { .. } => IntegerType::Int64,
         }
     }
@@ -387,6 +482,11 @@ pub enum FloatExpression {
         function: FunctionId,
         args: Vec<Rvalue>,
     },
+    Coalesce {
+        ty: FloatType,
+        left: Box<NullableScalarExpression>,
+        right: Box<FloatExpression>,
+    },
 }
 
 impl FloatExpression {
@@ -395,7 +495,8 @@ impl FloatExpression {
             Self::Use { ty, .. }
             | Self::Negate { ty, .. }
             | Self::Binary { ty, .. }
-            | Self::Call { ty, .. } => *ty,
+            | Self::Call { ty, .. }
+            | Self::Coalesce { ty, .. } => *ty,
             Self::IntToFloat { .. } => FloatType::Float64,
         }
     }
@@ -426,6 +527,10 @@ pub enum StringExpression {
     },
     ReadFile(Box<StringExpression>),
     Format(Box<FormatExpression>),
+    Coalesce {
+        left: Box<NullableStringExpression>,
+        right: Box<StringExpression>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -443,6 +548,103 @@ pub enum NullableStringExpression {
         function: FunctionId,
         args: Vec<Rvalue>,
     },
+    NullSafeProperty {
+        object: Box<NullableClassExpression>,
+        property: PropertyId,
+    },
+    NullSafeCall {
+        object: Box<NullableClassExpression>,
+        function: FunctionId,
+        args: Vec<Rvalue>,
+    },
+    Coalesce {
+        left: Box<NullableStringExpression>,
+        right: Box<NullableStringExpression>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NullableClassExpression {
+    Null(ClassId),
+    Class(ClassExpression),
+    Local {
+        class: ClassId,
+        local: LocalId,
+        transfer: bool,
+    },
+    Property {
+        class: ClassId,
+        object: LocalId,
+        property: PropertyId,
+    },
+    Call {
+        class: ClassId,
+        function: FunctionId,
+        args: Vec<Rvalue>,
+        return_borrow: Option<ReturnBorrow>,
+    },
+    NullSafeProperty {
+        class: ClassId,
+        object: Box<NullableClassExpression>,
+        property: PropertyId,
+    },
+    NullSafeCall {
+        class: ClassId,
+        object: Box<NullableClassExpression>,
+        function: FunctionId,
+        args: Vec<Rvalue>,
+        return_borrow: Option<ReturnBorrow>,
+    },
+    Coalesce {
+        class: ClassId,
+        left: Box<NullableClassExpression>,
+        right: Box<NullableClassExpression>,
+        transfer: bool,
+    },
+}
+
+impl NullableClassExpression {
+    pub const fn class(&self) -> ClassId {
+        match self {
+            Self::Null(class)
+            | Self::Local { class, .. }
+            | Self::Property { class, .. }
+            | Self::Call { class, .. }
+            | Self::NullSafeProperty { class, .. }
+            | Self::NullSafeCall { class, .. }
+            | Self::Coalesce { class, .. } => *class,
+            Self::Class(value) => value.class(),
+        }
+    }
+
+    pub const fn owned_temporary_class(&self) -> Option<ClassId> {
+        match self {
+            Self::Class(value) => value.owned_temporary_class(),
+            Self::Call {
+                class,
+                return_borrow: None,
+                ..
+            }
+            | Self::NullSafeCall {
+                class,
+                return_borrow: None,
+                ..
+            } => Some(*class),
+            Self::Null(_)
+            | Self::Local { .. }
+            | Self::Property { .. }
+            | Self::Call {
+                return_borrow: Some(_),
+                ..
+            }
+            | Self::NullSafeProperty { .. }
+            | Self::Coalesce { .. }
+            | Self::NullSafeCall {
+                return_borrow: Some(_),
+                ..
+            } => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -478,6 +680,8 @@ pub enum BoolExpression {
         left: Box<NullableStringExpression>,
         right: Box<NullableStringExpression>,
     },
+    NullableScalarIsPresent(Box<NullableScalarExpression>),
+    NullableClassIsPresent(Box<NullableClassExpression>),
     Not(Box<BoolExpression>),
     Binary {
         op: BoolBinaryOp,
@@ -487,6 +691,10 @@ pub enum BoolExpression {
     Call {
         function: FunctionId,
         args: Vec<Rvalue>,
+    },
+    Coalesce {
+        left: Box<NullableScalarExpression>,
+        right: Box<BoolExpression>,
     },
 }
 
@@ -520,6 +728,11 @@ pub enum Statement {
         args: Vec<Rvalue>,
     },
     CallBorrowed {
+        function: FunctionId,
+        args: Vec<Rvalue>,
+    },
+    CallNullSafe {
+        object: NullableClassExpression,
         function: FunctionId,
         args: Vec<Rvalue>,
     },
@@ -585,6 +798,13 @@ fn statement_class_temporary_capacity(statement: &Statement) -> usize {
         Statement::CallVoid { args, .. } | Statement::CallBorrowed { args, .. } => {
             args.iter().map(rvalue_class_temporary_capacity).sum()
         }
+        Statement::CallNullSafe { object, args, .. } => {
+            nullable_class_temporary_capacity(object)
+                + args
+                    .iter()
+                    .map(rvalue_class_temporary_capacity)
+                    .sum::<usize>()
+        }
         Statement::Printf(format) => format_class_temporary_capacity(format),
         Statement::WriteFile { path, contents } => {
             string_class_temporary_capacity(path) + string_class_temporary_capacity(contents)
@@ -605,8 +825,10 @@ fn rvalue_class_temporary_capacity(value: &Rvalue) -> usize {
     match value {
         Rvalue::Value(value) => value_class_temporary_capacity(value),
         Rvalue::String(value) => string_class_temporary_capacity(value),
+        Rvalue::NullableScalar(value) => nullable_scalar_class_temporary_capacity(value),
         Rvalue::NullableString(value) => nullable_string_class_temporary_capacity(value),
         Rvalue::Class(value) => class_expression_temporary_capacity(value),
+        Rvalue::NullableClass(value) => nullable_class_temporary_capacity(value),
     }
 }
 
@@ -632,6 +854,9 @@ fn integer_class_temporary_capacity(value: &IntegerExpression) -> usize {
         IntegerExpression::Call { args, .. } => {
             args.iter().map(rvalue_class_temporary_capacity).sum()
         }
+        IntegerExpression::Coalesce { left, right, .. } => {
+            nullable_scalar_class_temporary_capacity(left) + integer_class_temporary_capacity(right)
+        }
     }
 }
 
@@ -646,6 +871,9 @@ fn float_class_temporary_capacity(value: &FloatExpression) -> usize {
         FloatExpression::Call { args, .. } => {
             args.iter().map(rvalue_class_temporary_capacity).sum()
         }
+        FloatExpression::Coalesce { left, right, .. } => {
+            nullable_scalar_class_temporary_capacity(left) + float_class_temporary_capacity(right)
+        }
     }
 }
 
@@ -658,6 +886,9 @@ fn string_class_temporary_capacity(value: &StringExpression) -> usize {
         }
         StringExpression::ReadFile(path) => string_class_temporary_capacity(path),
         StringExpression::Format(format) => format_class_temporary_capacity(format),
+        StringExpression::Coalesce { left, right } => {
+            nullable_string_class_temporary_capacity(left) + string_class_temporary_capacity(right)
+        }
         StringExpression::Literal(_)
         | StringExpression::Local(_)
         | StringExpression::NullableLocalAssumeNonNull(_)
@@ -672,6 +903,20 @@ fn nullable_string_class_temporary_capacity(value: &NullableStringExpression) ->
         NullableStringExpression::Call { args, .. } => {
             args.iter().map(rvalue_class_temporary_capacity).sum()
         }
+        NullableStringExpression::NullSafeProperty { object, .. } => {
+            nullable_class_temporary_capacity(object)
+        }
+        NullableStringExpression::NullSafeCall { object, args, .. } => {
+            nullable_class_temporary_capacity(object)
+                + args
+                    .iter()
+                    .map(rvalue_class_temporary_capacity)
+                    .sum::<usize>()
+        }
+        NullableStringExpression::Coalesce { left, right } => {
+            nullable_string_class_temporary_capacity(left)
+                + nullable_string_class_temporary_capacity(right)
+        }
         NullableStringExpression::Null
         | NullableStringExpression::Local(_)
         | NullableStringExpression::Static(_)
@@ -682,7 +927,9 @@ fn nullable_string_class_temporary_capacity(value: &NullableStringExpression) ->
 
 fn class_expression_temporary_capacity(value: &ClassExpression) -> usize {
     match value {
-        ClassExpression::Local { .. } | ClassExpression::Property { .. } => 0,
+        ClassExpression::Local { .. }
+        | ClassExpression::Property { .. }
+        | ClassExpression::NullableLocalAssumeNonNull { .. } => 0,
         ClassExpression::Call { args, .. } => {
             usize::from(value.owned_temporary_class().is_some())
                 + args
@@ -708,6 +955,66 @@ fn class_expression_temporary_capacity(value: &ClassExpression) -> usize {
                     .map(rvalue_class_temporary_capacity)
                     .sum::<usize>()
         }
+        ClassExpression::Coalesce { left, right, .. } => {
+            nullable_class_temporary_capacity(left) + class_expression_temporary_capacity(right)
+        }
+    }
+}
+
+fn nullable_scalar_class_temporary_capacity(value: &NullableScalarExpression) -> usize {
+    match value {
+        NullableScalarExpression::Value(value) => value_class_temporary_capacity(value),
+        NullableScalarExpression::Call { args, .. } => {
+            args.iter().map(rvalue_class_temporary_capacity).sum()
+        }
+        NullableScalarExpression::NullSafeProperty { object, .. } => {
+            nullable_class_temporary_capacity(object)
+        }
+        NullableScalarExpression::NullSafeCall { object, args, .. } => {
+            nullable_class_temporary_capacity(object)
+                + args
+                    .iter()
+                    .map(rvalue_class_temporary_capacity)
+                    .sum::<usize>()
+        }
+        NullableScalarExpression::Coalesce { left, right, .. } => {
+            nullable_scalar_class_temporary_capacity(left)
+                + nullable_scalar_class_temporary_capacity(right)
+        }
+        NullableScalarExpression::Null(_)
+        | NullableScalarExpression::Local { .. }
+        | NullableScalarExpression::Property { .. }
+        | NullableScalarExpression::Static { .. } => 0,
+    }
+}
+
+fn nullable_class_temporary_capacity(value: &NullableClassExpression) -> usize {
+    match value {
+        NullableClassExpression::Class(value) => class_expression_temporary_capacity(value),
+        NullableClassExpression::Call { args, .. } => {
+            usize::from(value.owned_temporary_class().is_some())
+                + args
+                    .iter()
+                    .map(rvalue_class_temporary_capacity)
+                    .sum::<usize>()
+        }
+        NullableClassExpression::NullSafeCall { object, args, .. } => {
+            usize::from(value.owned_temporary_class().is_some())
+                + nullable_class_temporary_capacity(object)
+                + args
+                    .iter()
+                    .map(rvalue_class_temporary_capacity)
+                    .sum::<usize>()
+        }
+        NullableClassExpression::NullSafeProperty { object, .. } => {
+            nullable_class_temporary_capacity(object)
+        }
+        NullableClassExpression::Coalesce { left, right, .. } => {
+            nullable_class_temporary_capacity(left) + nullable_class_temporary_capacity(right)
+        }
+        NullableClassExpression::Null(_)
+        | NullableClassExpression::Local { .. }
+        | NullableClassExpression::Property { .. } => 0,
     }
 }
 
@@ -724,11 +1031,18 @@ pub(crate) fn bool_class_temporary_capacity(value: &BoolExpression) -> usize {
             nullable_string_class_temporary_capacity(left)
                 + nullable_string_class_temporary_capacity(right)
         }
+        BoolExpression::NullableScalarIsPresent(value) => {
+            nullable_scalar_class_temporary_capacity(value)
+        }
+        BoolExpression::NullableClassIsPresent(value) => nullable_class_temporary_capacity(value),
         BoolExpression::Not(value) => bool_class_temporary_capacity(value),
         BoolExpression::Binary { left, right, .. } => {
             bool_class_temporary_capacity(left) + bool_class_temporary_capacity(right)
         }
         BoolExpression::Call { args, .. } => args.iter().map(rvalue_class_temporary_capacity).sum(),
+        BoolExpression::Coalesce { left, right } => {
+            nullable_scalar_class_temporary_capacity(left) + bool_class_temporary_capacity(right)
+        }
     }
 }
 
@@ -824,8 +1138,10 @@ impl fmt::Display for Type {
         match self {
             Type::Scalar(ty) => write!(formatter, "{ty}"),
             Type::String => write!(formatter, "string"),
+            Type::NullableScalar(ty) => write!(formatter, "?{ty}"),
             Type::NullableString => write!(formatter, "?string"),
             Type::Class(class) => write!(formatter, "class#{}", class.0),
+            Type::NullableClass(class) => write!(formatter, "?class#{}", class.0),
         }
     }
 }
@@ -845,6 +1161,7 @@ impl fmt::Display for Operand {
         match self {
             Operand::Scalar(value) => write!(formatter, "{value}"),
             Operand::Local(id) => write!(formatter, "local{}", id.0),
+            Operand::NullablePayload(id) => write!(formatter, "payload(local{})", id.0),
             Operand::Static(id) => write!(formatter, "static{}", id.0),
             Operand::Property { object, property } => {
                 write!(
@@ -862,8 +1179,10 @@ impl fmt::Display for Rvalue {
         match self {
             Rvalue::Value(expression) => write!(formatter, "{expression}"),
             Rvalue::String(value) => write!(formatter, "{value}"),
+            Rvalue::NullableScalar(value) => write!(formatter, "{value}"),
             Rvalue::NullableString(value) => write!(formatter, "{value}"),
             Rvalue::Class(value) => write!(formatter, "{value}"),
+            Rvalue::NullableClass(value) => write!(formatter, "{value}"),
         }
     }
 }
@@ -894,6 +1213,18 @@ impl fmt::Display for ClassExpression {
                 write!(formatter, "call fn{} -> class#{}", function.0, class.0)
             }
             Self::New { class, .. } => write!(formatter, "new class#{}", class.0),
+            Self::NullableLocalAssumeNonNull {
+                class,
+                local,
+                transfer,
+            } => write!(
+                formatter,
+                "{} nonnull(local{}): class#{}",
+                if *transfer { "move" } else { "borrow" },
+                local.0,
+                class.0
+            ),
+            Self::Coalesce { left, right, .. } => write!(formatter, "({left} ?? {right})"),
         }
     }
 }
@@ -963,6 +1294,9 @@ impl fmt::Display for IntegerExpression {
             IntegerExpression::Use { ty, operand } => match operand {
                 Operand::Scalar(ScalarValue::Integer(value)) => write!(formatter, "{value}: {ty}"),
                 Operand::Local(id) => write!(formatter, "local{}: {ty}", id.0),
+                Operand::NullablePayload(id) => {
+                    write!(formatter, "payload(local{}): {ty}", id.0)
+                }
                 Operand::Static(id) => write!(formatter, "static{}: {ty}", id.0),
                 Operand::Property { object, property } => write!(
                     formatter,
@@ -990,6 +1324,9 @@ impl fmt::Display for IntegerExpression {
                 write_call(formatter, *function, args)?;
                 write!(formatter, ": {ty}")
             }
+            IntegerExpression::Coalesce { ty, left, right } => {
+                write!(formatter, "({left} ?? {right}): {ty}")
+            }
         }
     }
 }
@@ -1011,6 +1348,9 @@ impl fmt::Display for FloatExpression {
             Self::Use { ty, operand } => match operand {
                 Operand::Scalar(ScalarValue::Float(value)) => write!(formatter, "{value}: {ty}"),
                 Operand::Local(id) => write!(formatter, "local{}: {ty}", id.0),
+                Operand::NullablePayload(id) => {
+                    write!(formatter, "payload(local{}): {ty}", id.0)
+                }
                 Operand::Static(id) => write!(formatter, "static{}: {ty}", id.0),
                 Operand::Property { object, property } => write!(
                     formatter,
@@ -1030,6 +1370,9 @@ impl fmt::Display for FloatExpression {
             Self::Call { ty, function, args } => {
                 write_call(formatter, *function, args)?;
                 write!(formatter, ": {ty}")
+            }
+            Self::Coalesce { ty, left, right } => {
+                write!(formatter, "({left} ?? {right}): {ty}")
             }
         }
     }
@@ -1063,6 +1406,9 @@ impl fmt::Display for StringExpression {
             StringExpression::Call { function, args } => write_call(formatter, *function, args),
             StringExpression::ReadFile(path) => write!(formatter, "read_file({path})"),
             StringExpression::Format(format) => write!(formatter, "format({format})"),
+            StringExpression::Coalesce { left, right } => {
+                write!(formatter, "({left} ?? {right})")
+            }
         }
     }
 }
@@ -1079,6 +1425,18 @@ impl fmt::Display for NullableStringExpression {
             Self::Static(id) => write!(formatter, "static{}", id.0),
             Self::ReadLine => formatter.write_str("read_line()"),
             Self::Call { function, args } => write_call(formatter, *function, args),
+            Self::NullSafeProperty { object, property } => {
+                write!(formatter, "{object}?->property{}", property.index)
+            }
+            Self::NullSafeCall {
+                object,
+                function,
+                args,
+            } => {
+                write!(formatter, "{object}?->")?;
+                write_call(formatter, *function, args)
+            }
+            Self::Coalesce { left, right } => write!(formatter, "({left} ?? {right})"),
         }
     }
 }
@@ -1113,6 +1471,9 @@ impl fmt::Display for BoolExpression {
             Self::Use { operand } => match operand {
                 Operand::Scalar(ScalarValue::Bool(value)) => write!(formatter, "{value}: bool"),
                 Operand::Local(id) => write!(formatter, "local{}: bool", id.0),
+                Operand::NullablePayload(id) => {
+                    write!(formatter, "payload(local{}): bool", id.0)
+                }
                 Operand::Static(id) => write!(formatter, "static{}: bool", id.0),
                 Operand::Property { object, property } => {
                     write!(
@@ -1128,11 +1489,77 @@ impl fmt::Display for BoolExpression {
             Self::NullableStringCompare { op, left, right } => {
                 write!(formatter, "{left} {op} {right}")
             }
+            Self::NullableScalarIsPresent(value) => write!(formatter, "present({value})"),
+            Self::NullableClassIsPresent(value) => write!(formatter, "present({value})"),
             Self::Not(condition) => write!(formatter, "!({condition})"),
             Self::Binary { op, left, right } => {
                 write!(formatter, "({left}) {op} ({right})")
             }
             Self::Call { function, args } => write_call(formatter, *function, args),
+            Self::Coalesce { left, right } => write!(formatter, "({left} ?? {right})"),
+        }
+    }
+}
+
+impl fmt::Display for NullableScalarExpression {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Null(ty) => write!(formatter, "null: ?{ty}"),
+            Self::Value(value) => write!(formatter, "some({value})"),
+            Self::Local { local, .. } => write!(formatter, "local{}", local.0),
+            Self::Property {
+                object, property, ..
+            } => {
+                write!(formatter, "local{}->property{}", object.0, property.index)
+            }
+            Self::Static { id, .. } => write!(formatter, "static{}", id.0),
+            Self::Call { function, args, .. } => write_call(formatter, *function, args),
+            Self::NullSafeProperty {
+                object, property, ..
+            } => {
+                write!(formatter, "{object}?->property{}", property.index)
+            }
+            Self::NullSafeCall {
+                object,
+                function,
+                args,
+                ..
+            } => {
+                write!(formatter, "{object}?->")?;
+                write_call(formatter, *function, args)
+            }
+            Self::Coalesce { left, right, .. } => write!(formatter, "({left} ?? {right})"),
+        }
+    }
+}
+
+impl fmt::Display for NullableClassExpression {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Null(class) => write!(formatter, "null: ?class#{}", class.0),
+            Self::Class(value) => write!(formatter, "some({value})"),
+            Self::Local { local, .. } => write!(formatter, "local{}", local.0),
+            Self::Property {
+                object, property, ..
+            } => {
+                write!(formatter, "local{}->property{}", object.0, property.index)
+            }
+            Self::Call { function, args, .. } => write_call(formatter, *function, args),
+            Self::NullSafeProperty {
+                object, property, ..
+            } => {
+                write!(formatter, "{object}?->property{}", property.index)
+            }
+            Self::NullSafeCall {
+                object,
+                function,
+                args,
+                ..
+            } => {
+                write!(formatter, "{object}?->")?;
+                write_call(formatter, *function, args)
+            }
+            Self::Coalesce { left, right, .. } => write!(formatter, "({left} ?? {right})"),
         }
     }
 }
@@ -1171,6 +1598,14 @@ impl fmt::Display for Statement {
             }
             Statement::EchoString(value) => write!(formatter, "echo {value}"),
             Statement::CallVoid { function, args } | Statement::CallBorrowed { function, args } => {
+                write_call(formatter, *function, args)
+            }
+            Statement::CallNullSafe {
+                object,
+                function,
+                args,
+            } => {
+                write!(formatter, "null_safe {object} -> ")?;
                 write_call(formatter, *function, args)
             }
             Statement::Printf(format) => write!(formatter, "printf {format}"),

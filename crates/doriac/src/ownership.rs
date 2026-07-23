@@ -8,6 +8,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::ast::{self, AssignOp, BinaryOp, ClassMember, Expr, Item, Stmt};
 use crate::diagnostics::Diagnostic;
+use crate::narrowing::{Fact, FactsByUse};
 use crate::source::Span;
 use crate::symbols::{BorrowSource, ReturnBorrow};
 
@@ -35,6 +36,13 @@ enum State {
     Owned,
     Given { at: Span },
     MaybeGiven { at: Span },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CallExecution {
+    Always,
+    Never,
+    Maybe,
 }
 
 #[derive(Debug, Clone)]
@@ -129,13 +137,15 @@ fn join_state(left: &State, right: &State) -> State {
 }
 
 pub fn check_program(program: &ast::Program) -> Vec<Diagnostic> {
-    check_program_with_inferred_move_returns(program, &HashSet::new(), &HashMap::new())
+    let flow_facts = crate::narrowing::analyze_program(program);
+    check_program_with_inferred_move_returns(program, &HashSet::new(), &HashMap::new(), &flow_facts)
 }
 
 pub(crate) fn check_program_with_inferred_move_returns(
     program: &ast::Program,
     inferred_move_returns: &HashSet<usize>,
     return_borrows: &HashMap<usize, ReturnBorrow>,
+    flow_facts: &FactsByUse,
 ) -> Vec<Diagnostic> {
     let classes = program
         .items
@@ -246,6 +256,7 @@ pub(crate) fn check_program_with_inferred_move_returns(
         active_assignment_writes: HashSet::new(),
         active_assignment_targets: HashSet::new(),
         active_borrows: Vec::new(),
+        flow_facts,
         diagnostics: Vec::new(),
     };
     let mut top_level_scopes = Scopes::new();
@@ -507,6 +518,12 @@ fn expr_return_borrow(
                 })
         }
         Expr::Grouped { expr, .. } => expr_return_borrow(expr, function, resolve_call, shadowed),
+        Expr::Binary {
+            left,
+            op: BinaryOp::Coalesce,
+            right,
+            ..
+        } => coalesced_return_borrow(left, right, function, resolve_call, shadowed),
         Expr::PropertyAccess { object, .. } => {
             let mut direct_object = object.as_ref();
             while let Expr::Grouped { expr, .. } = direct_object {
@@ -530,6 +547,39 @@ fn expr_return_borrow(
         }
         _ => None,
     }
+}
+
+fn coalesced_return_borrow(
+    left: &Expr,
+    right: &Expr,
+    function: &ast::FunctionDecl,
+    resolve_call: &mut dyn FnMut(&Expr) -> Option<ReturnBorrow>,
+    shadowed: &HashSet<String>,
+) -> Option<ReturnBorrow> {
+    let left_null = matches!(ungroup_expr(left), Expr::Null { .. });
+    let right_null = matches!(ungroup_expr(right), Expr::Null { .. });
+    let left = (!left_null)
+        .then(|| expr_return_borrow(left, function, resolve_call, shadowed))
+        .flatten();
+    let right = (!right_null)
+        .then(|| expr_return_borrow(right, function, resolve_call, shadowed))
+        .flatten();
+
+    match (left, right, left_null, right_null) {
+        (Some(borrow), None, _, true) | (None, Some(borrow), true, _) => Some(borrow),
+        (Some(mut left), Some(right), _, _) if left.source == right.source => {
+            left.writable &= right.writable;
+            Some(left)
+        }
+        _ => None,
+    }
+}
+
+fn ungroup_expr(mut expr: &Expr) -> &Expr {
+    while let Expr::Grouped { expr: inner, .. } = expr {
+        expr = inner;
+    }
+    expr
 }
 
 fn returned_call_borrow(
@@ -645,7 +695,7 @@ impl Flow {
     }
 }
 
-struct Checker {
+struct Checker<'a> {
     classes: HashSet<String>,
     signatures: HashMap<String, Signature>,
     constructors: HashMap<String, Signature>,
@@ -660,10 +710,11 @@ struct Checker {
     active_assignment_writes: HashSet<String>,
     active_assignment_targets: HashSet<String>,
     active_borrows: Vec<ActiveBorrow>,
+    flow_facts: &'a FactsByUse,
     diagnostics: Vec<Diagnostic>,
 }
 
-impl Checker {
+impl Checker<'_> {
     fn check_function(&mut self, function: &ast::FunctionDecl, receiver_class: Option<&str>) {
         let previous_receiver =
             std::mem::replace(&mut self.receiver_class, receiver_class.map(str::to_owned));
@@ -1403,7 +1454,7 @@ impl Checker {
             }
             Expr::FunctionCall { name, args, .. } => {
                 let signature = self.signatures.get(name).cloned().unwrap_or_default();
-                self.use_call_args(None, args, &signature, scopes);
+                self.use_call_args(None, args, &signature, CallExecution::Always, scopes);
             }
             Expr::New {
                 class_name, args, ..
@@ -1413,19 +1464,21 @@ impl Checker {
                     .get(class_name)
                     .cloned()
                     .unwrap_or_default();
-                self.use_call_args(None, args, &signature, scopes);
+                self.use_call_args(None, args, &signature, CallExecution::Always, scopes);
             }
             Expr::MethodCall {
                 object,
                 method,
                 args,
+                null_safe,
                 ..
             } => {
                 let signature = self
                     .expr_class(object, scopes)
                     .and_then(|class| self.methods.get(&(class, method.clone())).cloned())
                     .unwrap_or_default();
-                self.use_call_args(Some(object), args, &signature, scopes);
+                let execution = self.method_call_execution(*null_safe, object);
+                self.use_call_args(Some(object), args, &signature, execution, scopes);
             }
             Expr::StaticCall {
                 qualifier,
@@ -1438,7 +1491,7 @@ impl Checker {
                     .and_then(|class_name| self.methods.get(&(class_name, method.clone())))
                     .cloned()
                     .unwrap_or_default();
-                self.use_call_args(None, args, &signature, scopes);
+                self.use_call_args(None, args, &signature, CallExecution::Always, scopes);
             }
             Expr::InterpolatedString { parts, .. } => {
                 let borrow_depth = self.active_borrows.len();
@@ -1468,6 +1521,7 @@ impl Checker {
                 self.active_borrows.truncate(borrow_depth);
             }
             Expr::Unary { expr, .. } => self.use_expr(expr, scopes, UseMode::Read),
+            Expr::IsType { expr, .. } => self.use_expr(expr, scopes, UseMode::Read),
             Expr::Binary {
                 left,
                 op: op @ (BinaryOp::And | BinaryOp::Or),
@@ -1489,6 +1543,37 @@ impl Checker {
                     }
                 }
                 self.active_borrows.truncate(borrow_depth);
+            }
+            Expr::Binary {
+                left,
+                op: BinaryOp::Coalesce,
+                right,
+                ..
+            } => {
+                match self.flow_fact(left) {
+                    Some(Fact::NonNull | Fact::Exact(_)) => {
+                        self.use_expr(left, scopes, mode);
+                        return;
+                    }
+                    Some(Fact::Null) => {
+                        self.use_expr(left, scopes, UseMode::Read);
+                        self.use_expr(right, scopes, mode);
+                        return;
+                    }
+                    None if matches!(ungroup_expr(left), Expr::Null { .. }) => {
+                        self.use_expr(left, scopes, UseMode::Read);
+                        self.use_expr(right, scopes, mode);
+                        return;
+                    }
+                    None => {}
+                }
+                let before = scopes.clone();
+                let mut selected = before.clone();
+                self.use_expr(left, &mut selected, mode);
+                let mut fallback = before;
+                self.use_expr(left, &mut fallback, UseMode::Read);
+                self.use_expr(right, &mut fallback, mode);
+                scopes.merge_from(&selected, &fallback);
             }
             Expr::Binary { left, right, .. }
             | Expr::Range {
@@ -1555,16 +1640,22 @@ impl Checker {
         receiver: Option<&Expr>,
         args: &[Expr],
         signature: &Signature,
+        execution: CallExecution,
         scopes: &mut Scopes,
     ) {
         let borrow_depth = self.active_borrows.len();
         if let Some(receiver) = receiver {
             self.use_expr(receiver, scopes, UseMode::Read);
             self.activate_place_input_borrows(receiver, scopes);
+            if execution == CallExecution::Never {
+                self.active_borrows.truncate(borrow_depth);
+                return;
+            }
             if let Some(mode) = signature.receiver {
                 self.activate_call_borrow(receiver, mode, scopes);
             }
         }
+        let without_call = (execution == CallExecution::Maybe).then(|| scopes.clone());
         for (index, arg) in args.iter().enumerate() {
             let mode = call_arg_mode(signature, index);
             if mode == UseMode::Write
@@ -1615,7 +1706,27 @@ impl Checker {
                 self.activate_call_borrow(arg, mode, scopes);
             }
         }
+        if let Some(without_call) = without_call {
+            let with_call = scopes.clone();
+            scopes.merge_from(&without_call, &with_call);
+        }
         self.active_borrows.truncate(borrow_depth);
+    }
+
+    fn method_call_execution(&self, null_safe: bool, object: &Expr) -> CallExecution {
+        if !null_safe {
+            return CallExecution::Always;
+        }
+        match self.flow_fact(object) {
+            Some(Fact::Null) => CallExecution::Never,
+            Some(Fact::NonNull | Fact::Exact(_)) => CallExecution::Always,
+            None => CallExecution::Maybe,
+        }
+    }
+
+    fn flow_fact(&self, expr: &Expr) -> Option<&Fact> {
+        let expr = ungroup_expr(expr);
+        self.flow_facts.get(&(expr.span().start, expr.span().end))
     }
 
     fn activate_call_borrow(&mut self, expr: &Expr, mode: UseMode, scopes: &Scopes) {
@@ -1708,13 +1819,23 @@ impl Checker {
                 object,
                 method,
                 args,
+                null_safe,
                 ..
             } => {
                 let signature = self
                     .expr_class(object, scopes)
                     .and_then(|class| self.methods.get(&(class, method.clone())).cloned())
                     .unwrap_or_default();
-                self.activate_nested_call_property_borrows(Some(object), args, &signature, scopes);
+                if self.method_call_execution(*null_safe, object) == CallExecution::Never {
+                    self.activate_nested_property_borrows(object, scopes);
+                } else {
+                    self.activate_nested_call_property_borrows(
+                        Some(object),
+                        args,
+                        &signature,
+                        scopes,
+                    );
+                }
             }
             Expr::StaticCall {
                 qualifier,
@@ -1790,6 +1911,7 @@ impl Checker {
                 object,
                 property,
                 span,
+                ..
             } => self.readonly_writable_path(object, scopes).or_else(|| {
                 self.expr_class(object, scopes)
                     .and_then(|class| self.properties.get(&(class, property.clone())))
@@ -2095,6 +2217,12 @@ impl Checker {
                     .is_some_and(|property| property.move_type)
             }
             Expr::This { .. } => self.receiver_class.is_some(),
+            Expr::Binary {
+                left,
+                op: BinaryOp::Coalesce,
+                right,
+                ..
+            } => self.expr_is_move_value(left, scopes) || self.expr_is_move_value(right, scopes),
             _ => false,
         }
     }
@@ -2120,6 +2248,12 @@ impl Checker {
                 .qualifier_class(qualifier)
                 .and_then(|class| self.methods.get(&(class, method.clone())))
                 .is_some_and(|signature| signature.return_borrow.is_some()),
+            Expr::Binary {
+                left,
+                op: BinaryOp::Coalesce,
+                right,
+                ..
+            } => self.expr_returns_borrow(left, scopes) || self.expr_returns_borrow(right, scopes),
             _ => false,
         }
     }
@@ -2158,6 +2292,19 @@ impl Checker {
                 .and_then(|signature| signature.returns.clone()),
             Expr::This { .. } => self.receiver_class.clone(),
             Expr::Grouped { expr, .. } => self.expr_class(expr, scopes),
+            Expr::Binary {
+                left,
+                op: BinaryOp::Coalesce,
+                right,
+                ..
+            } => match (
+                self.expr_class(left, scopes),
+                self.expr_class(right, scopes),
+            ) {
+                (Some(left), Some(right)) if left == right => Some(left),
+                (Some(class), None) | (None, Some(class)) => Some(class),
+                _ => None,
+            },
             _ => None,
         }
     }
@@ -2221,7 +2368,7 @@ fn type_ref_class_name(
     classes.contains(name).then(|| name.to_string())
 }
 
-fn type_ref_is_move_type(
+pub(crate) fn type_ref_is_move_type(
     ty: &crate::types::TypeRef,
     classes: &HashSet<String>,
     receiver_class: Option<&str>,
@@ -2246,7 +2393,7 @@ fn call_arg_mode(signature: &Signature, index: usize) -> UseMode {
     }
 }
 
-fn constant_bool(expr: &Expr) -> Option<bool> {
+pub(crate) fn constant_bool(expr: &Expr) -> Option<bool> {
     match expr {
         Expr::Bool { value, .. } => Some(*value),
         Expr::Grouped { expr, .. } => constant_bool(expr),

@@ -14,6 +14,7 @@ Documentation role: working note. This file prevents duplicated in-flight work. 
 - Stage 20 statically resolved instance/static methods, Copy-type static properties, class/top-level constants, `internal` enforcement, and concrete native `Displayable` execution are complete on the current branch. Static access is sigil-free, `self` resolves to the declaring class, and one class-level index rejects cross-kind member-name collisions.
 - Stage 20a/20b const-evaluable defaults are complete for Copy scalars and readonly strings across free functions, instance methods, static methods, and constructors through one caller-side MIR splice. Writable Copy scalars remain supported; `?string`, `writable string`, `take string`, and other move/`take` defaults retain explicit temporary diagnostics.
 - Stage 21 non-lexical borrowing, returned-borrow elision, and constructor definite initialization are complete on the current branch. Constructor paths use decision 0090's uninitialized/initialized/maybe-initialized lattice, and shared MIR validation independently enforces the normal-exit and readonly exactly-once invariants.
+- Stage 22 general nullable types, `??`, `?->`, exact `is`, flow-sensitive narrowing, and `mixed` static semantics are complete on the current branch. Narrowing reuses the shared CFG/forward-dataflow framework; nullable scalar, string, and concrete-class values execute through the interpreter, Cranelift, and LLVM.
 - `Shared<T>`/`Weak<T>`/`SharedMut<T>` are rescheduled to Stage 25a, after nullable/narrowing and generic classes provide the machinery their separately unauthored API depends on.
 - The parser accepts generalized `parent::member()` and trait-local `self::member` under the two-clocks rule; semantic checking names Stage 34 and Stage 35 respectively and stops those forms before MIR. `Foo::$prop` and `static::` are permanent errors with precise fixes.
 - Native remains one target: direct compile/run uses the Cranelift fast profile, while `--release` selects LLVM 18 over the same validated typed MIR.
@@ -24,7 +25,7 @@ Documentation role: working note. This file prevents duplicated in-flight work. 
 
 ## Next
 
-- Stage 22 nullable types, narrowing, `is`, and `mixed` static semantics.
+- Stage 23 runtime collections, typed arrays, `Bytes`, and the boxed `mixed` runtime representation.
 
 ## Do not duplicate
 
@@ -37,3 +38,4 @@ Documentation role: working note. This file prevents duplicated in-flight work. 
 - Runtime-initialized and owned statics until separately accepted lifetime/concurrency decisions.
 - Parent lookup/dispatch until Stage 34 and trait composition until Stage 35; their accepted grammar is already represented.
 - `Bytes` until Stage 23.
+- `match` narrowing until Stage 28, hierarchy `is` until Stage 34, and interface `is` until Stage 35.

@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::class_layout::{compute_class_layout, ClassId, FieldType};
+use crate::class_layout::{compute_class_layout, ClassId, FieldType, PropertyId};
 use crate::diagnostics::{Diagnostic, DiagnosticResult};
 use crate::format_string::{self, FormatConversion, FormatPiece};
 use crate::numeric::{parse_decimal_magnitude, FloatType, FloatValue, IntegerType, IntegerValue};
@@ -54,7 +54,8 @@ pub fn lower_program(program: &hir::Program) -> DiagnosticResult<mir::Program> {
         }) {
             let id = mir::StaticId(statics.len());
             let ty = mir_type_ref(&property.ty, &class_ids).ok_or_else(|| {
-                vec![unsupported(
+                vec![unsupported_native_type(
+                    &property.ty,
                     property.span,
                     format!(
                         "static property `{}::{}` has a type not supported by native compilation",
@@ -275,7 +276,8 @@ pub fn lower_program(program: &hir::Program) -> DiagnosticResult<mir::Program> {
                         id: property.id,
                         name: property.name.clone(),
                         ty: mir_type_ref(&property.ty, &class_ids).ok_or_else(|| {
-                            vec![unsupported(
+                            vec![unsupported_native_type(
+                                &property.ty,
                                 Span::default(),
                                 format!(
                                     "property `${}` has a type that is not supported by native class compilation",
@@ -331,24 +333,29 @@ fn lower_static_value(
     match (value, ty) {
         (
             crate::const_eval::ConstValue::Integer(value),
-            mir::Type::Scalar(mir::ScalarType::Integer(expected)),
+            mir::Type::Scalar(mir::ScalarType::Integer(expected))
+            | mir::Type::NullableScalar(mir::ScalarType::Integer(expected)),
         ) if value.ty == expected => {
             Ok(mir::StaticValue::Scalar(mir::ScalarValue::Integer(*value)))
         }
         (
             crate::const_eval::ConstValue::Float(value),
-            mir::Type::Scalar(mir::ScalarType::Float(expected)),
+            mir::Type::Scalar(mir::ScalarType::Float(expected))
+            | mir::Type::NullableScalar(mir::ScalarType::Float(expected)),
         ) if value.ty == expected => Ok(mir::StaticValue::Scalar(mir::ScalarValue::Float(*value))),
-        (crate::const_eval::ConstValue::Bool(value), mir::Type::Scalar(mir::ScalarType::Bool)) => {
-            Ok(mir::StaticValue::Scalar(mir::ScalarValue::Bool(*value)))
-        }
+        (
+            crate::const_eval::ConstValue::Bool(value),
+            mir::Type::Scalar(mir::ScalarType::Bool)
+            | mir::Type::NullableScalar(mir::ScalarType::Bool),
+        ) => Ok(mir::StaticValue::Scalar(mir::ScalarValue::Bool(*value))),
         (
             crate::const_eval::ConstValue::String(value),
             mir::Type::String | mir::Type::NullableString,
         ) => Ok(mir::StaticValue::String(value.clone())),
-        (crate::const_eval::ConstValue::Null, mir::Type::NullableString) => {
-            Ok(mir::StaticValue::Null)
-        }
+        (
+            crate::const_eval::ConstValue::Null,
+            mir::Type::NullableScalar(_) | mir::Type::NullableString | mir::Type::NullableClass(_),
+        ) => Ok(mir::StaticValue::Null),
         _ => Err(vec![unsupported(
             span,
             "evaluated static initializer does not match its native type",
@@ -377,7 +384,8 @@ fn collect_function_signature(
             mir::ReturnType::Value(mir_type_ref(ty, class_ids).expect("checked class return"))
         }
         Some(ty) => {
-            return Err(vec![unsupported(
+            return Err(vec![unsupported_native_type(
+                ty,
                 function.span,
                 format!(
                     "function `{}` has return type `{ty}`, which is not supported by native compilation",
@@ -426,7 +434,8 @@ fn collect_function_signature(
         let parameter_type = if let Some(ty) = mir_type_ref(&param.ty, class_ids) {
             ty
         } else {
-            return Err(vec![unsupported(
+            return Err(vec![unsupported_native_type(
+                &param.ty,
                 param.span,
                 format!(
                     "function `{}` has parameter type `{}`, which is not supported by native compilation",
@@ -434,7 +443,10 @@ fn collect_function_signature(
                 ),
             )]);
         };
-        let transfers = matches!(parameter_type, mir::Type::Class(_)) && param.take;
+        let transfers = matches!(
+            parameter_type,
+            mir::Type::Class(_) | mir::Type::NullableClass(_)
+        ) && param.take;
         let owns = transfers && param.promoted_access.is_none();
         let default = if param.default.is_some() {
             Some(
@@ -514,15 +526,29 @@ fn mir_type_ref(
     ty: &crate::types::TypeRef,
     class_ids: &HashMap<String, ClassId>,
 ) -> Option<mir::Type> {
-    scalar_type_ref(ty)
+    let mut plain = ty.clone();
+    plain.nullable = false;
+    let base = scalar_type_ref(&plain)
         .map(mir::Type::Scalar)
-        .or_else(|| is_plain_type(ty, "string").then_some(mir::Type::String))
-        .or_else(|| is_nullable_string_type(ty).then_some(mir::Type::NullableString))
+        .or_else(|| is_plain_type(&plain, "string").then_some(mir::Type::String))
         .or_else(|| {
-            (!ty.nullable && ty.args.is_empty())
+            ty.args
+                .is_empty()
                 .then(|| class_ids.get(&ty.name).copied().map(mir::Type::Class))
                 .flatten()
+        })?;
+    if ty.nullable {
+        Some(match base {
+            mir::Type::Scalar(ty) => mir::Type::NullableScalar(ty),
+            mir::Type::String => mir::Type::NullableString,
+            mir::Type::Class(class) => mir::Type::NullableClass(class),
+            mir::Type::NullableScalar(_)
+            | mir::Type::NullableString
+            | mir::Type::NullableClass(_) => return None,
         })
+    } else {
+        Some(base)
+    }
 }
 
 fn field_type(ty: mir::Type) -> Option<FieldType> {
@@ -531,23 +557,33 @@ fn field_type(ty: mir::Type) -> Option<FieldType> {
         mir::Type::Scalar(mir::ScalarType::Float(ty)) => Some(FieldType::Float(ty)),
         mir::Type::Scalar(mir::ScalarType::Bool) => Some(FieldType::Bool),
         mir::Type::String => Some(FieldType::String),
+        mir::Type::NullableScalar(mir::ScalarType::Integer(ty)) => {
+            Some(FieldType::NullableInteger(ty))
+        }
+        mir::Type::NullableScalar(mir::ScalarType::Float(ty)) => Some(FieldType::NullableFloat(ty)),
+        mir::Type::NullableScalar(mir::ScalarType::Bool) => Some(FieldType::NullableBool),
         mir::Type::NullableString => Some(FieldType::NullableString),
         mir::Type::Class(class) => Some(FieldType::Class(class)),
+        mir::Type::NullableClass(class) => Some(FieldType::NullableClass(class)),
     }
 }
 
 fn integer_type_ref(ty: &crate::types::TypeRef) -> Option<IntegerType> {
-    ty.args
-        .is_empty()
-        .then(|| IntegerType::from_source_name(&ty.name))
-        .flatten()
+    (!ty.nullable).then_some(()).and_then(|()| {
+        ty.args
+            .is_empty()
+            .then(|| IntegerType::from_source_name(&ty.name))
+            .flatten()
+    })
 }
 
 fn float_type_ref(ty: &crate::types::TypeRef) -> Option<FloatType> {
-    ty.args
-        .is_empty()
-        .then(|| FloatType::from_source_name(&ty.name))
-        .flatten()
+    (!ty.nullable).then_some(()).and_then(|()| {
+        ty.args
+            .is_empty()
+            .then(|| FloatType::from_source_name(&ty.name))
+            .flatten()
+    })
 }
 
 fn scalar_type_ref(ty: &crate::types::TypeRef) -> Option<mir::ScalarType> {
@@ -729,11 +765,18 @@ fn lower_statement_sequence(
                     method,
                     args,
                     span: call_span,
+                    null_safe,
                 } = expr
                 {
-                    let (signature, args) =
-                        lower_instance_method_call(object, method, args, *call_span, context)?;
-                    let statement = discarded_call_statement("method", signature, args, *span)?;
+                    let statement = if *null_safe {
+                        let (object, signature, args) =
+                            lower_null_safe_method_call(object, method, args, *call_span, context)?;
+                        discarded_null_safe_call_statement(object, signature, args, *span)?
+                    } else {
+                        let (signature, args) =
+                            lower_instance_method_call(object, method, args, *call_span, context)?;
+                        discarded_call_statement("method", signature, args, *span)?
+                    };
                     context.push_statement(statement);
                     continue;
                 }
@@ -1183,6 +1226,13 @@ struct LoopTargets {
     cleanup_depth: usize,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CoalesceSelection {
+    Left,
+    Right,
+    Dynamic,
+}
+
 struct LoweringContext<'semantic> {
     signatures: HashMap<String, FunctionSignature>,
     method_signatures: HashMap<(ClassId, String), FunctionSignature>,
@@ -1362,7 +1412,7 @@ impl<'semantic> LoweringContext<'semantic> {
     }
 
     fn declare_user_local(&mut self, name: &str, writable: bool, ty: mir::Type) -> mir::LocalId {
-        let owned = matches!(ty, mir::Type::Class(_));
+        let owned = matches!(ty, mir::Type::Class(_) | mir::Type::NullableClass(_));
         self.declare_user_local_owned(name, writable, ty, owned)
     }
 
@@ -1387,8 +1437,9 @@ impl<'semantic> LoweringContext<'semantic> {
             .expect("MIR lowering must have a local scope")
             .insert(name.to_string(), id);
         if owned {
-            let mir::Type::Class(class) = ty else {
-                unreachable!("only class locals may own native drop obligations")
+            let class = match ty {
+                mir::Type::Class(class) | mir::Type::NullableClass(class) => class,
+                _ => unreachable!("only class locals may own native drop obligations"),
             };
             self.scope_owned_locals
                 .last_mut()
@@ -1527,10 +1578,6 @@ impl<'semantic> LoweringContext<'semantic> {
         self.constant_decl(expr).map(|decl| &decl.value)
     }
 
-    fn constant_type(&self, expr: &hir::Expr) -> Option<crate::const_eval::ConstType> {
-        self.constant_decl(expr).map(|decl| decl.ty)
-    }
-
     fn static_property(
         &self,
         class_name: &str,
@@ -1566,29 +1613,28 @@ impl<'semantic> LoweringContext<'semantic> {
     }
 
     fn native_type_ref(&self, ty: &crate::types::TypeRef) -> Option<mir::Type> {
-        scalar_type_ref(ty)
+        let mut plain = ty.clone();
+        plain.nullable = false;
+        let base = scalar_type_ref(&plain)
             .map(mir::Type::Scalar)
-            .or_else(|| is_plain_type(ty, "string").then_some(mir::Type::String))
-            .or_else(|| is_nullable_string_type(ty).then_some(mir::Type::NullableString))
+            .or_else(|| is_plain_type(&plain, "string").then_some(mir::Type::String))
             .or_else(|| {
-                (!ty.nullable && ty.args.is_empty())
+                ty.args
+                    .is_empty()
                     .then(|| self.class_id_for_name(&ty.name).map(mir::Type::Class))
                     .flatten()
+            })?;
+        if ty.nullable {
+            Some(match base {
+                mir::Type::Scalar(ty) => mir::Type::NullableScalar(ty),
+                mir::Type::String => mir::Type::NullableString,
+                mir::Type::Class(class) => mir::Type::NullableClass(class),
+                mir::Type::NullableScalar(_)
+                | mir::Type::NullableString
+                | mir::Type::NullableClass(_) => return None,
             })
-    }
-
-    fn lookup_int_local(&self, name: &str, span: Span) -> DiagnosticResult<mir::LocalId> {
-        let local = self.lookup_local(name, span)?;
-        if matches!(
-            self.local_type(local),
-            mir::Type::Scalar(mir::ScalarType::Integer(_))
-        ) {
-            Ok(local)
         } else {
-            Err(vec![unsupported(
-                span,
-                format!("string local `${name}` cannot be used as an integer expression"),
-            )])
+            Some(base)
         }
     }
 
@@ -1623,33 +1669,89 @@ impl<'semantic> LoweringContext<'semantic> {
         })
     }
 
-    fn local_integer_type(&self, id: mir::LocalId) -> DiagnosticResult<IntegerType> {
-        match self.local_type(id) {
-            mir::Type::Scalar(mir::ScalarType::Integer(ty)) => Ok(ty),
-            _ => Err(vec![Diagnostic::new(
-                "I1301",
-                format!(
-                    "internal compiler consistency error: non-integer local local{} used as an integer",
-                    id.0
-                ),
-                Span::default(),
-            )]),
+    fn expression_type(&self, expr: &hir::Expr) -> DiagnosticResult<mir::Type> {
+        let resolved = self
+            .semantic_info
+            .expression_type(expr.span())
+            .ok_or_else(|| {
+                vec![Diagnostic::new(
+                    "I2201",
+                    "checked expression is missing its resolved semantic type",
+                    expr.span(),
+                )]
+            })?;
+        self.mir_resolved_type(resolved).ok_or_else(|| {
+            vec![unsupported(
+                expr.span(),
+                format!("resolved type `{resolved:?}` has no native representation"),
+            )]
+        })
+    }
+
+    fn expression_is_null(&self, expr: &hir::Expr) -> bool {
+        matches!(
+            self.semantic_info.expression_type(expr.span()),
+            Some(crate::types::ResolvedType::Null)
+        )
+    }
+
+    fn flow_fact(&self, expr: &hir::Expr) -> Option<&crate::narrowing::Fact> {
+        let expr = match expr {
+            hir::Expr::Grouped { expr, .. } => return self.flow_fact(expr),
+            expr => expr,
+        };
+        self.semantic_info
+            .flow_facts
+            .get(&(expr.span().start, expr.span().end))
+    }
+
+    fn coalesce_selection(&self, left: &hir::Expr) -> CoalesceSelection {
+        match self.flow_fact(left) {
+            Some(crate::narrowing::Fact::Null) => CoalesceSelection::Right,
+            Some(crate::narrowing::Fact::NonNull | crate::narrowing::Fact::Exact(_)) => {
+                CoalesceSelection::Left
+            }
+            None if self.expression_is_null(left) => CoalesceSelection::Right,
+            None => CoalesceSelection::Dynamic,
+        }
+    }
+
+    fn mir_resolved_type(&self, ty: &crate::types::ResolvedType) -> Option<mir::Type> {
+        use crate::types::ResolvedType;
+        match ty {
+            ResolvedType::Integer(ty) => Some(mir::Type::Scalar(mir::ScalarType::Integer(*ty))),
+            ResolvedType::Float(ty) => Some(mir::Type::Scalar(mir::ScalarType::Float(*ty))),
+            ResolvedType::Bool => Some(mir::Type::Scalar(mir::ScalarType::Bool)),
+            ResolvedType::String => Some(mir::Type::String),
+            ResolvedType::Class(name) => self.class_id_for_name(name).map(mir::Type::Class),
+            ResolvedType::Nullable(inner) => match self.mir_resolved_type(inner)? {
+                mir::Type::Scalar(ty) => Some(mir::Type::NullableScalar(ty)),
+                mir::Type::String => Some(mir::Type::NullableString),
+                mir::Type::Class(class) => Some(mir::Type::NullableClass(class)),
+                _ => None,
+            },
+            ResolvedType::Void
+            | ResolvedType::Null
+            | ResolvedType::Mixed
+            | ResolvedType::Unsupported => None,
         }
     }
 
     fn local_scalar_type(&self, id: mir::LocalId) -> DiagnosticResult<mir::ScalarType> {
         match self.local_type(id) {
             mir::Type::Scalar(ty) => Ok(ty),
-            mir::Type::String | mir::Type::NullableString | mir::Type::Class(_) => {
-                Err(vec![Diagnostic::new(
-                    "I1401",
-                    format!(
+            mir::Type::String
+            | mir::Type::NullableScalar(_)
+            | mir::Type::NullableString
+            | mir::Type::Class(_)
+            | mir::Type::NullableClass(_) => Err(vec![Diagnostic::new(
+                "I1401",
+                format!(
                     "internal compiler consistency error: string local local{} used as a scalar",
                     id.0
                 ),
-                    Span::default(),
-                )])
-            }
+                Span::default(),
+            )]),
         }
     }
 }
@@ -1659,11 +1761,20 @@ fn native_const_type(ty: crate::const_eval::ConstType) -> Option<mir::Type> {
         crate::const_eval::ConstType::Integer(ty) => {
             Some(mir::Type::Scalar(mir::ScalarType::Integer(ty)))
         }
+        crate::const_eval::ConstType::NullableInteger(ty) => {
+            Some(mir::Type::NullableScalar(mir::ScalarType::Integer(ty)))
+        }
         crate::const_eval::ConstType::Float(ty) => {
             Some(mir::Type::Scalar(mir::ScalarType::Float(ty)))
         }
+        crate::const_eval::ConstType::NullableFloat(ty) => {
+            Some(mir::Type::NullableScalar(mir::ScalarType::Float(ty)))
+        }
         crate::const_eval::ConstType::String => Some(mir::Type::String),
         crate::const_eval::ConstType::Bool => Some(mir::Type::Scalar(mir::ScalarType::Bool)),
+        crate::const_eval::ConstType::NullableBool => {
+            Some(mir::Type::NullableScalar(mir::ScalarType::Bool))
+        }
         crate::const_eval::ConstType::NullableString => Some(mir::Type::NullableString),
         crate::const_eval::ConstType::Null => None,
     }
@@ -1686,28 +1797,17 @@ fn terminator_targets(terminator: &mir::Terminator) -> Vec<mir::BlockId> {
 
 fn lower_var_decl(decl: &hir::VarDecl, context: &mut LoweringContext) -> DiagnosticResult<()> {
     let ty = match &decl.ty {
-        Some(ty) if scalar_type_ref(ty).is_some() => {
-            mir::Type::Scalar(scalar_type_ref(ty).expect("checked scalar type"))
-        }
-        Some(ty) if is_plain_type(ty, "string") => mir::Type::String,
-        Some(ty) if is_nullable_string_type(ty) => mir::Type::NullableString,
         Some(ty) if context.native_type_ref(ty).is_some() => {
             context.native_type_ref(ty).expect("guarded native type")
         }
         Some(ty) => {
-            return Err(vec![unsupported(
+            return Err(vec![unsupported_native_type(
+                ty,
                 decl.span,
                 format!("local type `{ty}` is not supported by native compilation"),
             )]);
         }
-        None if inferred_class_type(&decl.initializer, context).is_some() => mir::Type::Class(
-            inferred_class_type(&decl.initializer, context).expect("guarded class initializer"),
-        ),
-        None if is_string_local_initializer(&decl.initializer, context) => mir::Type::String,
-        None if is_nullable_string_initializer(&decl.initializer, context) => {
-            mir::Type::NullableString
-        }
-        None => mir::Type::Scalar(lower_value_expression(&decl.initializer, context)?.ty()),
+        None => context.expression_type(&decl.initializer)?,
     };
 
     if ty == mir::Type::String {
@@ -1719,6 +1819,24 @@ fn lower_var_decl(decl: &hir::VarDecl, context: &mut LoweringContext) -> Diagnos
         context.push_statement(mir::Statement::AssignLocal {
             target: local,
             value: mir::Rvalue::NullableString(value),
+        });
+        return Ok(());
+    }
+    if let mir::Type::NullableScalar(scalar) = ty {
+        let value = lower_nullable_scalar_expression(&decl.initializer, scalar, context)?;
+        let local = context.declare_user_local(&decl.name, decl.writable, ty);
+        context.push_statement(mir::Statement::AssignLocal {
+            target: local,
+            value: mir::Rvalue::NullableScalar(value),
+        });
+        return Ok(());
+    }
+    if let mir::Type::NullableClass(class) = ty {
+        let value = lower_nullable_class_expression(&decl.initializer, class, true, context)?;
+        let local = context.declare_user_local(&decl.name, decl.writable, ty);
+        context.push_statement(mir::Statement::AssignLocal {
+            target: local,
+            value: mir::Rvalue::NullableClass(value),
         });
         return Ok(());
     }
@@ -1747,131 +1865,16 @@ fn lower_var_decl(decl: &hir::VarDecl, context: &mut LoweringContext) -> Diagnos
 }
 
 fn inferred_class_type(expr: &hir::Expr, context: &LoweringContext) -> Option<ClassId> {
-    match expr {
-        hir::Expr::Grouped { expr, .. } => inferred_class_type(expr, context),
-        hir::Expr::New { class_name, .. } => context.class_id_for_name(class_name),
-        hir::Expr::Variable { name, span } => {
-            let mir::Type::Class(class) =
-                context.local_type(context.lookup_local(name, *span).ok()?)
-            else {
-                return None;
-            };
-            Some(class)
-        }
-        hir::Expr::This { span } => {
-            let mir::Type::Class(class) =
-                context.local_type(context.lookup_local("this", *span).ok()?)
-            else {
-                return None;
-            };
-            Some(class)
-        }
-        hir::Expr::FunctionCall { name, span, .. } => {
-            let mir::ReturnType::Value(mir::Type::Class(class)) =
-                context.lookup_function(name, *span).ok()?.return_type
-            else {
-                return None;
-            };
-            Some(class)
-        }
-        hir::Expr::MethodCall {
-            object,
-            method,
-            span,
-            ..
-        } => {
-            let receiver = inferred_class_type(object, context)?;
-            let mir::ReturnType::Value(mir::Type::Class(class)) = context
-                .lookup_method(receiver, method, *span)
-                .ok()?
-                .return_type
-            else {
-                return None;
-            };
-            Some(class)
-        }
-        hir::Expr::StaticCall {
-            class_name,
-            method,
-            span,
-            ..
-        } => {
-            let declaring_class = context.class_id_for_name(class_name)?;
-            let mir::ReturnType::Value(mir::Type::Class(class)) = context
-                .lookup_method(declaring_class, method, *span)
-                .ok()?
-                .return_type
-            else {
-                return None;
-            };
-            Some(class)
-        }
-        hir::Expr::PropertyAccess { .. } => property_access_type(expr, context)
-            .ok()
-            .flatten()
-            .and_then(|ty| match ty {
-                mir::Type::Class(class) => Some(class),
-                _ => None,
-            }),
+    match context.expression_type(expr).ok()? {
+        mir::Type::Class(class) | mir::Type::NullableClass(class) => Some(class),
         _ => None,
     }
 }
 
-fn is_nullable_string_initializer(expr: &hir::Expr, context: &LoweringContext) -> bool {
-    match expr {
-        hir::Expr::Null { .. } => true,
-        hir::Expr::Grouped { expr, .. } => is_nullable_string_initializer(expr, context),
-        _ if matches!(
-            context.constant_type(expr),
-            Some(crate::const_eval::ConstType::NullableString | crate::const_eval::ConstType::Null)
-        ) =>
-        {
-            true
-        }
-        hir::Expr::Variable { name, span } => context
-            .lookup_local(name, *span)
-            .is_ok_and(|local| context.local_type(local) == mir::Type::NullableString),
-        hir::Expr::PropertyAccess { .. } => lower_property_place(expr, context)
-            .is_ok_and(|(_, _, ty)| ty == mir::Type::NullableString),
-        hir::Expr::StaticMember {
-            class_name,
-            member,
-            span,
-        } => context
-            .static_property(class_name, member, *span)
-            .is_ok_and(|(_, ty)| ty == mir::Type::NullableString),
-        hir::Expr::FunctionCall { name, span, .. } if name == "read_line" => true,
-        hir::Expr::FunctionCall { name, span, .. } => {
-            context.lookup_function(name, *span).is_ok_and(|signature| {
-                signature.return_type == mir::ReturnType::Value(mir::Type::NullableString)
-            })
-        }
-        hir::Expr::MethodCall {
-            object,
-            method,
-            span,
-            ..
-        } => inferred_class_type(object, context).is_some_and(|class| {
-            context
-                .lookup_method(class, method, *span)
-                .is_ok_and(|signature| {
-                    signature.return_type == mir::ReturnType::Value(mir::Type::NullableString)
-                })
-        }),
-        hir::Expr::StaticCall {
-            class_name,
-            method,
-            span,
-            ..
-        } => context.class_id_for_name(class_name).is_some_and(|class| {
-            context
-                .lookup_method(class, method, *span)
-                .is_ok_and(|signature| {
-                    signature.return_type == mir::ReturnType::Value(mir::Type::NullableString)
-                })
-        }),
-        _ => false,
-    }
+fn is_nullable_string_expression(expr: &hir::Expr, context: &LoweringContext) -> bool {
+    context
+        .expression_type(expr)
+        .is_ok_and(|ty| ty == mir::Type::NullableString)
 }
 
 fn is_string_local_initializer(expr: &hir::Expr, context: &LoweringContext) -> bool {
@@ -1956,6 +1959,7 @@ fn lower_string_var_decl(
 #[derive(Clone, Copy)]
 enum ScalarPlace {
     Local(mir::LocalId),
+    NullableLocal(mir::LocalId),
     Property {
         object: mir::LocalId,
         property: crate::class_layout::PropertyId,
@@ -1967,20 +1971,31 @@ impl ScalarPlace {
     fn operand(self) -> mir::Operand {
         match self {
             Self::Local(local) => mir::Operand::Local(local),
+            Self::NullableLocal(local) => mir::Operand::NullablePayload(local),
             Self::Property { object, property } => mir::Operand::Property { object, property },
             Self::Static(id) => mir::Operand::Static(id),
         }
     }
 
-    fn assignment(self, value: mir::Rvalue) -> mir::Statement {
+    fn assignment(self, value: mir::ValueExpression) -> mir::Statement {
         match self {
-            Self::Local(target) => mir::Statement::AssignLocal { target, value },
+            Self::Local(target) => mir::Statement::AssignLocal {
+                target,
+                value: mir::Rvalue::Value(value),
+            },
+            Self::NullableLocal(target) => mir::Statement::AssignLocal {
+                target,
+                value: mir::Rvalue::NullableScalar(mir::NullableScalarExpression::Value(value)),
+            },
             Self::Property { object, property } => mir::Statement::AssignProperty {
                 object,
                 property,
-                value,
+                value: mir::Rvalue::Value(value),
             },
-            Self::Static(target) => mir::Statement::AssignStatic { target, value },
+            Self::Static(target) => mir::Statement::AssignStatic {
+                target,
+                value: mir::Rvalue::Value(value),
+            },
         }
     }
 }
@@ -1999,7 +2014,14 @@ fn lower_scalar_place(
     match unparenthesized_place(expr) {
         hir::Expr::Variable { name, span } => {
             let local = context.lookup_local(name, *span)?;
-            Ok((ScalarPlace::Local(local), context.local_scalar_type(local)?))
+            match context.local_type(local) {
+                mir::Type::Scalar(ty) => Ok((ScalarPlace::Local(local), ty)),
+                mir::Type::NullableScalar(ty) => Ok((ScalarPlace::NullableLocal(local), ty)),
+                _ => Err(vec![unsupported(
+                    *span,
+                    "local is not a scalar mutation place",
+                )]),
+            }
         }
         hir::Expr::PropertyAccess { .. } => {
             let (object, property, ty) = lower_property_place(expr, context)?;
@@ -2045,7 +2067,7 @@ fn lower_assignment(
             &assignment.value,
             context,
         )?;
-        context.push_statement(place.assignment(mir::Rvalue::Value(value)));
+        context.push_statement(place.assignment(value));
         return Ok(());
     }
 
@@ -2090,6 +2112,35 @@ fn lower_assignment(
         });
         return Ok(());
     }
+    if let mir::Type::NullableScalar(scalar) = context.local_type(target) {
+        context.push_statement(mir::Statement::AssignLocal {
+            target,
+            value: mir::Rvalue::NullableScalar(lower_nullable_scalar_expression(
+                &assignment.value,
+                scalar,
+                context,
+            )?),
+        });
+        return Ok(());
+    }
+    if let mir::Type::NullableClass(class) = context.local_type(target) {
+        if !context.local_owns(target) {
+            return Err(vec![unsupported(
+                assignment.span,
+                "this compiler version cannot replace a borrowed nullable class value",
+            )]);
+        }
+        context.push_statement(mir::Statement::AssignLocal {
+            target,
+            value: mir::Rvalue::NullableClass(lower_nullable_class_expression(
+                &assignment.value,
+                class,
+                true,
+                context,
+            )?),
+        });
+        return Ok(());
+    }
     if let mir::Type::Class(class) = context.local_type(target) {
         if !context.local_owns(target) {
             return Err(vec![
@@ -2129,7 +2180,7 @@ fn lower_increment(
 ) -> DiagnosticResult<()> {
     let (place, scalar_type) = lower_scalar_place(&increment.target, context)?;
     let value = lower_increment_value(place.operand(), scalar_type, &increment.op, increment.span)?;
-    context.push_statement(place.assignment(mir::Rvalue::Value(value)));
+    context.push_statement(place.assignment(value));
     Ok(())
 }
 
@@ -2221,6 +2272,19 @@ fn lower_string_expression(
         return Ok(mir::StringExpression::Literal(value.clone()));
     }
     match expr {
+        hir::Expr::Binary {
+            left,
+            op: hir::BinaryOp::Coalesce,
+            right,
+            ..
+        } => match context.coalesce_selection(left) {
+            CoalesceSelection::Left => lower_string_expression(left, context),
+            CoalesceSelection::Right => lower_string_expression(right, context),
+            CoalesceSelection::Dynamic => Ok(mir::StringExpression::Coalesce {
+                left: Box::new(lower_nullable_string_expression(left, context)?),
+                right: Box::new(lower_string_expression(right, context)?),
+            }),
+        },
         hir::Expr::String { value, .. } => Ok(mir::StringExpression::Literal(value.clone())),
         hir::Expr::Variable { name, span } => {
             let local = context.lookup_local(name, *span)?;
@@ -2304,6 +2368,7 @@ fn lower_string_expression(
             method,
             args,
             span,
+            ..
         } => {
             let (signature, args) =
                 lower_instance_method_call(object, method, args, *span, context)?;
@@ -2362,10 +2427,52 @@ fn lower_nullable_string_expression(
     match expr {
         hir::Expr::Null { .. } => Ok(mir::NullableStringExpression::Null),
         hir::Expr::Grouped { expr, .. } => lower_nullable_string_expression(expr, context),
+        hir::Expr::Binary {
+            left,
+            op: hir::BinaryOp::Coalesce,
+            right,
+            ..
+        } => match context.coalesce_selection(left) {
+            CoalesceSelection::Left => lower_nullable_string_expression(left, context),
+            CoalesceSelection::Right => lower_nullable_string_expression(right, context),
+            CoalesceSelection::Dynamic => Ok(mir::NullableStringExpression::Coalesce {
+                left: Box::new(lower_nullable_string_expression(left, context)?),
+                right: Box::new(lower_nullable_string_expression(right, context)?),
+            }),
+        },
+        hir::Expr::PropertyAccess {
+            object,
+            property,
+            null_safe: true,
+            span,
+        } => {
+            let (object, property, ty) =
+                lower_null_safe_property(object, property, *span, context)?;
+            if !matches!(ty, mir::Type::String | mir::Type::NullableString) {
+                return Err(vec![unsupported(
+                    *span,
+                    "null-safe property does not produce ?string",
+                )]);
+            }
+            Ok(mir::NullableStringExpression::NullSafeProperty {
+                object: Box::new(object),
+                property,
+            })
+        }
         hir::Expr::PropertyAccess { .. } => {
-            let (object, property) =
-                lower_property_operand(expr, mir::Type::NullableString, context)?;
-            Ok(mir::NullableStringExpression::Property { object, property })
+            let (object, property, ty) = lower_property_place(expr, context)?;
+            match ty {
+                mir::Type::NullableString => {
+                    Ok(mir::NullableStringExpression::Property { object, property })
+                }
+                mir::Type::String => Ok(mir::NullableStringExpression::String(
+                    mir::StringExpression::Property { object, property },
+                )),
+                _ => Err(vec![unsupported(
+                    expr.span(),
+                    "property does not produce string or ?string",
+                )]),
+            }
         }
         hir::Expr::StaticMember {
             class_name,
@@ -2373,15 +2480,29 @@ fn lower_nullable_string_expression(
             span,
         } => {
             let (id, ty) = context.static_property(class_name, member, *span)?;
-            if ty != mir::Type::NullableString {
-                return Err(vec![unsupported(*span, "static property is not ?string")]);
+            match ty {
+                mir::Type::NullableString => Ok(mir::NullableStringExpression::Static(id)),
+                mir::Type::String => Ok(mir::NullableStringExpression::String(
+                    mir::StringExpression::Static(id),
+                )),
+                _ => Err(vec![unsupported(
+                    *span,
+                    "static property does not produce string or ?string",
+                )]),
             }
-            Ok(mir::NullableStringExpression::Static(id))
         }
         hir::Expr::Variable { name, span } => {
             let local = context.lookup_local(name, *span)?;
             match context.local_type(local) {
-                mir::Type::NullableString => Ok(mir::NullableStringExpression::Local(local)),
+                mir::Type::NullableString => match context.flow_fact(expr) {
+                    Some(crate::narrowing::Fact::Null) => Ok(mir::NullableStringExpression::Null),
+                    Some(crate::narrowing::Fact::NonNull | crate::narrowing::Fact::Exact(_)) => {
+                        Ok(mir::NullableStringExpression::String(
+                            mir::StringExpression::NullableLocalAssumeNonNull(local),
+                        ))
+                    }
+                    None => Ok(mir::NullableStringExpression::Local(local)),
+                },
                 mir::Type::String => Ok(mir::NullableStringExpression::String(
                     mir::StringExpression::Local(local),
                 )),
@@ -2399,15 +2520,44 @@ fn lower_nullable_string_expression(
         }
         hir::Expr::FunctionCall { name, args, span } => {
             let signature = context.lookup_function(name, *span)?;
-            if signature.return_type != mir::ReturnType::Value(mir::Type::NullableString) {
+            match signature.return_type {
+                mir::ReturnType::Value(mir::Type::NullableString) => {
+                    Ok(mir::NullableStringExpression::Call {
+                        function: signature.id,
+                        args: lower_call_args(name, args, signature, *span, context)?,
+                    })
+                }
+                mir::ReturnType::Value(mir::Type::String) => Ok(
+                    mir::NullableStringExpression::String(lower_string_expression(expr, context)?),
+                ),
+                _ => Err(vec![unsupported(
+                    *span,
+                    format!("function `{name}` does not return string or ?string"),
+                )]),
+            }
+        }
+        hir::Expr::MethodCall {
+            object,
+            method,
+            args,
+            span,
+            null_safe: true,
+        } => {
+            let (object, signature, args) =
+                lower_null_safe_method_call(object, method, args, *span, context)?;
+            if !matches!(
+                signature.return_type,
+                mir::ReturnType::Value(mir::Type::String | mir::Type::NullableString)
+            ) {
                 return Err(vec![unsupported(
                     *span,
-                    format!("function `{name}` does not return ?string"),
+                    "null-safe method does not produce ?string",
                 )]);
             }
-            Ok(mir::NullableStringExpression::Call {
+            Ok(mir::NullableStringExpression::NullSafeCall {
+                object: Box::new(object),
                 function: signature.id,
-                args: lower_call_args(name, args, signature, *span, context)?,
+                args,
             })
         }
         hir::Expr::MethodCall {
@@ -2415,16 +2565,28 @@ fn lower_nullable_string_expression(
             method,
             args,
             span,
+            null_safe: false,
         } => {
             let (signature, args) =
                 lower_instance_method_call(object, method, args, *span, context)?;
-            if signature.return_type != mir::ReturnType::Value(mir::Type::NullableString) {
-                return Err(vec![unsupported(*span, "method does not return ?string")]);
+            match signature.return_type {
+                mir::ReturnType::Value(mir::Type::NullableString) => {
+                    Ok(mir::NullableStringExpression::Call {
+                        function: signature.id,
+                        args,
+                    })
+                }
+                mir::ReturnType::Value(mir::Type::String) => Ok(
+                    mir::NullableStringExpression::String(mir::StringExpression::Call {
+                        function: signature.id,
+                        args,
+                    }),
+                ),
+                _ => Err(vec![unsupported(
+                    *span,
+                    "method does not return string or ?string",
+                )]),
             }
-            Ok(mir::NullableStringExpression::Call {
-                function: signature.id,
-                args,
-            })
         }
         hir::Expr::StaticCall {
             class_name,
@@ -2434,16 +2596,24 @@ fn lower_nullable_string_expression(
         } => {
             let (signature, args) =
                 lower_static_method_call(class_name, method, args, *span, context)?;
-            if signature.return_type != mir::ReturnType::Value(mir::Type::NullableString) {
-                return Err(vec![unsupported(
+            match signature.return_type {
+                mir::ReturnType::Value(mir::Type::NullableString) => {
+                    Ok(mir::NullableStringExpression::Call {
+                        function: signature.id,
+                        args,
+                    })
+                }
+                mir::ReturnType::Value(mir::Type::String) => Ok(
+                    mir::NullableStringExpression::String(mir::StringExpression::Call {
+                        function: signature.id,
+                        args,
+                    }),
+                ),
+                _ => Err(vec![unsupported(
                     *span,
-                    "static method does not return ?string",
-                )]);
+                    "static method does not return string or ?string",
+                )]),
             }
-            Ok(mir::NullableStringExpression::Call {
-                function: signature.id,
-                args,
-            })
         }
         _ if is_string_local_initializer(expr, context) => Ok(
             mir::NullableStringExpression::String(lower_string_expression(expr, context)?),
@@ -2453,6 +2623,540 @@ fn lower_nullable_string_expression(
             "expected nullable string expression",
         )]),
     }
+}
+
+fn lower_nullable_scalar_expression(
+    expr: &hir::Expr,
+    expected: mir::ScalarType,
+    context: &LoweringContext,
+) -> DiagnosticResult<mir::NullableScalarExpression> {
+    match expr {
+        hir::Expr::Null { .. } => Ok(mir::NullableScalarExpression::Null(expected)),
+        hir::Expr::Grouped { expr, .. } => {
+            lower_nullable_scalar_expression(expr, expected, context)
+        }
+        hir::Expr::Binary {
+            left,
+            op: hir::BinaryOp::Coalesce,
+            right,
+            ..
+        } => match context.coalesce_selection(left) {
+            CoalesceSelection::Left => lower_nullable_scalar_expression(left, expected, context),
+            CoalesceSelection::Right => lower_nullable_scalar_expression(right, expected, context),
+            CoalesceSelection::Dynamic => Ok(mir::NullableScalarExpression::Coalesce {
+                ty: expected,
+                left: Box::new(lower_nullable_scalar_expression(left, expected, context)?),
+                right: Box::new(lower_nullable_scalar_expression(right, expected, context)?),
+            }),
+        },
+        hir::Expr::Variable { name, span } => {
+            let local = context.lookup_local(name, *span)?;
+            match context.local_type(local) {
+                mir::Type::NullableScalar(ty) if ty == expected => match context.flow_fact(expr) {
+                    Some(crate::narrowing::Fact::Null) => {
+                        Ok(mir::NullableScalarExpression::Null(ty))
+                    }
+                    Some(crate::narrowing::Fact::NonNull | crate::narrowing::Fact::Exact(_)) => {
+                        Ok(mir::NullableScalarExpression::Value(
+                            value_expression_from_operand(ty, mir::Operand::NullablePayload(local)),
+                        ))
+                    }
+                    None => Ok(mir::NullableScalarExpression::Local { ty, local }),
+                },
+                mir::Type::Scalar(ty) if ty == expected => Ok(
+                    mir::NullableScalarExpression::Value(lower_value_expression(expr, context)?),
+                ),
+                _ => Err(vec![unsupported(
+                    *span,
+                    "expected nullable scalar expression",
+                )]),
+            }
+        }
+        hir::Expr::PropertyAccess {
+            object,
+            property,
+            null_safe: true,
+            span,
+        } => {
+            let (object, property, ty) =
+                lower_null_safe_property(object, property, *span, context)?;
+            if !matches!(
+                ty,
+                mir::Type::Scalar(actual) | mir::Type::NullableScalar(actual)
+                    if actual == expected
+            ) {
+                return Err(vec![unsupported(
+                    *span,
+                    "null-safe property has another scalar type",
+                )]);
+            }
+            Ok(mir::NullableScalarExpression::NullSafeProperty {
+                ty: expected,
+                object: Box::new(object),
+                property,
+            })
+        }
+        hir::Expr::PropertyAccess { .. } => {
+            let (object, property, ty) = lower_property_place(expr, context)?;
+            match ty {
+                mir::Type::NullableScalar(actual) if actual == expected => {
+                    Ok(mir::NullableScalarExpression::Property {
+                        ty: expected,
+                        object,
+                        property,
+                    })
+                }
+                mir::Type::Scalar(actual) if actual == expected => Ok(
+                    mir::NullableScalarExpression::Value(value_expression_from_operand(
+                        expected,
+                        mir::Operand::Property { object, property },
+                    )),
+                ),
+                _ => Err(vec![unsupported(
+                    expr.span(),
+                    "property has another scalar type",
+                )]),
+            }
+        }
+        hir::Expr::StaticMember {
+            class_name,
+            member,
+            span,
+        } => {
+            let (id, ty) = context.static_property(class_name, member, *span)?;
+            match ty {
+                mir::Type::NullableScalar(actual) if actual == expected => {
+                    Ok(mir::NullableScalarExpression::Static { ty: expected, id })
+                }
+                mir::Type::Scalar(actual) if actual == expected => {
+                    Ok(mir::NullableScalarExpression::Value(
+                        value_expression_from_operand(expected, mir::Operand::Static(id)),
+                    ))
+                }
+                _ => Err(vec![unsupported(
+                    *span,
+                    "static property has another scalar type",
+                )]),
+            }
+        }
+        hir::Expr::FunctionCall { name, args, span } => {
+            let signature = context.lookup_function(name, *span)?;
+            match signature.return_type {
+                mir::ReturnType::Value(mir::Type::NullableScalar(actual)) if actual == expected => {
+                    Ok(mir::NullableScalarExpression::Call {
+                        ty: expected,
+                        function: signature.id,
+                        args: lower_call_args(name, args, signature, *span, context)?,
+                    })
+                }
+                mir::ReturnType::Value(mir::Type::Scalar(actual)) if actual == expected => {
+                    let value = lower_value_expression(expr, context)?;
+                    ensure_value_type(&value, expected, *span)?;
+                    Ok(mir::NullableScalarExpression::Value(value))
+                }
+                _ => Err(vec![unsupported(
+                    *span,
+                    "function has another scalar return type",
+                )]),
+            }
+        }
+        hir::Expr::MethodCall {
+            object,
+            method,
+            args,
+            span,
+            null_safe: true,
+        } => {
+            let (object, signature, args) =
+                lower_null_safe_method_call(object, method, args, *span, context)?;
+            if !matches!(
+                signature.return_type,
+                mir::ReturnType::Value(
+                    mir::Type::Scalar(actual) | mir::Type::NullableScalar(actual)
+                ) if actual == expected
+            ) {
+                return Err(vec![unsupported(
+                    *span,
+                    "null-safe method has another scalar return type",
+                )]);
+            }
+            Ok(mir::NullableScalarExpression::NullSafeCall {
+                ty: expected,
+                object: Box::new(object),
+                function: signature.id,
+                args,
+            })
+        }
+        hir::Expr::MethodCall {
+            object,
+            method,
+            args,
+            span,
+            null_safe: false,
+        } => {
+            let (signature, args) =
+                lower_instance_method_call(object, method, args, *span, context)?;
+            match signature.return_type {
+                mir::ReturnType::Value(mir::Type::NullableScalar(actual)) if actual == expected => {
+                    Ok(mir::NullableScalarExpression::Call {
+                        ty: expected,
+                        function: signature.id,
+                        args,
+                    })
+                }
+                mir::ReturnType::Value(mir::Type::Scalar(actual)) if actual == expected => {
+                    Ok(mir::NullableScalarExpression::Value(call_value_expression(
+                        expected,
+                        signature.id,
+                        args,
+                    )))
+                }
+                _ => Err(vec![unsupported(
+                    *span,
+                    "method has another scalar return type",
+                )]),
+            }
+        }
+        hir::Expr::StaticCall {
+            class_name,
+            method,
+            args,
+            span,
+        } => {
+            let (signature, args) =
+                lower_static_method_call(class_name, method, args, *span, context)?;
+            match signature.return_type {
+                mir::ReturnType::Value(mir::Type::NullableScalar(actual)) if actual == expected => {
+                    Ok(mir::NullableScalarExpression::Call {
+                        ty: expected,
+                        function: signature.id,
+                        args,
+                    })
+                }
+                mir::ReturnType::Value(mir::Type::Scalar(actual)) if actual == expected => {
+                    Ok(mir::NullableScalarExpression::Value(call_value_expression(
+                        expected,
+                        signature.id,
+                        args,
+                    )))
+                }
+                _ => Err(vec![unsupported(
+                    *span,
+                    "static method has another scalar return type",
+                )]),
+            }
+        }
+        _ => {
+            let value = lower_value_expression(expr, context)?;
+            ensure_value_type(&value, expected, expr.span())?;
+            Ok(mir::NullableScalarExpression::Value(value))
+        }
+    }
+}
+
+fn lower_nullable_class_expression(
+    expr: &hir::Expr,
+    expected: ClassId,
+    transfer: bool,
+    context: &LoweringContext,
+) -> DiagnosticResult<mir::NullableClassExpression> {
+    match expr {
+        hir::Expr::Null { .. } => Ok(mir::NullableClassExpression::Null(expected)),
+        hir::Expr::Grouped { expr, .. } => {
+            lower_nullable_class_expression(expr, expected, transfer, context)
+        }
+        hir::Expr::Binary {
+            left,
+            op: hir::BinaryOp::Coalesce,
+            right,
+            ..
+        } => match context.coalesce_selection(left) {
+            CoalesceSelection::Left => {
+                lower_nullable_class_expression(left, expected, transfer, context)
+            }
+            CoalesceSelection::Right => {
+                lower_nullable_class_expression(right, expected, transfer, context)
+            }
+            CoalesceSelection::Dynamic => Ok(mir::NullableClassExpression::Coalesce {
+                class: expected,
+                left: Box::new(lower_nullable_class_expression(
+                    left, expected, transfer, context,
+                )?),
+                right: Box::new(lower_nullable_class_expression(
+                    right, expected, transfer, context,
+                )?),
+                transfer,
+            }),
+        },
+        hir::Expr::Variable { name, span } => {
+            let local = context.lookup_local(name, *span)?;
+            match context.local_type(local) {
+                mir::Type::NullableClass(class) if class == expected => {
+                    if transfer && !context.local_owns(local) {
+                        return Err(vec![unsupported(
+                            *span,
+                            "borrowed nullable class value cannot be given away",
+                        )]);
+                    }
+                    match context.flow_fact(expr) {
+                        Some(crate::narrowing::Fact::Null) => {
+                            Ok(mir::NullableClassExpression::Null(class))
+                        }
+                        Some(
+                            crate::narrowing::Fact::NonNull | crate::narrowing::Fact::Exact(_),
+                        ) => Ok(mir::NullableClassExpression::Class(lower_class_expression(
+                            expr, expected, transfer, context,
+                        )?)),
+                        None => Ok(mir::NullableClassExpression::Local {
+                            class,
+                            local,
+                            transfer,
+                        }),
+                    }
+                }
+                mir::Type::Class(class) if class == expected => {
+                    Ok(mir::NullableClassExpression::Class(lower_class_expression(
+                        expr, expected, transfer, context,
+                    )?))
+                }
+                _ => Err(vec![unsupported(
+                    *span,
+                    "expected nullable class expression",
+                )]),
+            }
+        }
+        hir::Expr::PropertyAccess {
+            object,
+            property,
+            null_safe: true,
+            span,
+        } => {
+            let (object, property, ty) =
+                lower_null_safe_property(object, property, *span, context)?;
+            if !matches!(
+                ty,
+                mir::Type::Class(actual) | mir::Type::NullableClass(actual)
+                    if actual == expected
+            ) {
+                return Err(vec![unsupported(
+                    *span,
+                    "null-safe property has another class type",
+                )]);
+            }
+            Ok(mir::NullableClassExpression::NullSafeProperty {
+                class: expected,
+                object: Box::new(object),
+                property,
+            })
+        }
+        hir::Expr::PropertyAccess { span, .. } => {
+            if transfer {
+                return Err(vec![unsupported(
+                    *span,
+                    "moving directly out of an owned nullable class property is not supported",
+                )]);
+            }
+            let (object, property, ty) = lower_property_place(expr, context)?;
+            match ty {
+                mir::Type::NullableClass(actual) if actual == expected => {
+                    Ok(mir::NullableClassExpression::Property {
+                        class: expected,
+                        object,
+                        property,
+                    })
+                }
+                mir::Type::Class(actual) if actual == expected => Ok(
+                    mir::NullableClassExpression::Class(mir::ClassExpression::Property {
+                        class: expected,
+                        object,
+                        property,
+                    }),
+                ),
+                _ => Err(vec![unsupported(*span, "property has another class type")]),
+            }
+        }
+        hir::Expr::FunctionCall { name, args, span } => {
+            let signature = context.lookup_function(name, *span)?;
+            match signature.return_type {
+                mir::ReturnType::Value(mir::Type::NullableClass(actual)) if actual == expected => {
+                    Ok(mir::NullableClassExpression::Call {
+                        class: expected,
+                        function: signature.id,
+                        return_borrow: signature.return_borrow,
+                        args: lower_call_args_with_ownership(
+                            name, args, signature, *span, context,
+                        )?,
+                    })
+                }
+                mir::ReturnType::Value(mir::Type::Class(actual)) if actual == expected => {
+                    Ok(mir::NullableClassExpression::Class(lower_class_expression(
+                        expr, expected, transfer, context,
+                    )?))
+                }
+                _ => Err(vec![unsupported(
+                    *span,
+                    "function has another class return type",
+                )]),
+            }
+        }
+        hir::Expr::MethodCall {
+            object,
+            method,
+            args,
+            span,
+            null_safe: true,
+        } => {
+            let (object, signature, args) =
+                lower_null_safe_method_call(object, method, args, *span, context)?;
+            if !matches!(
+                signature.return_type,
+                mir::ReturnType::Value(
+                    mir::Type::Class(actual) | mir::Type::NullableClass(actual)
+                ) if actual == expected
+            ) {
+                return Err(vec![unsupported(
+                    *span,
+                    "null-safe method has another class return type",
+                )]);
+            }
+            Ok(mir::NullableClassExpression::NullSafeCall {
+                class: expected,
+                object: Box::new(object),
+                function: signature.id,
+                args,
+                return_borrow: signature.return_borrow,
+            })
+        }
+        hir::Expr::MethodCall {
+            object,
+            method,
+            args,
+            span,
+            null_safe: false,
+        } => {
+            let (signature, args) =
+                lower_instance_method_call(object, method, args, *span, context)?;
+            match signature.return_type {
+                mir::ReturnType::Value(mir::Type::NullableClass(actual)) if actual == expected => {
+                    Ok(mir::NullableClassExpression::Call {
+                        class: expected,
+                        function: signature.id,
+                        args,
+                        return_borrow: signature.return_borrow,
+                    })
+                }
+                mir::ReturnType::Value(mir::Type::Class(actual)) if actual == expected => Ok(
+                    mir::NullableClassExpression::Class(mir::ClassExpression::Call {
+                        class: expected,
+                        function: signature.id,
+                        args,
+                        return_borrow: signature.return_borrow,
+                    }),
+                ),
+                _ => Err(vec![unsupported(
+                    *span,
+                    "method has another class return type",
+                )]),
+            }
+        }
+        hir::Expr::StaticCall {
+            class_name,
+            method,
+            args,
+            span,
+        } => {
+            let (signature, args) =
+                lower_static_method_call(class_name, method, args, *span, context)?;
+            match signature.return_type {
+                mir::ReturnType::Value(mir::Type::NullableClass(actual)) if actual == expected => {
+                    Ok(mir::NullableClassExpression::Call {
+                        class: expected,
+                        function: signature.id,
+                        args,
+                        return_borrow: signature.return_borrow,
+                    })
+                }
+                mir::ReturnType::Value(mir::Type::Class(actual)) if actual == expected => Ok(
+                    mir::NullableClassExpression::Class(mir::ClassExpression::Call {
+                        class: expected,
+                        function: signature.id,
+                        args,
+                        return_borrow: signature.return_borrow,
+                    }),
+                ),
+                _ => Err(vec![unsupported(
+                    *span,
+                    "static method has another class return type",
+                )]),
+            }
+        }
+        _ => Ok(mir::NullableClassExpression::Class(lower_class_expression(
+            expr, expected, transfer, context,
+        )?)),
+    }
+}
+
+fn lower_null_safe_property(
+    object: &hir::Expr,
+    property: &str,
+    span: Span,
+    context: &LoweringContext,
+) -> DiagnosticResult<(mir::NullableClassExpression, PropertyId, mir::Type)> {
+    let mir::Type::NullableClass(class) = context.expression_type(object)? else {
+        return Err(vec![unsupported(
+            object.span(),
+            "null-safe receiver is not a nullable class",
+        )]);
+    };
+    let property_info = context.property_info(class, property).ok_or_else(|| {
+        vec![unsupported(
+            span,
+            format!("class#{} has no property `${property}`", class.0),
+        )]
+    })?;
+    let ty = context.native_type_ref(&property_info.ty).ok_or_else(|| {
+        vec![unsupported(
+            span,
+            format!("property `${property}` is not native-lowerable"),
+        )]
+    })?;
+    Ok((
+        lower_nullable_class_expression(object, class, false, context)?,
+        property_info.id,
+        ty,
+    ))
+}
+
+fn lower_null_safe_method_call(
+    object: &hir::Expr,
+    method: &str,
+    args: &[hir::Expr],
+    span: Span,
+    context: &LoweringContext,
+) -> DiagnosticResult<(
+    mir::NullableClassExpression,
+    FunctionSignature,
+    Vec<mir::Rvalue>,
+)> {
+    let mir::Type::NullableClass(class) = context.expression_type(object)? else {
+        return Err(vec![unsupported(
+            object.span(),
+            "null-safe receiver is not a nullable class",
+        )]);
+    };
+    let signature = context.lookup_method(class, method, span)?;
+    if signature.receiver_mode.is_none() {
+        return Err(vec![unsupported(
+            span,
+            "null-safe call requires an instance method",
+        )]);
+    }
+    let args = lower_call_args_with_ownership(method, args, signature.clone(), span, context)?;
+    Ok((
+        lower_nullable_class_expression(object, class, false, context)?,
+        signature,
+        args,
+    ))
 }
 
 fn lower_format_expression(
@@ -2500,7 +3204,8 @@ fn lower_display_string_expression(
     expr: &hir::Expr,
     context: &LoweringContext,
 ) -> DiagnosticResult<mir::StringExpression> {
-    if let Some(class) = inferred_class_type(expr, context) {
+    let ty = context.expression_type(expr)?;
+    if let mir::Type::Class(class) = ty {
         let class_info = context.class_info(class).ok_or_else(|| {
             vec![unsupported(
                 expr.span(),
@@ -2529,61 +3234,19 @@ fn lower_display_string_expression(
             args,
         });
     }
-    if let Some(property_type) = property_access_type(expr, context)? {
-        return match property_type {
-            mir::Type::String => lower_string_expression(expr, context),
-            mir::Type::NullableString | mir::Type::Class(_) => Err(vec![unsupported(
-                expr.span(),
-                "this property type cannot be displayed by native compilation",
-            )]),
-            mir::Type::Scalar(_) => {
-                lower_value_expression(expr, context).map(mir::StringExpression::Display)
-            }
-        };
-    }
-    let narrowed_nullable_local = matches!(expr, hir::Expr::Variable { name, span }
-        if context.lookup_local(name, *span).is_ok_and(|local| context.local_type(local) == mir::Type::NullableString));
-    if is_string_local_initializer(expr, context) || narrowed_nullable_local {
-        lower_string_expression(expr, context)
-    } else {
-        lower_value_expression(expr, context).map(mir::StringExpression::Display)
-    }
-}
-
-fn property_access_type(
-    expr: &hir::Expr,
-    context: &LoweringContext,
-) -> DiagnosticResult<Option<mir::Type>> {
-    let hir::Expr::PropertyAccess {
-        object,
-        property,
-        span,
-    } = expr
-    else {
-        return Ok(None);
-    };
-    let object_local = match object.as_ref() {
-        hir::Expr::Grouped { expr, .. } => {
-            return property_access_type(
-                &hir::Expr::PropertyAccess {
-                    object: expr.clone(),
-                    property: property.clone(),
-                    span: *span,
-                },
-                context,
-            );
+    match ty {
+        mir::Type::String => lower_string_expression(expr, context),
+        mir::Type::Scalar(_) => {
+            lower_value_expression(expr, context).map(mir::StringExpression::Display)
         }
-        hir::Expr::Variable { name, span } => context.lookup_local(name, *span)?,
-        hir::Expr::This { span } => context.lookup_local("this", *span)?,
-        _ => return Ok(None),
-    };
-    let mir::Type::Class(class) = context.local_type(object_local) else {
-        return Ok(None);
-    };
-    let Some(property_info) = context.property_info(class, property) else {
-        return Ok(None);
-    };
-    Ok(context.native_type_ref(&property_info.ty))
+        mir::Type::NullableScalar(_) | mir::Type::NullableString | mir::Type::NullableClass(_) => {
+            Err(vec![unsupported(
+                expr.span(),
+                "nullable values must be narrowed or defaulted before display",
+            )])
+        }
+        mir::Type::Class(_) => unreachable!("class display handled above"),
+    }
 }
 
 fn append_string_concat_parts(
@@ -2646,7 +3309,9 @@ fn discarded_call_statement(
             function: signature.id,
             args,
         },
-        mir::ReturnType::Value(mir::Type::Class(_)) if signature.return_borrow.is_some() => {
+        mir::ReturnType::Value(mir::Type::Class(_) | mir::Type::NullableClass(_))
+            if signature.return_borrow.is_some() =>
+        {
             mir::Statement::CallBorrowed {
                 function: signature.id,
                 args,
@@ -2660,6 +3325,30 @@ fn discarded_call_statement(
         }
     };
     Ok(statement)
+}
+
+fn discarded_null_safe_call_statement(
+    object: mir::NullableClassExpression,
+    signature: FunctionSignature,
+    args: Vec<mir::Rvalue>,
+    span: Span,
+) -> DiagnosticResult<mir::Statement> {
+    let supported = matches!(signature.return_type, mir::ReturnType::Void)
+        || matches!(
+            signature.return_type,
+            mir::ReturnType::Value(mir::Type::Class(_) | mir::Type::NullableClass(_))
+        ) && signature.return_borrow.is_some();
+    if !supported {
+        return Err(vec![unsupported(
+            span,
+            "non-void method call cannot be used as a statement",
+        )]);
+    }
+    Ok(mir::Statement::CallNullSafe {
+        object,
+        function: signature.id,
+        args,
+    })
 }
 
 fn lower_integer_call(
@@ -2724,6 +3413,9 @@ fn lower_call_args_with_ownership(
             mir::Type::Class(class) => {
                 mir::Rvalue::Class(lower_class_expression(arg, class, transfers, context)?)
             }
+            mir::Type::NullableClass(class) => mir::Rvalue::NullableClass(
+                lower_nullable_class_expression(arg, class, transfers, context)?,
+            ),
             _ => lower_rvalue_as_expected(arg, expected, context)?,
         };
         if lowered.ty() != expected {
@@ -2878,11 +3570,16 @@ fn lower_return(
         }
         (mir::ReturnType::Value(expected), Some(expr)) => {
             let borrowed_class =
-                matches!(expected, mir::Type::Class(_)) && context.return_borrow.is_some();
+                matches!(expected, mir::Type::Class(_) | mir::Type::NullableClass(_))
+                    && context.return_borrow.is_some();
             let value = match expected {
                 mir::Type::Class(class) => {
                     lower_class_expression(expr, class, !borrowed_class, context)
                         .map(mir::Rvalue::Class)?
+                }
+                mir::Type::NullableClass(class) => {
+                    lower_nullable_class_expression(expr, class, !borrowed_class, context)
+                        .map(mir::Rvalue::NullableClass)?
                 }
                 _ => lower_rvalue_as_expected(expr, expected, context)?,
             };
@@ -2897,21 +3594,10 @@ fn lower_return(
                 )]);
             }
             if context.has_cleanup_obligations() {
-                let borrowed_call = borrowed_class
-                    && matches!(
-                        &value,
-                        mir::Rvalue::Class(mir::ClassExpression::Call {
-                            return_borrow: Some(_),
-                            ..
-                        })
-                    );
-                if borrowed_class && !borrowed_call {
-                    context.cleanup_scopes_from(0);
-                    return Ok(mir::Terminator::Return(value));
-                }
                 let result = context.declare_return_temp(
                     expected,
-                    matches!(expected, mir::Type::Class(_)) && !borrowed_class,
+                    matches!(expected, mir::Type::Class(_) | mir::Type::NullableClass(_))
+                        && !borrowed_class,
                 );
                 context.push_statement(mir::Statement::AssignLocal {
                     target: result,
@@ -2952,6 +3638,9 @@ fn local_rvalue(local: mir::LocalId, ty: mir::Type, transfer: bool) -> mir::Rval
             }))
         }
         mir::Type::String => mir::Rvalue::String(mir::StringExpression::Local(local)),
+        mir::Type::NullableScalar(ty) => {
+            mir::Rvalue::NullableScalar(mir::NullableScalarExpression::Local { ty, local })
+        }
         mir::Type::NullableString => {
             mir::Rvalue::NullableString(mir::NullableStringExpression::Local(local))
         }
@@ -2960,6 +3649,13 @@ fn local_rvalue(local: mir::LocalId, ty: mir::Type, transfer: bool) -> mir::Rval
             local,
             transfer,
         }),
+        mir::Type::NullableClass(class) => {
+            mir::Rvalue::NullableClass(mir::NullableClassExpression::Local {
+                class,
+                local,
+                transfer,
+            })
+        }
     }
 }
 
@@ -2973,20 +3669,41 @@ fn lower_condition(
         });
     }
     match expr {
+        hir::Expr::Binary {
+            left,
+            op: hir::BinaryOp::Coalesce,
+            right,
+            ..
+        } => match context.coalesce_selection(left) {
+            CoalesceSelection::Left => lower_condition(left, context),
+            CoalesceSelection::Right => lower_condition(right, context),
+            CoalesceSelection::Dynamic => Ok(mir::BoolExpression::Coalesce {
+                left: Box::new(lower_nullable_scalar_expression(
+                    left,
+                    mir::ScalarType::Bool,
+                    context,
+                )?),
+                right: Box::new(lower_condition(right, context)?),
+            }),
+        },
+        hir::Expr::IsType { expr, span, .. } => lower_is_condition(expr, *span, context),
         hir::Expr::Bool { value, .. } => Ok(mir::BoolExpression::Use {
             operand: mir::Operand::Scalar(mir::ScalarValue::Bool(*value)),
         }),
         hir::Expr::Variable { name, span } => {
             let local = context.lookup_local(name, *span)?;
-            if context.local_type(local) != mir::Type::Scalar(mir::ScalarType::Bool) {
-                return Err(vec![unsupported(
+            match context.local_type(local) {
+                mir::Type::Scalar(mir::ScalarType::Bool) => Ok(mir::BoolExpression::Use {
+                    operand: mir::Operand::Local(local),
+                }),
+                mir::Type::NullableScalar(mir::ScalarType::Bool) => Ok(mir::BoolExpression::Use {
+                    operand: mir::Operand::NullablePayload(local),
+                }),
+                _ => Err(vec![unsupported(
                     *span,
                     "only bool locals may be used as conditions",
-                )]);
+                )]),
             }
-            Ok(mir::BoolExpression::Use {
-                operand: mir::Operand::Local(local),
-            })
         }
         hir::Expr::Grouped { expr, .. } => lower_condition(expr, context),
         hir::Expr::PropertyAccess { .. } => {
@@ -3025,8 +3742,12 @@ fn lower_condition(
             | hir::BinaryOp::LessEqual
             | hir::BinaryOp::Greater
             | hir::BinaryOp::GreaterEqual => {
-                if is_nullable_string_initializer(left, context)
-                    || is_nullable_string_initializer(right, context)
+                if matches!(unparenthesized_place(left), hir::Expr::Null { .. })
+                    || matches!(unparenthesized_place(right), hir::Expr::Null { .. })
+                {
+                    lower_null_comparison(left, op, right, context)
+                } else if is_nullable_string_expression(left, context)
+                    || is_nullable_string_expression(right, context)
                 {
                     Ok(mir::BoolExpression::NullableStringCompare {
                         op: lower_compare_op(op),
@@ -3081,6 +3802,7 @@ fn lower_condition(
             method,
             args,
             span,
+            ..
         } => {
             let (signature, args) =
                 lower_instance_method_call(object, method, args, *span, context)?;
@@ -3126,6 +3848,156 @@ fn lower_condition(
     }
 }
 
+fn lower_null_comparison(
+    left: &hir::Expr,
+    op: &hir::BinaryOp,
+    right: &hir::Expr,
+    context: &LoweringContext,
+) -> DiagnosticResult<mir::BoolExpression> {
+    let value = if matches!(unparenthesized_place(left), hir::Expr::Null { .. }) {
+        right
+    } else {
+        left
+    };
+    let present = match context.expression_type(value)? {
+        mir::Type::NullableScalar(ty) => mir::BoolExpression::NullableScalarIsPresent(Box::new(
+            lower_nullable_scalar_expression(value, ty, context)?,
+        )),
+        mir::Type::NullableString => {
+            return Ok(mir::BoolExpression::NullableStringCompare {
+                op: lower_compare_op(op),
+                left: Box::new(lower_nullable_string_expression(left, context)?),
+                right: Box::new(lower_nullable_string_expression(right, context)?),
+            });
+        }
+        mir::Type::NullableClass(class) => mir::BoolExpression::NullableClassIsPresent(Box::new(
+            lower_nullable_class_expression(value, class, false, context)?,
+        )),
+        _ => {
+            return Err(vec![unsupported(
+                value.span(),
+                "null comparison requires a nullable value",
+            )]);
+        }
+    };
+    Ok(if matches!(op, hir::BinaryOp::Equal) {
+        mir::BoolExpression::Not(Box::new(present))
+    } else {
+        present
+    })
+}
+
+fn lower_is_condition(
+    expr: &hir::Expr,
+    type_test_span: Span,
+    context: &LoweringContext,
+) -> DiagnosticResult<mir::BoolExpression> {
+    let tested_type = context
+        .semantic_info
+        .type_test_type(type_test_span)
+        .and_then(|resolved| context.mir_resolved_type(resolved));
+    let Some(tested_type) = tested_type else {
+        return Err(vec![unsupported(
+            expr.span(),
+            "type test does not name a native concrete type",
+        )]);
+    };
+    if context.expression_is_null(expr) {
+        return Ok(mir::BoolExpression::Use {
+            operand: mir::Operand::Scalar(mir::ScalarValue::Bool(false)),
+        });
+    }
+    let value_type = context.expression_type(expr)?;
+    let result = match value_type {
+        mir::Type::NullableScalar(ty) if tested_type == mir::Type::Scalar(ty) => {
+            mir::BoolExpression::NullableScalarIsPresent(Box::new(
+                lower_nullable_scalar_expression(expr, ty, context)?,
+            ))
+        }
+        mir::Type::NullableString if tested_type == mir::Type::String => {
+            mir::BoolExpression::Not(Box::new(mir::BoolExpression::NullableStringCompare {
+                op: mir::CompareOp::Equal,
+                left: Box::new(lower_nullable_string_expression(expr, context)?),
+                right: Box::new(mir::NullableStringExpression::Null),
+            }))
+        }
+        mir::Type::NullableClass(class) if tested_type == mir::Type::Class(class) => {
+            mir::BoolExpression::NullableClassIsPresent(Box::new(lower_nullable_class_expression(
+                expr, class, false, context,
+            )?))
+        }
+        mir::Type::Scalar(_) | mir::Type::String | mir::Type::Class(_) => {
+            let evaluated = lower_concrete_is_presence(expr, value_type, context)?;
+            if value_type == tested_type {
+                evaluated
+            } else {
+                mir::BoolExpression::Not(Box::new(evaluated))
+            }
+        }
+        mir::Type::NullableScalar(ty) => {
+            evaluate_then_false(mir::BoolExpression::NullableScalarIsPresent(Box::new(
+                lower_nullable_scalar_expression(expr, ty, context)?,
+            )))
+        }
+        mir::Type::NullableString => evaluate_then_false(mir::BoolExpression::Not(Box::new(
+            mir::BoolExpression::NullableStringCompare {
+                op: mir::CompareOp::Equal,
+                left: Box::new(lower_nullable_string_expression(expr, context)?),
+                right: Box::new(mir::NullableStringExpression::Null),
+            },
+        ))),
+        mir::Type::NullableClass(class) => {
+            evaluate_then_false(mir::BoolExpression::NullableClassIsPresent(Box::new(
+                lower_nullable_class_expression(expr, class, false, context)?,
+            )))
+        }
+    };
+    Ok(result)
+}
+
+fn evaluate_then_false(condition: mir::BoolExpression) -> mir::BoolExpression {
+    mir::BoolExpression::Binary {
+        op: mir::BoolBinaryOp::And,
+        left: Box::new(condition),
+        right: Box::new(mir::BoolExpression::Use {
+            operand: mir::Operand::Scalar(mir::ScalarValue::Bool(false)),
+        }),
+    }
+}
+
+fn lower_concrete_is_presence(
+    expr: &hir::Expr,
+    value_type: mir::Type,
+    context: &LoweringContext,
+) -> DiagnosticResult<mir::BoolExpression> {
+    match value_type {
+        mir::Type::Scalar(ty) => Ok(mir::BoolExpression::NullableScalarIsPresent(Box::new(
+            mir::NullableScalarExpression::Value({
+                let value = lower_value_expression(expr, context)?;
+                ensure_value_type(&value, ty, expr.span())?;
+                value
+            }),
+        ))),
+        mir::Type::String => Ok(mir::BoolExpression::Not(Box::new(
+            mir::BoolExpression::NullableStringCompare {
+                op: mir::CompareOp::Equal,
+                left: Box::new(mir::NullableStringExpression::String(
+                    lower_string_expression(expr, context)?,
+                )),
+                right: Box::new(mir::NullableStringExpression::Null),
+            },
+        ))),
+        mir::Type::Class(class) => Ok(mir::BoolExpression::NullableClassIsPresent(Box::new(
+            mir::NullableClassExpression::Class(lower_class_expression(
+                expr, class, false, context,
+            )?),
+        ))),
+        mir::Type::NullableScalar(_) | mir::Type::NullableString | mir::Type::NullableClass(_) => {
+            unreachable!("concrete `is` value type")
+        }
+    }
+}
+
 fn lower_compare_op(op: &hir::BinaryOp) -> mir::CompareOp {
     match op {
         hir::BinaryOp::Equal => mir::CompareOp::Equal,
@@ -3168,6 +4040,39 @@ fn lower_value_expression(
     lower_condition(expr, context).map(mir::ValueExpression::Bool)
 }
 
+fn call_value_expression(
+    ty: mir::ScalarType,
+    function: mir::FunctionId,
+    args: Vec<mir::Rvalue>,
+) -> mir::ValueExpression {
+    match ty {
+        mir::ScalarType::Integer(ty) => {
+            mir::ValueExpression::Integer(mir::IntegerExpression::Call { ty, function, args })
+        }
+        mir::ScalarType::Float(ty) => {
+            mir::ValueExpression::Float(mir::FloatExpression::Call { ty, function, args })
+        }
+        mir::ScalarType::Bool => {
+            mir::ValueExpression::Bool(mir::BoolExpression::Call { function, args })
+        }
+    }
+}
+
+fn value_expression_from_operand(
+    ty: mir::ScalarType,
+    operand: mir::Operand,
+) -> mir::ValueExpression {
+    match ty {
+        mir::ScalarType::Integer(ty) => {
+            mir::ValueExpression::Integer(mir::IntegerExpression::Use { ty, operand })
+        }
+        mir::ScalarType::Float(ty) => {
+            mir::ValueExpression::Float(mir::FloatExpression::Use { ty, operand })
+        }
+        mir::ScalarType::Bool => mir::ValueExpression::Bool(mir::BoolExpression::Use { operand }),
+    }
+}
+
 fn lower_rvalue_as_expected(
     expr: &hir::Expr,
     expected: mir::Type,
@@ -3175,12 +4080,19 @@ fn lower_rvalue_as_expected(
 ) -> DiagnosticResult<mir::Rvalue> {
     match expected {
         mir::Type::String => lower_string_expression(expr, context).map(mir::Rvalue::String),
+        mir::Type::NullableScalar(ty) => {
+            lower_nullable_scalar_expression(expr, ty, context).map(mir::Rvalue::NullableScalar)
+        }
         mir::Type::NullableString => {
             lower_nullable_string_expression(expr, context).map(mir::Rvalue::NullableString)
         }
         mir::Type::Scalar(_) => lower_value_expression(expr, context).map(mir::Rvalue::Value),
         mir::Type::Class(class) => {
             lower_class_expression(expr, class, true, context).map(mir::Rvalue::Class)
+        }
+        mir::Type::NullableClass(class) => {
+            lower_nullable_class_expression(expr, class, true, context)
+                .map(mir::Rvalue::NullableClass)
         }
     }
 }
@@ -3197,23 +4109,38 @@ fn lower_class_expression(
         }
         hir::Expr::Variable { name, span } => {
             let local = context.lookup_local(name, *span)?;
-            if context.local_type(local) != mir::Type::Class(expected) {
-                return Err(vec![unsupported(
+            match context.local_type(local) {
+                mir::Type::Class(class) if class == expected => {
+                    if transfer && !context.local_owns(local) {
+                        return Err(vec![unsupported(
+                            *span,
+                            format!("borrowed class local `${name}` cannot be given away"),
+                        )]);
+                    }
+                    Ok(mir::ClassExpression::Local {
+                        class: expected,
+                        local,
+                        transfer,
+                    })
+                }
+                mir::Type::NullableClass(class) if class == expected => {
+                    if transfer && !context.local_owns(local) {
+                        return Err(vec![unsupported(
+                            *span,
+                            format!("borrowed nullable class local `${name}` cannot be given away"),
+                        )]);
+                    }
+                    Ok(mir::ClassExpression::NullableLocalAssumeNonNull {
+                        class: expected,
+                        local,
+                        transfer,
+                    })
+                }
+                _ => Err(vec![unsupported(
                     *span,
                     format!("local `${name}` does not have the expected class type"),
-                )]);
+                )]),
             }
-            if transfer && !context.local_owns(local) {
-                return Err(vec![unsupported(
-                    *span,
-                    format!("borrowed class local `${name}` cannot be given away"),
-                )]);
-            }
-            Ok(mir::ClassExpression::Local {
-                class: expected,
-                local,
-                transfer,
-            })
         }
         hir::Expr::This { span } => {
             if transfer {
@@ -3306,6 +4233,7 @@ fn lower_class_expression(
             method,
             args,
             span,
+            ..
         } => {
             let (signature, args) =
                 lower_instance_method_call(object, method, args, *span, context)?;
@@ -3343,6 +4271,23 @@ fn lower_class_expression(
                 args,
             })
         }
+        hir::Expr::Binary {
+            left,
+            op: hir::BinaryOp::Coalesce,
+            right,
+            ..
+        } => match context.coalesce_selection(left) {
+            CoalesceSelection::Left => lower_class_expression(left, expected, transfer, context),
+            CoalesceSelection::Right => lower_class_expression(right, expected, transfer, context),
+            CoalesceSelection::Dynamic => Ok(mir::ClassExpression::Coalesce {
+                class: expected,
+                left: Box::new(lower_nullable_class_expression(
+                    left, expected, transfer, context,
+                )?),
+                right: Box::new(lower_class_expression(right, expected, transfer, context)?),
+                transfer,
+            }),
+        },
         _ => Err(vec![unsupported(
             expr.span(),
             "this class expression is not supported by native compilation",
@@ -3374,6 +4319,7 @@ fn lower_property_place(
         object,
         property,
         span,
+        ..
     } = expr
     else {
         return Err(vec![unsupported(
@@ -3391,11 +4337,14 @@ fn lower_property_place(
             )])
         }
     };
-    let mir::Type::Class(class) = context.local_type(object_local) else {
-        return Err(vec![unsupported(
-            object.span(),
-            "property access object is not a native class value",
-        )]);
+    let class = match context.local_type(object_local) {
+        mir::Type::Class(class) | mir::Type::NullableClass(class) => class,
+        _ => {
+            return Err(vec![unsupported(
+                object.span(),
+                "property access object is not a native class value",
+            )])
+        }
     };
     let property_info = context.property_info(class, property).ok_or_else(|| {
         vec![unsupported(
@@ -3501,6 +4450,24 @@ fn lower_float_expression(
     }
     let ty = context.float_type(expr)?;
     match expr {
+        hir::Expr::Binary {
+            left,
+            op: hir::BinaryOp::Coalesce,
+            right,
+            ..
+        } => match context.coalesce_selection(left) {
+            CoalesceSelection::Left => lower_float_expression(left, context),
+            CoalesceSelection::Right => lower_float_expression(right, context),
+            CoalesceSelection::Dynamic => Ok(mir::FloatExpression::Coalesce {
+                ty,
+                left: Box::new(lower_nullable_scalar_expression(
+                    left,
+                    mir::ScalarType::Float(ty),
+                    context,
+                )?),
+                right: Box::new(lower_float_expression(right, context)?),
+            }),
+        },
         hir::Expr::Float { value, .. } => FloatValue::parse_decimal(ty, value)
             .map(mir::FloatExpression::constant)
             .ok_or_else(|| {
@@ -3512,15 +4479,22 @@ fn lower_float_expression(
             }),
         hir::Expr::Variable { name, span } => {
             let local = context.lookup_local(name, *span)?;
-            let expected = mir::Type::Scalar(mir::ScalarType::Float(ty));
-            if context.local_type(local) != expected {
-                return Err(vec![Diagnostic::new(
+            match context.local_type(local) {
+                mir::Type::Scalar(mir::ScalarType::Float(local_ty)) if local_ty == ty => {
+                    Ok(local_float_expression(local, ty))
+                }
+                mir::Type::NullableScalar(mir::ScalarType::Float(local_ty)) if local_ty == ty => {
+                    Ok(mir::FloatExpression::Use {
+                        ty,
+                        operand: mir::Operand::NullablePayload(local),
+                    })
+                }
+                _ => Err(vec![Diagnostic::new(
                     "I1401",
                     format!("float local `${name}` does not have expected MIR type `{ty}`"),
                     *span,
-                )]);
+                )]),
             }
-            Ok(local_float_expression(local, ty))
         }
         hir::Expr::PropertyAccess { .. } => {
             let (object, property) = lower_property_operand(
@@ -3595,6 +4569,7 @@ fn lower_float_expression(
             method,
             args,
             span,
+            ..
         } => {
             let (signature, args) =
                 lower_instance_method_call(object, method, args, *span, context)?;
@@ -3706,6 +4681,7 @@ fn lower_integer_expression(
         method,
         args,
         span,
+        ..
     } = expr
     {
         let (signature, args) = lower_instance_method_call(object, method, args, *span, context)?;
@@ -3727,19 +4703,46 @@ fn lower_integer_expression(
 
     let ty = context.integer_type(expr)?;
     match expr {
+        hir::Expr::Binary {
+            left,
+            op: hir::BinaryOp::Coalesce,
+            right,
+            ..
+        } => match context.coalesce_selection(left) {
+            CoalesceSelection::Left => lower_integer_expression(left, context),
+            CoalesceSelection::Right => lower_integer_expression(right, context),
+            CoalesceSelection::Dynamic => Ok(mir::IntegerExpression::Coalesce {
+                ty,
+                left: Box::new(lower_nullable_scalar_expression(
+                    left,
+                    mir::ScalarType::Integer(ty),
+                    context,
+                )?),
+                right: Box::new(lower_integer_expression(right, context)?),
+            }),
+        },
         hir::Expr::Variable { name, span } => {
-            let local = context.lookup_int_local(name, *span)?;
-            let local_type = context.local_integer_type(local)?;
-            if local_type != ty {
-                return Err(vec![Diagnostic::new(
+            let local = context.lookup_local(name, *span)?;
+            match context.local_type(local) {
+                mir::Type::Scalar(mir::ScalarType::Integer(local_ty)) if local_ty == ty => {
+                    Ok(local_integer_expression(local, ty))
+                }
+                mir::Type::NullableScalar(mir::ScalarType::Integer(local_ty))
+                    if local_ty == ty =>
+                {
+                    Ok(mir::IntegerExpression::Use {
+                        ty,
+                        operand: mir::Operand::NullablePayload(local),
+                    })
+                }
+                _ => Err(vec![Diagnostic::new(
                     "I1301",
                     format!(
-                        "internal compiler consistency error: `${name}` has MIR type `{local_type}`, expression metadata says `{ty}`"
+                        "internal compiler consistency error: `${name}` does not have MIR type `{ty}`"
                     ),
                     *span,
-                )]);
+                )]),
             }
-            Ok(local_integer_expression(local, ty))
         }
         hir::Expr::PropertyAccess { .. } => {
             let (object, property) = lower_property_operand(
@@ -4061,6 +5064,7 @@ fn unsupported_int_expr(expr: &hir::Expr) -> Diagnostic {
         }
         hir::Expr::Float { .. } => "a float expression cannot be used as an integer expression",
         hir::Expr::Bool { .. } => "bool value reached integer-only MIR lowering",
+        hir::Expr::IsType { .. } => "a type-test result cannot be used as an integer expression",
         hir::Expr::Null { .. } => "`null` cannot be used as an integer expression",
         hir::Expr::Array { .. } => "a collection cannot be used as an integer expression",
         hir::Expr::FunctionCall { .. } => {
@@ -4115,4 +5119,20 @@ fn stmt_span(statement: &hir::Stmt) -> Span {
 
 fn unsupported(span: Span, detail: impl Into<String>) -> Diagnostic {
     Diagnostic::new("M1101", detail, span)
+}
+
+fn unsupported_native_type(
+    ty: &crate::types::TypeRef,
+    span: Span,
+    detail: impl Into<String>,
+) -> Diagnostic {
+    if ty.name == "mixed" {
+        Diagnostic::unsupported_stage(
+            "M1101",
+            "the `mixed` runtime representation lands at Stage 23",
+            span,
+        )
+    } else {
+        unsupported(span, detail)
+    }
 }

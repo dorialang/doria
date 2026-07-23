@@ -126,7 +126,7 @@ Design is locked; implementation is deferred behind hard dependencies:
 - the attributes & compile-time codegen decision (the derive engine);
 - the interfaces/`Cloneable` decision and an `Equatable`/`Hashable`/`Displayable`
   interface surface (around Stage 35);
-- named arguments (deferred) for ergonomic copy-with-changes;
+- named arguments (decision 0098, Stage 23a) for ergonomic copy-with-changes;
 - generics (Phase D) for generic data classes.
 
 It does not compete with the Stage 21 borrow checker. The implementation stage is

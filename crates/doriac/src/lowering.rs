@@ -345,21 +345,30 @@ fn lower_expr(expr: &ast::Expr, class_name: Option<&str>) -> hir::Expr {
         ast::Expr::PropertyAccess {
             object,
             property,
+            null_safe,
             span,
         } => hir::Expr::PropertyAccess {
             object: Box::new(lower_expr(object, class_name)),
             property: property.clone(),
+            null_safe: *null_safe,
             span: *span,
         },
         ast::Expr::MethodCall {
             object,
             method,
             args,
+            null_safe,
             span,
         } => hir::Expr::MethodCall {
             object: Box::new(lower_expr(object, class_name)),
             method: method.clone(),
             args: args.iter().map(|arg| lower_expr(arg, class_name)).collect(),
+            null_safe: *null_safe,
+            span: *span,
+        },
+        ast::Expr::IsType { expr, ty, span } => hir::Expr::IsType {
+            expr: Box::new(lower_expr(expr, class_name)),
+            ty: lower_type_ref(ty, class_name),
             span: *span,
         },
         ast::Expr::FunctionCall { name, args, span } => hir::Expr::FunctionCall {

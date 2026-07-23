@@ -13,7 +13,7 @@ use inkwell::targets::{
 use inkwell::types::{BasicMetadataTypeEnum, BasicType, BasicTypeEnum, IntType};
 use inkwell::values::{
     BasicMetadataValueEnum, BasicValueEnum, FloatValue as LlvmFloatValue, FunctionValue,
-    GlobalValue, IntValue, PointerValue, UnnamedAddress,
+    GlobalValue, IntValue, PointerValue, StructValue, UnnamedAddress,
 };
 use inkwell::{AddressSpace, FloatPredicate, IntPredicate, OptimizationLevel};
 
@@ -56,7 +56,7 @@ pub fn lower_mir_to_object(program: &mir::Program) -> Result<Vec<u8>, BackendErr
     let target_data = target_machine.get_target_data();
     module.set_data_layout(&target_data.get_data_layout());
 
-    let functions = declare_functions(&context, &module, program)?;
+    let functions = declare_functions(&context, &module, &target_data, program)?;
     let statics = declare_statics(&context, &module, &target_data, program)?;
     for function in &program.functions {
         define_function(
@@ -92,11 +92,12 @@ pub fn lower_mir_to_object(program: &mir::Program) -> Result<Vec<u8>, BackendErr
 fn declare_functions<'ctx>(
     context: &'ctx Context,
     module: &Module<'ctx>,
+    target_data: &TargetData,
     program: &mir::Program,
 ) -> Result<Vec<FunctionValue<'ctx>>, BackendError> {
     let mut functions = Vec::with_capacity(program.functions.len());
     for function in &program.functions {
-        let function_type = function_type(context, function)?;
+        let function_type = function_type(context, target_data, function)?;
         let value = module.add_function(
             &function_symbol(function),
             function_type,
@@ -114,7 +115,6 @@ fn declare_statics<'ctx>(
     target_data: &TargetData,
     program: &mir::Program,
 ) -> Result<Vec<GlobalValue<'ctx>>, BackendError> {
-    let pointer = context.ptr_type(AddressSpace::default());
     let usize_type = context.ptr_sized_int_type(target_data, None);
     let mut globals = Vec::with_capacity(program.statics.len());
     for property in &program.statics {
@@ -125,13 +125,21 @@ fn declare_statics<'ctx>(
         let global = match &property.initializer {
             mir::StaticValue::Scalar(value) => {
                 let initializer = scalar_constant(context, *value);
+                let initializer = if matches!(property.ty, mir::Type::NullableScalar(_)) {
+                    let ty = llvm_type(context, target_data, property.ty).into_struct_type();
+                    ty.const_named_struct(&[usize_type.const_int(1, false).into(), initializer])
+                        .into()
+                } else {
+                    initializer
+                };
                 let global = module.add_global(initializer.get_type(), None, &symbol);
                 global.set_initializer(&initializer);
                 global
             }
             mir::StaticValue::Null => {
-                let global = module.add_global(pointer, None, &symbol);
-                global.set_initializer(&pointer.const_null());
+                let ty = llvm_type(context, target_data, property.ty);
+                let global = module.add_global(ty, None, &symbol);
+                global.set_initializer(&ty.const_zero());
                 global
             }
             mir::StaticValue::String(value) => {
@@ -156,8 +164,19 @@ fn declare_statics<'ctx>(
                 object_global.set_linkage(Linkage::Private);
                 object_global.set_unnamed_address(UnnamedAddress::Global);
 
-                let global = module.add_global(pointer, None, &symbol);
-                global.set_initializer(&object_global.as_pointer_value());
+                let initializer: BasicValueEnum<'ctx> =
+                    if matches!(property.ty, mir::Type::NullableString) {
+                        let ty = llvm_type(context, target_data, property.ty).into_struct_type();
+                        ty.const_named_struct(&[
+                            usize_type.const_int(1, false).into(),
+                            object_global.as_pointer_value().into(),
+                        ])
+                        .into()
+                    } else {
+                        object_global.as_pointer_value().into()
+                    };
+                let global = module.add_global(initializer.get_type(), None, &symbol);
+                global.set_initializer(&initializer);
                 global
             }
         };
@@ -170,16 +189,19 @@ fn declare_statics<'ctx>(
 
 fn function_type<'ctx>(
     context: &'ctx Context,
+    target_data: &TargetData,
     function: &mir::Function,
 ) -> Result<inkwell::types::FunctionType<'ctx>, BackendError> {
     let mut parameters = vec![context.ptr_type(AddressSpace::default()).into()];
     for parameter in &function.params {
         let local = local_in(function, *parameter)?;
-        parameters.push(llvm_type(context, local.ty).into());
+        parameters.push(llvm_type(context, target_data, local.ty).into());
     }
     Ok(match function.return_type {
         mir::ReturnType::Void => context.void_type().fn_type(&parameters, false),
-        mir::ReturnType::Value(ty) => llvm_type(context, ty).fn_type(&parameters, false),
+        mir::ReturnType::Value(ty) => {
+            llvm_type(context, target_data, ty).fn_type(&parameters, false)
+        }
     })
 }
 
@@ -244,26 +266,10 @@ fn define_function<'ctx>(
 
     let mut local_slots = Vec::with_capacity(function.locals.len());
     for local in &function.locals {
-        match local.ty {
-            mir::Type::Scalar(ty) => {
-                let slot = build(
-                    builder.build_alloca(scalar_type(context, ty), &format!("local{}", local.id.0)),
-                )?;
-                build(builder.build_store(slot, scalar_zero(context, ty)))?;
-                local_slots.push(Some(slot));
-            }
-            mir::Type::String | mir::Type::NullableString | mir::Type::Class(_) => {
-                let slot = build(builder.build_alloca(
-                    context.ptr_type(AddressSpace::default()),
-                    &format!("local{}", local.id.0),
-                ))?;
-                build(
-                    builder
-                        .build_store(slot, context.ptr_type(AddressSpace::default()).const_null()),
-                )?;
-                local_slots.push(Some(slot));
-            }
-        }
+        let ty = llvm_type(context, target_data, local.ty);
+        let slot = build(builder.build_alloca(ty, &format!("local{}", local.id.0)))?;
+        build(builder.build_store(slot, ty.const_zero()))?;
+        local_slots.push(Some(slot));
     }
     let mut deferred_class_temporary_slots =
         Vec::with_capacity(mir::class_temporary_capacity(function));
@@ -408,6 +414,50 @@ struct FunctionLowerer<'ctx, 'program> {
 }
 
 impl<'ctx> FunctionLowerer<'ctx, '_> {
+    fn nullable_type(&self, payload: BasicTypeEnum<'ctx>) -> inkwell::types::StructType<'ctx> {
+        nullable_type(self.context, self.target_data, payload)
+    }
+
+    fn nullable_value(
+        &self,
+        present: IntValue<'ctx>,
+        payload: BasicValueEnum<'ctx>,
+    ) -> Result<StructValue<'ctx>, BackendError> {
+        let value = self.nullable_type(payload.get_type()).get_undef();
+        let value = build(
+            self.builder
+                .build_insert_value(value, present, 0, "nullable.present"),
+        )?
+        .into_struct_value();
+        Ok(build(
+            self.builder
+                .build_insert_value(value, payload, 1, "nullable.payload"),
+        )?
+        .into_struct_value())
+    }
+
+    fn nullable_parts(
+        &self,
+        value: StructValue<'ctx>,
+    ) -> Result<(IntValue<'ctx>, BasicValueEnum<'ctx>), BackendError> {
+        let present = build(
+            self.builder
+                .build_extract_value(value, 0, "nullable.present"),
+        )?
+        .into_int_value();
+        let payload = build(
+            self.builder
+                .build_extract_value(value, 1, "nullable.payload"),
+        )?;
+        Ok((present, payload))
+    }
+
+    fn present_word(&self, present: bool) -> IntValue<'ctx> {
+        self.context
+            .ptr_sized_int_type(self.target_data, None)
+            .const_int(u64::from(present), false)
+    }
+
     fn lower_block(&mut self, block: &mir::BasicBlock) -> Result<(), BackendError> {
         for statement in &block.statements {
             self.lower_statement(statement)?;
@@ -421,70 +471,46 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         match statement {
             mir::Statement::AssignLocal { target, value } => {
                 let local = local_in(self.function, *target)?;
-                match local.ty {
-                    mir::Type::Scalar(_) => {
-                        let mir::Rvalue::Value(expression) = value else {
-                            return Err(malformed_mir(format!(
-                                "scalar local local{} has a non-scalar assignment",
-                                target.0
-                            )));
-                        };
-                        let value = self.lower_value_expression(expression)?;
-                        build(
-                            self.builder
-                                .build_store(local_slot(&self.local_slots, *target)?, value),
-                        )?;
-                    }
-                    mir::Type::String => {
-                        let mir::Rvalue::String(expression) = value else {
-                            return Err(malformed_mir(format!(
-                                "string local local{} has a non-string assignment",
-                                target.0
-                            )));
-                        };
-                        let value = self.lower_string_expression(expression)?;
-                        let slot = local_slot(&self.local_slots, *target)?;
-                        let old = build(self.builder.build_load(
+                let slot = local_slot(&self.local_slots, *target)?;
+                let old = match local.ty {
+                    mir::Type::String => Some((
+                        build(self.builder.build_load(
                             self.context.ptr_type(AddressSpace::default()),
                             slot,
                             "string.old",
                         ))?
-                        .into_pointer_value();
-                        self.release_string(old)?;
-                        build(self.builder.build_store(slot, value))?;
-                    }
+                        .into_pointer_value(),
+                        None,
+                    )),
                     mir::Type::NullableString => {
-                        let mir::Rvalue::NullableString(expression) = value else {
-                            return Err(malformed_mir(format!(
-                                "nullable-string local local{} has another assignment type",
-                                target.0
-                            )));
-                        };
-                        let value = self.lower_nullable_string_expression(expression)?;
-                        let slot = local_slot(&self.local_slots, *target)?;
                         let old = build(self.builder.build_load(
-                            self.context.ptr_type(AddressSpace::default()),
+                            llvm_type(self.context, self.target_data, local.ty),
                             slot,
                             "nullable-string.old",
                         ))?
-                        .into_pointer_value();
-                        self.release_string(old)?;
-                        build(self.builder.build_store(slot, value))?;
+                        .into_struct_value();
+                        Some((self.nullable_parts(old)?.1.into_pointer_value(), None))
                     }
-                    mir::Type::Class(class) => {
-                        let mir::Rvalue::Class(expression) = value else {
-                            return Err(malformed_mir(format!(
-                                "class local local{} has a non-class assignment",
-                                target.0
-                            )));
-                        };
-                        let value = self.lower_class_expression(expression)?;
-                        let pointer = self.context.ptr_type(AddressSpace::default());
-                        let slot = local_slot(&self.local_slots, *target)?;
-                        let old = build(self.builder.build_load(pointer, slot, "class.old"))?
-                            .into_pointer_value();
-                        build(self.builder.build_store(slot, value))?;
+                    mir::Type::Class(class) | mir::Type::NullableClass(class) if local.owned => {
+                        Some((
+                            build(self.builder.build_load(
+                                self.context.ptr_type(AddressSpace::default()),
+                                slot,
+                                "class.old",
+                            ))?
+                            .into_pointer_value(),
+                            Some(class),
+                        ))
+                    }
+                    _ => None,
+                };
+                let value = self.lower_rvalue(value)?;
+                build(self.builder.build_store(slot, value))?;
+                if let Some((old, class)) = old {
+                    if let Some(class) = class {
                         self.drop_class_value_checked(old, class)?;
+                    } else {
+                        self.release_string(old)?;
                     }
                 }
             }
@@ -504,6 +530,11 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             | mir::Statement::CallBorrowed { function, args } => {
                 let _ = self.lower_call(*function, args, false)?;
             }
+            mir::Statement::CallNullSafe {
+                object,
+                function,
+                args,
+            } => self.lower_null_safe_statement_call(object, *function, args)?,
             mir::Statement::WriteStderr(value) => {
                 let value = self.lower_string_expression(value)?;
                 let pointer = self.context.ptr_type(AddressSpace::default());
@@ -548,7 +579,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 let value = self.lower_rvalue(value)?;
                 let address = self.lower_property_address(*object, *property)?;
                 let old = match property_ty {
-                    mir::Type::String | mir::Type::NullableString | mir::Type::Class(_) => Some(
+                    mir::Type::String | mir::Type::Class(_) | mir::Type::NullableClass(_) => Some(
                         build(self.builder.build_load(
                             self.context.ptr_type(AddressSpace::default()),
                             address,
@@ -556,14 +587,23 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                         ))?
                         .into_pointer_value(),
                     ),
-                    mir::Type::Scalar(_) => None,
+                    mir::Type::NullableString => {
+                        let value = build(self.builder.build_load(
+                            llvm_type(self.context, self.target_data, property_ty),
+                            address,
+                            "property.old",
+                        ))?
+                        .into_struct_value();
+                        Some(self.nullable_parts(value)?.1.into_pointer_value())
+                    }
+                    mir::Type::Scalar(_) | mir::Type::NullableScalar(_) => None,
                 };
                 build(self.builder.build_store(address, value))?;
                 match (property_ty, old) {
                     (mir::Type::String | mir::Type::NullableString, Some(value)) => {
                         self.release_string(value)?;
                     }
-                    (mir::Type::Class(class), Some(value)) => {
+                    (mir::Type::Class(class) | mir::Type::NullableClass(class), Some(value)) => {
                         self.drop_class_value_checked(value, class)?;
                     }
                     _ => {}
@@ -573,23 +613,35 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 let property = static_definition(self.program, *target)?;
                 let value = self.lower_rvalue(value)?;
                 let address = self.static_address(*target)?;
-                let old = matches!(property.ty, mir::Type::String | mir::Type::NullableString)
-                    .then(|| {
+                let old = match property.ty {
+                    mir::Type::String => Some(
                         build(self.builder.build_load(
                             self.context.ptr_type(AddressSpace::default()),
                             address,
                             "static.old",
                         ))
-                        .map(BasicValueEnum::into_pointer_value)
-                    })
-                    .transpose()?;
+                        .map(BasicValueEnum::into_pointer_value)?,
+                    ),
+                    mir::Type::NullableString => {
+                        let value = build(self.builder.build_load(
+                            llvm_type(self.context, self.target_data, property.ty),
+                            address,
+                            "static.old",
+                        ))?
+                        .into_struct_value();
+                        Some(self.nullable_parts(value)?.1.into_pointer_value())
+                    }
+                    _ => None,
+                };
                 build(self.builder.build_store(address, value))?;
                 if let Some(old) = old {
                     self.release_string(old)?;
                 }
             }
             mir::Statement::DropClass { local, .. } => {
-                let mir::Type::Class(class) = local_in(self.function, *local)?.ty else {
+                let (mir::Type::Class(class) | mir::Type::NullableClass(class)) =
+                    local_in(self.function, *local)?.ty
+                else {
                     return Err(malformed_mir(format!(
                         "drop local{} did not target a class local",
                         local.0
@@ -730,10 +782,16 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         match expression {
             mir::Rvalue::Value(value) => self.lower_value_expression(value),
             mir::Rvalue::String(value) => Ok(self.lower_string_expression(value)?.into()),
+            mir::Rvalue::NullableScalar(value) => {
+                Ok(self.lower_nullable_scalar_expression(value)?.into())
+            }
             mir::Rvalue::NullableString(value) => {
                 Ok(self.lower_nullable_string_expression(value)?.into())
             }
             mir::Rvalue::Class(value) => Ok(self.lower_class_expression(value)?.into()),
+            mir::Rvalue::NullableClass(value) => {
+                Ok(self.lower_nullable_class_expression(value)?.into())
+            }
         }
     }
 
@@ -745,6 +803,17 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         let usize_type = self.context.ptr_sized_int_type(self.target_data, None);
         match expression {
             mir::ClassExpression::Local {
+                local, transfer, ..
+            } => {
+                let slot = local_slot(&self.local_slots, *local)?;
+                let value = build(self.builder.build_load(pointer, slot, "class.local"))?
+                    .into_pointer_value();
+                if *transfer {
+                    build(self.builder.build_store(slot, pointer.const_null()))?;
+                }
+                Ok(value)
+            }
+            mir::ClassExpression::NullableLocalAssumeNonNull {
                 local, transfer, ..
             } => {
                 let slot = local_slot(&self.local_slots, *local)?;
@@ -790,8 +859,17 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 let mut owned_strings = Vec::new();
                 for (index, argument) in args.iter().enumerate() {
                     let value = self.lower_rvalue(argument)?;
-                    if matches!(argument.ty(), mir::Type::String | mir::Type::NullableString) {
-                        owned_strings.push((index, value.into_pointer_value()));
+                    match argument.ty() {
+                        mir::Type::String => {
+                            owned_strings.push((index, value.into_pointer_value()));
+                        }
+                        mir::Type::NullableString => owned_strings.push((
+                            index,
+                            self.nullable_parts(value.into_struct_value())?
+                                .1
+                                .into_pointer_value(),
+                        )),
+                        _ => {}
                     }
                     lowered_args.push(value);
                 }
@@ -857,10 +935,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
 
                     let constructor_definition = function_in(self.program, *constructor)?;
                     for (index, argument) in args.iter().enumerate() {
-                        let mir::Rvalue::Class(expression) = argument else {
-                            continue;
-                        };
-                        let Some(class) = expression.owned_temporary_class() else {
+                        let Some(class) = argument.owned_temporary_class() else {
                             continue;
                         };
                         let promoted = properties.iter().any(|property| {
@@ -900,7 +975,223 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 }
                 Ok(object)
             }
+            mir::ClassExpression::Coalesce {
+                left,
+                right,
+                transfer,
+                ..
+            } => {
+                let left_owned = left.owned_temporary_class().is_some();
+                let right_owned = right.owned_temporary_class().is_some();
+                let left = self.lower_nullable_class_expression(left)?;
+                let function = current_function(&self.builder)?;
+                let some = self
+                    .context
+                    .append_basic_block(function, "class.coalesce.some");
+                let none = self
+                    .context
+                    .append_basic_block(function, "class.coalesce.none");
+                let done = self
+                    .context
+                    .append_basic_block(function, "class.coalesce.done");
+                let present = build(
+                    self.builder
+                        .build_is_not_null(left, "class.coalesce.present"),
+                )?;
+                build(self.builder.build_conditional_branch(present, some, none))?;
+                self.builder.position_at_end(some);
+                build(self.builder.build_unconditional_branch(done))?;
+                let some_end = self
+                    .builder
+                    .get_insert_block()
+                    .expect("coalesce some block");
+                self.builder.position_at_end(none);
+                let right = self.lower_class_expression(right)?;
+                build(self.builder.build_unconditional_branch(done))?;
+                let none_end = self
+                    .builder
+                    .get_insert_block()
+                    .expect("coalesce none block");
+                self.builder.position_at_end(done);
+                let phi = build(self.builder.build_phi(pointer, "class.coalesce"))?;
+                phi.add_incoming(&[(&left, some_end), (&right, none_end)]);
+                let result = phi.as_basic_value().into_pointer_value();
+                if !transfer && (left_owned || right_owned) {
+                    let temporary =
+                        build(self.builder.build_phi(pointer, "class.coalesce.temporary"))?;
+                    let null = pointer.const_null();
+                    let left_temporary = if left_owned { left } else { null };
+                    let right_temporary = if right_owned { right } else { null };
+                    temporary
+                        .add_incoming(&[(&left_temporary, some_end), (&right_temporary, none_end)]);
+                    self.defer_or_drop_class_temporary(
+                        temporary.as_basic_value().into_pointer_value(),
+                        expression.class(),
+                    )?;
+                }
+                Ok(result)
+            }
         }
+    }
+
+    fn lower_nullable_class_expression(
+        &mut self,
+        expression: &mir::NullableClassExpression,
+    ) -> Result<PointerValue<'ctx>, BackendError> {
+        let pointer = self.context.ptr_type(AddressSpace::default());
+        match expression {
+            mir::NullableClassExpression::Null(_) => Ok(pointer.const_null()),
+            mir::NullableClassExpression::Class(value) => self.lower_class_expression(value),
+            mir::NullableClassExpression::Local {
+                local, transfer, ..
+            } => {
+                let slot = local_slot(&self.local_slots, *local)?;
+                let value = build(
+                    self.builder
+                        .build_load(pointer, slot, "nullable-class.local"),
+                )?
+                .into_pointer_value();
+                if *transfer {
+                    build(self.builder.build_store(slot, pointer.const_null()))?;
+                }
+                Ok(value)
+            }
+            mir::NullableClassExpression::Property {
+                object, property, ..
+            } => Ok(build(self.builder.build_load(
+                pointer,
+                self.lower_property_address(*object, *property)?,
+                "nullable-class.property",
+            ))?
+            .into_pointer_value()),
+            mir::NullableClassExpression::Call { function, args, .. } => Ok(self
+                .lower_call(*function, args, true)?
+                .ok_or_else(|| malformed_mir("nullable-class call produced no result"))?
+                .into_pointer_value()),
+            mir::NullableClassExpression::NullSafeProperty {
+                object, property, ..
+            } => {
+                let owned_receiver = object.owned_temporary_class();
+                let object = self.lower_nullable_class_expression(object)?;
+                self.lower_null_safe_pointer(object, owned_receiver, |lowerer| {
+                    Ok(build(lowerer.builder.build_load(
+                        pointer,
+                        lowerer.lower_property_address_from_value(object, *property)?,
+                        "null-safe.class.property",
+                    ))?
+                    .into_pointer_value())
+                })
+            }
+            mir::NullableClassExpression::NullSafeCall {
+                object,
+                function,
+                args,
+                ..
+            } => {
+                let owned_receiver = object.owned_temporary_class();
+                let object = self.lower_nullable_class_expression(object)?;
+                self.lower_null_safe_pointer(object, owned_receiver, |lowerer| {
+                    Ok(lowerer
+                        .lower_method_call(object, *function, args, true)?
+                        .ok_or_else(|| malformed_mir("null-safe class call produced no result"))?
+                        .into_pointer_value())
+                })
+            }
+            mir::NullableClassExpression::Coalesce {
+                class,
+                left,
+                right,
+                transfer,
+            } => {
+                let left_owned = left.owned_temporary_class().is_some();
+                let right_owned = right.owned_temporary_class().is_some();
+                let left = self.lower_nullable_class_expression(left)?;
+                let function = current_function(&self.builder)?;
+                let some = self
+                    .context
+                    .append_basic_block(function, "nullable-class.coalesce.some");
+                let none = self
+                    .context
+                    .append_basic_block(function, "nullable-class.coalesce.none");
+                let done = self
+                    .context
+                    .append_basic_block(function, "nullable-class.coalesce.done");
+                let present = build(
+                    self.builder
+                        .build_is_not_null(left, "nullable-class.coalesce.present"),
+                )?;
+                build(self.builder.build_conditional_branch(present, some, none))?;
+                self.builder.position_at_end(some);
+                build(self.builder.build_unconditional_branch(done))?;
+                let some_end = self
+                    .builder
+                    .get_insert_block()
+                    .expect("nullable coalesce some block");
+                self.builder.position_at_end(none);
+                let right = self.lower_nullable_class_expression(right)?;
+                build(self.builder.build_unconditional_branch(done))?;
+                let none_end = self
+                    .builder
+                    .get_insert_block()
+                    .expect("nullable coalesce none block");
+                self.builder.position_at_end(done);
+                let result = build(self.builder.build_phi(pointer, "nullable-class.coalesce"))?;
+                result.add_incoming(&[(&left, some_end), (&right, none_end)]);
+                if !transfer && (left_owned || right_owned) {
+                    let temporary = build(
+                        self.builder
+                            .build_phi(pointer, "nullable-class.coalesce.temporary"),
+                    )?;
+                    let null = pointer.const_null();
+                    let left_temporary = if left_owned { left } else { null };
+                    let right_temporary = if right_owned { right } else { null };
+                    temporary
+                        .add_incoming(&[(&left_temporary, some_end), (&right_temporary, none_end)]);
+                    self.defer_or_drop_class_temporary(
+                        temporary.as_basic_value().into_pointer_value(),
+                        *class,
+                    )?;
+                }
+                Ok(result.as_basic_value().into_pointer_value())
+            }
+        }
+    }
+
+    fn lower_null_safe_pointer(
+        &mut self,
+        object: PointerValue<'ctx>,
+        owned_receiver: Option<crate::class_layout::ClassId>,
+        present_value: impl FnOnce(&mut Self) -> Result<PointerValue<'ctx>, BackendError>,
+    ) -> Result<PointerValue<'ctx>, BackendError> {
+        if let Some(class) = owned_receiver {
+            self.defer_or_drop_class_temporary(object, class)?;
+        }
+        let function = current_function(&self.builder)?;
+        let some = self.context.append_basic_block(function, "null-safe.some");
+        let none = self.context.append_basic_block(function, "null-safe.none");
+        let done = self.context.append_basic_block(function, "null-safe.done");
+        let present = build(self.builder.build_is_not_null(object, "null-safe.present"))?;
+        build(self.builder.build_conditional_branch(present, some, none))?;
+        self.builder.position_at_end(some);
+        let value = present_value(self)?;
+        build(self.builder.build_unconditional_branch(done))?;
+        let some_end = self
+            .builder
+            .get_insert_block()
+            .expect("null-safe some block");
+        self.builder.position_at_end(none);
+        build(self.builder.build_unconditional_branch(done))?;
+        let none_end = self
+            .builder
+            .get_insert_block()
+            .expect("null-safe none block");
+        self.builder.position_at_end(done);
+        let pointer = self.context.ptr_type(AddressSpace::default());
+        let null = pointer.const_null();
+        let phi = build(self.builder.build_phi(pointer, "null-safe.pointer"))?;
+        phi.add_incoming(&[(&value, some_end), (&null, none_end)]);
+        let result = phi.as_basic_value().into_pointer_value();
+        Ok(result)
     }
 
     fn lower_property_address(
@@ -955,53 +1246,297 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
     fn lower_nullable_string_expression(
         &mut self,
         expression: &mir::NullableStringExpression,
-    ) -> Result<PointerValue<'ctx>, BackendError> {
+    ) -> Result<StructValue<'ctx>, BackendError> {
         let pointer = self.context.ptr_type(AddressSpace::default());
         match expression {
-            mir::NullableStringExpression::Null => Ok(pointer.const_null()),
-            mir::NullableStringExpression::String(value) => self.lower_string_expression(value),
+            mir::NullableStringExpression::Null => {
+                self.nullable_value(self.present_word(false), pointer.const_null().into())
+            }
+            mir::NullableStringExpression::String(value) => {
+                let payload = self.lower_string_expression(value)?;
+                self.nullable_value(self.present_word(true), payload.into())
+            }
             mir::NullableStringExpression::Local(local) => {
                 let value = build(self.builder.build_load(
-                    pointer,
+                    llvm_type(self.context, self.target_data, mir::Type::NullableString),
                     local_slot(&self.local_slots, *local)?,
                     "nullable-string.local",
                 ))?
-                .into_pointer_value();
-                self.retain_string(value)
+                .into_struct_value();
+                let (present, payload) = self.nullable_parts(value)?;
+                self.nullable_value(
+                    present,
+                    self.retain_string(payload.into_pointer_value())?.into(),
+                )
             }
             mir::NullableStringExpression::Static(id) => {
                 let value = build(self.builder.build_load(
-                    pointer,
+                    llvm_type(self.context, self.target_data, mir::Type::NullableString),
                     self.static_address(*id)?,
                     "nullable-string.static",
                 ))?
-                .into_pointer_value();
-                self.retain_string(value)
+                .into_struct_value();
+                let (present, payload) = self.nullable_parts(value)?;
+                self.nullable_value(
+                    present,
+                    self.retain_string(payload.into_pointer_value())?.into(),
+                )
             }
             mir::NullableStringExpression::Property { object, property } => {
                 let address = self.lower_property_address(*object, *property)?;
                 let value = build(self.builder.build_load(
-                    pointer,
+                    llvm_type(self.context, self.target_data, mir::Type::NullableString),
                     address,
                     "nullable-string.property",
                 ))?
-                .into_pointer_value();
-                self.retain_string(value)
+                .into_struct_value();
+                let (present, payload) = self.nullable_parts(value)?;
+                self.nullable_value(
+                    present,
+                    self.retain_string(payload.into_pointer_value())?.into(),
+                )
             }
-            mir::NullableStringExpression::ReadLine => Ok(self
-                .call_runtime(
-                    READ_STDIN_LINE,
-                    &[pointer.into()],
-                    Some(pointer.into()),
-                    &[self.current_frame.into()],
-                )?
-                .ok_or_else(|| backend_failure("read_line produced no result"))?
-                .into_pointer_value()),
+            mir::NullableStringExpression::ReadLine => {
+                let payload = self
+                    .call_runtime(
+                        READ_STDIN_LINE,
+                        &[pointer.into()],
+                        Some(pointer.into()),
+                        &[self.current_frame.into()],
+                    )?
+                    .ok_or_else(|| backend_failure("read_line produced no result"))?
+                    .into_pointer_value();
+                let present = build(self.builder.build_is_not_null(payload, "read-line.present"))?;
+                let present = build(self.builder.build_int_z_extend(
+                    present,
+                    self.context.ptr_sized_int_type(self.target_data, None),
+                    "read-line.present.word",
+                ))?;
+                self.nullable_value(present, payload.into())
+            }
             mir::NullableStringExpression::Call { function, args } => Ok(self
                 .lower_call(*function, args, true)?
                 .ok_or_else(|| malformed_mir("nullable-string call produced no result"))?
-                .into_pointer_value()),
+                .into_struct_value()),
+            mir::NullableStringExpression::NullSafeProperty { object, property } => {
+                let owned_receiver = object.owned_temporary_class();
+                let object = self.lower_nullable_class_expression(object)?;
+                self.lower_null_safe_nullable(pointer.into(), object, owned_receiver, |lowerer| {
+                    let property = property_definition(lowerer.program, *property)?;
+                    let value = build(lowerer.builder.build_load(
+                        llvm_type(lowerer.context, lowerer.target_data, property.ty),
+                        lowerer.lower_property_address_from_value(object, property.id)?,
+                        "null-safe.string.property",
+                    ))?;
+                    if property.ty == mir::Type::NullableString {
+                        let (present, payload) =
+                            lowerer.nullable_parts(value.into_struct_value())?;
+                        Ok(lowerer
+                            .nullable_value(
+                                present,
+                                lowerer.retain_string(payload.into_pointer_value())?.into(),
+                            )?
+                            .into())
+                    } else {
+                        Ok(lowerer.retain_string(value.into_pointer_value())?.into())
+                    }
+                })
+            }
+            mir::NullableStringExpression::NullSafeCall {
+                object,
+                function,
+                args,
+            } => {
+                let owned_receiver = object.owned_temporary_class();
+                let object = self.lower_nullable_class_expression(object)?;
+                self.lower_null_safe_nullable(pointer.into(), object, owned_receiver, |lowerer| {
+                    lowerer
+                        .lower_method_call(object, *function, args, true)?
+                        .ok_or_else(|| malformed_mir("null-safe string call produced no result"))
+                })
+            }
+            mir::NullableStringExpression::Coalesce { left, right } => {
+                let left = self.lower_nullable_string_expression(left)?;
+                self.lower_nullable_coalesce(left, |lowerer| {
+                    lowerer
+                        .lower_nullable_string_expression(right)
+                        .map(BasicValueEnum::from)
+                })
+            }
         }
+    }
+
+    fn lower_nullable_scalar_expression(
+        &mut self,
+        expression: &mir::NullableScalarExpression,
+    ) -> Result<StructValue<'ctx>, BackendError> {
+        let ty = expression.ty();
+        let payload_type = scalar_type(self.context, ty);
+        match expression {
+            mir::NullableScalarExpression::Null(_) => {
+                self.nullable_value(self.present_word(false), payload_type.const_zero())
+            }
+            mir::NullableScalarExpression::Value(value) => {
+                let payload = self.lower_value_expression(value)?;
+                self.nullable_value(self.present_word(true), payload)
+            }
+            mir::NullableScalarExpression::Local { local, .. } => {
+                Ok(build(self.builder.build_load(
+                    llvm_type(
+                        self.context,
+                        self.target_data,
+                        mir::Type::NullableScalar(ty),
+                    ),
+                    local_slot(&self.local_slots, *local)?,
+                    "nullable-scalar.local",
+                ))?
+                .into_struct_value())
+            }
+            mir::NullableScalarExpression::Property {
+                object, property, ..
+            } => Ok(build(self.builder.build_load(
+                llvm_type(
+                    self.context,
+                    self.target_data,
+                    mir::Type::NullableScalar(ty),
+                ),
+                self.lower_property_address(*object, *property)?,
+                "nullable-scalar.property",
+            ))?
+            .into_struct_value()),
+            mir::NullableScalarExpression::Static { id, .. } => {
+                Ok(build(self.builder.build_load(
+                    llvm_type(
+                        self.context,
+                        self.target_data,
+                        mir::Type::NullableScalar(ty),
+                    ),
+                    self.static_address(*id)?,
+                    "nullable-scalar.static",
+                ))?
+                .into_struct_value())
+            }
+            mir::NullableScalarExpression::Call { function, args, .. } => Ok(self
+                .lower_call(*function, args, true)?
+                .ok_or_else(|| malformed_mir("nullable-scalar call produced no result"))?
+                .into_struct_value()),
+            mir::NullableScalarExpression::NullSafeProperty {
+                object, property, ..
+            } => {
+                let owned_receiver = object.owned_temporary_class();
+                let object = self.lower_nullable_class_expression(object)?;
+                self.lower_null_safe_nullable(payload_type, object, owned_receiver, |lowerer| {
+                    let property = property_definition(lowerer.program, *property)?;
+                    build(lowerer.builder.build_load(
+                        llvm_type(lowerer.context, lowerer.target_data, property.ty),
+                        lowerer.lower_property_address_from_value(object, property.id)?,
+                        "null-safe.scalar.property",
+                    ))
+                })
+            }
+            mir::NullableScalarExpression::NullSafeCall {
+                object,
+                function,
+                args,
+                ..
+            } => {
+                let owned_receiver = object.owned_temporary_class();
+                let object = self.lower_nullable_class_expression(object)?;
+                self.lower_null_safe_nullable(payload_type, object, owned_receiver, |lowerer| {
+                    lowerer
+                        .lower_method_call(object, *function, args, true)?
+                        .ok_or_else(|| malformed_mir("null-safe scalar call produced no result"))
+                })
+            }
+            mir::NullableScalarExpression::Coalesce { left, right, .. } => {
+                let left = self.lower_nullable_scalar_expression(left)?;
+                self.lower_nullable_coalesce(left, |lowerer| {
+                    lowerer
+                        .lower_nullable_scalar_expression(right)
+                        .map(BasicValueEnum::from)
+                })
+            }
+        }
+    }
+
+    fn lower_null_safe_nullable(
+        &mut self,
+        payload_type: BasicTypeEnum<'ctx>,
+        object: PointerValue<'ctx>,
+        owned_receiver: Option<crate::class_layout::ClassId>,
+        present_value: impl FnOnce(&mut Self) -> Result<BasicValueEnum<'ctx>, BackendError>,
+    ) -> Result<StructValue<'ctx>, BackendError> {
+        if let Some(class) = owned_receiver {
+            self.defer_or_drop_class_temporary(object, class)?;
+        }
+        let function = current_function(&self.builder)?;
+        let some = self.context.append_basic_block(function, "null-safe.some");
+        let none = self.context.append_basic_block(function, "null-safe.none");
+        let done = self.context.append_basic_block(function, "null-safe.done");
+        let present = build(self.builder.build_is_not_null(object, "null-safe.present"))?;
+        build(self.builder.build_conditional_branch(present, some, none))?;
+        self.builder.position_at_end(some);
+        let payload = present_value(self)?;
+        let value = match payload {
+            BasicValueEnum::StructValue(value)
+                if value.get_type() == self.nullable_type(payload_type) =>
+            {
+                value
+            }
+            payload => self.nullable_value(self.present_word(true), payload)?,
+        };
+        build(self.builder.build_unconditional_branch(done))?;
+        let some_end = self
+            .builder
+            .get_insert_block()
+            .expect("null-safe some block");
+        self.builder.position_at_end(none);
+        let absent = self.nullable_value(self.present_word(false), payload_type.const_zero())?;
+        build(self.builder.build_unconditional_branch(done))?;
+        let none_end = self
+            .builder
+            .get_insert_block()
+            .expect("null-safe none block");
+        self.builder.position_at_end(done);
+        let phi = build(
+            self.builder
+                .build_phi(self.nullable_type(payload_type), "null-safe.nullable"),
+        )?;
+        phi.add_incoming(&[(&value, some_end), (&absent, none_end)]);
+        let result = phi.as_basic_value().into_struct_value();
+        Ok(result)
+    }
+
+    fn lower_null_safe_statement_call(
+        &mut self,
+        object: &mir::NullableClassExpression,
+        function: mir::FunctionId,
+        args: &[mir::Rvalue],
+    ) -> Result<(), BackendError> {
+        let receiver = self.lower_nullable_class_expression(object)?;
+        if let Some(class) = object.owned_temporary_class() {
+            self.defer_or_drop_class_temporary(receiver, class)?;
+        }
+        let current = current_function(&self.builder)?;
+        let call_block = self.context.append_basic_block(current, "null-safe.call");
+        let done = self.context.append_basic_block(current, "null-safe.done");
+        let present = build(
+            self.builder
+                .build_is_not_null(receiver, "null-safe.present"),
+        )?;
+        build(
+            self.builder
+                .build_conditional_branch(present, call_block, done),
+        )?;
+        self.builder.position_at_end(call_block);
+        let expects_result = !matches!(
+            function_in(self.program, function)?.return_type,
+            mir::ReturnType::Void
+        );
+        let _ = self.lower_method_call(receiver, function, args, expects_result)?;
+        build(self.builder.build_unconditional_branch(done))?;
+        self.builder.position_at_end(done);
+        Ok(())
     }
 
     fn runtime_function(
@@ -1051,15 +1586,20 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
     }
 
     fn cleanup_string_locals(&self) -> Result<(), BackendError> {
-        let pointer = self.context.ptr_type(AddressSpace::default());
         for local in &self.function.locals {
             if matches!(local.ty, mir::Type::String | mir::Type::NullableString) {
                 let value = build(self.builder.build_load(
-                    pointer,
+                    llvm_type(self.context, self.target_data, local.ty),
                     local_slot(&self.local_slots, local.id)?,
                     "string.cleanup",
-                ))?
-                .into_pointer_value();
+                ))?;
+                let value = if matches!(local.ty, mir::Type::NullableString) {
+                    self.nullable_parts(value.into_struct_value())?
+                        .1
+                        .into_pointer_value()
+                } else {
+                    value.into_pointer_value()
+                };
                 self.release_string(value)?;
             }
         }
@@ -1074,7 +1614,9 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             .iter()
             .rev()
             .filter_map(|local| match (local.owned, local.ty) {
-                (true, mir::Type::Class(class)) => Some((local.id, class)),
+                (true, mir::Type::Class(class) | mir::Type::NullableClass(class)) => {
+                    Some((local.id, class))
+                }
                 _ => None,
             })
             .collect::<Vec<_>>();
@@ -1175,17 +1717,26 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             let address = self.lower_property_address_from_value(object, property.id)?;
             match property.ty {
                 mir::Type::String | mir::Type::NullableString => {
-                    let value =
-                        build(self.builder.build_load(pointer, address, "property.string"))?
-                            .into_pointer_value();
+                    let value = build(self.builder.build_load(
+                        llvm_type(self.context, self.target_data, property.ty),
+                        address,
+                        "property.string",
+                    ))?;
+                    let value = if matches!(property.ty, mir::Type::NullableString) {
+                        self.nullable_parts(value.into_struct_value())?
+                            .1
+                            .into_pointer_value()
+                    } else {
+                        value.into_pointer_value()
+                    };
                     self.release_string(value)?;
                 }
-                mir::Type::Class(class) => {
+                mir::Type::Class(class) | mir::Type::NullableClass(class) => {
                     let value = build(self.builder.build_load(pointer, address, "property.class"))?
                         .into_pointer_value();
                     self.drop_class_value_checked(value, class)?;
                 }
-                mir::Type::Scalar(_) => {}
+                mir::Type::Scalar(_) | mir::Type::NullableScalar(_) => {}
             }
         }
         let _ = self.call_runtime(CLASS_FREE, &[pointer.into()], None, &[object.into()])?;
@@ -1193,16 +1744,30 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
     }
 
     fn retain_string_parameters(&self) -> Result<(), BackendError> {
-        let pointer = self.context.ptr_type(AddressSpace::default());
         for parameter in &self.function.params {
             if matches!(
                 local_in(self.function, *parameter)?.ty,
                 mir::Type::String | mir::Type::NullableString
             ) {
                 let slot = local_slot(&self.local_slots, *parameter)?;
-                let value = build(self.builder.build_load(pointer, slot, "string.parameter"))?
-                    .into_pointer_value();
+                let ty = local_in(self.function, *parameter)?.ty;
+                let value = build(self.builder.build_load(
+                    llvm_type(self.context, self.target_data, ty),
+                    slot,
+                    "string.parameter",
+                ))?;
+                let (present, value) = if matches!(ty, mir::Type::NullableString) {
+                    let (present, payload) = self.nullable_parts(value.into_struct_value())?;
+                    (Some(present), payload.into_pointer_value())
+                } else {
+                    (None, value.into_pointer_value())
+                };
                 let retained = self.retain_string(value)?;
+                let retained: BasicValueEnum<'ctx> = if let Some(present) = present {
+                    self.nullable_value(present, retained.into())?.into()
+                } else {
+                    retained.into()
+                };
                 build(self.builder.build_store(slot, retained))?;
             }
         }
@@ -1240,8 +1805,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     .ok_or_else(|| backend_failure("string allocation produced no result"))?
                     .into_pointer_value())
             }
-            mir::StringExpression::Local(local)
-            | mir::StringExpression::NullableLocalAssumeNonNull(local) => {
+            mir::StringExpression::Local(local) => {
                 let value = build(self.builder.build_load(
                     pointer,
                     local_slot(&self.local_slots, *local)?,
@@ -1249,6 +1813,16 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 ))?
                 .into_pointer_value();
                 self.retain_string(value)
+            }
+            mir::StringExpression::NullableLocalAssumeNonNull(local) => {
+                let value = build(self.builder.build_load(
+                    llvm_type(self.context, self.target_data, mir::Type::NullableString),
+                    local_slot(&self.local_slots, *local)?,
+                    "nullable-string.local",
+                ))?
+                .into_struct_value();
+                let payload = self.nullable_parts(value)?.1.into_pointer_value();
+                self.retain_string(payload)
             }
             mir::StringExpression::Static(id) => {
                 let value = build(self.builder.build_load(
@@ -1370,7 +1944,98 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 Ok(result)
             }
             mir::StringExpression::Format(format) => self.lower_format_expression(format),
+            mir::StringExpression::Coalesce { left, right } => {
+                let left = self.lower_nullable_string_expression(left)?;
+                Ok(self
+                    .lower_coalesce_payload(left, |lowerer| {
+                        Ok(lowerer.lower_string_expression(right)?.into())
+                    })?
+                    .into_pointer_value())
+            }
         }
+    }
+
+    fn lower_coalesce_payload(
+        &mut self,
+        nullable: StructValue<'ctx>,
+        fallback: impl FnOnce(&mut Self) -> Result<BasicValueEnum<'ctx>, BackendError>,
+    ) -> Result<BasicValueEnum<'ctx>, BackendError> {
+        let (present, payload) = self.nullable_parts(nullable)?;
+        let function = current_function(&self.builder)?;
+        let some = self.context.append_basic_block(function, "coalesce.some");
+        let none = self.context.append_basic_block(function, "coalesce.none");
+        let done = self.context.append_basic_block(function, "coalesce.done");
+        let present = build(self.builder.build_int_compare(
+            IntPredicate::NE,
+            present,
+            self.present_word(false),
+            "coalesce.present",
+        ))?;
+        build(self.builder.build_conditional_branch(present, some, none))?;
+        self.builder.position_at_end(some);
+        build(self.builder.build_unconditional_branch(done))?;
+        let some_end = self
+            .builder
+            .get_insert_block()
+            .expect("coalesce some block");
+        self.builder.position_at_end(none);
+        let fallback = fallback(self)?;
+        build(self.builder.build_unconditional_branch(done))?;
+        let none_end = self
+            .builder
+            .get_insert_block()
+            .expect("coalesce none block");
+        self.builder.position_at_end(done);
+        let phi = build(self.builder.build_phi(payload.get_type(), "coalesce.value"))?;
+        phi.add_incoming(&[(&payload, some_end), (&fallback, none_end)]);
+        Ok(phi.as_basic_value())
+    }
+
+    fn lower_nullable_coalesce(
+        &mut self,
+        left: StructValue<'ctx>,
+        fallback: impl FnOnce(&mut Self) -> Result<BasicValueEnum<'ctx>, BackendError>,
+    ) -> Result<StructValue<'ctx>, BackendError> {
+        let (present, _) = self.nullable_parts(left)?;
+        let function = current_function(&self.builder)?;
+        let some = self
+            .context
+            .append_basic_block(function, "nullable.coalesce.some");
+        let none = self
+            .context
+            .append_basic_block(function, "nullable.coalesce.none");
+        let done = self
+            .context
+            .append_basic_block(function, "nullable.coalesce.done");
+        let present = build(self.builder.build_int_compare(
+            IntPredicate::NE,
+            present,
+            self.present_word(false),
+            "nullable.coalesce.present",
+        ))?;
+        build(self.builder.build_conditional_branch(present, some, none))?;
+        self.builder.position_at_end(some);
+        build(self.builder.build_unconditional_branch(done))?;
+        let some_end = self
+            .builder
+            .get_insert_block()
+            .expect("nullable coalesce some block");
+        self.builder.position_at_end(none);
+        let fallback = fallback(self)?.into_struct_value();
+        if fallback.get_type() != left.get_type() {
+            return Err(malformed_mir(
+                "nullable coalesce operands have different MIR types",
+            ));
+        }
+        build(self.builder.build_unconditional_branch(done))?;
+        let none_end = self
+            .builder
+            .get_insert_block()
+            .expect("nullable coalesce none block");
+        self.builder.position_at_end(done);
+        let phi = build(self.builder.build_phi(left.get_type(), "nullable.coalesce"))?;
+        phi.add_incoming(&[(&left, some_end), (&fallback, none_end)]);
+        Ok(phi.as_basic_value().into_struct_value())
     }
 
     fn lower_format_expression(
@@ -1566,6 +2231,14 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     .lower_call(*function, args, true)?
                     .ok_or_else(|| malformed_mir("scalar call produced no result"))?;
                 Ok(result.into_int_value())
+            }
+            mir::IntegerExpression::Coalesce { left, right, .. } => {
+                let left = self.lower_nullable_scalar_expression(left)?;
+                Ok(self
+                    .lower_coalesce_payload(left, |lowerer| {
+                        Ok(lowerer.lower_integer_expression(right)?.into())
+                    })?
+                    .into_int_value())
             }
         }
     }
@@ -2018,6 +2691,19 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 "integer.local",
             ))?
             .into_int_value()),
+            mir::Operand::NullablePayload(local) => {
+                let value = build(self.builder.build_load(
+                    llvm_type(
+                        self.context,
+                        self.target_data,
+                        mir::Type::NullableScalar(mir::ScalarType::Integer(ty)),
+                    ),
+                    local_slot(&self.local_slots, *local)?,
+                    "integer.nullable.local",
+                ))?
+                .into_struct_value();
+                Ok(self.nullable_parts(value)?.1.into_int_value())
+            }
             mir::Operand::Static(id) => Ok(build(self.builder.build_load(
                 integer_type(self.context, ty),
                 self.static_address(*id)?,
@@ -2054,6 +2740,19 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     "float.local",
                 ))?
                 .into_float_value()),
+                mir::Operand::NullablePayload(local) => {
+                    let value = build(self.builder.build_load(
+                        llvm_type(
+                            self.context,
+                            self.target_data,
+                            mir::Type::NullableScalar(mir::ScalarType::Float(*ty)),
+                        ),
+                        local_slot(&self.local_slots, *local)?,
+                        "float.nullable.local",
+                    ))?
+                    .into_struct_value();
+                    Ok(self.nullable_parts(value)?.1.into_float_value())
+                }
                 mir::Operand::Static(id) => Ok(build(self.builder.build_load(
                     match ty {
                         FloatType::Float32 => self.context.f32_type(),
@@ -2114,6 +2813,14 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     .ok_or_else(|| malformed_mir("float call produced no result"))?;
                 Ok(result.into_float_value())
             }
+            mir::FloatExpression::Coalesce { left, right, .. } => {
+                let left = self.lower_nullable_scalar_expression(left)?;
+                Ok(self
+                    .lower_coalesce_payload(left, |lowerer| {
+                        Ok(lowerer.lower_float_expression(right)?.into())
+                    })?
+                    .into_float_value())
+            }
         }
     }
 
@@ -2162,18 +2869,47 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         args: &[mir::Rvalue],
         expects_result: bool,
     ) -> Result<Option<BasicValueEnum<'ctx>>, BackendError> {
+        self.lower_call_with_receiver(function, args, expects_result, None)
+    }
+
+    fn lower_method_call(
+        &mut self,
+        receiver: PointerValue<'ctx>,
+        function: mir::FunctionId,
+        args: &[mir::Rvalue],
+        expects_result: bool,
+    ) -> Result<Option<BasicValueEnum<'ctx>>, BackendError> {
+        self.lower_call_with_receiver(function, args, expects_result, Some(receiver))
+    }
+
+    fn lower_call_with_receiver(
+        &mut self,
+        function: mir::FunctionId,
+        args: &[mir::Rvalue],
+        expects_result: bool,
+        receiver: Option<PointerValue<'ctx>>,
+    ) -> Result<Option<BasicValueEnum<'ctx>>, BackendError> {
         let callee = *self
             .functions
             .get(function.0)
             .ok_or_else(|| malformed_mir(format!("function{} does not exist", function.0)))?;
         let mut values = Vec::<BasicMetadataValueEnum<'ctx>>::with_capacity(args.len() + 1);
         values.push(self.current_frame.into());
+        if let Some(receiver) = receiver {
+            values.push(receiver.into());
+        }
         let mut lowered_args = Vec::with_capacity(args.len());
         let mut owned_strings = Vec::new();
         for argument in args {
             let value = self.lower_rvalue(argument)?;
-            if matches!(argument.ty(), mir::Type::String | mir::Type::NullableString) {
-                owned_strings.push(value.into_pointer_value());
+            match argument.ty() {
+                mir::Type::String => owned_strings.push(value.into_pointer_value()),
+                mir::Type::NullableString => owned_strings.push(
+                    self.nullable_parts(value.into_struct_value())?
+                        .1
+                        .into_pointer_value(),
+                ),
+                _ => {}
             }
             values.push(value.into());
             lowered_args.push(value);
@@ -2192,18 +2928,19 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         }
         let callee_definition = function_in(self.program, function)?;
         for (index, argument) in args.iter().enumerate() {
-            let mir::Rvalue::Class(expression) = argument else {
+            let Some(class) = argument.owned_temporary_class() else {
                 continue;
             };
-            let Some(class) = expression.owned_temporary_class() else {
-                continue;
-            };
-            let parameter = *callee_definition.params.get(index).ok_or_else(|| {
-                malformed_mir(format!(
-                    "function{} is missing parameter {index}",
-                    function.0
-                ))
-            })?;
+            let parameter_index = index + usize::from(receiver.is_some());
+            let parameter = *callee_definition
+                .params
+                .get(parameter_index)
+                .ok_or_else(|| {
+                    malformed_mir(format!(
+                        "function{} is missing parameter {parameter_index}",
+                        function.0
+                    ))
+                })?;
             if !local_in(callee_definition, parameter)?.owned {
                 let value = lowered_args[index].into_pointer_value();
                 self.defer_or_drop_class_temporary(value, class)?;
@@ -2348,6 +3085,8 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 let pointer = self.context.ptr_type(AddressSpace::default());
                 let left = self.lower_nullable_string_expression(left)?;
                 let right = self.lower_nullable_string_expression(right)?;
+                let left = self.nullable_parts(left)?.1.into_pointer_value();
+                let right = self.nullable_parts(right)?.1.into_pointer_value();
                 let equal = self
                     .call_runtime(
                         NULLABLE_STRING_EQUAL,
@@ -2443,6 +3182,70 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                         .build_conditional_branch(condition, then_block, else_block),
                 )?;
             }
+            mir::BoolExpression::NullableScalarIsPresent(value) => {
+                let value = self.lower_nullable_scalar_expression(value)?;
+                let (present, _) = self.nullable_parts(value)?;
+                let condition = build(self.builder.build_int_compare(
+                    IntPredicate::NE,
+                    present,
+                    self.present_word(false),
+                    "nullable-scalar.present",
+                ))?;
+                build(
+                    self.builder
+                        .build_conditional_branch(condition, then_block, else_block),
+                )?;
+            }
+            mir::BoolExpression::NullableClassIsPresent(value) => {
+                let owned = value.owned_temporary_class();
+                let value = self.lower_nullable_class_expression(value)?;
+                if let Some(class) = owned {
+                    self.defer_or_drop_class_temporary(value, class)?;
+                }
+                let condition = build(
+                    self.builder
+                        .build_is_not_null(value, "nullable-class.present"),
+                )?;
+                build(
+                    self.builder
+                        .build_conditional_branch(condition, then_block, else_block),
+                )?;
+            }
+            mir::BoolExpression::Coalesce { left, right } => {
+                let left = self.lower_nullable_scalar_expression(left)?;
+                let (present, payload) = self.nullable_parts(left)?;
+                let function = current_function(&self.builder)?;
+                let use_left = self
+                    .context
+                    .append_basic_block(function, "bool.coalesce.left");
+                let use_right = self
+                    .context
+                    .append_basic_block(function, "bool.coalesce.right");
+                let present = build(self.builder.build_int_compare(
+                    IntPredicate::NE,
+                    present,
+                    self.present_word(false),
+                    "bool.coalesce.present",
+                ))?;
+                build(
+                    self.builder
+                        .build_conditional_branch(present, use_left, use_right),
+                )?;
+                self.builder.position_at_end(use_left);
+                let payload = payload.into_int_value();
+                let payload = build(self.builder.build_int_compare(
+                    IntPredicate::NE,
+                    payload,
+                    self.context.i8_type().const_zero(),
+                    "bool.coalesce.value",
+                ))?;
+                build(
+                    self.builder
+                        .build_conditional_branch(payload, then_block, else_block),
+                )?;
+                self.builder.position_at_end(use_right);
+                self.lower_condition_to_branch(right, then_block, else_block)?;
+            }
         }
         Ok(())
     }
@@ -2482,6 +3285,19 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 "bool.local",
             ))?
             .into_int_value()),
+            mir::Operand::NullablePayload(local) => {
+                let value = build(self.builder.build_load(
+                    llvm_type(
+                        self.context,
+                        self.target_data,
+                        mir::Type::NullableScalar(mir::ScalarType::Bool),
+                    ),
+                    local_slot(&self.local_slots, *local)?,
+                    "bool.nullable.local",
+                ))?
+                .into_struct_value();
+                Ok(self.nullable_parts(value)?.1.into_int_value())
+            }
             mir::Operand::Static(id) => Ok(build(self.builder.build_load(
                 self.context.i8_type(),
                 self.static_address(*id)?,
@@ -2626,17 +3442,35 @@ fn scalar_type(context: &Context, ty: mir::ScalarType) -> BasicTypeEnum<'_> {
     }
 }
 
-fn llvm_type(context: &Context, ty: mir::Type) -> BasicTypeEnum<'_> {
+fn nullable_type<'ctx>(
+    context: &'ctx Context,
+    target_data: &TargetData,
+    payload: BasicTypeEnum<'ctx>,
+) -> inkwell::types::StructType<'ctx> {
+    let word = context.ptr_sized_int_type(target_data, None);
+    context.struct_type(&[word.into(), payload], false)
+}
+
+fn llvm_type<'ctx>(
+    context: &'ctx Context,
+    target_data: &TargetData,
+    ty: mir::Type,
+) -> BasicTypeEnum<'ctx> {
     match ty {
         mir::Type::Scalar(ty) => scalar_type(context, ty),
-        mir::Type::String | mir::Type::NullableString | mir::Type::Class(_) => {
+        mir::Type::NullableScalar(ty) => {
+            nullable_type(context, target_data, scalar_type(context, ty)).into()
+        }
+        mir::Type::NullableString => nullable_type(
+            context,
+            target_data,
+            context.ptr_type(AddressSpace::default()).into(),
+        )
+        .into(),
+        mir::Type::String | mir::Type::Class(_) | mir::Type::NullableClass(_) => {
             context.ptr_type(AddressSpace::default()).into()
         }
     }
-}
-
-fn scalar_zero(context: &Context, ty: mir::ScalarType) -> BasicValueEnum<'_> {
-    scalar_type(context, ty).const_zero()
 }
 
 fn scalar_constant(context: &Context, value: mir::ScalarValue) -> BasicValueEnum<'_> {
@@ -2879,7 +3713,8 @@ fn resolve_string_expression_from_definitions(
         | mir::StringExpression::Static(_)
         | mir::StringExpression::NullableLocalAssumeNonNull(_)
         | mir::StringExpression::ReadFile(_)
-        | mir::StringExpression::Format(_) => {
+        | mir::StringExpression::Format(_)
+        | mir::StringExpression::Coalesce { .. } => {
             Err(malformed_mir("runtime string expression is not a constant"))
         }
     }
@@ -2911,7 +3746,8 @@ fn resolve_string_expression(
         | mir::StringExpression::Static(_)
         | mir::StringExpression::NullableLocalAssumeNonNull(_)
         | mir::StringExpression::ReadFile(_)
-        | mir::StringExpression::Format(_) => {
+        | mir::StringExpression::Format(_)
+        | mir::StringExpression::Coalesce { .. } => {
             Err(malformed_mir("runtime string expression is not a constant"))
         }
     }

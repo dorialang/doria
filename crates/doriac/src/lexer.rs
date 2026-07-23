@@ -39,6 +39,9 @@ pub enum TokenKind {
     As,
     If,
     Else,
+    When,
+    Given,
+    Finally,
     While,
     For,
     Break,
@@ -48,6 +51,9 @@ pub enum TokenKind {
     True,
     False,
     Null,
+    Is,
+    Object,
+    Resource,
     Void,
     IntType,
     Int8Type,
@@ -118,6 +124,7 @@ pub enum TokenKind {
     Xor,
     Question,
     QuestionQuestion,
+    QuestionArrow,
     FatArrow,
     LeftParen,
     RightParen,
@@ -204,7 +211,16 @@ impl<'source> Lexer<'source> {
                     }
                 }
                 b'*' => {
-                    if self.match_byte(b'=') {
+                    if self.match_byte(b'*') {
+                        self.match_byte(b'=');
+                        self.unsupported_syntax(
+                            "Doria does not support `**` or `**=`; use a typed numeric `pow` API",
+                            "use `Int::pow` or `Float::pow` with explicit operands",
+                            start,
+                            self.index,
+                        );
+                        continue;
+                    } else if self.match_byte(b'=') {
                         self.token(TokenKind::StarEquals, start)
                     } else {
                         self.token(TokenKind::Star, start)
@@ -253,7 +269,17 @@ impl<'source> Lexer<'source> {
                     }
                 }
                 b'<' => {
-                    if self.match_byte(b'<') {
+                    if self.peek() == Some(b'=') && self.peek_next() == Some(b'>') {
+                        self.advance();
+                        self.advance();
+                        self.unsupported_syntax(
+                            "Doria does not support the `<=>` operator; compare through `Comparable`",
+                            "use `Comparable::compare`, which returns `Ordering`",
+                            start,
+                            self.index,
+                        );
+                        continue;
+                    } else if self.match_byte(b'<') {
                         if self.match_byte(b'=') {
                             self.token(TokenKind::ShiftLeftEquals, start)
                         } else {
@@ -307,6 +333,13 @@ impl<'source> Lexer<'source> {
                 b'?' => {
                     if self.match_byte(b'?') {
                         self.token(TokenKind::QuestionQuestion, start)
+                    } else if self.match_byte(b'-') {
+                        if self.match_byte(b'>') {
+                            self.token(TokenKind::QuestionArrow, start)
+                        } else {
+                            self.error("expected `>` after `?-`", start, self.index);
+                            continue;
+                        }
                     } else {
                         self.token(TokenKind::Question, start)
                     }
@@ -326,6 +359,24 @@ impl<'source> Lexer<'source> {
                     }
                 }
                 b',' => self.token(TokenKind::Comma, start),
+                b'@' => {
+                    self.unsupported_syntax(
+                        "Doria does not support `@` error suppression",
+                        "handle the declared failure or nullable result explicitly",
+                        start,
+                        self.index,
+                    );
+                    continue;
+                }
+                b'`' => {
+                    self.unsupported_syntax(
+                        "Doria does not support backtick process execution",
+                        "use the typed process API when that standard-library surface lands",
+                        start,
+                        self.index,
+                    );
+                    continue;
+                }
                 byte => {
                     self.error(
                         format!("unexpected character `{}`", byte as char),
@@ -403,6 +454,9 @@ impl<'source> Lexer<'source> {
             "as" => TokenKind::As,
             "if" => TokenKind::If,
             "else" => TokenKind::Else,
+            "when" => TokenKind::When,
+            "given" => TokenKind::Given,
+            "finally" => TokenKind::Finally,
             "while" => TokenKind::While,
             "for" => TokenKind::For,
             "break" => TokenKind::Break,
@@ -412,6 +466,9 @@ impl<'source> Lexer<'source> {
             "true" => TokenKind::True,
             "false" => TokenKind::False,
             "null" => TokenKind::Null,
+            "is" => TokenKind::Is,
+            "object" => TokenKind::Object,
+            "resource" => TokenKind::Resource,
             "void" => TokenKind::Void,
             "int" => TokenKind::IntType,
             "int8" => TokenKind::Int8Type,
@@ -589,6 +646,17 @@ impl<'source> Lexer<'source> {
     fn error(&mut self, message: impl Into<String>, start: usize, end: usize) {
         self.diagnostics
             .push(Diagnostic::new("L0001", message, Span::new(start, end)));
+    }
+
+    fn unsupported_syntax(
+        &mut self,
+        message: impl Into<String>,
+        help: impl Into<String>,
+        start: usize,
+        end: usize,
+    ) {
+        self.diagnostics
+            .push(Diagnostic::new("L0002", message, Span::new(start, end)).with_help(help));
     }
 
     fn advance(&mut self) -> u8 {

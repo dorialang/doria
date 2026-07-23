@@ -336,6 +336,13 @@ impl Parser {
             }
         }
         let ty = self.parse_type_ref()?;
+        if self.match_kind(&TokenKind::Ampersand) {
+            self.error(
+                "Doria does not support PHP-style parameter references; use `writable` for an exclusive borrow or `take` for ownership transfer",
+                self.previous().span,
+            );
+            return None;
+        }
         let (name, name_span) = self.expect_variable("expected parameter variable name")?;
         let default = if self.match_kind(&TokenKind::Equals) {
             Some(self.parse_expression()?)
@@ -848,7 +855,26 @@ impl Parser {
     fn parse_binary(&mut self, min_prec: u8) -> Option<Expr> {
         let mut left = self.parse_unary()?;
 
-        while let Some((op, prec)) = self.current_binary_op() {
+        loop {
+            if self.check(&TokenKind::Is) {
+                const IS_PRECEDENCE: u8 = 8;
+                if IS_PRECEDENCE < min_prec {
+                    break;
+                }
+                self.advance();
+                let ty = self.parse_type_ref()?;
+                let span = left.span().merge(self.previous().span);
+                left = Expr::IsType {
+                    expr: Box::new(left),
+                    ty,
+                    span,
+                };
+                continue;
+            }
+
+            let Some((op, prec)) = self.current_binary_op() else {
+                break;
+            };
             if prec < min_prec {
                 break;
             }
@@ -945,9 +971,16 @@ impl Parser {
         let mut expr = self.parse_primary()?;
 
         loop {
-            if self.match_kind(&TokenKind::Arrow) {
+            let null_safe = if self.match_kind(&TokenKind::Arrow) {
+                Some(false)
+            } else if self.match_kind(&TokenKind::QuestionArrow) {
+                Some(true)
+            } else {
+                None
+            };
+            if let Some(null_safe) = null_safe {
                 let property =
-                    self.expect_identifier("expected property or method name after `->`")?;
+                    self.expect_identifier("expected property or method name after member access")?;
                 if self.match_kind(&TokenKind::LeftParen) {
                     let args = self.parse_argument_list_after_open()?;
                     let span = expr.span().merge(self.previous().span);
@@ -955,6 +988,7 @@ impl Parser {
                         object: Box::new(expr),
                         method: property,
                         args,
+                        null_safe,
                         span,
                     };
                 } else {
@@ -962,6 +996,7 @@ impl Parser {
                     expr = Expr::PropertyAccess {
                         object: Box::new(expr),
                         property,
+                        null_safe,
                         span,
                     };
                 }
@@ -1064,6 +1099,8 @@ impl Parser {
                 span: token.span,
             }),
             TokenKind::Null => Some(Expr::Null { span: token.span }),
+            TokenKind::When => self.parse_unsupported_when(token.span.start, false),
+            TokenKind::Given => self.parse_unsupported_when(token.span.start, true),
             TokenKind::New => self.parse_new(token.span.start),
             TokenKind::LeftBracket => self.parse_array(token.span.start),
             TokenKind::LeftParen => {
@@ -1302,6 +1339,7 @@ impl Parser {
             Expr::Grouped { expr, .. } | Expr::Unary { expr, .. } => {
                 Self::contains_bare_identifier(expr)
             }
+            Expr::IsType { expr, .. } => Self::contains_bare_identifier(expr),
             Expr::Binary { left, right, .. } => {
                 Self::contains_bare_identifier(left) || Self::contains_bare_identifier(right)
             }
@@ -1385,9 +1423,23 @@ impl Parser {
 
     fn parse_argument_list_after_open(&mut self) -> Option<Vec<Expr>> {
         let mut args = Vec::new();
+        let mut named_argument_span = None;
         if !self.check(&TokenKind::RightParen) {
             loop {
-                args.push(self.parse_expression()?);
+                let is_named = matches!(self.peek().kind, TokenKind::Identifier(_))
+                    && self
+                        .tokens
+                        .get(self.current + 1)
+                        .is_some_and(|token| matches!(token.kind, TokenKind::Colon));
+                if is_named {
+                    let name = self.advance().clone();
+                    self.advance();
+                    let value = self.parse_expression()?;
+                    named_argument_span.get_or_insert(name.span.merge(value.span()));
+                    args.push(value);
+                } else {
+                    args.push(self.parse_expression()?);
+                }
                 if !self.match_kind(&TokenKind::Comma) {
                     break;
                 }
@@ -1397,7 +1449,61 @@ impl Parser {
             }
         }
         self.expect(TokenKind::RightParen, "expected `)` after arguments")?;
+        if let Some(span) = named_argument_span {
+            self.diagnostics.push(Diagnostic::unsupported_stage(
+                "E0514",
+                "named arguments are accepted syntax but are not available until Stage 23a",
+                span,
+            ));
+        }
         Some(args)
+    }
+
+    fn parse_unsupported_when(&mut self, start: usize, has_given: bool) -> Option<Expr> {
+        if has_given {
+            self.parse_block()?;
+            self.expect(TokenKind::When, "expected `when` after `given` block")?;
+        }
+
+        self.expect(TokenKind::LeftParen, "expected `(` after when")?;
+        self.parse_expression()?;
+        self.expect(TokenKind::RightParen, "expected `)` after when condition")?;
+        if self.match_kind(&TokenKind::Colon) {
+            self.parse_type_ref()?;
+        }
+        let mut end = self.parse_block()?.span.end;
+
+        let mut has_else = false;
+        while self.match_kind(&TokenKind::Else) {
+            if self.match_kind(&TokenKind::When) {
+                self.expect(TokenKind::LeftParen, "expected `(` after `else when`")?;
+                self.parse_expression()?;
+                self.expect(TokenKind::RightParen, "expected `)` after when condition")?;
+                end = self.parse_block()?.span.end;
+            } else {
+                has_else = true;
+                end = self.parse_block()?.span.end;
+                break;
+            }
+        }
+
+        if !has_else {
+            self.error(
+                "value-returning `when` requires an `else` block",
+                self.peek().span,
+            );
+        }
+        if self.match_kind(&TokenKind::Finally) {
+            end = self.parse_block()?.span.end;
+        }
+
+        let span = Span::new(start, end);
+        self.diagnostics.push(Diagnostic::unsupported_stage(
+            "E0513",
+            "`when`, `given`, and control-flow `finally` are accepted syntax but are not available until Stage 28a",
+            span,
+        ));
+        Some(Expr::Null { span })
     }
 
     fn parse_type_ref(&mut self) -> Option<TypeRef> {
@@ -1431,6 +1537,8 @@ impl Parser {
             TokenKind::StringType => "string".to_string(),
             TokenKind::BoolType => "bool".to_string(),
             TokenKind::Null => "null".to_string(),
+            TokenKind::Object => "object".to_string(),
+            TokenKind::Resource => "resource".to_string(),
             TokenKind::SelfType => "self".to_string(),
             TokenKind::Identifier(name) => self.finish_qualified_name(
                 name,
@@ -1565,6 +1673,7 @@ impl Parser {
         matches!(
             self.peek().kind,
             TokenKind::Writable
+                | TokenKind::Question
                 | TokenKind::Void
                 | TokenKind::IntType
                 | TokenKind::Int8Type
@@ -1581,6 +1690,8 @@ impl Parser {
                 | TokenKind::StringType
                 | TokenKind::BoolType
                 | TokenKind::Null
+                | TokenKind::Object
+                | TokenKind::Resource
                 | TokenKind::SelfType
                 | TokenKind::Identifier(_)
         )
@@ -1746,6 +1857,9 @@ fn token_name(kind: &TokenKind) -> &'static str {
         TokenKind::As => "as",
         TokenKind::If => "if",
         TokenKind::Else => "else",
+        TokenKind::When => "when",
+        TokenKind::Given => "given",
+        TokenKind::Finally => "finally",
         TokenKind::While => "while",
         TokenKind::For => "for",
         TokenKind::Break => "break",
@@ -1755,6 +1869,9 @@ fn token_name(kind: &TokenKind) -> &'static str {
         TokenKind::True => "true",
         TokenKind::False => "false",
         TokenKind::Null => "null",
+        TokenKind::Is => "is",
+        TokenKind::Object => "object",
+        TokenKind::Resource => "resource",
         TokenKind::Void => "void",
         TokenKind::IntType => "int",
         TokenKind::Int8Type => "int8",
@@ -1821,6 +1938,7 @@ fn token_name(kind: &TokenKind) -> &'static str {
         TokenKind::Xor => "xor",
         TokenKind::Question => "?",
         TokenKind::QuestionQuestion => "??",
+        TokenKind::QuestionArrow => "?->",
         TokenKind::FatArrow => "=>",
         TokenKind::LeftParen => "(",
         TokenKind::RightParen => ")",

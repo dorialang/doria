@@ -20,8 +20,12 @@ pub enum FieldType {
     Float(FloatType),
     Bool,
     String,
+    NullableInteger(IntegerType),
+    NullableFloat(FloatType),
+    NullableBool,
     NullableString,
     Class(ClassId),
+    NullableClass(ClassId),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -90,7 +94,11 @@ pub const fn field_size_align(ty: FieldType, pointer_size: u32) -> (u32, u32) {
         FieldType::Float(FloatType::Float32) => (4, 4),
         FieldType::Float(FloatType::Float64) => (8, 8),
         FieldType::Bool => (1, 1),
-        FieldType::String | FieldType::NullableString | FieldType::Class(_) => {
+        FieldType::NullableInteger(_)
+        | FieldType::NullableFloat(_)
+        | FieldType::NullableBool
+        | FieldType::NullableString => (pointer_size * 2, pointer_size),
+        FieldType::String | FieldType::Class(_) | FieldType::NullableClass(_) => {
             (pointer_size, pointer_size)
         }
     }

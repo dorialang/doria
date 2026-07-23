@@ -100,7 +100,7 @@ pub enum TypeKind {
     Integer(IntegerType),
     Float(FloatType),
     String,
-    NullableString,
+    Nullable(TypeId),
     Bool,
     Null,
     Mixed,
@@ -112,6 +112,20 @@ pub enum TypeKind {
     List(TypeId),
     Dictionary(TypeId, TypeId),
     Set(TypeId),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolvedType {
+    Void,
+    Integer(IntegerType),
+    Float(FloatType),
+    String,
+    Bool,
+    Null,
+    Mixed,
+    Nullable(Box<ResolvedType>),
+    Class(String),
+    Unsupported,
 }
 
 #[derive(Debug, Default)]
@@ -157,7 +171,7 @@ impl TypeRegistry {
             TypeKind::Integer(integer) => integer.source_name().to_string(),
             TypeKind::Float(float) => float.source_name().to_string(),
             TypeKind::String => "string".to_string(),
-            TypeKind::NullableString => "?string".to_string(),
+            TypeKind::Nullable(inner) => format!("?{}", self.display(*inner)),
             TypeKind::Bool => "bool".to_string(),
             TypeKind::Null => "null".to_string(),
             TypeKind::Mixed => "mixed".to_string(),
@@ -175,6 +189,27 @@ impl TypeRegistry {
                 )
             }
             TypeKind::Set(element) => format!("Set<{}>", self.display(*element)),
+        }
+    }
+
+    pub fn resolved(&self, id: TypeId) -> ResolvedType {
+        match self.kind(id) {
+            TypeKind::Void => ResolvedType::Void,
+            TypeKind::Integer(ty) => ResolvedType::Integer(*ty),
+            TypeKind::Float(ty) => ResolvedType::Float(*ty),
+            TypeKind::String => ResolvedType::String,
+            TypeKind::Bool => ResolvedType::Bool,
+            TypeKind::Null => ResolvedType::Null,
+            TypeKind::Mixed => ResolvedType::Mixed,
+            TypeKind::Nullable(inner) => ResolvedType::Nullable(Box::new(self.resolved(*inner))),
+            TypeKind::Class(name) => ResolvedType::Class(name.clone()),
+            TypeKind::TypedArray(_)
+            | TypeKind::Unknown
+            | TypeKind::Heterogeneous
+            | TypeKind::EmptyCollection
+            | TypeKind::List(_)
+            | TypeKind::Dictionary(_, _)
+            | TypeKind::Set(_) => ResolvedType::Unsupported,
         }
     }
 }

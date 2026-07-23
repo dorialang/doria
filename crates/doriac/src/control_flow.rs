@@ -22,6 +22,7 @@ pub enum NodeAction {
     None,
     Statement(Stmt),
     Expression(Expr),
+    Assume { condition: Expr, truth: bool },
     ForInitializer(ForInitializer),
     ForIncrement(ForIncrement),
 }
@@ -198,7 +199,7 @@ impl Builder {
                 let body_incoming = if condition == ConstantCondition::AlwaysFalse {
                     Vec::new()
                 } else {
-                    vec![header]
+                    vec![self.assumption(&while_stmt.condition, true, header)]
                 };
                 let body_outgoing =
                     self.build_statements(&while_stmt.body.statements, body_incoming);
@@ -206,7 +207,7 @@ impl Builder {
                 let loop_context = self.loops.pop().expect("while loop context");
                 let mut outgoing = loop_context.breaks;
                 if condition != ConstantCondition::AlwaysTrue {
-                    outgoing.push(header);
+                    outgoing.push(self.assumption(&while_stmt.condition, false, header));
                 }
                 deduplicate(outgoing)
             }
@@ -263,14 +264,14 @@ impl Builder {
         let then_incoming = if condition == ConstantCondition::AlwaysFalse {
             Vec::new()
         } else {
-            vec![branch]
+            vec![self.assumption(&if_stmt.condition, true, branch)]
         };
         let mut outgoing = self.build_statements(&if_stmt.then_block.statements, then_incoming);
 
         let else_incoming = if condition == ConstantCondition::AlwaysTrue {
             Vec::new()
         } else {
-            vec![branch]
+            vec![self.assumption(&if_stmt.condition, false, branch)]
         };
         match &if_stmt.else_branch {
             Some(ElseBranch::If(nested)) => {
@@ -336,7 +337,10 @@ impl Builder {
         let body_incoming = if condition == ConstantCondition::AlwaysFalse {
             Vec::new()
         } else {
-            vec![header]
+            match &for_stmt.condition {
+                Some(condition) => vec![self.assumption(condition, true, header)],
+                None => vec![header],
+            }
         };
         let body_outgoing = self.build_statements(&for_stmt.body.statements, body_incoming);
         self.graph
@@ -344,7 +348,11 @@ impl Builder {
 
         let mut outgoing = self.loops.pop().expect("for loop context").breaks;
         if condition != ConstantCondition::AlwaysTrue {
-            outgoing.push(header);
+            if let Some(condition) = &for_stmt.condition {
+                outgoing.push(self.assumption(condition, false, header));
+            } else {
+                outgoing.push(header);
+            }
         }
         deduplicate(outgoing)
     }
@@ -361,6 +369,18 @@ impl Builder {
             .add_node(kind, span, action, !self.loops.is_empty());
         self.graph.connect_all(&incoming, node);
         node
+    }
+
+    fn assumption(&mut self, condition: &Expr, truth: bool, incoming: NodeId) -> NodeId {
+        self.normal(
+            NodeKind::Branch,
+            condition.span(),
+            NodeAction::Assume {
+                condition: condition.clone(),
+                truth,
+            },
+            vec![incoming],
+        )
     }
 
     fn terminal(&mut self, kind: NodeKind, span: Span, action: NodeAction, incoming: Vec<NodeId>) {

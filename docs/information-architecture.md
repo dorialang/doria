@@ -56,6 +56,14 @@ Role:
 
 ## Supporting context
 
+### docs/stdlib-reference.md
+
+Role:
+
+- The at-a-glance catalogue of the core and standard-library surface (companions, interfaces, collections, free functions, and `Doria\Std\*` modules with their members).
+- A derived **index**, not an authority: the end-to-end plan §9 owns direction and rationale, and the decision records own the precise contract. Every entry links to them.
+- Kept in sync when a stdlib decision record is authored or amended; marks members `(surface TBD in …)` until their decision exists.
+
 ### docs/notes/*
 
 Role:

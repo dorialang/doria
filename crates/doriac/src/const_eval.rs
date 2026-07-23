@@ -432,7 +432,7 @@ impl Evaluator {
                 right,
                 span,
             } => {
-                if Self::is_contextual_numeric_literal(left) {
+                if *op != BinaryOp::Coalesce && Self::is_contextual_numeric_literal(left) {
                     let right = self.evaluate_expr(right, expected, requester)?;
                     let left = self.evaluate_expr(left, Some(right.ty), requester)?;
                     return self.binary(op, left, right, *span).map(TypedValue::new);
@@ -444,6 +444,20 @@ impl Evaluator {
                     }
                     (BinaryOp::Or, ConstValue::Bool(true)) => {
                         return Some(TypedValue::new(ConstValue::Bool(true)));
+                    }
+                    (BinaryOp::Coalesce, ConstValue::Null) => {
+                        let expected = left
+                            .ty
+                            .nullable_payload()
+                            .or_else(|| expected.and_then(ConstType::nullable_payload))
+                            .or(expected);
+                        return self.evaluate_expr(right, expected, requester);
+                    }
+                    (BinaryOp::Coalesce, _) => {
+                        return Some(TypedValue {
+                            value: left.value,
+                            ty: left.ty.nullable_payload().unwrap_or(left.ty),
+                        });
                     }
                     _ => {}
                 }
@@ -619,29 +633,19 @@ impl Evaluator {
         span: Span,
     ) -> Option<ConstValue> {
         if matches!(op, BinaryOp::Equal | BinaryOp::NotEqual)
-            && (matches!(left.ty, ConstType::NullableString)
-                || matches!(right.ty, ConstType::NullableString))
+            && (left.ty.is_nullable() || right.ty.is_nullable())
+            && (left.ty.accepts(right.ty) || right.ty.accepts(left.ty))
+            && (matches!(left.value, ConstValue::Null) || matches!(right.value, ConstValue::Null))
         {
-            let nullable_operand = |ty: ConstType| {
-                matches!(
-                    ty,
-                    ConstType::String | ConstType::Null | ConstType::NullableString
-                )
-            };
-            if nullable_operand(left.ty) && nullable_operand(right.ty) {
-                let equal = match (&left.value, &right.value) {
-                    (ConstValue::String(left), ConstValue::String(right)) => left == right,
-                    (ConstValue::Null, ConstValue::Null) => true,
-                    (ConstValue::String(_), ConstValue::Null)
-                    | (ConstValue::Null, ConstValue::String(_)) => false,
-                    _ => unreachable!("nullable string types carry only string or null values"),
-                };
-                return Some(ConstValue::Bool(if *op == BinaryOp::Equal {
-                    equal
-                } else {
-                    !equal
-                }));
-            }
+            let equal = matches!(
+                (&left.value, &right.value),
+                (ConstValue::Null, ConstValue::Null)
+            );
+            return Some(ConstValue::Bool(if *op == BinaryOp::Equal {
+                equal
+            } else {
+                !equal
+            }));
         }
 
         let (left, right) = (left.value, right.value);
@@ -860,9 +864,12 @@ impl Evaluator {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConstType {
     Integer(IntegerType),
+    NullableInteger(IntegerType),
     Float(FloatType),
+    NullableFloat(FloatType),
     String,
     Bool,
+    NullableBool,
     Null,
     NullableString,
 }
@@ -880,22 +887,47 @@ impl ConstType {
 
     fn accepts(self, actual: Self) -> bool {
         self == actual
-            || matches!(
-                (self, actual),
+            || match (self, actual) {
                 (Self::NullableString, Self::String | Self::Null)
-            )
+                | (Self::NullableInteger(_), Self::Null)
+                | (Self::NullableFloat(_), Self::Null)
+                | (Self::NullableBool, Self::Bool | Self::Null) => true,
+                (Self::NullableInteger(expected), Self::Integer(actual)) => expected == actual,
+                (Self::NullableFloat(expected), Self::Float(actual)) => expected == actual,
+                _ => false,
+            }
+    }
+
+    const fn is_nullable(self) -> bool {
+        matches!(
+            self,
+            Self::NullableInteger(_)
+                | Self::NullableFloat(_)
+                | Self::NullableBool
+                | Self::NullableString
+        )
+    }
+
+    const fn nullable_payload(self) -> Option<Self> {
+        match self {
+            Self::NullableInteger(ty) => Some(Self::Integer(ty)),
+            Self::NullableFloat(ty) => Some(Self::Float(ty)),
+            Self::NullableBool => Some(Self::Bool),
+            Self::NullableString => Some(Self::String),
+            _ => None,
+        }
     }
 
     fn integer(self) -> Option<IntegerType> {
         match self {
-            Self::Integer(ty) => Some(ty),
+            Self::Integer(ty) | Self::NullableInteger(ty) => Some(ty),
             _ => None,
         }
     }
 
     fn float(self) -> Option<FloatType> {
         match self {
-            Self::Float(ty) => Some(ty),
+            Self::Float(ty) | Self::NullableFloat(ty) => Some(ty),
             _ => None,
         }
     }
@@ -905,9 +937,12 @@ impl fmt::Display for ConstType {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Integer(ty) => formatter.write_str(ty.source_name()),
+            Self::NullableInteger(ty) => write!(formatter, "?{}", ty.source_name()),
             Self::Float(ty) => formatter.write_str(ty.source_name()),
+            Self::NullableFloat(ty) => write!(formatter, "?{}", ty.source_name()),
             Self::String => formatter.write_str("string"),
             Self::Bool => formatter.write_str("bool"),
+            Self::NullableBool => formatter.write_str("?bool"),
             Self::Null => formatter.write_str("null"),
             Self::NullableString => formatter.write_str("?string"),
         }
@@ -917,16 +952,25 @@ impl fmt::Display for ConstType {
 fn const_type(ty: &TypeRef) -> Option<ConstType> {
     if ty.args.is_empty() {
         if let Some(integer) = IntegerType::from_source_name(&ty.name) {
-            return (!ty.nullable).then_some(ConstType::Integer(integer));
+            return Some(if ty.nullable {
+                ConstType::NullableInteger(integer)
+            } else {
+                ConstType::Integer(integer)
+            });
         }
         if let Some(float) = FloatType::from_source_name(&ty.name) {
-            return (!ty.nullable).then_some(ConstType::Float(float));
+            return Some(if ty.nullable {
+                ConstType::NullableFloat(float)
+            } else {
+                ConstType::Float(float)
+            });
         }
     }
     match (ty.nullable, ty.name.as_str(), ty.args.is_empty()) {
         (false, "string", true) => Some(ConstType::String),
         (true, "string", true) => Some(ConstType::NullableString),
         (false, "bool", true) => Some(ConstType::Bool),
+        (true, "bool", true) => Some(ConstType::NullableBool),
         _ => None,
     }
 }

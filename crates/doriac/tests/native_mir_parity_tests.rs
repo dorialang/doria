@@ -169,12 +169,14 @@ fn assert_closed_output_pipe(
     fs::write(&executable, bytes).expect("broken-pipe executable should be writable");
     make_executable(&executable);
 
-    let mut child = Command::new(&executable)
-        .current_dir(&directory)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap_or_else(|error| panic!("failed to start {backend} {name} fixture: {error}"));
+    let mut child = retry_transient_executable_busy(|| {
+        Command::new(&executable)
+            .current_dir(&directory)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+    })
+    .unwrap_or_else(|error| panic!("failed to start {backend} {name} fixture: {error}"));
     match closed_stream {
         ClosedStream::Stdout => drop(child.stdout.take()),
         ClosedStream::Stderr => drop(child.stderr.take()),
@@ -320,22 +322,28 @@ fn temp_working_directory(source: &str) -> PathBuf {
 }
 
 fn run_native_executable(executable: &Path, cwd: &Path, stdin: &[u8]) -> io::Result<Output> {
-    const MAX_ATTEMPTS: usize = 20;
-
-    for attempt in 0..MAX_ATTEMPTS {
-        match Command::new(executable)
+    let mut child = retry_transient_executable_busy(|| {
+        Command::new(executable)
             .current_dir(cwd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-        {
-            Ok(mut child) => {
-                let mut child_stdin = child.stdin.take().expect("piped stdin should be available");
-                write_stdin_tolerating_early_close(&mut child_stdin, stdin)?;
-                drop(child_stdin);
-                return child.wait_with_output();
-            }
+    })?;
+    let mut child_stdin = child.stdin.take().expect("piped stdin should be available");
+    write_stdin_tolerating_early_close(&mut child_stdin, stdin)?;
+    drop(child_stdin);
+    child.wait_with_output()
+}
+
+fn retry_transient_executable_busy<T>(
+    mut operation: impl FnMut() -> io::Result<T>,
+) -> io::Result<T> {
+    const MAX_ATTEMPTS: usize = 20;
+
+    for attempt in 0..MAX_ATTEMPTS {
+        match operation() {
+            Ok(value) => return Ok(value),
             Err(error) if is_transient_executable_busy(&error) && attempt + 1 < MAX_ATTEMPTS => {
                 thread::sleep(Duration::from_millis(25));
             }

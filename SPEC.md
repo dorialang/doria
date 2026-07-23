@@ -66,7 +66,7 @@ Valid PHP should be easy to migrate to Doria, but Doria-specific syntax does not
 
 Doria does not use `public`, `protected`, or `private` as member visibility modifiers. Class members are externally accessible by default, and `internal` marks implementation details.
 
-The current compiler implementation lowers the accepted native subset through validated typed MIR. The debug interpreter, default Cranelift fast profile, and `--release` LLVM profile consume that same MIR, and the durable executable parity manifest compares exact stdin-driven stdout bytes, stderr bytes, process status, declared file side effects, and class lifetime behavior across all three paths. The supported subset includes top-level free functions; parameterless int/void `main`; structured control flow and recursion; fixed-width numerics and bool; const-evaluable defaults for Copy scalars and readonly strings; immutable UTF-8 strings; expression interpolation; the narrow Stage 17 `?string` seed; checked formatting; UTF-8 line/file I/O; exact stdout/stderr; fatal panic; native class construction with path-sensitive definite initialization, property initialization/access, class-valued locals/arguments/returns, `take` transfer, compile-time non-lexical borrowing and returned-borrow elision, lifecycle bodies, recursive property destruction, and deterministic normal-exit cleanup; statically resolved instance and static methods; class/top-level constants; Copy-type static properties; complete `internal` checking; and concrete native `Displayable::toString()` calls. Native strings are private non-atomic refcounted buffers and are Copy at the source level. Native classes are pointer-sized move values whose headerless payload layout is compiler-known. `main(): int` crosses the accepted `0..125` process boundary and `main(): void` maps normal completion to status `0`. Release optimization does not change observable semantics. `doria-rt` owns process entry, class allocation/free, runtime strings, raw standard-device I/O, line discipline, text-file I/O, exact output, panic formatting, and Doria stack traces. Collections, general nullable types, interface-typed values, and `Bytes` remain unsupported. The former Stage 7-10 native smoke module remains retired.
+The current compiler implementation lowers the accepted native subset through validated typed MIR. The debug interpreter, default Cranelift fast profile, and `--release` LLVM profile consume that same MIR, and the durable executable parity manifest compares exact stdin-driven stdout bytes, stderr bytes, process status, declared file side effects, and class lifetime behavior across all three paths. The supported subset includes top-level free functions; parameterless int/void `main`; structured control flow and recursion; fixed-width numerics and bool; const-evaluable defaults for Copy scalars and readonly strings; immutable UTF-8 strings; expression interpolation; general nullable scalar, string, and concrete-class values with flow narrowing, `??`, `?->`, and exact `is`; checked formatting; UTF-8 line/file I/O; exact stdout/stderr; fatal panic; native class construction with path-sensitive definite initialization, property initialization/access, class-valued locals/arguments/returns, `take` transfer, compile-time non-lexical borrowing and returned-borrow elision, lifecycle bodies, recursive property destruction, and deterministic normal-exit cleanup; statically resolved instance and static methods; class/top-level constants; Copy-type static properties; complete `internal` checking; and concrete native `Displayable::toString()` calls. Native strings are private non-atomic refcounted buffers and are Copy at the source level. Native classes are pointer-sized move values whose headerless payload layout is compiler-known. `main(): int` crosses the accepted `0..125` process boundary and `main(): void` maps normal completion to status `0`. Release optimization does not change observable semantics. `doria-rt` owns process entry, class allocation/free, runtime strings, raw standard-device I/O, line discipline, text-file I/O, exact output, panic formatting, and Doria stack traces. Collections, the `mixed` runtime box, interface-typed values, and `Bytes` remain unsupported. The former Stage 7-10 native smoke module remains retired.
 
 Doria is not a Rust language. Rust is the current bootstrap implementation language for `doriac`, not the permanent identity of the compiler.
 
@@ -487,6 +487,7 @@ float64
 string
 bool
 mixed
+?T
 T[]
 List<T>
 Dictionary<K, V>
@@ -528,7 +529,9 @@ uint8  uint16  uint32  uint64
 
 Stage 14 implements `float32` as IEEE 754 binary32 and canonical `float`/`float64` as IEEE 754 binary64. `float` and `float64` are one semantic/runtime type; `float32` remains distinct, with no implicit width or integer conversion. Decision 0072 defines arithmetic, comparisons, special values, literal rounding, bool runtime values, and backend behavior.
 
-An unconstrained decimal integer literal defaults to `int`. A literal may instead adopt an expected integer type from a declaration, parameter, return, assignment, or typed binary operand when its mathematical value fits that type. Contextual literal typing is not an implicit conversion. Out-of-range literals are compile-time errors. Stage 13 adds no numeric suffixes and no hexadecimal, octal, or binary literal syntax.
+An unconstrained decimal integer literal defaults to `int`. A literal may instead adopt an expected integer type from a declaration, parameter, return, assignment, or typed binary operand when its mathematical value fits that type. Contextual literal typing is not an implicit conversion. Out-of-range literals are compile-time errors.
+
+The accepted future direction adds hexadecimal (`0x`), octal (`0o`), and binary (`0b`) integer literals plus `_` digit separators for readability (`1_000_000`, `0xFF_FF`). There will be **no typed numeric suffixes** (`100u8`): contextual literal typing already supplies a literal's width from its expected type, so a suffix would be a redundant second typing channel. These forms are not yet accepted source syntax; the current grammar remains decimal-only until a dedicated numeric-literals slice defines separator placement and malformed-form diagnostics and lands lexer, parser, semantic, and regression coverage together.
 
 Both operands of an integer binary operator must resolve to the same canonical integer type. Nonliteral values never widen or narrow implicitly, and Doria has no C-style integer promotions. The implemented integer operators are:
 
@@ -568,27 +571,81 @@ The exact operator, panic, and conversion rules are authoritative in decisions 0
 
 `mixed` is Doria's only dynamic type. It has three laws:
 
-1. `mixed` is unknown-flavored, never any-flavored. A `mixed` value permits no property access, method calls, arithmetic, concatenation, interpolation, comparison, or other typed operation until it is narrowed with `is` or `match`.
+1. `mixed` is unknown-flavored, never any-flavored. A `mixed` value permits no property access, method calls, arithmetic, concatenation, interpolation, comparison, or other typed operation until it is narrowed. Exact `is` narrowing is implemented; `match` supplies another narrowing form when it lands at Stage 28.
 2. Any value may flow into `mixed` implicitly. This is the deliberate dynamic-boundary exemption from the no-implicit-conversion rule. Values do not flow out of `mixed` implicitly; source must narrow first. There is no cast spelling.
 3. `mixed` is a boxed, runtime-tagged move type, always, even when the payload is a Copy value.
 
 ```doria
-mixed $payload = Json::decode($line);
+function describe(mixed $payload): string
+{
+    if ($payload is string) {
+        return $payload;
+    }
 
-let $label = match ($payload) {
-    string $value => $value,
-    int $value => Int::toString($value),
-    default => "unknown",
-};
+    return "unknown";
+}
 ```
 
-`object` does not exist in Doria. Use `mixed` for dynamic object-shaped boundaries and narrow with `is` or `match`.
+Stage 22 implements these static rules and classifies `mixed` as a move type.
+The boxed, runtime-tagged `dr_mixed` representation lands in Stage 23. A live
+`mixed` value reaching native lowering before then is rejected with a Stage 23
+unsupported-feature diagnostic; it is never represented by a placeholder.
+
+`object` does not exist in Doria. Use `mixed` for dynamic object-shaped boundaries and narrow with `is` now or `match` after Stage 28.
 
 `null` is a literal, not a type-position name. The internal null type exists for nullable machinery, but source spells nullable values as `?T`.
 
 `resource` is reserved for Phase I PHP bridge work and is rejected until the bridge specifies its exact semantics.
 
 `void` is valid only as a function or method return type, including `main(): void`; it is not a value type.
+
+### Nullable values and narrowing
+
+`?T` contains `T` and `null`. The null literal is assignable to `?T` and
+`mixed`, but not to non-nullable `T`. Nullable values have no implicit
+truthiness.
+
+```doria
+class Label
+{
+    function text(): string
+    {
+        return "Doria";
+    }
+}
+
+function display(?Label $label): string
+{
+    if ($label != null) {
+        return $label->text();
+    }
+
+    return $label?->text() ?? "none";
+}
+```
+
+`$left ?? $fallback` evaluates the left operand once and evaluates the fallback
+only when the left value is null. `$receiver?->member` evaluates the receiver
+once and skips the access, method body, and arguments when it is null. A
+value-producing null-safe access produces a nullable result; an already-nullable
+member result is not wrapped in another nullable layer.
+
+`== null` and `!= null` establish path-sensitive null facts. `$value is T`
+tests and narrows `mixed` or `?T` against an exact fixed-width numeric, `bool`,
+`string`, or declared concrete class type. Facts follow lexical bindings,
+short-circuit control flow, assignments, loops, and branch joins; a fact is
+available after a join only when every incoming path proves it. Ordinary member
+access on a possibly-null class value is an error until the value is narrowed.
+
+Stage 22 exact class tests do not perform subtype or interface conformance.
+Hierarchy `is` is deferred to Stage 34 and interface `is` to Stage 35; those
+forms parse and receive stage-named diagnostics. `match` narrowing remains Stage
+28.
+
+Nullable concrete classes use a null pointer for absence. Other nullable values
+use an explicit presence word and payload. `?T` keeps `T`'s ownership class:
+nullable Copy payloads remain Copy, while `?Class` remains a move value and drops
+the class only when present. Decision 0093 defines the complete Stage 22 model.
 
 Typed arrays use C-style suffix spelling:
 
@@ -658,7 +715,7 @@ Conformance requires the explicit `implements Displayable` declaration and exact
 
 The `.` operator is runtime string concatenation. Each operand may be a display-convertible primitive, but at least one operand of that binary operation must already be statically `string`; therefore `"x=" . 1` is valid while `1 . 2` is rejected. The result is `string`, evaluation is left-to-right, and no conversion is implied outside display contexts. `echo`, `.`, and current interpolation parts use decimal integers, shortest-round-trip locale-independent binary32/binary64 floats, lowercase `true`/`false`, and strings unchanged.
 
-There is no implicit widening, narrowing, or scalar coercion between distinct integer or float types. `float` is not assignable from an integer and an integer is not assignable from `float`. Stage 14 provides only `Int::toFloat(int): float` and checked `Float::toInt(float): int`; decision 0042 defines their exact contracts. Named arguments remain a separate future slice.
+There is no implicit widening, narrowing, or scalar coercion between distinct integer or float types. `float` is not assignable from an integer and an integer is not assignable from `float`. Stage 14 provides only `Int::toFloat(int): float` and checked `Float::toInt(float): int`; decision 0042 defines their exact contracts. Named arguments are designed by decision 0098 and scheduled for Stage 23a; they do not alter numeric conversion rules.
 
 Simple collection literals infer collection element/key/value types when all clear parts match. Clear heterogeneous collection literals, such as `[1, "two"]`, are rejected by typed array and narrow collection alias assignment checks rather than being erased to `Unknown`. The empty literal `[]` stays ambiguous so typed contexts may use it as an empty `T[]`, `List<T>`, or `Dictionary<K, V>`.
 
@@ -668,18 +725,21 @@ Stage 17 provides these compiler-known built-ins:
 
 ```doria
 read_line(): ?string
-sprintf(string $format, ...): string
-printf(string $format, ...): void
 read_file(string $path): string
 write_file(string $path, string $contents): void
 write_stderr(string $value): void
 ```
 
+The compiler-known `sprintf` returns `string` and `printf` returns `void`. Each
+takes a literal `string $format` first, followed by the typed operands required
+by that format. The intrinsic-only operand tail is not an untyped Doria
+parameter declaration.
+
 The additive text-file spelling is specified as
 `append_file(string $path, string $contents): void`. It lands in Stage 23 alongside the binary
 file tier; it is not a Stage 17 built-in. `write_file` remains truncate-only.
 
-`read_line` reads UTF-8 text, removes one LF ending and a preceding CR when present, preserves empty lines and final unterminated lines, and returns `null` only when EOF occurs before any bytes. Its return type is the first supported position for the nullable `?T` model specified for Stage 22, not an I/O-only replacement type. A `!= null` guard narrows `?string` to `string`; assigning `null` or another nullable result invalidates that fact, while assigning a known `string` establishes a new non-null fact. Stage 22 generalizes the same nullable model to other type positions and null-safe operations.
+`read_line` reads UTF-8 text, removes one LF ending and a preceding CR when present, preserves empty lines and final unterminated lines, and returns `null` only when EOF occurs before any bytes. Its return type was the first supported position for the nullable `?T` model now generalized by Decision 0093. A `!= null` guard narrows `?string` to `string`; assigning `null` or another nullable result invalidates that fact, while assigning a known `string` establishes a new non-null fact.
 
 `read_file` and `write_file` are text-file functions. `read_file` reads an entire file and validates UTF-8 before constructing a `string`; invalid bytes never enter a Doria string. `write_file` creates or truncates a text file and writes the string's exact bytes. `write_stderr` writes exact bytes without adding a newline. An ordinary program write to stdout or stderr that reports a closed pipe exits immediately with status 0 and emits no panic or stack trace. This exception does not apply to panic diagnostics: a panic remains fatal with status 101 when stderr is unavailable, although its best-effort diagnostic output may be absent. Other Stage 17 I/O failures, including invalid UTF-8, file failures, and non-broken-pipe operating-system failures, use the fatal panic path with a clear message; `null` from `read_line` means EOF and never signals an error. At Stage 29 these free functions migrate to declared `throws` signatures when checked errors are implemented, but the ordinary standard-stream broken-pipe clean exit is permanent and is never thrown.
 
@@ -744,7 +804,7 @@ Each `if`, `else if`, `else`, and `while` body has its own block scope. Variable
 
 `if` is statement control flow and does not return a value. `if` without `else` is valid Doria. `else`, `else if`, `given`, and `finally` are optional. A base `if`, `while`, `foreach`, or future control construct does not require `given` or `finally`.
 
-`when` is the planned value-returning conditional/control construct. `when`, `given`, and `finally` are accepted design direction but are not implemented in the current compiler slice.
+`when` is the value-returning form of `if`: the same `given` / `else when` / `else` / `finally` structure (`when` / `else when` in place of `if` / `else if`), differing only in that it always yields a value. Its one result type is written on the head only (`when (cond): T`) or, when omitted, inferred from the value the first block returns — never on an `else when`; every other branch is checked against that type and a mismatch is a compile error. It requires a total `else`, and each branch produces the value with a block-scoped `return` that completes the `when` rather than returning from the enclosing function. `when` is an expression, used where a value of its result type is expected. A `given` prelude runs its setup once, then its `bool` predicates are AND-ed with each `when` and `else when` condition: a branch is selected only when the predicates and that branch's own condition all hold, and when no such conjunction holds the `else` value is returned. A false `given` predicate disqualifies every conditional branch at once and selects `else` — it never falls through to the next `else when`. The grammar is settled in decision 0097; `when`, `given`, and `finally` parse as accepted syntax but are not yet implemented in the current compiler slice, so they produce a stage-named unsupported-feature diagnostic per §0.
 
 ### Checked errors
 
@@ -968,6 +1028,8 @@ For declared non-`void` return types, no reachable path may fall through the fun
 
 The program entrypoint may be `main(): int` or `main(): void`. `main(): int` returns an explicit process status. `main(): void` may fall through or use `return;` and maps normal completion to successful status `0`. Returning a value from `main(): void` is the same semantic error as returning a value from any other `void` function.
 
+`main` may also take command-line arguments through an optional parameter: `main(List<string> $args): int` (and the `: void` variant), per decision 0099. `$args` is the program's arguments, populated by the entry glue; `$args->count` is the argument count and there is no separate `argc`. This form depends on `List` and lands with the collections tier; the current compiler accepts only the parameterless forms.
+
 Calls are checked against declared parameter lists:
 
 ```doria
@@ -981,11 +1043,11 @@ greet();              // error
 greet(123);           // error
 ```
 
-Only positional arguments are supported in the current slice. Required parameters cannot follow optional parameters until named arguments exist.
+The current compiler accepts only positional arguments. Decision 0098 schedules named arguments for Stage 23a, where callers may skip a middle default by parameter name and required parameters may follow optional parameters.
 
 Native execution currently supports omitted trailing defaults when the parameter is a fixed-width integer, float, bool, or readonly string and the default is accepted by the Stage 20 constant-evaluation tier. This applies uniformly to free functions, instance methods, static methods, and constructors. A writable Copy-scalar parameter may use such a default because writability does not change its ownership classification. For a readonly string parameter, the caller materializes the folded value as an ordinary string-literal argument. Ordinary call temporaries are released after the call; a constructor-promoted value is retained by the property and released with the object. The compiler inserts each folded value at its omitted call position before MIR execution.
 
-Defaults for `?string`, `writable string`, `take string`, other move types, and `take` parameters remain deferred until their representation, mutation, construction, and destruction obligations are implemented. Non-constant defaults are rejected before MIR. Named arguments remain separate future work.
+Defaults for `?string`, `writable string`, `take string`, other move types, and `take` parameters remain deferred until their representation, mutation, construction, and destruction obligations are implemented. Non-constant defaults are rejected before MIR. Named arguments are specified by decision 0098 and remain unavailable until their scheduled Stage 23a implementation.
 
 ## 10. Collection aliases
 
@@ -1078,7 +1140,7 @@ As native code generation matures, Doria IR may lower into a simpler native-orie
 
 MIR is Doria's native-oriented, backend-independent control-flow representation for the executable subset. It contains typed scalar, string, nullable-string, and class locals, parameters, calls and returns; class allocation, compiler-known property initialization/load/store, explicit ownership transfer and drops; method identities with explicit receiver operands and receiver modes; static data operations; runtime string literal/local/call/concatenation/display expressions; string comparison; basic blocks; checked numeric operations/conversions; and panic termination. Constants are typed and evaluated before MIR, so consumers receive folded values rather than a second evaluator. The debug interpreter uses safe private string and class values, an explicit heap-backed Doria frame stack, per-program static storage, and exact stdout/stderr buffers. It models source value and lifetime behavior, not native pointer/refcount layout. Ordinary interpretation has no fixed execution-fuel or call-depth cap and does not reject repeated states.
 
-Native is the primary target. Checked HIR lowers to typed MIR, shared MIR validation gates both native lowerers, Cranelift emits the default fast object, LLVM 18 emits the O3 `--release` object, and the host linker combines either object with `doria-rt`. Native compilation has no interpreter preflight, fallback IR, or release-to-fast fallback. `doria-rt` owns entry policy, headerless class payload allocation/free, immutable refcounted runtime strings, Stage 17 text I/O and formatting support, exact stdout/stderr writes, abort-only panic formatting, stack traversal, and status 101. Both lowerers share scalar, opaque string, and pointer-sized class ABI conventions. Normal cleanup drops still-owned class locals and statement temporaries on fallthrough, `return`, `break`, and `continue`; invokes `__destruct` before reverse-order owned-property cleanup; and frees the payload last. Ordinary instance/static calls preserve those obligations. Owning class returns transfer ownership, while Decision 0089 returned-borrow elision preserves an inferred readonly or writable alias to `$this` or exactly one borrowed parameter; only explicit `take` parameters consume class arguments. Copy-type statics are private compiler-generated data symbols; compile-time string statics use an immortal private runtime representation and remain Copy at the Doria surface. Ownership transfer suppresses source cleanup, assignment acquires the replacement before dropping the old value, and abort-only panic runs no cleanup. Constructor definite initialization follows Decision 0090: semantic dataflow checks every reachable normal path, and MIR validation independently rejects incomplete or multiply initialized readonly property state before either native backend runs. Runtime failures use the shared panic path, except that an ordinary program write to a closed stdout or stderr pipe exits cleanly with status 0 under Decision 0091; panic reporting remains fatal even when its stderr sink is unavailable. Only canonical int/void entry results cross the process boundary. Unsupported coverage remains for collections, Stage 22 general nullable types, Stage 23 `Bytes`, dynamic dispatch, and general interfaces.
+Native is the primary target. Checked HIR lowers to typed MIR, shared MIR validation gates both native lowerers, Cranelift emits the default fast object, LLVM 18 emits the O3 `--release` object, and the host linker combines either object with `doria-rt`. Native compilation has no interpreter preflight, fallback IR, or release-to-fast fallback. `doria-rt` owns entry policy, headerless class payload allocation/free, immutable refcounted runtime strings, Stage 17 text I/O and formatting support, exact stdout/stderr writes, abort-only panic formatting, stack traversal, and status 101. Both lowerers share scalar, opaque string, pointer-sized class, and Decision 0093 nullable ABI conventions. Normal cleanup drops still-owned class locals and statement temporaries on fallthrough, `return`, `break`, and `continue`; invokes `__destruct` before reverse-order owned-property cleanup; and frees the payload last. Ordinary instance/static calls preserve those obligations. Owning class and nullable-class returns transfer ownership, while Decision 0089 returned-borrow elision preserves an inferred readonly or writable alias to `$this` or exactly one borrowed parameter; only explicit `take` parameters consume class arguments. Copy-type statics are private compiler-generated data symbols; compile-time string statics use an immortal private runtime representation and remain Copy at the Doria surface. Ownership transfer suppresses source cleanup, assignment acquires the replacement before dropping the old value, and abort-only panic runs no cleanup. Constructor definite initialization follows Decision 0090: semantic dataflow checks every reachable normal path, and MIR validation independently rejects incomplete or multiply initialized readonly property state before either native backend runs. Runtime failures use the shared panic path, except that an ordinary program write to a closed stdout or stderr pipe exits cleanly with status 0 under Decision 0091; panic reporting remains fatal even when its stderr sink is unavailable. Only canonical int/void entry results cross the process boundary. Unsupported coverage remains for collections, the Stage 23 `mixed` runtime box and `Bytes`, dynamic dispatch, and general interfaces.
 
 The PHP backend is currently implemented as a compatibility/debugging backend. It emits `<?php` and lowers Doria-only syntax away:
 
@@ -1099,7 +1161,6 @@ Backend-specific tests are useful, but the PHP backend must not be the required 
 Future work includes:
 
 - Better diagnostics with suggestions.
-- Nullable types.
 - Full type inference for lists and dictionaries.
 - Interfaces, traits, and namespaces.
 - Class inheritance through `extends`, interface conformance through `implements`, and class-body/trait-body `uses` trait composition.

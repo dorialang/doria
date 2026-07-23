@@ -290,12 +290,19 @@ pub enum Expr {
     PropertyAccess {
         object: Box<Expr>,
         property: String,
+        null_safe: bool,
         span: Span,
     },
     MethodCall {
         object: Box<Expr>,
         method: String,
         args: Vec<Expr>,
+        null_safe: bool,
+        span: Span,
+    },
+    IsType {
+        expr: Box<Expr>,
+        ty: TypeRef,
         span: Span,
     },
     FunctionCall {
@@ -413,6 +420,7 @@ impl Expr {
             | Expr::Array { span, .. }
             | Expr::PropertyAccess { span, .. }
             | Expr::MethodCall { span, .. }
+            | Expr::IsType { span, .. }
             | Expr::FunctionCall { span, .. }
             | Expr::StaticCall { span, .. }
             | Expr::StaticMember { span, .. }

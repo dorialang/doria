@@ -26,6 +26,20 @@ Dictionary<string, int> $items = ["apples" => 5];"#,
 }
 
 #[test]
+fn lexes_stage22_nullable_and_type_test_operators() {
+    let kinds = token_kinds("?Label $label = null; $label?->name ?? ($value is string);");
+
+    assert!(matches!(kinds[0], TokenKind::Question));
+    assert!(kinds
+        .iter()
+        .any(|kind| matches!(kind, TokenKind::QuestionArrow)));
+    assert!(kinds
+        .iter()
+        .any(|kind| matches!(kind, TokenKind::QuestionQuestion)));
+    assert!(kinds.iter().any(|kind| matches!(kind, TokenKind::Is)));
+}
+
+#[test]
 fn lexes_namespace_and_inheritance_grammar() {
     let kinds = token_kinds(
         r#"namespace Vendor\App;
@@ -172,6 +186,20 @@ fn lexes_boolean_word_operators() {
 }
 
 #[test]
+fn lexes_bitwise_and_before_an_adjacent_variable() {
+    let kinds = token_kinds("$mask&$flag");
+    assert_eq!(
+        kinds,
+        vec![
+            TokenKind::Variable("mask".to_string()),
+            TokenKind::Ampersand,
+            TokenKind::Variable("flag".to_string()),
+            TokenKind::Eof,
+        ]
+    );
+}
+
+#[test]
 fn lexes_stage_13_primitive_type_spellings() {
     let kinds =
         token_kinds("int int8 int16 int32 int64 uint8 uint16 uint32 uint64 float float32 float64");
@@ -271,10 +299,38 @@ fn lexes_future_reserved_words() {
 }
 
 #[test]
-fn lexes_planned_control_flow_words_as_identifiers() {
-    let kinds = token_kinds("when finally");
-    assert!(matches!(kinds[0], TokenKind::Identifier(ref word) if word == "when"));
-    assert!(matches!(kinds[1], TokenKind::Identifier(ref word) if word == "finally"));
+fn lexes_accepted_control_flow_keywords() {
+    let kinds = token_kinds("when given finally");
+    assert!(matches!(kinds[0], TokenKind::When));
+    assert!(matches!(kinds[1], TokenKind::Given));
+    assert!(matches!(kinds[2], TokenKind::Finally));
+}
+
+#[test]
+fn rejected_php_operator_surfaces_have_targeted_diagnostics() {
+    for (source, expected) in [
+        ("2 ** 3", "typed numeric `pow` API"),
+        ("$value **= 3", "typed numeric `pow` API"),
+        ("$left <=> $right", "`Comparable`"),
+        ("@$fallible", "error suppression"),
+        ("`uname`", "backtick process execution"),
+    ] {
+        let source = SourceFile::new("test.doria", source);
+        let diagnostics = Lexer::new(&source)
+            .lex()
+            .expect_err("retired PHP operator syntax must be rejected");
+        assert!(
+            diagnostics.iter().any(|diagnostic| {
+                diagnostic.code == "L0002"
+                    && (diagnostic.message.contains(expected)
+                        || diagnostic
+                            .help
+                            .as_deref()
+                            .is_some_and(|help| help.contains(expected)))
+            }),
+            "expected targeted guidance containing {expected}, got {diagnostics:#?}"
+        );
+    }
 }
 
 #[test]

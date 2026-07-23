@@ -638,7 +638,7 @@ string $payload = $chain->m0(1);
 }
 
 #[test]
-fn mixed_operation_help_does_not_point_to_unimplemented_narrowing_syntax() {
+fn mixed_operation_help_points_to_is_narrowing() {
     let err = doriac::check_source(
         "test.doria",
         r#"
@@ -656,13 +656,13 @@ let $sum = $payload + 1;
         .as_deref()
         .expect("diagnostic should have help");
 
-    assert!(help.contains("narrowing syntax is implemented"));
-    assert!(!help.contains("`is`"));
+    assert!(help.contains("narrow"));
+    assert!(help.contains("`is`"));
     assert!(!help.contains("`match`"));
 }
 
 #[test]
-fn null_type_help_marks_nullable_syntax_as_planned() {
+fn null_type_help_points_to_concrete_nullable_types() {
     let err = doriac::check_source(
         "test.doria",
         r#"
@@ -679,10 +679,10 @@ null $value = null;
         .as_deref()
         .expect("diagnostic should have help");
 
-    assert!(help.contains("planned"));
-    assert!(help.contains("not implemented"));
     assert!(help.contains("`?T`"));
-    assert!(!help.contains("such as `?User`"));
+    assert!(help.contains("`?string`"));
+    assert!(help.contains("`?Person`"));
+    assert!(!help.contains("planned"));
 }
 
 #[test]
@@ -3873,11 +3873,11 @@ fn reports_object_as_unknown_type_with_help() {
 
     assert!(err.iter().any(|diagnostic| {
         diagnostic.code == "E0401"
-            && diagnostic.message.contains("object")
+            && diagnostic.message.contains("`object` does not exist")
             && diagnostic
                 .help
                 .as_deref()
-                .is_some_and(|help| help.contains("Doria has no `object` type"))
+                .is_some_and(|help| help.contains("concrete class type") && help.contains("mixed"))
     }));
 }
 
@@ -3936,7 +3936,6 @@ Dictionary<int, int> $indexedCounts = [
     1 => 20,
 ];
 Dictionary<string, int> $emptyCounts = [];
-Set<string> $names = [];
 
 class Inventory
 {
@@ -4018,6 +4017,11 @@ let $values = [
     "second" => 1,
 ];
 Dictionary<string, int> $numbers = $values;
+"#,
+        r#"Set<string> $names = [];"#,
+        r#"
+let $empty = [];
+Set<string> $names = $empty;
 "#,
     ] {
         assert_type_mismatch(source);

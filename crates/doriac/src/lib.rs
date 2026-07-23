@@ -20,6 +20,7 @@ pub mod mir;
 pub mod mir_interpreter;
 pub mod mir_lowering;
 pub mod mir_validation;
+mod narrowing;
 pub mod native_abi;
 pub mod numeric;
 pub mod ownership;

@@ -1,0 +1,12 @@
+[E0506] cannot use method call on a possibly-null value
+help: narrow it with a null check or use `?->`
+[E0433] cannot use `mixed` value in operator before narrowing
+help: narrow the value with `is` before using it
+[E0431] `null` is a literal, not a type name
+help: write `?T` with a concrete type, such as `?string` or `?Person`
+[E0430] `void` is only valid as a return type
+help: -
+[E0401] `object` does not exist as a Doria type
+help: use a concrete class type, or `mixed` at a dynamic boundary and narrow it with `is`
+[E0432] `resource` is reserved for PHP interop through the future Phase I bridge and is not a Doria value type
+help: -

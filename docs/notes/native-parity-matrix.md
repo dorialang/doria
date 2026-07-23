@@ -111,6 +111,10 @@ Source of truth for sequencing remains `docs/doria-end-to-end-plan.md`. The dura
 | PHP float32 boundary | Diagnostic | Diagnostic | Diagnostic | Covered | PHP never emits unknown float width names; exact float64 division uses `fdiv`. |
 | Invalid process status panic | Covered | Covered | Covered | Covered | Runtime entry validates `main(): int` and exits 101 on failure. |
 | Narrow `?string` seed and flow guards | Covered | Covered | Covered | Covered | `read_line` EOF is distinct from empty string; assignment invalidates or re-establishes non-null facts. |
+| General nullable scalars and strings | Covered | Covered | Covered | Covered | An explicit presence word and payload cross locals, calls, returns, properties, and statics without backend-specific semantics. |
+| Nullable concrete classes | Covered | Covered | Covered | Covered | Null-pointer absence preserves class move ownership and drops only present payloads. |
+| `??`, `?->`, null guards, and exact `is` | Covered | Covered | Covered | Covered | `main_stage22_nullable.doria` covers lazy defaults, null-safe calls, path narrowing, matching and incompatible exact tests, and byte-identical output. |
+| `mixed` static boundary | Frontend | Frontend | Frontend | Covered | Bare operations are rejected until exact `is` narrowing; live runtime values stop before MIR with the Stage 23 diagnostic. |
 | `read_line` and repeated buffering | Covered | Covered | Covered | Covered | Raw sidecar stdin covers LF, CRLF, empty lines, buffered subsequent lines, and final unterminated input. |
 | `read_file` | Covered | Covered | Covered | Covered | Complete UTF-8 text and Unicode content agree through isolated fixture directories. |
 | `write_file` and file side effects | Covered | Covered | Covered | Covered | Create/truncate output is compared byte-for-byte against expected files. |
@@ -127,6 +131,6 @@ Source of truth for sequencing remains `docs/doria-end-to-end-plan.md`. The dura
 
 ## Retirement Gate
 
-Status: Passed through Stage 21 after this branch's full validation gates pass.
+Status: Passed through Stage 22 after this branch's full validation gates pass.
 
-All accepted Stage <=20 scalar, string, interpolation, checked-format, text-I/O, ownership, native-class, method, static, constant, and concrete-display lowering passes through typed MIR and shared MIR validation. The interpreter, Cranelift fast profile, and LLVM release profile consume that same MIR; every finite native example is required in the executable manifest with deterministic sidecars where needed; Linux CI memory-checks the ownership-bearing native fixtures, including the static-constructor and `self` paths; and the Stage 7-10 native smoke module remains retired and deleted. Stage 21 ordinary borrowing and constructor definite initialization now use the same backend-independent path and satisfy their acceptance criterion; the separately unauthored shared-ownership types are scheduled for Stage 25a.
+All accepted Stage <=22 scalar, string, interpolation, checked-format, text-I/O, ownership, native-class, method, static, constant, concrete-display, and nullable lowering passes through typed MIR and shared MIR validation. The interpreter, Cranelift fast profile, and LLVM release profile consume that same MIR; every finite native example is required in the executable manifest with deterministic sidecars where needed; Linux CI memory-checks the ownership-bearing native fixtures, including the static-constructor and `self` paths; and the Stage 7-10 native smoke module remains retired and deleted. Stage 21 ordinary borrowing and constructor definite initialization and Stage 22 narrowing use the same backend-independent control-flow/dataflow foundation. The `mixed` runtime box remains Stage 23, and the separately unauthored shared-ownership types remain scheduled for Stage 25a.

@@ -21,6 +21,8 @@ function main(): void
 }
 ```
 
+> Amendment (record 0099). `main` also accepts an optional command-line-argument parameter — `main(List<string> $args): int` / `: void` — populated by the entry glue, with `$args->count` for the count and no separate `argc`. That form depends on `List` and lands with the collections tier; the two return types this record settles are unchanged.
+
 `main(): int` is the explicit process-status form. The current native smoke backend accepts only returned status values in the portable `0..125` range. That range is a process-status boundary for this native slice, not the range of Doria `int`.
 
 `main(): void` is the implicit-success form:
