@@ -118,5 +118,5 @@ the diagnostics and methods land (SPEC tracks the implemented surface).
 - The migrate-php / unknown-operator fixit table gains `**` → `Int::pow`/
   `Float::pow`, `<=>` → `compare`, `@` → handle-the-result, `` ` `` →
   `Doria\Std\Process`, `&$` → ownership.
-- Decision 0092's reliance on `Comparable` ordering now has a concrete shape
-  (`compare(): Ordering`).
+- Decision 0092's reliance on `Comparable<T>` ordering now has a concrete shape
+  (`compare(T $other): Ordering`).

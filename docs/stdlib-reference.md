@@ -11,7 +11,7 @@ Two layers (plan §9): **core** (no I/O, always available) and **std** (hosted u
 ### Primitive companions
 Fixed-width numeric, bool, and string companion APIs — the member surface each primitive carries. Details: decisions 0013/0016 (numeric types), 0042 (conversions), 0095 (`pow`), 0096 (interface conformance); §4.6 (strings).
 
-- **`Int`, `Int8`/`Int16`/`Int32`/`Int64`, `UInt8`/`UInt16`/`UInt32`/`UInt64`** — `Int::parse(string): ?int`, `Int::toFloat(int): float`, `Int::pow(...)`, wrapping arithmetic (`wrappingAdd`/`wrappingSub`/`wrappingMul`), and per-width `Int32::from($x)` (checked, panics on overflow) / `Int32::tryFrom($x): ?Int32`.
+- **`Int`, `Int8`/`Int16`/`Int32`/`Int64`, `UInt8`/`UInt16`/`UInt32`/`UInt64`** — `Int::parse(string): ?int`, `Int::toFloat(int): float`, `Int::pow(...)`, wrapping arithmetic (`wrappingAdd`/`wrappingSub`/`wrappingMul`), and per-width `Int32::from($x)` (checked, panics on overflow) / `Int32::tryFrom($x): ?int32`.
 - **`Float`, `Float32`/`Float64`** — `Float::parse(string): ?float`, `Float::toInt(float): int` (checked, panics on NaN/out-of-range), `Float::pow(...)`. `float` is neither `Hashable` nor totally `Comparable` (0096).
 - **`Bool`** — companion helpers.
 - **`String`** — `$s->length` (byte length), `$s->isEmpty`, `$s->bytes` (a `Bytes` view, copy in v1.0); `$s->chars` (grapheme iteration) is deferred. Plus the `str_*` free-function family (below).
@@ -19,7 +19,7 @@ Fixed-width numeric, bool, and string companion APIs — the member surface each
 ### Value interfaces (core contracts)
 Details: decision 0096 (primitive conformance), the interfaces/traits decision (Stage 35), 0079 (`Displayable`).
 
-- **`Comparable<T>`** — `compare(): Ordering`, over the core enum **`Ordering { Less, Equal, Greater }`** (decision 0095). There is no `<=>` operator.
+- **`Comparable<T>`** — `compare(T $other): Ordering`, over the core enum **`Ordering { Less, Equal, Greater }`** (decision 0095). There is no `<=>` operator.
 - **`Equatable<T>`** — structural/value equality contract (`==`/`!=`).
 - **`Hashable`** — a canonical hash for `Dictionary`/`Set` keys.
 - **`Displayable`** — `toString(): string`; Doria's answer to `__toString`, drives interpolation / `.` / `echo` (§4.6, 0079).
@@ -89,3 +89,8 @@ Hosted modules under the reserved `Doria\Std` namespace. Most are direction-only
   - **raw mode** — entered through an ownership guard whose `__destruct` restores the terminal on every structured exit.
   Capability-based (no escape sequences or platform encodings in any public value); stateless (no `ScreenBuffer` std type). *(Method inventory settled in the Console/terminal decision, TermUtil-informed; lands Stage 46.)*
 - **`Doria\Std\Math`** — batteries-included game/graphics math as built-in Copy value types: `Vector2`/`Vector3`/`Vector4`, `Quaternion`, `Euler`, `Matrix3x3`/`Matrix4x4`, plus `lerp`/`clamp`/easing helpers. Compiler-known arithmetic operators; `$v->length` / `$v->normalized` properties, `$v->dot`/`$v->cross` methods. Direction: plan §9 (math); lands Stage 47. *(Geometry-math record unauthored.)*
+
+## Invalidated elsewhere
+
+- The plan's Decision 0095 catalogue entry and Decision 0095's `Comparable<T>` consequence now include the typed comparison operand.
+- No compiler behavior or implemented standard-library surface changes; this file catalogues planned APIs.

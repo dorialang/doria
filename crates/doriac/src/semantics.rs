@@ -106,13 +106,13 @@ pub fn analyze_program(program: &Program) -> DiagnosticResult<SemanticInfo> {
             .iter()
             .filter_map(|(span, signature)| signature.return_borrow.map(|borrow| (*span, borrow)))
             .collect();
-        checker
-            .diagnostics
-            .extend(crate::ownership::check_program_with_inferred_move_returns(
-                program,
-                &inferred_move_returns,
-                &return_borrows,
-            ));
+        let ownership_diagnostics = crate::ownership::check_program_with_inferred_move_returns(
+            program,
+            &inferred_move_returns,
+            &return_borrows,
+            &checker.flow_facts,
+        );
+        checker.diagnostics.extend(ownership_diagnostics);
     }
     if checker.diagnostics.is_empty() {
         Ok(SemanticInfo {
@@ -5565,15 +5565,34 @@ impl<'program> Checker<'program> {
                 declaring_class,
             );
             return match self.types.kind(inner) {
-                TypeKind::Void | TypeKind::Null | TypeKind::Mixed | TypeKind::Unknown => self
-                    .reject_type_ref_with_help(
-                        ty,
-                        span,
-                        "E0454",
-                        format!("`{ty}` is not a valid nullable type"),
-                        "write `?T` where `T` is a concrete value type",
-                    ),
-                _ => self.types.intern(TypeKind::Nullable(inner)),
+                TypeKind::Integer(_)
+                | TypeKind::Float(_)
+                | TypeKind::String
+                | TypeKind::Bool
+                | TypeKind::Class(_) => self.types.intern(TypeKind::Nullable(inner)),
+                TypeKind::TypedArray(_)
+                | TypeKind::List(_)
+                | TypeKind::Dictionary(_, _)
+                | TypeKind::Set(_) => self.reject_type_ref_with_help(
+                    ty,
+                    span,
+                    "E0454",
+                    format!("nullable collection type `{ty}` is not yet supported"),
+                    "use a non-null collection type in this compiler version",
+                ),
+                TypeKind::Void
+                | TypeKind::Null
+                | TypeKind::Mixed
+                | TypeKind::Nullable(_)
+                | TypeKind::Unknown
+                | TypeKind::Heterogeneous
+                | TypeKind::EmptyCollection => self.reject_type_ref_with_help(
+                    ty,
+                    span,
+                    "E0454",
+                    format!("`{ty}` is not a valid nullable type"),
+                    "write `?T` where `T` is a supported concrete value type",
+                ),
             };
         }
         if let Some(integer) = IntegerType::from_source_name(&ty.name) {

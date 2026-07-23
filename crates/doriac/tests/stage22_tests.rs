@@ -86,6 +86,7 @@ function read(?Label $label): string
     if ($label == null) { return "none"; }
     return $label->text();
 }
+
 function safe(?Label $label): string
 {
     return $label?->text() ?? "none";
@@ -93,6 +94,29 @@ function safe(?Label $label): string
 "#,
     )
     .expect("null guards and null-safe access should be accepted");
+}
+
+#[test]
+fn nullable_collection_payloads_remain_a_stage23_boundary() {
+    for ty in [
+        "?List<int>",
+        "?Dictionary<string, int>",
+        "?Set<int>",
+        "?int[]",
+    ] {
+        let diagnostics = diagnostics(&format!("function inspect({ty} $items): void {{}}"));
+        assert!(
+            diagnostics.iter().any(|diagnostic| {
+                diagnostic.code == "E0454"
+                    && diagnostic.message.contains("nullable collection type")
+                    && diagnostic
+                        .help
+                        .as_deref()
+                        .is_some_and(|help| help.contains("non-null collection"))
+            }),
+            "{ty} should fail at semantic type resolution: {diagnostics:#?}"
+        );
+    }
 }
 
 #[test]
@@ -1502,6 +1526,7 @@ function read(writable ?Box $box): void
     inspect($box);
     consume($box);
 }
+
 function main(): void {}
 "#,
     )
@@ -1524,6 +1549,108 @@ function main(): void {}
             .message
             .contains("without a dominating presence proof"),
         "unexpected shared-validation error: {error:?}"
+    );
+}
+
+#[test]
+fn shared_validation_requires_presence_for_every_nullable_payload_read() {
+    let mut program = doriac::lower_source_to_mir(
+        "stage22-nullable-payload-presence.doria",
+        r#"
+function main(): void
+{
+    ?int $value = maybe();
+    if ($value == null) { return; }
+    echo $value;
+}
+function maybe(): ?int { return 1; }
+"#,
+    )
+    .expect("the narrowed nullable scalar should lower");
+    doriac::mir_validation::validate_program(&program)
+        .expect("a dominating presence proof should validate");
+
+    let main = program
+        .functions
+        .iter_mut()
+        .find(|function| function.name == "main")
+        .expect("fixture should contain main");
+    let value = main
+        .locals
+        .iter()
+        .find(|local| local.name == "value")
+        .expect("fixture should contain value");
+    let doriac::mir::Type::NullableScalar(ty) = value.ty else {
+        panic!("value should be a nullable scalar")
+    };
+    let value = value.id;
+    let payload_block = main
+        .blocks
+        .iter_mut()
+        .find(|block| {
+            block
+                .statements
+                .iter()
+                .any(|statement| matches!(statement, doriac::mir::Statement::EchoString(_)))
+        })
+        .expect("fixture should contain the narrowed payload read");
+    payload_block.statements.insert(
+        0,
+        doriac::mir::Statement::AssignLocal {
+            target: value,
+            value: doriac::mir::Rvalue::NullableScalar(
+                doriac::mir::NullableScalarExpression::Null(ty),
+            ),
+        },
+    );
+
+    let error = doriac::mir_validation::validate_program(&program)
+        .expect_err("a null assignment must invalidate the payload presence proof");
+    assert!(
+        error
+            .message
+            .contains("without a dominating presence proof"),
+        "unexpected shared-validation error: {error:?}"
+    );
+}
+
+#[test]
+fn null_safe_ownership_effects_follow_receiver_presence() {
+    doriac::check_source(
+        "stage22-null-safe-skipped-take.doria",
+        r#"
+class Item {}
+class Consumer { function accept(take Item $item): void {} }
+function finish(take Item $item): void {}
+function main(): void
+{
+    ?Consumer $consumer = null;
+    let $item = new Item();
+    $consumer?->accept($item);
+    finish($item);
+}
+"#,
+    )
+    .expect("a proven-null null-safe call must not consume its arguments");
+
+    let diagnostics = diagnostics(
+        r#"
+class Item {}
+class Consumer { function accept(take Item $item): void {} }
+function finish(take Item $item): void {}
+function consume(?Consumer $consumer): void
+{
+    let $item = new Item();
+    $consumer?->accept($item);
+    finish($item);
+}
+"#,
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E0470"),
+        "a possibly executed null-safe call must consume the take argument: {diagnostics:#?}"
     );
 }
 

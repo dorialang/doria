@@ -268,7 +268,7 @@ fn validate_function(program: &mir::Program, function: &mir::Function) -> Result
         }
         validate_terminator(program, function, &block.terminator, reachable[block.id.0])?;
     }
-    validate_nullable_class_presence(program, function)?;
+    validate_nullable_presence(program, function)?;
     validate_class_local_lifetimes(function)
 }
 
@@ -1536,8 +1536,12 @@ fn collect_operand_class_local_accesses<'a>(
     operand: &'a mir::Operand,
     accesses: &mut ClassLocalAccesses<'a>,
 ) {
-    if let mir::Operand::Property { object, property } = operand {
-        accesses.borrow_property(*object, *property);
+    match operand {
+        mir::Operand::Property { object, property } => {
+            accesses.borrow_property(*object, *property);
+        }
+        mir::Operand::NullablePayload(local) => accesses.assume_nullable_present(*local),
+        mir::Operand::Scalar(_) | mir::Operand::Local(_) | mir::Operand::Static(_) => {}
     }
 }
 
@@ -1630,10 +1634,12 @@ fn collect_string_class_local_accesses<'a>(
             collect_nullable_string_class_local_accesses(left, accesses);
             collect_string_class_local_accesses(right, accesses);
         }
+        mir::StringExpression::NullableLocalAssumeNonNull(local) => {
+            accesses.assume_nullable_present(*local)
+        }
         mir::StringExpression::Literal(_)
         | mir::StringExpression::Local(_)
-        | mir::StringExpression::Static(_)
-        | mir::StringExpression::NullableLocalAssumeNonNull(_) => {}
+        | mir::StringExpression::Static(_) => {}
         mir::StringExpression::Property { object, property } => {
             accesses.borrow_property(*object, *property)
         }
@@ -2100,7 +2106,7 @@ fn apply_class_local_accesses(
     Ok(())
 }
 
-fn validate_nullable_class_presence(
+fn validate_nullable_presence(
     program: &mir::Program,
     function: &mir::Function,
 ) -> Result<(), BackendError> {
@@ -2114,7 +2120,7 @@ fn validate_nullable_class_presence(
             continue;
         };
         for statement in &block.statements {
-            apply_nullable_class_presence_statement(program, function, statement, &mut present)?;
+            apply_nullable_presence_statement(program, function, statement, &mut present)?;
         }
 
         apply_nullable_class_call_effects(
@@ -2142,11 +2148,7 @@ fn validate_nullable_class_presence(
                         continue;
                     }
                     let mut outgoing = present.clone();
-                    apply_nullable_class_presence_condition(
-                        condition,
-                        condition_value,
-                        &mut outgoing,
-                    );
+                    apply_nullable_presence_condition(condition, condition_value, &mut outgoing);
                     if merge_definitely_present(&mut entries[target.0], &outgoing) {
                         pending.push_back(target);
                     }
@@ -2164,13 +2166,15 @@ fn validate_nullable_class_presence(
             continue;
         };
         for statement in &block.statements {
-            validate_nullable_class_assumptions(
+            validate_nullable_assumptions(
+                function,
                 &collect_statement_class_local_accesses(statement),
                 &present,
             )?;
-            apply_nullable_class_presence_statement(program, function, statement, &mut present)?;
+            apply_nullable_presence_statement(program, function, statement, &mut present)?;
         }
-        validate_nullable_class_assumptions(
+        validate_nullable_assumptions(
+            function,
             &collect_terminator_class_local_accesses(&block.terminator),
             &present,
         )?;
@@ -2203,7 +2207,7 @@ fn merge_definitely_present(
     }
 }
 
-fn apply_nullable_class_presence_statement(
+fn apply_nullable_presence_statement(
     program: &mir::Program,
     function: &mir::Function,
     statement: &mir::Statement,
@@ -2216,14 +2220,18 @@ fn apply_nullable_class_presence_statement(
         present,
     )?;
     match statement {
-        mir::Statement::AssignLocal { target, value }
-            if matches!(local_in(function, *target)?.ty, mir::Type::NullableClass(_)) =>
-        {
-            let value_is_present = match value {
-                mir::Rvalue::NullableClass(value) => {
+        mir::Statement::AssignLocal { target, value } => {
+            let value_is_present = match (local_in(function, *target)?.ty, value) {
+                (mir::Type::NullableScalar(_), mir::Rvalue::NullableScalar(value)) => {
+                    nullable_scalar_expression_is_present(value, present)
+                }
+                (mir::Type::NullableString, mir::Rvalue::NullableString(value)) => {
+                    nullable_string_expression_is_present(value, present)
+                }
+                (mir::Type::NullableClass(_), mir::Rvalue::NullableClass(value)) => {
                     nullable_class_expression_is_present(value, present)
                 }
-                _ => false,
+                _ => return Ok(()),
             };
             if value_is_present {
                 present.insert(*target);
@@ -2283,28 +2291,85 @@ fn nullable_class_expression_is_present(
     }
 }
 
-fn apply_nullable_class_presence_condition(
+fn nullable_scalar_expression_is_present(
+    expression: &mir::NullableScalarExpression,
+    present: &HashSet<mir::LocalId>,
+) -> bool {
+    match expression {
+        mir::NullableScalarExpression::Value(_) => true,
+        mir::NullableScalarExpression::Local { local, .. } => present.contains(local),
+        mir::NullableScalarExpression::Coalesce { left, right, .. } => {
+            nullable_scalar_expression_is_present(left, present)
+                || nullable_scalar_expression_is_present(right, present)
+        }
+        mir::NullableScalarExpression::Null(_)
+        | mir::NullableScalarExpression::Property { .. }
+        | mir::NullableScalarExpression::Static { .. }
+        | mir::NullableScalarExpression::Call { .. }
+        | mir::NullableScalarExpression::NullSafeProperty { .. }
+        | mir::NullableScalarExpression::NullSafeCall { .. } => false,
+    }
+}
+
+fn nullable_string_expression_is_present(
+    expression: &mir::NullableStringExpression,
+    present: &HashSet<mir::LocalId>,
+) -> bool {
+    match expression {
+        mir::NullableStringExpression::String(_) => true,
+        mir::NullableStringExpression::Local(local) => present.contains(local),
+        mir::NullableStringExpression::Coalesce { left, right } => {
+            nullable_string_expression_is_present(left, present)
+                || nullable_string_expression_is_present(right, present)
+        }
+        mir::NullableStringExpression::Null
+        | mir::NullableStringExpression::Property { .. }
+        | mir::NullableStringExpression::Static(_)
+        | mir::NullableStringExpression::ReadLine
+        | mir::NullableStringExpression::Call { .. }
+        | mir::NullableStringExpression::NullSafeProperty { .. }
+        | mir::NullableStringExpression::NullSafeCall { .. } => false,
+    }
+}
+
+fn apply_nullable_presence_condition(
     condition: &mir::BoolExpression,
     when_true: bool,
     present: &mut HashSet<mir::LocalId>,
 ) {
     match condition {
+        mir::BoolExpression::NullableScalarIsPresent(value) => {
+            if let mir::NullableScalarExpression::Local { local, .. } = value.as_ref() {
+                set_nullable_presence(*local, when_true, present);
+            }
+        }
         mir::BoolExpression::NullableClassIsPresent(value) => {
             if let mir::NullableClassExpression::Local { local, .. } = value.as_ref() {
-                if when_true {
-                    present.insert(*local);
-                } else {
-                    present.remove(local);
-                }
+                set_nullable_presence(*local, when_true, present);
+            }
+        }
+        mir::BoolExpression::NullableStringCompare { op, left, right } => {
+            if let (Some(local), Some(equals_null)) = (
+                nullable_string_null_comparison_local(left, right),
+                match op {
+                    mir::CompareOp::Equal => Some(true),
+                    mir::CompareOp::NotEqual => Some(false),
+                    mir::CompareOp::Less
+                    | mir::CompareOp::LessEqual
+                    | mir::CompareOp::Greater
+                    | mir::CompareOp::GreaterEqual => None,
+                },
+            ) {
+                set_nullable_presence(local, when_true != equals_null, present);
             }
         }
         mir::BoolExpression::Not(value) => {
-            apply_nullable_class_presence_condition(value, !when_true, present)
+            apply_nullable_presence_condition(value, !when_true, present)
         }
         mir::BoolExpression::Binary { op, left, right } => match (op, when_true) {
             (mir::BoolBinaryOp::And, true) | (mir::BoolBinaryOp::Or, false) => {
-                apply_nullable_class_presence_condition(left, when_true, present);
-                apply_nullable_class_presence_condition(right, when_true, present);
+                apply_nullable_presence_condition(left, when_true, present);
+                apply_nullable_presence_condition(right, when_true, present);
             }
             _ => {}
         },
@@ -2312,15 +2377,42 @@ fn apply_nullable_class_presence_condition(
     }
 }
 
-fn validate_nullable_class_assumptions(
+fn set_nullable_presence(
+    local: mir::LocalId,
+    is_present: bool,
+    present: &mut HashSet<mir::LocalId>,
+) {
+    if is_present {
+        present.insert(local);
+    } else {
+        present.remove(&local);
+    }
+}
+
+fn nullable_string_null_comparison_local(
+    left: &mir::NullableStringExpression,
+    right: &mir::NullableStringExpression,
+) -> Option<mir::LocalId> {
+    match (left, right) {
+        (mir::NullableStringExpression::Local(local), mir::NullableStringExpression::Null)
+        | (mir::NullableStringExpression::Null, mir::NullableStringExpression::Local(local)) => {
+            Some(*local)
+        }
+        _ => None,
+    }
+}
+
+fn validate_nullable_assumptions(
+    function: &mir::Function,
     accesses: &ClassLocalAccesses<'_>,
     present: &HashSet<mir::LocalId>,
 ) -> Result<(), BackendError> {
     for local in accesses.nullable_assumptions() {
         if !present.contains(&local) {
             return Err(malformed_mir(format!(
-                "nullable class local local{} is assumed non-null without a dominating presence proof",
-                local.0
+                "{} local local{} is assumed non-null without a dominating presence proof",
+                local_in(function, local)?.ty,
+                local.0,
             )));
         }
     }

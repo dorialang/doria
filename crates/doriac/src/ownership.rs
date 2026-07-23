@@ -8,6 +8,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::ast::{self, AssignOp, BinaryOp, ClassMember, Expr, Item, Stmt};
 use crate::diagnostics::Diagnostic;
+use crate::narrowing::{Fact, FactsByUse};
 use crate::source::Span;
 use crate::symbols::{BorrowSource, ReturnBorrow};
 
@@ -35,6 +36,13 @@ enum State {
     Owned,
     Given { at: Span },
     MaybeGiven { at: Span },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CallExecution {
+    Always,
+    Never,
+    Maybe,
 }
 
 #[derive(Debug, Clone)]
@@ -129,13 +137,15 @@ fn join_state(left: &State, right: &State) -> State {
 }
 
 pub fn check_program(program: &ast::Program) -> Vec<Diagnostic> {
-    check_program_with_inferred_move_returns(program, &HashSet::new(), &HashMap::new())
+    let flow_facts = crate::narrowing::analyze_program(program);
+    check_program_with_inferred_move_returns(program, &HashSet::new(), &HashMap::new(), &flow_facts)
 }
 
 pub(crate) fn check_program_with_inferred_move_returns(
     program: &ast::Program,
     inferred_move_returns: &HashSet<usize>,
     return_borrows: &HashMap<usize, ReturnBorrow>,
+    flow_facts: &FactsByUse,
 ) -> Vec<Diagnostic> {
     let classes = program
         .items
@@ -246,6 +256,7 @@ pub(crate) fn check_program_with_inferred_move_returns(
         active_assignment_writes: HashSet::new(),
         active_assignment_targets: HashSet::new(),
         active_borrows: Vec::new(),
+        flow_facts,
         diagnostics: Vec::new(),
     };
     let mut top_level_scopes = Scopes::new();
@@ -684,7 +695,7 @@ impl Flow {
     }
 }
 
-struct Checker {
+struct Checker<'a> {
     classes: HashSet<String>,
     signatures: HashMap<String, Signature>,
     constructors: HashMap<String, Signature>,
@@ -699,10 +710,11 @@ struct Checker {
     active_assignment_writes: HashSet<String>,
     active_assignment_targets: HashSet<String>,
     active_borrows: Vec<ActiveBorrow>,
+    flow_facts: &'a FactsByUse,
     diagnostics: Vec<Diagnostic>,
 }
 
-impl Checker {
+impl Checker<'_> {
     fn check_function(&mut self, function: &ast::FunctionDecl, receiver_class: Option<&str>) {
         let previous_receiver =
             std::mem::replace(&mut self.receiver_class, receiver_class.map(str::to_owned));
@@ -1442,7 +1454,7 @@ impl Checker {
             }
             Expr::FunctionCall { name, args, .. } => {
                 let signature = self.signatures.get(name).cloned().unwrap_or_default();
-                self.use_call_args(None, args, &signature, scopes);
+                self.use_call_args(None, args, &signature, CallExecution::Always, scopes);
             }
             Expr::New {
                 class_name, args, ..
@@ -1452,19 +1464,21 @@ impl Checker {
                     .get(class_name)
                     .cloned()
                     .unwrap_or_default();
-                self.use_call_args(None, args, &signature, scopes);
+                self.use_call_args(None, args, &signature, CallExecution::Always, scopes);
             }
             Expr::MethodCall {
                 object,
                 method,
                 args,
+                null_safe,
                 ..
             } => {
                 let signature = self
                     .expr_class(object, scopes)
                     .and_then(|class| self.methods.get(&(class, method.clone())).cloned())
                     .unwrap_or_default();
-                self.use_call_args(Some(object), args, &signature, scopes);
+                let execution = self.method_call_execution(*null_safe, object);
+                self.use_call_args(Some(object), args, &signature, execution, scopes);
             }
             Expr::StaticCall {
                 qualifier,
@@ -1477,7 +1491,7 @@ impl Checker {
                     .and_then(|class_name| self.methods.get(&(class_name, method.clone())))
                     .cloned()
                     .unwrap_or_default();
-                self.use_call_args(None, args, &signature, scopes);
+                self.use_call_args(None, args, &signature, CallExecution::Always, scopes);
             }
             Expr::InterpolatedString { parts, .. } => {
                 let borrow_depth = self.active_borrows.len();
@@ -1614,16 +1628,22 @@ impl Checker {
         receiver: Option<&Expr>,
         args: &[Expr],
         signature: &Signature,
+        execution: CallExecution,
         scopes: &mut Scopes,
     ) {
         let borrow_depth = self.active_borrows.len();
         if let Some(receiver) = receiver {
             self.use_expr(receiver, scopes, UseMode::Read);
             self.activate_place_input_borrows(receiver, scopes);
+            if execution == CallExecution::Never {
+                self.active_borrows.truncate(borrow_depth);
+                return;
+            }
             if let Some(mode) = signature.receiver {
                 self.activate_call_borrow(receiver, mode, scopes);
             }
         }
+        let without_call = (execution == CallExecution::Maybe).then(|| scopes.clone());
         for (index, arg) in args.iter().enumerate() {
             let mode = call_arg_mode(signature, index);
             if mode == UseMode::Write
@@ -1674,7 +1694,25 @@ impl Checker {
                 self.activate_call_borrow(arg, mode, scopes);
             }
         }
+        if let Some(without_call) = without_call {
+            let with_call = scopes.clone();
+            scopes.merge_from(&without_call, &with_call);
+        }
         self.active_borrows.truncate(borrow_depth);
+    }
+
+    fn method_call_execution(&self, null_safe: bool, object: &Expr) -> CallExecution {
+        if !null_safe {
+            return CallExecution::Always;
+        }
+        match self
+            .flow_facts
+            .get(&(object.span().start, object.span().end))
+        {
+            Some(Fact::Null) => CallExecution::Never,
+            Some(Fact::NonNull | Fact::Exact(_)) => CallExecution::Always,
+            None => CallExecution::Maybe,
+        }
     }
 
     fn activate_call_borrow(&mut self, expr: &Expr, mode: UseMode, scopes: &Scopes) {
@@ -1767,13 +1805,23 @@ impl Checker {
                 object,
                 method,
                 args,
+                null_safe,
                 ..
             } => {
                 let signature = self
                     .expr_class(object, scopes)
                     .and_then(|class| self.methods.get(&(class, method.clone())).cloned())
                     .unwrap_or_default();
-                self.activate_nested_call_property_borrows(Some(object), args, &signature, scopes);
+                if self.method_call_execution(*null_safe, object) == CallExecution::Never {
+                    self.activate_nested_property_borrows(object, scopes);
+                } else {
+                    self.activate_nested_call_property_borrows(
+                        Some(object),
+                        args,
+                        &signature,
+                        scopes,
+                    );
+                }
             }
             Expr::StaticCall {
                 qualifier,

@@ -36,13 +36,6 @@ Most of the plan's "(… decision, unauthored)" markers are large features whose
 
 Format per item: **Status · Options · Tradeoffs · Recommendation (marked) · Blast radius.**
 
-### F1 — Command-line argument access is entirely unspecified [OPEN · foundational]
-- **Status.** For a language whose **#1 product is CLI tools/filters**, nothing in the plan, SPEC, or 0032 defines how a program reads `argv`. `main` has only `(): int` / `(): void` forms (0032); there is no `main(string[] $args)`, no `Env::args()`, no argv intrinsic. `Doria\Std\Env` / `Doria\Std\Process` are *named* as modules but their contents are unspecified. A CLI example literally cannot read its own arguments today.
-- **Options.** (a) `main(string[] $args): int` — a third `main` form (typed `$argv`; the array carries its own length, so no `argc`). (b) Keep `main` parameterless and expose args via `Doria\Std\Env::args(): string[]` (or `Process`). (c) A compiler-known free function (like `read_line`), available before the stdlib.
-- **Tradeoffs.** (a) most discoverable, but adds a `main` variant and couples entry to `T[]` (Stage 23). (b) keeps 0032's two `main` forms intact and groups process introspection (args, env, exit code, PID) in one module — but also needs `T[]` (Stage 23). (c) available earliest, but a bare intrinsic for args is odd once `Env` exists.
-- **Recommendation → (b), specified now, implemented with `T[]` (Stage 23).** Put `args()` (and env/exit) on `Doria\Std\Env`/`Process`, keeping `main` parameterless. Decide the **spelling and owning module now** — it's foundational to product 1 and shouldn't be discovered late — even though the `string[]` return rides Stage 23. If CLI examples need args before Stage 23, a narrow bridge intrinsic can fill the gap.
-- **Blast radius.** A `Doria\Std\Env`/`Process` spec; SPEC entry-point section; possibly 0032 (if a `main` param form is chosen); Stage 23 (`T[]`) or an earlier bridge; every CLI example/UAT that should parse args.
-
 ### F2 — Interface-dispatch representation: the plan contradicts itself [OPEN · internal inconsistency]
 - **Status.** §8.3 / record 0082 (line 780) states interface dispatch is **"committed to fat pointers"** — "recording it now prevents Stage 35 from reintroducing headers." But the Stage 35 roadmap entry (line 858) says interface-typed values are **"fat pointer or vtable-embedded — settle this in the interfaces/traits decision."** These disagree: one says decided, the other says open. (Same class of self-contradiction as the `when` Phase-E-vs-Stage-36 one already fixed.)
 - **Options.** (a) Honor 0082: fat pointers, and correct the Stage 35 entry. (b) Reopen the representation at Stage 35.
@@ -95,7 +88,6 @@ Format per item: **Status · Options · Tradeoffs · Recommendation (marked) · 
 
 ## Invalidated elsewhere (if recommendations are adopted)
 - **F2**: the Stage 35 plan entry (line 858) — reword to cite 0082's fat-pointer commitment; no code.
-- **F1**: 0032 (only if a `main` param form is chosen); a new `Doria\Std\Env`/`Process` spec; SPEC entry-point section; CLI examples.
 - **F3**: a new named-arguments record + stage; 0086 and 0095 cross-refs; DDO prerequisites.
 - **F4**: lexer + 0016 + SPEC literals; the `fixed-width-integers` example.
 - Nothing in this note edits the plan/SPEC/records — it is findings only. On approval, each item becomes a plan/SPEC amendment and/or a decision record (next free number, subject-cited until authored, `scripts/check_docs_authority.php` green).
