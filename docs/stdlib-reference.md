@@ -45,7 +45,7 @@ The escape hatch when single ownership does not fit (caches, graphs, back-refere
 ### PHP-familiar free-function layer
 Regularized `snake_case` free functions wrapping the member/companion surface — never PHP's fused spellings. Details: decision 0074 (formatted I/O), §9.1 charter.
 
-- **Formatting:** `sprintf(format, ...args): string`, `printf(format, ...args): void` — compile-time-checked literal format strings; specifiers `%s %d %f %.Nf %x %X %o %b %%`, width / `-` / `0` flags.
+- **Formatting:** compiler-known `sprintf` returns `string` and `printf` returns `void`. Each takes a literal `string $format` first, followed by the typed operands required by that format; this intrinsic-only tail is not an untyped userland parameter declaration. Specifiers: `%s %d %f %.Nf %x %X %o %b %%`, width / `-` / `0` flags.
 - **Text I/O:** `read_line(): ?string`, `read_file(string): string`, `write_file(string, string): void` (truncate), `append_file(string, string): void` (Stage 23), `write_stderr(string): void`.
 - **Output statement:** `echo` (the single output spelling — `print` is rejected).
 - **String/utility:** `get_time`, `str_starts_with`, `str_case_compare`, and the `str_*` family (fully worded after the `str_` prefix).

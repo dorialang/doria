@@ -305,22 +305,7 @@ impl<'source> Lexer<'source> {
                     }
                 }
                 b'&' => {
-                    if self.peek() == Some(b'$') {
-                        self.advance();
-                        while matches!(
-                            self.peek(),
-                            Some(b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_')
-                        ) {
-                            self.advance();
-                        }
-                        self.unsupported_syntax(
-                            "Doria does not support PHP-style `&$` references",
-                            "use Doria ownership and writable borrowing explicitly",
-                            start,
-                            self.index,
-                        );
-                        continue;
-                    } else if self.match_byte(b'&') {
+                    if self.match_byte(b'&') {
                         self.token(TokenKind::AndAnd, start)
                     } else if self.match_byte(b'=') {
                         self.token(TokenKind::AmpersandEquals, start)

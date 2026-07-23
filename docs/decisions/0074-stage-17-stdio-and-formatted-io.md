@@ -20,11 +20,14 @@ when it is authored.
 Stage 17 adds compiler-known free functions that cannot be redeclared:
 
 - `read_line(): ?string`
-- `sprintf(string-literal-format, ...arguments): string`
-- `printf(string-literal-format, ...arguments): void`
 - `read_file(string $path): string`
 - `write_file(string $path, string $contents): void`
 - `write_stderr(string $value): void`
+
+The compiler-known `sprintf` returns `string` and `printf` returns `void`. Each
+takes a literal `string $format` first, followed by typed operands checked
+against that format. This intrinsic-only tail is not an untyped userland
+variadic declaration.
 
 These are a narrow v0 text-I/O facade, not the final `Doria\Std\Io` object API. `print` is permanently
 rejected with guidance to use `echo`. `printf` writes exact bytes, adds no newline, and returns

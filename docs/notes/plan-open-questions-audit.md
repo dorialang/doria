@@ -13,7 +13,7 @@
 - **F1 — CLI args:** RESOLVED → optional **`main(List<string> $args)`** (no `argc`; `$args->count`); `Doria\Std\Process` owns the other process facts; `Console` rejected as a home. **Decision 0099** authored; depends on `List` (Stage 23).
 - **F2 — interface dispatch:** RESOLVED → **fat pointers** (per §8.3 / 0082). Stage 35 plan entry reconciled.
 - **F3 — named arguments:** RESOLVED → scheduled **Stage 23a** (after collections, before generic functions); **decision 0098** authored with the full binding/ordering/evaluation ruleset; variadics stay deferred.
-- **F4 — integer literals:** RESOLVED → add `0x`/`0o`/`0b` literals and `_` digit separators (`1_000_000`); **no** typed suffixes. Recorded in SPEC; a lexer slice still needs a stage assignment.
+- **F4 — integer literals:** RESOLVED direction → add `0x`/`0o`/`0b` literals and `_` digit separators (`1_000_000`); **no** typed suffixes. SPEC records this as future direction, not current syntax. A dedicated numeric-literals slice must settle separator placement and malformed-form diagnostics before promoting the forms into the accepted grammar.
 - **F5 — `uint8[]`↔`Bytes`:** RESOLVED → **explicit, non-implicit** conversion, copy in v1.0; method surface finalized with the collections decision (Stage 23).
 - **F6 — property-hook I/O policy:** RESOLVED → a hook **may `throws`**, **may not block/async** in v1.0, and is **not guaranteed side-effect-free** ("looks like data" is a readability convention, not a purity guarantee). Recorded on the §12 property-hooks subject for the future record.
 - **F7 — `Baton.lock` encoding:** RESOLVED → **JSON**.

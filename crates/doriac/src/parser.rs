@@ -336,6 +336,13 @@ impl Parser {
             }
         }
         let ty = self.parse_type_ref()?;
+        if self.match_kind(&TokenKind::Ampersand) {
+            self.error(
+                "Doria does not support PHP-style parameter references; use `writable` for an exclusive borrow or `take` for ownership transfer",
+                self.previous().span,
+            );
+            return None;
+        }
         let (name, name_span) = self.expect_variable("expected parameter variable name")?;
         let default = if self.match_kind(&TokenKind::Equals) {
             Some(self.parse_expression()?)

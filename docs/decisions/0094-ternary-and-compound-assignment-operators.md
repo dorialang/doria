@@ -74,8 +74,9 @@ write over the same place rule.
 
 ## Sequencing
 
-- **Ternary** lands alongside `match` (which exists) as an expression/parser
-  addition — a near stage.
+- **Ternary** lands with or after Stage 28 `match`, reusing its branch typing,
+  ownership, and lowering once that grammar and implementation exist. Until
+  then, this record settles semantics but does not expose ternary syntax.
 - **`.=`** lands with string read-modify-write (string concat exists; the
   compound-assign place machinery is §3.2 / the property-RMW work).
 - **`??=`** follows Stage 22 in a compound-assignment implementation slice once

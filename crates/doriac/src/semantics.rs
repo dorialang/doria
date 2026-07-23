@@ -37,6 +37,9 @@ pub struct SemanticInfo {
         HashMap<crate::const_eval::ParameterDefaultKey, crate::const_eval::ConstValue>,
     /// Elided class-result borrows keyed by callable source span.
     pub return_borrows: HashMap<usize, ReturnBorrow>,
+    /// Flow facts at checked source uses, consumed by MIR lowering so
+    /// statically selected nullable paths stay selected after lowering.
+    pub(crate) flow_facts: crate::narrowing::FactsByUse,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -130,6 +133,7 @@ pub fn analyze_program(program: &Program) -> DiagnosticResult<SemanticInfo> {
                     signature.return_borrow.map(|borrow| (*span, borrow))
                 })
                 .collect(),
+            flow_facts: checker.flow_facts,
         })
     } else {
         Err(checker.diagnostics)

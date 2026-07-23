@@ -531,7 +531,7 @@ Stage 14 implements `float32` as IEEE 754 binary32 and canonical `float`/`float6
 
 An unconstrained decimal integer literal defaults to `int`. A literal may instead adopt an expected integer type from a declaration, parameter, return, assignment, or typed binary operand when its mathematical value fits that type. Contextual literal typing is not an implicit conversion. Out-of-range literals are compile-time errors.
 
-Beyond decimal, Doria accepts hexadecimal (`0x`), octal (`0o`), and binary (`0b`) integer literals, and `_` digit separators for readability (`1_000_000`, `0xFF_FF`). There are **no typed numeric suffixes** (`100u8`): contextual literal typing already supplies a literal's width from its expected type, so a suffix would be a redundant second typing channel. These non-decimal forms and separators are accepted Doria syntax; their lexer slice is assigned in the numeric-literals work (Stage 13 itself added only decimal literals).
+The accepted future direction adds hexadecimal (`0x`), octal (`0o`), and binary (`0b`) integer literals plus `_` digit separators for readability (`1_000_000`, `0xFF_FF`). There will be **no typed numeric suffixes** (`100u8`): contextual literal typing already supplies a literal's width from its expected type, so a suffix would be a redundant second typing channel. These forms are not yet accepted source syntax; the current grammar remains decimal-only until a dedicated numeric-literals slice defines separator placement and malformed-form diagnostics and lands lexer, parser, semantic, and regression coverage together.
 
 Both operands of an integer binary operator must resolve to the same canonical integer type. Nonliteral values never widen or narrow implicitly, and Doria has no C-style integer promotions. The implemented integer operators are:
 
@@ -725,12 +725,15 @@ Stage 17 provides these compiler-known built-ins:
 
 ```doria
 read_line(): ?string
-sprintf(string $format, ...): string
-printf(string $format, ...): void
 read_file(string $path): string
 write_file(string $path, string $contents): void
 write_stderr(string $value): void
 ```
+
+The compiler-known `sprintf` returns `string` and `printf` returns `void`. Each
+takes a literal `string $format` first, followed by the typed operands required
+by that format. The intrinsic-only operand tail is not an untyped Doria
+parameter declaration.
 
 The additive text-file spelling is specified as
 `append_file(string $path, string $contents): void`. It lands in Stage 23 alongside the binary

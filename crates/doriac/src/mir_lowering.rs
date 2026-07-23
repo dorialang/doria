@@ -1226,6 +1226,13 @@ struct LoopTargets {
     cleanup_depth: usize,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CoalesceSelection {
+    Left,
+    Right,
+    Dynamic,
+}
+
 struct LoweringContext<'semantic> {
     signatures: HashMap<String, FunctionSignature>,
     method_signatures: HashMap<(ClassId, String), FunctionSignature>,
@@ -1686,6 +1693,27 @@ impl<'semantic> LoweringContext<'semantic> {
             self.semantic_info.expression_type(expr.span()),
             Some(crate::types::ResolvedType::Null)
         )
+    }
+
+    fn flow_fact(&self, expr: &hir::Expr) -> Option<&crate::narrowing::Fact> {
+        let expr = match expr {
+            hir::Expr::Grouped { expr, .. } => return self.flow_fact(expr),
+            expr => expr,
+        };
+        self.semantic_info
+            .flow_facts
+            .get(&(expr.span().start, expr.span().end))
+    }
+
+    fn coalesce_selection(&self, left: &hir::Expr) -> CoalesceSelection {
+        match self.flow_fact(left) {
+            Some(crate::narrowing::Fact::Null) => CoalesceSelection::Right,
+            Some(crate::narrowing::Fact::NonNull | crate::narrowing::Fact::Exact(_)) => {
+                CoalesceSelection::Left
+            }
+            None if self.expression_is_null(left) => CoalesceSelection::Right,
+            None => CoalesceSelection::Dynamic,
+        }
     }
 
     fn mir_resolved_type(&self, ty: &crate::types::ResolvedType) -> Option<mir::Type> {
@@ -2249,10 +2277,14 @@ fn lower_string_expression(
             op: hir::BinaryOp::Coalesce,
             right,
             ..
-        } => Ok(mir::StringExpression::Coalesce {
-            left: Box::new(lower_nullable_string_expression(left, context)?),
-            right: Box::new(lower_string_expression(right, context)?),
-        }),
+        } => match context.coalesce_selection(left) {
+            CoalesceSelection::Left => lower_string_expression(left, context),
+            CoalesceSelection::Right => lower_string_expression(right, context),
+            CoalesceSelection::Dynamic => Ok(mir::StringExpression::Coalesce {
+                left: Box::new(lower_nullable_string_expression(left, context)?),
+                right: Box::new(lower_string_expression(right, context)?),
+            }),
+        },
         hir::Expr::String { value, .. } => Ok(mir::StringExpression::Literal(value.clone())),
         hir::Expr::Variable { name, span } => {
             let local = context.lookup_local(name, *span)?;
@@ -2400,10 +2432,14 @@ fn lower_nullable_string_expression(
             op: hir::BinaryOp::Coalesce,
             right,
             ..
-        } => Ok(mir::NullableStringExpression::Coalesce {
-            left: Box::new(lower_nullable_string_expression(left, context)?),
-            right: Box::new(lower_nullable_string_expression(right, context)?),
-        }),
+        } => match context.coalesce_selection(left) {
+            CoalesceSelection::Left => lower_nullable_string_expression(left, context),
+            CoalesceSelection::Right => lower_nullable_string_expression(right, context),
+            CoalesceSelection::Dynamic => Ok(mir::NullableStringExpression::Coalesce {
+                left: Box::new(lower_nullable_string_expression(left, context)?),
+                right: Box::new(lower_nullable_string_expression(right, context)?),
+            }),
+        },
         hir::Expr::PropertyAccess {
             object,
             property,
@@ -2458,7 +2494,15 @@ fn lower_nullable_string_expression(
         hir::Expr::Variable { name, span } => {
             let local = context.lookup_local(name, *span)?;
             match context.local_type(local) {
-                mir::Type::NullableString => Ok(mir::NullableStringExpression::Local(local)),
+                mir::Type::NullableString => match context.flow_fact(expr) {
+                    Some(crate::narrowing::Fact::Null) => Ok(mir::NullableStringExpression::Null),
+                    Some(crate::narrowing::Fact::NonNull | crate::narrowing::Fact::Exact(_)) => {
+                        Ok(mir::NullableStringExpression::String(
+                            mir::StringExpression::NullableLocalAssumeNonNull(local),
+                        ))
+                    }
+                    None => Ok(mir::NullableStringExpression::Local(local)),
+                },
                 mir::Type::String => Ok(mir::NullableStringExpression::String(
                     mir::StringExpression::Local(local),
                 )),
@@ -2596,17 +2640,29 @@ fn lower_nullable_scalar_expression(
             op: hir::BinaryOp::Coalesce,
             right,
             ..
-        } => Ok(mir::NullableScalarExpression::Coalesce {
-            ty: expected,
-            left: Box::new(lower_nullable_scalar_expression(left, expected, context)?),
-            right: Box::new(lower_nullable_scalar_expression(right, expected, context)?),
-        }),
+        } => match context.coalesce_selection(left) {
+            CoalesceSelection::Left => lower_nullable_scalar_expression(left, expected, context),
+            CoalesceSelection::Right => lower_nullable_scalar_expression(right, expected, context),
+            CoalesceSelection::Dynamic => Ok(mir::NullableScalarExpression::Coalesce {
+                ty: expected,
+                left: Box::new(lower_nullable_scalar_expression(left, expected, context)?),
+                right: Box::new(lower_nullable_scalar_expression(right, expected, context)?),
+            }),
+        },
         hir::Expr::Variable { name, span } => {
             let local = context.lookup_local(name, *span)?;
             match context.local_type(local) {
-                mir::Type::NullableScalar(ty) if ty == expected => {
-                    Ok(mir::NullableScalarExpression::Local { ty, local })
-                }
+                mir::Type::NullableScalar(ty) if ty == expected => match context.flow_fact(expr) {
+                    Some(crate::narrowing::Fact::Null) => {
+                        Ok(mir::NullableScalarExpression::Null(ty))
+                    }
+                    Some(crate::narrowing::Fact::NonNull | crate::narrowing::Fact::Exact(_)) => {
+                        Ok(mir::NullableScalarExpression::Value(
+                            value_expression_from_operand(ty, mir::Operand::NullablePayload(local)),
+                        ))
+                    }
+                    None => Ok(mir::NullableScalarExpression::Local { ty, local }),
+                },
                 mir::Type::Scalar(ty) if ty == expected => Ok(
                     mir::NullableScalarExpression::Value(lower_value_expression(expr, context)?),
                 ),
@@ -2814,16 +2870,24 @@ fn lower_nullable_class_expression(
             op: hir::BinaryOp::Coalesce,
             right,
             ..
-        } => Ok(mir::NullableClassExpression::Coalesce {
-            class: expected,
-            left: Box::new(lower_nullable_class_expression(
-                left, expected, transfer, context,
-            )?),
-            right: Box::new(lower_nullable_class_expression(
-                right, expected, transfer, context,
-            )?),
-            transfer,
-        }),
+        } => match context.coalesce_selection(left) {
+            CoalesceSelection::Left => {
+                lower_nullable_class_expression(left, expected, transfer, context)
+            }
+            CoalesceSelection::Right => {
+                lower_nullable_class_expression(right, expected, transfer, context)
+            }
+            CoalesceSelection::Dynamic => Ok(mir::NullableClassExpression::Coalesce {
+                class: expected,
+                left: Box::new(lower_nullable_class_expression(
+                    left, expected, transfer, context,
+                )?),
+                right: Box::new(lower_nullable_class_expression(
+                    right, expected, transfer, context,
+                )?),
+                transfer,
+            }),
+        },
         hir::Expr::Variable { name, span } => {
             let local = context.lookup_local(name, *span)?;
             match context.local_type(local) {
@@ -2834,11 +2898,21 @@ fn lower_nullable_class_expression(
                             "borrowed nullable class value cannot be given away",
                         )]);
                     }
-                    Ok(mir::NullableClassExpression::Local {
-                        class,
-                        local,
-                        transfer,
-                    })
+                    match context.flow_fact(expr) {
+                        Some(crate::narrowing::Fact::Null) => {
+                            Ok(mir::NullableClassExpression::Null(class))
+                        }
+                        Some(
+                            crate::narrowing::Fact::NonNull | crate::narrowing::Fact::Exact(_),
+                        ) => Ok(mir::NullableClassExpression::Class(lower_class_expression(
+                            expr, expected, transfer, context,
+                        )?)),
+                        None => Ok(mir::NullableClassExpression::Local {
+                            class,
+                            local,
+                            transfer,
+                        }),
+                    }
                 }
                 mir::Type::Class(class) if class == expected => {
                     Ok(mir::NullableClassExpression::Class(lower_class_expression(
@@ -3600,14 +3674,18 @@ fn lower_condition(
             op: hir::BinaryOp::Coalesce,
             right,
             ..
-        } => Ok(mir::BoolExpression::Coalesce {
-            left: Box::new(lower_nullable_scalar_expression(
-                left,
-                mir::ScalarType::Bool,
-                context,
-            )?),
-            right: Box::new(lower_condition(right, context)?),
-        }),
+        } => match context.coalesce_selection(left) {
+            CoalesceSelection::Left => lower_condition(left, context),
+            CoalesceSelection::Right => lower_condition(right, context),
+            CoalesceSelection::Dynamic => Ok(mir::BoolExpression::Coalesce {
+                left: Box::new(lower_nullable_scalar_expression(
+                    left,
+                    mir::ScalarType::Bool,
+                    context,
+                )?),
+                right: Box::new(lower_condition(right, context)?),
+            }),
+        },
         hir::Expr::IsType { expr, span, .. } => lower_is_condition(expr, *span, context),
         hir::Expr::Bool { value, .. } => Ok(mir::BoolExpression::Use {
             operand: mir::Operand::Scalar(mir::ScalarValue::Bool(*value)),
@@ -4198,14 +4276,18 @@ fn lower_class_expression(
             op: hir::BinaryOp::Coalesce,
             right,
             ..
-        } => Ok(mir::ClassExpression::Coalesce {
-            class: expected,
-            left: Box::new(lower_nullable_class_expression(
-                left, expected, transfer, context,
-            )?),
-            right: Box::new(lower_class_expression(right, expected, transfer, context)?),
-            transfer,
-        }),
+        } => match context.coalesce_selection(left) {
+            CoalesceSelection::Left => lower_class_expression(left, expected, transfer, context),
+            CoalesceSelection::Right => lower_class_expression(right, expected, transfer, context),
+            CoalesceSelection::Dynamic => Ok(mir::ClassExpression::Coalesce {
+                class: expected,
+                left: Box::new(lower_nullable_class_expression(
+                    left, expected, transfer, context,
+                )?),
+                right: Box::new(lower_class_expression(right, expected, transfer, context)?),
+                transfer,
+            }),
+        },
         _ => Err(vec![unsupported(
             expr.span(),
             "this class expression is not supported by native compilation",
@@ -4373,15 +4455,19 @@ fn lower_float_expression(
             op: hir::BinaryOp::Coalesce,
             right,
             ..
-        } => Ok(mir::FloatExpression::Coalesce {
-            ty,
-            left: Box::new(lower_nullable_scalar_expression(
-                left,
-                mir::ScalarType::Float(ty),
-                context,
-            )?),
-            right: Box::new(lower_float_expression(right, context)?),
-        }),
+        } => match context.coalesce_selection(left) {
+            CoalesceSelection::Left => lower_float_expression(left, context),
+            CoalesceSelection::Right => lower_float_expression(right, context),
+            CoalesceSelection::Dynamic => Ok(mir::FloatExpression::Coalesce {
+                ty,
+                left: Box::new(lower_nullable_scalar_expression(
+                    left,
+                    mir::ScalarType::Float(ty),
+                    context,
+                )?),
+                right: Box::new(lower_float_expression(right, context)?),
+            }),
+        },
         hir::Expr::Float { value, .. } => FloatValue::parse_decimal(ty, value)
             .map(mir::FloatExpression::constant)
             .ok_or_else(|| {
@@ -4622,15 +4708,19 @@ fn lower_integer_expression(
             op: hir::BinaryOp::Coalesce,
             right,
             ..
-        } => Ok(mir::IntegerExpression::Coalesce {
-            ty,
-            left: Box::new(lower_nullable_scalar_expression(
-                left,
-                mir::ScalarType::Integer(ty),
-                context,
-            )?),
-            right: Box::new(lower_integer_expression(right, context)?),
-        }),
+        } => match context.coalesce_selection(left) {
+            CoalesceSelection::Left => lower_integer_expression(left, context),
+            CoalesceSelection::Right => lower_integer_expression(right, context),
+            CoalesceSelection::Dynamic => Ok(mir::IntegerExpression::Coalesce {
+                ty,
+                left: Box::new(lower_nullable_scalar_expression(
+                    left,
+                    mir::ScalarType::Integer(ty),
+                    context,
+                )?),
+                right: Box::new(lower_integer_expression(right, context)?),
+            }),
+        },
         hir::Expr::Variable { name, span } => {
             let local = context.lookup_local(name, *span)?;
             match context.local_type(local) {

@@ -186,6 +186,20 @@ fn lexes_boolean_word_operators() {
 }
 
 #[test]
+fn lexes_bitwise_and_before_an_adjacent_variable() {
+    let kinds = token_kinds("$mask&$flag");
+    assert_eq!(
+        kinds,
+        vec![
+            TokenKind::Variable("mask".to_string()),
+            TokenKind::Ampersand,
+            TokenKind::Variable("flag".to_string()),
+            TokenKind::Eof,
+        ]
+    );
+}
+
+#[test]
 fn lexes_stage_13_primitive_type_spellings() {
     let kinds =
         token_kinds("int int8 int16 int32 int64 uint8 uint16 uint32 uint64 float float32 float64");
@@ -300,7 +314,6 @@ fn rejected_php_operator_surfaces_have_targeted_diagnostics() {
         ("$left <=> $right", "`Comparable`"),
         ("@$fallible", "error suppression"),
         ("`uname`", "backtick process execution"),
-        ("&$value", "ownership and writable borrowing"),
     ] {
         let source = SourceFile::new("test.doria", source);
         let diagnostics = Lexer::new(&source)

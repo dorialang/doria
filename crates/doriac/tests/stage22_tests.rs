@@ -1195,21 +1195,49 @@ function main(): void
 
 #[test]
 fn coalesce_ownership_uses_proven_arm_selection() {
-    doriac::check_source(
-        "stage22-coalesce-ownership-facts.doria",
-        r#"
+    let source = r#"
 class Box {}
+class Item {}
+class Consumer
+{
+    function accept(take Item $item): void {}
+}
+
 function consume(take Box $value): void {}
+function consumeForBool(take Box $value): bool { return false; }
+function finishBox(take Box $value): void {}
+function finishItem(take Item $value): void {}
+
 function main(): void
 {
     writable ?Box $value = null;
     consume($value ?? new Box());
     $value = new Box();
     consume($value ?? new Box());
+
+    ?bool $ok = true;
+    let $box = new Box();
+    if ($ok ?? consumeForBool($box)) {}
+    finishBox($box);
+
+    ?Consumer $consumer = null;
+    let $item = new Item();
+    $consumer?->accept($item);
+    finishItem($item);
 }
-"#,
-    )
-    .expect("coalesce should apply ownership only to the arm selected by flow facts");
+"#;
+    let program = doriac::lower_source_to_mir("stage22-flow-selected-ownership.doria", source)
+        .expect("flow-selected expressions should lower without impossible ownership effects");
+    doriac::mir_validation::validate_program(&program)
+        .expect("shared validation should see only reachable ownership effects");
+    doriac::mir_interpreter::interpret(&program).expect("flow-selected expressions should execute");
+    assert!(!doriac::codegen_cranelift::lower_mir_to_object(&program)
+        .expect("Cranelift should lower flow-selected expressions")
+        .is_empty());
+    #[cfg(feature = "llvm-backend")]
+    assert!(!doriac::codegen_llvm::lower_mir_to_object(&program)
+        .expect("LLVM should lower flow-selected expressions")
+        .is_empty());
 }
 
 #[test]

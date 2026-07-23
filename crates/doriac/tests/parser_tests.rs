@@ -107,6 +107,17 @@ int[] $numbers = [1, 2, 3];
 }
 
 #[test]
+fn rejects_php_parameter_references_without_stealing_bitwise_syntax() {
+    let diagnostics = doriac::parse_source("test.doria", "function mutate(int &$value): void {}")
+        .expect_err("PHP-style parameter references should be rejected contextually");
+    assert!(diagnostics.iter().any(|diagnostic| {
+        diagnostic
+            .message
+            .contains("does not support PHP-style parameter references")
+    }));
+}
+
+#[test]
 fn parses_stage_13_primitive_type_spellings() {
     let program = doriac::parse_source(
         "test.doria",
