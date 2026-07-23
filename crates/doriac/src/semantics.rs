@@ -28,6 +28,8 @@ pub struct SemanticInfo {
     pub expression_types: HashMap<(usize, usize), ResolvedType>,
     /// Resolved concrete target for each checked `is` expression.
     pub type_test_types: HashMap<(usize, usize), ResolvedType>,
+    /// Compiler-resolved callable target for each user-defined call expression.
+    pub call_targets: HashMap<(usize, usize), CallableTarget>,
     /// Stable nominal class identities and the total Stage 19 property order.
     pub classes: Vec<ClassSemanticInfo>,
     /// Values produced by the bounded Stage 20 constant evaluator.
@@ -40,6 +42,23 @@ pub struct SemanticInfo {
     /// Flow facts at checked source uses, consumed by MIR lowering so
     /// statically selected nullable paths stay selected after lowering.
     pub(crate) flow_facts: crate::narrowing::FactsByUse,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CallableTarget {
+    Function {
+        name: String,
+    },
+    Method {
+        class_name: String,
+        method_name: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SemanticAnalysis {
+    pub info: SemanticInfo,
+    pub diagnostics: Vec<Diagnostic>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,9 +98,22 @@ impl SemanticInfo {
     pub fn type_test_type(&self, span: Span) -> Option<&ResolvedType> {
         self.type_test_types.get(&(span.start, span.end))
     }
+
+    pub fn call_target(&self, span: Span) -> Option<&CallableTarget> {
+        self.call_targets.get(&(span.start, span.end))
+    }
 }
 
 pub fn analyze_program(program: &Program) -> DiagnosticResult<SemanticInfo> {
+    let analysis = analyze_program_for_ide(program);
+    if analysis.diagnostics.is_empty() {
+        Ok(analysis.info)
+    } else {
+        Err(analysis.diagnostics)
+    }
+}
+
+pub fn analyze_program_for_ide(program: &Program) -> SemanticAnalysis {
     let (const_evaluation, const_diagnostics) = match crate::const_eval::evaluate_program(program) {
         Ok(evaluation) => (evaluation, Vec::new()),
         Err(diagnostics) => (crate::const_eval::Evaluation::default(), diagnostics),
@@ -117,26 +149,25 @@ pub fn analyze_program(program: &Program) -> DiagnosticResult<SemanticInfo> {
         );
         checker.diagnostics.extend(ownership_diagnostics);
     }
-    if checker.diagnostics.is_empty() {
-        Ok(SemanticInfo {
+    let return_borrows = checker
+        .function_signatures
+        .iter()
+        .filter_map(|(span, signature)| signature.return_borrow.map(|borrow| (*span, borrow)))
+        .collect();
+    SemanticAnalysis {
+        info: SemanticInfo {
             integer_expression_types: checker.integer_expression_types,
             float_expression_types: checker.float_expression_types,
             expression_types: checker.expression_types,
             type_test_types: checker.type_test_types,
+            call_targets: checker.call_targets,
             classes: collect_ordered_class_semantics(program),
             const_evaluation: checker.const_evaluation,
             parameter_defaults: checker.parameter_defaults,
-            return_borrows: checker
-                .function_signatures
-                .iter()
-                .filter_map(|(span, signature)| {
-                    signature.return_borrow.map(|borrow| (*span, borrow))
-                })
-                .collect(),
+            return_borrows,
             flow_facts: checker.flow_facts,
-        })
-    } else {
-        Err(checker.diagnostics)
+        },
+        diagnostics: checker.diagnostics,
     }
 }
 
@@ -250,6 +281,7 @@ struct Checker<'program> {
     float_expression_types: HashMap<(usize, usize), FloatType>,
     expression_types: HashMap<(usize, usize), ResolvedType>,
     type_test_types: HashMap<(usize, usize), ResolvedType>,
+    call_targets: HashMap<(usize, usize), CallableTarget>,
     integer_literals: HashMap<(usize, usize), u128>,
     negative_integer_literals: HashMap<(usize, usize), u128>,
     negated_integer_literal_operands: HashSet<(usize, usize)>,
@@ -407,6 +439,7 @@ impl<'program> Checker<'program> {
             float_expression_types: HashMap::new(),
             expression_types: HashMap::new(),
             type_test_types: HashMap::new(),
+            call_targets: HashMap::new(),
             integer_literals: HashMap::new(),
             negative_integer_literals: HashMap::new(),
             negated_integer_literal_operands: HashSet::new(),
@@ -4458,6 +4491,12 @@ impl<'program> Checker<'program> {
             return;
         };
 
+        self.call_targets.insert(
+            (span.start, span.end),
+            CallableTarget::Function {
+                name: name.to_string(),
+            },
+        );
         self.check_call_arguments(
             &format!("function `{name}`"),
             &function_info.params,
@@ -4676,6 +4715,13 @@ impl<'program> Checker<'program> {
             return;
         };
 
+        self.call_targets.insert(
+            (span.start, span.end),
+            CallableTarget::Method {
+                class_name: class_name.clone(),
+                method_name: method.to_string(),
+            },
+        );
         if method_info.is_static {
             self.diagnostics.push(Diagnostic::new(
                 "E0487",
@@ -4814,7 +4860,7 @@ impl<'program> Checker<'program> {
             ));
             return;
         };
-        let Some(method_info) = class_info.methods.get(access.member) else {
+        let Some(method_info) = class_info.methods.get(access.member).cloned() else {
             self.diagnostics.push(Diagnostic::new(
                 "E0304",
                 format!("unknown method `{class_name}::{}`", access.member),
@@ -4823,6 +4869,13 @@ impl<'program> Checker<'program> {
             return;
         };
 
+        self.call_targets.insert(
+            (access.span.start, access.span.end),
+            CallableTarget::Method {
+                class_name: class_name.to_string(),
+                method_name: access.member.to_string(),
+            },
+        );
         if self.check_direct_lifecycle_method_call(class_name, access.member, access.span) {
             return;
         }
