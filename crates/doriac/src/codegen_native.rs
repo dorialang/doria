@@ -163,6 +163,8 @@ fn linker_arguments(
         // Cranelift-generated objects do not carry MSVC /DEFAULTLIB directives.
         // For the current generated process wrapper, make Doria's main the executable
         // entrypoint instead of relying on CRT startup to discover and call it.
+        // LLVM may emit __chkstk for any function whose frame crosses the Windows
+        // stack-probe threshold; that ABI helper is exported by kernelbase.dll.
         return vec![
             OsString::from("/nologo"),
             object_path.as_os_str().to_os_string(),
@@ -172,6 +174,7 @@ fn linker_arguments(
             OsString::from("/ENTRY:main"),
             OsString::from("/SUBSYSTEM:CONSOLE"),
             OsString::from("kernel32.lib"),
+            OsString::from("kernelbase.lib"),
         ];
     }
 
@@ -220,6 +223,7 @@ mod tests {
                 OsString::from("/ENTRY:main"),
                 OsString::from("/SUBSYSTEM:CONSOLE"),
                 OsString::from("kernel32.lib"),
+                OsString::from("kernelbase.lib"),
             ]
         );
     }
@@ -247,6 +251,7 @@ mod tests {
                 OsString::from("/ENTRY:main"),
                 OsString::from("/SUBSYSTEM:CONSOLE"),
                 OsString::from("kernel32.lib"),
+                OsString::from("kernelbase.lib"),
             ]
         );
     }

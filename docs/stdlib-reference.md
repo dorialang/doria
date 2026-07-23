@@ -51,7 +51,7 @@ Regularized `snake_case` free functions wrapping the member/companion surface �
 - **String/utility:** `get_time`, `str_starts_with`, `str_case_compare`, and the `str_*` family (fully worded after the `str_` prefix).
 - **Meta:** `function_exists("name")` — const-evaluated compile-time predicate for guarded/polyfill declarations.
 
-Binary (`read_file_bytes`/`write_file_bytes`/`append_file_bytes`, `read_stdin_bytes`, `write_stdout_bytes`/`write_stderr_bytes`) arrives with `Bytes` in Stage 23 Slice 2; the stream tier moves to `Doria\Std\Io` post-Stage-29. See the I/O audit (`docs/notes/io-surface-audit.md`) for the byte/stream surface still being finalized.
+Binary (`read_file_bytes`/`write_file_bytes`/`append_file_bytes` per record 0091; the standard-stream byte functions `read_stdin_bytes`, `write_stdout_bytes`/`write_stderr_bytes` per record 0101) arrives with `Bytes` in Stage 23 Slice 2; the stream tier moves to `Doria\Std\Io` post-Stage-29. There is deliberately no `write_stdout(string)` — `echo` is the sole stdout text writer (0101).
 
 ---
 
