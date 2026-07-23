@@ -24,6 +24,7 @@ struct Parameter {
 struct Signature {
     params: Vec<Parameter>,
     returns: Option<String>,
+    returns_collection: Option<CollectionInfo>,
     returns_move_type: bool,
     return_borrow: Option<ReturnBorrow>,
     receiver: Option<UseMode>,
@@ -48,6 +49,7 @@ enum CallExecution {
 #[derive(Debug, Clone)]
 struct Binding {
     class: Option<String>,
+    collection: Option<CollectionInfo>,
     mixed: bool,
     borrowed_place: bool,
     writable: bool,
@@ -57,8 +59,25 @@ struct Binding {
 #[derive(Debug, Clone)]
 struct PropertyInfo {
     class: Option<String>,
+    collection: Option<CollectionInfo>,
     move_type: bool,
     writable: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CollectionFamily {
+    TypedArray,
+    List,
+    Dictionary,
+    Set,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CollectionInfo {
+    family: CollectionFamily,
+    value_move: bool,
+    value_class: Option<String>,
+    value_collection: Option<CollectionFamily>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -193,6 +212,11 @@ pub(crate) fn check_program_with_inferred_move_returns(
                                 (class.name.clone(), property.name.clone()),
                                 PropertyInfo {
                                     class: property_class,
+                                    collection: type_ref_collection_info(
+                                        &property.ty,
+                                        &classes,
+                                        Some(&class.name),
+                                    ),
                                     move_type,
                                     writable: property.writable,
                                 },
@@ -226,6 +250,11 @@ pub(crate) fn check_program_with_inferred_move_returns(
                                             (class.name.clone(), param.name.clone()),
                                             PropertyInfo {
                                                 class: property_class,
+                                                collection: type_ref_collection_info(
+                                                    &param.ty,
+                                                    &classes,
+                                                    Some(&class.name),
+                                                ),
                                                 move_type,
                                                 writable: param.writable,
                                             },
@@ -633,6 +662,10 @@ fn signature(
             .return_type
             .as_ref()
             .and_then(|ty| type_ref_class_name(ty, classes, receiver_class)),
+        returns_collection: function
+            .return_type
+            .as_ref()
+            .and_then(|ty| type_ref_collection_info(ty, classes, receiver_class)),
         returns_move_type: function.return_type.as_ref().is_some_and(|ty| {
             type_ref_is_move_type(ty, classes, receiver_class) && return_borrow.is_none()
         }) || (function.return_type.is_none()
@@ -751,6 +784,11 @@ impl Checker<'_> {
                     param.name.clone(),
                     Binding {
                         class,
+                        collection: type_ref_collection_info(
+                            &param.ty,
+                            &self.classes,
+                            self.receiver_class.as_deref(),
+                        ),
                         mixed,
                         borrowed_place: !param.take,
                         writable: param.writable,
@@ -820,7 +858,8 @@ impl Checker<'_> {
                     type_ref_class_name(ty, &self.classes, self.receiver_class.as_deref())
                 });
                 let class = declared_class.or_else(|| self.expr_class(&decl.initializer, scopes));
-                if self.expr_returns_borrow(&decl.initializer, scopes) {
+                let borrowed_initializer = self.expr_returns_borrow(&decl.initializer, scopes);
+                if borrowed_initializer {
                     self.diagnostics.push(
                         Diagnostic::new(
                             "E0478",
@@ -844,7 +883,9 @@ impl Checker<'_> {
                 self.use_expr(
                     &decl.initializer,
                     scopes,
-                    if initializer_moves || class.is_some() || mixed || declared_move_type {
+                    if borrowed_initializer {
+                        UseMode::Read
+                    } else if initializer_moves || class.is_some() || mixed || declared_move_type {
                         UseMode::Give
                     } else {
                         UseMode::Read
@@ -855,6 +896,17 @@ impl Checker<'_> {
                         decl.name.clone(),
                         Binding {
                             class,
+                            collection: decl
+                                .ty
+                                .as_ref()
+                                .and_then(|ty| {
+                                    type_ref_collection_info(
+                                        ty,
+                                        &self.classes,
+                                        self.receiver_class.as_deref(),
+                                    )
+                                })
+                                .or_else(|| self.expr_collection_info(&decl.initializer, scopes)),
                             mixed,
                             borrowed_place: false,
                             writable: decl.writable,
@@ -1212,6 +1264,11 @@ impl Checker<'_> {
             binding.name.clone(),
             Binding {
                 class: type_ref_class_name(ty, &self.classes, self.receiver_class.as_deref()),
+                collection: type_ref_collection_info(
+                    ty,
+                    &self.classes,
+                    self.receiver_class.as_deref(),
+                ),
                 mixed: ty.name == "mixed",
                 borrowed_place: true,
                 writable: false,
@@ -1319,7 +1376,7 @@ impl Checker<'_> {
         }
         let tracked_target = matches!(
             ungrouped_target,
-            Expr::PropertyAccess { .. } | Expr::StaticMember { .. }
+            Expr::PropertyAccess { .. } | Expr::StaticMember { .. } | Expr::Index { .. }
         );
         let assignment_root = tracked_target
             .then(|| self.borrow_root_key(target, scopes))
@@ -1473,6 +1530,10 @@ impl Checker<'_> {
                 null_safe,
                 ..
             } => {
+                if let Some(collection) = self.expr_collection_info(object, scopes) {
+                    self.use_collection_call(collection.family, object, method, args, scopes);
+                    return;
+                }
                 let signature = self
                     .expr_class(object, scopes)
                     .and_then(|class| self.methods.get(&(class, method.clone())).cloned())
@@ -1519,6 +1580,20 @@ impl Checker<'_> {
                     }
                 }
                 self.active_borrows.truncate(borrow_depth);
+            }
+            Expr::Index {
+                collection, index, ..
+            } => {
+                self.use_expr(
+                    collection,
+                    scopes,
+                    if mode == UseMode::Write {
+                        UseMode::Write
+                    } else {
+                        UseMode::Read
+                    },
+                );
+                self.use_expr(index, scopes, UseMode::Read);
             }
             Expr::Unary { expr, .. } => self.use_expr(expr, scopes, UseMode::Read),
             Expr::IsType { expr, .. } => self.use_expr(expr, scopes, UseMode::Read),
@@ -2193,6 +2268,17 @@ impl Checker<'_> {
                 .get(name)
                 .is_some_and(|signature| signature.returns_move_type),
             Expr::MethodCall { object, method, .. } => {
+                if let Some(collection) = self.expr_collection_info(object, scopes) {
+                    return matches!(
+                        (collection.family, method.as_str()),
+                        (CollectionFamily::List, "removeAt" | "pop")
+                            | (CollectionFamily::Dictionary, "remove")
+                    ) && collection.value_move
+                        || matches!(
+                            (collection.family, method.as_str()),
+                            (CollectionFamily::Set, "union" | "intersect" | "difference")
+                        );
+                }
                 let Some(class) = self.expr_class(object, scopes) else {
                     return false;
                 };
@@ -2202,13 +2288,26 @@ impl Checker<'_> {
             }
             Expr::StaticCall {
                 qualifier, method, ..
-            } => self
-                .qualifier_class(qualifier)
-                .and_then(|class_name| self.methods.get(&(class_name, method.clone())))
-                .is_some_and(|signature| signature.returns_move_type),
+            } => {
+                if matches!(
+                    qualifier,
+                    ast::StaticQualifier::Class(class_name) if class_name == "Set"
+                ) && method == "from"
+                {
+                    return true;
+                }
+                self.qualifier_class(qualifier)
+                    .and_then(|class_name| self.methods.get(&(class_name, method.clone())))
+                    .is_some_and(|signature| signature.returns_move_type)
+            }
             Expr::PropertyAccess {
                 object, property, ..
             } => {
+                if let Some(collection) = self.expr_collection_info(object, scopes) {
+                    return collection.family == CollectionFamily::List
+                        && matches!(property.as_str(), "first" | "last")
+                        && collection.value_move;
+                }
                 let Some(class) = self.expr_class(object, scopes) else {
                     return false;
                 };
@@ -2217,6 +2316,9 @@ impl Checker<'_> {
                     .is_some_and(|property| property.move_type)
             }
             Expr::This { .. } => self.receiver_class.is_some(),
+            Expr::Index { collection, .. } => self
+                .expr_collection_info(collection, scopes)
+                .is_some_and(|collection| collection.value_move),
             Expr::Binary {
                 left,
                 op: BinaryOp::Coalesce,
@@ -2235,6 +2337,13 @@ impl Checker<'_> {
                 .get(name)
                 .is_some_and(|signature| signature.return_borrow.is_some()),
             Expr::MethodCall { object, method, .. } => {
+                if let Some(collection) = self.expr_collection_info(object, scopes) {
+                    return collection.value_move
+                        && matches!(
+                            (collection.family, method.as_str()),
+                            (CollectionFamily::Dictionary, "get")
+                        );
+                }
                 let Some(class) = self.expr_class(object, scopes) else {
                     return false;
                 };
@@ -2254,6 +2363,18 @@ impl Checker<'_> {
                 right,
                 ..
             } => self.expr_returns_borrow(left, scopes) || self.expr_returns_borrow(right, scopes),
+            Expr::Index { collection, .. } => self
+                .expr_collection_info(collection, scopes)
+                .is_some_and(|collection| collection.value_move),
+            Expr::PropertyAccess {
+                object, property, ..
+            } => self
+                .expr_collection_info(object, scopes)
+                .is_some_and(|collection| {
+                    collection.family == CollectionFamily::List
+                        && collection.value_move
+                        && matches!(property.as_str(), "first" | "last")
+                }),
             _ => false,
         }
     }
@@ -2273,12 +2394,33 @@ impl Checker<'_> {
             Expr::PropertyAccess {
                 object, property, ..
             } => {
+                if let Some(class) = self
+                    .expr_collection_info(object, scopes)
+                    .and_then(|collection| collection.value_class)
+                    .filter(|_| matches!(property.as_str(), "first" | "last"))
+                {
+                    return Some(class);
+                }
                 let object_class = self.expr_class(object, scopes)?;
                 self.properties
                     .get(&(object_class, property.clone()))
                     .and_then(|property| property.class.clone())
             }
             Expr::MethodCall { object, method, .. } => {
+                if let Some(class) =
+                    self.expr_collection_info(object, scopes)
+                        .and_then(|collection| {
+                            matches!(
+                                (collection.family, method.as_str()),
+                                (CollectionFamily::List, "removeAt" | "pop")
+                                    | (CollectionFamily::Dictionary, "get" | "remove")
+                            )
+                            .then_some(collection.value_class)
+                            .flatten()
+                        })
+                {
+                    return Some(class);
+                }
                 let object_class = self.expr_class(object, scopes)?;
                 self.methods
                     .get(&(object_class, method.clone()))
@@ -2291,6 +2433,9 @@ impl Checker<'_> {
                 .and_then(|class_name| self.methods.get(&(class_name, method.clone())))
                 .and_then(|signature| signature.returns.clone()),
             Expr::This { .. } => self.receiver_class.clone(),
+            Expr::Index { collection, .. } => self
+                .expr_collection_info(collection, scopes)
+                .and_then(|collection| collection.value_class),
             Expr::Grouped { expr, .. } => self.expr_class(expr, scopes),
             Expr::Binary {
                 left,
@@ -2306,6 +2451,117 @@ impl Checker<'_> {
                 _ => None,
             },
             _ => None,
+        }
+    }
+
+    fn expr_collection_info(&self, expr: &Expr, scopes: &Scopes) -> Option<CollectionInfo> {
+        match expr {
+            Expr::Variable { name, .. } => scopes
+                .get(name)
+                .and_then(|binding| binding.collection.clone()),
+            Expr::Array { elements, .. } => {
+                let value = elements.first().map(|entry| &entry.value);
+                Some(CollectionInfo {
+                    family: if elements.iter().any(|entry| entry.key.is_some()) {
+                        CollectionFamily::Dictionary
+                    } else {
+                        CollectionFamily::List
+                    },
+                    value_move: value.is_some_and(|value| self.expr_is_move_value(value, scopes)),
+                    value_class: value.and_then(|value| self.expr_class(value, scopes)),
+                    value_collection: value
+                        .and_then(|value| self.expr_collection_info(value, scopes))
+                        .map(|info| info.family),
+                })
+            }
+            Expr::FunctionCall { name, .. } => self
+                .signatures
+                .get(name)
+                .and_then(|signature| signature.returns_collection.clone()),
+            Expr::PropertyAccess {
+                object, property, ..
+            } => {
+                let class = self.expr_class(object, scopes)?;
+                self.properties
+                    .get(&(class, property.clone()))
+                    .and_then(|property| property.collection.clone())
+            }
+            Expr::MethodCall { object, method, .. }
+                if matches!(method.as_str(), "union" | "intersect" | "difference") =>
+            {
+                let info = self.expr_collection_info(object, scopes)?;
+                (info.family == CollectionFamily::Set).then_some(info)
+            }
+            Expr::StaticCall {
+                qualifier: ast::StaticQualifier::Class(class_name),
+                method,
+                args,
+                ..
+            } if class_name == "Set" && method == "from" => {
+                let source = args
+                    .first()
+                    .and_then(|arg| self.expr_collection_info(arg, scopes));
+                Some(CollectionInfo {
+                    family: CollectionFamily::Set,
+                    value_move: source.as_ref().is_some_and(|info| info.value_move),
+                    value_class: source.as_ref().and_then(|info| info.value_class.clone()),
+                    value_collection: source.and_then(|info| info.value_collection),
+                })
+            }
+            Expr::Grouped { expr, .. } => self.expr_collection_info(expr, scopes),
+            Expr::Binary {
+                left,
+                op: BinaryOp::Coalesce,
+                right,
+                ..
+            } => {
+                let left = self.expr_collection_info(left, scopes);
+                let right = self.expr_collection_info(right, scopes);
+                (left == right).then_some(left).flatten()
+            }
+            _ => None,
+        }
+    }
+
+    fn use_collection_call(
+        &mut self,
+        collection: CollectionFamily,
+        object: &Expr,
+        method: &str,
+        args: &[Expr],
+        scopes: &mut Scopes,
+    ) {
+        let mutating = matches!(
+            (collection, method),
+            (
+                CollectionFamily::List,
+                "add" | "insertAt" | "removeAt" | "pop"
+            ) | (CollectionFamily::Dictionary, "set" | "remove")
+                | (CollectionFamily::Set, "add" | "remove")
+        );
+        self.use_expr(
+            object,
+            scopes,
+            if mutating {
+                UseMode::Write
+            } else {
+                UseMode::Read
+            },
+        );
+
+        for (index, argument) in args.iter().enumerate() {
+            let moves_in = matches!(
+                (collection, method, index),
+                (CollectionFamily::List, "add", 0)
+                    | (CollectionFamily::List, "insertAt", 1)
+                    | (CollectionFamily::Dictionary, "set", 0 | 1)
+                    | (CollectionFamily::Set, "add", 0)
+            );
+            if moves_in {
+                self.use_owned_expression(argument, scopes);
+            } else {
+                self.use_expr(argument, scopes, UseMode::Read);
+            }
         }
     }
 
@@ -2366,6 +2622,27 @@ fn type_ref_class_name(
         &ty.name
     };
     classes.contains(name).then(|| name.to_string())
+}
+
+fn type_ref_collection_info(
+    ty: &crate::types::TypeRef,
+    classes: &HashSet<String>,
+    receiver_class: Option<&str>,
+) -> Option<CollectionInfo> {
+    let (family, value) = match ty.name.as_str() {
+        "[]" if ty.args.len() == 1 => (CollectionFamily::TypedArray, &ty.args[0]),
+        "List" if ty.args.len() == 1 => (CollectionFamily::List, &ty.args[0]),
+        "Dictionary" if ty.args.len() == 2 => (CollectionFamily::Dictionary, &ty.args[1]),
+        "Set" if ty.args.len() == 1 => (CollectionFamily::Set, &ty.args[0]),
+        _ => return None,
+    };
+    Some(CollectionInfo {
+        family,
+        value_move: type_ref_is_move_type(value, classes, receiver_class),
+        value_class: type_ref_class_name(value, classes, receiver_class),
+        value_collection: type_ref_collection_info(value, classes, receiver_class)
+            .map(|info| info.family),
+    })
 }
 
 pub(crate) fn type_ref_is_move_type(

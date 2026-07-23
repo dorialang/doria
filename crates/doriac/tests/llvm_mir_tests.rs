@@ -50,6 +50,7 @@ fn lowers_complete_stage_14_mir_shapes_to_verified_objects() {
 fn rejects_malformed_mixed_width_float_mir_before_llvm_emission() {
     let program = Program {
         classes: vec![],
+        collection_types: vec![],
         statics: vec![],
         functions: vec![
             Function {

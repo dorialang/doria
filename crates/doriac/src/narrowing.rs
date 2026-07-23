@@ -899,6 +899,12 @@ fn kill_mutated_call_arguments(
                 kill_mutated_call_arguments(&element.value, state, resolution, mutations);
             }
         }
+        Expr::Index {
+            collection, index, ..
+        } => {
+            kill_mutated_call_arguments(collection, state, resolution, mutations);
+            kill_mutated_call_arguments(index, state, resolution, mutations);
+        }
         Expr::Binary {
             left,
             op: crate::ast::BinaryOp::And,
@@ -1062,6 +1068,7 @@ fn expression_fact(
         | Expr::Float { .. }
         | Expr::Bool { .. }
         | Expr::Array { .. }
+        | Expr::Index { .. }
         | Expr::Range { .. }
         | Expr::New { .. }
         | Expr::This { .. }
@@ -1378,6 +1385,12 @@ fn collect_expr(
                 state = collect_expr(&element.value, &state, resolution, mutations, facts);
             }
             state
+        }
+        Expr::Index {
+            collection, index, ..
+        } => {
+            let state = collect_expr(collection, state, resolution, mutations, facts);
+            collect_expr(index, &state, resolution, mutations, facts)
         }
         Expr::Binary {
             left,
@@ -1771,6 +1784,12 @@ impl Resolver {
                     }
                     self.resolve_expr(&element.value);
                 }
+            }
+            Expr::Index {
+                collection, index, ..
+            } => {
+                self.resolve_expr(collection);
+                self.resolve_expr(index);
             }
             Expr::Binary { left, right, .. }
             | Expr::Range {

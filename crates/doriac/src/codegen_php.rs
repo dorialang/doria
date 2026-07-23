@@ -516,6 +516,12 @@ fn validate_expr(expr: &Expr, semantic_info: &SemanticInfo) -> Result<(), Backen
             }
             Ok(())
         }
+        Expr::Index {
+            collection, index, ..
+        } => {
+            validate_expr(collection, semantic_info)?;
+            validate_expr(index, semantic_info)
+        }
         Expr::PropertyAccess { object, .. } => validate_expr(object, semantic_info),
         Expr::MethodCall { object, args, .. } => {
             validate_expr(object, semantic_info)?;
@@ -726,6 +732,9 @@ fn unsupported_php_property_default(
                 .and_then(|key| unsupported_php_property_default(key, semantic_info))
                 .or_else(|| unsupported_php_property_default(&element.value, semantic_info))
         }),
+        Expr::Index { span, .. } => {
+            Some((*span, "indexed access in instance property initializers"))
+        }
         Expr::PropertyAccess { span, .. } => {
             Some((*span, "instance property initializers that read properties"))
         }
@@ -1452,6 +1461,32 @@ fn emit_foreach(
         return;
     }
 
+    if let Some((dictionary, projection)) = dictionary_foreach_projection(&foreach.iterable) {
+        let iterable = emit_expr(dictionary, scopes);
+        scopes.push();
+        let value_name = scopes.declare(&foreach.value.name);
+        let ignored_value = (projection == DictionaryForeachProjection::Keys)
+            .then(|| scopes.fresh_temp("projection_value"));
+
+        write_indent(output, indent);
+        output.push_str("foreach (");
+        output.push_str(&iterable);
+        output.push_str(" as $");
+        output.push_str(&value_name);
+        if let Some(ignored_value) = ignored_value {
+            output.push_str(" => $");
+            output.push_str(&ignored_value);
+        }
+        output.push_str(")\n");
+        writeln(output, indent, "{");
+        for statement in &foreach.body.statements {
+            emit_statement(statement, output, indent + 1, scopes);
+        }
+        scopes.pop();
+        writeln(output, indent, "}");
+        return;
+    }
+
     let iterable = emit_expr(&foreach.iterable, scopes);
     scopes.push();
     let key_name = foreach.key.as_ref().map(|key| scopes.declare(&key.name));
@@ -1475,6 +1510,29 @@ fn emit_foreach(
     }
     scopes.pop();
     writeln(output, indent, "}");
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DictionaryForeachProjection {
+    Keys,
+    Values,
+}
+
+fn dictionary_foreach_projection(expr: &Expr) -> Option<(&Expr, DictionaryForeachProjection)> {
+    match expr {
+        Expr::Grouped { expr, .. } => dictionary_foreach_projection(expr),
+        Expr::PropertyAccess {
+            object,
+            property,
+            null_safe: false,
+            ..
+        } => match property.as_str() {
+            "keys" => Some((object, DictionaryForeachProjection::Keys)),
+            "values" => Some((object, DictionaryForeachProjection::Values)),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 fn grouped_range_expr(expr: &Expr) -> Option<(&Expr, &Expr, bool)> {
@@ -1590,6 +1648,13 @@ fn emit_expr(expr: &Expr, scopes: &PhpNameScopes) -> String {
                 .join(", ");
             format!("[{inner}]")
         }
+        Expr::Index {
+            collection, index, ..
+        } => format!(
+            "{}[{}]",
+            emit_expr(collection, scopes),
+            emit_expr(index, scopes)
+        ),
         Expr::PropertyAccess {
             object,
             property,

@@ -125,6 +125,10 @@ pub enum ResolvedType {
     Mixed,
     Nullable(Box<ResolvedType>),
     Class(String),
+    TypedArray(Box<ResolvedType>),
+    List(Box<ResolvedType>),
+    Dictionary(Box<ResolvedType>, Box<ResolvedType>),
+    Set(Box<ResolvedType>),
     Unsupported,
 }
 
@@ -203,13 +207,18 @@ impl TypeRegistry {
             TypeKind::Mixed => ResolvedType::Mixed,
             TypeKind::Nullable(inner) => ResolvedType::Nullable(Box::new(self.resolved(*inner))),
             TypeKind::Class(name) => ResolvedType::Class(name.clone()),
-            TypeKind::TypedArray(_)
-            | TypeKind::Unknown
-            | TypeKind::Heterogeneous
-            | TypeKind::EmptyCollection
-            | TypeKind::List(_)
-            | TypeKind::Dictionary(_, _)
-            | TypeKind::Set(_) => ResolvedType::Unsupported,
+            TypeKind::TypedArray(element) => {
+                ResolvedType::TypedArray(Box::new(self.resolved(*element)))
+            }
+            TypeKind::List(element) => ResolvedType::List(Box::new(self.resolved(*element))),
+            TypeKind::Dictionary(key, value) => ResolvedType::Dictionary(
+                Box::new(self.resolved(*key)),
+                Box::new(self.resolved(*value)),
+            ),
+            TypeKind::Set(element) => ResolvedType::Set(Box::new(self.resolved(*element))),
+            TypeKind::Unknown | TypeKind::Heterogeneous | TypeKind::EmptyCollection => {
+                ResolvedType::Unsupported
+            }
         }
     }
 }

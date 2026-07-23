@@ -2728,6 +2728,7 @@ fn display_spec() -> FormatSpec {
 fn valid_void_program() -> Program {
     Program {
         classes: vec![],
+        collection_types: vec![],
         statics: vec![],
         functions: vec![Function {
             id: FunctionId(0),

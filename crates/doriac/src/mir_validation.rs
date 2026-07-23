@@ -8,6 +8,24 @@ use crate::mir;
 use crate::numeric::IntegerType;
 
 pub fn validate_program(program: &mir::Program) -> Result<(), BackendError> {
+    for (index, collection) in program.collection_types.iter().enumerate() {
+        if collection.id != mir::CollectionTypeId(index) {
+            return Err(malformed_mir(format!(
+                "collection type table slot {index} contains collection#{}",
+                collection.id.0
+            )));
+        }
+        if let Some(key) = collection.key {
+            validate_type(program, key)?;
+        }
+        validate_type(program, collection.value)?;
+        if matches!(collection.kind, mir::CollectionKind::Dictionary) != collection.key.is_some() {
+            return Err(malformed_mir(format!(
+                "collection#{} has an invalid key-type shape",
+                collection.id.0
+            )));
+        }
+    }
     for (index, class) in program.classes.iter().enumerate() {
         validate_class(program, index, class)?;
     }
@@ -232,6 +250,7 @@ fn field_type(ty: mir::Type) -> FieldType {
         mir::Type::NullableString => FieldType::NullableString,
         mir::Type::Class(class) => FieldType::Class(class),
         mir::Type::NullableClass(class) => FieldType::NullableClass(class),
+        mir::Type::Collection(_) => FieldType::Collection,
     }
 }
 
@@ -275,6 +294,8 @@ fn validate_function(program: &mir::Program, function: &mir::Function) -> Result
 fn validate_type(program: &mir::Program, ty: mir::Type) -> Result<(), BackendError> {
     if let mir::Type::Class(class) | mir::Type::NullableClass(class) = ty {
         class_in(program, class)?;
+    } else if let mir::Type::Collection(collection) = ty {
+        collection_in(program, collection)?;
     }
     Ok(())
 }
@@ -369,6 +390,15 @@ fn validate_statement(
                     if expression.class() == expected =>
                 {
                     if !local.owned {
+                        if matches!(
+                            expression,
+                            mir::ClassExpression::CollectionIndex {
+                                transfer: false,
+                                ..
+                            }
+                        ) {
+                            return validate_class_expression(program, function, expression);
+                        }
                         if !local.synthetic {
                             return Err(malformed_mir(format!(
                                 "class assignment targets borrowed local local{}",
@@ -418,6 +448,36 @@ fn validate_statement(
                     mir::Rvalue::NullableScalar(_) | mir::Rvalue::NullableClass(_),
                 ) => Err(malformed_mir(format!(
                     "non-nullable local local{} receives a nullable rvalue",
+                    target.0
+                ))),
+                (mir::Type::Collection(expected), mir::Rvalue::Collection(expression))
+                    if expression.collection() == expected =>
+                {
+                    if !local.owned
+                        && !matches!(
+                            expression,
+                            mir::CollectionExpression::Local {
+                                transfer: false,
+                                ..
+                            } | mir::CollectionExpression::Index {
+                                transfer: false,
+                                ..
+                            }
+                        )
+                    {
+                        return Err(malformed_mir(format!(
+                            "borrowed collection local local{} receives an owning value",
+                            target.0
+                        )));
+                    }
+                    validate_collection_expression(program, function, expression)
+                }
+                (mir::Type::Collection(_), _) => Err(malformed_mir(format!(
+                    "collection local local{} receives a mismatched rvalue",
+                    target.0
+                ))),
+                (_, mir::Rvalue::Collection(_)) => Err(malformed_mir(format!(
+                    "non-collection local local{} receives a collection rvalue",
                     target.0
                 ))),
             }
@@ -567,6 +627,118 @@ fn validate_statement(
                 )));
             }
             class_in(program, *class).map(|_| ())
+        }
+        mir::Statement::CollectionAdd {
+            collection,
+            value,
+            index,
+            op,
+        } => {
+            let local = local_in(function, *collection)?;
+            let mir::Type::Collection(collection_type) = local.ty else {
+                return Err(malformed_mir(
+                    "collection add targets a non-collection local",
+                ));
+            };
+            let definition = collection_in(program, collection_type)?;
+            if !local.writable {
+                return Err(malformed_mir(format!(
+                    "collection add uses readonly local{}",
+                    local.id.0
+                )));
+            }
+            if value.ty() != definition.value {
+                return Err(malformed_mir("collection add value type mismatch"));
+            }
+            match (op, definition.kind, index) {
+                (
+                    mir::CollectionMutationOp::Add,
+                    mir::CollectionKind::List | mir::CollectionKind::Set,
+                    None,
+                )
+                | (mir::CollectionMutationOp::Remove, mir::CollectionKind::Set, None) => {}
+                (mir::CollectionMutationOp::InsertAt, mir::CollectionKind::List, Some(index)) => {
+                    if index.ty() != mir::Type::Scalar(mir::ScalarType::Integer(IntegerType::Int64))
+                    {
+                        return Err(malformed_mir("List::insertAt index is not int"));
+                    }
+                    validate_rvalue(program, function, index)?;
+                }
+                _ => {
+                    return Err(malformed_mir(
+                        "collection mutation does not match its collection kind",
+                    ));
+                }
+            }
+            validate_rvalue(program, function, value)
+        }
+        mir::Statement::CollectionSet {
+            collection,
+            key,
+            value,
+        } => {
+            let local = local_in(function, *collection)?;
+            let mir::Type::Collection(collection_type) = local.ty else {
+                return Err(malformed_mir(
+                    "collection set targets a non-collection local",
+                ));
+            };
+            let definition = collection_in(program, collection_type)?;
+            let Some(key_type) = definition.key else {
+                return Err(malformed_mir(
+                    "collection set targets a non-keyed collection",
+                ));
+            };
+            if !local.writable {
+                return Err(malformed_mir(format!(
+                    "collection set uses readonly local{}",
+                    local.id.0
+                )));
+            }
+            if key.ty() != key_type || value.ty() != definition.value {
+                return Err(malformed_mir("collection set key/value type mismatch"));
+            }
+            validate_rvalue(program, function, key)?;
+            validate_rvalue(program, function, value)
+        }
+        mir::Statement::AssignCollectionIndex {
+            collection,
+            index,
+            value,
+        } => {
+            let local = local_in(function, *collection)?;
+            let mir::Type::Collection(collection_type) = local.ty else {
+                return Err(malformed_mir(
+                    "indexed assignment targets a non-collection local",
+                ));
+            };
+            let definition = collection_in(program, collection_type)?;
+            if !local.writable {
+                return Err(malformed_mir(format!(
+                    "indexed assignment uses readonly local{}",
+                    local.id.0
+                )));
+            }
+            let index_type = definition
+                .key
+                .unwrap_or(mir::Type::Scalar(mir::ScalarType::Integer(
+                    IntegerType::Int64,
+                )));
+            if index.ty() != index_type || value.ty() != definition.value {
+                return Err(malformed_mir("indexed assignment type mismatch"));
+            }
+            validate_rvalue(program, function, index)?;
+            validate_rvalue(program, function, value)
+        }
+        mir::Statement::DropCollection { local, collection } => {
+            let definition = local_in(function, *local)?;
+            if definition.ty != mir::Type::Collection(*collection) || !definition.owned {
+                return Err(malformed_mir(format!(
+                    "drop collection#{} references incompatible local{}",
+                    collection.0, local.0
+                )));
+            }
+            collection_in(program, *collection).map(|_| ())
         }
     }
 }
@@ -756,6 +928,7 @@ fn validate_rvalue(
         mir::Rvalue::NullableClass(value) => {
             validate_nullable_class_expression(program, function, value)
         }
+        mir::Rvalue::Collection(value) => validate_collection_expression(program, function, value),
     }?;
     let mut accesses = ClassLocalAccesses::default();
     collect_rvalue_class_local_accesses(expression, &mut accesses);
@@ -767,6 +940,210 @@ fn validate_rvalue(
         &mut HashSet::new(),
     )?;
     Ok(())
+}
+
+fn validate_collection_expression(
+    program: &mir::Program,
+    function: &mir::Function,
+    expression: &mir::CollectionExpression,
+) -> Result<(), BackendError> {
+    let definition = collection_in(program, expression.collection())?;
+    match expression {
+        mir::CollectionExpression::Local {
+            local, transfer, ..
+        } => {
+            let local = local_in(function, *local)?;
+            if local.ty != mir::Type::Collection(definition.id) {
+                return Err(malformed_mir("collection local expression type mismatch"));
+            }
+            if *transfer && !local.owned {
+                return Err(malformed_mir(format!(
+                    "collection expression moves borrowed local{}",
+                    local.id.0
+                )));
+            }
+            Ok(())
+        }
+        mir::CollectionExpression::Literal { entries, .. } => {
+            for entry in entries {
+                match (definition.key, &entry.key) {
+                    (Some(expected), Some(key)) if key.ty() == expected => {
+                        validate_rvalue(program, function, key)?;
+                    }
+                    (None, None) => {}
+                    _ => return Err(malformed_mir("collection literal key shape mismatch")),
+                }
+                if entry.value.ty() != definition.value {
+                    return Err(malformed_mir("collection literal value type mismatch"));
+                }
+                validate_rvalue(program, function, &entry.value)?;
+            }
+            Ok(())
+        }
+        mir::CollectionExpression::Index {
+            source,
+            index,
+            transfer,
+            ..
+        } => {
+            let source = local_in(function, *source)?;
+            let mir::Type::Collection(source_type) = source.ty else {
+                return Err(malformed_mir("collection index source is not a collection"));
+            };
+            let source_type = collection_in(program, source_type)?;
+            if source_type.value != mir::Type::Collection(definition.id) {
+                return Err(malformed_mir("nested collection index type mismatch"));
+            }
+            if *transfer && (source_type.kind != mir::CollectionKind::List || !source.writable) {
+                return Err(malformed_mir(
+                    "collection value transfer requires a writable List source",
+                ));
+            }
+            validate_collection_index(program, function, source_type, index)
+        }
+        mir::CollectionExpression::SetFrom {
+            source,
+            transfer,
+            algebra,
+            ..
+        } => {
+            let source = local_in(function, *source)?;
+            let mir::Type::Collection(source_type) = source.ty else {
+                return Err(malformed_mir("Set::from source is not a collection"));
+            };
+            let source_type = collection_in(program, source_type)?;
+            if definition.kind != mir::CollectionKind::Set
+                || source_type.key.is_some()
+                || source_type.value != definition.value
+            {
+                return Err(malformed_mir("Set::from collection type mismatch"));
+            }
+            if *transfer {
+                return Err(malformed_mir(
+                    "Set construction must borrow its source collection",
+                ));
+            }
+            if let Some((_, other)) = algebra {
+                let other = local_in(function, *other)?;
+                let mir::Type::Collection(other_type) = other.ty else {
+                    return Err(malformed_mir("set algebra operand is not a collection"));
+                };
+                if collection_in(program, other_type)? != definition {
+                    return Err(malformed_mir("set algebra collection type mismatch"));
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+fn validate_collection_index(
+    program: &mir::Program,
+    function: &mir::Function,
+    collection: &mir::CollectionType,
+    index: &mir::Rvalue,
+) -> Result<(), BackendError> {
+    let expected = collection
+        .key
+        .unwrap_or(mir::Type::Scalar(mir::ScalarType::Integer(
+            IntegerType::Int64,
+        )));
+    if index.ty() != expected {
+        return Err(malformed_mir(format!(
+            "collection index has type {}, expected {expected}",
+            index.ty()
+        )));
+    }
+    validate_rvalue(program, function, index)
+}
+
+fn validate_collection_element_access(
+    program: &mir::Program,
+    function: &mir::Function,
+    local: &mir::Local,
+    collection: &mir::CollectionType,
+    index: &mir::Rvalue,
+    remove: bool,
+) -> Result<(), BackendError> {
+    if remove && (collection.kind != mir::CollectionKind::List || !local.writable) {
+        return Err(malformed_mir(
+            "element removal requires a writable List source",
+        ));
+    }
+    validate_collection_index(program, function, collection, index)
+}
+
+fn validate_collection_key_at(
+    program: &mir::Program,
+    function: &mir::Function,
+    local: mir::LocalId,
+    expected: mir::Type,
+    offset: &mir::Rvalue,
+) -> Result<(), BackendError> {
+    let definition = local_in(function, local)?;
+    let mir::Type::Collection(collection) = definition.ty else {
+        return Err(malformed_mir(
+            "collection key access uses a non-collection local",
+        ));
+    };
+    if collection_in(program, collection)?.key != Some(expected) {
+        return Err(malformed_mir("collection key access type mismatch"));
+    }
+    if offset.ty() != mir::Type::Scalar(mir::ScalarType::Integer(IntegerType::Int64)) {
+        return Err(malformed_mir("collection key offset is not int/int64"));
+    }
+    validate_rvalue(program, function, offset)
+}
+
+fn validate_dictionary_get(
+    program: &mir::Program,
+    function: &mir::Function,
+    local: mir::LocalId,
+    key: &mir::Rvalue,
+    expected: mir::Type,
+    access: mir::NullableCollectionAccess,
+) -> Result<(), BackendError> {
+    let definition = local_in(function, local)?;
+    let mir::Type::Collection(collection) = definition.ty else {
+        return Err(malformed_mir("Dictionary::get uses a non-collection local"));
+    };
+    let collection = collection_in(program, collection)?;
+    let expected_kind = match access {
+        mir::NullableCollectionAccess::Get | mir::NullableCollectionAccess::Remove => {
+            mir::CollectionKind::Dictionary
+        }
+        mir::NullableCollectionAccess::First
+        | mir::NullableCollectionAccess::Last
+        | mir::NullableCollectionAccess::Pop => mir::CollectionKind::List,
+    };
+    if collection.kind != expected_kind || collection.value != expected {
+        return Err(malformed_mir("nullable collection access type mismatch"));
+    }
+    let expected_key = match access {
+        mir::NullableCollectionAccess::Get | mir::NullableCollectionAccess::Remove => {
+            collection.key
+        }
+        mir::NullableCollectionAccess::First
+        | mir::NullableCollectionAccess::Last
+        | mir::NullableCollectionAccess::Pop => Some(mir::Type::Scalar(mir::ScalarType::Integer(
+            IntegerType::Int64,
+        ))),
+    };
+    if expected_key != Some(key.ty()) {
+        return Err(malformed_mir(
+            "nullable collection access key type mismatch",
+        ));
+    }
+    if matches!(
+        access,
+        mir::NullableCollectionAccess::Remove | mir::NullableCollectionAccess::Pop
+    ) && !definition.writable
+    {
+        return Err(malformed_mir(
+            "mutating nullable collection access uses a readonly local",
+        ));
+    }
+    validate_rvalue(program, function, key)
 }
 
 fn require_owned_class_expression(
@@ -820,6 +1197,12 @@ fn require_owned_class_expression(
             transfer: false, ..
         } => Err(malformed_mir(format!(
             "{destination} receives a borrowed class coalesce result"
+        ))),
+        mir::ClassExpression::CollectionIndex { transfer: true, .. } => Ok(()),
+        mir::ClassExpression::CollectionIndex {
+            transfer: false, ..
+        } => Err(malformed_mir(format!(
+            "{destination} receives a borrowed indexed class value"
         ))),
     }
 }
@@ -880,6 +1263,13 @@ fn require_owned_nullable_class_expression(
             transfer: false, ..
         } => Err(malformed_mir(format!(
             "{destination} receives a borrowed nullable class coalesce result"
+        ))),
+        mir::NullableClassExpression::DictionaryGet {
+            access: mir::NullableCollectionAccess::Remove | mir::NullableCollectionAccess::Pop,
+            ..
+        } => Ok(()),
+        mir::NullableClassExpression::DictionaryGet { .. } => Err(malformed_mir(format!(
+            "{destination} receives a borrowed nullable collection result"
         ))),
     }
 }
@@ -1019,6 +1409,12 @@ fn infer_nullable_expression_return_borrow(
                 )),
             }
         }
+        mir::NullableClassExpression::DictionaryGet { collection, .. } => Ok(
+            borrow_from_parameter(function, *collection).map(|borrow| mir::ReturnBorrow {
+                writable: false,
+                ..borrow
+            }),
+        ),
     }
 }
 
@@ -1108,6 +1504,7 @@ fn infer_expression_return_borrow(
             writable: false,
             ..borrow
         })),
+        mir::ClassExpression::CollectionIndex { .. } => Ok(None),
         mir::ClassExpression::Call {
             function: callee,
             args,
@@ -1251,6 +1648,7 @@ fn require_writable_class_expression(
                 })
                 .is_ok()
         }
+        mir::ClassExpression::CollectionIndex { .. } => false,
     };
     if writable {
         Ok(())
@@ -1306,7 +1704,8 @@ fn require_writable_nullable_class_expression(
                 .is_ok()
         }
         mir::NullableClassExpression::Local { transfer: true, .. }
-        | mir::NullableClassExpression::NullSafeProperty { .. } => false,
+        | mir::NullableClassExpression::NullSafeProperty { .. }
+        | mir::NullableClassExpression::DictionaryGet { .. } => false,
     };
     if writable {
         Ok(())
@@ -1324,7 +1723,8 @@ fn class_expression_transfers_receiver(expression: &mir::ClassExpression) -> boo
         | mir::ClassExpression::Coalesce { transfer, .. } => *transfer,
         mir::ClassExpression::Property { .. }
         | mir::ClassExpression::Call { .. }
-        | mir::ClassExpression::New { .. } => false,
+        | mir::ClassExpression::New { .. }
+        | mir::ClassExpression::CollectionIndex { .. } => false,
     }
 }
 
@@ -1337,7 +1737,8 @@ fn nullable_class_expression_transfers_receiver(expression: &mir::NullableClassE
         | mir::NullableClassExpression::Property { .. }
         | mir::NullableClassExpression::Call { .. }
         | mir::NullableClassExpression::NullSafeProperty { .. }
-        | mir::NullableClassExpression::NullSafeCall { .. } => false,
+        | mir::NullableClassExpression::NullSafeCall { .. }
+        | mir::NullableClassExpression::DictionaryGet { .. } => false,
     }
 }
 
@@ -1507,6 +1908,7 @@ fn collect_rvalue_class_local_accesses<'a>(
         }
         mir::Rvalue::Class(value) => collect_class_expression_local_accesses(value, accesses),
         mir::Rvalue::NullableClass(value) => collect_nullable_class_local_accesses(value, accesses),
+        mir::Rvalue::Collection(value) => collect_collection_class_local_accesses(value, accesses),
     }
 }
 
@@ -1516,6 +1918,26 @@ fn collect_rvalue_args_class_local_accesses<'a>(
 ) {
     for value in args {
         collect_rvalue_class_local_accesses(value, accesses);
+    }
+}
+
+fn collect_collection_class_local_accesses<'a>(
+    value: &'a mir::CollectionExpression,
+    accesses: &mut ClassLocalAccesses<'a>,
+) {
+    match value {
+        mir::CollectionExpression::Literal { entries, .. } => {
+            for entry in entries {
+                if let Some(key) = &entry.key {
+                    collect_rvalue_class_local_accesses(key, accesses);
+                }
+                collect_rvalue_class_local_accesses(&entry.value, accesses);
+            }
+        }
+        mir::CollectionExpression::Index { index, .. } => {
+            collect_rvalue_class_local_accesses(index, accesses)
+        }
+        mir::CollectionExpression::Local { .. } | mir::CollectionExpression::SetFrom { .. } => {}
     }
 }
 
@@ -1541,7 +1963,16 @@ fn collect_operand_class_local_accesses<'a>(
             accesses.borrow_property(*object, *property);
         }
         mir::Operand::NullablePayload(local) => accesses.assume_nullable_present(*local),
-        mir::Operand::Scalar(_) | mir::Operand::Local(_) | mir::Operand::Static(_) => {}
+        mir::Operand::CollectionIndex { index, .. } => {
+            collect_rvalue_class_local_accesses(index, accesses)
+        }
+        mir::Operand::CollectionKeyAt { offset, .. } => {
+            collect_rvalue_class_local_accesses(offset, accesses)
+        }
+        mir::Operand::Scalar(_)
+        | mir::Operand::Local(_)
+        | mir::Operand::Static(_)
+        | mir::Operand::CollectionLength(_) => {}
     }
 }
 
@@ -1634,6 +2065,12 @@ fn collect_string_class_local_accesses<'a>(
             collect_nullable_string_class_local_accesses(left, accesses);
             collect_string_class_local_accesses(right, accesses);
         }
+        mir::StringExpression::CollectionIndex { index, .. } => {
+            collect_rvalue_class_local_accesses(index, accesses)
+        }
+        mir::StringExpression::CollectionKeyAt { offset, .. } => {
+            collect_rvalue_class_local_accesses(offset, accesses)
+        }
         mir::StringExpression::NullableLocalAssumeNonNull(local) => {
             accesses.assume_nullable_present(*local)
         }
@@ -1684,6 +2121,9 @@ fn collect_nullable_string_class_local_accesses<'a>(
         mir::NullableStringExpression::Coalesce { left, right } => {
             collect_nullable_string_class_local_accesses(left, accesses);
             collect_nullable_string_class_local_accesses(right, accesses);
+        }
+        mir::NullableStringExpression::DictionaryGet { key, .. } => {
+            collect_rvalue_class_local_accesses(key, accesses)
         }
     }
 }
@@ -1749,6 +2189,9 @@ fn collect_class_expression_local_accesses<'a>(
         mir::ClassExpression::Coalesce { left, right, .. } => {
             collect_nullable_class_local_accesses(left, accesses);
             collect_class_expression_local_accesses(right, accesses);
+        }
+        mir::ClassExpression::CollectionIndex { index, .. } => {
+            collect_rvalue_class_local_accesses(index, accesses)
         }
     }
 }
@@ -1827,6 +2270,10 @@ fn collect_bool_class_local_accesses<'a>(
             collect_nullable_scalar_class_local_accesses(left, accesses);
             collect_bool_class_local_accesses(right, accesses);
         }
+        mir::BoolExpression::CollectionHas { value, .. } => {
+            collect_rvalue_class_local_accesses(value, accesses)
+        }
+        mir::BoolExpression::CollectionIsEmpty { .. } => {}
     }
 }
 
@@ -1865,6 +2312,9 @@ fn collect_nullable_scalar_class_local_accesses<'a>(
         mir::NullableScalarExpression::Coalesce { left, right, .. } => {
             collect_nullable_scalar_class_local_accesses(left, accesses);
             collect_nullable_scalar_class_local_accesses(right, accesses);
+        }
+        mir::NullableScalarExpression::DictionaryGet { key, .. } => {
+            collect_rvalue_class_local_accesses(key, accesses)
         }
         mir::NullableScalarExpression::Null(_)
         | mir::NullableScalarExpression::Local { .. }
@@ -1917,6 +2367,9 @@ fn collect_nullable_class_local_accesses<'a>(
         mir::NullableClassExpression::Coalesce { left, right, .. } => {
             collect_nullable_class_local_accesses(left, accesses);
             collect_nullable_class_local_accesses(right, accesses);
+        }
+        mir::NullableClassExpression::DictionaryGet { key, .. } => {
+            collect_rvalue_class_local_accesses(key, accesses)
         }
         mir::NullableClassExpression::Null(_) => {}
     }
@@ -1981,7 +2434,20 @@ fn collect_statement_class_local_accesses(statement: &mir::Statement) -> ClassLo
             collect_rvalue_class_local_accesses(value, &mut accesses);
             accesses.borrow(*object);
         }
-        mir::Statement::EchoStringLiteral(_) | mir::Statement::DropClass { .. } => {}
+        mir::Statement::CollectionAdd { value, .. } => {
+            collect_rvalue_class_local_accesses(value, &mut accesses)
+        }
+        mir::Statement::CollectionSet { key, value, .. } => {
+            collect_rvalue_class_local_accesses(key, &mut accesses);
+            collect_rvalue_class_local_accesses(value, &mut accesses);
+        }
+        mir::Statement::AssignCollectionIndex { index, value, .. } => {
+            collect_rvalue_class_local_accesses(index, &mut accesses);
+            collect_rvalue_class_local_accesses(value, &mut accesses);
+        }
+        mir::Statement::EchoStringLiteral(_)
+        | mir::Statement::DropClass { .. }
+        | mir::Statement::DropCollection { .. } => {}
     }
     accesses
 }
@@ -2287,7 +2753,8 @@ fn nullable_class_expression_is_present(
         | mir::NullableClassExpression::Property { .. }
         | mir::NullableClassExpression::Call { .. }
         | mir::NullableClassExpression::NullSafeProperty { .. }
-        | mir::NullableClassExpression::NullSafeCall { .. } => false,
+        | mir::NullableClassExpression::NullSafeCall { .. }
+        | mir::NullableClassExpression::DictionaryGet { .. } => false,
     }
 }
 
@@ -2307,7 +2774,8 @@ fn nullable_scalar_expression_is_present(
         | mir::NullableScalarExpression::Static { .. }
         | mir::NullableScalarExpression::Call { .. }
         | mir::NullableScalarExpression::NullSafeProperty { .. }
-        | mir::NullableScalarExpression::NullSafeCall { .. } => false,
+        | mir::NullableScalarExpression::NullSafeCall { .. }
+        | mir::NullableScalarExpression::DictionaryGet { .. } => false,
     }
 }
 
@@ -2328,7 +2796,8 @@ fn nullable_string_expression_is_present(
         | mir::NullableStringExpression::ReadLine
         | mir::NullableStringExpression::Call { .. }
         | mir::NullableStringExpression::NullSafeProperty { .. }
-        | mir::NullableStringExpression::NullSafeCall { .. } => false,
+        | mir::NullableStringExpression::NullSafeCall { .. }
+        | mir::NullableStringExpression::DictionaryGet { .. } => false,
     }
 }
 
@@ -2810,6 +3279,29 @@ fn validate_class_expression(
             validate_nullable_class_expression(program, function, left)?;
             validate_class_expression(program, function, right)
         }
+        mir::ClassExpression::CollectionIndex {
+            collection,
+            index,
+            transfer,
+            ..
+        } => {
+            let local = local_in(function, *collection)?;
+            let mir::Type::Collection(collection_type) = local.ty else {
+                return Err(malformed_mir("class index source is not a collection"));
+            };
+            let collection_type = collection_in(program, collection_type)?;
+            if collection_type.value != mir::Type::Class(class) {
+                return Err(malformed_mir("class index element type mismatch"));
+            }
+            validate_collection_element_access(
+                program,
+                function,
+                local,
+                collection_type,
+                index,
+                *transfer,
+            )
+        }
     }
 }
 
@@ -3042,7 +3534,9 @@ fn statement_observes_property(
         mir::Statement::AssignLocal { value, .. } => {
             rvalue_observes_property(value, receiver, property)
         }
-        mir::Statement::EchoStringLiteral(_) | mir::Statement::DropClass { .. } => false,
+        mir::Statement::EchoStringLiteral(_)
+        | mir::Statement::DropClass { .. }
+        | mir::Statement::DropCollection { .. } => false,
         mir::Statement::AssignStatic { value, .. } => {
             rvalue_observes_property(value, receiver, property)
         }
@@ -3065,6 +3559,16 @@ fn statement_observes_property(
         }
         mir::Statement::AssignProperty { value, .. } => {
             rvalue_observes_property(value, receiver, property)
+        }
+        mir::Statement::CollectionAdd { value, .. } => {
+            rvalue_observes_property(value, receiver, property)
+        }
+        mir::Statement::CollectionSet { key, value, .. }
+        | mir::Statement::AssignCollectionIndex {
+            index: key, value, ..
+        } => {
+            rvalue_observes_property(key, receiver, property)
+                || rvalue_observes_property(value, receiver, property)
         }
     }
 }
@@ -3104,6 +3608,7 @@ fn rvalue_observes_property(
         mir::Rvalue::NullableClass(value) => {
             nullable_class_observes_property(value, receiver, property)
         }
+        mir::Rvalue::Collection(value) => collection_observes_property(value, receiver, property),
     }
 }
 
@@ -3118,6 +3623,28 @@ fn value_observes_property(
         }
         mir::ValueExpression::Float(value) => float_observes_property(value, receiver, property),
         mir::ValueExpression::Bool(value) => bool_observes_property(value, receiver, property),
+    }
+}
+
+fn collection_observes_property(
+    value: &mir::CollectionExpression,
+    receiver: mir::LocalId,
+    property: crate::class_layout::PropertyId,
+) -> bool {
+    match value {
+        mir::CollectionExpression::Literal { entries, .. } => entries.iter().any(|entry| {
+            entry
+                .key
+                .as_ref()
+                .is_some_and(|key| rvalue_observes_property(key, receiver, property))
+                || rvalue_observes_property(&entry.value, receiver, property)
+        }),
+        mir::CollectionExpression::Index { index, .. } => {
+            rvalue_observes_property(index, receiver, property)
+        }
+        mir::CollectionExpression::Local { .. } | mir::CollectionExpression::SetFrom { .. } => {
+            false
+        }
     }
 }
 
@@ -3219,6 +3746,12 @@ fn string_observes_property(
             nullable_string_observes_property(left, receiver, property)
                 || string_observes_property(right, receiver, property)
         }
+        mir::StringExpression::CollectionIndex { index, .. } => {
+            rvalue_observes_property(index, receiver, property)
+        }
+        mir::StringExpression::CollectionKeyAt { offset, .. } => {
+            rvalue_observes_property(offset, receiver, property)
+        }
         mir::StringExpression::Literal(_)
         | mir::StringExpression::Local(_)
         | mir::StringExpression::Static(_)
@@ -3254,6 +3787,9 @@ fn nullable_string_observes_property(
         mir::NullableStringExpression::Coalesce { left, right } => {
             nullable_string_observes_property(left, receiver, property)
                 || nullable_string_observes_property(right, receiver, property)
+        }
+        mir::NullableStringExpression::DictionaryGet { key, .. } => {
+            rvalue_observes_property(key, receiver, property)
         }
         mir::NullableStringExpression::Null
         | mir::NullableStringExpression::Local(_)
@@ -3294,6 +3830,9 @@ fn class_observes_property(
         mir::ClassExpression::Coalesce { left, right, .. } => {
             nullable_class_observes_property(left, receiver, property)
                 || class_observes_property(right, receiver, property)
+        }
+        mir::ClassExpression::CollectionIndex { index, .. } => {
+            rvalue_observes_property(index, receiver, property)
         }
     }
 }
@@ -3337,6 +3876,10 @@ fn bool_observes_property(
             nullable_scalar_observes_property(left, receiver, property)
                 || bool_observes_property(right, receiver, property)
         }
+        mir::BoolExpression::CollectionHas { value, .. } => {
+            rvalue_observes_property(value, receiver, property)
+        }
+        mir::BoolExpression::CollectionIsEmpty { .. } => false,
     }
 }
 
@@ -3369,6 +3912,9 @@ fn nullable_scalar_observes_property(
         mir::NullableScalarExpression::Coalesce { left, right, .. } => {
             nullable_scalar_observes_property(left, receiver, property)
                 || nullable_scalar_observes_property(right, receiver, property)
+        }
+        mir::NullableScalarExpression::DictionaryGet { key, .. } => {
+            rvalue_observes_property(key, receiver, property)
         }
         mir::NullableScalarExpression::Null(_)
         | mir::NullableScalarExpression::Local { .. }
@@ -3406,6 +3952,9 @@ fn nullable_class_observes_property(
         mir::NullableClassExpression::Coalesce { left, right, .. } => {
             nullable_class_observes_property(left, receiver, property)
                 || nullable_class_observes_property(right, receiver, property)
+        }
+        mir::NullableClassExpression::DictionaryGet { key, .. } => {
+            rvalue_observes_property(key, receiver, property)
         }
         mir::NullableClassExpression::Null(_) => false,
     }
@@ -3450,6 +3999,13 @@ fn validate_float_expression(
                 *object,
                 *property,
                 mir::Type::Scalar(mir::ScalarType::Float(*ty)),
+            ),
+            mir::Operand::CollectionKeyAt { collection, offset } => validate_collection_key_at(
+                program,
+                function,
+                *collection,
+                mir::Type::Scalar(mir::ScalarType::Float(*ty)),
+                offset,
             ),
             _ => Err(malformed_mir(
                 "float expression has an incompatible operand",
@@ -3860,7 +4416,8 @@ fn escaping_class_expression_local_borrows(
             ..
         }
         | mir::ClassExpression::New { .. }
-        | mir::ClassExpression::Coalesce { transfer: true, .. } => Ok(Vec::new()),
+        | mir::ClassExpression::Coalesce { transfer: true, .. }
+        | mir::ClassExpression::CollectionIndex { .. } => Ok(Vec::new()),
     }
 }
 
@@ -3920,6 +4477,7 @@ fn escaping_nullable_class_expression_local_borrows(
             );
             Ok(locals)
         }
+        mir::NullableClassExpression::DictionaryGet { collection, .. } => Ok(vec![*collection]),
         mir::NullableClassExpression::Local { transfer: true, .. }
         | mir::NullableClassExpression::Call {
             return_borrow: None,
@@ -4006,6 +4564,13 @@ fn validate_condition(
                 *property,
                 mir::Type::Scalar(mir::ScalarType::Bool),
             ),
+            mir::Operand::CollectionKeyAt { collection, offset } => validate_collection_key_at(
+                program,
+                function,
+                *collection,
+                mir::Type::Scalar(mir::ScalarType::Bool),
+                offset,
+            ),
             _ => Err(malformed_mir("bool expression has an incompatible operand")),
         },
         mir::BoolExpression::Compare { op, left, right } => {
@@ -4067,6 +4632,55 @@ fn validate_condition(
             validate_nullable_scalar_expression(program, function, left)?;
             validate_condition(program, function, right)
         }
+        mir::BoolExpression::CollectionHas {
+            collection,
+            value,
+            op,
+        } => {
+            let local = local_in(function, *collection)?;
+            let mir::Type::Collection(collection_type) = local.ty else {
+                return Err(malformed_mir("collection has source is not a collection"));
+            };
+            let collection_type = collection_in(program, collection_type)?;
+            let expected = collection_type.key.unwrap_or(collection_type.value);
+            if value.ty() != expected {
+                return Err(malformed_mir("collection has argument type mismatch"));
+            }
+            match (op, collection_type.kind) {
+                (
+                    mir::CollectionMembershipOp::Contains,
+                    mir::CollectionKind::List
+                    | mir::CollectionKind::Dictionary
+                    | mir::CollectionKind::Set,
+                ) => {}
+                (
+                    mir::CollectionMembershipOp::Add | mir::CollectionMembershipOp::Remove,
+                    mir::CollectionKind::Set,
+                ) if local.writable => {}
+                (
+                    mir::CollectionMembershipOp::Add | mir::CollectionMembershipOp::Remove,
+                    mir::CollectionKind::Set,
+                ) => {
+                    return Err(malformed_mir(format!(
+                        "set mutation uses readonly local{}",
+                        local.id.0
+                    )));
+                }
+                _ => {
+                    return Err(malformed_mir(
+                        "collection membership operation does not match its collection kind",
+                    ));
+                }
+            }
+            validate_rvalue(program, function, value)
+        }
+        mir::BoolExpression::CollectionIsEmpty { collection } => {
+            let local = local_in(function, *collection)?;
+            if !matches!(local.ty, mir::Type::Collection(_)) {
+                return Err(malformed_mir("isEmpty source is not a collection"));
+            }
+            Ok(())
+        }
     }
 }
 
@@ -4116,6 +4730,42 @@ fn validate_integer_operand(
         mir::Operand::Scalar(_) => Err(malformed_mir(
             "integer expression contains non-integer constant",
         )),
+        mir::Operand::CollectionLength(local) => {
+            let definition = local_in(function, *local)?;
+            if ty != IntegerType::Int64 || !matches!(definition.ty, mir::Type::Collection(_)) {
+                return Err(malformed_mir("collection length is not used as int/int64"));
+            }
+            Ok(())
+        }
+        mir::Operand::CollectionIndex {
+            collection,
+            index,
+            remove,
+        } => {
+            let local = local_in(function, *collection)?;
+            let mir::Type::Collection(collection_type) = local.ty else {
+                return Err(malformed_mir("integer index source is not a collection"));
+            };
+            let collection_type = collection_in(program, collection_type)?;
+            if collection_type.value != mir::Type::Scalar(mir::ScalarType::Integer(ty)) {
+                return Err(malformed_mir("integer index element type mismatch"));
+            }
+            validate_collection_element_access(
+                program,
+                function,
+                local,
+                collection_type,
+                index,
+                *remove,
+            )
+        }
+        mir::Operand::CollectionKeyAt { collection, offset } => validate_collection_key_at(
+            program,
+            function,
+            *collection,
+            mir::Type::Scalar(mir::ScalarType::Integer(ty)),
+            offset,
+        ),
     }
 }
 
@@ -4141,6 +4791,31 @@ fn validate_string_expression(
         }
         mir::StringExpression::Property { object, property } => {
             validate_property_operand(program, function, *object, *property, mir::Type::String)
+        }
+        mir::StringExpression::CollectionIndex {
+            collection,
+            index,
+            remove,
+        } => {
+            let local = local_in(function, *collection)?;
+            let mir::Type::Collection(collection_type) = local.ty else {
+                return Err(malformed_mir("string index source is not a collection"));
+            };
+            let collection_type = collection_in(program, collection_type)?;
+            if collection_type.value != mir::Type::String {
+                return Err(malformed_mir("string index element type mismatch"));
+            }
+            validate_collection_element_access(
+                program,
+                function,
+                local,
+                collection_type,
+                index,
+                *remove,
+            )
+        }
+        mir::StringExpression::CollectionKeyAt { collection, offset } => {
+            validate_collection_key_at(program, function, *collection, mir::Type::String, offset)
         }
         mir::StringExpression::NullableLocalAssumeNonNull(local) => {
             if local_in(function, *local)?.ty != mir::Type::NullableString {
@@ -4240,6 +4915,19 @@ fn validate_nullable_string_expression(
             validate_nullable_string_expression(program, function, left)?;
             validate_nullable_string_expression(program, function, right)
         }
+        mir::NullableStringExpression::DictionaryGet {
+            collection,
+            key,
+            access,
+            ..
+        } => validate_dictionary_get(
+            program,
+            function,
+            *collection,
+            key,
+            mir::Type::String,
+            *access,
+        ),
     }
 }
 
@@ -4320,6 +5008,19 @@ fn validate_nullable_scalar_expression(
             validate_nullable_scalar_expression(program, function, left)?;
             validate_nullable_scalar_expression(program, function, right)
         }
+        mir::NullableScalarExpression::DictionaryGet {
+            collection,
+            key,
+            access,
+            ..
+        } => validate_dictionary_get(
+            program,
+            function,
+            *collection,
+            key,
+            mir::Type::Scalar(ty),
+            *access,
+        ),
         mir::NullableScalarExpression::Value(_) => {
             Err(malformed_mir("nullable scalar wraps another scalar type"))
         }
@@ -4424,6 +5125,19 @@ fn validate_nullable_class_expression(
             validate_nullable_class_expression(program, function, left)?;
             validate_nullable_class_expression(program, function, right)
         }
+        mir::NullableClassExpression::DictionaryGet {
+            collection,
+            key,
+            access,
+            ..
+        } => validate_dictionary_get(
+            program,
+            function,
+            *collection,
+            key,
+            mir::Type::Class(class),
+            *access,
+        ),
         mir::NullableClassExpression::Class(_) => {
             Err(malformed_mir("nullable class wraps another class type"))
         }
@@ -4447,6 +5161,11 @@ fn validate_null_safe_call(
         mir::Type::Scalar(ty) => mir::Type::NullableScalar(ty),
         mir::Type::String => mir::Type::NullableString,
         mir::Type::Class(class) => mir::Type::NullableClass(class),
+        mir::Type::Collection(_) => {
+            return Err(malformed_mir(
+                "null-safe calls cannot return collections before nullable collections exist",
+            ))
+        }
         mir::Type::NullableScalar(_) | mir::Type::NullableString | mir::Type::NullableClass(_) => {
             return Err(malformed_mir(
                 "null-safe call validator requires a non-null result type",
@@ -4710,6 +5429,22 @@ fn class_in(program: &mir::Program, id: ClassId) -> Result<&mir::Class, BackendE
         .get(id.0)
         .filter(|class| class.id == id)
         .ok_or_else(|| malformed_mir(format!("ClassId class#{} does not exist", id.0)))
+}
+
+fn collection_in(
+    program: &mir::Program,
+    id: mir::CollectionTypeId,
+) -> Result<&mir::CollectionType, BackendError> {
+    program
+        .collection_types
+        .get(id.0)
+        .filter(|collection| collection.id == id)
+        .ok_or_else(|| {
+            malformed_mir(format!(
+                "collection type collection#{} does not exist",
+                id.0
+            ))
+        })
 }
 
 fn static_in(

@@ -295,6 +295,7 @@ fn lower_foreach_binding(
     class_name: Option<&str>,
 ) -> hir::ForeachBinding {
     hir::ForeachBinding {
+        writable: binding.writable,
         ty: binding.ty.as_ref().map(|ty| lower_type_ref(ty, class_name)),
         name: binding.name.clone(),
     }
@@ -340,6 +341,15 @@ fn lower_expr(expr: &ast::Expr, class_name: Option<&str>) -> hir::Expr {
                 .iter()
                 .map(|element| lower_array_element(element, class_name))
                 .collect(),
+            span: *span,
+        },
+        ast::Expr::Index {
+            collection,
+            index,
+            span,
+        } => hir::Expr::Index {
+            collection: Box::new(lower_expr(collection, class_name)),
+            index: Box::new(lower_expr(index, class_name)),
             span: *span,
         },
         ast::Expr::PropertyAccess {

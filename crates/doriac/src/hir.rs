@@ -189,6 +189,7 @@ pub struct ForeachStmt {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ForeachBinding {
+    pub writable: bool,
     pub ty: Option<TypeRef>,
     pub name: String,
 }
@@ -231,6 +232,11 @@ pub enum Expr {
     },
     Array {
         elements: Vec<ArrayElement>,
+        span: Span,
+    },
+    Index {
+        collection: Box<Expr>,
+        index: Box<Expr>,
         span: Span,
     },
     PropertyAccess {
@@ -320,6 +326,7 @@ impl Expr {
             | Expr::Bool { span, .. }
             | Expr::Null { span }
             | Expr::Array { span, .. }
+            | Expr::Index { span, .. }
             | Expr::PropertyAccess { span, .. }
             | Expr::MethodCall { span, .. }
             | Expr::IsType { span, .. }

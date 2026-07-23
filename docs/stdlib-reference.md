@@ -46,24 +46,24 @@ The escape hatch when single ownership does not fit (caches, graphs, back-refere
 Regularized `snake_case` free functions wrapping the member/companion surface — never PHP's fused spellings. Details: decision 0074 (formatted I/O), §9.1 charter.
 
 - **Formatting:** compiler-known `sprintf` returns `string` and `printf` returns `void`. Each takes a literal `string $format` first, followed by the typed operands required by that format; this intrinsic-only tail is not an untyped userland parameter declaration. Specifiers: `%s %d %f %.Nf %x %X %o %b %%`, width / `-` / `0` flags.
-- **Text I/O:** `read_line(): ?string`, `read_file(string): string`, `write_file(string, string): void` (truncate), `append_file(string, string): void` (Stage 23), `write_stderr(string): void`.
+- **Text I/O:** `read_line(): ?string`, `read_file(string): string`, `write_file(string, string): void` (truncate), `append_file(string, string): void` (Stage 23 Slice 2), `write_stderr(string): void`.
 - **Output statement:** `echo` (the single output spelling — `print` is rejected).
 - **String/utility:** `get_time`, `str_starts_with`, `str_case_compare`, and the `str_*` family (fully worded after the `str_` prefix).
 - **Meta:** `function_exists("name")` — const-evaluated compile-time predicate for guarded/polyfill declarations.
 
-Binary (`read_file_bytes`/`write_file_bytes`/`append_file_bytes`, `read_stdin_bytes`, `write_stdout_bytes`/`write_stderr_bytes`) arrives with `Bytes` at Stage 23; the stream tier moves to `Doria\Std\Io` post-Stage-29. See the I/O audit (`docs/notes/io-surface-audit.md`) for the byte/stream surface still being finalized.
+Binary (`read_file_bytes`/`write_file_bytes`/`append_file_bytes`, `read_stdin_bytes`, `write_stdout_bytes`/`write_stderr_bytes`) arrives with `Bytes` in Stage 23 Slice 2; the stream tier moves to `Doria\Std\Io` post-Stage-29. See the I/O audit (`docs/notes/io-surface-audit.md`) for the byte/stream surface still being finalized.
 
 ---
 
 ## Collections (core-language move types)
-Owned move types with a growable/fixed distinction. The complete family and naming are settled in **decision 0092**; the method surface and `T[]` surface are settled in the collections decision (Stage 23–26). A bare name is the default (hash / insertion-ordered) collection; the `Sorted` prefix is the comparison-ordered variant.
+Owned move types with a growable/fixed distinction. The complete family and naming are settled in **decision 0092**; the **method surface** is settled in **decision 0100**. Stage 23 Slice 1 implements `T[]` plus the default `List`/`Dictionary`/`Set` surface; the sorted/priority/deque family lands later and closure methods wait for Stage 30. A bare name is the default (hash / insertion-ordered) collection; the `Sorted` prefix is the comparison-ordered variant. Cross-cutting rules (0100): reads are `readonly`, mutators `writable`; ingestion moves values in; `$l[i]`/`$d[k]` reads **assert presence and panic** on absence while the `?T` methods are the safe path; removal hands the owned element back; mutators return `void` (userland fluent APIs stay a decision-0088 capability).
 
-- **`T[]`** (typed arrays) — contiguous, fixed-length-after-creation; `length` property, indexing, slicing, `foreach`; the engine-grade buffer.
+- **`T[]`** (typed arrays) — contiguous, fixed-length-after-creation; `length` property, indexing (panics OOB), and `foreach`; the engine-grade buffer. Slicing is a future addition.
 - **`Bytes`** — mutable byte buffer for binary work; `uint8[]`↔`Bytes` interconvert only through explicit `Bytes::fromArray`/`->toArray` (copy in v1.0).
-- **`List<T>`** — the everyday growable sequence and default workhorse: `add`, `insertAt`, `removeAt`, `contains`, `count` (property), `isEmpty` (property), and `map`/`filter`/`reduce` once closures land (Stage 30).
-- **`Dictionary<K, V>` / `SortedDictionary<K, V>`** — `get` returning `?V`, `set`, `remove`, `has`, `keys`, `values`; `Dictionary` iterates in insertion order, `SortedDictionary` by `Comparable` key.
-- **`Set<T>` / `SortedSet<T>`** — `add`, `remove`, `has`, `union`, `intersect`; `Set` insertion-ordered, `SortedSet` by `Comparable` element.
-- **`PriorityQueue<T>`**, **`Deque<T>`** — `Deque` subsumes FIFO/LIFO, so there are no separate `Queue`/`Stack` types.
+- **`List<T>`** — the everyday growable sequence and default workhorse: `add`, `insertAt`, `removeAt` (returns the owned element), `pop` (`?T`), `contains`, `first`/`last` (`?T` properties), `count` (property), `isEmpty` (property), and `map`/`filter`/`reduce` once closures land (Stage 30).
+- **`Dictionary<K, V>` / `SortedDictionary<K, V>`** — `get` returning `?V`, `set`, `remove` returning `?V`, `has` (key membership), `keys`/`values` (`foreach`-only projections, not storable in v1.0); `Dictionary` iterates in insertion order, `SortedDictionary` by `Comparable` key.
+- **`Set<T>` / `SortedSet<T>`** — `Set::from`, `add` (`bool`), `remove` (`bool`), `contains`, `union`, `intersect`, `difference`; `Set` insertion-ordered, `SortedSet` by `Comparable` element.
+- **`PriorityQueue<T>`** — `push`, `pop` (`?T`), `peek` (`?T`), min-first by `Comparable`; no `foreach` (drain via `pop`). **`Deque<T>`** — `pushFront`/`pushBack`/`popFront`/`popBack`/`peekFront`/`peekBack`, `foreach` front-to-back; subsumes FIFO/LIFO, so there are no separate `Queue`/`Stack` types.
 
 ---
 

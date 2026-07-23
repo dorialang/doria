@@ -6,6 +6,7 @@ use core::ffi::c_void;
 use core::mem;
 use core::ptr;
 
+mod collection;
 mod device_io;
 mod file_io;
 mod line_io;
@@ -30,6 +31,262 @@ pub struct DrStackFrameV1 {
 pub struct DrStringV1 {
     references: usize,
     byte_length: usize,
+}
+
+pub use collection::DrCollectionV1;
+
+/// Allocates collection storage for generated Doria code.
+///
+/// # Safety
+///
+/// `keyed` and `fixed` must be canonical boolean bytes. The returned pointer
+/// must be released exactly once with `dr_v1_collection_free`.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_collection_new(
+    length: usize,
+    keyed: u8,
+    fixed: u8,
+) -> *mut DrCollectionV1 {
+    collection::new(length, keyed != 0, fixed != 0)
+}
+
+/// # Safety
+///
+/// `collection` must be null or a live pointer returned by
+/// `dr_v1_collection_new`, and it must not be used after this call.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_collection_free(collection: *mut DrCollectionV1) {
+    collection::free(collection)
+}
+
+/// # Safety
+///
+/// `collection` must point to a live collection allocation.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_collection_length(collection: *const DrCollectionV1) -> usize {
+    collection::length(collection)
+}
+
+/// # Safety
+///
+/// `collection` must be a uniquely borrowed live growable collection, and
+/// `value` must use the element representation declared by generated MIR.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_collection_push(collection: *mut DrCollectionV1, value: u64) {
+    collection::push(collection, value)
+}
+
+/// # Safety
+///
+/// `current_frame` must be null or a valid generated frame chain.
+/// `collection` must be a uniquely borrowed live growable collection, and
+/// `value` must use its element representation.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_collection_insert_at(
+    current_frame: *const DrStackFrameV1,
+    collection: *mut DrCollectionV1,
+    index: usize,
+    value: u64,
+) {
+    collection::insert_at(current_frame, collection, index, value)
+}
+
+/// # Safety
+///
+/// `current_frame` must be null or a valid generated frame chain, and
+/// `collection` must be a uniquely borrowed live growable collection.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_collection_remove_at(
+    current_frame: *const DrStackFrameV1,
+    collection: *mut DrCollectionV1,
+    index: usize,
+) -> u64 {
+    collection::remove_at(current_frame, collection, index)
+}
+
+/// # Safety
+///
+/// `collection` must be a uniquely borrowed live growable collection and
+/// `found` must point to writable storage for one byte.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_collection_pop(
+    collection: *mut DrCollectionV1,
+    found: *mut u8,
+) -> u64 {
+    collection::pop(collection, found)
+}
+
+/// # Safety
+///
+/// `current_frame` must be null or a valid generated frame chain, and
+/// `collection` must point to a live collection allocation.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_collection_value_at(
+    current_frame: *const DrStackFrameV1,
+    collection: *const DrCollectionV1,
+    index: usize,
+) -> u64 {
+    collection::value_at(current_frame, collection, index)
+}
+
+/// # Safety
+///
+/// `current_frame` must be null or a valid generated frame chain, and
+/// `collection` must point to a live keyed collection allocation.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_collection_key_at(
+    current_frame: *const DrStackFrameV1,
+    collection: *const DrCollectionV1,
+    index: usize,
+) -> u64 {
+    collection::key_at(current_frame, collection, index)
+}
+
+/// # Safety
+///
+/// `current_frame` must be null or a valid generated frame chain.
+/// `collection` must be a uniquely borrowed live collection, and `value` must
+/// use its element representation.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_collection_set_at(
+    current_frame: *const DrStackFrameV1,
+    collection: *mut DrCollectionV1,
+    index: usize,
+    value: u64,
+) -> u64 {
+    collection::set_at(current_frame, collection, index, value)
+}
+
+/// # Safety
+///
+/// `collection` must point to a live keyed collection. `key` must match
+/// `key_kind`, and `found` must point to writable storage for one byte.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_collection_keyed_get(
+    collection: *const DrCollectionV1,
+    key: u64,
+    key_kind: u8,
+    found: *mut u8,
+) -> u64 {
+    collection::keyed_get(collection, key, key_kind, found)
+}
+
+/// # Safety
+///
+/// `collection` must be a uniquely borrowed live keyed collection. `key` and
+/// `value` must match its declared representations, and `replaced` must point
+/// to writable storage for one byte.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_collection_keyed_set(
+    collection: *mut DrCollectionV1,
+    key: u64,
+    value: u64,
+    key_kind: u8,
+    replaced: *mut u8,
+) -> u64 {
+    collection::keyed_set(collection, key, value, key_kind, replaced)
+}
+
+/// # Safety
+///
+/// `collection` must point to a live keyed collection and `key` must match
+/// `key_kind`.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_collection_keyed_has(
+    collection: *const DrCollectionV1,
+    key: u64,
+    key_kind: u8,
+) -> u8 {
+    u8::from(collection::keyed_has(collection, key, key_kind))
+}
+
+/// # Safety
+///
+/// `collection` must be a uniquely borrowed live keyed collection. `key` must
+/// match `key_kind`; `found` and `removed_key` must point to writable storage.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_collection_keyed_remove(
+    collection: *mut DrCollectionV1,
+    key: u64,
+    key_kind: u8,
+    found: *mut u8,
+    removed_key: *mut u64,
+) -> u64 {
+    collection::keyed_remove(collection, key, key_kind, found, removed_key)
+}
+
+/// # Safety
+///
+/// `collection` must be a live collection, uniquely borrowed for mutating
+/// access modes. `key` must match `key_kind`; `found` and `removed_key` must
+/// point to writable storage.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_collection_nullable_access(
+    collection: *mut DrCollectionV1,
+    key: u64,
+    key_kind: u8,
+    access: u8,
+    found: *mut u8,
+    removed_key: *mut u64,
+) -> u64 {
+    collection::nullable_access(collection, key, key_kind, access, found, removed_key)
+}
+
+/// # Safety
+///
+/// `collection` must point to a live collection and `value` must match
+/// `value_kind`.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_collection_contains(
+    collection: *const DrCollectionV1,
+    value: u64,
+    value_kind: u8,
+) -> u8 {
+    u8::from(collection::contains(collection, value, value_kind))
+}
+
+/// # Safety
+///
+/// `collection` must be a uniquely borrowed live Set and `value` must match
+/// `value_kind`.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_collection_push_unique(
+    collection: *mut DrCollectionV1,
+    value: u64,
+    value_kind: u8,
+) -> u8 {
+    u8::from(collection::push_unique(collection, value, value_kind))
+}
+
+/// # Safety
+///
+/// `collection` must be a uniquely borrowed live Set, `value` must match
+/// `value_kind`, and `removed` must point to writable storage.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_collection_remove_value(
+    collection: *mut DrCollectionV1,
+    value: u64,
+    value_kind: u8,
+    removed: *mut u64,
+) -> u8 {
+    u8::from(collection::remove_value(
+        collection, value, value_kind, removed,
+    ))
+}
+
+/// # Safety
+///
+/// `left` and `right` must point to live Sets with the same element
+/// representation, and `value_kind` must describe that representation. The
+/// returned collection must be released exactly once.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_collection_set_algebra(
+    left: *const DrCollectionV1,
+    right: *const DrCollectionV1,
+    operation: u8,
+    value_kind: u8,
+) -> *mut DrCollectionV1 {
+    collection::set_algebra(left, right, operation, value_kind)
 }
 
 const STRING_HEADER_SIZE: usize = mem::size_of::<DrStringV1>();
@@ -354,6 +611,17 @@ unsafe fn allocate_string(byte_length: usize) -> *mut DrStringV1 {
         },
     );
     string
+}
+
+pub(crate) unsafe fn string_equal(left: *const DrStringV1, right: *const DrStringV1) -> bool {
+    if left == right {
+        return true;
+    }
+    if left.is_null() || right.is_null() || (*left).byte_length != (*right).byte_length {
+        return false;
+    }
+    core::slice::from_raw_parts(string_bytes(left), (*left).byte_length)
+        == core::slice::from_raw_parts(string_bytes(right), (*right).byte_length)
 }
 
 /// Retains one owned reference.

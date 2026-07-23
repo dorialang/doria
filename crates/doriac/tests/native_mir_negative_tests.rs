@@ -19,19 +19,17 @@ fn native_compilation_does_not_execute_an_infinite_program() {
 fn native_and_debug_share_remaining_mir_coverage_diagnostics() {
     let source = r#"function main(): void
 {
-    foreach ([1, 2] as int $item) {
+    foreach (0..<2 as int $key => int $item) {
     }
 }
 "#;
     let native = compile_error(source, BackendTarget::Native);
     let debug = compile_error(source, BackendTarget::Debug);
 
-    assert_eq!(native[0].code, "M1101");
+    assert_eq!(native[0].code, "E0425");
     assert_eq!(debug[0].code, native[0].code);
     assert_eq!(debug[0].message, native[0].message);
-    assert!(native[0]
-        .message
-        .contains("supports `foreach` only over integer ranges"));
+    assert!(native[0].message.contains("key bindings"));
 }
 
 fn compile_error(source: &str, target: BackendTarget) -> Vec<Diagnostic> {

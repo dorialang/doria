@@ -27,6 +27,25 @@ pub const STRING_FROM_F64: &str = "dr_v1_string_from_f64";
 pub const STRING_FROM_BOOL: &str = "dr_v1_string_from_bool";
 pub const CLASS_ALLOCATE: &str = "dr_v1_class_allocate";
 pub const CLASS_FREE: &str = "dr_v1_class_free";
+pub const COLLECTION_NEW: &str = "dr_v1_collection_new";
+pub const COLLECTION_FREE: &str = "dr_v1_collection_free";
+pub const COLLECTION_LENGTH: &str = "dr_v1_collection_length";
+pub const COLLECTION_PUSH: &str = "dr_v1_collection_push";
+pub const COLLECTION_INSERT_AT: &str = "dr_v1_collection_insert_at";
+pub const COLLECTION_REMOVE_AT: &str = "dr_v1_collection_remove_at";
+pub const COLLECTION_POP: &str = "dr_v1_collection_pop";
+pub const COLLECTION_PUSH_UNIQUE: &str = "dr_v1_collection_push_unique";
+pub const COLLECTION_REMOVE_VALUE: &str = "dr_v1_collection_remove_value";
+pub const COLLECTION_SET_ALGEBRA: &str = "dr_v1_collection_set_algebra";
+pub const COLLECTION_VALUE_AT: &str = "dr_v1_collection_value_at";
+pub const COLLECTION_KEY_AT: &str = "dr_v1_collection_key_at";
+pub const COLLECTION_SET_AT: &str = "dr_v1_collection_set_at";
+pub const COLLECTION_KEYED_GET: &str = "dr_v1_collection_keyed_get";
+pub const COLLECTION_KEYED_SET: &str = "dr_v1_collection_keyed_set";
+pub const COLLECTION_KEYED_HAS: &str = "dr_v1_collection_keyed_has";
+pub const COLLECTION_KEYED_REMOVE: &str = "dr_v1_collection_keyed_remove";
+pub const COLLECTION_NULLABLE_ACCESS: &str = "dr_v1_collection_nullable_access";
+pub const COLLECTION_CONTAINS: &str = "dr_v1_collection_contains";
 
 pub fn function_symbol(function: &mir::Function) -> String {
     let sanitized = function
