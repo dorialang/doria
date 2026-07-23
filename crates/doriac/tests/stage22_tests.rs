@@ -1757,6 +1757,140 @@ function maybe(): ?int { return 1; }
 }
 
 #[test]
+fn nullable_local_guards_lower_dominating_presence_proofs() {
+    let source =
+        include_str!("../../../examples/native/main_stage22_nullable_local_narrowing.doria");
+    let program = doriac::lower_source_to_mir("stage22-nullable-local-narrowing.doria", source)
+        .expect("nullable local guards should lower to valid MIR");
+    doriac::mir_validation::validate_program(&program)
+        .expect("nullable local guards should dominate narrowed payload uses");
+    assert!(!doriac::codegen_cranelift::lower_mir_to_object(&program)
+        .expect("Cranelift should lower nullable local guards")
+        .is_empty());
+    #[cfg(feature = "llvm-backend")]
+    assert!(!doriac::codegen_llvm::lower_mir_to_object(&program)
+        .expect("LLVM should lower nullable local guards")
+        .is_empty());
+    let output =
+        doriac::mir_interpreter::interpret(&program).expect("nullable local guards should execute");
+    assert_eq!(
+        output.stdout,
+        b"string-null;int-null;box-null;string-true;7;9;string-else;8;10;string-is;11;12;parameter:13;known;fallback;14;reset\n"
+    );
+}
+
+#[test]
+fn nullable_local_reassignment_invalidates_narrowing() {
+    for source in [
+        r#"
+function maybe(): ?int { return 1; }
+function use(int $value): void {}
+function main(): void
+{
+    writable ?int $value = maybe();
+    if ($value != null) {
+        $value = null;
+        use($value);
+    }
+}
+"#,
+        r#"
+function maybe(): ?string { return "value"; }
+function use(string $value): void {}
+function main(): void
+{
+    writable ?string $value = maybe();
+    if ($value != null) {
+        $value = null;
+        use($value);
+    }
+}
+"#,
+        r#"
+class Box {}
+function maybe(): ?Box { return new Box(); }
+function use(Box $value): void {}
+function main(): void
+{
+    writable ?Box $value = maybe();
+    if ($value != null) {
+        $value = null;
+        use($value);
+    }
+}
+"#,
+    ] {
+        let diagnostics = doriac::check_source("stage22-invalidated-local.doria", source)
+            .expect_err("a null assignment must invalidate local narrowing");
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "E0408"),
+            "unexpected diagnostics: {diagnostics:#?}"
+        );
+    }
+}
+
+#[test]
+fn nullable_local_reassignment_after_a_guard_remains_nullable() {
+    for (declarations, ty) in [
+        (
+            "function maybe(): ?int { return 1; } function use(int $value): void {}",
+            "?int",
+        ),
+        (
+            "function maybe(): ?string { return \"value\"; } function use(string $value): void {}",
+            "?string",
+        ),
+        (
+            "class Box {} function maybe(): ?Box { return new Box(); } function use(Box $value): void {}",
+            "?Box",
+        ),
+    ] {
+        let source = format!(
+            r#"
+{declarations}
+function main(): void
+{{
+    writable {ty} $value = maybe();
+    if ($value != null) {{
+        use($value);
+    }}
+    $value = null;
+    use($value);
+}}
+"#
+        );
+        let diagnostics = doriac::check_source("stage22-invalidated-after-guard.doria", source)
+            .expect_err("assignment after a guard must leave the local nullable");
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "E0408"),
+            "unexpected diagnostics: {diagnostics:#?}"
+        );
+    }
+}
+
+#[test]
+fn mixed_local_exact_is_narrowing_remains_statically_valid() {
+    doriac::check_source(
+        "stage22-mixed-local-is.doria",
+        r#"
+function inspect(): string
+{
+    mixed $local = "value";
+    if ($local is string) {
+        return $local;
+    }
+    return "other";
+}
+"#,
+    )
+    .expect("an exact is test should narrow a mixed local statically");
+}
+
+#[test]
 fn null_safe_ownership_effects_follow_receiver_presence() {
     doriac::check_source(
         "stage22-null-safe-skipped-take.doria",

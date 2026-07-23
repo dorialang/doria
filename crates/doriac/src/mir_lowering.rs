@@ -3861,17 +3861,17 @@ fn lower_null_comparison(
     };
     let present = match context.expression_type(value)? {
         mir::Type::NullableScalar(ty) => mir::BoolExpression::NullableScalarIsPresent(Box::new(
-            lower_nullable_scalar_expression(value, ty, context)?,
+            lower_nullable_scalar_presence_subject(value, ty, context)?,
         )),
         mir::Type::NullableString => {
             return Ok(mir::BoolExpression::NullableStringCompare {
                 op: lower_compare_op(op),
-                left: Box::new(lower_nullable_string_expression(left, context)?),
-                right: Box::new(lower_nullable_string_expression(right, context)?),
+                left: Box::new(lower_nullable_string_presence_subject(value, context)?),
+                right: Box::new(mir::NullableStringExpression::Null),
             });
         }
         mir::Type::NullableClass(class) => mir::BoolExpression::NullableClassIsPresent(Box::new(
-            lower_nullable_class_expression(value, class, false, context)?,
+            lower_nullable_class_presence_subject(value, class, context)?,
         )),
         _ => {
             return Err(vec![unsupported(
@@ -3911,20 +3911,20 @@ fn lower_is_condition(
     let result = match value_type {
         mir::Type::NullableScalar(ty) if tested_type == mir::Type::Scalar(ty) => {
             mir::BoolExpression::NullableScalarIsPresent(Box::new(
-                lower_nullable_scalar_expression(expr, ty, context)?,
+                lower_nullable_scalar_presence_subject(expr, ty, context)?,
             ))
         }
         mir::Type::NullableString if tested_type == mir::Type::String => {
             mir::BoolExpression::Not(Box::new(mir::BoolExpression::NullableStringCompare {
                 op: mir::CompareOp::Equal,
-                left: Box::new(lower_nullable_string_expression(expr, context)?),
+                left: Box::new(lower_nullable_string_presence_subject(expr, context)?),
                 right: Box::new(mir::NullableStringExpression::Null),
             }))
         }
         mir::Type::NullableClass(class) if tested_type == mir::Type::Class(class) => {
-            mir::BoolExpression::NullableClassIsPresent(Box::new(lower_nullable_class_expression(
-                expr, class, false, context,
-            )?))
+            mir::BoolExpression::NullableClassIsPresent(Box::new(
+                lower_nullable_class_presence_subject(expr, class, context)?,
+            ))
         }
         mir::Type::Scalar(_) | mir::Type::String | mir::Type::Class(_) => {
             let evaluated = lower_concrete_is_presence(expr, value_type, context)?;
@@ -3936,23 +3936,71 @@ fn lower_is_condition(
         }
         mir::Type::NullableScalar(ty) => {
             evaluate_then_false(mir::BoolExpression::NullableScalarIsPresent(Box::new(
-                lower_nullable_scalar_expression(expr, ty, context)?,
+                lower_nullable_scalar_presence_subject(expr, ty, context)?,
             )))
         }
         mir::Type::NullableString => evaluate_then_false(mir::BoolExpression::Not(Box::new(
             mir::BoolExpression::NullableStringCompare {
                 op: mir::CompareOp::Equal,
-                left: Box::new(lower_nullable_string_expression(expr, context)?),
+                left: Box::new(lower_nullable_string_presence_subject(expr, context)?),
                 right: Box::new(mir::NullableStringExpression::Null),
             },
         ))),
         mir::Type::NullableClass(class) => {
             evaluate_then_false(mir::BoolExpression::NullableClassIsPresent(Box::new(
-                lower_nullable_class_expression(expr, class, false, context)?,
+                lower_nullable_class_presence_subject(expr, class, context)?,
             )))
         }
     };
     Ok(result)
+}
+
+fn lower_nullable_scalar_presence_subject(
+    expr: &hir::Expr,
+    expected: mir::ScalarType,
+    context: &LoweringContext,
+) -> DiagnosticResult<mir::NullableScalarExpression> {
+    if let hir::Expr::Variable { name, span } = unparenthesized_place(expr) {
+        let local = context.lookup_local(name, *span)?;
+        if context.local_type(local) == mir::Type::NullableScalar(expected) {
+            return Ok(mir::NullableScalarExpression::Local {
+                ty: expected,
+                local,
+            });
+        }
+    }
+    lower_nullable_scalar_expression(expr, expected, context)
+}
+
+fn lower_nullable_string_presence_subject(
+    expr: &hir::Expr,
+    context: &LoweringContext,
+) -> DiagnosticResult<mir::NullableStringExpression> {
+    if let hir::Expr::Variable { name, span } = unparenthesized_place(expr) {
+        let local = context.lookup_local(name, *span)?;
+        if context.local_type(local) == mir::Type::NullableString {
+            return Ok(mir::NullableStringExpression::Local(local));
+        }
+    }
+    lower_nullable_string_expression(expr, context)
+}
+
+fn lower_nullable_class_presence_subject(
+    expr: &hir::Expr,
+    expected: ClassId,
+    context: &LoweringContext,
+) -> DiagnosticResult<mir::NullableClassExpression> {
+    if let hir::Expr::Variable { name, span } = unparenthesized_place(expr) {
+        let local = context.lookup_local(name, *span)?;
+        if context.local_type(local) == mir::Type::NullableClass(expected) {
+            return Ok(mir::NullableClassExpression::Local {
+                class: expected,
+                local,
+                transfer: false,
+            });
+        }
+    }
+    lower_nullable_class_expression(expr, expected, false, context)
 }
 
 fn evaluate_then_false(condition: mir::BoolExpression) -> mir::BoolExpression {

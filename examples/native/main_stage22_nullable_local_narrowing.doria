@@ -1,0 +1,153 @@
+class Box
+{
+    function __construct(int $value)
+    {
+    }
+
+    function id(): int
+    {
+        return $this->value;
+    }
+}
+
+function maybeInt(bool $present, int $value): ?int
+{
+    if ($present) {
+        return $value;
+    }
+
+    return null;
+}
+
+function maybeString(bool $present, string $value): ?string
+{
+    if ($present) {
+        return $value;
+    }
+
+    return null;
+}
+
+function maybeBox(bool $present, int $value): ?Box
+{
+    if ($present) {
+        return new Box($value);
+    }
+
+    return null;
+}
+
+function showInt(int $value): void
+{
+    echo "{$value};";
+}
+
+function showString(string $value): void
+{
+    echo $value . ";";
+}
+
+function showBox(Box $value): void
+{
+    echo "{$value->id()};";
+}
+
+function showParameter(?int $value): void
+{
+    if ($value != null) {
+        echo "parameter:{$value};";
+    }
+}
+
+function main(): void
+{
+    ?string $nullString = null;
+    if ($nullString != null) {
+        echo "bad;";
+    } else {
+        echo "string-null;";
+    }
+
+    ?int $nullInt = null;
+    if ($nullInt != null) {
+        echo "bad;";
+    } else {
+        echo "int-null;";
+    }
+
+    ?Box $nullBox = null;
+    if ($nullBox != null) {
+        echo "bad;";
+    } else {
+        echo "box-null;";
+    }
+
+    ?string $stringValue = maybeString(true, "string-true");
+    if ($stringValue != null) {
+        showString($stringValue);
+    }
+
+    ?int $intValue = maybeInt(true, 7);
+    if ($intValue != null) {
+        showInt($intValue);
+    }
+
+    ?Box $boxValue = maybeBox(true, 9);
+    if ($boxValue != null) {
+        showBox($boxValue);
+    }
+
+    ?string $stringElse = maybeString(true, "string-else");
+    if ($stringElse == null) {
+        echo "bad;";
+    } else {
+        showString($stringElse);
+    }
+
+    ?int $intElse = maybeInt(true, 8);
+    if ($intElse == null) {
+        echo "bad;";
+    } else {
+        showInt($intElse);
+    }
+
+    ?Box $boxElse = maybeBox(true, 10);
+    if ($boxElse == null) {
+        echo "bad;";
+    } else {
+        showBox($boxElse);
+    }
+
+    ?string $stringIs = maybeString(true, "string-is");
+    if ($stringIs is string) {
+        showString($stringIs);
+    }
+
+    ?int $intIs = maybeInt(true, 11);
+    if ($intIs is int) {
+        showInt($intIs);
+    }
+
+    ?Box $boxIs = maybeBox(true, 12);
+    if ($boxIs is Box) {
+        showBox($boxIs);
+    }
+
+    showParameter(maybeInt(true, 13));
+
+    ?string $knownString = "known";
+    echo $knownString . ";";
+
+    ?string $fallback = null;
+    echo ($fallback ?? "fallback") . ";";
+
+    writable ?int $reset = maybeInt(true, 14);
+    if ($reset != null) {
+        showInt($reset);
+        $reset = null;
+    }
+    if ($reset == null) {
+        echo "reset";
+    }
+    echo "\n";
+}
