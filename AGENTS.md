@@ -36,6 +36,7 @@ The accepted project-tool name is Baton. Baton is the planned user-facing projec
 - `doria` is the compiler repository and the subject of these instructions.
 - `doria-website` is a separate repository. It hosts the documentation site and a playground that invokes `doriac` against user source, plus per-stage examples used for acceptance testing. Do not modify, clone, scaffold, or make assumptions about it from compiler work.
 - Playground acceptance testing has repeatedly found language-design gaps before implementation calcified them. When a compiler change alters an accepted surface, report it as an "Invalidated elsewhere" item so the website can follow. Do not schedule website work from a compiler prompt.
+- `doria-language-server` is a separate repository that is **in scope for compiler work**, unlike `doria-website`. It sits beside this one on disk (`../doria-language-server`) and pins `doriac` by git revision in its root `Cargo.toml`. Because it restates language facts in hover text, diagnostics, and highlighting, it goes stale the moment a stage lands — and a stale language server tells the user their valid code is wrong, which is worse than no language server. "Coordinate" in the rules below means **do the work in that repository in the same beat**, not mention it in a report. See "Language-server sweep".
 - Andrew is the language designer and sole developer. He reviews and approves before anything advances.
 
 ## Non-negotiable engineering guardrails
@@ -91,6 +92,18 @@ The procedure is deliberately mechanical, because judgment is what fails here. G
 - When writing a guard, a lint, or a CI check, enumerate the forms the fact takes rather than the form in front of you. A pattern matched against one example is an example, not a pattern.
 - Sweep the whole tree, not the file being edited: `docs/`, `docs/decisions/`, `SPEC.md`, `README.md`, `AGENTS.md`, `examples/**`, tests, fixtures, and diagnostic snapshots. For editor-visible language changes, coordinate the corresponding work in `dorialang/doria-language-server`.
 - Fix what is in scope, report what is not, and never leave a falsified claim standing because it was outside the diff.
+
+### Language-server sweep (every stage or slice that changes user-visible language)
+
+The blast radius does not stop at this repository's edge. `../doria-language-server` restates language facts and must be swept in the same beat, then reported as a distinct section. The sweep is:
+
+- **Bump the `doriac` pin** in `doria-language-server/Cargo.toml` (`rev = "…"`) to the compiler commit this work lands, and confirm the workspace still builds. A pin left on an older revision is drift by definition.
+- **Grep the hover/description tables** (`server/src/lib.rs`) for every fact the change touches, plus any claim that is now false regardless of whether this change caused it. Phrases scoped to a superseded stage — "this compiler currently supports…", "represents the EOF result of…", "alias" for a now-implemented type — are the signature of drift.
+- **Add hovers for newly landed surface.** A type, intrinsic, or member that ships with no hover is a silent gap; enumerate what the stage added and cover it.
+- **Check no-false-diagnostics coverage** for newly accepted syntax: forms the parser accepts must not surface as editor errors, and stage-named unsupported diagnostics must read as pending, never as invalid code.
+- **Sweep syntax highlighting and shared editor fixtures** for the new keywords, types, and intrinsics.
+
+Report the language-server work under its own heading, listing the pin revision, every string corrected, and every hover added. "No language-server impact" is a valid answer only when stated explicitly and checked.
 
 Locally-correct fixes are this project's dominant defect source. Every recorded instance was caught late — by review or by acceptance testing — at the most expensive moment available.
 

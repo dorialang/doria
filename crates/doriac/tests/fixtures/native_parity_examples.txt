@@ -1,5 +1,5 @@
 # Durable executable source of truth for accepted native behavior.
-# Highest completed stage: Stage 23 Slice 2
+# Highest completed stage: Stage 23 Slice 3
 examples/native/main_add_overflow_panic.doria
 examples/native/main_arithmetic_42.doria
 examples/native/main_bitwise_42.doria
@@ -107,7 +107,10 @@ examples/native/main_stage23_bytes_nul_path_panic.doria
 examples/native/main_stage23_bytes_oob_panic.doria
 examples/native/main_stage23_bytes_ownership.doria
 examples/native/main_stage23_bytes_stdio.doria
+examples/native/main_stage23_mixed_collections.doria
+examples/native/main_stage23_mixed_round_trip.doria
 examples/native/main_stage23_mixed_stdin_reads.doria
+examples/native/main_stage23_nullable_mixed.doria
 examples/native/main_string_concat_hello.doria
 examples/native/main_string_comparison_42.doria
 examples/native/main_string_local_hello.doria

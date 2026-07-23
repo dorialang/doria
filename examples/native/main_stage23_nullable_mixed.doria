@@ -1,0 +1,22 @@
+function main(): void
+{
+    ?mixed $empty = null;
+    if ($empty == null) {
+        echo "empty\n";
+    }
+
+    ?mixed $value = 9;
+    if ($value != null) {
+        if ($value is int) {
+            echo "int={$value}\n";
+        } else {
+            echo "wrong\n";
+        }
+    }
+
+    ?mixed $text = "fallback";
+    ?mixed $chosen = $empty ?? $text;
+    if ($chosen is string) {
+        echo $chosen . "\n";
+    }
+}

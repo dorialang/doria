@@ -17,6 +17,7 @@ Documentation role: working note. This file prevents duplicated in-flight work. 
 - Stage 22 general nullable types, `??`, `?->`, exact `is`, flow-sensitive narrowing, and `mixed` static semantics are complete on the current branch. Narrowing reuses the shared CFG/forward-dataflow framework; local and parameter guards preserve dominating nullable-presence proofs in MIR, and nullable scalar, string, and concrete-class values execute through the interpreter, Cranelift, and LLVM.
 - Stage 23 Slice 1 runtime collections and typed arrays are complete on the current branch. `T[]`, `List<T>`, `Dictionary<K, V>`, and `Set<T>` are owned move types backed by shared collection MIR and `doria-rt`; contextual literals, fixed-length typed arrays, indexing and indexed read-modify-write, insertion-ordered `foreach`, move-in/removal ownership, and Decision 0100's default member surface run through the interpreter, Cranelift, and LLVM. Dictionary `keys`/`values` are readonly, insertion-ordered, `foreach`-only projections and are not storable values.
 - Stage 23 Slice 2 is complete on the current branch. The owned `Bytes` move type provides explicit copying conversion to and from `uint8[]`, length, byte indexing and indexed read-modify-write, and byte-wise equality. `read_file_bytes`/`write_file_bytes`/`append_file_bytes`, `read_stdin_bytes`/`write_stdout_bytes`/`write_stderr_bytes`, and text `append_file` use shared validated MIR and `doria-rt`, with exact non-UTF-8 bytes and interpreter/Cranelift/LLVM parity.
+- Stage 23 Slice 3 is complete on the current branch. The boxed `dr_mixed` runtime representation stores a tag, class type id when needed, and owned payload; bool, fixed-width integers, floats, string, and concrete classes box into `mixed`, narrow back out through exact `is`, and execute through the interpreter, Cranelift, and LLVM. `?mixed`, `List<mixed>`, `Dictionary<K, mixed>`, and `Set<mixed>` value paths use the same shared MIR/runtime box. Collection/interface/subtype `is` and boxing collections, typed arrays, or `Bytes` into `mixed` remain deferred with stage-named diagnostics.
 - `Shared<T>`/`Weak<T>`/`SharedMut<T>` are rescheduled to Stage 25a, after nullable/narrowing and generic classes provide the machinery their separately unauthored API depends on.
 - The parser accepts generalized `parent::member()` and trait-local `self::member` under the two-clocks rule; semantic checking names Stage 34 and Stage 35 respectively and stops those forms before MIR. `Foo::$prop` and `static::` are permanent errors with precise fixes.
 - Native remains one target: direct compile/run uses the Cranelift fast profile, while `--release` selects LLVM 18 over the same validated typed MIR.
@@ -27,7 +28,7 @@ Documentation role: working note. This file prevents duplicated in-flight work. 
 
 ## Next
 
-- Stage 23 Slice 3: the boxed `dr_mixed` runtime representation and runtime mixed collection elements.
+- Stage 23a: named arguments, Decision 0098.
 
 ## Do not duplicate
 
@@ -40,5 +41,5 @@ Documentation role: working note. This file prevents duplicated in-flight work. 
 - Runtime-initialized and owned statics until separately accepted lifetime/concurrency decisions.
 - Parent lookup/dispatch until Stage 34 and trait composition until Stage 35; their accepted grammar is already represented.
 - Growable/slice/search `Bytes` members until a future method-surface decision.
-- Runtime boxed `mixed` values until Stage 23 Slice 3.
 - `match` narrowing until Stage 28, hierarchy `is` until Stage 34, and interface `is` until Stage 35.
+- Collection/interface/subtype `is`, plus boxing collections, typed arrays, or `Bytes` into `mixed`, until their authored stages.

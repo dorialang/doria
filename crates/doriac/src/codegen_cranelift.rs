@@ -24,11 +24,14 @@ use crate::native_abi::{
     COLLECTION_LENGTH, COLLECTION_NEW, COLLECTION_NULLABLE_ACCESS, COLLECTION_PUSH,
     COLLECTION_PUSH_UNIQUE, COLLECTION_REMOVE_AT, COLLECTION_REMOVE_VALUE, COLLECTION_SET_ALGEBRA,
     COLLECTION_SET_AT, COLLECTION_VALUE_AT, FORMAT_F32, FORMAT_F64, FORMAT_I64, FORMAT_STRING,
-    FORMAT_U64, NULLABLE_STRING_EQUAL, READ_FILE, READ_FILE_BYTES, READ_STDIN_BYTES,
-    READ_STDIN_LINE, STRING_COMPARE, STRING_CONCAT, STRING_DATA, STRING_FROM_BOOL, STRING_FROM_F32,
-    STRING_FROM_F64, STRING_FROM_I64, STRING_FROM_U64, STRING_FROM_UTF8, STRING_LENGTH,
-    STRING_RELEASE, STRING_RETAIN, STRING_WRITE_STDERR, STRING_WRITE_STDOUT, WRITE_FILE,
-    WRITE_FILE_BYTES, WRITE_STDERR_BYTES, WRITE_STDOUT_BYTES,
+    FORMAT_U64, MIXED_FREE, MIXED_NEW, MIXED_PAYLOAD, MIXED_TAG, MIXED_TAG_BOOL, MIXED_TAG_CLASS,
+    MIXED_TAG_FLOAT32, MIXED_TAG_FLOAT64, MIXED_TAG_INT16, MIXED_TAG_INT32, MIXED_TAG_INT64,
+    MIXED_TAG_INT8, MIXED_TAG_STRING, MIXED_TAG_UINT16, MIXED_TAG_UINT32, MIXED_TAG_UINT64,
+    MIXED_TAG_UINT8, MIXED_TYPE_ID, NULLABLE_STRING_EQUAL, READ_FILE, READ_FILE_BYTES,
+    READ_STDIN_BYTES, READ_STDIN_LINE, STRING_COMPARE, STRING_CONCAT, STRING_DATA,
+    STRING_FROM_BOOL, STRING_FROM_F32, STRING_FROM_F64, STRING_FROM_I64, STRING_FROM_U64,
+    STRING_FROM_UTF8, STRING_LENGTH, STRING_RELEASE, STRING_RETAIN, STRING_WRITE_STDERR,
+    STRING_WRITE_STDOUT, WRITE_FILE, WRITE_FILE_BYTES, WRITE_STDERR_BYTES, WRITE_STDOUT_BYTES,
 };
 use crate::numeric::{FloatType, FloatValue, IntegerPanic, IntegerType, IntegerValue};
 
@@ -150,8 +153,10 @@ fn append_type_abi_params(params: &mut Vec<AbiParam>, ty: mir::Type, pointer_typ
     match ty {
         mir::Type::Scalar(ty) => params.push(scalar_abi_param(ty)),
         mir::Type::String
+        | mir::Type::Mixed
         | mir::Type::Class(_)
         | mir::Type::NullableClass(_)
+        | mir::Type::NullableMixed
         | mir::Type::Collection(_) => {
             params.push(AbiParam::new(pointer_type));
         }
@@ -350,8 +355,10 @@ fn define_function(
                     )))
                 }
                 mir::Type::String
+                | mir::Type::Mixed
                 | mir::Type::Class(_)
                 | mir::Type::NullableClass(_)
+                | mir::Type::NullableMixed
                 | mir::Type::Collection(_) => {
                     Some(builder.create_sized_stack_slot(StackSlotData::new(
                         StackSlotKind::ExplicitSlot,
@@ -474,8 +481,10 @@ fn initialize_locals(
             }
             mir::Type::Scalar(mir::ScalarType::Bool) => builder.ins().iconst(types::I8, 0),
             mir::Type::String
+            | mir::Type::Mixed
             | mir::Type::Class(_)
             | mir::Type::NullableClass(_)
+            | mir::Type::NullableMixed
             | mir::Type::Collection(_) => builder.ins().iconst(pointer_type, 0),
             mir::Type::NullableScalar(_) | mir::Type::NullableString => {
                 let zero = builder.ins().iconst(pointer_type, 0);
@@ -963,8 +972,10 @@ fn lower_statement(
             let pointer_type = resources.module.target_config().pointer_type();
             let old_value = match property_definition.ty {
                 mir::Type::String
+                | mir::Type::Mixed
                 | mir::Type::Class(_)
                 | mir::Type::NullableClass(_)
+                | mir::Type::NullableMixed
                 | mir::Type::Collection(_) => Some(
                     load_lowered_from_address(
                         builder,
@@ -1051,6 +1062,14 @@ fn lower_statement(
             builder.ins().stack_store(zero, slot, 0);
             release_string(builder, value, resources)?;
         }
+        mir::Statement::DropMixed { local } => {
+            let pointer = resources.module.target_config().pointer_type();
+            let slot = local_slot(resources.local_slots, *local)?;
+            let value = builder.ins().stack_load(pointer, slot, 0);
+            let zero = builder.ins().iconst(pointer, 0);
+            builder.ins().stack_store(zero, slot, 0);
+            lower_drop_mixed_value(builder, value, resources)?;
+        }
         mir::Statement::CollectionAdd {
             collection,
             value,
@@ -1124,8 +1143,10 @@ fn load_lowered_from_stack(
             LoweredValue::Single(builder.ins().stack_load(clif_scalar_type(scalar), slot, 0))
         }
         mir::Type::String
+        | mir::Type::Mixed
         | mir::Type::Class(_)
         | mir::Type::NullableClass(_)
+        | mir::Type::NullableMixed
         | mir::Type::Collection(_) => {
             LoweredValue::Single(builder.ins().stack_load(pointer, slot, 0))
         }
@@ -1184,8 +1205,10 @@ fn load_lowered_from_address(
             0,
         )),
         mir::Type::String
+        | mir::Type::Mixed
         | mir::Type::Class(_)
         | mir::Type::NullableClass(_)
+        | mir::Type::NullableMixed
         | mir::Type::Collection(_) => {
             LoweredValue::Single(builder.ins().load(pointer, flags, address, 0))
         }
@@ -1334,11 +1357,17 @@ fn lower_rvalue(
         mir::Rvalue::String(value) => {
             lower_string_expression(builder, value, resources).map(LoweredValue::Single)
         }
+        mir::Rvalue::Mixed(value) => {
+            lower_mixed_expression(builder, value, resources).map(LoweredValue::Single)
+        }
         mir::Rvalue::NullableScalar(value) => {
             lower_nullable_scalar_expression(builder, value, resources)
         }
         mir::Rvalue::NullableString(value) => {
             lower_nullable_string_expression(builder, value, resources)
+        }
+        mir::Rvalue::NullableMixed(value) => {
+            lower_nullable_mixed_expression(builder, value, resources).map(LoweredValue::Single)
         }
         mir::Rvalue::Class(value) => {
             lower_class_expression(builder, value, resources).map(LoweredValue::Single)
@@ -1372,14 +1401,16 @@ fn collection_compare_kind(ty: mir::Type) -> Result<i64, BackendError> {
         mir::Type::Scalar(mir::ScalarType::Float(FloatType::Float64)) => {
             Ok(i64::from(COLLECTION_COMPARE_FLOAT64))
         }
-        mir::Type::Scalar(_) | mir::Type::Class(_) | mir::Type::Collection(_) => {
-            Ok(i64::from(COLLECTION_COMPARE_WORD))
-        }
-        mir::Type::NullableScalar(_) | mir::Type::NullableString | mir::Type::NullableClass(_) => {
-            Err(malformed_mir(
-                "nullable collection elements are not supported by Stage 23 Slice 1",
-            ))
-        }
+        mir::Type::Scalar(_)
+        | mir::Type::Mixed
+        | mir::Type::Class(_)
+        | mir::Type::Collection(_) => Ok(i64::from(COLLECTION_COMPARE_WORD)),
+        mir::Type::NullableScalar(_)
+        | mir::Type::NullableString
+        | mir::Type::NullableMixed
+        | mir::Type::NullableClass(_) => Err(malformed_mir(
+            "nullable collection elements are not supported by Stage 23 Slice 3",
+        )),
     }
 }
 
@@ -1409,16 +1440,19 @@ fn value_to_collection_word(
                 builder.ins().uextend(types::I64, value)
             }
         }
-        mir::Type::String | mir::Type::Class(_) | mir::Type::Collection(_) => {
+        mir::Type::String | mir::Type::Mixed | mir::Type::Class(_) | mir::Type::Collection(_) => {
             if pointer == types::I64 {
                 value
             } else {
                 builder.ins().uextend(types::I64, value)
             }
         }
-        mir::Type::NullableScalar(_) | mir::Type::NullableString | mir::Type::NullableClass(_) => {
+        mir::Type::NullableScalar(_)
+        | mir::Type::NullableString
+        | mir::Type::NullableMixed
+        | mir::Type::NullableClass(_) => {
             return Err(malformed_mir(
-                "nullable collection elements are not supported by Stage 23 Slice 1",
+                "nullable collection elements are not supported by Stage 23 Slice 3",
             ))
         }
     })
@@ -1447,16 +1481,19 @@ fn collection_word_to_value(
         mir::Type::Scalar(mir::ScalarType::Float(FloatType::Float64)) => {
             builder.ins().bitcast(types::F64, MemFlagsData::new(), word)
         }
-        mir::Type::String | mir::Type::Class(_) | mir::Type::Collection(_) => {
+        mir::Type::String | mir::Type::Mixed | mir::Type::Class(_) | mir::Type::Collection(_) => {
             if pointer == types::I64 {
                 word
             } else {
                 builder.ins().ireduce(pointer, word)
             }
         }
-        mir::Type::NullableScalar(_) | mir::Type::NullableString | mir::Type::NullableClass(_) => {
+        mir::Type::NullableScalar(_)
+        | mir::Type::NullableString
+        | mir::Type::NullableMixed
+        | mir::Type::NullableClass(_) => {
             return Err(malformed_mir(
-                "nullable collection elements are not supported by Stage 23 Slice 1",
+                "nullable collection elements are not supported by Stage 23 Slice 3",
             ))
         }
     })
@@ -2212,6 +2249,9 @@ fn lower_drop_stored_value(
 ) -> Result<(), BackendError> {
     match ty {
         mir::Type::String => release_string(builder, value, resources),
+        mir::Type::Mixed | mir::Type::NullableMixed => {
+            lower_drop_mixed_value(builder, value, resources)
+        }
         mir::Type::Class(class) => lower_drop_class_value_checked(builder, value, class, resources),
         mir::Type::Collection(collection) => {
             lower_drop_collection_value(builder, value, collection, resources)
@@ -2430,6 +2470,28 @@ fn lower_class_expression(
                 builder.ins().call(callee, &constructor_args);
 
                 let constructor_definition = function_in(resources.program, *constructor)?;
+                for (index, value) in &lowered_args.owned_mixed {
+                    let promoted = properties.iter().any(|property| {
+                        matches!(
+                            property.source,
+                            mir::PropertyValueSource::ConstructorArgument(argument)
+                                if argument == *index
+                        )
+                    });
+                    let parameter =
+                        *constructor_definition
+                            .params
+                            .get(index + 1)
+                            .ok_or_else(|| {
+                                malformed_mir(format!(
+                                    "constructor function{} is missing parameter {index}",
+                                    constructor.0
+                                ))
+                            })?;
+                    if !promoted && !local_in(constructor_definition, parameter)?.owned {
+                        lower_drop_mixed_value(builder, *value, resources)?;
+                    }
+                }
                 for (index, argument) in args.iter().enumerate() {
                     let Some(class) = argument.owned_temporary_class() else {
                         continue;
@@ -2521,6 +2583,21 @@ fn lower_class_expression(
             transfer,
             ..
         } => lower_collection_index(builder, *collection, index, *transfer, resources),
+        mir::ClassExpression::MixedPayload {
+            mixed,
+            class,
+            transfer,
+        } => {
+            if *transfer {
+                return lower_take_mixed_payload(
+                    builder,
+                    *mixed,
+                    mir::MixedTag::Class(*class),
+                    resources,
+                );
+            }
+            lower_mixed_payload(builder, *mixed, mir::MixedTag::Class(*class), resources)
+        }
     }
 }
 
@@ -2777,6 +2854,15 @@ fn lower_drop_class_value(
                 );
                 lower_drop_collection_value(builder, value, collection, resources)?;
             }
+            mir::Type::Mixed | mir::Type::NullableMixed => {
+                let value = builder.ins().load(
+                    pointer_type,
+                    cranelift_codegen::ir::MachMemFlags::trusted(),
+                    address,
+                    0,
+                );
+                lower_drop_mixed_value(builder, value, resources)?;
+            }
             mir::Type::Scalar(_) | mir::Type::NullableScalar(_) => {}
         }
     }
@@ -2839,6 +2925,352 @@ fn release_string(
     Ok(())
 }
 
+fn lower_drop_mixed_value(
+    builder: &mut FunctionBuilder,
+    value: Value,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<(), BackendError> {
+    let pointer = resources.module.target_config().pointer_type();
+    let zero = builder.ins().iconst(pointer, 0);
+    let has_box = builder.ins().icmp(IntCC::NotEqual, value, zero);
+    let drop_block = builder.create_block();
+    let done = builder.create_block();
+    builder.ins().brif(has_box, drop_block, &[], done, &[]);
+    builder.switch_to_block(drop_block);
+
+    let tag = runtime_call(
+        builder,
+        MIXED_TAG,
+        &[pointer],
+        Some(types::I8),
+        &[value],
+        resources,
+    )?
+    .ok_or_else(|| backend_failure("mixed tag read produced no result"))?;
+    let payload = runtime_call(
+        builder,
+        MIXED_PAYLOAD,
+        &[pointer],
+        Some(types::I64),
+        &[value],
+        resources,
+    )?
+    .ok_or_else(|| backend_failure("mixed payload read produced no result"))?;
+
+    let string_block = builder.create_block();
+    let after_string = builder.create_block();
+    let string_tag = builder.ins().iconst(types::I8, i64::from(MIXED_TAG_STRING));
+    let is_string = builder.ins().icmp(IntCC::Equal, tag, string_tag);
+    builder
+        .ins()
+        .brif(is_string, string_block, &[], after_string, &[]);
+    builder.switch_to_block(string_block);
+    let string = collection_word_to_value(builder, payload, mir::Type::String, pointer)?;
+    release_string(builder, string, resources)?;
+    builder.ins().jump(after_string, &[]);
+
+    builder.switch_to_block(after_string);
+    let class_block = builder.create_block();
+    let after_class = builder.create_block();
+    let class_tag = builder.ins().iconst(types::I8, i64::from(MIXED_TAG_CLASS));
+    let is_class = builder.ins().icmp(IntCC::Equal, tag, class_tag);
+    builder
+        .ins()
+        .brif(is_class, class_block, &[], after_class, &[]);
+    builder.switch_to_block(class_block);
+    let type_id = runtime_call(
+        builder,
+        MIXED_TYPE_ID,
+        &[pointer],
+        Some(types::I32),
+        &[value],
+        resources,
+    )?
+    .ok_or_else(|| backend_failure("mixed type-id read produced no result"))?;
+    let object = collection_word_to_value(
+        builder,
+        payload,
+        mir::Type::Class(crate::class_layout::ClassId(0)),
+        pointer,
+    )?;
+    let classes = resources
+        .program
+        .classes
+        .iter()
+        .map(|class| class.id)
+        .collect::<Vec<_>>();
+    if classes.is_empty() {
+        builder.ins().jump(after_class, &[]);
+    } else {
+        let checks = classes
+            .iter()
+            .map(|_| builder.create_block())
+            .collect::<Vec<_>>();
+        builder.ins().jump(checks[0], &[]);
+        for (index, class) in classes.iter().enumerate() {
+            let check = checks[index];
+            let next = checks.get(index + 1).copied().unwrap_or(after_class);
+            builder.switch_to_block(check);
+            let expected = builder.ins().iconst(types::I32, class.0 as i64);
+            let matches = builder.ins().icmp(IntCC::Equal, type_id, expected);
+            let drop_class = builder.create_block();
+            builder.ins().brif(matches, drop_class, &[], next, &[]);
+            builder.switch_to_block(drop_class);
+            lower_drop_class_value_checked(builder, object, *class, resources)?;
+            builder.ins().jump(after_class, &[]);
+        }
+    }
+
+    builder.switch_to_block(after_class);
+    runtime_call(builder, MIXED_FREE, &[pointer], None, &[value], resources)?;
+    builder.ins().jump(done, &[]);
+    builder.switch_to_block(done);
+    Ok(())
+}
+
+fn mixed_tag_value(tag: mir::MixedTag) -> (u8, u32) {
+    match tag {
+        mir::MixedTag::Bool => (MIXED_TAG_BOOL, 0),
+        mir::MixedTag::Integer(IntegerType::Int8) => (MIXED_TAG_INT8, 0),
+        mir::MixedTag::Integer(IntegerType::Int16) => (MIXED_TAG_INT16, 0),
+        mir::MixedTag::Integer(IntegerType::Int32) => (MIXED_TAG_INT32, 0),
+        mir::MixedTag::Integer(IntegerType::Int64) => (MIXED_TAG_INT64, 0),
+        mir::MixedTag::Integer(IntegerType::UInt8) => (MIXED_TAG_UINT8, 0),
+        mir::MixedTag::Integer(IntegerType::UInt16) => (MIXED_TAG_UINT16, 0),
+        mir::MixedTag::Integer(IntegerType::UInt32) => (MIXED_TAG_UINT32, 0),
+        mir::MixedTag::Integer(IntegerType::UInt64) => (MIXED_TAG_UINT64, 0),
+        mir::MixedTag::Float(FloatType::Float32) => (MIXED_TAG_FLOAT32, 0),
+        mir::MixedTag::Float(FloatType::Float64) => (MIXED_TAG_FLOAT64, 0),
+        mir::MixedTag::String => (MIXED_TAG_STRING, 0),
+        mir::MixedTag::Class(class) => (MIXED_TAG_CLASS, class.0 as u32),
+    }
+}
+
+fn lower_mixed_box(
+    builder: &mut FunctionBuilder,
+    tag: mir::MixedTag,
+    payload: Value,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<Value, BackendError> {
+    let pointer = resources.module.target_config().pointer_type();
+    let payload_ty = tag.ty();
+    let (tag_value, type_id) = mixed_tag_value(tag);
+    let tag = builder.ins().iconst(types::I8, i64::from(tag_value));
+    let type_id = builder.ins().iconst(types::I32, i64::from(type_id));
+    let payload = value_to_collection_word(builder, payload, payload_ty, pointer)?;
+    runtime_call(
+        builder,
+        MIXED_NEW,
+        &[types::I8, types::I32, types::I64],
+        Some(pointer),
+        &[tag, type_id, payload],
+        resources,
+    )?
+    .ok_or_else(|| backend_failure("mixed allocation produced no result"))
+}
+
+fn lower_mixed_expression(
+    builder: &mut FunctionBuilder,
+    expression: &mir::MixedExpression,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<Value, BackendError> {
+    let pointer = resources.module.target_config().pointer_type();
+    match expression {
+        mir::MixedExpression::Local { local, transfer } => {
+            let slot = local_slot(resources.local_slots, *local)?;
+            let value =
+                load_lowered_from_stack(builder, mir::Type::Mixed, slot, pointer).single()?;
+            if *transfer {
+                let zero = builder.ins().iconst(pointer, 0);
+                builder.ins().stack_store(zero, slot, 0);
+            }
+            Ok(value)
+        }
+        mir::MixedExpression::Property { object, property } => {
+            let address = lower_property_address(builder, *object, *property, resources)?;
+            Ok(load_lowered_from_address(builder, mir::Type::Mixed, address, pointer).single()?)
+        }
+        mir::MixedExpression::Call { function, args } => {
+            lower_function_call(builder, *function, args, resources)
+                .and_then(|value| {
+                    value.ok_or_else(|| malformed_mir("mixed call produced no result"))
+                })
+                .and_then(LoweredValue::single)
+        }
+        mir::MixedExpression::BoxValue(value) => {
+            let tag = match value.ty() {
+                mir::ScalarType::Bool => mir::MixedTag::Bool,
+                mir::ScalarType::Integer(ty) => mir::MixedTag::Integer(ty),
+                mir::ScalarType::Float(ty) => mir::MixedTag::Float(ty),
+            };
+            let payload = lower_value_expression(builder, value, resources)?;
+            lower_mixed_box(builder, tag, payload, resources)
+        }
+        mir::MixedExpression::BoxString(value) => {
+            let payload = lower_string_expression(builder, value, resources)?;
+            lower_mixed_box(builder, mir::MixedTag::String, payload, resources)
+        }
+        mir::MixedExpression::BoxClass(value) => {
+            let class = value.class();
+            let payload = lower_class_expression(builder, value, resources)?;
+            lower_mixed_box(builder, mir::MixedTag::Class(class), payload, resources)
+        }
+        mir::MixedExpression::CollectionIndex {
+            collection,
+            index,
+            transfer,
+        } => lower_collection_index(builder, *collection, index, *transfer, resources),
+    }
+}
+
+fn lower_nullable_mixed_expression(
+    builder: &mut FunctionBuilder,
+    expression: &mir::NullableMixedExpression,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<Value, BackendError> {
+    let pointer = resources.module.target_config().pointer_type();
+    match expression {
+        mir::NullableMixedExpression::Null => Ok(builder.ins().iconst(pointer, 0)),
+        mir::NullableMixedExpression::Mixed(value) => {
+            lower_mixed_expression(builder, value, resources)
+        }
+        mir::NullableMixedExpression::Local { local, transfer } => {
+            let slot = local_slot(resources.local_slots, *local)?;
+            let value = load_lowered_from_stack(builder, mir::Type::NullableMixed, slot, pointer)
+                .single()?;
+            if *transfer {
+                let zero = builder.ins().iconst(pointer, 0);
+                builder.ins().stack_store(zero, slot, 0);
+            }
+            Ok(value)
+        }
+        mir::NullableMixedExpression::Property { object, property } => {
+            let address = lower_property_address(builder, *object, *property, resources)?;
+            Ok(
+                load_lowered_from_address(builder, mir::Type::NullableMixed, address, pointer)
+                    .single()?,
+            )
+        }
+        mir::NullableMixedExpression::Call { function, args } => {
+            lower_function_call(builder, *function, args, resources)
+                .and_then(|value| {
+                    value.ok_or_else(|| malformed_mir("nullable mixed call produced no result"))
+                })
+                .and_then(LoweredValue::single)
+        }
+        mir::NullableMixedExpression::Coalesce { left, right, .. } => {
+            let left = lower_nullable_mixed_expression(builder, left, resources)?;
+            let fallback_block = builder.create_block();
+            let done_block = builder.create_block();
+            let result = builder.append_block_param(done_block, pointer);
+            let zero = builder.ins().iconst(pointer, 0);
+            let present = builder.ins().icmp(IntCC::NotEqual, left, zero);
+            builder
+                .ins()
+                .brif(present, done_block, &[left.into()], fallback_block, &[]);
+            builder.switch_to_block(fallback_block);
+            let right = lower_nullable_mixed_expression(builder, right, resources)?;
+            builder.ins().jump(done_block, &[right.into()]);
+            builder.switch_to_block(done_block);
+            Ok(result)
+        }
+    }
+}
+
+fn lower_mixed_payload(
+    builder: &mut FunctionBuilder,
+    mixed: mir::LocalId,
+    tag: mir::MixedTag,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<Value, BackendError> {
+    let pointer = resources.module.target_config().pointer_type();
+    let slot = local_slot(resources.local_slots, mixed)?;
+    let mixed = load_lowered_from_stack(builder, mir::Type::Mixed, slot, pointer).single()?;
+    let word = runtime_call(
+        builder,
+        MIXED_PAYLOAD,
+        &[pointer],
+        Some(types::I64),
+        &[mixed],
+        resources,
+    )?
+    .ok_or_else(|| backend_failure("mixed payload read produced no result"))?;
+    collection_word_to_value(builder, word, tag.ty(), pointer)
+}
+
+fn lower_take_mixed_payload(
+    builder: &mut FunctionBuilder,
+    mixed: mir::LocalId,
+    tag: mir::MixedTag,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<Value, BackendError> {
+    let pointer = resources.module.target_config().pointer_type();
+    let slot = local_slot(resources.local_slots, mixed)?;
+    let mixed_value = load_lowered_from_stack(builder, mir::Type::Mixed, slot, pointer).single()?;
+    let word = runtime_call(
+        builder,
+        MIXED_PAYLOAD,
+        &[pointer],
+        Some(types::I64),
+        &[mixed_value],
+        resources,
+    )?
+    .ok_or_else(|| backend_failure("mixed payload read produced no result"))?;
+    let payload = collection_word_to_value(builder, word, tag.ty(), pointer)?;
+    let zero = builder.ins().iconst(pointer, 0);
+    builder.ins().stack_store(zero, slot, 0);
+    runtime_call(
+        builder,
+        MIXED_FREE,
+        &[pointer],
+        None,
+        &[mixed_value],
+        resources,
+    )?;
+    Ok(payload)
+}
+
+fn lower_mixed_is(
+    builder: &mut FunctionBuilder,
+    mixed: &mir::MixedExpression,
+    tag: mir::MixedTag,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<Value, BackendError> {
+    let pointer = resources.module.target_config().pointer_type();
+    let mixed = lower_mixed_expression(builder, mixed, resources)?;
+    let actual_tag = runtime_call(
+        builder,
+        MIXED_TAG,
+        &[pointer],
+        Some(types::I8),
+        &[mixed],
+        resources,
+    )?
+    .ok_or_else(|| backend_failure("mixed tag read produced no result"))?;
+    let (expected_tag, expected_type_id) = mixed_tag_value(tag);
+    let expected_tag = builder.ins().iconst(types::I8, i64::from(expected_tag));
+    let tag_matches = builder.ins().icmp(IntCC::Equal, actual_tag, expected_tag);
+    if !matches!(tag, mir::MixedTag::Class(_)) {
+        return Ok(tag_matches);
+    }
+    let actual_type_id = runtime_call(
+        builder,
+        MIXED_TYPE_ID,
+        &[pointer],
+        Some(types::I32),
+        &[mixed],
+        resources,
+    )?
+    .ok_or_else(|| backend_failure("mixed type-id read produced no result"))?;
+    let expected_type_id = builder
+        .ins()
+        .iconst(types::I32, i64::from(expected_type_id));
+    let type_matches = builder
+        .ins()
+        .icmp(IntCC::Equal, actual_type_id, expected_type_id);
+    Ok(builder.ins().band(tag_matches, type_matches))
+}
+
 fn lower_string_expression(
     builder: &mut FunctionBuilder,
     expression: &mir::StringExpression,
@@ -2874,6 +3306,10 @@ fn lower_string_expression(
                 address,
                 0,
             );
+            retain_string(builder, value, resources)
+        }
+        mir::StringExpression::MixedPayload(local) => {
+            let value = lower_mixed_payload(builder, *local, mir::MixedTag::String, resources)?;
             retain_string(builder, value, resources)
         }
         mir::StringExpression::NullableLocalAssumeNonNull(local) => {
@@ -4045,6 +4481,9 @@ fn lower_integer_operand(
             mir::Type::Scalar(mir::ScalarType::Integer(ty)),
             resources,
         ),
+        mir::Operand::MixedPayload { mixed, tag } => {
+            lower_mixed_payload(builder, *mixed, *tag, resources)
+        }
         mir::Operand::Scalar(_) => Err(malformed_mir(
             "integer expression contains non-integer constant",
         )),
@@ -4132,6 +4571,9 @@ fn lower_float_expression(
                 mir::Type::Scalar(mir::ScalarType::Float(*ty)),
                 resources,
             ),
+            mir::Operand::MixedPayload { mixed, tag } => {
+                lower_mixed_payload(builder, *mixed, *tag, resources)
+            }
             _ => Err(malformed_mir(
                 "float expression contains non-float constant",
             )),
@@ -4225,6 +4667,7 @@ struct LoweredCallArgs {
     arguments: Vec<LoweredValue>,
     abi_values: Vec<Value>,
     owned_strings: Vec<(usize, Value)>,
+    owned_mixed: Vec<(usize, Value)>,
 }
 
 fn lower_call_args(
@@ -4235,6 +4678,7 @@ fn lower_call_args(
     let mut arguments = Vec::with_capacity(args.len());
     let mut abi_values = Vec::with_capacity(args.len() * 2);
     let mut owned_strings = Vec::new();
+    let mut owned_mixed = Vec::new();
     for (index, argument) in args.iter().enumerate() {
         let value = lower_rvalue(builder, argument, resources)?;
         if matches!(argument.ty(), mir::Type::String | mir::Type::NullableString) {
@@ -4244,6 +4688,9 @@ fn lower_call_args(
             };
             owned_strings.push((index, string));
         }
+        if argument.owned_temporary_mixed() {
+            owned_mixed.push((index, value.single()?));
+        }
         value.append_to(&mut abi_values);
         arguments.push(value);
     }
@@ -4251,6 +4698,7 @@ fn lower_call_args(
         arguments,
         abi_values,
         owned_strings,
+        owned_mixed,
     })
 }
 
@@ -4287,6 +4735,17 @@ fn lower_function_call(
     };
     for (_, string) in lowered.owned_strings {
         release_string(builder, string, resources)?;
+    }
+    for (index, value) in &lowered.owned_mixed {
+        let parameter = *callee_definition.params.get(*index).ok_or_else(|| {
+            malformed_mir(format!(
+                "function{} is missing parameter {index}",
+                function.0
+            ))
+        })?;
+        if !local_in(callee_definition, parameter)?.owned {
+            lower_drop_mixed_value(builder, *value, resources)?;
+        }
     }
     for (index, argument) in args.iter().enumerate() {
         let Some(class) = argument.owned_temporary_class() else {
@@ -4340,6 +4799,18 @@ fn lower_method_call_with_receiver(
     };
     for (_, string) in lowered.owned_strings {
         release_string(builder, string, resources)?;
+    }
+    for (index, value) in &lowered.owned_mixed {
+        let parameter = *definition.params.get(index + 1).ok_or_else(|| {
+            malformed_mir(format!(
+                "method function{} is missing parameter {}",
+                function.0,
+                index + 1
+            ))
+        })?;
+        if !local_in(definition, parameter)?.owned {
+            lower_drop_mixed_value(builder, *value, resources)?;
+        }
     }
     for (index, argument) in args.iter().enumerate() {
         let Some(class) = argument.owned_temporary_class() else {
@@ -4533,6 +5004,19 @@ fn lower_condition_to_branch(
             builder
                 .ins()
                 .brif(present, then_block, &[], else_block, &[]);
+        }
+        mir::BoolExpression::NullableMixedIsPresent(value) => {
+            let value = lower_nullable_mixed_expression(builder, value, resources)?;
+            let pointer = resources.module.target_config().pointer_type();
+            let zero = builder.ins().iconst(pointer, 0);
+            let present = builder.ins().icmp(IntCC::NotEqual, value, zero);
+            builder
+                .ins()
+                .brif(present, then_block, &[], else_block, &[]);
+        }
+        mir::BoolExpression::MixedIs { mixed, tag } => {
+            let value = lower_mixed_is(builder, mixed, *tag, resources)?;
+            builder.ins().brif(value, then_block, &[], else_block, &[]);
         }
         mir::BoolExpression::Coalesce { left, right } => {
             let left = lower_nullable_scalar_expression(builder, left, resources)?;
@@ -4781,6 +5265,9 @@ fn lower_bool_operand(
             mir::Type::Scalar(mir::ScalarType::Bool),
             resources,
         ),
+        mir::Operand::MixedPayload { mixed, tag } => {
+            lower_mixed_payload(builder, *mixed, *tag, resources)
+        }
         _ => Err(malformed_mir("bool expression contains non-bool constant")),
     }
 }
@@ -4865,6 +5352,9 @@ fn resolve_string_expression_from_definitions(
         mir::StringExpression::Static(_) => {
             Err(malformed_mir("runtime string expression is not a constant"))
         }
+        mir::StringExpression::MixedPayload(_) => {
+            Err(malformed_mir("runtime string expression is not a constant"))
+        }
         mir::StringExpression::Property { .. } => {
             Err(malformed_mir("runtime string expression is not a constant"))
         }
@@ -4909,6 +5399,9 @@ fn resolve_string_expression(
             Err(malformed_mir("runtime string expression is not a constant"))
         }
         mir::StringExpression::Static(_) => {
+            Err(malformed_mir("runtime string expression is not a constant"))
+        }
+        mir::StringExpression::MixedPayload(_) => {
             Err(malformed_mir("runtime string expression is not a constant"))
         }
         mir::StringExpression::Property { .. } => {

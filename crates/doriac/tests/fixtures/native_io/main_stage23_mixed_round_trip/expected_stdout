@@ -1,0 +1,8 @@
+int=42
+string=hello
+bool=true
+float=3.5
+token=box
+<drop box>
+take=move
+<drop move>

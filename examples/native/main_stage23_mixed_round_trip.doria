@@ -1,0 +1,61 @@
+class Token
+{
+    function __construct(string $name)
+    {
+    }
+
+    function text(): string
+    {
+        return $this->name;
+    }
+
+    function __destruct()
+    {
+        echo "<drop " . $this->name . ">\n";
+    }
+}
+
+function describe(mixed $value): void
+{
+    if ($value is int) {
+        echo "int={$value}\n";
+    } else if ($value is string) {
+        echo "string=" . $value . "\n";
+    } else if ($value is bool) {
+        if ($value) {
+            echo "bool=true\n";
+        } else {
+            echo "bool=false\n";
+        }
+    } else if ($value is float) {
+        printf("float=%.1f\n", $value);
+    } else if ($value is Token) {
+        echo "token=" . $value->text() . "\n";
+    } else {
+        echo "unknown\n";
+    }
+}
+
+function consume(take Token $token): void
+{
+    echo "take=" . $token->text() . "\n";
+}
+
+function movePayload(take mixed $value): void
+{
+    if ($value is Token) {
+        consume($value);
+    } else {
+        echo "not-token\n";
+    }
+}
+
+function main(): void
+{
+    describe(42);
+    describe("hello");
+    describe(true);
+    describe(3.5);
+    describe(new Token("box"));
+    movePayload(new Token("move"));
+}

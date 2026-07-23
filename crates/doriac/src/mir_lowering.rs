@@ -383,6 +383,7 @@ fn intern_resolved_collection_types(
         ResolvedType::Bool => mir::Type::Scalar(mir::ScalarType::Bool),
         ResolvedType::String => mir::Type::String,
         ResolvedType::Bytes => mir::Type::Collection(intern_bytes_type(collections)),
+        ResolvedType::Mixed => mir::Type::Mixed,
         ResolvedType::Class(name) => mir::Type::Class(*class_ids.get(name)?),
         ResolvedType::TypedArray(value) => {
             let value = intern_resolved_collection_types(value, class_ids, collections)?;
@@ -409,17 +410,16 @@ fn intern_resolved_collection_types(
             match intern_resolved_collection_types(inner, class_ids, collections)? {
                 mir::Type::Scalar(ty) => mir::Type::NullableScalar(ty),
                 mir::Type::String => mir::Type::NullableString,
+                mir::Type::Mixed => mir::Type::NullableMixed,
                 mir::Type::Class(class) => mir::Type::NullableClass(class),
                 mir::Type::Collection(_)
                 | mir::Type::NullableScalar(_)
                 | mir::Type::NullableString
+                | mir::Type::NullableMixed
                 | mir::Type::NullableClass(_) => return None,
             }
         }
-        ResolvedType::Void
-        | ResolvedType::Null
-        | ResolvedType::Mixed
-        | ResolvedType::Unsupported => return None,
+        ResolvedType::Void | ResolvedType::Null | ResolvedType::Unsupported => return None,
     };
     Some(ty)
 }
@@ -616,7 +616,11 @@ fn collect_function_signature(
         };
         let transfers = matches!(
             parameter_type,
-            mir::Type::Class(_) | mir::Type::NullableClass(_) | mir::Type::Collection(_)
+            mir::Type::Class(_)
+                | mir::Type::NullableClass(_)
+                | mir::Type::Collection(_)
+                | mir::Type::Mixed
+                | mir::Type::NullableMixed
         ) && param.take;
         let owns = transfers && param.promoted_access.is_none();
         let default = if param.default.is_some() {
@@ -703,6 +707,7 @@ fn mir_type_ref(
     let base = scalar_type_ref(&plain)
         .map(mir::Type::Scalar)
         .or_else(|| is_plain_type(&plain, "string").then_some(mir::Type::String))
+        .or_else(|| is_plain_type(&plain, "mixed").then_some(mir::Type::Mixed))
         .or_else(|| {
             is_plain_type(&plain, "Bytes")
                 .then(|| mir::Type::Collection(intern_bytes_type(collection_registry)))
@@ -742,10 +747,12 @@ fn mir_type_ref(
         Some(match base {
             mir::Type::Scalar(ty) => mir::Type::NullableScalar(ty),
             mir::Type::String => mir::Type::NullableString,
+            mir::Type::Mixed => mir::Type::NullableMixed,
             mir::Type::Class(class) => mir::Type::NullableClass(class),
             mir::Type::Collection(_) => return None,
             mir::Type::NullableScalar(_)
             | mir::Type::NullableString
+            | mir::Type::NullableMixed
             | mir::Type::NullableClass(_) => return None,
         })
     } else {
@@ -765,12 +772,14 @@ fn field_type(ty: mir::Type) -> Option<FieldType> {
         mir::Type::Scalar(mir::ScalarType::Float(ty)) => Some(FieldType::Float(ty)),
         mir::Type::Scalar(mir::ScalarType::Bool) => Some(FieldType::Bool),
         mir::Type::String => Some(FieldType::String),
+        mir::Type::Mixed => Some(FieldType::Mixed),
         mir::Type::NullableScalar(mir::ScalarType::Integer(ty)) => {
             Some(FieldType::NullableInteger(ty))
         }
         mir::Type::NullableScalar(mir::ScalarType::Float(ty)) => Some(FieldType::NullableFloat(ty)),
         mir::Type::NullableScalar(mir::ScalarType::Bool) => Some(FieldType::NullableBool),
         mir::Type::NullableString => Some(FieldType::NullableString),
+        mir::Type::NullableMixed => Some(FieldType::NullableMixed),
         mir::Type::Class(class) => Some(FieldType::Class(class)),
         mir::Type::NullableClass(class) => Some(FieldType::NullableClass(class)),
         mir::Type::Collection(_) => Some(FieldType::Collection),
@@ -1479,9 +1488,10 @@ fn lower_collection_foreach_in_scope(
                     value: foreach_local_rvalue(value_local, definition.value)?,
                 });
             }
-            mir::Type::Class(_) | mir::Type::Collection(_) => {}
+            mir::Type::Class(_) | mir::Type::Mixed | mir::Type::Collection(_) => {}
             mir::Type::NullableScalar(_)
             | mir::Type::NullableString
+            | mir::Type::NullableMixed
             | mir::Type::NullableClass(_) => {
                 return Err(vec![unsupported(
                     foreach.span,
@@ -1568,6 +1578,11 @@ fn collection_value_rvalue(
             index: Box::new(index),
             transfer: false,
         })),
+        mir::Type::Mixed => Ok(mir::Rvalue::Mixed(mir::MixedExpression::CollectionIndex {
+            collection,
+            index: Box::new(index),
+            transfer: false,
+        })),
         mir::Type::Collection(nested) => {
             Ok(mir::Rvalue::Collection(mir::CollectionExpression::Index {
                 collection: nested,
@@ -1576,12 +1591,13 @@ fn collection_value_rvalue(
                 transfer: false,
             }))
         }
-        mir::Type::NullableScalar(_) | mir::Type::NullableString | mir::Type::NullableClass(_) => {
-            Err(vec![unsupported(
-                Span::new(0, 0),
-                "nullable collection elements are deferred beyond Stage 23 Slice 1",
-            )])
-        }
+        mir::Type::NullableScalar(_)
+        | mir::Type::NullableString
+        | mir::Type::NullableMixed
+        | mir::Type::NullableClass(_) => Err(vec![unsupported(
+            Span::new(0, 0),
+            "nullable collection elements are deferred beyond Stage 23 Slice 3",
+        )]),
     }
 }
 
@@ -1592,9 +1608,13 @@ fn foreach_local_rvalue(local: mir::LocalId, ty: mir::Type) -> DiagnosticResult<
             mir::Operand::Local(local),
         ))),
         mir::Type::String => Ok(mir::Rvalue::String(mir::StringExpression::Local(local))),
+        mir::Type::Mixed => Ok(mir::Rvalue::Mixed(mir::MixedExpression::Local {
+            local,
+            transfer: false,
+        })),
         _ => Err(vec![unsupported(
             Span::new(0, 0),
-            "this foreach binding cannot be written back in Stage 23 Slice 1",
+            "this foreach binding cannot be written back in Stage 23 Slice 3",
         )]),
     }
 }
@@ -1828,6 +1848,7 @@ struct LoweringContext<'semantic> {
 #[derive(Clone, Copy)]
 enum DropObligation {
     Class(mir::LocalId, ClassId),
+    Mixed(mir::LocalId),
     Collection(mir::LocalId, mir::CollectionTypeId),
 }
 
@@ -1972,6 +1993,7 @@ impl<'semantic> LoweringContext<'semantic> {
         for obligation in cleanup {
             self.push_statement(match obligation {
                 DropObligation::Class(local, class) => mir::Statement::DropClass { local, class },
+                DropObligation::Mixed(local) => mir::Statement::DropMixed { local },
                 DropObligation::Collection(local, collection) => {
                     mir::Statement::DropCollection { local, collection }
                 }
@@ -2002,7 +2024,11 @@ impl<'semantic> LoweringContext<'semantic> {
     fn declare_user_local(&mut self, name: &str, writable: bool, ty: mir::Type) -> mir::LocalId {
         let owned = matches!(
             ty,
-            mir::Type::Class(_) | mir::Type::NullableClass(_) | mir::Type::Collection(_)
+            mir::Type::Class(_)
+                | mir::Type::NullableClass(_)
+                | mir::Type::Mixed
+                | mir::Type::NullableMixed
+                | mir::Type::Collection(_)
         );
         self.declare_user_local_owned(name, writable, ty, owned)
     }
@@ -2032,6 +2058,7 @@ impl<'semantic> LoweringContext<'semantic> {
                 mir::Type::Class(class) | mir::Type::NullableClass(class) => {
                     DropObligation::Class(id, class)
                 }
+                mir::Type::Mixed | mir::Type::NullableMixed => DropObligation::Mixed(id),
                 mir::Type::Collection(collection) => DropObligation::Collection(id, collection),
                 _ => unreachable!("only move locals may own native drop obligations"),
             };
@@ -2119,6 +2146,7 @@ impl<'semantic> LoweringContext<'semantic> {
             mir::Type::Class(class) | mir::Type::NullableClass(class) => {
                 DropObligation::Class(id, class)
             }
+            mir::Type::Mixed | mir::Type::NullableMixed => DropObligation::Mixed(id),
             mir::Type::Collection(collection) => DropObligation::Collection(id, collection),
             _ => unreachable!("only move locals may own native drop obligations"),
         };
@@ -2276,6 +2304,7 @@ impl<'semantic> LoweringContext<'semantic> {
         let base = scalar_type_ref(&plain)
             .map(mir::Type::Scalar)
             .or_else(|| is_plain_type(&plain, "string").then_some(mir::Type::String))
+            .or_else(|| is_plain_type(&plain, "mixed").then_some(mir::Type::Mixed))
             .or_else(|| {
                 let key = match plain.name.as_str() {
                     "Bytes" if plain.args.is_empty() => (
@@ -2321,10 +2350,12 @@ impl<'semantic> LoweringContext<'semantic> {
             Some(match base {
                 mir::Type::Scalar(ty) => mir::Type::NullableScalar(ty),
                 mir::Type::String => mir::Type::NullableString,
+                mir::Type::Mixed => mir::Type::NullableMixed,
                 mir::Type::Class(class) => mir::Type::NullableClass(class),
                 mir::Type::Collection(_) => return None,
                 mir::Type::NullableScalar(_)
                 | mir::Type::NullableString
+                | mir::Type::NullableMixed
                 | mir::Type::NullableClass(_) => return None,
             })
         } else {
@@ -2399,6 +2430,23 @@ impl<'semantic> LoweringContext<'semantic> {
             .get(&(expr.span().start, expr.span().end))
     }
 
+    fn exact_mixed_local(&self, expr: &hir::Expr) -> Option<(mir::LocalId, mir::Type)> {
+        let hir::Expr::Variable { name, span } = unparenthesized_place(expr) else {
+            return None;
+        };
+        let local = self.lookup_local(name, *span).ok()?;
+        if !matches!(
+            self.local_type(local),
+            mir::Type::Mixed | mir::Type::NullableMixed
+        ) {
+            return None;
+        }
+        let crate::narrowing::Fact::Exact(type_ref) = self.flow_fact(expr)? else {
+            return None;
+        };
+        self.native_type_ref(type_ref).map(|ty| (local, ty))
+    }
+
     fn coalesce_selection(&self, left: &hir::Expr) -> CoalesceSelection {
         match self.flow_fact(left) {
             Some(crate::narrowing::Fact::Null) => CoalesceSelection::Right,
@@ -2417,6 +2465,7 @@ impl<'semantic> LoweringContext<'semantic> {
             ResolvedType::Float(ty) => Some(mir::Type::Scalar(mir::ScalarType::Float(*ty))),
             ResolvedType::Bool => Some(mir::Type::Scalar(mir::ScalarType::Bool)),
             ResolvedType::String => Some(mir::Type::String),
+            ResolvedType::Mixed => Some(mir::Type::Mixed),
             ResolvedType::Bytes => self
                 .collection_registry
                 .ids
@@ -2469,13 +2518,11 @@ impl<'semantic> LoweringContext<'semantic> {
             ResolvedType::Nullable(inner) => match self.mir_resolved_type(inner)? {
                 mir::Type::Scalar(ty) => Some(mir::Type::NullableScalar(ty)),
                 mir::Type::String => Some(mir::Type::NullableString),
+                mir::Type::Mixed => Some(mir::Type::NullableMixed),
                 mir::Type::Class(class) => Some(mir::Type::NullableClass(class)),
                 _ => None,
             },
-            ResolvedType::Void
-            | ResolvedType::Null
-            | ResolvedType::Mixed
-            | ResolvedType::Unsupported => None,
+            ResolvedType::Void | ResolvedType::Null | ResolvedType::Unsupported => None,
         }
     }
 
@@ -2483,8 +2530,10 @@ impl<'semantic> LoweringContext<'semantic> {
         match self.local_type(id) {
             mir::Type::Scalar(ty) => Ok(ty),
             mir::Type::String
+            | mir::Type::Mixed
             | mir::Type::NullableScalar(_)
             | mir::Type::NullableString
+            | mir::Type::NullableMixed
             | mir::Type::Class(_)
             | mir::Type::NullableClass(_)
             | mir::Type::Collection(_) => Err(vec![Diagnostic::new(
@@ -2590,6 +2639,24 @@ fn lower_var_decl(decl: &hir::VarDecl, context: &mut LoweringContext) -> Diagnos
         context.push_statement(mir::Statement::AssignLocal {
             target: local,
             value: mir::Rvalue::NullableClass(value),
+        });
+        return Ok(());
+    }
+    if ty == mir::Type::Mixed {
+        let value = lower_mixed_expression(&decl.initializer, true, context)?;
+        let local = context.declare_user_local_owned(&decl.name, decl.writable, ty, true);
+        context.push_statement(mir::Statement::AssignLocal {
+            target: local,
+            value: mir::Rvalue::Mixed(value),
+        });
+        return Ok(());
+    }
+    if ty == mir::Type::NullableMixed {
+        let value = lower_nullable_mixed_expression(&decl.initializer, true, context)?;
+        let local = context.declare_user_local_owned(&decl.name, decl.writable, ty, true);
+        context.push_statement(mir::Statement::AssignLocal {
+            target: local,
+            value: mir::Rvalue::NullableMixed(value),
         });
         return Ok(());
     }
@@ -2969,6 +3036,36 @@ fn lower_assignment(
         });
         return Ok(());
     }
+    if context.local_type(target) == mir::Type::Mixed {
+        if !context.local_owns(target) {
+            return Err(vec![unsupported(
+                assignment.span,
+                "this compiler version cannot replace a borrowed mixed value",
+            )]);
+        }
+        context.push_statement(mir::Statement::AssignLocal {
+            target,
+            value: mir::Rvalue::Mixed(lower_mixed_expression(&assignment.value, true, context)?),
+        });
+        return Ok(());
+    }
+    if context.local_type(target) == mir::Type::NullableMixed {
+        if !context.local_owns(target) {
+            return Err(vec![unsupported(
+                assignment.span,
+                "this compiler version cannot replace a borrowed nullable mixed value",
+            )]);
+        }
+        context.push_statement(mir::Statement::AssignLocal {
+            target,
+            value: mir::Rvalue::NullableMixed(lower_nullable_mixed_expression(
+                &assignment.value,
+                true,
+                context,
+            )?),
+        });
+        return Ok(());
+    }
     if let mir::Type::Class(class) = context.local_type(target) {
         if !context.local_owns(target) {
             return Err(vec![
@@ -3151,6 +3248,14 @@ fn lower_string_expression(
             let local = context.lookup_local(name, *span)?;
             if context.local_type(local) == mir::Type::String {
                 Ok(mir::StringExpression::Local(local))
+            } else if matches!(
+                context.local_type(local),
+                mir::Type::Mixed | mir::Type::NullableMixed
+            ) && context
+                .exact_mixed_local(expr)
+                .is_some_and(|(_, narrowed)| narrowed == mir::Type::String)
+            {
+                Ok(mir::StringExpression::MixedPayload(local))
             } else if context.local_type(local) == mir::Type::NullableString {
                 Ok(mir::StringExpression::NullableLocalAssumeNonNull(local))
             } else {
@@ -4205,12 +4310,17 @@ fn lower_display_string_expression(
         mir::Type::Scalar(_) => {
             lower_value_expression(expr, context).map(mir::StringExpression::Display)
         }
-        mir::Type::NullableScalar(_) | mir::Type::NullableString | mir::Type::NullableClass(_) => {
-            Err(vec![unsupported(
-                expr.span(),
-                "nullable values must be narrowed or defaulted before display",
-            )])
-        }
+        mir::Type::Mixed => Err(vec![unsupported(
+            expr.span(),
+            "mixed values must be narrowed before display",
+        )]),
+        mir::Type::NullableScalar(_)
+        | mir::Type::NullableString
+        | mir::Type::NullableMixed
+        | mir::Type::NullableClass(_) => Err(vec![unsupported(
+            expr.span(),
+            "nullable values must be narrowed or defaulted before display",
+        )]),
         mir::Type::Class(_) => unreachable!("class display handled above"),
         mir::Type::Collection(_) => Err(vec![unsupported(
             expr.span(),
@@ -4425,6 +4535,12 @@ fn lower_call_args_with_ownership(
             mir::Type::Collection(collection) => mir::Rvalue::Collection(
                 lower_collection_expression(arg, collection, transfers, context)?,
             ),
+            mir::Type::Mixed => {
+                mir::Rvalue::Mixed(lower_mixed_expression(arg, transfers, context)?)
+            }
+            mir::Type::NullableMixed => mir::Rvalue::NullableMixed(
+                lower_nullable_mixed_expression(arg, transfers, context)?,
+            ),
             _ => lower_rvalue_as_expected(arg, expected, context)?,
         };
         if lowered.ty() != expected {
@@ -4608,7 +4724,7 @@ fn lower_return(
             if context.has_cleanup_obligations() {
                 let result_owns = match expected {
                     mir::Type::Class(_) | mir::Type::NullableClass(_) => !borrowed_class,
-                    mir::Type::Collection(_) => true,
+                    mir::Type::Collection(_) | mir::Type::Mixed | mir::Type::NullableMixed => true,
                     _ => false,
                 };
                 let result = context.declare_return_temp(expected, result_owns);
@@ -4656,6 +4772,10 @@ fn local_rvalue(local: mir::LocalId, ty: mir::Type, transfer: bool) -> mir::Rval
         }
         mir::Type::NullableString => {
             mir::Rvalue::NullableString(mir::NullableStringExpression::Local(local))
+        }
+        mir::Type::Mixed => mir::Rvalue::Mixed(mir::MixedExpression::Local { local, transfer }),
+        mir::Type::NullableMixed => {
+            mir::Rvalue::NullableMixed(mir::NullableMixedExpression::Local { local, transfer })
         }
         mir::Type::Class(class) => mir::Rvalue::Class(mir::ClassExpression::Local {
             class,
@@ -4759,6 +4879,20 @@ fn lower_condition(
                 mir::Type::Scalar(mir::ScalarType::Bool) => Ok(mir::BoolExpression::Use {
                     operand: mir::Operand::Local(local),
                 }),
+                mir::Type::Mixed | mir::Type::NullableMixed
+                    if context
+                        .exact_mixed_local(expr)
+                        .is_some_and(|(_, narrowed)| {
+                            narrowed == mir::Type::Scalar(mir::ScalarType::Bool)
+                        }) =>
+                {
+                    Ok(mir::BoolExpression::Use {
+                        operand: mir::Operand::MixedPayload {
+                            mixed: local,
+                            tag: mir::MixedTag::Bool,
+                        },
+                    })
+                }
                 mir::Type::NullableScalar(mir::ScalarType::Bool) => Ok(mir::BoolExpression::Use {
                     operand: mir::Operand::NullablePayload(local),
                 }),
@@ -5008,7 +5142,16 @@ fn lower_null_comparison(
     } else {
         left
     };
-    let present = match context.expression_type(value)? {
+    let value_type = if let hir::Expr::Variable { name, span } = unparenthesized_place(value) {
+        if let Ok(local) = context.lookup_local(name, *span) {
+            context.local_type(local)
+        } else {
+            context.expression_type(value)?
+        }
+    } else {
+        context.expression_type(value)?
+    };
+    let present = match value_type {
         mir::Type::NullableScalar(ty) => mir::BoolExpression::NullableScalarIsPresent(Box::new(
             lower_nullable_scalar_presence_subject(value, ty, context)?,
         )),
@@ -5022,6 +5165,16 @@ fn lower_null_comparison(
         mir::Type::NullableClass(class) => mir::BoolExpression::NullableClassIsPresent(Box::new(
             lower_nullable_class_presence_subject(value, class, context)?,
         )),
+        mir::Type::NullableMixed => {
+            let present = mir::BoolExpression::NullableMixedIsPresent(Box::new(
+                lower_nullable_mixed_presence_subject(value, context)?,
+            ));
+            return Ok(if matches!(op, hir::BinaryOp::Equal) {
+                mir::BoolExpression::Not(Box::new(present))
+            } else {
+                present
+            });
+        }
         _ => {
             return Err(vec![unsupported(
                 value.span(),
@@ -5075,6 +5228,23 @@ fn lower_is_condition(
                 lower_nullable_class_presence_subject(expr, class, context)?,
             ))
         }
+        mir::Type::Mixed => mir::BoolExpression::MixedIs {
+            mixed: Box::new(lower_mixed_expression(expr, false, context)?),
+            tag: mixed_tag_for_type(tested_type, type_test_span)?,
+        },
+        mir::Type::NullableMixed => mir::BoolExpression::Binary {
+            op: mir::BoolBinaryOp::And,
+            left: Box::new(mir::BoolExpression::NullableMixedIsPresent(Box::new(
+                lower_nullable_mixed_presence_subject(expr, context)?,
+            ))),
+            right: Box::new(mir::BoolExpression::MixedIs {
+                mixed: Box::new(mir::MixedExpression::Local {
+                    local: lower_nullable_mixed_local(expr, context)?,
+                    transfer: false,
+                }),
+                tag: mixed_tag_for_type(tested_type, type_test_span)?,
+            }),
+        },
         mir::Type::Scalar(_) | mir::Type::String | mir::Type::Class(_) => {
             let evaluated = lower_concrete_is_presence(expr, value_type, context)?;
             if value_type == tested_type {
@@ -5112,6 +5282,33 @@ fn lower_is_condition(
         }
     };
     Ok(result)
+}
+
+fn lower_nullable_mixed_local(
+    expr: &hir::Expr,
+    context: &LoweringContext,
+) -> DiagnosticResult<mir::LocalId> {
+    if let hir::Expr::Variable { name, span } = unparenthesized_place(expr) {
+        let local = context.lookup_local(name, *span)?;
+        if context.local_type(local) == mir::Type::NullableMixed {
+            return Ok(local);
+        }
+    }
+    Err(vec![unsupported(
+        expr.span(),
+        "this nullable mixed expression cannot be used as a native presence subject",
+    )])
+}
+
+fn lower_nullable_mixed_presence_subject(
+    expr: &hir::Expr,
+    context: &LoweringContext,
+) -> DiagnosticResult<mir::NullableMixedExpression> {
+    let local = lower_nullable_mixed_local(expr, context)?;
+    Ok(mir::NullableMixedExpression::Local {
+        local,
+        transfer: false,
+    })
 }
 
 fn lower_nullable_scalar_presence_subject(
@@ -5199,9 +5396,13 @@ fn lower_concrete_is_presence(
                 expr, class, false, context,
             )?),
         ))),
-        mir::Type::NullableScalar(_) | mir::Type::NullableString | mir::Type::NullableClass(_) => {
-            unreachable!("concrete `is` value type")
-        }
+        mir::Type::Mixed => Ok(mir::BoolExpression::NullableMixedIsPresent(Box::new(
+            mir::NullableMixedExpression::Mixed(lower_mixed_expression(expr, false, context)?),
+        ))),
+        mir::Type::NullableScalar(_)
+        | mir::Type::NullableString
+        | mir::Type::NullableMixed
+        | mir::Type::NullableClass(_) => unreachable!("concrete `is` value type"),
         mir::Type::Collection(_) => Ok(mir::BoolExpression::Use {
             operand: mir::Operand::Scalar(mir::ScalarValue::Bool(true)),
         }),
@@ -5305,6 +5506,10 @@ fn lower_rvalue_as_expected(
         mir::Type::NullableString => {
             lower_nullable_string_expression(expr, context).map(mir::Rvalue::NullableString)
         }
+        mir::Type::Mixed => lower_mixed_expression(expr, true, context).map(mir::Rvalue::Mixed),
+        mir::Type::NullableMixed => {
+            lower_nullable_mixed_expression(expr, true, context).map(mir::Rvalue::NullableMixed)
+        }
         mir::Type::Scalar(_) => lower_value_expression(expr, context).map(mir::Rvalue::Value),
         mir::Type::Class(class) => {
             lower_class_expression(expr, class, true, context).map(mir::Rvalue::Class)
@@ -5337,7 +5542,205 @@ fn lower_rvalue_as_borrowed(
             lower_collection_expression(expr, collection, false, context)
                 .map(mir::Rvalue::Collection)
         }
+        mir::Type::Mixed => lower_mixed_expression(expr, false, context).map(mir::Rvalue::Mixed),
+        mir::Type::NullableMixed => {
+            lower_nullable_mixed_expression(expr, false, context).map(mir::Rvalue::NullableMixed)
+        }
         _ => lower_rvalue_as_expected(expr, expected, context),
+    }
+}
+
+fn lower_mixed_expression(
+    expr: &hir::Expr,
+    transfer: bool,
+    context: &LoweringContext,
+) -> DiagnosticResult<mir::MixedExpression> {
+    if let hir::Expr::Variable { name, span } = unparenthesized_place(expr) {
+        let local = context.lookup_local(name, *span)?;
+        if context.local_type(local) == mir::Type::Mixed {
+            return Ok(mir::MixedExpression::Local { local, transfer });
+        }
+        if context.local_type(local) == mir::Type::NullableMixed && !transfer {
+            return Ok(mir::MixedExpression::Local {
+                local,
+                transfer: false,
+            });
+        }
+    }
+    if matches!(
+        unparenthesized_place(expr),
+        hir::Expr::PropertyAccess { .. }
+    ) {
+        let (object, property, ty) = lower_property_place(expr, context)?;
+        if ty == mir::Type::Mixed {
+            return Ok(mir::MixedExpression::Property { object, property });
+        }
+    }
+    if let hir::Expr::FunctionCall { name, args, span } = expr {
+        let signature = context.lookup_function(name, *span)?;
+        if signature.return_type == mir::ReturnType::Value(mir::Type::Mixed) {
+            return Ok(mir::MixedExpression::Call {
+                function: signature.id,
+                args: lower_call_args(name, args, signature, *span, context)?,
+            });
+        }
+    }
+    if let hir::Expr::MethodCall {
+        object,
+        method,
+        args,
+        span,
+        ..
+    } = expr
+    {
+        let (signature, args) = lower_instance_method_call(object, method, args, *span, context)?;
+        if signature.return_type == mir::ReturnType::Value(mir::Type::Mixed) {
+            return Ok(mir::MixedExpression::Call {
+                function: signature.id,
+                args,
+            });
+        }
+    }
+    if let hir::Expr::StaticCall {
+        class_name,
+        method,
+        args,
+        span,
+    } = expr
+    {
+        let (signature, args) = lower_static_method_call(class_name, method, args, *span, context)?;
+        if signature.return_type == mir::ReturnType::Value(mir::Type::Mixed) {
+            return Ok(mir::MixedExpression::Call {
+                function: signature.id,
+                args,
+            });
+        }
+    }
+
+    match context.expression_type(expr)? {
+        mir::Type::Scalar(_) => Ok(mir::MixedExpression::BoxValue(lower_value_expression(
+            expr, context,
+        )?)),
+        mir::Type::String => Ok(mir::MixedExpression::BoxString(lower_string_expression(
+            expr, context,
+        )?)),
+        mir::Type::Class(class) => Ok(mir::MixedExpression::BoxClass(lower_class_expression(
+            expr, class, true, context,
+        )?)),
+        mir::Type::Mixed => Err(vec![unsupported(
+            expr.span(),
+            "mixed expression could not be lowered as a mixed value",
+        )]),
+        mir::Type::Collection(_) => Err(vec![Diagnostic::unsupported_stage(
+            "M1101",
+            "boxing collections, typed arrays, or Bytes into `mixed` lands after Stage 23 Slice 3",
+            expr.span(),
+        )]),
+        mir::Type::NullableScalar(_)
+        | mir::Type::NullableString
+        | mir::Type::NullableClass(_)
+        | mir::Type::NullableMixed => Err(vec![Diagnostic::unsupported_stage(
+            "M1101",
+            "boxing nullable values into `mixed` lands after Stage 23 Slice 3",
+            expr.span(),
+        )]),
+    }
+}
+
+fn mixed_tag_for_type(ty: mir::Type, span: Span) -> DiagnosticResult<mir::MixedTag> {
+    match ty {
+        mir::Type::Scalar(mir::ScalarType::Bool) => Ok(mir::MixedTag::Bool),
+        mir::Type::Scalar(mir::ScalarType::Integer(ty)) => Ok(mir::MixedTag::Integer(ty)),
+        mir::Type::Scalar(mir::ScalarType::Float(ty)) => Ok(mir::MixedTag::Float(ty)),
+        mir::Type::String => Ok(mir::MixedTag::String),
+        mir::Type::Class(class) => Ok(mir::MixedTag::Class(class)),
+        mir::Type::Mixed
+        | mir::Type::NullableMixed
+        | mir::Type::NullableScalar(_)
+        | mir::Type::NullableString
+        | mir::Type::NullableClass(_)
+        | mir::Type::Collection(_) => Err(vec![Diagnostic::unsupported_stage(
+            "M1101",
+            "only exact bool, integer, float, string, and concrete-class `is` tests unbox `mixed` in Stage 23 Slice 3",
+            span,
+        )]),
+    }
+}
+
+fn lower_nullable_mixed_expression(
+    expr: &hir::Expr,
+    transfer: bool,
+    context: &LoweringContext,
+) -> DiagnosticResult<mir::NullableMixedExpression> {
+    if context.expression_is_null(expr) {
+        return Ok(mir::NullableMixedExpression::Null);
+    }
+    match expr {
+        hir::Expr::Binary {
+            left,
+            op: hir::BinaryOp::Coalesce,
+            right,
+            ..
+        } => match context.coalesce_selection(left) {
+            CoalesceSelection::Left => lower_nullable_mixed_expression(left, transfer, context),
+            CoalesceSelection::Right => lower_nullable_mixed_expression(right, transfer, context),
+            CoalesceSelection::Dynamic => Ok(mir::NullableMixedExpression::Coalesce {
+                left: Box::new(lower_nullable_mixed_expression(left, transfer, context)?),
+                right: Box::new(lower_nullable_mixed_expression(right, transfer, context)?),
+                transfer,
+            }),
+        },
+        hir::Expr::Variable { name, span } => {
+            let local = context.lookup_local(name, *span)?;
+            match context.local_type(local) {
+                mir::Type::NullableMixed => {
+                    Ok(mir::NullableMixedExpression::Local { local, transfer })
+                }
+                mir::Type::Mixed => Ok(mir::NullableMixedExpression::Mixed(
+                    mir::MixedExpression::Local { local, transfer },
+                )),
+                _ => Ok(mir::NullableMixedExpression::Mixed(lower_mixed_expression(
+                    expr, transfer, context,
+                )?)),
+            }
+        }
+        hir::Expr::PropertyAccess { .. } => {
+            let (object, property, ty) = lower_property_place(expr, context)?;
+            match ty {
+                mir::Type::NullableMixed => {
+                    Ok(mir::NullableMixedExpression::Property { object, property })
+                }
+                mir::Type::Mixed => Ok(mir::NullableMixedExpression::Mixed(
+                    mir::MixedExpression::Property { object, property },
+                )),
+                _ => Ok(mir::NullableMixedExpression::Mixed(lower_mixed_expression(
+                    expr, transfer, context,
+                )?)),
+            }
+        }
+        hir::Expr::FunctionCall { name, args, span } => {
+            let signature = context.lookup_function(name, *span)?;
+            match signature.return_type {
+                mir::ReturnType::Value(mir::Type::NullableMixed) => {
+                    Ok(mir::NullableMixedExpression::Call {
+                        function: signature.id,
+                        args: lower_call_args(name, args, signature, *span, context)?,
+                    })
+                }
+                mir::ReturnType::Value(mir::Type::Mixed) => Ok(
+                    mir::NullableMixedExpression::Mixed(mir::MixedExpression::Call {
+                        function: signature.id,
+                        args: lower_call_args(name, args, signature, *span, context)?,
+                    }),
+                ),
+                _ => Ok(mir::NullableMixedExpression::Mixed(lower_mixed_expression(
+                    expr, transfer, context,
+                )?)),
+            }
+        }
+        _ => Ok(mir::NullableMixedExpression::Mixed(lower_mixed_expression(
+            expr, transfer, context,
+        )?)),
     }
 }
 
@@ -5727,6 +6130,11 @@ fn collection_remove_at_rvalue(
             index: Box::new(index),
             transfer: true,
         })),
+        mir::Type::Mixed => Ok(mir::Rvalue::Mixed(mir::MixedExpression::CollectionIndex {
+            collection,
+            index: Box::new(index),
+            transfer: true,
+        })),
         mir::Type::Collection(nested) => {
             Ok(mir::Rvalue::Collection(mir::CollectionExpression::Index {
                 collection: nested,
@@ -5735,12 +6143,13 @@ fn collection_remove_at_rvalue(
                 transfer: true,
             }))
         }
-        mir::Type::NullableScalar(_) | mir::Type::NullableString | mir::Type::NullableClass(_) => {
-            Err(vec![unsupported(
-                Span::new(0, 0),
-                "removing nullable collection elements is deferred beyond Stage 23 Slice 1",
-            )])
-        }
+        mir::Type::NullableScalar(_)
+        | mir::Type::NullableString
+        | mir::Type::NullableMixed
+        | mir::Type::NullableClass(_) => Err(vec![unsupported(
+            Span::new(0, 0),
+            "removing nullable collection elements is deferred beyond Stage 23 Slice 3",
+        )]),
     }
 }
 
@@ -6155,9 +6564,15 @@ fn nullable_collection_access_rvalue(
                 access,
             },
         )),
+        mir::Type::Mixed => Err(vec![Diagnostic::unsupported_stage(
+            "M1101",
+            "nullable accessors returning `?mixed` from collections land with the next mixed collection slice",
+            object.span(),
+        )]),
         mir::Type::Collection(_)
         | mir::Type::NullableScalar(_)
         | mir::Type::NullableString
+        | mir::Type::NullableMixed
         | mir::Type::NullableClass(_) => Err(vec![unsupported(
             object.span(),
             "discarding this nullable collection element type is not yet supported",
@@ -6169,7 +6584,11 @@ fn lower_discarded_rvalue(value: mir::Rvalue, context: &mut LoweringContext) {
     let ty = value.ty();
     let owned = matches!(
         ty,
-        mir::Type::Class(_) | mir::Type::NullableClass(_) | mir::Type::Collection(_)
+        mir::Type::Class(_)
+            | mir::Type::NullableClass(_)
+            | mir::Type::Mixed
+            | mir::Type::NullableMixed
+            | mir::Type::Collection(_)
     );
     let local = context.declare_return_temp(ty, owned);
     context.push_statement(mir::Statement::AssignLocal {
@@ -6182,6 +6601,9 @@ fn lower_discarded_rvalue(value: mir::Rvalue, context: &mut LoweringContext) {
         }
         mir::Type::Collection(collection) => {
             context.push_statement(mir::Statement::DropCollection { local, collection });
+        }
+        mir::Type::Mixed | mir::Type::NullableMixed => {
+            context.push_statement(mir::Statement::DropMixed { local });
         }
         mir::Type::Scalar(_)
         | mir::Type::String
@@ -6329,6 +6751,17 @@ fn lower_class_expression(
                     Ok(mir::ClassExpression::NullableLocalAssumeNonNull {
                         class: expected,
                         local,
+                        transfer,
+                    })
+                }
+                mir::Type::Mixed | mir::Type::NullableMixed
+                    if context
+                        .exact_mixed_local(expr)
+                        .is_some_and(|(_, narrowed)| narrowed == mir::Type::Class(expected)) =>
+                {
+                    Ok(mir::ClassExpression::MixedPayload {
+                        class: expected,
+                        mixed: local,
                         transfer,
                     })
                 }
@@ -6719,6 +7152,21 @@ fn lower_float_expression(
                 mir::Type::Scalar(mir::ScalarType::Float(local_ty)) if local_ty == ty => {
                     Ok(local_float_expression(local, ty))
                 }
+                mir::Type::Mixed | mir::Type::NullableMixed
+                    if context
+                        .exact_mixed_local(expr)
+                        .is_some_and(|(_, narrowed)| {
+                            narrowed == mir::Type::Scalar(mir::ScalarType::Float(ty))
+                        }) =>
+                {
+                    Ok(mir::FloatExpression::Use {
+                        ty,
+                        operand: mir::Operand::MixedPayload {
+                            mixed: local,
+                            tag: mir::MixedTag::Float(ty),
+                        },
+                    })
+                }
                 mir::Type::NullableScalar(mir::ScalarType::Float(local_ty)) if local_ty == ty => {
                     Ok(mir::FloatExpression::Use {
                         ty,
@@ -6998,6 +7446,21 @@ fn lower_integer_expression(
             match context.local_type(local) {
                 mir::Type::Scalar(mir::ScalarType::Integer(local_ty)) if local_ty == ty => {
                     Ok(local_integer_expression(local, ty))
+                }
+                mir::Type::Mixed | mir::Type::NullableMixed
+                    if context
+                        .exact_mixed_local(expr)
+                        .is_some_and(|(_, narrowed)| {
+                            narrowed == mir::Type::Scalar(mir::ScalarType::Integer(ty))
+                        }) =>
+                {
+                    Ok(mir::IntegerExpression::Use {
+                        ty,
+                        operand: mir::Operand::MixedPayload {
+                            mixed: local,
+                            tag: mir::MixedTag::Integer(ty),
+                        },
+                    })
                 }
                 mir::Type::NullableScalar(mir::ScalarType::Integer(local_ty))
                     if local_ty == ty =>

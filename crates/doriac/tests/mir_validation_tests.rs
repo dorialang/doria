@@ -80,6 +80,50 @@ fn shared_validator_rejects_noncanonical_bytes_storage() {
 }
 
 #[test]
+fn shared_validator_requires_exact_is_proof_for_mixed_payload_reads() {
+    let mut program = valid_void_program();
+    program.functions[0].return_type =
+        ReturnType::Value(Type::Scalar(ScalarType::Integer(IntegerType::Int64)));
+    program.functions[0].locals.push(Local {
+        id: LocalId(0),
+        name: "value".to_string(),
+        ty: Type::Mixed,
+        writable: false,
+        owned: true,
+        synthetic: false,
+    });
+    program.functions[0].blocks[0]
+        .statements
+        .push(Statement::AssignLocal {
+            target: LocalId(0),
+            value: Rvalue::Mixed(doriac::mir::MixedExpression::BoxValue(
+                ValueExpression::Integer(doriac::mir::IntegerExpression::Use {
+                    ty: IntegerType::Int64,
+                    operand: Operand::Scalar(ScalarValue::Integer(IntegerValue::from_bits(
+                        IntegerType::Int64,
+                        1,
+                    ))),
+                }),
+            )),
+        });
+    program.functions[0].blocks[0].terminator = Terminator::Return(Rvalue::Value(
+        ValueExpression::Integer(doriac::mir::IntegerExpression::Use {
+            ty: IntegerType::Int64,
+            operand: Operand::MixedPayload {
+                mixed: LocalId(0),
+                tag: doriac::mir::MixedTag::Integer(IntegerType::Int64),
+            },
+        }),
+    ));
+
+    let error = doriac::mir_validation::validate_program(&program)
+        .expect_err("mixed payload reads require a dominating exact is proof");
+    assert!(error
+        .message
+        .contains("without a dominating exact `is` proof"));
+}
+
+#[test]
 fn shared_validator_limits_explicit_string_drops_to_synthetic_temporaries() {
     let mut program = valid_void_program();
     program.functions[0].locals.push(Local {

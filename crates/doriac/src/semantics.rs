@@ -3317,7 +3317,7 @@ impl<'program> Checker<'program> {
             } => {
                 self.check_expr(left, scopes, method_context);
                 self.check_expr(right, scopes, method_context);
-                self.check_mixed_binary_operands(left, right, *span, scopes, method_context);
+                self.check_mixed_binary_operands(left, op, right, *span, scopes, method_context);
                 self.check_binary_operands(left, op, right, *span, scopes, method_context);
             }
             Expr::Range {
@@ -4130,11 +4130,18 @@ impl<'program> Checker<'program> {
     fn check_mixed_binary_operands(
         &mut self,
         left: &Expr,
+        op: &BinaryOp,
         right: &Expr,
         span: Span,
         scopes: &ScopeStack,
         method_context: Option<&MethodContext>,
     ) {
+        if matches!(op, BinaryOp::Coalesce)
+            || (matches!(op, BinaryOp::Equal | BinaryOp::NotEqual)
+                && (Self::is_null_literal(left) || Self::is_null_literal(right)))
+        {
+            return;
+        }
         if self.has_mixed_operand(left, right, scopes, method_context) {
             self.report_mixed_operation(span, "operator");
         }
@@ -5908,6 +5915,7 @@ impl<'program> Checker<'program> {
                 | TypeKind::Float(_)
                 | TypeKind::String
                 | TypeKind::Bool
+                | TypeKind::Mixed
                 | TypeKind::Class(_) => self.types.intern(TypeKind::Nullable(inner)),
                 TypeKind::Bytes
                 | TypeKind::TypedArray(_)
@@ -5922,7 +5930,6 @@ impl<'program> Checker<'program> {
                 ),
                 TypeKind::Void
                 | TypeKind::Null
-                | TypeKind::Mixed
                 | TypeKind::Nullable(_)
                 | TypeKind::Unknown
                 | TypeKind::Heterogeneous
@@ -6388,6 +6395,11 @@ impl<'program> Checker<'program> {
         match (target_kind, value_kind) {
             (TypeKind::Heterogeneous, _) | (_, TypeKind::Heterogeneous) => false,
             (TypeKind::Mixed, _) => true,
+            (TypeKind::Nullable(target), TypeKind::Mixed)
+                if matches!(self.types.kind(target), TypeKind::Mixed) =>
+            {
+                true
+            }
             (_, TypeKind::Mixed) => false,
             (TypeKind::Unknown, _) | (_, TypeKind::Unknown) => true,
             (TypeKind::Nullable(_), TypeKind::Null) => true,
@@ -7377,7 +7389,9 @@ impl<'program> Checker<'program> {
     fn exact_type_test_can_match(&self, value: TypeId, tested: TypeId) -> bool {
         match self.types.kind(value).clone() {
             TypeKind::Mixed | TypeKind::Unknown => true,
-            TypeKind::Nullable(inner) => inner == tested,
+            TypeKind::Nullable(inner) => {
+                inner == tested || matches!(self.types.kind(inner), TypeKind::Mixed)
+            }
             _ => value == tested,
         }
     }

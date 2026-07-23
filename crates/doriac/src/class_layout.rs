@@ -24,6 +24,8 @@ pub enum FieldType {
     NullableFloat(FloatType),
     NullableBool,
     NullableString,
+    Mixed,
+    NullableMixed,
     Class(ClassId),
     NullableClass(ClassId),
     Collection,
@@ -100,6 +102,8 @@ pub const fn field_size_align(ty: FieldType, pointer_size: u32) -> (u32, u32) {
         | FieldType::NullableBool
         | FieldType::NullableString => (pointer_size * 2, pointer_size),
         FieldType::String
+        | FieldType::Mixed
+        | FieldType::NullableMixed
         | FieldType::Class(_)
         | FieldType::NullableClass(_)
         | FieldType::Collection => (pointer_size, pointer_size),

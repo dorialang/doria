@@ -370,25 +370,25 @@ function main(): void
 }
 
 #[test]
-fn runtime_mixed_collection_values_remain_at_stage23_slice3() {
-    let diagnostics = doriac::lower_source_to_mir(
+fn runtime_mixed_collection_values_lower_to_stage23_slice3_boxes() {
+    let program = doriac::lower_source_to_mir(
         "stage23-mixed-collection.doria",
         r#"
 function main(): void
 {
     List<mixed> $values = [1];
+    foreach ($values as mixed $value) {
+        if ($value is int) {
+            echo "{$value}";
+        }
+    }
 }
 "#,
     )
-    .expect_err("runtime mixed collection elements require the Slice 3 box");
-    let boundary = diagnostics
-        .iter()
-        .find(|diagnostic| diagnostic.code == "M1101")
-        .unwrap_or_else(|| panic!("expected a native-stage diagnostic: {diagnostics:#?}"));
-    assert!(boundary.message.contains("Stage 23 Slice 3"));
-    assert!(!diagnostics
-        .iter()
-        .any(|diagnostic| diagnostic.code.starts_with('P')));
+    .expect("runtime mixed collection elements should lower after Slice 3");
+    let output = doriac::mir_interpreter::interpret(&program)
+        .expect("runtime mixed collection elements should execute");
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "1");
 }
 
 #[test]

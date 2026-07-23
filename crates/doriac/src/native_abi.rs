@@ -42,6 +42,11 @@ pub const STRING_FROM_F64: &str = "dr_v1_string_from_f64";
 pub const STRING_FROM_BOOL: &str = "dr_v1_string_from_bool";
 pub const CLASS_ALLOCATE: &str = "dr_v1_class_allocate";
 pub const CLASS_FREE: &str = "dr_v1_class_free";
+pub const MIXED_NEW: &str = "dr_v1_mixed_new";
+pub const MIXED_FREE: &str = "dr_v1_mixed_free";
+pub const MIXED_TAG: &str = "dr_v1_mixed_tag";
+pub const MIXED_TYPE_ID: &str = "dr_v1_mixed_type_id";
+pub const MIXED_PAYLOAD: &str = "dr_v1_mixed_payload";
 pub const COLLECTION_NEW: &str = "dr_v1_collection_new";
 pub const COLLECTION_FREE: &str = "dr_v1_collection_free";
 pub const COLLECTION_LENGTH: &str = "dr_v1_collection_length";
@@ -66,6 +71,20 @@ pub const COLLECTION_COMPARE_WORD: u8 = 0;
 pub const COLLECTION_COMPARE_STRING: u8 = 1;
 pub const COLLECTION_COMPARE_FLOAT32: u8 = 2;
 pub const COLLECTION_COMPARE_FLOAT64: u8 = 3;
+
+pub const MIXED_TAG_BOOL: u8 = 1;
+pub const MIXED_TAG_INT8: u8 = 2;
+pub const MIXED_TAG_INT16: u8 = 3;
+pub const MIXED_TAG_INT32: u8 = 4;
+pub const MIXED_TAG_INT64: u8 = 5;
+pub const MIXED_TAG_UINT8: u8 = 6;
+pub const MIXED_TAG_UINT16: u8 = 7;
+pub const MIXED_TAG_UINT32: u8 = 8;
+pub const MIXED_TAG_UINT64: u8 = 9;
+pub const MIXED_TAG_FLOAT32: u8 = 10;
+pub const MIXED_TAG_FLOAT64: u8 = 11;
+pub const MIXED_TAG_STRING: u8 = 12;
+pub const MIXED_TAG_CLASS: u8 = 13;
 
 pub fn function_symbol(function: &mir::Function) -> String {
     let sanitized = function
