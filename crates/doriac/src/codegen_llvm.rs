@@ -1582,9 +1582,9 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         };
         let definition = self.collection_definition(collection_type)?.clone();
         let collection_value = self.collection_pointer(collection)?;
+        let index = self.lower_rvalue(index)?;
         let value = self.lower_rvalue(value)?;
         if definition.kind == mir::CollectionKind::Bytes {
-            let index = self.lower_rvalue(index)?.into_int_value();
             let _ = self.call_runtime(
                 BYTES_SET,
                 &[
@@ -1597,7 +1597,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 &[
                     self.current_frame.into(),
                     collection_value.into(),
-                    index.into(),
+                    index.into_int_value().into(),
                     value.into_int_value().into(),
                 ],
             )?;
@@ -1605,16 +1605,14 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         }
         let value_word = self.value_to_collection_word(value, definition.value)?;
         if let Some(key_type) = definition.key {
-            let key = self.lower_rvalue(index)?;
             self.lower_dictionary_set_value(
                 collection_value,
-                key,
+                index,
                 key_type,
                 value,
                 definition.value,
             )?;
         } else {
-            let index = self.lower_rvalue(index)?.into_int_value();
             let old_word = self
                 .call_runtime(
                     COLLECTION_SET_AT,
@@ -1628,7 +1626,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     &[
                         self.current_frame.into(),
                         collection_value.into(),
-                        index.into(),
+                        index.into_int_value().into(),
                         value_word.into(),
                     ],
                 )?

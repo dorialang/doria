@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::backend::BackendError;
+use crate::builtins::Builtin;
 use crate::const_eval::{ConstKey, ConstValue, Evaluation, ParameterDefaultKey};
 use crate::diagnostics::Diagnostic;
 use crate::format_string::{self, FormatConversion, FormatPiece};
@@ -8,11 +9,12 @@ use crate::hir::*;
 use crate::numeric::{parse_decimal_magnitude, FloatType, IntegerType};
 use crate::semantics::SemanticInfo;
 use crate::source::Span;
-use crate::types::TypeRef;
+use crate::types::{ResolvedType, TypeRef};
 
 const PHP_INTEGER_UNSUPPORTED_CODE: &str = "B1301";
 const PHP_OWNERSHIP_UNSUPPORTED_CODE: &str = "B1901";
 const PHP_CONSTANT_UNSUPPORTED_CODE: &str = "B2001";
+const PHP_COLLECTION_UNSUPPORTED_CODE: &str = "B2301";
 
 pub fn generate(program: &Program) -> Result<String, BackendError> {
     validate_program(program)?;
@@ -330,6 +332,12 @@ fn is_move_type(ty: &TypeRef, semantic_info: &SemanticInfo) -> bool {
 }
 
 fn validate_type(ty: &TypeRef, span: Span) -> Result<(), BackendError> {
+    if ty.name == "Bytes" {
+        return Err(unsupported_collection_shape(
+            span,
+            "the native `Bytes` runtime representation",
+        ));
+    }
     if let Some(integer) = IntegerType::from_source_name(&ty.name) {
         if !integer.is_default_int() {
             return Err(unsupported_integer_shape(
@@ -414,7 +422,17 @@ fn validate_statement(statement: &Stmt, semantic_info: &SemanticInfo) -> Result<
         }
         Stmt::Break { .. } | Stmt::Continue { .. } => Ok(()),
         Stmt::Foreach(foreach) => {
-            validate_expr(&foreach.iterable, semantic_info)?;
+            if foreach.value.writable {
+                return Err(unsupported_collection_shape(
+                    foreach.span,
+                    "writable collection element iteration",
+                ));
+            }
+            if let Some((dictionary, _)) = dictionary_foreach_projection(&foreach.iterable) {
+                validate_expr(dictionary, semantic_info)?;
+            } else {
+                validate_expr(&foreach.iterable, semantic_info)?;
+            }
             if let Some(key) = &foreach.key {
                 if let Some(ty) = &key.ty {
                     validate_type(ty, foreach.span)?;
@@ -525,28 +543,90 @@ fn validate_expr(expr: &Expr, semantic_info: &SemanticInfo) -> Result<(), Backen
             Ok(())
         }
         Expr::Index {
-            collection, index, ..
+            collection,
+            index,
+            span,
         } => {
             validate_expr(collection, semantic_info)?;
-            validate_expr(index, semantic_info)
+            validate_expr(index, semantic_info)?;
+            if semantic_info
+                .expression_type(collection.span())
+                .is_some_and(is_stage23_runtime_type)
+            {
+                return Err(unsupported_collection_shape(
+                    *span,
+                    "assertive collection indexed access",
+                ));
+            }
+            Ok(())
         }
-        Expr::PropertyAccess { object, .. } => validate_expr(object, semantic_info),
-        Expr::MethodCall { object, args, .. } => {
+        Expr::PropertyAccess {
+            object,
+            property,
+            span,
+            ..
+        } => {
             validate_expr(object, semantic_info)?;
-            validate_exprs(args, semantic_info)
+            if semantic_info
+                .expression_type(object.span())
+                .is_some_and(is_stage23_runtime_type)
+            {
+                return Err(unsupported_collection_shape(
+                    *span,
+                    format!("collection property `{property}`"),
+                ));
+            }
+            Ok(())
+        }
+        Expr::MethodCall {
+            object,
+            method,
+            args,
+            span,
+            ..
+        } => {
+            validate_expr(object, semantic_info)?;
+            validate_exprs(args, semantic_info)?;
+            if semantic_info
+                .expression_type(object.span())
+                .is_some_and(is_stage23_runtime_type)
+            {
+                return Err(unsupported_collection_shape(
+                    *span,
+                    format!("collection method `{method}`"),
+                ));
+            }
+            Ok(())
         }
         Expr::FunctionCall { name, args, .. } if matches!(name.as_str(), "sprintf" | "printf") => {
             validate_php_format_call(args, semantic_info)
         }
-        Expr::FunctionCall { args, .. } | Expr::New { args, .. } => {
-            validate_exprs(args, semantic_info)
+        Expr::FunctionCall {
+            name, args, span, ..
+        } => {
+            validate_exprs(args, semantic_info)?;
+            if Builtin::from_name(name).is_some_and(Builtin::uses_bytes) {
+                return Err(unsupported_collection_shape(
+                    *span,
+                    format!("byte I/O intrinsic `{name}`"),
+                ));
+            }
+            Ok(())
         }
+        Expr::New { args, .. } => validate_exprs(args, semantic_info),
         Expr::StaticCall {
             class_name,
             method,
             args,
             span,
         } => {
+            if matches!(class_name.as_str(), "Bytes" | "Set") {
+                validate_exprs(args, semantic_info)?;
+                return Err(unsupported_collection_shape(
+                    *span,
+                    format!("collection constructor `{class_name}::{method}`"),
+                ));
+            }
             if (class_name == "Int" && method == "toFloat")
                 || (class_name == "Float" && method == "toInt")
             {
@@ -836,6 +916,29 @@ fn unsupported_constant_shape(span: Span, feature: impl Into<String>) -> Backend
         ),
         span,
     )])
+}
+
+fn unsupported_collection_shape(span: Span, feature: impl Into<String>) -> BackendError {
+    BackendError::from_diagnostics(vec![Diagnostic::new(
+        PHP_COLLECTION_UNSUPPORTED_CODE,
+        format!(
+            "PHP compatibility backend cannot preserve {} exactly; use the `native` or `debug` target for this valid Doria program",
+            feature.into()
+        ),
+        span,
+    )])
+}
+
+fn is_stage23_runtime_type(ty: &ResolvedType) -> bool {
+    match ty {
+        ResolvedType::Bytes
+        | ResolvedType::TypedArray(_)
+        | ResolvedType::List(_)
+        | ResolvedType::Dictionary(_, _)
+        | ResolvedType::Set(_) => true,
+        ResolvedType::Nullable(inner) => is_stage23_runtime_type(inner),
+        _ => false,
+    }
 }
 
 #[derive(Debug, Default)]

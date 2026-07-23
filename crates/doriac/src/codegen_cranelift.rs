@@ -1931,9 +1931,9 @@ fn lower_collection_set(
     };
     let definition = collection_definition(resources.program, collection_type)?.clone();
     let collection_value = lower_collection_pointer(builder, collection, resources)?;
+    let index = lower_rvalue(builder, index, resources)?.single()?;
     let value = lower_rvalue(builder, value, resources)?.single()?;
     if definition.kind == mir::CollectionKind::Bytes {
-        let index = lower_rvalue(builder, index, resources)?.single()?;
         let _ = runtime_call(
             builder,
             BYTES_SET,
@@ -1946,18 +1946,16 @@ fn lower_collection_set(
     }
     let value_word = value_to_collection_word(builder, value, definition.value, pointer)?;
     if let Some(key_type) = definition.key {
-        let key = lower_rvalue(builder, index, resources)?.single()?;
         lower_dictionary_set_value(
             builder,
             collection_value,
-            key,
+            index,
             key_type,
             value,
             definition.value,
             resources,
         )?;
     } else {
-        let index = lower_rvalue(builder, index, resources)?.single()?;
         let old_word = runtime_call(
             builder,
             COLLECTION_SET_AT,

@@ -556,13 +556,27 @@ pub unsafe extern "C" fn dr_v1_write_stderr_bytes(
 pub unsafe extern "C" fn dr_v1_read_stdin_bytes(
     current_frame: *const DrStackFrameV1,
 ) -> *mut DrBytesV1 {
+    let buffered = line_io::take_buffered_input();
     let mut capacity = 4096_usize;
+    while capacity < buffered.length {
+        let Some(next) = capacity.checked_mul(2) else {
+            static MESSAGE: &[u8] = b"byte-buffer allocation failed";
+            dr_v1_panic(current_frame, MESSAGE.as_ptr(), MESSAGE.len());
+        };
+        capacity = next;
+    }
     let mut data = allocate(capacity);
     if data.is_null() {
         static MESSAGE: &[u8] = b"byte-buffer allocation failed";
         dr_v1_panic(current_frame, MESSAGE.as_ptr(), MESSAGE.len());
     }
-    let mut length = 0_usize;
+    if buffered.length != 0 {
+        ptr::copy_nonoverlapping(buffered.bytes, data, buffered.length);
+    }
+    let mut length = buffered.length;
+    if buffered.eof {
+        return bytes::from_owned(data, length);
+    }
     loop {
         if length == capacity {
             let Some(next) = capacity.checked_mul(2) else {

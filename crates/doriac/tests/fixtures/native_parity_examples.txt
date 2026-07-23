@@ -107,6 +107,7 @@ examples/native/main_stage23_bytes_nul_path_panic.doria
 examples/native/main_stage23_bytes_oob_panic.doria
 examples/native/main_stage23_bytes_ownership.doria
 examples/native/main_stage23_bytes_stdio.doria
+examples/native/main_stage23_mixed_stdin_reads.doria
 examples/native/main_string_concat_hello.doria
 examples/native/main_string_comparison_42.doria
 examples/native/main_string_local_hello.doria

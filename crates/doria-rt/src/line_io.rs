@@ -17,6 +17,30 @@ pub(crate) enum ReadLineError {
     Allocation,
 }
 
+pub(crate) struct BufferedInput {
+    pub bytes: *const u8,
+    pub length: usize,
+    pub eof: bool,
+}
+
+/// Transfers unread line-discipline bytes back to the shared stdin consumer.
+///
+/// The returned bytes remain owned by this module and must be copied before another line read.
+pub(crate) unsafe fn take_buffered_input() -> BufferedInput {
+    let length = END - START;
+    let bytes = if length == 0 {
+        ptr::null()
+    } else {
+        BUFFER.add(START)
+    };
+    START = END;
+    BufferedInput {
+        bytes,
+        length,
+        eof: EOF,
+    }
+}
+
 /// Reads one UTF-8 line above the raw standard-device layer.
 ///
 /// `Ok(None)` is EOF before bytes. A returned slice remains valid only until the next call.

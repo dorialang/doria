@@ -113,6 +113,18 @@ impl Builtin {
     pub const fn returns_owned_bytes(self) -> bool {
         matches!(self, Self::ReadFileBytes | Self::ReadStdinBytes)
     }
+
+    pub const fn uses_bytes(self) -> bool {
+        matches!(
+            self,
+            Self::ReadFileBytes
+                | Self::WriteFileBytes
+                | Self::AppendFileBytes
+                | Self::ReadStdinBytes
+                | Self::WriteStdoutBytes
+                | Self::WriteStderrBytes
+        )
+    }
 }
 
 #[cfg(test)]

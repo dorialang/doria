@@ -29,6 +29,29 @@ class Holder
     }
 }
 
+class CollectionEvaluationOrder
+{
+    static writable int $step = 0;
+
+    static function key(): string
+    {
+        if (CollectionEvaluationOrder::step != 0) {
+            panic("collection value was evaluated before its key");
+        }
+        CollectionEvaluationOrder::step = 1;
+        return "answer";
+    }
+
+    static function value(): int
+    {
+        if (CollectionEvaluationOrder::step != 1) {
+            panic("collection key was not evaluated first");
+        }
+        CollectionEvaluationOrder::step = 2;
+        return 42;
+    }
+}
+
 function main(): void
 {
     writable List<List<int>> $matrix = [[1]];
@@ -66,4 +89,8 @@ function main(): void
     if (!$nans->contains($nan)) {
         echo "nan\n";
     }
+
+    writable Dictionary<string, int> $ordered = [];
+    $ordered[CollectionEvaluationOrder::key()] = CollectionEvaluationOrder::value();
+    echo "ordered {$ordered["answer"]}\n";
 }
