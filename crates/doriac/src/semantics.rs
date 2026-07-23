@@ -780,6 +780,13 @@ impl<'program> Checker<'program> {
                 "`Displayable` is a compiler-known interface and cannot be redeclared"
                     .to_string(),
             ),
+            "Bytes" => Some(
+                "`Bytes` is the compiler-known byte-buffer type and cannot be redeclared"
+                    .to_string(),
+            ),
+            "List" | "Dictionary" | "Set" => Some(format!(
+                "`{name}` is a compiler-known collection alias and cannot be redeclared"
+            )),
             "array" => Some(
                 "`array` is not a Doria class name; use typed arrays like `T[]` or collection aliases"
                     .to_string(),
@@ -4132,6 +4139,7 @@ impl<'program> Checker<'program> {
         match self.types.kind(ty) {
             TypeKind::Nullable(inner) => self.type_is_move_type(*inner),
             TypeKind::Class(_)
+            | TypeKind::Bytes
             | TypeKind::Mixed
             | TypeKind::TypedArray(_)
             | TypeKind::List(_)
@@ -4642,9 +4650,16 @@ impl<'program> Checker<'program> {
         method_context: Option<&MethodContext>,
     ) {
         let expected = match builtin {
-            Builtin::ReadLine => Some(0),
-            Builtin::ReadFile | Builtin::WriteStderr => Some(1),
-            Builtin::WriteFile => Some(2),
+            Builtin::ReadLine | Builtin::ReadStdinBytes => Some(0),
+            Builtin::ReadFile
+            | Builtin::ReadFileBytes
+            | Builtin::WriteStderr
+            | Builtin::WriteStdoutBytes
+            | Builtin::WriteStderrBytes => Some(1),
+            Builtin::WriteFile
+            | Builtin::AppendFile
+            | Builtin::WriteFileBytes
+            | Builtin::AppendFileBytes => Some(2),
             Builtin::Sprintf | Builtin::Printf => None,
             Builtin::Panic => return self.check_panic_call(args, span, scopes, method_context),
         };
@@ -4674,9 +4689,19 @@ impl<'program> Checker<'program> {
             Builtin::ReadFile | Builtin::WriteStderr => {
                 self.require_builtin_string_arg(builtin, &args[0], scopes, method_context)
             }
-            Builtin::WriteFile => {
+            Builtin::WriteFile | Builtin::AppendFile => {
                 self.require_builtin_string_arg(builtin, &args[0], scopes, method_context);
                 self.require_builtin_string_arg(builtin, &args[1], scopes, method_context);
+            }
+            Builtin::ReadFileBytes => {
+                self.require_builtin_string_arg(builtin, &args[0], scopes, method_context);
+            }
+            Builtin::WriteFileBytes | Builtin::AppendFileBytes => {
+                self.require_builtin_string_arg(builtin, &args[0], scopes, method_context);
+                self.require_builtin_bytes_arg(builtin, &args[1], scopes, method_context);
+            }
+            Builtin::WriteStdoutBytes | Builtin::WriteStderrBytes => {
+                self.require_builtin_bytes_arg(builtin, &args[0], scopes, method_context);
             }
             Builtin::Sprintf | Builtin::Printf => {
                 let Some(Expr::String { value, span }) = args.first() else {
@@ -4754,7 +4779,28 @@ impl<'program> Checker<'program> {
                     }
                 }
             }
-            Builtin::ReadLine | Builtin::Panic => {}
+            Builtin::ReadLine | Builtin::ReadStdinBytes | Builtin::Panic => {}
+        }
+    }
+
+    fn require_builtin_bytes_arg(
+        &mut self,
+        builtin: Builtin,
+        argument: &Expr,
+        scopes: &ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) {
+        let ty = self.infer_expr_type(argument, scopes, method_context);
+        if !matches!(self.types.kind(ty), TypeKind::Bytes | TypeKind::Unknown) {
+            self.diagnostics.push(Diagnostic::new(
+                "E0453",
+                format!(
+                    "{} expects `Bytes`, got `{}`",
+                    builtin.name(),
+                    self.types.display(ty)
+                ),
+                argument.span(),
+            ));
         }
     }
 
@@ -4968,6 +5014,39 @@ impl<'program> Checker<'program> {
                     ));
                 }
             }
+            return;
+        }
+        if class_name == "Bytes" {
+            if access.member != "fromArray" {
+                self.diagnostics.push(Diagnostic::unsupported_stage(
+                    "E0524",
+                    format!(
+                        "Bytes method `Bytes::{}` is deferred to the future Bytes method-surface record",
+                        access.member
+                    ),
+                    access.span,
+                ));
+                return;
+            }
+            if args.len() != 1 {
+                self.report_argument_count_mismatch(
+                    "Bytes::fromArray",
+                    1,
+                    1,
+                    args.len(),
+                    access.span,
+                );
+                return;
+            }
+            let uint8 = self.types.intern(TypeKind::Integer(IntegerType::UInt8));
+            let expected = self.types.intern(TypeKind::TypedArray(uint8));
+            self.check_expr_assignable(
+                expected,
+                &args[0],
+                scopes,
+                method_context,
+                AssignmentDestination::Type,
+            );
             return;
         }
 
@@ -5794,7 +5873,8 @@ impl<'program> Checker<'program> {
                 | TypeKind::String
                 | TypeKind::Bool
                 | TypeKind::Class(_) => self.types.intern(TypeKind::Nullable(inner)),
-                TypeKind::TypedArray(_)
+                TypeKind::Bytes
+                | TypeKind::TypedArray(_)
                 | TypeKind::List(_)
                 | TypeKind::Dictionary(_, _)
                 | TypeKind::Set(_) => self.reject_type_ref_with_help(
@@ -5844,6 +5924,7 @@ impl<'program> Checker<'program> {
                 self.reject_type_ref(ty, span, "E0430", "`void` is only valid as a return type")
             }
             "string" => self.resolve_zero_arg_type(ty, span, TypeKind::String),
+            "Bytes" => self.resolve_zero_arg_type(ty, span, TypeKind::Bytes),
             "bool" => self.resolve_zero_arg_type(ty, span, TypeKind::Bool),
             "null" => self.reject_type_ref_with_help(
                 ty,
@@ -6493,9 +6574,17 @@ impl<'program> Checker<'program> {
                             self.types.intern(TypeKind::Nullable(string))
                         }
                         Builtin::Sprintf | Builtin::ReadFile => self.types.intern(TypeKind::String),
+                        Builtin::ReadFileBytes | Builtin::ReadStdinBytes => {
+                            self.types.intern(TypeKind::Bytes)
+                        }
                         Builtin::Printf
                         | Builtin::WriteFile
+                        | Builtin::AppendFile
                         | Builtin::WriteStderr
+                        | Builtin::WriteFileBytes
+                        | Builtin::AppendFileBytes
+                        | Builtin::WriteStdoutBytes
+                        | Builtin::WriteStderrBytes
                         | Builtin::Panic => self.types.intern(TypeKind::Void),
                     }
                 } else {
@@ -6538,6 +6627,9 @@ impl<'program> Checker<'program> {
                     if let Some(integer) = IntegerType::from_companion_name(&class_name) {
                         return self.types.intern(TypeKind::Integer(integer));
                     }
+                }
+                if class_name == "Bytes" && method == "fromArray" {
+                    return self.types.intern(TypeKind::Bytes);
                 }
                 self.classes
                     .get(&class_name)
@@ -6595,6 +6687,10 @@ impl<'program> Checker<'program> {
         let int = self.types.intern(TypeKind::Integer(IntegerType::Int64));
         match self.types.kind(collection_ty).clone() {
             TypeKind::TypedArray(value) | TypeKind::List(value) => Some((int, value)),
+            TypeKind::Bytes => {
+                let byte = self.types.intern(TypeKind::Integer(IntegerType::UInt8));
+                Some((int, byte))
+            }
             TypeKind::Dictionary(key, value) => Some((key, value)),
             TypeKind::Set(_) => None,
             _ => None,
@@ -6652,6 +6748,7 @@ impl<'program> Checker<'program> {
         let bool_ty = self.types.intern(TypeKind::Bool);
         match (self.types.kind(ty), property) {
             (TypeKind::TypedArray(_), "length") => Some(int),
+            (TypeKind::Bytes, "length") => Some(int),
             (TypeKind::List(_) | TypeKind::Dictionary(_, _) | TypeKind::Set(_), "count") => {
                 Some(int)
             }
@@ -6663,7 +6760,8 @@ impl<'program> Checker<'program> {
             }
             (TypeKind::Dictionary(_, _), "keys" | "values") => Some(self.types.unknown()),
             (
-                TypeKind::TypedArray(_)
+                TypeKind::Bytes
+                | TypeKind::TypedArray(_)
                 | TypeKind::List(_)
                 | TypeKind::Dictionary(_, _)
                 | TypeKind::Set(_),
@@ -6701,8 +6799,13 @@ impl<'program> Checker<'program> {
             (TypeKind::Set(value), "union" | "intersect" | "difference") => {
                 Some(self.types.intern(TypeKind::Set(value)))
             }
+            (TypeKind::Bytes, "toArray") => {
+                let byte = self.types.intern(TypeKind::Integer(IntegerType::UInt8));
+                Some(self.types.intern(TypeKind::TypedArray(byte)))
+            }
             (
-                TypeKind::TypedArray(_)
+                TypeKind::Bytes
+                | TypeKind::TypedArray(_)
                 | TypeKind::List(_)
                 | TypeKind::Dictionary(_, _)
                 | TypeKind::Set(_),
@@ -6724,6 +6827,7 @@ impl<'program> Checker<'program> {
         let supported = matches!(
             (self.types.kind(ty), property),
             (TypeKind::TypedArray(_), "length")
+                | (TypeKind::Bytes, "length")
                 | (
                     TypeKind::List(_) | TypeKind::Dictionary(_, _) | TypeKind::Set(_),
                     "count"
@@ -6776,7 +6880,8 @@ impl<'program> Checker<'program> {
         let kind = self.types.kind(ty).clone();
         let is_collection = matches!(
             kind,
-            TypeKind::TypedArray(_)
+            TypeKind::Bytes
+                | TypeKind::TypedArray(_)
                 | TypeKind::List(_)
                 | TypeKind::Dictionary(_, _)
                 | TypeKind::Set(_)
@@ -6804,8 +6909,10 @@ impl<'program> Checker<'program> {
                 let set = self.types.intern(TypeKind::Set(value));
                 (vec![set], false)
             }
+            (TypeKind::Bytes, "toArray") => (vec![], false),
             (
-                TypeKind::TypedArray(_)
+                TypeKind::Bytes
+                | TypeKind::TypedArray(_)
                 | TypeKind::List(_)
                 | TypeKind::Dictionary(_, _)
                 | TypeKind::Set(_),
@@ -6814,6 +6921,16 @@ impl<'program> Checker<'program> {
                 self.diagnostics.push(Diagnostic::unsupported_stage(
                     "E0521",
                     format!("collection method `{method}` requires Stage 30 closures"),
+                    span,
+                ));
+                return true;
+            }
+            (TypeKind::Bytes, _) => {
+                self.diagnostics.push(Diagnostic::unsupported_stage(
+                    "E0524",
+                    format!(
+                        "Bytes method `{method}` is deferred to the future Bytes method-surface record"
+                    ),
                     span,
                 ));
                 return true;

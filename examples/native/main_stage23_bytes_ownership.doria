@@ -1,0 +1,21 @@
+function makeBytes(): Bytes
+{
+    return Bytes::fromArray([0, 128, 255]);
+}
+
+function inspect(Bytes $contents): int
+{
+    return $contents->length;
+}
+
+function consume(take Bytes $contents): int
+{
+    return $contents->length;
+}
+
+function main(): void
+{
+    Bytes $contents = makeBytes();
+    echo "{inspect($contents)}:";
+    echo "{consume($contents)}\n";
+}

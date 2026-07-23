@@ -15,7 +15,7 @@
 - `docs/decisions/` — **0074** (Stage 17 stdio & formatted I/O), **0075** (I/O family tiers & failure-semantics migration), **0045** (runtime strings/`Bytes`/canonical display), **0006** (console/terminal — deferred), **0081** (abort-only panic runs no cleanup), **0035** (checked throw/throws direction).
 - Code (verifying claims): `crates/doriac/src/builtins.rs` (shipped intrinsic set), `crates/doriac/src/mir_lowering.rs` (echo lowering), `crates/doria-rt/src/lib.rs` (`ignore_sigpipe` → EPIPE), `crates/doria-rt/src/device_io.rs` (broken-pipe detection).
 
-**Shipped surface today:** `echo` (statement), `read_line(): ?string`, `sprintf`, `printf`, `read_file(string): string`, `write_file(string, string): void`, `write_stderr(string): void`. `read_file_bytes`/`write_file_bytes` are **planned (Stage 23), not shipped**.
+**Status at the time of this audit:** `echo` (statement), `read_line(): ?string`, `sprintf`, `printf`, `read_file(string): string`, `write_file(string, string): void`, and `write_stderr(string): void` were shipped; the byte tier was still planned. Stage 23 Slice 2 subsequently shipped `Bytes`, binary file/standard-stream I/O, and text `append_file` under the decisions recorded below.
 
 ## Already settled (item → citation)
 

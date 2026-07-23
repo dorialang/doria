@@ -11,6 +11,10 @@ use doriac::backend::NativeProfile;
 const MANIFEST: &str = include_str!("fixtures/native_parity_examples.txt");
 const BROKEN_PIPE_STDOUT: &str = include_str!("fixtures/native_io/broken_pipe_stdout.doria");
 const BROKEN_PIPE_STDERR: &str = include_str!("fixtures/native_io/broken_pipe_stderr.doria");
+const BROKEN_PIPE_STDOUT_BYTES: &str =
+    include_str!("fixtures/native_io/broken_pipe_stdout_bytes.doria");
+const BROKEN_PIPE_STDERR_BYTES: &str =
+    include_str!("fixtures/native_io/broken_pipe_stderr_bytes.doria");
 
 #[test]
 fn manifest_covers_every_native_example() {
@@ -111,9 +115,22 @@ fn enabled_native_backends_exit_cleanly_when_an_output_pipe_closes() {
         return;
     }
 
-    for (name, source, closed_stream) in [
-        ("stdout", BROKEN_PIPE_STDOUT, ClosedStream::Stdout),
-        ("stderr", BROKEN_PIPE_STDERR, ClosedStream::Stderr),
+    let binary_input = vec![0xa5; 128 * 1024];
+    for (name, source, closed_stream, stdin) in [
+        ("stdout", BROKEN_PIPE_STDOUT, ClosedStream::Stdout, &[][..]),
+        ("stderr", BROKEN_PIPE_STDERR, ClosedStream::Stderr, &[][..]),
+        (
+            "stdout-bytes",
+            BROKEN_PIPE_STDOUT_BYTES,
+            ClosedStream::Stdout,
+            binary_input.as_slice(),
+        ),
+        (
+            "stderr-bytes",
+            BROKEN_PIPE_STDERR_BYTES,
+            ClosedStream::Stderr,
+            binary_input.as_slice(),
+        ),
     ] {
         let hir = doriac::lower_source(format!("broken_pipe_{name}.doria"), source.to_string())
             .unwrap_or_else(|diagnostics| {
@@ -122,9 +139,15 @@ fn enabled_native_backends_exit_cleanly_when_an_output_pipe_closes() {
         let mir = doriac::mir_lowering::lower_program(&hir).unwrap_or_else(|diagnostics| {
             panic!("MIR rejected broken-pipe {name} fixture: {diagnostics:#?}")
         });
-        let interpreted = doriac::mir_interpreter::interpret(&mir).unwrap_or_else(|error| {
-            panic!("interpreter rejected broken-pipe {name} fixture: {error}")
-        });
+        let interpreted = doriac::mir_interpreter::interpret_with_io(
+            &mir,
+            doriac::mir_interpreter::MirIo {
+                stdin: stdin.to_vec(),
+                files: BTreeMap::new(),
+            },
+        )
+        .unwrap_or_else(|error| panic!("interpreter rejected broken-pipe {name} fixture: {error}"))
+        .output;
         assert_eq!(interpreted.exit_status, 0);
         let emitted = match closed_stream {
             ClosedStream::Stdout => &interpreted.stdout,
@@ -135,9 +158,9 @@ fn enabled_native_backends_exit_cleanly_when_an_output_pipe_closes() {
             "{name} fixture must exceed a typical pipe buffer"
         );
 
-        assert_closed_output_pipe(&mir, NativeProfile::Fast, name, closed_stream);
+        assert_closed_output_pipe(&mir, NativeProfile::Fast, name, closed_stream, stdin);
         #[cfg(feature = "llvm-backend")]
-        assert_closed_output_pipe(&mir, NativeProfile::Release, name, closed_stream);
+        assert_closed_output_pipe(&mir, NativeProfile::Release, name, closed_stream, stdin);
     }
 }
 
@@ -152,6 +175,7 @@ fn assert_closed_output_pipe(
     profile: NativeProfile,
     name: &str,
     closed_stream: ClosedStream,
+    stdin: &[u8],
 ) {
     let backend = match profile {
         NativeProfile::Fast => "Cranelift",
@@ -172,6 +196,7 @@ fn assert_closed_output_pipe(
     let mut child = retry_transient_executable_busy(|| {
         Command::new(&executable)
             .current_dir(&directory)
+            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -180,6 +205,10 @@ fn assert_closed_output_pipe(
     match closed_stream {
         ClosedStream::Stdout => drop(child.stdout.take()),
         ClosedStream::Stderr => drop(child.stderr.take()),
+    }
+    if let Some(mut child_stdin) = child.stdin.take() {
+        write_stdin_tolerating_early_close(&mut child_stdin, stdin)
+            .unwrap_or_else(|error| panic!("failed to feed {backend} {name} fixture: {error}"));
     }
     let output = child
         .wait_with_output()
@@ -472,9 +501,19 @@ impl IoFixture {
 }
 
 fn read_optional(path: &Path) -> Option<Vec<u8>> {
-    path.exists().then(|| {
-        fs::read(path).unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()))
-    })
+    if path.exists() {
+        return Some(
+            fs::read(path)
+                .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display())),
+        );
+    }
+    let encoded = path.with_file_name(format!(
+        "{}.hex",
+        path.file_name()
+            .expect("fixture path should have a file name")
+            .to_string_lossy()
+    ));
+    encoded.exists().then(|| read_hex_fixture(&encoded))
 }
 
 fn read_tree(root: &Path) -> BTreeMap<String, Vec<u8>> {
@@ -493,18 +532,47 @@ fn read_tree_into(root: &Path, directory: &Path, files: &mut BTreeMap<String, Ve
         if path.is_dir() {
             read_tree_into(root, &path, files);
         } else {
-            let relative = path
+            let mut relative = path
                 .strip_prefix(root)
                 .expect("fixture file should be under its root")
                 .to_string_lossy()
                 .replace('\\', "/");
-            files.insert(
-                relative,
+            let bytes = if relative.ends_with(".hex") {
+                relative.truncate(relative.len() - ".hex".len());
+                read_hex_fixture(&path)
+            } else {
                 fs::read(&path)
-                    .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display())),
-            );
+                    .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()))
+            };
+            files.insert(relative, bytes);
         }
     }
+}
+
+fn read_hex_fixture(path: &Path) -> Vec<u8> {
+    let source = fs::read_to_string(path)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
+    let digits = source
+        .bytes()
+        .filter(|byte| !byte.is_ascii_whitespace())
+        .collect::<Vec<_>>();
+    assert!(
+        digits.len().is_multiple_of(2),
+        "{} must contain complete hexadecimal byte pairs",
+        path.display()
+    );
+    digits
+        .chunks_exact(2)
+        .map(|pair| {
+            let high = (pair[0] as char)
+                .to_digit(16)
+                .unwrap_or_else(|| panic!("{} contains a non-hexadecimal digit", path.display()));
+            let low = (pair[1] as char)
+                .to_digit(16)
+                .unwrap_or_else(|| panic!("{} contains a non-hexadecimal digit", path.display()));
+            ((high << 4) | low) as u8
+        })
+        .collect()
 }
 
 fn is_transient_executable_busy(error: &io::Error) -> bool {

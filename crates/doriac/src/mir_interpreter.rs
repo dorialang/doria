@@ -226,6 +226,16 @@ enum EvaluationTask {
     BuildFormat(mir::FormatExpression),
     ReadFile,
     WriteFile,
+    AppendFile,
+    ReadFileBytes(mir::CollectionTypeId),
+    WriteFileBytes {
+        contents: mir::LocalId,
+        append: bool,
+    },
+    WriteStreamBytes {
+        contents: mir::LocalId,
+        stderr: bool,
+    },
     WriteStderr,
     StringConcat(usize),
     StringDisplay,
@@ -612,6 +622,28 @@ impl Interpreter<'_> {
                 frame.tasks.push(EvaluationTask::WriteFile);
                 frame.tasks.push(EvaluationTask::String(contents));
                 frame.tasks.push(EvaluationTask::String(path));
+            }
+            mir::Statement::AppendFile { path, contents } => {
+                let frame = self.current_frame_mut()?;
+                frame.tasks.push(EvaluationTask::AppendFile);
+                frame.tasks.push(EvaluationTask::String(contents));
+                frame.tasks.push(EvaluationTask::String(path));
+            }
+            mir::Statement::WriteFileBytes {
+                path,
+                contents,
+                append,
+            } => {
+                let frame = self.current_frame_mut()?;
+                frame
+                    .tasks
+                    .push(EvaluationTask::WriteFileBytes { contents, append });
+                frame.tasks.push(EvaluationTask::String(path));
+            }
+            mir::Statement::WriteStreamBytes { contents, stderr } => {
+                self.current_frame_mut()?
+                    .tasks
+                    .push(EvaluationTask::WriteStreamBytes { contents, stderr });
             }
             mir::Statement::WriteStderr(value) => {
                 let frame = self.current_frame_mut()?;
@@ -1595,6 +1627,56 @@ impl Interpreter<'_> {
                 }
                 self.files.insert(path, contents.into_bytes());
             }
+            EvaluationTask::AppendFile => {
+                let contents = self.pop_string()?;
+                let path = self.pop_string()?;
+                if path.as_bytes().contains(&0) {
+                    return Ok(StepOutcome::Panic(
+                        "file path contained an embedded NUL".to_string(),
+                    ));
+                }
+                self.files
+                    .entry(path)
+                    .or_default()
+                    .extend_from_slice(contents.as_bytes());
+            }
+            EvaluationTask::ReadFileBytes(collection) => {
+                let path = self.pop_string()?;
+                if path.as_bytes().contains(&0) {
+                    return Ok(StepOutcome::Panic(
+                        "file path contained an embedded NUL".to_string(),
+                    ));
+                }
+                let Some(contents) = self.files.get(&path).cloned() else {
+                    return Ok(StepOutcome::Panic("failed to read file".to_string()));
+                };
+                self.push_byte_collection(collection, &contents)?;
+            }
+            EvaluationTask::WriteFileBytes { contents, append } => {
+                let path = self.pop_string()?;
+                if path.as_bytes().contains(&0) {
+                    return Ok(StepOutcome::Panic(
+                        "file path contained an embedded NUL".to_string(),
+                    ));
+                }
+                let bytes = self.byte_collection(contents)?;
+                if append {
+                    self.files
+                        .entry(path)
+                        .or_default()
+                        .extend_from_slice(&bytes);
+                } else {
+                    self.files.insert(path, bytes);
+                }
+            }
+            EvaluationTask::WriteStreamBytes { contents, stderr } => {
+                let bytes = self.byte_collection(contents)?;
+                if stderr {
+                    self.stderr.extend_from_slice(&bytes);
+                } else {
+                    self.stdout.extend_from_slice(&bytes);
+                }
+            }
             EvaluationTask::WriteStderr => {
                 let value = self.pop_string()?;
                 self.stderr.extend_from_slice(value.as_bytes());
@@ -2068,6 +2150,10 @@ impl Interpreter<'_> {
                 frame.tasks.push(EvaluationTask::NullableStringCompare(op));
                 frame.tasks.push(EvaluationTask::NullableString(*right));
                 frame.tasks.push(EvaluationTask::NullableString(*left));
+            }
+            mir::BoolExpression::CollectionEqual { left, right } => {
+                let equal = self.byte_collection(left)? == self.byte_collection(right)?;
+                self.push_scalar(mir::ScalarValue::Bool(equal))?;
             }
             mir::BoolExpression::NullableScalarIsPresent(value) => {
                 let frame = self.current_frame_mut()?;
@@ -2844,6 +2930,36 @@ impl Interpreter<'_> {
                     .push(EvaluationValue::Collection(CollectionValue::new(
                         collection, entries,
                     )));
+            }
+            mir::CollectionExpression::FromBytes { collection, source }
+            | mir::CollectionExpression::BytesFromArray { collection, source } => {
+                let entries = self.collection_local(source)?.entries().clone();
+                self.current_frame_mut()?
+                    .values
+                    .push(EvaluationValue::Collection(CollectionValue::new(
+                        collection, entries,
+                    )));
+            }
+            mir::CollectionExpression::ReadFileBytes { collection, path } => {
+                let frame = self.current_frame_mut()?;
+                frame.tasks.push(EvaluationTask::ReadFileBytes(collection));
+                frame.tasks.push(EvaluationTask::String(*path));
+            }
+            mir::CollectionExpression::ReadStdinBytes { collection } => {
+                let remaining = self.stdin[self.stdin_cursor..].to_vec();
+                self.stdin_cursor = self.stdin.len();
+                self.push_byte_collection(collection, &remaining)?;
+            }
+            mir::CollectionExpression::Call {
+                collection,
+                function,
+                args,
+            } => {
+                self.queue_call(
+                    function,
+                    args,
+                    ReturnExpectation::Value(mir::Type::Collection(collection)),
+                )?;
             }
         }
         Ok(())
@@ -3877,6 +3993,59 @@ impl Interpreter<'_> {
         }
     }
 
+    fn byte_collection(&self, local: mir::LocalId) -> Result<Vec<u8>, InterpreterError> {
+        let collection = self.collection_local(local)?;
+        let definition = self
+            .program
+            .collection_types
+            .get(collection.ty.0)
+            .ok_or_else(|| InterpreterError::new("Bytes type does not exist"))?;
+        if definition.kind != mir::CollectionKind::Bytes {
+            return Err(InterpreterError::new(
+                "MIR Bytes operation used another collection",
+            ));
+        }
+        collection
+            .entries()
+            .iter()
+            .map(|(_, value)| match value {
+                LocalValue::Scalar(mir::ScalarValue::Integer(value))
+                    if value.ty == IntegerType::UInt8 =>
+                {
+                    Ok(value.unsigned_value() as u8)
+                }
+                _ => Err(InterpreterError::new(
+                    "MIR Bytes contains a non-uint8 value",
+                )),
+            })
+            .collect()
+    }
+
+    fn push_byte_collection(
+        &mut self,
+        collection: mir::CollectionTypeId,
+        bytes: &[u8],
+    ) -> Result<(), InterpreterError> {
+        let entries = bytes
+            .iter()
+            .map(|byte| {
+                (
+                    None,
+                    LocalValue::Scalar(mir::ScalarValue::Integer(
+                        IntegerValue::from_u128(IntegerType::UInt8, u128::from(*byte))
+                            .expect("u8 always fits uint8"),
+                    )),
+                )
+            })
+            .collect();
+        self.current_frame_mut()?
+            .values
+            .push(EvaluationValue::Collection(CollectionValue::new(
+                collection, entries,
+            )));
+        Ok(())
+    }
+
     fn collection_position(
         &self,
         local: mir::LocalId,
@@ -3901,11 +4070,21 @@ impl Interpreter<'_> {
                 return Err("collection index is not an integer".to_string());
             };
             let Some(index) = usize::try_from(index.signed_value()).ok() else {
-                return Err("collection index out of bounds".to_string());
+                return Err(if definition.kind == mir::CollectionKind::Bytes {
+                    "byte index out of bounds".to_string()
+                } else {
+                    "collection index out of bounds".to_string()
+                });
             };
             (index < collection.entries().len())
                 .then_some(index)
-                .ok_or_else(|| "collection index out of bounds".to_string())
+                .ok_or_else(|| {
+                    if definition.kind == mir::CollectionKind::Bytes {
+                        "byte index out of bounds".to_string()
+                    } else {
+                        "collection index out of bounds".to_string()
+                    }
+                })
         }
     }
 

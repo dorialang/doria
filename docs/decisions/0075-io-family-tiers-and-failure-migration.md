@@ -17,11 +17,12 @@ Doria's file I/O family has three deliberate tiers:
    string. Invalid bytes never enter `string`. Decision 0091 specifies the additive
    `append_file(string $path, string $contents): void` spelling without changing truncate-only
    `write_file`; its implementation lands at Stage 23.
-2. Stage 23 binary functions: `read_file_bytes(string $path, ...)` and
-   `write_file_bytes(string $path, ...)`, plus the reserved `append_file_bytes` sibling,
-   introduced with the `Bytes` move type. A file operation always requires its path; any
-   additional parameters and their complete contracts are settled in Stage 23 rather than
-   inferred early from the text API.
+2. Stage 23 binary functions: `read_file_bytes(string $path): Bytes`,
+   `write_file_bytes(string $path, Bytes $contents): void`, and
+   `append_file_bytes(string $path, Bytes $contents): void`, introduced with the `Bytes` move
+   type. These are whole-file operations; offset and length variants belong to the later stream
+   tier. The content parameters are readonly borrows, so successful writes do not consume the
+   caller's buffer.
 3. Post-Stage 29 `File` and stream objects: owned RAII resources with buffered and seekable access.
 
 Until checked errors land, Stage 17 free-function I/O failures panic with a clear message and status

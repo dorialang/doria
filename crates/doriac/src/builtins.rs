@@ -6,15 +6,17 @@ pub enum Builtin {
     Printf,
     ReadFile,
     WriteFile,
+    AppendFile,
     WriteStderr,
+    ReadFileBytes,
+    WriteFileBytes,
+    AppendFileBytes,
+    ReadStdinBytes,
+    WriteStdoutBytes,
+    WriteStderrBytes,
 }
 
-const RESERVED_FUTURE_INTRINSIC_NAMES: &[&str] = &[
-    "append_file",
-    "read_file_bytes",
-    "write_file_bytes",
-    "append_file_bytes",
-];
+const RESERVED_FUTURE_INTRINSIC_NAMES: &[&str] = &[];
 
 /// A PHP free-function spelling and its Doria naming-charter replacement.
 ///
@@ -59,7 +61,14 @@ impl Builtin {
             "printf" => Some(Self::Printf),
             "read_file" => Some(Self::ReadFile),
             "write_file" => Some(Self::WriteFile),
+            "append_file" => Some(Self::AppendFile),
             "write_stderr" => Some(Self::WriteStderr),
+            "read_file_bytes" => Some(Self::ReadFileBytes),
+            "write_file_bytes" => Some(Self::WriteFileBytes),
+            "append_file_bytes" => Some(Self::AppendFileBytes),
+            "read_stdin_bytes" => Some(Self::ReadStdinBytes),
+            "write_stdout_bytes" => Some(Self::WriteStdoutBytes),
+            "write_stderr_bytes" => Some(Self::WriteStderrBytes),
             _ => None,
         }
     }
@@ -72,15 +81,32 @@ impl Builtin {
             Self::Printf => "printf",
             Self::ReadFile => "read_file",
             Self::WriteFile => "write_file",
+            Self::AppendFile => "append_file",
             Self::WriteStderr => "write_stderr",
+            Self::ReadFileBytes => "read_file_bytes",
+            Self::WriteFileBytes => "write_file_bytes",
+            Self::AppendFileBytes => "append_file_bytes",
+            Self::ReadStdinBytes => "read_stdin_bytes",
+            Self::WriteStdoutBytes => "write_stdout_bytes",
+            Self::WriteStderrBytes => "write_stderr_bytes",
         }
     }
 
     pub const fn return_is_non_null(self) -> Option<bool> {
         match self {
-            Self::Sprintf | Self::ReadFile => Some(true),
+            Self::Sprintf | Self::ReadFile | Self::ReadFileBytes | Self::ReadStdinBytes => {
+                Some(true)
+            }
             Self::ReadLine => Some(false),
-            Self::Panic | Self::Printf | Self::WriteFile | Self::WriteStderr => None,
+            Self::Panic
+            | Self::Printf
+            | Self::WriteFile
+            | Self::AppendFile
+            | Self::WriteStderr
+            | Self::WriteFileBytes
+            | Self::AppendFileBytes
+            | Self::WriteStdoutBytes
+            | Self::WriteStderrBytes => None,
         }
     }
 }
@@ -99,10 +125,10 @@ mod tests {
     }
 
     #[test]
-    fn reserves_future_intrinsics_without_implementing_them() {
-        for name in RESERVED_FUTURE_INTRINSIC_NAMES {
+    fn reserves_intrinsics() {
+        for name in ["append_file", "read_file_bytes", "write_stdout_bytes"] {
             assert!(is_reserved_intrinsic_name(name));
-            assert_eq!(Builtin::from_name(name), None);
+            assert!(Builtin::from_name(name).is_some());
         }
         assert!(is_reserved_intrinsic_name("read_file"));
         assert!(!is_reserved_intrinsic_name("user_function"));

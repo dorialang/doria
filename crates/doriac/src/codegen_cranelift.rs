@@ -16,15 +16,18 @@ use crate::format_string::{FormatConversion, FormatPiece};
 use crate::mir;
 use crate::mir_validation;
 use crate::native_abi::{
-    function_symbol, CLASS_ALLOCATE, CLASS_FREE, COLLECTION_CONTAINS, COLLECTION_FREE,
-    COLLECTION_INSERT_AT, COLLECTION_KEYED_GET, COLLECTION_KEYED_HAS, COLLECTION_KEYED_SET,
-    COLLECTION_KEY_AT, COLLECTION_LENGTH, COLLECTION_NEW, COLLECTION_NULLABLE_ACCESS,
-    COLLECTION_PUSH, COLLECTION_PUSH_UNIQUE, COLLECTION_REMOVE_AT, COLLECTION_REMOVE_VALUE,
-    COLLECTION_SET_ALGEBRA, COLLECTION_SET_AT, COLLECTION_VALUE_AT, FORMAT_F32, FORMAT_F64,
-    FORMAT_I64, FORMAT_STRING, FORMAT_U64, NULLABLE_STRING_EQUAL, READ_FILE, READ_STDIN_LINE,
+    function_symbol, APPEND_FILE, APPEND_FILE_BYTES, BYTES_EQUAL, BYTES_FREE,
+    BYTES_FROM_COLLECTION, BYTES_GET, BYTES_LENGTH, BYTES_SET, BYTES_TO_COLLECTION, CLASS_ALLOCATE,
+    CLASS_FREE, COLLECTION_CONTAINS, COLLECTION_FREE, COLLECTION_INSERT_AT, COLLECTION_KEYED_GET,
+    COLLECTION_KEYED_HAS, COLLECTION_KEYED_SET, COLLECTION_KEY_AT, COLLECTION_LENGTH,
+    COLLECTION_NEW, COLLECTION_NULLABLE_ACCESS, COLLECTION_PUSH, COLLECTION_PUSH_UNIQUE,
+    COLLECTION_REMOVE_AT, COLLECTION_REMOVE_VALUE, COLLECTION_SET_ALGEBRA, COLLECTION_SET_AT,
+    COLLECTION_VALUE_AT, FORMAT_F32, FORMAT_F64, FORMAT_I64, FORMAT_STRING, FORMAT_U64,
+    NULLABLE_STRING_EQUAL, READ_FILE, READ_FILE_BYTES, READ_STDIN_BYTES, READ_STDIN_LINE,
     STRING_COMPARE, STRING_CONCAT, STRING_DATA, STRING_FROM_BOOL, STRING_FROM_F32, STRING_FROM_F64,
     STRING_FROM_I64, STRING_FROM_U64, STRING_FROM_UTF8, STRING_LENGTH, STRING_RELEASE,
-    STRING_RETAIN, STRING_WRITE_STDERR, STRING_WRITE_STDOUT, WRITE_FILE,
+    STRING_RETAIN, STRING_WRITE_STDERR, STRING_WRITE_STDOUT, WRITE_FILE, WRITE_FILE_BYTES,
+    WRITE_STDERR_BYTES, WRITE_STDOUT_BYTES,
 };
 use crate::numeric::{FloatType, FloatValue, IntegerPanic, IntegerType, IntegerValue};
 
@@ -889,13 +892,19 @@ fn lower_statement(
             )?;
             release_string(builder, string, resources)?;
         }
-        mir::Statement::WriteFile { path, contents } => {
+        mir::Statement::WriteFile { path, contents }
+        | mir::Statement::AppendFile { path, contents } => {
             let path = lower_string_expression(builder, path, resources)?;
             let contents = lower_string_expression(builder, contents, resources)?;
             let pointer = resources.module.target_config().pointer_type();
+            let name = if matches!(statement, mir::Statement::AppendFile { .. }) {
+                APPEND_FILE
+            } else {
+                WRITE_FILE
+            };
             let _ = runtime_call(
                 builder,
-                WRITE_FILE,
+                name,
                 &[pointer, pointer, pointer],
                 None,
                 &[resources.current_frame, path, contents],
@@ -903,6 +912,44 @@ fn lower_statement(
             )?;
             release_string(builder, path, resources)?;
             release_string(builder, contents, resources)?;
+        }
+        mir::Statement::WriteFileBytes {
+            path,
+            contents,
+            append,
+        } => {
+            let path = lower_string_expression(builder, path, resources)?;
+            let contents = lower_collection_pointer(builder, *contents, resources)?;
+            let pointer = resources.module.target_config().pointer_type();
+            let _ = runtime_call(
+                builder,
+                if *append {
+                    APPEND_FILE_BYTES
+                } else {
+                    WRITE_FILE_BYTES
+                },
+                &[pointer, pointer, pointer],
+                None,
+                &[resources.current_frame, path, contents],
+                resources,
+            )?;
+            release_string(builder, path, resources)?;
+        }
+        mir::Statement::WriteStreamBytes { contents, stderr } => {
+            let contents = lower_collection_pointer(builder, *contents, resources)?;
+            let pointer = resources.module.target_config().pointer_type();
+            let _ = runtime_call(
+                builder,
+                if *stderr {
+                    WRITE_STDERR_BYTES
+                } else {
+                    WRITE_STDOUT_BYTES
+                },
+                &[pointer, pointer],
+                None,
+                &[resources.current_frame, contents],
+                resources,
+            )?;
         }
         mir::Statement::AssignProperty {
             object,
@@ -1523,6 +1570,58 @@ fn lower_collection_expression(
             *algebra,
             resources,
         ),
+        mir::CollectionExpression::FromBytes { source, .. } => {
+            let source = lower_collection_pointer(builder, *source, resources)?;
+            runtime_call(
+                builder,
+                BYTES_TO_COLLECTION,
+                &[pointer],
+                Some(pointer),
+                &[source],
+                resources,
+            )?
+            .ok_or_else(|| backend_failure("Bytes::toArray produced no result"))
+        }
+        mir::CollectionExpression::BytesFromArray { source, .. } => {
+            let source = lower_collection_pointer(builder, *source, resources)?;
+            runtime_call(
+                builder,
+                BYTES_FROM_COLLECTION,
+                &[pointer],
+                Some(pointer),
+                &[source],
+                resources,
+            )?
+            .ok_or_else(|| backend_failure("Bytes::fromArray produced no result"))
+        }
+        mir::CollectionExpression::ReadFileBytes { path, .. } => {
+            let path = lower_string_expression(builder, path, resources)?;
+            let result = runtime_call(
+                builder,
+                READ_FILE_BYTES,
+                &[pointer, pointer],
+                Some(pointer),
+                &[resources.current_frame, path],
+                resources,
+            )?
+            .ok_or_else(|| backend_failure("read_file_bytes produced no result"))?;
+            release_string(builder, path, resources)?;
+            Ok(result)
+        }
+        mir::CollectionExpression::ReadStdinBytes { .. } => runtime_call(
+            builder,
+            READ_STDIN_BYTES,
+            &[pointer],
+            Some(pointer),
+            &[resources.current_frame],
+            resources,
+        )?
+        .ok_or_else(|| backend_failure("read_stdin_bytes produced no result")),
+        mir::CollectionExpression::Call { function, args, .. } => {
+            lower_function_call(builder, *function, args, resources)?
+                .ok_or_else(|| malformed_mir("collection call produced no result"))?
+                .single()
+        }
     }
 }
 
@@ -1557,6 +1656,20 @@ fn lower_collection_index(
             IntegerType::Int64,
         )));
     let index_value = lower_rvalue(builder, index, resources)?.single()?;
+    if definition.kind == mir::CollectionKind::Bytes {
+        if remove {
+            return Err(malformed_mir("Bytes indexed reads cannot remove elements"));
+        }
+        return runtime_call(
+            builder,
+            BYTES_GET,
+            &[pointer, pointer, pointer],
+            Some(types::I8),
+            &[resources.current_frame, collection_value, index_value],
+            resources,
+        )?
+        .ok_or_else(|| backend_failure("Bytes index read produced no result"));
+    }
     let word = if definition.key.is_some() {
         if remove {
             return Err(malformed_mir(
@@ -1814,6 +1927,18 @@ fn lower_collection_set(
     let definition = collection_definition(resources.program, collection_type)?.clone();
     let collection_value = lower_collection_pointer(builder, collection, resources)?;
     let value = lower_rvalue(builder, value, resources)?.single()?;
+    if definition.kind == mir::CollectionKind::Bytes {
+        let index = lower_rvalue(builder, index, resources)?.single()?;
+        let _ = runtime_call(
+            builder,
+            BYTES_SET,
+            &[pointer, pointer, pointer, types::I8],
+            None,
+            &[resources.current_frame, collection_value, index, value],
+            resources,
+        )?;
+        return Ok(());
+    }
     let value_word = value_to_collection_word(builder, value, definition.value, pointer)?;
     if let Some(key_type) = definition.key {
         let key = lower_rvalue(builder, index, resources)?.single()?;
@@ -2063,6 +2188,19 @@ fn lower_drop_collection_value(
     let done = builder.create_block();
     builder.ins().brif(present, drop_block, &[], done, &[]);
     builder.switch_to_block(drop_block);
+    if definition.kind == mir::CollectionKind::Bytes {
+        let _ = runtime_call(
+            builder,
+            BYTES_FREE,
+            &[pointer],
+            None,
+            &[collection],
+            resources,
+        )?;
+        builder.ins().jump(done, &[]);
+        builder.switch_to_block(done);
+        return Ok(());
+    }
     let length = runtime_call(
         builder,
         COLLECTION_LENGTH,
@@ -3823,10 +3961,20 @@ fn lower_integer_operand(
         }
         mir::Operand::CollectionLength(collection) if ty == IntegerType::Int64 => {
             let pointer = resources.module.target_config().pointer_type();
+            let local = local_definition(resources.program, resources.function_id, *collection)?;
+            let mir::Type::Collection(collection_type) = local.ty else {
+                return Err(malformed_mir("length uses non-collection local"));
+            };
+            let is_bytes = collection_definition(resources.program, collection_type)?.kind
+                == mir::CollectionKind::Bytes;
             let collection = lower_collection_pointer(builder, *collection, resources)?;
             runtime_call(
                 builder,
-                COLLECTION_LENGTH,
+                if is_bytes {
+                    BYTES_LENGTH
+                } else {
+                    COLLECTION_LENGTH
+                },
                 &[pointer],
                 Some(pointer),
                 &[collection],
@@ -4442,6 +4590,21 @@ fn lower_condition_to_branch(
             let zero = builder.ins().iconst(pointer, 0);
             let empty = builder.ins().icmp(IntCC::Equal, length, zero);
             builder.ins().brif(empty, then_block, &[], else_block, &[]);
+        }
+        mir::BoolExpression::CollectionEqual { left, right } => {
+            let pointer = resources.module.target_config().pointer_type();
+            let left = lower_collection_pointer(builder, *left, resources)?;
+            let right = lower_collection_pointer(builder, *right, resources)?;
+            let equal = runtime_call(
+                builder,
+                BYTES_EQUAL,
+                &[pointer, pointer],
+                Some(types::I8),
+                &[left, right],
+                resources,
+            )?
+            .ok_or_else(|| backend_failure("Bytes equality produced no result"))?;
+            builder.ins().brif(equal, then_block, &[], else_block, &[]);
         }
     }
     Ok(())

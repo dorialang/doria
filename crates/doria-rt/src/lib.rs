@@ -6,6 +6,7 @@ use core::ffi::c_void;
 use core::mem;
 use core::ptr;
 
+mod bytes;
 mod collection;
 mod device_io;
 mod file_io;
@@ -33,7 +34,101 @@ pub struct DrStringV1 {
     byte_length: usize,
 }
 
+pub use bytes::DrBytesV1;
 pub use collection::DrCollectionV1;
+
+/// # Safety
+///
+/// `source` must be readable for `length` bytes, or may be null when `length` is zero.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_bytes_copy(source: *const u8, length: usize) -> *mut DrBytesV1 {
+    bytes::copy(source, length)
+}
+
+/// # Safety
+///
+/// `value` must be null or a live, uniquely owned byte buffer and must not be used afterward.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_bytes_free(value: *mut DrBytesV1) {
+    bytes::free(value)
+}
+
+/// # Safety
+///
+/// `value` must point to a live byte buffer.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_bytes_length(value: *const DrBytesV1) -> usize {
+    bytes::length(value)
+}
+
+/// # Safety
+///
+/// `value` must point to a live byte buffer and `current_frame` must be null or valid.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_bytes_get(
+    current_frame: *const DrStackFrameV1,
+    value: *const DrBytesV1,
+    index: usize,
+) -> u8 {
+    bytes::get(current_frame, value, index)
+}
+
+/// # Safety
+///
+/// `value` must be a uniquely borrowed live byte buffer and `current_frame` must be null or valid.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_bytes_set(
+    current_frame: *const DrStackFrameV1,
+    value: *mut DrBytesV1,
+    index: usize,
+    byte: u8,
+) {
+    bytes::set(current_frame, value, index, byte)
+}
+
+/// # Safety
+///
+/// `left` and `right` must point to live byte buffers.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_bytes_equal(left: *const DrBytesV1, right: *const DrBytesV1) -> u8 {
+    u8::from(bytes::equal(left, right))
+}
+
+/// # Safety
+///
+/// `collection` must point to a live canonical `uint8[]` runtime collection.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_bytes_from_collection(
+    collection: *const DrCollectionV1,
+) -> *mut DrBytesV1 {
+    let length = collection::length(collection);
+    let data = allocate(length);
+    if length != 0 && data.is_null() {
+        panic_static(ptr::null(), b"byte-buffer allocation failed");
+    }
+    for index in 0..length {
+        *data.add(index) = collection::value_at(ptr::null(), collection, index) as u8;
+    }
+    bytes::from_owned(data, length)
+}
+
+/// # Safety
+///
+/// `value` must point to a live byte buffer.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_bytes_to_collection(value: *const DrBytesV1) -> *mut DrCollectionV1 {
+    let length = bytes::length(value);
+    let collection = collection::new(length, false, true);
+    for index in 0..length {
+        collection::set_at(
+            ptr::null(),
+            collection,
+            index,
+            u64::from(bytes::get(ptr::null(), value, index)),
+        );
+    }
+    collection
+}
 
 /// Allocates collection storage for generated Doria code.
 ///
@@ -420,6 +515,83 @@ pub unsafe extern "C" fn dr_v1_write_stderr(bytes: *const u8, byte_length: usize
     }
 }
 
+/// # Safety
+///
+/// `value` must point to a live byte buffer and `current_frame` must be null or valid.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_write_stdout_bytes(
+    current_frame: *const DrStackFrameV1,
+    value: *const DrBytesV1,
+) {
+    write_byte_stream(
+        current_frame,
+        StandardStream::Stdout,
+        bytes::data(value),
+        bytes::length(value),
+        b"failed to write stdout",
+    )
+}
+
+/// # Safety
+///
+/// `value` must point to a live byte buffer and `current_frame` must be null or valid.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_write_stderr_bytes(
+    current_frame: *const DrStackFrameV1,
+    value: *const DrBytesV1,
+) {
+    write_byte_stream(
+        current_frame,
+        StandardStream::Stderr,
+        bytes::data(value),
+        bytes::length(value),
+        b"failed to write stderr",
+    )
+}
+
+/// # Safety
+///
+/// `current_frame` must be null or a valid generated frame chain.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_read_stdin_bytes(
+    current_frame: *const DrStackFrameV1,
+) -> *mut DrBytesV1 {
+    let mut capacity = 4096_usize;
+    let mut data = allocate(capacity);
+    if data.is_null() {
+        static MESSAGE: &[u8] = b"byte-buffer allocation failed";
+        dr_v1_panic(current_frame, MESSAGE.as_ptr(), MESSAGE.len());
+    }
+    let mut length = 0_usize;
+    loop {
+        if length == capacity {
+            let Some(next) = capacity.checked_mul(2) else {
+                static MESSAGE: &[u8] = b"byte-buffer allocation failed";
+                dr_v1_panic(current_frame, MESSAGE.as_ptr(), MESSAGE.len());
+            };
+            let replacement = allocate(next);
+            if replacement.is_null() {
+                deallocate(data);
+                static MESSAGE: &[u8] = b"byte-buffer allocation failed";
+                dr_v1_panic(current_frame, MESSAGE.as_ptr(), MESSAGE.len());
+            }
+            ptr::copy_nonoverlapping(data, replacement, length);
+            deallocate(data);
+            data = replacement;
+            capacity = next;
+        }
+        match device_io::read_bytes(StandardStream::Stdin, data.add(length), capacity - length) {
+            Ok(0) => return bytes::from_owned(data, length),
+            Ok(read) => length += read,
+            Err(()) => {
+                deallocate(data);
+                static MESSAGE: &[u8] = b"failed to read stdin";
+                dr_v1_panic(current_frame, MESSAGE.as_ptr(), MESSAGE.len());
+            }
+        }
+    }
+}
+
 /// Flushes stdout through the implementation-private standard-device abstraction.
 ///
 /// # Safety
@@ -550,6 +722,121 @@ pub unsafe extern "C" fn dr_v1_write_file(
             dr_v1_panic(current_frame, MESSAGE.as_ptr(), MESSAGE.len())
         }
     }
+}
+
+/// # Safety
+///
+/// `path` and `contents` must point to live runtime strings and `current_frame` must be null or valid.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_append_file(
+    current_frame: *const DrStackFrameV1,
+    path: *const DrStringV1,
+    contents: *const DrStringV1,
+) {
+    write_file_contents(
+        current_frame,
+        path,
+        string_bytes(contents),
+        (*contents).byte_length,
+        true,
+        b"string allocation failed",
+    )
+}
+
+/// # Safety
+///
+/// `path` must point to a live runtime string and `current_frame` must be null or valid.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_read_file_bytes(
+    current_frame: *const DrStackFrameV1,
+    path: *const DrStringV1,
+) -> *mut DrBytesV1 {
+    let path = core::slice::from_raw_parts(string_bytes(path), (*path).byte_length);
+    match file_io::read_file(path) {
+        Ok(contents) => {
+            let (data, length) = contents.into_raw_parts();
+            bytes::from_owned(data, length)
+        }
+        Err(file_io::FileError::PathNul) => {
+            panic_static(current_frame, b"file path contained an embedded NUL")
+        }
+        Err(file_io::FileError::Allocation) => {
+            panic_static(current_frame, b"byte-buffer allocation failed")
+        }
+        Err(_) => panic_static(current_frame, b"failed to read file"),
+    }
+}
+
+/// # Safety
+///
+/// `path` and `contents` must point to live values and `current_frame` must be null or valid.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_write_file_bytes(
+    current_frame: *const DrStackFrameV1,
+    path: *const DrStringV1,
+    contents: *const DrBytesV1,
+) {
+    write_file_contents(
+        current_frame,
+        path,
+        bytes::data(contents),
+        bytes::length(contents),
+        false,
+        b"byte-buffer allocation failed",
+    )
+}
+
+/// # Safety
+///
+/// `path` and `contents` must point to live values and `current_frame` must be null or valid.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_append_file_bytes(
+    current_frame: *const DrStackFrameV1,
+    path: *const DrStringV1,
+    contents: *const DrBytesV1,
+) {
+    write_file_contents(
+        current_frame,
+        path,
+        bytes::data(contents),
+        bytes::length(contents),
+        true,
+        b"byte-buffer allocation failed",
+    )
+}
+
+unsafe fn write_file_contents(
+    current_frame: *const DrStackFrameV1,
+    path: *const DrStringV1,
+    contents: *const u8,
+    length: usize,
+    append: bool,
+    allocation_failure: &'static [u8],
+) {
+    let path = core::slice::from_raw_parts(string_bytes(path), (*path).byte_length);
+    let contents = if length == 0 {
+        &[]
+    } else {
+        core::slice::from_raw_parts(contents, length)
+    };
+    let result = if append {
+        file_io::append_file(path, contents)
+    } else {
+        file_io::write_file(path, contents)
+    };
+    match result {
+        Ok(()) => {}
+        Err(file_io::FileError::PathNul) => {
+            panic_static(current_frame, b"file path contained an embedded NUL")
+        }
+        Err(file_io::FileError::Allocation) => panic_static(current_frame, allocation_failure),
+        Err(_) if append => panic_static(current_frame, b"failed to append file"),
+        Err(_) => panic_static(current_frame, b"failed to write file"),
+    }
+}
+
+unsafe fn panic_static(current_frame: *const DrStackFrameV1, message: &'static [u8]) -> ! {
+    dr_v1_panic(current_frame, message.as_ptr(), message.len())
 }
 
 /// Reports a fatal Doria panic and exits the process with status 101.
@@ -1236,6 +1523,23 @@ unsafe fn write_standard_stream(
     ignore_sigpipe();
 
     device_io::write(stream, bytes, byte_length)
+}
+
+unsafe fn write_byte_stream(
+    current_frame: *const DrStackFrameV1,
+    stream: StandardStream,
+    data: *const u8,
+    length: usize,
+    failure: &'static [u8],
+) {
+    #[cfg(unix)]
+    ignore_sigpipe();
+
+    match device_io::write_bytes(stream, data, length) {
+        WriteOutcome::Success => {}
+        WriteOutcome::BrokenPipe => exit_process(0),
+        WriteOutcome::OtherFailure => dr_v1_panic(current_frame, failure.as_ptr(), failure.len()),
+    }
 }
 
 #[cfg(unix)]

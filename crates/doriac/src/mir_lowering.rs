@@ -382,6 +382,7 @@ fn intern_resolved_collection_types(
         ResolvedType::Float(ty) => mir::Type::Scalar(mir::ScalarType::Float(*ty)),
         ResolvedType::Bool => mir::Type::Scalar(mir::ScalarType::Bool),
         ResolvedType::String => mir::Type::String,
+        ResolvedType::Bytes => mir::Type::Collection(intern_bytes_type(collections)),
         ResolvedType::Class(name) => mir::Type::Class(*class_ids.get(name)?),
         ResolvedType::TypedArray(value) => {
             let value = intern_resolved_collection_types(value, class_ids, collections)?;
@@ -703,6 +704,10 @@ fn mir_type_ref(
         .map(mir::Type::Scalar)
         .or_else(|| is_plain_type(&plain, "string").then_some(mir::Type::String))
         .or_else(|| {
+            is_plain_type(&plain, "Bytes")
+                .then(|| mir::Type::Collection(intern_bytes_type(collection_registry)))
+        })
+        .or_else(|| {
             let (kind, key_ref, value_ref) = match plain.name.as_str() {
                 "[]" if plain.args.len() == 1 => {
                     (mir::CollectionKind::TypedArray, None, &plain.args[0])
@@ -746,6 +751,12 @@ fn mir_type_ref(
     } else {
         Some(base)
     }
+}
+
+fn intern_bytes_type(collections: &mut CollectionRegistry) -> mir::CollectionTypeId {
+    let byte = mir::Type::Scalar(mir::ScalarType::Integer(IntegerType::UInt8));
+    collections.intern(mir::CollectionKind::TypedArray, None, byte);
+    collections.intern(mir::CollectionKind::Bytes, None, byte)
 }
 
 fn field_type(ty: mir::Type) -> Option<FieldType> {
@@ -1026,6 +1037,43 @@ fn lower_statement_sequence(
                         context.push_statement(mir::Statement::WriteFile {
                             path: lower_string_expression(path, context)?,
                             contents: lower_string_expression(contents, context)?,
+                        });
+                    } else if name == "append_file" {
+                        let [path, contents] = args.as_slice() else {
+                            return Err(vec![unsupported(
+                                *call_span,
+                                "append_file expects 2 arguments",
+                            )]);
+                        };
+                        context.push_statement(mir::Statement::AppendFile {
+                            path: lower_string_expression(path, context)?,
+                            contents: lower_string_expression(contents, context)?,
+                        });
+                    } else if matches!(name.as_str(), "write_file_bytes" | "append_file_bytes") {
+                        let [path, contents] = args.as_slice() else {
+                            return Err(vec![unsupported(
+                                *call_span,
+                                format!("{name} expects 2 arguments"),
+                            )]);
+                        };
+                        let path = lower_string_expression(path, context)?;
+                        let contents = lower_bytes_local(contents, context)?.0;
+                        context.push_statement(mir::Statement::WriteFileBytes {
+                            path,
+                            contents,
+                            append: name == "append_file_bytes",
+                        });
+                    } else if matches!(name.as_str(), "write_stdout_bytes" | "write_stderr_bytes") {
+                        let [contents] = args.as_slice() else {
+                            return Err(vec![unsupported(
+                                *call_span,
+                                format!("{name} expects 1 argument"),
+                            )]);
+                        };
+                        let contents = lower_bytes_local(contents, context)?.0;
+                        context.push_statement(mir::Statement::WriteStreamBytes {
+                            contents,
+                            stderr: name == "write_stderr_bytes",
                         });
                     } else if name == "write_stderr" {
                         let [value] = args.as_slice() else {
@@ -2230,6 +2278,11 @@ impl<'semantic> LoweringContext<'semantic> {
             .or_else(|| is_plain_type(&plain, "string").then_some(mir::Type::String))
             .or_else(|| {
                 let key = match plain.name.as_str() {
+                    "Bytes" if plain.args.is_empty() => (
+                        mir::CollectionKind::Bytes,
+                        None,
+                        mir::Type::Scalar(mir::ScalarType::Integer(IntegerType::UInt8)),
+                    ),
                     "[]" if plain.args.len() == 1 => (
                         mir::CollectionKind::TypedArray,
                         None,
@@ -2364,6 +2417,16 @@ impl<'semantic> LoweringContext<'semantic> {
             ResolvedType::Float(ty) => Some(mir::Type::Scalar(mir::ScalarType::Float(*ty))),
             ResolvedType::Bool => Some(mir::Type::Scalar(mir::ScalarType::Bool)),
             ResolvedType::String => Some(mir::Type::String),
+            ResolvedType::Bytes => self
+                .collection_registry
+                .ids
+                .get(&(
+                    mir::CollectionKind::Bytes,
+                    None,
+                    mir::Type::Scalar(mir::ScalarType::Integer(IntegerType::UInt8)),
+                ))
+                .copied()
+                .map(mir::Type::Collection),
             ResolvedType::Class(name) => self.class_id_for_name(name).map(mir::Type::Class),
             ResolvedType::TypedArray(value) => self
                 .mir_resolved_type(value)
@@ -4323,6 +4386,9 @@ fn lower_call_args_with_ownership(
             mir::Type::NullableClass(class) => mir::Rvalue::NullableClass(
                 lower_nullable_class_expression(arg, class, transfers, context)?,
             ),
+            mir::Type::Collection(collection) => mir::Rvalue::Collection(
+                lower_collection_expression(arg, collection, transfers, context)?,
+            ),
             _ => lower_rvalue_as_expected(arg, expected, context)?,
         };
         if lowered.ty() != expected {
@@ -4504,11 +4570,12 @@ fn lower_return(
                 )]);
             }
             if context.has_cleanup_obligations() {
-                let result = context.declare_return_temp(
-                    expected,
-                    matches!(expected, mir::Type::Class(_) | mir::Type::NullableClass(_))
-                        && !borrowed_class,
-                );
+                let result_owns = match expected {
+                    mir::Type::Class(_) | mir::Type::NullableClass(_) => !borrowed_class,
+                    mir::Type::Collection(_) => true,
+                    _ => false,
+                };
+                let result = context.declare_return_temp(expected, result_owns);
                 context.push_statement(mir::Statement::AssignLocal {
                     target: result,
                     value,
@@ -4687,6 +4754,19 @@ fn lower_condition(
                     || matches!(unparenthesized_place(right), hir::Expr::Null { .. })
                 {
                     lower_null_comparison(left, op, right, context)
+                } else if lower_bytes_local(left, context).is_ok()
+                    && lower_bytes_local(right, context).is_ok()
+                    && matches!(op, hir::BinaryOp::Equal | hir::BinaryOp::NotEqual)
+                {
+                    let equal = mir::BoolExpression::CollectionEqual {
+                        left: lower_bytes_local(left, context)?.0,
+                        right: lower_bytes_local(right, context)?.0,
+                    };
+                    Ok(if *op == hir::BinaryOp::NotEqual {
+                        mir::BoolExpression::Not(Box::new(equal))
+                    } else {
+                        equal
+                    })
                 } else if is_nullable_string_expression(left, context)
                     || is_nullable_string_expression(right, context)
                 {
@@ -5232,6 +5312,107 @@ fn lower_collection_expression(
             args,
             span,
             null_safe: false,
+        } if method == "toArray" && args.is_empty() => {
+            let (source, _) = lower_bytes_local(object, context)?;
+            Ok(mir::CollectionExpression::FromBytes {
+                collection: expected,
+                source,
+            })
+        }
+        hir::Expr::StaticCall {
+            class_name,
+            method,
+            args,
+            span,
+        } if class_name == "Bytes" && method == "fromArray" => {
+            let [source] = args.as_slice() else {
+                return Err(vec![unsupported(
+                    *span,
+                    "Bytes::fromArray expects 1 argument",
+                )]);
+            };
+            let (source, _) = lower_collection_local(source, context)?;
+            Ok(mir::CollectionExpression::BytesFromArray {
+                collection: expected,
+                source,
+            })
+        }
+        hir::Expr::FunctionCall { name, args, span }
+            if name == "read_file_bytes" && args.len() == 1 =>
+        {
+            Ok(mir::CollectionExpression::ReadFileBytes {
+                collection: expected,
+                path: Box::new(lower_string_expression(&args[0], context)?),
+            })
+        }
+        hir::Expr::FunctionCall { name, args, .. }
+            if name == "read_stdin_bytes" && args.is_empty() =>
+        {
+            Ok(mir::CollectionExpression::ReadStdinBytes {
+                collection: expected,
+            })
+        }
+        hir::Expr::FunctionCall { name, args, span } => {
+            let signature = context.lookup_function(name, *span)?;
+            if signature.return_type != mir::ReturnType::Value(mir::Type::Collection(expected)) {
+                return Err(vec![unsupported(
+                    *span,
+                    format!("function `{name}` does not return the expected collection type"),
+                )]);
+            }
+            Ok(mir::CollectionExpression::Call {
+                collection: expected,
+                function: signature.id,
+                args: lower_call_args_with_ownership(name, args, signature, *span, context)?,
+            })
+        }
+        hir::Expr::MethodCall {
+            object,
+            method,
+            args,
+            span,
+            null_safe: false,
+        } if !matches!(method.as_str(), "union" | "intersect" | "difference") => {
+            let (signature, args) =
+                lower_instance_method_call(object, method, args, *span, context)?;
+            if signature.return_type != mir::ReturnType::Value(mir::Type::Collection(expected)) {
+                return Err(vec![unsupported(
+                    *span,
+                    "method does not return the expected collection type",
+                )]);
+            }
+            Ok(mir::CollectionExpression::Call {
+                collection: expected,
+                function: signature.id,
+                args,
+            })
+        }
+        hir::Expr::StaticCall {
+            class_name,
+            method,
+            args,
+            span,
+        } if !(class_name == "Set" && method == "from") => {
+            let (signature, args) =
+                lower_static_method_call(class_name, method, args, *span, context)?;
+            if signature.return_type != mir::ReturnType::Value(mir::Type::Collection(expected)) {
+                return Err(vec![unsupported(
+                    *span,
+                    "static method does not return the expected collection type",
+                )]);
+            }
+            Ok(mir::CollectionExpression::Call {
+                collection: expected,
+                function: signature.id,
+                args,
+            })
+        }
+        hir::Expr::MethodCall {
+            object,
+            method,
+            args,
+            span,
+            null_safe: false,
         } if matches!(method.as_str(), "union" | "intersect" | "difference") => {
             let (left, left_type) = lower_collection_local(object, context)?;
             if left_type != expected
@@ -5522,22 +5703,73 @@ fn materialize_nested_collection_places(
             for arg in args {
                 materialize_nested_collection_places(arg, false, context)?;
             }
+            if matches!(
+                context.expression_type(object),
+                Ok(mir::Type::Collection(_))
+            ) {
+                materialize_collection_place(object, context)?;
+            }
         }
         hir::Expr::IsType { expr, .. }
         | hir::Expr::Grouped { expr, .. }
         | hir::Expr::Unary { expr, .. } => {
             materialize_nested_collection_places(expr, writable, context)?;
         }
-        hir::Expr::FunctionCall { args, .. }
-        | hir::Expr::StaticCall { args, .. }
-        | hir::Expr::New { args, .. } => {
+        hir::Expr::FunctionCall { name, args, .. } => {
+            for arg in args {
+                materialize_nested_collection_places(arg, false, context)?;
+            }
+            let byte_argument = match name.as_str() {
+                "write_file_bytes" | "append_file_bytes" => args.get(1),
+                "write_stdout_bytes" | "write_stderr_bytes" => args.first(),
+                _ => None,
+            };
+            if let Some(bytes) = byte_argument {
+                materialize_collection_place(bytes, context)?;
+            }
+        }
+        hir::Expr::StaticCall {
+            class_name,
+            method,
+            args,
+            ..
+        } => {
+            for arg in args {
+                materialize_nested_collection_places(arg, false, context)?;
+            }
+            if class_name == "Bytes" && method == "fromArray" {
+                if let Some(source) = args.first() {
+                    let byte_array = context
+                        .collection_registry
+                        .ids
+                        .get(&(
+                            mir::CollectionKind::TypedArray,
+                            None,
+                            mir::Type::Scalar(mir::ScalarType::Integer(IntegerType::UInt8)),
+                        ))
+                        .copied()
+                        .expect("Bytes requires the canonical uint8[] MIR type");
+                    materialize_collection_place_as(source, byte_array, context)?;
+                }
+            }
+        }
+        hir::Expr::New { args, .. } => {
             for arg in args {
                 materialize_nested_collection_places(arg, false, context)?;
             }
         }
-        hir::Expr::Binary { left, right, .. } => {
+        hir::Expr::Binary {
+            left, op, right, ..
+        } => {
             materialize_nested_collection_places(left, false, context)?;
             materialize_nested_collection_places(right, false, context)?;
+            if matches!(op, hir::BinaryOp::Equal | hir::BinaryOp::NotEqual)
+                && expression_is_bytes(left, context)
+                && expression_is_bytes(right, context)
+            {
+                materialize_collection_place(left, context)?;
+                materialize_collection_place(right, context)?;
+            }
         }
         hir::Expr::Range { start, end, .. } => {
             materialize_nested_collection_places(start, false, context)?;
@@ -5587,6 +5819,63 @@ fn lower_collection_local(
             "collection access requires a materialized collection place",
         )]),
     }
+}
+
+fn lower_bytes_local(
+    expr: &hir::Expr,
+    context: &LoweringContext,
+) -> DiagnosticResult<(mir::LocalId, mir::CollectionTypeId)> {
+    let (local, collection) = lower_collection_local(expr, context)?;
+    if context.collection_type(collection).kind != mir::CollectionKind::Bytes {
+        return Err(vec![unsupported(expr.span(), "value is not `Bytes`")]);
+    }
+    Ok((local, collection))
+}
+
+fn materialize_collection_place(
+    expr: &hir::Expr,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<()> {
+    if lower_collection_local(expr, context).is_ok() {
+        return Ok(());
+    }
+    let mir::Type::Collection(collection) = context.expression_type(expr)? else {
+        return Ok(());
+    };
+    materialize_collection_place_as(expr, collection, context)
+}
+
+fn materialize_collection_place_as(
+    expr: &hir::Expr,
+    collection: mir::CollectionTypeId,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<()> {
+    if lower_collection_local(expr, context).is_ok() {
+        return Ok(());
+    }
+    let borrowed = matches!(unparenthesized_place(expr), hir::Expr::Index { .. });
+    let value = lower_collection_expression(expr, collection, !borrowed, context)?;
+    let local = if borrowed {
+        context.declare_borrowed_temp(mir::Type::Collection(collection), false)
+    } else {
+        context.declare_owned_temp(mir::Type::Collection(collection))
+    };
+    context.push_statement(mir::Statement::AssignLocal {
+        target: local,
+        value: mir::Rvalue::Collection(value),
+    });
+    context
+        .materialized_collection_places
+        .insert((expr.span().start, expr.span().end), local);
+    Ok(())
+}
+
+fn expression_is_bytes(expr: &hir::Expr, context: &LoweringContext) -> bool {
+    matches!(
+        context.expression_type(expr),
+        Ok(mir::Type::Collection(collection))
+            if context.collection_type(collection).kind == mir::CollectionKind::Bytes
+    )
 }
 
 fn lower_collection_index_operand(
@@ -6905,13 +7194,17 @@ fn unsupported_native_type(
     span: Span,
     detail: impl Into<String>,
 ) -> Diagnostic {
-    if ty.name == "mixed" {
+    if type_ref_contains_mixed(ty) {
         Diagnostic::unsupported_stage(
             "M1101",
-            "the `mixed` runtime representation lands at Stage 23",
+            "the boxed `dr_mixed` runtime representation lands in Stage 23 Slice 3",
             span,
         )
     } else {
         unsupported(span, detail)
     }
+}
+
+fn type_ref_contains_mixed(ty: &crate::types::TypeRef) -> bool {
+    ty.name == "mixed" || ty.args.iter().any(type_ref_contains_mixed)
 }

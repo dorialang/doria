@@ -538,12 +538,12 @@ fn mixed_runtime_representation_remains_a_stage23_boundary() {
 function main(): void { mixed $value = 1; }
 "#,
     )
-    .expect_err("mixed runtime values should not lower before Stage 23");
+    .expect_err("mixed runtime values should not lower before Stage 23 Slice 3");
     let diagnostic = diagnostics
         .iter()
         .find(|diagnostic| diagnostic.code == "M1101")
         .unwrap_or_else(|| panic!("expected native-stage diagnostic, got {diagnostics:#?}"));
-    assert!(diagnostic.message.contains("Stage 23"));
+    assert!(diagnostic.message.contains("Stage 23 Slice 3"));
 }
 
 #[test]

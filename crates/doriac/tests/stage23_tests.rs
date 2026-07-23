@@ -159,6 +159,172 @@ function main(): void
 }
 
 #[test]
+fn bytes_surface_checks_lowers_and_executes_through_shared_mir() {
+    let mir = doriac::lower_source_to_mir(
+        "stage23-bytes.doria",
+        r#"
+function main(): void
+{
+    writable uint8[] $source = [0, 128, 255];
+    writable Bytes $bytes = Bytes::fromArray($source);
+    $source[0] = 99;
+
+    $bytes[1] = 42;
+    $bytes[0]++;
+    $bytes[1] += 1;
+    $bytes[2]--;
+
+    writable uint8[] $copy = $bytes->toArray();
+    Bytes $same = Bytes::fromArray($copy);
+    $copy[0] = 77;
+    Bytes $different = Bytes::fromArray([1]);
+
+    echo "{$bytes->length}:{$bytes[0]}:{$bytes[1]}:{$bytes[2]}:";
+    if ($bytes == $same) {
+        echo "equal:";
+    }
+    if ($bytes != $different) {
+        echo "different";
+    }
+}
+"#,
+    )
+    .expect("the complete Stage 23 Slice 2 Bytes surface should lower");
+    let output = doriac::mir_interpreter::interpret(&mir)
+        .expect("the complete Stage 23 Slice 2 Bytes surface should execute");
+    assert_eq!(output.stdout, b"3:1:43:254:equal:different");
+}
+
+#[test]
+fn bytes_io_accepts_readonly_borrows_and_materializes_expression_temporaries() {
+    doriac::lower_source_to_mir(
+        "stage23-bytes-io.doria",
+        r#"
+function main(): void
+{
+    uint8[] $source = [0, 128, 255];
+    Bytes $bytes = Bytes::fromArray($source);
+
+    write_file_bytes("data.bin", $bytes);
+    append_file_bytes("data.bin", Bytes::fromArray($source));
+    write_stdout_bytes(read_file_bytes("data.bin"));
+    write_stderr_bytes($bytes);
+}
+"#,
+    )
+    .expect("byte I/O should borrow locals and owned expression temporaries");
+}
+
+#[test]
+fn bytes_rejects_implicit_conversion_readonly_writes_and_unauthored_methods() {
+    let wrong_source = diagnostic(
+        r#"
+function main(): void
+{
+    int[] $values = [1];
+    Bytes $bytes = Bytes::fromArray($values);
+}
+"#,
+        "E0403",
+    );
+    assert!(wrong_source.message.contains("uint8[]"));
+
+    let readonly_write = diagnostic(
+        r#"
+function main(): void
+{
+    uint8[] $values = [1];
+    Bytes $bytes = Bytes::fromArray($values);
+    $bytes[0] = 2;
+}
+"#,
+        "E0201",
+    );
+    assert!(readonly_write.message.contains("readonly"));
+
+    let deferred = diagnostic(
+        r#"
+function main(): void
+{
+    uint8[] $values = [1];
+    writable Bytes $bytes = Bytes::fromArray($values);
+    $bytes->append(2);
+}
+"#,
+        "E0524",
+    );
+    assert!(deferred
+        .message
+        .contains("future Bytes method-surface record"));
+}
+
+#[test]
+fn runtime_mixed_collection_values_remain_at_stage23_slice3() {
+    let diagnostics = doriac::lower_source_to_mir(
+        "stage23-mixed-collection.doria",
+        r#"
+function main(): void
+{
+    List<mixed> $values = [1];
+}
+"#,
+    )
+    .expect_err("runtime mixed collection elements require the Slice 3 box");
+    let boundary = diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.code == "M1101")
+        .unwrap_or_else(|| panic!("expected a native-stage diagnostic: {diagnostics:#?}"));
+    assert!(boundary.message.contains("Stage 23 Slice 3"));
+    assert!(!diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code.starts_with('P')));
+}
+
+#[test]
+fn bytes_uses_move_ownership_and_readonly_borrow_parameters() {
+    doriac::lower_source_to_mir(
+        "stage23-bytes-borrow.doria",
+        r#"
+function inspect(Bytes $contents): int { return $contents->length; }
+function consume(take Bytes $contents): int { return $contents->length; }
+function main(): void
+{
+    Bytes $contents = Bytes::fromArray([1]);
+    echo "{inspect($contents)}";
+    echo "{consume($contents)}";
+}
+"#,
+    )
+    .expect("readonly Bytes parameters should borrow while take parameters move");
+
+    let moved = diagnostics(
+        r#"
+function consume(take Bytes $contents): void {}
+function main(): void
+{
+    Bytes $contents = Bytes::fromArray([1]);
+    consume($contents);
+    echo "{$contents->length}";
+}
+"#,
+    );
+    assert!(moved
+        .iter()
+        .any(|diagnostic| diagnostic.message.contains("given away")));
+}
+
+#[test]
+fn intrinsic_collection_type_names_cannot_be_redeclared_as_classes() {
+    for name in ["Bytes", "List", "Dictionary", "Set"] {
+        let errors = diagnostics(&format!("class {name} {{}}"));
+        assert!(
+            errors.iter().any(|diagnostic| diagnostic.code == "E0309"),
+            "{name} should remain reserved for its intrinsic type"
+        );
+    }
+}
+
+#[test]
 fn hash_collections_reject_non_hashable_float_types() {
     let errors = diagnostics(
         r#"

@@ -25,6 +25,16 @@ pub fn validate_program(program: &mir::Program) -> Result<(), BackendError> {
                 collection.id.0
             )));
         }
+        if collection.kind == mir::CollectionKind::Bytes
+            && (collection.key.is_some()
+                || collection.value
+                    != mir::Type::Scalar(mir::ScalarType::Integer(IntegerType::UInt8)))
+        {
+            return Err(malformed_mir(format!(
+                "Bytes collection#{} does not use packed uint8 elements",
+                collection.id.0
+            )));
+        }
     }
     for (index, class) in program.classes.iter().enumerate() {
         validate_class(program, index, class)?;
@@ -522,9 +532,17 @@ fn validate_statement(
             args,
         } => validate_null_safe_statement_call(program, function, object, *callee, args),
         mir::Statement::Printf(format) => validate_format_expression(program, function, format),
-        mir::Statement::WriteFile { path, contents } => {
+        mir::Statement::WriteFile { path, contents }
+        | mir::Statement::AppendFile { path, contents } => {
             validate_string_expression(program, function, path)?;
             validate_string_expression(program, function, contents)
+        }
+        mir::Statement::WriteFileBytes { path, contents, .. } => {
+            validate_string_expression(program, function, path)?;
+            validate_bytes_local(program, function, *contents)
+        }
+        mir::Statement::WriteStreamBytes { contents, .. } => {
+            validate_bytes_local(program, function, *contents)
         }
         mir::Statement::WriteStderr(value) => validate_string_expression(program, function, value),
         mir::Statement::AssignProperty {
@@ -1034,7 +1052,75 @@ fn validate_collection_expression(
             }
             Ok(())
         }
+        mir::CollectionExpression::FromBytes { source, .. } => {
+            if definition.kind != mir::CollectionKind::TypedArray
+                || definition.value
+                    != mir::Type::Scalar(mir::ScalarType::Integer(IntegerType::UInt8))
+            {
+                return Err(malformed_mir("Bytes::toArray destination is not uint8[]"));
+            }
+            validate_bytes_local(program, function, *source)
+        }
+        mir::CollectionExpression::BytesFromArray { source, .. } => {
+            if definition.kind != mir::CollectionKind::Bytes {
+                return Err(malformed_mir("Bytes::fromArray destination is not Bytes"));
+            }
+            let source = local_in(function, *source)?;
+            let mir::Type::Collection(source_type) = source.ty else {
+                return Err(malformed_mir("Bytes::fromArray source is not a collection"));
+            };
+            let source_type = collection_in(program, source_type)?;
+            if source_type.kind != mir::CollectionKind::TypedArray
+                || source_type.value
+                    != mir::Type::Scalar(mir::ScalarType::Integer(IntegerType::UInt8))
+            {
+                return Err(malformed_mir("Bytes::fromArray source is not uint8[]"));
+            }
+            Ok(())
+        }
+        mir::CollectionExpression::ReadFileBytes { path, .. } => {
+            if definition.kind != mir::CollectionKind::Bytes {
+                return Err(malformed_mir("read_file_bytes result is not Bytes"));
+            }
+            validate_string_expression(program, function, path)
+        }
+        mir::CollectionExpression::ReadStdinBytes { .. } => {
+            if definition.kind != mir::CollectionKind::Bytes {
+                return Err(malformed_mir("read_stdin_bytes result is not Bytes"));
+            }
+            Ok(())
+        }
+        mir::CollectionExpression::Call {
+            function: callee,
+            args,
+            ..
+        } => {
+            let callee = function_in(program, *callee)?;
+            if callee.return_type != mir::ReturnType::Value(mir::Type::Collection(definition.id)) {
+                return Err(malformed_mir(
+                    "collection call targets a function with another return type",
+                ));
+            }
+            validate_call_args(program, function, callee, args)
+        }
     }
+}
+
+fn validate_bytes_local(
+    program: &mir::Program,
+    function: &mir::Function,
+    local: mir::LocalId,
+) -> Result<(), BackendError> {
+    let local = local_in(function, local)?;
+    let mir::Type::Collection(collection) = local.ty else {
+        return Err(malformed_mir("Bytes operation uses a non-collection local"));
+    };
+    if collection_in(program, collection)?.kind != mir::CollectionKind::Bytes {
+        return Err(malformed_mir(
+            "Bytes operation uses another collection kind",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_collection_index(
@@ -1937,7 +2023,19 @@ fn collect_collection_class_local_accesses<'a>(
         mir::CollectionExpression::Index { index, .. } => {
             collect_rvalue_class_local_accesses(index, accesses)
         }
-        mir::CollectionExpression::Local { .. } | mir::CollectionExpression::SetFrom { .. } => {}
+        mir::CollectionExpression::ReadFileBytes { path, .. } => {
+            collect_string_class_local_accesses(path, accesses)
+        }
+        mir::CollectionExpression::Call { function, args, .. } => {
+            accesses.begin_call();
+            collect_rvalue_args_class_local_accesses(args, accesses);
+            accesses.call(*function, args);
+        }
+        mir::CollectionExpression::Local { .. }
+        | mir::CollectionExpression::SetFrom { .. }
+        | mir::CollectionExpression::FromBytes { .. }
+        | mir::CollectionExpression::BytesFromArray { .. }
+        | mir::CollectionExpression::ReadStdinBytes { .. } => {}
     }
 }
 
@@ -2266,6 +2364,7 @@ fn collect_bool_class_local_accesses<'a>(
             collect_rvalue_args_class_local_accesses(args, accesses);
             accesses.call(*function, args);
         }
+        mir::BoolExpression::CollectionEqual { .. } => {}
         mir::BoolExpression::Coalesce { left, right } => {
             collect_nullable_scalar_class_local_accesses(left, accesses);
             collect_bool_class_local_accesses(right, accesses);
@@ -2426,9 +2525,13 @@ fn collect_statement_class_local_accesses(statement: &mir::Statement) -> ClassLo
         mir::Statement::Printf(format) => {
             collect_format_class_local_accesses(format, &mut accesses);
         }
-        mir::Statement::WriteFile { path, contents } => {
+        mir::Statement::WriteFile { path, contents }
+        | mir::Statement::AppendFile { path, contents } => {
             collect_string_class_local_accesses(path, &mut accesses);
             collect_string_class_local_accesses(contents, &mut accesses);
+        }
+        mir::Statement::WriteFileBytes { path, .. } => {
+            collect_string_class_local_accesses(path, &mut accesses);
         }
         mir::Statement::AssignProperty { object, value, .. } => {
             collect_rvalue_class_local_accesses(value, &mut accesses);
@@ -2447,7 +2550,8 @@ fn collect_statement_class_local_accesses(statement: &mir::Statement) -> ClassLo
         }
         mir::Statement::EchoStringLiteral(_)
         | mir::Statement::DropClass { .. }
-        | mir::Statement::DropCollection { .. } => {}
+        | mir::Statement::DropCollection { .. }
+        | mir::Statement::WriteStreamBytes { .. } => {}
     }
     accesses
 }
@@ -3536,7 +3640,8 @@ fn statement_observes_property(
         }
         mir::Statement::EchoStringLiteral(_)
         | mir::Statement::DropClass { .. }
-        | mir::Statement::DropCollection { .. } => false,
+        | mir::Statement::DropCollection { .. }
+        | mir::Statement::WriteStreamBytes { .. } => false,
         mir::Statement::AssignStatic { value, .. } => {
             rvalue_observes_property(value, receiver, property)
         }
@@ -3553,9 +3658,13 @@ fn statement_observes_property(
                     .any(|value| rvalue_observes_property(value, receiver, property))
         }
         mir::Statement::Printf(format) => format_observes_property(format, receiver, property),
-        mir::Statement::WriteFile { path, contents } => {
+        mir::Statement::WriteFile { path, contents }
+        | mir::Statement::AppendFile { path, contents } => {
             string_observes_property(path, receiver, property)
                 || string_observes_property(contents, receiver, property)
+        }
+        mir::Statement::WriteFileBytes { path, .. } => {
+            string_observes_property(path, receiver, property)
         }
         mir::Statement::AssignProperty { value, .. } => {
             rvalue_observes_property(value, receiver, property)
@@ -3642,9 +3751,17 @@ fn collection_observes_property(
         mir::CollectionExpression::Index { index, .. } => {
             rvalue_observes_property(index, receiver, property)
         }
-        mir::CollectionExpression::Local { .. } | mir::CollectionExpression::SetFrom { .. } => {
-            false
+        mir::CollectionExpression::ReadFileBytes { path, .. } => {
+            string_observes_property(path, receiver, property)
         }
+        mir::CollectionExpression::Call { args, .. } => args
+            .iter()
+            .any(|argument| rvalue_observes_property(argument, receiver, property)),
+        mir::CollectionExpression::Local { .. }
+        | mir::CollectionExpression::SetFrom { .. }
+        | mir::CollectionExpression::FromBytes { .. }
+        | mir::CollectionExpression::BytesFromArray { .. }
+        | mir::CollectionExpression::ReadStdinBytes { .. } => false,
     }
 }
 
@@ -3872,6 +3989,7 @@ fn bool_observes_property(
         mir::BoolExpression::Call { args, .. } => args
             .iter()
             .any(|value| rvalue_observes_property(value, receiver, property)),
+        mir::BoolExpression::CollectionEqual { .. } => false,
         mir::BoolExpression::Coalesce { left, right } => {
             nullable_scalar_observes_property(left, receiver, property)
                 || bool_observes_property(right, receiver, property)
@@ -4680,6 +4798,10 @@ fn validate_condition(
                 return Err(malformed_mir("isEmpty source is not a collection"));
             }
             Ok(())
+        }
+        mir::BoolExpression::CollectionEqual { left, right } => {
+            validate_bytes_local(program, function, *left)?;
+            validate_bytes_local(program, function, *right)
         }
     }
 }

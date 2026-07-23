@@ -2291,9 +2291,10 @@ impl Checker<'_> {
             } => {
                 if matches!(
                     qualifier,
-                    ast::StaticQualifier::Class(class_name) if class_name == "Set"
-                ) && method == "from"
-                {
+                    ast::StaticQualifier::Class(class_name)
+                        if (class_name == "Set" && method == "from")
+                            || (class_name == "Bytes" && method == "fromArray")
+                ) {
                     return true;
                 }
                 self.qualifier_class(qualifier)
@@ -2653,7 +2654,7 @@ pub(crate) fn type_ref_is_move_type(
     type_ref_class_name(ty, classes, receiver_class).is_some()
         || matches!(
             ty.name.as_str(),
-            "mixed" | "[]" | "List" | "Dictionary" | "Set"
+            "mixed" | "Bytes" | "[]" | "List" | "Dictionary" | "Set"
         )
 }
 

@@ -1,0 +1,8 @@
+function main(): void
+{
+    ?string $path = read_line();
+    if ($path != null) {
+        Bytes $contents = read_file_bytes($path);
+        echo "{$contents->length}";
+    }
+}

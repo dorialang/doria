@@ -36,6 +36,7 @@ pub struct Program {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CollectionKind {
+    Bytes,
     TypedArray,
     List,
     Dictionary,
@@ -271,6 +272,26 @@ pub enum CollectionExpression {
         transfer: bool,
         algebra: Option<(SetAlgebraOp, LocalId)>,
     },
+    FromBytes {
+        collection: CollectionTypeId,
+        source: LocalId,
+    },
+    BytesFromArray {
+        collection: CollectionTypeId,
+        source: LocalId,
+    },
+    ReadFileBytes {
+        collection: CollectionTypeId,
+        path: Box<StringExpression>,
+    },
+    ReadStdinBytes {
+        collection: CollectionTypeId,
+    },
+    Call {
+        collection: CollectionTypeId,
+        function: FunctionId,
+        args: Vec<Rvalue>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -295,7 +316,12 @@ impl CollectionExpression {
             Self::Local { collection, .. }
             | Self::Literal { collection, .. }
             | Self::Index { collection, .. }
-            | Self::SetFrom { collection, .. } => *collection,
+            | Self::SetFrom { collection, .. }
+            | Self::FromBytes { collection, .. }
+            | Self::BytesFromArray { collection, .. }
+            | Self::ReadFileBytes { collection, .. }
+            | Self::ReadStdinBytes { collection }
+            | Self::Call { collection, .. } => *collection,
         }
     }
 }
@@ -833,6 +859,10 @@ pub enum BoolExpression {
     CollectionIsEmpty {
         collection: LocalId,
     },
+    CollectionEqual {
+        left: LocalId,
+        right: LocalId,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -885,7 +915,20 @@ pub enum Statement {
         path: StringExpression,
         contents: StringExpression,
     },
+    AppendFile {
+        path: StringExpression,
+        contents: StringExpression,
+    },
     WriteStderr(StringExpression),
+    WriteFileBytes {
+        path: StringExpression,
+        contents: LocalId,
+        append: bool,
+    },
+    WriteStreamBytes {
+        contents: LocalId,
+        stderr: bool,
+    },
     AssignProperty {
         object: LocalId,
         property: PropertyId,
@@ -971,7 +1014,8 @@ fn statement_class_temporary_capacity(statement: &Statement) -> usize {
         }
         Statement::EchoStringLiteral(_)
         | Statement::DropClass { .. }
-        | Statement::DropCollection { .. } => 0,
+        | Statement::DropCollection { .. }
+        | Statement::WriteStreamBytes { .. } => 0,
         Statement::EchoString(value) | Statement::WriteStderr(value) => {
             string_class_temporary_capacity(value)
         }
@@ -986,9 +1030,10 @@ fn statement_class_temporary_capacity(statement: &Statement) -> usize {
                     .sum::<usize>()
         }
         Statement::Printf(format) => format_class_temporary_capacity(format),
-        Statement::WriteFile { path, contents } => {
+        Statement::WriteFile { path, contents } | Statement::AppendFile { path, contents } => {
             string_class_temporary_capacity(path) + string_class_temporary_capacity(contents)
         }
+        Statement::WriteFileBytes { path, .. } => string_class_temporary_capacity(path),
     }
 }
 
@@ -1015,7 +1060,14 @@ fn rvalue_class_temporary_capacity(value: &Rvalue) -> usize {
 
 fn collection_class_temporary_capacity(value: &CollectionExpression) -> usize {
     match value {
-        CollectionExpression::Local { .. } | CollectionExpression::SetFrom { .. } => 0,
+        CollectionExpression::Local { .. }
+        | CollectionExpression::SetFrom { .. }
+        | CollectionExpression::FromBytes { .. }
+        | CollectionExpression::BytesFromArray { .. }
+        | CollectionExpression::ReadStdinBytes { .. } => 0,
+        CollectionExpression::Call { args, .. } => {
+            args.iter().map(rvalue_class_temporary_capacity).sum()
+        }
         CollectionExpression::Literal { entries, .. } => entries
             .iter()
             .map(|entry| {
@@ -1027,6 +1079,7 @@ fn collection_class_temporary_capacity(value: &CollectionExpression) -> usize {
             })
             .sum(),
         CollectionExpression::Index { index, .. } => rvalue_class_temporary_capacity(index),
+        CollectionExpression::ReadFileBytes { path, .. } => string_class_temporary_capacity(path),
     }
 }
 
@@ -1249,6 +1302,7 @@ pub(crate) fn bool_class_temporary_capacity(value: &BoolExpression) -> usize {
         }
         BoolExpression::CollectionHas { value, .. } => rvalue_class_temporary_capacity(value),
         BoolExpression::CollectionIsEmpty { .. } => 0,
+        BoolExpression::CollectionEqual { .. } => 0,
     }
 }
 
@@ -1454,6 +1508,15 @@ impl fmt::Display for CollectionExpression {
                 if *transfer { "move" } else { "borrow" },
                 source.0
             ),
+            Self::FromBytes { source, .. } => {
+                write!(formatter, "local{}->toArray()", source.0)
+            }
+            Self::BytesFromArray { source, .. } => {
+                write!(formatter, "Bytes::fromArray(local{})", source.0)
+            }
+            Self::ReadFileBytes { path, .. } => write!(formatter, "read_file_bytes({path})"),
+            Self::ReadStdinBytes { .. } => formatter.write_str("read_stdin_bytes()"),
+            Self::Call { function, args, .. } => write_call(formatter, *function, args),
         }
     }
 }
@@ -1834,6 +1897,9 @@ impl fmt::Display for BoolExpression {
             Self::CollectionIsEmpty { collection } => {
                 write!(formatter, "local{}.isEmpty", collection.0)
             }
+            Self::CollectionEqual { left, right } => {
+                write!(formatter, "local{} == local{}", left.0, right.0)
+            }
         }
     }
 }
@@ -1959,7 +2025,34 @@ impl fmt::Display for Statement {
             Statement::WriteFile { path, contents } => {
                 write!(formatter, "write_file({path}, {contents})")
             }
+            Statement::AppendFile { path, contents } => {
+                write!(formatter, "append_file({path}, {contents})")
+            }
             Statement::WriteStderr(value) => write!(formatter, "write_stderr({value})"),
+            Statement::WriteFileBytes {
+                path,
+                contents,
+                append,
+            } => write!(
+                formatter,
+                "{}({path}, local{})",
+                if *append {
+                    "append_file_bytes"
+                } else {
+                    "write_file_bytes"
+                },
+                contents.0
+            ),
+            Statement::WriteStreamBytes { contents, stderr } => write!(
+                formatter,
+                "{}(local{})",
+                if *stderr {
+                    "write_stderr_bytes"
+                } else {
+                    "write_stdout_bytes"
+                },
+                contents.0
+            ),
             Statement::AssignProperty {
                 object,
                 property,

@@ -1,0 +1,5 @@
+function main(): void
+{
+    Bytes $contents = read_file_bytes("missing.bin");
+    echo "{$contents->length}";
+}

@@ -1,11 +1,11 @@
 use doriac::class_layout::{compute_class_layout, ClassId, FieldType, PropertyId};
 use doriac::format_string::{FormatConversion, FormatPiece, FormatSpec};
 use doriac::mir::{
-    BasicBlock, BlockId, Class, ClassExpression, FloatBinaryOp, FloatExpression, FormatArgument,
-    FormatExpression, Function, FunctionId, Local, LocalId, NullableClassExpression,
-    NullableStringExpression, Operand, Program, Property, PropertyValue, PropertyValueSource,
-    ReturnType, Rvalue, ScalarType, ScalarValue, Statement, StaticId, StaticProperty, StaticValue,
-    StringExpression, Terminator, Type, ValueExpression,
+    BasicBlock, BlockId, Class, ClassExpression, CollectionKind, CollectionType, CollectionTypeId,
+    FloatBinaryOp, FloatExpression, FormatArgument, FormatExpression, Function, FunctionId, Local,
+    LocalId, NullableClassExpression, NullableStringExpression, Operand, Program, Property,
+    PropertyValue, PropertyValueSource, ReturnType, Rvalue, ScalarType, ScalarValue, Statement,
+    StaticId, StaticProperty, StaticValue, StringExpression, Terminator, Type, ValueExpression,
 };
 use doriac::numeric::{FloatType, FloatValue, IntegerType, IntegerValue};
 
@@ -61,6 +61,22 @@ fn shared_validator_rejects_noncanonical_bool_operands() {
     assert!(error
         .message
         .contains("bool expression has an incompatible operand"));
+}
+
+#[test]
+fn shared_validator_rejects_noncanonical_bytes_storage() {
+    let mut program = valid_void_program();
+    program.collection_types.push(CollectionType {
+        id: CollectionTypeId(0),
+        kind: CollectionKind::Bytes,
+        key: None,
+        value: Type::Scalar(ScalarType::Integer(IntegerType::Int64)),
+    });
+
+    let error = doriac::mir_validation::validate_program(&program)
+        .expect_err("Bytes must always use the packed uint8 element contract");
+    assert!(error.message.contains("Bytes collection"));
+    assert!(error.message.contains("packed uint8"));
 }
 
 #[test]
