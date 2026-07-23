@@ -11,7 +11,7 @@ Two layers (plan §9): **core** (no I/O, always available) and **std** (hosted u
 ### Primitive companions
 Fixed-width numeric, bool, and string companion APIs — the member surface each primitive carries. Details: decisions 0013/0016 (numeric types), 0042 (conversions), 0095 (`pow`), 0096 (interface conformance); §4.6 (strings).
 
-- **`Int`, `Int8`/`Int16`/`Int32`/`Int64`, `UInt8`/`UInt16`/`UInt32`/`UInt64`** — `Int::parse(string): ?int`, `Int::toFloat(int): float`, `Int::pow(...)`, wrapping arithmetic (`wrappingAdd`/`wrappingSub`/`wrappingMul`), and per-width `Int32::from($x)` (checked, panics on overflow) / `Int32::tryFrom($x): ?int32`.
+- **`Int`, `Int8`/`Int16`/`Int32`/`Int64`, `UInt8`/`UInt16`/`UInt32`/`UInt64`** — `Int::parse(string): ?int`, `Int::toFloat(int): float`, `Int::pow(...)`, wrapping arithmetic (`wrappingAdd`/`wrappingSub`/`wrappingMul`), and per-width checked conversion families such as `Int32::from` (panics on overflow) / `Int32::tryFrom` (returns `?int32`). Each accepts one fixed-width integer expression; their callable declaration surface is TBD with conversion-overload work rather than published as an untyped Doria parameter.
 - **`Float`, `Float32`/`Float64`** — `Float::parse(string): ?float`, `Float::toInt(float): int` (checked, panics on NaN/out-of-range), `Float::pow(...)`. `float` is neither `Hashable` nor totally `Comparable` (0096).
 - **`Bool`** — companion helpers.
 - **`String`** — `$s->length` (byte length), `$s->isEmpty`, `$s->bytes` (a `Bytes` view, copy in v1.0); `$s->chars` (grapheme iteration) is deferred. Plus the `str_*` free-function family (below).
@@ -93,4 +93,5 @@ Hosted modules under the reserved `Doria\Std` namespace. Most are direction-only
 ## Invalidated elsewhere
 
 - The plan's Decision 0095 catalogue entry and Decision 0095's `Comparable<T>` consequence now include the typed comparison operand.
+- The integer conversion inventory no longer presents an untyped parameter as a Doria signature; decision 0042 remains authoritative for the accepted integer-expression operand contract.
 - No compiler behavior or implemented standard-library surface changes; this file catalogues planned APIs.

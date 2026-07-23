@@ -2407,7 +2407,14 @@ fn validate_nullable_assumptions(
     accesses: &ClassLocalAccesses<'_>,
     present: &HashSet<mir::LocalId>,
 ) -> Result<(), BackendError> {
-    for local in accesses.nullable_assumptions() {
+    let property_receivers = accesses.property_borrowed().filter_map(|(local, _)| {
+        matches!(
+            local_in(function, local).ok()?.ty,
+            mir::Type::NullableClass(_)
+        )
+        .then_some(local)
+    });
+    for local in accesses.nullable_assumptions().chain(property_receivers) {
         if !present.contains(&local) {
             return Err(malformed_mir(format!(
                 "{} local local{} is assumed non-null without a dominating presence proof",
@@ -4758,11 +4765,14 @@ fn validate_property_operand(
     expected: mir::Type,
 ) -> Result<(), BackendError> {
     let object_definition = local_in(function, object)?;
-    let mir::Type::Class(class) = object_definition.ty else {
-        return Err(malformed_mir(format!(
-            "property operand uses non-class local local{}",
-            object.0
-        )));
+    let class = match object_definition.ty {
+        mir::Type::Class(class) | mir::Type::NullableClass(class) => class,
+        _ => {
+            return Err(malformed_mir(format!(
+                "property operand uses non-class local local{}",
+                object.0
+            )))
+        }
     };
     let property_definition = property_in(program, class, property)?;
     if property_definition.ty != expected {

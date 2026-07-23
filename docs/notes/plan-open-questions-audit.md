@@ -34,46 +34,8 @@ Most of the plan's "(… decision, unauthored)" markers are large features whose
 
 ## Open questions (answerable now)
 
-Format per item: **Status · Options · Tradeoffs · Recommendation (marked) · Blast radius.**
-
-### F2 — Interface-dispatch representation: the plan contradicts itself [OPEN · internal inconsistency]
-- **Status.** §8.3 / record 0082 (line 780) states interface dispatch is **"committed to fat pointers"** — "recording it now prevents Stage 35 from reintroducing headers." But the Stage 35 roadmap entry (line 858) says interface-typed values are **"fat pointer or vtable-embedded — settle this in the interfaces/traits decision."** These disagree: one says decided, the other says open. (Same class of self-contradiction as the `when` Phase-E-vs-Stage-36 one already fixed.)
-- **Options.** (a) Honor 0082: fat pointers, and correct the Stage 35 entry. (b) Reopen the representation at Stage 35.
-- **Recommendation → (a).** 0082 deliberately committed to fat pointers to stop exactly this reopening; the Stage 35 "settle this" wording is stale. Reconcile the Stage 35 entry to cite 0082's commitment. Pure doc-consistency, no code impact now.
-- **Blast radius.** Plan Stage 35 entry (line 858); the interfaces/traits decision when authored; cross-ref to 0082/§8.3.
-
-### F3 — Named arguments: undesigned, unscheduled, yet load-bearing [OPEN]
-- **Status.** SPEC defers named arguments to "a separate future slice" (three places: lines 716, 1039, 1043); 0095 defers spread/variadic "to the named-arguments slice." But named arguments are a **prerequisite** for: DDO's "named placeholders map onto named arguments" binding story; skipping *middle* optional arguments (0086 notes "required cannot follow optional until named arguments exist"); and attribute named arguments. Despite that, named arguments have **no stage and no design record** — the §0 "grammar/feature work is assigned, never implied" rule is being violated for a load-bearing feature.
-- **Options.** (a) Author the named-arguments design (PHP 8 `f(name: value)` spelling; rules for mixing with positional; no silent reordering of evaluation) and assign it a stage before DDO. (b) Leave it implicit until DDO forces it.
-- **Recommendation → (a).** Design it now (spelling is uncontroversial — PHP 8 `name:`), and schedule it explicitly ahead of its consumers rather than letting it surface late under DDO. This also unblocks the 0086 "omit a middle default" case.
-- **Blast radius.** A new decision record + stage assignment; 0086 (default-arg ordering); 0095 (spread deferral target); the DDO prerequisites; SPEC argument sections.
-
-### F4 — Non-decimal integer literals, digit separators, typed suffixes [OPEN]
-- **Status.** SPEC (line 532) says only *"Stage 13 adds no numeric suffixes and no hexadecimal, octal, or binary literal syntax."* That is a *not-yet*, not a decision. Whether Doria will ever have `0xFF` / `0o755` / `0b1010`, digit separators (`1_000_000`), or typed suffixes (`100u8`) is unrecorded. For a systems language doing bitmask, hardware, engine, and byte work — and one that already ships `%x`/`%o`/`%b` *formatting* — decimal-only *input* literals are a real ergonomic hole.
-- **Options.** (a) Add `0x`/`0o`/`0b` literals and `_` digit separators; no typed suffixes. (b) Also add typed suffixes (`100u8`). (c) Decimal-only, permanently.
-- **Recommendation → (a).** Add hex/octal/binary literals and `_` separators; **skip typed suffixes** — Doria's contextual literal typing already assigns a literal's width from its expected type, so `100u8` is redundant with inference (and a suffix would be a second, competing typing channel). Decidable now; implements with lexer/numeric work.
-- **Blast radius.** Lexer; the fixed-width-numerics decision (0016); SPEC literals section; the `fixed-width-integers` example (bit ops would read far better in hex/binary).
-
-### F5 — `uint8[]` ↔ `Bytes` interconversion [OPEN · lands Stage 23]
-- **Status.** Line 343: *"whether `uint8[]` and `Bytes` interconvert, and how, is decided in the collections decision."* Both are byte buffers; the relationship is undecided.
-- **Recommendation → explicit, non-implicit, copy in v1.0.** An explicit `Bytes::fromArray(uint8[])` / `$bytes->toArray()` (copy), never an implicit coercion; zero-copy views over either belong to the FFI/unsafe tier (Stage 40), not here. Decide the surface with the collections decision (Stage 23).
-- **Blast radius.** Collections decision; 0045 (`Bytes`); Stage 23.
-
-### F6 — Property-hook capability policy: may a hook do I/O, `throws`, or block? [OPEN · lands Stage 36]
-- **Status.** The property-hooks decision *"must decide"* this (line 744), designed against the ORM-shaped lazy-loaded-relation case — the one place a property-shaped API might need to hit the database on access.
-- **Options.** (a) Hooks are pure/total (no I/O, no `throws`, no blocking) — keeps "a property is data"; lazy relations must be methods. (b) Hooks may `throws` and do I/O — enables property-shaped lazy relations (the ORM case) but a `$post->author` access can now fail or block, which fights the §6 "looks like data" charter. (c) Allow `throws` but not blocking/async in v1.0.
-- **Recommendation → decide against the ORM case explicitly; lean (c).** Permit a hook to `throws` (so a lazy relation can surface a load failure through the checked-error path) while keeping the "looks like data" contract honest by documenting that a hooked property is not guaranteed side-effect-free. This is a genuine hard fork — flag it for a real decision, don't let Stage 36 default it silently.
-- **Blast radius.** Property-hooks decision; §6 charter wording; Stage 36; DDO/ORM design cases.
-
-### F7 — `Baton.lock` encoding: TOML vs JSON [OPEN · small · lands Stage 33]
-- **Status.** Line 695: the lockfile's encoding *"stays open until the Baton manifest/resolver decision."* `Baton.toml` (human-edited) is TOML; the lock is machine-generated and never hand-edited.
-- **Recommendation → JSON for the lock.** The human/machine split argues it: TOML earns its keep for the hand-edited manifest; the never-hand-edited lock wants the most ubiquitous, unambiguous machine format (JSON), avoiding TOML's edge cases in generated output. Decide with the Baton decision (Stage 33).
-- **Blast radius.** Baton manifest/resolver decision; §11.
-
-### F8 — `Console` statelessness vs a `ScreenBuffer` type [OPEN · lands Stage 46]
-- **Status.** Line 588 flags this as something that *"must be decided explicitly, never bolted on silently"*: is `Console` stateless, or is there a separate `ScreenBuffer` (the TermUtil `Grid`/`charAt` read-back, half of a flicker-free diffing renderer)?
-- **Recommendation → separate `ScreenBuffer` type; keep `Console` stateless.** A diffing renderer needs a readable back-buffer; bolting read-back onto a stateless capability facade muddies both. Best decided *with* the terminal API (Stage 46) rather than in the abstract, so lower priority — but the plan already commits to deciding it deliberately.
-- **Blast radius.** Console/terminal decision; Stage 46; `Doria\Std\Term`.
+No unresolved items remain from this audit. F1-F8 are archived in the resolutions
+above; their accepted decisions and scheduled work are the authority.
 
 ## Minor / spec-tightening (lower priority)
 - **`given` + chained `if`.** 0020 AND-s `given` predicates with *"the attached control condition"* (singular); 0097 generalized this to each `when`/`else when` and noted the `if`/`else if` mirror. 0020/SPEC's `if`-chain wording should be tightened to say the same (predicates AND with each `else if`), so the two constructs match on paper.

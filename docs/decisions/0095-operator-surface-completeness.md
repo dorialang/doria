@@ -72,9 +72,9 @@ conversions (0042); `instanceof` → `is`; short ternary `?:` → `??` (0094).
 ### Deferred
 
 `...` spread and variadic **user-function** parameters — the general spread/
-variadic surface is the named-arguments future slice (today's `...args` is limited
-to the compiler-known `sprintf`/`printf`). Not an operator gap to close now;
-reopen with the named-arguments/variadic work.
+variadic surface remains separate from the Stage 23a named-arguments slice
+(today's `...args` is limited to the compiler-known `sprintf`/`printf`). Not an
+operator gap to close now; reopen with dedicated variadic work.
 
 ## Alternatives considered
 

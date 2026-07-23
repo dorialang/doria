@@ -2424,9 +2424,19 @@ fn lower_nullable_string_expression(
             })
         }
         hir::Expr::PropertyAccess { .. } => {
-            let (object, property) =
-                lower_property_operand(expr, mir::Type::NullableString, context)?;
-            Ok(mir::NullableStringExpression::Property { object, property })
+            let (object, property, ty) = lower_property_place(expr, context)?;
+            match ty {
+                mir::Type::NullableString => {
+                    Ok(mir::NullableStringExpression::Property { object, property })
+                }
+                mir::Type::String => Ok(mir::NullableStringExpression::String(
+                    mir::StringExpression::Property { object, property },
+                )),
+                _ => Err(vec![unsupported(
+                    expr.span(),
+                    "property does not produce string or ?string",
+                )]),
+            }
         }
         hir::Expr::StaticMember {
             class_name,
@@ -2434,10 +2444,16 @@ fn lower_nullable_string_expression(
             span,
         } => {
             let (id, ty) = context.static_property(class_name, member, *span)?;
-            if ty != mir::Type::NullableString {
-                return Err(vec![unsupported(*span, "static property is not ?string")]);
+            match ty {
+                mir::Type::NullableString => Ok(mir::NullableStringExpression::Static(id)),
+                mir::Type::String => Ok(mir::NullableStringExpression::String(
+                    mir::StringExpression::Static(id),
+                )),
+                _ => Err(vec![unsupported(
+                    *span,
+                    "static property does not produce string or ?string",
+                )]),
             }
-            Ok(mir::NullableStringExpression::Static(id))
         }
         hir::Expr::Variable { name, span } => {
             let local = context.lookup_local(name, *span)?;
@@ -2625,13 +2641,26 @@ fn lower_nullable_scalar_expression(
             })
         }
         hir::Expr::PropertyAccess { .. } => {
-            let (object, property) =
-                lower_property_operand(expr, mir::Type::NullableScalar(expected), context)?;
-            Ok(mir::NullableScalarExpression::Property {
-                ty: expected,
-                object,
-                property,
-            })
+            let (object, property, ty) = lower_property_place(expr, context)?;
+            match ty {
+                mir::Type::NullableScalar(actual) if actual == expected => {
+                    Ok(mir::NullableScalarExpression::Property {
+                        ty: expected,
+                        object,
+                        property,
+                    })
+                }
+                mir::Type::Scalar(actual) if actual == expected => Ok(
+                    mir::NullableScalarExpression::Value(value_expression_from_operand(
+                        expected,
+                        mir::Operand::Property { object, property },
+                    )),
+                ),
+                _ => Err(vec![unsupported(
+                    expr.span(),
+                    "property has another scalar type",
+                )]),
+            }
         }
         hir::Expr::StaticMember {
             class_name,
@@ -2639,13 +2668,20 @@ fn lower_nullable_scalar_expression(
             span,
         } => {
             let (id, ty) = context.static_property(class_name, member, *span)?;
-            if ty != mir::Type::NullableScalar(expected) {
-                return Err(vec![unsupported(
+            match ty {
+                mir::Type::NullableScalar(actual) if actual == expected => {
+                    Ok(mir::NullableScalarExpression::Static { ty: expected, id })
+                }
+                mir::Type::Scalar(actual) if actual == expected => {
+                    Ok(mir::NullableScalarExpression::Value(
+                        value_expression_from_operand(expected, mir::Operand::Static(id)),
+                    ))
+                }
+                _ => Err(vec![unsupported(
                     *span,
-                    "static property has another nullable scalar type",
-                )]);
+                    "static property has another scalar type",
+                )]),
             }
-            Ok(mir::NullableScalarExpression::Static { ty: expected, id })
         }
         hir::Expr::FunctionCall { name, args, span } => {
             let signature = context.lookup_function(name, *span)?;
@@ -2847,17 +2883,23 @@ fn lower_nullable_class_expression(
                 )]);
             }
             let (object, property, ty) = lower_property_place(expr, context)?;
-            if ty != mir::Type::NullableClass(expected) {
-                return Err(vec![unsupported(
-                    *span,
-                    "property has another nullable class type",
-                )]);
+            match ty {
+                mir::Type::NullableClass(actual) if actual == expected => {
+                    Ok(mir::NullableClassExpression::Property {
+                        class: expected,
+                        object,
+                        property,
+                    })
+                }
+                mir::Type::Class(actual) if actual == expected => Ok(
+                    mir::NullableClassExpression::Class(mir::ClassExpression::Property {
+                        class: expected,
+                        object,
+                        property,
+                    }),
+                ),
+                _ => Err(vec![unsupported(*span, "property has another class type")]),
             }
-            Ok(mir::NullableClassExpression::Property {
-                class: expected,
-                object,
-                property,
-            })
         }
         hir::Expr::FunctionCall { name, args, span } => {
             let signature = context.lookup_function(name, *span)?;
@@ -3935,6 +3977,21 @@ fn call_value_expression(
         mir::ScalarType::Bool => {
             mir::ValueExpression::Bool(mir::BoolExpression::Call { function, args })
         }
+    }
+}
+
+fn value_expression_from_operand(
+    ty: mir::ScalarType,
+    operand: mir::Operand,
+) -> mir::ValueExpression {
+    match ty {
+        mir::ScalarType::Integer(ty) => {
+            mir::ValueExpression::Integer(mir::IntegerExpression::Use { ty, operand })
+        }
+        mir::ScalarType::Float(ty) => {
+            mir::ValueExpression::Float(mir::FloatExpression::Use { ty, operand })
+        }
+        mir::ScalarType::Bool => mir::ValueExpression::Bool(mir::BoolExpression::Use { operand }),
     }
 }
 

@@ -1550,10 +1550,22 @@ impl Checker<'_> {
                 right,
                 ..
             } => {
-                if matches!(ungroup_expr(left), Expr::Null { .. }) {
-                    self.use_expr(left, scopes, UseMode::Read);
-                    self.use_expr(right, scopes, mode);
-                    return;
+                match self.flow_fact(left) {
+                    Some(Fact::NonNull | Fact::Exact(_)) => {
+                        self.use_expr(left, scopes, mode);
+                        return;
+                    }
+                    Some(Fact::Null) => {
+                        self.use_expr(left, scopes, UseMode::Read);
+                        self.use_expr(right, scopes, mode);
+                        return;
+                    }
+                    None if matches!(ungroup_expr(left), Expr::Null { .. }) => {
+                        self.use_expr(left, scopes, UseMode::Read);
+                        self.use_expr(right, scopes, mode);
+                        return;
+                    }
+                    None => {}
                 }
                 let before = scopes.clone();
                 let mut selected = before.clone();
@@ -1705,14 +1717,16 @@ impl Checker<'_> {
         if !null_safe {
             return CallExecution::Always;
         }
-        match self
-            .flow_facts
-            .get(&(object.span().start, object.span().end))
-        {
+        match self.flow_fact(object) {
             Some(Fact::Null) => CallExecution::Never,
             Some(Fact::NonNull | Fact::Exact(_)) => CallExecution::Always,
             None => CallExecution::Maybe,
         }
+    }
+
+    fn flow_fact(&self, expr: &Expr) -> Option<&Fact> {
+        let expr = ungroup_expr(expr);
+        self.flow_facts.get(&(expr.span().start, expr.span().end))
     }
 
     fn activate_call_borrow(&mut self, expr: &Expr, mode: UseMode, scopes: &Scopes) {

@@ -1099,6 +1099,120 @@ function add(bool $condition, int $input): int
 }
 
 #[test]
+fn non_null_intrinsics_establish_nullable_flow_facts() {
+    doriac::check_source(
+        "stage22-intrinsic-flow-facts.doria",
+        r#"
+function read(): string
+{
+    ?string $formatted = sprintf("%s", "value");
+    ?string $contents = read_file("input.txt");
+    return $formatted . $contents;
+}
+"#,
+    )
+    .expect("compiler-known non-null intrinsic results should narrow nullable destinations");
+}
+
+#[test]
+fn non_null_properties_wrap_at_nullable_destinations_and_narrowed_receivers_validate() {
+    let source = r#"
+class Item
+{
+    function __construct(string $label) {}
+}
+
+class Holder
+{
+    static int $staticCount = 8;
+    static string $staticName = "static";
+    function __construct(int $count, string $name, take Item $item) {}
+}
+
+function itemLabel(?Item $item): string
+{
+    return $item?->label ?? "none";
+}
+
+function describe(?Holder $holder, bool $flag): string
+{
+    if ($holder == null) { return "none"; }
+    ?int $count = $holder->count;
+    ?string $name = $holder->name;
+    ?int $staticCount = Holder::staticCount;
+    ?string $staticName = Holder::staticName;
+    return $name . ":" . itemLabel($holder->item) . ":{$count}:{$staticName}:{$staticCount}";
+}
+
+function main(): void
+{
+    let $holder = new Holder(7, "held", new Item("child"));
+    echo describe($holder, false);
+}
+"#;
+    let program = doriac::lower_source_to_mir("stage22-property-wrapping.doria", source)
+        .expect("non-null properties should wrap at nullable destinations");
+    doriac::mir_validation::validate_program(&program)
+        .expect("guard-narrowed nullable property receivers should validate");
+    assert!(!doriac::codegen_cranelift::lower_mir_to_object(&program)
+        .expect("Cranelift should lower nullable property wrapping")
+        .is_empty());
+    #[cfg(feature = "llvm-backend")]
+    assert!(!doriac::codegen_llvm::lower_mir_to_object(&program)
+        .expect("LLVM should lower nullable property wrapping")
+        .is_empty());
+    let output = doriac::mir_interpreter::interpret(&program)
+        .expect("nullable property wrapping should execute");
+    assert_eq!(output.stdout, b"held:child:7:static:8");
+
+    let mut malformed = program;
+    let describe = malformed
+        .functions
+        .iter_mut()
+        .find(|function| function.name == "describe")
+        .expect("fixture should contain describe");
+    let flag = describe
+        .locals
+        .iter()
+        .find(|local| local.name == "flag")
+        .expect("fixture should contain flag")
+        .id;
+    let branch = describe
+        .blocks
+        .iter_mut()
+        .find_map(|block| match &mut block.terminator {
+            doriac::mir::Terminator::Branch { condition, .. } => Some(condition),
+            _ => None,
+        })
+        .expect("fixture should contain the null guard branch");
+    *branch = doriac::mir::BoolExpression::Use {
+        operand: doriac::mir::Operand::Local(flag),
+    };
+    let error = doriac::mir_validation::validate_program(&malformed)
+        .expect_err("nullable property receivers still require a dominating presence proof");
+    assert!(error.message.contains("assumed non-null"));
+}
+
+#[test]
+fn coalesce_ownership_uses_proven_arm_selection() {
+    doriac::check_source(
+        "stage22-coalesce-ownership-facts.doria",
+        r#"
+class Box {}
+function consume(take Box $value): void {}
+function main(): void
+{
+    writable ?Box $value = null;
+    consume($value ?? new Box());
+    $value = new Box();
+    consume($value ?? new Box());
+}
+"#,
+    )
+    .expect("coalesce should apply ownership only to the arm selected by flow facts");
+}
+
+#[test]
 fn is_results_establish_non_null_facts_in_nullable_bool_slots() {
     doriac::check_source(
         "stage22-is-nullable-bool.doria",

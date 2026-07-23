@@ -3,6 +3,7 @@ use std::collections::{BTreeMap, HashMap};
 use crate::ast::{
     Block, ElseBranch, Expr, ForIncrement, ForInitializer, FunctionDecl, Item, Param, Program, Stmt,
 };
+use crate::builtins::Builtin;
 use crate::control_flow::{build_function_cfg, Node, NodeAction};
 use crate::dataflow::{solve_forward, ForwardAnalysis};
 use crate::source::Span;
@@ -202,7 +203,9 @@ impl NullabilityCatalog {
     }
 
     fn function_is_non_null(&self, name: &str) -> Option<bool> {
-        self.functions.get(name).copied()
+        Builtin::from_name(name)
+            .and_then(Builtin::return_is_non_null)
+            .or_else(|| self.functions.get(name).copied())
     }
 
     fn method_is_non_null(&self, method: &str) -> Option<bool> {
