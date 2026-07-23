@@ -163,10 +163,8 @@ fn linker_arguments(
         // Cranelift-generated objects do not carry MSVC /DEFAULTLIB directives.
         // For the current generated process wrapper, make Doria's main the executable
         // entrypoint instead of relying on CRT startup to discover and call it.
-        // LLVM may emit __chkstk for any function whose frame crosses the Windows
-        // stack-probe threshold. Link the static CRT archive that owns the
-        // stack-probe support object because generated objects carry no
-        // /DEFAULTLIB directives.
+        // doria-rt owns the small MSVC support surface used by generated code,
+        // including LLVM's x86-64 stack-probe helper, so no C runtime is linked.
         return vec![
             OsString::from("/nologo"),
             object_path.as_os_str().to_os_string(),
@@ -175,7 +173,6 @@ fn linker_arguments(
             OsString::from("/link"),
             OsString::from("/ENTRY:main"),
             OsString::from("/SUBSYSTEM:CONSOLE"),
-            OsString::from("libcmt.lib"),
             OsString::from("kernel32.lib"),
         ];
     }
@@ -224,7 +221,6 @@ mod tests {
                 OsString::from("/link"),
                 OsString::from("/ENTRY:main"),
                 OsString::from("/SUBSYSTEM:CONSOLE"),
-                OsString::from("libcmt.lib"),
                 OsString::from("kernel32.lib"),
             ]
         );
@@ -252,7 +248,6 @@ mod tests {
                 OsString::from("/link"),
                 OsString::from("/ENTRY:main"),
                 OsString::from("/SUBSYSTEM:CONSOLE"),
-                OsString::from("libcmt.lib"),
                 OsString::from("kernel32.lib"),
             ]
         );

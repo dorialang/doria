@@ -1574,6 +1574,37 @@ extern "C" {
 #[no_mangle]
 pub static _fltused: i32 = 0;
 
+// LLVM emits this MSVC stack-probe call when a generated x86-64 function reserves more than one
+// page of stack. Probe each page before the function adjusts RSP so Windows can extend the stack's
+// guard region. The MSVC convention passes the allocation size in RAX and preserves RAX and RCX.
+#[cfg(all(windows, target_env = "msvc", target_arch = "x86_64"))]
+core::arch::global_asm!(
+    r#"
+    .text
+    .def __chkstk; .scl 2; .type 32; .endef
+    .globl __chkstk
+    .p2align 4, 0x90
+__chkstk:
+    push rax
+    push rcx
+    cmp rax, 0x1000
+    lea rcx, [rsp + 24]
+    jb 2f
+1:
+    sub rcx, 0x1000
+    test qword ptr [rcx], rcx
+    sub rax, 0x1000
+    cmp rax, 0x1000
+    ja 1b
+2:
+    sub rcx, rax
+    test qword ptr [rcx], rcx
+    pop rcx
+    pop rax
+    ret
+"#
+);
+
 /// Copies `count` bytes from `source` to the non-overlapping `destination`.
 ///
 /// # Safety
