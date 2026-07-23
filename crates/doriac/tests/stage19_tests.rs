@@ -663,17 +663,32 @@ fn owning_array_literals_move_their_elements() {
 }
 
 #[test]
-fn owning_dictionary_literals_move_their_keys() {
-    for key in ["$guard", "($guard)"] {
+fn owning_dictionary_literals_move_their_values() {
+    for value in ["$guard", "($guard)"] {
         let source = format!(
-            "class Guard {{}} function consume(take Guard $guard): void {{}} function route(take Guard $guard): void {{ mixed $payload = [{key} => 1]; consume($guard); }}"
+            "class Guard {{}} function consume(take Guard $guard): void {{}} function route(take Guard $guard): void {{ mixed $payload = [\"guard\" => {value}]; consume($guard); }}"
         );
-        let diagnostics = doriac::check_source("dictionary-key-move.doria", source)
-            .expect_err("the dictionary payload owns move-typed keys and values");
+        let diagnostics = doriac::check_source("dictionary-value-move.doria", source)
+            .expect_err("the dictionary payload owns move-typed values");
         assert!(diagnostics
             .iter()
             .any(|diagnostic| diagnostic.code == "E0470"));
     }
+}
+
+#[test]
+fn user_class_dictionary_keys_wait_for_hashable_conformance() {
+    let diagnostics = doriac::check_source(
+        "dictionary-class-key.doria",
+        "class Guard {} function route(take Guard $guard): void { Dictionary<Guard, int> $payload = [$guard => 1]; }",
+    )
+    .expect_err("user-defined Hashable conformance is deferred to Stage 35");
+    assert!(diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == "E0523"
+            && diagnostic
+                .message
+                .contains("requires Stage 35 user-defined `Hashable` conformance")
+    }));
 }
 
 #[test]
@@ -682,7 +697,7 @@ fn collection_reassignment_moves_the_source_owner() {
         "Guard[]",
         "List<Guard>",
         "Dictionary<string, Guard>",
-        "Set<Guard>",
+        "Set<string>",
     ] {
         let source = format!(
             "class Guard {{}} function sink(take {collection} $items): void {{}} function route(take {collection} $src, take {collection} $initial): void {{ let writable $dst = $initial; $dst = $src; sink($src); }}"
@@ -713,7 +728,7 @@ fn promoted_collection_parameters_require_take() {
         "Guard[]",
         "List<Guard>",
         "Dictionary<string, Guard>",
-        "Set<Guard>",
+        "Set<string>",
     ] {
         let source = format!(
             "class Guard {{}} class Box {{ function __construct({collection} $items) {{}} }}"
@@ -740,7 +755,7 @@ fn collection_properties_are_move_values() {
         "Guard[]",
         "List<Guard>",
         "Dictionary<string, Guard>",
-        "Set<Guard>",
+        "Set<string>",
     ] {
         let source = format!(
             "class Guard {{}} function sink(take {collection} $items): void {{}} class Box {{ function __construct(take {collection} $items) {{}} function release(): void {{ sink($this->items); }} }}"

@@ -15,7 +15,7 @@
 - `docs/decisions/` — **0074** (Stage 17 stdio & formatted I/O), **0075** (I/O family tiers & failure-semantics migration), **0045** (runtime strings/`Bytes`/canonical display), **0006** (console/terminal — deferred), **0081** (abort-only panic runs no cleanup), **0035** (checked throw/throws direction).
 - Code (verifying claims): `crates/doriac/src/builtins.rs` (shipped intrinsic set), `crates/doriac/src/mir_lowering.rs` (echo lowering), `crates/doria-rt/src/lib.rs` (`ignore_sigpipe` → EPIPE), `crates/doria-rt/src/device_io.rs` (broken-pipe detection).
 
-**Shipped surface today:** `echo` (statement), `read_line(): ?string`, `sprintf`, `printf`, `read_file(string): string`, `write_file(string, string): void`, `write_stderr(string): void`. `read_file_bytes`/`write_file_bytes` are **planned (Stage 23), not shipped**.
+**Status at the time of this audit:** `echo` (statement), `read_line(): ?string`, `sprintf`, `printf`, `read_file(string): string`, `write_file(string, string): void`, and `write_stderr(string): void` were shipped; the byte tier was still planned. Stage 23 Slice 2 subsequently shipped `Bytes`, binary file/standard-stream I/O, and text `append_file` under the decisions recorded below.
 
 ## Already settled (item → citation)
 
@@ -34,14 +34,16 @@
 
 Format per item: **Status · Options · Tradeoffs · Recommendation (marked) · Blast radius.**
 
-### Q1 — stdout byte-write surface / the stderr asymmetry [OPEN]
+### Q1 — stdout byte-write surface / the stderr asymmetry [ACCEPTED — Decision 0101; implementation Stage 23]
+- **Resolution.** Recommendation (b) ratified in Decision 0101: no `write_stdout(string)` (the text asymmetry is intentional — `echo` is the sole stdout text writer, `write_stderr` the stderr text escape hatch); `write_stdout_bytes(Bytes): void` and `write_stderr_bytes(Bytes): void` join the Stage 23 byte tier.
 - **Status.** `echo` writes text to stdout (display-converted, no newline — verified in lowering); `write_stderr(string)` writes exact text bytes to stderr. There is **no byte-level output to either stdout or stderr**. The asymmetry (`write_stderr` exists, no `write_stdout`) is real but, for *text*, cosmetic: `echo` is the stdout text writer.
 - **Options.** (a) Add `write_stdout(string)` now to mirror `write_stderr`. (b) Treat the text asymmetry as intentional (`echo` = the one text-stdout spelling; `write_stderr` = the error-channel escape hatch) and name the **byte** path as a Stage 23 `Bytes`-tier addition: `write_stdout_bytes(Bytes)` + `write_stderr_bytes(Bytes)`. (c) Leave byte output to files only.
 - **Tradeoffs.** (a) duplicates `echo` — reintroduces the exact `print`/`echo` redundancy Doria bans. (b) closes the *real* gap (binary piping, non-UTF-8) with symmetric names and honors "one output spelling." (c) leaves binary pipelines impossible.
 - **Recommendation → (b).** Do **not** add `write_stdout(string)`. Declare the text asymmetry intentional (`echo` is stdout text; `write_stderr` is the stderr text escape hatch), and reserve `write_stdout_bytes(Bytes): void` and `write_stderr_bytes(Bytes): void` for the Stage 23 `Bytes` tier. This names the byte path explicitly and keeps the naming symmetric where it matters (bytes).
 - **Blast radius.** Stage 23 scope; 0075 tier-2 text, plan §9 three-tier bullet, SPEC. No shipped signature changes.
 
-### Q2 — stdin byte tier [OPEN]
+### Q2 — stdin byte tier [ACCEPTED — Decision 0101; implementation Stage 23]
+- **Resolution.** Recommendation (a) ratified in Decision 0101: `read_stdin_bytes(): Bytes` (whole-stdin slurp, empty on immediate EOF, no UTF-8 validation) joins the Stage 23 byte tier; chunked/incremental reads stay deferred to the post-Stage-29 stream tier.
 - **Status.** `read_line` (text stdin), `read_file` (text file), `read_file_bytes` (binary **file**, Stage 23). No byte-level **stdin** read; the binary tier as written covers files only.
 - **Options.** (a) `read_stdin_bytes(): Bytes` free function in the Stage 23 `Bytes` tier (whole-stdin slurp), sibling of `read_file_bytes`. (b) byte stdin only via the post-Stage-29 stream tier.
 - **Tradeoffs.** (a) completes the binary tier across file **and** stdin at one stage; whole-stdin slurp only (chunked reads wait for streams). (b) leaves binary piping impossible until post-Stage-29, inconsistent with `read_file_bytes` landing at Stage 23.

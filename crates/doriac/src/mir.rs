@@ -22,12 +22,33 @@ pub struct LocalId(pub usize);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct StaticId(pub usize);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CollectionTypeId(pub usize);
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Program {
     pub classes: Vec<Class>,
+    pub collection_types: Vec<CollectionType>,
     pub statics: Vec<StaticProperty>,
     pub functions: Vec<Function>,
     pub entry: FunctionId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CollectionKind {
+    Bytes,
+    TypedArray,
+    List,
+    Dictionary,
+    Set,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CollectionType {
+    pub id: CollectionTypeId,
+    pub kind: CollectionKind,
+    pub key: Option<Type>,
+    pub value: Type,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -111,7 +132,7 @@ pub enum ReturnType {
     Void,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ScalarType {
     Integer(IntegerType),
     Float(FloatType),
@@ -145,7 +166,7 @@ pub struct Local {
     pub synthetic: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Type {
     Scalar(ScalarType),
     String,
@@ -153,6 +174,7 @@ pub enum Type {
     NullableString,
     Class(ClassId),
     NullableClass(ClassId),
+    Collection(CollectionTypeId),
 }
 
 impl From<ScalarType> for Type {
@@ -178,6 +200,16 @@ pub enum Operand {
         object: LocalId,
         property: PropertyId,
     },
+    CollectionLength(LocalId),
+    CollectionIndex {
+        collection: LocalId,
+        index: Box<Rvalue>,
+        remove: bool,
+    },
+    CollectionKeyAt {
+        collection: LocalId,
+        offset: Box<Rvalue>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -188,6 +220,7 @@ pub enum Rvalue {
     NullableString(NullableStringExpression),
     Class(ClassExpression),
     NullableClass(NullableClassExpression),
+    Collection(CollectionExpression),
 }
 
 impl Rvalue {
@@ -199,6 +232,7 @@ impl Rvalue {
             Self::NullableString(_) => Type::NullableString,
             Self::Class(value) => Type::Class(value.class()),
             Self::NullableClass(value) => Type::NullableClass(value.class()),
+            Self::Collection(value) => Type::Collection(value.collection()),
         }
     }
 
@@ -206,12 +240,102 @@ impl Rvalue {
         match self {
             Self::Class(value) => value.owned_temporary_class(),
             Self::NullableClass(value) => value.owned_temporary_class(),
+            Self::Collection(_) => None,
             Self::Value(_)
             | Self::String(_)
             | Self::NullableScalar(_)
             | Self::NullableString(_) => None,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CollectionExpression {
+    Local {
+        collection: CollectionTypeId,
+        local: LocalId,
+        transfer: bool,
+    },
+    Literal {
+        collection: CollectionTypeId,
+        entries: Vec<CollectionEntry>,
+    },
+    Index {
+        collection: CollectionTypeId,
+        source: LocalId,
+        index: Box<Rvalue>,
+        transfer: bool,
+    },
+    Property {
+        collection: CollectionTypeId,
+        object: LocalId,
+        property: PropertyId,
+    },
+    SetFrom {
+        collection: CollectionTypeId,
+        source: LocalId,
+        transfer: bool,
+        algebra: Option<(SetAlgebraOp, LocalId)>,
+    },
+    FromBytes {
+        collection: CollectionTypeId,
+        source: LocalId,
+    },
+    BytesFromArray {
+        collection: CollectionTypeId,
+        source: LocalId,
+    },
+    ReadFileBytes {
+        collection: CollectionTypeId,
+        path: Box<StringExpression>,
+    },
+    ReadStdinBytes {
+        collection: CollectionTypeId,
+    },
+    Call {
+        collection: CollectionTypeId,
+        function: FunctionId,
+        args: Vec<Rvalue>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetAlgebraOp {
+    Union,
+    Intersect,
+    Difference,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NullableCollectionAccess {
+    Get,
+    Remove,
+    First,
+    Last,
+    Pop,
+}
+
+impl CollectionExpression {
+    pub const fn collection(&self) -> CollectionTypeId {
+        match self {
+            Self::Local { collection, .. }
+            | Self::Literal { collection, .. }
+            | Self::Index { collection, .. }
+            | Self::Property { collection, .. }
+            | Self::SetFrom { collection, .. }
+            | Self::FromBytes { collection, .. }
+            | Self::BytesFromArray { collection, .. }
+            | Self::ReadFileBytes { collection, .. }
+            | Self::ReadStdinBytes { collection }
+            | Self::Call { collection, .. } => *collection,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CollectionEntry {
+    pub key: Option<Rvalue>,
+    pub value: Rvalue,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -252,6 +376,12 @@ pub enum NullableScalarExpression {
         left: Box<NullableScalarExpression>,
         right: Box<NullableScalarExpression>,
     },
+    DictionaryGet {
+        ty: ScalarType,
+        collection: LocalId,
+        key: Box<Rvalue>,
+        access: NullableCollectionAccess,
+    },
 }
 
 impl NullableScalarExpression {
@@ -264,7 +394,8 @@ impl NullableScalarExpression {
             | Self::Call { ty, .. }
             | Self::NullSafeProperty { ty, .. }
             | Self::NullSafeCall { ty, .. }
-            | Self::Coalesce { ty, .. } => *ty,
+            | Self::Coalesce { ty, .. }
+            | Self::DictionaryGet { ty, .. } => *ty,
             Self::Value(value) => value.ty(),
         }
     }
@@ -305,6 +436,12 @@ pub enum ClassExpression {
         right: Box<ClassExpression>,
         transfer: bool,
     },
+    CollectionIndex {
+        class: ClassId,
+        collection: LocalId,
+        index: Box<Rvalue>,
+        transfer: bool,
+    },
 }
 
 impl ClassExpression {
@@ -315,7 +452,8 @@ impl ClassExpression {
             | Self::Call { class, .. }
             | Self::New { class, .. }
             | Self::NullableLocalAssumeNonNull { class, .. }
-            | Self::Coalesce { class, .. } => *class,
+            | Self::Coalesce { class, .. }
+            | Self::CollectionIndex { class, .. } => *class,
         }
     }
 
@@ -331,6 +469,7 @@ impl ClassExpression {
             | Self::Property { .. }
             | Self::NullableLocalAssumeNonNull { .. }
             | Self::Coalesce { .. }
+            | Self::CollectionIndex { .. }
             | Self::Call {
                 return_borrow: Some(_),
                 ..
@@ -531,6 +670,15 @@ pub enum StringExpression {
         left: Box<NullableStringExpression>,
         right: Box<StringExpression>,
     },
+    CollectionIndex {
+        collection: LocalId,
+        index: Box<Rvalue>,
+        remove: bool,
+    },
+    CollectionKeyAt {
+        collection: LocalId,
+        offset: Box<Rvalue>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -560,6 +708,11 @@ pub enum NullableStringExpression {
     Coalesce {
         left: Box<NullableStringExpression>,
         right: Box<NullableStringExpression>,
+    },
+    DictionaryGet {
+        collection: LocalId,
+        key: Box<Rvalue>,
+        access: NullableCollectionAccess,
     },
 }
 
@@ -601,6 +754,12 @@ pub enum NullableClassExpression {
         right: Box<NullableClassExpression>,
         transfer: bool,
     },
+    DictionaryGet {
+        class: ClassId,
+        collection: LocalId,
+        key: Box<Rvalue>,
+        access: NullableCollectionAccess,
+    },
 }
 
 impl NullableClassExpression {
@@ -612,7 +771,8 @@ impl NullableClassExpression {
             | Self::Call { class, .. }
             | Self::NullSafeProperty { class, .. }
             | Self::NullSafeCall { class, .. }
-            | Self::Coalesce { class, .. } => *class,
+            | Self::Coalesce { class, .. }
+            | Self::DictionaryGet { class, .. } => *class,
             Self::Class(value) => value.class(),
         }
     }
@@ -639,6 +799,7 @@ impl NullableClassExpression {
             }
             | Self::NullSafeProperty { .. }
             | Self::Coalesce { .. }
+            | Self::DictionaryGet { .. }
             | Self::NullSafeCall {
                 return_borrow: Some(_),
                 ..
@@ -696,6 +857,25 @@ pub enum BoolExpression {
         left: Box<NullableScalarExpression>,
         right: Box<BoolExpression>,
     },
+    CollectionHas {
+        collection: LocalId,
+        value: Box<Rvalue>,
+        op: CollectionMembershipOp,
+    },
+    CollectionIsEmpty {
+        collection: LocalId,
+    },
+    CollectionEqual {
+        left: LocalId,
+        right: LocalId,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CollectionMembershipOp {
+    Contains,
+    Add,
+    Remove,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -741,7 +921,20 @@ pub enum Statement {
         path: StringExpression,
         contents: StringExpression,
     },
+    AppendFile {
+        path: StringExpression,
+        contents: StringExpression,
+    },
     WriteStderr(StringExpression),
+    WriteFileBytes {
+        path: StringExpression,
+        contents: LocalId,
+        append: bool,
+    },
+    WriteStreamBytes {
+        contents: LocalId,
+        stderr: bool,
+    },
     AssignProperty {
         object: LocalId,
         property: PropertyId,
@@ -755,6 +948,36 @@ pub enum Statement {
         local: LocalId,
         class: ClassId,
     },
+    DropString {
+        local: LocalId,
+    },
+    CollectionAdd {
+        collection: LocalId,
+        value: Rvalue,
+        index: Option<Rvalue>,
+        op: CollectionMutationOp,
+    },
+    CollectionSet {
+        collection: LocalId,
+        key: Rvalue,
+        value: Rvalue,
+    },
+    AssignCollectionIndex {
+        collection: LocalId,
+        index: Rvalue,
+        value: Rvalue,
+    },
+    DropCollection {
+        local: LocalId,
+        collection: CollectionTypeId,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CollectionMutationOp {
+    Add,
+    InsertAt,
+    Remove,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -791,7 +1014,18 @@ fn statement_class_temporary_capacity(statement: &Statement) -> usize {
         Statement::AssignLocal { value, .. }
         | Statement::AssignProperty { value, .. }
         | Statement::AssignStatic { value, .. } => rvalue_class_temporary_capacity(value),
-        Statement::EchoStringLiteral(_) | Statement::DropClass { .. } => 0,
+        Statement::CollectionAdd { value, .. } => rvalue_class_temporary_capacity(value),
+        Statement::CollectionSet { key, value, .. } => {
+            rvalue_class_temporary_capacity(key) + rvalue_class_temporary_capacity(value)
+        }
+        Statement::AssignCollectionIndex { index, value, .. } => {
+            rvalue_class_temporary_capacity(index) + rvalue_class_temporary_capacity(value)
+        }
+        Statement::EchoStringLiteral(_)
+        | Statement::DropClass { .. }
+        | Statement::DropString { .. }
+        | Statement::DropCollection { .. }
+        | Statement::WriteStreamBytes { .. } => 0,
         Statement::EchoString(value) | Statement::WriteStderr(value) => {
             string_class_temporary_capacity(value)
         }
@@ -806,9 +1040,10 @@ fn statement_class_temporary_capacity(statement: &Statement) -> usize {
                     .sum::<usize>()
         }
         Statement::Printf(format) => format_class_temporary_capacity(format),
-        Statement::WriteFile { path, contents } => {
+        Statement::WriteFile { path, contents } | Statement::AppendFile { path, contents } => {
             string_class_temporary_capacity(path) + string_class_temporary_capacity(contents)
         }
+        Statement::WriteFileBytes { path, .. } => string_class_temporary_capacity(path),
     }
 }
 
@@ -829,6 +1064,33 @@ fn rvalue_class_temporary_capacity(value: &Rvalue) -> usize {
         Rvalue::NullableString(value) => nullable_string_class_temporary_capacity(value),
         Rvalue::Class(value) => class_expression_temporary_capacity(value),
         Rvalue::NullableClass(value) => nullable_class_temporary_capacity(value),
+        Rvalue::Collection(value) => collection_class_temporary_capacity(value),
+    }
+}
+
+fn collection_class_temporary_capacity(value: &CollectionExpression) -> usize {
+    match value {
+        CollectionExpression::Local { .. }
+        | CollectionExpression::SetFrom { .. }
+        | CollectionExpression::FromBytes { .. }
+        | CollectionExpression::BytesFromArray { .. }
+        | CollectionExpression::ReadStdinBytes { .. } => 0,
+        CollectionExpression::Call { args, .. } => {
+            args.iter().map(rvalue_class_temporary_capacity).sum()
+        }
+        CollectionExpression::Literal { entries, .. } => entries
+            .iter()
+            .map(|entry| {
+                entry
+                    .key
+                    .as_ref()
+                    .map_or(0, rvalue_class_temporary_capacity)
+                    + rvalue_class_temporary_capacity(&entry.value)
+            })
+            .sum(),
+        CollectionExpression::Index { index, .. } => rvalue_class_temporary_capacity(index),
+        CollectionExpression::Property { .. } => 0,
+        CollectionExpression::ReadFileBytes { path, .. } => string_class_temporary_capacity(path),
     }
 }
 
@@ -889,6 +1151,8 @@ fn string_class_temporary_capacity(value: &StringExpression) -> usize {
         StringExpression::Coalesce { left, right } => {
             nullable_string_class_temporary_capacity(left) + string_class_temporary_capacity(right)
         }
+        StringExpression::CollectionIndex { index, .. } => rvalue_class_temporary_capacity(index),
+        StringExpression::CollectionKeyAt { offset, .. } => rvalue_class_temporary_capacity(offset),
         StringExpression::Literal(_)
         | StringExpression::Local(_)
         | StringExpression::NullableLocalAssumeNonNull(_)
@@ -917,6 +1181,7 @@ fn nullable_string_class_temporary_capacity(value: &NullableStringExpression) ->
             nullable_string_class_temporary_capacity(left)
                 + nullable_string_class_temporary_capacity(right)
         }
+        NullableStringExpression::DictionaryGet { key, .. } => rvalue_class_temporary_capacity(key),
         NullableStringExpression::Null
         | NullableStringExpression::Local(_)
         | NullableStringExpression::Static(_)
@@ -958,6 +1223,7 @@ fn class_expression_temporary_capacity(value: &ClassExpression) -> usize {
         ClassExpression::Coalesce { left, right, .. } => {
             nullable_class_temporary_capacity(left) + class_expression_temporary_capacity(right)
         }
+        ClassExpression::CollectionIndex { index, .. } => rvalue_class_temporary_capacity(index),
     }
 }
 
@@ -981,6 +1247,7 @@ fn nullable_scalar_class_temporary_capacity(value: &NullableScalarExpression) ->
             nullable_scalar_class_temporary_capacity(left)
                 + nullable_scalar_class_temporary_capacity(right)
         }
+        NullableScalarExpression::DictionaryGet { key, .. } => rvalue_class_temporary_capacity(key),
         NullableScalarExpression::Null(_)
         | NullableScalarExpression::Local { .. }
         | NullableScalarExpression::Property { .. }
@@ -1012,6 +1279,7 @@ fn nullable_class_temporary_capacity(value: &NullableClassExpression) -> usize {
         NullableClassExpression::Coalesce { left, right, .. } => {
             nullable_class_temporary_capacity(left) + nullable_class_temporary_capacity(right)
         }
+        NullableClassExpression::DictionaryGet { key, .. } => rvalue_class_temporary_capacity(key),
         NullableClassExpression::Null(_)
         | NullableClassExpression::Local { .. }
         | NullableClassExpression::Property { .. } => 0,
@@ -1043,6 +1311,9 @@ pub(crate) fn bool_class_temporary_capacity(value: &BoolExpression) -> usize {
         BoolExpression::Coalesce { left, right } => {
             nullable_scalar_class_temporary_capacity(left) + bool_class_temporary_capacity(right)
         }
+        BoolExpression::CollectionHas { value, .. } => rvalue_class_temporary_capacity(value),
+        BoolExpression::CollectionIsEmpty { .. } => 0,
+        BoolExpression::CollectionEqual { .. } => 0,
     }
 }
 
@@ -1142,6 +1413,7 @@ impl fmt::Display for Type {
             Type::NullableString => write!(formatter, "?string"),
             Type::Class(class) => write!(formatter, "class#{}", class.0),
             Type::NullableClass(class) => write!(formatter, "?class#{}", class.0),
+            Type::Collection(collection) => write!(formatter, "collection#{}", collection.0),
         }
     }
 }
@@ -1170,6 +1442,17 @@ impl fmt::Display for Operand {
                     object.0, property.class.0, property.index
                 )
             }
+            Operand::CollectionLength(local) => {
+                write!(formatter, "length(local{})", local.0)
+            }
+            Operand::CollectionIndex {
+                collection, index, ..
+            } => {
+                write!(formatter, "local{}[{index}]", collection.0)
+            }
+            Operand::CollectionKeyAt { collection, offset } => {
+                write!(formatter, "key_at(local{}, {offset})", collection.0)
+            }
         }
     }
 }
@@ -1183,6 +1466,75 @@ impl fmt::Display for Rvalue {
             Rvalue::NullableString(value) => write!(formatter, "{value}"),
             Rvalue::Class(value) => write!(formatter, "{value}"),
             Rvalue::NullableClass(value) => write!(formatter, "{value}"),
+            Rvalue::Collection(value) => write!(formatter, "{value}"),
+        }
+    }
+}
+
+impl fmt::Display for CollectionExpression {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Local {
+                local,
+                transfer: true,
+                ..
+            } => write!(formatter, "move local{}", local.0),
+            Self::Local {
+                local,
+                transfer: false,
+                ..
+            } => write!(formatter, "borrow local{}", local.0),
+            Self::Literal {
+                collection,
+                entries,
+            } => {
+                write!(formatter, "collection#{}[", collection.0)?;
+                for (index, entry) in entries.iter().enumerate() {
+                    if index != 0 {
+                        formatter.write_str(", ")?;
+                    }
+                    if let Some(key) = &entry.key {
+                        write!(formatter, "{key} => ")?;
+                    }
+                    write!(formatter, "{}", entry.value)?;
+                }
+                formatter.write_str("]")
+            }
+            Self::Index {
+                source,
+                index,
+                transfer,
+                ..
+            } => write!(
+                formatter,
+                "{} local{}[{index}]",
+                if *transfer { "move" } else { "borrow" },
+                source.0
+            ),
+            Self::Property {
+                object, property, ..
+            } => write!(
+                formatter,
+                "borrow local{}->property{}",
+                object.0, property.index
+            ),
+            Self::SetFrom {
+                source, transfer, ..
+            } => write!(
+                formatter,
+                "Set::from({} local{})",
+                if *transfer { "move" } else { "borrow" },
+                source.0
+            ),
+            Self::FromBytes { source, .. } => {
+                write!(formatter, "local{}->toArray()", source.0)
+            }
+            Self::BytesFromArray { source, .. } => {
+                write!(formatter, "Bytes::fromArray(local{})", source.0)
+            }
+            Self::ReadFileBytes { path, .. } => write!(formatter, "read_file_bytes({path})"),
+            Self::ReadStdinBytes { .. } => formatter.write_str("read_stdin_bytes()"),
+            Self::Call { function, args, .. } => write_call(formatter, *function, args),
         }
     }
 }
@@ -1225,6 +1577,18 @@ impl fmt::Display for ClassExpression {
                 class.0
             ),
             Self::Coalesce { left, right, .. } => write!(formatter, "({left} ?? {right})"),
+            Self::CollectionIndex {
+                class,
+                collection,
+                index,
+                transfer,
+            } => write!(
+                formatter,
+                "{} local{}[{index}]: class#{}",
+                if *transfer { "move" } else { "borrow" },
+                collection.0,
+                class.0
+            ),
         }
     }
 }
@@ -1304,6 +1668,17 @@ impl fmt::Display for IntegerExpression {
                     object.0, property.index
                 ),
                 Operand::Scalar(_) => write!(formatter, "<malformed scalar>: {ty}"),
+                Operand::CollectionLength(local) => {
+                    write!(formatter, "length(local{}): {ty}", local.0)
+                }
+                Operand::CollectionIndex {
+                    collection, index, ..
+                } => {
+                    write!(formatter, "local{}[{index}]: {ty}", collection.0)
+                }
+                Operand::CollectionKeyAt { collection, offset } => {
+                    write!(formatter, "key_at(local{}, {offset}): {ty}", collection.0)
+                }
             },
             IntegerExpression::Unary { ty, op, operand } => {
                 write!(formatter, "({op}{operand}): {ty}")
@@ -1358,6 +1733,17 @@ impl fmt::Display for FloatExpression {
                     object.0, property.index
                 ),
                 Operand::Scalar(_) => write!(formatter, "<malformed scalar>: {ty}"),
+                Operand::CollectionLength(local) => {
+                    write!(formatter, "length(local{}): {ty}", local.0)
+                }
+                Operand::CollectionIndex {
+                    collection, index, ..
+                } => {
+                    write!(formatter, "local{}[{index}]: {ty}", collection.0)
+                }
+                Operand::CollectionKeyAt { collection, offset } => {
+                    write!(formatter, "key_at(local{}, {offset}): {ty}", collection.0)
+                }
             },
             Self::Negate { ty, operand } => write!(formatter, "(-{operand}): {ty}"),
             Self::Binary {
@@ -1409,6 +1795,14 @@ impl fmt::Display for StringExpression {
             StringExpression::Coalesce { left, right } => {
                 write!(formatter, "({left} ?? {right})")
             }
+            StringExpression::CollectionIndex {
+                collection, index, ..
+            } => {
+                write!(formatter, "local{}[{index}]", collection.0)
+            }
+            StringExpression::CollectionKeyAt { collection, offset } => {
+                write!(formatter, "key_at(local{}, {offset})", collection.0)
+            }
         }
     }
 }
@@ -1437,6 +1831,11 @@ impl fmt::Display for NullableStringExpression {
                 write_call(formatter, *function, args)
             }
             Self::Coalesce { left, right } => write!(formatter, "({left} ?? {right})"),
+            Self::DictionaryGet {
+                collection, key, ..
+            } => {
+                write!(formatter, "local{}.get({key})", collection.0)
+            }
         }
     }
 }
@@ -1483,6 +1882,17 @@ impl fmt::Display for BoolExpression {
                     )
                 }
                 Operand::Scalar(_) => formatter.write_str("<malformed scalar>: bool"),
+                Operand::CollectionLength(local) => {
+                    write!(formatter, "length(local{}): bool", local.0)
+                }
+                Operand::CollectionIndex {
+                    collection, index, ..
+                } => {
+                    write!(formatter, "local{}[{index}]: bool", collection.0)
+                }
+                Operand::CollectionKeyAt { collection, offset } => {
+                    write!(formatter, "key_at(local{}, {offset}): bool", collection.0)
+                }
             },
             Self::Compare { op, left, right } => write!(formatter, "{left} {op} {right}"),
             Self::StringCompare { op, left, right } => write!(formatter, "{left} {op} {right}"),
@@ -1497,6 +1907,17 @@ impl fmt::Display for BoolExpression {
             }
             Self::Call { function, args } => write_call(formatter, *function, args),
             Self::Coalesce { left, right } => write!(formatter, "({left} ?? {right})"),
+            Self::CollectionHas {
+                collection, value, ..
+            } => {
+                write!(formatter, "local{}.has({value})", collection.0)
+            }
+            Self::CollectionIsEmpty { collection } => {
+                write!(formatter, "local{}.isEmpty", collection.0)
+            }
+            Self::CollectionEqual { left, right } => {
+                write!(formatter, "local{} == local{}", left.0, right.0)
+            }
         }
     }
 }
@@ -1529,6 +1950,11 @@ impl fmt::Display for NullableScalarExpression {
                 write_call(formatter, *function, args)
             }
             Self::Coalesce { left, right, .. } => write!(formatter, "({left} ?? {right})"),
+            Self::DictionaryGet {
+                collection, key, ..
+            } => {
+                write!(formatter, "local{}.get({key})", collection.0)
+            }
         }
     }
 }
@@ -1560,6 +1986,11 @@ impl fmt::Display for NullableClassExpression {
                 write_call(formatter, *function, args)
             }
             Self::Coalesce { left, right, .. } => write!(formatter, "({left} ?? {right})"),
+            Self::DictionaryGet {
+                collection, key, ..
+            } => {
+                write!(formatter, "local{}.get({key})", collection.0)
+            }
         }
     }
 }
@@ -1612,7 +2043,34 @@ impl fmt::Display for Statement {
             Statement::WriteFile { path, contents } => {
                 write!(formatter, "write_file({path}, {contents})")
             }
+            Statement::AppendFile { path, contents } => {
+                write!(formatter, "append_file({path}, {contents})")
+            }
             Statement::WriteStderr(value) => write!(formatter, "write_stderr({value})"),
+            Statement::WriteFileBytes {
+                path,
+                contents,
+                append,
+            } => write!(
+                formatter,
+                "{}({path}, local{})",
+                if *append {
+                    "append_file_bytes"
+                } else {
+                    "write_file_bytes"
+                },
+                contents.0
+            ),
+            Statement::WriteStreamBytes { contents, stderr } => write!(
+                formatter,
+                "{}(local{})",
+                if *stderr {
+                    "write_stderr_bytes"
+                } else {
+                    "write_stdout_bytes"
+                },
+                contents.0
+            ),
             Statement::AssignProperty {
                 object,
                 property,
@@ -1627,6 +2085,29 @@ impl fmt::Display for Statement {
             }
             Statement::DropClass { local, class } => {
                 write!(formatter, "drop class#{} local{}", class.0, local.0)
+            }
+            Statement::DropString { local } => write!(formatter, "drop string local{}", local.0),
+            Statement::CollectionAdd {
+                collection, value, ..
+            } => {
+                write!(formatter, "local{}.add({value})", collection.0)
+            }
+            Statement::CollectionSet {
+                collection,
+                key,
+                value,
+            } => write!(formatter, "local{}.set({key}, {value})", collection.0),
+            Statement::AssignCollectionIndex {
+                collection,
+                index,
+                value,
+            } => write!(formatter, "local{}[{index}] = {value}", collection.0),
+            Statement::DropCollection { local, collection } => {
+                write!(
+                    formatter,
+                    "drop collection#{} local{}",
+                    collection.0, local.0
+                )
             }
         }
     }

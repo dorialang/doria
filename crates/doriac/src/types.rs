@@ -62,7 +62,7 @@ impl TypeRef {
         }
         match self.name.as_str() {
             "void" | "float" | "float32" | "float64" | "string" | "bool" | "mixed" | "null"
-            | "resource" | "List" | "Dictionary" | "Set" | "[]" | "Unknown" => None,
+            | "resource" | "Bytes" | "List" | "Dictionary" | "Set" | "[]" | "Unknown" => None,
             _ => Some(&self.name),
         }
     }
@@ -100,6 +100,7 @@ pub enum TypeKind {
     Integer(IntegerType),
     Float(FloatType),
     String,
+    Bytes,
     Nullable(TypeId),
     Bool,
     Null,
@@ -120,11 +121,16 @@ pub enum ResolvedType {
     Integer(IntegerType),
     Float(FloatType),
     String,
+    Bytes,
     Bool,
     Null,
     Mixed,
     Nullable(Box<ResolvedType>),
     Class(String),
+    TypedArray(Box<ResolvedType>),
+    List(Box<ResolvedType>),
+    Dictionary(Box<ResolvedType>, Box<ResolvedType>),
+    Set(Box<ResolvedType>),
     Unsupported,
 }
 
@@ -171,6 +177,7 @@ impl TypeRegistry {
             TypeKind::Integer(integer) => integer.source_name().to_string(),
             TypeKind::Float(float) => float.source_name().to_string(),
             TypeKind::String => "string".to_string(),
+            TypeKind::Bytes => "Bytes".to_string(),
             TypeKind::Nullable(inner) => format!("?{}", self.display(*inner)),
             TypeKind::Bool => "bool".to_string(),
             TypeKind::Null => "null".to_string(),
@@ -198,18 +205,24 @@ impl TypeRegistry {
             TypeKind::Integer(ty) => ResolvedType::Integer(*ty),
             TypeKind::Float(ty) => ResolvedType::Float(*ty),
             TypeKind::String => ResolvedType::String,
+            TypeKind::Bytes => ResolvedType::Bytes,
             TypeKind::Bool => ResolvedType::Bool,
             TypeKind::Null => ResolvedType::Null,
             TypeKind::Mixed => ResolvedType::Mixed,
             TypeKind::Nullable(inner) => ResolvedType::Nullable(Box::new(self.resolved(*inner))),
             TypeKind::Class(name) => ResolvedType::Class(name.clone()),
-            TypeKind::TypedArray(_)
-            | TypeKind::Unknown
-            | TypeKind::Heterogeneous
-            | TypeKind::EmptyCollection
-            | TypeKind::List(_)
-            | TypeKind::Dictionary(_, _)
-            | TypeKind::Set(_) => ResolvedType::Unsupported,
+            TypeKind::TypedArray(element) => {
+                ResolvedType::TypedArray(Box::new(self.resolved(*element)))
+            }
+            TypeKind::List(element) => ResolvedType::List(Box::new(self.resolved(*element))),
+            TypeKind::Dictionary(key, value) => ResolvedType::Dictionary(
+                Box::new(self.resolved(*key)),
+                Box::new(self.resolved(*value)),
+            ),
+            TypeKind::Set(element) => ResolvedType::Set(Box::new(self.resolved(*element))),
+            TypeKind::Unknown | TypeKind::Heterogeneous | TypeKind::EmptyCollection => {
+                ResolvedType::Unsupported
+            }
         }
     }
 }

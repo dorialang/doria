@@ -507,6 +507,12 @@ fn inspect_expr(
                 inspect_expr(class, properties, state, &element.value, diagnostics);
             }
         }
+        Expr::Index {
+            collection, index, ..
+        } => {
+            inspect_expr(class, properties, state, collection, diagnostics);
+            inspect_expr(class, properties, state, index, diagnostics);
+        }
         Expr::IsType { expr, .. } => inspect_expr(class, properties, state, expr, diagnostics),
         Expr::Binary {
             left,

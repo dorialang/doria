@@ -1,11 +1,11 @@
 use doriac::class_layout::{compute_class_layout, ClassId, FieldType, PropertyId};
 use doriac::format_string::{FormatConversion, FormatPiece, FormatSpec};
 use doriac::mir::{
-    BasicBlock, BlockId, Class, ClassExpression, FloatBinaryOp, FloatExpression, FormatArgument,
-    FormatExpression, Function, FunctionId, Local, LocalId, NullableClassExpression,
-    NullableStringExpression, Operand, Program, Property, PropertyValue, PropertyValueSource,
-    ReturnType, Rvalue, ScalarType, ScalarValue, Statement, StaticId, StaticProperty, StaticValue,
-    StringExpression, Terminator, Type, ValueExpression,
+    BasicBlock, BlockId, Class, ClassExpression, CollectionKind, CollectionType, CollectionTypeId,
+    FloatBinaryOp, FloatExpression, FormatArgument, FormatExpression, Function, FunctionId, Local,
+    LocalId, NullableClassExpression, NullableStringExpression, Operand, Program, Property,
+    PropertyValue, PropertyValueSource, ReturnType, Rvalue, ScalarType, ScalarValue, Statement,
+    StaticId, StaticProperty, StaticValue, StringExpression, Terminator, Type, ValueExpression,
 };
 use doriac::numeric::{FloatType, FloatValue, IntegerType, IntegerValue};
 
@@ -61,6 +61,51 @@ fn shared_validator_rejects_noncanonical_bool_operands() {
     assert!(error
         .message
         .contains("bool expression has an incompatible operand"));
+}
+
+#[test]
+fn shared_validator_rejects_noncanonical_bytes_storage() {
+    let mut program = valid_void_program();
+    program.collection_types.push(CollectionType {
+        id: CollectionTypeId(0),
+        kind: CollectionKind::Bytes,
+        key: None,
+        value: Type::Scalar(ScalarType::Integer(IntegerType::Int64)),
+    });
+
+    let error = doriac::mir_validation::validate_program(&program)
+        .expect_err("Bytes must always use the packed uint8 element contract");
+    assert!(error.message.contains("Bytes collection"));
+    assert!(error.message.contains("packed uint8"));
+}
+
+#[test]
+fn shared_validator_limits_explicit_string_drops_to_synthetic_temporaries() {
+    let mut program = valid_void_program();
+    program.functions[0].locals.push(Local {
+        id: LocalId(0),
+        name: "_string0".to_string(),
+        ty: Type::String,
+        writable: false,
+        synthetic: true,
+        owned: false,
+    });
+    program.functions[0].blocks[0].statements = vec![
+        Statement::AssignLocal {
+            target: LocalId(0),
+            value: Rvalue::String(StringExpression::Literal("path".to_string())),
+        },
+        Statement::DropString { local: LocalId(0) },
+    ];
+    doriac::mir_validation::validate_program(&program)
+        .expect("a synthetic string temporary may be released explicitly");
+
+    program.functions[0].locals[0].synthetic = false;
+    let error = doriac::mir_validation::validate_program(&program)
+        .expect_err("an ordinary Doria string local must not be explicitly dropped");
+    assert!(error
+        .message
+        .contains("string drop must reference a synthetic string local"));
 }
 
 #[test]
@@ -2728,6 +2773,7 @@ fn display_spec() -> FormatSpec {
 fn valid_void_program() -> Program {
     Program {
         classes: vec![],
+        collection_types: vec![],
         statics: vec![],
         functions: vec![Function {
             id: FunctionId(0),

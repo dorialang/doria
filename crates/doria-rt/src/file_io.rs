@@ -14,6 +14,14 @@ pub(crate) struct OwnedBytes {
     pub(crate) length: usize,
 }
 
+impl OwnedBytes {
+    pub(crate) fn into_raw_parts(self) -> (*mut u8, usize) {
+        let result = (self.bytes, self.length);
+        core::mem::forget(self);
+        result
+    }
+}
+
 impl Drop for OwnedBytes {
     fn drop(&mut self) {
         unsafe {
@@ -82,8 +90,19 @@ unsafe fn read_descriptor(descriptor: i32) -> Result<OwnedBytes, FileError> {
 
 #[cfg(unix)]
 pub(crate) unsafe fn write_file(path: &[u8], contents: &[u8]) -> Result<(), FileError> {
+    write_file_mode(path, contents, false)
+}
+
+#[cfg(unix)]
+pub(crate) unsafe fn append_file(path: &[u8], contents: &[u8]) -> Result<(), FileError> {
+    write_file_mode(path, contents, true)
+}
+
+#[cfg(unix)]
+unsafe fn write_file_mode(path: &[u8], contents: &[u8], append: bool) -> Result<(), FileError> {
     let path = unix_path(path)?;
-    let descriptor = open(path.bytes.cast(), O_WRONLY | O_CREAT | O_TRUNC, 0o666);
+    let mode = if append { O_APPEND } else { O_TRUNC };
+    let descriptor = open(path.bytes.cast(), O_WRONLY | O_CREAT | mode, 0o666);
     drop(path);
     if descriptor < 0 {
         return Err(FileError::Write);
@@ -134,14 +153,20 @@ unsafe fn unix_path(path: &[u8]) -> Result<OwnedBytes, FileError> {
 const O_CREAT: i32 = 0o100;
 #[cfg(target_os = "linux")]
 const O_TRUNC: i32 = 0o1000;
+#[cfg(target_os = "linux")]
+const O_APPEND: i32 = 0o2000;
 #[cfg(target_os = "macos")]
 const O_CREAT: i32 = 0x0200;
 #[cfg(target_os = "macos")]
 const O_TRUNC: i32 = 0x0400;
+#[cfg(target_os = "macos")]
+const O_APPEND: i32 = 0x0008;
 #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
 const O_CREAT: i32 = 0o100;
 #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
 const O_TRUNC: i32 = 0o1000;
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+const O_APPEND: i32 = 0o2000;
 #[cfg(unix)]
 const O_RDONLY: i32 = 0;
 #[cfg(unix)]
@@ -154,11 +179,15 @@ const GENERIC_READ: u32 = 0x8000_0000;
 #[cfg(windows)]
 const GENERIC_WRITE: u32 = 0x4000_0000;
 #[cfg(windows)]
+const FILE_APPEND_DATA: u32 = 0x0000_0004;
+#[cfg(windows)]
 const FILE_SHARE_READ: u32 = 1;
 #[cfg(windows)]
 const OPEN_EXISTING: u32 = 3;
 #[cfg(windows)]
 const CREATE_ALWAYS: u32 = 2;
+#[cfg(windows)]
+const OPEN_ALWAYS: u32 = 4;
 #[cfg(windows)]
 const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
 #[cfg(windows)]
@@ -232,13 +261,27 @@ pub(crate) unsafe fn read_file(path: &[u8]) -> Result<OwnedBytes, FileError> {
 
 #[cfg(windows)]
 pub(crate) unsafe fn write_file(path: &[u8], contents: &[u8]) -> Result<(), FileError> {
+    write_file_mode(path, contents, false)
+}
+
+#[cfg(windows)]
+pub(crate) unsafe fn append_file(path: &[u8], contents: &[u8]) -> Result<(), FileError> {
+    write_file_mode(path, contents, true)
+}
+
+#[cfg(windows)]
+unsafe fn write_file_mode(path: &[u8], contents: &[u8], append: bool) -> Result<(), FileError> {
     let path = windows_path(path)?;
     let handle = CreateFileW(
         path.bytes.cast::<u16>(),
-        GENERIC_WRITE,
+        if append {
+            FILE_APPEND_DATA
+        } else {
+            GENERIC_WRITE
+        },
         0,
         ptr::null_mut(),
-        CREATE_ALWAYS,
+        if append { OPEN_ALWAYS } else { CREATE_ALWAYS },
         FILE_ATTRIBUTE_NORMAL,
         ptr::null_mut(),
     );
@@ -308,6 +351,11 @@ pub(crate) unsafe fn read_file(_path: &[u8]) -> Result<OwnedBytes, FileError> {
 
 #[cfg(not(any(unix, windows)))]
 pub(crate) unsafe fn write_file(_path: &[u8], _contents: &[u8]) -> Result<(), FileError> {
+    Err(FileError::Write)
+}
+
+#[cfg(not(any(unix, windows)))]
+pub(crate) unsafe fn append_file(_path: &[u8], _contents: &[u8]) -> Result<(), FileError> {
     Err(FileError::Write)
 }
 
@@ -384,16 +432,19 @@ mod tests {
     }
 
     #[test]
-    fn text_file_layer_creates_truncates_and_preserves_exact_bytes() {
+    fn file_layer_creates_appends_truncates_and_preserves_exact_bytes() {
         let path = path("roundtrip");
         let path_bytes = path_bytes(&path);
         unsafe {
             write_file(&path_bytes, b"long initial contents").expect("initial write");
             write_file(&path_bytes, "Dória\n漢字\0🎮".as_bytes()).expect("truncate write");
+            append_file(&path_bytes, b"\0\x80\xff").expect("binary append");
             let contents = read_file(&path_bytes).expect("round-trip read");
+            let mut expected = "Dória\n漢字\0🎮".as_bytes().to_vec();
+            expected.extend_from_slice(b"\0\x80\xff");
             assert_eq!(
                 core::slice::from_raw_parts(contents.bytes, contents.length),
-                "Dória\n漢字\0🎮".as_bytes()
+                expected
             );
             write_file(&path_bytes, b"").expect("empty write");
             let empty = read_file(&path_bytes).expect("empty read");

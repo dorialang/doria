@@ -819,13 +819,22 @@ impl Parser {
     }
 
     fn parse_foreach_binding(&mut self) -> Option<ForeachBinding> {
+        let writable = self.match_kind(&TokenKind::Writable);
         if let Some((name, _span)) = self.consume_variable() {
-            return Some(ForeachBinding { ty: None, name });
+            return Some(ForeachBinding {
+                writable,
+                ty: None,
+                name,
+            });
         }
 
         let ty = self.parse_type_ref()?;
         let (name, _span) = self.expect_variable("expected foreach binding variable")?;
-        Some(ForeachBinding { ty: Some(ty), name })
+        Some(ForeachBinding {
+            writable,
+            ty: Some(ty),
+            name,
+        })
     }
 
     fn parse_expression(&mut self) -> Option<Expr> {
@@ -1000,6 +1009,24 @@ impl Parser {
                         span,
                     };
                 }
+                continue;
+            }
+
+            if self.match_kind(&TokenKind::LeftBracket) {
+                let index = self.parse_expression()?;
+                let end = self
+                    .expect(
+                        TokenKind::RightBracket,
+                        "expected `]` after collection index",
+                    )?
+                    .span
+                    .end;
+                let start = expr.span().start;
+                expr = Expr::Index {
+                    collection: Box::new(expr),
+                    index: Box::new(index),
+                    span: Span::new(start, end),
+                };
                 continue;
             }
 
@@ -1328,6 +1355,11 @@ impl Parser {
                     .is_some_and(Self::contains_bare_identifier)
                     || Self::contains_bare_identifier(&element.value)
             }),
+            Expr::Index {
+                collection, index, ..
+            } => {
+                Self::contains_bare_identifier(collection) || Self::contains_bare_identifier(index)
+            }
             Expr::PropertyAccess { object, .. } => Self::contains_bare_identifier(object),
             Expr::MethodCall { object, args, .. } => {
                 Self::contains_bare_identifier(object)

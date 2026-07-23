@@ -1,0 +1,5 @@
+function main(): void
+{
+    Bytes $contents = read_stdin_bytes();
+    write_stdout_bytes($contents);
+}

@@ -1,0 +1,9 @@
+function main(): void
+{
+    Bytes $input = read_stdin_bytes();
+    write_stdout_bytes($input);
+
+    uint8[] $errorArray = [0, 255, 10];
+    Bytes $error = Bytes::fromArray($errorArray);
+    write_stderr_bytes($error);
+}

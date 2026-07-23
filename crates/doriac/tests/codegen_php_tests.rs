@@ -1389,6 +1389,7 @@ function main(): void
     if ($line != null) { write_stderr($line); }
     let $contents = read_file("input.txt");
     write_file("copy.txt", $contents);
+    append_file("copy.txt", $contents);
     printf("enabled=%s", false);
     echo sprintf("%05d", 42);
 }
@@ -1410,6 +1411,9 @@ function main(): void
     assert!(php.contains("__doria_read_file(\"input.txt\")"));
     assert!(php.contains("$contents === false"));
     assert!(php.contains("__doria_write_file(\"copy.txt\", $contents)"));
+    assert!(php.contains("__doria_append_file(\"copy.txt\", $contents)"));
+    assert!(php.contains("file_put_contents($path, $contents, FILE_APPEND)"));
+    assert!(php.contains("__doria_io_panic(\"failed to append file\")"));
     assert!(php.contains("$written === false || $written !== strlen($contents)"));
     assert!(php.contains("__doria_write_stderr($line)"));
     assert!(php.contains("__doria_printf(\"enabled=%s\", __doria_display(false))"));
@@ -1937,4 +1941,78 @@ function read(?Label $left, ?Label $right): ?string
     .expect("coalesced member receivers should lower to PHP");
 
     assert!(php.contains("($left ?? $right)?->text()"), "{php}");
+}
+
+#[test]
+fn php_backend_rejects_unimplemented_stage23_runtime_surfaces_consistently() {
+    for (name, source) in [
+        (
+            "indexed read",
+            r#"
+function main(): void
+{
+    List<int> $items = [1];
+    echo $items[0];
+}
+"#,
+        ),
+        (
+            "collection mutator",
+            r#"
+function main(): void
+{
+    writable List<int> $items = [];
+    $items->add(1);
+}
+"#,
+        ),
+        (
+            "writable foreach",
+            r#"
+function main(): void
+{
+    writable List<int> $items = [1];
+    foreach ($items as writable int $item) {
+        $item += 1;
+    }
+}
+"#,
+        ),
+        (
+            "byte I/O",
+            r#"
+function main(): void
+{
+    write_stdout_bytes(read_stdin_bytes());
+}
+"#,
+        ),
+    ] {
+        let diagnostics = doriac::compile_source_to_php("stage23.doria", source)
+            .expect_err("PHP must reject Stage 23 runtime behavior it cannot preserve");
+        assert_eq!(diagnostics[0].code, "B2301", "{name}: {diagnostics:?}");
+        assert!(
+            diagnostics[0].message.contains("native") && diagnostics[0].message.contains("debug"),
+            "{name}: {diagnostics:?}"
+        );
+    }
+}
+
+#[test]
+fn php_backend_keeps_readonly_dictionary_projections_iterable() {
+    let php = doriac::compile_source_to_php(
+        "dictionary-projection.doria",
+        r#"
+function main(): void
+{
+    Dictionary<string, int> $items = ["answer" => 42];
+    foreach ($items->keys as string $key) {
+        echo $key;
+    }
+}
+"#,
+    )
+    .expect("readonly dictionary projections have a faithful PHP foreach lowering");
+
+    assert!(php.contains("foreach ($items as $key => $"));
 }

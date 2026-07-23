@@ -1,0 +1,59 @@
+function main(): void
+{
+    writable int[] $array = [1, 2, 3];
+    $array[0]++;
+    foreach ($array as writable int $item) {
+        $item += 1;
+    }
+    echo "array {$array[0]} {$array[1]} {$array->length}\n";
+
+    writable List<int> $list = [1, 2, 3];
+    $list->insertAt(1, 8);
+    $list[2] += 3;
+    int $removed = $list->removeAt(1);
+    ?int $first = $list->first;
+    ?int $last = $list->last;
+    ?int $popped = $list->pop();
+    if ($first != null && $last != null && $popped != null) {
+        echo "list {$removed} {$first} {$last} {$popped} {$list->count} {$list->isEmpty} {$list->contains(5)}\n";
+    }
+
+    writable Dictionary<string, int> $scores = ["Ada" => 3, "Bea" => 4];
+    $scores->set("Cal", 5);
+    $scores["Ada"] += 7;
+    ?int $bea = $scores->get("Bea");
+    ?int $cal = $scores->remove("Cal");
+    if ($bea != null && $cal != null) {
+        echo "dictionary {$bea} {$cal} {$scores["Ada"]} {$scores->has("Cal")} {$scores->count} {$scores->isEmpty}\n";
+    }
+    foreach ($scores->keys as string $name) {
+        echo "key {$name}\n";
+    }
+    foreach ($scores->values as int $score) {
+        echo "value {$score}\n";
+    }
+
+    let $setSource = [1, 2, 2];
+    writable Set<int> $numbers = Set::from($setSource);
+    bool $added = $numbers->add(3);
+    bool $duplicate = $numbers->add(2);
+    bool $contained = $numbers->contains(3);
+    bool $setRemoved = $numbers->remove(1);
+    let $otherSource = [3, 4];
+    Set<int> $other = Set::from($otherSource);
+    Set<int> $union = $numbers->union($other);
+    Set<int> $intersection = $numbers->intersect($other);
+    Set<int> $difference = $numbers->difference($other);
+    echo "set {$added} {$duplicate} {$contained} {$setRemoved} {$numbers->count} {$union->count} {$intersection->count} {$difference->count}\n";
+
+    writable int[][] $matrix = [[1, 2], [3, 4]];
+    $matrix[1][0]++;
+    echo "nested {$matrix[1][0]}\n";
+    foreach ($matrix as int[] $row) {
+        echo "row {$row[0]} {$row[1]}\n";
+    }
+
+    let $inferredList = [6, 7];
+    let $inferredDictionary = ["x" => 8];
+    echo "inferred {$inferredList[1]} {$inferredDictionary["x"]}\n";
+}

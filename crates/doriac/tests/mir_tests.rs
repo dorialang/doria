@@ -111,6 +111,7 @@ fn debug_contents(source: &str) -> String {
 fn conditional_program(condition: Condition, then_status: i64, else_status: i64) -> Program {
     Program {
         classes: vec![],
+        collection_types: vec![],
         statics: vec![],
         functions: vec![Function {
             id: FunctionId(0),
@@ -776,6 +777,7 @@ fn interprets_multiple_echoes_without_newline() {
 fn interpreter_reports_arithmetic_overflow_as_runtime_panic() {
     let program = Program {
         classes: vec![],
+        collection_types: vec![],
         statics: vec![],
         functions: vec![Function {
             id: FunctionId(0),
@@ -1418,6 +1420,7 @@ fn interpreter_preserves_void_fallthrough_after_final_else_if() {
 fn explicitly_limited_interpreter_stops_repeated_mir_state_cycles() {
     let program = Program {
         classes: vec![],
+        collection_types: vec![],
         statics: vec![],
         functions: vec![Function {
             id: FunctionId(0),
@@ -2380,17 +2383,7 @@ fn lowers_early_return_inside_range_foreach() {
 }
 
 #[test]
-fn rejects_unsupported_stage_11e_foreach_shapes() {
-    let collection = unsupported_after_parsing(
-        r#"function main(): void
-{
-    foreach ($items as $item) {
-    }
-}
-"#,
-    );
-    assert_stage_11g_unsupported(&collection, "supports `foreach` only over integer ranges");
-
+fn rejects_range_foreach_key_bindings_before_mir() {
     let key_value = unsupported_after_parsing(
         r#"function main(): void
 {
@@ -2892,6 +2885,7 @@ fn stage_11f_debug_target_handles_all_examples() {
 fn explicitly_limited_interpreter_can_bound_call_frames() {
     let program = Program {
         classes: vec![],
+        collection_types: vec![],
         statics: vec![],
         functions: vec![Function {
             id: FunctionId(0),

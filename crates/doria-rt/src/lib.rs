@@ -6,6 +6,8 @@ use core::ffi::c_void;
 use core::mem;
 use core::ptr;
 
+mod bytes;
+mod collection;
 mod device_io;
 mod file_io;
 mod line_io;
@@ -30,6 +32,356 @@ pub struct DrStackFrameV1 {
 pub struct DrStringV1 {
     references: usize,
     byte_length: usize,
+}
+
+pub use bytes::DrBytesV1;
+pub use collection::DrCollectionV1;
+
+/// # Safety
+///
+/// `source` must be readable for `length` bytes, or may be null when `length` is zero.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_bytes_copy(source: *const u8, length: usize) -> *mut DrBytesV1 {
+    bytes::copy(source, length)
+}
+
+/// # Safety
+///
+/// `value` must be null or a live, uniquely owned byte buffer and must not be used afterward.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_bytes_free(value: *mut DrBytesV1) {
+    bytes::free(value)
+}
+
+/// # Safety
+///
+/// `value` must point to a live byte buffer.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_bytes_length(value: *const DrBytesV1) -> usize {
+    bytes::length(value)
+}
+
+/// # Safety
+///
+/// `value` must point to a live byte buffer and `current_frame` must be null or valid.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_bytes_get(
+    current_frame: *const DrStackFrameV1,
+    value: *const DrBytesV1,
+    index: usize,
+) -> u8 {
+    bytes::get(current_frame, value, index)
+}
+
+/// # Safety
+///
+/// `value` must be a uniquely borrowed live byte buffer and `current_frame` must be null or valid.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_bytes_set(
+    current_frame: *const DrStackFrameV1,
+    value: *mut DrBytesV1,
+    index: usize,
+    byte: u8,
+) {
+    bytes::set(current_frame, value, index, byte)
+}
+
+/// # Safety
+///
+/// `left` and `right` must point to live byte buffers.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_bytes_equal(left: *const DrBytesV1, right: *const DrBytesV1) -> u8 {
+    u8::from(bytes::equal(left, right))
+}
+
+/// # Safety
+///
+/// `collection` must point to a live canonical `uint8[]` runtime collection.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_bytes_from_collection(
+    collection: *const DrCollectionV1,
+) -> *mut DrBytesV1 {
+    let length = collection::length(collection);
+    let data = allocate(length);
+    if length != 0 && data.is_null() {
+        panic_static(ptr::null(), b"byte-buffer allocation failed");
+    }
+    for index in 0..length {
+        *data.add(index) = collection::value_at(ptr::null(), collection, index) as u8;
+    }
+    bytes::from_owned(data, length)
+}
+
+/// # Safety
+///
+/// `value` must point to a live byte buffer.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_bytes_to_collection(value: *const DrBytesV1) -> *mut DrCollectionV1 {
+    let length = bytes::length(value);
+    let collection = collection::new(length, false, true);
+    for index in 0..length {
+        collection::set_at(
+            ptr::null(),
+            collection,
+            index,
+            u64::from(bytes::get(ptr::null(), value, index)),
+        );
+    }
+    collection
+}
+
+/// Allocates collection storage for generated Doria code.
+///
+/// # Safety
+///
+/// `keyed` and `fixed` must be canonical boolean bytes. The returned pointer
+/// must be released exactly once with `dr_v1_collection_free`.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_collection_new(
+    length: usize,
+    keyed: u8,
+    fixed: u8,
+) -> *mut DrCollectionV1 {
+    collection::new(length, keyed != 0, fixed != 0)
+}
+
+/// # Safety
+///
+/// `collection` must be null or a live pointer returned by
+/// `dr_v1_collection_new`, and it must not be used after this call.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_collection_free(collection: *mut DrCollectionV1) {
+    collection::free(collection)
+}
+
+/// # Safety
+///
+/// `collection` must point to a live collection allocation.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_collection_length(collection: *const DrCollectionV1) -> usize {
+    collection::length(collection)
+}
+
+/// # Safety
+///
+/// `collection` must be a uniquely borrowed live growable collection, and
+/// `value` must use the element representation declared by generated MIR.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_collection_push(collection: *mut DrCollectionV1, value: u64) {
+    collection::push(collection, value)
+}
+
+/// # Safety
+///
+/// `current_frame` must be null or a valid generated frame chain.
+/// `collection` must be a uniquely borrowed live growable collection, and
+/// `value` must use its element representation.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_collection_insert_at(
+    current_frame: *const DrStackFrameV1,
+    collection: *mut DrCollectionV1,
+    index: usize,
+    value: u64,
+) {
+    collection::insert_at(current_frame, collection, index, value)
+}
+
+/// # Safety
+///
+/// `current_frame` must be null or a valid generated frame chain, and
+/// `collection` must be a uniquely borrowed live growable collection.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_collection_remove_at(
+    current_frame: *const DrStackFrameV1,
+    collection: *mut DrCollectionV1,
+    index: usize,
+) -> u64 {
+    collection::remove_at(current_frame, collection, index)
+}
+
+/// # Safety
+///
+/// `collection` must be a uniquely borrowed live growable collection and
+/// `found` must point to writable storage for one byte.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_collection_pop(
+    collection: *mut DrCollectionV1,
+    found: *mut u8,
+) -> u64 {
+    collection::pop(collection, found)
+}
+
+/// # Safety
+///
+/// `current_frame` must be null or a valid generated frame chain, and
+/// `collection` must point to a live collection allocation.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_collection_value_at(
+    current_frame: *const DrStackFrameV1,
+    collection: *const DrCollectionV1,
+    index: usize,
+) -> u64 {
+    collection::value_at(current_frame, collection, index)
+}
+
+/// # Safety
+///
+/// `current_frame` must be null or a valid generated frame chain, and
+/// `collection` must point to a live keyed collection allocation.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_collection_key_at(
+    current_frame: *const DrStackFrameV1,
+    collection: *const DrCollectionV1,
+    index: usize,
+) -> u64 {
+    collection::key_at(current_frame, collection, index)
+}
+
+/// # Safety
+///
+/// `current_frame` must be null or a valid generated frame chain.
+/// `collection` must be a uniquely borrowed live collection, and `value` must
+/// use its element representation.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_collection_set_at(
+    current_frame: *const DrStackFrameV1,
+    collection: *mut DrCollectionV1,
+    index: usize,
+    value: u64,
+) -> u64 {
+    collection::set_at(current_frame, collection, index, value)
+}
+
+/// # Safety
+///
+/// `collection` must point to a live keyed collection. `key` must match
+/// `key_kind`, and `found` must point to writable storage for one byte.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_collection_keyed_get(
+    collection: *const DrCollectionV1,
+    key: u64,
+    key_kind: u8,
+    found: *mut u8,
+) -> u64 {
+    collection::keyed_get(collection, key, key_kind, found)
+}
+
+/// # Safety
+///
+/// `collection` must be a uniquely borrowed live keyed collection. `key` and
+/// `value` must match its declared representations, and `replaced` must point
+/// to writable storage for one byte.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_collection_keyed_set(
+    collection: *mut DrCollectionV1,
+    key: u64,
+    value: u64,
+    key_kind: u8,
+    replaced: *mut u8,
+) -> u64 {
+    collection::keyed_set(collection, key, value, key_kind, replaced)
+}
+
+/// # Safety
+///
+/// `collection` must point to a live keyed collection and `key` must match
+/// `key_kind`.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_collection_keyed_has(
+    collection: *const DrCollectionV1,
+    key: u64,
+    key_kind: u8,
+) -> u8 {
+    u8::from(collection::keyed_has(collection, key, key_kind))
+}
+
+/// # Safety
+///
+/// `collection` must be a uniquely borrowed live keyed collection. `key` must
+/// match `key_kind`; `found` and `removed_key` must point to writable storage.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_collection_keyed_remove(
+    collection: *mut DrCollectionV1,
+    key: u64,
+    key_kind: u8,
+    found: *mut u8,
+    removed_key: *mut u64,
+) -> u64 {
+    collection::keyed_remove(collection, key, key_kind, found, removed_key)
+}
+
+/// # Safety
+///
+/// `collection` must be a live collection, uniquely borrowed for mutating
+/// access modes. `key` must match `key_kind`; `found` and `removed_key` must
+/// point to writable storage.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_collection_nullable_access(
+    collection: *mut DrCollectionV1,
+    key: u64,
+    key_kind: u8,
+    access: u8,
+    found: *mut u8,
+    removed_key: *mut u64,
+) -> u64 {
+    collection::nullable_access(collection, key, key_kind, access, found, removed_key)
+}
+
+/// # Safety
+///
+/// `collection` must point to a live collection and `value` must match
+/// `value_kind`.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_collection_contains(
+    collection: *const DrCollectionV1,
+    value: u64,
+    value_kind: u8,
+) -> u8 {
+    u8::from(collection::contains(collection, value, value_kind))
+}
+
+/// # Safety
+///
+/// `collection` must be a uniquely borrowed live Set and `value` must match
+/// `value_kind`.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_collection_push_unique(
+    collection: *mut DrCollectionV1,
+    value: u64,
+    value_kind: u8,
+) -> u8 {
+    u8::from(collection::push_unique(collection, value, value_kind))
+}
+
+/// # Safety
+///
+/// `collection` must be a uniquely borrowed live Set, `value` must match
+/// `value_kind`, and `removed` must point to writable storage.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_collection_remove_value(
+    collection: *mut DrCollectionV1,
+    value: u64,
+    value_kind: u8,
+    removed: *mut u64,
+) -> u8 {
+    u8::from(collection::remove_value(
+        collection, value, value_kind, removed,
+    ))
+}
+
+/// # Safety
+///
+/// `left` and `right` must point to live Sets with the same element
+/// representation, and `value_kind` must describe that representation. The
+/// returned collection must be released exactly once.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_collection_set_algebra(
+    left: *const DrCollectionV1,
+    right: *const DrCollectionV1,
+    operation: u8,
+    value_kind: u8,
+) -> *mut DrCollectionV1 {
+    collection::set_algebra(left, right, operation, value_kind)
 }
 
 const STRING_HEADER_SIZE: usize = mem::size_of::<DrStringV1>();
@@ -160,6 +512,97 @@ pub unsafe extern "C" fn dr_v1_write_stderr(bytes: *const u8, byte_length: usize
         WriteOutcome::Success => {}
         WriteOutcome::BrokenPipe => exit_process(0),
         WriteOutcome::OtherFailure => exit_process(PANIC_STATUS),
+    }
+}
+
+/// # Safety
+///
+/// `value` must point to a live byte buffer and `current_frame` must be null or valid.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_write_stdout_bytes(
+    current_frame: *const DrStackFrameV1,
+    value: *const DrBytesV1,
+) {
+    write_byte_stream(
+        current_frame,
+        StandardStream::Stdout,
+        bytes::data(value),
+        bytes::length(value),
+        b"failed to write stdout",
+    )
+}
+
+/// # Safety
+///
+/// `value` must point to a live byte buffer and `current_frame` must be null or valid.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_write_stderr_bytes(
+    current_frame: *const DrStackFrameV1,
+    value: *const DrBytesV1,
+) {
+    write_byte_stream(
+        current_frame,
+        StandardStream::Stderr,
+        bytes::data(value),
+        bytes::length(value),
+        b"failed to write stderr",
+    )
+}
+
+/// # Safety
+///
+/// `current_frame` must be null or a valid generated frame chain.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_read_stdin_bytes(
+    current_frame: *const DrStackFrameV1,
+) -> *mut DrBytesV1 {
+    let buffered = line_io::take_buffered_input();
+    let mut capacity = 4096_usize;
+    while capacity < buffered.length {
+        let Some(next) = capacity.checked_mul(2) else {
+            static MESSAGE: &[u8] = b"byte-buffer allocation failed";
+            dr_v1_panic(current_frame, MESSAGE.as_ptr(), MESSAGE.len());
+        };
+        capacity = next;
+    }
+    let mut data = allocate(capacity);
+    if data.is_null() {
+        static MESSAGE: &[u8] = b"byte-buffer allocation failed";
+        dr_v1_panic(current_frame, MESSAGE.as_ptr(), MESSAGE.len());
+    }
+    if buffered.length != 0 {
+        ptr::copy_nonoverlapping(buffered.bytes, data, buffered.length);
+    }
+    let mut length = buffered.length;
+    if buffered.eof {
+        return bytes::from_owned(data, length);
+    }
+    loop {
+        if length == capacity {
+            let Some(next) = capacity.checked_mul(2) else {
+                static MESSAGE: &[u8] = b"byte-buffer allocation failed";
+                dr_v1_panic(current_frame, MESSAGE.as_ptr(), MESSAGE.len());
+            };
+            let replacement = allocate(next);
+            if replacement.is_null() {
+                deallocate(data);
+                static MESSAGE: &[u8] = b"byte-buffer allocation failed";
+                dr_v1_panic(current_frame, MESSAGE.as_ptr(), MESSAGE.len());
+            }
+            ptr::copy_nonoverlapping(data, replacement, length);
+            deallocate(data);
+            data = replacement;
+            capacity = next;
+        }
+        match device_io::read_bytes(StandardStream::Stdin, data.add(length), capacity - length) {
+            Ok(0) => return bytes::from_owned(data, length),
+            Ok(read) => length += read,
+            Err(()) => {
+                deallocate(data);
+                static MESSAGE: &[u8] = b"failed to read stdin";
+                dr_v1_panic(current_frame, MESSAGE.as_ptr(), MESSAGE.len());
+            }
+        }
     }
 }
 
@@ -295,6 +738,121 @@ pub unsafe extern "C" fn dr_v1_write_file(
     }
 }
 
+/// # Safety
+///
+/// `path` and `contents` must point to live runtime strings and `current_frame` must be null or valid.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_append_file(
+    current_frame: *const DrStackFrameV1,
+    path: *const DrStringV1,
+    contents: *const DrStringV1,
+) {
+    write_file_contents(
+        current_frame,
+        path,
+        string_bytes(contents),
+        (*contents).byte_length,
+        true,
+        b"string allocation failed",
+    )
+}
+
+/// # Safety
+///
+/// `path` must point to a live runtime string and `current_frame` must be null or valid.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_read_file_bytes(
+    current_frame: *const DrStackFrameV1,
+    path: *const DrStringV1,
+) -> *mut DrBytesV1 {
+    let path = core::slice::from_raw_parts(string_bytes(path), (*path).byte_length);
+    match file_io::read_file(path) {
+        Ok(contents) => {
+            let (data, length) = contents.into_raw_parts();
+            bytes::from_owned(data, length)
+        }
+        Err(file_io::FileError::PathNul) => {
+            panic_static(current_frame, b"file path contained an embedded NUL")
+        }
+        Err(file_io::FileError::Allocation) => {
+            panic_static(current_frame, b"byte-buffer allocation failed")
+        }
+        Err(_) => panic_static(current_frame, b"failed to read file"),
+    }
+}
+
+/// # Safety
+///
+/// `path` and `contents` must point to live values and `current_frame` must be null or valid.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_write_file_bytes(
+    current_frame: *const DrStackFrameV1,
+    path: *const DrStringV1,
+    contents: *const DrBytesV1,
+) {
+    write_file_contents(
+        current_frame,
+        path,
+        bytes::data(contents),
+        bytes::length(contents),
+        false,
+        b"byte-buffer allocation failed",
+    )
+}
+
+/// # Safety
+///
+/// `path` and `contents` must point to live values and `current_frame` must be null or valid.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_append_file_bytes(
+    current_frame: *const DrStackFrameV1,
+    path: *const DrStringV1,
+    contents: *const DrBytesV1,
+) {
+    write_file_contents(
+        current_frame,
+        path,
+        bytes::data(contents),
+        bytes::length(contents),
+        true,
+        b"byte-buffer allocation failed",
+    )
+}
+
+unsafe fn write_file_contents(
+    current_frame: *const DrStackFrameV1,
+    path: *const DrStringV1,
+    contents: *const u8,
+    length: usize,
+    append: bool,
+    allocation_failure: &'static [u8],
+) {
+    let path = core::slice::from_raw_parts(string_bytes(path), (*path).byte_length);
+    let contents = if length == 0 {
+        &[]
+    } else {
+        core::slice::from_raw_parts(contents, length)
+    };
+    let result = if append {
+        file_io::append_file(path, contents)
+    } else {
+        file_io::write_file(path, contents)
+    };
+    match result {
+        Ok(()) => {}
+        Err(file_io::FileError::PathNul) => {
+            panic_static(current_frame, b"file path contained an embedded NUL")
+        }
+        Err(file_io::FileError::Allocation) => panic_static(current_frame, allocation_failure),
+        Err(_) if append => panic_static(current_frame, b"failed to append file"),
+        Err(_) => panic_static(current_frame, b"failed to write file"),
+    }
+}
+
+unsafe fn panic_static(current_frame: *const DrStackFrameV1, message: &'static [u8]) -> ! {
+    dr_v1_panic(current_frame, message.as_ptr(), message.len())
+}
+
 /// Reports a fatal Doria panic and exits the process with status 101.
 ///
 /// # Safety
@@ -354,6 +912,17 @@ unsafe fn allocate_string(byte_length: usize) -> *mut DrStringV1 {
         },
     );
     string
+}
+
+pub(crate) unsafe fn string_equal(left: *const DrStringV1, right: *const DrStringV1) -> bool {
+    if left == right {
+        return true;
+    }
+    if left.is_null() || right.is_null() || (*left).byte_length != (*right).byte_length {
+        return false;
+    }
+    core::slice::from_raw_parts(string_bytes(left), (*left).byte_length)
+        == core::slice::from_raw_parts(string_bytes(right), (*right).byte_length)
 }
 
 /// Retains one owned reference.
@@ -970,6 +1539,23 @@ unsafe fn write_standard_stream(
     device_io::write(stream, bytes, byte_length)
 }
 
+unsafe fn write_byte_stream(
+    current_frame: *const DrStackFrameV1,
+    stream: StandardStream,
+    data: *const u8,
+    length: usize,
+    failure: &'static [u8],
+) {
+    #[cfg(unix)]
+    ignore_sigpipe();
+
+    match device_io::write_bytes(stream, data, length) {
+        WriteOutcome::Success => {}
+        WriteOutcome::BrokenPipe => exit_process(0),
+        WriteOutcome::OtherFailure => dr_v1_panic(current_frame, failure.as_ptr(), failure.len()),
+    }
+}
+
 #[cfg(unix)]
 unsafe fn exit_process(status: i32) -> ! {
     _exit(status)
@@ -1001,6 +1587,37 @@ extern "C" {
 #[cfg(windows)]
 #[no_mangle]
 pub static _fltused: i32 = 0;
+
+// LLVM emits this MSVC stack-probe call when a generated x86-64 function reserves more than one
+// page of stack. Probe each page before the function adjusts RSP so Windows can extend the stack's
+// guard region. The MSVC convention passes the allocation size in RAX and preserves RAX and RCX.
+#[cfg(all(windows, target_env = "msvc", target_arch = "x86_64"))]
+core::arch::global_asm!(
+    r#"
+    .text
+    .def __chkstk; .scl 2; .type 32; .endef
+    .globl __chkstk
+    .p2align 4, 0x90
+__chkstk:
+    push rax
+    push rcx
+    cmp rax, 0x1000
+    lea rcx, [rsp + 24]
+    jb 2f
+1:
+    sub rcx, 0x1000
+    test qword ptr [rcx], rcx
+    sub rax, 0x1000
+    cmp rax, 0x1000
+    ja 1b
+2:
+    sub rcx, rax
+    test qword ptr [rcx], rcx
+    pop rcx
+    pop rax
+    ret
+"#
+);
 
 /// Copies `count` bytes from `source` to the non-overlapping `destination`.
 ///

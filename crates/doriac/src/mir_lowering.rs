@@ -8,6 +8,35 @@ use crate::semantics::SemanticInfo;
 use crate::source::Span;
 use crate::{hir, mir};
 
+#[derive(Clone, Default)]
+struct CollectionRegistry {
+    ids: HashMap<(mir::CollectionKind, Option<mir::Type>, mir::Type), mir::CollectionTypeId>,
+    types: Vec<mir::CollectionType>,
+}
+
+impl CollectionRegistry {
+    fn intern(
+        &mut self,
+        kind: mir::CollectionKind,
+        key: Option<mir::Type>,
+        value: mir::Type,
+    ) -> mir::CollectionTypeId {
+        let signature = (kind, key, value);
+        if let Some(id) = self.ids.get(&signature) {
+            return *id;
+        }
+        let id = mir::CollectionTypeId(self.types.len());
+        self.types.push(mir::CollectionType {
+            id,
+            kind,
+            key,
+            value,
+        });
+        self.ids.insert(signature, id);
+        id
+    }
+}
+
 #[derive(Clone)]
 struct FunctionSignature {
     id: mir::FunctionId,
@@ -41,6 +70,7 @@ pub fn lower_program(program: &hir::Program) -> DiagnosticResult<mir::Program> {
         .iter()
         .map(|class| (class.name.clone(), class.id))
         .collect::<HashMap<_, _>>();
+    let mut collection_registry = CollectionRegistry::default();
     let mut static_ids = HashMap::new();
     let mut statics = Vec::new();
     for class in program.items.iter().filter_map(|item| match item {
@@ -53,16 +83,18 @@ pub fn lower_program(program: &hir::Program) -> DiagnosticResult<mir::Program> {
             _ => None,
         }) {
             let id = mir::StaticId(statics.len());
-            let ty = mir_type_ref(&property.ty, &class_ids).ok_or_else(|| {
-                vec![unsupported_native_type(
-                    &property.ty,
-                    property.span,
-                    format!(
+            let ty = mir_type_ref(&property.ty, &class_ids, &mut collection_registry).ok_or_else(
+                || {
+                    vec![unsupported_native_type(
+                        &property.ty,
+                        property.span,
+                        format!(
                         "static property `{}::{}` has a type not supported by native compilation",
                         class.name, property.name
                     ),
-                )]
-            })?;
+                    )]
+                },
+            )?;
             let key = crate::const_eval::ConstKey::Static {
                 class_name: class.name.clone(),
                 name: property.name.clone(),
@@ -219,6 +251,7 @@ pub fn lower_program(program: &hir::Program) -> DiagnosticResult<mir::Program> {
             mir::FunctionId(index),
             &class_ids,
             &program.semantic_info,
+            &mut collection_registry,
             matches!(function.name.as_str(), "__construct" | "__destruct"),
             declaration.is_top_level() && function.name == "main",
         )?;
@@ -237,6 +270,17 @@ pub fn lower_program(program: &hir::Program) -> DiagnosticResult<mir::Program> {
     }
     let method_signatures = callable_signatures_by_method(&declarations, &callable_signatures);
 
+    for ty in program.semantic_info.expression_types.values() {
+        intern_resolved_collection_types(ty, &class_ids, &mut collection_registry);
+    }
+    for declaration in &declarations {
+        intern_block_collection_types(
+            &declaration.function.body,
+            &class_ids,
+            &mut collection_registry,
+        );
+    }
+
     let entry = signatures
         .get("main")
         .expect("exactly one collected main signature")
@@ -252,6 +296,7 @@ pub fn lower_program(program: &hir::Program) -> DiagnosticResult<mir::Program> {
                 property_initializers: &property_initializers,
                 constructor_body_initializers: &constructor_body_initializers,
                 static_ids: &static_ids,
+                collection_registry: &collection_registry,
             };
             lower_function(
                 declaration.function,
@@ -275,7 +320,7 @@ pub fn lower_program(program: &hir::Program) -> DiagnosticResult<mir::Program> {
                     Ok(mir::Property {
                         id: property.id,
                         name: property.name.clone(),
-                        ty: mir_type_ref(&property.ty, &class_ids).ok_or_else(|| {
+                        ty: mir_type_ref(&property.ty, &class_ids, &mut collection_registry).ok_or_else(|| {
                             vec![unsupported_native_type(
                                 &property.ty,
                                 Span::default(),
@@ -319,10 +364,131 @@ pub fn lower_program(program: &hir::Program) -> DiagnosticResult<mir::Program> {
 
     Ok(mir::Program {
         classes,
+        collection_types: collection_registry.types,
         statics,
         functions,
         entry,
     })
+}
+
+fn intern_resolved_collection_types(
+    ty: &crate::types::ResolvedType,
+    class_ids: &HashMap<String, ClassId>,
+    collections: &mut CollectionRegistry,
+) -> Option<mir::Type> {
+    use crate::types::ResolvedType;
+    let ty = match ty {
+        ResolvedType::Integer(ty) => mir::Type::Scalar(mir::ScalarType::Integer(*ty)),
+        ResolvedType::Float(ty) => mir::Type::Scalar(mir::ScalarType::Float(*ty)),
+        ResolvedType::Bool => mir::Type::Scalar(mir::ScalarType::Bool),
+        ResolvedType::String => mir::Type::String,
+        ResolvedType::Bytes => mir::Type::Collection(intern_bytes_type(collections)),
+        ResolvedType::Class(name) => mir::Type::Class(*class_ids.get(name)?),
+        ResolvedType::TypedArray(value) => {
+            let value = intern_resolved_collection_types(value, class_ids, collections)?;
+            mir::Type::Collection(collections.intern(mir::CollectionKind::TypedArray, None, value))
+        }
+        ResolvedType::List(value) => {
+            let value = intern_resolved_collection_types(value, class_ids, collections)?;
+            mir::Type::Collection(collections.intern(mir::CollectionKind::List, None, value))
+        }
+        ResolvedType::Dictionary(key, value) => {
+            let key = intern_resolved_collection_types(key, class_ids, collections)?;
+            let value = intern_resolved_collection_types(value, class_ids, collections)?;
+            mir::Type::Collection(collections.intern(
+                mir::CollectionKind::Dictionary,
+                Some(key),
+                value,
+            ))
+        }
+        ResolvedType::Set(value) => {
+            let value = intern_resolved_collection_types(value, class_ids, collections)?;
+            mir::Type::Collection(collections.intern(mir::CollectionKind::Set, None, value))
+        }
+        ResolvedType::Nullable(inner) => {
+            match intern_resolved_collection_types(inner, class_ids, collections)? {
+                mir::Type::Scalar(ty) => mir::Type::NullableScalar(ty),
+                mir::Type::String => mir::Type::NullableString,
+                mir::Type::Class(class) => mir::Type::NullableClass(class),
+                mir::Type::Collection(_)
+                | mir::Type::NullableScalar(_)
+                | mir::Type::NullableString
+                | mir::Type::NullableClass(_) => return None,
+            }
+        }
+        ResolvedType::Void
+        | ResolvedType::Null
+        | ResolvedType::Mixed
+        | ResolvedType::Unsupported => return None,
+    };
+    Some(ty)
+}
+
+fn intern_block_collection_types(
+    block: &hir::Block,
+    class_ids: &HashMap<String, ClassId>,
+    collections: &mut CollectionRegistry,
+) {
+    for statement in &block.statements {
+        match statement {
+            hir::Stmt::VarDecl(declaration) => {
+                if let Some(ty) = &declaration.ty {
+                    let _ = mir_type_ref(ty, class_ids, collections);
+                }
+            }
+            hir::Stmt::If(if_statement) => {
+                intern_if_collection_types(if_statement, class_ids, collections);
+            }
+            hir::Stmt::While(while_statement) => {
+                intern_block_collection_types(&while_statement.body, class_ids, collections);
+            }
+            hir::Stmt::For(for_statement) => {
+                if let Some(hir::ForInitializer::VarDecl(declaration)) = &for_statement.initializer
+                {
+                    if let Some(ty) = &declaration.ty {
+                        let _ = mir_type_ref(ty, class_ids, collections);
+                    }
+                }
+                intern_block_collection_types(&for_statement.body, class_ids, collections);
+            }
+            hir::Stmt::Foreach(foreach) => {
+                if let Some(binding) = &foreach.key {
+                    if let Some(ty) = &binding.ty {
+                        let _ = mir_type_ref(ty, class_ids, collections);
+                    }
+                }
+                if let Some(ty) = &foreach.value.ty {
+                    let _ = mir_type_ref(ty, class_ids, collections);
+                }
+                intern_block_collection_types(&foreach.body, class_ids, collections);
+            }
+            hir::Stmt::Assignment(_)
+            | hir::Stmt::Echo { .. }
+            | hir::Stmt::Return { .. }
+            | hir::Stmt::Break { .. }
+            | hir::Stmt::Continue { .. }
+            | hir::Stmt::Increment(_)
+            | hir::Stmt::Expr { .. } => {}
+        }
+    }
+}
+
+fn intern_if_collection_types(
+    statement: &hir::IfStmt,
+    class_ids: &HashMap<String, ClassId>,
+    collections: &mut CollectionRegistry,
+) {
+    intern_block_collection_types(&statement.then_block, class_ids, collections);
+    if let Some(branch) = &statement.else_branch {
+        match branch {
+            hir::ElseBranch::If(statement) => {
+                intern_if_collection_types(statement, class_ids, collections);
+            }
+            hir::ElseBranch::Block(block) => {
+                intern_block_collection_types(block, class_ids, collections);
+            }
+        }
+    }
 }
 
 fn lower_static_value(
@@ -368,6 +534,7 @@ fn collect_function_signature(
     id: mir::FunctionId,
     class_ids: &HashMap<String, ClassId>,
     semantic_info: &SemanticInfo,
+    collection_registry: &mut CollectionRegistry,
     lifecycle: bool,
     is_entry: bool,
 ) -> DiagnosticResult<FunctionSignature> {
@@ -380,8 +547,10 @@ fn collect_function_signature(
             mir::ReturnType::Value(mir::Type::NullableString)
         }
         Some(ty) if is_plain_type(ty, "void") => mir::ReturnType::Void,
-        Some(ty) if mir_type_ref(ty, class_ids).is_some() => {
-            mir::ReturnType::Value(mir_type_ref(ty, class_ids).expect("checked class return"))
+        Some(ty) if mir_type_ref(ty, class_ids, collection_registry).is_some() => {
+            mir::ReturnType::Value(
+                mir_type_ref(ty, class_ids, collection_registry).expect("checked native return"),
+            )
         }
         Some(ty) => {
             return Err(vec![unsupported_native_type(
@@ -431,7 +600,9 @@ fn collect_function_signature(
     let mut parameter_transfers = Vec::with_capacity(function.params.len());
     let mut parameter_owns = Vec::with_capacity(function.params.len());
     for (parameter_index, param) in function.params.iter().enumerate() {
-        let parameter_type = if let Some(ty) = mir_type_ref(&param.ty, class_ids) {
+        let parameter_type = if let Some(ty) =
+            mir_type_ref(&param.ty, class_ids, collection_registry)
+        {
             ty
         } else {
             return Err(vec![unsupported_native_type(
@@ -445,7 +616,7 @@ fn collect_function_signature(
         };
         let transfers = matches!(
             parameter_type,
-            mir::Type::Class(_) | mir::Type::NullableClass(_)
+            mir::Type::Class(_) | mir::Type::NullableClass(_) | mir::Type::Collection(_)
         ) && param.take;
         let owns = transfers && param.promoted_access.is_none();
         let default = if param.default.is_some() {
@@ -525,12 +696,42 @@ fn callable_signatures_by_method(
 fn mir_type_ref(
     ty: &crate::types::TypeRef,
     class_ids: &HashMap<String, ClassId>,
+    collection_registry: &mut CollectionRegistry,
 ) -> Option<mir::Type> {
     let mut plain = ty.clone();
     plain.nullable = false;
     let base = scalar_type_ref(&plain)
         .map(mir::Type::Scalar)
         .or_else(|| is_plain_type(&plain, "string").then_some(mir::Type::String))
+        .or_else(|| {
+            is_plain_type(&plain, "Bytes")
+                .then(|| mir::Type::Collection(intern_bytes_type(collection_registry)))
+        })
+        .or_else(|| {
+            let (kind, key_ref, value_ref) = match plain.name.as_str() {
+                "[]" if plain.args.len() == 1 => {
+                    (mir::CollectionKind::TypedArray, None, &plain.args[0])
+                }
+                "List" if plain.args.len() == 1 => {
+                    (mir::CollectionKind::List, None, &plain.args[0])
+                }
+                "Dictionary" if plain.args.len() == 2 => (
+                    mir::CollectionKind::Dictionary,
+                    Some(&plain.args[0]),
+                    &plain.args[1],
+                ),
+                "Set" if plain.args.len() == 1 => (mir::CollectionKind::Set, None, &plain.args[0]),
+                _ => return None,
+            };
+            let key = match key_ref {
+                Some(key) => Some(mir_type_ref(key, class_ids, collection_registry)?),
+                None => None,
+            };
+            let value = mir_type_ref(value_ref, class_ids, collection_registry)?;
+            Some(mir::Type::Collection(
+                collection_registry.intern(kind, key, value),
+            ))
+        })
         .or_else(|| {
             ty.args
                 .is_empty()
@@ -542,6 +743,7 @@ fn mir_type_ref(
             mir::Type::Scalar(ty) => mir::Type::NullableScalar(ty),
             mir::Type::String => mir::Type::NullableString,
             mir::Type::Class(class) => mir::Type::NullableClass(class),
+            mir::Type::Collection(_) => return None,
             mir::Type::NullableScalar(_)
             | mir::Type::NullableString
             | mir::Type::NullableClass(_) => return None,
@@ -549,6 +751,12 @@ fn mir_type_ref(
     } else {
         Some(base)
     }
+}
+
+fn intern_bytes_type(collections: &mut CollectionRegistry) -> mir::CollectionTypeId {
+    let byte = mir::Type::Scalar(mir::ScalarType::Integer(IntegerType::UInt8));
+    collections.intern(mir::CollectionKind::TypedArray, None, byte);
+    collections.intern(mir::CollectionKind::Bytes, None, byte)
 }
 
 fn field_type(ty: mir::Type) -> Option<FieldType> {
@@ -565,6 +773,7 @@ fn field_type(ty: mir::Type) -> Option<FieldType> {
         mir::Type::NullableString => Some(FieldType::NullableString),
         mir::Type::Class(class) => Some(FieldType::Class(class)),
         mir::Type::NullableClass(class) => Some(FieldType::NullableClass(class)),
+        mir::Type::Collection(_) => Some(FieldType::Collection),
     }
 }
 
@@ -608,6 +817,7 @@ struct FunctionLoweringInputs<'a> {
     property_initializers: &'a HashMap<crate::class_layout::PropertyId, hir::Expr>,
     constructor_body_initializers: &'a HashSet<crate::class_layout::PropertyId>,
     static_ids: &'a HashMap<(ClassId, String), mir::StaticId>,
+    collection_registry: &'a CollectionRegistry,
 }
 
 fn lower_function(
@@ -624,6 +834,7 @@ fn lower_function(
         inputs.property_initializers.clone(),
         inputs.constructor_body_initializers.clone(),
         inputs.static_ids.clone(),
+        inputs.collection_registry.clone(),
     );
     context.return_borrow = signature.return_borrow;
     let mut params = Vec::new();
@@ -760,6 +971,17 @@ fn lower_statement_sequence(
                 lower_loop_control(*span, LoopControl::Continue, context)?;
             }
             hir::Stmt::Expr { expr, span } => {
+                if let hir::Expr::FunctionCall {
+                    name,
+                    args,
+                    span: call_span,
+                } = expr
+                {
+                    if lower_byte_file_write_statement(name, args, *call_span, context)? {
+                        continue;
+                    }
+                }
+                materialize_nested_collection_places(expr, false, context)?;
                 if let hir::Expr::MethodCall {
                     object,
                     method,
@@ -768,6 +990,11 @@ fn lower_statement_sequence(
                     null_safe,
                 } = expr
                 {
+                    if !*null_safe
+                        && lower_collection_method_statement(object, method, args, context)?
+                    {
+                        continue;
+                    }
                     let statement = if *null_safe {
                         let (object, signature, args) =
                             lower_null_safe_method_call(object, method, args, *call_span, context)?;
@@ -817,6 +1044,29 @@ fn lower_statement_sequence(
                         context.push_statement(mir::Statement::WriteFile {
                             path: lower_string_expression(path, context)?,
                             contents: lower_string_expression(contents, context)?,
+                        });
+                    } else if name == "append_file" {
+                        let [path, contents] = args.as_slice() else {
+                            return Err(vec![unsupported(
+                                *call_span,
+                                "append_file expects 2 arguments",
+                            )]);
+                        };
+                        context.push_statement(mir::Statement::AppendFile {
+                            path: lower_string_expression(path, context)?,
+                            contents: lower_string_expression(contents, context)?,
+                        });
+                    } else if matches!(name.as_str(), "write_stdout_bytes" | "write_stderr_bytes") {
+                        let [contents] = args.as_slice() else {
+                            return Err(vec![unsupported(
+                                *call_span,
+                                format!("{name} expects 1 argument"),
+                            )]);
+                        };
+                        let contents = lower_bytes_local(contents, context)?.0;
+                        context.push_statement(mir::Statement::WriteStreamBytes {
+                            contents,
+                            stderr: name == "write_stderr_bytes",
                         });
                     } else if name == "write_stderr" {
                         let [value] = args.as_slice() else {
@@ -873,10 +1123,9 @@ fn lower_if_tree(
     context: &mut LoweringContext,
 ) -> DiagnosticResult<Vec<mir::BlockId>> {
     context.current_block = Some(condition_block);
-    let condition = lower_condition(&if_stmt.condition, context)?;
     let then_block = context.create_block();
     let else_block = context.create_block();
-    context.terminate_condition(condition, then_block, else_block);
+    lower_condition_to_blocks(&if_stmt.condition, then_block, else_block, context)?;
 
     let mut fallthrough_blocks =
         lower_scoped_block(&if_stmt.then_block, then_block, return_type, context)?;
@@ -905,8 +1154,7 @@ fn lower_while_statement(
 
     context.terminate_current(mir::Terminator::Jump(header_block));
     context.current_block = Some(header_block);
-    let condition = lower_condition(&while_stmt.condition, context)?;
-    context.terminate_condition(condition, body_block, exit_block);
+    lower_condition_to_blocks(&while_stmt.condition, body_block, exit_block, context)?;
 
     context.push_loop_targets(LoopTargets {
         continue_block: header_block,
@@ -956,15 +1204,17 @@ fn lower_for_statement_in_scope(
 
     context.terminate_current(mir::Terminator::Jump(header_block));
     context.current_block = Some(header_block);
-    let condition = for_stmt
-        .condition
-        .as_ref()
-        .map(|condition| lower_condition(condition, context))
-        .transpose()?
-        .unwrap_or(mir::BoolExpression::Use {
-            operand: mir::Operand::Scalar(mir::ScalarValue::Bool(true)),
-        });
-    context.terminate_condition(condition, body_block, exit_block);
+    if let Some(condition) = &for_stmt.condition {
+        lower_condition_to_blocks(condition, body_block, exit_block, context)?;
+    } else {
+        context.terminate_condition(
+            mir::BoolExpression::Use {
+                operand: mir::Operand::Scalar(mir::ScalarValue::Bool(true)),
+            },
+            body_block,
+            exit_block,
+        );
+    }
 
     context.push_loop_targets(LoopTargets {
         continue_block: increment_block,
@@ -998,33 +1248,355 @@ fn lower_foreach_statement(
     return_type: mir::ReturnType,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<()> {
-    if foreach.key.is_some() {
-        return Err(vec![unsupported(
-            foreach.span,
-            "integer range `foreach` does not support key bindings in native compilation",
-        )]);
-    }
-
-    let Some((start, end, inclusive)) = grouped_range_parts(&foreach.iterable) else {
-        return Err(vec![unsupported(
-            foreach.iterable.span(),
-            "native compilation currently supports `foreach` only over integer ranges",
-        )]);
-    };
-
-    if let Some(ty) = &foreach.value.ty {
-        if integer_type_ref(ty).is_none() {
+    if let Some((start, end, inclusive)) = grouped_range_parts(&foreach.iterable) {
+        if foreach.key.is_some() {
             return Err(vec![unsupported(
                 foreach.span,
-                format!("integer range foreach bindings require an integer type; got `{ty}`"),
+                "integer range `foreach` does not support key bindings in native compilation",
             )]);
         }
+        if let Some(ty) = &foreach.value.ty {
+            if integer_type_ref(ty).is_none() {
+                return Err(vec![unsupported(
+                    foreach.span,
+                    format!("integer range foreach bindings require an integer type; got `{ty}`"),
+                )]);
+            }
+        }
+        context.push_scope();
+        let result =
+            lower_range_foreach_in_scope(foreach, start, end, inclusive, return_type, context);
+        context.pop_scope();
+        return result;
     }
 
+    let (collection_expr, projection) = dictionary_foreach_projection(&foreach.iterable).map_or(
+        (&foreach.iterable, CollectionForeachProjection::Main),
+        |value| value,
+    );
     context.push_scope();
-    let result = lower_range_foreach_in_scope(foreach, start, end, inclusive, return_type, context);
+    materialize_nested_collection_places(collection_expr, false, context)?;
+    let (collection, collection_type) = match lower_collection_local(collection_expr, context) {
+        Ok(place) => place,
+        Err(_) => {
+            let mir::Type::Collection(collection_type) =
+                context.expression_type(collection_expr)?
+            else {
+                return Err(vec![unsupported(
+                    collection_expr.span(),
+                    "foreach iterable is not a collection",
+                )]);
+            };
+            let borrowed = collection_place_is_borrowed(collection_expr);
+            let value =
+                lower_collection_expression(collection_expr, collection_type, !borrowed, context)?;
+            let local = if borrowed {
+                context.declare_borrowed_temp(mir::Type::Collection(collection_type), false)
+            } else {
+                context.declare_owned_temp(mir::Type::Collection(collection_type))
+            };
+            context.push_statement(mir::Statement::AssignLocal {
+                target: local,
+                value: mir::Rvalue::Collection(value),
+            });
+            (local, collection_type)
+        }
+    };
+    let result = lower_collection_foreach_in_scope(
+        foreach,
+        collection,
+        collection_type,
+        projection,
+        return_type,
+        context,
+    );
     context.pop_scope();
     result
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CollectionForeachProjection {
+    Main,
+    Keys,
+    Values,
+}
+
+fn dictionary_foreach_projection(
+    expr: &hir::Expr,
+) -> Option<(&hir::Expr, CollectionForeachProjection)> {
+    match expr {
+        hir::Expr::Grouped { expr, .. } => dictionary_foreach_projection(expr),
+        hir::Expr::PropertyAccess {
+            object,
+            property,
+            null_safe: false,
+            ..
+        } => match property.as_str() {
+            "keys" => Some((object, CollectionForeachProjection::Keys)),
+            "values" => Some((object, CollectionForeachProjection::Values)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn lower_collection_foreach_in_scope(
+    foreach: &hir::ForeachStmt,
+    collection: mir::LocalId,
+    collection_type: mir::CollectionTypeId,
+    projection: CollectionForeachProjection,
+    return_type: mir::ReturnType,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<()> {
+    let definition = context.collection_type(collection_type).clone();
+    if projection != CollectionForeachProjection::Main
+        && definition.kind != mir::CollectionKind::Dictionary
+    {
+        return Err(vec![unsupported(
+            foreach.span,
+            "dictionary projections require a Dictionary",
+        )]);
+    }
+    if projection != CollectionForeachProjection::Main && foreach.key.is_some() {
+        return Err(vec![unsupported(
+            foreach.span,
+            "dictionary projections do not support foreach key bindings",
+        )]);
+    }
+    if projection != CollectionForeachProjection::Main && foreach.value.writable {
+        return Err(vec![unsupported(
+            foreach.span,
+            "dictionary projections are readonly",
+        )]);
+    }
+    let index_type = IntegerType::Int64;
+    let index_local = context.declare_temp(true, index_type);
+    context.push_statement(mir::Statement::AssignLocal {
+        target: index_local,
+        value: mir::Rvalue::Value(mir::ValueExpression::Integer(
+            mir::IntegerExpression::constant(
+                IntegerValue::from_i128(index_type, 0).expect("zero is a valid int"),
+            ),
+        )),
+    });
+
+    let key_local = match (&foreach.key, definition.key, projection) {
+        (Some(binding), Some(key_type), CollectionForeachProjection::Main) => {
+            Some(context.declare_user_local_owned(&binding.name, false, key_type, false))
+        }
+        (Some(_), None, CollectionForeachProjection::Main) => {
+            return Err(vec![unsupported(
+                foreach.span,
+                "foreach key bindings require a Dictionary",
+            )])
+        }
+        (None, _, _) => None,
+        (Some(_), _, _) => unreachable!("projection key bindings were rejected above"),
+    };
+    let binding_type = match projection {
+        CollectionForeachProjection::Keys => definition
+            .key
+            .expect("a Dictionary collection type must have a key type"),
+        CollectionForeachProjection::Main | CollectionForeachProjection::Values => definition.value,
+    };
+    let value_local = context.declare_user_local_owned(
+        &foreach.value.name,
+        foreach.value.writable,
+        binding_type,
+        false,
+    );
+
+    let header_block = context.create_block();
+    let body_block = context.create_block();
+    let update_block = context.create_block();
+    let exit_block = context.create_block();
+    context.terminate_current(mir::Terminator::Jump(header_block));
+    context.current_block = Some(header_block);
+    context.terminate_current(mir::Terminator::Branch {
+        condition: mir::BoolExpression::Compare {
+            op: mir::CompareOp::Less,
+            left: Box::new(mir::ValueExpression::Integer(local_integer_expression(
+                index_local,
+                index_type,
+            ))),
+            right: Box::new(mir::ValueExpression::Integer(mir::IntegerExpression::Use {
+                ty: index_type,
+                operand: mir::Operand::CollectionLength(collection),
+            })),
+        },
+        then_block: body_block,
+        else_block: exit_block,
+    });
+
+    let offset = collection_offset_rvalue(index_local);
+    let key = definition
+        .key
+        .map(|key_type| collection_key_at_rvalue(collection, offset.clone(), key_type))
+        .transpose()?;
+    context.current_block = Some(body_block);
+    if let (Some(target), Some(key)) = (key_local, key.clone()) {
+        context.push_statement(mir::Statement::AssignLocal { target, value: key });
+    }
+    let binding_value = match projection {
+        CollectionForeachProjection::Keys => key
+            .clone()
+            .expect("a Dictionary collection type must produce a key"),
+        CollectionForeachProjection::Main | CollectionForeachProjection::Values => {
+            collection_value_rvalue(
+                collection,
+                key.clone().unwrap_or_else(|| offset.clone()),
+                definition.value,
+            )?
+        }
+    };
+    context.push_statement(mir::Statement::AssignLocal {
+        target: value_local,
+        value: binding_value,
+    });
+
+    context.push_loop_targets(LoopTargets {
+        continue_block: update_block,
+        break_block: exit_block,
+        cleanup_depth: context.local_scopes.len(),
+    });
+    context.push_scope();
+    let body_result = lower_statement_sequence(&foreach.body.statements, return_type, context);
+    let body_fallthrough = context.current_block;
+    context.pop_scope();
+    context.pop_loop_targets();
+    body_result?;
+    if let Some(block) = body_fallthrough {
+        context.terminate_block(block, mir::Terminator::Jump(update_block));
+    }
+
+    context.current_block = Some(update_block);
+    if foreach.value.writable && projection == CollectionForeachProjection::Main {
+        match definition.value {
+            mir::Type::Scalar(_) | mir::Type::String => {
+                context.push_statement(mir::Statement::AssignCollectionIndex {
+                    collection,
+                    index: key.unwrap_or_else(|| offset.clone()),
+                    value: foreach_local_rvalue(value_local, definition.value)?,
+                });
+            }
+            mir::Type::Class(_) | mir::Type::Collection(_) => {}
+            mir::Type::NullableScalar(_)
+            | mir::Type::NullableString
+            | mir::Type::NullableClass(_) => {
+                return Err(vec![unsupported(
+                    foreach.span,
+                    "nullable collection elements are deferred beyond Stage 23 Slice 1",
+                )])
+            }
+        }
+    }
+    context.push_statement(mir::Statement::AssignLocal {
+        target: index_local,
+        value: mir::Rvalue::Value(mir::ValueExpression::Integer(
+            mir::IntegerExpression::Binary {
+                ty: index_type,
+                op: mir::IntegerBinaryOp::Add,
+                left: Box::new(local_integer_expression(index_local, index_type)),
+                right: Box::new(mir::IntegerExpression::constant(IntegerValue::one(
+                    index_type,
+                ))),
+            },
+        )),
+    });
+    context.terminate_current(mir::Terminator::Jump(header_block));
+    context.current_block = context.is_reachable(exit_block).then_some(exit_block);
+    Ok(())
+}
+
+fn collection_offset_rvalue(local: mir::LocalId) -> mir::Rvalue {
+    mir::Rvalue::Value(mir::ValueExpression::Integer(local_integer_expression(
+        local,
+        IntegerType::Int64,
+    )))
+}
+
+fn collection_key_at_rvalue(
+    collection: mir::LocalId,
+    offset: mir::Rvalue,
+    ty: mir::Type,
+) -> DiagnosticResult<mir::Rvalue> {
+    match ty {
+        mir::Type::Scalar(scalar) => Ok(mir::Rvalue::Value(value_expression_from_operand(
+            scalar,
+            mir::Operand::CollectionKeyAt {
+                collection,
+                offset: Box::new(offset),
+            },
+        ))),
+        mir::Type::String => Ok(mir::Rvalue::String(
+            mir::StringExpression::CollectionKeyAt {
+                collection,
+                offset: Box::new(offset),
+            },
+        )),
+        _ => Err(vec![unsupported(
+            Span::new(0, 0),
+            "Stage 23 Slice 1 dictionary keys must be scalar or string values",
+        )]),
+    }
+}
+
+fn collection_value_rvalue(
+    collection: mir::LocalId,
+    index: mir::Rvalue,
+    ty: mir::Type,
+) -> DiagnosticResult<mir::Rvalue> {
+    match ty {
+        mir::Type::Scalar(scalar) => Ok(mir::Rvalue::Value(value_expression_from_operand(
+            scalar,
+            mir::Operand::CollectionIndex {
+                collection,
+                index: Box::new(index),
+                remove: false,
+            },
+        ))),
+        mir::Type::String => Ok(mir::Rvalue::String(
+            mir::StringExpression::CollectionIndex {
+                collection,
+                index: Box::new(index),
+                remove: false,
+            },
+        )),
+        mir::Type::Class(class) => Ok(mir::Rvalue::Class(mir::ClassExpression::CollectionIndex {
+            class,
+            collection,
+            index: Box::new(index),
+            transfer: false,
+        })),
+        mir::Type::Collection(nested) => {
+            Ok(mir::Rvalue::Collection(mir::CollectionExpression::Index {
+                collection: nested,
+                source: collection,
+                index: Box::new(index),
+                transfer: false,
+            }))
+        }
+        mir::Type::NullableScalar(_) | mir::Type::NullableString | mir::Type::NullableClass(_) => {
+            Err(vec![unsupported(
+                Span::new(0, 0),
+                "nullable collection elements are deferred beyond Stage 23 Slice 1",
+            )])
+        }
+    }
+}
+
+fn foreach_local_rvalue(local: mir::LocalId, ty: mir::Type) -> DiagnosticResult<mir::Rvalue> {
+    match ty {
+        mir::Type::Scalar(scalar) => Ok(mir::Rvalue::Value(value_expression_from_operand(
+            scalar,
+            mir::Operand::Local(local),
+        ))),
+        mir::Type::String => Ok(mir::Rvalue::String(mir::StringExpression::Local(local))),
+        _ => Err(vec![unsupported(
+            Span::new(0, 0),
+            "this foreach binding cannot be written back in Stage 23 Slice 1",
+        )]),
+    }
 }
 
 fn lower_range_foreach_in_scope(
@@ -1240,15 +1812,23 @@ struct LoweringContext<'semantic> {
     property_initializers: HashMap<crate::class_layout::PropertyId, hir::Expr>,
     constructor_body_initializers: HashSet<crate::class_layout::PropertyId>,
     static_ids: HashMap<(ClassId, String), mir::StaticId>,
+    collection_registry: CollectionRegistry,
     locals: Vec<mir::Local>,
     local_scopes: Vec<HashMap<String, mir::LocalId>>,
-    scope_owned_locals: Vec<Vec<(mir::LocalId, ClassId)>>,
+    materialized_collection_places: HashMap<(usize, usize), mir::LocalId>,
+    scope_owned_locals: Vec<Vec<DropObligation>>,
     temp_counter: usize,
     blocks: Vec<BlockBuilder>,
     reachable_blocks: Vec<bool>,
     current_block: Option<mir::BlockId>,
     loop_targets: Vec<LoopTargets>,
     return_borrow: Option<mir::ReturnBorrow>,
+}
+
+#[derive(Clone, Copy)]
+enum DropObligation {
+    Class(mir::LocalId, ClassId),
+    Collection(mir::LocalId, mir::CollectionTypeId),
 }
 
 impl<'semantic> LoweringContext<'semantic> {
@@ -1259,6 +1839,7 @@ impl<'semantic> LoweringContext<'semantic> {
         property_initializers: HashMap<crate::class_layout::PropertyId, hir::Expr>,
         constructor_body_initializers: HashSet<crate::class_layout::PropertyId>,
         static_ids: HashMap<(ClassId, String), mir::StaticId>,
+        collection_registry: CollectionRegistry,
     ) -> Self {
         Self {
             signatures,
@@ -1267,8 +1848,10 @@ impl<'semantic> LoweringContext<'semantic> {
             property_initializers,
             constructor_body_initializers,
             static_ids,
+            collection_registry,
             locals: Vec::new(),
             local_scopes: vec![HashMap::new()],
+            materialized_collection_places: HashMap::new(),
             scope_owned_locals: vec![Vec::new()],
             temp_counter: 0,
             blocks: vec![BlockBuilder {
@@ -1386,8 +1969,13 @@ impl<'semantic> LoweringContext<'semantic> {
             .rev()
             .flat_map(|scope| scope.iter().rev().copied())
             .collect::<Vec<_>>();
-        for (local, class) in cleanup {
-            self.push_statement(mir::Statement::DropClass { local, class });
+        for obligation in cleanup {
+            self.push_statement(match obligation {
+                DropObligation::Class(local, class) => mir::Statement::DropClass { local, class },
+                DropObligation::Collection(local, collection) => {
+                    mir::Statement::DropCollection { local, collection }
+                }
+            });
         }
     }
 
@@ -1412,7 +2000,10 @@ impl<'semantic> LoweringContext<'semantic> {
     }
 
     fn declare_user_local(&mut self, name: &str, writable: bool, ty: mir::Type) -> mir::LocalId {
-        let owned = matches!(ty, mir::Type::Class(_) | mir::Type::NullableClass(_));
+        let owned = matches!(
+            ty,
+            mir::Type::Class(_) | mir::Type::NullableClass(_) | mir::Type::Collection(_)
+        );
         self.declare_user_local_owned(name, writable, ty, owned)
     }
 
@@ -1437,14 +2028,17 @@ impl<'semantic> LoweringContext<'semantic> {
             .expect("MIR lowering must have a local scope")
             .insert(name.to_string(), id);
         if owned {
-            let class = match ty {
-                mir::Type::Class(class) | mir::Type::NullableClass(class) => class,
-                _ => unreachable!("only class locals may own native drop obligations"),
+            let obligation = match ty {
+                mir::Type::Class(class) | mir::Type::NullableClass(class) => {
+                    DropObligation::Class(id, class)
+                }
+                mir::Type::Collection(collection) => DropObligation::Collection(id, collection),
+                _ => unreachable!("only move locals may own native drop obligations"),
             };
             self.scope_owned_locals
                 .last_mut()
                 .expect("MIR lowering must have an ownership scope")
-                .push((id, class));
+                .push(obligation);
         }
         id
     }
@@ -1476,6 +2070,62 @@ impl<'semantic> LoweringContext<'semantic> {
             owned,
             synthetic: true,
         });
+        id
+    }
+
+    fn declare_borrowed_temp(&mut self, ty: mir::Type, writable: bool) -> mir::LocalId {
+        let id = mir::LocalId(self.locals.len());
+        let name = format!("_borrow{}", self.temp_counter);
+        self.temp_counter += 1;
+        self.locals.push(mir::Local {
+            id,
+            name,
+            ty,
+            writable,
+            owned: false,
+            synthetic: true,
+        });
+        id
+    }
+
+    fn declare_string_temp(&mut self) -> mir::LocalId {
+        let id = mir::LocalId(self.locals.len());
+        let name = format!("_string{}", self.temp_counter);
+        self.temp_counter += 1;
+        self.locals.push(mir::Local {
+            id,
+            name,
+            ty: mir::Type::String,
+            writable: false,
+            owned: false,
+            synthetic: true,
+        });
+        id
+    }
+
+    fn declare_owned_temp(&mut self, ty: mir::Type) -> mir::LocalId {
+        let id = mir::LocalId(self.locals.len());
+        let name = format!("_owned{}", self.temp_counter);
+        self.temp_counter += 1;
+        self.locals.push(mir::Local {
+            id,
+            name,
+            ty,
+            writable: false,
+            owned: true,
+            synthetic: true,
+        });
+        let obligation = match ty {
+            mir::Type::Class(class) | mir::Type::NullableClass(class) => {
+                DropObligation::Class(id, class)
+            }
+            mir::Type::Collection(collection) => DropObligation::Collection(id, collection),
+            _ => unreachable!("only move locals may own native drop obligations"),
+        };
+        self.scope_owned_locals
+            .last_mut()
+            .expect("MIR lowering must have an ownership scope")
+            .push(obligation);
         id
     }
 
@@ -1521,6 +2171,14 @@ impl<'semantic> LoweringContext<'semantic> {
             .classes
             .iter()
             .find(|class| class.id == id)
+    }
+
+    fn collection_type(&self, id: mir::CollectionTypeId) -> &mir::CollectionType {
+        self.collection_registry
+            .types
+            .get(id.0)
+            .filter(|collection| collection.id == id)
+            .expect("lowered collection type must have a matching registry slot")
     }
 
     fn property_info(
@@ -1619,6 +2277,41 @@ impl<'semantic> LoweringContext<'semantic> {
             .map(mir::Type::Scalar)
             .or_else(|| is_plain_type(&plain, "string").then_some(mir::Type::String))
             .or_else(|| {
+                let key = match plain.name.as_str() {
+                    "Bytes" if plain.args.is_empty() => (
+                        mir::CollectionKind::Bytes,
+                        None,
+                        mir::Type::Scalar(mir::ScalarType::Integer(IntegerType::UInt8)),
+                    ),
+                    "[]" if plain.args.len() == 1 => (
+                        mir::CollectionKind::TypedArray,
+                        None,
+                        self.native_type_ref(&plain.args[0])?,
+                    ),
+                    "List" if plain.args.len() == 1 => (
+                        mir::CollectionKind::List,
+                        None,
+                        self.native_type_ref(&plain.args[0])?,
+                    ),
+                    "Dictionary" if plain.args.len() == 2 => (
+                        mir::CollectionKind::Dictionary,
+                        Some(self.native_type_ref(&plain.args[0])?),
+                        self.native_type_ref(&plain.args[1])?,
+                    ),
+                    "Set" if plain.args.len() == 1 => (
+                        mir::CollectionKind::Set,
+                        None,
+                        self.native_type_ref(&plain.args[0])?,
+                    ),
+                    _ => return None,
+                };
+                self.collection_registry
+                    .ids
+                    .get(&key)
+                    .copied()
+                    .map(mir::Type::Collection)
+            })
+            .or_else(|| {
                 ty.args
                     .is_empty()
                     .then(|| self.class_id_for_name(&ty.name).map(mir::Type::Class))
@@ -1629,6 +2322,7 @@ impl<'semantic> LoweringContext<'semantic> {
                 mir::Type::Scalar(ty) => mir::Type::NullableScalar(ty),
                 mir::Type::String => mir::Type::NullableString,
                 mir::Type::Class(class) => mir::Type::NullableClass(class),
+                mir::Type::Collection(_) => return None,
                 mir::Type::NullableScalar(_)
                 | mir::Type::NullableString
                 | mir::Type::NullableClass(_) => return None,
@@ -1723,7 +2417,55 @@ impl<'semantic> LoweringContext<'semantic> {
             ResolvedType::Float(ty) => Some(mir::Type::Scalar(mir::ScalarType::Float(*ty))),
             ResolvedType::Bool => Some(mir::Type::Scalar(mir::ScalarType::Bool)),
             ResolvedType::String => Some(mir::Type::String),
+            ResolvedType::Bytes => self
+                .collection_registry
+                .ids
+                .get(&(
+                    mir::CollectionKind::Bytes,
+                    None,
+                    mir::Type::Scalar(mir::ScalarType::Integer(IntegerType::UInt8)),
+                ))
+                .copied()
+                .map(mir::Type::Collection),
             ResolvedType::Class(name) => self.class_id_for_name(name).map(mir::Type::Class),
+            ResolvedType::TypedArray(value) => self
+                .mir_resolved_type(value)
+                .and_then(|value| {
+                    self.collection_registry.ids.get(&(
+                        mir::CollectionKind::TypedArray,
+                        None,
+                        value,
+                    ))
+                })
+                .copied()
+                .map(mir::Type::Collection),
+            ResolvedType::List(value) => self
+                .mir_resolved_type(value)
+                .and_then(|value| {
+                    self.collection_registry
+                        .ids
+                        .get(&(mir::CollectionKind::List, None, value))
+                })
+                .copied()
+                .map(mir::Type::Collection),
+            ResolvedType::Dictionary(key, value) => {
+                let key = self.mir_resolved_type(key)?;
+                let value = self.mir_resolved_type(value)?;
+                self.collection_registry
+                    .ids
+                    .get(&(mir::CollectionKind::Dictionary, Some(key), value))
+                    .copied()
+                    .map(mir::Type::Collection)
+            }
+            ResolvedType::Set(value) => self
+                .mir_resolved_type(value)
+                .and_then(|value| {
+                    self.collection_registry
+                        .ids
+                        .get(&(mir::CollectionKind::Set, None, value))
+                })
+                .copied()
+                .map(mir::Type::Collection),
             ResolvedType::Nullable(inner) => match self.mir_resolved_type(inner)? {
                 mir::Type::Scalar(ty) => Some(mir::Type::NullableScalar(ty)),
                 mir::Type::String => Some(mir::Type::NullableString),
@@ -1744,7 +2486,8 @@ impl<'semantic> LoweringContext<'semantic> {
             | mir::Type::NullableScalar(_)
             | mir::Type::NullableString
             | mir::Type::Class(_)
-            | mir::Type::NullableClass(_) => Err(vec![Diagnostic::new(
+            | mir::Type::NullableClass(_)
+            | mir::Type::Collection(_) => Err(vec![Diagnostic::new(
                 "I1401",
                 format!(
                     "internal compiler consistency error: string local local{} used as a scalar",
@@ -1796,6 +2539,7 @@ fn terminator_targets(terminator: &mir::Terminator) -> Vec<mir::BlockId> {
 }
 
 fn lower_var_decl(decl: &hir::VarDecl, context: &mut LoweringContext) -> DiagnosticResult<()> {
+    materialize_nested_collection_places(&decl.initializer, false, context)?;
     let ty = match &decl.ty {
         Some(ty) if context.native_type_ref(ty).is_some() => {
             context.native_type_ref(ty).expect("guarded native type")
@@ -1833,7 +2577,16 @@ fn lower_var_decl(decl: &hir::VarDecl, context: &mut LoweringContext) -> Diagnos
     }
     if let mir::Type::NullableClass(class) = ty {
         let value = lower_nullable_class_expression(&decl.initializer, class, true, context)?;
-        let local = context.declare_user_local(&decl.name, decl.writable, ty);
+        let owned = !matches!(
+            value,
+            mir::NullableClassExpression::DictionaryGet {
+                access: mir::NullableCollectionAccess::Get
+                    | mir::NullableCollectionAccess::First
+                    | mir::NullableCollectionAccess::Last,
+                ..
+            }
+        );
+        let local = context.declare_user_local_owned(&decl.name, decl.writable, ty, owned);
         context.push_statement(mir::Statement::AssignLocal {
             target: local,
             value: mir::Rvalue::NullableClass(value),
@@ -1846,6 +2599,15 @@ fn lower_var_decl(decl: &hir::VarDecl, context: &mut LoweringContext) -> Diagnos
         context.push_statement(mir::Statement::AssignLocal {
             target: local,
             value: mir::Rvalue::Class(value),
+        });
+        return Ok(());
+    }
+    if let mir::Type::Collection(collection) = ty {
+        let value = lower_collection_expression(&decl.initializer, collection, true, context)?;
+        let local = context.declare_user_local(&decl.name, decl.writable, ty);
+        context.push_statement(mir::Statement::AssignLocal {
+            target: local,
+            value: mir::Rvalue::Collection(value),
         });
         return Ok(());
     }
@@ -1956,7 +2718,7 @@ fn lower_string_var_decl(
     Ok(())
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum ScalarPlace {
     Local(mir::LocalId),
     NullableLocal(mir::LocalId),
@@ -1965,15 +2727,27 @@ enum ScalarPlace {
         property: crate::class_layout::PropertyId,
     },
     Static(mir::StaticId),
+    CollectionIndex {
+        collection: mir::LocalId,
+        index: mir::Rvalue,
+    },
 }
 
 impl ScalarPlace {
-    fn operand(self) -> mir::Operand {
+    fn operand(&self) -> mir::Operand {
         match self {
-            Self::Local(local) => mir::Operand::Local(local),
-            Self::NullableLocal(local) => mir::Operand::NullablePayload(local),
-            Self::Property { object, property } => mir::Operand::Property { object, property },
-            Self::Static(id) => mir::Operand::Static(id),
+            Self::Local(local) => mir::Operand::Local(*local),
+            Self::NullableLocal(local) => mir::Operand::NullablePayload(*local),
+            Self::Property { object, property } => mir::Operand::Property {
+                object: *object,
+                property: *property,
+            },
+            Self::Static(id) => mir::Operand::Static(*id),
+            Self::CollectionIndex { collection, index } => mir::Operand::CollectionIndex {
+                collection: *collection,
+                index: Box::new(index.clone()),
+                remove: false,
+            },
         }
     }
 
@@ -1994,6 +2768,11 @@ impl ScalarPlace {
             },
             Self::Static(target) => mir::Statement::AssignStatic {
                 target,
+                value: mir::Rvalue::Value(value),
+            },
+            Self::CollectionIndex { collection, index } => mir::Statement::AssignCollectionIndex {
+                collection,
+                index,
                 value: mir::Rvalue::Value(value),
             },
         }
@@ -2047,6 +2826,32 @@ fn lower_scalar_place(
             };
             Ok((ScalarPlace::Static(id), scalar))
         }
+        hir::Expr::Index {
+            collection,
+            index,
+            span,
+        } => {
+            let (collection, collection_type) = lower_collection_local(collection, context)?;
+            let info = context.collection_type(collection_type);
+            let mir::Type::Scalar(scalar) = info.value else {
+                return Err(vec![unsupported(
+                    *span,
+                    "indexed collection element is not a scalar mutation place",
+                )]);
+            };
+            let index_type = info
+                .key
+                .unwrap_or(mir::Type::Scalar(mir::ScalarType::Integer(
+                    IntegerType::Int64,
+                )));
+            Ok((
+                ScalarPlace::CollectionIndex {
+                    collection,
+                    index: lower_rvalue_as_expected(index, index_type, context)?,
+                },
+                scalar,
+            ))
+        }
         _ => Err(vec![unsupported(
             expr.span(),
             "this scalar mutation place is not supported by native compilation",
@@ -2058,6 +2863,8 @@ fn lower_assignment(
     assignment: &hir::Assignment,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<()> {
+    materialize_nested_collection_places(&assignment.target, true, context)?;
+    materialize_nested_collection_places(&assignment.value, false, context)?;
     if assignment.op != hir::AssignOp::Assign {
         let (place, scalar_type) = lower_scalar_place(&assignment.target, context)?;
         let value = lower_compound_value(
@@ -2093,6 +2900,27 @@ fn lower_assignment(
             });
             return Ok(());
         }
+    }
+    if let hir::Expr::Index {
+        collection,
+        index,
+        span,
+    } = target
+    {
+        let (collection, collection_type) = lower_collection_local(collection, context)?;
+        let info = context.collection_type(collection_type);
+        let index_type = info
+            .key
+            .unwrap_or(mir::Type::Scalar(mir::ScalarType::Integer(
+                IntegerType::Int64,
+            )));
+        context.push_statement(mir::Statement::AssignCollectionIndex {
+            collection,
+            index: lower_rvalue_as_expected(index, index_type, context)?,
+            value: lower_rvalue_as_expected(&assignment.value, info.value, context)?,
+        });
+        let _ = span;
+        return Ok(());
     }
     let target = lower_assignment_target(target, context)?;
     if context.local_type(target) == mir::Type::String {
@@ -2163,6 +2991,24 @@ fn lower_assignment(
         });
         return Ok(());
     }
+    if let mir::Type::Collection(collection) = context.local_type(target) {
+        if !context.local_owns(target) {
+            return Err(vec![unsupported(
+                assignment.span,
+                "this compiler version cannot replace a borrowed collection value",
+            )]);
+        }
+        context.push_statement(mir::Statement::AssignLocal {
+            target,
+            value: mir::Rvalue::Collection(lower_collection_expression(
+                &assignment.value,
+                collection,
+                true,
+                context,
+            )?),
+        });
+        return Ok(());
+    }
 
     let scalar_type = context.local_scalar_type(target)?;
     let value = lower_value_expression(&assignment.value, context)?;
@@ -2178,6 +3024,7 @@ fn lower_increment(
     increment: &hir::IncrementStmt,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<()> {
+    materialize_nested_collection_places(&increment.target, true, context)?;
     let (place, scalar_type) = lower_scalar_place(&increment.target, context)?;
     let value = lower_increment_value(place.operand(), scalar_type, &increment.op, increment.span)?;
     context.push_statement(place.assignment(value));
@@ -2243,7 +3090,8 @@ fn lower_assignment_target(
     }
 }
 
-fn lower_echo(expr: &hir::Expr, context: &LoweringContext) -> DiagnosticResult<mir::Statement> {
+fn lower_echo(expr: &hir::Expr, context: &mut LoweringContext) -> DiagnosticResult<mir::Statement> {
+    materialize_nested_collection_places(expr, false, context)?;
     match expr {
         hir::Expr::String { value, .. } => Ok(mir::Statement::EchoStringLiteral(value.clone())),
         _ => lower_display_string_expression(expr, context).map(mir::Statement::EchoString),
@@ -2268,6 +3116,19 @@ fn lower_string_expression(
     expr: &hir::Expr,
     context: &LoweringContext,
 ) -> DiagnosticResult<mir::StringExpression> {
+    if let Some((collection, index, value_type)) = lower_list_remove_at(expr, context)? {
+        if value_type != mir::Type::String {
+            return Err(vec![unsupported(
+                expr.span(),
+                "List::removeAt result has another value type",
+            )]);
+        }
+        return Ok(mir::StringExpression::CollectionIndex {
+            collection,
+            index: Box::new(index),
+            remove: true,
+        });
+    }
     if let Some(crate::const_eval::ConstValue::String(value)) = context.constant_value(expr) {
         return Ok(mir::StringExpression::Literal(value.clone()));
     }
@@ -2303,6 +3164,17 @@ fn lower_string_expression(
         hir::Expr::PropertyAccess { .. } => {
             let (object, property) = lower_property_operand(expr, mir::Type::String, context)?;
             Ok(mir::StringExpression::Property { object, property })
+        }
+        hir::Expr::Index {
+            collection, index, ..
+        } => {
+            let (collection, index) =
+                lower_collection_index_operand(collection, index, mir::Type::String, context)?;
+            Ok(mir::StringExpression::CollectionIndex {
+                collection,
+                index: Box::new(index),
+                remove: false,
+            })
         }
         hir::Expr::StaticMember {
             class_name,
@@ -2410,6 +3282,21 @@ fn lower_nullable_string_expression(
     expr: &hir::Expr,
     context: &LoweringContext,
 ) -> DiagnosticResult<mir::NullableStringExpression> {
+    if let Some((collection, key, value_type, access)) =
+        lower_collection_nullable_property(expr, context)?
+    {
+        if value_type != mir::Type::String {
+            return Err(vec![unsupported(
+                expr.span(),
+                "collection property has another value type",
+            )]);
+        }
+        return Ok(mir::NullableStringExpression::DictionaryGet {
+            collection,
+            key: Box::new(key),
+            access,
+        });
+    }
     if let Some(value) = context.constant_value(expr) {
         return match value {
             crate::const_eval::ConstValue::String(value) => {
@@ -2567,6 +3454,21 @@ fn lower_nullable_string_expression(
             span,
             null_safe: false,
         } => {
+            if let Some((collection, key, value_type, access)) =
+                lower_dictionary_get(object, method, args, context)?
+            {
+                if value_type != mir::Type::String {
+                    return Err(vec![unsupported(
+                        *span,
+                        "Dictionary::get has another value type",
+                    )]);
+                }
+                return Ok(mir::NullableStringExpression::DictionaryGet {
+                    collection,
+                    key: Box::new(key),
+                    access,
+                });
+            }
             let (signature, args) =
                 lower_instance_method_call(object, method, args, *span, context)?;
             match signature.return_type {
@@ -2630,6 +3532,22 @@ fn lower_nullable_scalar_expression(
     expected: mir::ScalarType,
     context: &LoweringContext,
 ) -> DiagnosticResult<mir::NullableScalarExpression> {
+    if let Some((collection, key, value_type, access)) =
+        lower_collection_nullable_property(expr, context)?
+    {
+        if value_type != mir::Type::Scalar(expected) {
+            return Err(vec![unsupported(
+                expr.span(),
+                "collection property has another scalar value type",
+            )]);
+        }
+        return Ok(mir::NullableScalarExpression::DictionaryGet {
+            ty: expected,
+            collection,
+            key: Box::new(key),
+            access,
+        });
+    }
     match expr {
         hir::Expr::Null { .. } => Ok(mir::NullableScalarExpression::Null(expected)),
         hir::Expr::Grouped { expr, .. } => {
@@ -2794,6 +3712,22 @@ fn lower_nullable_scalar_expression(
             span,
             null_safe: false,
         } => {
+            if let Some((collection, key, value_type, access)) =
+                lower_dictionary_get(object, method, args, context)?
+            {
+                if value_type != mir::Type::Scalar(expected) {
+                    return Err(vec![unsupported(
+                        *span,
+                        "Dictionary::get has another scalar value type",
+                    )]);
+                }
+                return Ok(mir::NullableScalarExpression::DictionaryGet {
+                    ty: expected,
+                    collection,
+                    key: Box::new(key),
+                    access,
+                });
+            }
             let (signature, args) =
                 lower_instance_method_call(object, method, args, *span, context)?;
             match signature.return_type {
@@ -2860,6 +3794,22 @@ fn lower_nullable_class_expression(
     transfer: bool,
     context: &LoweringContext,
 ) -> DiagnosticResult<mir::NullableClassExpression> {
+    if let Some((collection, key, value_type, access)) =
+        lower_collection_nullable_property(expr, context)?
+    {
+        if value_type != mir::Type::Class(expected) {
+            return Err(vec![unsupported(
+                expr.span(),
+                "collection property has another class value type",
+            )]);
+        }
+        return Ok(mir::NullableClassExpression::DictionaryGet {
+            class: expected,
+            collection,
+            key: Box::new(key),
+            access,
+        });
+    }
     match expr {
         hir::Expr::Null { .. } => Ok(mir::NullableClassExpression::Null(expected)),
         hir::Expr::Grouped { expr, .. } => {
@@ -3034,6 +3984,22 @@ fn lower_nullable_class_expression(
             span,
             null_safe: false,
         } => {
+            if let Some((collection, key, value_type, access)) =
+                lower_dictionary_get(object, method, args, context)?
+            {
+                if value_type != mir::Type::Class(expected) {
+                    return Err(vec![unsupported(
+                        *span,
+                        "Dictionary::get has another class value type",
+                    )]);
+                }
+                return Ok(mir::NullableClassExpression::DictionaryGet {
+                    class: expected,
+                    collection,
+                    key: Box::new(key),
+                    access,
+                });
+            }
             let (signature, args) =
                 lower_instance_method_call(object, method, args, *span, context)?;
             match signature.return_type {
@@ -3246,6 +4212,10 @@ fn lower_display_string_expression(
             )])
         }
         mir::Type::Class(_) => unreachable!("class display handled above"),
+        mir::Type::Collection(_) => Err(vec![unsupported(
+            expr.span(),
+            "collection values do not have an implicit display representation",
+        )]),
     }
 }
 
@@ -3285,6 +4255,42 @@ fn append_string_concat_parts(
             Ok(())
         }
     }
+}
+
+fn lower_byte_file_write_statement(
+    name: &str,
+    args: &[hir::Expr],
+    span: Span,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<bool> {
+    if !matches!(name, "write_file_bytes" | "append_file_bytes") {
+        return Ok(false);
+    }
+    let [path, contents] = args else {
+        return Err(vec![unsupported(
+            span,
+            format!("{name} expects 2 arguments"),
+        )]);
+    };
+
+    materialize_nested_collection_places(path, false, context)?;
+    let path = lower_string_expression(path, context)?;
+    let path_local = context.declare_string_temp();
+    context.push_statement(mir::Statement::AssignLocal {
+        target: path_local,
+        value: mir::Rvalue::String(path),
+    });
+
+    materialize_nested_collection_places(contents, false, context)?;
+    materialize_collection_place(contents, false, context)?;
+    let contents = lower_bytes_local(contents, context)?.0;
+    context.push_statement(mir::Statement::WriteFileBytes {
+        path: mir::StringExpression::Local(path_local),
+        contents,
+        append: name == "append_file_bytes",
+    });
+    context.push_statement(mir::Statement::DropString { local: path_local });
+    Ok(true)
 }
 
 fn lower_statement_call(
@@ -3415,6 +4421,9 @@ fn lower_call_args_with_ownership(
             }
             mir::Type::NullableClass(class) => mir::Rvalue::NullableClass(
                 lower_nullable_class_expression(arg, class, transfers, context)?,
+            ),
+            mir::Type::Collection(collection) => mir::Rvalue::Collection(
+                lower_collection_expression(arg, collection, transfers, context)?,
             ),
             _ => lower_rvalue_as_expected(arg, expected, context)?,
         };
@@ -3563,6 +4572,9 @@ fn lower_return(
     return_type: mir::ReturnType,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::Terminator> {
+    if let Some(expr) = expr {
+        materialize_nested_collection_places(expr, false, context)?;
+    }
     match (return_type, expr) {
         (mir::ReturnType::Void, None) => {
             context.cleanup_scopes_from(0);
@@ -3594,11 +4606,12 @@ fn lower_return(
                 )]);
             }
             if context.has_cleanup_obligations() {
-                let result = context.declare_return_temp(
-                    expected,
-                    matches!(expected, mir::Type::Class(_) | mir::Type::NullableClass(_))
-                        && !borrowed_class,
-                );
+                let result_owns = match expected {
+                    mir::Type::Class(_) | mir::Type::NullableClass(_) => !borrowed_class,
+                    mir::Type::Collection(_) => true,
+                    _ => false,
+                };
+                let result = context.declare_return_temp(expected, result_owns);
                 context.push_statement(mir::Statement::AssignLocal {
                     target: result,
                     value,
@@ -3656,6 +4669,56 @@ fn local_rvalue(local: mir::LocalId, ty: mir::Type, transfer: bool) -> mir::Rval
                 transfer,
             })
         }
+        mir::Type::Collection(collection) => {
+            mir::Rvalue::Collection(mir::CollectionExpression::Local {
+                collection,
+                local,
+                transfer,
+            })
+        }
+    }
+}
+
+fn lower_condition_to_blocks(
+    expr: &hir::Expr,
+    then_block: mir::BlockId,
+    else_block: mir::BlockId,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<()> {
+    match unparenthesized_place(expr) {
+        hir::Expr::Unary {
+            op: hir::UnaryOp::Not,
+            expr,
+            ..
+        } => lower_condition_to_blocks(expr, else_block, then_block, context),
+        hir::Expr::Binary {
+            left,
+            op: hir::BinaryOp::And,
+            right,
+            ..
+        } => {
+            let right_block = context.create_block();
+            lower_condition_to_blocks(left, right_block, else_block, context)?;
+            context.current_block = Some(right_block);
+            lower_condition_to_blocks(right, then_block, else_block, context)
+        }
+        hir::Expr::Binary {
+            left,
+            op: hir::BinaryOp::Or,
+            right,
+            ..
+        } => {
+            let right_block = context.create_block();
+            lower_condition_to_blocks(left, then_block, right_block, context)?;
+            context.current_block = Some(right_block);
+            lower_condition_to_blocks(right, then_block, else_block, context)
+        }
+        _ => {
+            materialize_nested_collection_places(expr, false, context)?;
+            let condition = lower_condition(expr, context)?;
+            context.terminate_condition(condition, then_block, else_block);
+            Ok(())
+        }
     }
 }
 
@@ -3706,11 +4769,35 @@ fn lower_condition(
             }
         }
         hir::Expr::Grouped { expr, .. } => lower_condition(expr, context),
-        hir::Expr::PropertyAccess { .. } => {
+        hir::Expr::PropertyAccess {
+            object, property, ..
+        } => {
+            if property == "isEmpty" {
+                if let Ok((collection, _)) = lower_collection_local(object, context) {
+                    return Ok(mir::BoolExpression::CollectionIsEmpty { collection });
+                }
+            }
             let (object, property) =
                 lower_property_operand(expr, mir::Type::Scalar(mir::ScalarType::Bool), context)?;
             Ok(mir::BoolExpression::Use {
                 operand: mir::Operand::Property { object, property },
+            })
+        }
+        hir::Expr::Index {
+            collection, index, ..
+        } => {
+            let (collection, index) = lower_collection_index_operand(
+                collection,
+                index,
+                mir::Type::Scalar(mir::ScalarType::Bool),
+                context,
+            )?;
+            Ok(mir::BoolExpression::Use {
+                operand: mir::Operand::CollectionIndex {
+                    collection,
+                    index: Box::new(index),
+                    remove: false,
+                },
             })
         }
         hir::Expr::StaticMember {
@@ -3746,6 +4833,19 @@ fn lower_condition(
                     || matches!(unparenthesized_place(right), hir::Expr::Null { .. })
                 {
                     lower_null_comparison(left, op, right, context)
+                } else if lower_bytes_local(left, context).is_ok()
+                    && lower_bytes_local(right, context).is_ok()
+                    && matches!(op, hir::BinaryOp::Equal | hir::BinaryOp::NotEqual)
+                {
+                    let equal = mir::BoolExpression::CollectionEqual {
+                        left: lower_bytes_local(left, context)?.0,
+                        right: lower_bytes_local(right, context)?.0,
+                    };
+                    Ok(if *op == hir::BinaryOp::NotEqual {
+                        mir::BoolExpression::Not(Box::new(equal))
+                    } else {
+                        equal
+                    })
                 } else if is_nullable_string_expression(left, context)
                     || is_nullable_string_expression(right, context)
                 {
@@ -3804,6 +4904,55 @@ fn lower_condition(
             span,
             ..
         } => {
+            if let Some((collection, index, value_type)) = lower_list_remove_at(expr, context)? {
+                if value_type != mir::Type::Scalar(mir::ScalarType::Bool) {
+                    return Err(vec![unsupported(
+                        *span,
+                        "List::removeAt result is not bool",
+                    )]);
+                }
+                return Ok(mir::BoolExpression::Use {
+                    operand: mir::Operand::CollectionIndex {
+                        collection,
+                        index: Box::new(index),
+                        remove: true,
+                    },
+                });
+            }
+            if let Ok((collection, collection_type)) = lower_collection_local(object, context) {
+                let info = context.collection_type(collection_type);
+                let op = match (info.kind, method.as_str()) {
+                    (mir::CollectionKind::List, "contains")
+                    | (mir::CollectionKind::Dictionary, "has")
+                    | (mir::CollectionKind::Set, "contains") => {
+                        Some(mir::CollectionMembershipOp::Contains)
+                    }
+                    (mir::CollectionKind::Set, "add") => Some(mir::CollectionMembershipOp::Add),
+                    (mir::CollectionKind::Set, "remove") => {
+                        Some(mir::CollectionMembershipOp::Remove)
+                    }
+                    _ => None,
+                };
+                if let Some(op) = op {
+                    let [value] = args.as_slice() else {
+                        return Err(vec![unsupported(
+                            *span,
+                            format!("collection `{method}` expects 1 argument"),
+                        )]);
+                    };
+                    let value_type = info.key.unwrap_or(info.value);
+                    let value = if op == mir::CollectionMembershipOp::Add {
+                        lower_rvalue_as_expected(value, value_type, context)?
+                    } else {
+                        lower_rvalue_as_borrowed(value, value_type, context)?
+                    };
+                    return Ok(mir::BoolExpression::CollectionHas {
+                        collection,
+                        value: Box::new(value),
+                        op,
+                    });
+                }
+            }
             let (signature, args) =
                 lower_instance_method_call(object, method, args, *span, context)?;
             if signature.return_type
@@ -3951,6 +5100,16 @@ fn lower_is_condition(
                 lower_nullable_class_presence_subject(expr, class, context)?,
             )))
         }
+        mir::Type::Collection(_) => {
+            let value = mir::BoolExpression::Use {
+                operand: mir::Operand::Scalar(mir::ScalarValue::Bool(true)),
+            };
+            if value_type == tested_type {
+                value
+            } else {
+                mir::BoolExpression::Not(Box::new(value))
+            }
+        }
     };
     Ok(result)
 }
@@ -4043,6 +5202,9 @@ fn lower_concrete_is_presence(
         mir::Type::NullableScalar(_) | mir::Type::NullableString | mir::Type::NullableClass(_) => {
             unreachable!("concrete `is` value type")
         }
+        mir::Type::Collection(_) => Ok(mir::BoolExpression::Use {
+            operand: mir::Operand::Scalar(mir::ScalarValue::Bool(true)),
+        }),
     }
 }
 
@@ -4126,6 +5288,15 @@ fn lower_rvalue_as_expected(
     expected: mir::Type,
     context: &LoweringContext,
 ) -> DiagnosticResult<mir::Rvalue> {
+    if let Some((collection, index, value_type)) = lower_list_remove_at(expr, context)? {
+        if value_type != expected {
+            return Err(vec![unsupported(
+                expr.span(),
+                "List::removeAt result has another type",
+            )]);
+        }
+        return collection_remove_at_rvalue(collection, index, expected);
+    }
     match expected {
         mir::Type::String => lower_string_expression(expr, context).map(mir::Rvalue::String),
         mir::Type::NullableScalar(ty) => {
@@ -4142,7 +5313,970 @@ fn lower_rvalue_as_expected(
             lower_nullable_class_expression(expr, class, true, context)
                 .map(mir::Rvalue::NullableClass)
         }
+        mir::Type::Collection(collection) => {
+            lower_collection_expression(expr, collection, true, context)
+                .map(mir::Rvalue::Collection)
+        }
     }
+}
+
+fn lower_rvalue_as_borrowed(
+    expr: &hir::Expr,
+    expected: mir::Type,
+    context: &LoweringContext,
+) -> DiagnosticResult<mir::Rvalue> {
+    match expected {
+        mir::Type::Class(class) => {
+            lower_class_expression(expr, class, false, context).map(mir::Rvalue::Class)
+        }
+        mir::Type::NullableClass(class) => {
+            lower_nullable_class_expression(expr, class, false, context)
+                .map(mir::Rvalue::NullableClass)
+        }
+        mir::Type::Collection(collection) => {
+            lower_collection_expression(expr, collection, false, context)
+                .map(mir::Rvalue::Collection)
+        }
+        _ => lower_rvalue_as_expected(expr, expected, context),
+    }
+}
+
+fn lower_collection_expression(
+    expr: &hir::Expr,
+    expected: mir::CollectionTypeId,
+    transfer: bool,
+    context: &LoweringContext,
+) -> DiagnosticResult<mir::CollectionExpression> {
+    if let Some((collection, index, value_type)) = lower_list_remove_at(expr, context)? {
+        if value_type != mir::Type::Collection(expected) {
+            return Err(vec![unsupported(
+                expr.span(),
+                "List::removeAt result has another collection type",
+            )]);
+        }
+        return Ok(mir::CollectionExpression::Index {
+            collection: expected,
+            source: collection,
+            index: Box::new(index),
+            transfer: true,
+        });
+    }
+    match expr {
+        hir::Expr::Grouped { expr, .. } => {
+            lower_collection_expression(expr, expected, transfer, context)
+        }
+        hir::Expr::Variable { name, span } => {
+            let local = context.lookup_local(name, *span)?;
+            if context.local_type(local) != mir::Type::Collection(expected) {
+                return Err(vec![unsupported(
+                    *span,
+                    format!("collection `${name}` does not have the expected collection type"),
+                )]);
+            }
+            if transfer && !context.local_owns(local) {
+                return Err(vec![unsupported(
+                    *span,
+                    format!("borrowed collection `${name}` cannot be given away"),
+                )]);
+            }
+            Ok(mir::CollectionExpression::Local {
+                collection: expected,
+                local,
+                transfer,
+            })
+        }
+        hir::Expr::PropertyAccess { span, .. } => {
+            if transfer {
+                return Err(vec![unsupported(
+                    *span,
+                    "collection properties are borrowed and cannot be given away directly",
+                )]);
+            }
+            let (object, property, property_type) = lower_property_place(expr, context)?;
+            if property_type != mir::Type::Collection(expected) {
+                return Err(vec![unsupported(
+                    *span,
+                    "collection property does not have the expected collection type",
+                )]);
+            }
+            Ok(mir::CollectionExpression::Property {
+                collection: expected,
+                object,
+                property,
+            })
+        }
+        hir::Expr::MethodCall {
+            object,
+            method,
+            args,
+            span,
+            null_safe: false,
+        } if method == "toArray" && args.is_empty() => {
+            let (source, _) = lower_bytes_local(object, context)?;
+            Ok(mir::CollectionExpression::FromBytes {
+                collection: expected,
+                source,
+            })
+        }
+        hir::Expr::StaticCall {
+            class_name,
+            method,
+            args,
+            span,
+        } if class_name == "Bytes" && method == "fromArray" => {
+            let [source] = args.as_slice() else {
+                return Err(vec![unsupported(
+                    *span,
+                    "Bytes::fromArray expects 1 argument",
+                )]);
+            };
+            let (source, _) = lower_collection_local(source, context)?;
+            Ok(mir::CollectionExpression::BytesFromArray {
+                collection: expected,
+                source,
+            })
+        }
+        hir::Expr::FunctionCall { name, args, span }
+            if name == "read_file_bytes" && args.len() == 1 =>
+        {
+            Ok(mir::CollectionExpression::ReadFileBytes {
+                collection: expected,
+                path: Box::new(lower_string_expression(&args[0], context)?),
+            })
+        }
+        hir::Expr::FunctionCall { name, args, .. }
+            if name == "read_stdin_bytes" && args.is_empty() =>
+        {
+            Ok(mir::CollectionExpression::ReadStdinBytes {
+                collection: expected,
+            })
+        }
+        hir::Expr::FunctionCall { name, args, span } => {
+            let signature = context.lookup_function(name, *span)?;
+            if signature.return_type != mir::ReturnType::Value(mir::Type::Collection(expected)) {
+                return Err(vec![unsupported(
+                    *span,
+                    format!("function `{name}` does not return the expected collection type"),
+                )]);
+            }
+            Ok(mir::CollectionExpression::Call {
+                collection: expected,
+                function: signature.id,
+                args: lower_call_args_with_ownership(name, args, signature, *span, context)?,
+            })
+        }
+        hir::Expr::MethodCall {
+            object,
+            method,
+            args,
+            span,
+            null_safe: false,
+        } if !matches!(method.as_str(), "union" | "intersect" | "difference") => {
+            let (signature, args) =
+                lower_instance_method_call(object, method, args, *span, context)?;
+            if signature.return_type != mir::ReturnType::Value(mir::Type::Collection(expected)) {
+                return Err(vec![unsupported(
+                    *span,
+                    "method does not return the expected collection type",
+                )]);
+            }
+            Ok(mir::CollectionExpression::Call {
+                collection: expected,
+                function: signature.id,
+                args,
+            })
+        }
+        hir::Expr::StaticCall {
+            class_name,
+            method,
+            args,
+            span,
+        } if !(class_name == "Set" && method == "from") => {
+            let (signature, args) =
+                lower_static_method_call(class_name, method, args, *span, context)?;
+            if signature.return_type != mir::ReturnType::Value(mir::Type::Collection(expected)) {
+                return Err(vec![unsupported(
+                    *span,
+                    "static method does not return the expected collection type",
+                )]);
+            }
+            Ok(mir::CollectionExpression::Call {
+                collection: expected,
+                function: signature.id,
+                args,
+            })
+        }
+        hir::Expr::MethodCall {
+            object,
+            method,
+            args,
+            span,
+            null_safe: false,
+        } if matches!(method.as_str(), "union" | "intersect" | "difference") => {
+            let (left, left_type) = lower_collection_local(object, context)?;
+            if left_type != expected
+                || context.collection_type(expected).kind != mir::CollectionKind::Set
+            {
+                return Err(vec![unsupported(
+                    *span,
+                    "set algebra requires matching Set<T> operands",
+                )]);
+            }
+            let [right] = args.as_slice() else {
+                return Err(vec![unsupported(
+                    *span,
+                    "set algebra expects one Set<T> argument",
+                )]);
+            };
+            let (right, right_type) = lower_collection_local(right, context)?;
+            if right_type != expected {
+                return Err(vec![unsupported(
+                    *span,
+                    "set algebra requires matching Set<T> operands",
+                )]);
+            }
+            let op = match method.as_str() {
+                "union" => mir::SetAlgebraOp::Union,
+                "intersect" => mir::SetAlgebraOp::Intersect,
+                "difference" => mir::SetAlgebraOp::Difference,
+                _ => unreachable!(),
+            };
+            Ok(mir::CollectionExpression::SetFrom {
+                collection: expected,
+                source: left,
+                transfer: false,
+                algebra: Some((op, right)),
+            })
+        }
+        hir::Expr::Array { elements, .. } => {
+            let collection = context.collection_type(expected);
+            let entries = elements
+                .iter()
+                .map(|element| {
+                    let key = match (&collection.key, &element.key) {
+                        (Some(key_type), Some(key)) => {
+                            Some(lower_rvalue_as_expected(key, *key_type, context)?)
+                        }
+                        (None, None) => None,
+                        (Some(_), None) => {
+                            return Err(vec![unsupported(
+                                element.value.span(),
+                                "dictionary literals require a key for every entry",
+                            )])
+                        }
+                        (None, Some(key)) => {
+                            return Err(vec![unsupported(
+                                key.span(),
+                                "sequence collection literals cannot contain keyed entries",
+                            )])
+                        }
+                    };
+                    Ok(mir::CollectionEntry {
+                        key,
+                        value: lower_rvalue_as_expected(&element.value, collection.value, context)?,
+                    })
+                })
+                .collect::<DiagnosticResult<Vec<_>>>()?;
+            Ok(mir::CollectionExpression::Literal {
+                collection: expected,
+                entries,
+            })
+        }
+        hir::Expr::Index {
+            collection,
+            index,
+            span,
+        } => {
+            if transfer {
+                return Err(vec![unsupported(
+                    *span,
+                    "indexed collection values are borrowed and cannot be moved out",
+                )]);
+            }
+            let (source, source_type) = lower_collection_local(collection, context)?;
+            let source_info = context.collection_type(source_type);
+            if source_info.value != mir::Type::Collection(expected) {
+                return Err(vec![unsupported(
+                    *span,
+                    "indexed collection element has another collection type",
+                )]);
+            }
+            let index_type =
+                source_info
+                    .key
+                    .unwrap_or(mir::Type::Scalar(mir::ScalarType::Integer(
+                        IntegerType::Int64,
+                    )));
+            Ok(mir::CollectionExpression::Index {
+                collection: expected,
+                source,
+                index: Box::new(lower_rvalue_as_expected(index, index_type, context)?),
+                transfer: false,
+            })
+        }
+        hir::Expr::StaticCall {
+            class_name,
+            method,
+            args,
+            span,
+        } if class_name == "Set" && method == "from" => {
+            let [source] = args.as_slice() else {
+                return Err(vec![unsupported(*span, "Set::from expects one argument")]);
+            };
+            if let hir::Expr::Array { elements, .. } = source {
+                let collection = context.collection_type(expected);
+                let entries = elements
+                    .iter()
+                    .map(|element| {
+                        if element.key.is_some() {
+                            return Err(vec![unsupported(
+                                element.value.span(),
+                                "Set::from accepts a sequence collection",
+                            )]);
+                        }
+                        Ok(mir::CollectionEntry {
+                            key: None,
+                            value: lower_rvalue_as_expected(
+                                &element.value,
+                                collection.value,
+                                context,
+                            )?,
+                        })
+                    })
+                    .collect::<DiagnosticResult<Vec<_>>>()?;
+                return Ok(mir::CollectionExpression::Literal {
+                    collection: expected,
+                    entries,
+                });
+            }
+            let (source, _) = lower_collection_local(source, context)?;
+            Ok(mir::CollectionExpression::SetFrom {
+                collection: expected,
+                source,
+                transfer: false,
+                algebra: None,
+            })
+        }
+        _ => Err(vec![unsupported(
+            expr.span(),
+            "this collection expression is not supported by Stage 23 Slice 1",
+        )]),
+    }
+}
+
+fn lower_list_remove_at(
+    expr: &hir::Expr,
+    context: &LoweringContext,
+) -> DiagnosticResult<Option<(mir::LocalId, mir::Rvalue, mir::Type)>> {
+    let hir::Expr::MethodCall {
+        object,
+        method,
+        args,
+        null_safe: false,
+        ..
+    } = unparenthesized_place(expr)
+    else {
+        return Ok(None);
+    };
+    if method != "removeAt" {
+        return Ok(None);
+    }
+    let (collection, collection_type) = lower_collection_local(object, context)?;
+    let definition = context.collection_type(collection_type);
+    if definition.kind != mir::CollectionKind::List {
+        return Ok(None);
+    }
+    let [index] = args.as_slice() else {
+        return Err(vec![unsupported(
+            expr.span(),
+            "List::removeAt expects one index",
+        )]);
+    };
+    let index = lower_rvalue_as_expected(
+        index,
+        mir::Type::Scalar(mir::ScalarType::Integer(IntegerType::Int64)),
+        context,
+    )?;
+    Ok(Some((collection, index, definition.value)))
+}
+
+fn collection_remove_at_rvalue(
+    collection: mir::LocalId,
+    index: mir::Rvalue,
+    ty: mir::Type,
+) -> DiagnosticResult<mir::Rvalue> {
+    match ty {
+        mir::Type::Scalar(scalar) => Ok(mir::Rvalue::Value(value_expression_from_operand(
+            scalar,
+            mir::Operand::CollectionIndex {
+                collection,
+                index: Box::new(index),
+                remove: true,
+            },
+        ))),
+        mir::Type::String => Ok(mir::Rvalue::String(
+            mir::StringExpression::CollectionIndex {
+                collection,
+                index: Box::new(index),
+                remove: true,
+            },
+        )),
+        mir::Type::Class(class) => Ok(mir::Rvalue::Class(mir::ClassExpression::CollectionIndex {
+            class,
+            collection,
+            index: Box::new(index),
+            transfer: true,
+        })),
+        mir::Type::Collection(nested) => {
+            Ok(mir::Rvalue::Collection(mir::CollectionExpression::Index {
+                collection: nested,
+                source: collection,
+                index: Box::new(index),
+                transfer: true,
+            }))
+        }
+        mir::Type::NullableScalar(_) | mir::Type::NullableString | mir::Type::NullableClass(_) => {
+            Err(vec![unsupported(
+                Span::new(0, 0),
+                "removing nullable collection elements is deferred beyond Stage 23 Slice 1",
+            )])
+        }
+    }
+}
+
+fn materialize_nested_collection_places(
+    expr: &hir::Expr,
+    writable: bool,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<()> {
+    match expr {
+        hir::Expr::Array { elements, .. } => {
+            for element in elements {
+                if let Some(key) = &element.key {
+                    materialize_nested_collection_places(key, false, context)?;
+                }
+                materialize_nested_collection_places(&element.value, false, context)?;
+            }
+        }
+        hir::Expr::Index {
+            collection, index, ..
+        } => {
+            materialize_nested_collection_places(collection, writable, context)?;
+            materialize_nested_collection_places(index, false, context)?;
+
+            let place = unparenthesized_place(collection);
+            if collection_place_is_borrowed(place) {
+                let key = (place.span().start, place.span().end);
+                if !context.materialized_collection_places.contains_key(&key) {
+                    let mir::Type::Collection(collection_type) = context.expression_type(place)?
+                    else {
+                        return Err(vec![unsupported(
+                            place.span(),
+                            "nested indexed place does not contain a collection",
+                        )]);
+                    };
+                    let value =
+                        lower_collection_expression(place, collection_type, false, context)?;
+                    let local = context
+                        .declare_borrowed_temp(mir::Type::Collection(collection_type), writable);
+                    context.push_statement(mir::Statement::AssignLocal {
+                        target: local,
+                        value: mir::Rvalue::Collection(value),
+                    });
+                    context.materialized_collection_places.insert(key, local);
+                }
+            }
+        }
+        hir::Expr::InterpolatedString { parts, .. } => {
+            for part in parts {
+                if let hir::InterpolatedStringPart::Expr(expr) = part {
+                    materialize_nested_collection_places(expr, false, context)?;
+                }
+            }
+        }
+        hir::Expr::PropertyAccess { object, .. } => {
+            materialize_nested_collection_places(object, false, context)?;
+            if matches!(
+                context.expression_type(object),
+                Ok(mir::Type::Collection(_))
+            ) {
+                materialize_collection_place(object, false, context)?;
+            }
+        }
+        hir::Expr::MethodCall {
+            object,
+            method,
+            args,
+            ..
+        } => {
+            let receiver_writable = method_receiver_is_writable(object, method, context);
+            materialize_nested_collection_places(object, receiver_writable, context)?;
+            for arg in args {
+                materialize_nested_collection_places(arg, false, context)?;
+            }
+            if matches!(
+                context.expression_type(object),
+                Ok(mir::Type::Collection(_))
+            ) {
+                materialize_collection_place(object, receiver_writable, context)?;
+            }
+        }
+        hir::Expr::IsType { expr, .. }
+        | hir::Expr::Grouped { expr, .. }
+        | hir::Expr::Unary { expr, .. } => {
+            materialize_nested_collection_places(expr, writable, context)?;
+        }
+        hir::Expr::FunctionCall { name, args, .. } => {
+            for arg in args {
+                materialize_nested_collection_places(arg, false, context)?;
+            }
+            let byte_argument = match name.as_str() {
+                "write_file_bytes" | "append_file_bytes" => args.get(1),
+                "write_stdout_bytes" | "write_stderr_bytes" => args.first(),
+                _ => None,
+            };
+            if let Some(bytes) = byte_argument {
+                materialize_collection_place(bytes, false, context)?;
+            }
+        }
+        hir::Expr::StaticCall {
+            class_name,
+            method,
+            args,
+            ..
+        } => {
+            for arg in args {
+                materialize_nested_collection_places(arg, false, context)?;
+            }
+            if class_name == "Bytes" && method == "fromArray" {
+                if let Some(source) = args.first() {
+                    let byte_array = context
+                        .collection_registry
+                        .ids
+                        .get(&(
+                            mir::CollectionKind::TypedArray,
+                            None,
+                            mir::Type::Scalar(mir::ScalarType::Integer(IntegerType::UInt8)),
+                        ))
+                        .copied()
+                        .expect("Bytes requires the canonical uint8[] MIR type");
+                    materialize_collection_place_as(source, byte_array, false, context)?;
+                }
+            }
+        }
+        hir::Expr::New { args, .. } => {
+            for arg in args {
+                materialize_nested_collection_places(arg, false, context)?;
+            }
+        }
+        hir::Expr::Binary {
+            left, op, right, ..
+        } => {
+            materialize_nested_collection_places(left, false, context)?;
+            materialize_nested_collection_places(right, false, context)?;
+            if matches!(op, hir::BinaryOp::Equal | hir::BinaryOp::NotEqual)
+                && expression_is_bytes(left, context)
+                && expression_is_bytes(right, context)
+            {
+                materialize_collection_place(left, false, context)?;
+                materialize_collection_place(right, false, context)?;
+            }
+        }
+        hir::Expr::Range { start, end, .. } => {
+            materialize_nested_collection_places(start, false, context)?;
+            materialize_nested_collection_places(end, false, context)?;
+        }
+        hir::Expr::Variable { .. }
+        | hir::Expr::This { .. }
+        | hir::Expr::Identifier { .. }
+        | hir::Expr::String { .. }
+        | hir::Expr::Int { .. }
+        | hir::Expr::Float { .. }
+        | hir::Expr::Bool { .. }
+        | hir::Expr::Null { .. }
+        | hir::Expr::StaticMember { .. } => {}
+    }
+    Ok(())
+}
+
+fn lower_collection_local(
+    expr: &hir::Expr,
+    context: &LoweringContext,
+) -> DiagnosticResult<(mir::LocalId, mir::CollectionTypeId)> {
+    let expr = unparenthesized_place(expr);
+    if let Some(local) = context
+        .materialized_collection_places
+        .get(&(expr.span().start, expr.span().end))
+        .copied()
+    {
+        let mir::Type::Collection(collection) = context.local_type(local) else {
+            unreachable!("materialized collection place must have collection type");
+        };
+        return Ok((local, collection));
+    }
+    match expr {
+        hir::Expr::Variable { name, span } => {
+            let local = context.lookup_local(name, *span)?;
+            let mir::Type::Collection(collection) = context.local_type(local) else {
+                return Err(vec![unsupported(
+                    *span,
+                    "indexed value is not a collection",
+                )]);
+            };
+            Ok((local, collection))
+        }
+        _ => Err(vec![unsupported(
+            expr.span(),
+            "collection access requires a materialized collection place",
+        )]),
+    }
+}
+
+fn lower_bytes_local(
+    expr: &hir::Expr,
+    context: &LoweringContext,
+) -> DiagnosticResult<(mir::LocalId, mir::CollectionTypeId)> {
+    let (local, collection) = lower_collection_local(expr, context)?;
+    if context.collection_type(collection).kind != mir::CollectionKind::Bytes {
+        return Err(vec![unsupported(expr.span(), "value is not `Bytes`")]);
+    }
+    Ok((local, collection))
+}
+
+fn materialize_collection_place(
+    expr: &hir::Expr,
+    writable: bool,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<()> {
+    if lower_collection_local(expr, context).is_ok() {
+        return Ok(());
+    }
+    let mir::Type::Collection(collection) = context.expression_type(expr)? else {
+        return Ok(());
+    };
+    materialize_collection_place_as(expr, collection, writable, context)
+}
+
+fn materialize_collection_place_as(
+    expr: &hir::Expr,
+    collection: mir::CollectionTypeId,
+    writable: bool,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<()> {
+    if lower_collection_local(expr, context).is_ok() {
+        return Ok(());
+    }
+    let borrowed = collection_place_is_borrowed(expr);
+    let value = lower_collection_expression(expr, collection, !borrowed, context)?;
+    let local = if borrowed {
+        context.declare_borrowed_temp(mir::Type::Collection(collection), writable)
+    } else {
+        context.declare_owned_temp(mir::Type::Collection(collection))
+    };
+    context.push_statement(mir::Statement::AssignLocal {
+        target: local,
+        value: mir::Rvalue::Collection(value),
+    });
+    context
+        .materialized_collection_places
+        .insert((expr.span().start, expr.span().end), local);
+    Ok(())
+}
+
+fn collection_method_mutates(method: &str) -> bool {
+    matches!(
+        method,
+        "add" | "insertAt" | "removeAt" | "pop" | "set" | "remove"
+    )
+}
+
+fn method_receiver_is_writable(
+    object: &hir::Expr,
+    method: &str,
+    context: &LoweringContext,
+) -> bool {
+    match context.expression_type(object) {
+        Ok(mir::Type::Collection(_)) => collection_method_mutates(method),
+        Ok(mir::Type::Class(class) | mir::Type::NullableClass(class)) => context
+            .lookup_method(class, method, object.span())
+            .is_ok_and(|signature| signature.receiver_mode == Some(mir::ReceiverMode::Writable)),
+        _ => false,
+    }
+}
+
+fn collection_place_is_borrowed(expr: &hir::Expr) -> bool {
+    matches!(
+        unparenthesized_place(expr),
+        hir::Expr::Index { .. } | hir::Expr::PropertyAccess { .. }
+    )
+}
+
+fn expression_is_bytes(expr: &hir::Expr, context: &LoweringContext) -> bool {
+    matches!(
+        context.expression_type(expr),
+        Ok(mir::Type::Collection(collection))
+            if context.collection_type(collection).kind == mir::CollectionKind::Bytes
+    )
+}
+
+fn lower_collection_index_operand(
+    collection_expr: &hir::Expr,
+    index: &hir::Expr,
+    expected: mir::Type,
+    context: &LoweringContext,
+) -> DiagnosticResult<(mir::LocalId, mir::Rvalue)> {
+    let (collection, collection_type) = lower_collection_local(collection_expr, context)?;
+    let info = context.collection_type(collection_type);
+    if info.value != expected {
+        return Err(vec![unsupported(
+            collection_expr.span(),
+            format!(
+                "collection element has MIR type `{}`, expected `{expected}`",
+                info.value
+            ),
+        )]);
+    }
+    let index_type = info
+        .key
+        .unwrap_or(mir::Type::Scalar(mir::ScalarType::Integer(
+            IntegerType::Int64,
+        )));
+    Ok((
+        collection,
+        lower_rvalue_as_expected(index, index_type, context)?,
+    ))
+}
+
+fn lower_collection_method_statement(
+    object: &hir::Expr,
+    method: &str,
+    args: &[hir::Expr],
+    context: &mut LoweringContext,
+) -> DiagnosticResult<bool> {
+    let Ok((collection, collection_type)) = lower_collection_local(object, context) else {
+        return Ok(false);
+    };
+    let info = context.collection_type(collection_type).clone();
+    match (info.kind, method, args) {
+        (mir::CollectionKind::List | mir::CollectionKind::Set, "add", [value]) => {
+            let statement = mir::Statement::CollectionAdd {
+                collection,
+                value: lower_rvalue_as_expected(value, info.value, context)?,
+                index: None,
+                op: mir::CollectionMutationOp::Add,
+            };
+            context.push_statement(statement);
+        }
+        (mir::CollectionKind::List, "insertAt", [index, value]) => {
+            let statement = mir::Statement::CollectionAdd {
+                collection,
+                value: lower_rvalue_as_expected(value, info.value, context)?,
+                index: Some(lower_rvalue_as_expected(
+                    index,
+                    mir::Type::Scalar(mir::ScalarType::Integer(IntegerType::Int64)),
+                    context,
+                )?),
+                op: mir::CollectionMutationOp::InsertAt,
+            };
+            context.push_statement(statement);
+        }
+        (mir::CollectionKind::Set, "remove", [value]) => {
+            let statement = mir::Statement::CollectionAdd {
+                collection,
+                value: lower_rvalue_as_borrowed(value, info.value, context)?,
+                index: None,
+                op: mir::CollectionMutationOp::Remove,
+            };
+            context.push_statement(statement);
+        }
+        (mir::CollectionKind::Dictionary, "set", [key, value]) => {
+            let key_type = info.key.expect("dictionary collection has a key type");
+            let statement = mir::Statement::CollectionSet {
+                collection,
+                key: lower_rvalue_as_expected(key, key_type, context)?,
+                value: lower_rvalue_as_expected(value, info.value, context)?,
+            };
+            context.push_statement(statement);
+        }
+        (mir::CollectionKind::List, "removeAt", [index]) => {
+            let index = lower_rvalue_as_expected(
+                index,
+                mir::Type::Scalar(mir::ScalarType::Integer(IntegerType::Int64)),
+                context,
+            )?;
+            let value = collection_remove_at_rvalue(collection, index, info.value)?;
+            lower_discarded_rvalue(value, context);
+        }
+        (mir::CollectionKind::List, "pop", [])
+        | (mir::CollectionKind::Dictionary, "remove", [_]) => {
+            let Some((collection, key, value_type, access)) =
+                lower_dictionary_get(object, method, args, context)?
+            else {
+                return Ok(false);
+            };
+            let value =
+                nullable_collection_access_rvalue(collection, key, value_type, access, object)?;
+            lower_discarded_rvalue(value, context);
+        }
+        _ => return Ok(false),
+    }
+    Ok(true)
+}
+
+fn nullable_collection_access_rvalue(
+    collection: mir::LocalId,
+    key: mir::Rvalue,
+    value_type: mir::Type,
+    access: mir::NullableCollectionAccess,
+    object: &hir::Expr,
+) -> DiagnosticResult<mir::Rvalue> {
+    let key = Box::new(key);
+    match value_type {
+        mir::Type::Scalar(ty) => Ok(mir::Rvalue::NullableScalar(
+            mir::NullableScalarExpression::DictionaryGet {
+                ty,
+                collection,
+                key,
+                access,
+            },
+        )),
+        mir::Type::String => Ok(mir::Rvalue::NullableString(
+            mir::NullableStringExpression::DictionaryGet {
+                collection,
+                key,
+                access,
+            },
+        )),
+        mir::Type::Class(class) => Ok(mir::Rvalue::NullableClass(
+            mir::NullableClassExpression::DictionaryGet {
+                class,
+                collection,
+                key,
+                access,
+            },
+        )),
+        mir::Type::Collection(_)
+        | mir::Type::NullableScalar(_)
+        | mir::Type::NullableString
+        | mir::Type::NullableClass(_) => Err(vec![unsupported(
+            object.span(),
+            "discarding this nullable collection element type is not yet supported",
+        )]),
+    }
+}
+
+fn lower_discarded_rvalue(value: mir::Rvalue, context: &mut LoweringContext) {
+    let ty = value.ty();
+    let owned = matches!(
+        ty,
+        mir::Type::Class(_) | mir::Type::NullableClass(_) | mir::Type::Collection(_)
+    );
+    let local = context.declare_return_temp(ty, owned);
+    context.push_statement(mir::Statement::AssignLocal {
+        target: local,
+        value,
+    });
+    match ty {
+        mir::Type::Class(class) | mir::Type::NullableClass(class) => {
+            context.push_statement(mir::Statement::DropClass { local, class });
+        }
+        mir::Type::Collection(collection) => {
+            context.push_statement(mir::Statement::DropCollection { local, collection });
+        }
+        mir::Type::Scalar(_)
+        | mir::Type::String
+        | mir::Type::NullableScalar(_)
+        | mir::Type::NullableString => {}
+    }
+}
+
+fn lower_dictionary_get(
+    object: &hir::Expr,
+    method: &str,
+    args: &[hir::Expr],
+    context: &LoweringContext,
+) -> DiagnosticResult<
+    Option<(
+        mir::LocalId,
+        mir::Rvalue,
+        mir::Type,
+        mir::NullableCollectionAccess,
+    )>,
+> {
+    let Ok((collection, collection_type)) = lower_collection_local(object, context) else {
+        return Ok(None);
+    };
+    let definition = context.collection_type(collection_type);
+    let (key, access) = match (definition.kind, method, args) {
+        (mir::CollectionKind::Dictionary, "get", [key]) => (
+            lower_rvalue_as_borrowed(
+                key,
+                definition
+                    .key
+                    .expect("dictionary collection has a key type"),
+                context,
+            )?,
+            mir::NullableCollectionAccess::Get,
+        ),
+        (mir::CollectionKind::Dictionary, "remove", [key]) => (
+            lower_rvalue_as_borrowed(
+                key,
+                definition
+                    .key
+                    .expect("dictionary collection has a key type"),
+                context,
+            )?,
+            mir::NullableCollectionAccess::Remove,
+        ),
+        (mir::CollectionKind::List, "pop", []) => (
+            mir::Rvalue::Value(mir::ValueExpression::Integer(
+                mir::IntegerExpression::constant(
+                    IntegerValue::from_i128(IntegerType::Int64, 0).expect("zero is a valid int"),
+                ),
+            )),
+            mir::NullableCollectionAccess::Pop,
+        ),
+        _ => return Ok(None),
+    };
+    Ok(Some((collection, key, definition.value, access)))
+}
+
+fn lower_collection_nullable_property(
+    expr: &hir::Expr,
+    context: &LoweringContext,
+) -> DiagnosticResult<
+    Option<(
+        mir::LocalId,
+        mir::Rvalue,
+        mir::Type,
+        mir::NullableCollectionAccess,
+    )>,
+> {
+    let hir::Expr::PropertyAccess {
+        object,
+        property,
+        null_safe: false,
+        ..
+    } = unparenthesized_place(expr)
+    else {
+        return Ok(None);
+    };
+    let access = match property.as_str() {
+        "first" => mir::NullableCollectionAccess::First,
+        "last" => mir::NullableCollectionAccess::Last,
+        _ => return Ok(None),
+    };
+    let (collection, collection_type) = lower_collection_local(object, context)?;
+    let definition = context.collection_type(collection_type);
+    if definition.kind != mir::CollectionKind::List {
+        return Ok(None);
+    }
+    let key = mir::Rvalue::Value(mir::ValueExpression::Integer(
+        mir::IntegerExpression::constant(
+            IntegerValue::from_i128(IntegerType::Int64, 0).expect("zero is a valid int"),
+        ),
+    ));
+    Ok(Some((collection, key, definition.value, access)))
 }
 
 fn lower_class_expression(
@@ -4151,6 +6285,20 @@ fn lower_class_expression(
     transfer: bool,
     context: &LoweringContext,
 ) -> DiagnosticResult<mir::ClassExpression> {
+    if let Some((collection, index, value_type)) = lower_list_remove_at(expr, context)? {
+        if value_type != mir::Type::Class(expected) {
+            return Err(vec![unsupported(
+                expr.span(),
+                "List::removeAt result has another class type",
+            )]);
+        }
+        return Ok(mir::ClassExpression::CollectionIndex {
+            class: expected,
+            collection,
+            index: Box::new(index),
+            transfer: true,
+        });
+    }
     match expr {
         hir::Expr::Grouped { expr, .. } => {
             lower_class_expression(expr, expected, transfer, context)
@@ -4225,6 +6373,30 @@ fn lower_class_expression(
                 class: expected,
                 object,
                 property,
+            })
+        }
+        hir::Expr::Index {
+            collection,
+            index,
+            span,
+        } => {
+            if transfer {
+                return Err(vec![unsupported(
+                    *span,
+                    "indexed class values are borrowed and cannot be moved out",
+                )]);
+            }
+            let (collection, index) = lower_collection_index_operand(
+                collection,
+                index,
+                mir::Type::Class(expected),
+                context,
+            )?;
+            Ok(mir::ClassExpression::CollectionIndex {
+                class: expected,
+                collection,
+                index: Box::new(index),
+                transfer: false,
             })
         }
         hir::Expr::New {
@@ -4381,7 +6553,7 @@ fn lower_property_place(
         _ => {
             return Err(vec![unsupported(
                 object.span(),
-                "native class property access requires a local object path in Stage 19",
+                "native class property access requires a local object path",
             )])
         }
     };
@@ -4497,6 +6669,22 @@ fn lower_float_expression(
         return Ok(mir::FloatExpression::constant(*value));
     }
     let ty = context.float_type(expr)?;
+    if let Some((collection, index, value_type)) = lower_list_remove_at(expr, context)? {
+        if value_type != mir::Type::Scalar(mir::ScalarType::Float(ty)) {
+            return Err(vec![unsupported(
+                expr.span(),
+                "List::removeAt result has another float type",
+            )]);
+        }
+        return Ok(mir::FloatExpression::Use {
+            ty,
+            operand: mir::Operand::CollectionIndex {
+                collection,
+                index: Box::new(index),
+                remove: true,
+            },
+        });
+    }
     match expr {
         hir::Expr::Binary {
             left,
@@ -4553,6 +6741,24 @@ fn lower_float_expression(
             Ok(mir::FloatExpression::Use {
                 ty,
                 operand: mir::Operand::Property { object, property },
+            })
+        }
+        hir::Expr::Index {
+            collection, index, ..
+        } => {
+            let (collection, index) = lower_collection_index_operand(
+                collection,
+                index,
+                mir::Type::Scalar(mir::ScalarType::Float(ty)),
+                context,
+            )?;
+            Ok(mir::FloatExpression::Use {
+                ty,
+                operand: mir::Operand::CollectionIndex {
+                    collection,
+                    index: Box::new(index),
+                    remove: false,
+                },
             })
         }
         hir::Expr::StaticMember {
@@ -4709,6 +6915,24 @@ fn lower_integer_expression(
         return Ok(mir::IntegerExpression::constant(value));
     }
 
+    if let Some((collection, index, value_type)) = lower_list_remove_at(expr, context)? {
+        let ty = context.integer_type(expr)?;
+        if value_type != mir::Type::Scalar(mir::ScalarType::Integer(ty)) {
+            return Err(vec![unsupported(
+                expr.span(),
+                "List::removeAt result has another integer type",
+            )]);
+        }
+        return Ok(mir::IntegerExpression::Use {
+            ty,
+            operand: mir::Operand::CollectionIndex {
+                collection,
+                index: Box::new(index),
+                remove: true,
+            },
+        });
+    }
+
     if let hir::Expr::FunctionCall { name, args, span } = expr {
         let (function, return_type, args) = lower_integer_call(name, args, *span, context)?;
         let ty = context.integer_type(expr)?;
@@ -4792,7 +7016,17 @@ fn lower_integer_expression(
                 )]),
             }
         }
-        hir::Expr::PropertyAccess { .. } => {
+        hir::Expr::PropertyAccess {
+            object, property, ..
+        } => {
+            if matches!(property.as_str(), "length" | "count") {
+                if let Ok((collection, _)) = lower_collection_local(object, context) {
+                    return Ok(mir::IntegerExpression::Use {
+                        ty,
+                        operand: mir::Operand::CollectionLength(collection),
+                    });
+                }
+            }
             let (object, property) = lower_property_operand(
                 expr,
                 mir::Type::Scalar(mir::ScalarType::Integer(ty)),
@@ -4801,6 +7035,24 @@ fn lower_integer_expression(
             Ok(mir::IntegerExpression::Use {
                 ty,
                 operand: mir::Operand::Property { object, property },
+            })
+        }
+        hir::Expr::Index {
+            collection, index, ..
+        } => {
+            let (collection, index) = lower_collection_index_operand(
+                collection,
+                index,
+                mir::Type::Scalar(mir::ScalarType::Integer(ty)),
+                context,
+            )?;
+            Ok(mir::IntegerExpression::Use {
+                ty,
+                operand: mir::Operand::CollectionIndex {
+                    collection,
+                    index: Box::new(index),
+                    remove: false,
+                },
             })
         }
         hir::Expr::StaticMember {
@@ -5115,6 +7367,9 @@ fn unsupported_int_expr(expr: &hir::Expr) -> Diagnostic {
         hir::Expr::IsType { .. } => "a type-test result cannot be used as an integer expression",
         hir::Expr::Null { .. } => "`null` cannot be used as an integer expression",
         hir::Expr::Array { .. } => "a collection cannot be used as an integer expression",
+        hir::Expr::Index { .. } => {
+            "this indexed value cannot be used as an integer expression in this lowering path"
+        }
         hir::Expr::FunctionCall { .. } => {
             "this function call cannot be used as an integer expression"
         }
@@ -5174,13 +7429,17 @@ fn unsupported_native_type(
     span: Span,
     detail: impl Into<String>,
 ) -> Diagnostic {
-    if ty.name == "mixed" {
+    if type_ref_contains_mixed(ty) {
         Diagnostic::unsupported_stage(
             "M1101",
-            "the `mixed` runtime representation lands at Stage 23",
+            "the boxed `dr_mixed` runtime representation lands in Stage 23 Slice 3",
             span,
         )
     } else {
         unsupported(span, detail)
     }
+}
+
+fn type_ref_contains_mixed(ty: &crate::types::TypeRef) -> bool {
+    ty.name == "mixed" || ty.args.iter().any(type_ref_contains_mixed)
 }

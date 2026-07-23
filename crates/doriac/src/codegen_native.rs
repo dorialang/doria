@@ -163,6 +163,8 @@ fn linker_arguments(
         // Cranelift-generated objects do not carry MSVC /DEFAULTLIB directives.
         // For the current generated process wrapper, make Doria's main the executable
         // entrypoint instead of relying on CRT startup to discover and call it.
+        // doria-rt owns the small MSVC support surface used by generated code,
+        // including LLVM's x86-64 stack-probe helper, so no C runtime is linked.
         return vec![
             OsString::from("/nologo"),
             object_path.as_os_str().to_os_string(),

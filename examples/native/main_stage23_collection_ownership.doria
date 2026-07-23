@@ -1,0 +1,31 @@
+class Token
+{
+    function __construct(int $id)
+    {
+    }
+
+    function __destruct()
+    {
+        echo "drop {$this->id}\n";
+    }
+}
+
+function main(): void
+{
+    writable List<Token> $tokens = [];
+    let $first = new Token(1);
+    let $second = new Token(2);
+    $tokens->add($first);
+    $tokens->add($second);
+
+    Token $removed = $tokens->removeAt(0);
+    echo "removed {$removed->id}\n";
+
+    writable Dictionary<string, Token> $named = [];
+    let $third = new Token(3);
+    $named->set("third", $third);
+    ?Token $taken = $named->remove("third");
+    if ($taken != null) {
+        echo "taken {$taken->id}\n";
+    }
+}

@@ -7,6 +7,8 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use doriac::backend::BackendTarget;
+#[cfg(unix)]
+use std::os::fd::{FromRawFd, OwnedFd};
 
 #[test]
 fn compiles_and_runs_legacy_native_boundary_examples() {
@@ -1391,6 +1393,69 @@ fn native_file_write_failure_still_panics() {
 
     let _ = fs::remove_file(output);
     let _ = fs::remove_dir_all(directory);
+}
+
+#[cfg(unix)]
+#[test]
+fn native_stdin_byte_read_failure_panics_with_stable_message() {
+    if !host_linker_is_available() {
+        eprintln!(
+            "native stdin-read integration test unavailable: host linker `{}` was not found",
+            host_linker()
+        );
+        return;
+    }
+
+    let output = temp_executable_path("main_stdin_byte_read_failure");
+    compile_native_source(
+        r#"
+function main(): void
+{
+    Bytes $contents = read_stdin_bytes();
+    write_stdout_bytes($contents);
+}
+"#,
+        &output,
+    );
+
+    let run = retry_transient_executable_busy(|| {
+        let (read_end, write_end) = os_pipe()?;
+        drop(read_end);
+        Command::new(&output)
+            .stdin(Stdio::from(write_end))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+    })
+    .expect("native executable should run with a write-only stdin");
+
+    assert_eq!(run.status.code(), Some(101));
+    assert!(run.stdout.is_empty());
+    assert_eq!(
+        run.stderr,
+        b"Panic: failed to read stdin\nStack Trace:\n  at main\n"
+    );
+
+    let _ = fs::remove_file(output);
+}
+
+#[cfg(unix)]
+fn os_pipe() -> io::Result<(OwnedFd, OwnedFd)> {
+    unsafe extern "C" {
+        fn pipe(descriptors: *mut i32) -> i32;
+    }
+
+    let mut descriptors = [-1_i32; 2];
+    if unsafe { pipe(descriptors.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: a successful pipe call returns two newly owned descriptors.
+    Ok(unsafe {
+        (
+            OwnedFd::from_raw_fd(descriptors[0]),
+            OwnedFd::from_raw_fd(descriptors[1]),
+        )
+    })
 }
 
 fn inline_native_source(stem: &str) -> &'static str {

@@ -1,8 +1,10 @@
+use std::cell::{Ref, RefCell, RefMut};
 use std::collections::BTreeMap;
 use std::fmt;
+use std::rc::Rc;
 
 use crate::mir;
-use crate::numeric::{FloatValue, IntegerPanic, IntegerType, IntegerValue};
+use crate::numeric::{FloatType, FloatValue, IntegerPanic, IntegerType, IntegerValue};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InterpreterOutput {
@@ -61,6 +63,7 @@ enum LocalValue {
         object: Option<usize>,
         class: crate::class_layout::ClassId,
     },
+    Collection(CollectionValue),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -80,6 +83,33 @@ enum EvaluationValue {
         object: Option<usize>,
         class: crate::class_layout::ClassId,
     },
+    Collection(CollectionValue),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CollectionValue {
+    ty: mir::CollectionTypeId,
+    entries: SharedCollectionEntries,
+}
+
+type CollectionEntries = Vec<(Option<LocalValue>, LocalValue)>;
+type SharedCollectionEntries = Rc<RefCell<CollectionEntries>>;
+
+impl CollectionValue {
+    fn new(ty: mir::CollectionTypeId, entries: CollectionEntries) -> Self {
+        Self {
+            ty,
+            entries: Rc::new(RefCell::new(entries)),
+        }
+    }
+
+    fn entries(&self) -> Ref<'_, CollectionEntries> {
+        self.entries.borrow()
+    }
+
+    fn entries_mut(&self) -> RefMut<'_, CollectionEntries> {
+        self.entries.borrow_mut()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -104,6 +134,41 @@ enum EvaluationTask {
     NullableString(mir::NullableStringExpression),
     Class(mir::ClassExpression),
     NullableClass(mir::NullableClassExpression),
+    Collection(mir::CollectionExpression),
+    BuildCollection {
+        collection: mir::CollectionTypeId,
+        keyed: Vec<bool>,
+    },
+    LoadCollectionValue {
+        collection: mir::LocalId,
+        transfer: bool,
+    },
+    CollectionAdd {
+        collection: mir::LocalId,
+        op: mir::CollectionMutationOp,
+        has_index: bool,
+    },
+    CollectionSet(mir::LocalId),
+    AssignCollectionIndex(mir::LocalId),
+    CollectionHas {
+        collection: mir::LocalId,
+        op: mir::CollectionMembershipOp,
+    },
+    CollectionIsEmpty(mir::LocalId),
+    CollectionLength(mir::LocalId),
+    CollectionIndexScalar(mir::LocalId),
+    CollectionKeyScalar(mir::LocalId),
+    CollectionKeyString(mir::LocalId),
+    DictionaryGet {
+        collection: mir::LocalId,
+        expected: mir::Type,
+        access: mir::NullableCollectionAccess,
+    },
+    CollectionIndexClass {
+        collection: mir::LocalId,
+        class: crate::class_layout::ClassId,
+        transfer: bool,
+    },
     BuildClassNew {
         class: crate::class_layout::ClassId,
         properties: Vec<mir::PropertyValue>,
@@ -161,6 +226,16 @@ enum EvaluationTask {
     BuildFormat(mir::FormatExpression),
     ReadFile,
     WriteFile,
+    AppendFile,
+    ReadFileBytes(mir::CollectionTypeId),
+    WriteFileBytes {
+        contents: mir::LocalId,
+        append: bool,
+    },
+    WriteStreamBytes {
+        contents: mir::LocalId,
+        stderr: bool,
+    },
     WriteStderr,
     StringConcat(usize),
     StringDisplay,
@@ -197,6 +272,7 @@ enum EvaluationTask {
         property: crate::class_layout::PropertyId,
     },
     DropClass(mir::LocalId),
+    DropCollection(mir::LocalId),
     DropObject {
         object: usize,
         class: crate::class_layout::ClassId,
@@ -486,6 +562,18 @@ impl Interpreter<'_> {
                             "MIR class local received a non-class value",
                         ));
                     }
+                    (mir::Type::Collection(expected), mir::Rvalue::Collection(expression))
+                        if expression.collection() == expected =>
+                    {
+                        let frame = self.current_frame_mut()?;
+                        frame.tasks.push(EvaluationTask::Assign(target));
+                        frame.tasks.push(EvaluationTask::Collection(expression));
+                    }
+                    (mir::Type::Collection(_), _) => {
+                        return Err(InterpreterError::new(
+                            "MIR collection local received a non-collection value",
+                        ));
+                    }
                 }
             }
             mir::Statement::EchoStringLiteral(value) => {
@@ -535,6 +623,28 @@ impl Interpreter<'_> {
                 frame.tasks.push(EvaluationTask::String(contents));
                 frame.tasks.push(EvaluationTask::String(path));
             }
+            mir::Statement::AppendFile { path, contents } => {
+                let frame = self.current_frame_mut()?;
+                frame.tasks.push(EvaluationTask::AppendFile);
+                frame.tasks.push(EvaluationTask::String(contents));
+                frame.tasks.push(EvaluationTask::String(path));
+            }
+            mir::Statement::WriteFileBytes {
+                path,
+                contents,
+                append,
+            } => {
+                let frame = self.current_frame_mut()?;
+                frame
+                    .tasks
+                    .push(EvaluationTask::WriteFileBytes { contents, append });
+                frame.tasks.push(EvaluationTask::String(path));
+            }
+            mir::Statement::WriteStreamBytes { contents, stderr } => {
+                self.current_frame_mut()?
+                    .tasks
+                    .push(EvaluationTask::WriteStreamBytes { contents, stderr });
+            }
             mir::Statement::WriteStderr(value) => {
                 let frame = self.current_frame_mut()?;
                 frame.tasks.push(EvaluationTask::WriteStderr);
@@ -560,6 +670,65 @@ impl Interpreter<'_> {
                 self.current_frame_mut()?
                     .tasks
                     .push(EvaluationTask::DropClass(local));
+            }
+            mir::Statement::DropString { local } => {
+                let value = self
+                    .current_frame_mut()?
+                    .locals
+                    .get_mut(local.0)
+                    .and_then(Option::take)
+                    .ok_or_else(|| {
+                        InterpreterError::new("string temporary was dropped before initialization")
+                    })?;
+                if !matches!(value, LocalValue::String(_)) {
+                    return Err(InterpreterError::new(
+                        "string drop references a non-string local",
+                    ));
+                }
+            }
+            mir::Statement::CollectionAdd {
+                collection,
+                value,
+                index,
+                op,
+            } => {
+                let frame = self.current_frame_mut()?;
+                frame.tasks.push(EvaluationTask::CollectionAdd {
+                    collection,
+                    op,
+                    has_index: index.is_some(),
+                });
+                frame.tasks.push(EvaluationTask::Rvalue(value));
+                if let Some(index) = index {
+                    frame.tasks.push(EvaluationTask::Rvalue(index));
+                }
+            }
+            mir::Statement::CollectionSet {
+                collection,
+                key,
+                value,
+            } => {
+                let frame = self.current_frame_mut()?;
+                frame.tasks.push(EvaluationTask::CollectionSet(collection));
+                frame.tasks.push(EvaluationTask::Rvalue(value));
+                frame.tasks.push(EvaluationTask::Rvalue(key));
+            }
+            mir::Statement::AssignCollectionIndex {
+                collection,
+                index,
+                value,
+            } => {
+                let frame = self.current_frame_mut()?;
+                frame
+                    .tasks
+                    .push(EvaluationTask::AssignCollectionIndex(collection));
+                frame.tasks.push(EvaluationTask::Rvalue(value));
+                frame.tasks.push(EvaluationTask::Rvalue(index));
+            }
+            mir::Statement::DropCollection { local, .. } => {
+                self.current_frame_mut()?
+                    .tasks
+                    .push(EvaluationTask::DropCollection(local));
             }
         }
         Ok(StepOutcome::Continue)
@@ -662,6 +831,10 @@ impl Interpreter<'_> {
                     .current_frame_mut()?
                     .tasks
                     .push(EvaluationTask::NullableClass(value)),
+                mir::Rvalue::Collection(value) => self
+                    .current_frame_mut()?
+                    .tasks
+                    .push(EvaluationTask::Collection(value)),
             },
             EvaluationTask::Value(expression) => match expression {
                 mir::ValueExpression::Integer(value) => {
@@ -690,6 +863,386 @@ impl Interpreter<'_> {
             EvaluationTask::Class(expression) => self.expand_class_expression(expression)?,
             EvaluationTask::NullableClass(expression) => {
                 self.expand_nullable_class_expression(expression)?
+            }
+            EvaluationTask::Collection(expression) => {
+                self.expand_collection_expression(expression)?
+            }
+            EvaluationTask::BuildCollection { collection, keyed } => {
+                let definition = self
+                    .program
+                    .collection_types
+                    .get(collection.0)
+                    .ok_or_else(|| InterpreterError::new("collection type does not exist"))?;
+                let key_type = definition.key;
+                let value_type = definition.value;
+                let value_count = keyed.len() + keyed.iter().filter(|keyed| **keyed).count();
+                let values = self.take_call_arguments(value_count)?;
+                let mut values = values.into_iter();
+                let mut entries: Vec<(Option<LocalValue>, LocalValue)> =
+                    Vec::with_capacity(keyed.len());
+                let unique =
+                    self.program.collection_types[collection.0].kind == mir::CollectionKind::Set;
+                let mut drops = Vec::new();
+                for keyed in keyed {
+                    let key = keyed.then(|| values.next()).flatten();
+                    let value = values.next().ok_or_else(|| {
+                        InterpreterError::new("MIR collection literal produced too few values")
+                    })?;
+                    if unique
+                        && entries.iter().any(|(_, current)| {
+                            collection_values_equal(value_type, current, &value)
+                        })
+                    {
+                        if let Some(key) = key {
+                            collect_owned_objects_from_value(key, &mut drops);
+                        }
+                        collect_owned_objects_from_value(value, &mut drops);
+                    } else if let Some(position) = key.as_ref().and_then(|key| {
+                        entries.iter().position(|(current, _)| {
+                            current.as_ref().is_some_and(|current| {
+                                key_type.is_some_and(|ty| collection_values_equal(ty, current, key))
+                            })
+                        })
+                    }) {
+                        let (old_key, old_value) =
+                            std::mem::replace(&mut entries[position], (key, value));
+                        if let Some(old_key) = old_key {
+                            collect_owned_objects_from_value(old_key, &mut drops);
+                        }
+                        collect_owned_objects_from_value(old_value, &mut drops);
+                    } else {
+                        entries.push((key, value));
+                    }
+                }
+                for (object, class) in drops {
+                    self.current_frame_mut()?
+                        .tasks
+                        .push(EvaluationTask::DropObject { object, class });
+                }
+                self.current_frame_mut()?
+                    .values
+                    .push(EvaluationValue::Collection(CollectionValue::new(
+                        collection, entries,
+                    )));
+            }
+            EvaluationTask::LoadCollectionValue {
+                collection,
+                transfer,
+            } => {
+                let index = self.pop_local_value()?;
+                let value = match self.collection_value_at(collection, &index, transfer) {
+                    Ok(value) => value,
+                    Err(message) => return Ok(StepOutcome::Panic(message)),
+                };
+                self.push_local_value(value)?;
+            }
+            EvaluationTask::CollectionAdd {
+                collection,
+                op,
+                has_index,
+            } => {
+                let value = self.pop_local_value()?;
+                let index = has_index
+                    .then(|| self.pop_collection_offset())
+                    .transpose()?;
+                let collection_kind = {
+                    let collection = self.collection_local(collection)?;
+                    self.program.collection_types[collection.ty.0].kind
+                };
+                match op {
+                    mir::CollectionMutationOp::Add => {
+                        let collection = self.collection_local(collection)?;
+                        if collection
+                            .entries()
+                            .iter()
+                            .any(|(_, current)| current == &value)
+                            && collection_kind == mir::CollectionKind::Set
+                        {
+                            self.queue_value_drops(value)?;
+                            return Ok(StepOutcome::Continue);
+                        }
+                        collection.entries_mut().push((None, value));
+                    }
+                    mir::CollectionMutationOp::InsertAt => {
+                        let index = index.expect("insertAt task carries an index");
+                        let collection = self.collection_local(collection)?;
+                        if index > collection.entries().len() {
+                            return Ok(StepOutcome::Panic(
+                                "collection index out of bounds".to_string(),
+                            ));
+                        }
+                        collection.entries_mut().insert(index, (None, value));
+                    }
+                    mir::CollectionMutationOp::Remove => {
+                        let position = self
+                            .collection_local(collection)?
+                            .entries()
+                            .iter()
+                            .position(|(_, current)| current == &value);
+                        if let Some(position) = position {
+                            let (_, removed) = self
+                                .collection_local(collection)?
+                                .entries_mut()
+                                .remove(position);
+                            self.queue_value_drops(removed)?;
+                        }
+                        self.queue_value_drops(value)?;
+                    }
+                }
+            }
+            EvaluationTask::CollectionSet(collection) => {
+                let value = self.pop_local_value()?;
+                let key = self.pop_local_value()?;
+                let position = self
+                    .collection_local(collection)?
+                    .entries()
+                    .iter()
+                    .position(|(current, _)| current.as_ref() == Some(&key));
+                if let Some(position) = position {
+                    let current = self.collection_local(collection)?;
+                    let old = std::mem::replace(&mut current.entries_mut()[position].1, value);
+                    self.queue_value_drops(old)?;
+                    self.queue_value_drops(key)?;
+                } else {
+                    self.collection_local(collection)?
+                        .entries_mut()
+                        .push((Some(key), value));
+                }
+            }
+            EvaluationTask::AssignCollectionIndex(collection) => {
+                let value = self.pop_local_value()?;
+                let index = self.pop_local_value()?;
+                let keyed = {
+                    let collection = self.collection_local(collection)?;
+                    self.program.collection_types[collection.ty.0].key.is_some()
+                };
+                match self.collection_position(collection, &index) {
+                    Ok(position) => {
+                        let current = self.collection_local(collection)?;
+                        let old = std::mem::replace(&mut current.entries_mut()[position].1, value);
+                        self.queue_value_drops(old)?;
+                    }
+                    Err(_) if keyed => {
+                        self.collection_local(collection)?
+                            .entries_mut()
+                            .push((Some(index), value));
+                    }
+                    Err(message) => return Ok(StepOutcome::Panic(message)),
+                }
+            }
+            EvaluationTask::CollectionHas { collection, op } => {
+                let needle = self.pop_local_value()?;
+                let (found, needle_type) = {
+                    let collection = self.collection_local(collection)?;
+                    let definition = &self.program.collection_types[collection.ty.0];
+                    let needle_type = definition.key.unwrap_or(definition.value);
+                    if definition.key.is_some() {
+                        (
+                            collection.entries().iter().any(|(key, _)| {
+                                key.as_ref().is_some_and(|key| {
+                                    collection_values_equal(needle_type, key, &needle)
+                                })
+                            }),
+                            needle_type,
+                        )
+                    } else {
+                        (
+                            collection.entries().iter().any(|(_, value)| {
+                                collection_values_equal(needle_type, value, &needle)
+                            }),
+                            needle_type,
+                        )
+                    }
+                };
+                if op == mir::CollectionMembershipOp::Add {
+                    if found {
+                        self.queue_value_drops(needle)?;
+                    } else {
+                        self.collection_local(collection)?
+                            .entries_mut()
+                            .push((None, needle));
+                    }
+                    self.push_scalar(mir::ScalarValue::Bool(!found))?;
+                    return Ok(StepOutcome::Continue);
+                }
+                let result = match op {
+                    mir::CollectionMembershipOp::Contains => found,
+                    mir::CollectionMembershipOp::Remove => {
+                        let position = {
+                            let collection = self.collection_local(collection)?;
+                            collection.entries().iter().position(|(_, value)| {
+                                collection_values_equal(needle_type, value, &needle)
+                            })
+                        };
+                        if let Some(position) = position {
+                            let (_, removed) = self
+                                .collection_local(collection)?
+                                .entries_mut()
+                                .remove(position);
+                            self.queue_value_drops(removed)?;
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                    mir::CollectionMembershipOp::Add => unreachable!("handled above"),
+                };
+                self.queue_value_drops(needle)?;
+                self.push_scalar(mir::ScalarValue::Bool(result))?;
+            }
+            EvaluationTask::CollectionIsEmpty(collection) => {
+                let empty = self.collection_local(collection)?.entries().is_empty();
+                self.push_scalar(mir::ScalarValue::Bool(empty))?;
+            }
+            EvaluationTask::CollectionLength(collection) => {
+                let length = self.collection_local(collection)?.entries().len();
+                self.push_scalar(mir::ScalarValue::Integer(
+                    IntegerValue::from_i128(IntegerType::Int64, length as i128)
+                        .expect("collection length fits interpreter address space"),
+                ))?;
+            }
+            EvaluationTask::CollectionIndexScalar(collection) => {
+                let index = self.pop_local_value()?;
+                let value = match self.collection_value_at(collection, &index, false) {
+                    Ok(value) => value,
+                    Err(message) => return Ok(StepOutcome::Panic(message)),
+                };
+                let LocalValue::Scalar(value) = value else {
+                    return Err(InterpreterError::new(
+                        "MIR indexed scalar produced another value type",
+                    ));
+                };
+                self.push_scalar(value)?;
+            }
+            EvaluationTask::CollectionKeyScalar(collection) => {
+                let offset = self.pop_collection_offset()?;
+                let value = self.collection_key_at(collection, offset)?;
+                let LocalValue::Scalar(value) = value else {
+                    return Err(InterpreterError::new(
+                        "MIR collection key produced another value type",
+                    ));
+                };
+                self.push_scalar(value)?;
+            }
+            EvaluationTask::CollectionKeyString(collection) => {
+                let offset = self.pop_collection_offset()?;
+                let value = self.collection_key_at(collection, offset)?;
+                let LocalValue::String(value) = value else {
+                    return Err(InterpreterError::new(
+                        "MIR collection key produced another value type",
+                    ));
+                };
+                self.push_string(value)?;
+            }
+            EvaluationTask::DictionaryGet {
+                collection,
+                expected,
+                access,
+            } => {
+                let key = self.pop_local_value()?;
+                let value = match access {
+                    mir::NullableCollectionAccess::Get => self
+                        .collection_local(collection)?
+                        .entries()
+                        .iter()
+                        .find(|(current, _)| current.as_ref() == Some(&key))
+                        .map(|(_, value)| value.clone()),
+                    mir::NullableCollectionAccess::Remove => {
+                        let position = self
+                            .collection_local(collection)?
+                            .entries()
+                            .iter()
+                            .position(|(current, _)| current.as_ref() == Some(&key));
+                        if let Some(position) = position {
+                            let (removed_key, value) = self
+                                .collection_local(collection)?
+                                .entries_mut()
+                                .remove(position);
+                            if let Some(removed_key) = removed_key {
+                                self.queue_value_drops(removed_key)?;
+                            }
+                            Some(value)
+                        } else {
+                            None
+                        }
+                    }
+                    mir::NullableCollectionAccess::First => self
+                        .collection_local(collection)?
+                        .entries()
+                        .first()
+                        .map(|(_, value)| value.clone()),
+                    mir::NullableCollectionAccess::Last => self
+                        .collection_local(collection)?
+                        .entries()
+                        .last()
+                        .map(|(_, value)| value.clone()),
+                    mir::NullableCollectionAccess::Pop => self
+                        .collection_local(collection)?
+                        .entries_mut()
+                        .pop()
+                        .map(|(_, value)| value),
+                };
+                match (expected, value) {
+                    (mir::Type::Scalar(ty), Some(LocalValue::Scalar(value)))
+                        if value.ty() == ty =>
+                    {
+                        self.push_nullable_scalar(ty, Some(value))?;
+                    }
+                    (mir::Type::Scalar(ty), None) => {
+                        self.push_nullable_scalar(ty, None)?;
+                    }
+                    (mir::Type::String, Some(LocalValue::String(value))) => {
+                        self.push_nullable_string(Some(value))?;
+                    }
+                    (mir::Type::String, None) => {
+                        self.push_nullable_string(None)?;
+                    }
+                    (
+                        mir::Type::Class(class),
+                        Some(LocalValue::Class {
+                            object,
+                            class: actual,
+                        }),
+                    ) if class == actual => {
+                        self.push_nullable_class(class, Some(object))?;
+                    }
+                    (mir::Type::Class(class), None) => {
+                        self.push_nullable_class(class, None)?;
+                    }
+                    _ => {
+                        return Err(InterpreterError::new(
+                            "Dictionary::get produced another value type",
+                        ))
+                    }
+                }
+            }
+            EvaluationTask::CollectionIndexClass {
+                collection,
+                class,
+                transfer,
+            } => {
+                let index = self.pop_local_value()?;
+                let value = match self.collection_value_at(collection, &index, transfer) {
+                    Ok(value) => value,
+                    Err(message) => return Ok(StepOutcome::Panic(message)),
+                };
+                let LocalValue::Class {
+                    object,
+                    class: actual,
+                } = value
+                else {
+                    return Err(InterpreterError::new(
+                        "MIR indexed class produced another value type",
+                    ));
+                };
+                if actual != class {
+                    return Err(InterpreterError::new(
+                        "MIR indexed class has another class type",
+                    ));
+                }
+                self.current_frame_mut()?
+                    .values
+                    .push(EvaluationValue::Class { object, class });
             }
             EvaluationTask::BuildClassNew {
                 class,
@@ -1108,6 +1661,56 @@ impl Interpreter<'_> {
                 }
                 self.files.insert(path, contents.into_bytes());
             }
+            EvaluationTask::AppendFile => {
+                let contents = self.pop_string()?;
+                let path = self.pop_string()?;
+                if path.as_bytes().contains(&0) {
+                    return Ok(StepOutcome::Panic(
+                        "file path contained an embedded NUL".to_string(),
+                    ));
+                }
+                self.files
+                    .entry(path)
+                    .or_default()
+                    .extend_from_slice(contents.as_bytes());
+            }
+            EvaluationTask::ReadFileBytes(collection) => {
+                let path = self.pop_string()?;
+                if path.as_bytes().contains(&0) {
+                    return Ok(StepOutcome::Panic(
+                        "file path contained an embedded NUL".to_string(),
+                    ));
+                }
+                let Some(contents) = self.files.get(&path).cloned() else {
+                    return Ok(StepOutcome::Panic("failed to read file".to_string()));
+                };
+                self.push_byte_collection(collection, &contents)?;
+            }
+            EvaluationTask::WriteFileBytes { contents, append } => {
+                let path = self.pop_string()?;
+                if path.as_bytes().contains(&0) {
+                    return Ok(StepOutcome::Panic(
+                        "file path contained an embedded NUL".to_string(),
+                    ));
+                }
+                let bytes = self.byte_collection(contents)?;
+                if append {
+                    self.files
+                        .entry(path)
+                        .or_default()
+                        .extend_from_slice(&bytes);
+                } else {
+                    self.files.insert(path, bytes);
+                }
+            }
+            EvaluationTask::WriteStreamBytes { contents, stderr } => {
+                let bytes = self.byte_collection(contents)?;
+                if stderr {
+                    self.stderr.extend_from_slice(&bytes);
+                } else {
+                    self.stdout.extend_from_slice(&bytes);
+                }
+            }
             EvaluationTask::WriteStderr => {
                 let value = self.pop_string()?;
                 self.stderr.extend_from_slice(value.as_bytes());
@@ -1313,6 +1916,14 @@ impl Interpreter<'_> {
                         self.current_frame_mut()?
                             .tasks
                             .push(EvaluationTask::DropObject { object, class });
+                    } else if let LocalValue::Collection(collection) = value {
+                        let mut drops = Vec::new();
+                        collect_owned_objects_from_collection(collection, &mut drops);
+                        for (object, class) in drops {
+                            self.current_frame_mut()?
+                                .tasks
+                                .push(EvaluationTask::DropObject { object, class });
+                        }
                     }
                 }
             }
@@ -1330,11 +1941,22 @@ impl Interpreter<'_> {
                         self.current_frame_mut()?
                             .tasks
                             .push(EvaluationTask::DropObject { object, class });
+                    } else if let LocalValue::Collection(collection) = old {
+                        let mut drops = Vec::new();
+                        collect_owned_objects_from_collection(collection, &mut drops);
+                        for (object, class) in drops {
+                            self.current_frame_mut()?
+                                .tasks
+                                .push(EvaluationTask::DropObject { object, class });
+                        }
                     }
                 }
             }
             EvaluationTask::DropClass(local) => {
                 self.drop_class_local(local)?;
+            }
+            EvaluationTask::DropCollection(local) => {
+                self.drop_collection_local(local)?;
             }
             EvaluationTask::DropObject { object, class } => {
                 self.queue_object_drop(object, class)?;
@@ -1383,6 +2005,9 @@ impl Interpreter<'_> {
     ) -> Result<(), InterpreterError> {
         match expression {
             mir::IntegerExpression::Use { ty, operand } => {
+                if self.queue_collection_scalar_operand(&operand)? {
+                    return Ok(());
+                }
                 let value = self.eval_operand(&operand)?;
                 let mir::ScalarValue::Integer(value) = value else {
                     return Err(InterpreterError::new(
@@ -1467,6 +2092,9 @@ impl Interpreter<'_> {
     ) -> Result<(), InterpreterError> {
         match expression {
             mir::FloatExpression::Use { ty, operand } => {
+                if self.queue_collection_scalar_operand(&operand)? {
+                    return Ok(());
+                }
                 let value = self.eval_operand(&operand)?;
                 let mir::ScalarValue::Float(value) = value else {
                     return Err(InterpreterError::new(
@@ -1521,6 +2149,9 @@ impl Interpreter<'_> {
     ) -> Result<(), InterpreterError> {
         match condition {
             mir::BoolExpression::Use { operand } => {
+                if self.queue_collection_scalar_operand(&operand)? {
+                    return Ok(());
+                }
                 let value = self.eval_operand(&operand)?;
                 if !matches!(value, mir::ScalarValue::Bool(_)) {
                     return Err(InterpreterError::new(
@@ -1553,6 +2184,10 @@ impl Interpreter<'_> {
                 frame.tasks.push(EvaluationTask::NullableStringCompare(op));
                 frame.tasks.push(EvaluationTask::NullableString(*right));
                 frame.tasks.push(EvaluationTask::NullableString(*left));
+            }
+            mir::BoolExpression::CollectionEqual { left, right } => {
+                let equal = self.byte_collection(left)? == self.byte_collection(right)?;
+                self.push_scalar(mir::ScalarValue::Bool(equal))?;
             }
             mir::BoolExpression::NullableScalarIsPresent(value) => {
                 let frame = self.current_frame_mut()?;
@@ -1612,6 +2247,22 @@ impl Interpreter<'_> {
                 frame.tasks.push(EvaluationTask::AfterBoolCoalesce(*right));
                 frame.tasks.push(EvaluationTask::NullableScalar(*left));
             }
+            mir::BoolExpression::CollectionHas {
+                collection,
+                value,
+                op,
+            } => {
+                let frame = self.current_frame_mut()?;
+                frame
+                    .tasks
+                    .push(EvaluationTask::CollectionHas { collection, op });
+                frame.tasks.push(EvaluationTask::Rvalue(*value));
+            }
+            mir::BoolExpression::CollectionIsEmpty { collection } => {
+                self.current_frame_mut()?
+                    .tasks
+                    .push(EvaluationTask::CollectionIsEmpty(collection));
+            }
         }
         Ok(())
     }
@@ -1646,6 +2297,12 @@ impl Interpreter<'_> {
                     LocalValue::NullableScalar { .. } | LocalValue::NullableClass { .. } => {
                         return Err(InterpreterError::new(format!(
                             "MIR nullable local local{} was used as a string value",
+                            id.0
+                        )))
+                    }
+                    LocalValue::Collection(_) => {
+                        return Err(InterpreterError::new(format!(
+                            "MIR collection local local{} was used as a string value",
                             id.0
                         )))
                     }
@@ -1718,6 +2375,25 @@ impl Interpreter<'_> {
                     .tasks
                     .push(EvaluationTask::AfterStringCoalesce(*right));
                 frame.tasks.push(EvaluationTask::NullableString(*left));
+            }
+            mir::StringExpression::CollectionIndex {
+                collection,
+                index,
+                remove,
+            } => {
+                let frame = self.current_frame_mut()?;
+                frame.tasks.push(EvaluationTask::LoadCollectionValue {
+                    collection,
+                    transfer: remove,
+                });
+                frame.tasks.push(EvaluationTask::Rvalue(*index));
+            }
+            mir::StringExpression::CollectionKeyAt { collection, offset } => {
+                let frame = self.current_frame_mut()?;
+                frame
+                    .tasks
+                    .push(EvaluationTask::CollectionKeyString(collection));
+                frame.tasks.push(EvaluationTask::Rvalue(*offset));
             }
         }
         Ok(())
@@ -1810,6 +2486,20 @@ impl Interpreter<'_> {
                     .tasks
                     .push(EvaluationTask::AfterNullableScalarCoalesce(*right));
                 frame.tasks.push(EvaluationTask::NullableScalar(*left));
+            }
+            mir::NullableScalarExpression::DictionaryGet {
+                ty,
+                collection,
+                key,
+                access,
+            } => {
+                let frame = self.current_frame_mut()?;
+                frame.tasks.push(EvaluationTask::DictionaryGet {
+                    collection,
+                    expected: mir::Type::Scalar(ty),
+                    access,
+                });
+                frame.tasks.push(EvaluationTask::Rvalue(*key));
             }
         }
         Ok(())
@@ -1917,6 +2607,19 @@ impl Interpreter<'_> {
                     .tasks
                     .push(EvaluationTask::AfterNullableStringCoalesce(*right));
                 frame.tasks.push(EvaluationTask::NullableString(*left));
+            }
+            mir::NullableStringExpression::DictionaryGet {
+                collection,
+                key,
+                access,
+            } => {
+                let frame = self.current_frame_mut()?;
+                frame.tasks.push(EvaluationTask::DictionaryGet {
+                    collection,
+                    expected: mir::Type::String,
+                    access,
+                });
+                frame.tasks.push(EvaluationTask::Rvalue(*key));
             }
         }
         Ok(())
@@ -2090,6 +2793,232 @@ impl Interpreter<'_> {
                 });
                 frame.tasks.push(EvaluationTask::NullableClass(*left));
             }
+            mir::ClassExpression::CollectionIndex {
+                class,
+                collection,
+                index,
+                transfer,
+            } => {
+                let frame = self.current_frame_mut()?;
+                frame.tasks.push(EvaluationTask::CollectionIndexClass {
+                    collection,
+                    class,
+                    transfer,
+                });
+                frame.tasks.push(EvaluationTask::Rvalue(*index));
+            }
+        }
+        Ok(())
+    }
+
+    fn expand_collection_expression(
+        &mut self,
+        expression: mir::CollectionExpression,
+    ) -> Result<(), InterpreterError> {
+        match expression {
+            mir::CollectionExpression::Local {
+                collection,
+                local,
+                transfer,
+            } => {
+                let value = if transfer {
+                    self.current_frame_mut()?
+                        .locals
+                        .get_mut(local.0)
+                        .and_then(Option::take)
+                        .ok_or_else(|| {
+                            InterpreterError::new(format!(
+                                "MIR collection local local{} was moved before use",
+                                local.0
+                            ))
+                        })?
+                } else {
+                    read_local(&self.current_frame()?.locals, local)?.clone()
+                };
+                let LocalValue::Collection(value) = value else {
+                    return Err(InterpreterError::new(
+                        "MIR collection expression used another local type",
+                    ));
+                };
+                if value.ty != collection {
+                    return Err(InterpreterError::new(
+                        "MIR collection expression has another collection type",
+                    ));
+                }
+                self.current_frame_mut()?
+                    .values
+                    .push(EvaluationValue::Collection(value));
+            }
+            mir::CollectionExpression::Literal {
+                collection,
+                entries,
+            } => {
+                let keyed = entries
+                    .iter()
+                    .map(|entry| entry.key.is_some())
+                    .collect::<Vec<_>>();
+                let frame = self.current_frame_mut()?;
+                frame
+                    .tasks
+                    .push(EvaluationTask::BuildCollection { collection, keyed });
+                for entry in entries.into_iter().rev() {
+                    frame.tasks.push(EvaluationTask::Rvalue(entry.value));
+                    if let Some(key) = entry.key {
+                        frame.tasks.push(EvaluationTask::Rvalue(key));
+                    }
+                }
+            }
+            mir::CollectionExpression::Index {
+                source,
+                index,
+                transfer,
+                ..
+            } => {
+                let frame = self.current_frame_mut()?;
+                frame.tasks.push(EvaluationTask::LoadCollectionValue {
+                    collection: source,
+                    transfer,
+                });
+                frame.tasks.push(EvaluationTask::Rvalue(*index));
+            }
+            mir::CollectionExpression::Property {
+                collection,
+                object,
+                property,
+            } => {
+                let LocalValue::Collection(value) = self.read_property(object, property)? else {
+                    return Err(InterpreterError::new(
+                        "MIR collection property contains another value type",
+                    ));
+                };
+                if value.ty != collection {
+                    return Err(InterpreterError::new(
+                        "MIR collection property has another collection type",
+                    ));
+                }
+                self.current_frame_mut()?
+                    .values
+                    .push(EvaluationValue::Collection(value));
+            }
+            mir::CollectionExpression::SetFrom {
+                collection,
+                source,
+                transfer,
+                algebra,
+            } => {
+                if let Some((op, right)) = algebra {
+                    let left = self.collection_local(source)?.clone();
+                    let right = self.collection_local(right)?.clone();
+                    let value_type = self.program.collection_types[left.ty.0].value;
+                    let left_entries = left.entries();
+                    let right_entries = right.entries();
+                    let mut entries = Vec::new();
+                    for (_, value) in left_entries.iter() {
+                        let include = match op {
+                            mir::SetAlgebraOp::Union => true,
+                            mir::SetAlgebraOp::Intersect => {
+                                right_entries.iter().any(|(_, candidate)| {
+                                    collection_values_equal(value_type, candidate, value)
+                                })
+                            }
+                            mir::SetAlgebraOp::Difference => {
+                                !right_entries.iter().any(|(_, candidate)| {
+                                    collection_values_equal(value_type, candidate, value)
+                                })
+                            }
+                        };
+                        if include {
+                            entries.push((None, value.clone()));
+                        }
+                    }
+                    if op == mir::SetAlgebraOp::Union {
+                        for (_, value) in right_entries.iter() {
+                            if !entries.iter().any(
+                                |(_, candidate): &(Option<LocalValue>, LocalValue)| {
+                                    collection_values_equal(value_type, candidate, value)
+                                },
+                            ) {
+                                entries.push((None, value.clone()));
+                            }
+                        }
+                    }
+                    self.current_frame_mut()?
+                        .values
+                        .push(EvaluationValue::Collection(CollectionValue::new(
+                            collection, entries,
+                        )));
+                    return Ok(());
+                }
+                let source = if transfer {
+                    self.current_frame_mut()?
+                        .locals
+                        .get_mut(source.0)
+                        .and_then(Option::take)
+                        .ok_or_else(|| {
+                            InterpreterError::new("Set::from source was moved before use")
+                        })?
+                } else {
+                    read_local(&self.current_frame()?.locals, source)?.clone()
+                };
+                let LocalValue::Collection(source) = source else {
+                    return Err(InterpreterError::new(
+                        "Set::from source is not a collection",
+                    ));
+                };
+                let mut entries = Vec::new();
+                let mut drops = Vec::new();
+                let source_entries = source.entries().clone();
+                for (_, value) in source_entries {
+                    if !entries
+                        .iter()
+                        .any(|(_, current): &(Option<LocalValue>, LocalValue)| current == &value)
+                    {
+                        entries.push((None, value));
+                    } else {
+                        collect_owned_objects_from_value(value, &mut drops);
+                    }
+                }
+                for (object, class) in drops {
+                    self.current_frame_mut()?
+                        .tasks
+                        .push(EvaluationTask::DropObject { object, class });
+                }
+                self.current_frame_mut()?
+                    .values
+                    .push(EvaluationValue::Collection(CollectionValue::new(
+                        collection, entries,
+                    )));
+            }
+            mir::CollectionExpression::FromBytes { collection, source }
+            | mir::CollectionExpression::BytesFromArray { collection, source } => {
+                let entries = self.collection_local(source)?.entries().clone();
+                self.current_frame_mut()?
+                    .values
+                    .push(EvaluationValue::Collection(CollectionValue::new(
+                        collection, entries,
+                    )));
+            }
+            mir::CollectionExpression::ReadFileBytes { collection, path } => {
+                let frame = self.current_frame_mut()?;
+                frame.tasks.push(EvaluationTask::ReadFileBytes(collection));
+                frame.tasks.push(EvaluationTask::String(*path));
+            }
+            mir::CollectionExpression::ReadStdinBytes { collection } => {
+                let remaining = self.stdin[self.stdin_cursor..].to_vec();
+                self.stdin_cursor = self.stdin.len();
+                self.push_byte_collection(collection, &remaining)?;
+            }
+            mir::CollectionExpression::Call {
+                collection,
+                function,
+                args,
+            } => {
+                self.queue_call(
+                    function,
+                    args,
+                    ReturnExpectation::Value(mir::Type::Collection(collection)),
+                )?;
+            }
         }
         Ok(())
     }
@@ -2208,6 +3137,20 @@ impl Interpreter<'_> {
                         transfer,
                     });
                 frame.tasks.push(EvaluationTask::NullableClass(*left));
+            }
+            mir::NullableClassExpression::DictionaryGet {
+                class,
+                collection,
+                key,
+                access,
+            } => {
+                let frame = self.current_frame_mut()?;
+                frame.tasks.push(EvaluationTask::DictionaryGet {
+                    collection,
+                    expected: mir::Type::Class(class),
+                    access,
+                });
+                frame.tasks.push(EvaluationTask::Rvalue(*key));
             }
         }
         Ok(())
@@ -2424,6 +3367,7 @@ impl Interpreter<'_> {
                     LocalValue::NullableClass { object, class } => {
                         EvaluationValue::NullableClass { object, class }
                     }
+                    LocalValue::Collection(value) => EvaluationValue::Collection(value),
                 });
             }
             (ReturnExpectation::Discard(expected), FunctionOutcome::Value(value)) => {
@@ -2487,6 +3431,7 @@ impl Interpreter<'_> {
                 EvaluationValue::NullableClass { object, class } => {
                     Ok(LocalValue::NullableClass { object, class })
                 }
+                EvaluationValue::Collection(value) => Ok(LocalValue::Collection(value)),
             })
             .collect()
     }
@@ -2513,6 +3458,9 @@ impl Interpreter<'_> {
             )),
             Some(EvaluationValue::Class { .. }) => Err(InterpreterError::new(
                 "MIR scalar evaluation produced a class",
+            )),
+            Some(EvaluationValue::Collection(_)) => Err(InterpreterError::new(
+                "MIR scalar evaluation produced a collection",
             )),
             None => Err(InterpreterError::new(
                 "MIR scalar evaluation produced no value",
@@ -2542,6 +3490,9 @@ impl Interpreter<'_> {
             )),
             Some(EvaluationValue::Class { .. }) => Err(InterpreterError::new(
                 "MIR string evaluation produced a class",
+            )),
+            Some(EvaluationValue::Collection(_)) => Err(InterpreterError::new(
+                "MIR string evaluation produced a collection",
             )),
             None => Err(InterpreterError::new(
                 "MIR string evaluation produced no value",
@@ -2693,7 +3644,68 @@ impl Interpreter<'_> {
             Some(EvaluationValue::NullableClass { object, class }) => {
                 Ok(LocalValue::NullableClass { object, class })
             }
+            Some(EvaluationValue::Collection(value)) => Ok(LocalValue::Collection(value)),
             None => Err(InterpreterError::new("MIR evaluation produced no value")),
+        }
+    }
+
+    fn push_local_value(&mut self, value: LocalValue) -> Result<(), InterpreterError> {
+        let value = match value {
+            LocalValue::Scalar(value) => EvaluationValue::Scalar(value),
+            LocalValue::String(value) => EvaluationValue::String(value),
+            LocalValue::NullableScalar { ty, value } => {
+                EvaluationValue::NullableScalar { ty, value }
+            }
+            LocalValue::NullableString(value) => EvaluationValue::NullableString(value),
+            LocalValue::Class { object, class } => EvaluationValue::Class { object, class },
+            LocalValue::NullableClass { object, class } => {
+                EvaluationValue::NullableClass { object, class }
+            }
+            LocalValue::Collection(value) => EvaluationValue::Collection(value),
+        };
+        self.current_frame_mut()?.values.push(value);
+        Ok(())
+    }
+
+    fn queue_collection_scalar_operand(
+        &mut self,
+        operand: &mir::Operand,
+    ) -> Result<bool, InterpreterError> {
+        match operand {
+            mir::Operand::CollectionLength(collection) => {
+                self.current_frame_mut()?
+                    .tasks
+                    .push(EvaluationTask::CollectionLength(*collection));
+                Ok(true)
+            }
+            mir::Operand::CollectionIndex {
+                collection,
+                index,
+                remove,
+            } => {
+                let frame = self.current_frame_mut()?;
+                if *remove {
+                    frame.tasks.push(EvaluationTask::LoadCollectionValue {
+                        collection: *collection,
+                        transfer: true,
+                    });
+                } else {
+                    frame
+                        .tasks
+                        .push(EvaluationTask::CollectionIndexScalar(*collection));
+                }
+                frame.tasks.push(EvaluationTask::Rvalue((**index).clone()));
+                Ok(true)
+            }
+            mir::Operand::CollectionKeyAt { collection, offset } => {
+                let frame = self.current_frame_mut()?;
+                frame
+                    .tasks
+                    .push(EvaluationTask::CollectionKeyScalar(*collection));
+                frame.tasks.push(EvaluationTask::Rvalue((**offset).clone()));
+                Ok(true)
+            }
+            _ => Ok(false),
         }
     }
 
@@ -2747,6 +3759,10 @@ impl Interpreter<'_> {
                     "MIR class local local{} was used as a scalar value",
                     id.0
                 ))),
+                LocalValue::Collection(_) => Err(InterpreterError::new(format!(
+                    "MIR collection local local{} was used as a scalar value",
+                    id.0
+                ))),
             },
             mir::Operand::NullablePayload(id) => {
                 match read_local(&self.current_frame()?.locals, *id)? {
@@ -2777,6 +3793,11 @@ impl Interpreter<'_> {
                     ))),
                 }
             }
+            mir::Operand::CollectionLength(_)
+            | mir::Operand::CollectionIndex { .. }
+            | mir::Operand::CollectionKeyAt { .. } => Err(InterpreterError::new(
+                "MIR collection operand requires queued evaluation",
+            )),
         }
     }
 
@@ -2944,15 +3965,8 @@ impl Interpreter<'_> {
         }
         let mut drops = Vec::new();
         for property in object_value.properties.iter_mut().rev() {
-            if let Some(
-                LocalValue::Class { object, class }
-                | LocalValue::NullableClass {
-                    object: Some(object),
-                    class,
-                },
-            ) = property.take()
-            {
-                drops.push((object, class));
+            if let Some(value) = property.take() {
+                collect_owned_objects_from_value(value, &mut drops);
             }
         }
         let frame = self.current_frame_mut()?;
@@ -2991,8 +4005,19 @@ impl Interpreter<'_> {
                 _ => None,
             })
             .collect::<Vec<_>>();
+        let owned_collections = function
+            .locals
+            .iter()
+            .filter_map(|local| match (local.owned, local.ty) {
+                (true, mir::Type::Collection(_)) => Some(local.id),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
         for local in owned_classes {
             self.drop_class_local(local)?;
+        }
+        for local in owned_collections {
+            self.drop_collection_local(local)?;
         }
         Ok(())
     }
@@ -3007,6 +4032,177 @@ impl Interpreter<'_> {
         self.frames
             .last_mut()
             .ok_or_else(|| InterpreterError::new("MIR interpreter has no active call frame"))
+    }
+
+    fn collection_local(&self, local: mir::LocalId) -> Result<&CollectionValue, InterpreterError> {
+        match read_local(&self.current_frame()?.locals, local)? {
+            LocalValue::Collection(value) => Ok(value),
+            _ => Err(InterpreterError::new(format!(
+                "MIR local local{} is not a collection",
+                local.0
+            ))),
+        }
+    }
+
+    fn byte_collection(&self, local: mir::LocalId) -> Result<Vec<u8>, InterpreterError> {
+        let collection = self.collection_local(local)?;
+        let definition = self
+            .program
+            .collection_types
+            .get(collection.ty.0)
+            .ok_or_else(|| InterpreterError::new("Bytes type does not exist"))?;
+        if definition.kind != mir::CollectionKind::Bytes {
+            return Err(InterpreterError::new(
+                "MIR Bytes operation used another collection",
+            ));
+        }
+        collection
+            .entries()
+            .iter()
+            .map(|(_, value)| match value {
+                LocalValue::Scalar(mir::ScalarValue::Integer(value))
+                    if value.ty == IntegerType::UInt8 =>
+                {
+                    Ok(value.unsigned_value() as u8)
+                }
+                _ => Err(InterpreterError::new(
+                    "MIR Bytes contains a non-uint8 value",
+                )),
+            })
+            .collect()
+    }
+
+    fn push_byte_collection(
+        &mut self,
+        collection: mir::CollectionTypeId,
+        bytes: &[u8],
+    ) -> Result<(), InterpreterError> {
+        let entries = bytes
+            .iter()
+            .map(|byte| {
+                (
+                    None,
+                    LocalValue::Scalar(mir::ScalarValue::Integer(
+                        IntegerValue::from_u128(IntegerType::UInt8, u128::from(*byte))
+                            .expect("u8 always fits uint8"),
+                    )),
+                )
+            })
+            .collect();
+        self.current_frame_mut()?
+            .values
+            .push(EvaluationValue::Collection(CollectionValue::new(
+                collection, entries,
+            )));
+        Ok(())
+    }
+
+    fn collection_position(
+        &self,
+        local: mir::LocalId,
+        index: &LocalValue,
+    ) -> Result<usize, String> {
+        let collection = self
+            .collection_local(local)
+            .map_err(|error| error.message)?;
+        let definition = self
+            .program
+            .collection_types
+            .get(collection.ty.0)
+            .ok_or_else(|| "collection type does not exist".to_string())?;
+        if definition.key.is_some() {
+            collection
+                .entries()
+                .iter()
+                .position(|(key, _)| key.as_ref() == Some(index))
+                .ok_or_else(|| "dictionary key not found".to_string())
+        } else {
+            let LocalValue::Scalar(mir::ScalarValue::Integer(index)) = index else {
+                return Err("collection index is not an integer".to_string());
+            };
+            let Some(index) = usize::try_from(index.signed_value()).ok() else {
+                return Err(if definition.kind == mir::CollectionKind::Bytes {
+                    "byte index out of bounds".to_string()
+                } else {
+                    "collection index out of bounds".to_string()
+                });
+            };
+            (index < collection.entries().len())
+                .then_some(index)
+                .ok_or_else(|| {
+                    if definition.kind == mir::CollectionKind::Bytes {
+                        "byte index out of bounds".to_string()
+                    } else {
+                        "collection index out of bounds".to_string()
+                    }
+                })
+        }
+    }
+
+    fn collection_value_at(
+        &mut self,
+        local: mir::LocalId,
+        index: &LocalValue,
+        transfer: bool,
+    ) -> Result<LocalValue, String> {
+        let position = self.collection_position(local, index)?;
+        if transfer {
+            self.collection_local(local)
+                .map(|collection| collection.entries_mut().remove(position).1)
+                .map_err(|error| error.message)
+        } else {
+            self.collection_local(local)
+                .map(|collection| collection.entries()[position].1.clone())
+                .map_err(|error| error.message)
+        }
+    }
+
+    fn pop_collection_offset(&mut self) -> Result<usize, InterpreterError> {
+        let value = self.pop_integer()?;
+        usize::try_from(value.signed_value())
+            .map_err(|_| InterpreterError::new("MIR collection offset is negative"))
+    }
+
+    fn collection_key_at(
+        &self,
+        local: mir::LocalId,
+        offset: usize,
+    ) -> Result<LocalValue, InterpreterError> {
+        self.collection_local(local)?
+            .entries()
+            .get(offset)
+            .and_then(|(key, _)| key.clone())
+            .ok_or_else(|| InterpreterError::new("MIR dictionary key offset is out of bounds"))
+    }
+
+    fn drop_collection_local(&mut self, local: mir::LocalId) -> Result<(), InterpreterError> {
+        let value = self
+            .current_frame_mut()?
+            .locals
+            .get_mut(local.0)
+            .ok_or_else(|| InterpreterError::new("collection local does not exist"))?
+            .take();
+        if let Some(LocalValue::Collection(collection)) = value {
+            let mut drops = Vec::new();
+            collect_owned_objects_from_collection(collection, &mut drops);
+            for (object, class) in drops {
+                self.current_frame_mut()?
+                    .tasks
+                    .push(EvaluationTask::DropObject { object, class });
+            }
+        }
+        Ok(())
+    }
+
+    fn queue_value_drops(&mut self, value: LocalValue) -> Result<(), InterpreterError> {
+        let mut drops = Vec::new();
+        collect_owned_objects_from_value(value, &mut drops);
+        for (object, class) in drops {
+            self.current_frame_mut()?
+                .tasks
+                .push(EvaluationTask::DropObject { object, class });
+        }
+        Ok(())
     }
 
     fn finish_entry(
@@ -3190,6 +4386,7 @@ fn local_value_type(value: &LocalValue) -> mir::Type {
         LocalValue::NullableString(_) => mir::Type::NullableString,
         LocalValue::Class { class, .. } => mir::Type::Class(*class),
         LocalValue::NullableClass { class, .. } => mir::Type::NullableClass(*class),
+        LocalValue::Collection(value) => mir::Type::Collection(value.ty),
     }
 }
 
@@ -3198,6 +4395,7 @@ fn non_nullable_type(ty: mir::Type) -> Option<mir::Type> {
         mir::Type::NullableScalar(ty) => Some(mir::Type::Scalar(ty)),
         mir::Type::NullableString => Some(mir::Type::String),
         mir::Type::NullableClass(class) => Some(mir::Type::Class(class)),
+        mir::Type::Collection(_) => None,
         _ => None,
     }
 }
@@ -3210,6 +4408,45 @@ fn owned_object(value: &LocalValue) -> Option<(usize, crate::class_layout::Class
             class,
         } => Some((*object, *class)),
         _ => None,
+    }
+}
+
+fn collect_owned_objects_from_collection(
+    collection: CollectionValue,
+    drops: &mut Vec<(usize, crate::class_layout::ClassId)>,
+) {
+    for (key, value) in collection.entries().iter().cloned() {
+        if let Some(key) = key {
+            collect_owned_objects_from_value(key, drops);
+        }
+        collect_owned_objects_from_value(value, drops);
+    }
+}
+
+fn collect_owned_objects_from_value(
+    value: LocalValue,
+    drops: &mut Vec<(usize, crate::class_layout::ClassId)>,
+) {
+    if let Some(object) = owned_object(&value) {
+        drops.push(object);
+    } else if let LocalValue::Collection(collection) = value {
+        collect_owned_objects_from_collection(collection, drops);
+    }
+}
+
+fn collection_values_equal(ty: mir::Type, left: &LocalValue, right: &LocalValue) -> bool {
+    match (ty, left, right) {
+        (
+            mir::Type::Scalar(mir::ScalarType::Float(FloatType::Float32)),
+            LocalValue::Scalar(mir::ScalarValue::Float(left)),
+            LocalValue::Scalar(mir::ScalarValue::Float(right)),
+        ) => left.as_f32() == right.as_f32(),
+        (
+            mir::Type::Scalar(mir::ScalarType::Float(FloatType::Float64)),
+            LocalValue::Scalar(mir::ScalarValue::Float(left)),
+            LocalValue::Scalar(mir::ScalarValue::Float(right)),
+        ) => left.as_f64() == right.as_f64(),
+        _ => left == right,
     }
 }
 
@@ -3387,6 +4624,9 @@ fn assign_local(
     ) || matches!(
         (definition.ty, &value),
         (mir::Type::NullableClass(expected), LocalValue::NullableClass { class, .. }) if expected == *class
+    ) || matches!(
+        (definition.ty, &value),
+        (mir::Type::Collection(expected), LocalValue::Collection(collection)) if expected == collection.ty
     );
     if !compatible {
         let actual = match &value {
@@ -3400,6 +4640,7 @@ fn assign_local(
             LocalValue::NullableString(_) => "?string",
             LocalValue::Class { .. } => "class",
             LocalValue::NullableClass { .. } => "nullable class",
+            LocalValue::Collection(_) => "collection",
         };
         return Err(InterpreterError::new(format!(
             "MIR local local{} has type {}, but assignment produced {actual}",

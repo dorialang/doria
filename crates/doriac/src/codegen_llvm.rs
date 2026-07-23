@@ -22,11 +22,19 @@ use crate::format_string::{FormatConversion, FormatPiece};
 use crate::mir;
 use crate::mir_validation;
 use crate::native_abi::{
-    function_symbol, CLASS_ALLOCATE, CLASS_FREE, FORMAT_F32, FORMAT_F64, FORMAT_I64, FORMAT_STRING,
-    FORMAT_U64, NULLABLE_STRING_EQUAL, READ_FILE, READ_STDIN_LINE, STRING_COMPARE, STRING_CONCAT,
-    STRING_DATA, STRING_FROM_BOOL, STRING_FROM_F32, STRING_FROM_F64, STRING_FROM_I64,
-    STRING_FROM_U64, STRING_FROM_UTF8, STRING_LENGTH, STRING_RELEASE, STRING_RETAIN,
-    STRING_WRITE_STDERR, STRING_WRITE_STDOUT, WRITE_FILE,
+    function_symbol, APPEND_FILE, APPEND_FILE_BYTES, BYTES_EQUAL, BYTES_FREE,
+    BYTES_FROM_COLLECTION, BYTES_GET, BYTES_LENGTH, BYTES_SET, BYTES_TO_COLLECTION, CLASS_ALLOCATE,
+    CLASS_FREE, COLLECTION_COMPARE_FLOAT32, COLLECTION_COMPARE_FLOAT64, COLLECTION_COMPARE_STRING,
+    COLLECTION_COMPARE_WORD, COLLECTION_CONTAINS, COLLECTION_FREE, COLLECTION_INSERT_AT,
+    COLLECTION_KEYED_GET, COLLECTION_KEYED_HAS, COLLECTION_KEYED_SET, COLLECTION_KEY_AT,
+    COLLECTION_LENGTH, COLLECTION_NEW, COLLECTION_NULLABLE_ACCESS, COLLECTION_PUSH,
+    COLLECTION_PUSH_UNIQUE, COLLECTION_REMOVE_AT, COLLECTION_REMOVE_VALUE, COLLECTION_SET_ALGEBRA,
+    COLLECTION_SET_AT, COLLECTION_VALUE_AT, FORMAT_F32, FORMAT_F64, FORMAT_I64, FORMAT_STRING,
+    FORMAT_U64, NULLABLE_STRING_EQUAL, READ_FILE, READ_FILE_BYTES, READ_STDIN_BYTES,
+    READ_STDIN_LINE, STRING_COMPARE, STRING_CONCAT, STRING_DATA, STRING_FROM_BOOL, STRING_FROM_F32,
+    STRING_FROM_F64, STRING_FROM_I64, STRING_FROM_U64, STRING_FROM_UTF8, STRING_LENGTH,
+    STRING_RELEASE, STRING_RETAIN, STRING_WRITE_STDERR, STRING_WRITE_STDOUT, WRITE_FILE,
+    WRITE_FILE_BYTES, WRITE_STDERR_BYTES, WRITE_STDOUT_BYTES,
 };
 use crate::numeric::{FloatType, FloatValue, IntegerPanic, IntegerType, IntegerValue};
 
@@ -502,12 +510,23 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                             Some(class),
                         ))
                     }
+                    mir::Type::Collection(_) if local.owned => Some((
+                        build(self.builder.build_load(
+                            self.context.ptr_type(AddressSpace::default()),
+                            slot,
+                            "collection.old",
+                        ))?
+                        .into_pointer_value(),
+                        None,
+                    )),
                     _ => None,
                 };
                 let value = self.lower_rvalue(value)?;
                 build(self.builder.build_store(slot, value))?;
                 if let Some((old, class)) = old {
-                    if let Some(class) = class {
+                    if let mir::Type::Collection(collection) = local.ty {
+                        self.drop_collection_value(old, collection)?;
+                    } else if let Some(class) = class {
                         self.drop_class_value_checked(old, class)?;
                     } else {
                         self.release_string(old)?;
@@ -557,18 +576,57 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 )?;
                 self.release_string(value)?;
             }
-            mir::Statement::WriteFile { path, contents } => {
+            mir::Statement::WriteFile { path, contents }
+            | mir::Statement::AppendFile { path, contents } => {
                 let path = self.lower_string_expression(path)?;
                 let contents = self.lower_string_expression(contents)?;
                 let pointer = self.context.ptr_type(AddressSpace::default());
                 let _ = self.call_runtime(
-                    WRITE_FILE,
+                    if matches!(statement, mir::Statement::AppendFile { .. }) {
+                        APPEND_FILE
+                    } else {
+                        WRITE_FILE
+                    },
                     &[pointer.into(), pointer.into(), pointer.into()],
                     None,
                     &[self.current_frame.into(), path.into(), contents.into()],
                 )?;
                 self.release_string(path)?;
                 self.release_string(contents)?;
+            }
+            mir::Statement::WriteFileBytes {
+                path,
+                contents,
+                append,
+            } => {
+                let path = self.lower_string_expression(path)?;
+                let contents = self.collection_pointer(*contents)?;
+                let pointer = self.context.ptr_type(AddressSpace::default());
+                let _ = self.call_runtime(
+                    if *append {
+                        APPEND_FILE_BYTES
+                    } else {
+                        WRITE_FILE_BYTES
+                    },
+                    &[pointer.into(), pointer.into(), pointer.into()],
+                    None,
+                    &[self.current_frame.into(), path.into(), contents.into()],
+                )?;
+                self.release_string(path)?;
+            }
+            mir::Statement::WriteStreamBytes { contents, stderr } => {
+                let contents = self.collection_pointer(*contents)?;
+                let pointer = self.context.ptr_type(AddressSpace::default());
+                let _ = self.call_runtime(
+                    if *stderr {
+                        WRITE_STDERR_BYTES
+                    } else {
+                        WRITE_STDOUT_BYTES
+                    },
+                    &[pointer.into(), pointer.into()],
+                    None,
+                    &[self.current_frame.into(), contents.into()],
+                )?;
             }
             mir::Statement::AssignProperty {
                 object,
@@ -579,7 +637,10 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 let value = self.lower_rvalue(value)?;
                 let address = self.lower_property_address(*object, *property)?;
                 let old = match property_ty {
-                    mir::Type::String | mir::Type::Class(_) | mir::Type::NullableClass(_) => Some(
+                    mir::Type::String
+                    | mir::Type::Class(_)
+                    | mir::Type::NullableClass(_)
+                    | mir::Type::Collection(_) => Some(
                         build(self.builder.build_load(
                             self.context.ptr_type(AddressSpace::default()),
                             address,
@@ -605,6 +666,9 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     }
                     (mir::Type::Class(class) | mir::Type::NullableClass(class), Some(value)) => {
                         self.drop_class_value_checked(value, class)?;
+                    }
+                    (mir::Type::Collection(collection), Some(value)) => {
+                        self.drop_collection_value(value, collection)?;
                     }
                     _ => {}
                 }
@@ -653,6 +717,40 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     .into_pointer_value();
                 build(self.builder.build_store(slot, pointer.const_null()))?;
                 self.drop_class_value_checked(value, class)?;
+            }
+            mir::Statement::DropString { local } => {
+                let pointer = self.context.ptr_type(AddressSpace::default());
+                let slot = local_slot(&self.local_slots, *local)?;
+                let value = build(self.builder.build_load(pointer, slot, "string.drop"))?
+                    .into_pointer_value();
+                build(self.builder.build_store(slot, pointer.const_null()))?;
+                self.release_string(value)?;
+            }
+            mir::Statement::CollectionAdd {
+                collection,
+                value,
+                index,
+                op,
+            } => {
+                self.lower_collection_add(*collection, value, index.as_ref(), *op)?;
+            }
+            mir::Statement::CollectionSet {
+                collection,
+                key,
+                value,
+            }
+            | mir::Statement::AssignCollectionIndex {
+                collection,
+                index: key,
+                value,
+            } => self.lower_collection_set(*collection, key, value)?,
+            mir::Statement::DropCollection { local, collection } => {
+                let pointer = self.context.ptr_type(AddressSpace::default());
+                let slot = local_slot(&self.local_slots, *local)?;
+                let value = build(self.builder.build_load(pointer, slot, "collection.drop"))?
+                    .into_pointer_value();
+                build(self.builder.build_store(slot, pointer.const_null()))?;
+                self.drop_collection_value(value, *collection)?;
             }
         }
         self.defer_class_temporary_drops = false;
@@ -792,7 +890,1183 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             mir::Rvalue::NullableClass(value) => {
                 Ok(self.lower_nullable_class_expression(value)?.into())
             }
+            mir::Rvalue::Collection(value) => Ok(self.lower_collection_expression(value)?.into()),
         }
+    }
+
+    fn collection_definition(
+        &self,
+        id: mir::CollectionTypeId,
+    ) -> Result<&mir::CollectionType, BackendError> {
+        self.program
+            .collection_types
+            .get(id.0)
+            .filter(|collection| collection.id == id)
+            .ok_or_else(|| malformed_mir(format!("collection type#{} does not exist", id.0)))
+    }
+
+    fn collection_compare_kind(&self, ty: mir::Type) -> Result<IntValue<'ctx>, BackendError> {
+        let kind = match ty {
+            mir::Type::String => COLLECTION_COMPARE_STRING,
+            mir::Type::Scalar(mir::ScalarType::Float(FloatType::Float32)) => {
+                COLLECTION_COMPARE_FLOAT32
+            }
+            mir::Type::Scalar(mir::ScalarType::Float(FloatType::Float64)) => {
+                COLLECTION_COMPARE_FLOAT64
+            }
+            mir::Type::Scalar(_) | mir::Type::Class(_) | mir::Type::Collection(_) => {
+                COLLECTION_COMPARE_WORD
+            }
+            mir::Type::NullableScalar(_)
+            | mir::Type::NullableString
+            | mir::Type::NullableClass(_) => {
+                return Err(malformed_mir(
+                    "nullable collection elements are not supported by Stage 23 Slice 1",
+                ))
+            }
+        };
+        Ok(self.context.i8_type().const_int(u64::from(kind), false))
+    }
+
+    fn value_to_collection_word(
+        &self,
+        value: BasicValueEnum<'ctx>,
+        ty: mir::Type,
+    ) -> Result<IntValue<'ctx>, BackendError> {
+        let i64_type = self.context.i64_type();
+        match ty {
+            mir::Type::Scalar(mir::ScalarType::Float(FloatType::Float32)) => {
+                let bits = build(self.builder.build_bit_cast(
+                    value,
+                    self.context.i32_type(),
+                    "collection.f32.bits",
+                ))?
+                .into_int_value();
+                Ok(build(self.builder.build_int_z_extend(
+                    bits,
+                    i64_type,
+                    "collection.f32.word",
+                ))?)
+            }
+            mir::Type::Scalar(mir::ScalarType::Float(FloatType::Float64)) => Ok(build(
+                self.builder
+                    .build_bit_cast(value, i64_type, "collection.f64.word"),
+            )?
+            .into_int_value()),
+            mir::Type::Scalar(_) => {
+                let value = value.into_int_value();
+                Ok(if value.get_type().get_bit_width() == 64 {
+                    value
+                } else {
+                    build(self.builder.build_int_z_extend(
+                        value,
+                        i64_type,
+                        "collection.scalar.word",
+                    ))?
+                })
+            }
+            mir::Type::String | mir::Type::Class(_) | mir::Type::Collection(_) => {
+                Ok(build(self.builder.build_ptr_to_int(
+                    value.into_pointer_value(),
+                    i64_type,
+                    "collection.pointer.word",
+                ))?)
+            }
+            mir::Type::NullableScalar(_)
+            | mir::Type::NullableString
+            | mir::Type::NullableClass(_) => Err(malformed_mir(
+                "nullable collection elements are not supported by Stage 23 Slice 1",
+            )),
+        }
+    }
+
+    fn collection_word_to_value(
+        &self,
+        word: IntValue<'ctx>,
+        ty: mir::Type,
+    ) -> Result<BasicValueEnum<'ctx>, BackendError> {
+        Ok(match ty {
+            mir::Type::Scalar(mir::ScalarType::Integer(integer)) => {
+                let target = integer_type(self.context, integer);
+                if integer.bit_width() == 64 {
+                    word.into()
+                } else {
+                    build(self.builder.build_int_truncate(
+                        word,
+                        target,
+                        "collection.integer.value",
+                    ))?
+                    .into()
+                }
+            }
+            mir::Type::Scalar(mir::ScalarType::Bool) => build(self.builder.build_int_truncate(
+                word,
+                self.context.i8_type(),
+                "collection.bool.value",
+            ))?
+            .into(),
+            mir::Type::Scalar(mir::ScalarType::Float(FloatType::Float32)) => {
+                let bits = build(self.builder.build_int_truncate(
+                    word,
+                    self.context.i32_type(),
+                    "collection.f32.bits",
+                ))?;
+                build(self.builder.build_bit_cast(
+                    bits,
+                    self.context.f32_type(),
+                    "collection.f32.value",
+                ))?
+            }
+            mir::Type::Scalar(mir::ScalarType::Float(FloatType::Float64)) => build(
+                self.builder
+                    .build_bit_cast(word, self.context.f64_type(), "collection.f64.value"),
+            )?,
+            mir::Type::String | mir::Type::Class(_) | mir::Type::Collection(_) => {
+                build(self.builder.build_int_to_ptr(
+                    word,
+                    self.context.ptr_type(AddressSpace::default()),
+                    "collection.pointer.value",
+                ))?
+                .into()
+            }
+            mir::Type::NullableScalar(_)
+            | mir::Type::NullableString
+            | mir::Type::NullableClass(_) => {
+                return Err(malformed_mir(
+                    "nullable collection elements are not supported by Stage 23 Slice 1",
+                ))
+            }
+        })
+    }
+
+    fn collection_pointer(&self, local: mir::LocalId) -> Result<PointerValue<'ctx>, BackendError> {
+        Ok(build(self.builder.build_load(
+            self.context.ptr_type(AddressSpace::default()),
+            local_slot(&self.local_slots, local)?,
+            "collection.local",
+        ))?
+        .into_pointer_value())
+    }
+
+    fn lower_collection_expression(
+        &mut self,
+        expression: &mir::CollectionExpression,
+    ) -> Result<PointerValue<'ctx>, BackendError> {
+        let pointer = self.context.ptr_type(AddressSpace::default());
+        let usize_type = self.context.ptr_sized_int_type(self.target_data, None);
+        match expression {
+            mir::CollectionExpression::Local {
+                local, transfer, ..
+            } => {
+                let value = self.collection_pointer(*local)?;
+                if *transfer {
+                    build(self.builder.build_store(
+                        local_slot(&self.local_slots, *local)?,
+                        pointer.const_null(),
+                    ))?;
+                }
+                Ok(value)
+            }
+            mir::CollectionExpression::Literal {
+                collection,
+                entries,
+            } => {
+                let definition = self.collection_definition(*collection)?.clone();
+                let fixed = definition.kind == mir::CollectionKind::TypedArray;
+                let result = self
+                    .call_runtime(
+                        COLLECTION_NEW,
+                        &[
+                            usize_type.into(),
+                            self.context.i8_type().into(),
+                            self.context.i8_type().into(),
+                        ],
+                        Some(pointer.into()),
+                        &[
+                            usize_type.const_int(entries.len() as u64, false).into(),
+                            self.context
+                                .i8_type()
+                                .const_int(u64::from(definition.key.is_some()), false)
+                                .into(),
+                            self.context
+                                .i8_type()
+                                .const_int(u64::from(fixed), false)
+                                .into(),
+                        ],
+                    )?
+                    .ok_or_else(|| backend_failure("collection allocation produced no result"))?
+                    .into_pointer_value();
+                for (index, entry) in entries.iter().enumerate() {
+                    if let (Some(key_type), Some(key)) = (definition.key, &entry.key) {
+                        let key = self.lower_rvalue(key)?;
+                        let value = self.lower_rvalue(&entry.value)?;
+                        self.lower_dictionary_set_value(
+                            result,
+                            key,
+                            key_type,
+                            value,
+                            definition.value,
+                        )?;
+                        continue;
+                    }
+                    let value = self.lower_rvalue(&entry.value)?;
+                    if fixed {
+                        let value_word = self.value_to_collection_word(value, definition.value)?;
+                        let _ = self.call_runtime(
+                            COLLECTION_SET_AT,
+                            &[
+                                pointer.into(),
+                                pointer.into(),
+                                usize_type.into(),
+                                self.context.i64_type().into(),
+                            ],
+                            Some(self.context.i64_type().into()),
+                            &[
+                                self.current_frame.into(),
+                                result.into(),
+                                usize_type.const_int(index as u64, false).into(),
+                                value_word.into(),
+                            ],
+                        )?;
+                    } else if definition.kind == mir::CollectionKind::Set {
+                        let value_word = self.value_to_collection_word(value, definition.value)?;
+                        let inserted = self
+                            .call_runtime(
+                                COLLECTION_PUSH_UNIQUE,
+                                &[
+                                    pointer.into(),
+                                    self.context.i64_type().into(),
+                                    self.context.i8_type().into(),
+                                ],
+                                Some(self.context.i8_type().into()),
+                                &[
+                                    result.into(),
+                                    value_word.into(),
+                                    self.collection_compare_kind(definition.value)?.into(),
+                                ],
+                            )?
+                            .ok_or_else(|| backend_failure("set insertion produced no result"))?
+                            .into_int_value();
+                        self.drop_value_unless(inserted, value, definition.value)?;
+                    } else {
+                        let value_word = self.value_to_collection_word(value, definition.value)?;
+                        let _ = self.call_runtime(
+                            COLLECTION_PUSH,
+                            &[pointer.into(), self.context.i64_type().into()],
+                            None,
+                            &[result.into(), value_word.into()],
+                        )?;
+                    }
+                }
+                Ok(result)
+            }
+            mir::CollectionExpression::Index {
+                source,
+                index,
+                transfer,
+                ..
+            } => Ok(self
+                .lower_collection_index(*source, index, *transfer)?
+                .into_pointer_value()),
+            mir::CollectionExpression::Property {
+                object, property, ..
+            } => Ok(build(self.builder.build_load(
+                pointer,
+                self.lower_property_address(*object, *property)?,
+                "collection.property",
+            ))?
+            .into_pointer_value()),
+            mir::CollectionExpression::SetFrom {
+                collection,
+                source,
+                transfer,
+                algebra,
+            } => self.lower_set_from(*collection, *source, *transfer, *algebra),
+            mir::CollectionExpression::FromBytes { source, .. } => {
+                let source = self.collection_pointer(*source)?;
+                Ok(self
+                    .call_runtime(
+                        BYTES_TO_COLLECTION,
+                        &[pointer.into()],
+                        Some(pointer.into()),
+                        &[source.into()],
+                    )?
+                    .ok_or_else(|| backend_failure("Bytes::toArray produced no result"))?
+                    .into_pointer_value())
+            }
+            mir::CollectionExpression::BytesFromArray { source, .. } => {
+                let source = self.collection_pointer(*source)?;
+                Ok(self
+                    .call_runtime(
+                        BYTES_FROM_COLLECTION,
+                        &[pointer.into()],
+                        Some(pointer.into()),
+                        &[source.into()],
+                    )?
+                    .ok_or_else(|| backend_failure("Bytes::fromArray produced no result"))?
+                    .into_pointer_value())
+            }
+            mir::CollectionExpression::ReadFileBytes { path, .. } => {
+                let path = self.lower_string_expression(path)?;
+                let result = self
+                    .call_runtime(
+                        READ_FILE_BYTES,
+                        &[pointer.into(), pointer.into()],
+                        Some(pointer.into()),
+                        &[self.current_frame.into(), path.into()],
+                    )?
+                    .ok_or_else(|| backend_failure("read_file_bytes produced no result"))?
+                    .into_pointer_value();
+                self.release_string(path)?;
+                Ok(result)
+            }
+            mir::CollectionExpression::ReadStdinBytes { .. } => Ok(self
+                .call_runtime(
+                    READ_STDIN_BYTES,
+                    &[pointer.into()],
+                    Some(pointer.into()),
+                    &[self.current_frame.into()],
+                )?
+                .ok_or_else(|| backend_failure("read_stdin_bytes produced no result"))?
+                .into_pointer_value()),
+            mir::CollectionExpression::Call { function, args, .. } => Ok(self
+                .lower_call(*function, args, true)?
+                .ok_or_else(|| malformed_mir("collection call produced no result"))?
+                .into_pointer_value()),
+        }
+    }
+
+    fn lower_collection_index(
+        &mut self,
+        collection: mir::LocalId,
+        index: &mir::Rvalue,
+        remove: bool,
+    ) -> Result<BasicValueEnum<'ctx>, BackendError> {
+        let pointer = self.context.ptr_type(AddressSpace::default());
+        let usize_type = self.context.ptr_sized_int_type(self.target_data, None);
+        let local = local_in(self.function, collection)?;
+        let mir::Type::Collection(collection_type) = local.ty else {
+            return Err(malformed_mir("collection index uses non-collection local"));
+        };
+        let definition = self.collection_definition(collection_type)?.clone();
+        let collection_value = self.collection_pointer(collection)?;
+        if definition.kind == mir::CollectionKind::Bytes {
+            if remove {
+                return Err(malformed_mir("byte indexing cannot remove a value"));
+            }
+            let index = self.lower_rvalue(index)?.into_int_value();
+            return self
+                .call_runtime(
+                    BYTES_GET,
+                    &[pointer.into(), pointer.into(), usize_type.into()],
+                    Some(self.context.i8_type().into()),
+                    &[
+                        self.current_frame.into(),
+                        collection_value.into(),
+                        index.into(),
+                    ],
+                )?
+                .ok_or_else(|| backend_failure("byte index produced no result"));
+        }
+        let index_type = definition
+            .key
+            .unwrap_or(mir::Type::Scalar(mir::ScalarType::Integer(
+                IntegerType::Int64,
+            )));
+        let index_value = self.lower_rvalue(index)?;
+        let word = if definition.key.is_some() {
+            if remove {
+                return Err(malformed_mir(
+                    "dictionary indexed removal must use Dictionary::remove",
+                ));
+            }
+            let index_word = self.value_to_collection_word(index_value, index_type)?;
+            let found = build(
+                self.builder
+                    .build_alloca(self.context.i8_type(), "dictionary.found"),
+            )?;
+            let word = self
+                .call_runtime(
+                    COLLECTION_KEYED_GET,
+                    &[
+                        pointer.into(),
+                        self.context.i64_type().into(),
+                        self.context.i8_type().into(),
+                        pointer.into(),
+                    ],
+                    Some(self.context.i64_type().into()),
+                    &[
+                        collection_value.into(),
+                        index_word.into(),
+                        self.collection_compare_kind(index_type)?.into(),
+                        found.into(),
+                    ],
+                )?
+                .ok_or_else(|| backend_failure("dictionary lookup produced no result"))?
+                .into_int_value();
+            let found = build(self.builder.build_load(
+                self.context.i8_type(),
+                found,
+                "dictionary.found",
+            ))?
+            .into_int_value();
+            let missing = build(self.builder.build_int_compare(
+                IntPredicate::EQ,
+                found,
+                self.context.i8_type().const_zero(),
+                "dictionary.missing",
+            ))?;
+            self.lower_panic_if(missing, b"dictionary key not found")?;
+            if index_type == mir::Type::String {
+                self.release_string(index_value.into_pointer_value())?;
+            }
+            word
+        } else if remove {
+            self.call_runtime(
+                COLLECTION_REMOVE_AT,
+                &[pointer.into(), pointer.into(), usize_type.into()],
+                Some(self.context.i64_type().into()),
+                &[
+                    self.current_frame.into(),
+                    collection_value.into(),
+                    index_value.into(),
+                ],
+            )?
+            .ok_or_else(|| backend_failure("collection removal produced no result"))?
+            .into_int_value()
+        } else {
+            self.call_runtime(
+                COLLECTION_VALUE_AT,
+                &[pointer.into(), pointer.into(), usize_type.into()],
+                Some(self.context.i64_type().into()),
+                &[
+                    self.current_frame.into(),
+                    collection_value.into(),
+                    index_value.into(),
+                ],
+            )?
+            .ok_or_else(|| backend_failure("collection index produced no result"))?
+            .into_int_value()
+        };
+        self.collection_word_to_value(word, definition.value)
+    }
+
+    fn lower_collection_key_at(
+        &mut self,
+        collection: mir::LocalId,
+        offset: &mir::Rvalue,
+        expected: mir::Type,
+    ) -> Result<BasicValueEnum<'ctx>, BackendError> {
+        let pointer = self.context.ptr_type(AddressSpace::default());
+        let usize_type = self.context.ptr_sized_int_type(self.target_data, None);
+        let local = local_in(self.function, collection)?;
+        let mir::Type::Collection(collection_type) = local.ty else {
+            return Err(malformed_mir(
+                "collection key access uses non-collection local",
+            ));
+        };
+        if self.collection_definition(collection_type)?.key != Some(expected) {
+            return Err(malformed_mir("collection key access has another type"));
+        }
+        let collection = self.collection_pointer(collection)?;
+        let offset = self.lower_rvalue(offset)?;
+        let word = self
+            .call_runtime(
+                COLLECTION_KEY_AT,
+                &[pointer.into(), pointer.into(), usize_type.into()],
+                Some(self.context.i64_type().into()),
+                &[
+                    self.current_frame.into(),
+                    collection.into(),
+                    offset.into_int_value().into(),
+                ],
+            )?
+            .ok_or_else(|| backend_failure("collection key read produced no result"))?
+            .into_int_value();
+        self.collection_word_to_value(word, expected)
+    }
+
+    fn lower_dictionary_get(
+        &mut self,
+        collection: mir::LocalId,
+        key: &mir::Rvalue,
+        expected: mir::Type,
+        access: mir::NullableCollectionAccess,
+    ) -> Result<(IntValue<'ctx>, BasicValueEnum<'ctx>), BackendError> {
+        let pointer = self.context.ptr_type(AddressSpace::default());
+        let local = local_in(self.function, collection)?;
+        let mir::Type::Collection(collection_type) = local.ty else {
+            return Err(malformed_mir("Dictionary::get uses a non-collection local"));
+        };
+        let definition = self.collection_definition(collection_type)?.clone();
+        if definition.value != expected {
+            return Err(malformed_mir("nullable collection access type mismatch"));
+        }
+        let key_type = match access {
+            mir::NullableCollectionAccess::Get | mir::NullableCollectionAccess::Remove => {
+                definition
+                    .key
+                    .ok_or_else(|| malformed_mir("dictionary access has no key type"))?
+            }
+            mir::NullableCollectionAccess::First
+            | mir::NullableCollectionAccess::Last
+            | mir::NullableCollectionAccess::Pop => {
+                mir::Type::Scalar(mir::ScalarType::Integer(IntegerType::Int64))
+            }
+        };
+        let collection = self.collection_pointer(collection)?;
+        let key_value = self.lower_rvalue(key)?;
+        let key_word = self.value_to_collection_word(key_value, key_type)?;
+        let found = build(
+            self.builder
+                .build_alloca(self.context.i8_type(), "dictionary.get.found"),
+        )?;
+        let removed_key = build(
+            self.builder
+                .build_alloca(self.context.i64_type(), "dictionary.removed.key"),
+        )?;
+        let access_value = self.context.i8_type().const_int(
+            match access {
+                mir::NullableCollectionAccess::Get => 0,
+                mir::NullableCollectionAccess::Remove => 1,
+                mir::NullableCollectionAccess::First => 2,
+                mir::NullableCollectionAccess::Last => 3,
+                mir::NullableCollectionAccess::Pop => 4,
+            },
+            false,
+        );
+        let word = self
+            .call_runtime(
+                COLLECTION_NULLABLE_ACCESS,
+                &[
+                    pointer.into(),
+                    self.context.i64_type().into(),
+                    self.context.i8_type().into(),
+                    self.context.i8_type().into(),
+                    pointer.into(),
+                    pointer.into(),
+                ],
+                Some(self.context.i64_type().into()),
+                &[
+                    collection.into(),
+                    key_word.into(),
+                    self.collection_compare_kind(key_type)?.into(),
+                    access_value.into(),
+                    found.into(),
+                    removed_key.into(),
+                ],
+            )?
+            .ok_or_else(|| backend_failure("nullable collection access produced no result"))?
+            .into_int_value();
+        if key_type == mir::Type::String {
+            self.release_string(key_value.into_pointer_value())?;
+            if access == mir::NullableCollectionAccess::Remove {
+                let removed_key = build(self.builder.build_load(
+                    self.context.i64_type(),
+                    removed_key,
+                    "dictionary.removed.key.value",
+                ))?
+                .into_int_value();
+                self.release_string(
+                    self.collection_word_to_value(removed_key, mir::Type::String)?
+                        .into_pointer_value(),
+                )?;
+            }
+        }
+        let found = build(self.builder.build_load(
+            self.context.i8_type(),
+            found,
+            "dictionary.get.found.value",
+        ))?
+        .into_int_value();
+        let present = build(self.builder.build_int_z_extend(
+            found,
+            self.context.ptr_sized_int_type(self.target_data, None),
+            "dictionary.get.present",
+        ))?;
+        Ok((present, self.collection_word_to_value(word, expected)?))
+    }
+
+    fn lower_collection_add(
+        &mut self,
+        collection: mir::LocalId,
+        value: &mir::Rvalue,
+        index: Option<&mir::Rvalue>,
+        op: mir::CollectionMutationOp,
+    ) -> Result<(), BackendError> {
+        let pointer = self.context.ptr_type(AddressSpace::default());
+        let local = local_in(self.function, collection)?;
+        let mir::Type::Collection(collection_type) = local.ty else {
+            return Err(malformed_mir("collection add uses non-collection local"));
+        };
+        let definition = self.collection_definition(collection_type)?.clone();
+        let collection_value = self.collection_pointer(collection)?;
+        let index = if op == mir::CollectionMutationOp::InsertAt {
+            Some(
+                self.lower_rvalue(index.ok_or_else(|| malformed_mir("insertAt has no index"))?)?
+                    .into_int_value(),
+            )
+        } else {
+            None
+        };
+        let value = self.lower_rvalue(value)?;
+        let word = self.value_to_collection_word(value, definition.value)?;
+        if op == mir::CollectionMutationOp::InsertAt {
+            let _ = self.call_runtime(
+                COLLECTION_INSERT_AT,
+                &[
+                    pointer.into(),
+                    pointer.into(),
+                    self.context
+                        .ptr_sized_int_type(self.target_data, None)
+                        .into(),
+                    self.context.i64_type().into(),
+                ],
+                None,
+                &[
+                    self.current_frame.into(),
+                    collection_value.into(),
+                    index.expect("insertAt index was lowered").into(),
+                    word.into(),
+                ],
+            )?;
+        } else if op == mir::CollectionMutationOp::Remove {
+            let removed_slot = build(
+                self.builder
+                    .build_alloca(self.context.i64_type(), "set.removed.value"),
+            )?;
+            let removed = self
+                .call_runtime(
+                    COLLECTION_REMOVE_VALUE,
+                    &[
+                        pointer.into(),
+                        self.context.i64_type().into(),
+                        self.context.i8_type().into(),
+                        pointer.into(),
+                    ],
+                    Some(self.context.i8_type().into()),
+                    &[
+                        collection_value.into(),
+                        word.into(),
+                        self.collection_compare_kind(definition.value)?.into(),
+                        removed_slot.into(),
+                    ],
+                )?
+                .ok_or_else(|| backend_failure("set removal produced no result"))?
+                .into_int_value();
+            let removed_word = build(self.builder.build_load(
+                self.context.i64_type(),
+                removed_slot,
+                "set.removed.word",
+            ))?
+            .into_int_value();
+            let removed_value = self.collection_word_to_value(removed_word, definition.value)?;
+            self.drop_value_if(removed, removed_value, definition.value)?;
+            self.drop_stored_value(value, definition.value)?;
+        } else if definition.kind == mir::CollectionKind::Set {
+            let inserted = self
+                .call_runtime(
+                    COLLECTION_PUSH_UNIQUE,
+                    &[
+                        pointer.into(),
+                        self.context.i64_type().into(),
+                        self.context.i8_type().into(),
+                    ],
+                    Some(self.context.i8_type().into()),
+                    &[
+                        collection_value.into(),
+                        word.into(),
+                        self.collection_compare_kind(definition.value)?.into(),
+                    ],
+                )?
+                .ok_or_else(|| backend_failure("set insertion produced no result"))?
+                .into_int_value();
+            self.drop_value_unless(inserted, value, definition.value)?;
+        } else {
+            let _ = self.call_runtime(
+                COLLECTION_PUSH,
+                &[pointer.into(), self.context.i64_type().into()],
+                None,
+                &[collection_value.into(), word.into()],
+            )?;
+        }
+        Ok(())
+    }
+
+    fn lower_collection_set(
+        &mut self,
+        collection: mir::LocalId,
+        index: &mir::Rvalue,
+        value: &mir::Rvalue,
+    ) -> Result<(), BackendError> {
+        let pointer = self.context.ptr_type(AddressSpace::default());
+        let usize_type = self.context.ptr_sized_int_type(self.target_data, None);
+        let local = local_in(self.function, collection)?;
+        let mir::Type::Collection(collection_type) = local.ty else {
+            return Err(malformed_mir("collection write uses non-collection local"));
+        };
+        let definition = self.collection_definition(collection_type)?.clone();
+        let collection_value = self.collection_pointer(collection)?;
+        let index = self.lower_rvalue(index)?;
+        let value = self.lower_rvalue(value)?;
+        if definition.kind == mir::CollectionKind::Bytes {
+            let _ = self.call_runtime(
+                BYTES_SET,
+                &[
+                    pointer.into(),
+                    pointer.into(),
+                    usize_type.into(),
+                    self.context.i8_type().into(),
+                ],
+                None,
+                &[
+                    self.current_frame.into(),
+                    collection_value.into(),
+                    index.into_int_value().into(),
+                    value.into_int_value().into(),
+                ],
+            )?;
+            return Ok(());
+        }
+        let value_word = self.value_to_collection_word(value, definition.value)?;
+        if let Some(key_type) = definition.key {
+            self.lower_dictionary_set_value(
+                collection_value,
+                index,
+                key_type,
+                value,
+                definition.value,
+            )?;
+        } else {
+            let old_word = self
+                .call_runtime(
+                    COLLECTION_SET_AT,
+                    &[
+                        pointer.into(),
+                        pointer.into(),
+                        usize_type.into(),
+                        self.context.i64_type().into(),
+                    ],
+                    Some(self.context.i64_type().into()),
+                    &[
+                        self.current_frame.into(),
+                        collection_value.into(),
+                        index.into_int_value().into(),
+                        value_word.into(),
+                    ],
+                )?
+                .ok_or_else(|| backend_failure("collection write produced no result"))?
+                .into_int_value();
+            let old_value = self.collection_word_to_value(old_word, definition.value)?;
+            self.drop_stored_value(old_value, definition.value)?;
+        }
+        Ok(())
+    }
+
+    fn lower_dictionary_set_value(
+        &mut self,
+        collection: PointerValue<'ctx>,
+        key: BasicValueEnum<'ctx>,
+        key_type: mir::Type,
+        value: BasicValueEnum<'ctx>,
+        value_type: mir::Type,
+    ) -> Result<(), BackendError> {
+        let pointer = self.context.ptr_type(AddressSpace::default());
+        let key_word = self.value_to_collection_word(key, key_type)?;
+        let value_word = self.value_to_collection_word(value, value_type)?;
+        let replaced_slot = build(
+            self.builder
+                .build_alloca(self.context.i8_type(), "dictionary.replaced"),
+        )?;
+        let old_word = self
+            .call_runtime(
+                COLLECTION_KEYED_SET,
+                &[
+                    pointer.into(),
+                    self.context.i64_type().into(),
+                    self.context.i64_type().into(),
+                    self.context.i8_type().into(),
+                    pointer.into(),
+                ],
+                Some(self.context.i64_type().into()),
+                &[
+                    collection.into(),
+                    key_word.into(),
+                    value_word.into(),
+                    self.collection_compare_kind(key_type)?.into(),
+                    replaced_slot.into(),
+                ],
+            )?
+            .ok_or_else(|| backend_failure("dictionary write produced no result"))?
+            .into_int_value();
+        let replaced = build(self.builder.build_load(
+            self.context.i8_type(),
+            replaced_slot,
+            "dictionary.replaced",
+        ))?
+        .into_int_value();
+        let old_value = self.collection_word_to_value(old_word, value_type)?;
+        self.drop_value_if(replaced, old_value, value_type)?;
+        self.drop_value_if(replaced, key, key_type)
+    }
+
+    fn lower_set_from(
+        &mut self,
+        target: mir::CollectionTypeId,
+        source: mir::LocalId,
+        transfer: bool,
+        algebra: Option<(mir::SetAlgebraOp, mir::LocalId)>,
+    ) -> Result<PointerValue<'ctx>, BackendError> {
+        let pointer = self.context.ptr_type(AddressSpace::default());
+        let usize_type = self.context.ptr_sized_int_type(self.target_data, None);
+        let target_definition = self.collection_definition(target)?.clone();
+        let source_local = local_in(self.function, source)?;
+        let mir::Type::Collection(source_type) = source_local.ty else {
+            return Err(malformed_mir("Set::from source is not a collection"));
+        };
+        let source_definition = self.collection_definition(source_type)?.clone();
+        if target_definition.value != source_definition.value {
+            return Err(malformed_mir("Set::from element type mismatch"));
+        }
+        if !transfer
+            && matches!(
+                source_definition.value,
+                mir::Type::Class(_) | mir::Type::Collection(_)
+            )
+        {
+            return Err(malformed_mir(
+                "Set::from cannot copy move-type elements from a borrowed source",
+            ));
+        }
+        let source_value = self.collection_pointer(source)?;
+        if let Some((op, right)) = algebra {
+            let right = self.collection_pointer(right)?;
+            let operation = self.context.i8_type().const_int(
+                match op {
+                    mir::SetAlgebraOp::Union => 0,
+                    mir::SetAlgebraOp::Intersect => 1,
+                    mir::SetAlgebraOp::Difference => 2,
+                },
+                false,
+            );
+            return Ok(self
+                .call_runtime(
+                    COLLECTION_SET_ALGEBRA,
+                    &[
+                        pointer.into(),
+                        pointer.into(),
+                        self.context.i8_type().into(),
+                        self.context.i8_type().into(),
+                    ],
+                    Some(pointer.into()),
+                    &[
+                        source_value.into(),
+                        right.into(),
+                        operation.into(),
+                        self.collection_compare_kind(target_definition.value)?
+                            .into(),
+                    ],
+                )?
+                .ok_or_else(|| backend_failure("set algebra produced no result"))?
+                .into_pointer_value());
+        }
+        if transfer {
+            build(
+                self.builder
+                    .build_store(local_slot(&self.local_slots, source)?, pointer.const_null()),
+            )?;
+        }
+        let result = self
+            .call_runtime(
+                COLLECTION_NEW,
+                &[
+                    usize_type.into(),
+                    self.context.i8_type().into(),
+                    self.context.i8_type().into(),
+                ],
+                Some(pointer.into()),
+                &[
+                    usize_type.const_zero().into(),
+                    self.context.i8_type().const_zero().into(),
+                    self.context.i8_type().const_zero().into(),
+                ],
+            )?
+            .ok_or_else(|| backend_failure("set allocation produced no result"))?
+            .into_pointer_value();
+        let length = self
+            .call_runtime(
+                COLLECTION_LENGTH,
+                &[pointer.into()],
+                Some(usize_type.into()),
+                &[source_value.into()],
+            )?
+            .ok_or_else(|| backend_failure("collection length produced no result"))?
+            .into_int_value();
+        let index_slot = build(self.builder.build_alloca(usize_type, "set.from.index"))?;
+        build(
+            self.builder
+                .build_store(index_slot, usize_type.const_zero()),
+        )?;
+        let function = current_function(&self.builder)?;
+        let header = self.context.append_basic_block(function, "set.from.header");
+        let body = self.context.append_basic_block(function, "set.from.body");
+        let done = self.context.append_basic_block(function, "set.from.done");
+        build(self.builder.build_unconditional_branch(header))?;
+        self.builder.position_at_end(header);
+        let index = build(
+            self.builder
+                .build_load(usize_type, index_slot, "set.from.index"),
+        )?
+        .into_int_value();
+        let more = build(self.builder.build_int_compare(
+            IntPredicate::ULT,
+            index,
+            length,
+            "set.from.more",
+        ))?;
+        build(self.builder.build_conditional_branch(more, body, done))?;
+        self.builder.position_at_end(body);
+        let word = self
+            .call_runtime(
+                COLLECTION_VALUE_AT,
+                &[pointer.into(), pointer.into(), usize_type.into()],
+                Some(self.context.i64_type().into()),
+                &[self.current_frame.into(), source_value.into(), index.into()],
+            )?
+            .ok_or_else(|| backend_failure("Set::from element read produced no result"))?
+            .into_int_value();
+        let mut value = self.collection_word_to_value(word, source_definition.value)?;
+        if !transfer && source_definition.value == mir::Type::String {
+            value = self.retain_string(value.into_pointer_value())?.into();
+        }
+        let word = self.value_to_collection_word(value, source_definition.value)?;
+        let inserted = self
+            .call_runtime(
+                COLLECTION_PUSH_UNIQUE,
+                &[
+                    pointer.into(),
+                    self.context.i64_type().into(),
+                    self.context.i8_type().into(),
+                ],
+                Some(self.context.i8_type().into()),
+                &[
+                    result.into(),
+                    word.into(),
+                    self.collection_compare_kind(source_definition.value)?
+                        .into(),
+                ],
+            )?
+            .ok_or_else(|| backend_failure("Set::from insertion produced no result"))?
+            .into_int_value();
+        self.drop_value_unless(inserted, value, source_definition.value)?;
+        let next = build(self.builder.build_int_add(
+            index,
+            usize_type.const_int(1, false),
+            "set.from.next",
+        ))?;
+        build(self.builder.build_store(index_slot, next))?;
+        build(self.builder.build_unconditional_branch(header))?;
+        self.builder.position_at_end(done);
+        if transfer {
+            let _ = self.call_runtime(
+                COLLECTION_FREE,
+                &[pointer.into()],
+                None,
+                &[source_value.into()],
+            )?;
+        }
+        Ok(result)
+    }
+
+    fn drop_value_if(
+        &mut self,
+        condition: IntValue<'ctx>,
+        value: BasicValueEnum<'ctx>,
+        ty: mir::Type,
+    ) -> Result<(), BackendError> {
+        if !matches!(
+            ty,
+            mir::Type::String | mir::Type::Class(_) | mir::Type::Collection(_)
+        ) {
+            return Ok(());
+        }
+        let condition = build(self.builder.build_int_compare(
+            IntPredicate::NE,
+            condition,
+            condition.get_type().const_zero(),
+            "collection.should_drop",
+        ))?;
+        let function = current_function(&self.builder)?;
+        let drop_block = self
+            .context
+            .append_basic_block(function, "collection.drop.value");
+        let done = self
+            .context
+            .append_basic_block(function, "collection.drop.value.done");
+        build(
+            self.builder
+                .build_conditional_branch(condition, drop_block, done),
+        )?;
+        self.builder.position_at_end(drop_block);
+        self.drop_stored_value(value, ty)?;
+        build(self.builder.build_unconditional_branch(done))?;
+        self.builder.position_at_end(done);
+        Ok(())
+    }
+
+    fn drop_value_unless(
+        &mut self,
+        condition: IntValue<'ctx>,
+        value: BasicValueEnum<'ctx>,
+        ty: mir::Type,
+    ) -> Result<(), BackendError> {
+        let should_drop = build(self.builder.build_int_compare(
+            IntPredicate::EQ,
+            condition,
+            condition.get_type().const_zero(),
+            "collection.not_inserted",
+        ))?;
+        self.drop_value_if(
+            build(self.builder.build_int_z_extend(
+                should_drop,
+                self.context.i8_type(),
+                "collection.not_inserted.i8",
+            ))?,
+            value,
+            ty,
+        )
+    }
+
+    fn drop_stored_value(
+        &mut self,
+        value: BasicValueEnum<'ctx>,
+        ty: mir::Type,
+    ) -> Result<(), BackendError> {
+        match ty {
+            mir::Type::String => self.release_string(value.into_pointer_value()),
+            mir::Type::Class(class) => {
+                self.drop_class_value_checked(value.into_pointer_value(), class)
+            }
+            mir::Type::Collection(collection) => {
+                self.drop_collection_value(value.into_pointer_value(), collection)
+            }
+            mir::Type::Scalar(_) => Ok(()),
+            mir::Type::NullableScalar(_)
+            | mir::Type::NullableString
+            | mir::Type::NullableClass(_) => Err(malformed_mir(
+                "nullable collection elements are not supported by Stage 23 Slice 1",
+            )),
+        }
+    }
+
+    fn drop_collection_value(
+        &mut self,
+        collection: PointerValue<'ctx>,
+        collection_type: mir::CollectionTypeId,
+    ) -> Result<(), BackendError> {
+        let pointer = self.context.ptr_type(AddressSpace::default());
+        let usize_type = self.context.ptr_sized_int_type(self.target_data, None);
+        let definition = self.collection_definition(collection_type)?.clone();
+        let function = current_function(&self.builder)?;
+        let drop_block = self.context.append_basic_block(function, "collection.drop");
+        let done = self
+            .context
+            .append_basic_block(function, "collection.drop.done");
+        let present = build(
+            self.builder
+                .build_is_not_null(collection, "collection.present"),
+        )?;
+        build(
+            self.builder
+                .build_conditional_branch(present, drop_block, done),
+        )?;
+        self.builder.position_at_end(drop_block);
+        if definition.kind == mir::CollectionKind::Bytes {
+            let _ = self.call_runtime(BYTES_FREE, &[pointer.into()], None, &[collection.into()])?;
+            build(self.builder.build_unconditional_branch(done))?;
+            self.builder.position_at_end(done);
+            return Ok(());
+        }
+        let length = self
+            .call_runtime(
+                COLLECTION_LENGTH,
+                &[pointer.into()],
+                Some(usize_type.into()),
+                &[collection.into()],
+            )?
+            .ok_or_else(|| backend_failure("collection length produced no result"))?
+            .into_int_value();
+        let index_slot = build(
+            self.builder
+                .build_alloca(usize_type, "collection.drop.index"),
+        )?;
+        build(self.builder.build_store(index_slot, length))?;
+        let header = self
+            .context
+            .append_basic_block(function, "collection.drop.header");
+        let body = self
+            .context
+            .append_basic_block(function, "collection.drop.body");
+        let free = self
+            .context
+            .append_basic_block(function, "collection.drop.free");
+        build(self.builder.build_unconditional_branch(header))?;
+        self.builder.position_at_end(header);
+        let index = build(self.builder.build_load(
+            usize_type,
+            index_slot,
+            "collection.drop.index",
+        ))?
+        .into_int_value();
+        let more = build(self.builder.build_int_compare(
+            IntPredicate::NE,
+            index,
+            usize_type.const_zero(),
+            "collection.drop.more",
+        ))?;
+        build(self.builder.build_conditional_branch(more, body, free))?;
+        self.builder.position_at_end(body);
+        let current = build(self.builder.build_int_sub(
+            index,
+            usize_type.const_int(1, false),
+            "collection.drop.current",
+        ))?;
+        let value_word = self
+            .call_runtime(
+                COLLECTION_VALUE_AT,
+                &[pointer.into(), pointer.into(), usize_type.into()],
+                Some(self.context.i64_type().into()),
+                &[self.current_frame.into(), collection.into(), current.into()],
+            )?
+            .ok_or_else(|| backend_failure("collection value read produced no result"))?
+            .into_int_value();
+        let value = self.collection_word_to_value(value_word, definition.value)?;
+        self.drop_stored_value(value, definition.value)?;
+        if let Some(key_type) = definition.key {
+            let key_word = self
+                .call_runtime(
+                    COLLECTION_KEY_AT,
+                    &[pointer.into(), pointer.into(), usize_type.into()],
+                    Some(self.context.i64_type().into()),
+                    &[self.current_frame.into(), collection.into(), current.into()],
+                )?
+                .ok_or_else(|| backend_failure("collection key read produced no result"))?
+                .into_int_value();
+            let key = self.collection_word_to_value(key_word, key_type)?;
+            self.drop_stored_value(key, key_type)?;
+        }
+        build(self.builder.build_store(index_slot, current))?;
+        build(self.builder.build_unconditional_branch(header))?;
+        self.builder.position_at_end(free);
+        let _ = self.call_runtime(
+            COLLECTION_FREE,
+            &[pointer.into()],
+            None,
+            &[collection.into()],
+        )?;
+        build(self.builder.build_unconditional_branch(done))?;
+        self.builder.position_at_end(done);
+        Ok(())
     }
 
     fn lower_class_expression(
@@ -1031,6 +2305,14 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 }
                 Ok(result)
             }
+            mir::ClassExpression::CollectionIndex {
+                collection,
+                index,
+                transfer,
+                ..
+            } => Ok(self
+                .lower_collection_index(*collection, index, *transfer)?
+                .into_pointer_value()),
         }
     }
 
@@ -1154,6 +2436,15 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 }
                 Ok(result.as_basic_value().into_pointer_value())
             }
+            mir::NullableClassExpression::DictionaryGet {
+                class,
+                collection,
+                key,
+                access,
+            } => Ok(self
+                .lower_dictionary_get(*collection, key, mir::Type::Class(*class), *access)?
+                .1
+                .into_pointer_value()),
         }
     }
 
@@ -1363,6 +2654,24 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                         .map(BasicValueEnum::from)
                 })
             }
+            mir::NullableStringExpression::DictionaryGet {
+                collection,
+                key,
+                access,
+            } => {
+                let (present, payload) =
+                    self.lower_dictionary_get(*collection, key, mir::Type::String, *access)?;
+                let payload = payload.into_pointer_value();
+                let payload = if matches!(
+                    access,
+                    mir::NullableCollectionAccess::Remove | mir::NullableCollectionAccess::Pop
+                ) {
+                    payload
+                } else {
+                    self.retain_string(payload)?
+                };
+                self.nullable_value(present, payload.into())
+            }
         }
     }
 
@@ -1455,6 +2764,16 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                         .lower_nullable_scalar_expression(right)
                         .map(BasicValueEnum::from)
                 })
+            }
+            mir::NullableScalarExpression::DictionaryGet {
+                collection,
+                key,
+                access,
+                ..
+            } => {
+                let (present, payload) =
+                    self.lower_dictionary_get(*collection, key, mir::Type::Scalar(ty), *access)?;
+                self.nullable_value(present, payload)
             }
         }
     }
@@ -1736,6 +3055,15 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                         .into_pointer_value();
                     self.drop_class_value_checked(value, class)?;
                 }
+                mir::Type::Collection(collection) => {
+                    let value = build(self.builder.build_load(
+                        pointer,
+                        address,
+                        "property.collection",
+                    ))?
+                    .into_pointer_value();
+                    self.drop_collection_value(value, collection)?;
+                }
                 mir::Type::Scalar(_) | mir::Type::NullableScalar(_) => {}
             }
         }
@@ -1951,6 +3279,26 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                         Ok(lowerer.lower_string_expression(right)?.into())
                     })?
                     .into_pointer_value())
+            }
+            mir::StringExpression::CollectionIndex {
+                collection,
+                index,
+                remove,
+            } => {
+                let value = self
+                    .lower_collection_index(*collection, index, *remove)?
+                    .into_pointer_value();
+                if *remove {
+                    Ok(value)
+                } else {
+                    self.retain_string(value)
+                }
+            }
+            mir::StringExpression::CollectionKeyAt { collection, offset } => {
+                let value = self
+                    .lower_collection_key_at(*collection, offset, mir::Type::String)?
+                    .into_pointer_value();
+                self.retain_string(value)
             }
         }
     }
@@ -2677,7 +4025,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
     }
 
     fn lower_integer_operand(
-        &self,
+        &mut self,
         ty: IntegerType,
         operand: &mir::Operand,
     ) -> Result<IntValue<'ctx>, BackendError> {
@@ -2716,6 +4064,43 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 "integer.property",
             ))?
             .into_int_value()),
+            mir::Operand::CollectionLength(collection) if ty == IntegerType::Int64 => {
+                let pointer = self.context.ptr_type(AddressSpace::default());
+                let usize_type = self.context.ptr_sized_int_type(self.target_data, None);
+                let local = local_in(self.function, *collection)?;
+                let mir::Type::Collection(collection_type) = local.ty else {
+                    return Err(malformed_mir("collection length uses non-collection local"));
+                };
+                let definition = self.collection_definition(collection_type)?;
+                let collection = self.collection_pointer(*collection)?;
+                Ok(self
+                    .call_runtime(
+                        if definition.kind == mir::CollectionKind::Bytes {
+                            BYTES_LENGTH
+                        } else {
+                            COLLECTION_LENGTH
+                        },
+                        &[pointer.into()],
+                        Some(usize_type.into()),
+                        &[collection.into()],
+                    )?
+                    .ok_or_else(|| backend_failure("collection length produced no result"))?
+                    .into_int_value())
+            }
+            mir::Operand::CollectionIndex {
+                collection,
+                index,
+                remove,
+            } => Ok(self
+                .lower_collection_index(*collection, index, *remove)?
+                .into_int_value()),
+            mir::Operand::CollectionKeyAt { collection, offset } => Ok(self
+                .lower_collection_key_at(
+                    *collection,
+                    offset,
+                    mir::Type::Scalar(mir::ScalarType::Integer(ty)),
+                )?
+                .into_int_value()),
             _ => Err(malformed_mir(
                 "integer expression has an incompatible operand",
             )),
@@ -2771,6 +4156,20 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     "float.property",
                 ))?
                 .into_float_value()),
+                mir::Operand::CollectionIndex {
+                    collection,
+                    index,
+                    remove,
+                } => Ok(self
+                    .lower_collection_index(*collection, index, *remove)?
+                    .into_float_value()),
+                mir::Operand::CollectionKeyAt { collection, offset } => Ok(self
+                    .lower_collection_key_at(
+                        *collection,
+                        offset,
+                        mir::Type::Scalar(mir::ScalarType::Float(*ty)),
+                    )?
+                    .into_float_value()),
                 _ => Err(malformed_mir(
                     "float expression has an incompatible operand",
                 )),
@@ -3246,6 +4645,160 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 self.builder.position_at_end(use_right);
                 self.lower_condition_to_branch(right, then_block, else_block)?;
             }
+            mir::BoolExpression::CollectionHas {
+                collection,
+                value,
+                op,
+            } => {
+                let pointer = self.context.ptr_type(AddressSpace::default());
+                let local = local_in(self.function, *collection)?;
+                let mir::Type::Collection(collection_type) = local.ty else {
+                    return Err(malformed_mir("collection has uses non-collection local"));
+                };
+                let definition = self.collection_definition(collection_type)?.clone();
+                let needle_type = definition.key.unwrap_or(definition.value);
+                let needle = self.lower_rvalue(value)?;
+                let needle_word = self.value_to_collection_word(needle, needle_type)?;
+                let collection_value = self.collection_pointer(*collection)?;
+                let kind = self.collection_compare_kind(needle_type)?;
+                let found = match op {
+                    mir::CollectionMembershipOp::Contains => {
+                        let name = if definition.key.is_some() {
+                            COLLECTION_KEYED_HAS
+                        } else {
+                            COLLECTION_CONTAINS
+                        };
+                        let found = self
+                            .call_runtime(
+                                name,
+                                &[
+                                    pointer.into(),
+                                    self.context.i64_type().into(),
+                                    self.context.i8_type().into(),
+                                ],
+                                Some(self.context.i8_type().into()),
+                                &[collection_value.into(), needle_word.into(), kind.into()],
+                            )?
+                            .ok_or_else(|| {
+                                backend_failure("collection membership produced no result")
+                            })?
+                            .into_int_value();
+                        self.drop_stored_value(needle, needle_type)?;
+                        found
+                    }
+                    mir::CollectionMembershipOp::Add => {
+                        let inserted = self
+                            .call_runtime(
+                                COLLECTION_PUSH_UNIQUE,
+                                &[
+                                    pointer.into(),
+                                    self.context.i64_type().into(),
+                                    self.context.i8_type().into(),
+                                ],
+                                Some(self.context.i8_type().into()),
+                                &[collection_value.into(), needle_word.into(), kind.into()],
+                            )?
+                            .ok_or_else(|| backend_failure("set insertion produced no result"))?
+                            .into_int_value();
+                        self.drop_value_unless(inserted, needle, needle_type)?;
+                        inserted
+                    }
+                    mir::CollectionMembershipOp::Remove => {
+                        let removed_slot = build(
+                            self.builder
+                                .build_alloca(self.context.i64_type(), "set.removed.value"),
+                        )?;
+                        let removed = self
+                            .call_runtime(
+                                COLLECTION_REMOVE_VALUE,
+                                &[
+                                    pointer.into(),
+                                    self.context.i64_type().into(),
+                                    self.context.i8_type().into(),
+                                    pointer.into(),
+                                ],
+                                Some(self.context.i8_type().into()),
+                                &[
+                                    collection_value.into(),
+                                    needle_word.into(),
+                                    kind.into(),
+                                    removed_slot.into(),
+                                ],
+                            )?
+                            .ok_or_else(|| backend_failure("set removal produced no result"))?
+                            .into_int_value();
+                        let removed_word = build(self.builder.build_load(
+                            self.context.i64_type(),
+                            removed_slot,
+                            "set.removed.word",
+                        ))?
+                        .into_int_value();
+                        let removed_value =
+                            self.collection_word_to_value(removed_word, needle_type)?;
+                        self.drop_value_if(removed, removed_value, needle_type)?;
+                        self.drop_stored_value(needle, needle_type)?;
+                        removed
+                    }
+                };
+                let found = build(self.builder.build_int_compare(
+                    IntPredicate::NE,
+                    found,
+                    self.context.i8_type().const_zero(),
+                    "collection.found",
+                ))?;
+                build(
+                    self.builder
+                        .build_conditional_branch(found, then_block, else_block),
+                )?;
+            }
+            mir::BoolExpression::CollectionIsEmpty { collection } => {
+                let pointer = self.context.ptr_type(AddressSpace::default());
+                let usize_type = self.context.ptr_sized_int_type(self.target_data, None);
+                let collection = self.collection_pointer(*collection)?;
+                let length = self
+                    .call_runtime(
+                        COLLECTION_LENGTH,
+                        &[pointer.into()],
+                        Some(usize_type.into()),
+                        &[collection.into()],
+                    )?
+                    .ok_or_else(|| backend_failure("collection length produced no result"))?
+                    .into_int_value();
+                let empty = build(self.builder.build_int_compare(
+                    IntPredicate::EQ,
+                    length,
+                    usize_type.const_zero(),
+                    "collection.empty",
+                ))?;
+                build(
+                    self.builder
+                        .build_conditional_branch(empty, then_block, else_block),
+                )?;
+            }
+            mir::BoolExpression::CollectionEqual { left, right } => {
+                let pointer = self.context.ptr_type(AddressSpace::default());
+                let left = self.collection_pointer(*left)?;
+                let right = self.collection_pointer(*right)?;
+                let equal = self
+                    .call_runtime(
+                        BYTES_EQUAL,
+                        &[pointer.into(), pointer.into()],
+                        Some(self.context.i8_type().into()),
+                        &[left.into(), right.into()],
+                    )?
+                    .ok_or_else(|| backend_failure("Bytes equality produced no result"))?
+                    .into_int_value();
+                let equal = build(self.builder.build_int_compare(
+                    IntPredicate::NE,
+                    equal,
+                    self.context.i8_type().const_zero(),
+                    "bytes.equal",
+                ))?;
+                build(
+                    self.builder
+                        .build_conditional_branch(equal, then_block, else_block),
+                )?;
+            }
         }
         Ok(())
     }
@@ -3274,7 +4827,10 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         Ok(phi.as_basic_value().into_int_value())
     }
 
-    fn lower_bool_operand(&self, operand: &mir::Operand) -> Result<IntValue<'ctx>, BackendError> {
+    fn lower_bool_operand(
+        &mut self,
+        operand: &mir::Operand,
+    ) -> Result<IntValue<'ctx>, BackendError> {
         match operand {
             mir::Operand::Scalar(mir::ScalarValue::Bool(value)) => {
                 Ok(self.context.i8_type().const_int(u64::from(*value), false))
@@ -3310,6 +4866,20 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 "bool.property",
             ))?
             .into_int_value()),
+            mir::Operand::CollectionIndex {
+                collection,
+                index,
+                remove,
+            } => Ok(self
+                .lower_collection_index(*collection, index, *remove)?
+                .into_int_value()),
+            mir::Operand::CollectionKeyAt { collection, offset } => Ok(self
+                .lower_collection_key_at(
+                    *collection,
+                    offset,
+                    mir::Type::Scalar(mir::ScalarType::Bool),
+                )?
+                .into_int_value()),
             _ => Err(malformed_mir("bool expression has an incompatible operand")),
         }
     }
@@ -3467,9 +5037,10 @@ fn llvm_type<'ctx>(
             context.ptr_type(AddressSpace::default()).into(),
         )
         .into(),
-        mir::Type::String | mir::Type::Class(_) | mir::Type::NullableClass(_) => {
-            context.ptr_type(AddressSpace::default()).into()
-        }
+        mir::Type::String
+        | mir::Type::Class(_)
+        | mir::Type::NullableClass(_)
+        | mir::Type::Collection(_) => context.ptr_type(AddressSpace::default()).into(),
     }
 }
 
@@ -3714,7 +5285,9 @@ fn resolve_string_expression_from_definitions(
         | mir::StringExpression::NullableLocalAssumeNonNull(_)
         | mir::StringExpression::ReadFile(_)
         | mir::StringExpression::Format(_)
-        | mir::StringExpression::Coalesce { .. } => {
+        | mir::StringExpression::Coalesce { .. }
+        | mir::StringExpression::CollectionIndex { .. }
+        | mir::StringExpression::CollectionKeyAt { .. } => {
             Err(malformed_mir("runtime string expression is not a constant"))
         }
     }
@@ -3747,7 +5320,9 @@ fn resolve_string_expression(
         | mir::StringExpression::NullableLocalAssumeNonNull(_)
         | mir::StringExpression::ReadFile(_)
         | mir::StringExpression::Format(_)
-        | mir::StringExpression::Coalesce { .. } => {
+        | mir::StringExpression::Coalesce { .. }
+        | mir::StringExpression::CollectionIndex { .. }
+        | mir::StringExpression::CollectionKeyAt { .. } => {
             Err(malformed_mir("runtime string expression is not a constant"))
         }
     }

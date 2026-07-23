@@ -1,0 +1,3 @@
+Panic: file path contained an embedded NUL
+Stack Trace:
+  at main

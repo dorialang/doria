@@ -3353,12 +3353,15 @@ function main(): void {}
 }
 
 #[test]
-fn reserves_future_intrinsic_names_without_implementing_them() {
+fn reserves_stage23_io_intrinsic_names_after_implementation() {
     for name in [
         "append_file",
         "read_file_bytes",
         "write_file_bytes",
         "append_file_bytes",
+        "read_stdin_bytes",
+        "write_stdout_bytes",
+        "write_stderr_bytes",
     ] {
         let declarations = format!(
             "function {name}(): void {{}}\nclass Example {{ function {name}(): void {{}} }}"
@@ -3377,13 +3380,6 @@ fn reserves_future_intrinsic_names_without_implementing_them() {
             2,
             "{name} must be reserved globally and as a method name"
         );
-
-        let call = format!("function main(): void {{ {name}(); }}");
-        let diagnostics = doriac::check_source("test.doria", call)
-            .expect_err("future intrinsic calls must remain unsupported");
-        assert!(diagnostics.iter().any(|diagnostic| {
-            diagnostic.code == "E0309" && diagnostic.message == format!("unknown function `{name}`")
-        }));
     }
 }
 
@@ -3932,7 +3928,7 @@ Dictionary<string, List<int>> $nestedCounts = [
     "oranges" => [],
 ];
 Dictionary<int, int> $indexedCounts = [
-    10,
+    0 => 10,
     1 => 20,
 ];
 Dictionary<string, int> $emptyCounts = [];

@@ -1,0 +1,5 @@
+function main(): void
+{
+    Bytes $input = read_stdin_bytes();
+    echo "{$input->length}\n";
+}

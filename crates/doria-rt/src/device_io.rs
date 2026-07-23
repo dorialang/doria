@@ -95,6 +95,24 @@ pub(crate) unsafe fn write(
     WriteOutcome::Success
 }
 
+#[cfg(unix)]
+pub(crate) unsafe fn write_bytes(
+    stream: StandardStream,
+    bytes: *const u8,
+    byte_length: usize,
+) -> WriteOutcome {
+    write(stream, bytes, byte_length)
+}
+
+#[cfg(unix)]
+pub(crate) unsafe fn read_bytes(
+    stream: StandardStream,
+    destination: *mut u8,
+    capacity: usize,
+) -> Result<usize, ()> {
+    read(stream, destination, capacity)
+}
+
 /// Raw writes are currently unbuffered, so flushing is intentionally a successful no-op.
 pub(crate) unsafe fn flush(stream: StandardStream) -> bool {
     stream != StandardStream::Stdin
@@ -182,6 +200,21 @@ pub(crate) unsafe fn write(
     if is_interactive(stream) {
         return write_console_utf8(handle, bytes, byte_length);
     }
+    write_file_bytes(handle, bytes, byte_length)
+}
+
+#[cfg(windows)]
+pub(crate) unsafe fn write_bytes(
+    stream: StandardStream,
+    bytes: *const u8,
+    byte_length: usize,
+) -> WriteOutcome {
+    if stream == StandardStream::Stdin {
+        return WriteOutcome::OtherFailure;
+    }
+    let Some(handle) = valid_handle(stream) else {
+        return WriteOutcome::OtherFailure;
+    };
     write_file_bytes(handle, bytes, byte_length)
 }
 
@@ -350,6 +383,36 @@ pub(crate) unsafe fn read(
 }
 
 #[cfg(windows)]
+pub(crate) unsafe fn read_bytes(
+    stream: StandardStream,
+    destination: *mut u8,
+    capacity: usize,
+) -> Result<usize, ()> {
+    if stream != StandardStream::Stdin {
+        return Err(());
+    }
+    let Some(handle) = valid_handle(stream) else {
+        return Err(());
+    };
+    let request = core::cmp::min(capacity, u32::MAX as usize) as u32;
+    let mut read = 0_u32;
+    if ReadFile(
+        handle,
+        destination.cast::<c_void>(),
+        request,
+        &mut read,
+        ptr::null_mut(),
+    ) == 0
+    {
+        if is_pipe_eof(GetLastError()) {
+            return Ok(0);
+        }
+        return Err(());
+    }
+    Ok(read as usize)
+}
+
+#[cfg(windows)]
 unsafe fn utf16_to_utf8(units: &[u16], destination: *mut u8, capacity: usize) -> Option<usize> {
     let mut written = 0_usize;
     for decoded in core::char::decode_utf16(units.iter().copied()) {
@@ -381,6 +444,24 @@ pub(crate) unsafe fn write(
     _byte_length: usize,
 ) -> WriteOutcome {
     WriteOutcome::OtherFailure
+}
+
+#[cfg(not(any(unix, windows)))]
+pub(crate) unsafe fn write_bytes(
+    stream: StandardStream,
+    bytes: *const u8,
+    byte_length: usize,
+) -> WriteOutcome {
+    write(stream, bytes, byte_length)
+}
+
+#[cfg(not(any(unix, windows)))]
+pub(crate) unsafe fn read_bytes(
+    stream: StandardStream,
+    destination: *mut u8,
+    capacity: usize,
+) -> Result<usize, ()> {
+    read(stream, destination, capacity)
 }
 
 #[cfg(not(any(unix, windows)))]

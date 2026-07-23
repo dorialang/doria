@@ -14,6 +14,12 @@ use crate::symbols::{
 };
 use crate::types::{ResolvedType, TypeId, TypeKind, TypeRef, TypeRegistry};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DictionaryProjection {
+    Keys,
+    Values,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SemanticInfo {
     /// Canonical integer type for every integer-valued source expression.
@@ -774,6 +780,13 @@ impl<'program> Checker<'program> {
                 "`Displayable` is a compiler-known interface and cannot be redeclared"
                     .to_string(),
             ),
+            "Bytes" => Some(
+                "`Bytes` is the compiler-known byte-buffer type and cannot be redeclared"
+                    .to_string(),
+            ),
+            "List" | "Dictionary" | "Set" => Some(format!(
+                "`{name}` is a compiler-known collection alias and cannot be redeclared"
+            )),
             "array" => Some(
                 "`array` is not a Doria class name; use typed arrays like `T[]` or collection aliases"
                     .to_string(),
@@ -1633,6 +1646,21 @@ impl<'program> Checker<'program> {
             return (unknown, self.types.intern(TypeKind::Integer(integer)));
         }
 
+        if let Some((dictionary, projection)) =
+            Self::dictionary_foreach_projection(&foreach.iterable)
+        {
+            let dictionary_ty = self.infer_expr_type(dictionary, scopes, method_context);
+            if let TypeKind::Dictionary(key, value) = self.types.kind(dictionary_ty).clone() {
+                return (
+                    unknown,
+                    match projection {
+                        DictionaryProjection::Keys => key,
+                        DictionaryProjection::Values => value,
+                    },
+                );
+            }
+        }
+
         let iterable_ty = self.infer_expr_type(&foreach.iterable, scopes, method_context);
         match self.types.kind(iterable_ty).clone() {
             TypeKind::List(value) | TypeKind::Set(value) => (
@@ -1646,6 +1674,23 @@ impl<'program> Checker<'program> {
             TypeKind::Dictionary(key, value) => (key, value),
             TypeKind::Mixed => (unknown, self.types.intern(TypeKind::Mixed)),
             _ => (unknown, unknown),
+        }
+    }
+
+    fn dictionary_foreach_projection(expr: &Expr) -> Option<(&Expr, DictionaryProjection)> {
+        match expr {
+            Expr::Grouped { expr, .. } => Self::dictionary_foreach_projection(expr),
+            Expr::PropertyAccess {
+                object,
+                property,
+                null_safe: false,
+                ..
+            } => match property.as_str() {
+                "keys" => Some((object, DictionaryProjection::Keys)),
+                "values" => Some((object, DictionaryProjection::Values)),
+                _ => None,
+            },
+            _ => None,
         }
     }
 
@@ -2431,6 +2476,12 @@ impl<'program> Checker<'program> {
             }
             Stmt::Foreach(foreach) => {
                 let range_iterable = Self::is_grouped_range_expr(&foreach.iterable);
+                let dictionary_projection = Self::dictionary_foreach_projection(&foreach.iterable)
+                    .and_then(|(dictionary, projection)| {
+                        let ty = self.infer_expr_type(dictionary, scopes, method_context);
+                        matches!(self.types.kind(ty), TypeKind::Dictionary(_, _))
+                            .then_some((dictionary, projection))
+                    });
                 if range_iterable {
                     if let Some(integer) = foreach
                         .value
@@ -2460,6 +2511,21 @@ impl<'program> Checker<'program> {
                         method_context,
                         true,
                     );
+                } else if let Some((dictionary, _)) = dictionary_projection {
+                    self.check_expr(dictionary, scopes, method_context);
+                    self.check_mixed_operation(
+                        dictionary,
+                        "foreach iterable",
+                        scopes,
+                        method_context,
+                    );
+                    self.check_nullable_member_access(
+                        dictionary,
+                        false,
+                        "foreach iterable",
+                        scopes,
+                        method_context,
+                    );
                 } else {
                     self.check_expr(&foreach.iterable, scopes, method_context);
                     self.check_mixed_operation(
@@ -2472,7 +2538,21 @@ impl<'program> Checker<'program> {
                 let mut loop_scopes = scopes.clone();
                 loop_scopes.push();
                 if let Some(key) = &foreach.key {
-                    let ty = if range_iterable {
+                    if key.writable {
+                        self.diagnostics.push(Diagnostic::new(
+                            "E0520",
+                            "foreach key bindings are readonly",
+                            foreach.span,
+                        ));
+                    }
+                    let ty = if dictionary_projection.is_some() {
+                        self.diagnostics.push(Diagnostic::new(
+                            "E0522",
+                            "dictionary `keys` and `values` projections yield one readonly element and do not support a key binding",
+                            foreach.span,
+                        ));
+                        self.types.unknown()
+                    } else if range_iterable {
                         self.diagnostics.push(Diagnostic::new(
                             "E0425",
                             "foreach over integer ranges does not support key bindings",
@@ -2520,11 +2600,27 @@ impl<'program> Checker<'program> {
                         annotated_ty
                     })
                 };
+                if dictionary_projection.is_some() && foreach.value.writable {
+                    self.diagnostics.push(Diagnostic::new(
+                        "E0522",
+                        "dictionary `keys` and `values` projections are readonly; use the main dictionary `foreach` form for writable values",
+                        foreach.span,
+                    ));
+                }
+                if range_iterable && foreach.value.writable {
+                    self.diagnostics.push(Diagnostic::new(
+                        "E0425",
+                        "foreach over integer ranges produces readonly value bindings",
+                        foreach.span,
+                    ));
+                }
                 self.declare_binding(
                     &mut loop_scopes,
                     foreach.value.name.clone(),
                     Binding {
-                        writable: false,
+                        writable: foreach.value.writable
+                            && dictionary_projection.is_none()
+                            && !range_iterable,
                         ty: value_ty,
                         declared_ty: value_ty,
                         int_constant: None,
@@ -3057,6 +3153,15 @@ impl<'program> Checker<'program> {
                     self.check_expr(&element.value, scopes, method_context);
                 }
             }
+            Expr::Index {
+                collection,
+                index,
+                span,
+            } => {
+                self.check_expr(collection, scopes, method_context);
+                self.check_expr(index, scopes, method_context);
+                self.check_collection_index(collection, index, *span, scopes, method_context);
+            }
             Expr::PropertyAccess {
                 object,
                 property,
@@ -3072,7 +3177,14 @@ impl<'program> Checker<'program> {
                     scopes,
                     method_context,
                 );
-                self.lookup_property(object, property, *span, scopes, method_context);
+                if self
+                    .collection_property_type(object, property, scopes, method_context)
+                    .is_some()
+                {
+                    self.check_collection_property(object, property, *span, scopes, method_context);
+                } else {
+                    self.lookup_property(object, property, *span, scopes, method_context);
+                }
             }
             Expr::MethodCall {
                 object,
@@ -3093,7 +3205,16 @@ impl<'program> Checker<'program> {
                     scopes,
                     method_context,
                 );
-                self.check_method_call(object, method, args, *span, scopes, method_context);
+                if !self.check_collection_method_call(
+                    object,
+                    method,
+                    args,
+                    *span,
+                    scopes,
+                    method_context,
+                ) {
+                    self.check_method_call(object, method, args, *span, scopes, method_context);
+                }
             }
             Expr::IsType { expr, ty, span } => {
                 self.check_expr(expr, scopes, method_context);
@@ -3766,6 +3887,21 @@ impl<'program> Checker<'program> {
     ) {
         let (left_ty, right_ty) =
             self.infer_contextual_binary_operand_types(left, right, scopes, method_context);
+        let left_collection = self.is_runtime_collection_type(left_ty);
+        let right_collection = self.is_runtime_collection_type(right_ty);
+        if left_collection || right_collection {
+            if matches!(self.types.kind(left_ty), TypeKind::Bytes)
+                && matches!(self.types.kind(right_ty), TypeKind::Bytes)
+            {
+                return;
+            }
+            self.diagnostics.push(Diagnostic::unsupported_stage(
+                "E0525",
+                "collection equality is not supported in Stage 23; only `Bytes` values have value equality",
+                span,
+            ));
+            return;
+        }
         if self.is_supported_nullable_equality(left, left_ty, right, right_ty)
             || self.is_equality_compatible(left_ty, right_ty)
         {
@@ -3906,6 +4042,18 @@ impl<'program> Checker<'program> {
         self.is_assignable(left, right) || self.is_assignable(right, left)
     }
 
+    fn is_runtime_collection_type(&self, ty: TypeId) -> bool {
+        matches!(
+            self.types.kind(ty),
+            TypeKind::Bytes
+                | TypeKind::TypedArray(_)
+                | TypeKind::List(_)
+                | TypeKind::Dictionary(_, _)
+                | TypeKind::Set(_)
+                | TypeKind::EmptyCollection
+        )
+    }
+
     fn is_supported_nullable_equality(
         &self,
         left: &Expr,
@@ -4027,6 +4175,7 @@ impl<'program> Checker<'program> {
         match self.types.kind(ty) {
             TypeKind::Nullable(inner) => self.type_is_move_type(*inner),
             TypeKind::Class(_)
+            | TypeKind::Bytes
             | TypeKind::Mixed
             | TypeKind::TypedArray(_)
             | TypeKind::List(_)
@@ -4353,6 +4502,27 @@ impl<'program> Checker<'program> {
                     None
                 }
             }
+            Expr::Index {
+                collection,
+                index,
+                span,
+            } => {
+                self.check_expr(collection, scopes, method_context);
+                self.check_expr(index, scopes, method_context);
+                self.check_collection_index(collection, index, *span, scopes, method_context);
+                let (_, value) = self.collection_index_types(collection, scopes, method_context)?;
+                if !self.is_writable_object_path(collection, scopes, method_context) {
+                    self.diagnostics.push(Diagnostic::new(
+                        "E0201",
+                        "cannot write through a readonly collection value",
+                        collection.span(),
+                    ));
+                }
+                Some(AssignmentTarget {
+                    ty: value,
+                    destination: AssignmentDestination::Type,
+                })
+            }
             Expr::StaticMember {
                 qualifier,
                 qualifier_span,
@@ -4516,9 +4686,16 @@ impl<'program> Checker<'program> {
         method_context: Option<&MethodContext>,
     ) {
         let expected = match builtin {
-            Builtin::ReadLine => Some(0),
-            Builtin::ReadFile | Builtin::WriteStderr => Some(1),
-            Builtin::WriteFile => Some(2),
+            Builtin::ReadLine | Builtin::ReadStdinBytes => Some(0),
+            Builtin::ReadFile
+            | Builtin::ReadFileBytes
+            | Builtin::WriteStderr
+            | Builtin::WriteStdoutBytes
+            | Builtin::WriteStderrBytes => Some(1),
+            Builtin::WriteFile
+            | Builtin::AppendFile
+            | Builtin::WriteFileBytes
+            | Builtin::AppendFileBytes => Some(2),
             Builtin::Sprintf | Builtin::Printf => None,
             Builtin::Panic => return self.check_panic_call(args, span, scopes, method_context),
         };
@@ -4548,9 +4725,19 @@ impl<'program> Checker<'program> {
             Builtin::ReadFile | Builtin::WriteStderr => {
                 self.require_builtin_string_arg(builtin, &args[0], scopes, method_context)
             }
-            Builtin::WriteFile => {
+            Builtin::WriteFile | Builtin::AppendFile => {
                 self.require_builtin_string_arg(builtin, &args[0], scopes, method_context);
                 self.require_builtin_string_arg(builtin, &args[1], scopes, method_context);
+            }
+            Builtin::ReadFileBytes => {
+                self.require_builtin_string_arg(builtin, &args[0], scopes, method_context);
+            }
+            Builtin::WriteFileBytes | Builtin::AppendFileBytes => {
+                self.require_builtin_string_arg(builtin, &args[0], scopes, method_context);
+                self.require_builtin_bytes_arg(builtin, &args[1], scopes, method_context);
+            }
+            Builtin::WriteStdoutBytes | Builtin::WriteStderrBytes => {
+                self.require_builtin_bytes_arg(builtin, &args[0], scopes, method_context);
             }
             Builtin::Sprintf | Builtin::Printf => {
                 let Some(Expr::String { value, span }) = args.first() else {
@@ -4628,7 +4815,28 @@ impl<'program> Checker<'program> {
                     }
                 }
             }
-            Builtin::ReadLine | Builtin::Panic => {}
+            Builtin::ReadLine | Builtin::ReadStdinBytes | Builtin::Panic => {}
+        }
+    }
+
+    fn require_builtin_bytes_arg(
+        &mut self,
+        builtin: Builtin,
+        argument: &Expr,
+        scopes: &ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) {
+        let ty = self.infer_expr_type(argument, scopes, method_context);
+        if !matches!(self.types.kind(ty), TypeKind::Bytes | TypeKind::Unknown) {
+            self.diagnostics.push(Diagnostic::new(
+                "E0453",
+                format!(
+                    "{} expects `Bytes`, got `{}`",
+                    builtin.name(),
+                    self.types.display(ty)
+                ),
+                argument.span(),
+            ));
         }
     }
 
@@ -4803,6 +5011,77 @@ impl<'program> Checker<'program> {
                 access.span,
                 scopes,
                 method_context,
+            );
+            return;
+        }
+        if class_name == "Set" {
+            if access.member != "from" {
+                self.diagnostics.push(Diagnostic::unsupported_stage(
+                    "E0521",
+                    format!(
+                        "collection method `Set::{}` is not part of the Stage 23 surface settled by Decision 0100",
+                        access.member
+                    ),
+                    access.span,
+                ));
+                return;
+            }
+            if args.len() != 1 {
+                self.report_argument_count_mismatch("Set::from", 1, 1, args.len(), access.span);
+                return;
+            }
+            let source = self.infer_expr_type(&args[0], scopes, method_context);
+            match self.types.kind(source).clone() {
+                TypeKind::TypedArray(element) | TypeKind::List(element) => {
+                    self.check_stage23_hashable_type(element, args[0].span(), "Set element");
+                }
+                TypeKind::EmptyCollection => {
+                    // The destination Set<T> supplies the element type. Lowering
+                    // materializes the empty source directly as that Set<T>.
+                }
+                _ => {
+                    self.diagnostics.push(Diagnostic::new(
+                        "E0403",
+                        format!(
+                            "`Set::from` requires a sequence collection, got `{}`",
+                            self.types.display(source)
+                        ),
+                        args[0].span(),
+                    ));
+                }
+            }
+            return;
+        }
+        if class_name == "Bytes" {
+            if access.member != "fromArray" {
+                self.diagnostics.push(Diagnostic::unsupported_stage(
+                    "E0524",
+                    format!(
+                        "Bytes method `Bytes::{}` is deferred to the future Bytes method-surface record",
+                        access.member
+                    ),
+                    access.span,
+                ));
+                return;
+            }
+            if args.len() != 1 {
+                self.report_argument_count_mismatch(
+                    "Bytes::fromArray",
+                    1,
+                    1,
+                    args.len(),
+                    access.span,
+                );
+                return;
+            }
+            let uint8 = self.types.intern(TypeKind::Integer(IntegerType::UInt8));
+            let expected = self.types.intern(TypeKind::TypedArray(uint8));
+            self.check_expr_assignable(
+                expected,
+                &args[0],
+                scopes,
+                method_context,
+                AssignmentDestination::Type,
             );
             return;
         }
@@ -5359,6 +5638,9 @@ impl<'program> Checker<'program> {
                     .map(|property| property.writable)
                     .unwrap_or(false)
             }
+            Expr::Index { collection, .. } => {
+                self.is_writable_object_path(collection, scopes, method_context)
+            }
             Expr::FunctionCall { name, args, .. } => {
                 self.functions.get(name).cloned().is_some_and(|function| {
                     self.call_result_is_writable(
@@ -5627,7 +5909,8 @@ impl<'program> Checker<'program> {
                 | TypeKind::String
                 | TypeKind::Bool
                 | TypeKind::Class(_) => self.types.intern(TypeKind::Nullable(inner)),
-                TypeKind::TypedArray(_)
+                TypeKind::Bytes
+                | TypeKind::TypedArray(_)
                 | TypeKind::List(_)
                 | TypeKind::Dictionary(_, _)
                 | TypeKind::Set(_) => self.reject_type_ref_with_help(
@@ -5677,6 +5960,7 @@ impl<'program> Checker<'program> {
                 self.reject_type_ref(ty, span, "E0430", "`void` is only valid as a return type")
             }
             "string" => self.resolve_zero_arg_type(ty, span, TypeKind::String),
+            "Bytes" => self.resolve_zero_arg_type(ty, span, TypeKind::Bytes),
             "bool" => self.resolve_zero_arg_type(ty, span, TypeKind::Bool),
             "null" => self.reject_type_ref_with_help(
                 ty,
@@ -5765,6 +6049,7 @@ impl<'program> Checker<'program> {
                 let key = self.resolve_type_ref_in_position(&ty.args[0], span, TypePosition::Value, declaring_class);
                 let value =
                     self.resolve_type_ref_in_position(&ty.args[1], span, TypePosition::Value, declaring_class);
+                self.check_stage23_hashable_type(key, span, "Dictionary key");
                 self.types.intern(TypeKind::Dictionary(key, value))
             }
             "Set" => {
@@ -5776,6 +6061,7 @@ impl<'program> Checker<'program> {
                 }
                 let element =
                     self.resolve_type_ref_in_position(&ty.args[0], span, TypePosition::Value, declaring_class);
+                self.check_stage23_hashable_type(element, span, "Set element");
                 self.types.intern(TypeKind::Set(element))
             }
             name if self.classes.contains_key(name) => {
@@ -5797,6 +6083,33 @@ impl<'program> Checker<'program> {
                 ));
                 self.types.unknown()
             }
+        }
+    }
+
+    fn check_stage23_hashable_type(&mut self, ty: TypeId, span: Span, role: &str) {
+        let diagnostic = match self.types.kind(ty) {
+            TypeKind::Integer(_) | TypeKind::String | TypeKind::Bool | TypeKind::Unknown => return,
+            TypeKind::Class(name) => Diagnostic::unsupported_stage(
+                "E0523",
+                format!(
+                    "{role} type `{name}` requires Stage 35 user-defined `Hashable` conformance"
+                ),
+                span,
+            ),
+            _ => Diagnostic::new(
+                "E0523",
+                format!(
+                    "{role} type `{}` does not conform to `Hashable`",
+                    self.types.display(ty)
+                ),
+                span,
+            )
+            .with_help("use an integer, string, or bool key/element; float is not Hashable"),
+        };
+        if !self.diagnostics.iter().any(|existing| {
+            existing.code == diagnostic.code && existing.message == diagnostic.message
+        }) {
+            self.diagnostics.push(diagnostic);
         }
     }
 
@@ -6037,17 +6350,14 @@ impl<'program> Checker<'program> {
                     return true;
                 }
 
-                if !elements.iter().any(|element| element.key.is_some()) {
+                if elements.iter().any(|element| element.key.is_none()) {
                     return false;
                 }
 
                 elements.iter().all(|array_element| {
-                    let key_ok = if let Some(key_expr) = &array_element.key {
+                    let key_ok = array_element.key.as_ref().is_some_and(|key_expr| {
                         self.is_expr_assignable(key, key_expr, scopes, method_context)
-                    } else {
-                        let implicit_key = self.types.intern(TypeKind::Integer(IntegerType::Int64));
-                        self.is_assignable(key, implicit_key)
-                    };
+                    });
                     let value_ok = self.is_expr_assignable(
                         value,
                         &array_element.value,
@@ -6174,6 +6484,10 @@ impl<'program> Checker<'program> {
                 }
             }
             Expr::Array { elements, .. } => self.infer_array_type(elements, scopes, method_context),
+            Expr::Index { collection, .. } => self
+                .collection_index_types(collection, scopes, method_context)
+                .map(|(_, value)| value)
+                .unwrap_or_else(|| self.types.unknown()),
             Expr::Variable { name, span } => {
                 let Some(binding) = scopes.lookup(name) else {
                     return self.types.unknown();
@@ -6226,6 +6540,11 @@ impl<'program> Checker<'program> {
                 null_safe,
                 ..
             } => {
+                if let Some(result) =
+                    self.collection_property_type(object, property, scopes, method_context)
+                {
+                    return result;
+                }
                 let Some(class_name) = self.expr_class_name(object, scopes, method_context) else {
                     return self.types.unknown();
                 };
@@ -6253,6 +6572,11 @@ impl<'program> Checker<'program> {
                 null_safe,
                 ..
             } => {
+                if let Some(result) =
+                    self.collection_method_return_type(object, method, scopes, method_context)
+                {
+                    return result;
+                }
                 let Some(class_name) = self.expr_class_name(object, scopes, method_context) else {
                     return self.types.unknown();
                 };
@@ -6283,9 +6607,17 @@ impl<'program> Checker<'program> {
                             self.types.intern(TypeKind::Nullable(string))
                         }
                         Builtin::Sprintf | Builtin::ReadFile => self.types.intern(TypeKind::String),
+                        Builtin::ReadFileBytes | Builtin::ReadStdinBytes => {
+                            self.types.intern(TypeKind::Bytes)
+                        }
                         Builtin::Printf
                         | Builtin::WriteFile
+                        | Builtin::AppendFile
                         | Builtin::WriteStderr
+                        | Builtin::WriteFileBytes
+                        | Builtin::AppendFileBytes
+                        | Builtin::WriteStdoutBytes
+                        | Builtin::WriteStderrBytes
                         | Builtin::Panic => self.types.intern(TypeKind::Void),
                     }
                 } else {
@@ -6296,7 +6628,10 @@ impl<'program> Checker<'program> {
                 }
             }
             Expr::StaticCall {
-                qualifier, method, ..
+                qualifier,
+                method,
+                args,
+                ..
             } => {
                 let Some(class_name) = Self::static_qualifier_class_name(qualifier, method_context)
                 else {
@@ -6309,9 +6644,25 @@ impl<'program> Checker<'program> {
                     return self.types.intern(TypeKind::Integer(IntegerType::Int64));
                 }
                 if method == "from" {
+                    if class_name == "Set" {
+                        let element = match args
+                            .first()
+                            .map(|arg| self.infer_expr_type(arg, scopes, method_context))
+                        {
+                            Some(source) => match self.types.kind(source) {
+                                TypeKind::TypedArray(element) | TypeKind::List(element) => *element,
+                                _ => self.types.unknown(),
+                            },
+                            None => self.types.unknown(),
+                        };
+                        return self.types.intern(TypeKind::Set(element));
+                    }
                     if let Some(integer) = IntegerType::from_companion_name(&class_name) {
                         return self.types.intern(TypeKind::Integer(integer));
                     }
+                }
+                if class_name == "Bytes" && method == "fromArray" {
+                    return self.types.intern(TypeKind::Bytes);
                 }
                 self.classes
                     .get(&class_name)
@@ -6356,6 +6707,331 @@ impl<'program> Checker<'program> {
                 left, op, right, ..
             } => self.infer_binary_type(left, op, right, scopes, method_context),
             Expr::Range { .. } => self.types.unknown(),
+        }
+    }
+
+    fn collection_index_types(
+        &mut self,
+        collection: &Expr,
+        scopes: &ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) -> Option<(TypeId, TypeId)> {
+        let collection_ty = self.infer_expr_type(collection, scopes, method_context);
+        let int = self.types.intern(TypeKind::Integer(IntegerType::Int64));
+        match self.types.kind(collection_ty).clone() {
+            TypeKind::TypedArray(value) | TypeKind::List(value) => Some((int, value)),
+            TypeKind::Bytes => {
+                let byte = self.types.intern(TypeKind::Integer(IntegerType::UInt8));
+                Some((int, byte))
+            }
+            TypeKind::Dictionary(key, value) => Some((key, value)),
+            TypeKind::Set(_) => None,
+            _ => None,
+        }
+    }
+
+    fn check_collection_index(
+        &mut self,
+        collection: &Expr,
+        index: &Expr,
+        span: Span,
+        scopes: &ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) {
+        let collection_ty = self.infer_expr_type(collection, scopes, method_context);
+        if matches!(self.types.kind(collection_ty), TypeKind::Set(_)) {
+            self.diagnostics.push(Diagnostic::new(
+                "E0520",
+                "`Set<T>` does not support indexed access; use `contains` or `foreach`",
+                span,
+            ));
+            return;
+        }
+        let Some((key, _)) = self.collection_index_types(collection, scopes, method_context) else {
+            if !matches!(self.types.kind(collection_ty), TypeKind::Unknown) {
+                self.diagnostics.push(Diagnostic::new(
+                    "E0520",
+                    format!(
+                        "value of type `{}` is not indexable",
+                        self.types.display(collection_ty)
+                    ),
+                    span,
+                ));
+            }
+            return;
+        };
+        self.check_expr_assignable(
+            key,
+            index,
+            scopes,
+            method_context,
+            AssignmentDestination::Type,
+        );
+    }
+
+    fn collection_property_type(
+        &mut self,
+        object: &Expr,
+        property: &str,
+        scopes: &ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) -> Option<TypeId> {
+        let ty = self.infer_expr_type(object, scopes, method_context);
+        let int = self.types.intern(TypeKind::Integer(IntegerType::Int64));
+        let bool_ty = self.types.intern(TypeKind::Bool);
+        match (self.types.kind(ty), property) {
+            (TypeKind::TypedArray(_), "length") => Some(int),
+            (TypeKind::Bytes, "length") => Some(int),
+            (TypeKind::List(_) | TypeKind::Dictionary(_, _) | TypeKind::Set(_), "count") => {
+                Some(int)
+            }
+            (TypeKind::List(_) | TypeKind::Dictionary(_, _) | TypeKind::Set(_), "isEmpty") => {
+                Some(bool_ty)
+            }
+            (TypeKind::List(value), "first" | "last") => {
+                Some(self.types.intern(TypeKind::Nullable(*value)))
+            }
+            (TypeKind::Dictionary(_, _), "keys" | "values") => Some(self.types.unknown()),
+            (
+                TypeKind::Bytes
+                | TypeKind::TypedArray(_)
+                | TypeKind::List(_)
+                | TypeKind::Dictionary(_, _)
+                | TypeKind::Set(_),
+                _,
+            ) => Some(self.types.unknown()),
+            _ => None,
+        }
+    }
+
+    fn collection_method_return_type(
+        &mut self,
+        object: &Expr,
+        method: &str,
+        scopes: &ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) -> Option<TypeId> {
+        let ty = self.infer_expr_type(object, scopes, method_context);
+        let void = self.types.intern(TypeKind::Void);
+        let bool_ty = self.types.intern(TypeKind::Bool);
+        match (self.types.kind(ty).clone(), method) {
+            (TypeKind::List(_), "add" | "insertAt") | (TypeKind::Dictionary(_, _), "set") => {
+                Some(void)
+            }
+            (TypeKind::List(value), "removeAt") => Some(value),
+            (TypeKind::List(value), "pop") => Some(self.types.intern(TypeKind::Nullable(value))),
+            (TypeKind::List(_), "contains") => Some(bool_ty),
+            (TypeKind::Dictionary(_, value), "get") => {
+                Some(self.types.intern(TypeKind::Nullable(value)))
+            }
+            (TypeKind::Dictionary(_, value), "remove") => {
+                Some(self.types.intern(TypeKind::Nullable(value)))
+            }
+            (TypeKind::Dictionary(_, _), "has")
+            | (TypeKind::Set(_), "add" | "remove" | "contains") => Some(bool_ty),
+            (TypeKind::Set(value), "union" | "intersect" | "difference") => {
+                Some(self.types.intern(TypeKind::Set(value)))
+            }
+            (TypeKind::Bytes, "toArray") => {
+                let byte = self.types.intern(TypeKind::Integer(IntegerType::UInt8));
+                Some(self.types.intern(TypeKind::TypedArray(byte)))
+            }
+            (
+                TypeKind::Bytes
+                | TypeKind::TypedArray(_)
+                | TypeKind::List(_)
+                | TypeKind::Dictionary(_, _)
+                | TypeKind::Set(_),
+                _,
+            ) => Some(self.types.unknown()),
+            _ => None,
+        }
+    }
+
+    fn check_collection_property(
+        &mut self,
+        object: &Expr,
+        property: &str,
+        span: Span,
+        scopes: &ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) {
+        let ty = self.infer_expr_type(object, scopes, method_context);
+        let supported = matches!(
+            (self.types.kind(ty), property),
+            (TypeKind::TypedArray(_), "length")
+                | (TypeKind::Bytes, "length")
+                | (
+                    TypeKind::List(_) | TypeKind::Dictionary(_, _) | TypeKind::Set(_),
+                    "count"
+                )
+                | (
+                    TypeKind::List(_) | TypeKind::Dictionary(_, _) | TypeKind::Set(_),
+                    "isEmpty"
+                )
+                | (TypeKind::List(_), "first" | "last")
+        );
+        if matches!(
+            (self.types.kind(ty), property),
+            (TypeKind::Dictionary(_, _), "keys" | "values")
+        ) {
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "E0522",
+                    format!(
+                        "Dictionary::{property} is a foreach-only projection and cannot be stored or used as a value"
+                    ),
+                    span,
+                )
+                .with_help(format!(
+                    "iterate it with `foreach ($dictionary->{property} as $value)` or build an owned copy explicitly"
+                )),
+            );
+            return;
+        }
+        if !supported {
+            self.diagnostics.push(Diagnostic::unsupported_stage(
+                "E0521",
+                format!(
+                    "collection property `{property}` is not part of the Stage 23 surface settled by Decision 0100"
+                ),
+                span,
+            ));
+        }
+    }
+
+    fn check_collection_method_call(
+        &mut self,
+        object: &Expr,
+        method: &str,
+        args: &[Expr],
+        span: Span,
+        scopes: &ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) -> bool {
+        let ty = self.infer_expr_type(object, scopes, method_context);
+        let kind = self.types.kind(ty).clone();
+        let is_collection = matches!(
+            kind,
+            TypeKind::Bytes
+                | TypeKind::TypedArray(_)
+                | TypeKind::List(_)
+                | TypeKind::Dictionary(_, _)
+                | TypeKind::Set(_)
+        );
+        if !is_collection {
+            return false;
+        }
+
+        let int = self.types.intern(TypeKind::Integer(IntegerType::Int64));
+        if let (TypeKind::List(value), "contains") = (&kind, method) {
+            self.check_stage23_equatable_type(*value, span);
+        }
+        let (expected, mutating): (Vec<TypeId>, bool) = match (kind, method) {
+            (TypeKind::List(value), "add") => (vec![value], true),
+            (TypeKind::List(value), "insertAt") => (vec![int, value], true),
+            (TypeKind::List(_), "removeAt") => (vec![int], true),
+            (TypeKind::List(_), "pop") => (vec![], true),
+            (TypeKind::List(value), "contains") => (vec![value], false),
+            (TypeKind::Dictionary(key, value), "set") => (vec![key, value], true),
+            (TypeKind::Dictionary(key, _), "get" | "has") => (vec![key], false),
+            (TypeKind::Dictionary(key, _), "remove") => (vec![key], true),
+            (TypeKind::Set(value), "add" | "remove") => (vec![value], true),
+            (TypeKind::Set(value), "contains") => (vec![value], false),
+            (TypeKind::Set(value), "union" | "intersect" | "difference") => {
+                let set = self.types.intern(TypeKind::Set(value));
+                (vec![set], false)
+            }
+            (TypeKind::Bytes, "toArray") => (vec![], false),
+            (
+                TypeKind::Bytes
+                | TypeKind::TypedArray(_)
+                | TypeKind::List(_)
+                | TypeKind::Dictionary(_, _)
+                | TypeKind::Set(_),
+                "map" | "filter" | "reduce",
+            ) => {
+                self.diagnostics.push(Diagnostic::unsupported_stage(
+                    "E0521",
+                    format!("collection method `{method}` requires Stage 30 closures"),
+                    span,
+                ));
+                return true;
+            }
+            (TypeKind::Bytes, _) => {
+                self.diagnostics.push(Diagnostic::unsupported_stage(
+                    "E0524",
+                    format!(
+                        "Bytes method `{method}` is deferred to the future Bytes method-surface record"
+                    ),
+                    span,
+                ));
+                return true;
+            }
+            _ => {
+                self.diagnostics.push(Diagnostic::unsupported_stage(
+                    "E0521",
+                    format!(
+                        "collection method `{method}` is not part of the Stage 23 surface settled by Decision 0100"
+                    ),
+                    span,
+                ));
+                return true;
+            }
+        };
+        if args.len() != expected.len() {
+            self.report_argument_count_mismatch(
+                &format!("collection method `{method}`"),
+                expected.len(),
+                expected.len(),
+                args.len(),
+                span,
+            );
+            return true;
+        }
+        for (argument, expected) in args.iter().zip(expected) {
+            self.check_expr_assignable(
+                expected,
+                argument,
+                scopes,
+                method_context,
+                AssignmentDestination::Type,
+            );
+        }
+        if mutating && !self.is_writable_object_path(object, scopes, method_context) {
+            self.diagnostics.push(Diagnostic::new(
+                "E0201",
+                format!(
+                    "cannot call mutating collection method `{method}` through a readonly value"
+                ),
+                object.span(),
+            ));
+        }
+        true
+    }
+
+    fn check_stage23_equatable_type(&mut self, ty: TypeId, span: Span) {
+        match self.types.kind(ty) {
+            TypeKind::Integer(_)
+            | TypeKind::Float(_)
+            | TypeKind::String
+            | TypeKind::Bool
+            | TypeKind::Unknown => {}
+            TypeKind::Class(name) => self.diagnostics.push(Diagnostic::unsupported_stage(
+                "E0524",
+                format!(
+                    "List::contains for `{name}` requires Stage 35 user-defined `Equatable` conformance"
+                ),
+                span,
+            )),
+            _ => self.diagnostics.push(Diagnostic::new(
+                "E0524",
+                format!(
+                    "List::contains cannot compare values of type `{}`",
+                    self.types.display(ty)
+                ),
+                span,
+            )),
         }
     }
 
@@ -6627,18 +7303,15 @@ impl<'program> Checker<'program> {
         }
 
         if elements.iter().any(|element| element.key.is_some()) {
+            if elements.iter().any(|element| element.key.is_none()) {
+                return self.types.intern(TypeKind::Heterogeneous);
+            }
             let explicit_keys = elements
                 .iter()
                 .filter_map(|element| element.key.as_ref())
                 .collect::<Vec<_>>();
-            let mut key_types =
+            let key_types =
                 self.infer_collection_member_types(&explicit_keys, scopes, method_context);
-            key_types.extend(
-                elements
-                    .iter()
-                    .filter(|element| element.key.is_none())
-                    .map(|_| self.types.intern(TypeKind::Integer(IntegerType::Int64))),
-            );
             let values = elements
                 .iter()
                 .map(|element| &element.value)
@@ -6646,6 +7319,13 @@ impl<'program> Checker<'program> {
             let value_types = self.infer_collection_member_types(&values, scopes, method_context);
             let key = self.common_clear_type(key_types);
             let value = self.common_clear_type(value_types);
+            self.check_stage23_hashable_type(
+                key,
+                explicit_keys
+                    .first()
+                    .map_or_else(|| elements[0].value.span(), |key| key.span()),
+                "Dictionary key",
+            );
             self.types.intern(TypeKind::Dictionary(key, value))
         } else {
             let values = elements

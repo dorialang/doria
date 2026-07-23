@@ -1,0 +1,60 @@
+function orderedOutputPath(): string
+{
+    echo "path:";
+    return "copy.bin";
+}
+
+function orderedInputPath(): string
+{
+    echo "contents\n";
+    return "roundtrip.bin";
+}
+
+function falseGuard(): bool
+{
+    echo "and:";
+    return false;
+}
+
+function trueGuard(): bool
+{
+    echo "or:";
+    return true;
+}
+
+function main(): void
+{
+    uint8[] $firstArray = [0, 128, 255];
+    Bytes $first = Bytes::fromArray($firstArray);
+    write_file_bytes("roundtrip.bin", $first);
+
+    Bytes $loaded = read_file_bytes("roundtrip.bin");
+    if ($loaded != $first) {
+        panic("binary file round-trip changed bytes");
+    }
+
+    uint8[] $tailArray = [127];
+    Bytes $tail = Bytes::fromArray($tailArray);
+    append_file_bytes("roundtrip.bin", $tail);
+
+    uint8[] $expectedArray = [0, 128, 255, 127];
+    Bytes $expected = Bytes::fromArray($expectedArray);
+    Bytes $appended = read_file_bytes("roundtrip.bin");
+    if ($appended != $expected) {
+        panic("binary append changed bytes");
+    }
+
+    write_file_bytes(orderedOutputPath(), read_file_bytes(orderedInputPath()));
+    if (falseGuard() && read_file_bytes("missing.bin") == read_stdin_bytes()) {
+        panic("short-circuited and evaluated its right operand");
+    }
+    if (trueGuard() || read_file_bytes("missing.bin") == read_stdin_bytes()) {
+    }
+
+    append_file("text.txt", "first");
+    append_file("text.txt", "+second");
+    write_file("text.txt", "reset");
+    append_file("text.txt", "!");
+
+    echo "byte-files-ok\n";
+}

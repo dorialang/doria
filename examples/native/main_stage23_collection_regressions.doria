@@ -1,0 +1,141 @@
+class Token
+{
+    function __construct(int $id)
+    {
+    }
+
+    function __destruct()
+    {
+        echo "drop {$this->id}\n";
+    }
+}
+
+class Counter
+{
+    function __construct(writable int $value)
+    {
+    }
+
+    writable function increment(): void
+    {
+        $this->value++;
+    }
+}
+
+class Holder
+{
+    function __construct(take List<Token> $tokens)
+    {
+    }
+}
+
+class CollectionOwner
+{
+    writable List<int> $items = [1];
+
+    writable function append(int $value): void
+    {
+        $this->items->add($value);
+    }
+}
+
+class CollectionEvaluationOrder
+{
+    static writable int $step = 0;
+
+    static function reset(): void
+    {
+        CollectionEvaluationOrder::step = 0;
+    }
+
+    static function key(): string
+    {
+        if (CollectionEvaluationOrder::step != 0) {
+            panic("collection value was evaluated before its key");
+        }
+        CollectionEvaluationOrder::step = 1;
+        return "answer";
+    }
+
+    static function value(): int
+    {
+        if (CollectionEvaluationOrder::step != 1) {
+            panic("collection key was not evaluated first");
+        }
+        CollectionEvaluationOrder::step = 2;
+        return 42;
+    }
+
+    static function index(): int
+    {
+        if (CollectionEvaluationOrder::step != 0) {
+            panic("collection value was evaluated before its index");
+        }
+        CollectionEvaluationOrder::step = 1;
+        return 1;
+    }
+}
+
+function main(): void
+{
+    writable List<List<int>> $matrix = [[1]];
+    $matrix[0]->add(2);
+    echo "nested {$matrix[0][1]}\n";
+
+    writable List<Counter> $counters = [new Counter(1)];
+    $counters[0]->increment();
+    foreach ($counters as writable Counter $counter) {
+        $counter->increment();
+    }
+    foreach ($counters as Counter $counter) {
+        echo "counter {$counter->value}\n";
+    }
+
+    writable List<Token> $removed = [new Token(1), new Token(2)];
+    $removed->removeAt(0);
+    $removed->pop();
+
+    writable Dictionary<string, Token> $named = ["three" => new Token(3)];
+    $named->remove("three");
+
+    Dictionary<string, Token> $duplicates = [
+        "same" => new Token(4),
+        "same" => new Token(5),
+    ];
+
+    let $holder = new Holder([new Token(6)]);
+    let writable $collectionOwner = new CollectionOwner();
+    $collectionOwner->append(2);
+    echo "property {$collectionOwner->items->count}:{$collectionOwner->items[1]}\n";
+
+    List<float> $zeros = [0.0];
+    if ($zeros->contains(-0.0)) {
+        echo "signed-zero\n";
+    }
+    float $nan = 0.0 / 0.0;
+    List<float> $nans = [$nan];
+    if (!$nans->contains($nan)) {
+        echo "nan\n";
+    }
+
+    writable Dictionary<string, int> $ordered = [];
+    CollectionEvaluationOrder::reset();
+    $ordered[CollectionEvaluationOrder::key()] = CollectionEvaluationOrder::value();
+    echo "ordered {$ordered["answer"]}\n";
+
+    CollectionEvaluationOrder::reset();
+    Dictionary<string, int> $literalOrder = [
+        CollectionEvaluationOrder::key() => CollectionEvaluationOrder::value(),
+    ];
+    echo "literal {$literalOrder["answer"]}\n";
+
+    CollectionEvaluationOrder::reset();
+    writable List<int> $insertOrder = [1];
+    $insertOrder->insertAt(
+        CollectionEvaluationOrder::index(),
+        CollectionEvaluationOrder::value()
+    );
+    echo "insert {$insertOrder[1]}\n";
+
+    List<Token> $reverseDrop = [new Token(7), new Token(8)];
+}

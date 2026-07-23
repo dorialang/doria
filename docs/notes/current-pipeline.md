@@ -15,6 +15,8 @@ Documentation role: working note. This file prevents duplicated in-flight work. 
 - Stage 20a/20b const-evaluable defaults are complete for Copy scalars and readonly strings across free functions, instance methods, static methods, and constructors through one caller-side MIR splice. Writable Copy scalars remain supported; `?string`, `writable string`, `take string`, and other move/`take` defaults retain explicit temporary diagnostics.
 - Stage 21 non-lexical borrowing, returned-borrow elision, and constructor definite initialization are complete on the current branch. Constructor paths use decision 0090's uninitialized/initialized/maybe-initialized lattice, and shared MIR validation independently enforces the normal-exit and readonly exactly-once invariants.
 - Stage 22 general nullable types, `??`, `?->`, exact `is`, flow-sensitive narrowing, and `mixed` static semantics are complete on the current branch. Narrowing reuses the shared CFG/forward-dataflow framework; local and parameter guards preserve dominating nullable-presence proofs in MIR, and nullable scalar, string, and concrete-class values execute through the interpreter, Cranelift, and LLVM.
+- Stage 23 Slice 1 runtime collections and typed arrays are complete on the current branch. `T[]`, `List<T>`, `Dictionary<K, V>`, and `Set<T>` are owned move types backed by shared collection MIR and `doria-rt`; contextual literals, fixed-length typed arrays, indexing and indexed read-modify-write, insertion-ordered `foreach`, move-in/removal ownership, and Decision 0100's default member surface run through the interpreter, Cranelift, and LLVM. Dictionary `keys`/`values` are readonly, insertion-ordered, `foreach`-only projections and are not storable values.
+- Stage 23 Slice 2 is complete on the current branch. The owned `Bytes` move type provides explicit copying conversion to and from `uint8[]`, length, byte indexing and indexed read-modify-write, and byte-wise equality. `read_file_bytes`/`write_file_bytes`/`append_file_bytes`, `read_stdin_bytes`/`write_stdout_bytes`/`write_stderr_bytes`, and text `append_file` use shared validated MIR and `doria-rt`, with exact non-UTF-8 bytes and interpreter/Cranelift/LLVM parity.
 - `Shared<T>`/`Weak<T>`/`SharedMut<T>` are rescheduled to Stage 25a, after nullable/narrowing and generic classes provide the machinery their separately unauthored API depends on.
 - The parser accepts generalized `parent::member()` and trait-local `self::member` under the two-clocks rule; semantic checking names Stage 34 and Stage 35 respectively and stops those forms before MIR. `Foo::$prop` and `static::` are permanent errors with precise fixes.
 - Native remains one target: direct compile/run uses the Cranelift fast profile, while `--release` selects LLVM 18 over the same validated typed MIR.
@@ -25,7 +27,7 @@ Documentation role: working note. This file prevents duplicated in-flight work. 
 
 ## Next
 
-- Stage 23 runtime collections, typed arrays, `Bytes`, and the boxed `mixed` runtime representation.
+- Stage 23 Slice 3: the boxed `dr_mixed` runtime representation and runtime mixed collection elements.
 
 ## Do not duplicate
 
@@ -37,5 +39,6 @@ Documentation role: working note. This file prevents duplicated in-flight work. 
 - General interface declarations and conformance until Stage 35.
 - Runtime-initialized and owned statics until separately accepted lifetime/concurrency decisions.
 - Parent lookup/dispatch until Stage 34 and trait composition until Stage 35; their accepted grammar is already represented.
-- `Bytes` until Stage 23.
+- Growable/slice/search `Bytes` members until a future method-surface decision.
+- Runtime boxed `mixed` values until Stage 23 Slice 3.
 - `match` narrowing until Stage 28, hierarchy `is` until Stage 34, and interface `is` until Stage 35.

@@ -1,0 +1,10 @@
+function main(): void
+{
+    ?string $line = read_line();
+    if ($line != null) {
+        echo "{$line}\n";
+    }
+
+    Bytes $remaining = read_stdin_bytes();
+    write_stdout_bytes($remaining);
+}
