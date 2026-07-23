@@ -1,0 +1,30 @@
+function main(): void
+{
+    writable List<mixed> $items = [];
+    $items->add(1);
+    $items->add("two");
+    $items->add(false);
+
+    foreach ($items as mixed $item) {
+        if ($item is int) {
+            echo "list-int={$item}\n";
+        } else if ($item is string) {
+            echo "list-string=" . $item . "\n";
+        } else if ($item is bool) {
+            echo "list-bool=false\n";
+        }
+    }
+
+    Dictionary<string, mixed> $values = [
+        "answer" => 42,
+        "name" => "doria",
+    ];
+
+    foreach ($values as string $key => mixed $value) {
+        if ($value is int) {
+            echo $key . "={$value}\n";
+        } else if ($value is string) {
+            echo $key . "=" . $value . "\n";
+        }
+    }
+}

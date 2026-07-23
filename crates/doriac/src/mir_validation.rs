@@ -252,12 +252,14 @@ fn field_type(ty: mir::Type) -> FieldType {
         mir::Type::Scalar(mir::ScalarType::Float(float)) => FieldType::Float(float),
         mir::Type::Scalar(mir::ScalarType::Bool) => FieldType::Bool,
         mir::Type::String => FieldType::String,
+        mir::Type::Mixed => FieldType::Mixed,
         mir::Type::NullableScalar(mir::ScalarType::Integer(integer)) => {
             FieldType::NullableInteger(integer)
         }
         mir::Type::NullableScalar(mir::ScalarType::Float(float)) => FieldType::NullableFloat(float),
         mir::Type::NullableScalar(mir::ScalarType::Bool) => FieldType::NullableBool,
         mir::Type::NullableString => FieldType::NullableString,
+        mir::Type::NullableMixed => FieldType::NullableMixed,
         mir::Type::Class(class) => FieldType::Class(class),
         mir::Type::NullableClass(class) => FieldType::NullableClass(class),
         mir::Type::Collection(_) => FieldType::Collection,
@@ -298,6 +300,7 @@ fn validate_function(program: &mir::Program, function: &mir::Function) -> Result
         validate_terminator(program, function, &block.terminator, reachable[block.id.0])?;
     }
     validate_nullable_presence(program, function)?;
+    validate_mixed_tag_proofs(program, function)?;
     validate_class_local_lifetimes(function)
 }
 
@@ -379,6 +382,34 @@ fn validate_statement(
                     "nullable-string local local{} receives another rvalue type",
                     target.0
                 ))),
+                (mir::Type::Mixed, mir::Rvalue::Mixed(expression)) => {
+                    validate_mixed_expression(program, function, expression)?;
+                    if !local.owned && !is_borrowed_mixed_expression(expression) {
+                        return Err(malformed_mir(format!(
+                            "borrowed mixed local local{} receives an owning value",
+                            target.0
+                        )));
+                    }
+                    Ok(())
+                }
+                (mir::Type::Mixed, _) => Err(malformed_mir(format!(
+                    "mixed local local{} receives a mismatched rvalue",
+                    target.0
+                ))),
+                (mir::Type::NullableMixed, mir::Rvalue::NullableMixed(expression)) => {
+                    validate_nullable_mixed_expression(program, function, expression)?;
+                    if !local.owned && !is_borrowed_nullable_mixed_expression(expression) {
+                        return Err(malformed_mir(format!(
+                            "borrowed nullable mixed local local{} receives an owning value",
+                            target.0
+                        )));
+                    }
+                    Ok(())
+                }
+                (mir::Type::NullableMixed, _) => Err(malformed_mir(format!(
+                    "nullable mixed local local{} receives a mismatched rvalue",
+                    target.0
+                ))),
                 (mir::Type::Scalar(_), mir::Rvalue::String(_) | mir::Rvalue::NullableString(_)) => {
                     Err(malformed_mir(format!(
                         "scalar local local{} receives a string rvalue",
@@ -447,6 +478,13 @@ fn validate_statement(
                         target.0
                     )))
                 }
+                (
+                    mir::Type::String | mir::Type::Scalar(_),
+                    mir::Rvalue::Mixed(_) | mir::Rvalue::NullableMixed(_),
+                ) => Err(malformed_mir(format!(
+                    "non-mixed local local{} receives a mixed rvalue",
+                    target.0
+                ))),
                 (mir::Type::NullableScalar(_) | mir::Type::NullableClass(_), _) => {
                     Err(malformed_mir(format!(
                         "nullable local local{} receives a mismatched rvalue",
@@ -659,6 +697,15 @@ fn validate_statement(
             if local.ty != mir::Type::String || !local.synthetic {
                 return Err(malformed_mir(
                     "string drop must reference a synthetic string local",
+                ));
+            }
+            Ok(())
+        }
+        mir::Statement::DropMixed { local } => {
+            let local = local_in(function, *local)?;
+            if !matches!(local.ty, mir::Type::Mixed | mir::Type::NullableMixed) || !local.owned {
+                return Err(malformed_mir(
+                    "mixed drop must reference an owned mixed local",
                 ));
             }
             Ok(())
@@ -953,11 +1000,15 @@ fn validate_rvalue(
     match expression {
         mir::Rvalue::Value(value) => validate_value_expression(program, function, value),
         mir::Rvalue::String(value) => validate_string_expression(program, function, value),
+        mir::Rvalue::Mixed(value) => validate_mixed_expression(program, function, value),
         mir::Rvalue::NullableScalar(value) => {
             validate_nullable_scalar_expression(program, function, value)
         }
         mir::Rvalue::NullableString(value) => {
             validate_nullable_string_expression(program, function, value)
+        }
+        mir::Rvalue::NullableMixed(value) => {
+            validate_nullable_mixed_expression(program, function, value)
         }
         mir::Rvalue::Class(value) => validate_class_expression(program, function, value),
         mir::Rvalue::NullableClass(value) => {
@@ -975,6 +1026,147 @@ fn validate_rvalue(
         &mut HashSet::new(),
     )?;
     Ok(())
+}
+
+fn is_borrowed_mixed_expression(expression: &mir::MixedExpression) -> bool {
+    matches!(
+        expression,
+        mir::MixedExpression::Local {
+            transfer: false,
+            ..
+        } | mir::MixedExpression::Property { .. }
+            | mir::MixedExpression::CollectionIndex {
+                transfer: false,
+                ..
+            }
+    )
+}
+
+fn is_borrowed_nullable_mixed_expression(expression: &mir::NullableMixedExpression) -> bool {
+    matches!(
+        expression,
+        mir::NullableMixedExpression::Local {
+            transfer: false,
+            ..
+        } | mir::NullableMixedExpression::Property { .. }
+    )
+}
+
+fn validate_mixed_expression(
+    program: &mir::Program,
+    function: &mir::Function,
+    expression: &mir::MixedExpression,
+) -> Result<(), BackendError> {
+    match expression {
+        mir::MixedExpression::Local { local, transfer } => {
+            let definition = local_in(function, *local)?;
+            if !matches!(definition.ty, mir::Type::Mixed | mir::Type::NullableMixed) {
+                return Err(malformed_mir(
+                    "mixed expression references another local type",
+                ));
+            }
+            if *transfer && (!definition.owned || definition.ty != mir::Type::Mixed) {
+                return Err(malformed_mir(
+                    "mixed expression transfers a non-owned mixed local",
+                ));
+            }
+            Ok(())
+        }
+        mir::MixedExpression::Property { object, property } => {
+            validate_property_operand(program, function, *object, *property, mir::Type::Mixed)
+        }
+        mir::MixedExpression::Call {
+            function: callee,
+            args,
+        } => {
+            let callee = function_in(program, *callee)?;
+            if callee.return_type != mir::ReturnType::Value(mir::Type::Mixed) {
+                return Err(malformed_mir("mixed call targets a non-mixed function"));
+            }
+            validate_call_args(program, function, callee, args)
+        }
+        mir::MixedExpression::BoxValue(value) => {
+            validate_value_expression(program, function, value)
+        }
+        mir::MixedExpression::BoxString(value) => {
+            validate_string_expression(program, function, value)
+        }
+        mir::MixedExpression::BoxClass(value) => {
+            validate_class_expression(program, function, value)
+        }
+        mir::MixedExpression::CollectionIndex {
+            collection,
+            index,
+            transfer: _,
+        } => {
+            let local = local_in(function, *collection)?;
+            let mir::Type::Collection(collection_type) = local.ty else {
+                return Err(malformed_mir("mixed index source is not a collection"));
+            };
+            let collection_type = collection_in(program, collection_type)?;
+            if collection_type.value != mir::Type::Mixed {
+                return Err(malformed_mir("mixed index element type mismatch"));
+            }
+            validate_collection_element_access(
+                program,
+                function,
+                local,
+                collection_type,
+                index,
+                false,
+            )
+        }
+    }
+}
+
+fn validate_nullable_mixed_expression(
+    program: &mir::Program,
+    function: &mir::Function,
+    expression: &mir::NullableMixedExpression,
+) -> Result<(), BackendError> {
+    match expression {
+        mir::NullableMixedExpression::Null => Ok(()),
+        mir::NullableMixedExpression::Mixed(value) => {
+            validate_mixed_expression(program, function, value)
+        }
+        mir::NullableMixedExpression::Local { local, transfer } => {
+            let definition = local_in(function, *local)?;
+            if definition.ty != mir::Type::NullableMixed {
+                return Err(malformed_mir(
+                    "nullable mixed expression references another local type",
+                ));
+            }
+            if *transfer && !definition.owned {
+                return Err(malformed_mir(
+                    "nullable mixed expression transfers a borrowed local",
+                ));
+            }
+            Ok(())
+        }
+        mir::NullableMixedExpression::Property { object, property } => validate_property_operand(
+            program,
+            function,
+            *object,
+            *property,
+            mir::Type::NullableMixed,
+        ),
+        mir::NullableMixedExpression::Call {
+            function: callee,
+            args,
+        } => {
+            let callee = function_in(program, *callee)?;
+            if callee.return_type != mir::ReturnType::Value(mir::Type::NullableMixed) {
+                return Err(malformed_mir(
+                    "nullable mixed call targets a non-nullable-mixed function",
+                ));
+            }
+            validate_call_args(program, function, callee, args)
+        }
+        mir::NullableMixedExpression::Coalesce { left, right, .. } => {
+            validate_nullable_mixed_expression(program, function, left)?;
+            validate_nullable_mixed_expression(program, function, right)
+        }
+    }
 }
 
 fn validate_collection_expression(
@@ -1373,6 +1565,12 @@ fn require_owned_class_expression(
         } => Err(malformed_mir(format!(
             "{destination} receives a borrowed indexed class value"
         ))),
+        mir::ClassExpression::MixedPayload { transfer: true, .. } => Ok(()),
+        mir::ClassExpression::MixedPayload {
+            transfer: false, ..
+        } => Err(malformed_mir(format!(
+            "{destination} receives a borrowed mixed class payload"
+        ))),
     }
 }
 
@@ -1696,7 +1894,8 @@ fn infer_expression_return_borrow(
             return_borrow: None,
             ..
         }
-        | mir::ClassExpression::New { .. } => Ok(None),
+        | mir::ClassExpression::New { .. }
+        | mir::ClassExpression::MixedPayload { .. } => Ok(None),
         mir::ClassExpression::Coalesce { .. } => Ok(None),
     }
 }
@@ -1820,6 +2019,7 @@ fn require_writable_class_expression(
         mir::ClassExpression::CollectionIndex { collection, .. } => {
             local_in(function, *collection)?.writable
         }
+        mir::ClassExpression::MixedPayload { .. } => false,
     };
     if writable {
         Ok(())
@@ -1895,7 +2095,8 @@ fn class_expression_transfers_receiver(expression: &mir::ClassExpression) -> boo
         mir::ClassExpression::Property { .. }
         | mir::ClassExpression::Call { .. }
         | mir::ClassExpression::New { .. }
-        | mir::ClassExpression::CollectionIndex { .. } => false,
+        | mir::ClassExpression::CollectionIndex { .. }
+        | mir::ClassExpression::MixedPayload { .. } => false,
     }
 }
 
@@ -1949,6 +2150,7 @@ enum ClassLocalAccess<'a> {
 struct ClassLocalAccesses<'a> {
     accesses: Vec<ClassLocalAccess<'a>>,
     nullable_assumptions: Vec<mir::LocalId>,
+    mixed_assumptions: Vec<(mir::LocalId, mir::MixedTag)>,
 }
 
 impl<'a> ClassLocalAccesses<'a> {
@@ -1988,12 +2190,20 @@ impl<'a> ClassLocalAccesses<'a> {
         self.nullable_assumptions.push(local);
     }
 
+    fn assume_mixed_tag(&mut self, local: mir::LocalId, tag: mir::MixedTag) {
+        self.mixed_assumptions.push((local, tag));
+    }
+
     fn iter(&self) -> impl Iterator<Item = ClassLocalAccess<'a>> + '_ {
         self.accesses.iter().copied()
     }
 
     fn nullable_assumptions(&self) -> impl Iterator<Item = mir::LocalId> + '_ {
         self.nullable_assumptions.iter().copied()
+    }
+
+    fn mixed_assumptions(&self) -> impl Iterator<Item = (mir::LocalId, mir::MixedTag)> + '_ {
+        self.mixed_assumptions.iter().copied()
     }
 
     fn borrowed(&self) -> impl Iterator<Item = mir::LocalId> + '_ {
@@ -2071,11 +2281,15 @@ fn collect_rvalue_class_local_accesses<'a>(
     match value {
         mir::Rvalue::Value(value) => collect_value_class_local_accesses(value, accesses),
         mir::Rvalue::String(value) => collect_string_class_local_accesses(value, accesses),
+        mir::Rvalue::Mixed(value) => collect_mixed_class_local_accesses(value, accesses),
         mir::Rvalue::NullableScalar(value) => {
             collect_nullable_scalar_class_local_accesses(value, accesses)
         }
         mir::Rvalue::NullableString(value) => {
             collect_nullable_string_class_local_accesses(value, accesses)
+        }
+        mir::Rvalue::NullableMixed(value) => {
+            collect_nullable_mixed_class_local_accesses(value, accesses)
         }
         mir::Rvalue::Class(value) => collect_class_expression_local_accesses(value, accesses),
         mir::Rvalue::NullableClass(value) => collect_nullable_class_local_accesses(value, accesses),
@@ -2127,6 +2341,55 @@ fn collect_collection_class_local_accesses<'a>(
     }
 }
 
+fn collect_mixed_class_local_accesses<'a>(
+    value: &'a mir::MixedExpression,
+    accesses: &mut ClassLocalAccesses<'a>,
+) {
+    match value {
+        mir::MixedExpression::BoxValue(value) => {
+            collect_value_class_local_accesses(value, accesses)
+        }
+        mir::MixedExpression::BoxString(value) => {
+            collect_string_class_local_accesses(value, accesses)
+        }
+        mir::MixedExpression::BoxClass(value) => {
+            collect_class_expression_local_accesses(value, accesses)
+        }
+        mir::MixedExpression::Call { function, args } => {
+            accesses.begin_call();
+            collect_rvalue_args_class_local_accesses(args, accesses);
+            accesses.call(*function, args);
+        }
+        mir::MixedExpression::CollectionIndex { index, .. } => {
+            collect_rvalue_class_local_accesses(index, accesses)
+        }
+        mir::MixedExpression::Local { .. } | mir::MixedExpression::Property { .. } => {}
+    }
+}
+
+fn collect_nullable_mixed_class_local_accesses<'a>(
+    value: &'a mir::NullableMixedExpression,
+    accesses: &mut ClassLocalAccesses<'a>,
+) {
+    match value {
+        mir::NullableMixedExpression::Mixed(value) => {
+            collect_mixed_class_local_accesses(value, accesses)
+        }
+        mir::NullableMixedExpression::Call { function, args } => {
+            accesses.begin_call();
+            collect_rvalue_args_class_local_accesses(args, accesses);
+            accesses.call(*function, args);
+        }
+        mir::NullableMixedExpression::Coalesce { left, right, .. } => {
+            collect_nullable_mixed_class_local_accesses(left, accesses);
+            collect_nullable_mixed_class_local_accesses(right, accesses);
+        }
+        mir::NullableMixedExpression::Null
+        | mir::NullableMixedExpression::Local { .. }
+        | mir::NullableMixedExpression::Property { .. } => {}
+    }
+}
+
 fn collect_value_class_local_accesses<'a>(
     value: &'a mir::ValueExpression,
     accesses: &mut ClassLocalAccesses<'a>,
@@ -2155,6 +2418,7 @@ fn collect_operand_class_local_accesses<'a>(
         mir::Operand::CollectionKeyAt { offset, .. } => {
             collect_rvalue_class_local_accesses(offset, accesses)
         }
+        mir::Operand::MixedPayload { mixed, tag } => accesses.assume_mixed_tag(*mixed, *tag),
         mir::Operand::Scalar(_)
         | mir::Operand::Local(_)
         | mir::Operand::Static(_)
@@ -2259,6 +2523,9 @@ fn collect_string_class_local_accesses<'a>(
         }
         mir::StringExpression::NullableLocalAssumeNonNull(local) => {
             accesses.assume_nullable_present(*local)
+        }
+        mir::StringExpression::MixedPayload(local) => {
+            accesses.assume_mixed_tag(*local, mir::MixedTag::String);
         }
         mir::StringExpression::Literal(_)
         | mir::StringExpression::Local(_)
@@ -2379,6 +2646,9 @@ fn collect_class_expression_local_accesses<'a>(
         mir::ClassExpression::CollectionIndex { index, .. } => {
             collect_rvalue_class_local_accesses(index, accesses)
         }
+        mir::ClassExpression::MixedPayload { class, mixed, .. } => {
+            accesses.assume_mixed_tag(*mixed, mir::MixedTag::Class(*class));
+        }
     }
 }
 
@@ -2434,6 +2704,12 @@ fn collect_bool_class_local_accesses<'a>(
         }
         mir::BoolExpression::NullableClassIsPresent(value) => {
             collect_nullable_class_local_accesses(value, accesses);
+        }
+        mir::BoolExpression::NullableMixedIsPresent(value) => {
+            collect_nullable_mixed_class_local_accesses(value, accesses);
+        }
+        mir::BoolExpression::MixedIs { mixed, .. } => {
+            collect_mixed_class_local_accesses(mixed, accesses);
         }
         mir::BoolExpression::Not(value) => {
             collect_bool_class_local_accesses(value, accesses);
@@ -2639,6 +2915,7 @@ fn collect_statement_class_local_accesses(statement: &mir::Statement) -> ClassLo
         mir::Statement::EchoStringLiteral(_)
         | mir::Statement::DropClass { .. }
         | mir::Statement::DropString { .. }
+        | mir::Statement::DropMixed { .. }
         | mir::Statement::DropCollection { .. }
         | mir::Statement::WriteStreamBytes { .. } => {}
     }
@@ -2842,6 +3119,76 @@ fn validate_nullable_presence(
     Ok(())
 }
 
+fn validate_mixed_tag_proofs(
+    _program: &mir::Program,
+    function: &mir::Function,
+) -> Result<(), BackendError> {
+    let mut entries = vec![None; function.blocks.len()];
+    entries[function.entry_block.0] = Some(HashMap::new());
+    let mut pending = VecDeque::from([function.entry_block]);
+
+    while let Some(block_id) = pending.pop_front() {
+        let block = block_in(function, block_id)?;
+        let Some(mut tags) = entries[block_id.0].clone() else {
+            continue;
+        };
+        for statement in &block.statements {
+            apply_mixed_tag_statement(function, statement, &mut tags)?;
+        }
+
+        match &block.terminator {
+            mir::Terminator::Jump(target) => {
+                if merge_definite_mixed_tags(&mut entries[target.0], &tags) {
+                    pending.push_back(*target);
+                }
+            }
+            mir::Terminator::Branch {
+                condition,
+                then_block,
+                else_block,
+            } => {
+                for (target, condition_value) in [(*then_block, true), (*else_block, false)] {
+                    if constant_bool_expression(condition)
+                        .is_some_and(|value| value != condition_value)
+                    {
+                        continue;
+                    }
+                    let mut outgoing = tags.clone();
+                    apply_mixed_tag_condition(condition, condition_value, &mut outgoing);
+                    if merge_definite_mixed_tags(&mut entries[target.0], &outgoing) {
+                        pending.push_back(target);
+                    }
+                }
+            }
+            mir::Terminator::Return(_)
+            | mir::Terminator::ReturnVoid
+            | mir::Terminator::Panic(_)
+            | mir::Terminator::Unreachable => {}
+        }
+    }
+
+    for block in &function.blocks {
+        let Some(mut tags) = entries[block.id.0].clone() else {
+            continue;
+        };
+        for statement in &block.statements {
+            validate_mixed_tag_assumptions(
+                function,
+                &collect_statement_class_local_accesses(statement),
+                &tags,
+            )?;
+            apply_mixed_tag_statement(function, statement, &mut tags)?;
+        }
+        validate_mixed_tag_assumptions(
+            function,
+            &collect_terminator_class_local_accesses(&block.terminator),
+            &tags,
+        )?;
+    }
+
+    Ok(())
+}
+
 fn merge_definitely_present(
     destination: &mut Option<HashSet<mir::LocalId>>,
     incoming: &HashSet<mir::LocalId>,
@@ -2852,6 +3199,32 @@ fn merge_definitely_present(
                 .intersection(incoming)
                 .copied()
                 .collect::<HashSet<_>>();
+            if *current == merged {
+                false
+            } else {
+                *current = merged;
+                true
+            }
+        }
+        None => {
+            *destination = Some(incoming.clone());
+            true
+        }
+    }
+}
+
+fn merge_definite_mixed_tags(
+    destination: &mut Option<HashMap<mir::LocalId, mir::MixedTag>>,
+    incoming: &HashMap<mir::LocalId, mir::MixedTag>,
+) -> bool {
+    match destination {
+        Some(current) => {
+            let merged = current
+                .iter()
+                .filter_map(|(local, tag)| {
+                    (incoming.get(local) == Some(tag)).then_some((*local, *tag))
+                })
+                .collect::<HashMap<_, _>>();
             if *current == merged {
                 false
             } else {
@@ -2902,6 +3275,79 @@ fn apply_nullable_presence_statement(
             present.remove(local);
         }
         _ => {}
+    }
+    Ok(())
+}
+
+fn apply_mixed_tag_statement(
+    function: &mir::Function,
+    statement: &mir::Statement,
+    tags: &mut HashMap<mir::LocalId, mir::MixedTag>,
+) -> Result<(), BackendError> {
+    match statement {
+        mir::Statement::AssignLocal { target, .. } => {
+            if matches!(
+                local_in(function, *target)?.ty,
+                mir::Type::Mixed | mir::Type::NullableMixed
+            ) {
+                tags.remove(target);
+            }
+        }
+        mir::Statement::DropMixed { local } => {
+            tags.remove(local);
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn apply_mixed_tag_condition(
+    condition: &mir::BoolExpression,
+    when_true: bool,
+    tags: &mut HashMap<mir::LocalId, mir::MixedTag>,
+) {
+    match condition {
+        mir::BoolExpression::MixedIs { mixed, tag } => {
+            if let Some(local) = mixed_expression_local(mixed) {
+                if when_true {
+                    tags.insert(local, *tag);
+                } else {
+                    tags.remove(&local);
+                }
+            }
+        }
+        mir::BoolExpression::Not(value) => apply_mixed_tag_condition(value, !when_true, tags),
+        mir::BoolExpression::Binary { op, left, right } => match (op, when_true) {
+            (mir::BoolBinaryOp::And, true) | (mir::BoolBinaryOp::Or, false) => {
+                apply_mixed_tag_condition(left, when_true, tags);
+                apply_mixed_tag_condition(right, when_true, tags);
+            }
+            _ => {}
+        },
+        _ => {}
+    }
+}
+
+fn mixed_expression_local(expression: &mir::MixedExpression) -> Option<mir::LocalId> {
+    match expression {
+        mir::MixedExpression::Local { local, .. } => Some(*local),
+        _ => None,
+    }
+}
+
+fn validate_mixed_tag_assumptions(
+    function: &mir::Function,
+    accesses: &ClassLocalAccesses<'_>,
+    tags: &HashMap<mir::LocalId, mir::MixedTag>,
+) -> Result<(), BackendError> {
+    for (local, tag) in accesses.mixed_assumptions() {
+        if tags.get(&local) != Some(&tag) {
+            return Err(malformed_mir(format!(
+                "{} local local{} is unboxed as {tag} without a dominating exact `is` proof",
+                local_in(function, local)?.ty,
+                local.0,
+            )));
+        }
     }
     Ok(())
 }
@@ -3495,6 +3941,12 @@ fn validate_class_expression(
                 *transfer,
             )
         }
+        mir::ClassExpression::MixedPayload { mixed, .. } => validate_mixed_payload_operand(
+            function,
+            *mixed,
+            mir::MixedTag::Class(class),
+            mir::Type::Class(class),
+        ),
     }
 }
 
@@ -3730,6 +4182,7 @@ fn statement_observes_property(
         mir::Statement::EchoStringLiteral(_)
         | mir::Statement::DropClass { .. }
         | mir::Statement::DropString { .. }
+        | mir::Statement::DropMixed { .. }
         | mir::Statement::DropCollection { .. }
         | mir::Statement::WriteStreamBytes { .. } => false,
         mir::Statement::AssignStatic { value, .. } => {
@@ -3797,11 +4250,15 @@ fn rvalue_observes_property(
     match value {
         mir::Rvalue::Value(value) => value_observes_property(value, receiver, property),
         mir::Rvalue::String(value) => string_observes_property(value, receiver, property),
+        mir::Rvalue::Mixed(value) => mixed_observes_property(value, receiver, property),
         mir::Rvalue::NullableScalar(value) => {
             nullable_scalar_observes_property(value, receiver, property)
         }
         mir::Rvalue::NullableString(value) => {
             nullable_string_observes_property(value, receiver, property)
+        }
+        mir::Rvalue::NullableMixed(value) => {
+            nullable_mixed_observes_property(value, receiver, property)
         }
         mir::Rvalue::Class(value) => class_observes_property(value, receiver, property),
         mir::Rvalue::NullableClass(value) => {
@@ -3857,6 +4314,49 @@ fn collection_observes_property(
         | mir::CollectionExpression::FromBytes { .. }
         | mir::CollectionExpression::BytesFromArray { .. }
         | mir::CollectionExpression::ReadStdinBytes { .. } => false,
+    }
+}
+
+fn mixed_observes_property(
+    value: &mir::MixedExpression,
+    receiver: mir::LocalId,
+    property: crate::class_layout::PropertyId,
+) -> bool {
+    match value {
+        mir::MixedExpression::BoxValue(value) => value_observes_property(value, receiver, property),
+        mir::MixedExpression::BoxString(value) => {
+            string_observes_property(value, receiver, property)
+        }
+        mir::MixedExpression::BoxClass(value) => class_observes_property(value, receiver, property),
+        mir::MixedExpression::Call { args, .. } => args
+            .iter()
+            .any(|value| rvalue_observes_property(value, receiver, property)),
+        mir::MixedExpression::CollectionIndex { index, .. } => {
+            rvalue_observes_property(index, receiver, property)
+        }
+        mir::MixedExpression::Local { .. } | mir::MixedExpression::Property { .. } => false,
+    }
+}
+
+fn nullable_mixed_observes_property(
+    value: &mir::NullableMixedExpression,
+    receiver: mir::LocalId,
+    property: crate::class_layout::PropertyId,
+) -> bool {
+    match value {
+        mir::NullableMixedExpression::Mixed(value) => {
+            mixed_observes_property(value, receiver, property)
+        }
+        mir::NullableMixedExpression::Call { args, .. } => args
+            .iter()
+            .any(|value| rvalue_observes_property(value, receiver, property)),
+        mir::NullableMixedExpression::Coalesce { left, right, .. } => {
+            nullable_mixed_observes_property(left, receiver, property)
+                || nullable_mixed_observes_property(right, receiver, property)
+        }
+        mir::NullableMixedExpression::Null
+        | mir::NullableMixedExpression::Local { .. }
+        | mir::NullableMixedExpression::Property { .. } => false,
     }
 }
 
@@ -3967,6 +4467,7 @@ fn string_observes_property(
         mir::StringExpression::Literal(_)
         | mir::StringExpression::Local(_)
         | mir::StringExpression::Static(_)
+        | mir::StringExpression::MixedPayload(_)
         | mir::StringExpression::NullableLocalAssumeNonNull(_) => false,
     }
 }
@@ -4046,6 +4547,7 @@ fn class_observes_property(
         mir::ClassExpression::CollectionIndex { index, .. } => {
             rvalue_observes_property(index, receiver, property)
         }
+        mir::ClassExpression::MixedPayload { .. } => false,
     }
 }
 
@@ -4075,6 +4577,12 @@ fn bool_observes_property(
         }
         mir::BoolExpression::NullableClassIsPresent(value) => {
             nullable_class_observes_property(value, receiver, property)
+        }
+        mir::BoolExpression::NullableMixedIsPresent(value) => {
+            nullable_mixed_observes_property(value, receiver, property)
+        }
+        mir::BoolExpression::MixedIs { mixed, .. } => {
+            mixed_observes_property(mixed, receiver, property)
         }
         mir::BoolExpression::Not(value) => bool_observes_property(value, receiver, property),
         mir::BoolExpression::Binary { left, right, .. } => {
@@ -4219,6 +4727,12 @@ fn validate_float_expression(
                 *collection,
                 mir::Type::Scalar(mir::ScalarType::Float(*ty)),
                 offset,
+            ),
+            mir::Operand::MixedPayload { mixed, tag } => validate_mixed_payload_operand(
+                function,
+                *mixed,
+                *tag,
+                mir::Type::Scalar(mir::ScalarType::Float(*ty)),
             ),
             _ => Err(malformed_mir(
                 "float expression has an incompatible operand",
@@ -4630,7 +5144,8 @@ fn escaping_class_expression_local_borrows(
         }
         | mir::ClassExpression::New { .. }
         | mir::ClassExpression::Coalesce { transfer: true, .. }
-        | mir::ClassExpression::CollectionIndex { .. } => Ok(Vec::new()),
+        | mir::ClassExpression::CollectionIndex { .. }
+        | mir::ClassExpression::MixedPayload { .. } => Ok(Vec::new()),
     }
 }
 
@@ -4784,6 +5299,12 @@ fn validate_condition(
                 mir::Type::Scalar(mir::ScalarType::Bool),
                 offset,
             ),
+            mir::Operand::MixedPayload { mixed, tag } => validate_mixed_payload_operand(
+                function,
+                *mixed,
+                *tag,
+                mir::Type::Scalar(mir::ScalarType::Bool),
+            ),
             _ => Err(malformed_mir("bool expression has an incompatible operand")),
         },
         mir::BoolExpression::Compare { op, left, right } => {
@@ -4820,6 +5341,16 @@ fn validate_condition(
         }
         mir::BoolExpression::NullableClassIsPresent(value) => {
             validate_nullable_class_expression(program, function, value)
+        }
+        mir::BoolExpression::NullableMixedIsPresent(value) => {
+            validate_nullable_mixed_expression(program, function, value)
+        }
+        mir::BoolExpression::MixedIs { mixed, tag } => {
+            validate_mixed_expression(program, function, mixed)?;
+            if let mir::MixedTag::Class(class) = tag {
+                class_in(program, *class)?;
+            }
+            Ok(())
         }
         mir::BoolExpression::Not(condition) => validate_condition(program, function, condition),
         mir::BoolExpression::Binary { left, right, .. } => {
@@ -4983,7 +5514,34 @@ fn validate_integer_operand(
             mir::Type::Scalar(mir::ScalarType::Integer(ty)),
             offset,
         ),
+        mir::Operand::MixedPayload { mixed, tag } => validate_mixed_payload_operand(
+            function,
+            *mixed,
+            *tag,
+            mir::Type::Scalar(mir::ScalarType::Integer(ty)),
+        ),
     }
+}
+
+fn validate_mixed_payload_operand(
+    function: &mir::Function,
+    mixed: mir::LocalId,
+    tag: mir::MixedTag,
+    expected: mir::Type,
+) -> Result<(), BackendError> {
+    let definition = local_in(function, mixed)?;
+    if !matches!(definition.ty, mir::Type::Mixed | mir::Type::NullableMixed) {
+        return Err(malformed_mir(format!(
+            "mixed payload reads local{} with type {}",
+            mixed.0, definition.ty
+        )));
+    }
+    if tag.ty() != expected {
+        return Err(malformed_mir(format!(
+            "mixed payload tag {tag} is used as {expected}"
+        )));
+    }
+    Ok(())
 }
 
 fn validate_string_expression(
@@ -5006,6 +5564,12 @@ fn validate_string_expression(
         mir::StringExpression::Static(id) => {
             validate_static_operand(program, *id, mir::Type::String)
         }
+        mir::StringExpression::MixedPayload(local) => validate_mixed_payload_operand(
+            function,
+            *local,
+            mir::MixedTag::String,
+            mir::Type::String,
+        ),
         mir::StringExpression::Property { object, property } => {
             validate_property_operand(program, function, *object, *property, mir::Type::String)
         }
@@ -5377,13 +5941,17 @@ fn validate_null_safe_call(
     let nullable_return_type = match return_type {
         mir::Type::Scalar(ty) => mir::Type::NullableScalar(ty),
         mir::Type::String => mir::Type::NullableString,
+        mir::Type::Mixed => mir::Type::NullableMixed,
         mir::Type::Class(class) => mir::Type::NullableClass(class),
         mir::Type::Collection(_) => {
             return Err(malformed_mir(
                 "null-safe calls cannot return collections before nullable collections exist",
             ))
         }
-        mir::Type::NullableScalar(_) | mir::Type::NullableString | mir::Type::NullableClass(_) => {
+        mir::Type::NullableScalar(_)
+        | mir::Type::NullableString
+        | mir::Type::NullableMixed
+        | mir::Type::NullableClass(_) => {
             return Err(malformed_mir(
                 "null-safe call validator requires a non-null result type",
             ))

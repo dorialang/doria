@@ -531,19 +531,23 @@ function invalid(?Label $label): void
 }
 
 #[test]
-fn mixed_runtime_representation_remains_a_stage23_boundary() {
-    let diagnostics = doriac::lower_source_to_mir(
+fn mixed_runtime_representation_lowers_after_stage23_slice3() {
+    let program = doriac::lower_source_to_mir(
         "stage22-mixed-runtime.doria",
         r#"
-function main(): void { mixed $value = 1; }
+function main(): void
+{
+    mixed $value = 1;
+    if ($value is int) {
+        echo "{$value}";
+    }
+}
 "#,
     )
-    .expect_err("mixed runtime values should not lower before Stage 23 Slice 3");
-    let diagnostic = diagnostics
-        .iter()
-        .find(|diagnostic| diagnostic.code == "M1101")
-        .unwrap_or_else(|| panic!("expected native-stage diagnostic, got {diagnostics:#?}"));
-    assert!(diagnostic.message.contains("Stage 23 Slice 3"));
+    .expect("mixed runtime values should lower after Stage 23 Slice 3");
+    let output =
+        doriac::mir_interpreter::interpret(&program).expect("mixed runtime value should execute");
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "1");
 }
 
 #[test]
