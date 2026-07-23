@@ -1089,9 +1089,9 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     .ok_or_else(|| backend_failure("collection allocation produced no result"))?
                     .into_pointer_value();
                 for (index, entry) in entries.iter().enumerate() {
-                    let value = self.lower_rvalue(&entry.value)?;
                     if let (Some(key_type), Some(key)) = (definition.key, &entry.key) {
                         let key = self.lower_rvalue(key)?;
+                        let value = self.lower_rvalue(&entry.value)?;
                         self.lower_dictionary_set_value(
                             result,
                             key,
@@ -1099,7 +1099,10 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                             value,
                             definition.value,
                         )?;
-                    } else if fixed {
+                        continue;
+                    }
+                    let value = self.lower_rvalue(&entry.value)?;
+                    if fixed {
                         let value_word = self.value_to_collection_word(value, definition.value)?;
                         let _ = self.call_runtime(
                             COLLECTION_SET_AT,
@@ -1157,6 +1160,14 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             } => Ok(self
                 .lower_collection_index(*source, index, *transfer)?
                 .into_pointer_value()),
+            mir::CollectionExpression::Property {
+                object, property, ..
+            } => Ok(build(self.builder.build_load(
+                pointer,
+                self.lower_property_address(*object, *property)?,
+                "collection.property",
+            ))?
+            .into_pointer_value()),
             mir::CollectionExpression::SetFrom {
                 collection,
                 source,
@@ -1482,11 +1493,17 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         };
         let definition = self.collection_definition(collection_type)?.clone();
         let collection_value = self.collection_pointer(collection)?;
+        let index = if op == mir::CollectionMutationOp::InsertAt {
+            Some(
+                self.lower_rvalue(index.ok_or_else(|| malformed_mir("insertAt has no index"))?)?
+                    .into_int_value(),
+            )
+        } else {
+            None
+        };
         let value = self.lower_rvalue(value)?;
         let word = self.value_to_collection_word(value, definition.value)?;
         if op == mir::CollectionMutationOp::InsertAt {
-            let index = index.ok_or_else(|| malformed_mir("insertAt has no index"))?;
-            let index = self.lower_rvalue(index)?.into_int_value();
             let _ = self.call_runtime(
                 COLLECTION_INSERT_AT,
                 &[
@@ -1501,7 +1518,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 &[
                     self.current_frame.into(),
                     collection_value.into(),
-                    index.into(),
+                    index.expect("insertAt index was lowered").into(),
                     word.into(),
                 ],
             )?;

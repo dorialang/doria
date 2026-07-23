@@ -1493,9 +1493,9 @@ fn lower_collection_expression(
             )?
             .ok_or_else(|| backend_failure("collection allocation produced no result"))?;
             for (index, entry) in entries.iter().enumerate() {
-                let value = lower_rvalue(builder, &entry.value, resources)?.single()?;
                 if let (Some(key_ty), Some(key)) = (definition.key, &entry.key) {
                     let key_value = lower_rvalue(builder, key, resources)?.single()?;
+                    let value = lower_rvalue(builder, &entry.value, resources)?.single()?;
                     lower_dictionary_set_value(
                         builder,
                         result,
@@ -1505,7 +1505,10 @@ fn lower_collection_expression(
                         definition.value,
                         resources,
                     )?;
-                } else if fixed {
+                    continue;
+                }
+                let value = lower_rvalue(builder, &entry.value, resources)?.single()?;
+                if fixed {
                     let value =
                         value_to_collection_word(builder, value, definition.value, pointer)?;
                     let index = builder.ins().iconst(pointer, index as i64);
@@ -1562,6 +1565,12 @@ fn lower_collection_expression(
             transfer,
             ..
         } => lower_collection_index(builder, *source, index, *transfer, resources),
+        mir::CollectionExpression::Property {
+            object, property, ..
+        } => {
+            let address = lower_property_address(builder, *object, *property, resources)?;
+            Ok(builder.ins().load(pointer, MemFlagsData::new(), address, 0))
+        }
         mir::CollectionExpression::SetFrom {
             collection,
             source,
@@ -1856,17 +1865,32 @@ fn lower_collection_add(
     };
     let definition = collection_definition(resources.program, collection_type)?.clone();
     let collection_value = lower_collection_pointer(builder, collection, resources)?;
+    let index = if op == mir::CollectionMutationOp::InsertAt {
+        Some(
+            lower_rvalue(
+                builder,
+                index.ok_or_else(|| malformed_mir("insertAt has no index"))?,
+                resources,
+            )?
+            .single()?,
+        )
+    } else {
+        None
+    };
     let value = lower_rvalue(builder, value, resources)?.single()?;
     let word = value_to_collection_word(builder, value, definition.value, pointer)?;
     if op == mir::CollectionMutationOp::InsertAt {
-        let index = index.ok_or_else(|| malformed_mir("insertAt has no index"))?;
-        let index = lower_rvalue(builder, index, resources)?.single()?;
         let _ = runtime_call(
             builder,
             COLLECTION_INSERT_AT,
             &[pointer, pointer, pointer, types::I64],
             None,
-            &[resources.current_frame, collection_value, index, word],
+            &[
+                resources.current_frame,
+                collection_value,
+                index.expect("insertAt index was lowered"),
+                word,
+            ],
             resources,
         )?;
     } else if op == mir::CollectionMutationOp::Remove {

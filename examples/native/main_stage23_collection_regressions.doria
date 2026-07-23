@@ -29,9 +29,24 @@ class Holder
     }
 }
 
+class CollectionOwner
+{
+    writable List<int> $items = [1];
+
+    writable function append(int $value): void
+    {
+        $this->items->add($value);
+    }
+}
+
 class CollectionEvaluationOrder
 {
     static writable int $step = 0;
+
+    static function reset(): void
+    {
+        CollectionEvaluationOrder::step = 0;
+    }
 
     static function key(): string
     {
@@ -50,6 +65,15 @@ class CollectionEvaluationOrder
         CollectionEvaluationOrder::step = 2;
         return 42;
     }
+
+    static function index(): int
+    {
+        if (CollectionEvaluationOrder::step != 0) {
+            panic("collection value was evaluated before its index");
+        }
+        CollectionEvaluationOrder::step = 1;
+        return 1;
+    }
 }
 
 function main(): void
@@ -59,6 +83,7 @@ function main(): void
     echo "nested {$matrix[0][1]}\n";
 
     writable List<Counter> $counters = [new Counter(1)];
+    $counters[0]->increment();
     foreach ($counters as writable Counter $counter) {
         $counter->increment();
     }
@@ -79,6 +104,9 @@ function main(): void
     ];
 
     let $holder = new Holder([new Token(6)]);
+    let writable $collectionOwner = new CollectionOwner();
+    $collectionOwner->append(2);
+    echo "property {$collectionOwner->items->count}:{$collectionOwner->items[1]}\n";
 
     List<float> $zeros = [0.0];
     if ($zeros->contains(-0.0)) {
@@ -91,6 +119,21 @@ function main(): void
     }
 
     writable Dictionary<string, int> $ordered = [];
+    CollectionEvaluationOrder::reset();
     $ordered[CollectionEvaluationOrder::key()] = CollectionEvaluationOrder::value();
     echo "ordered {$ordered["answer"]}\n";
+
+    CollectionEvaluationOrder::reset();
+    Dictionary<string, int> $literalOrder = [
+        CollectionEvaluationOrder::key() => CollectionEvaluationOrder::value(),
+    ];
+    echo "literal {$literalOrder["answer"]}\n";
+
+    CollectionEvaluationOrder::reset();
+    writable List<int> $insertOrder = [1];
+    $insertOrder->insertAt(
+        CollectionEvaluationOrder::index(),
+        CollectionEvaluationOrder::value()
+    );
+    echo "insert {$insertOrder[1]}\n";
 }

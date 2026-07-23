@@ -3928,7 +3928,7 @@ Dictionary<string, List<int>> $nestedCounts = [
     "oranges" => [],
 ];
 Dictionary<int, int> $indexedCounts = [
-    10,
+    0 => 10,
     1 => 20,
 ];
 Dictionary<string, int> $emptyCounts = [];

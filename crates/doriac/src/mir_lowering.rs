@@ -1296,10 +1296,7 @@ fn lower_foreach_statement(
                     "foreach iterable is not a collection",
                 )]);
             };
-            let borrowed = matches!(
-                unparenthesized_place(collection_expr),
-                hir::Expr::Index { .. }
-            );
+            let borrowed = collection_place_is_borrowed(collection_expr);
             let value =
                 lower_collection_expression(collection_expr, collection_type, !borrowed, context)?;
             let local = if borrowed {
@@ -5303,6 +5300,26 @@ fn lower_collection_expression(
                 transfer,
             })
         }
+        hir::Expr::PropertyAccess { span, .. } => {
+            if transfer {
+                return Err(vec![unsupported(
+                    *span,
+                    "collection properties are borrowed and cannot be given away directly",
+                )]);
+            }
+            let (object, property, property_type) = lower_property_place(expr, context)?;
+            if property_type != mir::Type::Collection(expected) {
+                return Err(vec![unsupported(
+                    *span,
+                    "collection property does not have the expected collection type",
+                )]);
+            }
+            Ok(mir::CollectionExpression::Property {
+                collection: expected,
+                object,
+                property,
+            })
+        }
         hir::Expr::MethodCall {
             object,
             method,
@@ -5663,7 +5680,7 @@ fn materialize_nested_collection_places(
             materialize_nested_collection_places(index, false, context)?;
 
             let place = unparenthesized_place(collection);
-            if matches!(place, hir::Expr::Index { .. }) {
+            if collection_place_is_borrowed(place) {
                 let key = (place.span().start, place.span().end);
                 if !context.materialized_collection_places.contains_key(&key) {
                     let mir::Type::Collection(collection_type) = context.expression_type(place)?
@@ -5694,6 +5711,12 @@ fn materialize_nested_collection_places(
         }
         hir::Expr::PropertyAccess { object, .. } => {
             materialize_nested_collection_places(object, false, context)?;
+            if matches!(
+                context.expression_type(object),
+                Ok(mir::Type::Collection(_))
+            ) {
+                materialize_collection_place(object, false, context)?;
+            }
         }
         hir::Expr::MethodCall {
             object,
@@ -5701,7 +5724,7 @@ fn materialize_nested_collection_places(
             args,
             ..
         } => {
-            let receiver_writable = collection_method_mutates(method);
+            let receiver_writable = method_receiver_is_writable(object, method, context);
             materialize_nested_collection_places(object, receiver_writable, context)?;
             for arg in args {
                 materialize_nested_collection_places(arg, false, context)?;
@@ -5858,7 +5881,7 @@ fn materialize_collection_place_as(
     if lower_collection_local(expr, context).is_ok() {
         return Ok(());
     }
-    let borrowed = matches!(unparenthesized_place(expr), hir::Expr::Index { .. });
+    let borrowed = collection_place_is_borrowed(expr);
     let value = lower_collection_expression(expr, collection, !borrowed, context)?;
     let local = if borrowed {
         context.declare_borrowed_temp(mir::Type::Collection(collection), writable)
@@ -5879,6 +5902,27 @@ fn collection_method_mutates(method: &str) -> bool {
     matches!(
         method,
         "add" | "insertAt" | "removeAt" | "pop" | "set" | "remove"
+    )
+}
+
+fn method_receiver_is_writable(
+    object: &hir::Expr,
+    method: &str,
+    context: &LoweringContext,
+) -> bool {
+    match context.expression_type(object) {
+        Ok(mir::Type::Collection(_)) => collection_method_mutates(method),
+        Ok(mir::Type::Class(class) | mir::Type::NullableClass(class)) => context
+            .lookup_method(class, method, object.span())
+            .is_ok_and(|signature| signature.receiver_mode == Some(mir::ReceiverMode::Writable)),
+        _ => false,
+    }
+}
+
+fn collection_place_is_borrowed(expr: &hir::Expr) -> bool {
+    matches!(
+        unparenthesized_place(expr),
+        hir::Expr::Index { .. } | hir::Expr::PropertyAccess { .. }
     )
 }
 
@@ -6424,7 +6468,7 @@ fn lower_property_place(
         _ => {
             return Err(vec![unsupported(
                 object.span(),
-                "native class property access requires a local object path in Stage 19",
+                "native class property access requires a local object path",
             )])
         }
     };

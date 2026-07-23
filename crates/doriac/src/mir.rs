@@ -266,6 +266,11 @@ pub enum CollectionExpression {
         index: Box<Rvalue>,
         transfer: bool,
     },
+    Property {
+        collection: CollectionTypeId,
+        object: LocalId,
+        property: PropertyId,
+    },
     SetFrom {
         collection: CollectionTypeId,
         source: LocalId,
@@ -316,6 +321,7 @@ impl CollectionExpression {
             Self::Local { collection, .. }
             | Self::Literal { collection, .. }
             | Self::Index { collection, .. }
+            | Self::Property { collection, .. }
             | Self::SetFrom { collection, .. }
             | Self::FromBytes { collection, .. }
             | Self::BytesFromArray { collection, .. }
@@ -1079,6 +1085,7 @@ fn collection_class_temporary_capacity(value: &CollectionExpression) -> usize {
             })
             .sum(),
         CollectionExpression::Index { index, .. } => rvalue_class_temporary_capacity(index),
+        CollectionExpression::Property { .. } => 0,
         CollectionExpression::ReadFileBytes { path, .. } => string_class_temporary_capacity(path),
     }
 }
@@ -1499,6 +1506,13 @@ impl fmt::Display for CollectionExpression {
                 "{} local{}[{index}]",
                 if *transfer { "move" } else { "borrow" },
                 source.0
+            ),
+            Self::Property {
+                object, property, ..
+            } => write!(
+                formatter,
+                "borrow local{}->property{}",
+                object.0, property.index
             ),
             Self::SetFrom {
                 source, transfer, ..

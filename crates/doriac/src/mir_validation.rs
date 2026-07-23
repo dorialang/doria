@@ -472,13 +472,21 @@ fn validate_statement(
                             } | mir::CollectionExpression::Index {
                                 transfer: false,
                                 ..
-                            }
+                            } | mir::CollectionExpression::Property { .. }
                         )
                     {
                         return Err(malformed_mir(format!(
                             "borrowed collection local local{} receives an owning value",
                             target.0
                         )));
+                    }
+                    if !local.owned {
+                        validate_collection_borrow_writability(
+                            program,
+                            function,
+                            expression,
+                            local.writable,
+                        )?;
                     }
                     validate_collection_expression(program, function, expression)
                 }
@@ -1019,6 +1027,26 @@ fn validate_collection_expression(
             }
             validate_collection_index(program, function, source_type, index)
         }
+        mir::CollectionExpression::Property {
+            object, property, ..
+        } => {
+            let object = local_in(function, *object)?;
+            let class = match object.ty {
+                mir::Type::Class(class) | mir::Type::NullableClass(class) => class,
+                _ => {
+                    return Err(malformed_mir(
+                        "collection property access uses a non-class local",
+                    ));
+                }
+            };
+            let property = property_in(program, class, *property)?;
+            if property.ty != mir::Type::Collection(definition.id) {
+                return Err(malformed_mir(
+                    "collection property expression type mismatch",
+                ));
+            }
+            Ok(())
+        }
         mir::CollectionExpression::SetFrom {
             source,
             transfer,
@@ -1104,6 +1132,52 @@ fn validate_collection_expression(
             validate_call_args(program, function, callee, args)
         }
     }
+}
+
+fn validate_collection_borrow_writability(
+    program: &mir::Program,
+    function: &mir::Function,
+    expression: &mir::CollectionExpression,
+    writable: bool,
+) -> Result<(), BackendError> {
+    if !writable {
+        return Ok(());
+    }
+
+    let source_is_writable = match expression {
+        mir::CollectionExpression::Local {
+            local,
+            transfer: false,
+            ..
+        } => local_in(function, *local)?.writable,
+        mir::CollectionExpression::Index {
+            source,
+            transfer: false,
+            ..
+        } => local_in(function, *source)?.writable,
+        mir::CollectionExpression::Property {
+            object, property, ..
+        } => {
+            let object = local_in(function, *object)?;
+            let class = match object.ty {
+                mir::Type::Class(class) | mir::Type::NullableClass(class) => class,
+                _ => {
+                    return Err(malformed_mir(
+                        "collection property borrow uses a non-class local",
+                    ));
+                }
+            };
+            object.writable && property_in(program, class, *property)?.writable
+        }
+        _ => false,
+    };
+
+    if !source_is_writable {
+        return Err(malformed_mir(
+            "writable collection borrow requires a writable source place",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_bytes_local(
@@ -1734,7 +1808,9 @@ fn require_writable_class_expression(
                 })
                 .is_ok()
         }
-        mir::ClassExpression::CollectionIndex { .. } => false,
+        mir::ClassExpression::CollectionIndex { collection, .. } => {
+            local_in(function, *collection)?.writable
+        }
     };
     if writable {
         Ok(())
@@ -2023,6 +2099,9 @@ fn collect_collection_class_local_accesses<'a>(
         mir::CollectionExpression::Index { index, .. } => {
             collect_rvalue_class_local_accesses(index, accesses)
         }
+        mir::CollectionExpression::Property {
+            object, property, ..
+        } => accesses.borrow_property(*object, *property),
         mir::CollectionExpression::ReadFileBytes { path, .. } => {
             collect_string_class_local_accesses(path, accesses)
         }
@@ -3751,6 +3830,11 @@ fn collection_observes_property(
         mir::CollectionExpression::Index { index, .. } => {
             rvalue_observes_property(index, receiver, property)
         }
+        mir::CollectionExpression::Property {
+            object,
+            property: observed,
+            ..
+        } => *object == receiver && *observed == property,
         mir::CollectionExpression::ReadFileBytes { path, .. } => {
             string_observes_property(path, receiver, property)
         }

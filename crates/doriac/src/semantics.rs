@@ -3887,6 +3887,21 @@ impl<'program> Checker<'program> {
     ) {
         let (left_ty, right_ty) =
             self.infer_contextual_binary_operand_types(left, right, scopes, method_context);
+        let left_collection = self.is_runtime_collection_type(left_ty);
+        let right_collection = self.is_runtime_collection_type(right_ty);
+        if left_collection || right_collection {
+            if matches!(self.types.kind(left_ty), TypeKind::Bytes)
+                && matches!(self.types.kind(right_ty), TypeKind::Bytes)
+            {
+                return;
+            }
+            self.diagnostics.push(Diagnostic::unsupported_stage(
+                "E0525",
+                "collection equality is not supported in Stage 23; only `Bytes` values have value equality",
+                span,
+            ));
+            return;
+        }
         if self.is_supported_nullable_equality(left, left_ty, right, right_ty)
             || self.is_equality_compatible(left_ty, right_ty)
         {
@@ -4025,6 +4040,18 @@ impl<'program> Checker<'program> {
         }
 
         self.is_assignable(left, right) || self.is_assignable(right, left)
+    }
+
+    fn is_runtime_collection_type(&self, ty: TypeId) -> bool {
+        matches!(
+            self.types.kind(ty),
+            TypeKind::Bytes
+                | TypeKind::TypedArray(_)
+                | TypeKind::List(_)
+                | TypeKind::Dictionary(_, _)
+                | TypeKind::Set(_)
+                | TypeKind::EmptyCollection
+        )
     }
 
     fn is_supported_nullable_equality(
@@ -6323,17 +6350,14 @@ impl<'program> Checker<'program> {
                     return true;
                 }
 
-                if !elements.iter().any(|element| element.key.is_some()) {
+                if elements.iter().any(|element| element.key.is_none()) {
                     return false;
                 }
 
                 elements.iter().all(|array_element| {
-                    let key_ok = if let Some(key_expr) = &array_element.key {
+                    let key_ok = array_element.key.as_ref().is_some_and(|key_expr| {
                         self.is_expr_assignable(key, key_expr, scopes, method_context)
-                    } else {
-                        let implicit_key = self.types.intern(TypeKind::Integer(IntegerType::Int64));
-                        self.is_assignable(key, implicit_key)
-                    };
+                    });
                     let value_ok = self.is_expr_assignable(
                         value,
                         &array_element.value,
@@ -7279,18 +7303,15 @@ impl<'program> Checker<'program> {
         }
 
         if elements.iter().any(|element| element.key.is_some()) {
+            if elements.iter().any(|element| element.key.is_none()) {
+                return self.types.intern(TypeKind::Heterogeneous);
+            }
             let explicit_keys = elements
                 .iter()
                 .filter_map(|element| element.key.as_ref())
                 .collect::<Vec<_>>();
-            let mut key_types =
+            let key_types =
                 self.infer_collection_member_types(&explicit_keys, scopes, method_context);
-            key_types.extend(
-                elements
-                    .iter()
-                    .filter(|element| element.key.is_none())
-                    .map(|_| self.types.intern(TypeKind::Integer(IntegerType::Int64))),
-            );
             let values = elements
                 .iter()
                 .map(|element| &element.value)

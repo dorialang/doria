@@ -79,7 +79,7 @@ struct CollectionInfo {
     family: CollectionFamily,
     value_move: bool,
     value_class: Option<String>,
-    value_collection: Option<CollectionFamily>,
+    value_collection: Option<Box<CollectionInfo>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1549,6 +1549,17 @@ impl Checker<'_> {
                 args,
                 ..
             } => {
+                if matches!(
+                    qualifier,
+                    ast::StaticQualifier::Class(class_name)
+                        if (class_name == "Set" && method == "from")
+                            || (class_name == "Bytes" && method == "fromArray")
+                ) {
+                    for arg in args {
+                        self.use_expr(arg, scopes, UseMode::Read);
+                    }
+                    return;
+                }
                 let signature = self
                     .qualifier_class(qualifier)
                     .and_then(|class_name| self.methods.get(&(class_name, method.clone())))
@@ -2481,7 +2492,7 @@ impl Checker<'_> {
                     value_class: value.and_then(|value| self.expr_class(value, scopes)),
                     value_collection: value
                         .and_then(|value| self.expr_collection_info(value, scopes))
-                        .map(|info| info.family),
+                        .map(Box::new),
                 })
             }
             Expr::FunctionCall { name, .. } => {
@@ -2523,7 +2534,7 @@ impl Checker<'_> {
                     family: CollectionFamily::Set,
                     value_move: source.as_ref().is_some_and(|info| info.value_move),
                     value_class: source.as_ref().and_then(|info| info.value_class.clone()),
-                    value_collection: source.and_then(|info| info.value_collection),
+                    value_collection: source.and_then(|info| info.value_collection.clone()),
                 })
             }
             Expr::StaticCall {
@@ -2531,6 +2542,9 @@ impl Checker<'_> {
                 method,
                 ..
             } if class_name == "Bytes" && method == "fromArray" => Some(bytes_collection_info()),
+            Expr::Index { collection, .. } => self
+                .expr_collection_info(collection, scopes)
+                .and_then(|info| info.value_collection.map(|nested| *nested)),
             Expr::Grouped { expr, .. } => self.expr_collection_info(expr, scopes),
             Expr::Binary {
                 left,
@@ -2666,8 +2680,7 @@ fn type_ref_collection_info(
         family,
         value_move: type_ref_is_move_type(value, classes, receiver_class),
         value_class: type_ref_class_name(value, classes, receiver_class),
-        value_collection: type_ref_collection_info(value, classes, receiver_class)
-            .map(|info| info.family),
+        value_collection: type_ref_collection_info(value, classes, receiver_class).map(Box::new),
     })
 }
 

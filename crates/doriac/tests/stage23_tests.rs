@@ -62,6 +62,39 @@ function main(): void
 }
 
 #[test]
+fn collection_properties_and_indexed_class_values_preserve_writable_borrows() {
+    let mir = doriac::lower_source_to_mir(
+        "stage23-collection-places.doria",
+        r#"
+class Counter
+{
+    function __construct(writable int $value) {}
+    writable function increment(): void { $this->value++; }
+    function current(): int { return $this->value; }
+}
+class Holder
+{
+    writable List<int> $items = [1];
+    writable function append(int $value): void { $this->items->add($value); }
+}
+function main(): void
+{
+    writable List<Counter> $counters = [new Counter(1)];
+    $counters[0]->increment();
+
+    let writable $holder = new Holder();
+    $holder->append(2);
+    echo "{$counters[0]->current()}:{$holder->items->count}:{$holder->items[1]}";
+}
+"#,
+    )
+    .expect("indexed class and collection property places should lower as writable borrows");
+    let output = doriac::mir_interpreter::interpret(&mir)
+        .expect("borrowed collection places should execute through shared MIR");
+    assert_eq!(output.stdout, b"2:2:2");
+}
+
+#[test]
 fn foreach_materializes_collection_expression_with_scoped_ownership() {
     let mir = doriac::lower_source_to_mir(
         "stage23-foreach-expression.doria",
@@ -96,6 +129,54 @@ function main(): void
         "E0470",
     );
     assert!(error.message.contains("given away"));
+}
+
+#[test]
+fn nested_collection_ingestion_tracks_moved_arguments() {
+    let errors = diagnostics(
+        r#"
+class Token { function __construct(int $id) {} }
+function main(): void
+{
+    writable List<List<List<Token>>> $outer = [[[]]];
+    List<Token> $inner = [new Token(1)];
+    $outer[0]->add($inner);
+    echo "{$inner->count}";
+}
+"#,
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("given away")),
+        "{errors:#?}"
+    );
+}
+
+#[test]
+fn static_collection_constructors_observe_moved_sources() {
+    for source in [
+        r#"
+function main(): void
+{
+    uint8[] $source = [1];
+    let $moved = $source;
+    Bytes $bytes = Bytes::fromArray($source);
+}
+"#,
+        r#"
+function main(): void
+{
+    List<int> $source = [1];
+    let $moved = $source;
+    Set<int> $set = Set::from($source);
+}
+"#,
+    ] {
+        assert!(diagnostics(source)
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("given away")));
+    }
 }
 
 #[test]
@@ -193,6 +274,36 @@ function main(): void
     let output = doriac::mir_interpreter::interpret(&mir)
         .expect("the complete Stage 23 Slice 2 Bytes surface should execute");
     assert_eq!(output.stdout, b"3:1:43:254:equal:different");
+}
+
+#[test]
+fn non_bytes_collection_equality_is_rejected_before_mir() {
+    for declaration in [
+        "List<int> $left = [1]; List<int> $right = [1];",
+        "Dictionary<string, int> $left = [\"one\" => 1]; Dictionary<string, int> $right = [\"one\" => 1];",
+        "Set<int> $left = Set::from([1]); Set<int> $right = Set::from([1]);",
+        "int[] $left = [1]; int[] $right = [1];",
+    ] {
+        let source = format!(
+            "function main(): void {{ {declaration} if ($left == $right) {{ echo \"same\"; }} }}"
+        );
+        let error = diagnostic(&source, "E0525");
+        assert!(error.message.contains("only `Bytes`"));
+    }
+}
+
+#[test]
+fn dictionary_literals_require_explicit_keys_for_every_entry() {
+    let error = diagnostic(
+        r#"
+function main(): void
+{
+    Dictionary<int, string> $values = [0 => "zero", "one"];
+}
+"#,
+        "E0403",
+    );
+    assert!(error.message.contains("cannot assign"));
 }
 
 #[test]

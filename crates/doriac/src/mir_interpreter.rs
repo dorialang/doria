@@ -2866,6 +2866,25 @@ impl Interpreter<'_> {
                 });
                 frame.tasks.push(EvaluationTask::Rvalue(*index));
             }
+            mir::CollectionExpression::Property {
+                collection,
+                object,
+                property,
+            } => {
+                let LocalValue::Collection(value) = self.read_property(object, property)? else {
+                    return Err(InterpreterError::new(
+                        "MIR collection property contains another value type",
+                    ));
+                };
+                if value.ty != collection {
+                    return Err(InterpreterError::new(
+                        "MIR collection property has another collection type",
+                    ));
+                }
+                self.current_frame_mut()?
+                    .values
+                    .push(EvaluationValue::Collection(value));
+            }
             mir::CollectionExpression::SetFrom {
                 collection,
                 source,
