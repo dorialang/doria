@@ -662,6 +662,35 @@ function main(): void
 }
 
 #[test]
+fn bool_collection_element_read_lowers_without_malformed_mir() {
+    // Regression: reading a `bool` element out of a collection/array used to fail
+    // shared MIR validation ("bool expression has an incompatible operand") because
+    // the bool operand surface omitted `Operand::CollectionIndex`.
+    doriac::lower_source_to_mir(
+        "stage23-bool-collection.doria",
+        r#"
+function main(): void
+{
+    writable List<bool> $flags = [];
+    $flags->add(true);
+    if ($flags[0]) {
+        echo "ok\n";
+    }
+    bool[] $mask = [true, false];
+    if (!$mask[1]) {
+        echo "ok\n";
+    }
+    writable Dictionary<int, bool> $seen = [1 => true];
+    if ($seen[1]) {
+        echo "ok\n";
+    }
+}
+"#,
+    )
+    .expect("bool collection/array element reads must lower to well-formed MIR");
+}
+
+#[test]
 fn mixed_remove_at_lowers_to_a_removing_collection_index() {
     let program = doriac::lower_source_to_mir(
         "stage23-mixed-removeat.doria",

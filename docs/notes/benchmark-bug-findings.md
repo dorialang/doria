@@ -10,7 +10,15 @@
 Toolchain at time of writing: `doriac` on develop with Stage 23 Slices 1–3
 landed; native profiles Cranelift (fast) and LLVM (`--release`).
 
-## Bug 1 — `bool`-typed collection/array element reads are miscompiled (B0001)
+## Bug 1 — `bool`-typed collection/array element reads are miscompiled (B0001) — RESOLVED
+
+**RESOLVED.** Root cause: the shared MIR `BoolExpression::Use` operand validation
+omitted `mir::Operand::CollectionIndex` (present for the integer operand), so a
+`bool` element load was rejected before any backend. Fixed by adding the
+`CollectionIndex` arm to the bool operand validation (the interpreter and both
+native backends already lowered it). Regression coverage:
+`examples/native/main_stage23_bool_collections.doria` (parity manifest) plus a
+`stage23_tests` lowering test.
 
 **Severity: high.** Any `bool` element stored in a collection or array is unusable
 in native code, so `bool` collections are effectively broken. This blocks the

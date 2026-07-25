@@ -5361,6 +5361,28 @@ fn validate_condition(
                 *tag,
                 mir::Type::Scalar(mir::ScalarType::Bool),
             ),
+            mir::Operand::CollectionIndex {
+                collection,
+                index,
+                remove,
+            } => {
+                let local = local_in(function, *collection)?;
+                let mir::Type::Collection(collection_type) = local.ty else {
+                    return Err(malformed_mir("bool index source is not a collection"));
+                };
+                let collection_type = collection_in(program, collection_type)?;
+                if collection_type.value != mir::Type::Scalar(mir::ScalarType::Bool) {
+                    return Err(malformed_mir("bool index element type mismatch"));
+                }
+                validate_collection_element_access(
+                    program,
+                    function,
+                    local,
+                    collection_type,
+                    index,
+                    *remove,
+                )
+            }
             _ => Err(malformed_mir("bool expression has an incompatible operand")),
         },
         mir::BoolExpression::Compare { op, left, right } => {
