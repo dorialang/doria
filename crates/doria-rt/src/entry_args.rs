@@ -77,12 +77,12 @@ unsafe fn append_platform_arguments(
 ) {
     let command_line = GetCommandLineW();
     if command_line.is_null() {
-        return;
+        argument_panic(b"failed to decode program arguments");
     }
     let mut wide_count: i32 = 0;
     let wide_argv = CommandLineToArgvW(command_line, &mut wide_count);
     if wide_argv.is_null() {
-        return;
+        argument_panic(b"failed to decode program arguments");
     }
 
     // Element 0 is the executable path, exactly as on Unix.

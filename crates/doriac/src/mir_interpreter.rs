@@ -416,6 +416,8 @@ fn interpret_internal(
     limits: InterpreterLimits,
     io: MirIo,
 ) -> Result<InterpreterIoOutput, InterpreterError> {
+    crate::mir_validation::validate_program(program)
+        .map_err(|error| InterpreterError::new(error.message))?;
     let entry = function_in(program, program.entry)?;
     // Decision 0099: the entry takes either no parameters or one `List<string>`
     // of program arguments, which the glue owns and lends to `main`.

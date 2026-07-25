@@ -1,4 +1,5 @@
 use std::env;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
@@ -18,17 +19,28 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<ExitCode, String> {
-    let args = env::args().skip(1).collect::<Vec<_>>();
-    if args.is_empty() || args[0] == "--help" || args[0] == "-h" {
+    let args = env::args_os().skip(1).collect::<Vec<_>>();
+    let Some(command) = args.first() else {
+        print_help();
+        return Ok(ExitCode::SUCCESS);
+    };
+    let command = command
+        .to_str()
+        .ok_or_else(|| "doriac command must be valid UTF-8".to_string())?;
+    if command == "--help" || command == "-h" {
         print_help();
         return Ok(ExitCode::SUCCESS);
     }
-    if args[0] == "--version" || args[0] == "-V" {
+    if command == "--version" || command == "-V" {
         println!("doriac {}", doriac::TOOLCHAIN_VERSION);
         return Ok(ExitCode::SUCCESS);
     }
+    if command == "run" {
+        return run_command(&args[1..]);
+    }
 
-    match args[0].as_str() {
+    let args = utf8_cli_arguments(&args)?;
+    match command {
         "check" => {
             let input = args
                 .get(1)
@@ -59,7 +71,6 @@ fn run() -> Result<ExitCode, String> {
         "hir" => hir_command(&args[1..]).map(|()| ExitCode::SUCCESS),
         "mir" => mir_command(&args[1..]).map(|()| ExitCode::SUCCESS),
         "compile" => compile_command(&args[1..]).map(|()| ExitCode::SUCCESS),
-        "run" => run_command(&args[1..]),
         command if command.ends_with(".doria") || Path::new(command).is_file() => Err(format!(
             "unknown command `{command}`\n\n\
              `{command}` looks like a source file, and the command comes first. Did you mean:\n    \
@@ -71,6 +82,17 @@ fn run() -> Result<ExitCode, String> {
             "unknown command `{command}`\n\nRun `doriac --help`."
         )),
     }
+}
+
+fn utf8_cli_arguments(args: &[OsString]) -> Result<Vec<String>, String> {
+    args.iter()
+        .map(|argument| {
+            argument
+                .to_str()
+                .map(str::to_owned)
+                .ok_or_else(|| "doriac commands and options must be valid UTF-8".to_string())
+        })
+        .collect()
 }
 
 fn compile_command(args: &[String]) -> Result<(), String> {
@@ -260,23 +282,27 @@ fn default_output_extension(target: BackendTarget) -> &'static str {
     }
 }
 
-fn run_command(args: &[String]) -> Result<ExitCode, String> {
-    let input = args
+fn run_command(args: &[OsString]) -> Result<ExitCode, String> {
+    let separator = args
+        .iter()
+        .position(|argument| argument == OsStr::new("--"));
+    let (compiler_args, program_args) = match separator {
+        Some(index) => (&args[..index], &args[index + 1..]),
+        None => (args, &[][..]),
+    };
+    let compiler_args = utf8_cli_arguments(compiler_args)?;
+    let input = compiler_args
         .first()
         .ok_or_else(|| "missing input file".to_string())?;
     let mut release = false;
     // Everything after `--` belongs to the program, not to `doriac`, so a
     // program argument can safely look like a compiler option (decision 0099).
-    let mut program_args: Vec<String> = Vec::new();
-    let mut options = args[1..].iter();
-    for option in options.by_ref() {
+    for option in &compiler_args[1..] {
         match option.as_str() {
             "--release" => release = true,
-            "--" => break,
             option => return Err(format!("unknown run option `{option}`")),
         }
     }
-    program_args.extend(options.cloned());
 
     let (path, text) = read_source(input)?;
     let profile = if release {
@@ -296,7 +322,7 @@ fn run_command(args: &[String]) -> Result<ExitCode, String> {
         .map_err(|error| format!("failed to write temp native executable: {error}"))?;
 
     let status = Command::new(&temp_path)
-        .args(&program_args)
+        .args(program_args)
         .status()
         .map_err(|error| {
             format!(

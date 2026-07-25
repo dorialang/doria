@@ -6,7 +6,9 @@
 
 use std::collections::BTreeMap;
 
+use doriac::mir::{LocalId, ScalarType, Type};
 use doriac::mir_interpreter::{interpret_with_io, MirIo};
+use doriac::numeric::IntegerType;
 
 const ENTRY_ARGUMENTS_EXAMPLE: &str =
     include_str!("../../../examples/native/main_stage23b_entry_arguments.doria");
@@ -155,4 +157,51 @@ function main(take List<string> $args): int
             "expected E0526, got {found:#?}"
         );
     }
+}
+
+#[test]
+fn shared_validation_rejects_a_writable_entry_argument_list() {
+    let mut program = doriac::lower_source_to_mir(
+        "stage23b-writable-mir.doria",
+        "function main(List<string> $args): void {}",
+    )
+    .expect("source should lower to MIR");
+    let entry = program.entry;
+    let parameter = program.functions[entry.0].params[0];
+    program.functions[entry.0].locals[parameter.0].writable = true;
+
+    let error = doriac::mir_validation::validate_program(&program)
+        .expect_err("entry glue lends a readonly argument list");
+    assert!(error
+        .message
+        .contains("readonly borrow from the entry glue"));
+}
+
+#[test]
+fn the_interpreter_rejects_malformed_entry_argument_mir() {
+    let source = "function main(List<string> $args): void {}";
+
+    let mut wrong_element = doriac::lower_source_to_mir("stage23b-wrong-element.doria", source)
+        .expect("source should lower to MIR");
+    let entry = wrong_element.entry;
+    let parameter = wrong_element.functions[entry.0].params[0];
+    let Type::Collection(collection) = wrong_element.functions[entry.0].locals[parameter.0].ty
+    else {
+        panic!("entry parameter should be a collection");
+    };
+    wrong_element.collection_types[collection.0].value =
+        Type::Scalar(ScalarType::Integer(IntegerType::Int64));
+    let error = interpret_with_io(&wrong_element, MirIo::default())
+        .expect_err("the interpreter must reject a non-string entry list");
+    assert!(error.message.contains("List<string>"));
+
+    let mut missing_local = doriac::lower_source_to_mir("stage23b-missing-local.doria", source)
+        .expect("source should lower to MIR");
+    let entry = missing_local.entry;
+    missing_local.functions[entry.0].params[0] = LocalId(usize::MAX);
+    let error = interpret_with_io(&missing_local, MirIo::default())
+        .expect_err("the interpreter must reject an out-of-range entry parameter");
+    assert!(error
+        .message
+        .contains("entry parameter local does not exist"));
 }

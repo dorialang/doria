@@ -115,6 +115,11 @@ pub fn validate_program(program: &mir::Program) -> Result<(), BackendError> {
                     "the entry argument list is borrowed from the entry glue, not owned by `main`",
                 ));
             }
+            if local.writable {
+                return Err(malformed_mir(
+                    "the entry argument list is a readonly borrow from the entry glue",
+                ));
+            }
         }
         _ => {
             return Err(malformed_mir(
