@@ -183,8 +183,17 @@ unsafe fn argument_panic(message: &[u8]) -> ! {
 #[cfg(windows)]
 extern "system" {
     fn GetCommandLineW() -> *const u16;
-    fn CommandLineToArgvW(command_line: *const u16, argument_count: *mut i32) -> *mut *const u16;
     fn LocalFree(memory: *mut c_void) -> *mut c_void;
+}
+
+// `CommandLineToArgvW` ships in shell32, not kernel32, so it needs an explicit
+// link directive: the default MSVC library set resolves the kernel32 entries
+// above but not this one. Cross-target `cargo check` and `clippy` do not link,
+// so only a real Windows link surfaces a missing directive here.
+#[cfg(windows)]
+#[link(name = "shell32")]
+extern "system" {
+    fn CommandLineToArgvW(command_line: *const u16, argument_count: *mut i32) -> *mut *const u16;
 }
 
 #[cfg(all(test, unix))]
