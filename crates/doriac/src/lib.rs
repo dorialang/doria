@@ -75,6 +75,20 @@ pub fn compile_source_to_php(
     }
 }
 
+pub fn compile_source_to_debug(
+    path: impl Into<String>,
+    text: impl Into<String>,
+) -> DiagnosticResult<String> {
+    match compile_source(path, text, BackendTarget::Debug)? {
+        backend::BackendOutput::Text { contents, .. } => Ok(contents),
+        _ => Err(vec![Diagnostic::new(
+            "B0002",
+            "debug backend did not return text output",
+            Span::default(),
+        )]),
+    }
+}
+
 pub fn lower_source(
     path: impl Into<String>,
     text: impl Into<String>,
