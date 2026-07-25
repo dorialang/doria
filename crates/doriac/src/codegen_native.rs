@@ -174,6 +174,11 @@ fn linker_arguments(
             OsString::from("/ENTRY:main"),
             OsString::from("/SUBSYSTEM:CONSOLE"),
             OsString::from("kernel32.lib"),
+            // `doria_rt.lib` is a staticlib, so it carries archived objects
+            // without the crate metadata that records a `#[link]` dependency.
+            // The entry glue's `CommandLineToArgvW` therefore has to be named
+            // here; shell32 is not in the default library set.
+            OsString::from("shell32.lib"),
         ];
     }
 
@@ -222,6 +227,7 @@ mod tests {
                 OsString::from("/ENTRY:main"),
                 OsString::from("/SUBSYSTEM:CONSOLE"),
                 OsString::from("kernel32.lib"),
+                OsString::from("shell32.lib"),
             ]
         );
     }
@@ -249,6 +255,7 @@ mod tests {
                 OsString::from("/ENTRY:main"),
                 OsString::from("/SUBSYSTEM:CONSOLE"),
                 OsString::from("kernel32.lib"),
+                OsString::from("shell32.lib"),
             ]
         );
     }
