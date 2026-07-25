@@ -163,9 +163,12 @@ their types, at or after Stage 23 per the collections-runtime rollout.
 Bracket literals build `List`/`Dictionary`/`T[]` by context typing (§4.9). `::from`
 is the explicit constructor from an existing sequence: it is **required** for
 `Set` (which has no literal form) and available as the equivalent explicit form
-for the others. Capacity hints (`withCapacity`) and other performance-shaped
-constructors are a profiling-driven addition, deferred with the runtime
-representation (0092).
+for the others. The runtime-sized **fill** constructor — a `T[]`/`List<T>` of
+`count` copies of a value — is spelled as the `[value; count]` repeat literal
+(decision 0102), which supersedes this record's original bundling of fill with
+capacity. Capacity hints (`withCapacity`, an empty pre-allocated sequence) and
+other performance-shaped constructors remain a profiling-driven addition, deferred
+with the runtime representation (0092).
 
 ## Alternatives considered
 
