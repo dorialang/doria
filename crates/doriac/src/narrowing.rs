@@ -1,7 +1,8 @@
 use std::collections::{BTreeMap, HashMap};
 
 use crate::ast::{
-    Block, ElseBranch, Expr, ForIncrement, ForInitializer, FunctionDecl, Item, Param, Program, Stmt,
+    Argument, Block, ElseBranch, Expr, ForIncrement, ForInitializer, FunctionDecl, Item, Param,
+    Program, Stmt,
 };
 use crate::builtins::Builtin;
 use crate::control_flow::{build_function_cfg, Node, NodeAction};
@@ -47,10 +48,49 @@ struct Resolution {
 
 #[derive(Default)]
 struct MutationCatalog {
-    functions: HashMap<String, Vec<bool>>,
-    methods: HashMap<String, Vec<bool>>,
-    qualified_methods: HashMap<(String, String), Vec<bool>>,
-    constructors: HashMap<String, Vec<bool>>,
+    functions: HashMap<String, ParamModes>,
+    methods: HashMap<String, ParamModes>,
+    qualified_methods: HashMap<(String, String), ParamModes>,
+    constructors: HashMap<String, ParamModes>,
+}
+
+/// Per-parameter mutability with parameter names, so named-argument binding
+/// (decision 0098) can find the parameter a named argument targets rather than
+/// assuming source position. `names` is empty when it cannot be determined
+/// unambiguously (overloaded unqualified methods merged from different classes);
+/// callers treat a named argument against empty `names` conservatively.
+#[derive(Default, Clone)]
+struct ParamModes {
+    names: Vec<String>,
+    mutable: Vec<bool>,
+}
+
+impl ParamModes {
+    /// Whether the parameter bound by `argument` is mutated by the callee (so any
+    /// narrowing fact about the argument's target must be discarded). Positional
+    /// arguments use their source position; named arguments resolve by name.
+    fn argument_is_mutating(&self, index: usize, argument: &Argument) -> bool {
+        match &argument.name {
+            None => self.mutable.get(index).copied().unwrap_or(false),
+            Some(name) => {
+                if self.names.is_empty() {
+                    // Callee parameter names are ambiguous; conservatively assume
+                    // the argument may be mutated (over-discarding narrowing facts
+                    // is sound — it can never invent knowledge).
+                    true
+                } else if let Some(position) = self
+                    .names
+                    .iter()
+                    .position(|candidate| candidate == &name.text)
+                {
+                    self.mutable.get(position).copied().unwrap_or(false)
+                } else {
+                    // Unknown name: semantic analysis reports it; nothing to kill.
+                    false
+                }
+            }
+        }
+    }
 }
 
 #[derive(Default, Clone)]
@@ -341,12 +381,12 @@ impl MutationCatalog {
         catalog
     }
 
-    fn function_modes(&self, name: &str) -> Option<&[bool]> {
-        self.functions.get(name).map(Vec::as_slice)
+    fn function_modes(&self, name: &str) -> Option<&ParamModes> {
+        self.functions.get(name)
     }
 
-    fn method_modes(&self, method: &str) -> Option<&[bool]> {
-        self.methods.get(method).map(Vec::as_slice)
+    fn method_modes(&self, method: &str) -> Option<&ParamModes> {
+        self.methods.get(method)
     }
 
     fn instance_method_modes(
@@ -355,12 +395,9 @@ impl MutationCatalog {
         method: &str,
         resolution: &Resolution,
         state: &State,
-    ) -> Option<&[bool]> {
+    ) -> Option<&ParamModes> {
         if let Some(class) = expression_class_name(object, resolution, Some(state)) {
-            return self
-                .qualified_methods
-                .get(&(class, method.to_string()))
-                .map(Vec::as_slice);
+            return self.qualified_methods.get(&(class, method.to_string()));
         }
         self.method_modes(method)
     }
@@ -370,24 +407,23 @@ impl MutationCatalog {
         qualifier: &crate::ast::StaticQualifier,
         method: &str,
         resolution: &Resolution,
-    ) -> Option<&[bool]> {
+    ) -> Option<&ParamModes> {
         if let Some(class) = static_qualifier_class_name(qualifier, resolution) {
             self.qualified_methods
                 .get(&(class, method.to_string()))
                 .or_else(|| self.methods.get(method))
-                .map(Vec::as_slice)
         } else {
             self.method_modes(method)
         }
     }
 
-    fn constructor_modes(&self, class: &str) -> Option<&[bool]> {
-        self.constructors.get(class).map(Vec::as_slice)
+    fn constructor_modes(&self, class: &str) -> Option<&ParamModes> {
+        self.constructors.get(class)
     }
 }
 
 fn merge_parameter_modes(
-    target: &mut Vec<bool>,
+    target: &mut ParamModes,
     parameters: &[Param],
     classes: &std::collections::HashSet<String>,
     declaring_class: Option<&str>,
@@ -400,27 +436,42 @@ fn parameter_modes(
     parameters: &[Param],
     classes: &std::collections::HashSet<String>,
     declaring_class: Option<&str>,
-) -> Vec<bool> {
-    parameters
-        .iter()
-        .map(|parameter| {
-            parameter.writable
-                || (parameter.take
-                    && crate::ownership::type_ref_is_move_type(
-                        &parameter.ty,
-                        classes,
-                        declaring_class,
-                    ))
-        })
-        .collect()
+) -> ParamModes {
+    ParamModes {
+        names: parameters
+            .iter()
+            .map(|parameter| parameter.name.clone())
+            .collect(),
+        mutable: parameters
+            .iter()
+            .map(|parameter| {
+                parameter.writable
+                    || (parameter.take
+                        && crate::ownership::type_ref_is_move_type(
+                            &parameter.ty,
+                            classes,
+                            declaring_class,
+                        ))
+            })
+            .collect(),
+    }
 }
 
-fn merge_modes(target: &mut Vec<bool>, incoming: &[bool]) {
-    if target.len() < incoming.len() {
-        target.resize(incoming.len(), false);
+fn merge_modes(target: &mut ParamModes, incoming: &ParamModes) {
+    let fresh = target.mutable.is_empty() && target.names.is_empty();
+    if target.mutable.len() < incoming.mutable.len() {
+        target.mutable.resize(incoming.mutable.len(), false);
     }
-    for (index, mutable) in incoming.iter().enumerate() {
-        target[index] |= mutable;
+    for (index, mutable) in incoming.mutable.iter().enumerate() {
+        target.mutable[index] |= mutable;
+    }
+    // Parameter names are usable only when every merged callable agrees on them;
+    // an overloaded unqualified method name with differing parameter names leaves
+    // the names ambiguous, so blank them and fall back to conservative handling.
+    if fresh {
+        target.names = incoming.names.clone();
+    } else if target.names != incoming.names {
+        target.names.clear();
     }
 }
 
@@ -988,28 +1039,28 @@ fn kill_short_circuit_effects(
 }
 
 fn kill_calls_in_arguments(
-    args: &[Expr],
+    args: &[Argument],
     state: &mut State,
     resolution: &Resolution,
     mutations: &MutationCatalog,
 ) {
     for argument in args {
-        kill_mutated_call_arguments(argument, state, resolution, mutations);
+        kill_mutated_call_arguments(&argument.value, state, resolution, mutations);
     }
 }
 
 fn kill_arguments_for_modes(
-    args: &[Expr],
-    modes: Option<&[bool]>,
+    args: &[Argument],
+    modes: Option<&ParamModes>,
     state: &mut State,
     resolution: &Resolution,
 ) {
     let Some(modes) = modes else {
         return;
     };
-    for (argument, mutable) in args.iter().zip(modes) {
-        if *mutable {
-            kill_target(argument, state, resolution);
+    for (index, argument) in args.iter().enumerate() {
+        if modes.argument_is_mutating(index, argument) {
+            kill_target(&argument.value, state, resolution);
         }
     }
 }
@@ -1476,14 +1527,14 @@ fn collect_short_circuit(
 }
 
 fn collect_expr_sequence(
-    expressions: &[Expr],
+    arguments: &[Argument],
     state: &State,
     resolution: &Resolution,
     mutations: &MutationCatalog,
     facts: &mut FactsByUse,
 ) -> State {
-    expressions.iter().fold(state.clone(), |state, expression| {
-        collect_expr(expression, &state, resolution, mutations, facts)
+    arguments.iter().fold(state.clone(), |state, argument| {
+        collect_expr(&argument.value, &state, resolution, mutations, facts)
     })
 }
 
@@ -1760,14 +1811,14 @@ impl Resolver {
             Expr::MethodCall { object, args, .. } => {
                 self.resolve_expr(object);
                 for argument in args {
-                    self.resolve_expr(argument);
+                    self.resolve_expr(&argument.value);
                 }
             }
             Expr::FunctionCall { args, .. }
             | Expr::StaticCall { args, .. }
             | Expr::New { args, .. } => {
                 for argument in args {
-                    self.resolve_expr(argument);
+                    self.resolve_expr(&argument.value);
                 }
             }
             Expr::InterpolatedString { parts, .. } => {

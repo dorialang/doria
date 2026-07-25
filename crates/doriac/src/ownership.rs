@@ -6,7 +6,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::ast::{self, AssignOp, BinaryOp, ClassMember, Expr, Item, Stmt};
+use crate::ast::{self, Argument, AssignOp, BinaryOp, ClassMember, Expr, Item, Stmt};
 use crate::builtins::Builtin;
 use crate::diagnostics::Diagnostic;
 use crate::narrowing::{Fact, FactsByUse};
@@ -15,6 +15,7 @@ use crate::symbols::{BorrowSource, ReturnBorrow};
 
 #[derive(Debug, Clone)]
 struct Parameter {
+    name: String,
     move_type: bool,
     class_type: bool,
     take: bool,
@@ -29,6 +30,29 @@ struct Signature {
     returns_move_type: bool,
     return_borrow: Option<ReturnBorrow>,
     receiver: Option<UseMode>,
+}
+
+impl Signature {
+    /// Bind call arguments to parameters by name (decision 0098). Ownership
+    /// analysis runs over source (written) order, but a named argument's
+    /// ownership mode comes from the parameter it binds to, not its source
+    /// position — so both directions of the mapping are needed.
+    fn bind_arguments(&self, args: &[Argument]) -> crate::arg_binding::BoundArguments {
+        let param_names: Vec<&str> = self
+            .params
+            .iter()
+            .map(|param| param.name.as_str())
+            .collect();
+        // Defaults do not affect the argument<->parameter mapping, only the
+        // missing-required diagnostic (owned by semantic analysis), so `false`
+        // for every parameter is sufficient here.
+        let param_has_default = vec![false; param_names.len()];
+        let arg_names: Vec<Option<&str>> = args
+            .iter()
+            .map(|arg| arg.name.as_ref().map(|name| name.text.as_str()))
+            .collect();
+        crate::arg_binding::bind_arguments(&param_names, &param_has_default, &arg_names)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -620,7 +644,7 @@ fn ungroup_expr(mut expr: &Expr) -> &Expr {
 fn returned_call_borrow(
     call: &Expr,
     receiver: Option<&Expr>,
-    args: &[Expr],
+    args: &[Argument],
     function: &ast::FunctionDecl,
     resolve_call: &mut dyn FnMut(&Expr) -> Option<ReturnBorrow>,
     shadowed: &HashSet<String>,
@@ -628,12 +652,42 @@ fn returned_call_borrow(
     let returned = resolve_call(call)?;
     let source = match returned.source {
         BorrowSource::Receiver => receiver?,
-        BorrowSource::Parameter(index) => args.get(index)?,
+        BorrowSource::Parameter(index) => {
+            &argument_bound_to_parameter(function, args, index)?.value
+        }
     };
     expr_return_borrow(source, function, resolve_call, shadowed).map(|mut borrow| {
         borrow.writable &= returned.writable;
         borrow
     })
+}
+
+/// Resolve the source-order argument bound to parameter `param_index` of
+/// `function` under named-argument binding (decision 0098). A borrow annotation
+/// names a parameter position; the argument feeding it may sit elsewhere in the
+/// written call once named arguments reorder.
+fn argument_bound_to_parameter<'a>(
+    function: &ast::FunctionDecl,
+    args: &'a [Argument],
+    param_index: usize,
+) -> Option<&'a Argument> {
+    let param_names: Vec<&str> = function
+        .params
+        .iter()
+        .map(|param| param.name.as_str())
+        .collect();
+    let param_has_default = vec![false; param_names.len()];
+    let arg_names: Vec<Option<&str>> = args
+        .iter()
+        .map(|arg| arg.name.as_ref().map(|name| name.text.as_str()))
+        .collect();
+    let bound = crate::arg_binding::bind_arguments(&param_names, &param_has_default, &arg_names);
+    bound
+        .param_to_arg
+        .get(param_index)
+        .copied()
+        .flatten()
+        .and_then(|arg_index| args.get(arg_index))
 }
 
 fn signature(
@@ -658,6 +712,7 @@ fn signature(
             .params
             .iter()
             .map(|param| Parameter {
+                name: param.name.clone(),
                 move_type: type_ref_is_move_type(&param.ty, classes, receiver_class),
                 class_type: type_ref_class_name(&param.ty, classes, receiver_class).is_some(),
                 take: param.take,
@@ -1585,7 +1640,7 @@ impl Checker<'_> {
                             || (class_name == "Bytes" && method == "fromArray")
                 ) {
                     for arg in args {
-                        self.use_expr(arg, scopes, UseMode::Read);
+                        self.use_expr(&arg.value, scopes, UseMode::Read);
                     }
                     return;
                 }
@@ -1755,7 +1810,7 @@ impl Checker<'_> {
     fn use_call_args(
         &mut self,
         receiver: Option<&Expr>,
-        args: &[Expr],
+        args: &[Argument],
         signature: &Signature,
         execution: CallExecution,
         scopes: &mut Scopes,
@@ -1772,13 +1827,19 @@ impl Checker<'_> {
                 self.activate_call_borrow(receiver, mode, scopes);
             }
         }
+        // Arguments are visited in source (written) order so ownership and
+        // borrow conflicts are checked over the caller-visible evaluation order
+        // (decision 0098). Each argument's ownership mode, however, comes from
+        // the parameter it binds to by name, not its source position.
+        let bound = signature.bind_arguments(args);
         let without_call = (execution == CallExecution::Maybe).then(|| scopes.clone());
-        for (index, arg) in args.iter().enumerate() {
-            let mode = call_arg_mode(signature, index);
+        for (index, argument) in args.iter().enumerate() {
+            let arg = &argument.value;
+            let param_index = bound.arg_to_param.get(index).copied().flatten();
+            let mode = param_index.map_or(UseMode::Read, |param| call_arg_mode(signature, param));
             if mode == UseMode::Write
-                && signature
-                    .params
-                    .get(index)
+                && param_index
+                    .and_then(|param| signature.params.get(param))
                     .is_some_and(|param| !param.class_type)
             {
                 self.check_writable_move_argument(arg, scopes);
@@ -1973,7 +2034,7 @@ impl Checker<'_> {
     fn activate_nested_call_property_borrows(
         &mut self,
         receiver: Option<&Expr>,
-        args: &[Expr],
+        args: &[Argument],
         signature: &Signature,
         scopes: &Scopes,
     ) {
@@ -1988,8 +2049,15 @@ impl Checker<'_> {
                 }
             }
         }
-        for (index, arg) in args.iter().enumerate() {
-            let mode = call_arg_mode(signature, index);
+        let bound = signature.bind_arguments(args);
+        for (index, argument) in args.iter().enumerate() {
+            let arg = &argument.value;
+            let mode = bound
+                .arg_to_param
+                .get(index)
+                .copied()
+                .flatten()
+                .map_or(UseMode::Read, |param| call_arg_mode(signature, param));
             self.activate_place_input_borrows(arg, scopes);
             if matches!(mode, UseMode::Read | UseMode::Write) {
                 self.activate_call_borrow(arg, mode, scopes);
@@ -2139,11 +2207,11 @@ impl Checker<'_> {
                     .contains_key(&(class.clone(), member.clone()))
                     .then(|| format!("static:{class}::{member}"))
             }),
-            Expr::FunctionCall { name, args, .. } => self
-                .signatures
-                .get(name)
-                .and_then(|signature| signature.return_borrow)
-                .and_then(|borrow| self.call_borrow_root(borrow, None, args, scopes)),
+            Expr::FunctionCall { name, args, .. } => {
+                let signature = self.signatures.get(name)?;
+                let borrow = signature.return_borrow?;
+                self.call_borrow_root(borrow, None, signature, args, scopes)
+            }
             Expr::MethodCall {
                 object,
                 method,
@@ -2151,21 +2219,21 @@ impl Checker<'_> {
                 ..
             } => {
                 let class = self.expr_class(object, scopes)?;
-                self.methods
-                    .get(&(class, method.clone()))
-                    .and_then(|signature| signature.return_borrow)
-                    .and_then(|borrow| self.call_borrow_root(borrow, Some(object), args, scopes))
+                let signature = self.methods.get(&(class, method.clone()))?;
+                let borrow = signature.return_borrow?;
+                self.call_borrow_root(borrow, Some(object), signature, args, scopes)
             }
             Expr::StaticCall {
                 qualifier,
                 method,
                 args,
                 ..
-            } => self
-                .qualifier_class(qualifier)
-                .and_then(|class| self.methods.get(&(class, method.clone())))
-                .and_then(|signature| signature.return_borrow)
-                .and_then(|borrow| self.call_borrow_root(borrow, None, args, scopes)),
+            } => {
+                let class = self.qualifier_class(qualifier)?;
+                let signature = self.methods.get(&(class, method.clone()))?;
+                let borrow = signature.return_borrow?;
+                self.call_borrow_root(borrow, None, signature, args, scopes)
+            }
             _ => None,
         }
     }
@@ -2189,12 +2257,19 @@ impl Checker<'_> {
         &self,
         borrow: ReturnBorrow,
         receiver: Option<&Expr>,
-        args: &[Expr],
+        signature: &Signature,
+        args: &[Argument],
         scopes: &Scopes,
     ) -> Option<String> {
         match borrow.source {
             BorrowSource::Receiver => self.borrow_root_key(receiver?, scopes),
-            BorrowSource::Parameter(index) => self.borrow_root_key(args.get(index)?, scopes),
+            BorrowSource::Parameter(index) => {
+                // The annotation names a parameter position; named binding may
+                // place that argument anywhere in the written call.
+                let bound = signature.bind_arguments(args);
+                let arg_index = bound.param_to_arg.get(index).copied().flatten()?;
+                self.borrow_root_key(&args.get(arg_index)?.value, scopes)
+            }
         }
     }
 
@@ -2597,7 +2672,7 @@ impl Checker<'_> {
             } if class_name == "Set" && method == "from" => {
                 let source = args
                     .first()
-                    .and_then(|arg| self.expr_collection_info(arg, scopes));
+                    .and_then(|arg| self.expr_collection_info(&arg.value, scopes));
                 Some(CollectionInfo {
                     family: CollectionFamily::Set,
                     value_move: source.as_ref().is_some_and(|info| info.value_move),
@@ -2634,7 +2709,7 @@ impl Checker<'_> {
         collection: CollectionFamily,
         object: &Expr,
         method: &str,
-        args: &[Expr],
+        args: &[Argument],
         scopes: &mut Scopes,
     ) {
         let mutating = matches!(
@@ -2664,9 +2739,9 @@ impl Checker<'_> {
                     | (CollectionFamily::Set, "add", 0)
             );
             if moves_in {
-                self.use_owned_expression(argument, scopes);
+                self.use_owned_expression(&argument.value, scopes);
             } else {
-                self.use_expr(argument, scopes, UseMode::Read);
+                self.use_expr(&argument.value, scopes, UseMode::Read);
             }
         }
     }

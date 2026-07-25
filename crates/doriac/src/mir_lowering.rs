@@ -37,12 +37,23 @@ impl CollectionRegistry {
     }
 }
 
+/// Intrinsics, built-ins, and collection methods bind positionally only —
+/// semantic analysis rejects named arguments for them (decision 0098 makes
+/// parameter names public API for user callables, not for language intrinsics).
+/// Lowering for those paths therefore reads argument expressions directly.
+fn argument_values(args: &[hir::Argument]) -> Vec<&hir::Expr> {
+    args.iter().map(|argument| &argument.value).collect()
+}
+
 #[derive(Clone)]
 struct FunctionSignature {
     id: mir::FunctionId,
     return_type: mir::ReturnType,
     return_borrow: Option<mir::ReturnBorrow>,
     parameter_types: Vec<mir::Type>,
+    /// Declared parameter names, in declaration order. Named-argument binding
+    /// (decision 0098) resolves `name: value` against these.
+    parameter_names: Vec<String>,
     parameter_defaults: Vec<Option<crate::const_eval::ConstValue>>,
     parameter_transfers: Vec<bool>,
     parameter_owns: Vec<bool>,
@@ -661,6 +672,11 @@ fn collect_function_signature(
             .copied()
             .map(mir_return_borrow),
         parameter_types,
+        parameter_names: function
+            .params
+            .iter()
+            .map(|param| param.name.clone())
+            .collect(),
         parameter_defaults,
         parameter_transfers,
         parameter_owns,
@@ -1040,33 +1056,30 @@ fn lower_statement_sequence(
                         let message = lower_panic_message(args, *call_span, context)?;
                         context.terminate_current(mir::Terminator::Panic(message));
                     } else if name == "printf" {
-                        context.push_statement(mir::Statement::Printf(lower_format_expression(
-                            args, *call_span, context,
-                        )?));
+                        let format = lower_format_expression(args, *call_span, context)?;
+                        context.push_statement(mir::Statement::Printf(format));
                     } else if name == "write_file" {
-                        let [path, contents] = args.as_slice() else {
+                        let [path, contents] = argument_values(args)[..] else {
                             return Err(vec![unsupported(
                                 *call_span,
                                 "write_file expects 2 arguments",
                             )]);
                         };
-                        context.push_statement(mir::Statement::WriteFile {
-                            path: lower_string_expression(path, context)?,
-                            contents: lower_string_expression(contents, context)?,
-                        });
+                        let path = lower_string_expression(path, context)?;
+                        let contents = lower_string_expression(contents, context)?;
+                        context.push_statement(mir::Statement::WriteFile { path, contents });
                     } else if name == "append_file" {
-                        let [path, contents] = args.as_slice() else {
+                        let [path, contents] = argument_values(args)[..] else {
                             return Err(vec![unsupported(
                                 *call_span,
                                 "append_file expects 2 arguments",
                             )]);
                         };
-                        context.push_statement(mir::Statement::AppendFile {
-                            path: lower_string_expression(path, context)?,
-                            contents: lower_string_expression(contents, context)?,
-                        });
+                        let path = lower_string_expression(path, context)?;
+                        let contents = lower_string_expression(contents, context)?;
+                        context.push_statement(mir::Statement::AppendFile { path, contents });
                     } else if matches!(name.as_str(), "write_stdout_bytes" | "write_stderr_bytes") {
-                        let [contents] = args.as_slice() else {
+                        let [contents] = argument_values(args)[..] else {
                             return Err(vec![unsupported(
                                 *call_span,
                                 format!("{name} expects 1 argument"),
@@ -1078,15 +1091,14 @@ fn lower_statement_sequence(
                             stderr: name == "write_stderr_bytes",
                         });
                     } else if name == "write_stderr" {
-                        let [value] = args.as_slice() else {
+                        let [value] = argument_values(args)[..] else {
                             return Err(vec![unsupported(
                                 *call_span,
                                 "write_stderr expects 1 argument",
                             )]);
                         };
-                        context.push_statement(mir::Statement::WriteStderr(
-                            lower_string_expression(value, context)?,
-                        ));
+                        let value = lower_string_expression(value, context)?;
+                        context.push_statement(mir::Statement::WriteStderr(value));
                     } else {
                         let call = lower_statement_call(name, args, *call_span, context)?;
                         context.push_statement(call);
@@ -2695,20 +2707,20 @@ fn lower_var_decl(decl: &hir::VarDecl, context: &mut LoweringContext) -> Diagnos
     Ok(())
 }
 
-fn inferred_class_type(expr: &hir::Expr, context: &LoweringContext) -> Option<ClassId> {
+fn inferred_class_type(expr: &hir::Expr, context: &mut LoweringContext) -> Option<ClassId> {
     match context.expression_type(expr).ok()? {
         mir::Type::Class(class) | mir::Type::NullableClass(class) => Some(class),
         _ => None,
     }
 }
 
-fn is_nullable_string_expression(expr: &hir::Expr, context: &LoweringContext) -> bool {
+fn is_nullable_string_expression(expr: &hir::Expr, context: &mut LoweringContext) -> bool {
     context
         .expression_type(expr)
         .is_ok_and(|ty| ty == mir::Type::NullableString)
 }
 
-fn is_string_local_initializer(expr: &hir::Expr, context: &LoweringContext) -> bool {
+fn is_string_local_initializer(expr: &hir::Expr, context: &mut LoweringContext) -> bool {
     match expr {
         hir::Expr::String { .. } | hir::Expr::InterpolatedString { .. } => true,
         hir::Expr::Grouped { expr, .. } => is_string_local_initializer(expr, context),
@@ -2857,7 +2869,7 @@ fn unparenthesized_place(expr: &hir::Expr) -> &hir::Expr {
 
 fn lower_scalar_place(
     expr: &hir::Expr,
-    context: &LoweringContext,
+    context: &mut LoweringContext,
 ) -> DiagnosticResult<(ScalarPlace, mir::ScalarType)> {
     match unparenthesized_place(expr) {
         hir::Expr::Variable { name, span } => {
@@ -2901,7 +2913,7 @@ fn lower_scalar_place(
             span,
         } => {
             let (collection, collection_type) = lower_collection_local(collection, context)?;
-            let info = context.collection_type(collection_type);
+            let info = context.collection_type(collection_type).clone();
             let mir::Type::Scalar(scalar) = info.value else {
                 return Err(vec![unsupported(
                     *span,
@@ -2977,47 +2989,43 @@ fn lower_assignment(
     } = target
     {
         let (collection, collection_type) = lower_collection_local(collection, context)?;
-        let info = context.collection_type(collection_type);
+        let info = context.collection_type(collection_type).clone();
         let index_type = info
             .key
             .unwrap_or(mir::Type::Scalar(mir::ScalarType::Integer(
                 IntegerType::Int64,
             )));
+        let index = lower_rvalue_as_expected(index, index_type, context)?;
+        let value = lower_rvalue_as_expected(&assignment.value, info.value, context)?;
         context.push_statement(mir::Statement::AssignCollectionIndex {
             collection,
-            index: lower_rvalue_as_expected(index, index_type, context)?,
-            value: lower_rvalue_as_expected(&assignment.value, info.value, context)?,
+            index,
+            value,
         });
         let _ = span;
         return Ok(());
     }
     let target = lower_assignment_target(target, context)?;
     if context.local_type(target) == mir::Type::String {
-        context.push_statement(mir::Statement::AssignLocal {
-            target,
-            value: mir::Rvalue::String(lower_string_expression(&assignment.value, context)?),
-        });
+        let value = mir::Rvalue::String(lower_string_expression(&assignment.value, context)?);
+        context.push_statement(mir::Statement::AssignLocal { target, value });
         return Ok(());
     }
     if context.local_type(target) == mir::Type::NullableString {
-        context.push_statement(mir::Statement::AssignLocal {
-            target,
-            value: mir::Rvalue::NullableString(lower_nullable_string_expression(
-                &assignment.value,
-                context,
-            )?),
-        });
+        let value = mir::Rvalue::NullableString(lower_nullable_string_expression(
+            &assignment.value,
+            context,
+        )?);
+        context.push_statement(mir::Statement::AssignLocal { target, value });
         return Ok(());
     }
     if let mir::Type::NullableScalar(scalar) = context.local_type(target) {
-        context.push_statement(mir::Statement::AssignLocal {
-            target,
-            value: mir::Rvalue::NullableScalar(lower_nullable_scalar_expression(
-                &assignment.value,
-                scalar,
-                context,
-            )?),
-        });
+        let value = mir::Rvalue::NullableScalar(lower_nullable_scalar_expression(
+            &assignment.value,
+            scalar,
+            context,
+        )?);
+        context.push_statement(mir::Statement::AssignLocal { target, value });
         return Ok(());
     }
     if let mir::Type::NullableClass(class) = context.local_type(target) {
@@ -3027,15 +3035,13 @@ fn lower_assignment(
                 "this compiler version cannot replace a borrowed nullable class value",
             )]);
         }
-        context.push_statement(mir::Statement::AssignLocal {
-            target,
-            value: mir::Rvalue::NullableClass(lower_nullable_class_expression(
-                &assignment.value,
-                class,
-                true,
-                context,
-            )?),
-        });
+        let value = mir::Rvalue::NullableClass(lower_nullable_class_expression(
+            &assignment.value,
+            class,
+            true,
+            context,
+        )?);
+        context.push_statement(mir::Statement::AssignLocal { target, value });
         return Ok(());
     }
     if context.local_type(target) == mir::Type::Mixed {
@@ -3045,10 +3051,8 @@ fn lower_assignment(
                 "this compiler version cannot replace a borrowed mixed value",
             )]);
         }
-        context.push_statement(mir::Statement::AssignLocal {
-            target,
-            value: mir::Rvalue::Mixed(lower_mixed_expression(&assignment.value, true, context)?),
-        });
+        let value = mir::Rvalue::Mixed(lower_mixed_expression(&assignment.value, true, context)?);
+        context.push_statement(mir::Statement::AssignLocal { target, value });
         return Ok(());
     }
     if context.local_type(target) == mir::Type::NullableMixed {
@@ -3058,14 +3062,12 @@ fn lower_assignment(
                 "this compiler version cannot replace a borrowed nullable mixed value",
             )]);
         }
-        context.push_statement(mir::Statement::AssignLocal {
-            target,
-            value: mir::Rvalue::NullableMixed(lower_nullable_mixed_expression(
-                &assignment.value,
-                true,
-                context,
-            )?),
-        });
+        let value = mir::Rvalue::NullableMixed(lower_nullable_mixed_expression(
+            &assignment.value,
+            true,
+            context,
+        )?);
+        context.push_statement(mir::Statement::AssignLocal { target, value });
         return Ok(());
     }
     if let mir::Type::Class(class) = context.local_type(target) {
@@ -3079,15 +3081,13 @@ fn lower_assignment(
                 .with_help("mutate the object's writable properties, or use a `take` parameter when the callee should own a replacement"),
             ]);
         }
-        context.push_statement(mir::Statement::AssignLocal {
-            target,
-            value: mir::Rvalue::Class(lower_class_expression(
-                &assignment.value,
-                class,
-                true,
-                context,
-            )?),
-        });
+        let value = mir::Rvalue::Class(lower_class_expression(
+            &assignment.value,
+            class,
+            true,
+            context,
+        )?);
+        context.push_statement(mir::Statement::AssignLocal { target, value });
         return Ok(());
     }
     if let mir::Type::Collection(collection) = context.local_type(target) {
@@ -3097,15 +3097,13 @@ fn lower_assignment(
                 "this compiler version cannot replace a borrowed collection value",
             )]);
         }
-        context.push_statement(mir::Statement::AssignLocal {
-            target,
-            value: mir::Rvalue::Collection(lower_collection_expression(
-                &assignment.value,
-                collection,
-                true,
-                context,
-            )?),
-        });
+        let value = mir::Rvalue::Collection(lower_collection_expression(
+            &assignment.value,
+            collection,
+            true,
+            context,
+        )?);
+        context.push_statement(mir::Statement::AssignLocal { target, value });
         return Ok(());
     }
 
@@ -3178,7 +3176,7 @@ fn lower_increment_value(
 
 fn lower_assignment_target(
     target: &hir::Expr,
-    context: &LoweringContext,
+    context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::LocalId> {
     match unparenthesized_place(target) {
         hir::Expr::Variable { name, span } => context.lookup_local(name, *span),
@@ -3198,9 +3196,9 @@ fn lower_echo(expr: &hir::Expr, context: &mut LoweringContext) -> DiagnosticResu
 }
 
 fn lower_panic_message(
-    args: &[hir::Expr],
+    args: &[hir::Argument],
     span: Span,
-    context: &LoweringContext,
+    context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::StringExpression> {
     let [message] = args else {
         return Err(vec![unsupported(
@@ -3208,12 +3206,12 @@ fn lower_panic_message(
             format!("panic expects exactly 1 argument, got {}", args.len()),
         )]);
     };
-    lower_string_expression(message, context)
+    lower_string_expression(&message.value, context)
 }
 
 fn lower_string_expression(
     expr: &hir::Expr,
-    context: &LoweringContext,
+    context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::StringExpression> {
     if let Some((collection, index, value_type)) = lower_list_remove_at(expr, context)? {
         if value_type != mir::Type::String {
@@ -3318,7 +3316,7 @@ fn lower_string_expression(
         }
         hir::Expr::FunctionCall { name, args, span } => {
             if name == "read_file" {
-                let [path] = args.as_slice() else {
+                let [path] = argument_values(args)[..] else {
                     return Err(vec![unsupported(*span, "read_file expects 1 argument")]);
                 };
                 return Ok(mir::StringExpression::ReadFile(Box::new(
@@ -3387,7 +3385,7 @@ fn lower_string_expression(
 
 fn lower_nullable_string_expression(
     expr: &hir::Expr,
-    context: &LoweringContext,
+    context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::NullableStringExpression> {
     if let Some((collection, key, value_type, access)) =
         lower_collection_nullable_property(expr, context)?
@@ -3637,7 +3635,7 @@ fn lower_nullable_string_expression(
 fn lower_nullable_scalar_expression(
     expr: &hir::Expr,
     expected: mir::ScalarType,
-    context: &LoweringContext,
+    context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::NullableScalarExpression> {
     if let Some((collection, key, value_type, access)) =
         lower_collection_nullable_property(expr, context)?
@@ -3668,7 +3666,7 @@ fn lower_nullable_scalar_expression(
             let is_float = matches!(class_name.as_str(), "Float" | "Float64")
                 && expected == mir::ScalarType::Float(FloatType::Float64);
             if is_int || is_float {
-                let [argument] = args.as_slice() else {
+                let [argument] = argument_values(args)[..] else {
                     return Err(vec![unsupported(
                         *span,
                         "parse expects exactly one string argument",
@@ -3925,7 +3923,7 @@ fn lower_nullable_class_expression(
     expr: &hir::Expr,
     expected: ClassId,
     transfer: bool,
-    context: &LoweringContext,
+    context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::NullableClassExpression> {
     if let Some((collection, key, value_type, access)) =
         lower_collection_nullable_property(expr, context)?
@@ -4199,7 +4197,7 @@ fn lower_null_safe_property(
     object: &hir::Expr,
     property: &str,
     span: Span,
-    context: &LoweringContext,
+    context: &mut LoweringContext,
 ) -> DiagnosticResult<(mir::NullableClassExpression, PropertyId, mir::Type)> {
     let mir::Type::NullableClass(class) = context.expression_type(object)? else {
         return Err(vec![unsupported(
@@ -4219,9 +4217,10 @@ fn lower_null_safe_property(
             format!("property `${property}` is not native-lowerable"),
         )]
     })?;
+    let property_id = property_info.id;
     Ok((
         lower_nullable_class_expression(object, class, false, context)?,
-        property_info.id,
+        property_id,
         ty,
     ))
 }
@@ -4229,9 +4228,9 @@ fn lower_null_safe_property(
 fn lower_null_safe_method_call(
     object: &hir::Expr,
     method: &str,
-    args: &[hir::Expr],
+    args: &[hir::Argument],
     span: Span,
-    context: &LoweringContext,
+    context: &mut LoweringContext,
 ) -> DiagnosticResult<(
     mir::NullableClassExpression,
     FunctionSignature,
@@ -4259,14 +4258,14 @@ fn lower_null_safe_method_call(
 }
 
 fn lower_format_expression(
-    args: &[hir::Expr],
+    args: &[hir::Argument],
     span: Span,
-    context: &LoweringContext,
+    context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::FormatExpression> {
     let Some(hir::Expr::String {
         value,
         span: format_span,
-    }) = args.first()
+    }) = args.first().map(|argument| &argument.value)
     else {
         return Err(vec![unsupported(
             span,
@@ -4280,6 +4279,7 @@ fn lower_format_expression(
     });
     let arguments = args[1..]
         .iter()
+        .map(|argument| &argument.value)
         .zip(specs)
         .map(|(argument, spec)| {
             if spec.conversion == FormatConversion::Display {
@@ -4301,7 +4301,7 @@ fn lower_format_expression(
 
 fn lower_display_string_expression(
     expr: &hir::Expr,
-    context: &LoweringContext,
+    context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::StringExpression> {
     let ty = context.expression_type(expr)?;
     if let mir::Type::Class(class) = ty {
@@ -4359,7 +4359,7 @@ fn lower_display_string_expression(
 
 fn append_string_concat_parts(
     expr: &hir::Expr,
-    context: &LoweringContext,
+    context: &mut LoweringContext,
     parts: &mut Vec<mir::StringExpression>,
 ) -> DiagnosticResult<()> {
     match expr {
@@ -4397,14 +4397,14 @@ fn append_string_concat_parts(
 
 fn lower_byte_file_write_statement(
     name: &str,
-    args: &[hir::Expr],
+    args: &[hir::Argument],
     span: Span,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<bool> {
     if !matches!(name, "write_file_bytes" | "append_file_bytes") {
         return Ok(false);
     }
-    let [path, contents] = args else {
+    let [path, contents] = argument_values(args)[..] else {
         return Err(vec![unsupported(
             span,
             format!("{name} expects 2 arguments"),
@@ -4433,9 +4433,9 @@ fn lower_byte_file_write_statement(
 
 fn lower_statement_call(
     name: &str,
-    args: &[hir::Expr],
+    args: &[hir::Argument],
     span: Span,
-    context: &LoweringContext,
+    context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::Statement> {
     let signature = context.lookup_function(name, span)?;
     let args = lower_call_args(name, args, signature.clone(), span, context)?;
@@ -4497,9 +4497,9 @@ fn discarded_null_safe_call_statement(
 
 fn lower_integer_call(
     name: &str,
-    args: &[hir::Expr],
+    args: &[hir::Argument],
     span: Span,
-    context: &LoweringContext,
+    context: &mut LoweringContext,
 ) -> DiagnosticResult<(mir::FunctionId, IntegerType, Vec<mir::Rvalue>)> {
     let signature = context.lookup_function(name, span)?;
     let mir::ReturnType::Value(mir::Type::Scalar(mir::ScalarType::Integer(return_type))) =
@@ -4518,20 +4518,20 @@ fn lower_integer_call(
 
 fn lower_call_args(
     name: &str,
-    args: &[hir::Expr],
+    args: &[hir::Argument],
     signature: FunctionSignature,
     span: Span,
-    context: &LoweringContext,
+    context: &mut LoweringContext,
 ) -> DiagnosticResult<Vec<mir::Rvalue>> {
     lower_call_args_with_ownership(name, args, signature, span, context)
 }
 
 fn lower_call_args_with_ownership(
     name: &str,
-    args: &[hir::Expr],
+    args: &[hir::Argument],
     signature: FunctionSignature,
     span: Span,
-    context: &LoweringContext,
+    context: &mut LoweringContext,
 ) -> DiagnosticResult<Vec<mir::Rvalue>> {
     let required = signature
         .parameter_defaults
@@ -4549,27 +4549,65 @@ fn lower_call_args_with_ownership(
         )]);
     }
 
-    let mut lowered_args = Vec::with_capacity(total);
-    for (index, arg) in args.iter().enumerate() {
-        let expected = signature.parameter_types[index];
-        let transfers = signature.parameter_transfers[index];
+    // Bind arguments to parameters by name (decision 0098). Positional-only
+    // calls bind identically to before: argument i binds parameter i.
+    let param_names: Vec<&str> = signature
+        .parameter_names
+        .iter()
+        .map(String::as_str)
+        .collect();
+    let param_has_default: Vec<bool> = signature
+        .parameter_defaults
+        .iter()
+        .map(Option::is_some)
+        .collect();
+    let arg_names: Vec<Option<&str>> = args
+        .iter()
+        .map(|arg| arg.name.as_ref().map(|name| name.text.as_str()))
+        .collect();
+    let bound = crate::arg_binding::bind_arguments(&param_names, &param_has_default, &arg_names);
+
+    // A call needs no reordering when each argument binds the parameter at its
+    // own source position. Then source order *is* parameter order, and the
+    // arguments lower straight into the call vector as before — no temporaries.
+    let in_order = bound
+        .arg_to_param
+        .iter()
+        .enumerate()
+        .all(|(arg_index, param)| *param == Some(arg_index));
+
+    let mut lowered_args: Vec<Option<mir::Rvalue>> = vec![None; total];
+    for (arg_index, arg) in args.iter().enumerate() {
+        let Some(param_index) = bound.arg_to_param[arg_index] else {
+            return Err(vec![Diagnostic::new(
+                "I1302",
+                format!(
+                    "internal compiler consistency error: argument {} of `{name}` was not bound to a parameter after semantic checking",
+                    arg_index + 1
+                ),
+                arg.span,
+            )]);
+        };
+        let expected = signature.parameter_types[param_index];
+        let transfers = signature.parameter_transfers[param_index];
+        let value = &arg.value;
         let lowered = match expected {
             mir::Type::Class(class) => {
-                mir::Rvalue::Class(lower_class_expression(arg, class, transfers, context)?)
+                mir::Rvalue::Class(lower_class_expression(value, class, transfers, context)?)
             }
             mir::Type::NullableClass(class) => mir::Rvalue::NullableClass(
-                lower_nullable_class_expression(arg, class, transfers, context)?,
+                lower_nullable_class_expression(value, class, transfers, context)?,
             ),
             mir::Type::Collection(collection) => mir::Rvalue::Collection(
-                lower_collection_expression(arg, collection, transfers, context)?,
+                lower_collection_expression(value, collection, transfers, context)?,
             ),
             mir::Type::Mixed => {
-                mir::Rvalue::Mixed(lower_mixed_expression(arg, transfers, context)?)
+                mir::Rvalue::Mixed(lower_mixed_expression(value, transfers, context)?)
             }
             mir::Type::NullableMixed => mir::Rvalue::NullableMixed(
-                lower_nullable_mixed_expression(arg, transfers, context)?,
+                lower_nullable_mixed_expression(value, transfers, context)?,
             ),
-            _ => lower_rvalue_as_expected(arg, expected, context)?,
+            _ => lower_rvalue_as_expected(value, expected, context)?,
         };
         if lowered.ty() != expected {
             return Err(vec![Diagnostic::new(
@@ -4578,24 +4616,146 @@ fn lower_call_args_with_ownership(
                     "internal compiler consistency error: argument to `{name}` has MIR type `{}`, expected `{expected}`",
                     lowered.ty()
                 ),
-                arg.span(),
+                value.span(),
             )]);
         }
-        lowered_args.push(lowered);
+
+        // When the call reorders, each argument whose evaluation is observable
+        // is evaluated in source order into its own temporary here, and the call
+        // vector below reads those temporaries in parameter order. Evaluation
+        // order therefore stays the written order (0098) while the callee still
+        // receives a plain parameter-ordered vector, so no backend changes.
+        // Pure arguments need no temporary: moving them is unobservable.
+        lowered_args[param_index] =
+            Some(if in_order || !argument_evaluation_is_observable(value) {
+                lowered
+            } else {
+                hoist_argument_temporary(lowered, expected, arg.span, context)?
+            });
     }
 
-    append_omitted_trailing_defaults(name, args.len(), &signature, span, &mut lowered_args)?;
-    Ok(lowered_args)
+    splice_omitted_parameter_defaults(name, &bound, &signature, span, &mut lowered_args)?;
+
+    Ok(lowered_args
+        .into_iter()
+        .map(|arg| arg.expect("every parameter is supplied or defaulted after binding"))
+        .collect())
 }
 
-fn append_omitted_trailing_defaults(
+/// Whether an argument expression's evaluation is observable — that is, whether
+/// moving it relative to its neighbours could change program behavior. Only
+/// expressions that can call user code (or an effectful intrinsic) qualify;
+/// reads of locals, properties, and literals are pure, and a read that conflicts
+/// with a sibling argument's write is already rejected by the one-writer rule.
+fn argument_evaluation_is_observable(expr: &hir::Expr) -> bool {
+    match expr {
+        hir::Expr::FunctionCall { .. }
+        | hir::Expr::MethodCall { .. }
+        | hir::Expr::StaticCall { .. }
+        | hir::Expr::New { .. } => true,
+        hir::Expr::Grouped { expr, .. }
+        | hir::Expr::Unary { expr, .. }
+        | hir::Expr::IsType { expr, .. } => argument_evaluation_is_observable(expr),
+        hir::Expr::Binary { left, right, .. } => {
+            argument_evaluation_is_observable(left) || argument_evaluation_is_observable(right)
+        }
+        hir::Expr::Range { start, end, .. } => {
+            argument_evaluation_is_observable(start) || argument_evaluation_is_observable(end)
+        }
+        hir::Expr::Index {
+            collection, index, ..
+        } => {
+            argument_evaluation_is_observable(collection)
+                || argument_evaluation_is_observable(index)
+        }
+        hir::Expr::PropertyAccess { object, .. } => argument_evaluation_is_observable(object),
+        hir::Expr::InterpolatedString { parts, .. } => parts.iter().any(|part| match part {
+            hir::InterpolatedStringPart::Expr(expr) => argument_evaluation_is_observable(expr),
+            hir::InterpolatedStringPart::Text { .. } => false,
+        }),
+        hir::Expr::Array { elements, .. } => elements.iter().any(|element| {
+            element
+                .key
+                .as_ref()
+                .is_some_and(argument_evaluation_is_observable)
+                || argument_evaluation_is_observable(&element.value)
+        }),
+        _ => false,
+    }
+}
+
+/// Evaluate one already-lowered argument into a fresh temporary local, and
+/// return an rvalue that reads it back. This is what preserves source-order
+/// evaluation when named binding reorders a call: the `AssignLocal` statements
+/// are emitted in source order, and the call reads the temporaries in parameter
+/// order.
+fn hoist_argument_temporary(
+    value: mir::Rvalue,
+    ty: mir::Type,
+    span: Span,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<mir::Rvalue> {
+    let local = match ty {
+        mir::Type::Scalar(_) | mir::Type::String => context.declare_borrowed_temp(ty, false),
+        // A move-type argument carries an ownership obligation, so parking it in
+        // a temporary and moving it out again needs the drop machinery to track
+        // the transfer. Reordering a *side-effecting* move-type argument is the
+        // one named-call shape this slice does not lower; pure move-type
+        // arguments reorder freely because their evaluation is unobservable.
+        _ => {
+            return Err(vec![unsupported(
+                span,
+                "a named argument that both reorders the call and produces an owned value is not yet supported by native compilation",
+            )]);
+        }
+    };
+    context.push_statement(mir::Statement::AssignLocal {
+        target: local,
+        value,
+    });
+    Ok(read_local_as_rvalue(local, ty))
+}
+
+/// Read a temporary local back as an rvalue of its own type.
+fn read_local_as_rvalue(local: mir::LocalId, ty: mir::Type) -> mir::Rvalue {
+    match ty {
+        mir::Type::String => mir::Rvalue::String(mir::StringExpression::Local(local)),
+        mir::Type::Scalar(mir::ScalarType::Integer(integer)) => {
+            mir::Rvalue::Value(mir::ValueExpression::Integer(mir::IntegerExpression::Use {
+                ty: integer,
+                operand: mir::Operand::Local(local),
+            }))
+        }
+        mir::Type::Scalar(mir::ScalarType::Float(float)) => {
+            mir::Rvalue::Value(mir::ValueExpression::Float(mir::FloatExpression::Use {
+                ty: float,
+                operand: mir::Operand::Local(local),
+            }))
+        }
+        mir::Type::Scalar(mir::ScalarType::Bool) => {
+            mir::Rvalue::Value(mir::ValueExpression::Bool(mir::BoolExpression::Use {
+                operand: mir::Operand::Local(local),
+            }))
+        }
+        _ => unreachable!("only scalar and string argument temporaries are hoisted"),
+    }
+}
+
+/// Fill every parameter the call did not supply with its const-folded default
+/// (decision 0086). Positional calls can only omit a trailing run, but a named
+/// call may skip a defaulted parameter in the *middle* — the case 0086 could not
+/// express — so the gaps are filled by parameter index rather than by appending.
+fn splice_omitted_parameter_defaults(
     name: &str,
-    supplied: usize,
+    bound: &crate::arg_binding::BoundArguments,
     signature: &FunctionSignature,
     span: Span,
-    args: &mut Vec<mir::Rvalue>,
+    args: &mut [Option<mir::Rvalue>],
 ) -> DiagnosticResult<()> {
-    for index in supplied..signature.parameter_types.len() {
+    for index in 0..signature.parameter_types.len() {
+        if bound.param_to_arg[index].is_some() {
+            continue;
+        }
         let value = signature.parameter_defaults[index]
             .as_ref()
             .ok_or_else(|| {
@@ -4608,7 +4768,7 @@ fn append_omitted_trailing_defaults(
                     span,
                 )]
             })?;
-        args.push(lower_const_parameter_default(
+        args[index] = Some(lower_const_parameter_default(
             value,
             signature.parameter_types[index],
             span,
@@ -4660,9 +4820,9 @@ fn lower_const_parameter_default(
 fn lower_instance_method_call(
     object: &hir::Expr,
     method: &str,
-    args: &[hir::Expr],
+    args: &[hir::Argument],
     span: Span,
-    context: &LoweringContext,
+    context: &mut LoweringContext,
 ) -> DiagnosticResult<(FunctionSignature, Vec<mir::Rvalue>)> {
     let class = inferred_class_type(object, context).ok_or_else(|| {
         vec![unsupported(
@@ -4692,9 +4852,9 @@ fn lower_instance_method_call(
 fn lower_static_method_call(
     class_name: &str,
     method: &str,
-    args: &[hir::Expr],
+    args: &[hir::Argument],
     span: Span,
-    context: &LoweringContext,
+    context: &mut LoweringContext,
 ) -> DiagnosticResult<(FunctionSignature, Vec<mir::Rvalue>)> {
     let class = context
         .class_id_for_name(class_name)
@@ -4872,7 +5032,7 @@ fn lower_condition_to_blocks(
 
 fn lower_condition(
     expr: &hir::Expr,
-    context: &LoweringContext,
+    context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::BoolExpression> {
     if let Some(crate::const_eval::ConstValue::Bool(value)) = context.constant_value(expr) {
         return Ok(mir::BoolExpression::Use {
@@ -5082,7 +5242,7 @@ fn lower_condition(
                 });
             }
             if let Ok((collection, collection_type)) = lower_collection_local(object, context) {
-                let info = context.collection_type(collection_type);
+                let info = context.collection_type(collection_type).clone();
                 let op = match (info.kind, method.as_str()) {
                     (mir::CollectionKind::List, "contains")
                     | (mir::CollectionKind::Dictionary, "has")
@@ -5096,7 +5256,7 @@ fn lower_condition(
                     _ => None,
                 };
                 if let Some(op) = op {
-                    let [value] = args.as_slice() else {
+                    let [value] = argument_values(args)[..] else {
                         return Err(vec![unsupported(
                             *span,
                             format!("collection `{method}` expects 1 argument"),
@@ -5163,7 +5323,7 @@ fn lower_null_comparison(
     left: &hir::Expr,
     op: &hir::BinaryOp,
     right: &hir::Expr,
-    context: &LoweringContext,
+    context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::BoolExpression> {
     let value = if matches!(unparenthesized_place(left), hir::Expr::Null { .. }) {
         right
@@ -5220,7 +5380,7 @@ fn lower_null_comparison(
 fn lower_is_condition(
     expr: &hir::Expr,
     type_test_span: Span,
-    context: &LoweringContext,
+    context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::BoolExpression> {
     let tested_type = context
         .semantic_info
@@ -5314,7 +5474,7 @@ fn lower_is_condition(
 
 fn lower_nullable_mixed_local(
     expr: &hir::Expr,
-    context: &LoweringContext,
+    context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::LocalId> {
     if let hir::Expr::Variable { name, span } = unparenthesized_place(expr) {
         let local = context.lookup_local(name, *span)?;
@@ -5330,7 +5490,7 @@ fn lower_nullable_mixed_local(
 
 fn lower_nullable_mixed_presence_subject(
     expr: &hir::Expr,
-    context: &LoweringContext,
+    context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::NullableMixedExpression> {
     let local = lower_nullable_mixed_local(expr, context)?;
     Ok(mir::NullableMixedExpression::Local {
@@ -5342,7 +5502,7 @@ fn lower_nullable_mixed_presence_subject(
 fn lower_nullable_scalar_presence_subject(
     expr: &hir::Expr,
     expected: mir::ScalarType,
-    context: &LoweringContext,
+    context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::NullableScalarExpression> {
     if let hir::Expr::Variable { name, span } = unparenthesized_place(expr) {
         let local = context.lookup_local(name, *span)?;
@@ -5358,7 +5518,7 @@ fn lower_nullable_scalar_presence_subject(
 
 fn lower_nullable_string_presence_subject(
     expr: &hir::Expr,
-    context: &LoweringContext,
+    context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::NullableStringExpression> {
     if let hir::Expr::Variable { name, span } = unparenthesized_place(expr) {
         let local = context.lookup_local(name, *span)?;
@@ -5372,7 +5532,7 @@ fn lower_nullable_string_presence_subject(
 fn lower_nullable_class_presence_subject(
     expr: &hir::Expr,
     expected: ClassId,
-    context: &LoweringContext,
+    context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::NullableClassExpression> {
     if let hir::Expr::Variable { name, span } = unparenthesized_place(expr) {
         let local = context.lookup_local(name, *span)?;
@@ -5400,7 +5560,7 @@ fn evaluate_then_false(condition: mir::BoolExpression) -> mir::BoolExpression {
 fn lower_concrete_is_presence(
     expr: &hir::Expr,
     value_type: mir::Type,
-    context: &LoweringContext,
+    context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::BoolExpression> {
     match value_type {
         mir::Type::Scalar(ty) => Ok(mir::BoolExpression::NullableScalarIsPresent(Box::new(
@@ -5460,7 +5620,7 @@ fn lower_condition_binary_op(op: &hir::BinaryOp) -> mir::BoolBinaryOp {
 
 fn lower_value_expression(
     expr: &hir::Expr,
-    context: &LoweringContext,
+    context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::ValueExpression> {
     if let hir::Expr::FunctionCall { name, span, .. } = expr {
         if context.lookup_function(name, *span)?.return_type == mir::ReturnType::Void {
@@ -5515,7 +5675,7 @@ fn value_expression_from_operand(
 fn lower_rvalue_as_expected(
     expr: &hir::Expr,
     expected: mir::Type,
-    context: &LoweringContext,
+    context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::Rvalue> {
     if let Some((collection, index, value_type)) = lower_list_remove_at(expr, context)? {
         if value_type != expected {
@@ -5556,7 +5716,7 @@ fn lower_rvalue_as_expected(
 fn lower_rvalue_as_borrowed(
     expr: &hir::Expr,
     expected: mir::Type,
-    context: &LoweringContext,
+    context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::Rvalue> {
     match expected {
         mir::Type::Class(class) => {
@@ -5581,7 +5741,7 @@ fn lower_rvalue_as_borrowed(
 fn lower_mixed_expression(
     expr: &hir::Expr,
     transfer: bool,
-    context: &LoweringContext,
+    context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::MixedExpression> {
     // `List<mixed>::removeAt(i)` is a collection removal, not a class method call, so it
     // must be intercepted before the method-call arm below (which requires a concrete
@@ -5742,7 +5902,7 @@ fn mixed_tag_for_type(ty: mir::Type, span: Span) -> DiagnosticResult<mir::MixedT
 fn lower_nullable_mixed_expression(
     expr: &hir::Expr,
     transfer: bool,
-    context: &LoweringContext,
+    context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::NullableMixedExpression> {
     if context.expression_is_null(expr) {
         return Ok(mir::NullableMixedExpression::Null);
@@ -5820,7 +5980,7 @@ fn lower_collection_expression(
     expr: &hir::Expr,
     expected: mir::CollectionTypeId,
     transfer: bool,
-    context: &LoweringContext,
+    context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::CollectionExpression> {
     if let Some((collection, index, value_type)) = lower_list_remove_at(expr, context)? {
         if value_type != mir::Type::Collection(expected) {
@@ -5899,7 +6059,7 @@ fn lower_collection_expression(
             args,
             span,
         } if class_name == "Bytes" && method == "fromArray" => {
-            let [source] = args.as_slice() else {
+            let [source] = argument_values(args)[..] else {
                 return Err(vec![unsupported(
                     *span,
                     "Bytes::fromArray expects 1 argument",
@@ -5916,7 +6076,7 @@ fn lower_collection_expression(
         {
             Ok(mir::CollectionExpression::ReadFileBytes {
                 collection: expected,
-                path: Box::new(lower_string_expression(&args[0], context)?),
+                path: Box::new(lower_string_expression(&args[0].value, context)?),
             })
         }
         hir::Expr::FunctionCall { name, args, .. }
@@ -5997,7 +6157,7 @@ fn lower_collection_expression(
                     "set algebra requires matching Set<T> operands",
                 )]);
             }
-            let [right] = args.as_slice() else {
+            let [right] = argument_values(args)[..] else {
                 return Err(vec![unsupported(
                     *span,
                     "set algebra expects one Set<T> argument",
@@ -6024,7 +6184,7 @@ fn lower_collection_expression(
             })
         }
         hir::Expr::Array { elements, .. } => {
-            let collection = context.collection_type(expected);
+            let collection = context.collection_type(expected).clone();
             let entries = elements
                 .iter()
                 .map(|element| {
@@ -6095,11 +6255,11 @@ fn lower_collection_expression(
             args,
             span,
         } if class_name == "Set" && method == "from" => {
-            let [source] = args.as_slice() else {
+            let [source] = argument_values(args)[..] else {
                 return Err(vec![unsupported(*span, "Set::from expects one argument")]);
             };
             if let hir::Expr::Array { elements, .. } = source {
-                let collection = context.collection_type(expected);
+                let collection = context.collection_type(expected).clone();
                 let entries = elements
                     .iter()
                     .map(|element| {
@@ -6141,7 +6301,7 @@ fn lower_collection_expression(
 
 fn lower_list_remove_at(
     expr: &hir::Expr,
-    context: &LoweringContext,
+    context: &mut LoweringContext,
 ) -> DiagnosticResult<Option<(mir::LocalId, mir::Rvalue, mir::Type)>> {
     let hir::Expr::MethodCall {
         object,
@@ -6157,11 +6317,11 @@ fn lower_list_remove_at(
         return Ok(None);
     }
     let (collection, collection_type) = lower_collection_local(object, context)?;
-    let definition = context.collection_type(collection_type);
+    let definition = context.collection_type(collection_type).clone();
     if definition.kind != mir::CollectionKind::List {
         return Ok(None);
     }
-    let [index] = args.as_slice() else {
+    let [index] = argument_values(args)[..] else {
         return Err(vec![unsupported(
             expr.span(),
             "List::removeAt expects one index",
@@ -6294,7 +6454,7 @@ fn materialize_nested_collection_places(
             let receiver_writable = method_receiver_is_writable(object, method, context);
             materialize_nested_collection_places(object, receiver_writable, context)?;
             for arg in args {
-                materialize_nested_collection_places(arg, false, context)?;
+                materialize_nested_collection_places(&arg.value, false, context)?;
             }
             if matches!(
                 context.expression_type(object),
@@ -6310,7 +6470,7 @@ fn materialize_nested_collection_places(
         }
         hir::Expr::FunctionCall { name, args, .. } => {
             for arg in args {
-                materialize_nested_collection_places(arg, false, context)?;
+                materialize_nested_collection_places(&arg.value, false, context)?;
             }
             let byte_argument = match name.as_str() {
                 "write_file_bytes" | "append_file_bytes" => args.get(1),
@@ -6318,7 +6478,7 @@ fn materialize_nested_collection_places(
                 _ => None,
             };
             if let Some(bytes) = byte_argument {
-                materialize_collection_place(bytes, false, context)?;
+                materialize_collection_place(&bytes.value, false, context)?;
             }
         }
         hir::Expr::StaticCall {
@@ -6328,7 +6488,7 @@ fn materialize_nested_collection_places(
             ..
         } => {
             for arg in args {
-                materialize_nested_collection_places(arg, false, context)?;
+                materialize_nested_collection_places(&arg.value, false, context)?;
             }
             if class_name == "Bytes" && method == "fromArray" {
                 if let Some(source) = args.first() {
@@ -6342,13 +6502,13 @@ fn materialize_nested_collection_places(
                         ))
                         .copied()
                         .expect("Bytes requires the canonical uint8[] MIR type");
-                    materialize_collection_place_as(source, byte_array, false, context)?;
+                    materialize_collection_place_as(&source.value, byte_array, false, context)?;
                 }
             }
         }
         hir::Expr::New { args, .. } => {
             for arg in args {
-                materialize_nested_collection_places(arg, false, context)?;
+                materialize_nested_collection_places(&arg.value, false, context)?;
             }
         }
         hir::Expr::Binary {
@@ -6383,7 +6543,7 @@ fn materialize_nested_collection_places(
 
 fn lower_collection_local(
     expr: &hir::Expr,
-    context: &LoweringContext,
+    context: &mut LoweringContext,
 ) -> DiagnosticResult<(mir::LocalId, mir::CollectionTypeId)> {
     let expr = unparenthesized_place(expr);
     if let Some(local) = context
@@ -6416,7 +6576,7 @@ fn lower_collection_local(
 
 fn lower_bytes_local(
     expr: &hir::Expr,
-    context: &LoweringContext,
+    context: &mut LoweringContext,
 ) -> DiagnosticResult<(mir::LocalId, mir::CollectionTypeId)> {
     let (local, collection) = lower_collection_local(expr, context)?;
     if context.collection_type(collection).kind != mir::CollectionKind::Bytes {
@@ -6475,7 +6635,7 @@ fn collection_method_mutates(method: &str) -> bool {
 fn method_receiver_is_writable(
     object: &hir::Expr,
     method: &str,
-    context: &LoweringContext,
+    context: &mut LoweringContext,
 ) -> bool {
     match context.expression_type(object) {
         Ok(mir::Type::Collection(_)) => collection_method_mutates(method),
@@ -6493,7 +6653,7 @@ fn collection_place_is_borrowed(expr: &hir::Expr) -> bool {
     )
 }
 
-fn expression_is_bytes(expr: &hir::Expr, context: &LoweringContext) -> bool {
+fn expression_is_bytes(expr: &hir::Expr, context: &mut LoweringContext) -> bool {
     matches!(
         context.expression_type(expr),
         Ok(mir::Type::Collection(collection))
@@ -6505,10 +6665,10 @@ fn lower_collection_index_operand(
     collection_expr: &hir::Expr,
     index: &hir::Expr,
     expected: mir::Type,
-    context: &LoweringContext,
+    context: &mut LoweringContext,
 ) -> DiagnosticResult<(mir::LocalId, mir::Rvalue)> {
     let (collection, collection_type) = lower_collection_local(collection_expr, context)?;
-    let info = context.collection_type(collection_type);
+    let info = context.collection_type(collection_type).clone();
     if info.value != expected {
         return Err(vec![unsupported(
             collection_expr.span(),
@@ -6532,7 +6692,7 @@ fn lower_collection_index_operand(
 fn lower_collection_method_statement(
     object: &hir::Expr,
     method: &str,
-    args: &[hir::Expr],
+    args: &[hir::Argument],
     context: &mut LoweringContext,
 ) -> DiagnosticResult<bool> {
     let Ok((collection, collection_type)) = lower_collection_local(object, context) else {
@@ -6543,7 +6703,7 @@ fn lower_collection_method_statement(
         (mir::CollectionKind::List | mir::CollectionKind::Set, "add", [value]) => {
             let statement = mir::Statement::CollectionAdd {
                 collection,
-                value: lower_rvalue_as_expected(value, info.value, context)?,
+                value: lower_rvalue_as_expected(&value.value, info.value, context)?,
                 index: None,
                 op: mir::CollectionMutationOp::Add,
             };
@@ -6552,9 +6712,9 @@ fn lower_collection_method_statement(
         (mir::CollectionKind::List, "insertAt", [index, value]) => {
             let statement = mir::Statement::CollectionAdd {
                 collection,
-                value: lower_rvalue_as_expected(value, info.value, context)?,
+                value: lower_rvalue_as_expected(&value.value, info.value, context)?,
                 index: Some(lower_rvalue_as_expected(
-                    index,
+                    &index.value,
                     mir::Type::Scalar(mir::ScalarType::Integer(IntegerType::Int64)),
                     context,
                 )?),
@@ -6565,7 +6725,7 @@ fn lower_collection_method_statement(
         (mir::CollectionKind::Set, "remove", [value]) => {
             let statement = mir::Statement::CollectionAdd {
                 collection,
-                value: lower_rvalue_as_borrowed(value, info.value, context)?,
+                value: lower_rvalue_as_borrowed(&value.value, info.value, context)?,
                 index: None,
                 op: mir::CollectionMutationOp::Remove,
             };
@@ -6575,14 +6735,14 @@ fn lower_collection_method_statement(
             let key_type = info.key.expect("dictionary collection has a key type");
             let statement = mir::Statement::CollectionSet {
                 collection,
-                key: lower_rvalue_as_expected(key, key_type, context)?,
-                value: lower_rvalue_as_expected(value, info.value, context)?,
+                key: lower_rvalue_as_expected(&key.value, key_type, context)?,
+                value: lower_rvalue_as_expected(&value.value, info.value, context)?,
             };
             context.push_statement(statement);
         }
         (mir::CollectionKind::List, "removeAt", [index]) => {
             let index = lower_rvalue_as_expected(
-                index,
+                &index.value,
                 mir::Type::Scalar(mir::ScalarType::Integer(IntegerType::Int64)),
                 context,
             )?;
@@ -6688,8 +6848,8 @@ fn lower_discarded_rvalue(value: mir::Rvalue, context: &mut LoweringContext) {
 fn lower_dictionary_get(
     object: &hir::Expr,
     method: &str,
-    args: &[hir::Expr],
-    context: &LoweringContext,
+    args: &[hir::Argument],
+    context: &mut LoweringContext,
 ) -> DiagnosticResult<
     Option<(
         mir::LocalId,
@@ -6701,11 +6861,11 @@ fn lower_dictionary_get(
     let Ok((collection, collection_type)) = lower_collection_local(object, context) else {
         return Ok(None);
     };
-    let definition = context.collection_type(collection_type);
+    let definition = context.collection_type(collection_type).clone();
     let (key, access) = match (definition.kind, method, args) {
         (mir::CollectionKind::Dictionary, "get", [key]) => (
             lower_rvalue_as_borrowed(
-                key,
+                &key.value,
                 definition
                     .key
                     .expect("dictionary collection has a key type"),
@@ -6715,7 +6875,7 @@ fn lower_dictionary_get(
         ),
         (mir::CollectionKind::Dictionary, "remove", [key]) => (
             lower_rvalue_as_borrowed(
-                key,
+                &key.value,
                 definition
                     .key
                     .expect("dictionary collection has a key type"),
@@ -6738,7 +6898,7 @@ fn lower_dictionary_get(
 
 fn lower_collection_nullable_property(
     expr: &hir::Expr,
-    context: &LoweringContext,
+    context: &mut LoweringContext,
 ) -> DiagnosticResult<
     Option<(
         mir::LocalId,
@@ -6762,7 +6922,7 @@ fn lower_collection_nullable_property(
         _ => return Ok(None),
     };
     let (collection, collection_type) = lower_collection_local(object, context)?;
-    let definition = context.collection_type(collection_type);
+    let definition = context.collection_type(collection_type).clone();
     if definition.kind != mir::CollectionKind::List {
         return Ok(None);
     }
@@ -6778,7 +6938,7 @@ fn lower_class_expression(
     expr: &hir::Expr,
     expected: ClassId,
     transfer: bool,
-    context: &LoweringContext,
+    context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::ClassExpression> {
     if let Some((collection, index, value_type)) = lower_list_remove_at(expr, context)? {
         if value_type != mir::Type::Class(expected) {
@@ -7024,7 +7184,7 @@ fn lower_class_expression(
 fn lower_property_operand(
     expr: &hir::Expr,
     expected: mir::Type,
-    context: &LoweringContext,
+    context: &mut LoweringContext,
 ) -> DiagnosticResult<(mir::LocalId, crate::class_layout::PropertyId)> {
     let (object, property, property_type) = lower_property_place(expr, context)?;
     if property_type != expected {
@@ -7038,7 +7198,7 @@ fn lower_property_operand(
 
 fn lower_property_place(
     expr: &hir::Expr,
-    context: &LoweringContext,
+    context: &mut LoweringContext,
 ) -> DiagnosticResult<(mir::LocalId, crate::class_layout::PropertyId, mir::Type)> {
     let expr = unparenthesized_place(expr);
     let hir::Expr::PropertyAccess {
@@ -7089,15 +7249,19 @@ fn lower_property_place(
 
 fn lower_new_property_values(
     class: ClassId,
-    context: &LoweringContext,
+    context: &mut LoweringContext,
 ) -> DiagnosticResult<Vec<mir::PropertyValue>> {
-    let info = context.class_info(class).ok_or_else(|| {
-        vec![unsupported(
-            Span::default(),
-            format!("unknown class#{}", class.0),
-        )]
-    })?;
-    info.properties
+    let properties = context
+        .class_info(class)
+        .ok_or_else(|| {
+            vec![unsupported(
+                Span::default(),
+                format!("unknown class#{}", class.0),
+            )]
+        })?
+        .properties
+        .clone();
+    properties
         .iter()
         .map(|property| {
             if property.promoted {
@@ -7116,7 +7280,7 @@ fn lower_new_property_values(
                     source: mir::PropertyValueSource::ConstructorArgument(index),
                 });
             }
-            if let Some(initializer) = context.property_initializers.get(&property.id) {
+            if let Some(initializer) = context.property_initializers.get(&property.id).cloned() {
                 let property_type = context.native_type_ref(&property.ty).ok_or_else(|| {
                     vec![unsupported(
                         initializer.span(),
@@ -7126,7 +7290,7 @@ fn lower_new_property_values(
                 return Ok(mir::PropertyValue {
                     property: property.id,
                     source: mir::PropertyValueSource::Expression(lower_rvalue_as_expected(
-                        initializer,
+                        &initializer,
                         property_type,
                         context,
                     )?),
@@ -7155,7 +7319,7 @@ fn lower_new_property_values(
 fn promoted_constructor_argument_index(
     class: ClassId,
     property_name: &str,
-    context: &LoweringContext,
+    context: &mut LoweringContext,
 ) -> Option<usize> {
     let constructor = context.lookup_lifecycle(class, "__construct")?;
     let class_info = context.class_info(class)?;
@@ -7169,7 +7333,7 @@ fn promoted_constructor_argument_index(
 
 fn lower_float_expression(
     expr: &hir::Expr,
-    context: &LoweringContext,
+    context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::FloatExpression> {
     if let Some(crate::const_eval::ConstValue::Float(value)) = context.constant_value(expr) {
         return Ok(mir::FloatExpression::constant(*value));
@@ -7368,7 +7532,7 @@ fn lower_float_expression(
             args,
             span,
         } if class_name == "Int" && method == "toFloat" => {
-            let [value] = args.as_slice() else {
+            let [value] = argument_values(args)[..] else {
                 return Err(vec![Diagnostic::new(
                     "I1401",
                     "checked Int::toFloat call does not have one argument",
@@ -7410,7 +7574,7 @@ fn lower_float_expression(
 
 fn lower_integer_expression(
     expr: &hir::Expr,
-    context: &LoweringContext,
+    context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::IntegerExpression> {
     if let Some(crate::const_eval::ConstValue::Integer(value)) = context.constant_value(expr) {
         return Ok(mir::IntegerExpression::constant(*value));
@@ -7649,7 +7813,7 @@ fn lower_integer_expression(
             args,
             span,
         } if class_name == "Float" && method == "toInt" => {
-            let [value] = args.as_slice() else {
+            let [value] = argument_values(args)[..] else {
                 return Err(vec![Diagnostic::new(
                     "I1401",
                     "checked Float::toInt call does not have one argument",
@@ -7666,7 +7830,7 @@ fn lower_integer_expression(
             args,
             span,
         } if method == "from" && IntegerType::from_companion_name(class_name).is_some() => {
-            let [value] = args.as_slice() else {
+            let [value] = argument_values(args)[..] else {
                 return Err(vec![Diagnostic::new(
                     "I1301",
                     "internal compiler consistency error: checked integer conversion does not have exactly one argument",
@@ -7776,7 +7940,7 @@ fn lower_compound_value(
     ty: mir::ScalarType,
     op: &hir::AssignOp,
     right: &hir::Expr,
-    context: &LoweringContext,
+    context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::ValueExpression> {
     match ty {
         mir::ScalarType::Integer(integer) => {

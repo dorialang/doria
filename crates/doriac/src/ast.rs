@@ -107,6 +107,25 @@ pub struct Param {
     pub span: Span,
 }
 
+/// The name written before a named call argument (`name: value`), with the
+/// span of the identifier for diagnostics. `None` on an `Argument` means the
+/// argument was supplied positionally.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ArgumentName {
+    pub text: String,
+    pub span: Span,
+}
+
+/// A single call-site argument. Arguments are stored in source (written) order
+/// regardless of the parameter each named argument binds to; name-resolution
+/// binding (decision 0098) maps them onto parameters in a later step.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Argument {
+    pub name: Option<ArgumentName>,
+    pub value: Expr,
+    pub span: Span,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Block {
     pub statements: Vec<Stmt>,
@@ -302,7 +321,7 @@ pub enum Expr {
     MethodCall {
         object: Box<Expr>,
         method: String,
-        args: Vec<Expr>,
+        args: Vec<Argument>,
         null_safe: bool,
         span: Span,
     },
@@ -313,7 +332,7 @@ pub enum Expr {
     },
     FunctionCall {
         name: String,
-        args: Vec<Expr>,
+        args: Vec<Argument>,
         span: Span,
     },
     StaticCall {
@@ -321,7 +340,7 @@ pub enum Expr {
         qualifier_span: Span,
         method: String,
         member_sigil_span: Option<Span>,
-        args: Vec<Expr>,
+        args: Vec<Argument>,
         span: Span,
     },
     StaticMember {
@@ -333,7 +352,7 @@ pub enum Expr {
     },
     New {
         class_name: String,
-        args: Vec<Expr>,
+        args: Vec<Argument>,
         span: Span,
     },
     Grouped {

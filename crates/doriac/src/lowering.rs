@@ -301,6 +301,14 @@ fn lower_foreach_binding(
     }
 }
 
+fn lower_argument(argument: &ast::Argument, class_name: Option<&str>) -> hir::Argument {
+    hir::Argument {
+        name: argument.name.clone(),
+        value: lower_expr(&argument.value, class_name),
+        span: argument.span,
+    }
+}
+
 fn lower_expr(expr: &ast::Expr, class_name: Option<&str>) -> hir::Expr {
     match expr {
         ast::Expr::Variable { name, span } => hir::Expr::Variable {
@@ -372,7 +380,10 @@ fn lower_expr(expr: &ast::Expr, class_name: Option<&str>) -> hir::Expr {
         } => hir::Expr::MethodCall {
             object: Box::new(lower_expr(object, class_name)),
             method: method.clone(),
-            args: args.iter().map(|arg| lower_expr(arg, class_name)).collect(),
+            args: args
+                .iter()
+                .map(|arg| lower_argument(arg, class_name))
+                .collect(),
             null_safe: *null_safe,
             span: *span,
         },
@@ -383,7 +394,10 @@ fn lower_expr(expr: &ast::Expr, class_name: Option<&str>) -> hir::Expr {
         },
         ast::Expr::FunctionCall { name, args, span } => hir::Expr::FunctionCall {
             name: name.clone(),
-            args: args.iter().map(|arg| lower_expr(arg, class_name)).collect(),
+            args: args
+                .iter()
+                .map(|arg| lower_argument(arg, class_name))
+                .collect(),
             span: *span,
         },
         ast::Expr::StaticCall {
@@ -395,7 +409,10 @@ fn lower_expr(expr: &ast::Expr, class_name: Option<&str>) -> hir::Expr {
         } => hir::Expr::StaticCall {
             class_name: resolved_qualifier_name(qualifier, class_name),
             method: method.clone(),
-            args: args.iter().map(|arg| lower_expr(arg, class_name)).collect(),
+            args: args
+                .iter()
+                .map(|arg| lower_argument(arg, class_name))
+                .collect(),
             span: *span,
         },
         ast::Expr::StaticMember {
@@ -414,7 +431,10 @@ fn lower_expr(expr: &ast::Expr, class_name: Option<&str>) -> hir::Expr {
             span,
         } => hir::Expr::New {
             class_name: constructed_class.clone(),
-            args: args.iter().map(|arg| lower_expr(arg, class_name)).collect(),
+            args: args
+                .iter()
+                .map(|arg| lower_argument(arg, class_name))
+                .collect(),
             span: *span,
         },
         ast::Expr::Grouped { expr, span } => hir::Expr::Grouped {

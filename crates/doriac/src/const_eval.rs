@@ -2,7 +2,7 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fmt;
 
-use crate::ast::{self, BinaryOp, Expr, Item, MemberAccess, StaticQualifier, UnaryOp};
+use crate::ast::{self, Argument, BinaryOp, Expr, Item, MemberAccess, StaticQualifier, UnaryOp};
 use crate::diagnostics::{Diagnostic, DiagnosticResult};
 use crate::numeric::{parse_decimal_magnitude, FloatType, FloatValue, IntegerType, IntegerValue};
 use crate::source::Span;
@@ -763,7 +763,7 @@ impl Evaluator {
         &mut self,
         class_name: &str,
         method: &str,
-        args: &[Expr],
+        args: &[Argument],
         span: Span,
         requester: &EvaluationRequester,
     ) -> Option<TypedValue> {
@@ -771,6 +771,7 @@ impl Evaluator {
             self.invalid(span, "constant conversion expects exactly one argument");
             return None;
         };
+        let argument = &argument.value;
         if method == "from" {
             if let Some(target) = IntegerType::from_companion_name(class_name) {
                 let ConstValue::Integer(value) =
