@@ -1,0 +1,35 @@
+function main(): void
+{
+    // Reading a bool element out of a List, a typed array, and a Dictionary must
+    // produce a well-formed bool operand: directly in an `if`, through boolean
+    // operators, and bound to a local first.
+    writable List<bool> $flags = [];
+    $flags->add(true);
+    $flags->add(false);
+    if ($flags[0]) {
+        echo "list-0-true\n";
+    }
+    if (!$flags[1]) {
+        echo "list-1-false\n";
+    }
+    bool $bound = $flags[0];
+    if ($bound) {
+        echo "list-bound-true\n";
+    }
+
+    bool[] $mask = [true, false, true];
+    if ($mask[2] && !$mask[1]) {
+        echo "array-and-ok\n";
+    }
+
+    writable Dictionary<int, bool> $seen = [1 => true];
+    if ($seen[1]) {
+        echo "dict-index-true\n";
+    }
+    let $got = $seen->get(1);
+    if ($got != null) {
+        if ($got) {
+            echo "dict-get-true\n";
+        }
+    }
+}

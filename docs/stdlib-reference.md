@@ -9,12 +9,12 @@ Two layers (plan §9): **core** (no I/O, always available) and **std** (hosted u
 ## Core layer (no I/O, always available)
 
 ### Primitive companions
-Fixed-width numeric, bool, and string companion APIs — the member surface each primitive carries. Details: decisions 0013/0016 (numeric types), 0042 (conversions), 0095 (`pow`), 0096 (interface conformance); §4.6 (strings).
+Every primitive has a companion, and the set is a **complete, symmetric matrix** — not a per-type ad-hoc collection (decision 0104). The uniform v1.0 baseline: `parse(string): ?T` on every scalar companion (int family, float family, `bool`); `String` carries pure transforms instead of `parse` because `string` is the parse *domain* (0103); display is uniform through the display path, so no companion has `toString`. Absences are deliberate — a member not meaningful for a primitive is a documented N/A, one not in v1.0 is a named v1.0+ furnishing (`MIN`/`MAX`, `Bool::toInt`, the fuller string transforms). Details: decisions 0013/0016 (numeric types), 0042 (conversions), 0095 (`pow`), 0096 (interface conformance), 0103 (string transforms), 0104 (completeness); §4.6 (strings).
 
 - **`Int`, `Int8`/`Int16`/`Int32`/`Int64`, `UInt8`/`UInt16`/`UInt32`/`UInt64`** — `Int::parse(string): ?int`, `Int::toFloat(int): float`, `Int::pow(...)`, wrapping arithmetic (`wrappingAdd`/`wrappingSub`/`wrappingMul`), and per-width checked conversion families such as `Int32::from` (panics on overflow) / `Int32::tryFrom` (returns `?int32`). Each accepts one fixed-width integer expression; their callable declaration surface is TBD with conversion-overload work rather than published as an untyped Doria parameter.
 - **`Float`, `Float32`/`Float64`** — `Float::parse(string): ?float`, `Float::toInt(float): int` (checked, panics on NaN/out-of-range), `Float::pow(...)`. `float` is neither `Hashable` nor totally `Comparable` (0096).
-- **`Bool`** — companion helpers.
-- **`String`** — `$s->length` (byte length), `$s->isEmpty`, `$s->bytes` (a `Bytes` view, copy in v1.0); `$s->chars` (grapheme iteration) is deferred. Plus the `str_*` free-function family (below).
+- **`Bool`** — `Bool::parse(string): ?bool` (returns `true`/`false` for exactly `"true"`/`"false"`, case-sensitive, no whitespace tolerance; `null` otherwise). No `MIN`/`MAX`/`pow`/wrapping (N/A for a two-valued type); `Bool::toInt` is a named v1.0+ furnishing (0104).
+- **`String`** — intrinsic members `$s->length` (byte length), `$s->isEmpty`, `$s->bytes` (a `Bytes` view, copy in v1.0); `$s->chars` (grapheme iteration) is deferred. Pure **transforms** live on the `String` companion (decision 0103): `String::trim`, `String::lower`, `String::upper` (seed set; `replace`/`split`/`pad`/`substring` and the Unicode-vs-ASCII contract are *surface TBD* with the strings work). Plus the `str_*` free-function family (below) — the PHP-familiar predicate/search layer, which does **not** duplicate the companion transforms (there is no `str_trim`/`str_lower`).
 
 ### Value interfaces (core contracts)
 Details: decision 0096 (primitive conformance), the interfaces/traits decision (Stage 35), 0079 (`Displayable`).

@@ -158,6 +158,7 @@ enum EvaluationTask {
     Rvalue(mir::Rvalue),
     Value(mir::ValueExpression),
     String(mir::StringExpression),
+    ParseNullableScalar(mir::ScalarType),
     Mixed(mir::MixedExpression),
     NullableScalar(mir::NullableScalarExpression),
     NullableString(mir::NullableStringExpression),
@@ -1514,6 +1515,29 @@ impl Interpreter<'_> {
                 }
                 self.push_nullable_scalar(ty, Some(value))?;
             }
+            EvaluationTask::ParseNullableScalar(ty) => {
+                let text = self.pop_string()?;
+                let trimmed = text.trim();
+                let value = match ty {
+                    mir::ScalarType::Integer(IntegerType::Int64) => trimmed
+                        .parse::<i64>()
+                        .ok()
+                        .and_then(|value| {
+                            IntegerValue::from_i128(IntegerType::Int64, i128::from(value))
+                        })
+                        .map(mir::ScalarValue::Integer),
+                    mir::ScalarType::Float(FloatType::Float64) => trimmed
+                        .parse::<f64>()
+                        .ok()
+                        .map(|value| mir::ScalarValue::Float(FloatValue::from_f64(value))),
+                    _ => {
+                        return Err(InterpreterError::new(
+                            "parse only supports `int` and `float` in Stage 23",
+                        ));
+                    }
+                };
+                self.push_nullable_scalar(ty, value)?;
+            }
             EvaluationTask::BuildNullableClassSome(class) => {
                 let LocalValue::Class {
                     object,
@@ -2747,6 +2771,11 @@ impl Interpreter<'_> {
                     access,
                 });
                 frame.tasks.push(EvaluationTask::Rvalue(*key));
+            }
+            mir::NullableScalarExpression::Parse { ty, value } => {
+                let frame = self.current_frame_mut()?;
+                frame.tasks.push(EvaluationTask::ParseNullableScalar(ty));
+                frame.tasks.push(EvaluationTask::String(*value));
             }
         }
         Ok(())

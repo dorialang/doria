@@ -23,16 +23,16 @@ use crate::native_abi::{
     COLLECTION_KEYED_GET, COLLECTION_KEYED_HAS, COLLECTION_KEYED_SET, COLLECTION_KEY_AT,
     COLLECTION_LENGTH, COLLECTION_NEW, COLLECTION_NULLABLE_ACCESS, COLLECTION_PUSH,
     COLLECTION_PUSH_UNIQUE, COLLECTION_REMOVE_AT, COLLECTION_REMOVE_VALUE, COLLECTION_SET_ALGEBRA,
-    COLLECTION_SET_AT, COLLECTION_VALUE_AT, FORMAT_F32, FORMAT_F64, FORMAT_I64, FORMAT_STRING,
-    FORMAT_U64, MIXED_CLONE_OWNED, MIXED_FREE, MIXED_NEW, MIXED_NEW_BORROWED, MIXED_PAYLOAD,
-    MIXED_RELEASE_OWNED, MIXED_TAG, MIXED_TAG_BOOL, MIXED_TAG_CLASS, MIXED_TAG_FLOAT32,
-    MIXED_TAG_FLOAT64, MIXED_TAG_INT16, MIXED_TAG_INT32, MIXED_TAG_INT64, MIXED_TAG_INT8,
-    MIXED_TAG_STRING, MIXED_TAG_UINT16, MIXED_TAG_UINT32, MIXED_TAG_UINT64, MIXED_TAG_UINT8,
-    MIXED_TYPE_ID, NULLABLE_STRING_EQUAL, READ_FILE, READ_FILE_BYTES, READ_STDIN_BYTES,
-    READ_STDIN_LINE, STRING_COMPARE, STRING_CONCAT, STRING_DATA, STRING_FROM_BOOL, STRING_FROM_F32,
-    STRING_FROM_F64, STRING_FROM_I64, STRING_FROM_U64, STRING_FROM_UTF8, STRING_LENGTH,
-    STRING_RELEASE, STRING_RETAIN, STRING_WRITE_STDERR, STRING_WRITE_STDOUT, WRITE_FILE,
-    WRITE_FILE_BYTES, WRITE_STDERR_BYTES, WRITE_STDOUT_BYTES,
+    COLLECTION_SET_AT, COLLECTION_VALUE_AT, FLOAT_PARSE, FORMAT_F32, FORMAT_F64, FORMAT_I64,
+    FORMAT_STRING, FORMAT_U64, INT_PARSE, MIXED_CLONE_OWNED, MIXED_FREE, MIXED_NEW,
+    MIXED_NEW_BORROWED, MIXED_PAYLOAD, MIXED_RELEASE_OWNED, MIXED_TAG, MIXED_TAG_BOOL,
+    MIXED_TAG_CLASS, MIXED_TAG_FLOAT32, MIXED_TAG_FLOAT64, MIXED_TAG_INT16, MIXED_TAG_INT32,
+    MIXED_TAG_INT64, MIXED_TAG_INT8, MIXED_TAG_STRING, MIXED_TAG_UINT16, MIXED_TAG_UINT32,
+    MIXED_TAG_UINT64, MIXED_TAG_UINT8, MIXED_TYPE_ID, NULLABLE_STRING_EQUAL, READ_FILE,
+    READ_FILE_BYTES, READ_STDIN_BYTES, READ_STDIN_LINE, STRING_COMPARE, STRING_CONCAT, STRING_DATA,
+    STRING_FROM_BOOL, STRING_FROM_F32, STRING_FROM_F64, STRING_FROM_I64, STRING_FROM_U64,
+    STRING_FROM_UTF8, STRING_LENGTH, STRING_RELEASE, STRING_RETAIN, STRING_WRITE_STDERR,
+    STRING_WRITE_STDOUT, WRITE_FILE, WRITE_FILE_BYTES, WRITE_STDERR_BYTES, WRITE_STDOUT_BYTES,
 };
 use crate::numeric::{FloatType, FloatValue, IntegerPanic, IntegerType, IntegerValue};
 
@@ -4022,6 +4022,36 @@ fn lower_nullable_scalar_expression(
                 *access,
                 resources,
             )?;
+            Ok(LoweredValue::Nullable { present, payload })
+        }
+        mir::NullableScalarExpression::Parse { value, .. } => {
+            let text = lower_string_expression(builder, value, resources)?;
+            let found_slot = builder.create_sized_stack_slot(StackSlotData::new(
+                StackSlotKind::ExplicitSlot,
+                1,
+                0,
+            ));
+            let found_pointer = builder.ins().stack_addr(pointer, found_slot, 0);
+            let symbol = match ty {
+                mir::ScalarType::Integer(_) => INT_PARSE,
+                mir::ScalarType::Float(_) => FLOAT_PARSE,
+                mir::ScalarType::Bool => {
+                    return Err(malformed_mir("parse does not produce a bool value"));
+                }
+            };
+            let word = runtime_call(
+                builder,
+                symbol,
+                &[pointer, pointer],
+                Some(types::I64),
+                &[text, found_pointer],
+                resources,
+            )?
+            .ok_or_else(|| backend_failure("parse produced no result"))?;
+            release_string(builder, text, resources)?;
+            let found = builder.ins().stack_load(types::I8, found_slot, 0);
+            let present = builder.ins().uextend(pointer, found);
+            let payload = collection_word_to_value(builder, word, mir::Type::Scalar(ty), pointer)?;
             Ok(LoweredValue::Nullable { present, payload })
         }
     }

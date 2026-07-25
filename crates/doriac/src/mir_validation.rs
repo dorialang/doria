@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use crate::backend::BackendError;
 use crate::class_layout::{compute_class_layout, ClassId, FieldType};
 use crate::mir;
-use crate::numeric::IntegerType;
+use crate::numeric::{FloatType, IntegerType};
 
 pub fn validate_program(program: &mir::Program) -> Result<(), BackendError> {
     for (index, collection) in program.collection_types.iter().enumerate() {
@@ -2822,7 +2822,8 @@ fn collect_nullable_scalar_class_local_accesses<'a>(
         mir::NullableScalarExpression::DictionaryGet { key, .. } => {
             collect_rvalue_class_local_accesses(key, accesses)
         }
-        mir::NullableScalarExpression::Null(_)
+        mir::NullableScalarExpression::Parse { .. }
+        | mir::NullableScalarExpression::Null(_)
         | mir::NullableScalarExpression::Local { .. }
         | mir::NullableScalarExpression::Static { .. } => {}
     }
@@ -3457,7 +3458,8 @@ fn nullable_scalar_expression_is_present(
         | mir::NullableScalarExpression::Call { .. }
         | mir::NullableScalarExpression::NullSafeProperty { .. }
         | mir::NullableScalarExpression::NullSafeCall { .. }
-        | mir::NullableScalarExpression::DictionaryGet { .. } => false,
+        | mir::NullableScalarExpression::DictionaryGet { .. }
+        | mir::NullableScalarExpression::Parse { .. } => false,
     }
 }
 
@@ -4682,6 +4684,9 @@ fn nullable_scalar_observes_property(
         mir::NullableScalarExpression::DictionaryGet { key, .. } => {
             rvalue_observes_property(key, receiver, property)
         }
+        mir::NullableScalarExpression::Parse { value, .. } => {
+            string_observes_property(value, receiver, property)
+        }
         mir::NullableScalarExpression::Null(_)
         | mir::NullableScalarExpression::Local { .. }
         | mir::NullableScalarExpression::Static { .. } => false,
@@ -5361,6 +5366,28 @@ fn validate_condition(
                 *tag,
                 mir::Type::Scalar(mir::ScalarType::Bool),
             ),
+            mir::Operand::CollectionIndex {
+                collection,
+                index,
+                remove,
+            } => {
+                let local = local_in(function, *collection)?;
+                let mir::Type::Collection(collection_type) = local.ty else {
+                    return Err(malformed_mir("bool index source is not a collection"));
+                };
+                let collection_type = collection_in(program, collection_type)?;
+                if collection_type.value != mir::Type::Scalar(mir::ScalarType::Bool) {
+                    return Err(malformed_mir("bool index element type mismatch"));
+                }
+                validate_collection_element_access(
+                    program,
+                    function,
+                    local,
+                    collection_type,
+                    index,
+                    *remove,
+                )
+            }
             _ => Err(malformed_mir("bool expression has an incompatible operand")),
         },
         mir::BoolExpression::Compare { op, left, right } => {
@@ -5858,6 +5885,21 @@ fn validate_nullable_scalar_expression(
             mir::Type::Scalar(ty),
             *access,
         ),
+        mir::NullableScalarExpression::Parse {
+            ty: parse_ty,
+            value,
+        } => {
+            if *parse_ty != ty
+                || !matches!(
+                    ty,
+                    mir::ScalarType::Integer(IntegerType::Int64)
+                        | mir::ScalarType::Float(FloatType::Float64)
+                )
+            {
+                return Err(malformed_mir("parse produces only `?int` or `?float`"));
+            }
+            validate_string_expression(program, function, value)
+        }
         mir::NullableScalarExpression::Value(_) => {
             Err(malformed_mir("nullable scalar wraps another scalar type"))
         }

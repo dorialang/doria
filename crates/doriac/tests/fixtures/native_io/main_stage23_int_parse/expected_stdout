@@ -1,0 +1,6 @@
+int=42
+int-trim=-7
+int-invalid-null
+int-overflow-null
+float=3.5
+float-invalid-null

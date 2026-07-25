@@ -3655,6 +3655,32 @@ fn lower_nullable_scalar_expression(
             access,
         });
     }
+    if let hir::Expr::StaticCall {
+        class_name,
+        method,
+        args,
+        span,
+    } = unparenthesized_place(expr)
+    {
+        if method == "parse" {
+            let is_int = IntegerType::from_companion_name(class_name) == Some(IntegerType::Int64)
+                && expected == mir::ScalarType::Integer(IntegerType::Int64);
+            let is_float = matches!(class_name.as_str(), "Float" | "Float64")
+                && expected == mir::ScalarType::Float(FloatType::Float64);
+            if is_int || is_float {
+                let [argument] = args.as_slice() else {
+                    return Err(vec![unsupported(
+                        *span,
+                        "parse expects exactly one string argument",
+                    )]);
+                };
+                return Ok(mir::NullableScalarExpression::Parse {
+                    ty: expected,
+                    value: Box::new(lower_string_expression(argument, context)?),
+                });
+            }
+        }
+    }
     match expr {
         hir::Expr::Null { .. } => Ok(mir::NullableScalarExpression::Null(expected)),
         hir::Expr::Grouped { expr, .. } => {

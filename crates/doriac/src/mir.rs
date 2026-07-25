@@ -537,6 +537,12 @@ pub enum NullableScalarExpression {
         key: Box<Rvalue>,
         access: NullableCollectionAccess,
     },
+    /// `Int::parse(string)` / `Float::parse(string)`: parses the string and yields
+    /// `?ty`, producing the absent value when the text is not a valid number.
+    Parse {
+        ty: ScalarType,
+        value: Box<StringExpression>,
+    },
 }
 
 impl NullableScalarExpression {
@@ -550,7 +556,8 @@ impl NullableScalarExpression {
             | Self::NullSafeProperty { ty, .. }
             | Self::NullSafeCall { ty, .. }
             | Self::Coalesce { ty, .. }
-            | Self::DictionaryGet { ty, .. } => *ty,
+            | Self::DictionaryGet { ty, .. }
+            | Self::Parse { ty, .. } => *ty,
             Self::Value(value) => value.ty(),
         }
     }
@@ -1466,7 +1473,8 @@ fn nullable_scalar_class_temporary_capacity(value: &NullableScalarExpression) ->
                 + nullable_scalar_class_temporary_capacity(right)
         }
         NullableScalarExpression::DictionaryGet { key, .. } => rvalue_class_temporary_capacity(key),
-        NullableScalarExpression::Null(_)
+        NullableScalarExpression::Parse { .. }
+        | NullableScalarExpression::Null(_)
         | NullableScalarExpression::Local { .. }
         | NullableScalarExpression::Property { .. }
         | NullableScalarExpression::Static { .. } => 0,
@@ -2286,6 +2294,7 @@ impl fmt::Display for NullableScalarExpression {
             } => {
                 write!(formatter, "local{}.get({key})", collection.0)
             }
+            Self::Parse { ty, value } => write!(formatter, "parse::<{ty}>({value})"),
         }
     }
 }

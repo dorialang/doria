@@ -1,0 +1,37 @@
+function main(): void
+{
+    let $ok = Int::parse("42");
+    if ($ok != null) {
+        echo "int={$ok}\n";
+    } else {
+        echo "int-null\n";
+    }
+    let $trimmed = Int::parse("  -7 ");
+    if ($trimmed != null) {
+        echo "int-trim={$trimmed}\n";
+    }
+    let $bad = Int::parse("not-a-number");
+    if ($bad != null) {
+        echo "unexpected\n";
+    } else {
+        echo "int-invalid-null\n";
+    }
+    let $overflow = Int::parse("99999999999999999999999999");
+    if ($overflow != null) {
+        echo "unexpected\n";
+    } else {
+        echo "int-overflow-null\n";
+    }
+    let $pi = Float::parse("3.5");
+    if ($pi != null) {
+        echo "float={$pi}\n";
+    } else {
+        echo "float-null\n";
+    }
+    let $badf = Float::parse("x");
+    if ($badf != null) {
+        echo "unexpected\n";
+    } else {
+        echo "float-invalid-null\n";
+    }
+}

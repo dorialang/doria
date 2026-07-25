@@ -1572,6 +1572,57 @@ unsafe fn string_bytes_mut(string: *mut DrStringV1) -> *mut u8 {
     string.cast::<u8>().add(STRING_HEADER_SIZE)
 }
 
+/// Parses `text` as a base-10 64-bit signed integer, ignoring surrounding ASCII
+/// whitespace. Writes `1` to `found` and returns the value reinterpreted as a
+/// `u64` word on success; writes `0` and returns `0` when the text is not a valid
+/// `int` (including out-of-range values and non-UTF-8 bytes).
+///
+/// # Safety
+/// `text` must be null or a valid `DrStringV1` pointer; `found` must be writable.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_int_parse(text: *const DrStringV1, found: *mut u8) -> u64 {
+    *found = 0;
+    if text.is_null() {
+        return 0;
+    }
+    let bytes = core::slice::from_raw_parts(string_bytes(text), (*text).byte_length);
+    let Ok(text) = core::str::from_utf8(bytes) else {
+        return 0;
+    };
+    match text.trim().parse::<i64>() {
+        Ok(value) => {
+            *found = 1;
+            value as u64
+        }
+        Err(_) => 0,
+    }
+}
+
+/// Parses `text` as a 64-bit float, ignoring surrounding ASCII whitespace. Writes
+/// `1` to `found` and returns the IEEE-754 bit pattern on success; writes `0` and
+/// returns `0` when the text is not a valid `float` (including non-UTF-8 bytes).
+///
+/// # Safety
+/// `text` must be null or a valid `DrStringV1` pointer; `found` must be writable.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_float_parse(text: *const DrStringV1, found: *mut u8) -> u64 {
+    *found = 0;
+    if text.is_null() {
+        return 0;
+    }
+    let bytes = core::slice::from_raw_parts(string_bytes(text), (*text).byte_length);
+    let Ok(text) = core::str::from_utf8(bytes) else {
+        return 0;
+    };
+    match text.trim().parse::<f64>() {
+        Ok(value) => {
+            *found = 1;
+            value.to_bits()
+        }
+        Err(_) => 0,
+    }
+}
+
 unsafe fn string_runtime_panic(message: &[u8]) -> ! {
     dr_v1_panic(ptr::null(), message.as_ptr(), message.len())
 }

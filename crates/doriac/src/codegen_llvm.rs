@@ -29,16 +29,16 @@ use crate::native_abi::{
     COLLECTION_KEYED_GET, COLLECTION_KEYED_HAS, COLLECTION_KEYED_SET, COLLECTION_KEY_AT,
     COLLECTION_LENGTH, COLLECTION_NEW, COLLECTION_NULLABLE_ACCESS, COLLECTION_PUSH,
     COLLECTION_PUSH_UNIQUE, COLLECTION_REMOVE_AT, COLLECTION_REMOVE_VALUE, COLLECTION_SET_ALGEBRA,
-    COLLECTION_SET_AT, COLLECTION_VALUE_AT, FORMAT_F32, FORMAT_F64, FORMAT_I64, FORMAT_STRING,
-    FORMAT_U64, MIXED_CLONE_OWNED, MIXED_FREE, MIXED_NEW, MIXED_NEW_BORROWED, MIXED_PAYLOAD,
-    MIXED_RELEASE_OWNED, MIXED_TAG, MIXED_TAG_BOOL, MIXED_TAG_CLASS, MIXED_TAG_FLOAT32,
-    MIXED_TAG_FLOAT64, MIXED_TAG_INT16, MIXED_TAG_INT32, MIXED_TAG_INT64, MIXED_TAG_INT8,
-    MIXED_TAG_STRING, MIXED_TAG_UINT16, MIXED_TAG_UINT32, MIXED_TAG_UINT64, MIXED_TAG_UINT8,
-    MIXED_TYPE_ID, NULLABLE_STRING_EQUAL, READ_FILE, READ_FILE_BYTES, READ_STDIN_BYTES,
-    READ_STDIN_LINE, STRING_COMPARE, STRING_CONCAT, STRING_DATA, STRING_FROM_BOOL, STRING_FROM_F32,
-    STRING_FROM_F64, STRING_FROM_I64, STRING_FROM_U64, STRING_FROM_UTF8, STRING_LENGTH,
-    STRING_RELEASE, STRING_RETAIN, STRING_WRITE_STDERR, STRING_WRITE_STDOUT, WRITE_FILE,
-    WRITE_FILE_BYTES, WRITE_STDERR_BYTES, WRITE_STDOUT_BYTES,
+    COLLECTION_SET_AT, COLLECTION_VALUE_AT, FLOAT_PARSE, FORMAT_F32, FORMAT_F64, FORMAT_I64,
+    FORMAT_STRING, FORMAT_U64, INT_PARSE, MIXED_CLONE_OWNED, MIXED_FREE, MIXED_NEW,
+    MIXED_NEW_BORROWED, MIXED_PAYLOAD, MIXED_RELEASE_OWNED, MIXED_TAG, MIXED_TAG_BOOL,
+    MIXED_TAG_CLASS, MIXED_TAG_FLOAT32, MIXED_TAG_FLOAT64, MIXED_TAG_INT16, MIXED_TAG_INT32,
+    MIXED_TAG_INT64, MIXED_TAG_INT8, MIXED_TAG_STRING, MIXED_TAG_UINT16, MIXED_TAG_UINT32,
+    MIXED_TAG_UINT64, MIXED_TAG_UINT8, MIXED_TYPE_ID, NULLABLE_STRING_EQUAL, READ_FILE,
+    READ_FILE_BYTES, READ_STDIN_BYTES, READ_STDIN_LINE, STRING_COMPARE, STRING_CONCAT, STRING_DATA,
+    STRING_FROM_BOOL, STRING_FROM_F32, STRING_FROM_F64, STRING_FROM_I64, STRING_FROM_U64,
+    STRING_FROM_UTF8, STRING_LENGTH, STRING_RELEASE, STRING_RETAIN, STRING_WRITE_STDERR,
+    STRING_WRITE_STDOUT, WRITE_FILE, WRITE_FILE_BYTES, WRITE_STDERR_BYTES, WRITE_STDOUT_BYTES,
 };
 use crate::numeric::{FloatType, FloatValue, IntegerPanic, IntegerType, IntegerValue};
 
@@ -2962,6 +2962,44 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             } => {
                 let (present, payload) =
                     self.lower_dictionary_get(*collection, key, mir::Type::Scalar(ty), *access)?;
+                self.nullable_value(present, payload)
+            }
+            mir::NullableScalarExpression::Parse { value, .. } => {
+                let pointer = self.context.ptr_type(AddressSpace::default());
+                let text = self.lower_string_expression(value)?;
+                let found_slot = build(
+                    self.builder
+                        .build_alloca(self.context.i8_type(), "parse.found"),
+                )?;
+                let symbol = match ty {
+                    mir::ScalarType::Integer(_) => INT_PARSE,
+                    mir::ScalarType::Float(_) => FLOAT_PARSE,
+                    mir::ScalarType::Bool => {
+                        return Err(malformed_mir("parse does not produce a bool value"));
+                    }
+                };
+                let word = self
+                    .call_runtime(
+                        symbol,
+                        &[pointer.into(), pointer.into()],
+                        Some(self.context.i64_type().into()),
+                        &[text.into(), found_slot.into()],
+                    )?
+                    .ok_or_else(|| backend_failure("parse produced no result"))?
+                    .into_int_value();
+                self.release_string(text)?;
+                let found = build(self.builder.build_load(
+                    self.context.i8_type(),
+                    found_slot,
+                    "parse.found.value",
+                ))?
+                .into_int_value();
+                let present = build(self.builder.build_int_z_extend(
+                    found,
+                    self.context.ptr_sized_int_type(self.target_data, None),
+                    "parse.present",
+                ))?;
+                let payload = self.collection_word_to_value(word, mir::Type::Scalar(ty))?;
                 self.nullable_value(present, payload)
             }
         }

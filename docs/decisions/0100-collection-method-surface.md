@@ -161,11 +161,19 @@ their types, at or after Stage 23 per the collections-runtime rollout.
 ### Construction
 
 Bracket literals build `List`/`Dictionary`/`T[]` by context typing (§4.9). `::from`
-is the explicit constructor from an existing sequence: it is **required** for
-`Set` (which has no literal form) and available as the equivalent explicit form
-for the others. Capacity hints (`withCapacity`) and other performance-shaped
-constructors are a profiling-driven addition, deferred with the runtime
-representation (0092).
+is the explicit constructor from an existing sequence, and it is **required** for
+**every collection with no bracket-literal form** — `Set`, `SortedSet`,
+`SortedDictionary`, `PriorityQueue`, and `Deque` — because for those it is the only
+construction path. It is also **available** as the equivalent explicit form for the
+literal-constructible types (`List`/`Dictionary`/`T[]`). Each `::from` accepts the
+element (or key/value pair, for the map types) sequence its own type expects — e.g.
+`Set::from([...])`, `PriorityQueue::from([...])`, `Deque::from([...])`, and
+`SortedDictionary::from(["k" => v, ...])`. The runtime-sized **fill** constructor — a `T[]`/`List<T>` of
+`count` copies of a value — is spelled as the `[value; count]` repeat literal
+(decision 0102), which supersedes this record's original bundling of fill with
+capacity. Capacity hints (`withCapacity`, an empty pre-allocated sequence) and
+other performance-shaped constructors remain a profiling-driven addition, deferred
+with the runtime representation (0092).
 
 ## Alternatives considered
 
