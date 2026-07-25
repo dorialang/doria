@@ -1055,11 +1055,36 @@ greet();              // error
 greet(123);           // error
 ```
 
-The current compiler accepts only positional arguments. Decision 0098 schedules named arguments for Stage 23a, where callers may skip a middle default by parameter name and required parameters may follow optional parameters.
+Arguments may also be passed by parameter name, per decision 0098:
+
+```doria
+function describe(string $name, int $age, string $city = "unknown"): void
+{
+}
+
+describe(name: "Ada", age: 36);        // named
+describe(age: 36, name: "Ada");        // any order
+describe("Ada", city: "London", age: 36); // positional first, then named
+describe(name: "Ada", 36);             // error: positional after named
+```
+
+Positional arguments may precede named arguments but may not follow them. Named
+arguments may appear in any order, and may skip a parameter that has a default —
+including a *middle* one, which positional calls cannot express. A parameter
+supplied twice (named twice, or once positionally and once by name), an unknown
+parameter name, and a missing required parameter are each errors.
+
+Arguments evaluate in source (written) order regardless of the parameter each
+one binds to: `f(b: g(), a: h())` runs `g()` then `h()`, then binds those results
+to `b` and `a`. Ownership and borrowing are checked over that same written order.
+
+Because a callable can be invoked by parameter name, its parameter names are part
+of its public interface: renaming a parameter is a breaking change for
+named-argument callers. Language intrinsics keep positional-only binding.
 
 Native execution currently supports omitted trailing defaults when the parameter is a fixed-width integer, float, bool, or readonly string and the default is accepted by the Stage 20 constant-evaluation tier. This applies uniformly to free functions, instance methods, static methods, and constructors. A writable Copy-scalar parameter may use such a default because writability does not change its ownership classification. For a readonly string parameter, the caller materializes the folded value as an ordinary string-literal argument. Ordinary call temporaries are released after the call; a constructor-promoted value is retained by the property and released with the object. The compiler inserts each folded value at its omitted call position before MIR execution.
 
-Defaults for `?string`, `writable string`, `take string`, other move types, and `take` parameters remain deferred until their representation, mutation, construction, and destruction obligations are implemented. Non-constant defaults are rejected before MIR. Named arguments are specified by decision 0098 and remain unavailable until their scheduled Stage 23a implementation.
+Defaults for `?string`, `writable string`, `take string`, other move types, and `take` parameters remain deferred until their representation, mutation, construction, and destruction obligations are implemented. Non-constant defaults are rejected before MIR. A named argument may skip any parameter whose default is supported above, including a middle one; the compiler splices the folded value at that parameter's position.
 
 ## 10. Collection aliases
 

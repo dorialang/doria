@@ -1,0 +1,58 @@
+class Store
+{
+    function __construct(string $label, writable int $size = 0)
+    {
+    }
+
+    function describe(string $prefix, int $count = 7): int
+    {
+        printf("%s|%d|%s|%d\n", $prefix, $count, $this->label, $this->size);
+        return $count;
+    }
+
+    static function build(string $tag, int $weight = 2, bool $ready = false): int
+    {
+        printf("static|%s|%d|%s\n", $tag, $weight, $ready);
+        return $weight;
+    }
+}
+
+function describe(string $name, int $age, string $city = "unknown"): void
+{
+    printf("free|%s|%d|%s\n", $name, $age, $city);
+}
+
+function middle(int $first, int $second = 20, int $third = 30, int $fourth = 40): int
+{
+    return $first + $second + $third + $fourth;
+}
+
+function main(): void
+{
+    // Free function: fully named, reordered, and mixed positional-then-named.
+    describe(name: "Ada", age: 36, city: "London");
+    describe(age: 42, name: "Grace");
+    describe("Alan", city: "Cambridge", age: 41);
+
+    // Constructor with a reordered named argument list.
+    let $store = new Store(size: 5, label: "shop");
+
+    // Instance method: reordered, and skipping a trailing default.
+    echo $store->describe(count: 3, prefix: "method");
+    echo "\n";
+    echo $store->describe(prefix: "default");
+    echo "\n";
+
+    // Static method: reordered, skipping a defaulted middle parameter.
+    echo Store::build(ready: true, tag: "static");
+    echo "\n";
+
+    // Skipping a defaulted *middle* parameter is the case positional calls
+    // could not express: `second` and `third` keep their defaults.
+    echo middle(1, fourth: 4);
+    echo ":";
+    echo middle(fourth: 4, first: 1);
+    echo ":";
+    echo middle(1, third: 3);
+    echo "\n";
+}
