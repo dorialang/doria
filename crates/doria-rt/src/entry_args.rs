@@ -105,10 +105,23 @@ unsafe fn append_platform_arguments(
 ) {
 }
 
+/// Whether an argument's bytes may become a Doria `string`.
+///
+/// Decision 0099: only valid UTF-8 may, because `string` is defined as
+/// immutable UTF-8. This is the decision point the panic below acts on, split
+/// out so it can be tested without aborting the process.
+///
+/// Unix only: the Windows path decodes UTF-16 instead, where the equivalent
+/// rejection is an unpaired surrogate rather than a malformed byte sequence.
+#[cfg(unix)]
+fn argument_is_representable(bytes: &[u8]) -> bool {
+    core::str::from_utf8(bytes).is_ok()
+}
+
 /// Interns `byte_length` bytes as a Doria string and appends it to the list.
 #[cfg(unix)]
 unsafe fn push_utf8(list: *mut DrCollectionV1, bytes: *const u8, byte_length: usize) {
-    if core::str::from_utf8(core::slice::from_raw_parts(bytes, byte_length)).is_err() {
+    if !argument_is_representable(core::slice::from_raw_parts(bytes, byte_length)) {
         argument_panic(b"program argument is not valid UTF-8");
     }
     let string = crate::dr_v1_string_from_utf8(bytes, byte_length);
@@ -217,6 +230,21 @@ mod tests {
         let collected =
             unsafe { collect(&[b"/bin/prog\0", b"two words\0", b"\xc3\xa9\xe6\x97\xa5\0"]) };
         assert_eq!(collected, ["two words", "é日"]);
+    }
+
+    #[test]
+    fn only_valid_utf8_arguments_may_become_doria_strings() {
+        // Decision 0099: `string` is immutable UTF-8, so a malformed argument is
+        // rejected at the process boundary rather than entering the program.
+        assert!(argument_is_representable(b""));
+        assert!(argument_is_representable(b"plain"));
+        assert!(argument_is_representable("é日".as_bytes()));
+
+        // A lone continuation byte, a truncated multi-byte sequence, and an
+        // unpaired surrogate encoding are all rejected.
+        assert!(!argument_is_representable(b"\x80"));
+        assert!(!argument_is_representable(b"\xc3"));
+        assert!(!argument_is_representable(b"\xed\xa0\x80"));
     }
 
     #[test]
