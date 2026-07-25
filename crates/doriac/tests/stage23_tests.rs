@@ -662,6 +662,42 @@ function main(): void
 }
 
 #[test]
+fn int_and_float_parse_type_and_lower_and_fixed_width_is_deferred() {
+    doriac::lower_source_to_mir(
+        "stage23-parse.doria",
+        r#"
+function main(): void
+{
+    let $n = Int::parse("42");
+    if ($n != null) {
+        echo "{$n}\n";
+    }
+    let $f = Float::parse("3.5");
+    if ($f != null) {
+        echo "{$f}\n";
+    }
+}
+"#,
+    )
+    .expect("Int::parse and Float::parse must type as nullable and lower");
+
+    let errors = doriac::lower_source_to_mir(
+        "stage23-int8-parse.doria",
+        r#"
+function main(): void
+{
+    let $n = Int8::parse("1");
+}
+"#,
+    )
+    .expect_err("fixed-width parse is not available yet");
+    assert!(errors
+        .iter()
+        .any(|diagnostic| diagnostic.message.contains("Int8::parse")
+            && diagnostic.message.contains("not available")));
+}
+
+#[test]
 fn bool_collection_element_read_lowers_without_malformed_mir() {
     // Regression: reading a `bool` element out of a collection/array used to fail
     // shared MIR validation ("bool expression has an incompatible operand") because

@@ -5060,6 +5060,25 @@ impl<'program> Checker<'program> {
             );
             return;
         }
+        if matches!(class_name, "Float" | "Float64") && access.member == "parse" {
+            self.check_parse_intrinsic_argument(
+                "Float::parse",
+                args,
+                access.span,
+                scopes,
+                method_context,
+            );
+            return;
+        }
+        if class_name == "Float32" && access.member == "parse" {
+            self.diagnostics.push(Diagnostic::new(
+                "E0304",
+                "fixed-width `Float32::parse` is not available yet; parse with `Float::parse` and convert"
+                    .to_string(),
+                access.span,
+            ));
+            return;
+        }
         if class_name == "Set" {
             if access.member != "from" {
                 self.diagnostics.push(Diagnostic::unsupported_stage(
@@ -5133,11 +5152,31 @@ impl<'program> Checker<'program> {
         }
 
         if let Some(target) = IntegerType::from_companion_name(class_name) {
+            if access.member == "parse" {
+                if target != IntegerType::Int64 {
+                    self.diagnostics.push(Diagnostic::new(
+                        "E0304",
+                        format!(
+                            "fixed-width `{class_name}::parse` is not available yet; parse with `Int::parse` and convert with `{class_name}::from(...)`"
+                        ),
+                        access.span,
+                    ));
+                    return;
+                }
+                self.check_parse_intrinsic_argument(
+                    "Int::parse",
+                    args,
+                    access.span,
+                    scopes,
+                    method_context,
+                );
+                return;
+            }
             if access.member != "from" {
                 self.diagnostics.push(Diagnostic::new(
                     "E0304",
                     format!(
-                        "unknown integer companion intrinsic `{class_name}::{}`; only `{class_name}::from(...)` is available",
+                        "unknown integer companion intrinsic `{class_name}::{}`; `{class_name}::from(...)` and `Int::parse(...)` are available",
                         access.member
                     ),
                     access.span,
@@ -5454,6 +5493,38 @@ impl<'program> Checker<'program> {
                 format!(
                     "{name} requires a `{}` argument, got `{}`",
                     self.types.display(expected),
+                    self.types.display(actual)
+                ),
+                args[0].span(),
+            ));
+        }
+    }
+
+    fn check_parse_intrinsic_argument(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        span: Span,
+        scopes: &ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) {
+        if args.len() != 1 {
+            self.diagnostics.push(Diagnostic::new(
+                "E0443",
+                format!("{name} expects exactly 1 argument, got {}", args.len()),
+                span,
+            ));
+            return;
+        }
+        let actual = self.infer_expr_type(&args[0], scopes, method_context);
+        if !matches!(
+            self.types.kind(actual),
+            TypeKind::String | TypeKind::Unknown
+        ) {
+            self.diagnostics.push(Diagnostic::new(
+                "E0443",
+                format!(
+                    "{name} requires a `string` argument, got `{}`",
                     self.types.display(actual)
                 ),
                 args[0].span(),
@@ -6693,6 +6764,16 @@ impl<'program> Checker<'program> {
                 }
                 if class_name == "Float" && method == "toInt" {
                     return self.types.intern(TypeKind::Integer(IntegerType::Int64));
+                }
+                if method == "parse" {
+                    if IntegerType::from_companion_name(&class_name) == Some(IntegerType::Int64) {
+                        let inner = self.types.intern(TypeKind::Integer(IntegerType::Int64));
+                        return self.types.intern(TypeKind::Nullable(inner));
+                    }
+                    if matches!(class_name.as_str(), "Float" | "Float64") {
+                        let inner = self.types.intern(TypeKind::Float(FloatType::Float64));
+                        return self.types.intern(TypeKind::Nullable(inner));
+                    }
                 }
                 if method == "from" {
                     if class_name == "Set" {

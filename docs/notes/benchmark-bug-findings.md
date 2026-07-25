@@ -62,7 +62,17 @@ well-formed bool operand a plain `bool` local does. Add parity fixtures: `bool[]
 `List<bool>`, and `Dictionary<K, bool>` element read → used in `if`, in a boolean
 operator, and bound-to-local-then-used, across interpreter/Cranelift/LLVM.
 
-## Bug 2 — `Int::parse` is unresolved (E0420)
+## Bug 2 — `Int::parse` is unresolved (E0420) — RESOLVED
+
+**RESOLVED.** `Int::parse(string): ?int` and `Float::parse(string): ?float` are
+now wired end to end (resolution, typing, a `NullableScalarExpression::Parse` MIR
+node, `doria-rt` `dr_v1_int_parse`/`dr_v1_float_parse`, and interpreter/Cranelift/
+LLVM lowering). Grammar: surrounding ASCII whitespace is ignored, then Rust's
+base-10 `i64` / `f64` parse; unparseable text and out-of-range integers yield
+`null`. Fixed-width companions (`Int8::parse`, `Float32::parse`, …) are deferred
+under a two-clocks diagnostic (parse with `Int`/`Float`, convert with `::from`).
+Regression: `examples/native/main_stage23_int_parse.doria` (parity manifest) plus
+a `stage23_tests` typing/deferral test.
 
 **Severity: medium.** `Int::parse(string): ?int` is in the documented stdlib
 surface (stdlib-reference; decision 0016 numeric companions) but is not wired into
