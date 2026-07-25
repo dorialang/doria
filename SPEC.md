@@ -1040,7 +1040,25 @@ For declared non-`void` return types, no reachable path may fall through the fun
 
 The program entrypoint may be `main(): int` or `main(): void`. `main(): int` returns an explicit process status. `main(): void` may fall through or use `return;` and maps normal completion to successful status `0`. Returning a value from `main(): void` is the same semantic error as returning a value from any other `void` function.
 
-`main` may also take command-line arguments through an optional parameter: `main(List<string> $args): int` (and the `: void` variant), per decision 0099. `$args` is the program's arguments, populated by the entry glue; `$args->count` is the argument count and there is no separate `argc`. This form depends on `List` and lands with the collections tier; the current compiler accepts only the parameterless forms.
+`main` may also take command-line arguments through an optional parameter: `main(List<string> $args): int` (and the `: void` variant), per decision 0099. `$args` is populated by the entry glue at process start; `$args->count` is the argument count and there is no separate `argc`, so `main(string[] $argv, int $argc)` is rejected.
+
+```doria
+function main(List<string> $args): int
+{
+    printf("count=%d\n", $args->count);
+    foreach ($args as $argument) {
+        echo $argument;
+        echo "\n";
+    }
+    return 0;
+}
+```
+
+`$args` holds the program's arguments only: **the executable path is not element 0**, so `$args[0]` is the first real argument and `$args->count` is how many arguments the user passed. A program invoked with no arguments receives an empty list — never a one-element list, and never null. The executable path is a process fact reached through `Doria\Std\Process` instead.
+
+The argument list is owned by the entry glue and borrowed by `main` for the duration of the call, so the parameter is an ordinary readonly borrow; declaring it `writable` or `take` is an error. An argument that is not valid UTF-8 panics rather than entering the program, because `string` is defined as immutable UTF-8 and invalid bytes never enter a Doria string.
+
+This contract is identical on Linux, macOS, and Windows, and across the interpreter, Cranelift, and LLVM.
 
 Calls are checked against declared parameter lists:
 

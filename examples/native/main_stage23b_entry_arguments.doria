@@ -1,0 +1,25 @@
+function main(List<string> $args): int
+{
+    // `$args->count` is how many arguments the user passed: the executable
+    // path is not element 0 (decision 0099).
+    printf("count=%d\n", $args->count);
+
+    if ($args->isEmpty) {
+        echo "no arguments\n";
+        return 0;
+    }
+
+    // Indexed access.
+    echo "first=";
+    echo $args[0];
+    echo "\n";
+
+    // Insertion-ordered iteration.
+    foreach ($args as $argument) {
+        echo "arg=";
+        echo $argument;
+        echo "\n";
+    }
+
+    return 0;
+}

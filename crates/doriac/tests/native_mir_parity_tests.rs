@@ -74,6 +74,7 @@ fn interpreter_cranelift_and_enabled_llvm_match_for_the_durable_native_manifest(
             doriac::mir_interpreter::MirIo {
                 stdin: fixture.stdin.clone(),
                 files: fixture.files.clone(),
+                args: fixture.args.clone(),
             },
         )
         .unwrap_or_else(|error| {
@@ -144,6 +145,7 @@ fn enabled_native_backends_exit_cleanly_when_an_output_pipe_closes() {
             doriac::mir_interpreter::MirIo {
                 stdin: stdin.to_vec(),
                 files: BTreeMap::new(),
+                args: Vec::new(),
             },
         )
         .unwrap_or_else(|error| panic!("interpreter rejected broken-pipe {name} fixture: {error}"))
@@ -248,10 +250,15 @@ fn compile_and_run(
         panic!("failed to write {backend} parity executable for {relative_path}: {error}")
     });
     make_executable(&executable);
-    let output = run_native_executable(&executable, &working_directory, &fixture.stdin)
-        .unwrap_or_else(|error| {
-            panic!("failed to run {backend} parity executable for {relative_path}: {error}")
-        });
+    let output = run_native_executable(
+        &executable,
+        &working_directory,
+        &fixture.stdin,
+        &fixture.args,
+    )
+    .unwrap_or_else(|error| {
+        panic!("failed to run {backend} parity executable for {relative_path}: {error}")
+    });
     let mut files = read_tree(&working_directory);
     files.remove(if cfg!(windows) {
         "program.exe"
@@ -350,9 +357,15 @@ fn temp_working_directory(source: &str) -> PathBuf {
     ))
 }
 
-fn run_native_executable(executable: &Path, cwd: &Path, stdin: &[u8]) -> io::Result<Output> {
+fn run_native_executable(
+    executable: &Path,
+    cwd: &Path,
+    stdin: &[u8],
+    args: &[String],
+) -> io::Result<Output> {
     let mut child = retry_transient_executable_busy(|| {
         Command::new(executable)
+            .args(args)
             .current_dir(cwd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -418,6 +431,9 @@ struct NativeRun {
 #[derive(Debug, Default)]
 struct IoFixture {
     stdin: Vec<u8>,
+    /// Program arguments for a `main(List<string> $args)` fixture, one per line
+    /// of the fixture's `args` file (decision 0099).
+    args: Vec<String>,
     files: BTreeMap<String, Vec<u8>>,
     expected_files: BTreeMap<String, Vec<u8>>,
     expected_stdout: Option<Vec<u8>>,
@@ -445,6 +461,15 @@ impl IoFixture {
         });
         Self {
             stdin: read_optional(&root.join("stdin")).unwrap_or_default(),
+            args: read_optional(&root.join("args"))
+                .map(|bytes| {
+                    String::from_utf8(bytes)
+                        .expect("fixture args should be UTF-8")
+                        .lines()
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default(),
             files: read_tree(&root.join("files")),
             expected_files: read_tree(&root.join("expected_files")),
             expected_stdout: read_optional(&root.join("expected_stdout")),

@@ -13,6 +13,7 @@ fn interpret(
         MirIo {
             stdin: stdin.to_vec(),
             files,
+            args: Vec::new(),
         },
     )
     .expect("MIR should interpret")

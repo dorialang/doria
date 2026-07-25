@@ -585,11 +585,28 @@ fn collect_function_signature(
         }
     };
 
+    // Decision 0099: the entry function takes either no parameters or exactly
+    // one `List<string>` that the entry glue owns and lends to `main`. Semantic
+    // checking rejects every other shape, so this only has to confirm the form
+    // it is about to lower.
     if is_entry && !function.params.is_empty() {
-        return Err(vec![unsupported(
-            function.params[0].span,
-            "the native entry function `main` cannot declare parameters",
-        )]);
+        let entry_arguments_are_supported = function.params.len() == 1
+            && mir_type_ref(&function.params[0].ty, class_ids, collection_registry).is_some_and(
+                |ty| match ty {
+                    mir::Type::Collection(collection) => {
+                        let definition = &collection_registry.types[collection.0];
+                        definition.kind == mir::CollectionKind::List
+                            && definition.value == mir::Type::String
+                    }
+                    _ => false,
+                },
+            );
+        if !entry_arguments_are_supported {
+            return Err(vec![unsupported(
+                function.params[0].span,
+                "the native entry function `main` accepts only a `List<string>` argument list",
+            )]);
+        }
     }
 
     if is_entry

@@ -1,0 +1,15 @@
+function main(List<string> $args): int
+{
+    // A no-argument invocation yields an empty list — never a one-element list
+    // holding the executable path, and never null (decision 0099).
+    printf("count=%d\n", $args->count);
+    printf("empty=%s\n", $args->isEmpty);
+
+    foreach ($args as $argument) {
+        echo "unexpected=";
+        echo $argument;
+        echo "\n";
+    }
+
+    return 0;
+}

@@ -265,12 +265,18 @@ fn run_command(args: &[String]) -> Result<ExitCode, String> {
         .first()
         .ok_or_else(|| "missing input file".to_string())?;
     let mut release = false;
-    for option in &args[1..] {
+    // Everything after `--` belongs to the program, not to `doriac`, so a
+    // program argument can safely look like a compiler option (decision 0099).
+    let mut program_args: Vec<String> = Vec::new();
+    let mut options = args[1..].iter();
+    for option in options.by_ref() {
         match option.as_str() {
             "--release" => release = true,
+            "--" => break,
             option => return Err(format!("unknown run option `{option}`")),
         }
     }
+    program_args.extend(options.cloned());
 
     let (path, text) = read_source(input)?;
     let profile = if release {
@@ -289,12 +295,15 @@ fn run_command(args: &[String]) -> Result<ExitCode, String> {
     write_backend_output(&temp_path, output)
         .map_err(|error| format!("failed to write temp native executable: {error}"))?;
 
-    let status = Command::new(&temp_path).status().map_err(|error| {
-        format!(
-            "failed to run native executable `{}`: {error}",
-            temp_path.display()
-        )
-    })?;
+    let status = Command::new(&temp_path)
+        .args(&program_args)
+        .status()
+        .map_err(|error| {
+            format!(
+                "failed to run native executable `{}`: {error}",
+                temp_path.display()
+            )
+        })?;
 
     let _ = fs::remove_file(&temp_path);
     exit_code_from_status(status)
@@ -355,7 +364,7 @@ fn direct_executable_hint(path: &Path) -> String {
 
 fn print_help() {
     println!(
-        "doriac {}\n\nUSAGE:\n    doriac check <source.doria> [--json]\n    doriac ast <source.doria>\n    doriac hir <source.doria>\n    doriac mir <source.doria>\n    doriac compile <source.doria> [--release] [--out <file>]\n    doriac compile <source.doria> --target php [--out <file>]\n    doriac run <source.doria> [--release]\n\nNATIVE PROFILES:\n    fast       default Cranelift profile for rapid local feedback\n    release    LLVM optimized profile selected with --release\n\nTARGETS:\n    native    default target for standalone executables\n    php       compatibility and inspection backend\n    debug     MIR interpreter debug artifact\n    wasm      planned WebAssembly backend",
+        "doriac {}\n\nUSAGE:\n    doriac check <source.doria> [--json]\n    doriac ast <source.doria>\n    doriac hir <source.doria>\n    doriac mir <source.doria>\n    doriac compile <source.doria> [--release] [--out <file>]\n    doriac compile <source.doria> --target php [--out <file>]\n    doriac run <source.doria> [--release] [-- <program args>...]\n\nNATIVE PROFILES:\n    fast       default Cranelift profile for rapid local feedback\n    release    LLVM optimized profile selected with --release\n\nTARGETS:\n    native    default target for standalone executables\n    php       compatibility and inspection backend\n    debug     MIR interpreter debug artifact\n    wasm      planned WebAssembly backend",
         doriac::TOOLCHAIN_VERSION
     );
 }
