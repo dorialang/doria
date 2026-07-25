@@ -1,0 +1,41 @@
+function g(): int
+{
+    echo "g";
+    return 1;
+}
+
+function h(): int
+{
+    echo "h";
+    return 2;
+}
+
+function k(): int
+{
+    echo "k";
+    return 3;
+}
+
+function pair(int $a, int $b): void
+{
+    printf("|a=%d b=%d\n", $a, $b);
+}
+
+function triple(int $a, int $b, int $c = 9): void
+{
+    printf("|a=%d b=%d c=%d\n", $a, $b, $c);
+}
+
+function main(): void
+{
+    // Decision 0098: arguments evaluate in source (written) order regardless of
+    // the parameter each one binds to. `g()` runs before `h()` even though
+    // `h()`'s result binds the earlier parameter.
+    pair(b: g(), a: h());
+
+    // The same rule with a positional argument first: source order is g, h.
+    triple(g(), c: k(), b: h());
+
+    // Reversing the writing order reverses the side effects, not the binding.
+    pair(a: h(), b: g());
+}

@@ -482,14 +482,14 @@ fn inspect_expr(
                 inspect_expr(class, properties, state, object, diagnostics);
             }
             for argument in args {
-                inspect_expr(class, properties, state, argument, diagnostics);
+                inspect_expr(class, properties, state, &argument.value, diagnostics);
             }
         }
         Expr::FunctionCall { args, .. }
         | Expr::StaticCall { args, .. }
         | Expr::New { args, .. } => {
             for argument in args {
-                inspect_expr(class, properties, state, argument, diagnostics);
+                inspect_expr(class, properties, state, &argument.value, diagnostics);
             }
         }
         Expr::InterpolatedString { parts, .. } => {

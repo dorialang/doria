@@ -1,7 +1,9 @@
 use crate::source::Span;
 use crate::types::TypeRef;
 
-pub use crate::ast::{AssignOp, BinaryOp, IncrementOp, IncrementPosition, MemberAccess, UnaryOp};
+pub use crate::ast::{
+    ArgumentName, AssignOp, BinaryOp, IncrementOp, IncrementPosition, MemberAccess, UnaryOp,
+};
 
 /// Current Doria IR implementation.
 ///
@@ -194,6 +196,16 @@ pub struct ForeachBinding {
     pub name: String,
 }
 
+/// A single call-site argument in Doria IR. Arguments remain in source (written)
+/// order; MIR lowering evaluates them in this order and then assembles the callee
+/// argument vector in parameter order (decision 0098).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Argument {
+    pub name: Option<ArgumentName>,
+    pub value: Expr,
+    pub span: Span,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
     Variable {
@@ -248,7 +260,7 @@ pub enum Expr {
     MethodCall {
         object: Box<Expr>,
         method: String,
-        args: Vec<Expr>,
+        args: Vec<Argument>,
         null_safe: bool,
         span: Span,
     },
@@ -259,13 +271,13 @@ pub enum Expr {
     },
     FunctionCall {
         name: String,
-        args: Vec<Expr>,
+        args: Vec<Argument>,
         span: Span,
     },
     StaticCall {
         class_name: String,
         method: String,
-        args: Vec<Expr>,
+        args: Vec<Argument>,
         span: Span,
     },
     StaticMember {
@@ -275,7 +287,7 @@ pub enum Expr {
     },
     New {
         class_name: String,
-        args: Vec<Expr>,
+        args: Vec<Argument>,
         span: Span,
     },
     Grouped {

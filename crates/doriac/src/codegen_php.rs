@@ -586,7 +586,7 @@ fn validate_expr(expr: &Expr, semantic_info: &SemanticInfo) -> Result<(), Backen
             ..
         } => {
             validate_expr(object, semantic_info)?;
-            validate_exprs(args, semantic_info)?;
+            validate_arguments(args, semantic_info)?;
             if semantic_info
                 .expression_type(object.span())
                 .is_some_and(is_stage23_runtime_type)
@@ -604,7 +604,7 @@ fn validate_expr(expr: &Expr, semantic_info: &SemanticInfo) -> Result<(), Backen
         Expr::FunctionCall {
             name, args, span, ..
         } => {
-            validate_exprs(args, semantic_info)?;
+            validate_arguments(args, semantic_info)?;
             if Builtin::from_name(name).is_some_and(Builtin::uses_bytes) {
                 return Err(unsupported_collection_shape(
                     *span,
@@ -613,7 +613,7 @@ fn validate_expr(expr: &Expr, semantic_info: &SemanticInfo) -> Result<(), Backen
             }
             Ok(())
         }
-        Expr::New { args, .. } => validate_exprs(args, semantic_info),
+        Expr::New { args, .. } => validate_arguments(args, semantic_info),
         Expr::StaticCall {
             class_name,
             method,
@@ -621,7 +621,7 @@ fn validate_expr(expr: &Expr, semantic_info: &SemanticInfo) -> Result<(), Backen
             span,
         } => {
             if matches!(class_name.as_str(), "Bytes" | "Set") {
-                validate_exprs(args, semantic_info)?;
+                validate_arguments(args, semantic_info)?;
                 return Err(unsupported_collection_shape(
                     *span,
                     format!("collection constructor `{class_name}::{method}`"),
@@ -643,7 +643,7 @@ fn validate_expr(expr: &Expr, semantic_info: &SemanticInfo) -> Result<(), Backen
                     ),
                 ));
             }
-            validate_exprs(args, semantic_info)
+            validate_arguments(args, semantic_info)
         }
         Expr::StaticMember { .. } => Ok(()),
         Expr::Grouped { expr, .. } => validate_expr(expr, semantic_info),
@@ -743,24 +743,25 @@ fn validate_display_expr(expr: &Expr, semantic_info: &SemanticInfo) -> Result<()
 }
 
 fn validate_php_format_call(
-    args: &[Expr],
+    args: &[Argument],
     semantic_info: &SemanticInfo,
 ) -> Result<(), BackendError> {
-    let Some(format) = args.first() else {
+    let Some(format) = args.first().map(|argument| &argument.value) else {
         return Ok(());
     };
     validate_expr(format, semantic_info)?;
     let Expr::String { value, span } = format else {
-        return validate_exprs(&args[1..], semantic_info);
+        return validate_arguments(&args[1..], semantic_info);
     };
     let Ok(pieces) = format_string::parse(value, *span) else {
-        return validate_exprs(&args[1..], semantic_info);
+        return validate_arguments(&args[1..], semantic_info);
     };
     let conversions = pieces.iter().filter_map(|piece| match piece {
         FormatPiece::Argument { spec, .. } => Some(spec.conversion),
         FormatPiece::Literal(_) => None,
     });
     for (argument, conversion) in args[1..].iter().zip(conversions) {
+        let argument = &argument.value;
         match conversion {
             FormatConversion::Display => validate_display_expr(argument, semantic_info)?,
             FormatConversion::Float => {
@@ -775,11 +776,28 @@ fn validate_php_format_call(
     Ok(())
 }
 
-fn validate_exprs(expressions: &[Expr], semantic_info: &SemanticInfo) -> Result<(), BackendError> {
-    for expression in expressions {
-        validate_expr(expression, semantic_info)?;
+fn validate_arguments(
+    arguments: &[Argument],
+    semantic_info: &SemanticInfo,
+) -> Result<(), BackendError> {
+    for argument in arguments {
+        validate_expr(&argument.value, semantic_info)?;
     }
     Ok(())
+}
+
+/// Emit a call argument list. PHP 8 spells named arguments `name: value`
+/// identically to Doria and evaluates arguments in written order, so the
+/// arguments are emitted as written; no reordering is needed on this backend.
+fn emit_arguments(arguments: &[Argument], scopes: &PhpNameScopes) -> String {
+    arguments
+        .iter()
+        .map(|argument| match &argument.name {
+            Some(name) => format!("{}: {}", name.text, emit_expr(&argument.value, scopes)),
+            None => emit_expr(&argument.value, scopes),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 // Instance initializers are currently emitted in PHP property-default syntax.
@@ -1398,7 +1416,7 @@ fn emit_statement(
         Stmt::Expr { expr, .. } => {
             if let Expr::FunctionCall { name, args, .. } = expr {
                 if name == "panic" && args.len() == 1 {
-                    emit_panic(&args[0], output, indent, scopes);
+                    emit_panic(&args[0].value, output, indent, scopes);
                     return;
                 }
             }
@@ -1786,10 +1804,7 @@ fn emit_expr(expr: &Expr, scopes: &PhpNameScopes) -> String {
             "{}{}{method}({})",
             emit_member_receiver(object, scopes),
             if *null_safe { "?->" } else { "->" },
-            args.iter()
-                .map(|arg| emit_expr(arg, scopes))
-                .collect::<Vec<_>>()
-                .join(", ")
+            emit_arguments(args, scopes)
         ),
         Expr::FunctionCall { name, args, .. } => emit_function_call(name, args, scopes),
         Expr::StaticCall {
@@ -1797,13 +1812,7 @@ fn emit_expr(expr: &Expr, scopes: &PhpNameScopes) -> String {
             method,
             args,
             ..
-        } => format!(
-            "{class_name}::{method}({})",
-            args.iter()
-                .map(|arg| emit_expr(arg, scopes))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
+        } => format!("{class_name}::{method}({})", emit_arguments(args, scopes)),
         Expr::StaticMember {
             class_name, member, ..
         } if scopes.is_static_property(class_name, member) => {
@@ -1814,13 +1823,7 @@ fn emit_expr(expr: &Expr, scopes: &PhpNameScopes) -> String {
         } => format!("{class_name}::{member}"),
         Expr::New {
             class_name, args, ..
-        } => format!(
-            "new {class_name}({})",
-            args.iter()
-                .map(|arg| emit_expr(arg, scopes))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
+        } => format!("new {class_name}({})", emit_arguments(args, scopes)),
         Expr::Grouped { expr, .. } => format!("({})", emit_expr(expr, scopes)),
         Expr::IsType { expr, ty, .. } => {
             let value = emit_expr(expr, scopes);
@@ -1980,7 +1983,7 @@ fn emit_binary_op(op: &BinaryOp) -> &'static str {
     }
 }
 
-fn emit_function_call(name: &str, args: &[Expr], scopes: &PhpNameScopes) -> String {
+fn emit_function_call(name: &str, args: &[Argument], scopes: &PhpNameScopes) -> String {
     let helper = match name {
         "read_line" => "__doria_read_line",
         "read_file" => "__doria_read_file",
@@ -1993,10 +1996,13 @@ fn emit_function_call(name: &str, args: &[Expr], scopes: &PhpNameScopes) -> Stri
     };
     let mut emitted = args
         .iter()
-        .map(|argument| emit_expr(argument, scopes))
+        .map(|argument| match &argument.name {
+            Some(name) => format!("{}: {}", name.text, emit_expr(&argument.value, scopes)),
+            None => emit_expr(&argument.value, scopes),
+        })
         .collect::<Vec<_>>();
     if matches!(name, "sprintf" | "printf") {
-        if let Some(Expr::String { value, span }) = args.first() {
+        if let Some(Expr::String { value, span }) = args.first().map(|argument| &argument.value) {
             if let Ok(pieces) = format_string::parse(value, *span) {
                 emitted[0] = emit_php_string_literal(&php_format_from_plan(&pieces));
                 let conversions = pieces.iter().filter_map(|piece| match piece {

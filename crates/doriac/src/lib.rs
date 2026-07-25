@@ -1,3 +1,4 @@
+pub mod arg_binding;
 pub mod ast;
 pub mod backend;
 pub mod builtins;

@@ -304,6 +304,18 @@ struct MethodContext {
     this_available: bool,
 }
 
+/// The callee facts a call site needs to resolve a returned borrow back to the
+/// argument that feeds it. Carrying the parameter list alongside the arguments
+/// is what lets named-argument binding (decision 0098) find the right argument
+/// when the written order differs from the parameter order.
+#[derive(Clone, Copy)]
+struct CallSite<'a> {
+    return_ty: TypeId,
+    return_borrow: Option<ReturnBorrow>,
+    params: &'a [ParamInfo],
+    args: &'a [Argument],
+}
+
 #[derive(Debug, Clone)]
 struct ConstructorInitContext {
     class_name: String,
@@ -2367,7 +2379,7 @@ impl<'program> Checker<'program> {
             Stmt::Expr { expr, .. } => match expr {
                 Expr::FunctionCall { name, args, span } if name == "panic" => {
                     for arg in args {
-                        self.check_expr(arg, scopes, method_context);
+                        self.check_expr(&arg.value, scopes, method_context);
                     }
                     self.check_panic_call(args, *span, scopes, method_context);
                 }
@@ -3195,7 +3207,7 @@ impl<'program> Checker<'program> {
             } => {
                 self.check_expr(object, scopes, method_context);
                 for arg in args {
-                    self.check_expr(arg, scopes, method_context);
+                    self.check_expr(&arg.value, scopes, method_context);
                 }
                 self.check_mixed_operation(object, "method call", scopes, method_context);
                 self.check_nullable_member_access(
@@ -3222,7 +3234,7 @@ impl<'program> Checker<'program> {
             }
             Expr::FunctionCall { name, args, span } => {
                 for arg in args {
-                    self.check_expr(arg, scopes, method_context);
+                    self.check_expr(&arg.value, scopes, method_context);
                 }
                 self.check_function_call(name, args, *span, scopes, method_context);
             }
@@ -3235,7 +3247,7 @@ impl<'program> Checker<'program> {
                 span,
             } => {
                 for arg in args {
-                    self.check_expr(arg, scopes, method_context);
+                    self.check_expr(&arg.value, scopes, method_context);
                 }
                 self.check_static_call(
                     StaticAccess {
@@ -3285,7 +3297,7 @@ impl<'program> Checker<'program> {
                     ));
                 }
                 for arg in args {
-                    self.check_expr(arg, scopes, method_context);
+                    self.check_expr(&arg.value, scopes, method_context);
                 }
                 if class_exists {
                     self.check_constructor_call(class_name, args, *span, scopes, method_context);
@@ -4646,7 +4658,7 @@ impl<'program> Checker<'program> {
     fn check_function_call(
         &mut self,
         name: &str,
-        args: &[Expr],
+        args: &[Argument],
         span: Span,
         scopes: &ScopeStack,
         method_context: Option<&MethodContext>,
@@ -4661,7 +4673,7 @@ impl<'program> Checker<'program> {
                     .with_help("echo writes output and does not return a value"),
             );
             for arg in args {
-                self.check_expr(arg, scopes, method_context);
+                self.check_expr(&arg.value, scopes, method_context);
             }
             return;
         }
@@ -4695,7 +4707,7 @@ impl<'program> Checker<'program> {
                     .with_help(format!("replace `{name}()` with `{suggestion}()`")),
                 );
                 for arg in args {
-                    self.check_expr(arg, scopes, method_context);
+                    self.check_expr(&arg.value, scopes, method_context);
                 }
             } else {
                 self.diagnostics.push(Diagnostic::new(
@@ -4726,11 +4738,14 @@ impl<'program> Checker<'program> {
     fn check_builtin_call(
         &mut self,
         builtin: Builtin,
-        args: &[Expr],
+        args: &[Argument],
         span: Span,
         scopes: &ScopeStack,
         method_context: Option<&MethodContext>,
     ) {
+        if self.reject_named_arguments(builtin.name(), args) {
+            return;
+        }
         let expected = match builtin {
             Builtin::ReadLine | Builtin::ReadStdinBytes => Some(0),
             Builtin::ReadFile
@@ -4769,28 +4784,32 @@ impl<'program> Checker<'program> {
 
         match builtin {
             Builtin::ReadFile | Builtin::WriteStderr => {
-                self.require_builtin_string_arg(builtin, &args[0], scopes, method_context)
+                self.require_builtin_string_arg(builtin, &args[0].value, scopes, method_context)
             }
             Builtin::WriteFile | Builtin::AppendFile => {
-                self.require_builtin_string_arg(builtin, &args[0], scopes, method_context);
-                self.require_builtin_string_arg(builtin, &args[1], scopes, method_context);
+                self.require_builtin_string_arg(builtin, &args[0].value, scopes, method_context);
+                self.require_builtin_string_arg(builtin, &args[1].value, scopes, method_context);
             }
             Builtin::ReadFileBytes => {
-                self.require_builtin_string_arg(builtin, &args[0], scopes, method_context);
+                self.require_builtin_string_arg(builtin, &args[0].value, scopes, method_context);
             }
             Builtin::WriteFileBytes | Builtin::AppendFileBytes => {
-                self.require_builtin_string_arg(builtin, &args[0], scopes, method_context);
-                self.require_builtin_bytes_arg(builtin, &args[1], scopes, method_context);
+                self.require_builtin_string_arg(builtin, &args[0].value, scopes, method_context);
+                self.require_builtin_bytes_arg(builtin, &args[1].value, scopes, method_context);
             }
             Builtin::WriteStdoutBytes | Builtin::WriteStderrBytes => {
-                self.require_builtin_bytes_arg(builtin, &args[0], scopes, method_context);
+                self.require_builtin_bytes_arg(builtin, &args[0].value, scopes, method_context);
             }
             Builtin::Sprintf | Builtin::Printf => {
-                let Some(Expr::String { value, span }) = args.first() else {
+                let Some(Argument {
+                    value: Expr::String { value, span },
+                    ..
+                }) = args.first()
+                else {
                     self.diagnostics.push(Diagnostic::new(
                         "E0452",
                         format!("{} format must be a direct string literal", builtin.name()),
-                        args[0].span(),
+                        args[0].value.span(),
                     ));
                     return;
                 };
@@ -4822,14 +4841,14 @@ impl<'program> Checker<'program> {
                     return;
                 }
                 for (argument, spec) in args[1..].iter().zip(specs) {
-                    let ty = self.infer_expr_type(argument, scopes, method_context);
+                    let ty = self.infer_expr_type(&argument.value, scopes, method_context);
                     if spec.conversion == FormatConversion::Display
                         && matches!(
                             self.display_conversion_kind(ty),
                             DisplayConversionKind::NonDisplayableClass
                         )
                     {
-                        self.report_non_displayable_class(ty, argument.span());
+                        self.report_non_displayable_class(ty, argument.value.span());
                         continue;
                     }
                     let valid = match spec.conversion {
@@ -4856,7 +4875,7 @@ impl<'program> Checker<'program> {
                                 spec.conversion.specifier(),
                                 self.types.display(ty)
                             ),
-                            argument.span(),
+                            argument.value.span(),
                         ));
                     }
                 }
@@ -4909,11 +4928,14 @@ impl<'program> Checker<'program> {
 
     fn check_panic_call(
         &mut self,
-        args: &[Expr],
+        args: &[Argument],
         span: Span,
         scopes: &ScopeStack,
         method_context: Option<&MethodContext>,
     ) {
+        if self.reject_named_arguments("panic", args) {
+            return;
+        }
         if args.len() != 1 {
             self.diagnostics.push(Diagnostic::new(
                 "E0434",
@@ -4923,7 +4945,7 @@ impl<'program> Checker<'program> {
             return;
         }
 
-        let message = &args[0];
+        let message = &args[0].value;
         let message_ty = self.infer_expr_type(message, scopes, method_context);
         if !matches!(
             self.types.kind(message_ty),
@@ -4944,7 +4966,7 @@ impl<'program> Checker<'program> {
         &mut self,
         object: &Expr,
         method: &str,
-        args: &[Expr],
+        args: &[Argument],
         span: Span,
         scopes: &ScopeStack,
         method_context: Option<&MethodContext>,
@@ -5026,7 +5048,7 @@ impl<'program> Checker<'program> {
     fn check_static_call(
         &mut self,
         access: StaticAccess<'_>,
-        args: &[Expr],
+        args: &[Argument],
         scopes: &ScopeStack,
         method_context: Option<&MethodContext>,
     ) {
@@ -5091,14 +5113,17 @@ impl<'program> Checker<'program> {
                 ));
                 return;
             }
+            if self.reject_named_arguments("Set::from", args) {
+                return;
+            }
             if args.len() != 1 {
                 self.report_argument_count_mismatch("Set::from", 1, 1, args.len(), access.span);
                 return;
             }
-            let source = self.infer_expr_type(&args[0], scopes, method_context);
+            let source = self.infer_expr_type(&args[0].value, scopes, method_context);
             match self.types.kind(source).clone() {
                 TypeKind::TypedArray(element) | TypeKind::List(element) => {
-                    self.check_stage23_hashable_type(element, args[0].span(), "Set element");
+                    self.check_stage23_hashable_type(element, args[0].value.span(), "Set element");
                 }
                 TypeKind::EmptyCollection => {
                     // The destination Set<T> supplies the element type. Lowering
@@ -5111,7 +5136,7 @@ impl<'program> Checker<'program> {
                             "`Set::from` requires a sequence collection, got `{}`",
                             self.types.display(source)
                         ),
-                        args[0].span(),
+                        args[0].value.span(),
                     ));
                 }
             }
@@ -5129,6 +5154,9 @@ impl<'program> Checker<'program> {
                 ));
                 return;
             }
+            if self.reject_named_arguments("Bytes::fromArray", args) {
+                return;
+            }
             if args.len() != 1 {
                 self.report_argument_count_mismatch(
                     "Bytes::fromArray",
@@ -5143,7 +5171,7 @@ impl<'program> Checker<'program> {
             let expected = self.types.intern(TypeKind::TypedArray(uint8));
             self.check_expr_assignable(
                 expected,
-                &args[0],
+                &args[0].value,
                 scopes,
                 method_context,
                 AssignmentDestination::Type,
@@ -5152,6 +5180,9 @@ impl<'program> Checker<'program> {
         }
 
         if let Some(target) = IntegerType::from_companion_name(class_name) {
+            if self.reject_named_arguments(&format!("{class_name}::{}", access.member), args) {
+                return;
+            }
             if access.member == "parse" {
                 if target != IntegerType::Int64 {
                     self.diagnostics.push(Diagnostic::new(
@@ -5196,7 +5227,7 @@ impl<'program> Checker<'program> {
                 return;
             }
 
-            let argument = &args[0];
+            let argument = &args[0].value;
             self.contextualize_integer_literals(argument, IntegerType::Int64);
             let argument_ty = self.infer_expr_type(argument, scopes, method_context);
             if !matches!(
@@ -5471,12 +5502,15 @@ impl<'program> Checker<'program> {
     fn check_cross_kind_intrinsic_argument(
         &mut self,
         name: &str,
-        args: &[Expr],
+        args: &[Argument],
         expected_kind: TypeKind,
         span: Span,
         scopes: &ScopeStack,
         method_context: Option<&MethodContext>,
     ) {
+        if self.reject_named_arguments(name, args) {
+            return;
+        }
         if args.len() != 1 {
             self.diagnostics.push(Diagnostic::new(
                 "E0443",
@@ -5486,7 +5520,7 @@ impl<'program> Checker<'program> {
             return;
         }
         let expected = self.types.intern(expected_kind);
-        let actual = self.infer_expr_type(&args[0], scopes, method_context);
+        let actual = self.infer_expr_type(&args[0].value, scopes, method_context);
         if actual != expected && !self.is_unknown_type(actual) {
             self.diagnostics.push(Diagnostic::new(
                 "E0443",
@@ -5495,7 +5529,7 @@ impl<'program> Checker<'program> {
                     self.types.display(expected),
                     self.types.display(actual)
                 ),
-                args[0].span(),
+                args[0].value.span(),
             ));
         }
     }
@@ -5503,11 +5537,14 @@ impl<'program> Checker<'program> {
     fn check_parse_intrinsic_argument(
         &mut self,
         name: &str,
-        args: &[Expr],
+        args: &[Argument],
         span: Span,
         scopes: &ScopeStack,
         method_context: Option<&MethodContext>,
     ) {
+        if self.reject_named_arguments(name, args) {
+            return;
+        }
         if args.len() != 1 {
             self.diagnostics.push(Diagnostic::new(
                 "E0443",
@@ -5516,7 +5553,7 @@ impl<'program> Checker<'program> {
             ));
             return;
         }
-        let actual = self.infer_expr_type(&args[0], scopes, method_context);
+        let actual = self.infer_expr_type(&args[0].value, scopes, method_context);
         if !matches!(
             self.types.kind(actual),
             TypeKind::String | TypeKind::Unknown
@@ -5527,7 +5564,7 @@ impl<'program> Checker<'program> {
                     "{name} requires a `string` argument, got `{}`",
                     self.types.display(actual)
                 ),
-                args[0].span(),
+                args[0].value.span(),
             ));
         }
     }
@@ -5568,7 +5605,7 @@ impl<'program> Checker<'program> {
     fn check_constructor_call(
         &mut self,
         class_name: &str,
-        args: &[Expr],
+        args: &[Argument],
         span: Span,
         scopes: &ScopeStack,
         method_context: Option<&MethodContext>,
@@ -5614,7 +5651,7 @@ impl<'program> Checker<'program> {
         &mut self,
         callee: &str,
         params: &[ParamInfo],
-        args: &[Expr],
+        args: &[Argument],
         span: Span,
         scopes: &ScopeStack,
         method_context: Option<&MethodContext>,
@@ -5622,58 +5659,187 @@ impl<'program> Checker<'program> {
         let required = params.iter().filter(|param| !param.has_default).count();
         let total = params.len();
 
-        if args.len() < required || args.len() > total {
-            self.report_argument_count_mismatch(callee, required, total, args.len(), span);
+        let param_names: Vec<&str> = params.iter().map(|param| param.name.as_str()).collect();
+        let param_has_default: Vec<bool> = params.iter().map(|param| param.has_default).collect();
+        let arg_names: Vec<Option<&str>> = args
+            .iter()
+            .map(|arg| arg.name.as_ref().map(|name| name.text.as_str()))
+            .collect();
+
+        // Positional-only calls keep the exact existing arity and positional
+        // type-checking behavior; named binding (decision 0098) only engages once
+        // a name appears in the call.
+        if !crate::arg_binding::BoundArguments::has_named(&arg_names) {
+            if args.len() < required || args.len() > total {
+                self.report_argument_count_mismatch(callee, required, total, args.len(), span);
+                return;
+            }
+            for (index, (arg, param)) in args.iter().zip(params.iter()).enumerate() {
+                self.check_bound_argument_type(
+                    callee,
+                    param,
+                    &arg.value,
+                    index,
+                    scopes,
+                    method_context,
+                );
+            }
             return;
         }
 
-        for (index, (arg, param)) in args.iter().zip(params.iter()).enumerate() {
-            let got = self.infer_expr_type(arg, scopes, method_context);
-            let parameter_is_class_like = self.type_is_class_or_nullable_class(param.ty);
+        let bound =
+            crate::arg_binding::bind_arguments(&param_names, &param_has_default, &arg_names);
 
-            if self.is_expr_assignable(param.ty, arg, scopes, method_context)
-                || self.is_assignable(param.ty, got)
-            {
-                if param.writable
-                    && (parameter_is_class_like
-                        || matches!(self.types.kind(param.ty), TypeKind::Mixed)
-                            && self.writable_mixed_requires_semantic_check(
-                                got,
-                                arg,
-                                method_context,
-                            ))
-                    && !self.is_writable_object_path(arg, scopes, method_context)
-                {
-                    let message = if parameter_is_class_like {
-                        format!(
-                            "argument {} of {callee} must be a writable class value",
-                            index + 1
-                        )
-                    } else {
-                        format!(
-                            "argument {} of {callee} must reference writable storage",
-                            index + 1
-                        )
-                    };
-                    self.diagnostics
-                        .push(Diagnostic::new("E0204", message, arg.span()).with_help(
-                            "pass a `writable` binding or property that the callee can mutate",
-                        ));
-                }
-                continue;
-            }
-
-            self.diagnostics.push(Diagnostic::new(
-                "E0408",
-                format!(
-                    "argument {} of {callee} expects `{}`, got `{}`",
-                    index + 1,
-                    self.types.display(param.ty),
-                    self.types.display(got)
-                ),
-                arg.span(),
-            ));
+        let mut fatal = false;
+        if bound.overflow > 0 {
+            self.report_argument_count_mismatch(callee, required, total, args.len(), span);
+            fatal = true;
         }
+        for &arg_index in &bound.unknown {
+            let name = args[arg_index]
+                .name
+                .as_ref()
+                .expect("an unknown-named argument always carries a name");
+            self.diagnostics.push(Diagnostic::new(
+                "E0516",
+                format!("{callee} has no parameter named `{}`", name.text),
+                name.span,
+            ));
+            fatal = true;
+        }
+        for &arg_index in &bound.duplicate {
+            let arg = &args[arg_index];
+            let (report_span, message) = match &arg.name {
+                Some(name) => (
+                    name.span,
+                    format!("argument `{}` of {callee} was already supplied", name.text),
+                ),
+                None => (
+                    arg.span,
+                    format!("this argument of {callee} was already supplied"),
+                ),
+            };
+            self.diagnostics
+                .push(Diagnostic::new("E0517", message, report_span).with_help(
+                    "each parameter may be supplied once, positionally or by name, not both",
+                ));
+            fatal = true;
+        }
+        if !bound.missing.is_empty() {
+            let names = bound
+                .missing
+                .iter()
+                .map(|&param_index| format!("`{}`", param_names[param_index]))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let word = if bound.missing.len() == 1 {
+                "argument"
+            } else {
+                "arguments"
+            };
+            self.diagnostics.push(Diagnostic::new(
+                "E0518",
+                format!("{callee} is missing required {word} {names}"),
+                span,
+            ));
+            fatal = true;
+        }
+        if fatal {
+            return;
+        }
+
+        // Binding resolved cleanly: type-check each parameter against the
+        // argument bound to it, in parameter order. Generic inference (Stage 24)
+        // will consume this same parameter->argument assignment unchanged.
+        for (param_index, param) in params.iter().enumerate() {
+            let Some(arg_index) = bound.param_to_arg[param_index] else {
+                continue;
+            };
+            self.check_bound_argument_type(
+                callee,
+                param,
+                &args[arg_index].value,
+                param_index,
+                scopes,
+                method_context,
+            );
+        }
+    }
+
+    /// Intrinsics and built-in calls bind positionally only; their parameter
+    /// names are not public API (decision 0098 makes parameter names public for
+    /// user free functions, methods, static methods, and constructors — not for
+    /// language intrinsics). Reject any named argument, returning whether one was
+    /// found so the caller can stop before positional processing.
+    fn reject_named_arguments(&mut self, callee: &str, args: &[Argument]) -> bool {
+        let mut rejected = false;
+        for arg in args {
+            if let Some(name) = &arg.name {
+                self.diagnostics.push(
+                    Diagnostic::new(
+                        "E0519",
+                        format!("{callee} does not accept named arguments"),
+                        name.span,
+                    )
+                    .with_help("call this intrinsic with positional arguments"),
+                );
+                rejected = true;
+            }
+        }
+        rejected
+    }
+
+    fn check_bound_argument_type(
+        &mut self,
+        callee: &str,
+        param: &ParamInfo,
+        arg: &Expr,
+        index: usize,
+        scopes: &ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) {
+        let got = self.infer_expr_type(arg, scopes, method_context);
+        let parameter_is_class_like = self.type_is_class_or_nullable_class(param.ty);
+
+        if self.is_expr_assignable(param.ty, arg, scopes, method_context)
+            || self.is_assignable(param.ty, got)
+        {
+            if param.writable
+                && (parameter_is_class_like
+                    || matches!(self.types.kind(param.ty), TypeKind::Mixed)
+                        && self.writable_mixed_requires_semantic_check(got, arg, method_context))
+                && !self.is_writable_object_path(arg, scopes, method_context)
+            {
+                let message = if parameter_is_class_like {
+                    format!(
+                        "argument {} of {callee} must be a writable class value",
+                        index + 1
+                    )
+                } else {
+                    format!(
+                        "argument {} of {callee} must reference writable storage",
+                        index + 1
+                    )
+                };
+                self.diagnostics.push(
+                    Diagnostic::new("E0204", message, arg.span()).with_help(
+                        "pass a `writable` binding or property that the callee can mutate",
+                    ),
+                );
+            }
+            return;
+        }
+
+        self.diagnostics.push(Diagnostic::new(
+            "E0408",
+            format!(
+                "argument {} of {callee} expects `{}`, got `{}`",
+                index + 1,
+                self.types.display(param.ty),
+                self.types.display(got)
+            ),
+            arg.span(),
+        ));
     }
 
     fn type_is_class_or_nullable_class(&self, ty: TypeId) -> bool {
@@ -5761,10 +5927,13 @@ impl<'program> Checker<'program> {
             Expr::FunctionCall { name, args, .. } => {
                 self.functions.get(name).cloned().is_some_and(|function| {
                     self.call_result_is_writable(
-                        function.return_ty,
-                        function.return_borrow,
+                        CallSite {
+                            return_ty: function.return_ty,
+                            return_borrow: function.return_borrow,
+                            params: &function.params,
+                            args,
+                        },
                         None,
-                        args,
                         scopes,
                         method_context,
                     )
@@ -5788,10 +5957,13 @@ impl<'program> Checker<'program> {
                     return false;
                 };
                 self.call_result_is_writable(
-                    method_info.return_ty,
-                    method_info.return_borrow,
+                    CallSite {
+                        return_ty: method_info.return_ty,
+                        return_borrow: method_info.return_borrow,
+                        params: &method_info.params,
+                        args,
+                    },
                     Some(object),
-                    args,
                     scopes,
                     method_context,
                 )
@@ -5817,10 +5989,13 @@ impl<'program> Checker<'program> {
                     return false;
                 };
                 self.call_result_is_writable(
-                    method_info.return_ty,
-                    method_info.return_borrow,
+                    CallSite {
+                        return_ty: method_info.return_ty,
+                        return_borrow: method_info.return_borrow,
+                        params: &method_info.params,
+                        args,
+                    },
                     None,
-                    args,
                     scopes,
                     method_context,
                 )
@@ -5863,13 +6038,17 @@ impl<'program> Checker<'program> {
 
     fn call_result_is_writable(
         &mut self,
-        return_ty: TypeId,
-        return_borrow: Option<ReturnBorrow>,
+        callee: CallSite<'_>,
         receiver: Option<&Expr>,
-        args: &[Expr],
         scopes: &ScopeStack,
         method_context: Option<&MethodContext>,
     ) -> bool {
+        let CallSite {
+            return_ty,
+            return_borrow,
+            params,
+            args,
+        } = callee;
         if !self.type_is_class_or_nullable_class(return_ty) {
             return false;
         }
@@ -5883,10 +6062,40 @@ impl<'program> Checker<'program> {
             BorrowSource::Receiver => receiver.is_some_and(|receiver| {
                 self.is_writable_object_path(receiver, scopes, method_context)
             }),
-            BorrowSource::Parameter(index) => args.get(index).is_some_and(|argument| {
-                self.is_writable_object_path(argument, scopes, method_context)
-            }),
+            BorrowSource::Parameter(index) => {
+                // The borrow annotation refers to a parameter position; resolve
+                // the argument that binds to it (named binding may reorder or
+                // skip), then check that source expression's writability.
+                Self::argument_bound_to_parameter(params, args, index).is_some_and(|argument| {
+                    self.is_writable_object_path(argument, scopes, method_context)
+                })
+            }
         }
+    }
+
+    /// Resolve the source-order argument expression bound to parameter
+    /// `param_index` under named-argument binding (decision 0098). Returns `None`
+    /// when the parameter was omitted (its default applies) or the binding could
+    /// not resolve it.
+    fn argument_bound_to_parameter<'a>(
+        params: &[ParamInfo],
+        args: &'a [Argument],
+        param_index: usize,
+    ) -> Option<&'a Expr> {
+        let param_names: Vec<&str> = params.iter().map(|param| param.name.as_str()).collect();
+        let param_has_default: Vec<bool> = params.iter().map(|param| param.has_default).collect();
+        let arg_names: Vec<Option<&str>> = args
+            .iter()
+            .map(|arg| arg.name.as_ref().map(|name| name.text.as_str()))
+            .collect();
+        let bound =
+            crate::arg_binding::bind_arguments(&param_names, &param_has_default, &arg_names);
+        bound
+            .param_to_arg
+            .get(param_index)
+            .copied()
+            .flatten()
+            .map(|arg_index| &args[arg_index].value)
     }
 
     fn is_direct_this(expr: &Expr) -> bool {
@@ -6779,7 +6988,7 @@ impl<'program> Checker<'program> {
                     if class_name == "Set" {
                         let element = match args
                             .first()
-                            .map(|arg| self.infer_expr_type(arg, scopes, method_context))
+                            .map(|arg| self.infer_expr_type(&arg.value, scopes, method_context))
                         {
                             Some(source) => match self.types.kind(source) {
                                 TypeKind::TypedArray(element) | TypeKind::List(element) => *element,
@@ -7036,7 +7245,7 @@ impl<'program> Checker<'program> {
         &mut self,
         object: &Expr,
         method: &str,
-        args: &[Expr],
+        args: &[Argument],
         span: Span,
         scopes: &ScopeStack,
         method_context: Option<&MethodContext>,
@@ -7053,6 +7262,9 @@ impl<'program> Checker<'program> {
         );
         if !is_collection {
             return false;
+        }
+        if self.reject_named_arguments(&format!("collection method `{method}`"), args) {
+            return true;
         }
 
         let int = self.types.intern(TypeKind::Integer(IntegerType::Int64));
@@ -7124,7 +7336,7 @@ impl<'program> Checker<'program> {
         for (argument, expected) in args.iter().zip(expected) {
             self.check_expr_assignable(
                 expected,
-                argument,
+                &argument.value,
                 scopes,
                 method_context,
                 AssignmentDestination::Type,

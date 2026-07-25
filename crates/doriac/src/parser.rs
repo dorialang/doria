@@ -1363,11 +1363,15 @@ impl Parser {
             Expr::PropertyAccess { object, .. } => Self::contains_bare_identifier(object),
             Expr::MethodCall { object, args, .. } => {
                 Self::contains_bare_identifier(object)
-                    || args.iter().any(Self::contains_bare_identifier)
+                    || args
+                        .iter()
+                        .any(|arg| Self::contains_bare_identifier(&arg.value))
             }
             Expr::FunctionCall { args, .. }
             | Expr::StaticCall { args, .. }
-            | Expr::New { args, .. } => args.iter().any(Self::contains_bare_identifier),
+            | Expr::New { args, .. } => args
+                .iter()
+                .any(|arg| Self::contains_bare_identifier(&arg.value)),
             Expr::Grouped { expr, .. } | Expr::Unary { expr, .. } => {
                 Self::contains_bare_identifier(expr)
             }
@@ -1453,9 +1457,9 @@ impl Parser {
         })
     }
 
-    fn parse_argument_list_after_open(&mut self) -> Option<Vec<Expr>> {
+    fn parse_argument_list_after_open(&mut self) -> Option<Vec<Argument>> {
         let mut args = Vec::new();
-        let mut named_argument_span = None;
+        let mut last_named_span: Option<Span> = None;
         if !self.check(&TokenKind::RightParen) {
             loop {
                 let is_named = matches!(self.peek().kind, TokenKind::Identifier(_))
@@ -1464,13 +1468,43 @@ impl Parser {
                         .get(self.current + 1)
                         .is_some_and(|token| matches!(token.kind, TokenKind::Colon));
                 if is_named {
-                    let name = self.advance().clone();
+                    let name_token = self.advance().clone();
+                    let TokenKind::Identifier(name) = name_token.kind.clone() else {
+                        unreachable!("named-argument lookahead guarantees an identifier");
+                    };
                     self.advance();
                     let value = self.parse_expression()?;
-                    named_argument_span.get_or_insert(name.span.merge(value.span()));
-                    args.push(value);
+                    let span = name_token.span.merge(value.span());
+                    last_named_span = Some(name_token.span);
+                    args.push(Argument {
+                        name: Some(ArgumentName {
+                            text: name,
+                            span: name_token.span,
+                        }),
+                        value,
+                        span,
+                    });
                 } else {
-                    args.push(self.parse_expression()?);
+                    let value = self.parse_expression()?;
+                    let span = value.span();
+                    if let Some(named_span) = last_named_span {
+                        self.diagnostics.push(
+                            Diagnostic::new(
+                                "E0515",
+                                "a positional argument cannot follow a named argument",
+                                span,
+                            )
+                            .with_help(
+                                "once a call uses a named argument, every following argument must also be named",
+                            )
+                            .with_related(named_span, "named argument appears here"),
+                        );
+                    }
+                    args.push(Argument {
+                        name: None,
+                        value,
+                        span,
+                    });
                 }
                 if !self.match_kind(&TokenKind::Comma) {
                     break;
@@ -1481,13 +1515,6 @@ impl Parser {
             }
         }
         self.expect(TokenKind::RightParen, "expected `)` after arguments")?;
-        if let Some(span) = named_argument_span {
-            self.diagnostics.push(Diagnostic::unsupported_stage(
-                "E0514",
-                "named arguments are accepted syntax but are not available until Stage 23a",
-                span,
-            ));
-        }
         Some(args)
     }
 

@@ -1036,7 +1036,7 @@ let $value = given {
 
 #[test]
 fn accepted_named_argument_grammar_is_shared_by_every_call_form() {
-    let diagnostics = doriac::parse_source(
+    let program = doriac::parse_source(
         "test.doria",
         r#"
 function main(): void
@@ -1048,18 +1048,73 @@ function main(): void
 }
 "#,
     )
-    .expect_err("named arguments must stop before their binding stage");
+    .expect("named arguments parse cleanly for every call form");
+
+    let Item::Function(main) = &program.items[0] else {
+        panic!("expected the parsed function");
+    };
+    let names: Vec<Option<&str>> = main
+        .body
+        .statements
+        .iter()
+        .map(|statement| {
+            let Stmt::Expr { expr, .. } = statement else {
+                panic!("expected a call statement");
+            };
+            let args = match expr {
+                Expr::FunctionCall { args, .. }
+                | Expr::MethodCall { args, .. }
+                | Expr::StaticCall { args, .. }
+                | Expr::New { args, .. } => args,
+                _ => panic!("expected a call expression"),
+            };
+            assert_eq!(args.len(), 1, "each call carries one argument");
+            args[0].name.as_ref().map(|name| name.text.as_str())
+        })
+        .collect();
+
+    // Free function, instance method, static method, and constructor all carry
+    // the captured argument name (decision 0098's four callable forms).
+    assert_eq!(
+        names,
+        vec![Some("name"), Some("name"), Some("name"), Some("name")]
+    );
+}
+
+#[test]
+fn positional_argument_after_named_argument_is_rejected() {
+    let diagnostics = doriac::parse_source(
+        "test.doria",
+        r#"
+function main(): void
+{
+    save(name: "free", 1);
+}
+"#,
+    )
+    .expect_err("a positional argument may not follow a named argument");
 
     assert_eq!(
         diagnostics
             .iter()
-            .filter(|diagnostic| diagnostic.code == "E0514")
+            .filter(|diagnostic| diagnostic.code == "E0515")
             .count(),
-        4
+        1
     );
-    assert!(diagnostics
-        .iter()
-        .all(|diagnostic| !diagnostic.code.starts_with('P')));
+}
+
+#[test]
+fn positional_arguments_may_precede_named_arguments() {
+    doriac::parse_source(
+        "test.doria",
+        r#"
+function main(): void
+{
+    save(1, name: "free");
+}
+"#,
+    )
+    .expect("positional arguments may precede named arguments");
 }
 
 #[test]

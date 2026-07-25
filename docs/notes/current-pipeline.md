@@ -24,11 +24,12 @@ Documentation role: working note. This file prevents duplicated in-flight work. 
 - Ordinary expression interpolation of primitive/string values lowers through the existing ordered MIR string and display operations consumed by all three execution paths.
 - Native classes now cover construction, property initialization/access, class-valued locals/arguments/returns, `take` transfer, lifecycle bodies, recursive destruction, and deterministic normal structured-exit cleanup through the interpreter, Cranelift, and LLVM.
 - Concrete `Displayable` conversion lowers to an ordinary direct `toString()` method call for interpolation, `.`, `echo`, and `%s`; interface-typed values and general interface dispatch remain deferred.
+- Stage 23a named arguments are complete on the current branch. Call arguments carry an optional parameter name through the AST and Doria IR, and one shared binding step maps them to parameters before type inference for free functions, instance methods, static methods, and constructors. Positional arguments may precede named ones but not follow them; named arguments reorder freely and may skip a defaulted parameter, including a middle one, whose folded default the caller-side splice fills in by parameter position. Arguments evaluate in source order regardless of the parameter they bind to — a reordered call evaluates each observable argument into an ordered temporary and then assembles the callee vector in parameter order, so ownership/borrow checking and side effects follow the written order and no backend needed a change. Parameter names are part of a callable's public API; language intrinsics stay positional-only.
 - The durable manifest supports raw stdin, isolated seeded files, and exact interpreter/Cranelift/LLVM stdout, stderr, status, generated-file, and class-lifetime comparison.
 
 ## Next
 
-- Stage 23a: named arguments, Decision 0098.
+- Stage 24: generic functions.
 
 ## Do not duplicate
 
@@ -43,3 +44,5 @@ Documentation role: working note. This file prevents duplicated in-flight work. 
 - Growable/slice/search `Bytes` members until a future method-surface decision.
 - `match` narrowing until Stage 28, hierarchy `is` until Stage 34, and interface `is` until Stage 35.
 - Collection/interface/subtype `is`, plus boxing collections, typed arrays, or `Bytes` into `mixed`, until their authored stages.
+- Variadic/spread user parameters stay deferred from Stage 23a as their own slice, per decisions 0095 and 0098.
+- A named argument that *both* reorders the call and produces an owned move value (a class, collection, `Bytes`, or `mixed` result of a nested call) carries an ownership obligation through the ordered temporary that the drop machinery does not yet track, and stops with a native-coverage diagnostic. Pure move-type arguments reorder freely because their evaluation is unobservable; scalar and string arguments hoist normally.
