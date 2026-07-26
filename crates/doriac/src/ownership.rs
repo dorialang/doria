@@ -1678,6 +1678,16 @@ impl Checker<'_> {
                 }
                 self.active_borrows.truncate(borrow_depth);
             }
+            Expr::ArrayRepeat { value, count, .. } => {
+                let borrow_depth = self.active_borrows.len();
+                let mode = self.use_owned_expression(value, scopes);
+                self.activate_place_input_borrows(value, scopes);
+                if mode == UseMode::Read {
+                    self.activate_call_borrow(value, mode, scopes);
+                }
+                self.use_read_with_place_borrow(count, scopes);
+                self.active_borrows.truncate(borrow_depth);
+            }
             Expr::Index {
                 collection, index, ..
             } => {
@@ -1978,6 +1988,10 @@ impl Checker<'_> {
                     }
                     self.activate_nested_property_borrows(&element.value, scopes);
                 }
+            }
+            Expr::ArrayRepeat { value, count, .. } => {
+                self.activate_nested_property_borrows(value, scopes);
+                self.activate_nested_property_borrows(count, scopes);
             }
             Expr::FunctionCall { name, args, .. } => {
                 let signature = self.signatures.get(name).cloned().unwrap_or_default();
@@ -2379,6 +2393,7 @@ impl Checker<'_> {
             Expr::Variable { name, .. } => scopes.get(name).is_some(),
             Expr::Grouped { expr, .. } => self.expr_is_move_value(expr, scopes),
             Expr::Array { .. } => true,
+            Expr::ArrayRepeat { .. } => true,
             Expr::New { class_name, .. } => self.classes.contains(class_name),
             Expr::FunctionCall { name, .. } => {
                 Builtin::from_name(name).is_some_and(Builtin::returns_owned_bytes)
@@ -2638,6 +2653,13 @@ impl Checker<'_> {
                         .map(Box::new),
                 })
             }
+            Expr::ArrayRepeat { value, .. } => Some(CollectionInfo {
+                family: CollectionFamily::List,
+                value_move: self.expr_is_move_value(value, scopes),
+                value_mixed: self.expr_is_mixed_value(value, scopes),
+                value_class: self.expr_class(value, scopes),
+                value_collection: self.expr_collection_info(value, scopes).map(Box::new),
+            }),
             Expr::FunctionCall { name, .. } => {
                 if Builtin::from_name(name).is_some_and(Builtin::returns_owned_bytes) {
                     return Some(bytes_collection_info());

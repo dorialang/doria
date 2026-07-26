@@ -1,6 +1,6 @@
 use std::env;
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn main() {
@@ -10,6 +10,15 @@ fn main() {
 
     let manifest_dir =
         PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("manifest directory"));
+    let repository_dir = manifest_dir.join("../..");
+    println!("cargo:rerun-if-env-changed=DORIA_BUILD_COMMIT");
+    watch_git_identity(&repository_dir);
+    let build_commit = env::var("DORIA_BUILD_COMMIT")
+        .ok()
+        .or_else(|| git_output(&repository_dir, &["rev-parse", "--verify", "HEAD"]))
+        .unwrap_or_else(|| "unknown".to_string());
+    println!("cargo:rustc-env=DORIA_BUILD_COMMIT={build_commit}",);
+
     let runtime_dir = manifest_dir.join("../doria-rt");
     let runtime_source_dir = runtime_dir.join("src");
     let runtime_source = runtime_source_dir.join("lib.rs");
@@ -55,6 +64,8 @@ fn main() {
         .arg("--crate-type=staticlib")
         .arg("--target")
         .arg(&target)
+        .arg("--cfg")
+        .arg("feature=\"standalone-windows-support\"")
         .arg("-L")
         .arg(format!("dependency={}", dependency_dir.display()))
         .arg("--extern")
@@ -82,6 +93,43 @@ fn main() {
     assert!(status.success(), "failed to build doria-rt static library");
 
     println!("cargo:rustc-env=DORIA_RT_BUILT_PATH={}", output.display());
+}
+
+fn watch_git_identity(repository_dir: &Path) {
+    let mut identities = vec!["HEAD".to_string()];
+    if let Some(reference) = git_output(repository_dir, &["symbolic-ref", "-q", "HEAD"]) {
+        identities.push(reference);
+    }
+    for identity in identities {
+        let Some(path) = git_output(
+            repository_dir,
+            &["rev-parse", "--git-path", identity.as_str()],
+        ) else {
+            continue;
+        };
+        let path = PathBuf::from(path);
+        let path = if path.is_absolute() {
+            path
+        } else {
+            repository_dir.join(path)
+        };
+        println!("cargo:rerun-if-changed={}", path.display());
+    }
+}
+
+fn git_output(repository_dir: &Path, args: &[&str]) -> Option<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repository_dir)
+        .args(args)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value = String::from_utf8(output.stdout).ok()?;
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_string())
 }
 
 fn canonical_toolchain_version(package_version: &str) -> String {

@@ -1355,6 +1355,9 @@ impl Parser {
                     .is_some_and(Self::contains_bare_identifier)
                     || Self::contains_bare_identifier(&element.value)
             }),
+            Expr::ArrayRepeat { value, count, .. } => {
+                Self::contains_bare_identifier(value) || Self::contains_bare_identifier(count)
+            }
             Expr::Index {
                 collection, index, ..
             } => {
@@ -1420,8 +1423,29 @@ impl Parser {
     fn parse_array(&mut self, start: usize) -> Option<Expr> {
         let mut elements = Vec::new();
         if !self.check(&TokenKind::RightBracket) {
+            let first = self.parse_expression()?;
+            if self.match_kind(&TokenKind::Semicolon) {
+                let count = self.parse_expression()?;
+                let end = self
+                    .expect(
+                        TokenKind::RightBracket,
+                        "expected `]` after collection repeat literal",
+                    )?
+                    .span
+                    .end;
+                return Some(Expr::ArrayRepeat {
+                    value: Box::new(first),
+                    count: Box::new(count),
+                    span: Span::new(start, end),
+                });
+            }
+
+            let mut first = Some(first);
             loop {
-                let first = self.parse_expression()?;
+                let first = match first.take() {
+                    Some(first) => first,
+                    None => self.parse_expression()?,
+                };
                 if self.match_kind(&TokenKind::FatArrow) {
                     let value = self.parse_expression()?;
                     elements.push(ArrayElement {

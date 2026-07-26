@@ -3229,6 +3229,13 @@ impl<'program> Checker<'program> {
                     self.check_expr(&element.value, scopes, method_context);
                 }
             }
+            Expr::ArrayRepeat { value, count, .. } => {
+                self.check_expr(value, scopes, method_context);
+                self.check_expr(count, scopes, method_context);
+                self.check_repeat_count(count, scopes, method_context);
+                let element = self.infer_expr_type(value, scopes, method_context);
+                self.check_repeat_element_eligibility(element, value.span());
+            }
             Expr::Index {
                 collection,
                 index,
@@ -6598,6 +6605,16 @@ impl<'program> Checker<'program> {
             return fits;
         }
 
+        if let Expr::ArrayRepeat { value, .. } = value_expr {
+            return self.check_repeat_literal_assignable(
+                target,
+                value,
+                scopes,
+                method_context,
+                destination,
+            );
+        }
+
         let value = self.infer_expr_type(value_expr, scopes, method_context);
         if self.is_expr_assignable(target, value_expr, scopes, method_context)
             || self.is_assignable(target, value)
@@ -6674,6 +6691,9 @@ impl<'program> Checker<'program> {
             }
             Expr::Array { elements, .. } => {
                 self.is_array_literal_assignable(target, elements, scopes, method_context)
+            }
+            Expr::ArrayRepeat { value, .. } => {
+                self.is_repeat_literal_assignable(target, value, scopes, method_context)
             }
             _ => {
                 let value = self.infer_expr_type(value_expr, scopes, method_context);
@@ -6760,6 +6780,177 @@ impl<'program> Checker<'program> {
             _ => {
                 let value = self.infer_array_type(elements, scopes, method_context);
                 self.is_assignable(target, value)
+            }
+        }
+    }
+
+    fn check_repeat_count(
+        &mut self,
+        count: &Expr,
+        scopes: &ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) {
+        self.contextualize_integer_literals(count, IntegerType::Int64);
+        let count_ty = self.infer_expr_type(count, scopes, method_context);
+        if !matches!(
+            self.types.kind(count_ty),
+            TypeKind::Integer(IntegerType::Int64) | TypeKind::Unknown
+        ) {
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "E0527",
+                    format!(
+                        "sequence fill count must have type `int`, got `{}`",
+                        self.types.display(count_ty)
+                    ),
+                    count.span(),
+                )
+                .with_help("use a runtime `int` expression for the fill count"),
+            );
+            return;
+        }
+
+        let local_constant = Self::eval_int_constant(count, scopes, IntegerType::Int64);
+        let evaluated_constant = matches!(
+            local_constant,
+            IntConstantEval::Unknown | IntConstantEval::Invalid
+        )
+        .then(|| {
+            crate::const_eval::evaluate_parameter_default(
+                &self.const_evaluation,
+                count,
+                &TypeRef::named("int"),
+                method_context.map(|context| context.class_name.as_str()),
+            )
+        })
+        .flatten();
+        let is_negative = match (local_constant, evaluated_constant) {
+            (IntConstantEval::Known(value), _) => value.signed_value() < 0,
+            (
+                IntConstantEval::Unknown | IntConstantEval::Invalid,
+                Some(crate::const_eval::ConstValue::Integer(value)),
+            ) => value.signed_value() < 0,
+            (IntConstantEval::Unknown | IntConstantEval::Invalid, _) => false,
+        };
+        if is_negative {
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "E0527",
+                    "sequence fill count cannot be negative at compile time",
+                    count.span(),
+                )
+                .with_help(
+                    "use a non-negative count; a runtime-negative count panics with `fill count is negative`",
+                ),
+            );
+        }
+    }
+
+    fn check_repeat_element_eligibility(&mut self, element: TypeId, span: Span) -> bool {
+        match self.types.kind(element) {
+            TypeKind::Bool
+            | TypeKind::Integer(_)
+            | TypeKind::Float(_)
+            | TypeKind::String
+            | TypeKind::Unknown => true,
+            _ => {
+                if !self
+                    .diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.code == "E0528" && diagnostic.span == span)
+                {
+                    self.diagnostics.push(
+                        Diagnostic::unsupported_stage(
+                            "E0528",
+                            format!(
+                                "sequence fill cannot replicate move-type element `{}` in Stage 23c (decision 0102); this requires `Cloneable` in Stage 35",
+                                self.types.display(element)
+                            ),
+                            span,
+                        )
+                        .with_help(
+                            "use a Copy scalar or string element until the `Cloneable` contract is available",
+                        ),
+                    );
+                }
+                false
+            }
+        }
+    }
+
+    fn is_repeat_literal_assignable(
+        &mut self,
+        target: TypeId,
+        value: &Expr,
+        scopes: &ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) -> bool {
+        match self.types.kind(target).clone() {
+            TypeKind::Mixed | TypeKind::Unknown => true,
+            TypeKind::TypedArray(element) | TypeKind::List(element) => {
+                self.check_repeat_element_eligibility(element, value.span())
+                    && self.is_expr_assignable(element, value, scopes, method_context)
+            }
+            TypeKind::Set(_) | TypeKind::Dictionary(_, _) => false,
+            _ => {
+                let inferred = self.infer_expr_type(value, scopes, method_context);
+                let repeated = self.types.intern(TypeKind::List(inferred));
+                self.is_assignable(target, repeated)
+            }
+        }
+    }
+
+    fn check_repeat_literal_assignable(
+        &mut self,
+        target: TypeId,
+        value: &Expr,
+        scopes: &ScopeStack,
+        method_context: Option<&MethodContext>,
+        destination: AssignmentDestination,
+    ) -> bool {
+        match self.types.kind(target).clone() {
+            TypeKind::Set(_) | TypeKind::Dictionary(_, _) => {
+                self.diagnostics.push(
+                    Diagnostic::new(
+                        "E0529",
+                        format!(
+                            "sequence fill literal cannot construct `{}`",
+                            self.types.display(target)
+                        ),
+                        value.span(),
+                    )
+                    .with_help(
+                        "`[value; count]` constructs only `T[]` or `List<T>`; Set and Dictionary fills are intentionally unsupported",
+                    ),
+                );
+                false
+            }
+            TypeKind::TypedArray(element) | TypeKind::List(element) => {
+                if !self.check_repeat_element_eligibility(element, value.span()) {
+                    return false;
+                }
+                if self.is_expr_assignable(element, value, scopes, method_context) {
+                    true
+                } else {
+                    let value_ty = self.infer_expr_type(value, scopes, method_context);
+                    self.check_assignable(
+                        element,
+                        value_ty,
+                        value.span(),
+                        AssignmentDestination::Type,
+                    );
+                    false
+                }
+            }
+            _ => {
+                let element = self.infer_expr_type(value, scopes, method_context);
+                let repeated = self.types.intern(TypeKind::List(element));
+                if self.is_assignable(target, repeated) {
+                    true
+                } else {
+                    self.check_assignable(target, repeated, value.span(), destination);
+                    false
+                }
             }
         }
     }
@@ -6879,6 +7070,10 @@ impl<'program> Checker<'program> {
                 }
             }
             Expr::Array { elements, .. } => self.infer_array_type(elements, scopes, method_context),
+            Expr::ArrayRepeat { value, .. } => {
+                let element = self.infer_expr_type(value, scopes, method_context);
+                self.types.intern(TypeKind::List(element))
+            }
             Expr::Index { collection, .. } => self
                 .collection_index_types(collection, scopes, method_context)
                 .map(|(_, value)| value)

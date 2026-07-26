@@ -4637,18 +4637,21 @@ fn lower_call_args_with_ownership(
             )]);
         }
 
-        // When the call reorders, each argument whose evaluation is observable
-        // is evaluated in source order into its own temporary here, and the call
-        // vector below reads those temporaries in parameter order. Evaluation
-        // order therefore stays the written order (0098) while the callee still
-        // receives a plain parameter-ordered vector, so no backend changes.
-        // Pure arguments need no temporary: moving them is unobservable.
-        lowered_args[param_index] =
-            Some(if in_order || !argument_evaluation_is_observable(value) {
+        // When the call reorders, every observable expression and every owned
+        // temporary is evaluated in source order into a local here. Ownership is
+        // checked from the lowered MIR rather than an expression-shape list:
+        // constructing even a syntactically-pure collection affects destruction
+        // order. The call vector then reads those locals in parameter order.
+        let owns_temporary = lowered.owned_temporary_class().is_some()
+            || lowered.owned_temporary_collection().is_some()
+            || lowered.mixed_ownership().has_shell();
+        lowered_args[param_index] = Some(
+            if in_order || (!argument_evaluation_is_observable(value) && !owns_temporary) {
                 lowered
             } else {
-                hoist_argument_temporary(lowered, expected, arg.span, context)?
-            });
+                hoist_argument_temporary(lowered, expected, context)
+            },
+        );
     }
 
     splice_omitted_parameter_defaults(name, &bound, &signature, span, &mut lowered_args)?;
@@ -4697,6 +4700,9 @@ fn argument_evaluation_is_observable(expr: &hir::Expr) -> bool {
                 .is_some_and(argument_evaluation_is_observable)
                 || argument_evaluation_is_observable(&element.value)
         }),
+        // Allocation and the runtime-negative-count check can panic even when
+        // both operands are otherwise pure.
+        hir::Expr::ArrayRepeat { .. } => true,
         _ => false,
     }
 }
@@ -4709,53 +4715,42 @@ fn argument_evaluation_is_observable(expr: &hir::Expr) -> bool {
 fn hoist_argument_temporary(
     value: mir::Rvalue,
     ty: mir::Type,
-    span: Span,
     context: &mut LoweringContext,
-) -> DiagnosticResult<mir::Rvalue> {
+) -> mir::Rvalue {
+    let borrowed_class_value = value.borrows_class_value();
     let local = match ty {
-        mir::Type::Scalar(_) | mir::Type::String => context.declare_borrowed_temp(ty, false),
-        // A move-type argument carries an ownership obligation, so parking it in
-        // a temporary and moving it out again needs the drop machinery to track
-        // the transfer. Reordering a *side-effecting* move-type argument is the
-        // one named-call shape this slice does not lower; pure move-type
-        // arguments reorder freely because their evaluation is unobservable.
-        _ => {
-            return Err(vec![unsupported(
-                span,
-                "a named argument that both reorders the call and produces an owned value is not yet supported by native compilation",
-            )]);
+        mir::Type::Scalar(_)
+        | mir::Type::NullableScalar(_)
+        | mir::Type::String
+        | mir::Type::NullableString => context.declare_borrowed_temp(ty, false),
+        mir::Type::Class(_) | mir::Type::NullableClass(_) if borrowed_class_value => {
+            context.declare_borrowed_temp(ty, false)
         }
+        mir::Type::Mixed
+        | mir::Type::NullableMixed
+        | mir::Type::Class(_)
+        | mir::Type::NullableClass(_)
+        | mir::Type::Collection(_) => context.declare_owned_temp(ty),
     };
     context.push_statement(mir::Statement::AssignLocal {
         target: local,
         value,
     });
-    Ok(read_local_as_rvalue(local, ty))
+    read_local_as_rvalue(local, ty, !borrowed_class_value)
 }
 
 /// Read a temporary local back as an rvalue of its own type.
-fn read_local_as_rvalue(local: mir::LocalId, ty: mir::Type) -> mir::Rvalue {
-    match ty {
-        mir::Type::String => mir::Rvalue::String(mir::StringExpression::Local(local)),
-        mir::Type::Scalar(mir::ScalarType::Integer(integer)) => {
-            mir::Rvalue::Value(mir::ValueExpression::Integer(mir::IntegerExpression::Use {
-                ty: integer,
-                operand: mir::Operand::Local(local),
-            }))
-        }
-        mir::Type::Scalar(mir::ScalarType::Float(float)) => {
-            mir::Rvalue::Value(mir::ValueExpression::Float(mir::FloatExpression::Use {
-                ty: float,
-                operand: mir::Operand::Local(local),
-            }))
-        }
-        mir::Type::Scalar(mir::ScalarType::Bool) => {
-            mir::Rvalue::Value(mir::ValueExpression::Bool(mir::BoolExpression::Use {
-                operand: mir::Operand::Local(local),
-            }))
-        }
-        _ => unreachable!("only scalar and string argument temporaries are hoisted"),
-    }
+fn read_local_as_rvalue(local: mir::LocalId, ty: mir::Type, transfer_owned: bool) -> mir::Rvalue {
+    let transfer = transfer_owned
+        && matches!(
+            ty,
+            mir::Type::Mixed
+                | mir::Type::NullableMixed
+                | mir::Type::Class(_)
+                | mir::Type::NullableClass(_)
+                | mir::Type::Collection(_)
+        );
+    local_rvalue(local, ty, transfer)
 }
 
 /// Fill every parameter the call did not supply with its const-folded default
@@ -6234,6 +6229,14 @@ fn lower_collection_expression(
                 entries,
             })
         }
+        hir::Expr::ArrayRepeat { value, count, .. } => {
+            let collection = context.collection_type(expected).clone();
+            Ok(mir::CollectionExpression::Fill {
+                collection: expected,
+                value: Box::new(lower_rvalue_as_expected(value, collection.value, context)?),
+                count: Box::new(lower_integer_expression(count, context)?),
+            })
+        }
         hir::Expr::Index {
             collection,
             index,
@@ -6417,6 +6420,10 @@ fn materialize_nested_collection_places(
                 materialize_nested_collection_places(&element.value, false, context)?;
             }
         }
+        hir::Expr::ArrayRepeat { value, count, .. } => {
+            materialize_nested_collection_places(value, false, context)?;
+            materialize_nested_collection_places(count, false, context)?;
+        }
         hir::Expr::Index {
             collection, index, ..
         } => {
@@ -6506,6 +6513,16 @@ fn materialize_nested_collection_places(
         } => {
             for arg in args {
                 materialize_nested_collection_places(&arg.value, false, context)?;
+            }
+            if class_name == "Set" && method == "from" {
+                if let Some(source) = args.first() {
+                    if !matches!(
+                        unparenthesized_place(&source.value),
+                        hir::Expr::Array { .. }
+                    ) {
+                        materialize_collection_place(&source.value, false, context)?;
+                    }
+                }
             }
             if class_name == "Bytes" && method == "fromArray" {
                 if let Some(source) = args.first() {
@@ -8083,7 +8100,9 @@ fn unsupported_int_expr(expr: &hir::Expr) -> Diagnostic {
         hir::Expr::Bool { .. } => "bool value reached integer-only MIR lowering",
         hir::Expr::IsType { .. } => "a type-test result cannot be used as an integer expression",
         hir::Expr::Null { .. } => "`null` cannot be used as an integer expression",
-        hir::Expr::Array { .. } => "a collection cannot be used as an integer expression",
+        hir::Expr::Array { .. } | hir::Expr::ArrayRepeat { .. } => {
+            "a collection cannot be used as an integer expression"
+        }
         hir::Expr::Index { .. } => {
             "this indexed value cannot be used as an integer expression in this lowering path"
         }

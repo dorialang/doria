@@ -107,6 +107,36 @@ int[] $numbers = [1, 2, 3];
 }
 
 #[test]
+fn parses_sequence_fill_literal_without_confusing_element_lists() {
+    let program = doriac::parse_source(
+        "test.doria",
+        r#"
+bool[] $flags = [true; count()];
+List<int> $values = [1, 2];
+"#,
+    )
+    .expect("both bracket literal forms should parse");
+
+    let Item::Statement(Stmt::VarDecl(fill)) = &program.items[0] else {
+        panic!("expected fill declaration");
+    };
+    assert!(matches!(
+        &fill.initializer,
+        Expr::ArrayRepeat { value, count, .. }
+            if matches!(value.as_ref(), Expr::Bool { value: true, .. })
+                && matches!(count.as_ref(), Expr::FunctionCall { name, .. } if name == "count")
+    ));
+
+    let Item::Statement(Stmt::VarDecl(elements)) = &program.items[1] else {
+        panic!("expected element-list declaration");
+    };
+    assert!(matches!(
+        &elements.initializer,
+        Expr::Array { elements, .. } if elements.len() == 2
+    ));
+}
+
+#[test]
 fn rejects_php_parameter_references_without_stealing_bitwise_syntax() {
     let diagnostics = doriac::parse_source("test.doria", "function mutate(int &$value): void {}")
         .expect_err("PHP-style parameter references should be rejected contextually");

@@ -246,6 +246,11 @@ pub enum Expr {
         elements: Vec<ArrayElement>,
         span: Span,
     },
+    ArrayRepeat {
+        value: Box<Expr>,
+        count: Box<Expr>,
+        span: Span,
+    },
     Index {
         collection: Box<Expr>,
         index: Box<Expr>,
@@ -338,6 +343,7 @@ impl Expr {
             | Expr::Bool { span, .. }
             | Expr::Null { span }
             | Expr::Array { span, .. }
+            | Expr::ArrayRepeat { span, .. }
             | Expr::Index { span, .. }
             | Expr::PropertyAccess { span, .. }
             | Expr::MethodCall { span, .. }

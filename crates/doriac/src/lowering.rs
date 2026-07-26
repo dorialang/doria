@@ -351,6 +351,11 @@ fn lower_expr(expr: &ast::Expr, class_name: Option<&str>) -> hir::Expr {
                 .collect(),
             span: *span,
         },
+        ast::Expr::ArrayRepeat { value, count, span } => hir::Expr::ArrayRepeat {
+            value: Box::new(lower_expr(value, class_name)),
+            count: Box::new(lower_expr(count, class_name)),
+            span: *span,
+        },
         ast::Expr::Index {
             collection,
             index,

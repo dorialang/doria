@@ -542,6 +542,10 @@ fn validate_expr(expr: &Expr, semantic_info: &SemanticInfo) -> Result<(), Backen
             }
             Ok(())
         }
+        Expr::ArrayRepeat { span, .. } => Err(unsupported_collection_shape(
+            *span,
+            "sequence fill literals require the native collection runtime",
+        )),
         Expr::Index {
             collection,
             index,
@@ -838,6 +842,9 @@ fn unsupported_php_property_default(
                 .and_then(|key| unsupported_php_property_default(key, semantic_info))
                 .or_else(|| unsupported_php_property_default(&element.value, semantic_info))
         }),
+        Expr::ArrayRepeat { span, .. } => {
+            Some((*span, "sequence fill instance property initializers"))
+        }
         Expr::Index { span, .. } => {
             Some((*span, "indexed access in instance property initializers"))
         }
@@ -1776,6 +1783,9 @@ fn emit_expr(expr: &Expr, scopes: &PhpNameScopes) -> String {
                 .collect::<Vec<_>>()
                 .join(", ");
             format!("[{inner}]")
+        }
+        Expr::ArrayRepeat { .. } => {
+            unreachable!("PHP validation rejects native sequence fill literals")
         }
         Expr::Index {
             collection, index, ..

@@ -398,9 +398,7 @@ fn validate_statement(
                                 target.0
                             )));
                         }
-                        if infer_nullable_expression_return_borrow(program, function, expression)?
-                            .is_none()
-                        {
+                        if !expression.borrows_class_value() {
                             return Err(malformed_mir(format!(
                                 "borrowed nullable class temporary local{} receives an owning value",
                                 target.0
@@ -509,8 +507,7 @@ fn validate_statement(
                             )));
                         }
                         validate_class_expression(program, function, expression)?;
-                        if infer_expression_return_borrow(program, function, expression)?.is_none()
-                        {
+                        if !expression.borrows_class_value() {
                             return Err(malformed_mir(format!(
                                 "borrowed class temporary local{} receives an owning value",
                                 target.0
@@ -1288,6 +1285,30 @@ fn validate_collection_expression(
                 validate_rvalue(program, function, &entry.value)?;
             }
             Ok(())
+        }
+        mir::CollectionExpression::Fill { value, count, .. } => {
+            if !matches!(
+                definition.kind,
+                mir::CollectionKind::List | mir::CollectionKind::TypedArray
+            ) || definition.key.is_some()
+            {
+                return Err(malformed_mir(
+                    "collection fill destination is not a sequence",
+                ));
+            }
+            if value.ty() != definition.value {
+                return Err(malformed_mir("collection fill value type mismatch"));
+            }
+            if !matches!(definition.value, mir::Type::Scalar(_) | mir::Type::String) {
+                return Err(malformed_mir(
+                    "collection fill value is not a Copy scalar or string",
+                ));
+            }
+            if count.ty() != IntegerType::Int64 {
+                return Err(malformed_mir("collection fill count is not int"));
+            }
+            validate_rvalue(program, function, value)?;
+            validate_integer_expression(program, function, count)
         }
         mir::CollectionExpression::Index {
             source,
@@ -2400,6 +2421,10 @@ fn collect_collection_class_local_accesses<'a>(
                 }
                 collect_rvalue_class_local_accesses(&entry.value, accesses);
             }
+        }
+        mir::CollectionExpression::Fill { value, count, .. } => {
+            collect_rvalue_class_local_accesses(value, accesses);
+            collect_integer_class_local_accesses(count, accesses);
         }
         mir::CollectionExpression::Index { index, .. } => {
             collect_rvalue_class_local_accesses(index, accesses)
@@ -4379,6 +4404,10 @@ fn collection_observes_property(
                 .is_some_and(|key| rvalue_observes_property(key, receiver, property))
                 || rvalue_observes_property(&entry.value, receiver, property)
         }),
+        mir::CollectionExpression::Fill { value, count, .. } => {
+            rvalue_observes_property(value, receiver, property)
+                || integer_observes_property(count, receiver, property)
+        }
         mir::CollectionExpression::Index { index, .. } => {
             rvalue_observes_property(index, receiver, property)
         }
@@ -4998,15 +5027,13 @@ fn validate_call_args_for_params(
                     expression,
                     &format!("call to {} argument {}", callee.name, index + 1),
                 )?;
-            } else if matches!(
-                expression,
-                mir::ClassExpression::Local { transfer: true, .. }
-            ) {
-                return Err(malformed_mir(format!(
-                    "call to {} transfers argument {} into a borrowed parameter",
-                    callee.name,
-                    index + 1
-                )));
+            } else if let mir::ClassExpression::Local {
+                local,
+                transfer: true,
+                ..
+            } = expression
+            {
+                require_owned_synthetic_argument_temp(caller, *local, &callee.name, index + 1)?;
             }
             if parameter_definition.writable {
                 require_writable_class_expression(
@@ -5025,6 +5052,13 @@ fn validate_call_args_for_params(
                     expression,
                     &format!("call to {} argument {}", callee.name, index + 1),
                 )?;
+            } else if let mir::NullableClassExpression::Local {
+                local,
+                transfer: true,
+                ..
+            } = expression
+            {
+                require_owned_synthetic_argument_temp(caller, *local, &callee.name, index + 1)?;
             }
             if parameter_definition.writable {
                 require_writable_nullable_class_expression(
@@ -5044,6 +5078,18 @@ fn validate_call_args_for_params(
                     callee.name,
                     index + 1
                 )));
+            }
+        } else if matches!(parameter_type, mir::Type::Collection(_))
+            && !parameter_definition.owned
+            && !promoted_transfer
+        {
+            if let mir::Rvalue::Collection(mir::CollectionExpression::Local {
+                local,
+                transfer: true,
+                ..
+            }) = argument
+            {
+                require_owned_synthetic_argument_temp(caller, *local, &callee.name, index + 1)?;
             }
         }
         if class_like_parameter && !parameter_definition.owned && !promoted_transfer {
@@ -5078,6 +5124,21 @@ fn validate_call_args_for_params(
         }
     }
     Ok(())
+}
+
+fn require_owned_synthetic_argument_temp(
+    caller: &mir::Function,
+    local: mir::LocalId,
+    callee: &str,
+    argument: usize,
+) -> Result<(), BackendError> {
+    let definition = local_in(caller, local)?;
+    if definition.owned && definition.synthetic {
+        return Ok(());
+    }
+    Err(malformed_mir(format!(
+        "call to {callee} transfers argument {argument} into a borrowed parameter"
+    )))
 }
 
 #[derive(Clone, Copy)]

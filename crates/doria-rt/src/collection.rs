@@ -12,24 +12,93 @@ pub struct DrCollectionV1 {
     length: usize,
     capacity: usize,
     keys: *mut u64,
-    values: *mut u64,
+    values: *mut u8,
     keyed: u8,
     fixed: u8,
+    value_width: u8,
 }
 
-unsafe fn allocate_words(capacity: usize) -> *mut u64 {
+pub const DR_COLLECTION_LENGTH_OFFSET: usize = mem::offset_of!(DrCollectionV1, length);
+pub const DR_COLLECTION_CAPACITY_OFFSET: usize = mem::offset_of!(DrCollectionV1, capacity);
+pub const DR_COLLECTION_KEYS_OFFSET: usize = mem::offset_of!(DrCollectionV1, keys);
+pub const DR_COLLECTION_VALUES_OFFSET: usize = mem::offset_of!(DrCollectionV1, values);
+pub const DR_COLLECTION_KEYED_OFFSET: usize = mem::offset_of!(DrCollectionV1, keyed);
+pub const DR_COLLECTION_FIXED_OFFSET: usize = mem::offset_of!(DrCollectionV1, fixed);
+pub const DR_COLLECTION_VALUE_WIDTH_OFFSET: usize = mem::offset_of!(DrCollectionV1, value_width);
+
+fn valid_value_width(width: u8) -> bool {
+    matches!(width, 1 | 2 | 4 | 8)
+}
+
+unsafe fn value_address(collection: *const DrCollectionV1, index: usize) -> *mut u8 {
+    (*collection)
+        .values
+        .add(index * usize::from((*collection).value_width))
+}
+
+unsafe fn read_value(collection: *const DrCollectionV1, index: usize) -> u64 {
+    let address = value_address(collection, index);
+    match (*collection).value_width {
+        1 => u64::from(*address),
+        2 => u64::from(*address.cast::<u16>()),
+        4 => u64::from(*address.cast::<u32>()),
+        8 => *address.cast::<u64>(),
+        _ => collection_panic(b"invalid collection value width"),
+    }
+}
+
+unsafe fn write_value(collection: *mut DrCollectionV1, index: usize, value: u64) {
+    let address = value_address(collection, index);
+    match (*collection).value_width {
+        1 => *address = value as u8,
+        2 => *address.cast::<u16>() = value as u16,
+        4 => *address.cast::<u32>() = value as u32,
+        8 => *address.cast::<u64>() = value,
+        _ => collection_panic(b"invalid collection value width"),
+    }
+}
+
+unsafe fn allocate_words_with_frame(frame: *const DrStackFrameV1, capacity: usize) -> *mut u64 {
     if capacity == 0 {
         return ptr::null_mut();
     }
     let bytes = capacity
         .checked_mul(mem::size_of::<u64>())
-        .unwrap_or_else(|| collection_panic(b"collection capacity overflow"));
+        .unwrap_or_else(|| collection_panic_with_frame(frame, b"collection capacity overflow"));
     let words = allocate(bytes).cast::<u64>();
     if words.is_null() {
-        collection_panic(b"collection allocation failed");
+        collection_panic_with_frame(frame, b"collection allocation failed");
     }
     ptr::write_bytes(words, 0, capacity);
     words
+}
+
+unsafe fn allocate_words(capacity: usize) -> *mut u64 {
+    allocate_words_with_frame(ptr::null(), capacity)
+}
+
+unsafe fn allocate_values_with_frame(
+    frame: *const DrStackFrameV1,
+    capacity: usize,
+    value_width: u8,
+) -> *mut u8 {
+    if capacity == 0 {
+        return ptr::null_mut();
+    }
+    // Preserve the implementation-wide maximum collection length even when a
+    // compact scalar representation needs fewer physical bytes.
+    capacity
+        .checked_mul(mem::size_of::<u64>())
+        .unwrap_or_else(|| collection_panic_with_frame(frame, b"collection capacity overflow"));
+    let bytes = capacity
+        .checked_mul(usize::from(value_width))
+        .unwrap_or_else(|| collection_panic_with_frame(frame, b"collection capacity overflow"));
+    let values = allocate(bytes);
+    if values.is_null() {
+        collection_panic_with_frame(frame, b"collection allocation failed");
+    }
+    ptr::write_bytes(values, 0, bytes);
+    values
 }
 
 unsafe fn grow(collection: *mut DrCollectionV1) {
@@ -41,9 +110,13 @@ unsafe fn grow(collection: *mut DrCollectionV1) {
         .checked_mul(2)
         .unwrap_or_else(|| collection_panic(b"collection capacity overflow"))
         .max(4);
-    let values = allocate_words(next);
+    let values = allocate_values_with_frame(ptr::null(), next, (*collection).value_width);
     if (*collection).length != 0 {
-        ptr::copy_nonoverlapping((*collection).values, values, (*collection).length);
+        ptr::copy_nonoverlapping(
+            (*collection).values,
+            values,
+            (*collection).length * usize::from((*collection).value_width),
+        );
     }
     if !(*collection).values.is_null() {
         deallocate((*collection).values.cast::<u8>());
@@ -63,11 +136,24 @@ unsafe fn grow(collection: *mut DrCollectionV1) {
     (*collection).capacity = next;
 }
 
-pub unsafe fn new(length: usize, keyed: bool, fixed: bool) -> *mut DrCollectionV1 {
+pub unsafe fn new(length: usize, keyed: bool, fixed: bool, value_width: u8) -> *mut DrCollectionV1 {
+    new_with_frame(ptr::null(), length, keyed, fixed, value_width)
+}
+
+unsafe fn new_with_frame(
+    frame: *const DrStackFrameV1,
+    length: usize,
+    keyed: bool,
+    fixed: bool,
+    value_width: u8,
+) -> *mut DrCollectionV1 {
+    if !valid_value_width(value_width) {
+        collection_panic_with_frame(frame, b"invalid collection value width");
+    }
     let capacity = if fixed { length } else { length.max(4) };
     let collection = allocate(mem::size_of::<DrCollectionV1>()).cast::<DrCollectionV1>();
     if collection.is_null() {
-        collection_panic(b"collection allocation failed");
+        collection_panic_with_frame(frame, b"collection allocation failed");
     }
     ptr::write(
         collection,
@@ -75,15 +161,52 @@ pub unsafe fn new(length: usize, keyed: bool, fixed: bool) -> *mut DrCollectionV
             length: if fixed { length } else { 0 },
             capacity,
             keys: if keyed {
-                allocate_words(capacity)
+                allocate_words_with_frame(frame, capacity)
             } else {
                 ptr::null_mut()
             },
-            values: allocate_words(capacity),
+            values: allocate_values_with_frame(frame, capacity, value_width),
             keyed: u8::from(keyed),
             fixed: u8::from(fixed),
+            value_width,
         },
     );
+    collection
+}
+
+pub unsafe fn fill_word(
+    frame: *const DrStackFrameV1,
+    value: u64,
+    count: usize,
+    fixed: bool,
+    value_width: u8,
+) -> *mut DrCollectionV1 {
+    let collection = new_with_frame(frame, count, false, true, value_width);
+    for index in 0..count {
+        write_value(collection, index, value);
+    }
+    (*collection).fixed = u8::from(fixed);
+    collection
+}
+
+pub unsafe fn fill_string(
+    frame: *const DrStackFrameV1,
+    value: *mut DrStringV1,
+    count: usize,
+    fixed: bool,
+) -> *mut DrCollectionV1 {
+    let collection = new_with_frame(
+        frame,
+        count,
+        false,
+        true,
+        mem::size_of::<*mut DrStringV1>() as u8,
+    );
+    for index in 0..count {
+        let retained = crate::dr_v1_string_retain(value);
+        write_value(collection, index, retained as u64);
+    }
+    (*collection).fixed = u8::from(fixed);
     collection
 }
 
@@ -108,7 +231,7 @@ pub unsafe fn push(collection: *mut DrCollectionV1, value: u64) {
     if (*collection).length == (*collection).capacity {
         grow(collection);
     }
-    ptr::write((*collection).values.add((*collection).length), value);
+    write_value(collection, (*collection).length, value);
     (*collection).length += 1;
 }
 
@@ -128,12 +251,12 @@ pub unsafe fn insert_at(
     let tail = (*collection).length - index;
     if tail != 0 {
         ptr::copy(
-            (*collection).values.add(index),
-            (*collection).values.add(index + 1),
-            tail,
+            value_address(collection, index),
+            value_address(collection, index + 1),
+            tail * usize::from((*collection).value_width),
         );
     }
-    *(*collection).values.add(index) = value;
+    write_value(collection, index, value);
     (*collection).length += 1;
 }
 
@@ -146,13 +269,13 @@ pub unsafe fn remove_at(
         static MESSAGE: &[u8] = b"collection index out of bounds";
         dr_v1_panic(frame, MESSAGE.as_ptr(), MESSAGE.len());
     }
-    let removed = *(*collection).values.add(index);
+    let removed = read_value(collection, index);
     let tail = (*collection).length - index - 1;
     if tail != 0 {
         ptr::copy(
-            (*collection).values.add(index + 1),
-            (*collection).values.add(index),
-            tail,
+            value_address(collection, index + 1),
+            value_address(collection, index),
+            tail * usize::from((*collection).value_width),
         );
     }
     (*collection).length -= 1;
@@ -166,7 +289,7 @@ pub unsafe fn pop(collection: *mut DrCollectionV1, found: *mut u8) -> u64 {
     }
     *found = 1;
     (*collection).length -= 1;
-    *(*collection).values.add((*collection).length)
+    read_value(collection, (*collection).length)
 }
 
 pub unsafe fn value_at(
@@ -178,7 +301,7 @@ pub unsafe fn value_at(
         static MESSAGE: &[u8] = b"collection index out of bounds";
         dr_v1_panic(frame, MESSAGE.as_ptr(), MESSAGE.len());
     }
-    *(*collection).values.add(index)
+    read_value(collection, index)
 }
 
 pub unsafe fn key_at(
@@ -209,9 +332,8 @@ pub unsafe fn set_at(
         static MESSAGE: &[u8] = b"collection index out of bounds";
         dr_v1_panic(frame, MESSAGE.as_ptr(), MESSAGE.len());
     }
-    let slot = (*collection).values.add(index);
-    let previous = *slot;
-    *slot = value;
+    let previous = read_value(collection, index);
+    write_value(collection, index, value);
     previous
 }
 
@@ -241,7 +363,7 @@ pub unsafe fn keyed_get(
 ) -> u64 {
     if let Some(index) = find(collection, key, key_kind) {
         *found = 1;
-        *(*collection).values.add(index)
+        read_value(collection, index)
     } else {
         *found = 0;
         0
@@ -257,9 +379,8 @@ pub unsafe fn keyed_set(
 ) -> u64 {
     if let Some(index) = find(collection, key, key_kind) {
         *replaced = 1;
-        let slot = (*collection).values.add(index);
-        let previous = *slot;
-        *slot = value;
+        let previous = read_value(collection, index);
+        write_value(collection, index, value);
         return previous;
     }
     *replaced = 0;
@@ -268,7 +389,7 @@ pub unsafe fn keyed_set(
     }
     let index = (*collection).length;
     *(*collection).keys.add(index) = key;
-    *(*collection).values.add(index) = value;
+    write_value(collection, index, value);
     (*collection).length += 1;
     0
 }
@@ -291,7 +412,7 @@ pub unsafe fn keyed_remove(
     };
     *found = 1;
     *removed_key = *(*collection).keys.add(index);
-    let removed_value = *(*collection).values.add(index);
+    let removed_value = read_value(collection, index);
     let tail = (*collection).length - index - 1;
     if tail != 0 {
         ptr::copy(
@@ -300,9 +421,9 @@ pub unsafe fn keyed_remove(
             tail,
         );
         ptr::copy(
-            (*collection).values.add(index + 1),
-            (*collection).values.add(index),
-            tail,
+            value_address(collection, index + 1),
+            value_address(collection, index),
+            tail * usize::from((*collection).value_width),
         );
     }
     (*collection).length -= 1;
@@ -327,7 +448,7 @@ pub unsafe fn nullable_access(
                 0
             } else {
                 *found = 1;
-                *(*collection).values
+                read_value(collection, 0)
             }
         }
         3 => {
@@ -336,7 +457,7 @@ pub unsafe fn nullable_access(
                 0
             } else {
                 *found = 1;
-                *(*collection).values.add((*collection).length - 1)
+                read_value(collection, (*collection).length - 1)
             }
         }
         4 => pop(collection, found),
@@ -346,7 +467,7 @@ pub unsafe fn nullable_access(
 
 pub unsafe fn contains(collection: *const DrCollectionV1, value: u64, value_kind: u8) -> bool {
     (0..(*collection).length)
-        .any(|index| keys_equal(*(*collection).values.add(index), value, value_kind))
+        .any(|index| keys_equal(read_value(collection, index), value, value_kind))
 }
 
 pub unsafe fn push_unique(collection: *mut DrCollectionV1, value: u64, value_kind: u8) -> bool {
@@ -365,18 +486,18 @@ pub unsafe fn remove_value(
     removed: *mut u64,
 ) -> bool {
     let Some(index) = (0..(*collection).length)
-        .find(|index| keys_equal(*(*collection).values.add(*index), value, value_kind))
+        .find(|index| keys_equal(read_value(collection, *index), value, value_kind))
     else {
         *removed = 0;
         return false;
     };
-    *removed = *(*collection).values.add(index);
+    *removed = read_value(collection, index);
     let tail = (*collection).length - index - 1;
     if tail != 0 {
         ptr::copy(
-            (*collection).values.add(index + 1),
-            (*collection).values.add(index),
-            tail,
+            value_address(collection, index + 1),
+            value_address(collection, index),
+            tail * usize::from((*collection).value_width),
         );
     }
     (*collection).length -= 1;
@@ -389,9 +510,9 @@ pub unsafe fn set_algebra(
     operation: u8,
     value_kind: u8,
 ) -> *mut DrCollectionV1 {
-    let result = new(0, false, false);
+    let result = new(0, false, false, (*left).value_width);
     for index in 0..(*left).length {
-        let value = *(*left).values.add(index);
+        let value = read_value(left, index);
         let include = match operation {
             0 => true,
             1 => contains(right, value, value_kind),
@@ -404,7 +525,7 @@ pub unsafe fn set_algebra(
     }
     if operation == 0 {
         for index in 0..(*right).length {
-            let value = *(*right).values.add(index);
+            let value = read_value(right, index);
             if !contains(result, value, value_kind) {
                 push_retained(result, value, value_kind);
             }
@@ -421,5 +542,9 @@ unsafe fn push_retained(collection: *mut DrCollectionV1, value: u64, value_kind:
 }
 
 fn collection_panic(message: &'static [u8]) -> ! {
-    unsafe { dr_v1_panic(ptr::null(), message.as_ptr(), message.len()) }
+    collection_panic_with_frame(ptr::null(), message)
+}
+
+fn collection_panic_with_frame(frame: *const DrStackFrameV1, message: &'static [u8]) -> ! {
+    unsafe { dr_v1_panic(frame, message.as_ptr(), message.len()) }
 }

@@ -1,0 +1,9 @@
+function runtimeCount(): int
+{
+    return 9223372036854775807;
+}
+
+function main(): void
+{
+    let $flags = [false; runtimeCount()];
+}

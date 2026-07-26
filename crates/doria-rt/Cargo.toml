@@ -10,5 +10,9 @@ name = "doria_rt"
 path = "src/lib.rs"
 crate-type = ["rlib", "staticlib"]
 
+[features]
+default = ["standalone-windows-support"]
+standalone-windows-support = []
+
 [dependencies]
 ryu.workspace = true

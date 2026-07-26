@@ -98,15 +98,12 @@ with `Error[E0420]: equality operands must have compatible types, got Unknown an
 nullable per the companion contract. Add fixtures for parse-success and
 parse-failure (`null`) across the three backends.
 
-## Not a bug — noted so it isn't "fixed"
+## Resolved — runtime-sized sequence fill
 
-**No sized/fill array constructor** (`int[n]`, `List::filled(n, v)`,
-`withCapacity`) exists, so the sieve builds its buffer with `n` individual `add`
-calls. This is a **deliberate deferral** — decision 0100 parks capacity/fill
-constructors as a profiling-driven addition, not a launch feature. Treat it as a
-*feature request* (a fill constructor would materially help array/buffer
-workloads, and the benchmark shows the cost), **not** a regression to fix
-silently. If pursued, it wants its own decision/amendment, not an ad-hoc method.
+Decision 0102 added `[value; count]`, so the sieve can now build a runtime-sized
+`bool[]` or `List<bool>` directly (for example, `[true; n]`) instead of issuing
+`n` individual `add` calls. This is the sole runtime-sized `T[]` constructor.
+The separate `withCapacity` capacity hint remains deliberately deferred.
 
 ## Where the repros come from
 

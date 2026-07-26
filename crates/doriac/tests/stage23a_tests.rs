@@ -11,6 +11,10 @@ const NAMED_ARGUMENTS_EXAMPLE: &str =
     include_str!("../../../examples/native/main_stage23a_named_arguments.doria");
 const NAMED_ARGUMENT_ORDER_EXAMPLE: &str =
     include_str!("../../../examples/native/main_stage23a_named_argument_order.doria");
+const NAMED_OWNED_ARGUMENTS_EXAMPLE: &str =
+    include_str!("../../../examples/native/main_stage23a_named_owned_arguments.doria");
+const NAMED_OWNED_ARGUMENTS_STDOUT: &str =
+    include_str!("fixtures/native_io/main_stage23a_named_owned_arguments/expected_stdout");
 
 fn diagnostics(source: &str) -> Vec<doriac::diagnostics::Diagnostic> {
     doriac::check_source("stage23a.doria", source).expect_err("source should be rejected")
@@ -75,6 +79,48 @@ fn named_arguments_evaluate_in_source_order() {
     assert_eq!(
         String::from_utf8(output.stdout).expect("stdout is UTF-8"),
         concat!("gh|a=2 b=1\n", "gkh|a=1 b=2 c=3\n", "hg|a=2 b=1\n")
+    );
+}
+
+#[test]
+fn reordered_repeat_literals_panic_before_later_arguments_run() {
+    let source = r#"
+function marker(): int
+{
+    echo "marker\n";
+    return 1;
+}
+
+function sink(int $first, List<bool> $second): void {}
+
+function route(int $count): void
+{
+    sink(second: [true; $count], first: marker());
+}
+
+function main(): void
+{
+    route(-1);
+}
+"#;
+    let output = interpret(source);
+    assert_eq!(output.exit_status, 101);
+    assert!(
+        output.stdout.is_empty(),
+        "the later marker must not run before the source-earlier fill panic"
+    );
+    assert_eq!(
+        output.stderr,
+        b"Panic: fill count is negative\nStack Trace:\n  at route\n  at main\n"
+    );
+}
+
+#[test]
+fn reordered_owned_arguments_move_through_tracked_temporaries() {
+    let output = interpret(NAMED_OWNED_ARGUMENTS_EXAMPLE);
+    assert_eq!(
+        String::from_utf8(output.stdout).expect("stdout is UTF-8"),
+        NAMED_OWNED_ARGUMENTS_STDOUT
     );
 }
 

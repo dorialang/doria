@@ -6,6 +6,8 @@ use std::rc::Rc;
 use crate::mir;
 use crate::numeric::{FloatType, FloatValue, IntegerPanic, IntegerType, IntegerValue};
 
+type SharedString = Rc<str>;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InterpreterOutput {
     pub stdout: Vec<u8>,
@@ -49,13 +51,13 @@ enum FunctionOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum LocalValue {
     Scalar(mir::ScalarValue),
-    String(String),
+    String(SharedString),
     Mixed(MixedValue),
     NullableScalar {
         ty: mir::ScalarType,
         value: Option<mir::ScalarValue>,
     },
-    NullableString(Option<String>),
+    NullableString(Option<SharedString>),
     NullableMixed(Option<MixedValue>),
     Class {
         object: usize,
@@ -71,13 +73,13 @@ enum LocalValue {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum EvaluationValue {
     Scalar(mir::ScalarValue),
-    String(String),
+    String(SharedString),
     Mixed(MixedValue),
     NullableScalar {
         ty: mir::ScalarType,
         value: Option<mir::ScalarValue>,
     },
-    NullableString(Option<String>),
+    NullableString(Option<SharedString>),
     NullableMixed(Option<MixedValue>),
     Class {
         object: usize,
@@ -93,7 +95,7 @@ enum EvaluationValue {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum MixedValue {
     Scalar(mir::ScalarValue),
-    String(String),
+    String(SharedString),
     Class {
         object: usize,
         class: crate::class_layout::ClassId,
@@ -170,6 +172,9 @@ enum EvaluationTask {
         collection: mir::CollectionTypeId,
         keyed: Vec<bool>,
     },
+    BuildCollectionFill {
+        collection: mir::CollectionTypeId,
+    },
     LoadCollectionValue {
         collection: mir::LocalId,
         transfer: bool,
@@ -207,8 +212,7 @@ enum EvaluationTask {
         constructor: Option<mir::FunctionId>,
         argument_count: usize,
         property_expression_count: usize,
-        temporary_class_args: Vec<Option<crate::class_layout::ClassId>>,
-        temporary_mixed_args: Vec<mir::MixedOwnership>,
+        temporary_arg_drops: Vec<usize>,
     },
     FinishClassNew {
         object: usize,
@@ -309,8 +313,7 @@ enum EvaluationTask {
         function: mir::FunctionId,
         argument_count: usize,
         expectation: ReturnExpectation,
-        temporary_class_args: Vec<bool>,
-        temporary_mixed_args: Vec<mir::MixedOwnership>,
+        temporary_arg_drops: Vec<usize>,
     },
     FinishStatement,
     DropTemporaryClasses(Vec<(usize, crate::class_layout::ClassId)>),
@@ -442,7 +445,12 @@ fn interpret_internal(
             collection,
             io.args
                 .iter()
-                .map(|argument| (None, LocalValue::String(argument.clone())))
+                .map(|argument| {
+                    (
+                        None,
+                        LocalValue::String(SharedString::from(argument.as_str())),
+                    )
+                })
                 .collect(),
         ))
     });
@@ -469,9 +477,11 @@ fn interpret_internal(
                 }
                 mir::StaticValue::Scalar(value) => LocalValue::Scalar(*value),
                 mir::StaticValue::String(value) if property.ty == mir::Type::String => {
-                    LocalValue::String(value.clone())
+                    LocalValue::String(SharedString::from(value.as_str()))
                 }
-                mir::StaticValue::String(value) => LocalValue::NullableString(Some(value.clone())),
+                mir::StaticValue::String(value) => {
+                    LocalValue::NullableString(Some(SharedString::from(value.as_str())))
+                }
                 mir::StaticValue::Null => match property.ty {
                     mir::Type::NullableScalar(ty) => LocalValue::NullableScalar { ty, value: None },
                     mir::Type::NullableString => LocalValue::NullableString(None),
@@ -1045,6 +1055,41 @@ impl Interpreter<'_> {
                         collection, entries,
                     )));
             }
+            EvaluationTask::BuildCollectionFill { collection } => {
+                let count = self.pop_local_value()?;
+                let LocalValue::Scalar(mir::ScalarValue::Integer(count)) = count else {
+                    return Err(InterpreterError::new(
+                        "MIR collection fill count produced another value type",
+                    ));
+                };
+                if count.ty != IntegerType::Int64 {
+                    return Err(InterpreterError::new(
+                        "MIR collection fill count is not canonical int",
+                    ));
+                }
+                let count = count.signed_value();
+                if count < 0 {
+                    return Ok(StepOutcome::Panic("fill count is negative".to_string()));
+                }
+                let count = usize::try_from(count).map_err(|_| {
+                    InterpreterError::new("MIR collection fill count exceeds host capacity")
+                })?;
+                let value = self.pop_local_value()?;
+                if !matches!(value, LocalValue::Scalar(_) | LocalValue::String(_)) {
+                    return Err(InterpreterError::new(
+                        "MIR collection fill value is not a Copy scalar or string",
+                    ));
+                }
+                let entries = match repeat_collection_entries(value, count) {
+                    Ok(entries) => entries,
+                    Err(message) => return Ok(StepOutcome::Panic(message.to_string())),
+                };
+                self.current_frame_mut()?
+                    .values
+                    .push(EvaluationValue::Collection(CollectionValue::new(
+                        collection, entries,
+                    )));
+            }
             EvaluationTask::LoadCollectionValue {
                 collection,
                 transfer,
@@ -1378,8 +1423,7 @@ impl Interpreter<'_> {
                 constructor,
                 argument_count,
                 property_expression_count,
-                temporary_class_args,
-                temporary_mixed_args,
+                temporary_arg_drops,
             } => {
                 let arguments = self.take_call_arguments(argument_count)?;
                 let property_expressions = self.take_call_arguments(property_expression_count)?;
@@ -1424,72 +1468,8 @@ impl Interpreter<'_> {
                     },
                 );
                 if let Some(constructor) = constructor {
-                    let constructor_definition = function_in(self.program, constructor)?;
                     let mut temporary_drops = Vec::new();
-                    for (index, temporary_class) in temporary_class_args.iter().enumerate() {
-                        let Some(class) = temporary_class else {
-                            continue;
-                        };
-                        let promoted = properties.iter().any(|property| {
-                            matches!(
-                                property.source,
-                                mir::PropertyValueSource::ConstructorArgument(argument)
-                                    if argument == index
-                            )
-                        });
-                        let parameter =
-                            *constructor_definition
-                                .params
-                                .get(index + 1)
-                                .ok_or_else(|| {
-                                    InterpreterError::new(format!(
-                                        "MIR constructor function{} is missing parameter {index}",
-                                        constructor.0
-                                    ))
-                                })?;
-                        if promoted || local_in(constructor_definition, parameter)?.owned {
-                            continue;
-                        }
-                        let LocalValue::Class {
-                            object,
-                            class: actual,
-                        } = &arguments[index]
-                        else {
-                            return Err(InterpreterError::new(
-                                "MIR temporary constructor argument produced another value type",
-                            ));
-                        };
-                        if actual != class {
-                            return Err(InterpreterError::new(
-                                "MIR temporary constructor argument produced the wrong class",
-                            ));
-                        }
-                        temporary_drops.push((*object, *class));
-                    }
-                    for (index, temporary_mixed) in temporary_mixed_args.iter().enumerate() {
-                        if *temporary_mixed != mir::MixedOwnership::Owned {
-                            continue;
-                        }
-                        let promoted = properties.iter().any(|property| {
-                            matches!(
-                                property.source,
-                                mir::PropertyValueSource::ConstructorArgument(argument)
-                                    if argument == index
-                            )
-                        });
-                        let parameter =
-                            *constructor_definition
-                                .params
-                                .get(index + 1)
-                                .ok_or_else(|| {
-                                    InterpreterError::new(format!(
-                                        "MIR constructor function{} is missing parameter {index}",
-                                        constructor.0
-                                    ))
-                                })?;
-                        if promoted || local_in(constructor_definition, parameter)?.owned {
-                            continue;
-                        }
+                    for index in temporary_arg_drops {
                         collect_owned_objects_from_value(
                             arguments[index].clone(),
                             &mut temporary_drops,
@@ -1897,7 +1877,7 @@ impl Interpreter<'_> {
                         "file path contained an embedded NUL".to_string(),
                     ));
                 }
-                let Some(bytes) = self.files.get(&path) else {
+                let Some(bytes) = self.files.get(path.as_ref()) else {
                     return Ok(StepOutcome::Panic("failed to read file".to_string()));
                 };
                 let Ok(value) = String::from_utf8(bytes.clone()) else {
@@ -1915,7 +1895,8 @@ impl Interpreter<'_> {
                         "file path contained an embedded NUL".to_string(),
                     ));
                 }
-                self.files.insert(path, contents.into_bytes());
+                self.files
+                    .insert(path.to_string(), contents.as_bytes().to_vec());
             }
             EvaluationTask::AppendFile => {
                 let contents = self.pop_string()?;
@@ -1926,7 +1907,7 @@ impl Interpreter<'_> {
                     ));
                 }
                 self.files
-                    .entry(path)
+                    .entry(path.to_string())
                     .or_default()
                     .extend_from_slice(contents.as_bytes());
             }
@@ -1937,7 +1918,7 @@ impl Interpreter<'_> {
                         "file path contained an embedded NUL".to_string(),
                     ));
                 }
-                let Some(contents) = self.files.get(&path).cloned() else {
+                let Some(contents) = self.files.get(path.as_ref()).cloned() else {
                     return Ok(StepOutcome::Panic("failed to read file".to_string()));
                 };
                 self.push_byte_collection(collection, &contents)?;
@@ -1952,11 +1933,11 @@ impl Interpreter<'_> {
                 let bytes = self.byte_collection(contents)?;
                 if append {
                     self.files
-                        .entry(path)
+                        .entry(path.to_string())
                         .or_default()
                         .extend_from_slice(&bytes);
                 } else {
-                    self.files.insert(path, bytes);
+                    self.files.insert(path.to_string(), bytes);
                 }
             }
             EvaluationTask::WriteStreamBytes { contents, stderr } => {
@@ -2002,7 +1983,7 @@ impl Interpreter<'_> {
                 self.stdout.extend_from_slice(value.as_bytes());
             }
             EvaluationTask::PanicString => {
-                return Ok(StepOutcome::Panic(self.pop_string()?));
+                return Ok(StepOutcome::Panic(self.pop_string()?.to_string()));
             }
             EvaluationTask::Integer(expression) => self.expand_integer_expression(expression)?,
             EvaluationTask::IntegerUnary(op) => {
@@ -2112,33 +2093,12 @@ impl Interpreter<'_> {
                 function,
                 argument_count,
                 expectation,
-                temporary_class_args,
-                temporary_mixed_args,
+                temporary_arg_drops,
             } => {
                 let args = self.take_call_arguments(argument_count)?;
                 let mut drops = Vec::new();
-                for (argument, temporary) in args.iter().zip(temporary_class_args) {
-                    if !temporary {
-                        continue;
-                    }
-                    match argument {
-                        LocalValue::Class { object, class } => drops.push((*object, *class)),
-                        LocalValue::NullableClass {
-                            object: Some(object),
-                            class,
-                        } => drops.push((*object, *class)),
-                        LocalValue::NullableClass { object: None, .. } => {}
-                        _ => {
-                            return Err(InterpreterError::new(
-                                "MIR temporary-class call argument produced another value type",
-                            ))
-                        }
-                    }
-                }
-                for (argument, ownership) in args.iter().zip(temporary_mixed_args) {
-                    if ownership == mir::MixedOwnership::Owned {
-                        collect_owned_objects_from_value(argument.clone(), &mut drops);
-                    }
+                for index in temporary_arg_drops {
+                    collect_owned_objects_from_value(args[index].clone(), &mut drops);
                 }
                 if !drops.is_empty() {
                     self.current_frame_mut()?
@@ -3019,7 +2979,7 @@ impl Interpreter<'_> {
                         .map_err(|_| InterpreterError::new("stdin contained invalid UTF-8"))?
                         .to_string();
                     self.stdin_cursor += consumed;
-                    self.push_nullable_string(Some(line))?;
+                    self.push_nullable_string(Some(line.into()))?;
                 }
             }
             mir::NullableStringExpression::Call { function, args } => {
@@ -3169,11 +3129,20 @@ impl Interpreter<'_> {
                 constructor,
                 args,
             } => {
-                let temporary_class_args = args
-                    .iter()
-                    .map(mir::Rvalue::owned_temporary_class)
-                    .collect();
-                let temporary_mixed_args = args.iter().map(mir::Rvalue::mixed_ownership).collect();
+                let temporary_arg_drops = if let Some(constructor) = constructor {
+                    let definition = function_in(self.program, constructor)?;
+                    temporary_argument_drop_order(&args, definition, 1, |index| {
+                        properties.iter().any(|property| {
+                            matches!(
+                                property.source,
+                                mir::PropertyValueSource::ConstructorArgument(argument)
+                                    if argument == index
+                            )
+                        })
+                    })?
+                } else {
+                    Vec::new()
+                };
                 let property_expression_count = properties
                     .iter()
                     .filter(|property| {
@@ -3187,8 +3156,7 @@ impl Interpreter<'_> {
                     constructor,
                     argument_count: args.len(),
                     property_expression_count,
-                    temporary_class_args,
-                    temporary_mixed_args,
+                    temporary_arg_drops,
                 });
                 for argument in args.into_iter().rev() {
                     frame.tasks.push(EvaluationTask::Rvalue(argument));
@@ -3416,6 +3384,20 @@ impl Interpreter<'_> {
                         frame.tasks.push(EvaluationTask::Rvalue(key));
                     }
                 }
+            }
+            mir::CollectionExpression::Fill {
+                collection,
+                value,
+                count,
+            } => {
+                let frame = self.current_frame_mut()?;
+                frame
+                    .tasks
+                    .push(EvaluationTask::BuildCollectionFill { collection });
+                frame
+                    .tasks
+                    .push(EvaluationTask::Value(mir::ValueExpression::Integer(*count)));
+                frame.tasks.push(EvaluationTask::Rvalue(*value));
             }
             mir::CollectionExpression::Index {
                 source,
@@ -3723,32 +3705,13 @@ impl Interpreter<'_> {
         expectation: ReturnExpectation,
     ) -> Result<(), InterpreterError> {
         let callee = function_in(self.program, function)?;
-        let temporary_class_args = args
-            .iter()
-            .zip(&callee.params)
-            .map(|(argument, parameter)| {
-                argument.owned_temporary_class().is_some()
-                    && !local_in(callee, *parameter).is_ok_and(|local| local.owned)
-            })
-            .collect();
-        let temporary_mixed_args = args
-            .iter()
-            .zip(&callee.params)
-            .map(|(argument, parameter)| {
-                if !local_in(callee, *parameter).is_ok_and(|local| local.owned) {
-                    argument.mixed_ownership()
-                } else {
-                    mir::MixedOwnership::None
-                }
-            })
-            .collect();
+        let temporary_arg_drops = temporary_argument_drop_order(&args, callee, 0, |_| false)?;
         let frame = self.current_frame_mut()?;
         frame.tasks.push(EvaluationTask::Invoke {
             function,
             argument_count: args.len(),
             expectation,
-            temporary_class_args,
-            temporary_mixed_args,
+            temporary_arg_drops,
         });
         for argument in args.into_iter().rev() {
             frame.tasks.push(EvaluationTask::Rvalue(argument));
@@ -3777,25 +3740,10 @@ impl Interpreter<'_> {
                 "null-safe call result does not match the requested nullable type",
             ));
         }
-        let mut temporary_class_args = Vec::with_capacity(args.len() + 1);
-        temporary_class_args.push(false);
-        temporary_class_args.extend(args.iter().zip(callee.params.iter().skip(1)).map(
-            |(argument, parameter)| {
-                argument.owned_temporary_class().is_some()
-                    && !local_in(callee, *parameter).is_ok_and(|local| local.owned)
-            },
-        ));
-        let mut temporary_mixed_args = Vec::with_capacity(args.len() + 1);
-        temporary_mixed_args.push(mir::MixedOwnership::None);
-        temporary_mixed_args.extend(args.iter().zip(callee.params.iter().skip(1)).map(
-            |(argument, parameter)| {
-                if !local_in(callee, *parameter).is_ok_and(|local| local.owned) {
-                    argument.mixed_ownership()
-                } else {
-                    mir::MixedOwnership::None
-                }
-            },
-        ));
+        let temporary_arg_drops = temporary_argument_drop_order(&args, callee, 1, |_| false)?
+            .into_iter()
+            .map(|index| index + 1)
+            .collect();
         let frame = self.current_frame_mut()?;
         frame.values.push(EvaluationValue::Class { object, class });
         if result == non_nullable_result {
@@ -3807,8 +3755,7 @@ impl Interpreter<'_> {
             function,
             argument_count: args.len() + 1,
             expectation: ReturnExpectation::Value(result),
-            temporary_class_args,
-            temporary_mixed_args,
+            temporary_arg_drops,
         });
         for argument in args.into_iter().rev() {
             frame.tasks.push(EvaluationTask::Rvalue(argument));
@@ -3828,33 +3775,17 @@ impl Interpreter<'_> {
             mir::ReturnType::Void => ReturnExpectation::Void,
             mir::ReturnType::Value(ty) => ReturnExpectation::Discard(ty),
         };
-        let mut temporary_class_args = Vec::with_capacity(args.len() + 1);
-        temporary_class_args.push(false);
-        temporary_class_args.extend(args.iter().zip(callee.params.iter().skip(1)).map(
-            |(argument, parameter)| {
-                argument.owned_temporary_class().is_some()
-                    && !local_in(callee, *parameter).is_ok_and(|local| local.owned)
-            },
-        ));
-        let mut temporary_mixed_args = Vec::with_capacity(args.len() + 1);
-        temporary_mixed_args.push(mir::MixedOwnership::None);
-        temporary_mixed_args.extend(args.iter().zip(callee.params.iter().skip(1)).map(
-            |(argument, parameter)| {
-                if !local_in(callee, *parameter).is_ok_and(|local| local.owned) {
-                    argument.mixed_ownership()
-                } else {
-                    mir::MixedOwnership::None
-                }
-            },
-        ));
+        let temporary_arg_drops = temporary_argument_drop_order(&args, callee, 1, |_| false)?
+            .into_iter()
+            .map(|index| index + 1)
+            .collect();
         let frame = self.current_frame_mut()?;
         frame.values.push(EvaluationValue::Class { object, class });
         frame.tasks.push(EvaluationTask::Invoke {
             function,
             argument_count: args.len() + 1,
             expectation,
-            temporary_class_args,
-            temporary_mixed_args,
+            temporary_arg_drops,
         });
         for argument in args.into_iter().rev() {
             frame.tasks.push(EvaluationTask::Rvalue(argument));
@@ -4060,14 +3991,14 @@ impl Interpreter<'_> {
         }
     }
 
-    fn push_string(&mut self, value: String) -> Result<(), InterpreterError> {
+    fn push_string(&mut self, value: impl Into<SharedString>) -> Result<(), InterpreterError> {
         self.current_frame_mut()?
             .values
-            .push(EvaluationValue::String(value));
+            .push(EvaluationValue::String(value.into()));
         Ok(())
     }
 
-    fn pop_string(&mut self) -> Result<String, InterpreterError> {
+    fn pop_string(&mut self) -> Result<SharedString, InterpreterError> {
         match self.current_frame_mut()?.values.pop() {
             Some(EvaluationValue::String(value)) => Ok(value),
             Some(EvaluationValue::Scalar(_)) => Err(InterpreterError::new(
@@ -4095,7 +4026,10 @@ impl Interpreter<'_> {
         }
     }
 
-    fn push_nullable_string(&mut self, value: Option<String>) -> Result<(), InterpreterError> {
+    fn push_nullable_string(
+        &mut self,
+        value: Option<SharedString>,
+    ) -> Result<(), InterpreterError> {
         self.current_frame_mut()?
             .values
             .push(EvaluationValue::NullableString(value));
@@ -4128,7 +4062,7 @@ impl Interpreter<'_> {
         }
     }
 
-    fn pop_nullable_string(&mut self) -> Result<Option<String>, InterpreterError> {
+    fn pop_nullable_string(&mut self) -> Result<Option<SharedString>, InterpreterError> {
         match self.current_frame_mut()?.values.pop() {
             Some(EvaluationValue::NullableString(value)) => Ok(value),
             Some(_) => Err(InterpreterError::new(
@@ -5161,6 +5095,21 @@ fn collection_values_equal(ty: mir::Type, left: &LocalValue, right: &LocalValue)
     }
 }
 
+fn repeat_collection_entries(
+    value: LocalValue,
+    count: usize,
+) -> Result<CollectionEntries, &'static str> {
+    if count.checked_mul(core::mem::size_of::<u64>()).is_none() {
+        return Err("collection capacity overflow");
+    }
+    let mut entries = Vec::new();
+    entries
+        .try_reserve_exact(count)
+        .map_err(|_| "collection allocation failed")?;
+    entries.extend(core::iter::repeat_n((None, value), count));
+    Ok(entries)
+}
+
 fn display_scalar(value: mir::ScalarValue) -> String {
     match value {
         mir::ScalarValue::Integer(value) => value.display(),
@@ -5187,7 +5136,9 @@ fn render_format(
                     (FormatConversion::Display, EvaluationValue::Scalar(value)) => {
                         display_scalar(*value)
                     }
-                    (FormatConversion::Display, EvaluationValue::String(value)) => value.clone(),
+                    (FormatConversion::Display, EvaluationValue::String(value)) => {
+                        value.to_string()
+                    }
                     (
                         FormatConversion::Decimal,
                         EvaluationValue::Scalar(mir::ScalarValue::Integer(value)),
@@ -5409,6 +5360,45 @@ fn local_in(function: &mir::Function, id: mir::LocalId) -> Result<&mir::Local, I
         .ok_or_else(|| InterpreterError::new(format!("MIR LocalId local{} does not exist", id.0)))
 }
 
+fn temporary_argument_drop_order(
+    args: &[mir::Rvalue],
+    callee: &mir::Function,
+    parameter_offset: usize,
+    promoted: impl Fn(usize) -> bool,
+) -> Result<Vec<usize>, InterpreterError> {
+    let mut drops = Vec::new();
+    for (index, argument) in args.iter().enumerate() {
+        let temporary = argument.owned_temporary_class().is_some()
+            || argument.owned_temporary_collection().is_some()
+            || argument.mixed_ownership() == mir::MixedOwnership::Owned;
+        if !temporary || promoted(index) {
+            continue;
+        }
+        let parameter = *callee.params.get(index + parameter_offset).ok_or_else(|| {
+            InterpreterError::new(format!(
+                "MIR function{} is missing parameter {}",
+                callee.id.0,
+                index + parameter_offset
+            ))
+        })?;
+        if !local_in(callee, parameter)?.owned {
+            drops.push(index);
+        }
+    }
+    if drops
+        .iter()
+        .all(|index| args[*index].transferred_owned_local().is_some())
+    {
+        drops.sort_by_key(|index| {
+            args[*index]
+                .transferred_owned_local()
+                .expect("all reordered owned temporaries have source-order locals")
+                .0
+        });
+    }
+    Ok(drops)
+}
+
 fn block_in(
     function: &mir::Function,
     id: mir::BlockId,
@@ -5418,4 +5408,34 @@ fn block_in(
         .get(id.0)
         .filter(|block| block.id == id)
         .ok_or_else(|| InterpreterError::new(format!("MIR BlockId block{} does not exist", id.0)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn repeated_strings_share_one_immutable_allocation() {
+        let string = SharedString::from("shared");
+        let entries =
+            repeat_collection_entries(LocalValue::String(string.clone()), 3).expect("small fill");
+
+        assert_eq!(Rc::strong_count(&string), 4);
+        for (_, value) in entries {
+            let LocalValue::String(value) = value else {
+                panic!("string fill produced another value type");
+            };
+            assert!(Rc::ptr_eq(&string, &value));
+        }
+    }
+
+    #[test]
+    fn oversized_repeat_capacity_is_a_doria_panic_message() {
+        let count = usize::MAX / core::mem::size_of::<u64>() + 1;
+        let error =
+            repeat_collection_entries(LocalValue::Scalar(mir::ScalarValue::Bool(false)), count)
+                .expect_err("native-word capacity overflow should be rejected");
+
+        assert_eq!(error, "collection capacity overflow");
+    }
 }

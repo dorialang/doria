@@ -1,0 +1,254 @@
+class Token
+{
+    function __construct(string $name)
+    {
+    }
+
+    function __destruct()
+    {
+        echo "drop " . $this->name . "\n";
+    }
+}
+
+class Sink
+{
+    function inspect(int $marker, Token $token): void
+    {
+        echo "method borrow " . $token->name . " {$marker}\n";
+    }
+
+    function consume(int $marker, take Token $token): void
+    {
+        echo "method take " . $token->name . " {$marker}\n";
+    }
+
+    static function borrowStatic(int $marker, Token $token): void
+    {
+        echo "static borrow " . $token->name . " {$marker}\n";
+    }
+}
+
+class Envelope
+{
+    function __construct(int $marker, take Token $token)
+    {
+        echo "construct {$marker}\n";
+    }
+
+    function __destruct()
+    {
+        echo "drop envelope\n";
+    }
+}
+
+function marker(string $name): int
+{
+    echo "mark " . $name . "\n";
+    return 1;
+}
+
+function makeToken(string $name): Token
+{
+    echo "make " . $name . "\n";
+    return new Token($name);
+}
+
+function borrowToken(int $marker, Token $token): void
+{
+    echo "borrow " . $token->name . " {$marker}\n";
+}
+
+function identityToken(Token $token): Token
+{
+    echo "identity " . $token->name . "\n";
+    return $token;
+}
+
+function takeToken(int $marker, take Token $token): void
+{
+    echo "take " . $token->name . " {$marker}\n";
+}
+
+function borrowPair(Token $first, Token $second): void
+{
+    echo "borrow pair\n";
+}
+
+function makeTokens(string $name): List<Token>
+{
+    echo "make " . $name . "\n";
+    return [new Token($name)];
+}
+
+function borrowTokens(int $marker, List<Token> $tokens): void
+{
+    echo "borrow list {$tokens->count} {$marker}\n";
+}
+
+function takeTokens(int $marker, take List<Token> $tokens): void
+{
+    echo "take list {$tokens->count} {$marker}\n";
+}
+
+function borrowTokenLists(List<Token> $first, List<Token> $second): void
+{
+    echo "borrow list pair\n";
+}
+
+function makeBytes(string $name): Bytes
+{
+    echo "make " . $name . "\n";
+    return Bytes::fromArray([1, 2, 3]);
+}
+
+function borrowBytes(int $marker, Bytes $bytes): void
+{
+    echo "borrow bytes {$bytes->length} {$marker}\n";
+}
+
+function takeBytes(int $marker, take Bytes $bytes): void
+{
+    echo "take bytes {$bytes->length} {$marker}\n";
+}
+
+function makeMixed(string $name): mixed
+{
+    echo "make " . $name . "\n";
+    return new Token($name);
+}
+
+function borrowMixed(int $marker, mixed $value): void
+{
+    if ($value is Token) {
+        echo "borrow mixed {$marker}\n";
+    }
+}
+
+function takeMixed(int $marker, take mixed $value): void
+{
+    if ($value is Token) {
+        echo "take mixed {$marker}\n";
+    }
+}
+
+function borrowMixedPair(mixed $first, mixed $second): void
+{
+    echo "borrow mixed pair\n";
+}
+
+function borrowKinds(Token $token, List<Token> $tokens, mixed $value): void
+{
+    echo "borrow kinds\n";
+}
+
+function makeNullableToken(string $name): ?Token
+{
+    echo "make " . $name . "\n";
+    return new Token($name);
+}
+
+function borrowNullableToken(int $marker, ?Token $token): void
+{
+    if ($token != null) {
+        echo "borrow " . $token->name . " {$marker}\n";
+    }
+}
+
+function makeNullableMixed(string $name): ?mixed
+{
+    echo "make " . $name . "\n";
+    return new Token($name);
+}
+
+function borrowNullableMixed(int $marker, ?mixed $value): void
+{
+    if ($value is Token) {
+        echo "borrow nullable mixed {$marker}\n";
+    }
+}
+
+function main(): void
+{
+    borrowToken(token: makeToken("class-borrow"), marker: marker("class-borrow"));
+    echo "after class borrow\n";
+    takeToken(token: makeToken("class-take"), marker: marker("class-take"));
+    echo "after class take\n";
+    borrowPair(
+        second: makeToken("pair-first"),
+        first: makeToken("pair-second"),
+    );
+    echo "after pair borrow\n";
+
+    borrowTokens(tokens: makeTokens("list-borrow"), marker: marker("list-borrow"));
+    echo "after list borrow\n";
+    takeTokens(tokens: makeTokens("list-take"), marker: marker("list-take"));
+    echo "after list take\n";
+    borrowTokenLists(
+        second: makeTokens("list-pair-first"),
+        first: makeTokens("list-pair-second"),
+    );
+    echo "after list pair borrow\n";
+    let $literalToken = new Token("literal-pair-first");
+    borrowTokenLists(
+        second: [$literalToken],
+        first: makeTokens("literal-pair-second"),
+    );
+    echo "after literal list pair borrow\n";
+
+    borrowBytes(bytes: makeBytes("bytes-borrow"), marker: marker("bytes-borrow"));
+    echo "after bytes borrow\n";
+    takeBytes(bytes: makeBytes("bytes-take"), marker: marker("bytes-take"));
+    echo "after bytes take\n";
+
+    borrowMixed(value: makeMixed("mixed-borrow"), marker: marker("mixed-borrow"));
+    echo "after mixed borrow\n";
+    takeMixed(value: makeMixed("mixed-take"), marker: marker("mixed-take"));
+    echo "after mixed take\n";
+    borrowMixedPair(
+        second: makeMixed("mixed-pair-first"),
+        first: makeMixed("mixed-pair-second"),
+    );
+    echo "after mixed pair borrow\n";
+    borrowKinds(
+        value: makeMixed("kinds-first"),
+        token: makeToken("kinds-second"),
+        tokens: makeTokens("kinds-third"),
+    );
+    echo "after kinds borrow\n";
+
+    borrowNullableToken(
+        token: makeNullableToken("nullable-class-borrow"),
+        marker: marker("nullable-class-borrow"),
+    );
+    echo "after nullable class borrow\n";
+
+    borrowNullableMixed(
+        value: makeNullableMixed("nullable-mixed-borrow"),
+        marker: marker("nullable-mixed-borrow"),
+    );
+    echo "after nullable mixed borrow\n";
+
+    let $sink = new Sink();
+    $sink->inspect(token: makeToken("method-borrow"), marker: marker("method-borrow"));
+    echo "after method borrow\n";
+    $sink->consume(token: makeToken("method-take"), marker: marker("method-take"));
+    echo "after method take\n";
+    Sink::borrowStatic(
+        token: makeToken("static-borrow"),
+        marker: marker("static-borrow"),
+    );
+    echo "after static borrow\n";
+
+    let $envelope = new Envelope(
+        token: makeToken("constructor-take"),
+        marker: marker("constructor-take"),
+    );
+    echo "after constructor\n";
+
+    let $returnedBorrow = new Token("returned-borrow");
+    borrowToken(
+        token: identityToken($returnedBorrow),
+        marker: marker("returned-borrow"),
+    );
+    echo "after returned borrow\n";
+}
