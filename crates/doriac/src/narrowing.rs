@@ -950,6 +950,10 @@ fn kill_mutated_call_arguments(
                 kill_mutated_call_arguments(&element.value, state, resolution, mutations);
             }
         }
+        Expr::ArrayRepeat { value, count, .. } => {
+            kill_mutated_call_arguments(value, state, resolution, mutations);
+            kill_mutated_call_arguments(count, state, resolution, mutations);
+        }
         Expr::Index {
             collection, index, ..
         } => {
@@ -1119,6 +1123,7 @@ fn expression_fact(
         | Expr::Float { .. }
         | Expr::Bool { .. }
         | Expr::Array { .. }
+        | Expr::ArrayRepeat { .. }
         | Expr::Index { .. }
         | Expr::Range { .. }
         | Expr::New { .. }
@@ -1436,6 +1441,10 @@ fn collect_expr(
                 state = collect_expr(&element.value, &state, resolution, mutations, facts);
             }
             state
+        }
+        Expr::ArrayRepeat { value, count, .. } => {
+            let state = collect_expr(value, state, resolution, mutations, facts);
+            collect_expr(count, &state, resolution, mutations, facts)
         }
         Expr::Index {
             collection, index, ..
@@ -1835,6 +1844,10 @@ impl Resolver {
                     }
                     self.resolve_expr(&element.value);
                 }
+            }
+            Expr::ArrayRepeat { value, count, .. } => {
+                self.resolve_expr(value);
+                self.resolve_expr(count);
             }
             Expr::Index {
                 collection, index, ..

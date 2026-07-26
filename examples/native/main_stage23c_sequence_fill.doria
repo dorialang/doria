@@ -1,0 +1,33 @@
+function runtimeCount(): int
+{
+    echo "count\n";
+    return 3;
+}
+
+function fillValue(): string
+{
+    echo "value\n";
+    return "repeat";
+}
+
+function main(): int
+{
+    bool[] $flags = [true; runtimeCount()];
+    int[] $numbers = [42; 2];
+    List<bool> $listFlags = [false; 2];
+    List<int> $counts = [7; 3];
+    let $defaulted = [9; 2];
+    List<string> $words = [fillValue(); runtimeCount()];
+
+    writable bool[] $sieve = [true; runtimeCount()];
+    $sieve[1] = false;
+
+    echo "{$flags->length}:{$flags[2]}\n";
+    echo "{$numbers->length}:{$numbers[0]}:{$numbers[1]}\n";
+    echo "{$listFlags->count}:{$listFlags[1]}\n";
+    echo "{$counts->count}:{$counts[2]}\n";
+    echo "{$defaulted->count}:{$defaulted[0]}\n";
+    echo "{$words->count}:{$words[0]}:{$words[2]}\n";
+    echo "{$sieve->length}:{$sieve[0]}:{$sieve[1]}\n";
+    return 0;
+}

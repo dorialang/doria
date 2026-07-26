@@ -1,0 +1,10 @@
+function negativeCount(): int
+{
+    return -1;
+}
+
+function main(): void
+{
+    bool[] $flags = [true; negativeCount()];
+    echo "{$flags->length}\n";
+}

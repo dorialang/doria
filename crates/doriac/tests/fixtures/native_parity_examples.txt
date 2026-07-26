@@ -121,6 +121,8 @@ examples/native/main_stage23a_named_argument_order.doria
 examples/native/main_stage23a_named_owned_arguments.doria
 examples/native/main_stage23b_entry_arguments.doria
 examples/native/main_stage23b_entry_arguments_empty.doria
+examples/native/main_stage23c_negative_fill_panic.doria
+examples/native/main_stage23c_sequence_fill.doria
 examples/native/main_string_concat_hello.doria
 examples/native/main_string_comparison_42.doria
 examples/native/main_string_local_hello.doria

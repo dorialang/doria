@@ -1,11 +1,12 @@
 use doriac::class_layout::{compute_class_layout, ClassId, FieldType, PropertyId};
 use doriac::format_string::{FormatConversion, FormatPiece, FormatSpec};
 use doriac::mir::{
-    BasicBlock, BlockId, Class, ClassExpression, CollectionKind, CollectionType, CollectionTypeId,
-    FloatBinaryOp, FloatExpression, FormatArgument, FormatExpression, Function, FunctionId, Local,
-    LocalId, NullableClassExpression, NullableStringExpression, Operand, Program, Property,
-    PropertyValue, PropertyValueSource, ReturnType, Rvalue, ScalarType, ScalarValue, Statement,
-    StaticId, StaticProperty, StaticValue, StringExpression, Terminator, Type, ValueExpression,
+    BasicBlock, BlockId, Class, ClassExpression, CollectionExpression, CollectionKind,
+    CollectionType, CollectionTypeId, FloatBinaryOp, FloatExpression, FormatArgument,
+    FormatExpression, Function, FunctionId, IntegerExpression, Local, LocalId,
+    NullableClassExpression, NullableStringExpression, Operand, Program, Property, PropertyValue,
+    PropertyValueSource, ReturnType, Rvalue, ScalarType, ScalarValue, Statement, StaticId,
+    StaticProperty, StaticValue, StringExpression, Terminator, Type, ValueExpression,
 };
 use doriac::numeric::{FloatType, FloatValue, IntegerType, IntegerValue};
 
@@ -77,6 +78,71 @@ fn shared_validator_rejects_noncanonical_bytes_storage() {
         .expect_err("Bytes must always use the packed uint8 element contract");
     assert!(error.message.contains("Bytes collection"));
     assert!(error.message.contains("packed uint8"));
+}
+
+#[test]
+fn shared_validator_enforces_sequence_fill_shape() {
+    let mut program = valid_void_program();
+    program.collection_types.push(CollectionType {
+        id: CollectionTypeId(0),
+        kind: CollectionKind::List,
+        key: None,
+        value: Type::Scalar(ScalarType::Integer(IntegerType::Int64)),
+    });
+    program.functions[0].locals.push(Local {
+        id: LocalId(0),
+        name: "values".to_string(),
+        ty: Type::Collection(CollectionTypeId(0)),
+        writable: false,
+        owned: true,
+        synthetic: false,
+    });
+    program.functions[0].blocks[0].statements = vec![
+        Statement::AssignLocal {
+            target: LocalId(0),
+            value: Rvalue::Collection(CollectionExpression::Fill {
+                collection: CollectionTypeId(0),
+                value: Box::new(Rvalue::Value(ValueExpression::Integer(
+                    IntegerExpression::constant(
+                        IntegerValue::from_i128(IntegerType::Int64, 7).expect("valid int"),
+                    ),
+                ))),
+                count: Box::new(IntegerExpression::constant(
+                    IntegerValue::from_i128(IntegerType::Int64, 3).expect("valid int"),
+                )),
+            }),
+        },
+        Statement::DropCollection {
+            local: LocalId(0),
+            collection: CollectionTypeId(0),
+        },
+    ];
+    doriac::mir_validation::validate_program(&program)
+        .expect("well-typed sequence fill MIR should validate");
+
+    let mut keyed = program.clone();
+    keyed.collection_types[0].kind = CollectionKind::Dictionary;
+    keyed.collection_types[0].key = Some(Type::String);
+    let error = doriac::mir_validation::validate_program(&keyed)
+        .expect_err("fill MIR must reject keyed destinations");
+    assert!(error
+        .message
+        .contains("collection fill destination is not a sequence"));
+
+    let mut narrow_count = program;
+    let Statement::AssignLocal {
+        value: Rvalue::Collection(CollectionExpression::Fill { count, .. }),
+        ..
+    } = &mut narrow_count.functions[0].blocks[0].statements[0]
+    else {
+        panic!("expected fill assignment");
+    };
+    **count = IntegerExpression::constant(
+        IntegerValue::from_i128(IntegerType::Int32, 3).expect("valid int32"),
+    );
+    let error = doriac::mir_validation::validate_program(&narrow_count)
+        .expect_err("fill MIR must reject non-int counts");
+    assert!(error.message.contains("collection fill count is not int"));
 }
 
 #[test]

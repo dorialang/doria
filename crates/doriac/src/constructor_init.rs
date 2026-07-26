@@ -507,6 +507,10 @@ fn inspect_expr(
                 inspect_expr(class, properties, state, &element.value, diagnostics);
             }
         }
+        Expr::ArrayRepeat { value, count, .. } => {
+            inspect_expr(class, properties, state, value, diagnostics);
+            inspect_expr(class, properties, state, count, diagnostics);
+        }
         Expr::Index {
             collection, index, ..
         } => {

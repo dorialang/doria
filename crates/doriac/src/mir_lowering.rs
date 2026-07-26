@@ -4697,6 +4697,9 @@ fn argument_evaluation_is_observable(expr: &hir::Expr) -> bool {
                 .is_some_and(argument_evaluation_is_observable)
                 || argument_evaluation_is_observable(&element.value)
         }),
+        hir::Expr::ArrayRepeat { value, count, .. } => {
+            argument_evaluation_is_observable(value) || argument_evaluation_is_observable(count)
+        }
         _ => false,
     }
 }
@@ -6218,6 +6221,14 @@ fn lower_collection_expression(
                 entries,
             })
         }
+        hir::Expr::ArrayRepeat { value, count, .. } => {
+            let collection = context.collection_type(expected).clone();
+            Ok(mir::CollectionExpression::Fill {
+                collection: expected,
+                value: Box::new(lower_rvalue_as_expected(value, collection.value, context)?),
+                count: Box::new(lower_integer_expression(count, context)?),
+            })
+        }
         hir::Expr::Index {
             collection,
             index,
@@ -6400,6 +6411,10 @@ fn materialize_nested_collection_places(
                 }
                 materialize_nested_collection_places(&element.value, false, context)?;
             }
+        }
+        hir::Expr::ArrayRepeat { value, count, .. } => {
+            materialize_nested_collection_places(value, false, context)?;
+            materialize_nested_collection_places(count, false, context)?;
         }
         hir::Expr::Index {
             collection, index, ..
@@ -8067,7 +8082,9 @@ fn unsupported_int_expr(expr: &hir::Expr) -> Diagnostic {
         hir::Expr::Bool { .. } => "bool value reached integer-only MIR lowering",
         hir::Expr::IsType { .. } => "a type-test result cannot be used as an integer expression",
         hir::Expr::Null { .. } => "`null` cannot be used as an integer expression",
-        hir::Expr::Array { .. } => "a collection cannot be used as an integer expression",
+        hir::Expr::Array { .. } | hir::Expr::ArrayRepeat { .. } => {
+            "a collection cannot be used as an integer expression"
+        }
         hir::Expr::Index { .. } => {
             "this indexed value cannot be used as an integer expression in this lowering path"
         }

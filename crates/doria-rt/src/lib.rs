@@ -148,6 +148,48 @@ pub unsafe extern "C" fn dr_v1_collection_new(
     collection::new(length, keyed != 0, fixed != 0)
 }
 
+/// Allocates a sequence containing `count` bitwise copies of `value`.
+///
+/// # Safety
+///
+/// `current_frame` must be null or a valid generated frame chain, and `fixed`
+/// must be a canonical boolean byte. The returned pointer must be released
+/// exactly once with `dr_v1_collection_free`.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_collection_fill_word(
+    current_frame: *const DrStackFrameV1,
+    value: u64,
+    count: i64,
+    fixed: u8,
+) -> *mut DrCollectionV1 {
+    if count < 0 {
+        static MESSAGE: &[u8] = b"fill count is negative";
+        dr_v1_panic(current_frame, MESSAGE.as_ptr(), MESSAGE.len());
+    }
+    collection::fill_word(value, count as usize, fixed != 0)
+}
+
+/// Allocates a sequence containing `count` retained references to `value`.
+///
+/// # Safety
+///
+/// `current_frame` must be null or a valid generated frame chain, `value` must
+/// be null or a live Doria string, and `fixed` must be a canonical boolean
+/// byte. Every retained slot is released when the collection is dropped.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_collection_fill_string(
+    current_frame: *const DrStackFrameV1,
+    value: *mut DrStringV1,
+    count: i64,
+    fixed: u8,
+) -> *mut DrCollectionV1 {
+    if count < 0 {
+        static MESSAGE: &[u8] = b"fill count is negative";
+        dr_v1_panic(current_frame, MESSAGE.as_ptr(), MESSAGE.len());
+    }
+    collection::fill_string(value, count as usize, fixed != 0)
+}
+
 /// # Safety
 ///
 /// `collection` must be null or a live pointer returned by
@@ -2009,6 +2051,31 @@ mod tests {
             dr_v1_string_release(retained);
             dr_v1_string_release(right);
             dr_v1_string_release(joined);
+        }
+    }
+
+    #[test]
+    fn sequence_fill_copies_words_and_retains_each_string_slot() {
+        unsafe {
+            let words = dr_v1_collection_fill_word(ptr::null(), 42, 3, 1);
+            assert_eq!(dr_v1_collection_length(words), 3);
+            for index in 0..3 {
+                assert_eq!(dr_v1_collection_value_at(ptr::null(), words, index), 42);
+            }
+            dr_v1_collection_free(words);
+
+            let string = dr_v1_string_from_utf8(b"shared".as_ptr(), 6);
+            let strings = dr_v1_collection_fill_string(ptr::null(), string, 3, 0);
+            assert_eq!((*string).references, 4);
+            for index in 0..3 {
+                let slot =
+                    dr_v1_collection_value_at(ptr::null(), strings, index) as *mut DrStringV1;
+                assert_eq!(slot, string);
+                dr_v1_string_release(slot);
+            }
+            assert_eq!((*string).references, 1);
+            dr_v1_collection_free(strings);
+            dr_v1_string_release(string);
         }
     }
 

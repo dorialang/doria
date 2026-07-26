@@ -1289,6 +1289,30 @@ fn validate_collection_expression(
             }
             Ok(())
         }
+        mir::CollectionExpression::Fill { value, count, .. } => {
+            if !matches!(
+                definition.kind,
+                mir::CollectionKind::List | mir::CollectionKind::TypedArray
+            ) || definition.key.is_some()
+            {
+                return Err(malformed_mir(
+                    "collection fill destination is not a sequence",
+                ));
+            }
+            if value.ty() != definition.value {
+                return Err(malformed_mir("collection fill value type mismatch"));
+            }
+            if !matches!(definition.value, mir::Type::Scalar(_) | mir::Type::String) {
+                return Err(malformed_mir(
+                    "collection fill value is not a Copy scalar or string",
+                ));
+            }
+            if count.ty() != IntegerType::Int64 {
+                return Err(malformed_mir("collection fill count is not int"));
+            }
+            validate_rvalue(program, function, value)?;
+            validate_integer_expression(program, function, count)
+        }
         mir::CollectionExpression::Index {
             source,
             index,
@@ -2400,6 +2424,10 @@ fn collect_collection_class_local_accesses<'a>(
                 }
                 collect_rvalue_class_local_accesses(&entry.value, accesses);
             }
+        }
+        mir::CollectionExpression::Fill { value, count, .. } => {
+            collect_rvalue_class_local_accesses(value, accesses);
+            collect_integer_class_local_accesses(count, accesses);
         }
         mir::CollectionExpression::Index { index, .. } => {
             collect_rvalue_class_local_accesses(index, accesses)
@@ -4379,6 +4407,10 @@ fn collection_observes_property(
                 .is_some_and(|key| rvalue_observes_property(key, receiver, property))
                 || rvalue_observes_property(&entry.value, receiver, property)
         }),
+        mir::CollectionExpression::Fill { value, count, .. } => {
+            rvalue_observes_property(value, receiver, property)
+                || integer_observes_property(count, receiver, property)
+        }
         mir::CollectionExpression::Index { index, .. } => {
             rvalue_observes_property(index, receiver, property)
         }

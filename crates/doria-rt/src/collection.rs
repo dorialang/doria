@@ -87,6 +87,29 @@ pub unsafe fn new(length: usize, keyed: bool, fixed: bool) -> *mut DrCollectionV
     collection
 }
 
+pub unsafe fn fill_word(value: u64, count: usize, fixed: bool) -> *mut DrCollectionV1 {
+    let collection = new(count, false, true);
+    for index in 0..count {
+        ptr::write((*collection).values.add(index), value);
+    }
+    (*collection).fixed = u8::from(fixed);
+    collection
+}
+
+pub unsafe fn fill_string(
+    value: *mut DrStringV1,
+    count: usize,
+    fixed: bool,
+) -> *mut DrCollectionV1 {
+    let collection = new(count, false, true);
+    for index in 0..count {
+        let retained = crate::dr_v1_string_retain(value);
+        ptr::write((*collection).values.add(index), retained as u64);
+    }
+    (*collection).fixed = u8::from(fixed);
+    collection
+}
+
 pub unsafe fn free(collection: *mut DrCollectionV1) {
     if collection.is_null() {
         return;

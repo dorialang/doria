@@ -170,6 +170,9 @@ enum EvaluationTask {
         collection: mir::CollectionTypeId,
         keyed: Vec<bool>,
     },
+    BuildCollectionFill {
+        collection: mir::CollectionTypeId,
+    },
     LoadCollectionValue {
         collection: mir::LocalId,
         transfer: bool,
@@ -1037,6 +1040,38 @@ impl Interpreter<'_> {
                         .tasks
                         .push(EvaluationTask::DropObject { object, class });
                 }
+                self.current_frame_mut()?
+                    .values
+                    .push(EvaluationValue::Collection(CollectionValue::new(
+                        collection, entries,
+                    )));
+            }
+            EvaluationTask::BuildCollectionFill { collection } => {
+                let count = self.pop_local_value()?;
+                let LocalValue::Scalar(mir::ScalarValue::Integer(count)) = count else {
+                    return Err(InterpreterError::new(
+                        "MIR collection fill count produced another value type",
+                    ));
+                };
+                if count.ty != IntegerType::Int64 {
+                    return Err(InterpreterError::new(
+                        "MIR collection fill count is not canonical int",
+                    ));
+                }
+                let count = count.signed_value();
+                if count < 0 {
+                    return Ok(StepOutcome::Panic("fill count is negative".to_string()));
+                }
+                let count = usize::try_from(count).map_err(|_| {
+                    InterpreterError::new("MIR collection fill count exceeds host capacity")
+                })?;
+                let value = self.pop_local_value()?;
+                if !matches!(value, LocalValue::Scalar(_) | LocalValue::String(_)) {
+                    return Err(InterpreterError::new(
+                        "MIR collection fill value is not a Copy scalar or string",
+                    ));
+                }
+                let entries = (0..count).map(|_| (None, value.clone())).collect();
                 self.current_frame_mut()?
                     .values
                     .push(EvaluationValue::Collection(CollectionValue::new(
@@ -3336,6 +3371,20 @@ impl Interpreter<'_> {
                         frame.tasks.push(EvaluationTask::Rvalue(key));
                     }
                 }
+            }
+            mir::CollectionExpression::Fill {
+                collection,
+                value,
+                count,
+            } => {
+                let frame = self.current_frame_mut()?;
+                frame
+                    .tasks
+                    .push(EvaluationTask::BuildCollectionFill { collection });
+                frame
+                    .tasks
+                    .push(EvaluationTask::Value(mir::ValueExpression::Integer(*count)));
+                frame.tasks.push(EvaluationTask::Rvalue(*value));
             }
             mir::CollectionExpression::Index {
                 source,

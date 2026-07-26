@@ -342,6 +342,11 @@ pub enum CollectionExpression {
         collection: CollectionTypeId,
         entries: Vec<CollectionEntry>,
     },
+    Fill {
+        collection: CollectionTypeId,
+        value: Box<Rvalue>,
+        count: Box<IntegerExpression>,
+    },
     Index {
         collection: CollectionTypeId,
         source: LocalId,
@@ -402,6 +407,7 @@ impl CollectionExpression {
         match self {
             Self::Local { collection, .. }
             | Self::Literal { collection, .. }
+            | Self::Fill { collection, .. }
             | Self::Index { collection, .. }
             | Self::Property { collection, .. }
             | Self::SetFrom { collection, .. }
@@ -1381,6 +1387,9 @@ fn collection_class_temporary_capacity(value: &CollectionExpression) -> usize {
                     + rvalue_class_temporary_capacity(&entry.value)
             })
             .sum(),
+        CollectionExpression::Fill { value, count, .. } => {
+            rvalue_class_temporary_capacity(value) + integer_class_temporary_capacity(count)
+        }
         CollectionExpression::Index { index, .. } => rvalue_class_temporary_capacity(index),
         CollectionExpression::Property { .. } => 0,
         CollectionExpression::ReadFileBytes { path, .. } => string_class_temporary_capacity(path),
@@ -1807,6 +1816,11 @@ impl fmt::Display for CollectionExpression {
                 }
                 formatter.write_str("]")
             }
+            Self::Fill {
+                collection,
+                value,
+                count,
+            } => write!(formatter, "collection#{}[{value}; {count}]", collection.0),
             Self::Index {
                 source,
                 index,
