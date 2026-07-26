@@ -4697,9 +4697,9 @@ fn argument_evaluation_is_observable(expr: &hir::Expr) -> bool {
                 .is_some_and(argument_evaluation_is_observable)
                 || argument_evaluation_is_observable(&element.value)
         }),
-        hir::Expr::ArrayRepeat { value, count, .. } => {
-            argument_evaluation_is_observable(value) || argument_evaluation_is_observable(count)
-        }
+        // Allocation and the runtime-negative-count check can panic even when
+        // both operands are otherwise pure.
+        hir::Expr::ArrayRepeat { .. } => true,
         _ => false,
     }
 }

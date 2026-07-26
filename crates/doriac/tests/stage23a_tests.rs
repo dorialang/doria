@@ -83,6 +83,39 @@ fn named_arguments_evaluate_in_source_order() {
 }
 
 #[test]
+fn reordered_repeat_literals_panic_before_later_arguments_run() {
+    let source = r#"
+function marker(): int
+{
+    echo "marker\n";
+    return 1;
+}
+
+function sink(int $first, List<bool> $second): void {}
+
+function route(int $count): void
+{
+    sink(second: [true; $count], first: marker());
+}
+
+function main(): void
+{
+    route(-1);
+}
+"#;
+    let output = interpret(source);
+    assert_eq!(output.exit_status, 101);
+    assert!(
+        output.stdout.is_empty(),
+        "the later marker must not run before the source-earlier fill panic"
+    );
+    assert_eq!(
+        output.stderr,
+        b"Panic: fill count is negative\nStack Trace:\n  at route\n  at main\n"
+    );
+}
+
+#[test]
 fn reordered_owned_arguments_move_through_tracked_temporaries() {
     let output = interpret(NAMED_OWNED_ARGUMENTS_EXAMPLE);
     assert_eq!(

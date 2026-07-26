@@ -49,6 +49,38 @@ function main(): void
 }
 
 #[test]
+fn negative_named_constant_fill_counts_are_rejected() {
+    let errors = diagnostics(
+        r#"
+const int NEGATIVE = -1;
+
+class Counts
+{
+    const int NEGATIVE = -2;
+}
+
+function main(): void
+{
+    bool[] $first = [true; NEGATIVE];
+    bool[] $second = [true; Counts::NEGATIVE];
+}
+"#,
+    );
+    assert_eq!(
+        errors
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic.code == "E0527"
+                    && diagnostic
+                        .message
+                        .contains("cannot be negative at compile time")
+            })
+            .count(),
+        2
+    );
+}
+
+#[test]
 fn move_elements_name_the_cloneable_gate() {
     let errors = diagnostics(
         r#"
