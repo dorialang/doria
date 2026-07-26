@@ -4867,70 +4867,50 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         left: IntValue<'ctx>,
         right: IntValue<'ctx>,
     ) -> Result<IntValue<'ctx>, BackendError> {
-        let wide_type = self
-            .context
-            .custom_width_int_type(
-                NonZeroU32::new(ty.bit_width().saturating_mul(2))
-                    .expect("Doria integer widths are nonzero"),
-            )
-            .expect("Doria widened integer type is supported by LLVM");
-        let left = if ty.is_signed() {
-            build(
-                self.builder
-                    .build_int_s_extend(left, wide_type, "left.wide"),
-            )?
-        } else {
-            build(
-                self.builder
-                    .build_int_z_extend(left, wide_type, "left.wide"),
-            )?
-        };
-        let right = if ty.is_signed() {
-            build(
-                self.builder
-                    .build_int_s_extend(right, wide_type, "right.wide"),
-            )?
-        } else {
-            build(
-                self.builder
-                    .build_int_z_extend(right, wide_type, "right.wide"),
-            )?
-        };
-        let result = match op {
-            mir::IntegerBinaryOp::Add => {
-                build(self.builder.build_int_add(left, right, "checked.add"))?
-            }
-            mir::IntegerBinaryOp::Subtract => {
-                build(self.builder.build_int_sub(left, right, "checked.sub"))?
-            }
-            mir::IntegerBinaryOp::Multiply => {
-                build(self.builder.build_int_mul(left, right, "checked.mul"))?
-            }
+        let operation = match op {
+            mir::IntegerBinaryOp::Add => "add",
+            mir::IntegerBinaryOp::Subtract => "sub",
+            mir::IntegerBinaryOp::Multiply => "mul",
             _ => unreachable!("non-arithmetic operator reached checked arithmetic lowering"),
         };
-        let minimum = wide_integer_constant(wide_type, ty.min_value());
-        let maximum = wide_integer_constant(wide_type, ty.max_value());
-        let below = build(self.builder.build_int_compare(
-            if ty.is_signed() {
-                IntPredicate::SLT
-            } else {
-                IntPredicate::ULT
-            },
-            result,
-            minimum,
-            "below.minimum",
-        ))?;
-        let above = build(self.builder.build_int_compare(
-            if ty.is_signed() {
-                IntPredicate::SGT
-            } else {
-                IntPredicate::UGT
-            },
-            result,
-            maximum,
-            "above.maximum",
-        ))?;
-        let overflow = build(self.builder.build_or(below, above, "arithmetic.overflow"))?;
+        let integer = integer_type(self.context, ty);
+        let result_type = self
+            .context
+            .struct_type(&[integer.into(), self.context.bool_type().into()], false);
+        let signedness = if ty.is_signed() { "s" } else { "u" };
+        let intrinsic_name = format!(
+            "llvm.{signedness}{operation}.with.overflow.i{}",
+            ty.bit_width()
+        );
+        let intrinsic = self
+            .module
+            .get_function(&intrinsic_name)
+            .unwrap_or_else(|| {
+                self.module.add_function(
+                    &intrinsic_name,
+                    result_type.fn_type(&[integer.into(), integer.into()], false),
+                    None,
+                )
+            });
+        let result = build(self.builder.build_call(
+            intrinsic,
+            &[left.into(), right.into()],
+            "checked.arithmetic",
+        ))?
+        .try_as_basic_value()
+        .basic()
+        .ok_or_else(|| backend_failure("checked arithmetic intrinsic produced no result"))?
+        .into_struct_value();
+        let value = build(
+            self.builder
+                .build_extract_value(result, 0, "checked.result"),
+        )?
+        .into_int_value();
+        let overflow = build(
+            self.builder
+                .build_extract_value(result, 1, "arithmetic.overflow"),
+        )?
+        .into_int_value();
         let panic = match op {
             mir::IntegerBinaryOp::Add => IntegerPanic::OverflowAddition,
             mir::IntegerBinaryOp::Subtract => IntegerPanic::OverflowSubtraction,
@@ -4938,11 +4918,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             _ => unreachable!("non-arithmetic operator reached checked arithmetic lowering"),
         };
         self.lower_panic_if(overflow, panic.message().as_bytes())?;
-        build(self.builder.build_int_truncate(
-            result,
-            integer_type(self.context, ty),
-            "checked.result",
-        ))
+        Ok(value)
     }
 
     fn lower_integer_division(
@@ -6458,13 +6434,6 @@ fn integer_type(context: &Context, ty: IntegerType) -> IntType<'_> {
 
 fn integer_constant<'ctx>(context: &'ctx Context, value: IntegerValue) -> IntValue<'ctx> {
     integer_type(context, value.ty).const_int(value.bits, false)
-}
-
-fn wide_integer_constant(integer_type: IntType<'_>, value: i128) -> IntValue<'_> {
-    let bits = value as u128;
-    let words = [bits as u64, (bits >> 64) as u64];
-    let word_count = integer_type.get_bit_width().div_ceil(64) as usize;
-    integer_type.const_int_arbitrary_precision(&words[..word_count])
 }
 
 fn float_constant<'ctx>(context: &'ctx Context, value: FloatValue) -> LlvmFloatValue<'ctx> {
