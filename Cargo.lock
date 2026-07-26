@@ -359,7 +359,7 @@ dependencies = [
 name = "doriac"
 version = "2026.3.1-canary"
 dependencies = [
- "cranelift-codegen 0.133.1",
+ "cranelift-codegen 0.134.2",
  "cranelift-frontend",
  "cranelift-module 0.134.2",
  "cranelift-native",

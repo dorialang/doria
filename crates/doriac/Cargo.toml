@@ -16,7 +16,7 @@ bundled-runtime = []
 llvm-backend = ["dep:inkwell"]
 
 [dependencies]
-cranelift-codegen = "0.133.1"
+cranelift-codegen = "0.134.2"
 cranelift-frontend = "0.133.1"
 cranelift-module = "0.134.2"
 cranelift-native = "0.133.1"
