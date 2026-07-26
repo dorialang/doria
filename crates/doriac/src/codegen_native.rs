@@ -182,12 +182,16 @@ fn linker_arguments(
         ];
     }
 
-    vec![
+    let mut arguments = vec![
         object_path.as_os_str().to_os_string(),
         runtime_path.as_os_str().to_os_string(),
         OsString::from("-o"),
         executable_path.as_os_str().to_os_string(),
-    ]
+    ];
+    if windows {
+        arguments.push(OsString::from("-lshell32"));
+    }
+    arguments
 }
 
 fn is_msvc_style_compiler_driver(linker: &str) -> bool {
@@ -279,6 +283,7 @@ mod tests {
                 OsString::from("doria_rt.lib"),
                 OsString::from("-o"),
                 OsString::from("main.exe"),
+                OsString::from("-lshell32"),
             ]
         );
     }
@@ -302,6 +307,7 @@ mod tests {
                 OsString::from("libdoria_rt.a"),
                 OsString::from("-o"),
                 OsString::from("main.exe"),
+                OsString::from("-lshell32"),
             ]
         );
         assert_eq!(default_linker(false), "cc");
