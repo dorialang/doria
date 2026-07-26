@@ -207,8 +207,7 @@ enum EvaluationTask {
         constructor: Option<mir::FunctionId>,
         argument_count: usize,
         property_expression_count: usize,
-        temporary_class_args: Vec<Option<crate::class_layout::ClassId>>,
-        temporary_mixed_args: Vec<mir::MixedOwnership>,
+        temporary_arg_drops: Vec<usize>,
     },
     FinishClassNew {
         object: usize,
@@ -309,8 +308,7 @@ enum EvaluationTask {
         function: mir::FunctionId,
         argument_count: usize,
         expectation: ReturnExpectation,
-        temporary_class_args: Vec<bool>,
-        temporary_mixed_args: Vec<mir::MixedOwnership>,
+        temporary_arg_drops: Vec<usize>,
     },
     FinishStatement,
     DropTemporaryClasses(Vec<(usize, crate::class_layout::ClassId)>),
@@ -1378,8 +1376,7 @@ impl Interpreter<'_> {
                 constructor,
                 argument_count,
                 property_expression_count,
-                temporary_class_args,
-                temporary_mixed_args,
+                temporary_arg_drops,
             } => {
                 let arguments = self.take_call_arguments(argument_count)?;
                 let property_expressions = self.take_call_arguments(property_expression_count)?;
@@ -1424,72 +1421,8 @@ impl Interpreter<'_> {
                     },
                 );
                 if let Some(constructor) = constructor {
-                    let constructor_definition = function_in(self.program, constructor)?;
                     let mut temporary_drops = Vec::new();
-                    for (index, temporary_class) in temporary_class_args.iter().enumerate() {
-                        let Some(class) = temporary_class else {
-                            continue;
-                        };
-                        let promoted = properties.iter().any(|property| {
-                            matches!(
-                                property.source,
-                                mir::PropertyValueSource::ConstructorArgument(argument)
-                                    if argument == index
-                            )
-                        });
-                        let parameter =
-                            *constructor_definition
-                                .params
-                                .get(index + 1)
-                                .ok_or_else(|| {
-                                    InterpreterError::new(format!(
-                                        "MIR constructor function{} is missing parameter {index}",
-                                        constructor.0
-                                    ))
-                                })?;
-                        if promoted || local_in(constructor_definition, parameter)?.owned {
-                            continue;
-                        }
-                        let LocalValue::Class {
-                            object,
-                            class: actual,
-                        } = &arguments[index]
-                        else {
-                            return Err(InterpreterError::new(
-                                "MIR temporary constructor argument produced another value type",
-                            ));
-                        };
-                        if actual != class {
-                            return Err(InterpreterError::new(
-                                "MIR temporary constructor argument produced the wrong class",
-                            ));
-                        }
-                        temporary_drops.push((*object, *class));
-                    }
-                    for (index, temporary_mixed) in temporary_mixed_args.iter().enumerate() {
-                        if *temporary_mixed != mir::MixedOwnership::Owned {
-                            continue;
-                        }
-                        let promoted = properties.iter().any(|property| {
-                            matches!(
-                                property.source,
-                                mir::PropertyValueSource::ConstructorArgument(argument)
-                                    if argument == index
-                            )
-                        });
-                        let parameter =
-                            *constructor_definition
-                                .params
-                                .get(index + 1)
-                                .ok_or_else(|| {
-                                    InterpreterError::new(format!(
-                                        "MIR constructor function{} is missing parameter {index}",
-                                        constructor.0
-                                    ))
-                                })?;
-                        if promoted || local_in(constructor_definition, parameter)?.owned {
-                            continue;
-                        }
+                    for index in temporary_arg_drops {
                         collect_owned_objects_from_value(
                             arguments[index].clone(),
                             &mut temporary_drops,
@@ -2112,33 +2045,12 @@ impl Interpreter<'_> {
                 function,
                 argument_count,
                 expectation,
-                temporary_class_args,
-                temporary_mixed_args,
+                temporary_arg_drops,
             } => {
                 let args = self.take_call_arguments(argument_count)?;
                 let mut drops = Vec::new();
-                for (argument, temporary) in args.iter().zip(temporary_class_args) {
-                    if !temporary {
-                        continue;
-                    }
-                    match argument {
-                        LocalValue::Class { object, class } => drops.push((*object, *class)),
-                        LocalValue::NullableClass {
-                            object: Some(object),
-                            class,
-                        } => drops.push((*object, *class)),
-                        LocalValue::NullableClass { object: None, .. } => {}
-                        _ => {
-                            return Err(InterpreterError::new(
-                                "MIR temporary-class call argument produced another value type",
-                            ))
-                        }
-                    }
-                }
-                for (argument, ownership) in args.iter().zip(temporary_mixed_args) {
-                    if ownership == mir::MixedOwnership::Owned {
-                        collect_owned_objects_from_value(argument.clone(), &mut drops);
-                    }
+                for index in temporary_arg_drops {
+                    collect_owned_objects_from_value(args[index].clone(), &mut drops);
                 }
                 if !drops.is_empty() {
                     self.current_frame_mut()?
@@ -3169,11 +3081,20 @@ impl Interpreter<'_> {
                 constructor,
                 args,
             } => {
-                let temporary_class_args = args
-                    .iter()
-                    .map(mir::Rvalue::owned_temporary_class)
-                    .collect();
-                let temporary_mixed_args = args.iter().map(mir::Rvalue::mixed_ownership).collect();
+                let temporary_arg_drops = if let Some(constructor) = constructor {
+                    let definition = function_in(self.program, constructor)?;
+                    temporary_argument_drop_order(&args, definition, 1, |index| {
+                        properties.iter().any(|property| {
+                            matches!(
+                                property.source,
+                                mir::PropertyValueSource::ConstructorArgument(argument)
+                                    if argument == index
+                            )
+                        })
+                    })?
+                } else {
+                    Vec::new()
+                };
                 let property_expression_count = properties
                     .iter()
                     .filter(|property| {
@@ -3187,8 +3108,7 @@ impl Interpreter<'_> {
                     constructor,
                     argument_count: args.len(),
                     property_expression_count,
-                    temporary_class_args,
-                    temporary_mixed_args,
+                    temporary_arg_drops,
                 });
                 for argument in args.into_iter().rev() {
                     frame.tasks.push(EvaluationTask::Rvalue(argument));
@@ -3723,32 +3643,13 @@ impl Interpreter<'_> {
         expectation: ReturnExpectation,
     ) -> Result<(), InterpreterError> {
         let callee = function_in(self.program, function)?;
-        let temporary_class_args = args
-            .iter()
-            .zip(&callee.params)
-            .map(|(argument, parameter)| {
-                argument.owned_temporary_class().is_some()
-                    && !local_in(callee, *parameter).is_ok_and(|local| local.owned)
-            })
-            .collect();
-        let temporary_mixed_args = args
-            .iter()
-            .zip(&callee.params)
-            .map(|(argument, parameter)| {
-                if !local_in(callee, *parameter).is_ok_and(|local| local.owned) {
-                    argument.mixed_ownership()
-                } else {
-                    mir::MixedOwnership::None
-                }
-            })
-            .collect();
+        let temporary_arg_drops = temporary_argument_drop_order(&args, callee, 0, |_| false)?;
         let frame = self.current_frame_mut()?;
         frame.tasks.push(EvaluationTask::Invoke {
             function,
             argument_count: args.len(),
             expectation,
-            temporary_class_args,
-            temporary_mixed_args,
+            temporary_arg_drops,
         });
         for argument in args.into_iter().rev() {
             frame.tasks.push(EvaluationTask::Rvalue(argument));
@@ -3777,25 +3678,10 @@ impl Interpreter<'_> {
                 "null-safe call result does not match the requested nullable type",
             ));
         }
-        let mut temporary_class_args = Vec::with_capacity(args.len() + 1);
-        temporary_class_args.push(false);
-        temporary_class_args.extend(args.iter().zip(callee.params.iter().skip(1)).map(
-            |(argument, parameter)| {
-                argument.owned_temporary_class().is_some()
-                    && !local_in(callee, *parameter).is_ok_and(|local| local.owned)
-            },
-        ));
-        let mut temporary_mixed_args = Vec::with_capacity(args.len() + 1);
-        temporary_mixed_args.push(mir::MixedOwnership::None);
-        temporary_mixed_args.extend(args.iter().zip(callee.params.iter().skip(1)).map(
-            |(argument, parameter)| {
-                if !local_in(callee, *parameter).is_ok_and(|local| local.owned) {
-                    argument.mixed_ownership()
-                } else {
-                    mir::MixedOwnership::None
-                }
-            },
-        ));
+        let temporary_arg_drops = temporary_argument_drop_order(&args, callee, 1, |_| false)?
+            .into_iter()
+            .map(|index| index + 1)
+            .collect();
         let frame = self.current_frame_mut()?;
         frame.values.push(EvaluationValue::Class { object, class });
         if result == non_nullable_result {
@@ -3807,8 +3693,7 @@ impl Interpreter<'_> {
             function,
             argument_count: args.len() + 1,
             expectation: ReturnExpectation::Value(result),
-            temporary_class_args,
-            temporary_mixed_args,
+            temporary_arg_drops,
         });
         for argument in args.into_iter().rev() {
             frame.tasks.push(EvaluationTask::Rvalue(argument));
@@ -3828,33 +3713,17 @@ impl Interpreter<'_> {
             mir::ReturnType::Void => ReturnExpectation::Void,
             mir::ReturnType::Value(ty) => ReturnExpectation::Discard(ty),
         };
-        let mut temporary_class_args = Vec::with_capacity(args.len() + 1);
-        temporary_class_args.push(false);
-        temporary_class_args.extend(args.iter().zip(callee.params.iter().skip(1)).map(
-            |(argument, parameter)| {
-                argument.owned_temporary_class().is_some()
-                    && !local_in(callee, *parameter).is_ok_and(|local| local.owned)
-            },
-        ));
-        let mut temporary_mixed_args = Vec::with_capacity(args.len() + 1);
-        temporary_mixed_args.push(mir::MixedOwnership::None);
-        temporary_mixed_args.extend(args.iter().zip(callee.params.iter().skip(1)).map(
-            |(argument, parameter)| {
-                if !local_in(callee, *parameter).is_ok_and(|local| local.owned) {
-                    argument.mixed_ownership()
-                } else {
-                    mir::MixedOwnership::None
-                }
-            },
-        ));
+        let temporary_arg_drops = temporary_argument_drop_order(&args, callee, 1, |_| false)?
+            .into_iter()
+            .map(|index| index + 1)
+            .collect();
         let frame = self.current_frame_mut()?;
         frame.values.push(EvaluationValue::Class { object, class });
         frame.tasks.push(EvaluationTask::Invoke {
             function,
             argument_count: args.len() + 1,
             expectation,
-            temporary_class_args,
-            temporary_mixed_args,
+            temporary_arg_drops,
         });
         for argument in args.into_iter().rev() {
             frame.tasks.push(EvaluationTask::Rvalue(argument));
@@ -5407,6 +5276,45 @@ fn local_in(function: &mir::Function, id: mir::LocalId) -> Result<&mir::Local, I
         .get(id.0)
         .filter(|local| local.id == id)
         .ok_or_else(|| InterpreterError::new(format!("MIR LocalId local{} does not exist", id.0)))
+}
+
+fn temporary_argument_drop_order(
+    args: &[mir::Rvalue],
+    callee: &mir::Function,
+    parameter_offset: usize,
+    promoted: impl Fn(usize) -> bool,
+) -> Result<Vec<usize>, InterpreterError> {
+    let mut drops = Vec::new();
+    for (index, argument) in args.iter().enumerate() {
+        let temporary = argument.owned_temporary_class().is_some()
+            || argument.owned_temporary_collection().is_some()
+            || argument.mixed_ownership() == mir::MixedOwnership::Owned;
+        if !temporary || promoted(index) {
+            continue;
+        }
+        let parameter = *callee.params.get(index + parameter_offset).ok_or_else(|| {
+            InterpreterError::new(format!(
+                "MIR function{} is missing parameter {}",
+                callee.id.0,
+                index + parameter_offset
+            ))
+        })?;
+        if !local_in(callee, parameter)?.owned {
+            drops.push(index);
+        }
+    }
+    if drops
+        .iter()
+        .all(|index| args[*index].transferred_owned_local().is_some())
+    {
+        drops.sort_by_key(|index| {
+            args[*index]
+                .transferred_owned_local()
+                .expect("all reordered owned temporaries have source-order locals")
+                .0
+        });
+    }
+    Ok(drops)
 }
 
 fn block_in(

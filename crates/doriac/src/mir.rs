@@ -260,6 +260,62 @@ impl Rvalue {
         }
     }
 
+    pub const fn owned_temporary_collection(&self) -> Option<CollectionTypeId> {
+        match self {
+            Self::Collection(CollectionExpression::Local {
+                collection,
+                transfer: true,
+                ..
+            }) => Some(*collection),
+            Self::Value(_)
+            | Self::String(_)
+            | Self::Mixed(_)
+            | Self::NullableScalar(_)
+            | Self::NullableString(_)
+            | Self::NullableMixed(_)
+            | Self::Class(_)
+            | Self::NullableClass(_)
+            | Self::Collection(_) => None,
+        }
+    }
+
+    pub const fn transferred_owned_local(&self) -> Option<LocalId> {
+        match self {
+            Self::Mixed(MixedExpression::Local {
+                local,
+                transfer: true,
+            })
+            | Self::NullableMixed(NullableMixedExpression::Local {
+                local,
+                transfer: true,
+            })
+            | Self::Class(ClassExpression::Local {
+                local,
+                transfer: true,
+                ..
+            })
+            | Self::NullableClass(NullableClassExpression::Local {
+                local,
+                transfer: true,
+                ..
+            })
+            | Self::Collection(CollectionExpression::Local {
+                local,
+                transfer: true,
+                ..
+            }) => Some(*local),
+            Self::Value(_)
+            | Self::String(_)
+            | Self::Mixed(_)
+            | Self::NullableScalar(_)
+            | Self::NullableString(_)
+            | Self::NullableMixed(_)
+            | Self::Class(_)
+            | Self::NullableClass(_)
+            | Self::Collection(_) => None,
+        }
+    }
+
     pub const fn mixed_ownership(&self) -> MixedOwnership {
         match self {
             Self::Mixed(value) => value.ownership(),
@@ -633,7 +689,14 @@ impl ClassExpression {
                 return_borrow: None,
                 ..
             } => Some(*class),
-            Self::Local { .. }
+            Self::Local {
+                class,
+                transfer: true,
+                ..
+            } => Some(*class),
+            Self::Local {
+                transfer: false, ..
+            }
             | Self::Property { .. }
             | Self::NullableLocalAssumeNonNull { .. }
             | Self::Coalesce { .. }
@@ -963,6 +1026,11 @@ impl NullableClassExpression {
     pub const fn owned_temporary_class(&self) -> Option<ClassId> {
         match self {
             Self::Class(value) => value.owned_temporary_class(),
+            Self::Local {
+                class,
+                transfer: true,
+                ..
+            } => Some(*class),
             Self::Call {
                 class,
                 return_borrow: None,
@@ -974,7 +1042,9 @@ impl NullableClassExpression {
                 ..
             } => Some(*class),
             Self::Null(_)
-            | Self::Local { .. }
+            | Self::Local {
+                transfer: false, ..
+            }
             | Self::Property { .. }
             | Self::Call {
                 return_borrow: Some(_),
@@ -1271,7 +1341,8 @@ fn mixed_class_temporary_capacity(value: &MixedExpression) -> usize {
             args.iter().map(rvalue_class_temporary_capacity).sum()
         }
         MixedExpression::CollectionIndex { index, .. } => rvalue_class_temporary_capacity(index),
-        MixedExpression::Local { .. } | MixedExpression::Property { .. } => 0,
+        MixedExpression::Local { transfer, .. } => usize::from(*transfer),
+        MixedExpression::Property { .. } => 0,
     }
 }
 
@@ -1285,16 +1356,15 @@ fn nullable_mixed_class_temporary_capacity(value: &NullableMixedExpression) -> u
             nullable_mixed_class_temporary_capacity(left)
                 + nullable_mixed_class_temporary_capacity(right)
         }
-        NullableMixedExpression::Null
-        | NullableMixedExpression::Local { .. }
-        | NullableMixedExpression::Property { .. } => 0,
+        NullableMixedExpression::Local { transfer, .. } => usize::from(*transfer),
+        NullableMixedExpression::Null | NullableMixedExpression::Property { .. } => 0,
     }
 }
 
 fn collection_class_temporary_capacity(value: &CollectionExpression) -> usize {
     match value {
-        CollectionExpression::Local { .. }
-        | CollectionExpression::SetFrom { .. }
+        CollectionExpression::Local { transfer, .. } => usize::from(*transfer),
+        CollectionExpression::SetFrom { .. }
         | CollectionExpression::FromBytes { .. }
         | CollectionExpression::BytesFromArray { .. }
         | CollectionExpression::ReadStdinBytes { .. } => 0,

@@ -727,15 +727,25 @@ fn flush_deferred_class_temporary_drops(
 
 fn emit_deferred_class_temporary_drops(
     builder: &mut FunctionBuilder,
-    drops: &[(StackSlot, crate::class_layout::ClassId)],
+    drops: &[(StackSlot, DeferredOwnedTemporary)],
     resources: &mut LoweringResources<'_, '_>,
 ) -> Result<(), BackendError> {
     let pointer = resources.module.target_config().pointer_type();
-    for (slot, class) in drops.iter().rev() {
+    for (slot, temporary) in drops.iter().rev() {
         let value = builder.ins().stack_load(pointer, *slot, 0);
         let zero = builder.ins().iconst(pointer, 0);
         builder.ins().stack_store(zero, *slot, 0);
-        lower_drop_class_value_checked(builder, value, *class, resources)?;
+        match temporary {
+            DeferredOwnedTemporary::Class(class) => {
+                lower_drop_class_value_checked(builder, value, *class, resources)?;
+            }
+            DeferredOwnedTemporary::Collection(collection) => {
+                lower_drop_collection_value(builder, value, *collection, resources)?;
+            }
+            DeferredOwnedTemporary::Mixed(ownership) => {
+                lower_cleanup_mixed_temporary(builder, value, *ownership, resources)?;
+            }
+        }
     }
     Ok(())
 }
@@ -755,7 +765,51 @@ fn defer_or_drop_class_temporary(
         .ok_or_else(|| malformed_mir("class temporary stack-slot capacity was exhausted"))?;
     resources.deferred_class_temporary_slot_cursor += 1;
     builder.ins().stack_store(value, slot, 0);
-    resources.deferred_class_temporary_drops.push((slot, class));
+    resources
+        .deferred_class_temporary_drops
+        .push((slot, DeferredOwnedTemporary::Class(class)));
+    Ok(())
+}
+
+fn defer_or_drop_collection_temporary(
+    builder: &mut FunctionBuilder,
+    value: Value,
+    collection: mir::CollectionTypeId,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<(), BackendError> {
+    if !resources.defer_class_temporary_drops {
+        return lower_drop_collection_value(builder, value, collection, resources);
+    }
+    let slot = *resources
+        .deferred_class_temporary_slots
+        .get(resources.deferred_class_temporary_slot_cursor)
+        .ok_or_else(|| malformed_mir("owned temporary stack-slot capacity was exhausted"))?;
+    resources.deferred_class_temporary_slot_cursor += 1;
+    builder.ins().stack_store(value, slot, 0);
+    resources
+        .deferred_class_temporary_drops
+        .push((slot, DeferredOwnedTemporary::Collection(collection)));
+    Ok(())
+}
+
+fn defer_or_cleanup_mixed_temporary(
+    builder: &mut FunctionBuilder,
+    value: Value,
+    ownership: mir::MixedOwnership,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<(), BackendError> {
+    if !resources.defer_class_temporary_drops {
+        return lower_cleanup_mixed_temporary(builder, value, ownership, resources);
+    }
+    let slot = *resources
+        .deferred_class_temporary_slots
+        .get(resources.deferred_class_temporary_slot_cursor)
+        .ok_or_else(|| malformed_mir("owned temporary stack-slot capacity was exhausted"))?;
+    resources.deferred_class_temporary_slot_cursor += 1;
+    builder.ins().stack_store(value, slot, 0);
+    resources
+        .deferred_class_temporary_drops
+        .push((slot, DeferredOwnedTemporary::Mixed(ownership)));
     Ok(())
 }
 
@@ -874,7 +928,14 @@ struct LoweringResources<'module, 'program> {
     function_id: mir::FunctionId,
     current_frame: Value,
     defer_class_temporary_drops: bool,
-    deferred_class_temporary_drops: Vec<(StackSlot, crate::class_layout::ClassId)>,
+    deferred_class_temporary_drops: Vec<(StackSlot, DeferredOwnedTemporary)>,
+}
+
+#[derive(Clone, Copy)]
+enum DeferredOwnedTemporary {
+    Class(crate::class_layout::ClassId),
+    Collection(mir::CollectionTypeId),
+    Mixed(mir::MixedOwnership),
 }
 
 impl<'module, 'program> LoweringResources<'module, 'program> {
@@ -2630,6 +2691,9 @@ fn lower_class_expression(
 
                 let constructor_definition = function_in(resources.program, *constructor)?;
                 for (index, value, ownership) in &lowered_args.temporary_mixed {
+                    if args[*index].transferred_owned_local().is_some() {
+                        continue;
+                    }
                     let promoted = properties.iter().any(|property| {
                         matches!(
                             property.source,
@@ -2651,10 +2715,8 @@ fn lower_class_expression(
                         lower_cleanup_mixed_temporary(builder, *value, *ownership, resources)?;
                     }
                 }
-                for (index, argument) in args.iter().enumerate() {
-                    let Some(class) = argument.owned_temporary_class() else {
-                        continue;
-                    };
+                for index in ordered_owned_argument_indices(args) {
+                    let argument = &args[index];
                     let promoted = properties.iter().any(|property| {
                         matches!(
                             property.source,
@@ -2674,7 +2736,20 @@ fn lower_class_expression(
                             })?;
                     if !promoted && !local_in(constructor_definition, parameter)?.owned {
                         let value = lowered_args.arguments[index].single()?;
-                        defer_or_drop_class_temporary(builder, value, class, resources)?;
+                        if let Some(class) = argument.owned_temporary_class() {
+                            defer_or_drop_class_temporary(builder, value, class, resources)?;
+                        } else if let Some(collection) = argument.owned_temporary_collection() {
+                            defer_or_drop_collection_temporary(
+                                builder, value, collection, resources,
+                            )?;
+                        } else if argument.mixed_ownership().has_shell() {
+                            defer_or_cleanup_mixed_temporary(
+                                builder,
+                                value,
+                                argument.mixed_ownership(),
+                                resources,
+                            )?;
+                        }
                     }
                 }
             }
@@ -5064,6 +5139,32 @@ struct LoweredCallArgs {
     temporary_mixed: Vec<(usize, Value, mir::MixedOwnership)>,
 }
 
+fn ordered_owned_argument_indices(args: &[mir::Rvalue]) -> Vec<usize> {
+    let mut indices = args
+        .iter()
+        .enumerate()
+        .filter_map(|(index, argument)| {
+            (argument.owned_temporary_class().is_some()
+                || argument.owned_temporary_collection().is_some()
+                || (argument.mixed_ownership().has_shell()
+                    && argument.transferred_owned_local().is_some()))
+            .then_some(index)
+        })
+        .collect::<Vec<_>>();
+    if indices
+        .iter()
+        .all(|index| args[*index].transferred_owned_local().is_some())
+    {
+        indices.sort_by_key(|index| {
+            args[*index]
+                .transferred_owned_local()
+                .expect("all reordered owned temporaries have source-order locals")
+                .0
+        });
+    }
+    indices
+}
+
 fn lower_call_args(
     builder: &mut FunctionBuilder,
     args: &[mir::Rvalue],
@@ -5132,6 +5233,9 @@ fn lower_function_call(
         release_string(builder, string, resources)?;
     }
     for (index, value, ownership) in &lowered.temporary_mixed {
+        if args[*index].transferred_owned_local().is_some() {
+            continue;
+        }
         let parameter = *callee_definition.params.get(*index).ok_or_else(|| {
             malformed_mir(format!(
                 "function{} is missing parameter {index}",
@@ -5142,10 +5246,8 @@ fn lower_function_call(
             lower_cleanup_mixed_temporary(builder, *value, *ownership, resources)?;
         }
     }
-    for (index, argument) in args.iter().enumerate() {
-        let Some(class) = argument.owned_temporary_class() else {
-            continue;
-        };
+    for index in ordered_owned_argument_indices(args) {
+        let argument = &args[index];
         let parameter = *callee_definition.params.get(index).ok_or_else(|| {
             malformed_mir(format!(
                 "function{} is missing parameter {index}",
@@ -5154,7 +5256,18 @@ fn lower_function_call(
         })?;
         if !local_in(callee_definition, parameter)?.owned {
             let value = lowered.arguments[index].single()?;
-            defer_or_drop_class_temporary(builder, value, class, resources)?;
+            if let Some(class) = argument.owned_temporary_class() {
+                defer_or_drop_class_temporary(builder, value, class, resources)?;
+            } else if let Some(collection) = argument.owned_temporary_collection() {
+                defer_or_drop_collection_temporary(builder, value, collection, resources)?;
+            } else if argument.mixed_ownership().has_shell() {
+                defer_or_cleanup_mixed_temporary(
+                    builder,
+                    value,
+                    argument.mixed_ownership(),
+                    resources,
+                )?;
+            }
         }
     }
     Ok(result)
@@ -5196,6 +5309,9 @@ fn lower_method_call_with_receiver(
         release_string(builder, string, resources)?;
     }
     for (index, value, ownership) in &lowered.temporary_mixed {
+        if args[*index].transferred_owned_local().is_some() {
+            continue;
+        }
         let parameter = *definition.params.get(index + 1).ok_or_else(|| {
             malformed_mir(format!(
                 "method function{} is missing parameter {}",
@@ -5207,10 +5323,8 @@ fn lower_method_call_with_receiver(
             lower_cleanup_mixed_temporary(builder, *value, *ownership, resources)?;
         }
     }
-    for (index, argument) in args.iter().enumerate() {
-        let Some(class) = argument.owned_temporary_class() else {
-            continue;
-        };
+    for index in ordered_owned_argument_indices(args) {
+        let argument = &args[index];
         let parameter = *definition.params.get(index + 1).ok_or_else(|| {
             malformed_mir(format!(
                 "method function{} is missing parameter {}",
@@ -5219,12 +5333,19 @@ fn lower_method_call_with_receiver(
             ))
         })?;
         if !local_in(definition, parameter)?.owned {
-            defer_or_drop_class_temporary(
-                builder,
-                lowered.arguments[index].single()?,
-                class,
-                resources,
-            )?;
+            let value = lowered.arguments[index].single()?;
+            if let Some(class) = argument.owned_temporary_class() {
+                defer_or_drop_class_temporary(builder, value, class, resources)?;
+            } else if let Some(collection) = argument.owned_temporary_collection() {
+                defer_or_drop_collection_temporary(builder, value, collection, resources)?;
+            } else if argument.mixed_ownership().has_shell() {
+                defer_or_cleanup_mixed_temporary(
+                    builder,
+                    value,
+                    argument.mixed_ownership(),
+                    resources,
+                )?;
+            }
         }
     }
     Ok(result)

@@ -574,7 +574,14 @@ struct FunctionLowerer<'ctx, 'program> {
     defer_class_temporary_drops: bool,
     deferred_class_temporary_slots: Vec<PointerValue<'ctx>>,
     deferred_class_temporary_slot_cursor: usize,
-    deferred_class_temporary_drops: Vec<(PointerValue<'ctx>, crate::class_layout::ClassId)>,
+    deferred_class_temporary_drops: Vec<(PointerValue<'ctx>, DeferredOwnedTemporary)>,
+}
+
+#[derive(Clone, Copy)]
+enum DeferredOwnedTemporary {
+    Class(crate::class_layout::ClassId),
+    Collection(mir::CollectionTypeId),
+    Mixed(mir::MixedOwnership),
 }
 
 impl<'ctx> FunctionLowerer<'ctx, '_> {
@@ -2417,6 +2424,9 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
 
                     let constructor_definition = function_in(self.program, *constructor)?;
                     for (index, value, ownership) in &temporary_mixed {
+                        if args[*index].transferred_owned_local().is_some() {
+                            continue;
+                        }
                         let promoted = properties.iter().any(|property| {
                             matches!(
                                 property.source,
@@ -2438,10 +2448,8 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                             self.cleanup_mixed_temporary(*value, *ownership)?;
                         }
                     }
-                    for (index, argument) in args.iter().enumerate() {
-                        let Some(class) = argument.owned_temporary_class() else {
-                            continue;
-                        };
+                    for index in ordered_owned_argument_indices(args) {
+                        let argument = &args[index];
                         let promoted = properties.iter().any(|property| {
                             matches!(
                                 property.source,
@@ -2461,7 +2469,16 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                                 })?;
                         if !promoted && !local_in(constructor_definition, parameter)?.owned {
                             let value = lowered_args[index].into_pointer_value();
-                            self.defer_or_drop_class_temporary(value, class)?;
+                            if let Some(class) = argument.owned_temporary_class() {
+                                self.defer_or_drop_class_temporary(value, class)?;
+                            } else if let Some(collection) = argument.owned_temporary_collection() {
+                                self.defer_or_drop_collection_temporary(value, collection)?;
+                            } else if argument.mixed_ownership().has_shell() {
+                                self.defer_or_cleanup_mixed_temporary(
+                                    value,
+                                    argument.mixed_ownership(),
+                                )?;
+                            }
                         }
                     }
                 }
@@ -3891,17 +3908,27 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
 
     fn emit_deferred_class_temporary_drops(
         &mut self,
-        drops: &[(PointerValue<'ctx>, crate::class_layout::ClassId)],
+        drops: &[(PointerValue<'ctx>, DeferredOwnedTemporary)],
     ) -> Result<(), BackendError> {
         let pointer = self.context.ptr_type(AddressSpace::default());
-        for (slot, class) in drops.iter().rev() {
+        for (slot, temporary) in drops.iter().rev() {
             let value = build(
                 self.builder
                     .build_load(pointer, *slot, "class.temporary.drop"),
             )?
             .into_pointer_value();
             build(self.builder.build_store(*slot, pointer.const_null()))?;
-            self.drop_class_value_checked(value, *class)?;
+            match temporary {
+                DeferredOwnedTemporary::Class(class) => {
+                    self.drop_class_value_checked(value, *class)?;
+                }
+                DeferredOwnedTemporary::Collection(collection) => {
+                    self.drop_collection_value(value, *collection)?;
+                }
+                DeferredOwnedTemporary::Mixed(ownership) => {
+                    self.cleanup_mixed_temporary(value, *ownership)?;
+                }
+            }
         }
         Ok(())
     }
@@ -3920,7 +3947,46 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             .ok_or_else(|| malformed_mir("class temporary stack-slot capacity was exhausted"))?;
         self.deferred_class_temporary_slot_cursor += 1;
         build(self.builder.build_store(slot, value))?;
-        self.deferred_class_temporary_drops.push((slot, class));
+        self.deferred_class_temporary_drops
+            .push((slot, DeferredOwnedTemporary::Class(class)));
+        Ok(())
+    }
+
+    fn defer_or_drop_collection_temporary(
+        &mut self,
+        value: PointerValue<'ctx>,
+        collection: mir::CollectionTypeId,
+    ) -> Result<(), BackendError> {
+        if !self.defer_class_temporary_drops {
+            return self.drop_collection_value(value, collection);
+        }
+        let slot = *self
+            .deferred_class_temporary_slots
+            .get(self.deferred_class_temporary_slot_cursor)
+            .ok_or_else(|| malformed_mir("owned temporary stack-slot capacity was exhausted"))?;
+        self.deferred_class_temporary_slot_cursor += 1;
+        build(self.builder.build_store(slot, value))?;
+        self.deferred_class_temporary_drops
+            .push((slot, DeferredOwnedTemporary::Collection(collection)));
+        Ok(())
+    }
+
+    fn defer_or_cleanup_mixed_temporary(
+        &mut self,
+        value: PointerValue<'ctx>,
+        ownership: mir::MixedOwnership,
+    ) -> Result<(), BackendError> {
+        if !self.defer_class_temporary_drops {
+            return self.cleanup_mixed_temporary(value, ownership);
+        }
+        let slot = *self
+            .deferred_class_temporary_slots
+            .get(self.deferred_class_temporary_slot_cursor)
+            .ok_or_else(|| malformed_mir("owned temporary stack-slot capacity was exhausted"))?;
+        self.deferred_class_temporary_slot_cursor += 1;
+        build(self.builder.build_store(slot, value))?;
+        self.deferred_class_temporary_drops
+            .push((slot, DeferredOwnedTemporary::Mixed(ownership)));
         Ok(())
     }
 
@@ -5305,6 +5371,9 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         }
         let callee_definition = function_in(self.program, function)?;
         for (index, value, ownership) in &temporary_mixed {
+            if args[*index].transferred_owned_local().is_some() {
+                continue;
+            }
             let parameter_index = *index + usize::from(receiver.is_some());
             let parameter = *callee_definition
                 .params
@@ -5319,10 +5388,8 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 self.cleanup_mixed_temporary(*value, *ownership)?;
             }
         }
-        for (index, argument) in args.iter().enumerate() {
-            let Some(class) = argument.owned_temporary_class() else {
-                continue;
-            };
+        for index in ordered_owned_argument_indices(args) {
+            let argument = &args[index];
             let parameter_index = index + usize::from(receiver.is_some());
             let parameter = *callee_definition
                 .params
@@ -5335,11 +5402,43 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 })?;
             if !local_in(callee_definition, parameter)?.owned {
                 let value = lowered_args[index].into_pointer_value();
-                self.defer_or_drop_class_temporary(value, class)?;
+                if let Some(class) = argument.owned_temporary_class() {
+                    self.defer_or_drop_class_temporary(value, class)?;
+                } else if let Some(collection) = argument.owned_temporary_collection() {
+                    self.defer_or_drop_collection_temporary(value, collection)?;
+                } else if argument.mixed_ownership().has_shell() {
+                    self.defer_or_cleanup_mixed_temporary(value, argument.mixed_ownership())?;
+                }
             }
         }
         Ok(result)
     }
+}
+
+fn ordered_owned_argument_indices(args: &[mir::Rvalue]) -> Vec<usize> {
+    let mut indices = args
+        .iter()
+        .enumerate()
+        .filter_map(|(index, argument)| {
+            (argument.owned_temporary_class().is_some()
+                || argument.owned_temporary_collection().is_some()
+                || (argument.mixed_ownership().has_shell()
+                    && argument.transferred_owned_local().is_some()))
+            .then_some(index)
+        })
+        .collect::<Vec<_>>();
+    if indices
+        .iter()
+        .all(|index| args[*index].transferred_owned_local().is_some())
+    {
+        indices.sort_by_key(|index| {
+            args[*index]
+                .transferred_owned_local()
+                .expect("all reordered owned temporaries have source-order locals")
+                .0
+        });
+    }
+    indices
 }
 
 fn apply_call_abi_attributes(

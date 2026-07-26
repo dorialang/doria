@@ -1,0 +1,95 @@
+make class-borrow
+mark class-borrow
+borrow class-borrow 1
+drop class-borrow
+after class borrow
+make class-take
+mark class-take
+take class-take 1
+drop class-take
+after class take
+make pair-first
+make pair-second
+borrow pair
+drop pair-second
+drop pair-first
+after pair borrow
+make list-borrow
+mark list-borrow
+borrow list 1 1
+drop list-borrow
+after list borrow
+make list-take
+mark list-take
+take list 1 1
+drop list-take
+after list take
+make list-pair-first
+make list-pair-second
+borrow list pair
+drop list-pair-second
+drop list-pair-first
+after list pair borrow
+make bytes-borrow
+mark bytes-borrow
+borrow bytes 3 1
+after bytes borrow
+make bytes-take
+mark bytes-take
+take bytes 3 1
+after bytes take
+make mixed-borrow
+mark mixed-borrow
+borrow mixed 1
+drop mixed-borrow
+after mixed borrow
+make mixed-take
+mark mixed-take
+take mixed 1
+drop mixed-take
+after mixed take
+make mixed-pair-first
+make mixed-pair-second
+borrow mixed pair
+drop mixed-pair-second
+drop mixed-pair-first
+after mixed pair borrow
+make kinds-first
+make kinds-second
+make kinds-third
+borrow kinds
+drop kinds-third
+drop kinds-second
+drop kinds-first
+after kinds borrow
+make nullable-class-borrow
+mark nullable-class-borrow
+borrow nullable-class-borrow 1
+drop nullable-class-borrow
+after nullable class borrow
+make nullable-mixed-borrow
+mark nullable-mixed-borrow
+borrow nullable mixed 1
+drop nullable-mixed-borrow
+after nullable mixed borrow
+make method-borrow
+mark method-borrow
+method borrow method-borrow 1
+drop method-borrow
+after method borrow
+make method-take
+mark method-take
+method take method-take 1
+drop method-take
+after method take
+make static-borrow
+mark static-borrow
+static borrow static-borrow 1
+drop static-borrow
+after static borrow
+make constructor-take
+mark constructor-take
+construct 1
+after constructor
+drop envelope
+drop constructor-take
