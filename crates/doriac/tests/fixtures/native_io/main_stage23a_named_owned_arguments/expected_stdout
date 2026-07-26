@@ -30,6 +30,11 @@ borrow list pair
 drop list-pair-second
 drop list-pair-first
 after list pair borrow
+make literal-pair-second
+borrow list pair
+drop literal-pair-second
+drop literal-pair-first
+after literal list pair borrow
 make bytes-borrow
 mark bytes-borrow
 borrow bytes 3 1

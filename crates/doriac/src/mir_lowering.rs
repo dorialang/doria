@@ -4637,18 +4637,21 @@ fn lower_call_args_with_ownership(
             )]);
         }
 
-        // When the call reorders, each argument whose evaluation is observable
-        // is evaluated in source order into its own temporary here, and the call
-        // vector below reads those temporaries in parameter order. Evaluation
-        // order therefore stays the written order (0098) while the callee still
-        // receives a plain parameter-ordered vector. Pure arguments need no
-        // temporary: moving them is unobservable.
-        lowered_args[param_index] =
-            Some(if in_order || !argument_evaluation_is_observable(value) {
+        // When the call reorders, every observable expression and every owned
+        // temporary is evaluated in source order into a local here. Ownership is
+        // checked from the lowered MIR rather than an expression-shape list:
+        // constructing even a syntactically-pure collection affects destruction
+        // order. The call vector then reads those locals in parameter order.
+        let owns_temporary = lowered.owned_temporary_class().is_some()
+            || lowered.owned_temporary_collection().is_some()
+            || lowered.mixed_ownership().has_shell();
+        lowered_args[param_index] = Some(
+            if in_order || (!argument_evaluation_is_observable(value) && !owns_temporary) {
                 lowered
             } else {
                 hoist_argument_temporary(lowered, expected, context)
-            });
+            },
+        );
     }
 
     splice_omitted_parameter_defaults(name, &bound, &signature, span, &mut lowered_args)?;
@@ -6510,6 +6513,16 @@ fn materialize_nested_collection_places(
         } => {
             for arg in args {
                 materialize_nested_collection_places(&arg.value, false, context)?;
+            }
+            if class_name == "Set" && method == "from" {
+                if let Some(source) = args.first() {
+                    if !matches!(
+                        unparenthesized_place(&source.value),
+                        hir::Expr::Array { .. }
+                    ) {
+                        materialize_collection_place(&source.value, false, context)?;
+                    }
+                }
             }
             if class_name == "Bytes" && method == "fromArray" {
                 if let Some(source) = args.first() {

@@ -6811,21 +6811,25 @@ impl<'program> Checker<'program> {
         }
 
         let local_constant = Self::eval_int_constant(count, scopes, IntegerType::Int64);
-        let evaluated_constant = matches!(local_constant, IntConstantEval::Unknown)
-            .then(|| {
-                crate::const_eval::evaluate_parameter_default(
-                    &self.const_evaluation,
-                    count,
-                    &TypeRef::named("int"),
-                    method_context.map(|context| context.class_name.as_str()),
-                )
-            })
-            .flatten();
+        let evaluated_constant = matches!(
+            local_constant,
+            IntConstantEval::Unknown | IntConstantEval::Invalid
+        )
+        .then(|| {
+            crate::const_eval::evaluate_parameter_default(
+                &self.const_evaluation,
+                count,
+                &TypeRef::named("int"),
+                method_context.map(|context| context.class_name.as_str()),
+            )
+        })
+        .flatten();
         let is_negative = match (local_constant, evaluated_constant) {
             (IntConstantEval::Known(value), _) => value.signed_value() < 0,
-            (IntConstantEval::Unknown, Some(crate::const_eval::ConstValue::Integer(value))) => {
-                value.signed_value() < 0
-            }
+            (
+                IntConstantEval::Unknown | IntConstantEval::Invalid,
+                Some(crate::const_eval::ConstValue::Integer(value)),
+            ) => value.signed_value() < 0,
             (IntConstantEval::Unknown | IntConstantEval::Invalid, _) => false,
         };
         if is_negative {

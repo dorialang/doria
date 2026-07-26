@@ -188,6 +188,12 @@ function main(): void
         first: makeTokens("list-pair-second"),
     );
     echo "after list pair borrow\n";
+    let $literalToken = new Token("literal-pair-first");
+    borrowTokenLists(
+        second: [$literalToken],
+        first: makeTokens("literal-pair-second"),
+    );
+    echo "after literal list pair borrow\n";
 
     borrowBytes(bytes: makeBytes("bytes-borrow"), marker: marker("bytes-borrow"));
     echo "after bytes borrow\n";

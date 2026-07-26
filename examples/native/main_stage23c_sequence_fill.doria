@@ -23,6 +23,7 @@ function main(): int
     List<int> $counts = [7; 3];
     let $defaulted = [9; 2];
     List<string> $words = [fillValue(); runtimeCount()];
+    Set<int> $unique = Set::from([11; 3]);
     inspectWords(["borrowed"; runtimeCount()]);
 
     writable bool[] $sieve = [true; runtimeCount()];
@@ -34,6 +35,7 @@ function main(): int
     echo "{$counts->count}:{$counts[2]}\n";
     echo "{$defaulted->count}:{$defaulted[0]}\n";
     echo "{$words->count}:{$words[0]}:{$words[2]}\n";
+    echo "{$unique->count}:{$unique->contains(11)}\n";
     echo "{$sieve->length}:{$sieve[0]}:{$sieve[1]}\n";
     return 0;
 }
