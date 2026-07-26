@@ -105,13 +105,12 @@ that.
 
 ## Sequencing
 
-Small, additive, and independent of Stage 23a/23b. Proposed as a focused
-collections slice (**Stage 23c**) after the benchmark correctness bugs land; exact
-placement is Andrew's call. Touches the parser (the `;` repeat form), HIR/MIR (a
-fill construction node), shared MIR validation, `doria-rt` (a sequence fill
-routine; `string` fill retains per slot), and the interpreter/Cranelift/LLVM
-lowering, with parity fixtures for `bool[]`/`int[]`/`List<bool>`/`string` fills
-across all three backends.
+Small, additive, and independent of Stage 23a/23b. Implemented as the focused
+collections slice **Stage 23c**, after the benchmark correctness bugs landed. It
+touches the parser (the `;` repeat form), HIR/MIR (a fill construction node),
+shared MIR validation, `doria-rt` (a sequence fill routine; `string` fill retains
+per slot), and the interpreter/Cranelift/LLVM lowering, with parity fixtures for
+`bool[]`/`int[]`/`List<bool>`/`string` fills across all three backends.
 
 ## Affected components
 

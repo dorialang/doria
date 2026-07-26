@@ -97,4 +97,5 @@ Hosted modules under the reserved `Doria\Std` namespace. Most are direction-only
 - The plan's Decision 0095 catalogue entry and Decision 0095's `Comparable<T>` consequence now include the typed comparison operand.
 - The integer conversion inventory no longer presents an untyped parameter as a Doria signature; decision 0042 remains authoritative for the accepted integer-expression operand contract.
 - The collection inventory now documents decision 0102's `[value; count]` sequence constructor and its v1.0 restrictions.
-- No compiler behavior or implemented standard-library surface changes; this file catalogues planned APIs.
+- Stage 23c implements the core-language sequence constructor described above;
+  the `Doria\Std\*` module inventory remains a catalogue of planned APIs.
