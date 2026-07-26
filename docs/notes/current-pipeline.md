@@ -30,7 +30,7 @@ Documentation role: working note. This file prevents duplicated in-flight work. 
 
 ## Next
 
-- Stage 23c: the `[value; count]` sequence fill literal, Decision 0102 — proposed in the decision-record list but not yet written into the plan's stage list.
+- Stage 23c: the `[value; count]` sequence fill literal, Decision 0102 — now in the plan stage list (§13) and the 0102 decision-record catalogue.
 - Stage 24: generic functions. Blocked on authoring: plan §4.5 states the direction (MIR monomorphization, `T implements A, B` constraints, inference from argument types, no turbofish) but marks the generics decision itself **unauthored**, and the parser rejects `function first<T>(...)` outright rather than accepting it under the two-clocks rule.
 
 ## Do not duplicate
