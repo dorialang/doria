@@ -87,9 +87,17 @@ pub struct FunctionDecl {
     pub is_static: bool,
     pub static_span: Option<Span>,
     pub name: String,
+    pub type_params: Vec<TypeParamDecl>,
     pub params: Vec<Param>,
     pub return_type: Option<TypeRef>,
     pub body: Block,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypeParamDecl {
+    pub name: String,
+    pub constraints: Vec<TypeRef>,
     pub span: Span,
 }
 

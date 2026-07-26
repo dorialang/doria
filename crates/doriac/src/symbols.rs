@@ -91,6 +91,7 @@ pub struct ParamInfo {
 
 #[derive(Debug, Clone)]
 pub struct FunctionInfo {
+    pub type_params: Vec<String>,
     pub params: Vec<ParamInfo>,
     pub return_ty: TypeId,
     pub return_borrow: Option<ReturnBorrow>,
@@ -102,6 +103,7 @@ pub struct MethodInfo {
     pub receiver_mode: Option<ReceiverMode>,
     pub return_borrow: Option<ReturnBorrow>,
     pub is_static: bool,
+    pub type_params: Vec<String>,
     pub params: Vec<ParamInfo>,
     pub return_ty: TypeId,
 }

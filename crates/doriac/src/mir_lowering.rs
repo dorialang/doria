@@ -4,7 +4,7 @@ use crate::class_layout::{compute_class_layout, ClassId, FieldType, PropertyId};
 use crate::diagnostics::{Diagnostic, DiagnosticResult};
 use crate::format_string::{self, FormatConversion, FormatPiece};
 use crate::numeric::{parse_decimal_magnitude, FloatType, FloatValue, IntegerType, IntegerValue};
-use crate::semantics::SemanticInfo;
+use crate::semantics::{CallableTarget, GenericArgument, SemanticInfo};
 use crate::source::Span;
 use crate::{hir, mir};
 
@@ -61,6 +61,25 @@ struct FunctionSignature {
     receiver_mode: Option<mir::ReceiverMode>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct CallableInstance {
+    declaration: usize,
+    arguments: Vec<GenericArgument>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct FunctionInstanceKey {
+    name: String,
+    arguments: Vec<GenericArgument>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct MethodInstanceKey {
+    class: ClassId,
+    name: String,
+    arguments: Vec<GenericArgument>,
+}
+
 #[derive(Clone, Copy)]
 struct CallableDecl<'a> {
     function: &'a hir::FunctionDecl,
@@ -71,6 +90,213 @@ struct CallableDecl<'a> {
 impl CallableDecl<'_> {
     fn is_top_level(self) -> bool {
         self.class.is_none()
+    }
+}
+
+fn collect_callable_instances(
+    program: &hir::Program,
+    declarations: &[CallableDecl<'_>],
+    class_ids: &HashMap<String, ClassId>,
+    semantic_info: &SemanticInfo,
+) -> DiagnosticResult<Vec<CallableInstance>> {
+    let functions = declarations
+        .iter()
+        .enumerate()
+        .filter(|(_, declaration)| declaration.is_top_level())
+        .map(|(index, declaration)| (declaration.function.name.clone(), index))
+        .collect::<HashMap<_, _>>();
+    let methods = declarations
+        .iter()
+        .enumerate()
+        .filter_map(|(index, declaration)| {
+            declaration
+                .class
+                .map(|class| ((class, declaration.function.name.clone()), index))
+        })
+        .collect::<HashMap<_, _>>();
+
+    let mut instances = Vec::new();
+    let mut ids = HashMap::new();
+    for (declaration, callable) in declarations.iter().enumerate() {
+        if callable.function.type_params.is_empty() {
+            let instance = CallableInstance {
+                declaration,
+                arguments: Vec::new(),
+            };
+            ids.insert(instance.clone(), instances.len());
+            instances.push(instance);
+        }
+    }
+
+    let mut calls = semantic_info
+        .generic_call_specializations
+        .iter()
+        .collect::<Vec<_>>();
+    calls.sort_by_key(|(span, _)| **span);
+
+    let mut cursor = 0;
+    while cursor < instances.len() {
+        let instance = instances[cursor].clone();
+        cursor += 1;
+        let callable = declarations[instance.declaration];
+        let substitutions = type_substitutions(callable.function, &instance.arguments)?;
+        for (span, specialization) in &calls {
+            let in_function =
+                span.0 >= callable.function.span.start && span.1 <= callable.function.span.end;
+            let in_property_initializer = callable.class.is_some_and(|class| {
+                callable.function.name == "__construct"
+                    && program.items.iter().any(|item| {
+                        let hir::Item::Class(declaration) = item else {
+                            return false;
+                        };
+                        class_ids.get(&declaration.name) == Some(&class)
+                            && declaration.members.iter().any(|member| {
+                                matches!(
+                                    member,
+                                    hir::ClassMember::Property(hir::PropertyDecl {
+                                        is_static: false,
+                                        initializer: Some(initializer),
+                                        ..
+                                    }) if span.0 >= initializer.span().start
+                                        && span.1 <= initializer.span().end
+                                )
+                            })
+                    })
+            });
+            if !in_function && !in_property_initializer {
+                continue;
+            }
+            let Some(target) = semantic_info.call_targets.get(span) else {
+                continue;
+            };
+            let target_declaration = match target {
+                CallableTarget::Function { name } => functions.get(name).copied(),
+                CallableTarget::Method {
+                    class_name,
+                    method_name,
+                } => class_ids
+                    .get(class_name)
+                    .and_then(|class| methods.get(&(*class, method_name.clone())))
+                    .copied(),
+            }
+            .ok_or_else(|| {
+                vec![Diagnostic::new(
+                    "I2401",
+                    "checked generic call has no callable declaration",
+                    Span::new(span.0, span.1),
+                )]
+            })?;
+            let arguments = specialization
+                .arguments
+                .iter()
+                .map(|argument| substitute_generic_argument(argument, &substitutions))
+                .collect::<Vec<_>>();
+            if arguments.iter().any(generic_argument_is_symbolic) {
+                return Err(vec![Diagnostic::new(
+                    "I2401",
+                    "generic specialization retained an unresolved type parameter",
+                    Span::new(span.0, span.1),
+                )]);
+            }
+            let target = CallableInstance {
+                declaration: target_declaration,
+                arguments,
+            };
+            if !ids.contains_key(&target) {
+                ids.insert(target.clone(), instances.len());
+                instances.push(target);
+            }
+        }
+    }
+
+    Ok(instances)
+}
+
+fn type_substitutions(
+    function: &hir::FunctionDecl,
+    arguments: &[GenericArgument],
+) -> DiagnosticResult<HashMap<String, crate::types::ResolvedType>> {
+    if function.type_params.len() != arguments.len() {
+        return Err(vec![Diagnostic::new(
+            "I2401",
+            format!(
+                "generic function `{}` expected {} specialization arguments but received {}",
+                function.name,
+                function.type_params.len(),
+                arguments.len()
+            ),
+            function.span,
+        )]);
+    }
+    Ok(function
+        .type_params
+        .iter()
+        .zip(arguments)
+        .map(|(parameter, argument)| {
+            let GenericArgument::Type(ty) = argument;
+            (parameter.name.clone(), ty.clone())
+        })
+        .collect())
+}
+
+fn substitute_generic_argument(
+    argument: &GenericArgument,
+    substitutions: &HashMap<String, crate::types::ResolvedType>,
+) -> GenericArgument {
+    match argument {
+        GenericArgument::Type(ty) => {
+            GenericArgument::Type(substitute_resolved_type(ty, substitutions))
+        }
+    }
+}
+
+fn generic_argument_is_symbolic(argument: &GenericArgument) -> bool {
+    let GenericArgument::Type(ty) = argument;
+    resolved_type_is_symbolic(ty)
+}
+
+fn resolved_type_is_symbolic(ty: &crate::types::ResolvedType) -> bool {
+    use crate::types::ResolvedType;
+    match ty {
+        ResolvedType::TypeParameter(_) => true,
+        ResolvedType::Nullable(inner)
+        | ResolvedType::TypedArray(inner)
+        | ResolvedType::List(inner)
+        | ResolvedType::Set(inner) => resolved_type_is_symbolic(inner),
+        ResolvedType::Dictionary(key, value) => {
+            resolved_type_is_symbolic(key) || resolved_type_is_symbolic(value)
+        }
+        _ => false,
+    }
+}
+
+fn substitute_resolved_type(
+    ty: &crate::types::ResolvedType,
+    substitutions: &HashMap<String, crate::types::ResolvedType>,
+) -> crate::types::ResolvedType {
+    use crate::types::ResolvedType;
+    match ty {
+        ResolvedType::TypeParameter(name) => substitutions
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| ty.clone()),
+        ResolvedType::Nullable(inner) => {
+            ResolvedType::Nullable(Box::new(substitute_resolved_type(inner, substitutions)))
+        }
+        ResolvedType::TypedArray(inner) => {
+            ResolvedType::TypedArray(Box::new(substitute_resolved_type(inner, substitutions)))
+        }
+        ResolvedType::List(inner) => {
+            ResolvedType::List(Box::new(substitute_resolved_type(inner, substitutions)))
+        }
+        ResolvedType::Dictionary(key, value) => ResolvedType::Dictionary(
+            Box::new(substitute_resolved_type(key, substitutions)),
+            Box::new(substitute_resolved_type(value, substitutions)),
+        ),
+        ResolvedType::Set(inner) => {
+            ResolvedType::Set(Box::new(substitute_resolved_type(inner, substitutions)))
+        }
+        _ => ty.clone(),
     }
 }
 
@@ -244,18 +470,31 @@ pub fn lower_program(program: &hir::Program) -> DiagnosticResult<mir::Program> {
         )]);
     }
 
+    let instances =
+        collect_callable_instances(program, &declarations, &class_ids, &program.semantic_info)?;
     let mut signatures = HashMap::new();
+    let mut method_signatures = HashMap::new();
     let mut callable_signatures = Vec::new();
-    for (index, declaration) in declarations.iter().enumerate() {
+    let mut instance_substitutions = Vec::new();
+    for (index, instance) in instances.iter().enumerate() {
+        let declaration = declarations[instance.declaration];
         let function = declaration.function;
-        if declaration.is_top_level() && signatures.contains_key(&function.name) {
-            return Err(vec![unsupported(
-                function.span,
-                format!(
-                    "duplicate top-level function `{}` cannot be compiled",
-                    function.name
-                ),
-            )]);
+        let substitutions = type_substitutions(function, &instance.arguments)?;
+        intern_block_collection_types(
+            &function.body,
+            &class_ids,
+            &mut collection_registry,
+            &substitutions,
+        );
+        for (span, ty) in &program.semantic_info.expression_types {
+            if span.0 >= function.span.start && span.1 <= function.span.end {
+                let specialized = substitute_resolved_type(ty, &substitutions);
+                let _ = intern_resolved_collection_types(
+                    &specialized,
+                    &class_ids,
+                    &mut collection_registry,
+                );
+            }
         }
         let mut signature = collect_function_signature(
             function,
@@ -263,8 +502,11 @@ pub fn lower_program(program: &hir::Program) -> DiagnosticResult<mir::Program> {
             &class_ids,
             &program.semantic_info,
             &mut collection_registry,
-            matches!(function.name.as_str(), "__construct" | "__destruct"),
-            declaration.is_top_level() && function.name == "main",
+            &substitutions,
+            SignatureOptions {
+                lifecycle: matches!(function.name.as_str(), "__construct" | "__destruct"),
+                is_entry: declaration.is_top_level() && function.name == "main",
+            },
         )?;
         signature.method_class = declaration.class;
         signature.receiver_mode = declaration.receiver.map(|_| {
@@ -275,31 +517,44 @@ pub fn lower_program(program: &hir::Program) -> DiagnosticResult<mir::Program> {
             }
         });
         if declaration.is_top_level() {
-            signatures.insert(function.name.clone(), signature.clone());
+            signatures.insert(
+                FunctionInstanceKey {
+                    name: function.name.clone(),
+                    arguments: instance.arguments.clone(),
+                },
+                signature.clone(),
+            );
+        } else if let Some(class) = declaration.class {
+            method_signatures.insert(
+                MethodInstanceKey {
+                    class,
+                    name: function.name.clone(),
+                    arguments: instance.arguments.clone(),
+                },
+                signature.clone(),
+            );
         }
         callable_signatures.push(signature);
+        instance_substitutions.push(substitutions);
     }
-    let method_signatures = callable_signatures_by_method(&declarations, &callable_signatures);
 
     for ty in program.semantic_info.expression_types.values() {
-        intern_resolved_collection_types(ty, &class_ids, &mut collection_registry);
-    }
-    for declaration in &declarations {
-        intern_block_collection_types(
-            &declaration.function.body,
-            &class_ids,
-            &mut collection_registry,
-        );
+        let _ = intern_resolved_collection_types(ty, &class_ids, &mut collection_registry);
     }
 
     let entry = signatures
-        .get("main")
+        .get(&FunctionInstanceKey {
+            name: "main".to_string(),
+            arguments: Vec::new(),
+        })
         .expect("exactly one collected main signature")
         .id;
-    let functions = declarations
+    let functions = instances
         .iter()
         .zip(callable_signatures)
-        .map(|(declaration, signature)| {
+        .zip(instance_substitutions)
+        .map(|((instance, signature), substitutions)| {
+            let declaration = declarations[instance.declaration];
             let inputs = FunctionLoweringInputs {
                 signatures: &signatures,
                 method_signatures: &method_signatures,
@@ -308,6 +563,7 @@ pub fn lower_program(program: &hir::Program) -> DiagnosticResult<mir::Program> {
                 constructor_body_initializers: &constructor_body_initializers,
                 static_ids: &static_ids,
                 collection_registry: &collection_registry,
+                type_substitutions: &substitutions,
             };
             lower_function(
                 declaration.function,
@@ -357,8 +613,11 @@ pub fn lower_program(program: &hir::Program) -> DiagnosticResult<mir::Program> {
                 std::mem::size_of::<usize>() as u32,
             );
             let lifecycle = |name: &str| {
-                declarations.iter().enumerate().find_map(|(index, declaration)| {
-                    (declaration.receiver == Some(class.id) && declaration.function.name == name)
+                instances.iter().enumerate().find_map(|(index, instance)| {
+                    let declaration = declarations[instance.declaration];
+                    (instance.arguments.is_empty()
+                        && declaration.receiver == Some(class.id)
+                        && declaration.function.name == name)
                         .then_some(mir::FunctionId(index))
                 })
             };
@@ -430,7 +689,10 @@ fn intern_resolved_collection_types(
                 | mir::Type::NullableClass(_) => return None,
             }
         }
-        ResolvedType::Void | ResolvedType::Null | ResolvedType::Unsupported => return None,
+        ResolvedType::TypeParameter(_)
+        | ResolvedType::Void
+        | ResolvedType::Null
+        | ResolvedType::Unsupported => return None,
     };
     Some(ty)
 }
@@ -439,39 +701,62 @@ fn intern_block_collection_types(
     block: &hir::Block,
     class_ids: &HashMap<String, ClassId>,
     collections: &mut CollectionRegistry,
+    substitutions: &HashMap<String, crate::types::ResolvedType>,
 ) {
     for statement in &block.statements {
         match statement {
             hir::Stmt::VarDecl(declaration) => {
                 if let Some(ty) = &declaration.ty {
-                    let _ = mir_type_ref(ty, class_ids, collections);
+                    let _ =
+                        mir_type_ref_with_substitutions(ty, class_ids, collections, substitutions);
                 }
             }
             hir::Stmt::If(if_statement) => {
-                intern_if_collection_types(if_statement, class_ids, collections);
+                intern_if_collection_types(if_statement, class_ids, collections, substitutions);
             }
             hir::Stmt::While(while_statement) => {
-                intern_block_collection_types(&while_statement.body, class_ids, collections);
+                intern_block_collection_types(
+                    &while_statement.body,
+                    class_ids,
+                    collections,
+                    substitutions,
+                );
             }
             hir::Stmt::For(for_statement) => {
                 if let Some(hir::ForInitializer::VarDecl(declaration)) = &for_statement.initializer
                 {
                     if let Some(ty) = &declaration.ty {
-                        let _ = mir_type_ref(ty, class_ids, collections);
+                        let _ = mir_type_ref_with_substitutions(
+                            ty,
+                            class_ids,
+                            collections,
+                            substitutions,
+                        );
                     }
                 }
-                intern_block_collection_types(&for_statement.body, class_ids, collections);
+                intern_block_collection_types(
+                    &for_statement.body,
+                    class_ids,
+                    collections,
+                    substitutions,
+                );
             }
             hir::Stmt::Foreach(foreach) => {
                 if let Some(binding) = &foreach.key {
                     if let Some(ty) = &binding.ty {
-                        let _ = mir_type_ref(ty, class_ids, collections);
+                        let _ = mir_type_ref_with_substitutions(
+                            ty,
+                            class_ids,
+                            collections,
+                            substitutions,
+                        );
                     }
                 }
                 if let Some(ty) = &foreach.value.ty {
-                    let _ = mir_type_ref(ty, class_ids, collections);
+                    let _ =
+                        mir_type_ref_with_substitutions(ty, class_ids, collections, substitutions);
                 }
-                intern_block_collection_types(&foreach.body, class_ids, collections);
+                intern_block_collection_types(&foreach.body, class_ids, collections, substitutions);
             }
             hir::Stmt::Assignment(_)
             | hir::Stmt::Echo { .. }
@@ -488,15 +773,16 @@ fn intern_if_collection_types(
     statement: &hir::IfStmt,
     class_ids: &HashMap<String, ClassId>,
     collections: &mut CollectionRegistry,
+    substitutions: &HashMap<String, crate::types::ResolvedType>,
 ) {
-    intern_block_collection_types(&statement.then_block, class_ids, collections);
+    intern_block_collection_types(&statement.then_block, class_ids, collections, substitutions);
     if let Some(branch) = &statement.else_branch {
         match branch {
             hir::ElseBranch::If(statement) => {
-                intern_if_collection_types(statement, class_ids, collections);
+                intern_if_collection_types(statement, class_ids, collections, substitutions);
             }
             hir::ElseBranch::Block(block) => {
-                intern_block_collection_types(block, class_ids, collections);
+                intern_block_collection_types(block, class_ids, collections, substitutions);
             }
         }
     }
@@ -546,8 +832,8 @@ fn collect_function_signature(
     class_ids: &HashMap<String, ClassId>,
     semantic_info: &SemanticInfo,
     collection_registry: &mut CollectionRegistry,
-    lifecycle: bool,
-    is_entry: bool,
+    substitutions: &HashMap<String, crate::types::ResolvedType>,
+    options: SignatureOptions,
 ) -> DiagnosticResult<FunctionSignature> {
     let return_type = match function.return_type.as_ref() {
         Some(ty) if scalar_type_ref(ty).is_some() => mir::ReturnType::Value(mir::Type::Scalar(
@@ -558,9 +844,18 @@ fn collect_function_signature(
             mir::ReturnType::Value(mir::Type::NullableString)
         }
         Some(ty) if is_plain_type(ty, "void") => mir::ReturnType::Void,
-        Some(ty) if mir_type_ref(ty, class_ids, collection_registry).is_some() => {
+        Some(ty)
+            if mir_type_ref_with_substitutions(
+                ty,
+                class_ids,
+                collection_registry,
+                substitutions,
+            )
+            .is_some() =>
+        {
             mir::ReturnType::Value(
-                mir_type_ref(ty, class_ids, collection_registry).expect("checked native return"),
+                mir_type_ref_with_substitutions(ty, class_ids, collection_registry, substitutions)
+                    .expect("checked native return"),
             )
         }
         Some(ty) => {
@@ -573,7 +868,7 @@ fn collect_function_signature(
                 ),
             )]);
         }
-        None if lifecycle => mir::ReturnType::Void,
+        None if options.lifecycle => mir::ReturnType::Void,
         None => {
             return Err(vec![unsupported(
                 function.span,
@@ -589,18 +884,22 @@ fn collect_function_signature(
     // one `List<string>` that the entry glue owns and lends to `main`. Semantic
     // checking rejects every other shape, so this only has to confirm the form
     // it is about to lower.
-    if is_entry && !function.params.is_empty() {
+    if options.is_entry && !function.params.is_empty() {
         let entry_arguments_are_supported = function.params.len() == 1
-            && mir_type_ref(&function.params[0].ty, class_ids, collection_registry).is_some_and(
-                |ty| match ty {
-                    mir::Type::Collection(collection) => {
-                        let definition = &collection_registry.types[collection.0];
-                        definition.kind == mir::CollectionKind::List
-                            && definition.value == mir::Type::String
-                    }
-                    _ => false,
-                },
-            );
+            && mir_type_ref_with_substitutions(
+                &function.params[0].ty,
+                class_ids,
+                collection_registry,
+                substitutions,
+            )
+            .is_some_and(|ty| match ty {
+                mir::Type::Collection(collection) => {
+                    let definition = &collection_registry.types[collection.0];
+                    definition.kind == mir::CollectionKind::List
+                        && definition.value == mir::Type::String
+                }
+                _ => false,
+            });
         if !entry_arguments_are_supported {
             return Err(vec![unsupported(
                 function.params[0].span,
@@ -609,7 +908,7 @@ fn collect_function_signature(
         }
     }
 
-    if is_entry
+    if options.is_entry
         && !matches!(
             return_type,
             mir::ReturnType::Value(mir::Type::Scalar(mir::ScalarType::Integer(
@@ -628,9 +927,12 @@ fn collect_function_signature(
     let mut parameter_transfers = Vec::with_capacity(function.params.len());
     let mut parameter_owns = Vec::with_capacity(function.params.len());
     for (parameter_index, param) in function.params.iter().enumerate() {
-        let parameter_type = if let Some(ty) =
-            mir_type_ref(&param.ty, class_ids, collection_registry)
-        {
+        let parameter_type = if let Some(ty) = mir_type_ref_with_substitutions(
+            &param.ty,
+            class_ids,
+            collection_registry,
+            substitutions,
+        ) {
             ty
         } else {
             return Err(vec![unsupported_native_type(
@@ -702,6 +1004,12 @@ fn collect_function_signature(
     })
 }
 
+#[derive(Clone, Copy)]
+struct SignatureOptions {
+    lifecycle: bool,
+    is_entry: bool,
+}
+
 fn mir_return_borrow(borrow: crate::symbols::ReturnBorrow) -> mir::ReturnBorrow {
     mir::ReturnBorrow {
         source: match borrow.source {
@@ -712,33 +1020,29 @@ fn mir_return_borrow(borrow: crate::symbols::ReturnBorrow) -> mir::ReturnBorrow 
     }
 }
 
-fn callable_signatures_by_method(
-    declarations: &[CallableDecl<'_>],
-    signatures: &[FunctionSignature],
-) -> HashMap<(ClassId, String), FunctionSignature> {
-    declarations
-        .iter()
-        .zip(signatures.iter())
-        .filter_map(|(declaration, signature)| {
-            declaration.class.map(|class| {
-                (
-                    (class, declaration.function.name.clone()),
-                    signature.clone(),
-                )
-            })
-        })
-        .collect()
-}
-
 fn mir_type_ref(
     ty: &crate::types::TypeRef,
     class_ids: &HashMap<String, ClassId>,
     collection_registry: &mut CollectionRegistry,
 ) -> Option<mir::Type> {
+    mir_type_ref_with_substitutions(ty, class_ids, collection_registry, &HashMap::new())
+}
+
+fn mir_type_ref_with_substitutions(
+    ty: &crate::types::TypeRef,
+    class_ids: &HashMap<String, ClassId>,
+    collection_registry: &mut CollectionRegistry,
+    substitutions: &HashMap<String, crate::types::ResolvedType>,
+) -> Option<mir::Type> {
     let mut plain = ty.clone();
     plain.nullable = false;
-    let base = scalar_type_ref(&plain)
-        .map(mir::Type::Scalar)
+    let base = substitutions
+        .get(&plain.name)
+        .filter(|_| plain.args.is_empty())
+        .and_then(|resolved| {
+            intern_resolved_collection_types(resolved, class_ids, collection_registry)
+        })
+        .or_else(|| scalar_type_ref(&plain).map(mir::Type::Scalar))
         .or_else(|| is_plain_type(&plain, "string").then_some(mir::Type::String))
         .or_else(|| is_plain_type(&plain, "mixed").then_some(mir::Type::Mixed))
         .or_else(|| {
@@ -762,10 +1066,20 @@ fn mir_type_ref(
                 _ => return None,
             };
             let key = match key_ref {
-                Some(key) => Some(mir_type_ref(key, class_ids, collection_registry)?),
+                Some(key) => Some(mir_type_ref_with_substitutions(
+                    key,
+                    class_ids,
+                    collection_registry,
+                    substitutions,
+                )?),
                 None => None,
             };
-            let value = mir_type_ref(value_ref, class_ids, collection_registry)?;
+            let value = mir_type_ref_with_substitutions(
+                value_ref,
+                class_ids,
+                collection_registry,
+                substitutions,
+            )?;
             Some(mir::Type::Collection(
                 collection_registry.intern(kind, key, value),
             ))
@@ -853,13 +1167,14 @@ fn is_nullable_string_type(ty: &crate::types::TypeRef) -> bool {
 }
 
 struct FunctionLoweringInputs<'a> {
-    signatures: &'a HashMap<String, FunctionSignature>,
-    method_signatures: &'a HashMap<(ClassId, String), FunctionSignature>,
+    signatures: &'a HashMap<FunctionInstanceKey, FunctionSignature>,
+    method_signatures: &'a HashMap<MethodInstanceKey, FunctionSignature>,
     semantic_info: &'a SemanticInfo,
     property_initializers: &'a HashMap<crate::class_layout::PropertyId, hir::Expr>,
     constructor_body_initializers: &'a HashSet<crate::class_layout::PropertyId>,
     static_ids: &'a HashMap<(ClassId, String), mir::StaticId>,
     collection_registry: &'a CollectionRegistry,
+    type_substitutions: &'a HashMap<String, crate::types::ResolvedType>,
 }
 
 fn lower_function(
@@ -869,15 +1184,7 @@ fn lower_function(
     class: Option<ClassId>,
     receiver: Option<ClassId>,
 ) -> DiagnosticResult<mir::Function> {
-    let mut context = LoweringContext::new(
-        inputs.signatures.clone(),
-        inputs.method_signatures.clone(),
-        inputs.semantic_info,
-        inputs.property_initializers.clone(),
-        inputs.constructor_body_initializers.clone(),
-        inputs.static_ids.clone(),
-        inputs.collection_registry.clone(),
-    );
+    let mut context = LoweringContext::new(&inputs);
     context.return_borrow = signature.return_borrow;
     let mut params = Vec::new();
     if let Some(class) = receiver {
@@ -1856,13 +2163,14 @@ enum CoalesceSelection {
 }
 
 struct LoweringContext<'semantic> {
-    signatures: HashMap<String, FunctionSignature>,
-    method_signatures: HashMap<(ClassId, String), FunctionSignature>,
+    signatures: HashMap<FunctionInstanceKey, FunctionSignature>,
+    method_signatures: HashMap<MethodInstanceKey, FunctionSignature>,
     semantic_info: &'semantic SemanticInfo,
     property_initializers: HashMap<crate::class_layout::PropertyId, hir::Expr>,
     constructor_body_initializers: HashSet<crate::class_layout::PropertyId>,
     static_ids: HashMap<(ClassId, String), mir::StaticId>,
     collection_registry: CollectionRegistry,
+    type_substitutions: HashMap<String, crate::types::ResolvedType>,
     locals: Vec<mir::Local>,
     local_scopes: Vec<HashMap<String, mir::LocalId>>,
     materialized_collection_places: HashMap<(usize, usize), mir::LocalId>,
@@ -1883,23 +2191,16 @@ enum DropObligation {
 }
 
 impl<'semantic> LoweringContext<'semantic> {
-    fn new(
-        signatures: HashMap<String, FunctionSignature>,
-        method_signatures: HashMap<(ClassId, String), FunctionSignature>,
-        semantic_info: &'semantic SemanticInfo,
-        property_initializers: HashMap<crate::class_layout::PropertyId, hir::Expr>,
-        constructor_body_initializers: HashSet<crate::class_layout::PropertyId>,
-        static_ids: HashMap<(ClassId, String), mir::StaticId>,
-        collection_registry: CollectionRegistry,
-    ) -> Self {
+    fn new(inputs: &FunctionLoweringInputs<'semantic>) -> Self {
         Self {
-            signatures,
-            method_signatures,
-            semantic_info,
-            property_initializers,
-            constructor_body_initializers,
-            static_ids,
-            collection_registry,
+            signatures: inputs.signatures.clone(),
+            method_signatures: inputs.method_signatures.clone(),
+            semantic_info: inputs.semantic_info,
+            property_initializers: inputs.property_initializers.clone(),
+            constructor_body_initializers: inputs.constructor_body_initializers.clone(),
+            static_ids: inputs.static_ids.clone(),
+            collection_registry: inputs.collection_registry.clone(),
+            type_substitutions: inputs.type_substitutions.clone(),
             locals: Vec::new(),
             local_scopes: vec![HashMap::new()],
             materialized_collection_places: HashMap::new(),
@@ -2252,7 +2553,11 @@ impl<'semantic> LoweringContext<'semantic> {
 
     fn lookup_lifecycle(&self, class: ClassId, name: &str) -> Option<FunctionSignature> {
         self.method_signatures
-            .get(&(class, name.to_string()))
+            .get(&MethodInstanceKey {
+                class,
+                name: name.to_string(),
+                arguments: Vec::new(),
+            })
             .cloned()
     }
 
@@ -2262,8 +2567,13 @@ impl<'semantic> LoweringContext<'semantic> {
         name: &str,
         span: Span,
     ) -> DiagnosticResult<FunctionSignature> {
+        let arguments = self.specialization_arguments(span);
         self.method_signatures
-            .get(&(class, name.to_string()))
+            .get(&MethodInstanceKey {
+                class,
+                name: name.to_string(),
+                arguments,
+            })
             .cloned()
             .ok_or_else(|| {
                 vec![unsupported(
@@ -2331,8 +2641,12 @@ impl<'semantic> LoweringContext<'semantic> {
     fn native_type_ref(&self, ty: &crate::types::TypeRef) -> Option<mir::Type> {
         let mut plain = ty.clone();
         plain.nullable = false;
-        let base = scalar_type_ref(&plain)
-            .map(mir::Type::Scalar)
+        let base = self
+            .type_substitutions
+            .get(&plain.name)
+            .filter(|_| plain.args.is_empty())
+            .and_then(|resolved| self.mir_resolved_type(resolved))
+            .or_else(|| scalar_type_ref(&plain).map(mir::Type::Scalar))
             .or_else(|| is_plain_type(&plain, "string").then_some(mir::Type::String))
             .or_else(|| is_plain_type(&plain, "mixed").then_some(mir::Type::Mixed))
             .or_else(|| {
@@ -2394,7 +2708,11 @@ impl<'semantic> LoweringContext<'semantic> {
     }
 
     fn lookup_function(&self, name: &str, span: Span) -> DiagnosticResult<FunctionSignature> {
-        self.signatures.get(name).cloned().ok_or_else(|| {
+        let key = FunctionInstanceKey {
+            name: name.to_string(),
+            arguments: self.specialization_arguments(span),
+        };
+        self.signatures.get(&key).cloned().ok_or_else(|| {
             vec![unsupported(
                 span,
                 format!("call references unknown top-level function `{name}`"),
@@ -2402,9 +2720,28 @@ impl<'semantic> LoweringContext<'semantic> {
         })
     }
 
+    fn specialization_arguments(&self, span: Span) -> Vec<GenericArgument> {
+        self.semantic_info
+            .generic_call_specializations
+            .get(&(span.start, span.end))
+            .map(|specialization| {
+                specialization
+                    .arguments
+                    .iter()
+                    .map(|argument| substitute_generic_argument(argument, &self.type_substitutions))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     fn integer_type(&self, expr: &hir::Expr) -> DiagnosticResult<IntegerType> {
         self.semantic_info
             .integer_type(expr.span())
+            .or_else(|| match self.expression_type(expr).ok() {
+                Some(mir::Type::Scalar(mir::ScalarType::Integer(ty)))
+                | Some(mir::Type::NullableScalar(mir::ScalarType::Integer(ty))) => Some(ty),
+                _ => None,
+            })
             .ok_or_else(|| {
                 vec![Diagnostic::new(
                     "I1301",
@@ -2415,13 +2752,20 @@ impl<'semantic> LoweringContext<'semantic> {
     }
 
     fn float_type(&self, expr: &hir::Expr) -> DiagnosticResult<FloatType> {
-        self.semantic_info.float_type(expr.span()).ok_or_else(|| {
+        self.semantic_info
+            .float_type(expr.span())
+            .or_else(|| match self.expression_type(expr).ok() {
+                Some(mir::Type::Scalar(mir::ScalarType::Float(ty)))
+                | Some(mir::Type::NullableScalar(mir::ScalarType::Float(ty))) => Some(ty),
+                _ => None,
+            })
+            .ok_or_else(|| {
             vec![Diagnostic::new(
                 "I1401",
                 "internal compiler consistency error: checked float expression has no canonical float type",
                 expr.span(),
             )]
-        })
+            })
     }
 
     fn expression_type(&self, expr: &hir::Expr) -> DiagnosticResult<mir::Type> {
@@ -2496,6 +2840,10 @@ impl<'semantic> LoweringContext<'semantic> {
             ResolvedType::Bool => Some(mir::Type::Scalar(mir::ScalarType::Bool)),
             ResolvedType::String => Some(mir::Type::String),
             ResolvedType::Mixed => Some(mir::Type::Mixed),
+            ResolvedType::TypeParameter(name) => self
+                .type_substitutions
+                .get(name)
+                .and_then(|resolved| self.mir_resolved_type(resolved)),
             ResolvedType::Bytes => self
                 .collection_registry
                 .ids
@@ -4470,14 +4818,16 @@ fn discarded_call_statement(
             function: signature.id,
             args,
         },
-        mir::ReturnType::Value(mir::Type::Class(_) | mir::Type::NullableClass(_))
-            if signature.return_borrow.is_some() =>
-        {
-            mir::Statement::CallBorrowed {
-                function: signature.id,
-                args,
-            }
-        }
+        mir::ReturnType::Value(
+            mir::Type::Class(_)
+            | mir::Type::NullableClass(_)
+            | mir::Type::Collection(_)
+            | mir::Type::Mixed
+            | mir::Type::NullableMixed,
+        ) if signature.return_borrow.is_some() => mir::Statement::CallBorrowed {
+            function: signature.id,
+            args,
+        },
         mir::ReturnType::Value(_) => {
             return Err(vec![unsupported(
                 span,
@@ -4497,7 +4847,13 @@ fn discarded_null_safe_call_statement(
     let supported = matches!(signature.return_type, mir::ReturnType::Void)
         || matches!(
             signature.return_type,
-            mir::ReturnType::Value(mir::Type::Class(_) | mir::Type::NullableClass(_))
+            mir::ReturnType::Value(
+                mir::Type::Class(_)
+                    | mir::Type::NullableClass(_)
+                    | mir::Type::Collection(_)
+                    | mir::Type::Mixed
+                    | mir::Type::NullableMixed
+            )
         ) && signature.return_borrow.is_some();
     if !supported {
         return Err(vec![unsupported(
@@ -4897,18 +5253,24 @@ fn lower_return(
             Ok(mir::Terminator::ReturnVoid)
         }
         (mir::ReturnType::Value(expected), Some(expr)) => {
-            let borrowed_class =
-                matches!(expected, mir::Type::Class(_) | mir::Type::NullableClass(_))
-                    && context.return_borrow.is_some();
+            let borrowed_move = matches!(
+                expected,
+                mir::Type::Class(_)
+                    | mir::Type::NullableClass(_)
+                    | mir::Type::Collection(_)
+                    | mir::Type::Mixed
+                    | mir::Type::NullableMixed
+            ) && context.return_borrow.is_some();
             let value = match expected {
                 mir::Type::Class(class) => {
-                    lower_class_expression(expr, class, !borrowed_class, context)
+                    lower_class_expression(expr, class, !borrowed_move, context)
                         .map(mir::Rvalue::Class)?
                 }
                 mir::Type::NullableClass(class) => {
-                    lower_nullable_class_expression(expr, class, !borrowed_class, context)
+                    lower_nullable_class_expression(expr, class, !borrowed_move, context)
                         .map(mir::Rvalue::NullableClass)?
                 }
+                _ if borrowed_move => lower_rvalue_as_borrowed(expr, expected, context)?,
                 _ => lower_rvalue_as_expected(expr, expected, context)?,
             };
             if value.ty() != expected {
@@ -4923,8 +5285,11 @@ fn lower_return(
             }
             if context.has_cleanup_obligations() {
                 let result_owns = match expected {
-                    mir::Type::Class(_) | mir::Type::NullableClass(_) => !borrowed_class,
-                    mir::Type::Collection(_) | mir::Type::Mixed | mir::Type::NullableMixed => true,
+                    mir::Type::Class(_)
+                    | mir::Type::NullableClass(_)
+                    | mir::Type::Collection(_)
+                    | mir::Type::Mixed
+                    | mir::Type::NullableMixed => !borrowed_move,
                     _ => false,
                 };
                 let result = context.declare_return_temp(expected, result_owns);
@@ -4936,7 +5301,7 @@ fn lower_return(
                 Ok(mir::Terminator::Return(local_rvalue(
                     result,
                     expected,
-                    !borrowed_class,
+                    !borrowed_move,
                 )))
             } else {
                 Ok(mir::Terminator::Return(value))
@@ -5648,7 +6013,24 @@ fn lower_value_expression(
     if context.semantic_info.float_type(expr.span()).is_some() {
         return lower_float_expression(expr, context).map(mir::ValueExpression::Float);
     }
-    lower_condition(expr, context).map(mir::ValueExpression::Bool)
+    match context.expression_type(expr)? {
+        mir::Type::Scalar(mir::ScalarType::Integer(_))
+        | mir::Type::NullableScalar(mir::ScalarType::Integer(_)) => {
+            lower_integer_expression(expr, context).map(mir::ValueExpression::Integer)
+        }
+        mir::Type::Scalar(mir::ScalarType::Float(_))
+        | mir::Type::NullableScalar(mir::ScalarType::Float(_)) => {
+            lower_float_expression(expr, context).map(mir::ValueExpression::Float)
+        }
+        mir::Type::Scalar(mir::ScalarType::Bool)
+        | mir::Type::NullableScalar(mir::ScalarType::Bool) => {
+            lower_condition(expr, context).map(mir::ValueExpression::Bool)
+        }
+        _ => Err(vec![unsupported(
+            expr.span(),
+            "this expression is not a scalar value",
+        )]),
+    }
 }
 
 fn call_value_expression(
@@ -5815,6 +6197,7 @@ fn lower_mixed_expression(
         if signature.return_type == mir::ReturnType::Value(mir::Type::Mixed) {
             return Ok(mir::MixedExpression::Call {
                 function: signature.id,
+                return_borrow: signature.return_borrow,
                 args: lower_call_args(name, args, signature, *span, context)?,
             });
         }
@@ -5832,6 +6215,7 @@ fn lower_mixed_expression(
             return Ok(mir::MixedExpression::Call {
                 function: signature.id,
                 args,
+                return_borrow: signature.return_borrow,
             });
         }
     }
@@ -5847,6 +6231,7 @@ fn lower_mixed_expression(
             return Ok(mir::MixedExpression::Call {
                 function: signature.id,
                 args,
+                return_borrow: signature.return_borrow,
             });
         }
     }
@@ -5968,12 +6353,14 @@ fn lower_nullable_mixed_expression(
                 mir::ReturnType::Value(mir::Type::NullableMixed) => {
                     Ok(mir::NullableMixedExpression::Call {
                         function: signature.id,
+                        return_borrow: signature.return_borrow,
                         args: lower_call_args(name, args, signature, *span, context)?,
                     })
                 }
                 mir::ReturnType::Value(mir::Type::Mixed) => Ok(
                     mir::NullableMixedExpression::Mixed(mir::MixedExpression::Call {
                         function: signature.id,
+                        return_borrow: signature.return_borrow,
                         args: lower_call_args(name, args, signature, *span, context)?,
                     }),
                 ),
@@ -6109,6 +6496,7 @@ fn lower_collection_expression(
             Ok(mir::CollectionExpression::Call {
                 collection: expected,
                 function: signature.id,
+                return_borrow: signature.return_borrow,
                 args: lower_call_args_with_ownership(name, args, signature, *span, context)?,
             })
         }
@@ -6131,6 +6519,7 @@ fn lower_collection_expression(
                 collection: expected,
                 function: signature.id,
                 args,
+                return_borrow: signature.return_borrow,
             })
         }
         hir::Expr::StaticCall {
@@ -6151,6 +6540,7 @@ fn lower_collection_expression(
                 collection: expected,
                 function: signature.id,
                 args,
+                return_borrow: signature.return_borrow,
             })
         }
         hir::Expr::MethodCall {

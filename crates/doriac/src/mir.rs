@@ -392,6 +392,7 @@ pub enum CollectionExpression {
         collection: CollectionTypeId,
         function: FunctionId,
         args: Vec<Rvalue>,
+        return_borrow: Option<ReturnBorrow>,
     },
 }
 
@@ -447,14 +448,22 @@ impl CollectionExpression {
             | Self::BytesFromArray { collection, .. }
             | Self::ReadFileBytes { collection, .. }
             | Self::ReadStdinBytes { collection }
-            | Self::Call { collection, .. } => Some(*collection),
+            | Self::Call {
+                collection,
+                return_borrow: None,
+                ..
+            } => Some(*collection),
             Self::Local {
                 transfer: false, ..
             }
             | Self::Index {
                 transfer: false, ..
             }
-            | Self::Property { .. } => None,
+            | Self::Property { .. }
+            | Self::Call {
+                return_borrow: Some(_),
+                ..
+            } => None,
         }
     }
 }
@@ -512,6 +521,7 @@ pub enum MixedExpression {
     Call {
         function: FunctionId,
         args: Vec<Rvalue>,
+        return_borrow: Option<ReturnBorrow>,
     },
     BoxValue(ValueExpression),
     BoxString {
@@ -533,9 +543,13 @@ pub enum MixedExpression {
 impl MixedExpression {
     pub const fn ownership(&self) -> MixedOwnership {
         match self {
-            Self::Local { transfer: true, .. }
-            | Self::Call { .. }
-            | Self::CollectionIndex { transfer: true, .. } => MixedOwnership::Owned,
+            Self::Local { transfer: true, .. } | Self::CollectionIndex { transfer: true, .. } => {
+                MixedOwnership::Owned
+            }
+            Self::Call {
+                return_borrow: None,
+                ..
+            } => MixedOwnership::Owned,
             Self::BoxValue(_) => MixedOwnership::ShellOnly,
             Self::BoxString { payload_owned, .. } | Self::BoxClass { payload_owned, .. } => {
                 if *payload_owned {
@@ -548,6 +562,10 @@ impl MixedExpression {
                 transfer: false, ..
             }
             | Self::Property { .. }
+            | Self::Call {
+                return_borrow: Some(_),
+                ..
+            }
             | Self::CollectionIndex {
                 transfer: false, ..
             } => MixedOwnership::None,
@@ -570,6 +588,7 @@ pub enum NullableMixedExpression {
     Call {
         function: FunctionId,
         args: Vec<Rvalue>,
+        return_borrow: Option<ReturnBorrow>,
     },
     Coalesce {
         left: Box<NullableMixedExpression>,
@@ -582,14 +601,20 @@ impl NullableMixedExpression {
     pub const fn ownership(&self) -> MixedOwnership {
         match self {
             Self::Mixed(value) => value.ownership(),
-            Self::Local { transfer: true, .. } | Self::Call { .. } | Self::Coalesce { .. } => {
-                MixedOwnership::Owned
-            }
+            Self::Local { transfer: true, .. } | Self::Coalesce { .. } => MixedOwnership::Owned,
+            Self::Call {
+                return_borrow: None,
+                ..
+            } => MixedOwnership::Owned,
             Self::Null
             | Self::Local {
                 transfer: false, ..
             }
-            | Self::Property { .. } => MixedOwnership::None,
+            | Self::Property { .. }
+            | Self::Call {
+                return_borrow: Some(_),
+                ..
+            } => MixedOwnership::None,
         }
     }
 }
@@ -2045,7 +2070,7 @@ impl fmt::Display for MixedExpression {
                 "borrow local{}->property#{}:{}",
                 object.0, property.class.0, property.index
             ),
-            Self::Call { function, args } => write_call(formatter, *function, args),
+            Self::Call { function, args, .. } => write_call(formatter, *function, args),
             Self::BoxValue(value) => write!(formatter, "mixed({value})"),
             Self::BoxString { value, .. } => write!(formatter, "mixed({value})"),
             Self::BoxClass { value, .. } => write!(formatter, "mixed({value})"),
@@ -2088,7 +2113,7 @@ impl fmt::Display for NullableMixedExpression {
                 "borrow local{}->property#{}:{}",
                 object.0, property.class.0, property.index
             ),
-            Self::Call { function, args } => write_call(formatter, *function, args),
+            Self::Call { function, args, .. } => write_call(formatter, *function, args),
             Self::Coalesce { left, right, .. } => write!(formatter, "({left} ?? {right})"),
         }
     }

@@ -112,6 +112,19 @@ fn lower_function(function: &ast::FunctionDecl, class_name: Option<&str>) -> hir
         writable_this: function.writable_this,
         is_static: function.is_static,
         name: function.name.clone(),
+        type_params: function
+            .type_params
+            .iter()
+            .map(|param| hir::TypeParamDecl {
+                name: param.name.clone(),
+                constraints: param
+                    .constraints
+                    .iter()
+                    .map(|constraint| lower_type_ref(constraint, class_name))
+                    .collect(),
+                span: param.span,
+            })
+            .collect(),
         params: function
             .params
             .iter()

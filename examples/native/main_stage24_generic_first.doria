@@ -1,0 +1,55 @@
+class Token
+{
+    function __construct(string $text)
+    {
+    }
+
+    function __destruct()
+    {
+        echo "<drop:" . $this->text . ">\n";
+    }
+}
+
+class GenericMethods
+{
+    function choose<T, U>(T $ignored, U $value): U
+    {
+        return $value;
+    }
+
+    static function same<T>(T $value): T
+    {
+        return $value;
+    }
+}
+
+function first<T>(List<T> $items): ?T
+{
+    return $items->first;
+}
+
+function identity<T>(T $value): T
+{
+    return $value;
+}
+
+function main(): int
+{
+    List<int> $numbers = [42];
+    ?int $number = first($numbers);
+    List<string> $words = ["generic"];
+    ?string $word = first($words);
+    List<Token> $tokens = [new Token("class")];
+    let $methods = new GenericMethods();
+    int $chosen = $methods->choose("ignored", 7);
+    string $same = GenericMethods::same("static");
+    int $deduplicated = identity(1) + identity(2);
+
+    if ($number != null) { echo $number . "\n"; }
+    if ($word != null) { echo $word . "\n"; }
+    if (first($tokens) != null) { echo "class\n"; }
+    echo $chosen . "\n";
+    echo $same . "\n";
+    echo $deduplicated . "\n";
+    return 0;
+}

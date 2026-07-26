@@ -109,13 +109,14 @@ pub enum TypeKind {
     Unknown,
     Heterogeneous,
     EmptyCollection,
+    TypeParameter(String),
     Class(String),
     List(TypeId),
     Dictionary(TypeId, TypeId),
     Set(TypeId),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ResolvedType {
     Void,
     Integer(IntegerType),
@@ -125,6 +126,7 @@ pub enum ResolvedType {
     Bool,
     Null,
     Mixed,
+    TypeParameter(String),
     Nullable(Box<ResolvedType>),
     Class(String),
     TypedArray(Box<ResolvedType>),
@@ -186,6 +188,7 @@ impl TypeRegistry {
             TypeKind::Unknown => "Unknown".to_string(),
             TypeKind::Heterogeneous => "heterogeneous".to_string(),
             TypeKind::EmptyCollection => "[]".to_string(),
+            TypeKind::TypeParameter(name) => name.clone(),
             TypeKind::Class(name) => name.clone(),
             TypeKind::List(element) => format!("List<{}>", self.display(*element)),
             TypeKind::Dictionary(key, value) => {
@@ -209,6 +212,7 @@ impl TypeRegistry {
             TypeKind::Bool => ResolvedType::Bool,
             TypeKind::Null => ResolvedType::Null,
             TypeKind::Mixed => ResolvedType::Mixed,
+            TypeKind::TypeParameter(name) => ResolvedType::TypeParameter(name.clone()),
             TypeKind::Nullable(inner) => ResolvedType::Nullable(Box::new(self.resolved(*inner))),
             TypeKind::Class(name) => ResolvedType::Class(name.clone()),
             TypeKind::TypedArray(element) => {

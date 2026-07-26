@@ -242,6 +242,7 @@ impl Parser {
     ) -> Option<FunctionDecl> {
         let start = start_span.start;
         let name = self.expect_identifier("expected function name")?;
+        let type_params = self.parse_function_type_params()?;
         self.expect(TokenKind::LeftParen, "expected `(` after function name")?;
 
         let mut params = Vec::new();
@@ -274,11 +275,61 @@ impl Parser {
             is_static: static_span.is_some(),
             static_span,
             name,
+            type_params,
             params,
             return_type,
             body,
             span,
         })
+    }
+
+    fn parse_function_type_params(&mut self) -> Option<Vec<TypeParamDecl>> {
+        if !self.match_kind(&TokenKind::Less) {
+            return Some(Vec::new());
+        }
+
+        let mut params = Vec::new();
+        loop {
+            let start = self.peek().span.start;
+            let name = self.expect_identifier("expected type-parameter name")?;
+            let mut constraints = Vec::new();
+            if self.match_kind(&TokenKind::Implements) {
+                loop {
+                    constraints.push(self.parse_type_ref()?);
+                    // A comma followed by `Name implements` starts the next
+                    // parameter. Without that second `implements`,
+                    // `<T implements A, U>` remains the documented
+                    // comma-separated constraint list for `T`.
+                    if !self.check(&TokenKind::Comma)
+                        || self
+                            .tokens
+                            .get(self.current + 1)
+                            .zip(self.tokens.get(self.current + 2))
+                            .is_some_and(|(name, implements)| {
+                                matches!(name.kind, TokenKind::Identifier(_))
+                                    && matches!(implements.kind, TokenKind::Implements)
+                            })
+                    {
+                        break;
+                    }
+                    self.advance();
+                }
+            }
+            let end = self.previous().span.end;
+            params.push(TypeParamDecl {
+                name,
+                constraints,
+                span: Span::new(start, end),
+            });
+
+            if self.check(&TokenKind::Greater) {
+                self.advance();
+                break;
+            }
+            self.expect(TokenKind::Comma, "expected `,` or `>` after type parameter")?;
+        }
+
+        Some(params)
     }
 
     fn parse_interface(&mut self) -> Option<InterfaceDecl> {
