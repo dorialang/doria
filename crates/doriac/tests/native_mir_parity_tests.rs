@@ -17,6 +17,23 @@ const BROKEN_PIPE_STDERR_BYTES: &str =
     include_str!("fixtures/native_io/broken_pipe_stderr_bytes.doria");
 
 #[test]
+fn release_panic_projection_preserves_output_and_omits_only_frames() {
+    let expected = b"prefix\nPanic: boom\nStack Trace:\n  at fail\n  at main\n";
+    assert!(release_stderr_is_projection(
+        expected,
+        b"prefix\nPanic: boom\nStack Trace:\n"
+    ));
+    assert!(release_stderr_is_projection(
+        expected,
+        b"prefix\nPanic: boom\nStack Trace:\n  at main\n"
+    ));
+    assert!(!release_stderr_is_projection(
+        expected,
+        b"prefix\nPanic: boom\nStack Trace:\n  at other\n"
+    ));
+}
+
+#[test]
 fn manifest_covers_every_native_example() {
     let workspace = workspace_root();
     let manifest = manifest_paths();
@@ -89,7 +106,13 @@ fn interpreter_cranelift_and_enabled_llvm_match_for_the_durable_native_manifest(
             "Cranelift",
             &fixture,
         );
-        assert_matches_interpreter(&relative_path, "Cranelift fast", &interpreted, &fast);
+        assert_matches_interpreter(
+            &relative_path,
+            "Cranelift fast",
+            NativeProfile::Fast,
+            &interpreted,
+            &fast,
+        );
 
         #[cfg(feature = "llvm-backend")]
         {
@@ -100,7 +123,13 @@ fn interpreter_cranelift_and_enabled_llvm_match_for_the_durable_native_manifest(
                 "LLVM",
                 &fixture,
             );
-            assert_matches_interpreter(&relative_path, "LLVM release", &interpreted, &release);
+            assert_matches_interpreter(
+                &relative_path,
+                "LLVM release",
+                NativeProfile::Release,
+                &interpreted,
+                &release,
+            );
         }
     }
 }
@@ -274,6 +303,7 @@ fn compile_and_run(
 fn assert_matches_interpreter(
     relative_path: &str,
     backend: &str,
+    profile: NativeProfile,
     interpreted: &doriac::mir_interpreter::InterpreterIoOutput,
     native: &NativeRun,
 ) {
@@ -287,14 +317,66 @@ fn assert_matches_interpreter(
         native.output.stdout, interpreted.output.stdout,
         "stdout mismatch for {relative_path} ({backend})"
     );
-    assert_eq!(
-        native.output.stderr, interpreted.output.stderr,
-        "stderr mismatch for {relative_path} ({backend})"
-    );
+    if profile == NativeProfile::Release && interpreted.output.exit_status == 101 {
+        assert!(
+            release_stderr_is_projection(&interpreted.output.stderr, &native.output.stderr),
+            "stderr mismatch for {relative_path} ({backend})\nexpected projection of: {:?}\nactual: {:?}",
+            interpreted.output.stderr,
+            native.output.stderr
+        );
+    } else {
+        assert_eq!(
+            native.output.stderr, interpreted.output.stderr,
+            "stderr mismatch for {relative_path} ({backend})"
+        );
+    }
     assert_eq!(
         native.files, interpreted.files,
         "file side-effect mismatch for {relative_path} ({backend})"
     );
+}
+
+fn release_stderr_is_projection(expected: &[u8], actual: &[u8]) -> bool {
+    const STACK_TRACE_HEADER: &[u8] = b"Stack Trace:\n";
+    let Some(expected_header) = expected
+        .windows(STACK_TRACE_HEADER.len())
+        .rposition(|window| window == STACK_TRACE_HEADER)
+    else {
+        return actual == expected;
+    };
+    let Some(actual_header) = actual
+        .windows(STACK_TRACE_HEADER.len())
+        .rposition(|window| window == STACK_TRACE_HEADER)
+    else {
+        return false;
+    };
+    let expected_frames = expected_header + STACK_TRACE_HEADER.len();
+    let actual_frames = actual_header + STACK_TRACE_HEADER.len();
+    if expected[..expected_frames] != actual[..actual_frames] || !actual.ends_with(b"\n") {
+        return false;
+    }
+
+    let expected_frames = expected[expected_frames..]
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    let mut next_expected = 0;
+    for frame in actual[actual_frames..]
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+    {
+        if !frame.starts_with(b"  at ") {
+            return false;
+        }
+        let Some(offset) = expected_frames[next_expected..]
+            .iter()
+            .position(|expected| *expected == frame)
+        else {
+            return false;
+        };
+        next_expected += offset + 1;
+    }
+    true
 }
 fn manifest_paths() -> BTreeSet<String> {
     MANIFEST

@@ -344,32 +344,10 @@ fn define_function<'ctx>(
         build(builder.build_store(local_slot(&local_slots, *parameter)?, value))?;
     }
 
-    let pointer_type = context.ptr_type(AddressSpace::default());
-    let usize_type = context.ptr_sized_int_type(target_data, None);
-    let frame_type = context.struct_type(
-        &[pointer_type.into(), pointer_type.into(), usize_type.into()],
-        false,
-    );
-    let frame = build(builder.build_alloca(frame_type, "doria.frame"))?;
-    let parent = llvm_function
-        .get_first_param()
-        .ok_or_else(|| malformed_mir("LLVM function is missing its parent frame"))?
-        .into_pointer_value();
-    let function_name = define_bytes(
-        context,
-        module,
-        function.name.as_bytes(),
-        &format!("__doria_function_name_{}", function.id.0),
-    );
-    let parent_slot = build(builder.build_struct_gep(frame_type, frame, 0, "frame.parent"))?;
-    let name_slot = build(builder.build_struct_gep(frame_type, frame, 1, "frame.name"))?;
-    let length_slot = build(builder.build_struct_gep(frame_type, frame, 2, "frame.name_length"))?;
-    build(builder.build_store(parent_slot, parent))?;
-    build(builder.build_store(name_slot, function_name))?;
-    build(builder.build_store(
-        length_slot,
-        usize_type.const_int(function.name.len() as u64, false),
-    ))?;
+    // Release objects deliberately omit the shadow-frame chain. Every runtime
+    // call receives null, allowing LLVM to remove the now-unused hidden frame
+    // parameter from internal calls and recover normal tail-call optimization.
+    let current_frame = context.ptr_type(AddressSpace::default()).const_null();
     let mut lowerer = FunctionLowerer {
         context,
         module,
@@ -382,7 +360,7 @@ fn define_function<'ctx>(
         statics: &declarations.statics,
         local_slots,
         blocks,
-        current_frame: frame,
+        current_frame,
         next_data_id: 0,
         defer_class_temporary_drops: false,
         deferred_class_temporary_slots,
@@ -424,10 +402,7 @@ fn define_class_drop_functions<'ctx>(
         let builder = context.create_builder();
         let entry = context.append_basic_block(llvm_function, "entry");
         builder.position_at_end(entry);
-        let current_frame = llvm_function
-            .get_nth_param(0)
-            .ok_or_else(|| malformed_mir("class drop function is missing its frame"))?
-            .into_pointer_value();
+        let current_frame = context.ptr_type(AddressSpace::default()).const_null();
         let object = llvm_function
             .get_nth_param(1)
             .ok_or_else(|| malformed_mir("class drop function is missing its object"))?
