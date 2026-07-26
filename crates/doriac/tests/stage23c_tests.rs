@@ -95,3 +95,28 @@ fn runtime_negative_fill_count_preserves_canonical_panic() {
         b"Panic: fill count is negative\nStack Trace:\n  at main\n"
     );
 }
+
+#[test]
+fn oversized_runtime_fill_count_produces_a_doria_panic() {
+    let source = r#"
+function runtimeCount(): int
+{
+    return 9223372036854775807;
+}
+
+function main(): void
+{
+    let $flags = [false; runtimeCount()];
+}
+"#;
+    let mir = doriac::lower_source_to_mir("stage23c-oversized.doria", source)
+        .expect("runtime-sized fill should lower");
+    let output = doriac::mir_interpreter::interpret(&mir)
+        .expect("oversized fill should produce a Doria panic rather than aborting the host");
+
+    assert_eq!(output.exit_status, 101);
+    assert_eq!(
+        output.stderr,
+        b"Panic: collection capacity overflow\nStack Trace:\n  at main\n"
+    );
+}

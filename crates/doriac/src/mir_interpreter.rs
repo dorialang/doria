@@ -6,6 +6,8 @@ use std::rc::Rc;
 use crate::mir;
 use crate::numeric::{FloatType, FloatValue, IntegerPanic, IntegerType, IntegerValue};
 
+type SharedString = Rc<str>;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InterpreterOutput {
     pub stdout: Vec<u8>,
@@ -49,13 +51,13 @@ enum FunctionOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum LocalValue {
     Scalar(mir::ScalarValue),
-    String(String),
+    String(SharedString),
     Mixed(MixedValue),
     NullableScalar {
         ty: mir::ScalarType,
         value: Option<mir::ScalarValue>,
     },
-    NullableString(Option<String>),
+    NullableString(Option<SharedString>),
     NullableMixed(Option<MixedValue>),
     Class {
         object: usize,
@@ -71,13 +73,13 @@ enum LocalValue {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum EvaluationValue {
     Scalar(mir::ScalarValue),
-    String(String),
+    String(SharedString),
     Mixed(MixedValue),
     NullableScalar {
         ty: mir::ScalarType,
         value: Option<mir::ScalarValue>,
     },
-    NullableString(Option<String>),
+    NullableString(Option<SharedString>),
     NullableMixed(Option<MixedValue>),
     Class {
         object: usize,
@@ -93,7 +95,7 @@ enum EvaluationValue {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum MixedValue {
     Scalar(mir::ScalarValue),
-    String(String),
+    String(SharedString),
     Class {
         object: usize,
         class: crate::class_layout::ClassId,
@@ -443,7 +445,12 @@ fn interpret_internal(
             collection,
             io.args
                 .iter()
-                .map(|argument| (None, LocalValue::String(argument.clone())))
+                .map(|argument| {
+                    (
+                        None,
+                        LocalValue::String(SharedString::from(argument.as_str())),
+                    )
+                })
                 .collect(),
         ))
     });
@@ -470,9 +477,11 @@ fn interpret_internal(
                 }
                 mir::StaticValue::Scalar(value) => LocalValue::Scalar(*value),
                 mir::StaticValue::String(value) if property.ty == mir::Type::String => {
-                    LocalValue::String(value.clone())
+                    LocalValue::String(SharedString::from(value.as_str()))
                 }
-                mir::StaticValue::String(value) => LocalValue::NullableString(Some(value.clone())),
+                mir::StaticValue::String(value) => {
+                    LocalValue::NullableString(Some(SharedString::from(value.as_str())))
+                }
                 mir::StaticValue::Null => match property.ty {
                     mir::Type::NullableScalar(ty) => LocalValue::NullableScalar { ty, value: None },
                     mir::Type::NullableString => LocalValue::NullableString(None),
@@ -1071,7 +1080,10 @@ impl Interpreter<'_> {
                         "MIR collection fill value is not a Copy scalar or string",
                     ));
                 }
-                let entries = (0..count).map(|_| (None, value.clone())).collect();
+                let entries = match repeat_collection_entries(value, count) {
+                    Ok(entries) => entries,
+                    Err(message) => return Ok(StepOutcome::Panic(message.to_string())),
+                };
                 self.current_frame_mut()?
                     .values
                     .push(EvaluationValue::Collection(CollectionValue::new(
@@ -1865,7 +1877,7 @@ impl Interpreter<'_> {
                         "file path contained an embedded NUL".to_string(),
                     ));
                 }
-                let Some(bytes) = self.files.get(&path) else {
+                let Some(bytes) = self.files.get(path.as_ref()) else {
                     return Ok(StepOutcome::Panic("failed to read file".to_string()));
                 };
                 let Ok(value) = String::from_utf8(bytes.clone()) else {
@@ -1883,7 +1895,8 @@ impl Interpreter<'_> {
                         "file path contained an embedded NUL".to_string(),
                     ));
                 }
-                self.files.insert(path, contents.into_bytes());
+                self.files
+                    .insert(path.to_string(), contents.as_bytes().to_vec());
             }
             EvaluationTask::AppendFile => {
                 let contents = self.pop_string()?;
@@ -1894,7 +1907,7 @@ impl Interpreter<'_> {
                     ));
                 }
                 self.files
-                    .entry(path)
+                    .entry(path.to_string())
                     .or_default()
                     .extend_from_slice(contents.as_bytes());
             }
@@ -1905,7 +1918,7 @@ impl Interpreter<'_> {
                         "file path contained an embedded NUL".to_string(),
                     ));
                 }
-                let Some(contents) = self.files.get(&path).cloned() else {
+                let Some(contents) = self.files.get(path.as_ref()).cloned() else {
                     return Ok(StepOutcome::Panic("failed to read file".to_string()));
                 };
                 self.push_byte_collection(collection, &contents)?;
@@ -1920,11 +1933,11 @@ impl Interpreter<'_> {
                 let bytes = self.byte_collection(contents)?;
                 if append {
                     self.files
-                        .entry(path)
+                        .entry(path.to_string())
                         .or_default()
                         .extend_from_slice(&bytes);
                 } else {
-                    self.files.insert(path, bytes);
+                    self.files.insert(path.to_string(), bytes);
                 }
             }
             EvaluationTask::WriteStreamBytes { contents, stderr } => {
@@ -1970,7 +1983,7 @@ impl Interpreter<'_> {
                 self.stdout.extend_from_slice(value.as_bytes());
             }
             EvaluationTask::PanicString => {
-                return Ok(StepOutcome::Panic(self.pop_string()?));
+                return Ok(StepOutcome::Panic(self.pop_string()?.to_string()));
             }
             EvaluationTask::Integer(expression) => self.expand_integer_expression(expression)?,
             EvaluationTask::IntegerUnary(op) => {
@@ -2966,7 +2979,7 @@ impl Interpreter<'_> {
                         .map_err(|_| InterpreterError::new("stdin contained invalid UTF-8"))?
                         .to_string();
                     self.stdin_cursor += consumed;
-                    self.push_nullable_string(Some(line))?;
+                    self.push_nullable_string(Some(line.into()))?;
                 }
             }
             mir::NullableStringExpression::Call { function, args } => {
@@ -3978,14 +3991,14 @@ impl Interpreter<'_> {
         }
     }
 
-    fn push_string(&mut self, value: String) -> Result<(), InterpreterError> {
+    fn push_string(&mut self, value: impl Into<SharedString>) -> Result<(), InterpreterError> {
         self.current_frame_mut()?
             .values
-            .push(EvaluationValue::String(value));
+            .push(EvaluationValue::String(value.into()));
         Ok(())
     }
 
-    fn pop_string(&mut self) -> Result<String, InterpreterError> {
+    fn pop_string(&mut self) -> Result<SharedString, InterpreterError> {
         match self.current_frame_mut()?.values.pop() {
             Some(EvaluationValue::String(value)) => Ok(value),
             Some(EvaluationValue::Scalar(_)) => Err(InterpreterError::new(
@@ -4013,7 +4026,10 @@ impl Interpreter<'_> {
         }
     }
 
-    fn push_nullable_string(&mut self, value: Option<String>) -> Result<(), InterpreterError> {
+    fn push_nullable_string(
+        &mut self,
+        value: Option<SharedString>,
+    ) -> Result<(), InterpreterError> {
         self.current_frame_mut()?
             .values
             .push(EvaluationValue::NullableString(value));
@@ -4046,7 +4062,7 @@ impl Interpreter<'_> {
         }
     }
 
-    fn pop_nullable_string(&mut self) -> Result<Option<String>, InterpreterError> {
+    fn pop_nullable_string(&mut self) -> Result<Option<SharedString>, InterpreterError> {
         match self.current_frame_mut()?.values.pop() {
             Some(EvaluationValue::NullableString(value)) => Ok(value),
             Some(_) => Err(InterpreterError::new(
@@ -5079,6 +5095,21 @@ fn collection_values_equal(ty: mir::Type, left: &LocalValue, right: &LocalValue)
     }
 }
 
+fn repeat_collection_entries(
+    value: LocalValue,
+    count: usize,
+) -> Result<CollectionEntries, &'static str> {
+    if count.checked_mul(core::mem::size_of::<u64>()).is_none() {
+        return Err("collection capacity overflow");
+    }
+    let mut entries = Vec::new();
+    entries
+        .try_reserve_exact(count)
+        .map_err(|_| "collection allocation failed")?;
+    entries.extend(core::iter::repeat_n((None, value), count));
+    Ok(entries)
+}
+
 fn display_scalar(value: mir::ScalarValue) -> String {
     match value {
         mir::ScalarValue::Integer(value) => value.display(),
@@ -5105,7 +5136,9 @@ fn render_format(
                     (FormatConversion::Display, EvaluationValue::Scalar(value)) => {
                         display_scalar(*value)
                     }
-                    (FormatConversion::Display, EvaluationValue::String(value)) => value.clone(),
+                    (FormatConversion::Display, EvaluationValue::String(value)) => {
+                        value.to_string()
+                    }
                     (
                         FormatConversion::Decimal,
                         EvaluationValue::Scalar(mir::ScalarValue::Integer(value)),
@@ -5375,4 +5408,34 @@ fn block_in(
         .get(id.0)
         .filter(|block| block.id == id)
         .ok_or_else(|| InterpreterError::new(format!("MIR BlockId block{} does not exist", id.0)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn repeated_strings_share_one_immutable_allocation() {
+        let string = SharedString::from("shared");
+        let entries =
+            repeat_collection_entries(LocalValue::String(string.clone()), 3).expect("small fill");
+
+        assert_eq!(Rc::strong_count(&string), 4);
+        for (_, value) in entries {
+            let LocalValue::String(value) = value else {
+                panic!("string fill produced another value type");
+            };
+            assert!(Rc::ptr_eq(&string, &value));
+        }
+    }
+
+    #[test]
+    fn oversized_repeat_capacity_is_a_doria_panic_message() {
+        let count = usize::MAX / core::mem::size_of::<u64>() + 1;
+        let error =
+            repeat_collection_entries(LocalValue::Scalar(mir::ScalarValue::Bool(false)), count)
+                .expect_err("native-word capacity overflow should be rejected");
+
+        assert_eq!(error, "collection capacity overflow");
+    }
 }

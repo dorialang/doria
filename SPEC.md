@@ -675,6 +675,24 @@ Dictionary<K, V>
 Set<T>
 ```
 
+Bracket sequence literals have an element-list form and a repeat form:
+
+```doria
+int[] $values = [1, 2, 3];
+bool[] $flags = [false; $count];
+List<string> $labels = ["pending"; $count];
+let $zeros = [0; $count]; // List<int>
+```
+
+`[value; count]` is contextually typed as `T[]` or `List<T>` and defaults to
+`List<T>` when there is no expected type. `value` is evaluated once, then the
+runtime `int` count is evaluated once. A constant-negative count is a compile
+error, a runtime-negative count panics with `fill count is negative`, and zero
+produces an empty sequence. Copy scalars are bit-copied; immutable string
+handles are shared. The repeat form is rejected for `Set` and `Dictionary`, and
+move-type elements remain unavailable until the `Cloneable` contract can define
+their replication.
+
 `let` declarations infer simple literal and constructor types:
 
 ```doria
