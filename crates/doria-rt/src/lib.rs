@@ -9,6 +9,7 @@ use core::ptr;
 mod bytes;
 mod collection;
 mod device_io;
+mod entry_args;
 mod file_io;
 mod line_io;
 mod mixed;
@@ -478,6 +479,22 @@ const IMMORTAL_STRING_REFERENCES: usize = usize::MAX;
 pub type DrMainIntV1 = unsafe extern "C" fn(*const DrStackFrameV1) -> i64;
 pub type DrMainVoidV1 = unsafe extern "C" fn(*const DrStackFrameV1);
 
+/// Entry forms that take the program arguments (decision 0099). The list is
+/// owned by the glue and borrowed by `main`, so the callee never releases it.
+pub type DrMainIntArgsV1 = unsafe extern "C" fn(*const DrStackFrameV1, *mut DrCollectionV1) -> i64;
+pub type DrMainVoidArgsV1 = unsafe extern "C" fn(*const DrStackFrameV1, *mut DrCollectionV1);
+
+/// Validates process arguments for an entrypoint that does not request the list.
+///
+/// # Safety
+///
+/// `argv` must be the argument vector the process was started with, valid for
+/// `argc` entries.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_validate_entry_args(argc: i32, argv: *const *const u8) {
+    entry_args::validate(argc, argv);
+}
+
 /// Allocates a headerless native class payload.
 ///
 /// This is a private, versioned compiler/runtime ABI. `byte_alignment` is
@@ -537,7 +554,12 @@ pub unsafe extern "C" fn dr_v1_class_free(payload: *mut u8) {
 /// for the duration of the call.
 #[no_mangle]
 pub unsafe extern "C" fn dr_v1_main_int(entry: DrMainIntV1) -> i32 {
-    let status = entry(ptr::null());
+    process_status(entry(ptr::null()))
+}
+
+/// Maps a Doria `main(): int` result to a process status, panicking outside the
+/// representable `0..=125` range.
+unsafe fn process_status(status: i64) -> i32 {
     if (0..=125).contains(&status) {
         return status as i32;
     }
@@ -550,6 +572,44 @@ pub unsafe extern "C" fn dr_v1_main_int(entry: DrMainIntV1) -> i32 {
         function_name_length: MAIN.len(),
     };
     dr_v1_panic(&frame, MESSAGE.as_ptr(), MESSAGE.len())
+}
+
+/// Invokes a Doria `main(List<string> $args): int`, building the argument list
+/// from the platform argument vector and releasing it after `main` returns.
+///
+/// # Safety
+///
+/// `entry` must implement `DrMainIntArgsV1`. `argv` must be the argument vector
+/// the process was started with, valid for `argc` entries.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_main_int_args(
+    entry: DrMainIntArgsV1,
+    argc: i32,
+    argv: *const *const u8,
+) -> i32 {
+    let args = entry_args::build(argc, argv);
+    // Validate before cleanup: an invalid status is an abort-only panic path.
+    let status = process_status(entry(ptr::null(), args));
+    entry_args::release(args);
+    status
+}
+
+/// Invokes a Doria `main(List<string> $args): void`.
+///
+/// # Safety
+///
+/// `entry` must implement `DrMainVoidArgsV1`. `argv` must be the argument vector
+/// the process was started with, valid for `argc` entries.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_main_void_args(
+    entry: DrMainVoidArgsV1,
+    argc: i32,
+    argv: *const *const u8,
+) -> i32 {
+    let args = entry_args::build(argc, argv);
+    entry(ptr::null(), args);
+    entry_args::release(args);
+    0
 }
 
 /// Invokes a generated Doria void entry function.
@@ -984,7 +1044,7 @@ pub unsafe extern "C" fn dr_v1_string_from_utf8(
     string
 }
 
-unsafe fn allocate_string(byte_length: usize) -> *mut DrStringV1 {
+pub(crate) unsafe fn allocate_string(byte_length: usize) -> *mut DrStringV1 {
     let total = STRING_HEADER_SIZE
         .checked_add(byte_length)
         .unwrap_or_else(|| string_runtime_panic(b"string length overflow"));
@@ -1568,7 +1628,7 @@ unsafe fn string_bytes(string: *const DrStringV1) -> *const u8 {
     string.cast::<u8>().add(STRING_HEADER_SIZE)
 }
 
-unsafe fn string_bytes_mut(string: *mut DrStringV1) -> *mut u8 {
+pub(crate) unsafe fn string_bytes_mut(string: *mut DrStringV1) -> *mut u8 {
     string.cast::<u8>().add(STRING_HEADER_SIZE)
 }
 

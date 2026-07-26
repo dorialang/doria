@@ -85,8 +85,47 @@ pub fn validate_program(program: &mir::Program) -> Result<(), BackendError> {
             "entry FunctionId does not match its table slot",
         ));
     }
-    if !entry.params.is_empty() {
-        return Err(malformed_mir("entry function declares parameters"));
+    // Decision 0099: the entry takes either no parameters or exactly one
+    // borrowed `List<string>` of program arguments, which the entry glue owns
+    // for the duration of the call.
+    match entry.params.as_slice() {
+        [] => {}
+        [parameter] => {
+            let local = entry
+                .locals
+                .get(parameter.0)
+                .ok_or_else(|| malformed_mir("entry parameter local does not exist"))?;
+            let mir::Type::Collection(collection) = local.ty else {
+                return Err(malformed_mir(
+                    "entry parameter must be the `List<string>` argument list",
+                ));
+            };
+            let definition = program
+                .collection_types
+                .get(collection.0)
+                .ok_or_else(|| malformed_mir("entry argument collection does not exist"))?;
+            if definition.kind != mir::CollectionKind::List || definition.value != mir::Type::String
+            {
+                return Err(malformed_mir(
+                    "entry parameter must be the `List<string>` argument list",
+                ));
+            }
+            if local.owned {
+                return Err(malformed_mir(
+                    "the entry argument list is borrowed from the entry glue, not owned by `main`",
+                ));
+            }
+            if local.writable {
+                return Err(malformed_mir(
+                    "the entry argument list is a readonly borrow from the entry glue",
+                ));
+            }
+        }
+        _ => {
+            return Err(malformed_mir(
+                "entry function declares more than one parameter",
+            ));
+        }
     }
     if entry.method.is_some() || entry.receiver_mode.is_some() {
         return Err(malformed_mir("entry function cannot be a method"));

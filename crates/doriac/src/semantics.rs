@@ -2021,6 +2021,66 @@ impl<'program> Checker<'program> {
         }
     }
 
+    /// Decision 0099: `main` takes either no parameters or exactly one
+    /// `List<string>` holding the program's arguments. There is no `argc` — the
+    /// list carries its own length — and the parameter is an ordinary readonly
+    /// borrow, because the entry glue owns the list and releases it after `main`
+    /// returns.
+    fn check_entry_parameters(&mut self, function: &FunctionDecl) {
+        if function.params.is_empty() {
+            return;
+        }
+
+        if function.params.len() > 1 {
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "E0526",
+                    format!(
+                        "process entrypoint `main` takes at most one parameter, got {}",
+                        function.params.len()
+                    ),
+                    function.span,
+                )
+                .with_help(
+                    "declare `main(List<string> $args)`; the list carries its own length, so there is no separate argument count",
+                ),
+            );
+            return;
+        }
+
+        let param = &function.params[0];
+        if param.take || param.writable {
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "E0526",
+                    "the `main` argument list cannot be `writable` or `take`",
+                    param.span,
+                )
+                .with_help("declare it as `main(List<string> $args)`; the program arguments are borrowed for the duration of `main`"),
+            );
+            return;
+        }
+
+        let expected = {
+            let string = self.types.intern(TypeKind::String);
+            self.types.intern(TypeKind::List(string))
+        };
+        let actual = self.resolve_type_ref(&param.ty, param.span);
+        if actual != expected && !self.is_unknown_type(actual) {
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "E0526",
+                    format!(
+                        "process entrypoint `main` expects `List<string>` for its argument list, got `{}`",
+                        self.types.display(actual)
+                    ),
+                    param.span,
+                )
+                .with_help("declare `main(List<string> $args)`"),
+            );
+        }
+    }
+
     fn check_function(&mut self, function: &FunctionDecl, method_context: Option<MethodContext>) {
         let mut scopes = ScopeStack::new();
         let signature = self.current_function_signature(function);
@@ -2042,6 +2102,10 @@ impl<'program> Checker<'program> {
                 )
                 .with_help("helper functions may return fixed-width integers, floats, or bool"),
             );
+        }
+
+        if method_context.is_none() && function.name == "main" {
+            self.check_entry_parameters(function);
         }
         let return_context = self.return_context_for_function(function, method_context.as_ref());
         for (parameter_index, (param, param_info)) in function

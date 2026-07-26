@@ -3,6 +3,11 @@ use std::path::PathBuf;
 use std::process::{Command, Output};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[cfg(unix)]
+use std::ffi::OsString;
+#[cfg(unix)]
+use std::os::unix::ffi::OsStringExt;
+
 #[test]
 fn version_uses_canonical_toolchain_calver() {
     let output = Command::new(doriac_bin())
@@ -180,6 +185,79 @@ function main(): int
         Some(42),
         "doriac run should return the native program status"
     );
+
+    let _ = fs::remove_dir_all(temp_dir);
+}
+
+#[test]
+fn run_forwards_program_arguments_after_the_separator() {
+    if !host_linker_is_available() {
+        eprintln!(
+            "native CLI argument test unavailable: host linker `{}` was not found",
+            host_linker()
+        );
+        return;
+    }
+
+    let temp_dir = temp_dir_path("native-run-arguments");
+    fs::create_dir_all(&temp_dir).expect("temp directory should be created");
+    fs::write(
+        temp_dir.join("main.doria"),
+        "function main(List<string> $args): int { return $args->count; }",
+    )
+    .expect("source file should be writable");
+
+    let run = Command::new(doriac_bin())
+        .current_dir(&temp_dir)
+        .arg("run")
+        .arg("main.doria")
+        .arg("--")
+        .arg("--looks-like-an-option")
+        .arg("two words")
+        .status()
+        .expect("doriac binary should launch the generated program");
+
+    assert_eq!(run.code(), Some(2));
+
+    let _ = fs::remove_dir_all(temp_dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn run_preserves_non_utf8_program_arguments_for_the_runtime() {
+    if !host_linker_is_available() {
+        eprintln!(
+            "native CLI argument test unavailable: host linker `{}` was not found",
+            host_linker()
+        );
+        return;
+    }
+
+    let temp_dir = temp_dir_path("native-run-non-utf8-argument");
+    fs::create_dir_all(&temp_dir).expect("temp directory should be created");
+    for source in [
+        "function main(): void {}",
+        "function main(List<string> $args): void {}",
+    ] {
+        fs::write(temp_dir.join("main.doria"), source).expect("source file should be writable");
+
+        let run = Command::new(doriac_bin())
+            .current_dir(&temp_dir)
+            .arg("run")
+            .arg("main.doria")
+            .arg("--")
+            .arg(OsString::from_vec(vec![0xff]))
+            .output()
+            .expect("doriac binary should launch the generated program");
+
+        assert_eq!(run.status.code(), Some(101), "source: {source}");
+        assert!(
+            String::from_utf8_lossy(&run.stderr)
+                .contains("Panic: program argument is not valid UTF-8"),
+            "the generated Doria runtime should reject the argument for `{source}`: {}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+    }
 
     let _ = fs::remove_dir_all(temp_dir);
 }

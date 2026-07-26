@@ -465,35 +465,90 @@ fn define_process_main<'ctx>(
     let entry_function = *functions
         .get(program.entry.0)
         .ok_or_else(|| malformed_mir("entry function was not declared"))?;
+    let pointer_type = context.ptr_type(AddressSpace::default());
+    // The process entry point is C `main(int argc, char **argv)`. Both
+    // parameters are always declared, even when the Doria entry ignores them,
+    // so the platform start-up code always sees the signature it expects.
     let main = module.add_function(
         "main",
-        context.i32_type().fn_type(&[], false),
+        context
+            .i32_type()
+            .fn_type(&[context.i32_type().into(), pointer_type.into()], false),
         Some(Linkage::External),
     );
     let builder = context.create_builder();
     let block = context.append_basic_block(main, "entry");
     builder.position_at_end(block);
-    let pointer_type = context.ptr_type(AddressSpace::default());
-    let runtime_name = match entry.return_type {
-        mir::ReturnType::Value(mir::Type::Scalar(mir::ScalarType::Integer(IntegerType::Int64))) => {
-            "dr_v1_main_int"
-        }
-        mir::ReturnType::Void => "dr_v1_main_void",
-        mir::ReturnType::Value(other) => {
+    let argc = main
+        .get_nth_param(0)
+        .ok_or_else(|| backend_failure("process entry is missing its argument count"))?;
+    let argv = main
+        .get_nth_param(1)
+        .ok_or_else(|| backend_failure("process entry is missing its argument vector"))?;
+    // Decision 0099: an entry that declares the argument list is invoked
+    // through the `_args` runtime glue, which builds an owned `List<string>`,
+    // lends it to `main`, and releases it afterwards.
+    let takes_arguments = !entry.params.is_empty();
+    if !takes_arguments {
+        let validation = module
+            .get_function("dr_v1_validate_entry_args")
+            .unwrap_or_else(|| {
+                module.add_function(
+                    "dr_v1_validate_entry_args",
+                    context
+                        .void_type()
+                        .fn_type(&[context.i32_type().into(), pointer_type.into()], false),
+                    Some(Linkage::External),
+                )
+            });
+        build(builder.build_call(
+            validation,
+            &[argc.into(), argv.into()],
+            "process.args.validated",
+        ))?;
+    }
+    let runtime_name = match (entry.return_type, takes_arguments) {
+        (
+            mir::ReturnType::Value(mir::Type::Scalar(mir::ScalarType::Integer(IntegerType::Int64))),
+            false,
+        ) => "dr_v1_main_int",
+        (
+            mir::ReturnType::Value(mir::Type::Scalar(mir::ScalarType::Integer(IntegerType::Int64))),
+            true,
+        ) => "dr_v1_main_int_args",
+        (mir::ReturnType::Void, false) => "dr_v1_main_void",
+        (mir::ReturnType::Void, true) => "dr_v1_main_void_args",
+        (mir::ReturnType::Value(other), _) => {
             return Err(malformed_mir(format!(
                 "entry function has unsupported process return type {other}"
             )))
         }
     };
     let runtime = module.get_function(runtime_name).unwrap_or_else(|| {
-        module.add_function(
-            runtime_name,
-            context.i32_type().fn_type(&[pointer_type.into()], false),
-            Some(Linkage::External),
-        )
+        let signature = if takes_arguments {
+            context.i32_type().fn_type(
+                &[
+                    pointer_type.into(),
+                    context.i32_type().into(),
+                    pointer_type.into(),
+                ],
+                false,
+            )
+        } else {
+            context.i32_type().fn_type(&[pointer_type.into()], false)
+        };
+        module.add_function(runtime_name, signature, Some(Linkage::External))
     });
     let entry_pointer = entry_function.as_global_value().as_pointer_value();
-    let call = build(builder.build_call(runtime, &[entry_pointer.into()], "process.status"))?;
+    let call = if takes_arguments {
+        build(builder.build_call(
+            runtime,
+            &[entry_pointer.into(), argc.into(), argv.into()],
+            "process.status",
+        ))?
+    } else {
+        build(builder.build_call(runtime, &[entry_pointer.into()], "process.status"))?
+    };
     let status = call
         .try_as_basic_value()
         .basic()

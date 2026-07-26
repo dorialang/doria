@@ -174,15 +174,24 @@ fn linker_arguments(
             OsString::from("/ENTRY:main"),
             OsString::from("/SUBSYSTEM:CONSOLE"),
             OsString::from("kernel32.lib"),
+            // `doria_rt.lib` is a staticlib, so it carries archived objects
+            // without the crate metadata that records a `#[link]` dependency.
+            // The entry glue's `CommandLineToArgvW` therefore has to be named
+            // here; shell32 is not in the default library set.
+            OsString::from("shell32.lib"),
         ];
     }
 
-    vec![
+    let mut arguments = vec![
         object_path.as_os_str().to_os_string(),
         runtime_path.as_os_str().to_os_string(),
         OsString::from("-o"),
         executable_path.as_os_str().to_os_string(),
-    ]
+    ];
+    if windows {
+        arguments.push(OsString::from("-lshell32"));
+    }
+    arguments
 }
 
 fn is_msvc_style_compiler_driver(linker: &str) -> bool {
@@ -222,6 +231,7 @@ mod tests {
                 OsString::from("/ENTRY:main"),
                 OsString::from("/SUBSYSTEM:CONSOLE"),
                 OsString::from("kernel32.lib"),
+                OsString::from("shell32.lib"),
             ]
         );
     }
@@ -249,6 +259,7 @@ mod tests {
                 OsString::from("/ENTRY:main"),
                 OsString::from("/SUBSYSTEM:CONSOLE"),
                 OsString::from("kernel32.lib"),
+                OsString::from("shell32.lib"),
             ]
         );
     }
@@ -272,6 +283,7 @@ mod tests {
                 OsString::from("doria_rt.lib"),
                 OsString::from("-o"),
                 OsString::from("main.exe"),
+                OsString::from("-lshell32"),
             ]
         );
     }
@@ -295,6 +307,7 @@ mod tests {
                 OsString::from("libdoria_rt.a"),
                 OsString::from("-o"),
                 OsString::from("main.exe"),
+                OsString::from("-lshell32"),
             ]
         );
         assert_eq!(default_linker(false), "cc");

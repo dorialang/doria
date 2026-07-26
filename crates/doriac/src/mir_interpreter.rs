@@ -375,6 +375,10 @@ struct Interpreter<'program> {
 pub struct MirIo {
     pub stdin: Vec<u8>,
     pub files: BTreeMap<String, Vec<u8>>,
+    /// Program arguments handed to a `main(List<string> $args)` (decision
+    /// 0099). These are the arguments only — the executable path is stripped by
+    /// the entry glue, so element 0 is the first real argument.
+    pub args: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -412,12 +416,36 @@ fn interpret_internal(
     limits: InterpreterLimits,
     io: MirIo,
 ) -> Result<InterpreterIoOutput, InterpreterError> {
+    crate::mir_validation::validate_program(program)
+        .map_err(|error| InterpreterError::new(error.message))?;
     let entry = function_in(program, program.entry)?;
-    if !entry.params.is_empty() {
-        return Err(InterpreterError::new(
-            "MIR entry function must not declare parameters",
-        ));
-    }
+    // Decision 0099: the entry takes either no parameters or one `List<string>`
+    // of program arguments, which the glue owns and lends to `main`.
+    let entry_argument_collection = match entry.params.as_slice() {
+        [] => None,
+        [parameter] => match entry.locals[parameter.0].ty {
+            mir::Type::Collection(collection) => Some(collection),
+            _ => {
+                return Err(InterpreterError::new(
+                    "MIR entry parameter must be the `List<string>` argument list",
+                ));
+            }
+        },
+        _ => {
+            return Err(InterpreterError::new(
+                "MIR entry function declares more than one parameter",
+            ));
+        }
+    };
+    let entry_arguments = entry_argument_collection.map(|collection| {
+        LocalValue::Collection(CollectionValue::new(
+            collection,
+            io.args
+                .iter()
+                .map(|argument| (None, LocalValue::String(argument.clone())))
+                .collect(),
+        ))
+    });
 
     let mut interpreter = Interpreter {
         program,
@@ -461,7 +489,8 @@ fn interpret_internal(
         executed_blocks: 0,
         pending_panic: None,
     };
-    interpreter.push_frame(program.entry, &[], None)?;
+    let entry_frame_arguments: Vec<LocalValue> = entry_arguments.into_iter().collect();
+    interpreter.push_frame(program.entry, &entry_frame_arguments, None)?;
 
     loop {
         match interpreter.step()? {

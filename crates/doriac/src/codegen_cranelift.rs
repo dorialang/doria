@@ -66,7 +66,15 @@ pub fn lower_mir_to_object(program: &mir::Program) -> Result<Vec<u8>, BackendErr
     let class_drop_function_ids = declare_class_drop_functions(&mut module, program)?;
     let static_ids = define_static_data(&mut module, program)?;
 
+    // The process entry point is C `main(int argc, char **argv)`. Both
+    // parameters are always declared, even when the Doria entry ignores them,
+    // so the platform start-up code always sees the signature it expects.
     let mut process_signature = module.make_signature();
+    let process_pointer_type = module.target_config().pointer_type();
+    process_signature.params.push(AbiParam::new(types::I32));
+    process_signature
+        .params
+        .push(AbiParam::new(process_pointer_type));
     process_signature.returns.push(AbiParam::new(types::I32));
     let process_main_id = module
         .declare_function("main", Linkage::Export, &process_signature)
@@ -772,21 +780,58 @@ fn define_process_main(
     {
         let mut builder = FunctionBuilder::new(&mut context.func, &mut builder_context);
         let block = builder.create_block();
+        builder.append_block_params_for_function_params(block);
         builder.switch_to_block(block);
         builder.seal_block(block);
+        let argc = builder.block_params(block)[0];
+        let argv = builder.block_params(block)[1];
 
         let pointer_type = module.target_config().pointer_type();
         let entry_ref = module.declare_func_in_func(entry_id, builder.func);
         let entry_pointer = builder.ins().func_addr(pointer_type, entry_ref);
+        // Decision 0099: an entry that declares the argument list is invoked
+        // through the `_args` runtime glue, which builds an owned
+        // `List<string>`, lends it to `main`, and releases it afterwards.
+        let takes_arguments = !entry.params.is_empty();
+        if !takes_arguments {
+            let mut validation_signature = module.make_signature();
+            validation_signature.params.push(AbiParam::new(types::I32));
+            validation_signature
+                .params
+                .push(AbiParam::new(pointer_type));
+            let validation_id = module
+                .declare_function(
+                    "dr_v1_validate_entry_args",
+                    Linkage::Import,
+                    &validation_signature,
+                )
+                .map_err(|error| backend_failure(error.to_string()))?;
+            let validation = module.declare_func_in_func(validation_id, builder.func);
+            builder.ins().call(validation, &[argc, argv]);
+        }
         let mut runtime_signature = module.make_signature();
         runtime_signature.params.push(AbiParam::new(pointer_type));
+        if takes_arguments {
+            runtime_signature.params.push(AbiParam::new(types::I32));
+            runtime_signature.params.push(AbiParam::new(pointer_type));
+        }
         runtime_signature.returns.push(AbiParam::new(types::I32));
-        let runtime_symbol = match entry.return_type {
-            mir::ReturnType::Value(mir::Type::Scalar(mir::ScalarType::Integer(
-                IntegerType::Int64,
-            ))) => "dr_v1_main_int",
-            mir::ReturnType::Void => "dr_v1_main_void",
-            mir::ReturnType::Value(other) => {
+        let runtime_symbol = match (entry.return_type, takes_arguments) {
+            (
+                mir::ReturnType::Value(mir::Type::Scalar(mir::ScalarType::Integer(
+                    IntegerType::Int64,
+                ))),
+                false,
+            ) => "dr_v1_main_int",
+            (
+                mir::ReturnType::Value(mir::Type::Scalar(mir::ScalarType::Integer(
+                    IntegerType::Int64,
+                ))),
+                true,
+            ) => "dr_v1_main_int_args",
+            (mir::ReturnType::Void, false) => "dr_v1_main_void",
+            (mir::ReturnType::Void, true) => "dr_v1_main_void_args",
+            (mir::ReturnType::Value(other), _) => {
                 return Err(malformed_mir(format!(
                     "entry function has unsupported process return type {other}"
                 )));
@@ -796,7 +841,11 @@ fn define_process_main(
             .declare_function(runtime_symbol, Linkage::Import, &runtime_signature)
             .map_err(|error| backend_failure(error.to_string()))?;
         let runtime = module.declare_func_in_func(runtime_id, builder.func);
-        let call = builder.ins().call(runtime, &[entry_pointer]);
+        let call = if takes_arguments {
+            builder.ins().call(runtime, &[entry_pointer, argc, argv])
+        } else {
+            builder.ins().call(runtime, &[entry_pointer])
+        };
         let status = builder.inst_results(call)[0];
         builder.ins().return_(&[status]);
         builder.finalize();
