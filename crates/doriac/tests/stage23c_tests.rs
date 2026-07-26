@@ -11,7 +11,7 @@ fn sequence_fills_are_contextual_and_execute_in_source_order() {
         .expect("sequence fills should execute through shared MIR");
     assert_eq!(
         output.stdout,
-        b"count\nvalue\ncount\ncount\n3:true\n2:42:42\n2:false\n3:7\n2:9\n3:repeat:repeat\n3:true:false\n"
+        b"count\nvalue\ncount\ncount\n3:borrowed\ncount\n3:true\n2:42:42\n2:false\n3:7\n2:9\n3:repeat:repeat\n3:true:false\n"
     );
     assert!(mir.functions.iter().any(|function| {
         function.blocks.iter().any(|block| {

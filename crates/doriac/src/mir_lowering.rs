@@ -4714,11 +4714,15 @@ fn hoist_argument_temporary(
     ty: mir::Type,
     context: &mut LoweringContext,
 ) -> mir::Rvalue {
+    let borrowed_class_value = value.borrows_class_value();
     let local = match ty {
         mir::Type::Scalar(_)
         | mir::Type::NullableScalar(_)
         | mir::Type::String
         | mir::Type::NullableString => context.declare_borrowed_temp(ty, false),
+        mir::Type::Class(_) | mir::Type::NullableClass(_) if borrowed_class_value => {
+            context.declare_borrowed_temp(ty, false)
+        }
         mir::Type::Mixed
         | mir::Type::NullableMixed
         | mir::Type::Class(_)
@@ -4729,19 +4733,20 @@ fn hoist_argument_temporary(
         target: local,
         value,
     });
-    read_local_as_rvalue(local, ty)
+    read_local_as_rvalue(local, ty, !borrowed_class_value)
 }
 
 /// Read a temporary local back as an rvalue of its own type.
-fn read_local_as_rvalue(local: mir::LocalId, ty: mir::Type) -> mir::Rvalue {
-    let transfer = matches!(
-        ty,
-        mir::Type::Mixed
-            | mir::Type::NullableMixed
-            | mir::Type::Class(_)
-            | mir::Type::NullableClass(_)
-            | mir::Type::Collection(_)
-    );
+fn read_local_as_rvalue(local: mir::LocalId, ty: mir::Type, transfer_owned: bool) -> mir::Rvalue {
+    let transfer = transfer_owned
+        && matches!(
+            ty,
+            mir::Type::Mixed
+                | mir::Type::NullableMixed
+                | mir::Type::Class(_)
+                | mir::Type::NullableClass(_)
+                | mir::Type::Collection(_)
+        );
     local_rvalue(local, ty, transfer)
 }
 

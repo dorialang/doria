@@ -10,6 +10,11 @@ function fillValue(): string
     return "repeat";
 }
 
+function inspectWords(List<string> $words): void
+{
+    echo "{$words->count}:{$words[1]}\n";
+}
+
 function main(): int
 {
     bool[] $flags = [true; runtimeCount()];
@@ -18,6 +23,7 @@ function main(): int
     List<int> $counts = [7; 3];
     let $defaulted = [9; 2];
     List<string> $words = [fillValue(); runtimeCount()];
+    inspectWords(["borrowed"; runtimeCount()]);
 
     writable bool[] $sieve = [true; runtimeCount()];
     $sieve[1] = false;

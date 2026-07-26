@@ -39,7 +39,14 @@ fn version_json_exposes_the_baton_compiler_contract() {
         identity["target"],
         format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH)
     );
-    assert!(identity["commit"].is_string());
+    let commit = identity["commit"]
+        .as_str()
+        .expect("compiler commit should be a string");
+    assert_eq!(commit.len(), 40, "compiler commit should be a full Git SHA");
+    assert!(
+        commit.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "compiler commit should be hexadecimal"
+    );
 }
 
 #[test]

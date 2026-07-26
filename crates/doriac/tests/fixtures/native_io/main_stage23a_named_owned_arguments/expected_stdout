@@ -91,5 +91,10 @@ make constructor-take
 mark constructor-take
 construct 1
 after constructor
+identity returned-borrow
+mark returned-borrow
+borrow returned-borrow 1
+after returned borrow
+drop returned-borrow
 drop envelope
 drop constructor-take

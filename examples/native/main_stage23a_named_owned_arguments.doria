@@ -58,6 +58,12 @@ function borrowToken(int $marker, Token $token): void
     echo "borrow " . $token->name . " {$marker}\n";
 }
 
+function identityToken(Token $token): Token
+{
+    echo "identity " . $token->name . "\n";
+    return $token;
+}
+
 function takeToken(int $marker, take Token $token): void
 {
     echo "take " . $token->name . " {$marker}\n";
@@ -232,4 +238,11 @@ function main(): void
         marker: marker("constructor-take"),
     );
     echo "after constructor\n";
+
+    let $returnedBorrow = new Token("returned-borrow");
+    borrowToken(
+        token: identityToken($returnedBorrow),
+        marker: marker("returned-borrow"),
+    );
+    echo "after returned borrow\n";
 }

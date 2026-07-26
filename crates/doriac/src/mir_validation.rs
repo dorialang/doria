@@ -398,9 +398,7 @@ fn validate_statement(
                                 target.0
                             )));
                         }
-                        if infer_nullable_expression_return_borrow(program, function, expression)?
-                            .is_none()
-                        {
+                        if !expression.borrows_class_value() {
                             return Err(malformed_mir(format!(
                                 "borrowed nullable class temporary local{} receives an owning value",
                                 target.0
@@ -509,8 +507,7 @@ fn validate_statement(
                             )));
                         }
                         validate_class_expression(program, function, expression)?;
-                        if infer_expression_return_borrow(program, function, expression)?.is_none()
-                        {
+                        if !expression.borrows_class_value() {
                             return Err(malformed_mir(format!(
                                 "borrowed class temporary local{} receives an owning value",
                                 target.0

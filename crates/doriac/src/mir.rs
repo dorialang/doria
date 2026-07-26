@@ -262,11 +262,7 @@ impl Rvalue {
 
     pub const fn owned_temporary_collection(&self) -> Option<CollectionTypeId> {
         match self {
-            Self::Collection(CollectionExpression::Local {
-                collection,
-                transfer: true,
-                ..
-            }) => Some(*collection),
+            Self::Collection(value) => value.owned_temporary_collection(),
             Self::Value(_)
             | Self::String(_)
             | Self::Mixed(_)
@@ -274,8 +270,21 @@ impl Rvalue {
             | Self::NullableString(_)
             | Self::NullableMixed(_)
             | Self::Class(_)
-            | Self::NullableClass(_)
-            | Self::Collection(_) => None,
+            | Self::NullableClass(_) => None,
+        }
+    }
+
+    pub const fn borrows_class_value(&self) -> bool {
+        match self {
+            Self::Class(value) => value.borrows_class_value(),
+            Self::NullableClass(value) => value.borrows_class_value(),
+            Self::Value(_)
+            | Self::String(_)
+            | Self::Mixed(_)
+            | Self::NullableScalar(_)
+            | Self::NullableString(_)
+            | Self::NullableMixed(_)
+            | Self::Collection(_) => false,
         }
     }
 
@@ -416,6 +425,36 @@ impl CollectionExpression {
             | Self::ReadFileBytes { collection, .. }
             | Self::ReadStdinBytes { collection }
             | Self::Call { collection, .. } => *collection,
+        }
+    }
+
+    pub const fn owned_temporary_collection(&self) -> Option<CollectionTypeId> {
+        match self {
+            Self::Local {
+                collection,
+                transfer: true,
+                ..
+            }
+            | Self::Literal { collection, .. }
+            | Self::Fill { collection, .. }
+            | Self::Index {
+                collection,
+                transfer: true,
+                ..
+            }
+            | Self::SetFrom { collection, .. }
+            | Self::FromBytes { collection, .. }
+            | Self::BytesFromArray { collection, .. }
+            | Self::ReadFileBytes { collection, .. }
+            | Self::ReadStdinBytes { collection }
+            | Self::Call { collection, .. } => Some(*collection),
+            Self::Local {
+                transfer: false, ..
+            }
+            | Self::Index {
+                transfer: false, ..
+            }
+            | Self::Property { .. } => None,
         }
     }
 }
@@ -712,6 +751,26 @@ impl ClassExpression {
                 return_borrow: Some(_),
                 ..
             } => None,
+        }
+    }
+
+    pub const fn borrows_class_value(&self) -> bool {
+        match self {
+            Self::Local { transfer, .. }
+            | Self::NullableLocalAssumeNonNull { transfer, .. }
+            | Self::Coalesce { transfer, .. }
+            | Self::CollectionIndex { transfer, .. }
+            | Self::MixedPayload { transfer, .. } => !*transfer,
+            Self::Property { .. }
+            | Self::Call {
+                return_borrow: Some(_),
+                ..
+            } => true,
+            Self::Call {
+                return_borrow: None,
+                ..
+            }
+            | Self::New { .. } => false,
         }
     }
 }
@@ -1065,6 +1124,36 @@ impl NullableClassExpression {
             } => None,
         }
     }
+
+    pub const fn borrows_class_value(&self) -> bool {
+        match self {
+            Self::Class(value) => value.borrows_class_value(),
+            Self::Local { transfer, .. } | Self::Coalesce { transfer, .. } => !*transfer,
+            Self::Property { .. }
+            | Self::NullSafeProperty { .. }
+            | Self::Call {
+                return_borrow: Some(_),
+                ..
+            }
+            | Self::NullSafeCall {
+                return_borrow: Some(_),
+                ..
+            } => true,
+            Self::DictionaryGet { access, .. } => !matches!(
+                access,
+                NullableCollectionAccess::Remove | NullableCollectionAccess::Pop
+            ),
+            Self::Null(_)
+            | Self::Call {
+                return_borrow: None,
+                ..
+            }
+            | Self::NullSafeCall {
+                return_borrow: None,
+                ..
+            } => false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1368,32 +1457,35 @@ fn nullable_mixed_class_temporary_capacity(value: &NullableMixedExpression) -> u
 }
 
 fn collection_class_temporary_capacity(value: &CollectionExpression) -> usize {
-    match value {
-        CollectionExpression::Local { transfer, .. } => usize::from(*transfer),
-        CollectionExpression::SetFrom { .. }
-        | CollectionExpression::FromBytes { .. }
-        | CollectionExpression::BytesFromArray { .. }
-        | CollectionExpression::ReadStdinBytes { .. } => 0,
-        CollectionExpression::Call { args, .. } => {
-            args.iter().map(rvalue_class_temporary_capacity).sum()
+    usize::from(value.owned_temporary_collection().is_some())
+        + match value {
+            CollectionExpression::Local { .. } => 0,
+            CollectionExpression::SetFrom { .. }
+            | CollectionExpression::FromBytes { .. }
+            | CollectionExpression::BytesFromArray { .. }
+            | CollectionExpression::ReadStdinBytes { .. } => 0,
+            CollectionExpression::Call { args, .. } => {
+                args.iter().map(rvalue_class_temporary_capacity).sum()
+            }
+            CollectionExpression::Literal { entries, .. } => entries
+                .iter()
+                .map(|entry| {
+                    entry
+                        .key
+                        .as_ref()
+                        .map_or(0, rvalue_class_temporary_capacity)
+                        + rvalue_class_temporary_capacity(&entry.value)
+                })
+                .sum(),
+            CollectionExpression::Fill { value, count, .. } => {
+                rvalue_class_temporary_capacity(value) + integer_class_temporary_capacity(count)
+            }
+            CollectionExpression::Index { index, .. } => rvalue_class_temporary_capacity(index),
+            CollectionExpression::Property { .. } => 0,
+            CollectionExpression::ReadFileBytes { path, .. } => {
+                string_class_temporary_capacity(path)
+            }
         }
-        CollectionExpression::Literal { entries, .. } => entries
-            .iter()
-            .map(|entry| {
-                entry
-                    .key
-                    .as_ref()
-                    .map_or(0, rvalue_class_temporary_capacity)
-                    + rvalue_class_temporary_capacity(&entry.value)
-            })
-            .sum(),
-        CollectionExpression::Fill { value, count, .. } => {
-            rvalue_class_temporary_capacity(value) + integer_class_temporary_capacity(count)
-        }
-        CollectionExpression::Index { index, .. } => rvalue_class_temporary_capacity(index),
-        CollectionExpression::Property { .. } => 0,
-        CollectionExpression::ReadFileBytes { path, .. } => string_class_temporary_capacity(path),
-    }
 }
 
 fn value_class_temporary_capacity(value: &ValueExpression) -> usize {
