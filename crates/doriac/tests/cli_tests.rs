@@ -235,27 +235,29 @@ fn run_preserves_non_utf8_program_arguments_for_the_runtime() {
 
     let temp_dir = temp_dir_path("native-run-non-utf8-argument");
     fs::create_dir_all(&temp_dir).expect("temp directory should be created");
-    fs::write(
-        temp_dir.join("main.doria"),
+    for source in [
+        "function main(): void {}",
         "function main(List<string> $args): void {}",
-    )
-    .expect("source file should be writable");
+    ] {
+        fs::write(temp_dir.join("main.doria"), source).expect("source file should be writable");
 
-    let run = Command::new(doriac_bin())
-        .current_dir(&temp_dir)
-        .arg("run")
-        .arg("main.doria")
-        .arg("--")
-        .arg(OsString::from_vec(vec![0xff]))
-        .output()
-        .expect("doriac binary should launch the generated program");
+        let run = Command::new(doriac_bin())
+            .current_dir(&temp_dir)
+            .arg("run")
+            .arg("main.doria")
+            .arg("--")
+            .arg(OsString::from_vec(vec![0xff]))
+            .output()
+            .expect("doriac binary should launch the generated program");
 
-    assert_eq!(run.status.code(), Some(101));
-    assert!(
-        String::from_utf8_lossy(&run.stderr).contains("Panic: program argument is not valid UTF-8"),
-        "the generated Doria runtime should reject the argument: {}",
-        String::from_utf8_lossy(&run.stderr)
-    );
+        assert_eq!(run.status.code(), Some(101), "source: {source}");
+        assert!(
+            String::from_utf8_lossy(&run.stderr)
+                .contains("Panic: program argument is not valid UTF-8"),
+            "the generated Doria runtime should reject the argument for `{source}`: {}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+    }
 
     let _ = fs::remove_dir_all(temp_dir);
 }

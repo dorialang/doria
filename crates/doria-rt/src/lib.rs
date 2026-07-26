@@ -484,6 +484,17 @@ pub type DrMainVoidV1 = unsafe extern "C" fn(*const DrStackFrameV1);
 pub type DrMainIntArgsV1 = unsafe extern "C" fn(*const DrStackFrameV1, *mut DrCollectionV1) -> i64;
 pub type DrMainVoidArgsV1 = unsafe extern "C" fn(*const DrStackFrameV1, *mut DrCollectionV1);
 
+/// Validates process arguments for an entrypoint that does not request the list.
+///
+/// # Safety
+///
+/// `argv` must be the argument vector the process was started with, valid for
+/// `argc` entries.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_validate_entry_args(argc: i32, argv: *const *const u8) {
+    entry_args::validate(argc, argv);
+}
+
 /// Allocates a headerless native class payload.
 ///
 /// This is a private, versioned compiler/runtime ABI. `byte_alignment` is
@@ -577,9 +588,10 @@ pub unsafe extern "C" fn dr_v1_main_int_args(
     argv: *const *const u8,
 ) -> i32 {
     let args = entry_args::build(argc, argv);
-    let status = entry(ptr::null(), args);
+    // Validate before cleanup: an invalid status is an abort-only panic path.
+    let status = process_status(entry(ptr::null(), args));
     entry_args::release(args);
-    process_status(status)
+    status
 }
 
 /// Invokes a Doria `main(List<string> $args): void`.

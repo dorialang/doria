@@ -37,6 +37,19 @@ pub unsafe fn build(argc: i32, argv: *const *const u8) -> *mut DrCollectionV1 {
     list
 }
 
+/// Validates the platform argument vector without materializing a Doria list.
+///
+/// Parameterless entrypoints still cross the same process boundary, so invalid
+/// platform text must panic even when the program does not request `$args`.
+///
+/// # Safety
+///
+/// On Unix, `argv` must be a valid array of `argc` NUL-terminated pointers, as
+/// supplied to C `main`. On Windows both parameters are ignored.
+pub unsafe fn validate(argc: i32, argv: *const *const u8) {
+    append_platform_arguments(ptr::null_mut(), argc, argv);
+}
+
 /// Releases an argument list built by [`build`], including its element strings.
 ///
 /// # Safety
@@ -124,6 +137,9 @@ unsafe fn push_utf8(list: *mut DrCollectionV1, bytes: *const u8, byte_length: us
     if !argument_is_representable(core::slice::from_raw_parts(bytes, byte_length)) {
         argument_panic(b"program argument is not valid UTF-8");
     }
+    if list.is_null() {
+        return;
+    }
     let string = crate::dr_v1_string_from_utf8(bytes, byte_length);
     collection::push(list, string as usize as u64);
 }
@@ -139,6 +155,9 @@ unsafe fn push_wide(list: *mut DrCollectionV1, argument: *const u16) {
             Ok(character) => byte_length += character.len_utf8(),
             Err(_) => argument_panic(b"program argument is not valid UTF-8"),
         }
+    }
+    if list.is_null() {
+        return;
     }
 
     // Allocate the exact byte length and encode straight into it: passing a

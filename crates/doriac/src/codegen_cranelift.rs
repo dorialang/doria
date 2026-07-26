@@ -793,6 +793,22 @@ fn define_process_main(
         // through the `_args` runtime glue, which builds an owned
         // `List<string>`, lends it to `main`, and releases it afterwards.
         let takes_arguments = !entry.params.is_empty();
+        if !takes_arguments {
+            let mut validation_signature = module.make_signature();
+            validation_signature.params.push(AbiParam::new(types::I32));
+            validation_signature
+                .params
+                .push(AbiParam::new(pointer_type));
+            let validation_id = module
+                .declare_function(
+                    "dr_v1_validate_entry_args",
+                    Linkage::Import,
+                    &validation_signature,
+                )
+                .map_err(|error| backend_failure(error.to_string()))?;
+            let validation = module.declare_func_in_func(validation_id, builder.func);
+            builder.ins().call(validation, &[argc, argv]);
+        }
         let mut runtime_signature = module.make_signature();
         runtime_signature.params.push(AbiParam::new(pointer_type));
         if takes_arguments {

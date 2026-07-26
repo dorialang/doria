@@ -489,6 +489,24 @@ fn define_process_main<'ctx>(
     // through the `_args` runtime glue, which builds an owned `List<string>`,
     // lends it to `main`, and releases it afterwards.
     let takes_arguments = !entry.params.is_empty();
+    if !takes_arguments {
+        let validation = module
+            .get_function("dr_v1_validate_entry_args")
+            .unwrap_or_else(|| {
+                module.add_function(
+                    "dr_v1_validate_entry_args",
+                    context
+                        .void_type()
+                        .fn_type(&[context.i32_type().into(), pointer_type.into()], false),
+                    Some(Linkage::External),
+                )
+            });
+        build(builder.build_call(
+            validation,
+            &[argc.into(), argv.into()],
+            "process.args.validated",
+        ))?;
+    }
     let runtime_name = match (entry.return_type, takes_arguments) {
         (
             mir::ReturnType::Value(mir::Type::Scalar(mir::ScalarType::Integer(IntegerType::Int64))),
