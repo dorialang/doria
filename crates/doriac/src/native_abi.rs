@@ -85,6 +85,7 @@ pub const COLLECTION_KEYS_FIELD: u32 = 2;
 pub const COLLECTION_VALUES_FIELD: u32 = 3;
 pub const COLLECTION_KEYED_FIELD: u32 = 4;
 pub const COLLECTION_FIXED_FIELD: u32 = 5;
+pub const COLLECTION_VALUE_WIDTH_FIELD: u32 = 6;
 
 pub const MIXED_TAG_BOOL: u8 = 1;
 pub const MIXED_TAG_INT8: u8 = 2;
@@ -99,6 +100,22 @@ pub const MIXED_TAG_FLOAT32: u8 = 10;
 pub const MIXED_TAG_FLOAT64: u8 = 11;
 pub const MIXED_TAG_STRING: u8 = 12;
 pub const MIXED_TAG_CLASS: u8 = 13;
+
+pub const fn collection_value_width(ty: mir::Type, pointer_width: u8) -> Option<u8> {
+    match ty {
+        mir::Type::Scalar(mir::ScalarType::Bool) => Some(1),
+        mir::Type::Scalar(mir::ScalarType::Integer(ty)) => Some(ty.storage_bytes() as u8),
+        mir::Type::Scalar(mir::ScalarType::Float(crate::numeric::FloatType::Float32)) => Some(4),
+        mir::Type::Scalar(mir::ScalarType::Float(crate::numeric::FloatType::Float64)) => Some(8),
+        mir::Type::String | mir::Type::Mixed | mir::Type::Class(_) | mir::Type::Collection(_) => {
+            Some(pointer_width)
+        }
+        mir::Type::NullableScalar(_)
+        | mir::Type::NullableString
+        | mir::Type::NullableMixed
+        | mir::Type::NullableClass(_) => None,
+    }
+}
 
 pub fn function_symbol(function: &mir::Function) -> String {
     let sanitized = function

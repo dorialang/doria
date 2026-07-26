@@ -32,7 +32,12 @@ use crate::{collection, DrCollectionV1};
 /// On Unix, `argv` must be a valid array of `argc` NUL-terminated pointers, as
 /// supplied to C `main`. On Windows both parameters are ignored.
 pub unsafe fn build(argc: i32, argv: *const *const u8) -> *mut DrCollectionV1 {
-    let list = collection::new(0, false, false);
+    let list = collection::new(
+        0,
+        false,
+        false,
+        core::mem::size_of::<*mut crate::DrStringV1>() as u8,
+    );
     append_platform_arguments(list, argc, argv);
     list
 }

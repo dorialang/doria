@@ -40,7 +40,7 @@ pub use bytes::DrBytesV1;
 pub use collection::{
     DrCollectionV1, DR_COLLECTION_CAPACITY_OFFSET, DR_COLLECTION_FIXED_OFFSET,
     DR_COLLECTION_KEYED_OFFSET, DR_COLLECTION_KEYS_OFFSET, DR_COLLECTION_LENGTH_OFFSET,
-    DR_COLLECTION_VALUES_OFFSET,
+    DR_COLLECTION_VALUES_OFFSET, DR_COLLECTION_VALUE_WIDTH_OFFSET,
 };
 pub use mixed::DrMixedV1;
 
@@ -125,7 +125,7 @@ pub unsafe extern "C" fn dr_v1_bytes_from_collection(
 #[no_mangle]
 pub unsafe extern "C" fn dr_v1_bytes_to_collection(value: *const DrBytesV1) -> *mut DrCollectionV1 {
     let length = bytes::length(value);
-    let collection = collection::new(length, false, true);
+    let collection = collection::new(length, false, true, mem::size_of::<u8>() as u8);
     for index in 0..length {
         collection::set_at(
             ptr::null(),
@@ -141,15 +141,17 @@ pub unsafe extern "C" fn dr_v1_bytes_to_collection(value: *const DrBytesV1) -> *
 ///
 /// # Safety
 ///
-/// `keyed` and `fixed` must be canonical boolean bytes. The returned pointer
-/// must be released exactly once with `dr_v1_collection_free`.
+/// `keyed` and `fixed` must be canonical boolean bytes, and `value_width` must
+/// be 1, 2, 4, or 8. The returned pointer must be released exactly once with
+/// `dr_v1_collection_free`.
 #[no_mangle]
 pub unsafe extern "C" fn dr_v1_collection_new(
     length: usize,
     keyed: u8,
     fixed: u8,
+    value_width: u8,
 ) -> *mut DrCollectionV1 {
-    collection::new(length, keyed != 0, fixed != 0)
+    collection::new(length, keyed != 0, fixed != 0, value_width)
 }
 
 /// Allocates a sequence containing `count` bitwise copies of `value`.
@@ -165,12 +167,19 @@ pub unsafe extern "C" fn dr_v1_collection_fill_word(
     value: u64,
     count: i64,
     fixed: u8,
+    value_width: u8,
 ) -> *mut DrCollectionV1 {
     if count < 0 {
         static MESSAGE: &[u8] = b"fill count is negative";
         dr_v1_panic(current_frame, MESSAGE.as_ptr(), MESSAGE.len());
     }
-    collection::fill_word(current_frame, value, count as usize, fixed != 0)
+    collection::fill_word(
+        current_frame,
+        value,
+        count as usize,
+        fixed != 0,
+        value_width,
+    )
 }
 
 /// Allocates a sequence containing `count` retained references to `value`.
@@ -2061,12 +2070,19 @@ mod tests {
     #[test]
     fn sequence_fill_copies_words_and_retains_each_string_slot() {
         unsafe {
-            let words = dr_v1_collection_fill_word(ptr::null(), 42, 3, 1);
-            assert_eq!(dr_v1_collection_length(words), 3);
-            for index in 0..3 {
-                assert_eq!(dr_v1_collection_value_at(ptr::null(), words, index), 42);
+            for (width, value) in [
+                (1, 0xabu64),
+                (2, 0xabcdu64),
+                (4, 0xabcdef01u64),
+                (8, 0xabcdef0123456789u64),
+            ] {
+                let words = dr_v1_collection_fill_word(ptr::null(), value, 3, 1, width);
+                assert_eq!(dr_v1_collection_length(words), 3);
+                for index in 0..3 {
+                    assert_eq!(dr_v1_collection_value_at(ptr::null(), words, index), value);
+                }
+                dr_v1_collection_free(words);
             }
-            dr_v1_collection_free(words);
 
             let string = dr_v1_string_from_utf8(b"shared".as_ptr(), 6);
             let strings = dr_v1_collection_fill_string(ptr::null(), string, 3, 0);

@@ -16,24 +16,24 @@ use crate::format_string::{FormatConversion, FormatPiece};
 use crate::mir;
 use crate::mir_validation;
 use crate::native_abi::{
-    function_symbol, APPEND_FILE, APPEND_FILE_BYTES, BYTES_EQUAL, BYTES_FREE,
-    BYTES_FROM_COLLECTION, BYTES_GET, BYTES_LENGTH, BYTES_SET, BYTES_TO_COLLECTION, CLASS_ALLOCATE,
-    CLASS_FREE, COLLECTION_COMPARE_FLOAT32, COLLECTION_COMPARE_FLOAT64, COLLECTION_COMPARE_STRING,
-    COLLECTION_COMPARE_WORD, COLLECTION_CONTAINS, COLLECTION_FILL_STRING, COLLECTION_FILL_WORD,
-    COLLECTION_FREE, COLLECTION_INSERT_AT, COLLECTION_KEYED_GET, COLLECTION_KEYED_HAS,
-    COLLECTION_KEYED_SET, COLLECTION_KEY_AT, COLLECTION_LENGTH, COLLECTION_NEW,
-    COLLECTION_NULLABLE_ACCESS, COLLECTION_PUSH, COLLECTION_PUSH_UNIQUE, COLLECTION_REMOVE_AT,
-    COLLECTION_REMOVE_VALUE, COLLECTION_SET_ALGEBRA, COLLECTION_SET_AT, COLLECTION_VALUE_AT,
-    FLOAT_PARSE, FORMAT_F32, FORMAT_F64, FORMAT_I64, FORMAT_STRING, FORMAT_U64, INT_PARSE,
-    MIXED_CLONE_OWNED, MIXED_FREE, MIXED_NEW, MIXED_NEW_BORROWED, MIXED_PAYLOAD,
-    MIXED_RELEASE_OWNED, MIXED_TAG, MIXED_TAG_BOOL, MIXED_TAG_CLASS, MIXED_TAG_FLOAT32,
-    MIXED_TAG_FLOAT64, MIXED_TAG_INT16, MIXED_TAG_INT32, MIXED_TAG_INT64, MIXED_TAG_INT8,
-    MIXED_TAG_STRING, MIXED_TAG_UINT16, MIXED_TAG_UINT32, MIXED_TAG_UINT64, MIXED_TAG_UINT8,
-    MIXED_TYPE_ID, NULLABLE_STRING_EQUAL, READ_FILE, READ_FILE_BYTES, READ_STDIN_BYTES,
-    READ_STDIN_LINE, STRING_COMPARE, STRING_CONCAT, STRING_DATA, STRING_FROM_BOOL, STRING_FROM_F32,
-    STRING_FROM_F64, STRING_FROM_I64, STRING_FROM_U64, STRING_FROM_UTF8, STRING_LENGTH,
-    STRING_RELEASE, STRING_RETAIN, STRING_WRITE_STDERR, STRING_WRITE_STDOUT, WRITE_FILE,
-    WRITE_FILE_BYTES, WRITE_STDERR_BYTES, WRITE_STDOUT_BYTES,
+    collection_value_width, function_symbol, APPEND_FILE, APPEND_FILE_BYTES, BYTES_EQUAL,
+    BYTES_FREE, BYTES_FROM_COLLECTION, BYTES_GET, BYTES_LENGTH, BYTES_SET, BYTES_TO_COLLECTION,
+    CLASS_ALLOCATE, CLASS_FREE, COLLECTION_COMPARE_FLOAT32, COLLECTION_COMPARE_FLOAT64,
+    COLLECTION_COMPARE_STRING, COLLECTION_COMPARE_WORD, COLLECTION_CONTAINS,
+    COLLECTION_FILL_STRING, COLLECTION_FILL_WORD, COLLECTION_FREE, COLLECTION_INSERT_AT,
+    COLLECTION_KEYED_GET, COLLECTION_KEYED_HAS, COLLECTION_KEYED_SET, COLLECTION_KEY_AT,
+    COLLECTION_LENGTH, COLLECTION_NEW, COLLECTION_NULLABLE_ACCESS, COLLECTION_PUSH,
+    COLLECTION_PUSH_UNIQUE, COLLECTION_REMOVE_AT, COLLECTION_REMOVE_VALUE, COLLECTION_SET_ALGEBRA,
+    COLLECTION_SET_AT, COLLECTION_VALUE_AT, FLOAT_PARSE, FORMAT_F32, FORMAT_F64, FORMAT_I64,
+    FORMAT_STRING, FORMAT_U64, INT_PARSE, MIXED_CLONE_OWNED, MIXED_FREE, MIXED_NEW,
+    MIXED_NEW_BORROWED, MIXED_PAYLOAD, MIXED_RELEASE_OWNED, MIXED_TAG, MIXED_TAG_BOOL,
+    MIXED_TAG_CLASS, MIXED_TAG_FLOAT32, MIXED_TAG_FLOAT64, MIXED_TAG_INT16, MIXED_TAG_INT32,
+    MIXED_TAG_INT64, MIXED_TAG_INT8, MIXED_TAG_STRING, MIXED_TAG_UINT16, MIXED_TAG_UINT32,
+    MIXED_TAG_UINT64, MIXED_TAG_UINT8, MIXED_TYPE_ID, NULLABLE_STRING_EQUAL, READ_FILE,
+    READ_FILE_BYTES, READ_STDIN_BYTES, READ_STDIN_LINE, STRING_COMPARE, STRING_CONCAT, STRING_DATA,
+    STRING_FROM_BOOL, STRING_FROM_F32, STRING_FROM_F64, STRING_FROM_I64, STRING_FROM_U64,
+    STRING_FROM_UTF8, STRING_LENGTH, STRING_RELEASE, STRING_RETAIN, STRING_WRITE_STDERR,
+    STRING_WRITE_STDOUT, WRITE_FILE, WRITE_FILE_BYTES, WRITE_STDERR_BYTES, WRITE_STDOUT_BYTES,
 };
 use crate::numeric::{FloatType, FloatValue, IntegerPanic, IntegerType, IntegerValue};
 
@@ -1769,12 +1769,24 @@ fn lower_collection_expression(
                 .ins()
                 .iconst(types::I8, i64::from(definition.key.is_some()));
             let fixed_value = builder.ins().iconst(types::I8, i64::from(fixed));
+            let value_width = builder.ins().iconst(
+                types::I8,
+                i64::from(
+                    collection_value_width(definition.value, pointer.bytes() as u8).ok_or_else(
+                        || {
+                            malformed_mir(
+                                "nullable collection elements are not supported by Stage 23 Slice 3",
+                            )
+                        },
+                    )?,
+                ),
+            );
             let result = runtime_call(
                 builder,
                 COLLECTION_NEW,
-                &[pointer, types::I8, types::I8],
+                &[pointer, types::I8, types::I8, types::I8],
                 Some(pointer),
-                &[length, keyed, fixed_value],
+                &[length, keyed, fixed_value, value_width],
                 resources,
             )?
             .ok_or_else(|| backend_failure("collection allocation produced no result"))?;
@@ -1855,6 +1867,18 @@ fn lower_collection_expression(
             let value = lower_rvalue(builder, value, resources)?.single()?;
             let count = lower_integer_expression(builder, count, resources)?;
             let fixed = builder.ins().iconst(types::I8, i64::from(fixed));
+            let value_width = builder.ins().iconst(
+                types::I8,
+                i64::from(
+                    collection_value_width(definition.value, pointer.bytes() as u8).ok_or_else(
+                        || {
+                            malformed_mir(
+                                "nullable collection elements are not supported by Stage 23 Slice 3",
+                            )
+                        },
+                    )?,
+                ),
+            );
             let (name, value_type, argument) = if definition.value == mir::Type::String {
                 (COLLECTION_FILL_STRING, pointer, value)
             } else {
@@ -1864,12 +1888,18 @@ fn lower_collection_expression(
                     value_to_collection_word(builder, value, definition.value, pointer)?,
                 )
             };
+            let mut parameter_types = vec![pointer, value_type, types::I64, types::I8];
+            let mut arguments = vec![resources.current_frame, argument, count, fixed];
+            if name == COLLECTION_FILL_WORD {
+                parameter_types.push(types::I8);
+                arguments.push(value_width);
+            }
             let result = runtime_call(
                 builder,
                 name,
-                &[pointer, value_type, types::I64, types::I8],
+                &parameter_types,
                 Some(pointer),
-                &[resources.current_frame, argument, count, fixed],
+                &arguments,
                 resources,
             )?
             .ok_or_else(|| backend_failure("collection fill allocation produced no result"))?;
@@ -2414,12 +2444,24 @@ fn lower_set_from(
     }
     let zero_length = builder.ins().iconst(pointer, 0);
     let false_value = builder.ins().iconst(types::I8, 0);
+    let value_width = builder.ins().iconst(
+        types::I8,
+        i64::from(
+            collection_value_width(target_definition.value, pointer.bytes() as u8).ok_or_else(
+                || {
+                    malformed_mir(
+                        "nullable collection elements are not supported by Stage 23 Slice 3",
+                    )
+                },
+            )?,
+        ),
+    );
     let target_value = runtime_call(
         builder,
         COLLECTION_NEW,
-        &[pointer, types::I8, types::I8],
+        &[pointer, types::I8, types::I8, types::I8],
         Some(pointer),
-        &[zero_length, false_value, false_value],
+        &[zero_length, false_value, false_value, value_width],
         resources,
     )?
     .ok_or_else(|| backend_failure("set allocation produced no result"))?;

@@ -22,24 +22,25 @@ use crate::format_string::{FormatConversion, FormatPiece};
 use crate::mir;
 use crate::mir_validation;
 use crate::native_abi::{
-    function_symbol, APPEND_FILE, APPEND_FILE_BYTES, BYTES_EQUAL, BYTES_FREE,
-    BYTES_FROM_COLLECTION, BYTES_GET, BYTES_LENGTH, BYTES_SET, BYTES_TO_COLLECTION, CLASS_ALLOCATE,
-    CLASS_FREE, COLLECTION_COMPARE_FLOAT32, COLLECTION_COMPARE_FLOAT64, COLLECTION_COMPARE_STRING,
-    COLLECTION_COMPARE_WORD, COLLECTION_CONTAINS, COLLECTION_FILL_STRING, COLLECTION_FILL_WORD,
-    COLLECTION_FREE, COLLECTION_INSERT_AT, COLLECTION_KEYED_GET, COLLECTION_KEYED_HAS,
-    COLLECTION_KEYED_SET, COLLECTION_KEY_AT, COLLECTION_LENGTH, COLLECTION_LENGTH_FIELD,
-    COLLECTION_NEW, COLLECTION_NULLABLE_ACCESS, COLLECTION_PUSH, COLLECTION_PUSH_UNIQUE,
-    COLLECTION_REMOVE_AT, COLLECTION_REMOVE_VALUE, COLLECTION_SET_ALGEBRA, COLLECTION_SET_AT,
-    COLLECTION_VALUES_FIELD, COLLECTION_VALUE_AT, FLOAT_PARSE, FORMAT_F32, FORMAT_F64, FORMAT_I64,
-    FORMAT_STRING, FORMAT_U64, INT_PARSE, MIXED_CLONE_OWNED, MIXED_FREE, MIXED_NEW,
-    MIXED_NEW_BORROWED, MIXED_PAYLOAD, MIXED_RELEASE_OWNED, MIXED_TAG, MIXED_TAG_BOOL,
-    MIXED_TAG_CLASS, MIXED_TAG_FLOAT32, MIXED_TAG_FLOAT64, MIXED_TAG_INT16, MIXED_TAG_INT32,
-    MIXED_TAG_INT64, MIXED_TAG_INT8, MIXED_TAG_STRING, MIXED_TAG_UINT16, MIXED_TAG_UINT32,
-    MIXED_TAG_UINT64, MIXED_TAG_UINT8, MIXED_TYPE_ID, NULLABLE_STRING_EQUAL, READ_FILE,
-    READ_FILE_BYTES, READ_STDIN_BYTES, READ_STDIN_LINE, STRING_COMPARE, STRING_CONCAT, STRING_DATA,
-    STRING_FROM_BOOL, STRING_FROM_F32, STRING_FROM_F64, STRING_FROM_I64, STRING_FROM_U64,
-    STRING_FROM_UTF8, STRING_LENGTH, STRING_RELEASE, STRING_RETAIN, STRING_WRITE_STDERR,
-    STRING_WRITE_STDOUT, WRITE_FILE, WRITE_FILE_BYTES, WRITE_STDERR_BYTES, WRITE_STDOUT_BYTES,
+    collection_value_width, function_symbol, APPEND_FILE, APPEND_FILE_BYTES, BYTES_EQUAL,
+    BYTES_FREE, BYTES_FROM_COLLECTION, BYTES_GET, BYTES_LENGTH, BYTES_SET, BYTES_TO_COLLECTION,
+    CLASS_ALLOCATE, CLASS_FREE, COLLECTION_COMPARE_FLOAT32, COLLECTION_COMPARE_FLOAT64,
+    COLLECTION_COMPARE_STRING, COLLECTION_COMPARE_WORD, COLLECTION_CONTAINS,
+    COLLECTION_FILL_STRING, COLLECTION_FILL_WORD, COLLECTION_FREE, COLLECTION_INSERT_AT,
+    COLLECTION_KEYED_GET, COLLECTION_KEYED_HAS, COLLECTION_KEYED_SET, COLLECTION_KEY_AT,
+    COLLECTION_LENGTH, COLLECTION_LENGTH_FIELD, COLLECTION_NEW, COLLECTION_NULLABLE_ACCESS,
+    COLLECTION_PUSH, COLLECTION_PUSH_UNIQUE, COLLECTION_REMOVE_AT, COLLECTION_REMOVE_VALUE,
+    COLLECTION_SET_ALGEBRA, COLLECTION_SET_AT, COLLECTION_VALUES_FIELD, COLLECTION_VALUE_AT,
+    FLOAT_PARSE, FORMAT_F32, FORMAT_F64, FORMAT_I64, FORMAT_STRING, FORMAT_U64, INT_PARSE,
+    MIXED_CLONE_OWNED, MIXED_FREE, MIXED_NEW, MIXED_NEW_BORROWED, MIXED_PAYLOAD,
+    MIXED_RELEASE_OWNED, MIXED_TAG, MIXED_TAG_BOOL, MIXED_TAG_CLASS, MIXED_TAG_FLOAT32,
+    MIXED_TAG_FLOAT64, MIXED_TAG_INT16, MIXED_TAG_INT32, MIXED_TAG_INT64, MIXED_TAG_INT8,
+    MIXED_TAG_STRING, MIXED_TAG_UINT16, MIXED_TAG_UINT32, MIXED_TAG_UINT64, MIXED_TAG_UINT8,
+    MIXED_TYPE_ID, NULLABLE_STRING_EQUAL, READ_FILE, READ_FILE_BYTES, READ_STDIN_BYTES,
+    READ_STDIN_LINE, STRING_COMPARE, STRING_CONCAT, STRING_DATA, STRING_FROM_BOOL, STRING_FROM_F32,
+    STRING_FROM_F64, STRING_FROM_I64, STRING_FROM_U64, STRING_FROM_UTF8, STRING_LENGTH,
+    STRING_RELEASE, STRING_RETAIN, STRING_WRITE_STDERR, STRING_WRITE_STDOUT, WRITE_FILE,
+    WRITE_FILE_BYTES, WRITE_STDERR_BYTES, WRITE_STDOUT_BYTES,
 };
 use crate::numeric::{FloatType, FloatValue, IntegerPanic, IntegerType, IntegerValue};
 
@@ -1252,10 +1253,11 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         .into_pointer_value())
     }
 
-    fn checked_collection_word_address(
+    fn checked_collection_value_address(
         &mut self,
         collection: PointerValue<'ctx>,
         index: IntValue<'ctx>,
+        value_type: mir::Type,
     ) -> Result<PointerValue<'ctx>, BackendError> {
         let header = collection_header_type(self.context, self.target_data);
         let usize_type = self.context.ptr_sized_int_type(self.target_data, None);
@@ -1333,7 +1335,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         .into_pointer_value();
         build(unsafe {
             self.builder.build_in_bounds_gep(
-                self.context.i64_type(),
+                collection_storage_type(self.context, self.target_data, value_type)?,
                 values,
                 &[element_index],
                 "collection.value.address",
@@ -1366,11 +1368,21 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             } => {
                 let definition = self.collection_definition(*collection)?.clone();
                 let fixed = definition.kind == mir::CollectionKind::TypedArray;
+                let value_width = collection_value_width(
+                    definition.value,
+                    self.target_data.get_pointer_byte_size(None) as u8,
+                )
+                .ok_or_else(|| {
+                    malformed_mir(
+                        "nullable collection elements are not supported by Stage 23 Slice 3",
+                    )
+                })?;
                 let result = self
                     .call_runtime(
                         COLLECTION_NEW,
                         &[
                             usize_type.into(),
+                            self.context.i8_type().into(),
                             self.context.i8_type().into(),
                             self.context.i8_type().into(),
                         ],
@@ -1384,6 +1396,10 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                             self.context
                                 .i8_type()
                                 .const_int(u64::from(fixed), false)
+                                .into(),
+                            self.context
+                                .i8_type()
+                                .const_int(u64::from(value_width), false)
                                 .into(),
                         ],
                     )?
@@ -1463,6 +1479,20 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 let value = self.lower_rvalue(value)?;
                 let count = self.lower_integer_expression(count)?;
                 let fixed = self.context.i8_type().const_int(u64::from(fixed), false);
+                let value_width = self.context.i8_type().const_int(
+                    u64::from(
+                        collection_value_width(
+                            definition.value,
+                            self.target_data.get_pointer_byte_size(None) as u8,
+                        )
+                        .ok_or_else(|| {
+                            malformed_mir(
+                                "nullable collection elements are not supported by Stage 23 Slice 3",
+                            )
+                        })?,
+                    ),
+                    false,
+                );
                 let (name, value_type, argument) = if definition.value == mir::Type::String {
                     (COLLECTION_FILL_STRING, pointer.into(), value)
                 } else {
@@ -1473,23 +1503,24 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                         word.into(),
                     )
                 };
+                let mut parameter_types = vec![
+                    pointer.into(),
+                    value_type,
+                    self.context.i64_type().into(),
+                    self.context.i8_type().into(),
+                ];
+                let mut arguments = vec![
+                    self.current_frame.into(),
+                    argument.into(),
+                    count.into(),
+                    fixed.into(),
+                ];
+                if name == COLLECTION_FILL_WORD {
+                    parameter_types.push(self.context.i8_type().into());
+                    arguments.push(value_width.into());
+                }
                 let result = self
-                    .call_runtime(
-                        name,
-                        &[
-                            pointer.into(),
-                            value_type,
-                            self.context.i64_type().into(),
-                            self.context.i8_type().into(),
-                        ],
-                        Some(pointer.into()),
-                        &[
-                            self.current_frame.into(),
-                            argument.into(),
-                            count.into(),
-                            fixed.into(),
-                        ],
-                    )?
+                    .call_runtime(name, &parameter_types, Some(pointer.into()), &arguments)?
                     .ok_or_else(|| {
                         backend_failure("collection fill allocation produced no result")
                     })?
@@ -1672,13 +1703,21 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             .ok_or_else(|| backend_failure("collection removal produced no result"))?
             .into_int_value()
         } else {
-            let address = self
-                .checked_collection_word_address(collection_value, index_value.into_int_value())?;
-            build(
+            let storage_type =
+                collection_storage_type(self.context, self.target_data, definition.value)?;
+            let address = self.checked_collection_value_address(
+                collection_value,
+                index_value.into_int_value(),
+                definition.value,
+            )?;
+            let value = build(
                 self.builder
-                    .build_load(self.context.i64_type(), address, "collection.value"),
-            )?
-            .into_int_value()
+                    .build_load(storage_type, address, "collection.value"),
+            )?;
+            if matches!(definition.value, mir::Type::Scalar(_)) {
+                return Ok(value);
+            }
+            collection_storage_to_word(&self.builder, self.context, value.into_int_value())?
         };
         self.collection_word_to_value(word, definition.value)
     }
@@ -1960,7 +1999,6 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             )?;
             return Ok(());
         }
-        let value_word = self.value_to_collection_word(value, definition.value)?;
         if let Some(key_type) = definition.key {
             self.lower_dictionary_set_value(
                 collection_value,
@@ -1970,22 +2008,36 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 definition.value,
             )?;
         } else {
-            let address =
-                self.checked_collection_word_address(collection_value, index.into_int_value())?;
-            let old_word = if matches!(definition.value, mir::Type::Scalar(_)) {
-                None
+            let address = self.checked_collection_value_address(
+                collection_value,
+                index.into_int_value(),
+                definition.value,
+            )?;
+            if matches!(definition.value, mir::Type::Scalar(_)) {
+                build(self.builder.build_store(address, value))?;
             } else {
-                Some(
-                    build(self.builder.build_load(
-                        self.context.i64_type(),
-                        address,
-                        "collection.old-value",
+                let storage_type =
+                    collection_storage_type(self.context, self.target_data, definition.value)?
+                        .into_int_type();
+                let old_storage = build(self.builder.build_load(
+                    storage_type,
+                    address,
+                    "collection.old-value",
+                ))?
+                .into_int_value();
+                let old_word =
+                    collection_storage_to_word(&self.builder, self.context, old_storage)?;
+                let value_word = self.value_to_collection_word(value, definition.value)?;
+                let stored_word = if storage_type.get_bit_width() == 64 {
+                    value_word
+                } else {
+                    build(self.builder.build_int_truncate(
+                        value_word,
+                        storage_type,
+                        "collection.stored-value",
                     ))?
-                    .into_int_value(),
-                )
-            };
-            build(self.builder.build_store(address, value_word))?;
-            if let Some(old_word) = old_word {
+                };
+                build(self.builder.build_store(address, stored_word))?;
                 let old_value = self.collection_word_to_value(old_word, definition.value)?;
                 self.drop_stored_value(old_value, definition.value)?;
             }
@@ -2113,12 +2165,30 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     usize_type.into(),
                     self.context.i8_type().into(),
                     self.context.i8_type().into(),
+                    self.context.i8_type().into(),
                 ],
                 Some(pointer.into()),
                 &[
                     usize_type.const_zero().into(),
                     self.context.i8_type().const_zero().into(),
                     self.context.i8_type().const_zero().into(),
+                    self.context
+                        .i8_type()
+                        .const_int(
+                            u64::from(
+                                collection_value_width(
+                                    target_definition.value,
+                                    self.target_data.get_pointer_byte_size(None) as u8,
+                                )
+                                .ok_or_else(|| {
+                                    malformed_mir(
+                                        "nullable collection elements are not supported by Stage 23 Slice 3",
+                                    )
+                                })?,
+                            ),
+                            false,
+                        )
+                        .into(),
                 ],
             )?
             .ok_or_else(|| backend_failure("set allocation produced no result"))?
@@ -6306,6 +6376,39 @@ fn scalar_type(context: &Context, ty: mir::ScalarType) -> BasicTypeEnum<'_> {
     }
 }
 
+fn collection_storage_type<'ctx>(
+    context: &'ctx Context,
+    target_data: &TargetData,
+    ty: mir::Type,
+) -> Result<BasicTypeEnum<'ctx>, BackendError> {
+    Ok(match ty {
+        mir::Type::Scalar(ty) => scalar_type(context, ty),
+        mir::Type::String | mir::Type::Mixed | mir::Type::Class(_) | mir::Type::Collection(_) => {
+            context.ptr_sized_int_type(target_data, None).into()
+        }
+        mir::Type::NullableScalar(_)
+        | mir::Type::NullableString
+        | mir::Type::NullableMixed
+        | mir::Type::NullableClass(_) => {
+            return Err(malformed_mir(
+                "nullable collection elements are not supported by Stage 23 Slice 3",
+            ))
+        }
+    })
+}
+
+fn collection_storage_to_word<'ctx>(
+    builder: &Builder<'ctx>,
+    context: &'ctx Context,
+    value: IntValue<'ctx>,
+) -> Result<IntValue<'ctx>, BackendError> {
+    Ok(if value.get_type().get_bit_width() == 64 {
+        value
+    } else {
+        build(builder.build_int_z_extend(value, context.i64_type(), "collection.value.word"))?
+    })
+}
+
 fn nullable_type<'ctx>(
     context: &'ctx Context,
     target_data: &TargetData,
@@ -6327,6 +6430,7 @@ fn collection_header_type<'ctx>(
             word.into(),
             pointer.into(),
             pointer.into(),
+            context.i8_type().into(),
             context.i8_type().into(),
             context.i8_type().into(),
         ],
@@ -6692,6 +6796,10 @@ mod tests {
             (
                 crate::native_abi::COLLECTION_FIXED_FIELD,
                 doria_rt::DR_COLLECTION_FIXED_OFFSET,
+            ),
+            (
+                crate::native_abi::COLLECTION_VALUE_WIDTH_FIELD,
+                doria_rt::DR_COLLECTION_VALUE_WIDTH_OFFSET,
             ),
         ] {
             assert_eq!(
