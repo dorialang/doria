@@ -448,9 +448,9 @@ fn define_function(
         initialize_locals(&mut builder, function, &local_slots, pointer_type)?;
         let zero = builder.ins().iconst(pointer_type, 0);
         for slot in &deferred_class_temporary_slots {
-            builder.ins().stack_store(zero, *slot, 0);
+            builder.ins().stack_store(pointer_type, zero, *slot, 0);
         }
-        bind_parameters(&mut builder, function, &local_slots, entry)?;
+        bind_parameters(&mut builder, function, &local_slots, entry, pointer_type)?;
         let parent_frame = builder.block_params(entry)[0];
         let function_name = define_named_data(
             &mut builder,
@@ -458,16 +458,24 @@ fn define_function(
             module,
             &format!("__doria_function_name_{}", function.id.0),
         )?;
-        builder.ins().stack_store(parent_frame, frame_slot, 0);
         builder
             .ins()
-            .stack_store(function_name, frame_slot, pointer_bytes as i32);
+            .stack_store(pointer_type, parent_frame, frame_slot, 0);
+        builder.ins().stack_store(
+            pointer_type,
+            function_name,
+            frame_slot,
+            pointer_bytes as i32,
+        );
         let function_name_length = builder
             .ins()
             .iconst(pointer_type, function.name.len() as i64);
-        builder
-            .ins()
-            .stack_store(function_name_length, frame_slot, (pointer_bytes * 2) as i32);
+        builder.ins().stack_store(
+            pointer_type,
+            function_name_length,
+            frame_slot,
+            (pointer_bytes * 2) as i32,
+        );
         let current_frame = builder.ins().stack_addr(pointer_type, frame_slot, 0);
 
         let mut resources = LoweringResources {
@@ -504,7 +512,7 @@ fn define_function(
         }
 
         builder.seal_all_blocks();
-        builder.finalize();
+        builder.finalize(module.target_config());
     }
 
     module
@@ -559,7 +567,7 @@ fn define_class_drop_function(
         lower_drop_class_value(&mut builder, object, class, &mut resources)?;
         builder.ins().return_(&[]);
         builder.seal_all_blocks();
-        builder.finalize();
+        builder.finalize(module.target_config());
     }
     module
         .define_function(function_id, &mut context)
@@ -597,13 +605,13 @@ fn initialize_locals(
                 let slot = local_slot(slots, local.id)?;
                 builder
                     .ins()
-                    .stack_store(zero, slot, pointer_type.bytes() as i32);
+                    .stack_store(pointer_type, zero, slot, pointer_type.bytes() as i32);
                 zero
             }
         };
         builder
             .ins()
-            .stack_store(zero, local_slot(slots, local.id)?, 0);
+            .stack_store(pointer_type, zero, local_slot(slots, local.id)?, 0);
     }
     Ok(())
 }
@@ -613,6 +621,7 @@ fn bind_parameters(
     function: &mir::Function,
     slots: &[Option<StackSlot>],
     entry: Block,
+    pointer_type: ClifType,
 ) -> Result<(), BackendError> {
     let params = builder.block_params(entry).to_vec();
     let mut params = params.into_iter().skip(1);
@@ -622,13 +631,15 @@ fn bind_parameters(
         let first = params
             .next()
             .ok_or_else(|| malformed_mir("function parameter is missing an ABI value"))?;
-        builder.ins().stack_store(first, slot, 0);
+        builder.ins().stack_store(pointer_type, first, slot, 0);
         if matches!(ty, mir::Type::NullableScalar(_) | mir::Type::NullableString) {
             let payload = params.next().ok_or_else(|| {
                 malformed_mir("nullable function parameter is missing its ABI payload")
             })?;
             let payload_offset = builder.func.dfg.value_type(first).bytes() as i32;
-            builder.ins().stack_store(payload, slot, payload_offset);
+            builder
+                .ins()
+                .stack_store(pointer_type, payload, slot, payload_offset);
         }
     }
     Ok(())
@@ -654,9 +665,9 @@ fn retain_string_parameters(
             } else {
                 0
             };
-            let value = builder.ins().stack_load(pointer, slot, offset);
+            let value = builder.ins().stack_load(pointer, pointer, slot, offset);
             let retained = retain_string(builder, value, resources)?;
-            builder.ins().stack_store(retained, slot, offset);
+            builder.ins().stack_store(pointer, retained, slot, offset);
         }
     }
     Ok(())
@@ -681,10 +692,12 @@ fn cleanup_string_locals(
         } else {
             0
         };
-        let value =
-            builder
-                .ins()
-                .stack_load(pointer, local_slot(resources.local_slots, local)?, offset);
+        let value = builder.ins().stack_load(
+            pointer,
+            pointer,
+            local_slot(resources.local_slots, local)?,
+            offset,
+        );
         release_string(builder, value, resources)?;
     }
     Ok(())
@@ -709,9 +722,11 @@ fn cleanup_class_locals(
         .collect::<Vec<_>>();
     for (local, class) in class_locals {
         let slot = local_slot(resources.local_slots, local)?;
-        let value = builder.ins().stack_load(pointer_type, slot, 0);
+        let value = builder
+            .ins()
+            .stack_load(pointer_type, pointer_type, slot, 0);
         let zero = builder.ins().iconst(pointer_type, 0);
-        builder.ins().stack_store(zero, slot, 0);
+        builder.ins().stack_store(pointer_type, zero, slot, 0);
         lower_drop_class_value_checked(builder, value, class, resources)?;
     }
     Ok(())
@@ -732,9 +747,9 @@ fn emit_deferred_class_temporary_drops(
 ) -> Result<(), BackendError> {
     let pointer = resources.module.target_config().pointer_type();
     for (slot, temporary) in drops.iter().rev() {
-        let value = builder.ins().stack_load(pointer, *slot, 0);
+        let value = builder.ins().stack_load(pointer, pointer, *slot, 0);
         let zero = builder.ins().iconst(pointer, 0);
-        builder.ins().stack_store(zero, *slot, 0);
+        builder.ins().stack_store(pointer, zero, *slot, 0);
         match temporary {
             DeferredOwnedTemporary::Class(class) => {
                 lower_drop_class_value_checked(builder, value, *class, resources)?;
@@ -764,7 +779,8 @@ fn defer_or_drop_class_temporary(
         .get(resources.deferred_class_temporary_slot_cursor)
         .ok_or_else(|| malformed_mir("class temporary stack-slot capacity was exhausted"))?;
     resources.deferred_class_temporary_slot_cursor += 1;
-    builder.ins().stack_store(value, slot, 0);
+    let pointer = resources.module.target_config().pointer_type();
+    builder.ins().stack_store(pointer, value, slot, 0);
     resources
         .deferred_class_temporary_drops
         .push((slot, DeferredOwnedTemporary::Class(class)));
@@ -785,7 +801,8 @@ fn defer_or_drop_collection_temporary(
         .get(resources.deferred_class_temporary_slot_cursor)
         .ok_or_else(|| malformed_mir("owned temporary stack-slot capacity was exhausted"))?;
     resources.deferred_class_temporary_slot_cursor += 1;
-    builder.ins().stack_store(value, slot, 0);
+    let pointer = resources.module.target_config().pointer_type();
+    builder.ins().stack_store(pointer, value, slot, 0);
     resources
         .deferred_class_temporary_drops
         .push((slot, DeferredOwnedTemporary::Collection(collection)));
@@ -806,7 +823,8 @@ fn defer_or_cleanup_mixed_temporary(
         .get(resources.deferred_class_temporary_slot_cursor)
         .ok_or_else(|| malformed_mir("owned temporary stack-slot capacity was exhausted"))?;
     resources.deferred_class_temporary_slot_cursor += 1;
-    builder.ins().stack_store(value, slot, 0);
+    let pointer = resources.module.target_config().pointer_type();
+    builder.ins().stack_store(pointer, value, slot, 0);
     resources
         .deferred_class_temporary_drops
         .push((slot, DeferredOwnedTemporary::Mixed(ownership)));
@@ -902,7 +920,7 @@ fn define_process_main(
         };
         let status = builder.inst_results(call)[0];
         builder.ins().return_(&[status]);
-        builder.finalize();
+        builder.finalize(module.target_config());
     }
 
     module
@@ -1257,9 +1275,11 @@ fn lower_statement(
         mir::Statement::DropClass { local, .. } => {
             let pointer_type = resources.module.target_config().pointer_type();
             let slot = local_slot(resources.local_slots, *local)?;
-            let value = builder.ins().stack_load(pointer_type, slot, 0);
+            let value = builder
+                .ins()
+                .stack_load(pointer_type, pointer_type, slot, 0);
             let zero = builder.ins().iconst(pointer_type, 0);
-            builder.ins().stack_store(zero, slot, 0);
+            builder.ins().stack_store(pointer_type, zero, slot, 0);
             let (mir::Type::Class(class) | mir::Type::NullableClass(class)) =
                 local_definition(resources.program, resources.function_id, *local)?.ty
             else {
@@ -1273,17 +1293,17 @@ fn lower_statement(
         mir::Statement::DropString { local } => {
             let pointer = resources.module.target_config().pointer_type();
             let slot = local_slot(resources.local_slots, *local)?;
-            let value = builder.ins().stack_load(pointer, slot, 0);
+            let value = builder.ins().stack_load(pointer, pointer, slot, 0);
             let zero = builder.ins().iconst(pointer, 0);
-            builder.ins().stack_store(zero, slot, 0);
+            builder.ins().stack_store(pointer, zero, slot, 0);
             release_string(builder, value, resources)?;
         }
         mir::Statement::DropMixed { local } => {
             let pointer = resources.module.target_config().pointer_type();
             let slot = local_slot(resources.local_slots, *local)?;
-            let value = builder.ins().stack_load(pointer, slot, 0);
+            let value = builder.ins().stack_load(pointer, pointer, slot, 0);
             let zero = builder.ins().iconst(pointer, 0);
-            builder.ins().stack_store(zero, slot, 0);
+            builder.ins().stack_store(pointer, zero, slot, 0);
             lower_drop_mixed_value(builder, value, resources)?;
         }
         mir::Statement::CollectionAdd {
@@ -1309,9 +1329,9 @@ fn lower_statement(
         mir::Statement::DropCollection { local, collection } => {
             let pointer = resources.module.target_config().pointer_type();
             let slot = local_slot(resources.local_slots, *local)?;
-            let value = builder.ins().stack_load(pointer, slot, 0);
+            let value = builder.ins().stack_load(pointer, pointer, slot, 0);
             let zero = builder.ins().iconst(pointer, 0);
-            builder.ins().stack_store(zero, slot, 0);
+            builder.ins().stack_store(pointer, zero, slot, 0);
             lower_drop_collection_value(builder, value, *collection, resources)?;
         }
     }
@@ -1331,7 +1351,7 @@ fn lower_static_address(
     let global = resources.module.declare_data_in_func(data_id, builder.func);
     Ok(builder
         .ins()
-        .global_value(resources.module.target_config().pointer_type(), global))
+        .symbol_value(resources.module.target_config().pointer_type(), global))
 }
 
 fn load_lowered_from_stack(
@@ -1342,29 +1362,33 @@ fn load_lowered_from_stack(
 ) -> LoweredValue {
     match ty {
         mir::Type::NullableScalar(scalar) => LoweredValue::Nullable {
-            present: builder.ins().stack_load(pointer, slot, 0),
+            present: builder.ins().stack_load(pointer, pointer, slot, 0),
             payload: builder.ins().stack_load(
+                pointer,
                 clif_scalar_type(scalar),
                 slot,
                 pointer.bytes() as i32,
             ),
         },
         mir::Type::NullableString => LoweredValue::Nullable {
-            present: builder.ins().stack_load(pointer, slot, 0),
+            present: builder.ins().stack_load(pointer, pointer, slot, 0),
             payload: builder
                 .ins()
-                .stack_load(pointer, slot, pointer.bytes() as i32),
+                .stack_load(pointer, pointer, slot, pointer.bytes() as i32),
         },
-        mir::Type::Scalar(scalar) => {
-            LoweredValue::Single(builder.ins().stack_load(clif_scalar_type(scalar), slot, 0))
-        }
+        mir::Type::Scalar(scalar) => LoweredValue::Single(builder.ins().stack_load(
+            pointer,
+            clif_scalar_type(scalar),
+            slot,
+            0,
+        )),
         mir::Type::String
         | mir::Type::Mixed
         | mir::Type::Class(_)
         | mir::Type::NullableClass(_)
         | mir::Type::NullableMixed
         | mir::Type::Collection(_) => {
-            LoweredValue::Single(builder.ins().stack_load(pointer, slot, 0))
+            LoweredValue::Single(builder.ins().stack_load(pointer, pointer, slot, 0))
         }
     }
 }
@@ -1379,13 +1403,13 @@ fn store_lowered_to_stack(
     match ty {
         mir::Type::NullableScalar(_) | mir::Type::NullableString => {
             let (present, payload) = value.nullable()?;
-            builder.ins().stack_store(present, slot, 0);
+            builder.ins().stack_store(pointer, present, slot, 0);
             builder
                 .ins()
-                .stack_store(payload, slot, pointer.bytes() as i32);
+                .stack_store(pointer, payload, slot, pointer.bytes() as i32);
         }
         _ => {
-            builder.ins().stack_store(value.single()?, slot, 0);
+            builder.ins().stack_store(pointer, value.single()?, slot, 0);
         }
     }
     Ok(())
@@ -1726,10 +1750,10 @@ fn lower_collection_expression(
             local, transfer, ..
         } => {
             let slot = local_slot(resources.local_slots, *local)?;
-            let value = builder.ins().stack_load(pointer, slot, 0);
+            let value = builder.ins().stack_load(pointer, pointer, slot, 0);
             if *transfer {
                 let zero = builder.ins().iconst(pointer, 0);
-                builder.ins().stack_store(zero, slot, 0);
+                builder.ins().stack_store(pointer, zero, slot, 0);
             }
             Ok(value)
         }
@@ -1906,9 +1930,12 @@ fn lower_collection_pointer(
     resources: &LoweringResources<'_, '_>,
 ) -> Result<Value, BackendError> {
     let pointer = resources.module.target_config().pointer_type();
-    Ok(builder
-        .ins()
-        .stack_load(pointer, local_slot(resources.local_slots, local)?, 0))
+    Ok(builder.ins().stack_load(
+        pointer,
+        pointer,
+        local_slot(resources.local_slots, local)?,
+        0,
+    ))
 }
 
 fn lower_collection_index(
@@ -1967,7 +1994,7 @@ fn lower_collection_index(
             resources,
         )?
         .ok_or_else(|| backend_failure("dictionary lookup produced no result"))?;
-        let found = builder.ins().stack_load(types::I8, found_slot, 0);
+        let found = builder.ins().stack_load(pointer, types::I8, found_slot, 0);
         let zero = builder.ins().iconst(types::I8, 0);
         let missing = builder.ins().icmp(IntCC::Equal, found, zero);
         lower_panic_if_message(builder, missing, b"dictionary key not found", resources)?;
@@ -2099,13 +2126,15 @@ fn lower_dictionary_get(
     if key_type == mir::Type::String {
         release_string(builder, key_value, resources)?;
         if access == mir::NullableCollectionAccess::Remove {
-            let removed_key = builder.ins().stack_load(types::I64, removed_key_slot, 0);
+            let removed_key = builder
+                .ins()
+                .stack_load(pointer, types::I64, removed_key_slot, 0);
             let removed_key =
                 collection_word_to_value(builder, removed_key, mir::Type::String, pointer)?;
             release_string(builder, removed_key, resources)?;
         }
     }
-    let found = builder.ins().stack_load(types::I8, found_slot, 0);
+    let found = builder.ins().stack_load(pointer, types::I8, found_slot, 0);
     let present = builder.ins().uextend(pointer, found);
     let payload = collection_word_to_value(builder, word, expected, pointer)?;
     Ok((present, payload))
@@ -2170,7 +2199,9 @@ fn lower_collection_add(
             resources,
         )?
         .ok_or_else(|| backend_failure("set removal produced no result"))?;
-        let removed_word = builder.ins().stack_load(types::I64, removed_slot, 0);
+        let removed_word = builder
+            .ins()
+            .stack_load(pointer, types::I64, removed_slot, 0);
         let removed_value =
             collection_word_to_value(builder, removed_word, definition.value, pointer)?;
         lower_drop_value_if(builder, removed, removed_value, definition.value, resources)?;
@@ -2283,7 +2314,9 @@ fn lower_dictionary_set_value(
         resources,
     )?
     .ok_or_else(|| backend_failure("dictionary write produced no result"))?;
-    let replaced = builder.ins().stack_load(types::I8, replaced_slot, 0);
+    let replaced = builder
+        .ins()
+        .stack_load(pointer, types::I8, replaced_slot, 0);
     let old_value = collection_word_to_value(builder, old_word, value_type, pointer)?;
     lower_drop_value_if(builder, replaced, old_value, value_type, resources)?;
     lower_drop_value_if(builder, replaced, key, key_type, resources)
@@ -2345,7 +2378,7 @@ fn lower_set_from(
         let zero = builder.ins().iconst(pointer, 0);
         builder
             .ins()
-            .stack_store(zero, local_slot(resources.local_slots, source)?, 0);
+            .stack_store(pointer, zero, local_slot(resources.local_slots, source)?, 0);
     }
     let zero_length = builder.ins().iconst(pointer, 0);
     let false_value = builder.ins().iconst(types::I8, 0);
@@ -2583,10 +2616,12 @@ fn lower_class_expression(
             local, transfer, ..
         } => {
             let slot = local_slot(resources.local_slots, *local)?;
-            let value = builder.ins().stack_load(pointer_type, slot, 0);
+            let value = builder
+                .ins()
+                .stack_load(pointer_type, pointer_type, slot, 0);
             if *transfer {
                 let zero = builder.ins().iconst(pointer_type, 0);
-                builder.ins().stack_store(zero, slot, 0);
+                builder.ins().stack_store(pointer_type, zero, slot, 0);
             }
             Ok(value)
         }
@@ -2594,10 +2629,12 @@ fn lower_class_expression(
             local, transfer, ..
         } => {
             let slot = local_slot(resources.local_slots, *local)?;
-            let value = builder.ins().stack_load(pointer_type, slot, 0);
+            let value = builder
+                .ins()
+                .stack_load(pointer_type, pointer_type, slot, 0);
             if *transfer {
                 let zero = builder.ins().iconst(pointer_type, 0);
-                builder.ins().stack_store(zero, slot, 0);
+                builder.ins().stack_store(pointer_type, zero, slot, 0);
             }
             Ok(value)
         }
@@ -2856,10 +2893,10 @@ fn lower_nullable_class_expression(
             local, transfer, ..
         } => {
             let slot = local_slot(resources.local_slots, *local)?;
-            let value = builder.ins().stack_load(pointer, slot, 0);
+            let value = builder.ins().stack_load(pointer, pointer, slot, 0);
             if *transfer {
                 let zero = builder.ins().iconst(pointer, 0);
-                builder.ins().stack_store(zero, slot, 0);
+                builder.ins().stack_store(pointer, zero, slot, 0);
             }
             Ok(value)
         }
@@ -3438,7 +3475,7 @@ fn lower_mixed_expression(
                 load_lowered_from_stack(builder, mir::Type::Mixed, slot, pointer).single()?;
             if *transfer {
                 let zero = builder.ins().iconst(pointer, 0);
-                builder.ins().stack_store(zero, slot, 0);
+                builder.ins().stack_store(pointer, zero, slot, 0);
             }
             Ok(value)
         }
@@ -3531,7 +3568,7 @@ fn lower_nullable_mixed_expression(
                 .single()?;
             if *transfer {
                 let zero = builder.ins().iconst(pointer, 0);
-                builder.ins().stack_store(zero, slot, 0);
+                builder.ins().stack_store(pointer, zero, slot, 0);
             }
             Ok(value)
         }
@@ -3628,7 +3665,7 @@ fn lower_take_mixed_payload(
     .ok_or_else(|| backend_failure("mixed payload read produced no result"))?;
     let payload = collection_word_to_value(builder, word, tag.ty(), pointer)?;
     let zero = builder.ins().iconst(pointer, 0);
-    builder.ins().stack_store(zero, slot, 0);
+    builder.ins().stack_store(pointer, zero, slot, 0);
     let owns_final = runtime_call(
         builder,
         MIXED_RELEASE_OWNED,
@@ -3731,10 +3768,12 @@ fn lower_string_expression(
             .ok_or_else(|| backend_failure("string allocation produced no result"))
         }
         mir::StringExpression::Local(local) => {
-            let value =
-                builder
-                    .ins()
-                    .stack_load(pointer, local_slot(resources.local_slots, *local)?, 0);
+            let value = builder.ins().stack_load(
+                pointer,
+                pointer,
+                local_slot(resources.local_slots, *local)?,
+                0,
+            );
             retain_string(builder, value, resources)
         }
         mir::StringExpression::Static(id) => {
@@ -3754,6 +3793,7 @@ fn lower_string_expression(
         mir::StringExpression::NullableLocalAssumeNonNull(local) => {
             let pointer = resources.module.target_config().pointer_type();
             let value = builder.ins().stack_load(
+                pointer,
                 pointer,
                 local_slot(resources.local_slots, *local)?,
                 pointer.bytes() as i32,
@@ -4173,7 +4213,7 @@ fn lower_nullable_scalar_expression(
             )?
             .ok_or_else(|| backend_failure("parse produced no result"))?;
             release_string(builder, text, resources)?;
-            let found = builder.ins().stack_load(types::I8, found_slot, 0);
+            let found = builder.ins().stack_load(pointer, types::I8, found_slot, 0);
             let present = builder.ins().uextend(pointer, found);
             let payload = collection_word_to_value(builder, word, mir::Type::Scalar(ty), pointer)?;
             Ok(LoweredValue::Nullable { present, payload })
@@ -4880,7 +4920,10 @@ fn lower_integer_operand(
                 )));
             }
             let slot = local_slot(resources.local_slots, *id)?;
-            Ok(builder.ins().stack_load(clif_integer_type(ty), slot, 0))
+            let pointer = resources.module.target_config().pointer_type();
+            Ok(builder
+                .ins()
+                .stack_load(pointer, clif_integer_type(ty), slot, 0))
         }
         mir::Operand::NullablePayload(id) => {
             let definition = local_definition(resources.program, resources.function_id, *id)?;
@@ -4892,6 +4935,7 @@ fn lower_integer_operand(
             }
             let pointer = resources.module.target_config().pointer_type();
             Ok(builder.ins().stack_load(
+                pointer,
                 clif_integer_type(ty),
                 local_slot(resources.local_slots, *id)?,
                 pointer.bytes() as i32,
@@ -4988,7 +5032,9 @@ fn lower_float_expression(
                         id.0, definition.ty
                     )));
                 }
+                let pointer = resources.module.target_config().pointer_type();
                 Ok(builder.ins().stack_load(
+                    pointer,
                     clif_scalar_type(mir::ScalarType::Float(*ty)),
                     local_slot(resources.local_slots, *id)?,
                     0,
@@ -5005,6 +5051,7 @@ fn lower_float_expression(
                 }
                 let pointer = resources.module.target_config().pointer_type();
                 Ok(builder.ins().stack_load(
+                    pointer,
                     clif_scalar_type(mir::ScalarType::Float(*ty)),
                     local_slot(resources.local_slots, *id)?,
                     pointer.bytes() as i32,
@@ -5635,7 +5682,10 @@ fn lower_condition_to_branch(
                         resources,
                     )?
                     .ok_or_else(|| backend_failure("set removal produced no result"))?;
-                    let removed_word = builder.ins().stack_load(types::I64, removed_slot, 0);
+                    let removed_word =
+                        builder
+                            .ins()
+                            .stack_load(pointer, types::I64, removed_slot, 0);
                     let removed_value =
                         collection_word_to_value(builder, removed_word, needle_type, pointer)?;
                     lower_drop_value_if(builder, removed, removed_value, needle_type, resources)?;
@@ -5755,9 +5805,13 @@ fn lower_bool_operand(
                     id.0, definition.ty
                 )));
             }
-            Ok(builder
-                .ins()
-                .stack_load(types::I8, local_slot(resources.local_slots, *id)?, 0))
+            let pointer = resources.module.target_config().pointer_type();
+            Ok(builder.ins().stack_load(
+                pointer,
+                types::I8,
+                local_slot(resources.local_slots, *id)?,
+                0,
+            ))
         }
         mir::Operand::NullablePayload(id) => {
             let definition = local_definition(resources.program, resources.function_id, *id)?;
@@ -5769,6 +5823,7 @@ fn lower_bool_operand(
             }
             let pointer = resources.module.target_config().pointer_type();
             Ok(builder.ins().stack_load(
+                pointer,
                 types::I8,
                 local_slot(resources.local_slots, *id)?,
                 pointer.bytes() as i32,
@@ -6023,7 +6078,7 @@ fn define_named_data(
         .map_err(|error| backend_failure(error.to_string()))?;
     let pointer_type = module.target_config().pointer_type();
     let global = module.declare_data_in_func(data_id, builder.func);
-    Ok(builder.ins().global_value(pointer_type, global))
+    Ok(builder.ins().symbol_value(pointer_type, global))
 }
 
 fn define_data(
@@ -6048,7 +6103,7 @@ fn define_data(
         .map_err(|error| backend_failure(error.to_string()))?;
     let pointer_type = resources.module.target_config().pointer_type();
     let global = resources.module.declare_data_in_func(data_id, builder.func);
-    Ok(builder.ins().global_value(pointer_type, global))
+    Ok(builder.ins().symbol_value(pointer_type, global))
 }
 
 fn function_in(
@@ -6119,7 +6174,9 @@ fn lower_property_address(
 ) -> Result<Value, BackendError> {
     let pointer_type = resources.module.target_config().pointer_type();
     let slot = local_slot(resources.local_slots, object)?;
-    let object = builder.ins().stack_load(pointer_type, slot, 0);
+    let object = builder
+        .ins()
+        .stack_load(pointer_type, pointer_type, slot, 0);
     lower_property_address_from_value(builder, object, property, resources)
 }
 
