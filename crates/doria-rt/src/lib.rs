@@ -166,7 +166,7 @@ pub unsafe extern "C" fn dr_v1_collection_fill_word(
         static MESSAGE: &[u8] = b"fill count is negative";
         dr_v1_panic(current_frame, MESSAGE.as_ptr(), MESSAGE.len());
     }
-    collection::fill_word(value, count as usize, fixed != 0)
+    collection::fill_word(current_frame, value, count as usize, fixed != 0)
 }
 
 /// Allocates a sequence containing `count` retained references to `value`.
@@ -187,7 +187,7 @@ pub unsafe extern "C" fn dr_v1_collection_fill_string(
         static MESSAGE: &[u8] = b"fill count is negative";
         dr_v1_panic(current_frame, MESSAGE.as_ptr(), MESSAGE.len());
     }
-    collection::fill_string(value, count as usize, fixed != 0)
+    collection::fill_string(current_frame, value, count as usize, fixed != 0)
 }
 
 /// # Safety

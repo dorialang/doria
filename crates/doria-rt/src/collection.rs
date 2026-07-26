@@ -17,19 +17,23 @@ pub struct DrCollectionV1 {
     fixed: u8,
 }
 
-unsafe fn allocate_words(capacity: usize) -> *mut u64 {
+unsafe fn allocate_words_with_frame(frame: *const DrStackFrameV1, capacity: usize) -> *mut u64 {
     if capacity == 0 {
         return ptr::null_mut();
     }
     let bytes = capacity
         .checked_mul(mem::size_of::<u64>())
-        .unwrap_or_else(|| collection_panic(b"collection capacity overflow"));
+        .unwrap_or_else(|| collection_panic_with_frame(frame, b"collection capacity overflow"));
     let words = allocate(bytes).cast::<u64>();
     if words.is_null() {
-        collection_panic(b"collection allocation failed");
+        collection_panic_with_frame(frame, b"collection allocation failed");
     }
     ptr::write_bytes(words, 0, capacity);
     words
+}
+
+unsafe fn allocate_words(capacity: usize) -> *mut u64 {
+    allocate_words_with_frame(ptr::null(), capacity)
 }
 
 unsafe fn grow(collection: *mut DrCollectionV1) {
@@ -64,10 +68,19 @@ unsafe fn grow(collection: *mut DrCollectionV1) {
 }
 
 pub unsafe fn new(length: usize, keyed: bool, fixed: bool) -> *mut DrCollectionV1 {
+    new_with_frame(ptr::null(), length, keyed, fixed)
+}
+
+unsafe fn new_with_frame(
+    frame: *const DrStackFrameV1,
+    length: usize,
+    keyed: bool,
+    fixed: bool,
+) -> *mut DrCollectionV1 {
     let capacity = if fixed { length } else { length.max(4) };
     let collection = allocate(mem::size_of::<DrCollectionV1>()).cast::<DrCollectionV1>();
     if collection.is_null() {
-        collection_panic(b"collection allocation failed");
+        collection_panic_with_frame(frame, b"collection allocation failed");
     }
     ptr::write(
         collection,
@@ -75,11 +88,11 @@ pub unsafe fn new(length: usize, keyed: bool, fixed: bool) -> *mut DrCollectionV
             length: if fixed { length } else { 0 },
             capacity,
             keys: if keyed {
-                allocate_words(capacity)
+                allocate_words_with_frame(frame, capacity)
             } else {
                 ptr::null_mut()
             },
-            values: allocate_words(capacity),
+            values: allocate_words_with_frame(frame, capacity),
             keyed: u8::from(keyed),
             fixed: u8::from(fixed),
         },
@@ -87,8 +100,13 @@ pub unsafe fn new(length: usize, keyed: bool, fixed: bool) -> *mut DrCollectionV
     collection
 }
 
-pub unsafe fn fill_word(value: u64, count: usize, fixed: bool) -> *mut DrCollectionV1 {
-    let collection = new(count, false, true);
+pub unsafe fn fill_word(
+    frame: *const DrStackFrameV1,
+    value: u64,
+    count: usize,
+    fixed: bool,
+) -> *mut DrCollectionV1 {
+    let collection = new_with_frame(frame, count, false, true);
     for index in 0..count {
         ptr::write((*collection).values.add(index), value);
     }
@@ -97,11 +115,12 @@ pub unsafe fn fill_word(value: u64, count: usize, fixed: bool) -> *mut DrCollect
 }
 
 pub unsafe fn fill_string(
+    frame: *const DrStackFrameV1,
     value: *mut DrStringV1,
     count: usize,
     fixed: bool,
 ) -> *mut DrCollectionV1 {
-    let collection = new(count, false, true);
+    let collection = new_with_frame(frame, count, false, true);
     for index in 0..count {
         let retained = crate::dr_v1_string_retain(value);
         ptr::write((*collection).values.add(index), retained as u64);
@@ -444,5 +463,9 @@ unsafe fn push_retained(collection: *mut DrCollectionV1, value: u64, value_kind:
 }
 
 fn collection_panic(message: &'static [u8]) -> ! {
-    unsafe { dr_v1_panic(ptr::null(), message.as_ptr(), message.len()) }
+    collection_panic_with_frame(ptr::null(), message)
+}
+
+fn collection_panic_with_frame(frame: *const DrStackFrameV1, message: &'static [u8]) -> ! {
+    unsafe { dr_v1_panic(frame, message.as_ptr(), message.len()) }
 }

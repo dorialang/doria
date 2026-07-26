@@ -1,0 +1,3 @@
+Panic: collection capacity overflow
+Stack Trace:
+  at main
