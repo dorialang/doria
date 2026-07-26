@@ -145,6 +145,11 @@ jobs:
           cargo run -p doriac -- compile examples/native/main_stage23a_named_owned_arguments.doria --out build/native/main_stage23a_named_owned_arguments
           valgrind --leak-check=full --show-leak-kinds=all --errors-for-leak-kinds=definite,indirect --track-origins=yes --error-exitcode=1 build/native/main_stage23a_named_owned_arguments
 
+      - name: Leak-check Stage 23c string sequence fills with Cranelift
+        run: |
+          cargo run -p doriac -- compile examples/native/main_stage23c_sequence_fill.doria --out build/native/main_stage23c_sequence_fill
+          valgrind --leak-check=full --show-leak-kinds=all --errors-for-leak-kinds=definite,indirect --track-origins=yes --error-exitcode=1 build/native/main_stage23c_sequence_fill
+
       - name: Smoke signed and unsigned narrow-width native fixtures
         run: |
           cargo run -p doriac -- compile examples/native/main_integer_div_mod_42.doria --target native --out build/native/main_integer_div_mod_42
@@ -356,6 +361,13 @@ jobs:
         run: |
           cargo run -p doriac --features llvm-backend -- compile examples/native/main_stage23a_named_owned_arguments.doria --release --out build/native/main_stage23a_named_owned_arguments_release
           valgrind --leak-check=full --show-leak-kinds=all --errors-for-leak-kinds=definite,indirect --track-origins=yes --error-exitcode=1 build/native/main_stage23a_named_owned_arguments_release
+
+      - name: Leak-check Stage 23c string sequence fills with LLVM
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          cargo run -p doriac --features llvm-backend -- compile examples/native/main_stage23c_sequence_fill.doria --release --out build/native/main_stage23c_sequence_fill_release
+          valgrind --leak-check=full --show-leak-kinds=all --errors-for-leak-kinds=definite,indirect --track-origins=yes --error-exitcode=1 build/native/main_stage23c_sequence_fill_release
 
       - name: Smoke LLVM release profile and panic parity on Unix
         if: runner.os != 'Windows'
