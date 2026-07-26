@@ -29,7 +29,7 @@ ryu.workspace = true
 ryu.workspace = true
 
 [dev-dependencies]
-doria-rt = { path = "../doria-rt" }
+doria-rt = { path = "../doria-rt", default-features = false }
 
 [[bin]]
 name = "doriac"

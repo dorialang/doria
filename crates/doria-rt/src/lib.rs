@@ -1837,15 +1837,21 @@ extern "C" {
 
 // Doria's Windows executables deliberately do not link the C runtime. Rust and ryu still lower
 // byte copies/fills and floating-point use to these MSVC support symbols, so the runtime owns the
-// small subset they require.
-#[cfg(windows)]
+// small subset they require. Hosted Rust binaries link the CRT instead and disable this feature
+// through their dependency declaration so both providers can never define the same symbol.
+#[cfg(all(windows, feature = "standalone-windows-support"))]
 #[no_mangle]
 pub static _fltused: i32 = 0;
 
 // LLVM emits this MSVC stack-probe call when a generated x86-64 function reserves more than one
 // page of stack. Probe each page before the function adjusts RSP so Windows can extend the stack's
 // guard region. The MSVC convention passes the allocation size in RAX and preserves RAX and RCX.
-#[cfg(all(windows, target_env = "msvc", target_arch = "x86_64"))]
+#[cfg(all(
+    windows,
+    target_env = "msvc",
+    target_arch = "x86_64",
+    feature = "standalone-windows-support"
+))]
 core::arch::global_asm!(
     r#"
     .text
@@ -1878,7 +1884,7 @@ __chkstk:
 /// # Safety
 ///
 /// `source` and `destination` must be valid for `count` bytes and must not overlap.
-#[cfg(windows)]
+#[cfg(all(windows, feature = "standalone-windows-support"))]
 #[no_mangle]
 pub unsafe extern "C" fn memcpy(
     destination: *mut c_void,
@@ -1899,7 +1905,7 @@ pub unsafe extern "C" fn memcpy(
 /// # Safety
 ///
 /// `source` and `destination` must be valid for `count` bytes.
-#[cfg(windows)]
+#[cfg(all(windows, feature = "standalone-windows-support"))]
 #[no_mangle]
 pub unsafe extern "C" fn memmove(
     destination: *mut c_void,
@@ -1932,7 +1938,7 @@ pub unsafe extern "C" fn memmove(
 /// # Safety
 ///
 /// `left` and `right` must both be valid for reads of `count` bytes.
-#[cfg(windows)]
+#[cfg(all(windows, feature = "standalone-windows-support"))]
 #[no_mangle]
 pub unsafe extern "C" fn memcmp(left: *const c_void, right: *const c_void, count: usize) -> i32 {
     let left = left.cast::<u8>();
@@ -1958,7 +1964,7 @@ pub unsafe extern "C" fn memcmp(left: *const c_void, right: *const c_void, count
 ///
 /// This function may only be entered by the Windows exception dispatcher with its four native
 /// dispatcher pointers. Doria code must never call it directly.
-#[cfg(all(windows, target_env = "msvc"))]
+#[cfg(all(windows, target_env = "msvc", feature = "standalone-windows-support"))]
 #[no_mangle]
 pub unsafe extern "C" fn __CxxFrameHandler3(
     _exception_record: *mut c_void,
@@ -1975,7 +1981,7 @@ pub unsafe extern "C" fn __CxxFrameHandler3(
 /// # Safety
 ///
 /// `destination` must be valid for writes of `count` bytes.
-#[cfg(windows)]
+#[cfg(all(windows, feature = "standalone-windows-support"))]
 #[no_mangle]
 pub unsafe extern "C" fn memset(destination: *mut c_void, value: i32, count: usize) -> *mut c_void {
     let destination_bytes = destination.cast::<u8>();
