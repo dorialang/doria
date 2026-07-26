@@ -35,6 +35,7 @@ pub mod symbols;
 pub mod types;
 
 pub const TOOLCHAIN_VERSION: &str = env!("DORIA_TOOLCHAIN_VERSION");
+pub const BUILD_COMMIT: &str = env!("DORIA_BUILD_COMMIT");
 
 use ast::Program;
 use backend::{BackendTarget, CompileOptions};

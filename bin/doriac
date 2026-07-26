@@ -1,0 +1,35 @@
+#!/usr/bin/env php
+<?php
+
+declare(strict_types=1);
+
+$repositoryRoot = dirname(__DIR__);
+$command = [
+    'cargo',
+    'run',
+    '--color=always',
+    '--manifest-path',
+    $repositoryRoot . DIRECTORY_SEPARATOR . 'Cargo.toml',
+    '--package',
+    'doriac',
+    '--',
+    ...array_slice($argv, 1),
+];
+$descriptors = [
+    0 => ['file', 'php://stdin', 'r'],
+    1 => ['file', 'php://stdout', 'w'],
+    2 => ['file', 'php://stderr', 'w'],
+];
+$environment = getenv();
+if (!is_array($environment)) {
+    $environment = [];
+}
+$environment['CLICOLOR_FORCE'] = '1';
+
+$process = proc_open($command, $descriptors, $pipes, null, $environment);
+if (!is_resource($process)) {
+    fwrite(STDERR, "doriac development launcher could not start Cargo.\n");
+    exit(1);
+}
+
+exit(proc_close($process));

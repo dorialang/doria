@@ -23,6 +23,26 @@ fn version_uses_canonical_toolchain_calver() {
 }
 
 #[test]
+fn version_json_exposes_the_baton_compiler_contract() {
+    let output = Command::new(doriac_bin())
+        .args(["--version", "--json"])
+        .output()
+        .expect("doriac binary should run");
+
+    assert_success("JSON version", output.clone());
+    let identity: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("version output should be valid JSON");
+    assert_eq!(identity["schema"], 1);
+    assert_eq!(identity["component"], "doriac");
+    assert_eq!(identity["toolchainVersion"], "2026.03.1-canary");
+    assert_eq!(
+        identity["target"],
+        format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH)
+    );
+    assert!(identity["commit"].is_string());
+}
+
+#[test]
 fn check_json_exposes_static_identity_fix_ranges() {
     let temp_dir = temp_dir_path("check-json-static-fix");
     fs::create_dir_all(&temp_dir).expect("temp directory should be created");

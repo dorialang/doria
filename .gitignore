@@ -12,7 +12,8 @@
 vendor/
 *.log
 .idea
-/bin/
+/bin/*
+!/bin/doriac
 
 # Local toolchain convenience (machine-specific LLVM path); each environment
 # sets LLVM_SYS_181_PREFIX itself, and CI sets it per-OS. See the file for details.

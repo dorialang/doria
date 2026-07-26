@@ -32,8 +32,7 @@ fn run() -> Result<ExitCode, String> {
         return Ok(ExitCode::SUCCESS);
     }
     if command == "--version" || command == "-V" {
-        println!("doriac {}", doriac::TOOLCHAIN_VERSION);
-        return Ok(ExitCode::SUCCESS);
+        return version_command(&args[1..]);
     }
     if command == "run" {
         return run_command(&args[1..]);
@@ -81,6 +80,53 @@ fn run() -> Result<ExitCode, String> {
         command => Err(format!(
             "unknown command `{command}`\n\nRun `doriac --help`."
         )),
+    }
+}
+
+fn version_command(args: &[OsString]) -> Result<ExitCode, String> {
+    let args = utf8_cli_arguments(args)?;
+    match args.as_slice() {
+        [] => println!("doriac {}", doriac::TOOLCHAIN_VERSION),
+        [option] if option == "--json" => {
+            let target = format!(
+                "{}-{}",
+                normalized_platform(std::env::consts::OS),
+                normalized_architecture(std::env::consts::ARCH)
+            );
+            let identity = serde_json::json!({
+                "schema": 1,
+                "component": "doriac",
+                "toolchainVersion": doriac::TOOLCHAIN_VERSION,
+                "target": target,
+                "commit": doriac::BUILD_COMMIT,
+            });
+            println!(
+                "{}",
+                serde_json::to_string(&identity)
+                    .map_err(|error| format!("failed to encode version metadata: {error}"))?
+            );
+        }
+        [option] => return Err(format!("unknown version option `{option}`")),
+        _ => return Err("too many version options".to_string()),
+    }
+
+    Ok(ExitCode::SUCCESS)
+}
+
+fn normalized_platform(platform: &str) -> &str {
+    match platform {
+        "macos" => "macos",
+        "windows" => "windows",
+        "linux" => "linux",
+        other => other,
+    }
+}
+
+fn normalized_architecture(architecture: &str) -> &str {
+    match architecture {
+        "x86_64" => "x86_64",
+        "aarch64" => "aarch64",
+        other => other,
     }
 }
 

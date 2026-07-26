@@ -7,6 +7,11 @@ fn main() {
     let package_version = env::var("CARGO_PKG_VERSION").expect("Cargo package version");
     let toolchain_version = canonical_toolchain_version(&package_version);
     println!("cargo:rustc-env=DORIA_TOOLCHAIN_VERSION={toolchain_version}");
+    println!("cargo:rerun-if-env-changed=DORIA_BUILD_COMMIT");
+    println!(
+        "cargo:rustc-env=DORIA_BUILD_COMMIT={}",
+        env::var("DORIA_BUILD_COMMIT").unwrap_or_else(|_| "unknown".to_string())
+    );
 
     let manifest_dir =
         PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("manifest directory"));

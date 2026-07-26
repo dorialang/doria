@@ -87,10 +87,11 @@ The MVP supports:
 - Function calls, method calls, property access, object construction, and literals.
 - Collection literals using bracket syntax.
 
+The MVP also supports named arguments using `name: expression`, per decision 0098; §9 records their binding, ordering, and evaluation rules.
+
 Planned near-term syntax includes:
 
-- Attribute lists using `#[...]`.
-- Named arguments using `name: expression`.
+- Attribute lists using `#[...]`, which reuse the named-argument syntax above.
 - Richer property initializer expressions, including object construction.
 
 Planned future control-flow design includes:
