@@ -64,6 +64,8 @@ fn main() {
         .arg("--crate-type=staticlib")
         .arg("--target")
         .arg(&target)
+        .arg("--cfg")
+        .arg("feature=\"standalone-windows-support\"")
         .arg("-L")
         .arg(format!("dependency={}", dependency_dir.display()))
         .arg("--extern")
