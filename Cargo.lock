@@ -280,17 +280,6 @@ checksum = "b6f1c1dc4d6b4bc4f0be12b08cee0e59f7610287827aa62590f8e9ec6f45dff4"
 
 [[package]]
 name = "cranelift-module"
-version = "0.133.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dcbbdbe0c3c6cd97359ac2f6744187e89a48e202674e24200afc653f6aa9b7c2"
-dependencies = [
- "anyhow",
- "cranelift-codegen 0.133.1",
- "cranelift-control 0.133.1",
-]
-
-[[package]]
-name = "cranelift-module"
 version = "0.134.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "790e3fa73ee25bbb25eee937986051f8b6f6a2f5582477662f95e09d1e9f85f3"
@@ -313,14 +302,14 @@ dependencies = [
 
 [[package]]
 name = "cranelift-object"
-version = "0.133.1"
+version = "0.134.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "016cb9ab44af02e47766ec214338e21f682660e4f643a8ef8b032bc7c7211f0a"
+checksum = "ef16bb4647b1f9b8ca0e8f0a8354165310551943af44d42aa9ec3307f172c7de"
 dependencies = [
  "anyhow",
- "cranelift-codegen 0.133.1",
- "cranelift-control 0.133.1",
- "cranelift-module 0.133.1",
+ "cranelift-codegen 0.134.2",
+ "cranelift-control 0.134.2",
+ "cranelift-module",
  "gimli",
  "log",
  "object",
@@ -361,7 +350,7 @@ version = "2026.3.1-canary"
 dependencies = [
  "cranelift-codegen 0.133.1",
  "cranelift-frontend",
- "cranelift-module 0.134.2",
+ "cranelift-module",
  "cranelift-native",
  "cranelift-object",
  "inkwell",
