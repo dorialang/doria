@@ -568,12 +568,16 @@ fn expr_return_borrow(
         }),
         Expr::Variable { name, .. }
             if !shadowed.contains(name)
-                && function
+                && (function.params.iter().any(|param| {
+                    param.name == *name
+                        && !param.take
+                        && type_ref_mentions_parameter(&param.ty, &function.type_params)
+                }) || function
                     .params
                     .iter()
                     .filter(|param| !param.take && param.ty.as_class_name().is_some())
                     .count()
-                    == 1 =>
+                    == 1) =>
         {
             function
                 .params
@@ -860,6 +864,7 @@ impl Checker<'_> {
             .as_ref()
             .is_some_and(|ty| {
                 type_ref_class_name(ty, &self.classes, self.receiver_class.as_deref()).is_some()
+                    || type_ref_mentions_parameter(ty, &function.type_params)
             })
             .then(|| {
                 self.return_borrows
@@ -880,7 +885,10 @@ impl Checker<'_> {
             let class =
                 type_ref_class_name(&param.ty, &self.classes, self.receiver_class.as_deref());
             let mixed = param.ty.name == "mixed";
-            if type_ref_is_move_type(&param.ty, &self.classes, self.receiver_class.as_deref()) {
+            if type_ref_is_move_type(&param.ty, &self.classes, self.receiver_class.as_deref())
+                || ((param.take || param.writable)
+                    && type_ref_mentions_parameter(&param.ty, &function.type_params))
+            {
                 scopes.declare(
                     param.name.clone(),
                     Binding {
@@ -2846,9 +2854,10 @@ impl Checker<'_> {
         };
         let move_type = param.move_type
             || (param.generic
-                && self
-                    .resolved_type(arg)
-                    .is_some_and(resolved_type_is_move_type));
+                && self.resolved_type(arg).is_some_and(|ty| {
+                    resolved_type_is_move_type(ty)
+                        || matches!(ty, crate::types::ResolvedType::TypeParameter(_))
+                }));
         if param.take && move_type {
             UseMode::Give
         } else if param.writable && move_type {

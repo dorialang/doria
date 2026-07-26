@@ -615,11 +615,17 @@ fn validate_statement(
             let callee = function_in(program, *callee)?;
             if !matches!(
                 callee.return_type,
-                mir::ReturnType::Value(mir::Type::Class(_) | mir::Type::NullableClass(_))
+                mir::ReturnType::Value(
+                    mir::Type::Class(_)
+                        | mir::Type::NullableClass(_)
+                        | mir::Type::Collection(_)
+                        | mir::Type::Mixed
+                        | mir::Type::NullableMixed
+                )
             ) || infer_function_return_borrow(program, callee)?.is_none()
             {
                 return Err(malformed_mir(format!(
-                    "borrowed call targets function {} without a borrowed class return",
+                    "borrowed call targets function {} without a borrowed move-value return",
                     callee.name
                 )));
             }
@@ -960,6 +966,41 @@ fn validate_terminator(
                             &format!("return from {}", function.name),
                         )?;
                     }
+                } else if let (mir::Type::Collection(_), mir::Rvalue::Collection(collection)) =
+                    (return_type, expression)
+                {
+                    let expected = infer_function_return_borrow(program, function)?;
+                    let actual =
+                        infer_collection_expression_return_borrow(program, function, collection)?;
+                    if !return_borrow_is_compatible(actual, expected) {
+                        return Err(malformed_mir(format!(
+                            "return from {} has inconsistent collection ownership",
+                            function.name
+                        )));
+                    }
+                    if expected.is_none() && collection.owned_temporary_collection().is_none() {
+                        return Err(malformed_mir(format!(
+                            "return from {} receives a borrowed collection value",
+                            function.name
+                        )));
+                    }
+                } else if let (mir::Type::Mixed, mir::Rvalue::Mixed(mixed)) =
+                    (return_type, expression)
+                {
+                    let expected = infer_function_return_borrow(program, function)?;
+                    let actual = infer_mixed_expression_return_borrow(program, function, mixed)?;
+                    if !return_borrow_is_compatible(actual, expected) {
+                        return Err(malformed_mir(format!(
+                            "return from {} has inconsistent mixed ownership",
+                            function.name
+                        )));
+                    }
+                    if expected.is_none() && !mixed.ownership().has_shell() {
+                        return Err(malformed_mir(format!(
+                            "return from {} receives a borrowed mixed value",
+                            function.name
+                        )));
+                    }
                 }
             }
             Ok(())
@@ -1140,10 +1181,17 @@ fn validate_mixed_expression(
         mir::MixedExpression::Call {
             function: callee,
             args,
+            return_borrow,
         } => {
             let callee = function_in(program, *callee)?;
             if callee.return_type != mir::ReturnType::Value(mir::Type::Mixed) {
                 return Err(malformed_mir("mixed call targets a non-mixed function"));
+            }
+            if *return_borrow != infer_function_return_borrow(program, callee)? {
+                return Err(malformed_mir(format!(
+                    "mixed call disagrees with function {} return ownership",
+                    callee.name
+                )));
             }
             validate_call_args(program, function, callee, args)
         }
@@ -1232,12 +1280,19 @@ fn validate_nullable_mixed_expression(
         mir::NullableMixedExpression::Call {
             function: callee,
             args,
+            return_borrow,
         } => {
             let callee = function_in(program, *callee)?;
             if callee.return_type != mir::ReturnType::Value(mir::Type::NullableMixed) {
                 return Err(malformed_mir(
                     "nullable mixed call targets a non-nullable-mixed function",
                 ));
+            }
+            if *return_borrow != infer_function_return_borrow(program, callee)? {
+                return Err(malformed_mir(format!(
+                    "nullable mixed call disagrees with function {} return ownership",
+                    callee.name
+                )));
             }
             validate_call_args(program, function, callee, args)
         }
@@ -1425,6 +1480,7 @@ fn validate_collection_expression(
         mir::CollectionExpression::Call {
             function: callee,
             args,
+            return_borrow,
             ..
         } => {
             let callee = function_in(program, *callee)?;
@@ -1432,6 +1488,12 @@ fn validate_collection_expression(
                 return Err(malformed_mir(
                     "collection call targets a function with another return type",
                 ));
+            }
+            if *return_borrow != infer_function_return_borrow(program, callee)? {
+                return Err(malformed_mir(format!(
+                    "collection call disagrees with function {} return ownership",
+                    callee.name
+                )));
             }
             validate_call_args(program, function, callee, args)
         }
@@ -1761,6 +1823,18 @@ fn infer_function_return_borrow(
             mir::Terminator::Return(mir::Rvalue::NullableClass(expression)) => Some(
                 infer_nullable_expression_return_borrow(program, function, expression)?,
             ),
+            mir::Terminator::Return(mir::Rvalue::Collection(expression)) => Some(
+                infer_collection_expression_return_borrow(program, function, expression)?,
+            ),
+            mir::Terminator::Return(mir::Rvalue::Mixed(expression)) => Some(
+                infer_mixed_expression_return_borrow(program, function, expression)?,
+            ),
+            mir::Terminator::Return(mir::Rvalue::NullableMixed(
+                mir::NullableMixedExpression::Null,
+            )) => None,
+            mir::Terminator::Return(mir::Rvalue::NullableMixed(expression)) => Some(
+                infer_nullable_mixed_expression_return_borrow(program, function, expression)?,
+            ),
             _ => continue,
         };
         let Some(candidate) = candidate else {
@@ -1774,7 +1848,7 @@ fn infer_function_return_borrow(
             (Some(None), None) => {}
             _ => {
                 return Err(malformed_mir(format!(
-                    "function {} mixes owned and borrowed class returns",
+                    "function {} mixes owned and borrowed move-value returns",
                     function.name
                 )));
             }
@@ -1926,9 +2000,166 @@ fn infer_rvalue_return_borrow(
         mir::Rvalue::NullableClass(source) => {
             infer_nullable_expression_return_borrow(program, function, source)
         }
-        _ => Err(malformed_mir(
-            "borrowed class call source is not a class value",
-        )),
+        mir::Rvalue::Collection(source) => {
+            infer_collection_expression_return_borrow(program, function, source)
+        }
+        mir::Rvalue::Mixed(source) => {
+            infer_mixed_expression_return_borrow(program, function, source)
+        }
+        mir::Rvalue::NullableMixed(source) => {
+            infer_nullable_mixed_expression_return_borrow(program, function, source)
+        }
+        _ => Err(malformed_mir("borrowed call source is not a move value")),
+    }
+}
+
+fn infer_collection_expression_return_borrow(
+    program: &mir::Program,
+    function: &mir::Function,
+    expression: &mir::CollectionExpression,
+) -> Result<Option<mir::ReturnBorrow>, BackendError> {
+    match expression {
+        mir::CollectionExpression::Local {
+            local,
+            transfer: false,
+            ..
+        } => match borrow_from_parameter(function, *local) {
+            Some(borrow) => Ok(Some(borrow)),
+            None => infer_synthetic_local_return_borrow(program, function, *local),
+        },
+        mir::CollectionExpression::Property { object, .. } => Ok(borrow_from_parameter(
+            function, *object,
+        )
+        .map(|borrow| mir::ReturnBorrow {
+            writable: false,
+            ..borrow
+        })),
+        mir::CollectionExpression::Index {
+            source,
+            transfer: false,
+            ..
+        } => Ok(
+            borrow_from_parameter(function, *source).map(|borrow| mir::ReturnBorrow {
+                writable: false,
+                ..borrow
+            }),
+        ),
+        mir::CollectionExpression::Call {
+            function: callee,
+            args,
+            return_borrow: Some(return_borrow),
+            ..
+        } => infer_borrowed_rvalue_source(program, function, *callee, args, *return_borrow),
+        mir::CollectionExpression::Local { transfer: true, .. }
+        | mir::CollectionExpression::Literal { .. }
+        | mir::CollectionExpression::Fill { .. }
+        | mir::CollectionExpression::Index { transfer: true, .. }
+        | mir::CollectionExpression::SetFrom { .. }
+        | mir::CollectionExpression::FromBytes { .. }
+        | mir::CollectionExpression::BytesFromArray { .. }
+        | mir::CollectionExpression::ReadFileBytes { .. }
+        | mir::CollectionExpression::ReadStdinBytes { .. }
+        | mir::CollectionExpression::Call {
+            return_borrow: None,
+            ..
+        } => Ok(None),
+    }
+}
+
+fn infer_mixed_expression_return_borrow(
+    program: &mir::Program,
+    function: &mir::Function,
+    expression: &mir::MixedExpression,
+) -> Result<Option<mir::ReturnBorrow>, BackendError> {
+    match expression {
+        mir::MixedExpression::Local {
+            local,
+            transfer: false,
+        } => match borrow_from_parameter(function, *local) {
+            Some(borrow) => Ok(Some(borrow)),
+            None => infer_synthetic_local_return_borrow(program, function, *local),
+        },
+        mir::MixedExpression::Property { object, .. } => Ok(borrow_from_parameter(
+            function, *object,
+        )
+        .map(|borrow| mir::ReturnBorrow {
+            writable: false,
+            ..borrow
+        })),
+        mir::MixedExpression::CollectionIndex {
+            collection,
+            transfer: false,
+            ..
+        } => Ok(
+            borrow_from_parameter(function, *collection).map(|borrow| mir::ReturnBorrow {
+                writable: false,
+                ..borrow
+            }),
+        ),
+        mir::MixedExpression::Call {
+            function: callee,
+            args,
+            return_borrow: Some(return_borrow),
+        } => infer_borrowed_rvalue_source(program, function, *callee, args, *return_borrow),
+        mir::MixedExpression::Local { transfer: true, .. }
+        | mir::MixedExpression::Call {
+            return_borrow: None,
+            ..
+        }
+        | mir::MixedExpression::BoxValue(_)
+        | mir::MixedExpression::BoxString { .. }
+        | mir::MixedExpression::BoxClass { .. }
+        | mir::MixedExpression::CollectionIndex { transfer: true, .. } => Ok(None),
+    }
+}
+
+fn infer_nullable_mixed_expression_return_borrow(
+    program: &mir::Program,
+    function: &mir::Function,
+    expression: &mir::NullableMixedExpression,
+) -> Result<Option<mir::ReturnBorrow>, BackendError> {
+    match expression {
+        mir::NullableMixedExpression::Null => Ok(None),
+        mir::NullableMixedExpression::Mixed(value) => {
+            infer_mixed_expression_return_borrow(program, function, value)
+        }
+        mir::NullableMixedExpression::Local {
+            local,
+            transfer: false,
+        } => match borrow_from_parameter(function, *local) {
+            Some(borrow) => Ok(Some(borrow)),
+            None => infer_synthetic_local_return_borrow(program, function, *local),
+        },
+        mir::NullableMixedExpression::Property { object, .. } => Ok(borrow_from_parameter(
+            function, *object,
+        )
+        .map(|borrow| mir::ReturnBorrow {
+            writable: false,
+            ..borrow
+        })),
+        mir::NullableMixedExpression::Call {
+            function: callee,
+            args,
+            return_borrow: Some(return_borrow),
+        } => infer_borrowed_rvalue_source(program, function, *callee, args, *return_borrow),
+        mir::NullableMixedExpression::Coalesce { left, right, .. } => {
+            let left_borrow =
+                infer_nullable_mixed_expression_return_borrow(program, function, left)?;
+            let right_borrow =
+                infer_nullable_mixed_expression_return_borrow(program, function, right)?;
+            if left_borrow == right_borrow {
+                Ok(left_borrow)
+            } else {
+                Err(malformed_mir(
+                    "nullable mixed coalesce mixes owned and borrowed results",
+                ))
+            }
+        }
+        mir::NullableMixedExpression::Local { transfer: true, .. }
+        | mir::NullableMixedExpression::Call {
+            return_borrow: None,
+            ..
+        } => Ok(None),
     }
 }
 
@@ -2462,7 +2693,7 @@ fn collect_mixed_class_local_accesses<'a>(
         mir::MixedExpression::BoxClass { value, .. } => {
             collect_class_expression_local_accesses(value, accesses)
         }
-        mir::MixedExpression::Call { function, args } => {
+        mir::MixedExpression::Call { function, args, .. } => {
             accesses.begin_call();
             collect_rvalue_args_class_local_accesses(args, accesses);
             accesses.call(*function, args);
@@ -2482,7 +2713,7 @@ fn collect_nullable_mixed_class_local_accesses<'a>(
         mir::NullableMixedExpression::Mixed(value) => {
             collect_mixed_class_local_accesses(value, accesses)
         }
-        mir::NullableMixedExpression::Call { function, args } => {
+        mir::NullableMixedExpression::Call { function, args, .. } => {
             accesses.begin_call();
             collect_rvalue_args_class_local_accesses(args, accesses);
             accesses.call(*function, args);

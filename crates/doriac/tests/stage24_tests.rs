@@ -13,6 +13,7 @@ fn parses_generic_function_and_method_parameter_lists() {
 function pair<T, U>(T $left, U $right): U { return $right; }
 class Box {
     function constrained<T implements A, B>(T $value): T { return $value; }
+    function composed<T implements A, U implements B>(T $left, U $right): U { return $right; }
 }
 "#,
     )
@@ -35,6 +36,12 @@ class Box {
         panic!("class member should be the generic method");
     };
     assert_eq!(method.type_params[0].constraints.len(), 2);
+    let ClassMember::Method(composed) = &class.members[1] else {
+        panic!("second class member should be the composed generic method");
+    };
+    assert_eq!(composed.type_params.len(), 2);
+    assert_eq!(composed.type_params[0].constraints.len(), 1);
+    assert_eq!(composed.type_params[1].constraints.len(), 1);
 }
 
 #[test]
@@ -166,6 +173,84 @@ function main(): void
     assert!(errors.iter().any(|diagnostic| {
         diagnostic.code == "E0470" && diagnostic.message.contains("given away")
     }));
+}
+
+#[test]
+fn generic_take_parameters_are_owned_inside_the_generic_body() {
+    let errors = diagnostics(
+        r#"
+function sink<T>(take T $value): void {}
+function twice<T>(take T $value): void
+{
+    sink($value);
+    sink($value);
+}
+function main(): void {}
+"#,
+    );
+    assert!(errors.iter().any(|diagnostic| {
+        diagnostic.code == "E0470" && diagnostic.message.contains("given away")
+    }));
+}
+
+#[test]
+fn property_initializers_contribute_reachable_specializations() {
+    let source = r#"
+function identity<T>(T $value): T { return $value; }
+class Box
+{
+    int $value = identity(42);
+    function __construct() {}
+}
+function main(): int
+{
+    let $box = new Box();
+    return $box->value;
+}
+"#;
+    let mir = doriac::lower_source_to_mir("stage24-property-root.doria", source)
+        .expect("property-initializer generic calls should collect their specialization");
+    let output = doriac::mir_interpreter::interpret(&mir)
+        .expect("property-initializer generic specialization should execute");
+    assert_eq!(output.exit_status, 42);
+}
+
+#[test]
+fn inferred_collection_locals_are_interned_per_specialization() {
+    let source = r#"
+function countWrapped<T>(T $value): int
+{
+    let $items = [$value];
+    return $items->count;
+}
+function main(): int { return countWrapped(42); }
+"#;
+    let mir = doriac::lower_source_to_mir("stage24-inferred-collection.doria", source)
+        .expect("specialized inferred collection types should be interned");
+    let output = doriac::mir_interpreter::interpret(&mir)
+        .expect("specialized inferred collection should execute");
+    assert_eq!(output.exit_status, 1);
+}
+
+#[test]
+fn borrowed_generic_collection_and_mixed_returns_retain_their_sources() {
+    let source = r#"
+function identity<T>(T $value): T { return $value; }
+function count(List<int> $values): int { return identity($values)->count; }
+function isInt(mixed $value): bool { return identity($value) is int; }
+function main(): int
+{
+    List<int> $values = [41];
+    mixed $value = 1;
+    if (isInt($value)) { return count($values) + 41; }
+    return 0;
+}
+"#;
+    let mir = doriac::lower_source_to_mir("stage24-borrowed-move-return.doria", source)
+        .expect("generic move-value borrows should survive MIR lowering");
+    let output = doriac::mir_interpreter::interpret(&mir)
+        .expect("borrowed generic move-value returns should execute");
+    assert_eq!(output.exit_status, 42);
 }
 
 #[test]

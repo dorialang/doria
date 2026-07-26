@@ -2805,7 +2805,7 @@ impl Interpreter<'_> {
                 };
                 self.push_mixed(value)?;
             }
-            mir::MixedExpression::Call { function, args } => {
+            mir::MixedExpression::Call { function, args, .. } => {
                 self.queue_call(function, args, ReturnExpectation::Value(mir::Type::Mixed))?;
             }
             mir::MixedExpression::BoxValue(value) => {
@@ -2892,7 +2892,7 @@ impl Interpreter<'_> {
                 };
                 self.push_nullable_mixed(value)?;
             }
-            mir::NullableMixedExpression::Call { function, args } => {
+            mir::NullableMixedExpression::Call { function, args, .. } => {
                 self.queue_call(
                     function,
                     args,
@@ -3543,6 +3543,7 @@ impl Interpreter<'_> {
                 collection,
                 function,
                 args,
+                ..
             } => {
                 self.queue_call(
                     function,

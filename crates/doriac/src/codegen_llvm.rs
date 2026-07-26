@@ -3471,7 +3471,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                         .into_pointer_value(),
                 )
             }
-            mir::MixedExpression::Call { function, args } => Ok(self
+            mir::MixedExpression::Call { function, args, .. } => Ok(self
                 .lower_call(*function, args, true)?
                 .ok_or_else(|| malformed_mir("mixed call produced no result"))?
                 .into_pointer_value()),
@@ -3555,7 +3555,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 )?
                 .into_pointer_value())
             }
-            mir::NullableMixedExpression::Call { function, args } => Ok(self
+            mir::NullableMixedExpression::Call { function, args, .. } => Ok(self
                 .lower_call(*function, args, true)?
                 .ok_or_else(|| malformed_mir("nullable-mixed call produced no result"))?
                 .into_pointer_value()),

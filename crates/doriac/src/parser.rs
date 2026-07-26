@@ -296,9 +296,23 @@ impl Parser {
             if self.match_kind(&TokenKind::Implements) {
                 loop {
                     constraints.push(self.parse_type_ref()?);
-                    if !self.match_kind(&TokenKind::Comma) {
+                    // A comma followed by `Name implements` starts the next
+                    // parameter. Without that second `implements`,
+                    // `<T implements A, U>` remains the documented
+                    // comma-separated constraint list for `T`.
+                    if !self.check(&TokenKind::Comma)
+                        || self
+                            .tokens
+                            .get(self.current + 1)
+                            .zip(self.tokens.get(self.current + 2))
+                            .is_some_and(|(name, implements)| {
+                                matches!(name.kind, TokenKind::Identifier(_))
+                                    && matches!(implements.kind, TokenKind::Implements)
+                            })
+                    {
                         break;
                     }
+                    self.advance();
                 }
             }
             let end = self.previous().span.end;

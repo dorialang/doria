@@ -94,6 +94,7 @@ impl CallableDecl<'_> {
 }
 
 fn collect_callable_instances(
+    program: &hir::Program,
     declarations: &[CallableDecl<'_>],
     class_ids: &HashMap<String, ClassId>,
     semantic_info: &SemanticInfo,
@@ -140,7 +141,29 @@ fn collect_callable_instances(
         let callable = declarations[instance.declaration];
         let substitutions = type_substitutions(callable.function, &instance.arguments)?;
         for (span, specialization) in &calls {
-            if span.0 < callable.function.span.start || span.1 > callable.function.span.end {
+            let in_function =
+                span.0 >= callable.function.span.start && span.1 <= callable.function.span.end;
+            let in_property_initializer = callable.class.is_some_and(|class| {
+                callable.function.name == "__construct"
+                    && program.items.iter().any(|item| {
+                        let hir::Item::Class(declaration) = item else {
+                            return false;
+                        };
+                        class_ids.get(&declaration.name) == Some(&class)
+                            && declaration.members.iter().any(|member| {
+                                matches!(
+                                    member,
+                                    hir::ClassMember::Property(hir::PropertyDecl {
+                                        is_static: false,
+                                        initializer: Some(initializer),
+                                        ..
+                                    }) if span.0 >= initializer.span().start
+                                        && span.1 <= initializer.span().end
+                                )
+                            })
+                    })
+            });
+            if !in_function && !in_property_initializer {
                 continue;
             }
             let Some(target) = semantic_info.call_targets.get(span) else {
@@ -447,7 +470,8 @@ pub fn lower_program(program: &hir::Program) -> DiagnosticResult<mir::Program> {
         )]);
     }
 
-    let instances = collect_callable_instances(&declarations, &class_ids, &program.semantic_info)?;
+    let instances =
+        collect_callable_instances(program, &declarations, &class_ids, &program.semantic_info)?;
     let mut signatures = HashMap::new();
     let mut method_signatures = HashMap::new();
     let mut callable_signatures = Vec::new();
@@ -462,6 +486,16 @@ pub fn lower_program(program: &hir::Program) -> DiagnosticResult<mir::Program> {
             &mut collection_registry,
             &substitutions,
         );
+        for (span, ty) in &program.semantic_info.expression_types {
+            if span.0 >= function.span.start && span.1 <= function.span.end {
+                let specialized = substitute_resolved_type(ty, &substitutions);
+                let _ = intern_resolved_collection_types(
+                    &specialized,
+                    &class_ids,
+                    &mut collection_registry,
+                );
+            }
+        }
         let mut signature = collect_function_signature(
             function,
             mir::FunctionId(index),
@@ -4784,14 +4818,16 @@ fn discarded_call_statement(
             function: signature.id,
             args,
         },
-        mir::ReturnType::Value(mir::Type::Class(_) | mir::Type::NullableClass(_))
-            if signature.return_borrow.is_some() =>
-        {
-            mir::Statement::CallBorrowed {
-                function: signature.id,
-                args,
-            }
-        }
+        mir::ReturnType::Value(
+            mir::Type::Class(_)
+            | mir::Type::NullableClass(_)
+            | mir::Type::Collection(_)
+            | mir::Type::Mixed
+            | mir::Type::NullableMixed,
+        ) if signature.return_borrow.is_some() => mir::Statement::CallBorrowed {
+            function: signature.id,
+            args,
+        },
         mir::ReturnType::Value(_) => {
             return Err(vec![unsupported(
                 span,
@@ -4811,7 +4847,13 @@ fn discarded_null_safe_call_statement(
     let supported = matches!(signature.return_type, mir::ReturnType::Void)
         || matches!(
             signature.return_type,
-            mir::ReturnType::Value(mir::Type::Class(_) | mir::Type::NullableClass(_))
+            mir::ReturnType::Value(
+                mir::Type::Class(_)
+                    | mir::Type::NullableClass(_)
+                    | mir::Type::Collection(_)
+                    | mir::Type::Mixed
+                    | mir::Type::NullableMixed
+            )
         ) && signature.return_borrow.is_some();
     if !supported {
         return Err(vec![unsupported(
@@ -5211,18 +5253,24 @@ fn lower_return(
             Ok(mir::Terminator::ReturnVoid)
         }
         (mir::ReturnType::Value(expected), Some(expr)) => {
-            let borrowed_class =
-                matches!(expected, mir::Type::Class(_) | mir::Type::NullableClass(_))
-                    && context.return_borrow.is_some();
+            let borrowed_move = matches!(
+                expected,
+                mir::Type::Class(_)
+                    | mir::Type::NullableClass(_)
+                    | mir::Type::Collection(_)
+                    | mir::Type::Mixed
+                    | mir::Type::NullableMixed
+            ) && context.return_borrow.is_some();
             let value = match expected {
                 mir::Type::Class(class) => {
-                    lower_class_expression(expr, class, !borrowed_class, context)
+                    lower_class_expression(expr, class, !borrowed_move, context)
                         .map(mir::Rvalue::Class)?
                 }
                 mir::Type::NullableClass(class) => {
-                    lower_nullable_class_expression(expr, class, !borrowed_class, context)
+                    lower_nullable_class_expression(expr, class, !borrowed_move, context)
                         .map(mir::Rvalue::NullableClass)?
                 }
+                _ if borrowed_move => lower_rvalue_as_borrowed(expr, expected, context)?,
                 _ => lower_rvalue_as_expected(expr, expected, context)?,
             };
             if value.ty() != expected {
@@ -5237,8 +5285,11 @@ fn lower_return(
             }
             if context.has_cleanup_obligations() {
                 let result_owns = match expected {
-                    mir::Type::Class(_) | mir::Type::NullableClass(_) => !borrowed_class,
-                    mir::Type::Collection(_) | mir::Type::Mixed | mir::Type::NullableMixed => true,
+                    mir::Type::Class(_)
+                    | mir::Type::NullableClass(_)
+                    | mir::Type::Collection(_)
+                    | mir::Type::Mixed
+                    | mir::Type::NullableMixed => !borrowed_move,
                     _ => false,
                 };
                 let result = context.declare_return_temp(expected, result_owns);
@@ -5250,7 +5301,7 @@ fn lower_return(
                 Ok(mir::Terminator::Return(local_rvalue(
                     result,
                     expected,
-                    !borrowed_class,
+                    !borrowed_move,
                 )))
             } else {
                 Ok(mir::Terminator::Return(value))
@@ -6146,6 +6197,7 @@ fn lower_mixed_expression(
         if signature.return_type == mir::ReturnType::Value(mir::Type::Mixed) {
             return Ok(mir::MixedExpression::Call {
                 function: signature.id,
+                return_borrow: signature.return_borrow,
                 args: lower_call_args(name, args, signature, *span, context)?,
             });
         }
@@ -6163,6 +6215,7 @@ fn lower_mixed_expression(
             return Ok(mir::MixedExpression::Call {
                 function: signature.id,
                 args,
+                return_borrow: signature.return_borrow,
             });
         }
     }
@@ -6178,6 +6231,7 @@ fn lower_mixed_expression(
             return Ok(mir::MixedExpression::Call {
                 function: signature.id,
                 args,
+                return_borrow: signature.return_borrow,
             });
         }
     }
@@ -6299,12 +6353,14 @@ fn lower_nullable_mixed_expression(
                 mir::ReturnType::Value(mir::Type::NullableMixed) => {
                     Ok(mir::NullableMixedExpression::Call {
                         function: signature.id,
+                        return_borrow: signature.return_borrow,
                         args: lower_call_args(name, args, signature, *span, context)?,
                     })
                 }
                 mir::ReturnType::Value(mir::Type::Mixed) => Ok(
                     mir::NullableMixedExpression::Mixed(mir::MixedExpression::Call {
                         function: signature.id,
+                        return_borrow: signature.return_borrow,
                         args: lower_call_args(name, args, signature, *span, context)?,
                     }),
                 ),
@@ -6440,6 +6496,7 @@ fn lower_collection_expression(
             Ok(mir::CollectionExpression::Call {
                 collection: expected,
                 function: signature.id,
+                return_borrow: signature.return_borrow,
                 args: lower_call_args_with_ownership(name, args, signature, *span, context)?,
             })
         }
@@ -6462,6 +6519,7 @@ fn lower_collection_expression(
                 collection: expected,
                 function: signature.id,
                 args,
+                return_borrow: signature.return_borrow,
             })
         }
         hir::Expr::StaticCall {
@@ -6482,6 +6540,7 @@ fn lower_collection_expression(
                 collection: expected,
                 function: signature.id,
                 args,
+                return_borrow: signature.return_borrow,
             })
         }
         hir::Expr::MethodCall {

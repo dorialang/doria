@@ -3557,7 +3557,7 @@ fn lower_mixed_expression(
             let address = lower_property_address(builder, *object, *property, resources)?;
             Ok(load_lowered_from_address(builder, mir::Type::Mixed, address, pointer).single()?)
         }
-        mir::MixedExpression::Call { function, args } => {
+        mir::MixedExpression::Call { function, args, .. } => {
             lower_function_call(builder, *function, args, resources)
                 .and_then(|value| {
                     value.ok_or_else(|| malformed_mir("mixed call produced no result"))
@@ -3653,7 +3653,7 @@ fn lower_nullable_mixed_expression(
                     .single()?,
             )
         }
-        mir::NullableMixedExpression::Call { function, args } => {
+        mir::NullableMixedExpression::Call { function, args, .. } => {
             lower_function_call(builder, *function, args, resources)
                 .and_then(|value| {
                     value.ok_or_else(|| malformed_mir("nullable mixed call produced no result"))
