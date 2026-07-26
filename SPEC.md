@@ -517,6 +517,26 @@ The semantic model also has an internal `Unknown` recovery type for diagnostics 
 
 Lowercase primitive names are type-position names: `int`, `int8`, `int16`, `int32`, `int64`, `uint8`, `uint16`, `uint32`, `uint64`, `float`, `float32`, `float64`, `string`, and `bool`. PascalCase names are expression-level standard-library/helper or compiler-known companion APIs, not primitive type spellings or namespaces.
 
+### Generic functions and methods
+
+Free functions, instance methods, and static methods may declare type parameters after their name:
+
+```doria
+function first<T>(List<T> $items): ?T
+{
+    return $items->first;
+}
+
+function pair<T, U>(T $left, U $right): U
+{
+    return $right;
+}
+```
+
+Calls infer type arguments from the arguments after ordinary positional/named binding. If arguments do not determine every parameter, a typed declaration may supply the expected result type. Doria has no explicit call-site turbofish syntax. Native compilation monomorphizes reachable calls and deduplicates identical concrete specializations.
+
+Constraint declarations use `<T implements A, B>`. The grammar is accepted and retained, but nominal constraint enforcement remains pending until Stage 35. Generic classes remain Stage 25. The generics decision is still unauthored.
+
 ### Fixed-width integers
 
 Stage 13 implements these canonical integer types through semantic analysis, typed MIR, the debug interpreter, and Cranelift:

@@ -36,6 +36,12 @@ pub struct SemanticInfo {
     pub type_test_types: HashMap<(usize, usize), ResolvedType>,
     /// Compiler-resolved callable target for each user-defined call expression.
     pub call_targets: HashMap<(usize, usize), CallableTarget>,
+    /// Concrete generic arguments selected for each checked user-defined call.
+    ///
+    /// The argument enum is intentionally kinded: Stage 24 supplies only type
+    /// arguments, while future compile-time value parameters can add another
+    /// variant without changing specialization identity.
+    pub generic_call_specializations: HashMap<(usize, usize), GenericSpecialization>,
     /// Stable nominal class identities and the total Stage 19 property order.
     pub classes: Vec<ClassSemanticInfo>,
     /// Values produced by the bounded Stage 20 constant evaluator.
@@ -48,6 +54,16 @@ pub struct SemanticInfo {
     /// Flow facts at checked source uses, consumed by MIR lowering so
     /// statically selected nullable paths stay selected after lowering.
     pub(crate) flow_facts: crate::narrowing::FactsByUse,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct GenericSpecialization {
+    pub arguments: Vec<GenericArgument>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum GenericArgument {
+    Type(ResolvedType),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -151,6 +167,7 @@ pub fn analyze_program_for_ide(program: &Program) -> SemanticAnalysis {
             program,
             &inferred_move_returns,
             &return_borrows,
+            &checker.expression_types,
             &checker.flow_facts,
         );
         checker.diagnostics.extend(ownership_diagnostics);
@@ -167,6 +184,7 @@ pub fn analyze_program_for_ide(program: &Program) -> SemanticAnalysis {
             expression_types: checker.expression_types,
             type_test_types: checker.type_test_types,
             call_targets: checker.call_targets,
+            generic_call_specializations: checker.generic_call_specializations,
             classes: collect_ordered_class_semantics(program),
             const_evaluation: checker.const_evaluation,
             parameter_defaults: checker.parameter_defaults,
@@ -288,6 +306,9 @@ struct Checker<'program> {
     expression_types: HashMap<(usize, usize), ResolvedType>,
     type_test_types: HashMap<(usize, usize), ResolvedType>,
     call_targets: HashMap<(usize, usize), CallableTarget>,
+    generic_call_specializations: HashMap<(usize, usize), GenericSpecialization>,
+    pending_generic_calls: HashMap<(usize, usize), PendingGenericCall>,
+    type_parameter_scopes: Vec<HashSet<String>>,
     integer_literals: HashMap<(usize, usize), u128>,
     negative_integer_literals: HashMap<(usize, usize), u128>,
     negated_integer_literal_operands: HashSet<(usize, usize)>,
@@ -314,6 +335,14 @@ struct CallSite<'a> {
     return_borrow: Option<ReturnBorrow>,
     params: &'a [ParamInfo],
     args: &'a [Argument],
+}
+
+#[derive(Debug, Clone)]
+struct PendingGenericCall {
+    callee: String,
+    type_params: Vec<String>,
+    bindings: HashMap<String, TypeId>,
+    return_ty: TypeId,
 }
 
 #[derive(Debug, Clone)]
@@ -458,6 +487,9 @@ impl<'program> Checker<'program> {
             expression_types: HashMap::new(),
             type_test_types: HashMap::new(),
             call_targets: HashMap::new(),
+            generic_call_specializations: HashMap::new(),
+            pending_generic_calls: HashMap::new(),
+            type_parameter_scopes: Vec::new(),
             integer_literals: HashMap::new(),
             negative_integer_literals: HashMap::new(),
             negated_integer_literal_operands: HashSet::new(),
@@ -501,6 +533,7 @@ impl<'program> Checker<'program> {
                 }
             }
         }
+        self.report_unresolved_generic_calls();
         self.check_pending_integer_literal_ranges();
     }
 
@@ -627,6 +660,7 @@ impl<'program> Checker<'program> {
                                     ),
                                     return_borrow: signature.return_borrow,
                                     is_static: method.is_static,
+                                    type_params: signature.type_params,
                                     params: signature.params,
                                     return_ty: signature.return_ty,
                                 },
@@ -916,16 +950,89 @@ impl<'program> Checker<'program> {
         function: &FunctionDecl,
         declaring_class: Option<&str>,
     ) -> FunctionInfo {
+        self.check_type_parameter_declarations(function);
+        self.type_parameter_scopes.push(
+            function
+                .type_params
+                .iter()
+                .map(|param| param.name.clone())
+                .collect(),
+        );
         let params = self.resolve_param_infos(function, declaring_class);
         let return_ty = self.resolve_function_return_type(function, declaring_class);
-        let return_borrow = matches!(self.types.kind(return_ty), TypeKind::Class(_))
-            .then(|| crate::ownership::function_return_borrow(function))
-            .flatten();
+        self.type_parameter_scopes.pop();
+        let return_borrow = matches!(
+            self.types.kind(return_ty),
+            TypeKind::Class(_) | TypeKind::TypeParameter(_)
+        )
+        .then(|| crate::ownership::function_return_borrow(function))
+        .flatten();
 
         FunctionInfo {
+            type_params: function
+                .type_params
+                .iter()
+                .map(|param| param.name.clone())
+                .collect(),
             params,
             return_ty,
             return_borrow,
+        }
+    }
+
+    fn check_type_parameter_declarations(&mut self, function: &FunctionDecl) {
+        let mut names = HashSet::new();
+        if !function.type_params.is_empty()
+            && matches!(
+                function.name.as_str(),
+                "main" | "__construct" | "__destruct"
+            )
+        {
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "E0530",
+                    format!(
+                        "`{}` cannot declare type parameters because it is invoked by the runtime",
+                        function.name
+                    ),
+                    function.span,
+                )
+                .with_help("move the generic behavior into a regular function or method"),
+            );
+        }
+        for param in &function.type_params {
+            let valid_name =
+                param.name.len() == 1 && param.name.bytes().all(|byte| byte.is_ascii_uppercase());
+            if !valid_name {
+                self.diagnostics.push(
+                    Diagnostic::new(
+                        "E0530",
+                        format!(
+                            "type parameter `{}` must be a single Pascal capital",
+                            param.name
+                        ),
+                        param.span,
+                    )
+                    .with_help("use a name such as `T`, `K`, or `V`"),
+                );
+            }
+            if !names.insert(param.name.clone()) {
+                self.diagnostics.push(Diagnostic::new(
+                    "E0530",
+                    format!("type parameter `{}` is declared more than once", param.name),
+                    param.span,
+                ));
+            }
+            if !param.constraints.is_empty() {
+                self.diagnostics.push(Diagnostic::unsupported_stage(
+                    "E0533",
+                    format!(
+                        "constraint checking for type parameter `{}` is pending until Stage 35",
+                        param.name
+                    ),
+                    param.span,
+                ));
+            }
         }
     }
 
@@ -960,9 +1067,12 @@ impl<'program> Checker<'program> {
                     continue;
                 };
                 let class_return = match self.types.kind(signature.return_ty) {
-                    TypeKind::Class(_) => true,
+                    TypeKind::Class(_) | TypeKind::TypeParameter(_) => true,
                     TypeKind::Nullable(inner) => {
-                        matches!(self.types.kind(*inner), TypeKind::Class(_))
+                        matches!(
+                            self.types.kind(*inner),
+                            TypeKind::Class(_) | TypeKind::TypeParameter(_)
+                        )
                     }
                     _ => false,
                 };
@@ -2082,6 +2192,13 @@ impl<'program> Checker<'program> {
     }
 
     fn check_function(&mut self, function: &FunctionDecl, method_context: Option<MethodContext>) {
+        self.type_parameter_scopes.push(
+            function
+                .type_params
+                .iter()
+                .map(|param| param.name.clone())
+                .collect(),
+        );
         let mut scopes = ScopeStack::new();
         let signature = self.current_function_signature(function);
         if method_context.is_none()
@@ -2170,6 +2287,7 @@ impl<'program> Checker<'program> {
             0,
         );
         self.check_missing_final_return(function, &return_context);
+        self.type_parameter_scopes.pop();
     }
 
     fn check_parameter_default_support(
@@ -4796,6 +4914,14 @@ impl<'program> Checker<'program> {
                 name: name.to_string(),
             },
         );
+        let function_info = self.instantiate_generic_call(
+            &format!("function `{name}`"),
+            &function_info,
+            args,
+            span,
+            scopes,
+            method_context,
+        );
         self.check_call_arguments(
             &format!("function `{name}`"),
             &function_info.params,
@@ -5106,6 +5232,14 @@ impl<'program> Checker<'program> {
             ));
         }
 
+        let method_info = self.instantiate_generic_method_call(
+            &format!("method `{class_name}::{method}`"),
+            method_info,
+            args,
+            span,
+            scopes,
+            method_context,
+        );
         self.check_call_arguments(
             &format!("method `{class_name}::{method}`"),
             &method_info.params,
@@ -5368,6 +5502,14 @@ impl<'program> Checker<'program> {
             ));
         }
 
+        let method_info = self.instantiate_generic_method_call(
+            &format!("method `{class_name}::{}`", access.member),
+            &method_info,
+            args,
+            access.span,
+            scopes,
+            method_context,
+        );
         self.check_call_arguments(
             &format!("method `{class_name}::{}`", access.member),
             &method_info.params,
@@ -5833,6 +5975,340 @@ impl<'program> Checker<'program> {
                 param_index,
                 scopes,
                 method_context,
+            );
+        }
+    }
+
+    fn instantiate_generic_call(
+        &mut self,
+        callee: &str,
+        function: &FunctionInfo,
+        args: &[Argument],
+        span: Span,
+        scopes: &ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) -> FunctionInfo {
+        if function.type_params.is_empty() {
+            return function.clone();
+        }
+        let bindings = self.infer_generic_call_bindings(
+            callee,
+            &function.type_params,
+            &function.params,
+            args,
+            span,
+            scopes,
+            method_context,
+            function.return_ty,
+        );
+        FunctionInfo {
+            type_params: function.type_params.clone(),
+            params: function
+                .params
+                .iter()
+                .map(|param| self.substitute_param_info(param, &bindings))
+                .collect(),
+            return_ty: self.substitute_type(function.return_ty, &bindings),
+            return_borrow: function.return_borrow,
+        }
+    }
+
+    fn instantiate_generic_method_call(
+        &mut self,
+        callee: &str,
+        method: &MethodInfo,
+        args: &[Argument],
+        span: Span,
+        scopes: &ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) -> MethodInfo {
+        if method.type_params.is_empty() {
+            return method.clone();
+        }
+        let bindings = self.infer_generic_call_bindings(
+            callee,
+            &method.type_params,
+            &method.params,
+            args,
+            span,
+            scopes,
+            method_context,
+            method.return_ty,
+        );
+        MethodInfo {
+            access: method.access.clone(),
+            receiver_mode: method.receiver_mode,
+            return_borrow: method.return_borrow,
+            is_static: method.is_static,
+            type_params: method.type_params.clone(),
+            params: method
+                .params
+                .iter()
+                .map(|param| self.substitute_param_info(param, &bindings))
+                .collect(),
+            return_ty: self.substitute_type(method.return_ty, &bindings),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn infer_generic_call_bindings(
+        &mut self,
+        callee: &str,
+        type_params: &[String],
+        params: &[ParamInfo],
+        args: &[Argument],
+        span: Span,
+        scopes: &ScopeStack,
+        method_context: Option<&MethodContext>,
+        return_ty: TypeId,
+    ) -> HashMap<String, TypeId> {
+        let param_names = params
+            .iter()
+            .map(|param| param.name.as_str())
+            .collect::<Vec<_>>();
+        let param_has_default = params
+            .iter()
+            .map(|param| param.has_default)
+            .collect::<Vec<_>>();
+        let arg_names = args
+            .iter()
+            .map(|arg| arg.name.as_ref().map(|name| name.text.as_str()))
+            .collect::<Vec<_>>();
+        let bound =
+            crate::arg_binding::bind_arguments(&param_names, &param_has_default, &arg_names);
+        let mut bindings = HashMap::new();
+        for (param_index, param) in params.iter().enumerate() {
+            let Some(arg_index) = bound.param_to_arg[param_index] else {
+                continue;
+            };
+            let actual = self.infer_expr_type(&args[arg_index].value, scopes, method_context);
+            self.infer_type_parameter_bindings(
+                callee,
+                param.ty,
+                actual,
+                args[arg_index].value.span(),
+                &mut bindings,
+            );
+        }
+
+        let key = (span.start, span.end);
+        self.pending_generic_calls.insert(
+            key,
+            PendingGenericCall {
+                callee: callee.to_string(),
+                type_params: type_params.to_vec(),
+                bindings: bindings.clone(),
+                return_ty,
+            },
+        );
+        self.publish_generic_specialization(key);
+        bindings
+    }
+
+    fn infer_type_parameter_bindings(
+        &mut self,
+        callee: &str,
+        pattern: TypeId,
+        actual: TypeId,
+        span: Span,
+        bindings: &mut HashMap<String, TypeId>,
+    ) {
+        match (
+            self.types.kind(pattern).clone(),
+            self.types.kind(actual).clone(),
+        ) {
+            (TypeKind::TypeParameter(name), TypeKind::Unknown | TypeKind::EmptyCollection) => {
+                let _ = name;
+            }
+            (TypeKind::TypeParameter(name), _) => {
+                if let Some(previous) = bindings.get(&name).copied() {
+                    if previous != actual {
+                        self.diagnostics.push(
+                            Diagnostic::new(
+                                "E0532",
+                                format!(
+                                    "type parameter `{name}` of {callee} was inferred as both `{}` and `{}`",
+                                    self.types.display(previous),
+                                    self.types.display(actual)
+                                ),
+                                span,
+                            )
+                            .with_help(
+                                "pass arguments whose corresponding generic types are identical",
+                            ),
+                        );
+                    }
+                } else {
+                    bindings.insert(name, actual);
+                }
+            }
+            (TypeKind::Nullable(pattern), TypeKind::Nullable(actual)) => {
+                self.infer_type_parameter_bindings(callee, pattern, actual, span, bindings);
+            }
+            (TypeKind::Nullable(pattern), TypeKind::Null) => {
+                let _ = pattern;
+            }
+            (TypeKind::Nullable(pattern), _) => {
+                self.infer_type_parameter_bindings(callee, pattern, actual, span, bindings);
+            }
+            (TypeKind::TypedArray(pattern), TypeKind::TypedArray(actual))
+            | (TypeKind::List(pattern), TypeKind::List(actual))
+            | (TypeKind::Set(pattern), TypeKind::Set(actual)) => {
+                self.infer_type_parameter_bindings(callee, pattern, actual, span, bindings);
+            }
+            (
+                TypeKind::Dictionary(pattern_key, pattern_value),
+                TypeKind::Dictionary(actual_key, actual_value),
+            ) => {
+                self.infer_type_parameter_bindings(callee, pattern_key, actual_key, span, bindings);
+                self.infer_type_parameter_bindings(
+                    callee,
+                    pattern_value,
+                    actual_value,
+                    span,
+                    bindings,
+                );
+            }
+            _ => {}
+        }
+    }
+
+    fn substitute_param_info(
+        &mut self,
+        param: &ParamInfo,
+        bindings: &HashMap<String, TypeId>,
+    ) -> ParamInfo {
+        ParamInfo {
+            name: param.name.clone(),
+            ty: self.substitute_type(param.ty, bindings),
+            take: param.take,
+            writable: param.writable,
+            has_default: param.has_default,
+        }
+    }
+
+    fn substitute_type(&mut self, ty: TypeId, bindings: &HashMap<String, TypeId>) -> TypeId {
+        match self.types.kind(ty).clone() {
+            TypeKind::TypeParameter(name) => bindings.get(&name).copied().unwrap_or(ty),
+            TypeKind::Nullable(inner) => {
+                let inner = self.substitute_type(inner, bindings);
+                self.types.intern(TypeKind::Nullable(inner))
+            }
+            TypeKind::TypedArray(element) => {
+                let element = self.substitute_type(element, bindings);
+                self.types.intern(TypeKind::TypedArray(element))
+            }
+            TypeKind::List(element) => {
+                let element = self.substitute_type(element, bindings);
+                self.types.intern(TypeKind::List(element))
+            }
+            TypeKind::Dictionary(key, value) => {
+                let key = self.substitute_type(key, bindings);
+                let value = self.substitute_type(value, bindings);
+                self.types.intern(TypeKind::Dictionary(key, value))
+            }
+            TypeKind::Set(element) => {
+                let element = self.substitute_type(element, bindings);
+                self.types.intern(TypeKind::Set(element))
+            }
+            _ => ty,
+        }
+    }
+
+    fn publish_generic_specialization(&mut self, key: (usize, usize)) {
+        let Some(pending) = self.pending_generic_calls.get(&key) else {
+            return;
+        };
+        let Some(arguments) = pending
+            .type_params
+            .iter()
+            .map(|name| {
+                pending
+                    .bindings
+                    .get(name)
+                    .map(|ty| GenericArgument::Type(self.types.resolved(*ty)))
+            })
+            .collect::<Option<Vec<_>>>()
+        else {
+            return;
+        };
+        self.generic_call_specializations
+            .insert(key, GenericSpecialization { arguments });
+    }
+
+    fn complete_generic_call_from_expected(&mut self, expr: &Expr, expected: TypeId) {
+        if let Expr::Grouped { expr, .. } = expr {
+            self.complete_generic_call_from_expected(expr, expected);
+            return;
+        }
+        let key = match expr {
+            Expr::FunctionCall { span, .. }
+            | Expr::MethodCall { span, .. }
+            | Expr::StaticCall { span, .. } => (span.start, span.end),
+            _ => return,
+        };
+        let Some(pending) = self.pending_generic_calls.get(&key).cloned() else {
+            return;
+        };
+        let mut bindings = pending.bindings;
+        self.infer_type_parameter_bindings(
+            &pending.callee,
+            pending.return_ty,
+            expected,
+            expr.span(),
+            &mut bindings,
+        );
+        if let Some(call) = self.pending_generic_calls.get_mut(&key) {
+            call.bindings = bindings;
+        }
+        self.publish_generic_specialization(key);
+    }
+
+    fn generic_call_result_type(&mut self, span: Span, fallback: TypeId) -> TypeId {
+        let key = (span.start, span.end);
+        let Some(pending) = self.pending_generic_calls.get(&key).cloned() else {
+            return fallback;
+        };
+        if pending
+            .type_params
+            .iter()
+            .all(|name| pending.bindings.contains_key(name))
+        {
+            return self.substitute_type(pending.return_ty, &pending.bindings);
+        }
+        fallback
+    }
+
+    fn report_unresolved_generic_calls(&mut self) {
+        let mut calls = self.pending_generic_calls.iter().collect::<Vec<_>>();
+        calls.sort_by_key(|(span, _)| **span);
+        for (span, pending) in calls {
+            let missing_names = pending
+                .type_params
+                .iter()
+                .filter(|name| !pending.bindings.contains_key(*name))
+                .collect::<Vec<_>>();
+            if missing_names.is_empty() {
+                continue;
+            }
+            let missing = missing_names
+                .iter()
+                .map(|name| format!("`{name}`"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let plural = if missing_names.len() == 1 { "" } else { "s" };
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "E0531",
+                    format!(
+                        "cannot infer type parameter{plural} {missing} for {}",
+                        pending.callee
+                    ),
+                    Span::new(span.0, span.1),
+                )
+                .with_help(
+                    "bind the result through a typed declaration so the expected type determines the missing generic argument",
+                ),
             );
         }
     }
@@ -6306,6 +6782,7 @@ impl<'program> Checker<'program> {
                 | TypeKind::String
                 | TypeKind::Bool
                 | TypeKind::Mixed
+                | TypeKind::TypeParameter(_)
                 | TypeKind::Class(_) => self.types.intern(TypeKind::Nullable(inner)),
                 TypeKind::Bytes
                 | TypeKind::TypedArray(_)
@@ -6338,6 +6815,14 @@ impl<'program> Checker<'program> {
 
         if let Some(float) = FloatType::from_source_name(&ty.name) {
             return self.resolve_zero_arg_type(ty, span, TypeKind::Float(float));
+        }
+        if ty.args.is_empty()
+            && self
+                .type_parameter_scopes
+                .last()
+                .is_some_and(|params| params.contains(&ty.name))
+        {
+            return self.types.intern(TypeKind::TypeParameter(ty.name.clone()));
         }
 
         match ty.name.as_str() {
@@ -6485,7 +6970,11 @@ impl<'program> Checker<'program> {
 
     fn check_stage23_hashable_type(&mut self, ty: TypeId, span: Span, role: &str) {
         let diagnostic = match self.types.kind(ty) {
-            TypeKind::Integer(_) | TypeKind::String | TypeKind::Bool | TypeKind::Unknown => return,
+            TypeKind::Integer(_)
+            | TypeKind::String
+            | TypeKind::Bool
+            | TypeKind::TypeParameter(_)
+            | TypeKind::Unknown => return,
             TypeKind::Class(name) => Diagnostic::unsupported_stage(
                 "E0523",
                 format!(
@@ -6601,6 +7090,7 @@ impl<'program> Checker<'program> {
         method_context: Option<&MethodContext>,
         destination: AssignmentDestination,
     ) -> bool {
+        self.complete_generic_call_from_expected(value_expr, target);
         if let Some(fits) = self.contextualize_scalar_literals(target, value_expr) {
             return fits;
         }
@@ -6681,6 +7171,7 @@ impl<'program> Checker<'program> {
         scopes: &ScopeStack,
         method_context: Option<&MethodContext>,
     ) -> bool {
+        self.complete_generic_call_from_expected(value_expr, target);
         if let Some(fits) = self.contextualize_scalar_literals(target, value_expr) {
             return fits;
         }
@@ -7005,6 +7496,7 @@ impl<'program> Checker<'program> {
                     && self.is_assignable(target_value, value_value)
             }
             (TypeKind::Set(target), TypeKind::Set(value)) => self.is_assignable(target, value),
+            (TypeKind::TypeParameter(target), TypeKind::TypeParameter(value)) => target == value,
             _ => false,
         }
     }
@@ -7160,6 +7652,7 @@ impl<'program> Checker<'program> {
                 object,
                 method,
                 null_safe,
+                span,
                 ..
             } => {
                 if let Some(result) =
@@ -7176,6 +7669,7 @@ impl<'program> Checker<'program> {
                     .and_then(|class_info| class_info.methods.get(method))
                     .map(|method| method.return_ty)
                     .unwrap_or_else(|| self.types.unknown());
+                let result = self.generic_call_result_type(*span, result);
                 if *null_safe
                     && !matches!(self.types.kind(result), TypeKind::Void | TypeKind::Unknown)
                 {
@@ -7189,7 +7683,7 @@ impl<'program> Checker<'program> {
                 }
             }
             Expr::IsType { .. } => self.types.intern(TypeKind::Bool),
-            Expr::FunctionCall { name, .. } => {
+            Expr::FunctionCall { name, span, .. } => {
                 if let Some(builtin) = Builtin::from_name(name) {
                     match builtin {
                         Builtin::ReadLine => {
@@ -7211,16 +7705,19 @@ impl<'program> Checker<'program> {
                         | Builtin::Panic => self.types.intern(TypeKind::Void),
                     }
                 } else {
-                    self.functions
+                    let result = self
+                        .functions
                         .get(name)
                         .map(|function| function.return_ty)
-                        .unwrap_or_else(|| self.types.unknown())
+                        .unwrap_or_else(|| self.types.unknown());
+                    self.generic_call_result_type(*span, result)
                 }
             }
             Expr::StaticCall {
                 qualifier,
                 method,
                 args,
+                span,
                 ..
             } => {
                 let Some(class_name) = Self::static_qualifier_class_name(qualifier, method_context)
@@ -7264,11 +7761,13 @@ impl<'program> Checker<'program> {
                 if class_name == "Bytes" && method == "fromArray" {
                     return self.types.intern(TypeKind::Bytes);
                 }
-                self.classes
+                let result = self
+                    .classes
                     .get(&class_name)
                     .and_then(|class_info| class_info.methods.get(method))
                     .map(|method| method.return_ty)
-                    .unwrap_or_else(|| self.types.unknown())
+                    .unwrap_or_else(|| self.types.unknown());
+                self.generic_call_result_type(*span, result)
             }
             Expr::StaticMember {
                 qualifier, member, ..

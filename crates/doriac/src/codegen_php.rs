@@ -15,6 +15,7 @@ const PHP_INTEGER_UNSUPPORTED_CODE: &str = "B1301";
 const PHP_OWNERSHIP_UNSUPPORTED_CODE: &str = "B1901";
 const PHP_CONSTANT_UNSUPPORTED_CODE: &str = "B2001";
 const PHP_COLLECTION_UNSUPPORTED_CODE: &str = "B2301";
+const PHP_GENERICS_UNSUPPORTED_CODE: &str = "B2401";
 
 pub fn generate(program: &Program) -> Result<String, BackendError> {
     validate_program(program)?;
@@ -277,6 +278,13 @@ fn validate_function(
     semantic_info: &SemanticInfo,
     is_method: bool,
 ) -> Result<(), BackendError> {
+    if !function.type_params.is_empty() {
+        return Err(BackendError::from_diagnostics(vec![Diagnostic::new(
+            PHP_GENERICS_UNSUPPORTED_CODE,
+            "PHP compatibility output does not support generic function specialization; compile this program for a native target",
+            function.span,
+        )]));
+    }
     if is_method && function.name == "__destruct" {
         return Err(unsupported_ownership_shape(
             function.span,

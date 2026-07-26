@@ -18,6 +18,7 @@ struct Parameter {
     name: String,
     move_type: bool,
     class_type: bool,
+    generic: bool,
     take: bool,
     writable: bool,
 }
@@ -185,13 +186,20 @@ fn join_state(left: &State, right: &State) -> State {
 
 pub fn check_program(program: &ast::Program) -> Vec<Diagnostic> {
     let flow_facts = crate::narrowing::analyze_program(program);
-    check_program_with_inferred_move_returns(program, &HashSet::new(), &HashMap::new(), &flow_facts)
+    check_program_with_inferred_move_returns(
+        program,
+        &HashSet::new(),
+        &HashMap::new(),
+        &HashMap::new(),
+        &flow_facts,
+    )
 }
 
 pub(crate) fn check_program_with_inferred_move_returns(
     program: &ast::Program,
     inferred_move_returns: &HashSet<usize>,
     return_borrows: &HashMap<usize, ReturnBorrow>,
+    resolved_types: &HashMap<(usize, usize), crate::types::ResolvedType>,
     flow_facts: &FactsByUse,
 ) -> Vec<Diagnostic> {
     let classes = program
@@ -309,6 +317,7 @@ pub(crate) fn check_program_with_inferred_move_returns(
         static_properties,
         inferred_move_returns: inferred_move_returns.clone(),
         return_borrows: return_borrows.clone(),
+        resolved_types,
         receiver_class: None,
         receiver_writable: false,
         current_return_borrow: None,
@@ -583,10 +592,31 @@ fn expr_return_borrow(
             right,
             ..
         } => coalesced_return_borrow(left, right, function, resolve_call, shadowed),
-        Expr::PropertyAccess { object, .. } => {
+        Expr::PropertyAccess {
+            object, property, ..
+        } => {
             let mut direct_object = object.as_ref();
             while let Expr::Grouped { expr, .. } = direct_object {
                 direct_object = expr;
+            }
+            if matches!(property.as_str(), "first" | "last") {
+                if let Expr::Variable { name, .. } = direct_object {
+                    if !shadowed.contains(name) {
+                        if let Some((index, param)) =
+                            function.params.iter().enumerate().find(|(_, param)| {
+                                param.name == *name
+                                    && !param.take
+                                    && param.ty.name == "List"
+                                    && param.ty.args.len() == 1
+                            })
+                        {
+                            return Some(ReturnBorrow {
+                                source: BorrowSource::Parameter(index),
+                                writable: param.writable,
+                            });
+                        }
+                    }
+                }
             }
             if !matches!(direct_object, Expr::Variable { .. } | Expr::This { .. }) {
                 return None;
@@ -702,10 +732,10 @@ fn signature(
         .copied()
         .or_else(|| function_return_borrow(function))
         .filter(|_| {
-            function
-                .return_type
-                .as_ref()
-                .is_some_and(|ty| type_ref_class_name(ty, classes, receiver_class).is_some())
+            function.return_type.as_ref().is_some_and(|ty| {
+                type_ref_class_name(ty, classes, receiver_class).is_some()
+                    || type_ref_mentions_parameter(ty, &function.type_params)
+            })
         });
     Signature {
         params: function
@@ -715,6 +745,7 @@ fn signature(
                 name: param.name.clone(),
                 move_type: type_ref_is_move_type(&param.ty, classes, receiver_class),
                 class_type: type_ref_class_name(&param.ty, classes, receiver_class).is_some(),
+                generic: type_ref_mentions_parameter(&param.ty, &function.type_params),
                 take: param.take,
                 writable: param.writable,
             })
@@ -740,6 +771,14 @@ fn signature(
             }
         }),
     }
+}
+
+fn type_ref_mentions_parameter(ty: &crate::types::TypeRef, params: &[ast::TypeParamDecl]) -> bool {
+    params.iter().any(|param| param.name == ty.name)
+        || ty
+            .args
+            .iter()
+            .any(|argument| type_ref_mentions_parameter(argument, params))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -798,6 +837,7 @@ struct Checker<'a> {
     static_properties: HashMap<(String, String), bool>,
     inferred_move_returns: HashSet<usize>,
     return_borrows: HashMap<usize, ReturnBorrow>,
+    resolved_types: &'a HashMap<(usize, usize), crate::types::ResolvedType>,
     receiver_class: Option<String>,
     receiver_writable: bool,
     current_return_borrow: Option<UseMode>,
@@ -922,7 +962,16 @@ impl Checker<'_> {
                 let borrowed_initializer = self.expr_returns_borrow(&decl.initializer, scopes);
                 let borrowed_mixed_index = borrowed_initializer
                     && self.expr_is_mixed_collection_index(&decl.initializer, scopes);
-                if borrowed_initializer && !borrowed_mixed_index {
+                let initializer_moves = self.expr_is_move_value(&decl.initializer, scopes);
+                let mixed = decl.ty.as_ref().is_some_and(|ty| ty.name == "mixed")
+                    || (decl.ty.is_none() && class.is_none() && initializer_moves);
+                let declared_move_type = decl.ty.as_ref().is_some_and(|ty| {
+                    type_ref_is_move_type(ty, &self.classes, self.receiver_class.as_deref())
+                });
+                let borrowed_owning_value = borrowed_initializer
+                    && !borrowed_mixed_index
+                    && (initializer_moves || class.is_some() || mixed || declared_move_type);
+                if borrowed_owning_value {
                     self.diagnostics.push(
                         Diagnostic::new(
                             "E0478",
@@ -937,16 +986,10 @@ impl Checker<'_> {
                         ),
                     );
                 }
-                let initializer_moves = self.expr_is_move_value(&decl.initializer, scopes);
-                let mixed = decl.ty.as_ref().is_some_and(|ty| ty.name == "mixed")
-                    || (decl.ty.is_none() && class.is_none() && initializer_moves);
-                let declared_move_type = decl.ty.as_ref().is_some_and(|ty| {
-                    type_ref_is_move_type(ty, &self.classes, self.receiver_class.as_deref())
-                });
                 self.use_expr(
                     &decl.initializer,
                     scopes,
-                    if borrowed_initializer && !borrowed_mixed_index {
+                    if borrowed_owning_value {
                         UseMode::Read
                     } else if initializer_moves || class.is_some() || mixed || declared_move_type {
                         UseMode::Give
@@ -1846,7 +1889,9 @@ impl Checker<'_> {
         for (index, argument) in args.iter().enumerate() {
             let arg = &argument.value;
             let param_index = bound.arg_to_param.get(index).copied().flatten();
-            let mode = param_index.map_or(UseMode::Read, |param| call_arg_mode(signature, param));
+            let mode = param_index.map_or(UseMode::Read, |param| {
+                self.call_arg_mode(signature, param, arg)
+            });
             if mode == UseMode::Write
                 && param_index
                     .and_then(|param| signature.params.get(param))
@@ -2071,7 +2116,9 @@ impl Checker<'_> {
                 .get(index)
                 .copied()
                 .flatten()
-                .map_or(UseMode::Read, |param| call_arg_mode(signature, param));
+                .map_or(UseMode::Read, |param| {
+                    self.call_arg_mode(signature, param, arg)
+                });
             self.activate_place_input_borrows(arg, scopes);
             if matches!(mode, UseMode::Read | UseMode::Write) {
                 self.activate_call_borrow(arg, mode, scopes);
@@ -2389,6 +2436,12 @@ impl Checker<'_> {
     }
 
     fn expr_is_move_value(&self, expr: &Expr, scopes: &Scopes) -> bool {
+        if self
+            .resolved_type(expr)
+            .is_some_and(resolved_type_is_move_type)
+        {
+            return true;
+        }
         match expr {
             Expr::Variable { name, .. } => scopes.get(name).is_some(),
             Expr::Grouped { expr, .. } => self.expr_is_move_value(expr, scopes),
@@ -2558,6 +2611,9 @@ impl Checker<'_> {
     }
 
     fn expr_class(&self, expr: &Expr, scopes: &Scopes) -> Option<String> {
+        if let Some(class) = self.resolved_type(expr).and_then(resolved_type_class) {
+            return Some(class.to_string());
+        }
         match expr {
             Expr::Variable { name, .. } => {
                 scopes.get(name).and_then(|binding| binding.class.clone())
@@ -2633,6 +2689,9 @@ impl Checker<'_> {
     }
 
     fn expr_collection_info(&self, expr: &Expr, scopes: &Scopes) -> Option<CollectionInfo> {
+        if let Some(collection) = self.resolved_type(expr).and_then(resolved_collection_info) {
+            return Some(collection);
+        }
         match expr {
             Expr::Variable { name, .. } => scopes
                 .get(name)
@@ -2775,6 +2834,29 @@ impl Checker<'_> {
             ast::StaticQualifier::Parent | ast::StaticQualifier::InvalidStatic => None,
         }
     }
+
+    fn resolved_type(&self, expr: &Expr) -> Option<&crate::types::ResolvedType> {
+        self.resolved_types
+            .get(&(expr.span().start, expr.span().end))
+    }
+
+    fn call_arg_mode(&self, signature: &Signature, index: usize, arg: &Expr) -> UseMode {
+        let Some(param) = signature.params.get(index) else {
+            return UseMode::Read;
+        };
+        let move_type = param.move_type
+            || (param.generic
+                && self
+                    .resolved_type(arg)
+                    .is_some_and(resolved_type_is_move_type));
+        if param.take && move_type {
+            UseMode::Give
+        } else if param.writable && move_type {
+            UseMode::Write
+        } else {
+            UseMode::Read
+        }
+    }
 }
 
 fn variable_name(expr: &Expr) -> Option<&str> {
@@ -2825,6 +2907,64 @@ fn type_ref_class_name(
         &ty.name
     };
     classes.contains(name).then(|| name.to_string())
+}
+
+fn resolved_type_class(ty: &crate::types::ResolvedType) -> Option<&str> {
+    match ty {
+        crate::types::ResolvedType::Class(name) => Some(name),
+        crate::types::ResolvedType::Nullable(inner) => resolved_type_class(inner),
+        _ => None,
+    }
+}
+
+fn resolved_type_is_move_type(ty: &crate::types::ResolvedType) -> bool {
+    match ty {
+        crate::types::ResolvedType::Bytes
+        | crate::types::ResolvedType::Mixed
+        | crate::types::ResolvedType::Class(_)
+        | crate::types::ResolvedType::TypedArray(_)
+        | crate::types::ResolvedType::List(_)
+        | crate::types::ResolvedType::Dictionary(_, _)
+        | crate::types::ResolvedType::Set(_) => true,
+        crate::types::ResolvedType::Nullable(inner) => resolved_type_is_move_type(inner),
+        _ => false,
+    }
+}
+
+fn resolved_collection_info(ty: &crate::types::ResolvedType) -> Option<CollectionInfo> {
+    use crate::types::ResolvedType;
+    let (family, value) = match ty {
+        ResolvedType::Bytes => {
+            return Some(CollectionInfo {
+                family: CollectionFamily::Bytes,
+                value_move: false,
+                value_mixed: false,
+                value_class: None,
+                value_collection: None,
+            });
+        }
+        ResolvedType::TypedArray(value) => (CollectionFamily::TypedArray, value.as_ref()),
+        ResolvedType::List(value) => (CollectionFamily::List, value.as_ref()),
+        ResolvedType::Dictionary(_, value) => (CollectionFamily::Dictionary, value.as_ref()),
+        ResolvedType::Set(value) => (CollectionFamily::Set, value.as_ref()),
+        ResolvedType::Nullable(inner) => return resolved_collection_info(inner),
+        _ => return None,
+    };
+    Some(CollectionInfo {
+        family,
+        value_move: resolved_type_is_move_type(value),
+        value_mixed: resolved_type_is_mixed(value),
+        value_class: resolved_type_class(value).map(str::to_string),
+        value_collection: resolved_collection_info(value).map(Box::new),
+    })
+}
+
+fn resolved_type_is_mixed(ty: &crate::types::ResolvedType) -> bool {
+    match ty {
+        crate::types::ResolvedType::Mixed => true,
+        crate::types::ResolvedType::Nullable(inner) => resolved_type_is_mixed(inner),
+        _ => false,
+    }
 }
 
 fn type_ref_collection_info(
@@ -2881,19 +3021,6 @@ pub(crate) fn type_ref_is_move_type(
             ty.name.as_str(),
             "mixed" | "Bytes" | "[]" | "List" | "Dictionary" | "Set"
         )
-}
-
-fn call_arg_mode(signature: &Signature, index: usize) -> UseMode {
-    let Some(param) = signature.params.get(index) else {
-        return UseMode::Read;
-    };
-    if param.take && param.move_type {
-        UseMode::Give
-    } else if param.writable && param.move_type {
-        UseMode::Write
-    } else {
-        UseMode::Read
-    }
 }
 
 pub(crate) fn constant_bool(expr: &Expr) -> Option<bool> {
