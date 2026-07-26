@@ -10,7 +10,7 @@ use inkwell::passes::PassBuilderOptions;
 use inkwell::targets::{
     CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetData, TargetMachine,
 };
-use inkwell::types::{BasicMetadataTypeEnum, BasicType, BasicTypeEnum, IntType};
+use inkwell::types::{BasicMetadataTypeEnum, BasicType, BasicTypeEnum, IntType, StructType};
 use inkwell::values::{
     BasicMetadataValueEnum, BasicValueEnum, FloatValue as LlvmFloatValue, FunctionValue,
     GlobalValue, IntValue, PointerValue, StructValue, UnnamedAddress,
@@ -27,19 +27,19 @@ use crate::native_abi::{
     CLASS_FREE, COLLECTION_COMPARE_FLOAT32, COLLECTION_COMPARE_FLOAT64, COLLECTION_COMPARE_STRING,
     COLLECTION_COMPARE_WORD, COLLECTION_CONTAINS, COLLECTION_FILL_STRING, COLLECTION_FILL_WORD,
     COLLECTION_FREE, COLLECTION_INSERT_AT, COLLECTION_KEYED_GET, COLLECTION_KEYED_HAS,
-    COLLECTION_KEYED_SET, COLLECTION_KEY_AT, COLLECTION_LENGTH, COLLECTION_NEW,
-    COLLECTION_NULLABLE_ACCESS, COLLECTION_PUSH, COLLECTION_PUSH_UNIQUE, COLLECTION_REMOVE_AT,
-    COLLECTION_REMOVE_VALUE, COLLECTION_SET_ALGEBRA, COLLECTION_SET_AT, COLLECTION_VALUE_AT,
-    FLOAT_PARSE, FORMAT_F32, FORMAT_F64, FORMAT_I64, FORMAT_STRING, FORMAT_U64, INT_PARSE,
-    MIXED_CLONE_OWNED, MIXED_FREE, MIXED_NEW, MIXED_NEW_BORROWED, MIXED_PAYLOAD,
-    MIXED_RELEASE_OWNED, MIXED_TAG, MIXED_TAG_BOOL, MIXED_TAG_CLASS, MIXED_TAG_FLOAT32,
-    MIXED_TAG_FLOAT64, MIXED_TAG_INT16, MIXED_TAG_INT32, MIXED_TAG_INT64, MIXED_TAG_INT8,
-    MIXED_TAG_STRING, MIXED_TAG_UINT16, MIXED_TAG_UINT32, MIXED_TAG_UINT64, MIXED_TAG_UINT8,
-    MIXED_TYPE_ID, NULLABLE_STRING_EQUAL, READ_FILE, READ_FILE_BYTES, READ_STDIN_BYTES,
-    READ_STDIN_LINE, STRING_COMPARE, STRING_CONCAT, STRING_DATA, STRING_FROM_BOOL, STRING_FROM_F32,
-    STRING_FROM_F64, STRING_FROM_I64, STRING_FROM_U64, STRING_FROM_UTF8, STRING_LENGTH,
-    STRING_RELEASE, STRING_RETAIN, STRING_WRITE_STDERR, STRING_WRITE_STDOUT, WRITE_FILE,
-    WRITE_FILE_BYTES, WRITE_STDERR_BYTES, WRITE_STDOUT_BYTES,
+    COLLECTION_KEYED_SET, COLLECTION_KEY_AT, COLLECTION_LENGTH, COLLECTION_LENGTH_FIELD,
+    COLLECTION_NEW, COLLECTION_NULLABLE_ACCESS, COLLECTION_PUSH, COLLECTION_PUSH_UNIQUE,
+    COLLECTION_REMOVE_AT, COLLECTION_REMOVE_VALUE, COLLECTION_SET_ALGEBRA, COLLECTION_SET_AT,
+    COLLECTION_VALUES_FIELD, COLLECTION_VALUE_AT, FLOAT_PARSE, FORMAT_F32, FORMAT_F64, FORMAT_I64,
+    FORMAT_STRING, FORMAT_U64, INT_PARSE, MIXED_CLONE_OWNED, MIXED_FREE, MIXED_NEW,
+    MIXED_NEW_BORROWED, MIXED_PAYLOAD, MIXED_RELEASE_OWNED, MIXED_TAG, MIXED_TAG_BOOL,
+    MIXED_TAG_CLASS, MIXED_TAG_FLOAT32, MIXED_TAG_FLOAT64, MIXED_TAG_INT16, MIXED_TAG_INT32,
+    MIXED_TAG_INT64, MIXED_TAG_INT8, MIXED_TAG_STRING, MIXED_TAG_UINT16, MIXED_TAG_UINT32,
+    MIXED_TAG_UINT64, MIXED_TAG_UINT8, MIXED_TYPE_ID, NULLABLE_STRING_EQUAL, READ_FILE,
+    READ_FILE_BYTES, READ_STDIN_BYTES, READ_STDIN_LINE, STRING_COMPARE, STRING_CONCAT, STRING_DATA,
+    STRING_FROM_BOOL, STRING_FROM_F32, STRING_FROM_F64, STRING_FROM_I64, STRING_FROM_U64,
+    STRING_FROM_UTF8, STRING_LENGTH, STRING_RELEASE, STRING_RETAIN, STRING_WRITE_STDERR,
+    STRING_WRITE_STDOUT, WRITE_FILE, WRITE_FILE_BYTES, WRITE_STDERR_BYTES, WRITE_STDOUT_BYTES,
 };
 use crate::numeric::{FloatType, FloatValue, IntegerPanic, IntegerType, IntegerValue};
 
@@ -1252,6 +1252,95 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         .into_pointer_value())
     }
 
+    fn checked_collection_word_address(
+        &mut self,
+        collection: PointerValue<'ctx>,
+        index: IntValue<'ctx>,
+    ) -> Result<PointerValue<'ctx>, BackendError> {
+        let header = collection_header_type(self.context, self.target_data);
+        let usize_type = self.context.ptr_sized_int_type(self.target_data, None);
+        let length_address = build(self.builder.build_struct_gep(
+            header,
+            collection,
+            COLLECTION_LENGTH_FIELD,
+            "collection.length.address",
+        ))?;
+        let length = build(self.builder.build_load(
+            usize_type,
+            length_address,
+            "collection.length",
+        ))?
+        .into_int_value();
+        let (comparable_index, comparable_length) = match index
+            .get_type()
+            .get_bit_width()
+            .cmp(&usize_type.get_bit_width())
+        {
+            std::cmp::Ordering::Less => (
+                build(self.builder.build_int_z_extend(
+                    index,
+                    usize_type,
+                    "collection.index.usize",
+                ))?,
+                length,
+            ),
+            std::cmp::Ordering::Equal => (index, length),
+            std::cmp::Ordering::Greater => (
+                index,
+                build(self.builder.build_int_z_extend(
+                    length,
+                    index.get_type(),
+                    "collection.length.index-width",
+                ))?,
+            ),
+        };
+        let out_of_bounds = build(self.builder.build_int_compare(
+            IntPredicate::UGE,
+            comparable_index,
+            comparable_length,
+            "collection.index.out-of-bounds",
+        ))?;
+        self.lower_panic_if(out_of_bounds, b"collection index out of bounds")?;
+
+        let element_index = match index
+            .get_type()
+            .get_bit_width()
+            .cmp(&usize_type.get_bit_width())
+        {
+            std::cmp::Ordering::Less => build(self.builder.build_int_z_extend(
+                index,
+                usize_type,
+                "collection.index.usize",
+            ))?,
+            std::cmp::Ordering::Equal => index,
+            std::cmp::Ordering::Greater => build(self.builder.build_int_truncate(
+                index,
+                usize_type,
+                "collection.index.usize",
+            ))?,
+        };
+        let values_address = build(self.builder.build_struct_gep(
+            header,
+            collection,
+            COLLECTION_VALUES_FIELD,
+            "collection.values.address",
+        ))?;
+        let values = build(self.builder.build_load(
+            self.context.ptr_type(AddressSpace::default()),
+            values_address,
+            "collection.values",
+        ))?
+        .into_pointer_value();
+        build(unsafe {
+            self.builder.build_in_bounds_gep(
+                self.context.i64_type(),
+                values,
+                &[element_index],
+                "collection.value.address",
+            )
+        })
+    }
+
     fn lower_collection_expression(
         &mut self,
         expression: &mir::CollectionExpression,
@@ -1583,17 +1672,12 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             .ok_or_else(|| backend_failure("collection removal produced no result"))?
             .into_int_value()
         } else {
-            self.call_runtime(
-                COLLECTION_VALUE_AT,
-                &[pointer.into(), pointer.into(), usize_type.into()],
-                Some(self.context.i64_type().into()),
-                &[
-                    self.current_frame.into(),
-                    collection_value.into(),
-                    index_value.into(),
-                ],
+            let address = self
+                .checked_collection_word_address(collection_value, index_value.into_int_value())?;
+            build(
+                self.builder
+                    .build_load(self.context.i64_type(), address, "collection.value"),
             )?
-            .ok_or_else(|| backend_failure("collection index produced no result"))?
             .into_int_value()
         };
         self.collection_word_to_value(word, definition.value)
@@ -1886,27 +1970,25 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 definition.value,
             )?;
         } else {
-            let old_word = self
-                .call_runtime(
-                    COLLECTION_SET_AT,
-                    &[
-                        pointer.into(),
-                        pointer.into(),
-                        usize_type.into(),
-                        self.context.i64_type().into(),
-                    ],
-                    Some(self.context.i64_type().into()),
-                    &[
-                        self.current_frame.into(),
-                        collection_value.into(),
-                        index.into_int_value().into(),
-                        value_word.into(),
-                    ],
-                )?
-                .ok_or_else(|| backend_failure("collection write produced no result"))?
-                .into_int_value();
-            let old_value = self.collection_word_to_value(old_word, definition.value)?;
-            self.drop_stored_value(old_value, definition.value)?;
+            let address =
+                self.checked_collection_word_address(collection_value, index.into_int_value())?;
+            let old_word = if matches!(definition.value, mir::Type::Scalar(_)) {
+                None
+            } else {
+                Some(
+                    build(self.builder.build_load(
+                        self.context.i64_type(),
+                        address,
+                        "collection.old-value",
+                    ))?
+                    .into_int_value(),
+                )
+            };
+            build(self.builder.build_store(address, value_word))?;
+            if let Some(old_word) = old_word {
+                let old_value = self.collection_word_to_value(old_word, definition.value)?;
+                self.drop_stored_value(old_value, definition.value)?;
+            }
         }
         Ok(())
     }
@@ -2238,6 +2320,21 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         self.builder.position_at_end(drop_block);
         if definition.kind == mir::CollectionKind::Bytes {
             let _ = self.call_runtime(BYTES_FREE, &[pointer.into()], None, &[collection.into()])?;
+            build(self.builder.build_unconditional_branch(done))?;
+            self.builder.position_at_end(done);
+            return Ok(());
+        }
+        let scalar_values = matches!(definition.value, mir::Type::Scalar(_));
+        let scalar_keys = definition
+            .key
+            .is_none_or(|key| matches!(key, mir::Type::Scalar(_)));
+        if scalar_values && scalar_keys {
+            let _ = self.call_runtime(
+                COLLECTION_FREE,
+                &[pointer.into()],
+                None,
+                &[collection.into()],
+            )?;
             build(self.builder.build_unconditional_branch(done))?;
             self.builder.position_at_end(done);
             return Ok(());
@@ -3208,13 +3305,23 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         params: &[BasicMetadataTypeEnum<'ctx>],
         result: Option<BasicTypeEnum<'ctx>>,
     ) -> FunctionValue<'ctx> {
-        self.module.get_function(name).unwrap_or_else(|| {
+        let function = self.module.get_function(name).unwrap_or_else(|| {
             let ty = match result {
                 Some(result) => result.fn_type(params, false),
                 None => self.context.void_type().fn_type(params, false),
             };
             self.module.add_function(name, ty, Some(Linkage::External))
-        })
+        });
+        if name == "dr_v1_panic" {
+            for name in ["cold", "noreturn"] {
+                let kind = inkwell::attributes::Attribute::get_named_enum_kind_id(name);
+                function.add_attribute(
+                    AttributeLoc::Function,
+                    self.context.create_enum_attribute(kind, 0),
+                );
+            }
+        }
+        function
     }
 
     fn call_runtime(
@@ -6132,20 +6239,15 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
     fn lower_runtime_panic(&mut self, message: &[u8]) -> Result<(), BackendError> {
         let pointer = self.define_data(message, "panic.message");
         let usize_type = self.context.ptr_sized_int_type(self.target_data, None);
-        let runtime = self.module.get_function("dr_v1_panic").unwrap_or_else(|| {
-            self.module.add_function(
-                "dr_v1_panic",
-                self.context.void_type().fn_type(
-                    &[
-                        self.context.ptr_type(AddressSpace::default()).into(),
-                        self.context.ptr_type(AddressSpace::default()).into(),
-                        usize_type.into(),
-                    ],
-                    false,
-                ),
-                Some(Linkage::External),
-            )
-        });
+        let runtime = self.runtime_function(
+            "dr_v1_panic",
+            &[
+                self.context.ptr_type(AddressSpace::default()).into(),
+                self.context.ptr_type(AddressSpace::default()).into(),
+                usize_type.into(),
+            ],
+            None,
+        );
         build(self.builder.build_call(
             runtime,
             &[
@@ -6211,6 +6313,25 @@ fn nullable_type<'ctx>(
 ) -> inkwell::types::StructType<'ctx> {
     let word = context.ptr_sized_int_type(target_data, None);
     context.struct_type(&[word.into(), payload], false)
+}
+
+fn collection_header_type<'ctx>(
+    context: &'ctx Context,
+    target_data: &TargetData,
+) -> StructType<'ctx> {
+    let word = context.ptr_sized_int_type(target_data, None);
+    let pointer = context.ptr_type(AddressSpace::default());
+    context.struct_type(
+        &[
+            word.into(),
+            word.into(),
+            pointer.into(),
+            pointer.into(),
+            context.i8_type().into(),
+            context.i8_type().into(),
+        ],
+        false,
+    )
 }
 
 fn llvm_type<'ctx>(
@@ -6520,6 +6641,63 @@ fn resolve_string_expression(
         | mir::StringExpression::CollectionIndex { .. }
         | mir::StringExpression::CollectionKeyAt { .. } => {
             Err(malformed_mir("runtime string expression is not a constant"))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn collection_header_layout_matches_the_runtime_abi() {
+        Target::initialize_native(&InitializationConfig::default())
+            .expect("native LLVM target should initialize");
+        let triple = TargetMachine::get_default_triple();
+        let target = Target::from_triple(&triple).expect("host LLVM target should exist");
+        let machine = target
+            .create_target_machine(
+                &triple,
+                "generic",
+                "",
+                OptimizationLevel::None,
+                RelocMode::PIC,
+                CodeModel::Default,
+            )
+            .expect("host LLVM target machine should exist");
+        let target_data = machine.get_target_data();
+        let context = Context::create();
+        let header = collection_header_type(&context, &target_data);
+        for (field, expected) in [
+            (
+                crate::native_abi::COLLECTION_LENGTH_FIELD,
+                doria_rt::DR_COLLECTION_LENGTH_OFFSET,
+            ),
+            (
+                crate::native_abi::COLLECTION_CAPACITY_FIELD,
+                doria_rt::DR_COLLECTION_CAPACITY_OFFSET,
+            ),
+            (
+                crate::native_abi::COLLECTION_KEYS_FIELD,
+                doria_rt::DR_COLLECTION_KEYS_OFFSET,
+            ),
+            (
+                crate::native_abi::COLLECTION_VALUES_FIELD,
+                doria_rt::DR_COLLECTION_VALUES_OFFSET,
+            ),
+            (
+                crate::native_abi::COLLECTION_KEYED_FIELD,
+                doria_rt::DR_COLLECTION_KEYED_OFFSET,
+            ),
+            (
+                crate::native_abi::COLLECTION_FIXED_FIELD,
+                doria_rt::DR_COLLECTION_FIXED_OFFSET,
+            ),
+        ] {
+            assert_eq!(
+                target_data.offset_of_element(&header, field),
+                Some(expected as u64)
+            );
         }
     }
 }

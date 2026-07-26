@@ -17,6 +17,13 @@ pub struct DrCollectionV1 {
     fixed: u8,
 }
 
+pub const DR_COLLECTION_LENGTH_OFFSET: usize = mem::offset_of!(DrCollectionV1, length);
+pub const DR_COLLECTION_CAPACITY_OFFSET: usize = mem::offset_of!(DrCollectionV1, capacity);
+pub const DR_COLLECTION_KEYS_OFFSET: usize = mem::offset_of!(DrCollectionV1, keys);
+pub const DR_COLLECTION_VALUES_OFFSET: usize = mem::offset_of!(DrCollectionV1, values);
+pub const DR_COLLECTION_KEYED_OFFSET: usize = mem::offset_of!(DrCollectionV1, keyed);
+pub const DR_COLLECTION_FIXED_OFFSET: usize = mem::offset_of!(DrCollectionV1, fixed);
+
 unsafe fn allocate_words_with_frame(frame: *const DrStackFrameV1, capacity: usize) -> *mut u64 {
     if capacity == 0 {
         return ptr::null_mut();

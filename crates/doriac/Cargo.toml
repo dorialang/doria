@@ -28,6 +28,9 @@ ryu.workspace = true
 [build-dependencies]
 ryu.workspace = true
 
+[dev-dependencies]
+doria-rt = { path = "../doria-rt" }
+
 [[bin]]
 name = "doriac"
 path = "src/main.rs"

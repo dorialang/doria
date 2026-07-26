@@ -37,7 +37,11 @@ pub struct DrStringV1 {
 }
 
 pub use bytes::DrBytesV1;
-pub use collection::DrCollectionV1;
+pub use collection::{
+    DrCollectionV1, DR_COLLECTION_CAPACITY_OFFSET, DR_COLLECTION_FIXED_OFFSET,
+    DR_COLLECTION_KEYED_OFFSET, DR_COLLECTION_KEYS_OFFSET, DR_COLLECTION_LENGTH_OFFSET,
+    DR_COLLECTION_VALUES_OFFSET,
+};
 pub use mixed::DrMixedV1;
 
 /// # Safety
