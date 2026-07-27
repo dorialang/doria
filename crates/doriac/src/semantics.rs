@@ -4086,7 +4086,11 @@ impl<'program> Checker<'program> {
             } => {
                 let class_name = &class_type.name;
                 let qualified = class_name.contains('\\');
-                let class_exists = !qualified && self.classes.contains_key(class_name);
+                let is_current_class = class_name == "self"
+                    && class_type.arguments.is_empty()
+                    && method_context.is_some();
+                let class_exists =
+                    !qualified && (is_current_class || self.classes.contains_key(class_name));
                 if qualified {
                     self.report_deferred_qualified_name(class_name, *span);
                 } else if !class_exists {
@@ -4719,12 +4723,8 @@ impl<'program> Checker<'program> {
             self.infer_contextual_binary_operand_types(left, right, scopes, method_context);
         let left_kind = self.types.kind(left_ty).clone();
         let right_kind = self.types.kind(right_ty).clone();
-        if let (TypeKind::TypeParameter(left), TypeKind::TypeParameter(right)) =
-            (&left_kind, &right_kind)
-        {
-            if left == right && self.type_parameter_has_constraint(left, "Equatable") {
-                return;
-            }
+        if self.constrained_equality_operands(left_ty, right_ty) {
+            return;
         }
         if let Some(parameter) = match (&left_kind, &right_kind) {
             (TypeKind::TypeParameter(parameter), _) | (_, TypeKind::TypeParameter(parameter)) => {
@@ -7635,17 +7635,38 @@ impl<'program> Checker<'program> {
     }
 
     fn constrained_relational_operands(&mut self, left: TypeId, right: TypeId) -> bool {
+        self.constrained_binary_operands(left, right, "Comparable")
+    }
+
+    fn constrained_equality_operands(&mut self, left: TypeId, right: TypeId) -> bool {
+        self.constrained_binary_operands(left, right, "Equatable")
+    }
+
+    fn constrained_binary_operands(
+        &mut self,
+        left: TypeId,
+        right: TypeId,
+        constraint_name: &str,
+    ) -> bool {
         let left_kind = self.types.kind(left).clone();
         let right_kind = self.types.kind(right).clone();
         matches!(left_kind, TypeKind::TypeParameter(ref parameter)
-            if self.type_parameter_accepts_comparable_operand(parameter, right))
-            || matches!(right_kind, TypeKind::TypeParameter(ref parameter)
-                if self.type_parameter_accepts_comparable_operand(parameter, left))
+        if self.type_parameter_accepts_constraint_operand(
+            parameter,
+            constraint_name,
+            right
+        )) || matches!(right_kind, TypeKind::TypeParameter(ref parameter)
+        if self.type_parameter_accepts_constraint_operand(
+            parameter,
+            constraint_name,
+            left
+        ))
     }
 
-    fn type_parameter_accepts_comparable_operand(
+    fn type_parameter_accepts_constraint_operand(
         &mut self,
         parameter: &str,
+        constraint_name: &str,
         operand: TypeId,
     ) -> bool {
         let constraints = self
@@ -7655,16 +7676,19 @@ impl<'program> Checker<'program> {
             .find_map(|scope| scope.get(parameter))
             .into_iter()
             .flatten()
-            .filter(|constraint| constraint.name == "Comparable")
+            .filter(|constraint| constraint.name == constraint_name)
             .cloned()
             .collect::<Vec<_>>();
 
         constraints.into_iter().any(|constraint| {
+            if matches!(
+                self.types.kind(operand),
+                TypeKind::TypeParameter(other) if other == parameter
+            ) {
+                return true;
+            }
             if constraint.arguments.is_empty() {
-                return matches!(
-                    self.types.kind(operand),
-                    TypeKind::TypeParameter(other) if other == parameter
-                );
+                return false;
             }
             if constraint.has_value_arguments() || constraint.type_argument_count() != 1 {
                 return false;

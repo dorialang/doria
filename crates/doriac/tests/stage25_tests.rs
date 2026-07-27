@@ -691,6 +691,49 @@ function main(): void {}
 }
 
 #[test]
+fn equatable_constraints_honor_their_declared_operand_type() {
+    let mir = doriac::lower_source_to_mir(
+        "stage25-equatable-operand.doria",
+        r#"
+function equalsZero<T implements Equatable<int>>(T $value): bool
+{
+    return $value == 0;
+}
+function zeroEquals<T implements Equatable<int>>(T $value): bool
+{
+    return 0 == $value;
+}
+function equal<T implements Equatable<int>>(T $left, T $right): bool
+{
+    return $left == $right;
+}
+function main(): int
+{
+    if (equalsZero(0) && zeroEquals(0) && equal(1, 1)) { return 42; }
+    return 1;
+}
+"#,
+    )
+    .expect("Equatable<int> should guarantee equality with int operands");
+    let output =
+        doriac::mir_interpreter::interpret(&mir).expect("the specialized equality should execute");
+    assert_eq!(output.exit_status, 42);
+
+    let errors = diagnostics(
+        r#"
+function invalid<T implements Equatable<int>>(T $value): bool
+{
+    return $value == "not an int";
+}
+function main(): void {}
+"#,
+    );
+    assert!(errors.iter().any(|diagnostic| {
+        diagnostic.code == "E0537" && diagnostic.message.contains("equality")
+    }));
+}
+
+#[test]
 fn bool_comparable_specializations_use_the_canonical_false_before_true_order() {
     let mir = doriac::lower_source_to_mir(
         "stage25-bool-comparable.doria",
@@ -780,6 +823,35 @@ function main(): int
         .expect("self should retain Box<T> through HIR and static call lowering");
     let output =
         doriac::mir_interpreter::interpret(&mir).expect("specialized self calls should execute");
+    assert_eq!(output.exit_status, 42);
+}
+
+#[test]
+fn self_constructor_targets_preserve_the_declaring_class() {
+    let mir = doriac::lower_source_to_mir(
+        "stage25-new-self.doria",
+        r#"
+class Token
+{
+    function fresh(): self { return new self(); }
+}
+class Box<T>
+{
+    function fresh(): self { return new self(); }
+}
+function main(): int
+{
+    let $token = new Token();
+    let $freshToken = $token->fresh();
+    let $box = new Box<int>();
+    let $freshBox = $box->fresh();
+    return 42;
+}
+"#,
+    )
+    .expect("new self should resolve ordinary and generic declaring classes");
+    let output = doriac::mir_interpreter::interpret(&mir)
+        .expect("new self should execute through the current specialization");
     assert_eq!(output.exit_status, 42);
 }
 
