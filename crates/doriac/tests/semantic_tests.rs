@@ -989,6 +989,7 @@ let $greeting = "Hello " . $concatName . "!";
 bool $less = 1 < 2;
 bool $floatLess = 1.5 <= 2.5;
 bool $stringLess = "a" < "b";
+bool $boolLess = false < true;
 bool $same = "a" == "b";
 bool $different = "a" != "b";
 bool $logic = true && false;
@@ -1009,7 +1010,6 @@ string $name = null ?? "Andrew";
         r#"int $value = "x" . "y";"#,
         r#"bool $value = 1 < "2";"#,
         r#"bool $value = "2" >= 1;"#,
-        r#"bool $value = true <= false;"#,
         r#"bool $value = 1 && 2;"#,
         r#"bool $value = "x" || "y";"#,
         r#"bool $value = not 1;"#,

@@ -4948,11 +4948,10 @@ fn eval_compare(
         (mir::ScalarValue::Bool(left), mir::ScalarValue::Bool(right)) => match op {
             mir::CompareOp::Equal => left == right,
             mir::CompareOp::NotEqual => left != right,
-            _ => {
-                return Err(InterpreterError::new(
-                    "MIR ordered bool comparison is invalid",
-                ))
-            }
+            mir::CompareOp::Less => !left && right,
+            mir::CompareOp::LessEqual => !left || right,
+            mir::CompareOp::Greater => left && !right,
+            mir::CompareOp::GreaterEqual => left || !right,
         },
         _ => {
             return Err(InterpreterError::new(

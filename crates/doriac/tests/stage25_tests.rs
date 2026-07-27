@@ -296,7 +296,10 @@ fn native_fixture_covers_history_nested_layout_and_drop_specializations() {
     let output = doriac::mir_interpreter::interpret(&mir)
         .expect("the Stage 25 native fixture should execute");
     assert_eq!(output.exit_status, 0);
-    assert_eq!(output.stdout, b"42\ngeneric\nnested:7\n<drop:history>\n");
+    assert_eq!(
+        output.stdout,
+        b"42\ngeneric\nnested:7\n1:2:1\ntrue:true\n<drop:history>\n"
+    );
 }
 
 #[test]
@@ -542,6 +545,28 @@ function main(): int { return maximum(42, 7); }
 }
 
 #[test]
+fn bool_comparable_specializations_use_the_canonical_false_before_true_order() {
+    let mir = doriac::lower_source_to_mir(
+        "stage25-bool-comparable.doria",
+        r#"
+function atLeast<T implements Comparable<T>>(T $left, T $right): bool
+{
+    return $left >= $right;
+}
+function main(): int
+{
+    if (atLeast(true, false) && false < true && true >= true) { return 42; }
+    return 1;
+}
+"#,
+    )
+    .expect("bool Comparable specializations should lower ordered comparisons");
+    let output =
+        doriac::mir_interpreter::interpret(&mir).expect("bool ordered comparisons should execute");
+    assert_eq!(output.exit_status, 42);
+}
+
+#[test]
 fn recursively_expanding_class_specializations_are_rejected() {
     let errors = diagnostics(
         r#"
@@ -609,6 +634,38 @@ function main(): int
         .expect("self should retain Box<T> through HIR and static call lowering");
     let output =
         doriac::mir_interpreter::interpret(&mir).expect("specialized self calls should execute");
+    assert_eq!(output.exit_status, 42);
+}
+
+#[test]
+fn self_static_properties_resolve_against_each_enclosing_specialization() {
+    let mir = doriac::lower_source_to_mir(
+        "stage25-self-static-property.doria",
+        r#"
+class Counter<T>
+{
+    static writable int $count = 0;
+
+    function next(): int
+    {
+        self::count = self::count + 1;
+        return self::count;
+    }
+}
+function main(): int
+{
+    let $numbers = new Counter<int>();
+    let $words = new Counter<string>();
+    if ($numbers->next() == 1 && $numbers->next() == 2 && $words->next() == 1) {
+        return 42;
+    }
+    return 1;
+}
+"#,
+    )
+    .expect("self static properties should retain the enclosing class specialization");
+    let output = doriac::mir_interpreter::interpret(&mir)
+        .expect("specialized self static properties should execute");
     assert_eq!(output.exit_status, 42);
 }
 

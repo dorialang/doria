@@ -5721,18 +5721,13 @@ fn validate_condition(
             }
             _ => Err(malformed_mir("bool expression has an incompatible operand")),
         },
-        mir::BoolExpression::Compare { op, left, right } => {
+        mir::BoolExpression::Compare { left, right, .. } => {
             if left.ty() != right.ty() {
                 return Err(malformed_mir(format!(
                     "comparison has {} and {} operands",
                     left.ty(),
                     right.ty()
                 )));
-            }
-            if left.ty() == mir::ScalarType::Bool
-                && !matches!(op, mir::CompareOp::Equal | mir::CompareOp::NotEqual)
-            {
-                return Err(malformed_mir("ordered bool comparison is invalid"));
             }
             validate_value_expression(program, function, left)?;
             validate_value_expression(program, function, right)

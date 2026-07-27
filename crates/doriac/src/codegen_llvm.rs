@@ -5690,21 +5690,12 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                         right.into_float_value(),
                         "float.compare",
                     ))?,
-                    mir::ScalarType::Bool => match op {
-                        mir::CompareOp::Equal | mir::CompareOp::NotEqual => {
-                            build(self.builder.build_int_compare(
-                                if matches!(op, mir::CompareOp::Equal) {
-                                    IntPredicate::EQ
-                                } else {
-                                    IntPredicate::NE
-                                },
-                                left.into_int_value(),
-                                right.into_int_value(),
-                                "bool.compare",
-                            ))?
-                        }
-                        _ => return Err(malformed_mir("ordered bool comparison is invalid")),
-                    },
+                    mir::ScalarType::Bool => build(self.builder.build_int_compare(
+                        bool_compare_predicate(*op),
+                        left.into_int_value(),
+                        right.into_int_value(),
+                        "bool.compare",
+                    ))?,
                 };
                 build(
                     self.builder
@@ -6303,6 +6294,17 @@ fn integer_compare_predicate(op: mir::CompareOp, ty: IntegerType) -> IntPredicat
         mir::CompareOp::Greater if ty.is_signed() => IntPredicate::SGT,
         mir::CompareOp::Greater => IntPredicate::UGT,
         mir::CompareOp::GreaterEqual if ty.is_signed() => IntPredicate::SGE,
+        mir::CompareOp::GreaterEqual => IntPredicate::UGE,
+    }
+}
+
+fn bool_compare_predicate(op: mir::CompareOp) -> IntPredicate {
+    match op {
+        mir::CompareOp::Equal => IntPredicate::EQ,
+        mir::CompareOp::NotEqual => IntPredicate::NE,
+        mir::CompareOp::Less => IntPredicate::ULT,
+        mir::CompareOp::LessEqual => IntPredicate::ULE,
+        mir::CompareOp::Greater => IntPredicate::UGT,
         mir::CompareOp::GreaterEqual => IntPredicate::UGE,
     }
 }

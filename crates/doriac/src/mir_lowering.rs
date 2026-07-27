@@ -455,7 +455,7 @@ pub fn lower_program(program: &hir::Program) -> DiagnosticResult<mir::Program> {
                     )]
                 })?;
             let initializer = lower_static_value(&evaluated.value, ty, property.span)?;
-            static_ids.insert((class_id, property.name.clone()), id);
+            static_ids.insert((class_id, property.name.clone()), (id, ty));
             statics.push(mir::StaticProperty {
                 id,
                 class: class_id,
@@ -1256,7 +1256,7 @@ struct FunctionLoweringInputs<'a> {
     semantic_info: &'a SemanticInfo,
     property_initializers: &'a HashMap<crate::class_layout::PropertyId, hir::Expr>,
     constructor_body_initializers: &'a HashSet<crate::class_layout::PropertyId>,
-    static_ids: &'a HashMap<(ClassId, String), mir::StaticId>,
+    static_ids: &'a HashMap<(ClassId, String), (mir::StaticId, mir::Type)>,
     collection_registry: &'a CollectionRegistry,
     type_substitutions: &'a HashMap<String, crate::types::ResolvedType>,
 }
@@ -1269,6 +1269,7 @@ fn lower_function(
     receiver: Option<ClassId>,
 ) -> DiagnosticResult<mir::Function> {
     let mut context = LoweringContext::new(&inputs);
+    context.current_class = class;
     context.return_borrow = signature.return_borrow;
     let mut params = Vec::new();
     if let Some(class) = receiver {
@@ -2252,9 +2253,10 @@ struct LoweringContext<'semantic> {
     semantic_info: &'semantic SemanticInfo,
     property_initializers: HashMap<crate::class_layout::PropertyId, hir::Expr>,
     constructor_body_initializers: HashSet<crate::class_layout::PropertyId>,
-    static_ids: HashMap<(ClassId, String), mir::StaticId>,
+    static_ids: HashMap<(ClassId, String), (mir::StaticId, mir::Type)>,
     collection_registry: CollectionRegistry,
     type_substitutions: HashMap<String, crate::types::ResolvedType>,
+    current_class: Option<ClassId>,
     locals: Vec<mir::Local>,
     local_scopes: Vec<HashMap<String, mir::LocalId>>,
     materialized_collection_places: HashMap<(usize, usize), mir::LocalId>,
@@ -2285,6 +2287,7 @@ impl<'semantic> LoweringContext<'semantic> {
             static_ids: inputs.static_ids.clone(),
             collection_registry: inputs.collection_registry.clone(),
             type_substitutions: inputs.type_substitutions.clone(),
+            current_class: None,
             locals: Vec::new(),
             local_scopes: vec![HashMap::new()],
             materialized_collection_places: HashMap::new(),
@@ -2611,6 +2614,15 @@ impl<'semantic> LoweringContext<'semantic> {
             .map(|class| class.id)
     }
 
+    fn class_id_for_static_access(&self, name: &str) -> Option<ClassId> {
+        self.class_id_for_name(name).or_else(|| {
+            let class = self.current_class?;
+            self.class_info(class)
+                .is_some_and(|info| info.declaration_name == name)
+                .then_some(class)
+        })
+    }
+
     fn class_id_for_type(&self, class_type: &ClassType<ResolvedType>) -> Option<ClassId> {
         self.semantic_info
             .classes
@@ -2725,9 +2737,9 @@ impl<'semantic> LoweringContext<'semantic> {
         span: Span,
     ) -> DiagnosticResult<(mir::StaticId, mir::Type)> {
         let class = self
-            .class_id_for_name(class_name)
+            .class_id_for_static_access(class_name)
             .ok_or_else(|| vec![unsupported(span, format!("unknown class `{class_name}`"))])?;
-        let id = self
+        let (id, ty) = self
             .static_ids
             .get(&(class, member.to_string()))
             .copied()
@@ -2737,18 +2749,6 @@ impl<'semantic> LoweringContext<'semantic> {
                     format!("unknown static property `{class_name}::{member}`"),
                 )]
             })?;
-        let key = crate::const_eval::ConstKey::Static {
-            class_name: class_name.to_string(),
-            name: member.to_string(),
-        };
-        let const_ty = self
-            .semantic_info
-            .const_evaluation
-            .values
-            .get(&key)
-            .expect("checked static has evaluated metadata")
-            .ty;
-        let ty = native_const_type(const_ty).expect("checked static has a native type");
         Ok((id, ty))
     }
 
@@ -2974,30 +2974,6 @@ impl<'semantic> LoweringContext<'semantic> {
                 Span::default(),
             )]),
         }
-    }
-}
-
-fn native_const_type(ty: crate::const_eval::ConstType) -> Option<mir::Type> {
-    match ty {
-        crate::const_eval::ConstType::Integer(ty) => {
-            Some(mir::Type::Scalar(mir::ScalarType::Integer(ty)))
-        }
-        crate::const_eval::ConstType::NullableInteger(ty) => {
-            Some(mir::Type::NullableScalar(mir::ScalarType::Integer(ty)))
-        }
-        crate::const_eval::ConstType::Float(ty) => {
-            Some(mir::Type::Scalar(mir::ScalarType::Float(ty)))
-        }
-        crate::const_eval::ConstType::NullableFloat(ty) => {
-            Some(mir::Type::NullableScalar(mir::ScalarType::Float(ty)))
-        }
-        crate::const_eval::ConstType::String => Some(mir::Type::String),
-        crate::const_eval::ConstType::Bool => Some(mir::Type::Scalar(mir::ScalarType::Bool)),
-        crate::const_eval::ConstType::NullableBool => {
-            Some(mir::Type::NullableScalar(mir::ScalarType::Bool))
-        }
-        crate::const_eval::ConstType::NullableString => Some(mir::Type::NullableString),
-        crate::const_eval::ConstType::Null => None,
     }
 }
 

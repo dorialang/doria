@@ -32,6 +32,22 @@ class Pair<T, U>
     }
 }
 
+class Counter<T>
+{
+    static writable int $count = 0;
+
+    function next(): int
+    {
+        self::count = self::count + 1;
+        return self::count;
+    }
+}
+
+function atLeast<T implements Comparable<T>>(T $left, T $right): bool
+{
+    return $left >= $right;
+}
+
 function main(): int
 {
     writable History<int> $numbers = new History<int>();
@@ -51,5 +67,9 @@ function main(): int
     if ($number != null) { echo $number . "\n"; }
     if ($word != null) { echo $word . "\n"; }
     echo $pair->right . ":" . $pair->left . "\n";
+    let $numberCounter = new Counter<int>();
+    let $wordCounter = new Counter<string>();
+    echo $numberCounter->next() . ":" . $numberCounter->next() . ":" . $wordCounter->next() . "\n";
+    echo atLeast(true, false) . ":" . (false < true) . "\n";
     return 0;
 }

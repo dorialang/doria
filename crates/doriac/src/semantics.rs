@@ -4290,6 +4290,9 @@ impl<'program> Checker<'program> {
                 ) || matches!(
                     (self.types.kind(left_ty), self.types.kind(right_ty)),
                     (TypeKind::String, TypeKind::String)
+                ) || matches!(
+                    (self.types.kind(left_ty), self.types.kind(right_ty)),
+                    (TypeKind::Bool, TypeKind::Bool)
                 ) || self.matching_constrained_type_parameters(left_ty, right_ty, "Comparable")
                     || matches!(
                         (self.types.kind(left_ty), self.types.kind(right_ty)),
@@ -9261,6 +9264,7 @@ impl<'program> Checker<'program> {
                 self.types.intern(TypeKind::Bool)
             }
             (TypeKind::String, TypeKind::String) => self.types.intern(TypeKind::Bool),
+            (TypeKind::Bool, TypeKind::Bool) => self.types.intern(TypeKind::Bool),
             (TypeKind::TypeParameter(left_parameter), TypeKind::TypeParameter(right_parameter))
                 if left_parameter == right_parameter
                     && self.type_parameter_has_constraint(&left_parameter, "Comparable") =>
