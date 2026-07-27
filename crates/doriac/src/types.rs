@@ -108,6 +108,9 @@ impl TypeRef {
         if IntegerType::from_source_name(&self.name).is_some() {
             return None;
         }
+        if SharedHandleKind::from_source_name(&self.name).is_some() {
+            return None;
+        }
         match self.name.as_str() {
             "void" | "float" | "float32" | "float64" | "string" | "bool" | "mixed" | "null"
             | "resource" | "Bytes" | "List" | "Dictionary" | "Set" | "[]" | "Unknown" => None,
@@ -161,6 +164,94 @@ impl<T> ClassType<T> {
     }
 }
 
+/// The six compiler-known Stage 25a shared-ownership types (record 0106). Each
+/// takes exactly one type argument and belongs to one of two permanently disjoint
+/// families; the family is fixed at construction and never converts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SharedHandleKind {
+    SharedReference,
+    WeakReference,
+    WritableSharedReference,
+    WritableWeakReference,
+    ReadonlySharedReferenceAccess,
+    WritableSharedReferenceAccess,
+}
+
+/// Which disjoint shared-ownership family a handle belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SharedFamily {
+    /// `SharedReference<T>` / `WeakReference<T>`: direct readonly payload access,
+    /// no writable-access runtime state on the allocation.
+    Readonly,
+    /// `WritableSharedReference<T>` and friends: access must be acquired, and the
+    /// allocation carries one access state shared by all its strong handles.
+    Writable,
+}
+
+impl SharedHandleKind {
+    pub const ALL: [SharedHandleKind; 6] = [
+        SharedHandleKind::SharedReference,
+        SharedHandleKind::WeakReference,
+        SharedHandleKind::WritableSharedReference,
+        SharedHandleKind::WritableWeakReference,
+        SharedHandleKind::ReadonlySharedReferenceAccess,
+        SharedHandleKind::WritableSharedReferenceAccess,
+    ];
+
+    pub fn source_name(self) -> &'static str {
+        match self {
+            SharedHandleKind::SharedReference => "SharedReference",
+            SharedHandleKind::WeakReference => "WeakReference",
+            SharedHandleKind::WritableSharedReference => "WritableSharedReference",
+            SharedHandleKind::WritableWeakReference => "WritableWeakReference",
+            SharedHandleKind::ReadonlySharedReferenceAccess => "ReadonlySharedReferenceAccess",
+            SharedHandleKind::WritableSharedReferenceAccess => "WritableSharedReferenceAccess",
+        }
+    }
+
+    pub fn from_source_name(name: &str) -> Option<Self> {
+        SharedHandleKind::ALL
+            .into_iter()
+            .find(|kind| kind.source_name() == name)
+    }
+
+    pub fn family(self) -> SharedFamily {
+        match self {
+            SharedHandleKind::SharedReference | SharedHandleKind::WeakReference => {
+                SharedFamily::Readonly
+            }
+            SharedHandleKind::WritableSharedReference
+            | SharedHandleKind::WritableWeakReference
+            | SharedHandleKind::ReadonlySharedReferenceAccess
+            | SharedHandleKind::WritableSharedReferenceAccess => SharedFamily::Writable,
+        }
+    }
+
+    /// Weak handles do not keep their payload alive.
+    pub fn is_weak(self) -> bool {
+        matches!(
+            self,
+            SharedHandleKind::WeakReference | SharedHandleKind::WritableWeakReference
+        )
+    }
+
+    /// Access guards returned by the writable family's acquire operations.
+    pub fn is_access(self) -> bool {
+        matches!(
+            self,
+            SharedHandleKind::ReadonlySharedReferenceAccess
+                | SharedHandleKind::WritableSharedReferenceAccess
+        )
+    }
+
+    /// Only `SharedReference<T>` is user-constructible through `shared new`, and
+    /// only `WritableSharedReference<T>` through its ordinary constructor. Weak and
+    /// access handles are produced exclusively by their approved operations.
+    pub fn is_directly_constructible(self) -> bool {
+        matches!(self, SharedHandleKind::WritableSharedReference)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum TypeKind {
     Void,
@@ -181,6 +272,7 @@ pub enum TypeKind {
     List(TypeId),
     Dictionary(TypeId, TypeId),
     Set(TypeId),
+    SharedHandle(SharedHandleKind, TypeId),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -200,6 +292,7 @@ pub enum ResolvedType {
     List(Box<ResolvedType>),
     Dictionary(Box<ResolvedType>, Box<ResolvedType>),
     Set(Box<ResolvedType>),
+    SharedHandle(SharedHandleKind, Box<ResolvedType>),
     Unsupported,
 }
 
@@ -208,7 +301,8 @@ pub(crate) fn resolved_type_complexity(ty: &ResolvedType) -> usize {
         ResolvedType::Nullable(inner)
         | ResolvedType::TypedArray(inner)
         | ResolvedType::List(inner)
-        | ResolvedType::Set(inner) => 1 + resolved_type_complexity(inner),
+        | ResolvedType::Set(inner)
+        | ResolvedType::SharedHandle(_, inner) => 1 + resolved_type_complexity(inner),
         ResolvedType::Dictionary(key, value) => {
             1 + resolved_type_complexity(key) + resolved_type_complexity(value)
         }
@@ -310,6 +404,9 @@ impl TypeRegistry {
                 )
             }
             TypeKind::Set(element) => format!("Set<{}>", self.display(*element)),
+            TypeKind::SharedHandle(kind, payload) => {
+                format!("{}<{}>", kind.source_name(), self.display(*payload))
+            }
         }
     }
 
@@ -342,6 +439,9 @@ impl TypeRegistry {
                 Box::new(self.resolved(*value)),
             ),
             TypeKind::Set(element) => ResolvedType::Set(Box::new(self.resolved(*element))),
+            TypeKind::SharedHandle(kind, payload) => {
+                ResolvedType::SharedHandle(*kind, Box::new(self.resolved(*payload)))
+            }
             TypeKind::Unknown | TypeKind::Heterogeneous | TypeKind::EmptyCollection => {
                 ResolvedType::Unsupported
             }

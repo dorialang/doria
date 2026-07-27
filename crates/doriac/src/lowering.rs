@@ -496,6 +496,7 @@ fn lower_expr(expr: &ast::Expr, class_name: Option<ClassContext<'_>>) -> hir::Ex
         ast::Expr::New {
             class_type: constructed_class,
             args,
+            shared,
             span,
         } => hir::Expr::New {
             class_type: lower_type_ref(constructed_class, class_name),
@@ -503,6 +504,7 @@ fn lower_expr(expr: &ast::Expr, class_name: Option<ClassContext<'_>>) -> hir::Ex
                 .iter()
                 .map(|arg| lower_argument(arg, class_name))
                 .collect(),
+            shared: *shared,
             span: *span,
         },
         ast::Expr::Grouped { expr, span } => hir::Expr::Grouped {

@@ -1190,7 +1190,8 @@ impl Parser {
             TokenKind::Null => Some(Expr::Null { span: token.span }),
             TokenKind::When => self.parse_unsupported_when(token.span.start, false),
             TokenKind::Given => self.parse_unsupported_when(token.span.start, true),
-            TokenKind::New => self.parse_new(token.span.start),
+            TokenKind::New => self.parse_new(token.span.start, false),
+            TokenKind::Shared => self.parse_shared_new(token.span.start),
             TokenKind::LeftBracket => self.parse_array(token.span.start),
             TokenKind::LeftParen => {
                 let start = token.span.start;
@@ -1470,7 +1471,44 @@ impl Parser {
         );
     }
 
-    fn parse_new(&mut self, start: usize) -> Option<Expr> {
+    /// `shared` is a construction modifier only (records 0005 and 0106): the sole
+    /// accepted form is `shared new T(...)`. Every other continuation is rejected
+    /// here with a migration diagnostic rather than a bare unexpected-token error.
+    fn parse_shared_new(&mut self, start: usize) -> Option<Expr> {
+        if self.match_kind(&TokenKind::New) {
+            return self.parse_new(start, true);
+        }
+
+        let next = self.peek().clone();
+        let span = Span::new(start, next.span.end);
+        if matches!(next.kind, TokenKind::Writable) {
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "E0540",
+                    "`shared writable new` Is Not Doria Syntax",
+                    span,
+                )
+                .with_help(
+                    "shared ownership picks its family at construction: use `shared new T(...)` for `SharedReference<T>`, or `new WritableSharedReference(new T(...))` for the writable family",
+                ),
+            );
+            return None;
+        }
+
+        self.diagnostics.push(
+            Diagnostic::new(
+                "E0541",
+                "`shared` Is A Construction Modifier, Not A Declaration Modifier",
+                span,
+            )
+            .with_help(
+                "write the type as `SharedReference<T>` and construct with `shared new T(...)`; `shared T $value` is superseded",
+            ),
+        );
+        None
+    }
+
+    fn parse_new(&mut self, start: usize, shared: bool) -> Option<Expr> {
         let type_start = self.peek().span.start;
         let class_type = self.parse_type_ref()?;
         let type_span = Span::new(type_start, self.previous().span.end);
@@ -1483,6 +1521,7 @@ impl Parser {
         Some(Expr::New {
             class_type,
             args,
+            shared,
             span,
         })
     }
@@ -2022,6 +2061,7 @@ fn token_name(kind: &TokenKind) -> &'static str {
         TokenKind::Return => "return",
         TokenKind::Echo => "echo",
         TokenKind::New => "new",
+        TokenKind::Shared => "shared",
         TokenKind::Foreach => "foreach",
         TokenKind::As => "as",
         TokenKind::If => "if",

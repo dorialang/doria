@@ -368,6 +368,11 @@ pub enum Expr {
     New {
         class_type: TypeRef,
         args: Vec<Argument>,
+        /// `true` for `shared new T(...)` (record 0106): the value is created
+        /// directly under shared ownership and the expression's type is
+        /// `SharedReference<T>`. Recorded explicitly here rather than
+        /// reconstructed from an expected type.
+        shared: bool,
         span: Span,
     },
     Grouped {

@@ -879,7 +879,10 @@ fn intern_resolved_collection_types(
                 | mir::Type::NullableClass(_) => return None,
             }
         }
-        ResolvedType::TypeParameter(_)
+        // Stage 25a Slice 1 lands the surface and type model only; shared handles
+        // have no MIR representation until the runtime slices.
+        ResolvedType::SharedHandle(_, _)
+        | ResolvedType::TypeParameter(_)
         | ResolvedType::Void
         | ResolvedType::Null
         | ResolvedType::Unsupported => return None,
@@ -2908,6 +2911,9 @@ impl<'semantic> LoweringContext<'semantic> {
             })?;
         let resolved = substitute_resolved_type(resolved, &self.type_substitutions);
         self.mir_resolved_type(&resolved).ok_or_else(|| {
+            if resolved_type_contains_shared_handle(&resolved) {
+                return vec![shared_ownership_runtime_unsupported(expr.span())];
+            }
             vec![unsupported(
                 expr.span(),
                 format!("resolved type `{resolved:?}` has no native representation"),
@@ -3034,7 +3040,10 @@ impl<'semantic> LoweringContext<'semantic> {
                 | mir::Type::NullableClass(_)) => Some(already),
                 mir::Type::Collection(_) => None,
             },
-            ResolvedType::Void | ResolvedType::Null | ResolvedType::Unsupported => None,
+            ResolvedType::SharedHandle(_, _)
+            | ResolvedType::Void
+            | ResolvedType::Null
+            | ResolvedType::Unsupported => None,
         }
     }
 
@@ -7615,8 +7624,12 @@ fn lower_class_expression(
         hir::Expr::New {
             class_type,
             args,
+            shared,
             span,
         } => {
+            if *shared {
+                return Err(vec![shared_ownership_runtime_unsupported(*span)]);
+            }
             let class_name = &class_type.name;
             let mir::Type::Class(class) = context.native_type_ref(class_type).ok_or_else(|| {
                 vec![unsupported(
@@ -8688,6 +8701,18 @@ fn unsupported(span: Span, detail: impl Into<String>) -> Diagnostic {
     Diagnostic::new("M1101", detail, span)
 }
 
+/// Stage 25a Slice 1 lands the shared-ownership surface and type model; the
+/// reference-counted runtime arrives in the following slices. Accepted syntax must
+/// therefore reach a stage-named unsupported diagnostic here rather than a parser
+/// error, an unknown-type error, or an internal compiler error (the two-clocks rule).
+pub(crate) fn shared_ownership_runtime_unsupported(span: Span) -> Diagnostic {
+    Diagnostic::unsupported_stage(
+        "M1102",
+        "Stage 25a Shared-Ownership Runtime Support Is Not Yet Implemented",
+        span,
+    )
+}
+
 fn unsupported_native_type(
     ty: &crate::types::TypeRef,
     span: Span,
@@ -8706,4 +8731,26 @@ fn unsupported_native_type(
 
 fn type_ref_contains_mixed(ty: &crate::types::TypeRef) -> bool {
     ty.name == "mixed" || ty.type_arguments().any(type_ref_contains_mixed)
+}
+
+/// Whether a resolved type mentions a Stage 25a shared-ownership handle anywhere,
+/// so lowering can report the stage-named runtime diagnostic instead of leaking an
+/// internal representation.
+pub(crate) fn resolved_type_contains_shared_handle(ty: &crate::types::ResolvedType) -> bool {
+    use crate::types::ResolvedType;
+    match ty {
+        ResolvedType::SharedHandle(_, _) => true,
+        ResolvedType::Nullable(inner)
+        | ResolvedType::TypedArray(inner)
+        | ResolvedType::List(inner)
+        | ResolvedType::Set(inner) => resolved_type_contains_shared_handle(inner),
+        ResolvedType::Dictionary(key, value) => {
+            resolved_type_contains_shared_handle(key) || resolved_type_contains_shared_handle(value)
+        }
+        ResolvedType::Class(class) => class
+            .arguments
+            .iter()
+            .any(resolved_type_contains_shared_handle),
+        _ => false,
+    }
 }
