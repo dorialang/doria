@@ -48,17 +48,20 @@ fast. There is **no runtime generic reflection** in v1.0.
   parameters, returns, and method bodies, and is instantiated by supplying
   arguments (`Box<int>`, `Box<Token>`). Each instantiation is a **distinct
   monomorphized type** with its own specialized layout and code.
-- **Copy-vs-move classification is compositional, computed per instantiation.** An
-  instantiation is classified by the ordinary per-type rule with the type
-  arguments substituted in: it is a **move type** if it has a destructor or any
-  field that is a move type after substitution, and a **Copy type** only when
-  every field is Copy after substitution. So a value/`Copy`-eligible generic class
-  `Pair<A, B>` is Copy as `Pair<int, bool>` and a move type as `Pair<int, Token>`,
-  while a class that owns a resource or declares `__destruct` is a move type at
-  every instantiation regardless of `T`. Classification never depends on the
-  *name* `T`, only on the concrete arguments — the same composition rule Doria
-  already applies to non-generic types, so no new classification concept is
-  introduced.
+- **A generic class instantiation is a move type — always.** Classes are
+  identity-bearing, owned heap move types (plan D3, decisions 0082 and 0087), and
+  Doria has **no user-defined Copy aggregates** (the only Copy aggregates are the
+  compiler-known `Doria\Std\Math` value types, Stage 47). Substituting type
+  arguments never makes an instantiation Copy: `Box<int>` and `Box<Token>` are both
+  move types, exactly as a non-generic class is. What monomorphization specializes
+  per instantiation is not the *class's* classification but its **field handling
+  and drop glue**, computed from the substituted field types — a field of type `T`
+  is copied or moved-and-destructed according to `T`'s own Copy-vs-move
+  classification, so `Box<int>`'s destructor drops nothing for its Copy `int` field
+  while `Box<Token>`'s destructor drops its move `Token` field. That is §1's
+  monomorphization applied to class fields, not a Copy-vs-move classification of the
+  class. (A future user value/`struct` type, if ever introduced, is separate design
+  work — 0087 prohibits it in v1.0.)
 - Type-parameter **constraints on classes** (`class Sorted<T implements
   Comparable<T>>`) are checked at instantiation exactly as for functions; the body
   may rely only on the constrained surface of `T`.
@@ -96,10 +99,17 @@ implementations as self-hosting matures, without changing their surface.
   both `implements` clauses and constraints.
 - **Turbofish `f::<int>()`.** Rejected — inference plus typed-declaration fallback
   covers the cases; a second explicit-argument syntax is surface without payoff.
-- **Classification of a generic class fixed by declaration (always move).**
-  Rejected — it would make `Pair<int, bool>` a move type even though it holds only
-  Copy data, breaking the composition rule that makes small value aggregates cheap.
-  Classification follows the substituted fields.
+- **Compositional Copy classification (a generic class is Copy when its
+  substituted fields are all Copy).** Rejected — it would create user-defined Copy
+  aggregates, which plan D3, decision 0082, and decision 0087 prohibit: classes are
+  identity-bearing move types and the only Copy aggregates are the compiler-known
+  `Doria\Std\Math` value types. Making a generic class the sole exception would be
+  internally inconsistent (generic vs non-generic classes classified by different
+  rules). An instantiation is therefore always a move type; monomorphization still
+  specializes each instantiation's field/drop glue from the substituted field types.
+- **A user value/`struct` type so `Pair<int, bool>` could be Copy.** Rejected as
+  out of scope — introducing user Copy aggregates reverses 0087 and is its own
+  design effort, not part of Stage 25 generics.
 - **Variance / default type args in v1.0.** Rejected as scope — invariance is
   sound and simple; both can be added later without breaking existing code.
 
@@ -107,9 +117,10 @@ implementations as self-hosting matures, without changing their surface.
 
 - Generic functions/methods (Stage 24, shipped) now rest on a written contract;
   Stage 25 implements generic classes against §3 here.
-- The Copy-vs-move rule for instantiations is settled compositionally, so the
-  borrow checker and native layout treat `Pair<int, bool>` and `Pair<int, Token>`
-  correctly without a special generic-classification pass.
+- Generic class instantiations are move types like all classes (D3/0082/0087), so
+  the borrow checker and native layout need no special generic-classification pass;
+  monomorphization alone produces the correct per-instantiation field/drop glue
+  (`Box<int>` drops nothing for its `int` field, `Box<Token>` drops its `Token`).
 - Built-in collections and user generic classes are one mechanism, easing the
   self-hosting migration.
 - Interfaces/traits as *generic constraints that users define and implement*, and
@@ -128,7 +139,7 @@ value-parameter extension point reopens only when a concrete need is scheduled.
 
 Parser (type-parameter and constraint grammar — already accepted for functions;
 extended to classes), semantic analysis (type-parameter scoping, constraint
-checking, inference, per-instantiation Copy-vs-move classification), HIR/MIR and
+checking, inference, per-instantiation field/drop-glue specialization), HIR/MIR and
 monomorphization keying, shared MIR validation, native layout in the
 interpreter/Cranelift/LLVM, diagnostics, the LSP (`dorialang/doria-language-server`),
 SPEC's generics section, and plan §4.5 / the D9 row (the "unauthored" marker is
@@ -141,5 +152,7 @@ discharged here).
 - The current-pipeline note that "the generics decision remains unauthored and is a
   merge prerequisite for this generics work" — discharged; Stage 25 may proceed
   against this record.
-- Any assumption that a generic class instantiation is classified move-or-Copy by
-  declaration rather than by its substituted fields.
+- Nothing in plan D3, decision 0082, or decision 0087 changes: generic class
+  instantiations are move types like all classes. This record aligns with them; an
+  earlier draft's claim that an instantiation could be Copy is corrected — there
+  are no user-defined Copy aggregates in v1.0.
