@@ -3,11 +3,45 @@
 
 declare(strict_types=1);
 
+// Development launcher for `doriac` (cargo run from source).
+//
+// Two build choices make the from-source `doriac` behave like a real toolchain:
+//
+//   --no-default-features   drops the `bundled-runtime` feature so build.rs
+//                           compiles doria-rt fresh from source on every runtime
+//                           change. Without this, `--release` links a stale
+//                           bundled `libdoria_rt.a` and fails with undefined
+//                           runtime symbols after the runtime changes.
+//
+//   --features llvm-backend added only when an LLVM 18 toolchain is present, so
+//                           `doriac compile --release` (the LLVM profile) works.
+//                           Without LLVM the launcher still builds (Cranelift
+//                           only) and `--release` reports the usual clear error.
+//
+// Both are applied unconditionally-consistently, so the cached build never
+// thrashes between feature sets.
+
 $repositoryRoot = dirname(__DIR__);
+
+$environment = getenv();
+if (!is_array($environment)) {
+    $environment = [];
+}
+$environment['CLICOLOR_FORCE'] = '1';
+
+$features = ['--no-default-features'];
+$llvmPrefix = detect_llvm18_prefix();
+if ($llvmPrefix !== null) {
+    $features[] = '--features';
+    $features[] = 'llvm-backend';
+    $environment['LLVM_SYS_181_PREFIX'] = $llvmPrefix;
+}
+
 $command = [
     'cargo',
     'run',
     '--color=always',
+    ...$features,
     '--manifest-path',
     $repositoryRoot . DIRECTORY_SEPARATOR . 'Cargo.toml',
     '--package',
@@ -15,16 +49,12 @@ $command = [
     '--',
     ...array_slice($argv, 1),
 ];
+
 $descriptors = [
     0 => ['file', 'php://stdin', 'r'],
     1 => ['file', 'php://stdout', 'w'],
     2 => ['file', 'php://stderr', 'w'],
 ];
-$environment = getenv();
-if (!is_array($environment)) {
-    $environment = [];
-}
-$environment['CLICOLOR_FORCE'] = '1';
 
 $process = proc_open($command, $descriptors, $pipes, null, $environment);
 if (!is_resource($process)) {
@@ -33,3 +63,55 @@ if (!is_resource($process)) {
 }
 
 exit(proc_close($process));
+
+/**
+ * Locate an LLVM 18 installation for the `llvm-backend` feature: an explicit
+ * LLVM_SYS_181_PREFIX first, then the usual Homebrew/Linux locations, verified
+ * by asking llvm-config for a matching major version. Returns null when none is
+ * found, so the launcher degrades to a Cranelift-only build.
+ */
+function detect_llvm18_prefix(): ?string
+{
+    $fromEnv = getenv('LLVM_SYS_181_PREFIX');
+    if (is_string($fromEnv) && $fromEnv !== '' && llvm_config_is_18($fromEnv)) {
+        return $fromEnv;
+    }
+
+    $candidates = [
+        '/opt/homebrew/opt/llvm@18',
+        '/usr/local/opt/llvm@18',
+        '/usr/lib/llvm-18',
+        '/opt/homebrew/opt/llvm',
+        '/usr/local/opt/llvm',
+    ];
+    foreach ($candidates as $prefix) {
+        if (llvm_config_is_18($prefix)) {
+            return $prefix;
+        }
+    }
+
+    return null;
+}
+
+function llvm_config_is_18(string $prefix): bool
+{
+    $llvmConfig = $prefix . '/bin/llvm-config';
+    if (!is_file($llvmConfig)) {
+        return false;
+    }
+
+    $process = proc_open(
+        [$llvmConfig, '--version'],
+        [1 => ['pipe', 'w'], 2 => ['pipe', 'w']],
+        $pipes
+    );
+    if (!is_resource($process)) {
+        return false;
+    }
+    $version = stream_get_contents($pipes[1]) ?: '';
+    fclose($pipes[1]);
+    fclose($pipes[2]);
+    proc_close($process);
+
+    return str_starts_with(trim($version), '18');
+}
