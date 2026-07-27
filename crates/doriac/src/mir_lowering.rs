@@ -121,6 +121,7 @@ fn collect_callable_instances(
         .collect::<HashMap<_, _>>();
 
     let mut instances = Vec::new();
+    let mut parents = Vec::new();
     let mut ids = HashMap::new();
     for (declaration, callable) in declarations.iter().enumerate() {
         if callable.function.type_params.is_empty() {
@@ -130,6 +131,7 @@ fn collect_callable_instances(
             };
             ids.insert(instance.clone(), instances.len());
             instances.push(instance);
+            parents.push(None);
         }
     }
 
@@ -141,6 +143,7 @@ fn collect_callable_instances(
 
     let mut cursor = 0;
     while cursor < instances.len() {
+        let instance_index = cursor;
         let instance = instances[cursor].clone();
         cursor += 1;
         let callable = declarations[instance.declaration];
@@ -218,13 +221,95 @@ fn collect_callable_instances(
                 arguments,
             };
             if !ids.contains_key(&target) {
+                if specialization_expands_recursively(&instances, &parents, instance_index, &target)
+                {
+                    let name = &declarations[target.declaration].function.name;
+                    return Err(vec![Diagnostic::new(
+                        "E0539",
+                        format!(
+                            "generic specialization of `{name}` recursively expands its type arguments and has no finite monomorphization"
+                        ),
+                        Span::new(span.0, span.1),
+                    )
+                    .with_help(
+                        "keep recursive generic calls at the same concrete type, or move the type-changing step outside the recursion",
+                    )]);
+                }
                 ids.insert(target.clone(), instances.len());
                 instances.push(target);
+                parents.push(Some(instance_index));
             }
         }
     }
 
     Ok(instances)
+}
+
+fn specialization_expands_recursively(
+    instances: &[CallableInstance],
+    parents: &[Option<usize>],
+    current: usize,
+    target: &CallableInstance,
+) -> bool {
+    // One type-changing recursive step can still converge (for example, T -> int).
+    // Two consecutive increases for the same declaration establish an expanding
+    // specialization chain while keeping bounded type changes valid.
+    let mut matching_ancestors = Vec::new();
+    let mut cursor = Some(current);
+    while let Some(index) = cursor {
+        if instances[index].declaration == target.declaration {
+            matching_ancestors.push(&instances[index]);
+            if matching_ancestors.len() == 2 {
+                break;
+            }
+        }
+        cursor = parents[index];
+    }
+    let [nearest, previous] = matching_ancestors.as_slice() else {
+        return false;
+    };
+    specialization_complexity(&target.arguments) > specialization_complexity(&nearest.arguments)
+        && specialization_complexity(&nearest.arguments)
+            > specialization_complexity(&previous.arguments)
+}
+
+fn specialization_complexity(arguments: &[GenericArgument]) -> usize {
+    arguments
+        .iter()
+        .map(|argument| {
+            let GenericArgument::Type(ty) = argument;
+            resolved_type_complexity(ty)
+        })
+        .sum()
+}
+
+fn resolved_type_complexity(ty: &ResolvedType) -> usize {
+    match ty {
+        ResolvedType::Nullable(inner)
+        | ResolvedType::TypedArray(inner)
+        | ResolvedType::List(inner)
+        | ResolvedType::Set(inner) => 1 + resolved_type_complexity(inner),
+        ResolvedType::Dictionary(key, value) => {
+            1 + resolved_type_complexity(key) + resolved_type_complexity(value)
+        }
+        ResolvedType::Class(class) => {
+            1 + class
+                .arguments
+                .iter()
+                .map(resolved_type_complexity)
+                .sum::<usize>()
+        }
+        ResolvedType::Integer(_)
+        | ResolvedType::Float(_)
+        | ResolvedType::Bool
+        | ResolvedType::String
+        | ResolvedType::Bytes
+        | ResolvedType::Mixed
+        | ResolvedType::Void
+        | ResolvedType::Null
+        | ResolvedType::TypeParameter(_)
+        | ResolvedType::Unsupported => 1,
+    }
 }
 
 fn type_substitutions(

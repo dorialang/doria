@@ -886,8 +886,7 @@ impl Checker<'_> {
                 type_ref_class_name(&param.ty, &self.classes, self.receiver_class.as_deref());
             let mixed = param.ty.name == "mixed";
             if type_ref_is_move_type(&param.ty, &self.classes, self.receiver_class.as_deref())
-                || ((param.take || param.writable)
-                    && type_ref_mentions_parameter(&param.ty, &function.type_params))
+                || type_ref_mentions_parameter(&param.ty, &function.type_params)
             {
                 scopes.declare(
                     param.name.clone(),

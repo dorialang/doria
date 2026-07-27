@@ -215,6 +215,98 @@ function main(): void {}
 }
 
 #[test]
+fn readonly_generic_parameters_are_tracked_as_potential_move_borrows() {
+    let errors = diagnostics(
+        r#"
+function append<T>(writable List<T> $items, T $value): void
+{
+    $items->add($value);
+}
+function main(): void {}
+"#,
+    );
+    assert!(errors.iter().any(|diagnostic| {
+        diagnostic.code == "E0474"
+            && diagnostic.message.contains("$value")
+            && diagnostic.message.contains("cannot be given away")
+    }));
+}
+
+#[test]
+fn generic_inference_rejects_null_and_void_as_value_types() {
+    let errors = diagnostics(
+        r#"
+function consume<T>(T $value): void {}
+function nothing(): void {}
+function main(): void
+{
+    consume(null);
+    consume(nothing());
+}
+"#,
+    );
+    assert!(errors.iter().any(|diagnostic| {
+        diagnostic.code == "E0538"
+            && diagnostic.message.contains("from `null`")
+            && diagnostic.message.contains("nullable expected type")
+    }));
+    assert!(errors.iter().any(|diagnostic| {
+        diagnostic.code == "E0538" && diagnostic.message.contains("from a `void` expression")
+    }));
+}
+
+#[test]
+fn displayable_protocol_method_cannot_be_generic() {
+    let errors = diagnostics(
+        r#"
+class Label implements Displayable
+{
+    function toString<T>(): string { return "label"; }
+}
+function main(): void {}
+"#,
+    );
+    assert!(errors.iter().any(|diagnostic| {
+        diagnostic.code == "E0463"
+            && diagnostic
+                .message
+                .contains("incompatible `Displayable::toString`")
+    }));
+}
+
+#[test]
+fn expanding_recursive_specializations_fail_finitely() {
+    let errors = doriac::lower_source_to_mir(
+        "stage24-expanding-recursion.doria",
+        r#"
+function grow<T>(take T $value): void
+{
+    grow([$value]);
+}
+function main(): void { grow(1); }
+"#,
+    )
+    .expect_err("recursive type growth has no finite monomorphization");
+    assert!(errors.iter().any(|diagnostic| {
+        diagnostic.code == "E0539"
+            && diagnostic.message.contains("recursively expands")
+            && diagnostic.message.contains("finite monomorphization")
+    }));
+
+    doriac::lower_source_to_mir(
+        "stage24-bounded-recursion.doria",
+        r#"
+function normalize<T>(T $value): void
+{
+    normalize(1);
+}
+function main(): void { normalize("value"); }
+"#,
+    )
+    .expect("a bounded type-changing recursive call should monomorphize finitely");
+}
+
+#[test]
 fn property_initializers_contribute_reachable_specializations() {
     let source = r#"
 function identity<T>(T $value): T { return $value; }
@@ -239,7 +331,7 @@ function main(): int
 #[test]
 fn inferred_collection_locals_are_interned_per_specialization() {
     let source = r#"
-function countWrapped<T>(T $value): int
+function countWrapped<T>(take T $value): int
 {
     let $items = [$value];
     return $items->count;

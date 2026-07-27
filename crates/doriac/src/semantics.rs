@@ -882,6 +882,7 @@ impl<'program> Checker<'program> {
         let valid = method.access == MemberAccess::External
             && method.receiver_mode == Some(ReceiverMode::Readonly)
             && !method.is_static
+            && method.type_params.is_empty()
             && method.params.is_empty()
             && matches!(self.types.kind(method.return_ty), TypeKind::String);
         if !valid {
@@ -6475,6 +6476,40 @@ impl<'program> Checker<'program> {
             self.types.kind(pattern).clone(),
             self.types.kind(actual).clone(),
         ) {
+            (TypeKind::TypeParameter(name), TypeKind::Null) => {
+                let message = format!(
+                    "cannot infer type parameter `{name}` of {callee} from `null`; `null` requires a nullable expected type"
+                );
+                if !self.diagnostics.iter().any(|diagnostic| {
+                    diagnostic.code == "E0538"
+                        && diagnostic.span == span
+                        && diagnostic.message == message
+                }) {
+                    self.diagnostics
+                        .push(Diagnostic::new("E0538", message, span).with_help(
+                            "pass a value with a concrete type or use a nullable parameter shape",
+                        ));
+                }
+                let unknown = self.types.unknown();
+                bindings.entry(name).or_insert(unknown);
+            }
+            (TypeKind::TypeParameter(name), TypeKind::Void) => {
+                let message = format!(
+                    "cannot infer type parameter `{name}` of {callee} from a `void` expression"
+                );
+                if !self.diagnostics.iter().any(|diagnostic| {
+                    diagnostic.code == "E0538"
+                        && diagnostic.span == span
+                        && diagnostic.message == message
+                }) {
+                    self.diagnostics.push(
+                        Diagnostic::new("E0538", message, span)
+                            .with_help("pass an expression that produces a value"),
+                    );
+                }
+                let unknown = self.types.unknown();
+                bindings.entry(name).or_insert(unknown);
+            }
             (TypeKind::TypeParameter(name), TypeKind::Unknown | TypeKind::EmptyCollection) => {
                 let _ = name;
             }
