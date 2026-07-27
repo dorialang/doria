@@ -78,7 +78,8 @@ function main(): int
     bool $either = $ready or false;
     bool $different = $either xor false;
     bool $same = $different == true;
-    if ($same) {
+    bool $ordered = false < $different;
+    if ($same && $ordered) {
         return 42;
     }
     return 0;
@@ -92,7 +93,6 @@ fn rejects_bool_numeric_behavior_truthiness_and_nonportable_main() {
     for source in [
         "bool $value = 1;",
         "int $value = true;",
-        "bool $a = true; bool $b = false; let $value = $a < $b;",
         "bool $a = true; let $value = $a + true;",
         "writable bool $a = true; $a++;",
         "function main(): int { if (1) { return 42; } return 0; }",

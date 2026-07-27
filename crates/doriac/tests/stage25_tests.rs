@@ -1,0 +1,1154 @@
+use doriac::ast::Item;
+use doriac::backend::BackendTarget;
+use doriac::const_eval::{ConstKey, ConstValue};
+
+fn diagnostics(source: &str) -> Vec<doriac::diagnostics::Diagnostic> {
+    doriac::check_source("stage25.doria", source).expect_err("source should be rejected")
+}
+
+#[test]
+fn parses_generic_class_parameters_constraints_and_instantiations() {
+    let program = doriac::parse_source(
+        "stage25-syntax.doria",
+        r#"
+class Box<T, U implements Comparable<U>>
+{
+    T $left;
+    U $right;
+}
+function accept(Box<int, string> $value): void {}
+"#,
+    )
+    .expect("Stage 25 generic class syntax should parse without errors");
+
+    let Item::Class(class) = &program.items[0] else {
+        panic!("first declaration should be the generic class");
+    };
+    assert_eq!(class.type_params.len(), 2);
+    assert_eq!(
+        class.type_params[1].constraints[0].to_string(),
+        "Comparable<U>"
+    );
+}
+
+#[test]
+fn generic_class_member_types_are_substituted_at_use_sites() {
+    let mir = doriac::lower_source_to_mir(
+        "stage25-check.doria",
+        r#"
+class Box<T>
+{
+    function __construct(take T $value) {}
+}
+function main(): int
+{
+    Box<int> $box = new Box<int>(42);
+    return $box->value;
+}
+"#,
+    )
+    .expect("generic class construction and property access should lower");
+    let output = doriac::mir_interpreter::interpret(&mir)
+        .expect("generic class construction should execute");
+    assert_eq!(output.exit_status, 42);
+}
+
+#[test]
+fn concrete_copy_property_reads_do_not_inherit_symbolic_move_classification() {
+    let mir = doriac::lower_source_to_mir(
+        "stage25-copy-property.doria",
+        r#"
+class Box<T>
+{
+    function __construct(take T $value) {}
+}
+function main(): int
+{
+    let $box = new Box<int>(42);
+    int $number = $box->value;
+    return $number;
+}
+"#,
+    )
+    .expect("a concrete Copy specialization should read its property without moving it");
+    let output = doriac::mir_interpreter::interpret(&mir)
+        .expect("the specialized Copy property read should execute");
+    assert_eq!(output.exit_status, 42);
+}
+
+#[test]
+fn writable_paths_specialize_generic_method_returns() {
+    doriac::check_source(
+        "stage25-writable-generic-return.doria",
+        r#"
+class Child
+{
+    writable function touch(): void {}
+}
+class Box<T>
+{
+    function value(writable T $candidate): T
+    {
+        return $candidate;
+    }
+}
+function main(): void
+{
+    let $box = new Box<Child>();
+    writable Child $child = new Child();
+    $box->value($child)->touch();
+}
+"#,
+    )
+    .expect("a writable borrow of concrete T should retain the class specialization");
+}
+
+#[test]
+fn narrowing_retains_generic_class_identity_for_method_effects() {
+    doriac::check_source(
+        "stage25-generic-narrowing.doria",
+        r#"
+class Box<T>
+{
+    function touch(mixed $value): void {}
+}
+class Other
+{
+    function touch(writable mixed $value): void {}
+}
+function consumeString(string $value): void {}
+function main(): void
+{
+    Box<int> $box = new Box<int>();
+    mixed $value = "narrowed";
+    if ($value is string) {
+        $box->touch($value);
+        consumeString($value);
+    }
+}
+"#,
+    )
+    .expect("an unrelated same-named writable method must not invalidate a generic class call");
+}
+
+#[test]
+fn class_constraints_are_checked_at_instantiation() {
+    let errors = diagnostics(
+        r#"
+class Sorted<T implements Comparable<T>> {}
+function main(): void
+{
+    let $invalid = new Sorted<float>();
+}
+"#,
+    );
+    assert!(errors.iter().any(|diagnostic| {
+        diagnostic.code == "E0535"
+            && diagnostic.message.contains("float")
+            && diagnostic.message.contains("Comparable")
+    }));
+}
+
+#[test]
+fn default_type_arguments_are_retained_for_a_decision_named_diagnostic() {
+    let errors = diagnostics(
+        r#"
+class Box<T = int> {}
+function main(): void {}
+"#,
+    );
+    assert!(errors.iter().any(|diagnostic| {
+        diagnostic.code == "E0534" && diagnostic.message.contains("decision 0105")
+    }));
+}
+
+#[test]
+fn generic_class_methods_are_specialized_per_class_instantiation() {
+    let mir = doriac::lower_source_to_mir(
+        "stage25-methods.doria",
+        r#"
+class Box<T>
+{
+    function __construct(take T $value) {}
+
+    function get(): T
+    {
+        return $this->value;
+    }
+
+    function choose<U>(U $value): U
+    {
+        return $value;
+    }
+}
+function main(): int
+{
+    let $number = new Box<int>(41);
+    let $word = new Box<string>("generic");
+    echo $word->get() . "\n";
+    return $number->get() + $number->choose(1);
+}
+"#,
+    )
+    .expect("generic class and method specializations should lower");
+    let output = doriac::mir_interpreter::interpret(&mir)
+        .expect("generic class and method specializations should execute");
+    assert_eq!(output.stdout, b"generic\n");
+    assert_eq!(output.exit_status, 42);
+    assert_eq!(
+        mir.classes
+            .iter()
+            .filter(|class| class.name.starts_with("Box<"))
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn generic_class_drop_glue_uses_the_substituted_field_type() {
+    let mir = doriac::lower_source_to_mir(
+        "stage25-drop.doria",
+        r#"
+class Token
+{
+    function __construct(string $name) {}
+    function __destruct() { echo "<drop:" . $this->name . ">\n"; }
+}
+class Box<T>
+{
+    function __construct(take T $value) {}
+}
+function main(): void
+{
+    let $number = new Box<int>(42);
+    let $token = new Box<Token>(new Token("owned"));
+}
+"#,
+    )
+    .expect("generic class field drop glue should lower");
+    let output = doriac::mir_interpreter::interpret(&mir)
+        .expect("generic class field drop glue should execute");
+    assert_eq!(output.stdout, b"<drop:owned>\n");
+}
+
+#[test]
+fn user_defined_constraints_are_deferred_to_stage_35() {
+    let errors = diagnostics(
+        r#"
+class Box<T implements UserConstraint> {}
+function main(): void {}
+"#,
+    );
+    assert!(errors.iter().any(|diagnostic| {
+        diagnostic.code == "E0533"
+            && diagnostic.message.contains("UserConstraint")
+            && diagnostic.message.contains("Stage 35")
+    }));
+}
+
+#[test]
+fn generic_class_instantiations_are_invariant_move_types() {
+    let invariant = diagnostics(
+        r#"
+class Cat {}
+class Animal {}
+class Box<T> { function __construct(take T $value) {} }
+function main(): void
+{
+    Box<Cat> $cats = new Box<Cat>(new Cat());
+    Box<Animal> $animals = $cats;
+}
+"#,
+    );
+    assert!(invariant.iter().any(|diagnostic| {
+        diagnostic.code == "E0403"
+            && diagnostic.message.contains("Box<Cat>")
+            && diagnostic.message.contains("Box<Animal>")
+    }));
+
+    let moved = diagnostics(
+        r#"
+class Box<T> { function __construct(take T $value) {} }
+function consume(take Box<int> $value): void {}
+function main(): void
+{
+    let $box = new Box<int>(42);
+    consume($box);
+    consume($box);
+}
+"#,
+    );
+    assert!(moved.iter().any(|diagnostic| {
+        diagnostic.code == "E0470"
+            && diagnostic
+                .message
+                .contains("after its value was given away")
+    }));
+}
+
+#[test]
+fn value_arguments_parse_then_receive_the_decision_0105_fence() {
+    let errors = diagnostics(
+        r#"
+class Buffer<T> {}
+function consume(Buffer<float32, 4096> $buffer): void {}
+function main(): void {}
+"#,
+    );
+    assert!(errors.iter().any(|diagnostic| {
+        diagnostic.code == "E0536"
+            && diagnostic.message.contains("decision 0105")
+            && diagnostic.message.contains("4096")
+    }));
+    assert!(
+        errors
+            .iter()
+            .all(|diagnostic| !diagnostic.code.starts_with('P')),
+        "reserved value-argument syntax must pass the parser clock"
+    );
+}
+
+#[test]
+fn nested_generic_class_instantiations_round_trip_through_collections() {
+    let mir = doriac::lower_source_to_mir(
+        "stage25-nested.doria",
+        r#"
+class Pair<T, U>
+{
+    function __construct(take T $left, take U $right) {}
+}
+function main(): int
+{
+    writable List<Pair<int, string>> $pairs = [new Pair<int, string>(42, "answer")];
+    Pair<int, string> $pair = $pairs->removeAt(0);
+    echo $pair->right . "\n";
+    return $pair->left;
+}
+"#,
+    )
+    .expect("nested generic class instantiations should lower");
+    let output = doriac::mir_interpreter::interpret(&mir)
+        .expect("nested generic class instantiations should execute");
+    assert_eq!(output.stdout, b"answer\n");
+    assert_eq!(output.exit_status, 42);
+}
+
+#[test]
+fn history_generic_class_specializes_collection_members() {
+    let mir = doriac::lower_source_to_mir(
+        "stage25-history.doria",
+        r#"
+class History<T>
+{
+    internal writable List<T> $entries = [];
+
+    writable function push(take T $entry): void
+    {
+        $this->entries->add($entry);
+    }
+
+    writable function pop(): ?T
+    {
+        return $this->entries->pop();
+    }
+}
+function main(): int
+{
+    writable History<int> $numbers = new History<int>();
+    $numbers->push(42);
+    ?int $number = $numbers->pop();
+    if ($number != null) { return $number; }
+    return 0;
+}
+"#,
+    )
+    .expect("History<int> should specialize its List<T> member");
+    let output = doriac::mir_interpreter::interpret(&mir).expect("History<int> should execute");
+    assert_eq!(output.exit_status, 42);
+}
+
+#[test]
+fn native_fixture_covers_history_nested_layout_and_drop_specializations() {
+    let source = include_str!("../../../examples/native/main_stage25_generic_classes.doria");
+    let mir = doriac::lower_source_to_mir("stage25-native.doria", source)
+        .expect("the Stage 25 native fixture should lower through shared MIR");
+    let output = doriac::mir_interpreter::interpret(&mir)
+        .expect("the Stage 25 native fixture should execute");
+    assert_eq!(output.exit_status, 0);
+    assert_eq!(
+        output.stdout,
+        b"42\ngeneric\nnested:7\n1:2:1\ntrue:true\n<drop:history>\n"
+    );
+}
+
+#[test]
+fn class_body_instantiations_are_specialized_transitively() {
+    let mir = doriac::lower_source_to_mir(
+        "stage25-transitive.doria",
+        r#"
+class Inner<T>
+{
+}
+class Outer<T>
+{
+    function pass(Inner<T> $inner): Inner<T>
+    {
+        return $inner;
+    }
+}
+function main(): int
+{
+    let $outer = new Outer<int>();
+    return 42;
+}
+"#,
+    )
+    .expect("class-body generic instantiations should specialize with their owner");
+    let output = doriac::mir_interpreter::interpret(&mir)
+        .expect("transitively-specialized generic classes should execute");
+    assert_eq!(output.exit_status, 42);
+    assert!(mir.classes.iter().any(|class| class.name == "Inner<int>"));
+}
+
+#[test]
+fn generic_callable_body_instantiations_are_specialized_at_the_call_site() {
+    let mir = doriac::lower_source_to_mir(
+        "stage25-callable-transitive.doria",
+        r#"
+class Box<T>
+{
+    function __construct(take T $value) {}
+}
+function discard<T>(take T $value): void
+{
+    let $box = new Box<T>($value);
+}
+function main(): int
+{
+    discard(42);
+    return 7;
+}
+"#,
+    )
+    .expect("generic callable bodies should publish reached class instantiations");
+    let output = doriac::mir_interpreter::interpret(&mir)
+        .expect("callable-body generic class instantiations should execute");
+    assert_eq!(output.exit_status, 7);
+    assert!(mir.classes.iter().any(|class| class.name == "Box<int>"));
+}
+
+#[test]
+fn generic_callable_instantiations_follow_transitive_calls() {
+    let mir = doriac::lower_source_to_mir(
+        "stage25-callable-chain.doria",
+        r#"
+class Holder<T>
+{
+    function __construct(take T $value) {}
+    function get(): T { return $this->value; }
+}
+function inner<U>(take U $value): Holder<U>
+{
+    return new Holder<U>($value);
+}
+function outer<T>(take T $value): Holder<T>
+{
+    return inner($value);
+}
+function main(): int
+{
+    let $holder = outer(42);
+    return $holder->get();
+}
+"#,
+    )
+    .expect("concrete generic calls should specialize class templates in transitive callees");
+    let output = doriac::mir_interpreter::interpret(&mir)
+        .expect("transitively-specialized generic callable bodies should execute");
+    assert_eq!(output.exit_status, 42);
+    assert!(mir.classes.iter().any(|class| class.name == "Holder<int>"));
+}
+
+#[test]
+fn promoted_generic_parameters_require_ownership_transfer() {
+    let source = "class Box<T> { function __construct(T $value) {} }";
+    let errors = doriac::check_source("stage25-generic-promotion.doria", source)
+        .expect_err("a promoted T may specialize to a move type");
+    let diagnostic = errors
+        .iter()
+        .find(|diagnostic| diagnostic.code == "E0468")
+        .expect("generic promotion should require take");
+    assert_eq!(
+        diagnostic
+            .fix
+            .as_ref()
+            .expect("generic promotion should offer a fix")
+            .replacement,
+        "take "
+    );
+
+    doriac::check_source(
+        "stage25-generic-promotion-take.doria",
+        "class Box<T> { function __construct(take T $value) {} }",
+    )
+    .expect("take makes generic property promotion ownership-safe");
+}
+
+#[test]
+fn generic_property_initializer_calls_do_not_require_an_explicit_constructor() {
+    let mir = doriac::lower_source_to_mir(
+        "stage25-implicit-constructor-initializer.doria",
+        r#"
+function empty<T>(): List<T> { return []; }
+class History<T>
+{
+    List<T> $entries = empty();
+}
+function main(): int
+{
+    let $history = new History<int>();
+    return $history->entries->count;
+}
+"#,
+    )
+    .expect("concrete class instances should seed generic property-initializer calls");
+    let output = doriac::mir_interpreter::interpret(&mir)
+        .expect("the implicit constructor should execute the specialized initializer");
+    assert_eq!(output.exit_status, 0);
+}
+
+#[test]
+fn external_static_access_requires_a_concrete_generic_class_identity() {
+    let errors = diagnostics(
+        r#"
+class Box<T>
+{
+    static int $count = 42;
+    static function answer(): int { return self::count; }
+}
+function main(): int
+{
+    let $box = new Box<int>();
+    return Box::answer();
+}
+"#,
+    );
+    let diagnostic = errors
+        .iter()
+        .find(|diagnostic| diagnostic.code == "E0540")
+        .expect("bare generic static access should be rejected before MIR");
+    assert!(diagnostic.message.contains("concrete specialization"));
+    assert!(diagnostic
+        .help
+        .as_deref()
+        .is_some_and(|help| help.contains("self::answer")));
+}
+
+#[test]
+fn substituted_nested_class_instantiations_recheck_constraints() {
+    let errors = diagnostics(
+        r#"
+class Sorted<T implements Comparable<T>> {}
+class Outer<T>
+{
+    function create(): void
+    {
+        let $sorted = new Sorted<T>();
+    }
+}
+function main(): void
+{
+    let $outer = new Outer<float>();
+}
+"#,
+    );
+    assert!(errors.iter().any(|diagnostic| {
+        diagnostic.code == "E0535"
+            && diagnostic.message.contains("float")
+            && diagnostic.message.contains("Comparable")
+    }));
+}
+
+#[test]
+fn php_backend_rejects_generic_classes_explicitly() {
+    let errors = doriac::compile_source(
+        "stage25-php.doria",
+        r#"
+class Box<T> { function __construct(take T $value) {} }
+function main(): void { let $box = new Box<int>(42); }
+"#,
+        BackendTarget::Php,
+    )
+    .expect_err("the PHP compatibility backend should reject generic classes");
+    assert!(errors.iter().any(|diagnostic| {
+        diagnostic.code == "B2401"
+            && diagnostic.message.contains("generic class specialization")
+            && diagnostic.message.contains("native target")
+    }));
+}
+
+#[test]
+fn generic_bodies_use_only_the_surface_guaranteed_by_constraints() {
+    let mir = doriac::lower_source_to_mir(
+        "stage25-constrained-body.doria",
+        r#"
+class Label implements Displayable
+{
+    function __construct(string $value) {}
+    function toString(): string { return $this->value; }
+}
+class Plain
+{
+    function toString(): string { return "ordinary"; }
+}
+function render<T implements Displayable>(T $value): string
+{
+    return $value->toString();
+}
+function main(): void
+{
+    echo render(42) . "\n";
+    echo render("text") . "\n";
+    echo render(new Label("class")) . "\n";
+    echo (new Plain())->toString() . "\n";
+}
+"#,
+    )
+    .expect("Displayable should expose toString inside a constrained generic body");
+    let output = doriac::mir_interpreter::interpret(&mir)
+        .expect("constrained generic bodies should specialize without boxing");
+    assert_eq!(output.stdout, b"42\ntext\nclass\nordinary\n");
+
+    let errors = diagnostics(
+        r#"
+function invalid<T>(T $value): void
+{
+    $value->missing();
+    echo $value->field;
+}
+function main(): void {}
+"#,
+    );
+    assert!(errors.iter().any(|diagnostic| {
+        diagnostic.code == "E0537" && diagnostic.message.contains("method `missing`")
+    }));
+    assert!(errors.iter().any(|diagnostic| {
+        diagnostic.code == "E0537" && diagnostic.message.contains("property `field`")
+    }));
+
+    let unconstrained_operations = diagnostics(
+        r#"
+function compare<T>(T $left, T $right): bool
+{
+    Set<T> $values = [$left];
+    return $left == $right;
+}
+function main(): void {}
+"#,
+    );
+    assert!(unconstrained_operations.iter().any(|diagnostic| {
+        diagnostic.code == "E0537"
+            && diagnostic
+                .message
+                .contains("not guaranteed to implement `Hashable`")
+    }));
+    assert!(unconstrained_operations.iter().any(|diagnostic| {
+        diagnostic.code == "E0537" && diagnostic.message.contains("equality is not guaranteed")
+    }));
+}
+
+#[test]
+fn generic_method_parameters_cannot_shadow_class_parameters() {
+    let errors = diagnostics(
+        r#"
+class Box<T>
+{
+    function choose<T>(T $value): T { return $value; }
+}
+function main(): void {}
+"#,
+    );
+    assert!(errors.iter().any(|diagnostic| {
+        diagnostic.code == "E0530"
+            && diagnostic.message.contains("shadows")
+            && diagnostic.message.contains("Box::choose")
+    }));
+}
+
+#[test]
+fn compiler_known_constraint_arguments_are_substituted_and_checked() {
+    doriac::check_source(
+        "stage25-constraint-self.doria",
+        r#"
+function constrained<T implements Comparable<T>>(T $value): T { return $value; }
+function main(): int { return constrained(42); }
+"#,
+    )
+    .expect("the constrained type itself should satisfy Comparable<T>");
+
+    let errors = diagnostics(
+        r#"
+function constrained<T implements Comparable<string>>(T $value): T { return $value; }
+function main(): int { return constrained(42); }
+"#,
+    );
+    assert!(errors.iter().any(|diagnostic| {
+        diagnostic.code == "E0535"
+            && diagnostic.message.contains("int")
+            && diagnostic.message.contains("Comparable<string>")
+    }));
+
+    let class_errors = diagnostics(
+        r#"
+class Sorted<T implements Comparable<string>> {}
+function main(): void { let $sorted = new Sorted<int>(); }
+"#,
+    );
+    assert!(class_errors.iter().any(|diagnostic| {
+        diagnostic.code == "E0535"
+            && diagnostic.message.contains("int")
+            && diagnostic.message.contains("Comparable<string>")
+    }));
+}
+
+#[test]
+fn compiler_known_constraint_declarations_validate_argument_shape_and_types() {
+    let errors = diagnostics(
+        r#"
+function invalidHash<T implements Hashable<T>>(T $value): T { return $value; }
+function invalidDisplay<T implements Displayable<int>>(T $value): T { return $value; }
+function invalidCompare<T implements Comparable<Missing>>(T $value): T { return $value; }
+function main(): void {}
+"#,
+    );
+    assert!(errors.iter().any(|diagnostic| {
+        diagnostic.code == "E0530"
+            && diagnostic.message.contains("Hashable")
+            && diagnostic.message.contains("no type arguments")
+    }));
+    assert!(errors.iter().any(|diagnostic| {
+        diagnostic.code == "E0530"
+            && diagnostic.message.contains("Displayable")
+            && diagnostic.message.contains("no type arguments")
+    }));
+    assert!(errors.iter().any(|diagnostic| {
+        diagnostic.code == "E0401" && diagnostic.message.contains("Missing")
+    }));
+
+    doriac::check_source(
+        "stage25-valid-constraint-declarations.doria",
+        r#"
+function hash<T implements Hashable>(T $value): T { return $value; }
+function display<T implements Displayable>(T $value): T { return $value; }
+function compare<T implements Comparable<T>>(T $value): T { return $value; }
+function equal<T implements Equatable<int>>(T $value): T { return $value; }
+function main(): void {}
+"#,
+    )
+    .expect("valid compiler-known constraint declarations should remain accepted");
+}
+
+#[test]
+fn comparable_constraints_enable_relational_operators() {
+    let mir = doriac::lower_source_to_mir(
+        "stage25-comparable.doria",
+        r#"
+function maximum<T implements Comparable<T>>(T $left, T $right): T
+{
+    if ($left >= $right) { return $left; }
+    return $right;
+}
+function main(): int { return maximum(42, 7); }
+"#,
+    )
+    .expect("Comparable<T> should guarantee relational operators");
+    let output = doriac::mir_interpreter::interpret(&mir)
+        .expect("the specialized comparison should execute");
+    assert_eq!(output.exit_status, 42);
+}
+
+#[test]
+fn comparable_constraints_honor_their_declared_operand_type() {
+    let mir = doriac::lower_source_to_mir(
+        "stage25-comparable-operand.doria",
+        r#"
+function below<T implements Comparable<int>>(T $value): bool
+{
+    return $value < 0;
+}
+function above<T implements Comparable<int>>(T $value): bool
+{
+    return 0 < $value;
+}
+function main(): int
+{
+    if (below(-1) && above(1)) { return 42; }
+    return 1;
+}
+"#,
+    )
+    .expect("Comparable<int> should guarantee comparisons with int operands");
+    let output = doriac::mir_interpreter::interpret(&mir)
+        .expect("the specialized comparisons should execute");
+    assert_eq!(output.exit_status, 42);
+
+    let errors = diagnostics(
+        r#"
+function invalid<T implements Comparable<int>>(T $value): bool
+{
+    return $value < "not an int";
+}
+function main(): void {}
+"#,
+    );
+    assert!(errors
+        .iter()
+        .any(|diagnostic| diagnostic.code == "E0441" && diagnostic.message.contains("comparison")));
+}
+
+#[test]
+fn equatable_constraints_honor_their_declared_operand_type() {
+    let mir = doriac::lower_source_to_mir(
+        "stage25-equatable-operand.doria",
+        r#"
+function equalsZero<T implements Equatable<int>>(T $value): bool
+{
+    return $value == 0;
+}
+function zeroEquals<T implements Equatable<int>>(T $value): bool
+{
+    return 0 == $value;
+}
+function equal<T implements Equatable<int>>(T $left, T $right): bool
+{
+    return $left == $right;
+}
+function main(): int
+{
+    if (equalsZero(0) && zeroEquals(0) && equal(1, 1)) { return 42; }
+    return 1;
+}
+"#,
+    )
+    .expect("Equatable<int> should guarantee equality with int operands");
+    let output =
+        doriac::mir_interpreter::interpret(&mir).expect("the specialized equality should execute");
+    assert_eq!(output.exit_status, 42);
+
+    let errors = diagnostics(
+        r#"
+function invalid<T implements Equatable<int>>(T $value): bool
+{
+    return $value == "not an int";
+}
+function main(): void {}
+"#,
+    );
+    assert!(errors.iter().any(|diagnostic| {
+        diagnostic.code == "E0537" && diagnostic.message.contains("equality")
+    }));
+}
+
+#[test]
+fn bool_comparable_specializations_use_the_canonical_false_before_true_order() {
+    let mir = doriac::lower_source_to_mir(
+        "stage25-bool-comparable.doria",
+        r#"
+function atLeast<T implements Comparable<T>>(T $left, T $right): bool
+{
+    return $left >= $right;
+}
+function main(): int
+{
+    if (atLeast(true, false) && false < true && true >= true) { return 42; }
+    return 1;
+}
+"#,
+    )
+    .expect("bool Comparable specializations should lower ordered comparisons");
+    let output =
+        doriac::mir_interpreter::interpret(&mir).expect("bool ordered comparisons should execute");
+    assert_eq!(output.exit_status, 42);
+}
+
+#[test]
+fn recursively_expanding_class_specializations_are_rejected() {
+    let errors = diagnostics(
+        r#"
+class Node<T>
+{
+    ?Node<List<T>> $next = null;
+}
+function main(): void
+{
+    let $node = new Node<int>();
+}
+"#,
+    );
+    assert!(errors.iter().any(|diagnostic| {
+        diagnostic.code == "E0539"
+            && diagnostic.message.contains("Node")
+            && diagnostic.message.contains("no finite monomorphization")
+    }));
+}
+
+#[test]
+fn self_types_and_static_calls_preserve_the_enclosing_specialization() {
+    let source = r#"
+class Box<T>
+{
+    function __construct(take T $value) {}
+
+    static function identity(T $value): T { return $value; }
+
+    function same(): self { return $this; }
+
+    function choose(T $value): T
+    {
+        return self::identity($value);
+    }
+}
+function main(): int
+{
+    let $box = new Box<int>(40);
+    return $box->value + $box->choose(2);
+}
+"#;
+    let hir = doriac::lower_source("stage25-self.doria", source)
+        .expect("self should retain Box<T> through HIR");
+    let doriac::hir::Item::Class(class) = &hir.items[0] else {
+        panic!("expected generic class");
+    };
+    let same = class
+        .members
+        .iter()
+        .find_map(|member| match member {
+            doriac::hir::ClassMember::Method(method) if method.name == "same" => Some(method),
+            _ => None,
+        })
+        .expect("same method");
+    assert_eq!(
+        same.return_type
+            .as_ref()
+            .map(ToString::to_string)
+            .as_deref(),
+        Some("Box<T>")
+    );
+
+    let mir = doriac::lower_source_to_mir("stage25-self.doria", source)
+        .expect("self should retain Box<T> through HIR and static call lowering");
+    let output =
+        doriac::mir_interpreter::interpret(&mir).expect("specialized self calls should execute");
+    assert_eq!(output.exit_status, 42);
+}
+
+#[test]
+fn self_constructor_targets_preserve_the_declaring_class() {
+    let mir = doriac::lower_source_to_mir(
+        "stage25-new-self.doria",
+        r#"
+class Token
+{
+    function fresh(): self { return new self(); }
+}
+class Box<T>
+{
+    function fresh(): self { return new self(); }
+}
+function main(): int
+{
+    let $token = new Token();
+    let $freshToken = $token->fresh();
+    let $box = new Box<int>();
+    let $freshBox = $box->fresh();
+    return 42;
+}
+"#,
+    )
+    .expect("new self should resolve ordinary and generic declaring classes");
+    let output = doriac::mir_interpreter::interpret(&mir)
+        .expect("new self should execute through the current specialization");
+    assert_eq!(output.exit_status, 42);
+}
+
+#[test]
+fn self_static_properties_resolve_against_each_enclosing_specialization() {
+    let mir = doriac::lower_source_to_mir(
+        "stage25-self-static-property.doria",
+        r#"
+class Counter<T>
+{
+    static writable int $count = 0;
+
+    function next(): int
+    {
+        self::count = self::count + 1;
+        return self::count;
+    }
+}
+function main(): int
+{
+    let $numbers = new Counter<int>();
+    let $words = new Counter<string>();
+    if ($numbers->next() == 1 && $numbers->next() == 2 && $words->next() == 1) {
+        return 42;
+    }
+    return 1;
+}
+"#,
+    )
+    .expect("self static properties should retain the enclosing class specialization");
+    let output = doriac::mir_interpreter::interpret(&mir)
+        .expect("specialized self static properties should execute");
+    assert_eq!(output.exit_status, 42);
+}
+
+#[test]
+fn ownership_checks_class_type_parameters_in_method_signatures() {
+    let errors = diagnostics(
+        r#"
+class Token
+{
+    function __construct(string $name) {}
+}
+class Sink<T>
+{
+    function consume(take T $value): void {}
+}
+function main(): void
+{
+    let $token = new Token("owned");
+    let $sink = new Sink<Token>();
+    $sink->consume($token);
+    echo $token->name;
+}
+"#,
+    );
+    assert!(errors.iter().any(|diagnostic| {
+        diagnostic.code == "E0470"
+            && diagnostic
+                .message
+                .contains("after its value was given away")
+    }));
+}
+
+#[test]
+fn ownership_treats_class_type_parameter_properties_as_potential_move_values() {
+    let errors = diagnostics(
+        r#"
+function discard<T>(take T $value): void {}
+class Box<T>
+{
+    function __construct(take T $value) {}
+    function discardValue(): void { discard($this->value); }
+}
+function main(): void {}
+"#,
+    );
+    assert!(errors.iter().any(|diagnostic| {
+        diagnostic.code == "E0472"
+            && diagnostic
+                .message
+                .contains("direct moves out of owned properties")
+    }));
+}
+
+#[test]
+fn ownership_propagates_symbolic_move_types_into_collection_elements() {
+    let errors = diagnostics(
+        r#"
+class Token {}
+class Box<T>
+{
+    List<T> $items = [];
+
+    function first(): T
+    {
+        return $this->items[0];
+    }
+}
+function main(): void {}
+"#,
+    );
+    assert!(errors.iter().any(|diagnostic| {
+        diagnostic.code == "E0478"
+            && diagnostic
+                .message
+                .contains("borrowed result cannot satisfy an owning return")
+    }));
+}
+
+#[test]
+fn nullable_field_instantiated_with_a_nullable_argument_collapses_to_a_single_nullable() {
+    // `?T` where `T = ?int` must normalize to `?int`, not a doubly-nullable
+    // type that native lowering cannot represent.
+    let mir = doriac::lower_source_to_mir(
+        "stage25-nested-nullable.doria",
+        r#"
+class Maybe<T>
+{
+    ?T $value = null;
+}
+function main(): int
+{
+    let $maybe = new Maybe<?int>();
+    if ($maybe->value == null) { return 42; }
+    return 1;
+}
+"#,
+    )
+    .expect("`?T` instantiated with a nullable argument should lower");
+    let output =
+        doriac::mir_interpreter::interpret(&mir).expect("collapsed nullable field should execute");
+    assert_eq!(output.exit_status, 42);
+}
+
+#[test]
+fn constant_bool_relational_comparisons_use_the_canonical_false_before_true_order() {
+    // Relational operators over concrete `bool` operands are accepted in
+    // functions; constant evaluation must agree with `false < true`.
+    let hir = doriac::lower_source(
+        "stage25-const-bool-order.doria",
+        r#"
+const bool ORDERED = false < true;
+const bool NOT_AFTER = true <= true;
+const bool DESCENDING = true > false;
+"#,
+    )
+    .expect("constant bool relational comparisons should evaluate");
+    let values = &hir.semantic_info.const_evaluation.values;
+    for name in ["ORDERED", "NOT_AFTER", "DESCENDING"] {
+        assert!(
+            matches!(
+                values[&ConstKey::TopLevel(name.to_string())].value,
+                ConstValue::Bool(true)
+            ),
+            "{name} should evaluate to true"
+        );
+    }
+}
+
+#[test]
+fn generic_field_nullability_is_specialized_for_coalesce_fallback() {
+    // A promoted `T $value` instantiated as `Box<?int>` can hold `null`, so the
+    // `??` fallback must survive lowering rather than being pruned by a stale
+    // non-null flow fact derived from the unspecialized syntax.
+    let mir = doriac::lower_source_to_mir(
+        "stage25-generic-nullable-coalesce.doria",
+        r#"
+class Box<T>
+{
+    function __construct(take T $value) {}
+}
+function main(): int
+{
+    let $box = new Box<?int>(null);
+    return $box->value ?? 42;
+}
+"#,
+    )
+    .expect("generic nullable field coalesce should lower");
+    let output = doriac::mir_interpreter::interpret(&mir)
+        .expect("generic nullable field coalesce should execute");
+    assert_eq!(output.exit_status, 42);
+}

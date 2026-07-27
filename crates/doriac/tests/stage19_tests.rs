@@ -355,6 +355,7 @@ fn inferred_move_returns_cover_classes_collections_methods_and_forward_calls() {
         "class Guard {} class Factory { function make() { return new Guard(); } } function duplicate(Factory $factory): void { let $first = $factory->make(); let $second = $first; let $third = $first; }",
         "class Guard {} function forward() { return make(); } function make() { return new Guard(); } function duplicate(): void { let $first = forward(); let $second = $first; let $third = $first; }",
         "class Guard {} function make() { Guard[] $items = []; return $items; } function duplicate(): void { let $first = make(); let $second = $first; let $third = $first; }",
+        "class Box<T> { function __construct(take T $value) {} } function make() { Box<int> $value = new Box<int>(42); return $value; } function duplicate(): void { let $first = make(); let $second = $first; let $third = $first; }",
     ] {
         let diagnostics = doriac::check_source("inferred-move-return.doria", source)
             .expect_err("every inferred move return must retain one-owner semantics");

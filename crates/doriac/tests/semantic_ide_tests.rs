@@ -51,7 +51,7 @@ fn exposes_compiler_resolved_method_targets() {
     assert_eq!(
         analysis.info.call_target(call_span),
         Some(&CallableTarget::Method {
-            class_name: "Greeter".to_string(),
+            class_type: doriac::types::ClassType::new("Greeter", Vec::new()),
             method_name: "greet".to_string(),
         })
     );
@@ -83,7 +83,7 @@ fn keeps_resolved_targets_when_other_semantic_diagnostics_exist() {
     assert_eq!(
         analysis.info.call_target(call_span),
         Some(&CallableTarget::Method {
-            class_name: "Greeter".to_string(),
+            class_type: doriac::types::ClassType::new("Greeter", Vec::new()),
             method_name: "greet".to_string(),
         })
     );

@@ -214,7 +214,7 @@ impl NullabilityCatalog {
                                         catalog.record_property(
                                             &class.name,
                                             &parameter.name,
-                                            !parameter.ty.nullable,
+                                            member_is_non_null(&parameter.ty, &class.type_params),
                                         );
                                     }
                                 }
@@ -223,7 +223,7 @@ impl NullabilityCatalog {
                                 catalog.record_property(
                                     &class.name,
                                     &property.name,
-                                    !property.ty.nullable,
+                                    member_is_non_null(&property.ty, &class.type_params),
                                 );
                             }
                             crate::ast::ClassMember::Constant(_) => {}
@@ -323,6 +323,25 @@ impl NullabilityCatalog {
 
 fn declared_return_is_non_null(function: &FunctionDecl) -> Option<bool> {
     function.return_type.as_ref().map(|ty| !ty.nullable)
+}
+
+/// A member whose declared type is a bare class type parameter can become
+/// nullable once the class is instantiated (e.g. `Box<?int>` for `T $value`),
+/// so its nullability cannot be established from the unspecialized syntax.
+fn type_ref_is_type_param(
+    ty: &crate::types::TypeRef,
+    type_params: &[crate::ast::TypeParamDecl],
+) -> bool {
+    type_params.iter().any(|param| param.name == ty.name)
+}
+
+/// Non-null guarantee for a class member, treating members typed by a bare
+/// type parameter conservatively (never guaranteed non-null).
+fn member_is_non_null(
+    ty: &crate::types::TypeRef,
+    type_params: &[crate::ast::TypeParamDecl],
+) -> bool {
+    !ty.nullable && !type_ref_is_type_param(ty, type_params)
 }
 
 fn merge_guarantee(entry: std::collections::hash_map::Entry<'_, String, bool>, incoming: bool) {
@@ -925,12 +944,12 @@ fn kill_mutated_call_arguments(
             );
         }
         Expr::New {
-            class_name, args, ..
+            class_type, args, ..
         } => {
             kill_calls_in_arguments(args, state, resolution, mutations);
             kill_arguments_for_modes(
                 args,
-                mutations.constructor_modes(class_name),
+                mutations.constructor_modes(&class_type.name),
                 state,
                 resolution,
             );
@@ -1412,12 +1431,12 @@ fn collect_expr(
             state
         }
         Expr::New {
-            class_name, args, ..
+            class_type, args, ..
         } => {
             let mut state = collect_expr_sequence(args, state, resolution, mutations, facts);
             kill_arguments_for_modes(
                 args,
-                mutations.constructor_modes(class_name),
+                mutations.constructor_modes(&class_type.name),
                 &mut state,
                 resolution,
             );
@@ -1560,7 +1579,7 @@ fn expression_class_name(
     state: Option<&State>,
 ) -> Option<String> {
     match ungroup(expr) {
-        Expr::New { class_name, .. } => Some(class_name.clone()),
+        Expr::New { class_type, .. } => Some(class_type.name.clone()),
         Expr::This { .. } => resolution.current_class.clone(),
         Expr::Variable { .. } => {
             let binding = variable_binding(expr, resolution)?;
@@ -1672,7 +1691,7 @@ impl Resolver {
             .expect("scope")
             .insert(name.to_string(), id);
         self.resolution.declarations.insert(span_start, id);
-        if let Some(ty) = ty.as_ref().filter(|ty| ty.args.is_empty()) {
+        if let Some(ty) = ty.as_ref() {
             let class_name = if ty.name == "self" {
                 self.resolution
                     .current_class

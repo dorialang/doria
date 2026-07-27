@@ -1,0 +1,75 @@
+class Token
+{
+    function __construct(string $name)
+    {
+    }
+
+    function __destruct()
+    {
+        echo "<drop:" . $this->name . ">\n";
+    }
+}
+
+class History<T>
+{
+    internal writable List<T> $entries = [];
+
+    writable function push(take T $entry): void
+    {
+        $this->entries->add($entry);
+    }
+
+    writable function pop(): ?T
+    {
+        return $this->entries->pop();
+    }
+}
+
+class Pair<T, U>
+{
+    function __construct(take T $left, take U $right)
+    {
+    }
+}
+
+class Counter<T>
+{
+    static writable int $count = 0;
+
+    function next(): int
+    {
+        self::count = self::count + 1;
+        return self::count;
+    }
+}
+
+function atLeast<T implements Comparable<T>>(T $left, T $right): bool
+{
+    return $left >= $right;
+}
+
+function main(): int
+{
+    writable History<int> $numbers = new History<int>();
+    $numbers->push(42);
+    ?int $number = $numbers->pop();
+
+    writable History<string> $words = new History<string>();
+    $words->push("generic");
+    ?string $word = $words->pop();
+
+    writable History<Token> $tokens = new History<Token>();
+    $tokens->push(new Token("history"));
+
+    writable List<Pair<int, string>> $pairs = [new Pair<int, string>(7, "nested")];
+    Pair<int, string> $pair = $pairs->removeAt(0);
+
+    if ($number != null) { echo $number . "\n"; }
+    if ($word != null) { echo $word . "\n"; }
+    echo $pair->right . ":" . $pair->left . "\n";
+    let $numberCounter = new Counter<int>();
+    let $wordCounter = new Counter<string>();
+    echo $numberCounter->next() . ":" . $numberCounter->next() . ":" . $wordCounter->next() . "\n";
+    echo atLeast(true, false) . ":" . (false < true) . "\n";
+    return 0;
+}

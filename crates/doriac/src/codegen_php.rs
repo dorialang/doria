@@ -173,6 +173,13 @@ fn validate_program(program: &Program) -> Result<(), BackendError> {
 fn validate_item(item: &Item, semantic_info: &SemanticInfo) -> Result<(), BackendError> {
     match item {
         Item::Class(class_decl) => {
+            if !class_decl.type_params.is_empty() {
+                return Err(BackendError::from_diagnostics(vec![Diagnostic::new(
+                    PHP_GENERICS_UNSUPPORTED_CODE,
+                    "PHP compatibility output does not support generic class specialization; compile this program for a native target",
+                    class_decl.span,
+                )]));
+            }
             for member in &class_decl.members {
                 match member {
                     ClassMember::Property(property) => {
@@ -365,7 +372,7 @@ fn validate_type(ty: &TypeRef, span: Span) -> Result<(), BackendError> {
             ));
         }
     }
-    for argument in &ty.args {
+    for argument in ty.type_arguments() {
         validate_type(argument, span)?;
     }
     Ok(())
@@ -1840,8 +1847,8 @@ fn emit_expr(expr: &Expr, scopes: &PhpNameScopes) -> String {
             class_name, member, ..
         } => format!("{class_name}::{member}"),
         Expr::New {
-            class_name, args, ..
-        } => format!("new {class_name}({})", emit_arguments(args, scopes)),
+            class_type, args, ..
+        } => format!("new {class_type}({})", emit_arguments(args, scopes)),
         Expr::Grouped { expr, .. } => format!("({})", emit_expr(expr, scopes)),
         Expr::IsType { expr, ty, .. } => {
             let value = emit_expr(expr, scopes);

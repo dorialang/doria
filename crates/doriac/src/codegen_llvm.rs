@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroU32;
+use std::sync::OnceLock;
 
 use inkwell::attributes::AttributeLoc;
 use inkwell::basic_block::BasicBlock;
@@ -46,9 +47,7 @@ use crate::numeric::{FloatType, FloatValue, IntegerPanic, IntegerType, IntegerVa
 
 pub fn lower_mir_to_object(program: &mir::Program) -> Result<Vec<u8>, BackendError> {
     mir_validation::validate_program(program)?;
-    Target::initialize_native(&InitializationConfig::default()).map_err(|error| {
-        backend_failure(format!("failed to initialize host LLVM target: {error}"))
-    })?;
+    initialize_native_target()?;
 
     let triple = TargetMachine::get_default_triple();
     let target = Target::from_triple(&triple)
@@ -115,6 +114,15 @@ pub fn lower_mir_to_object(program: &mir::Program) -> Result<Vec<u8>, BackendErr
         .write_to_memory_buffer(&module, FileType::Object)
         .map_err(|error| backend_failure(format!("LLVM object emission failed: {error}")))?;
     Ok(object.as_slice().to_vec())
+}
+
+fn initialize_native_target() -> Result<(), BackendError> {
+    static INITIALIZATION: OnceLock<Result<(), String>> = OnceLock::new();
+    INITIALIZATION
+        .get_or_init(|| Target::initialize_native(&InitializationConfig::default()))
+        .as_ref()
+        .map_err(|error| backend_failure(format!("failed to initialize host LLVM target: {error}")))
+        .copied()
 }
 
 struct DeclaredProgram<'ctx> {
@@ -5690,21 +5698,12 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                         right.into_float_value(),
                         "float.compare",
                     ))?,
-                    mir::ScalarType::Bool => match op {
-                        mir::CompareOp::Equal | mir::CompareOp::NotEqual => {
-                            build(self.builder.build_int_compare(
-                                if matches!(op, mir::CompareOp::Equal) {
-                                    IntPredicate::EQ
-                                } else {
-                                    IntPredicate::NE
-                                },
-                                left.into_int_value(),
-                                right.into_int_value(),
-                                "bool.compare",
-                            ))?
-                        }
-                        _ => return Err(malformed_mir("ordered bool comparison is invalid")),
-                    },
+                    mir::ScalarType::Bool => build(self.builder.build_int_compare(
+                        bool_compare_predicate(*op),
+                        left.into_int_value(),
+                        right.into_int_value(),
+                        "bool.compare",
+                    ))?,
                 };
                 build(
                     self.builder
@@ -6307,6 +6306,17 @@ fn integer_compare_predicate(op: mir::CompareOp, ty: IntegerType) -> IntPredicat
     }
 }
 
+fn bool_compare_predicate(op: mir::CompareOp) -> IntPredicate {
+    match op {
+        mir::CompareOp::Equal => IntPredicate::EQ,
+        mir::CompareOp::NotEqual => IntPredicate::NE,
+        mir::CompareOp::Less => IntPredicate::ULT,
+        mir::CompareOp::LessEqual => IntPredicate::ULE,
+        mir::CompareOp::Greater => IntPredicate::UGT,
+        mir::CompareOp::GreaterEqual => IntPredicate::UGE,
+    }
+}
+
 fn float_compare_predicate(op: mir::CompareOp) -> FloatPredicate {
     match op {
         mir::CompareOp::Equal => FloatPredicate::OEQ,
@@ -6699,8 +6709,7 @@ mod tests {
 
     #[test]
     fn collection_header_layout_matches_the_runtime_abi() {
-        Target::initialize_native(&InitializationConfig::default())
-            .expect("native LLVM target should initialize");
+        initialize_native_target().expect("native LLVM target should initialize");
         let triple = TargetMachine::get_default_triple();
         let target = Target::from_triple(&triple).expect("host LLVM target should exist");
         let machine = target

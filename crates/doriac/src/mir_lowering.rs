@@ -4,9 +4,12 @@ use crate::class_layout::{compute_class_layout, ClassId, FieldType, PropertyId};
 use crate::diagnostics::{Diagnostic, DiagnosticResult};
 use crate::format_string::{self, FormatConversion, FormatPiece};
 use crate::numeric::{parse_decimal_magnitude, FloatType, FloatValue, IntegerType, IntegerValue};
-use crate::semantics::{CallableTarget, GenericArgument, SemanticInfo};
+use crate::semantics::{CallableTarget, GenericArgument, GenericSpecialization, SemanticInfo};
 use crate::source::Span;
+use crate::types::{resolved_type_complexity, ClassType, ResolvedType};
 use crate::{hir, mir};
+
+type ClassIds = HashMap<ClassType<ResolvedType>, ClassId>;
 
 #[derive(Clone, Default)]
 struct CollectionRegistry {
@@ -80,11 +83,19 @@ struct MethodInstanceKey {
     arguments: Vec<GenericArgument>,
 }
 
+#[derive(Clone)]
+struct PropertyInitializer {
+    expression: hir::Expr,
+    type_substitutions: HashMap<String, ResolvedType>,
+}
+
 #[derive(Clone, Copy)]
 struct CallableDecl<'a> {
     function: &'a hir::FunctionDecl,
     class: Option<ClassId>,
     receiver: Option<ClassId>,
+    class_type_params: &'a [hir::TypeParamDecl],
+    class_arguments: &'a [ResolvedType],
 }
 
 impl CallableDecl<'_> {
@@ -93,10 +104,68 @@ impl CallableDecl<'_> {
     }
 }
 
+fn specialize_callable_instance(
+    span: &(usize, usize),
+    specialization: &GenericSpecialization,
+    substitutions: &HashMap<String, ResolvedType>,
+    functions: &HashMap<String, usize>,
+    methods: &HashMap<(ClassId, String), usize>,
+    class_ids: &ClassIds,
+    semantic_info: &SemanticInfo,
+) -> DiagnosticResult<CallableInstance> {
+    let Some(target) = semantic_info.call_targets.get(span) else {
+        return Err(vec![Diagnostic::new(
+            "I2401",
+            "checked generic call has no callable target",
+            Span::new(span.0, span.1),
+        )]);
+    };
+    let declaration = match target {
+        CallableTarget::Function { name } => functions.get(name).copied(),
+        CallableTarget::Method {
+            class_type,
+            method_name,
+        } => {
+            let specialized =
+                substitute_resolved_type(&ResolvedType::Class(class_type.clone()), substitutions);
+            let ResolvedType::Class(class_type) = specialized else {
+                unreachable!("class target substitution must remain a class");
+            };
+            class_ids
+                .get(&class_type)
+                .and_then(|class| methods.get(&(*class, method_name.clone())))
+                .copied()
+        }
+    }
+    .ok_or_else(|| {
+        vec![Diagnostic::new(
+            "I2401",
+            "checked generic call has no callable declaration",
+            Span::new(span.0, span.1),
+        )]
+    })?;
+    let arguments = specialization
+        .arguments
+        .iter()
+        .map(|argument| substitute_generic_argument(argument, substitutions))
+        .collect::<Vec<_>>();
+    if arguments.iter().any(generic_argument_is_symbolic) {
+        return Err(vec![Diagnostic::new(
+            "I2401",
+            "generic specialization retained an unresolved type parameter",
+            Span::new(span.0, span.1),
+        )]);
+    }
+    Ok(CallableInstance {
+        declaration,
+        arguments,
+    })
+}
+
 fn collect_callable_instances(
     program: &hir::Program,
     declarations: &[CallableDecl<'_>],
-    class_ids: &HashMap<String, ClassId>,
+    class_ids: &ClassIds,
     semantic_info: &SemanticInfo,
 ) -> DiagnosticResult<Vec<CallableInstance>> {
     let functions = declarations
@@ -116,6 +185,7 @@ fn collect_callable_instances(
         .collect::<HashMap<_, _>>();
 
     let mut instances = Vec::new();
+    let mut parents = Vec::new();
     let mut ids = HashMap::new();
     for (declaration, callable) in declarations.iter().enumerate() {
         if callable.function.type_params.is_empty() {
@@ -125,6 +195,7 @@ fn collect_callable_instances(
             };
             ids.insert(instance.clone(), instances.len());
             instances.push(instance);
+            parents.push(None);
         }
     }
 
@@ -134,77 +205,93 @@ fn collect_callable_instances(
         .collect::<Vec<_>>();
     calls.sort_by_key(|(span, _)| **span);
 
+    for item in &program.items {
+        let hir::Item::Class(class) = item else {
+            continue;
+        };
+        for class_info in semantic_info
+            .classes
+            .iter()
+            .filter(|info| info.declaration_name == class.name)
+        {
+            let substitutions = class
+                .type_params
+                .iter()
+                .zip(&class_info.arguments)
+                .map(|(parameter, argument)| (parameter.name.clone(), argument.clone()))
+                .collect::<HashMap<_, _>>();
+            for member in &class.members {
+                let hir::ClassMember::Property(hir::PropertyDecl {
+                    is_static: false,
+                    initializer: Some(initializer),
+                    ..
+                }) = member
+                else {
+                    continue;
+                };
+                for (span, specialization) in &calls {
+                    if span.0 < initializer.span().start || span.1 > initializer.span().end {
+                        continue;
+                    }
+                    let target = specialize_callable_instance(
+                        span,
+                        specialization,
+                        &substitutions,
+                        &functions,
+                        &methods,
+                        class_ids,
+                        semantic_info,
+                    )?;
+                    if !ids.contains_key(&target) {
+                        ids.insert(target.clone(), instances.len());
+                        instances.push(target);
+                        parents.push(None);
+                    }
+                }
+            }
+        }
+    }
+
     let mut cursor = 0;
     while cursor < instances.len() {
+        let instance_index = cursor;
         let instance = instances[cursor].clone();
         cursor += 1;
         let callable = declarations[instance.declaration];
-        let substitutions = type_substitutions(callable.function, &instance.arguments)?;
+        let substitutions = type_substitutions(callable, &instance.arguments)?;
         for (span, specialization) in &calls {
             let in_function =
                 span.0 >= callable.function.span.start && span.1 <= callable.function.span.end;
-            let in_property_initializer = callable.class.is_some_and(|class| {
-                callable.function.name == "__construct"
-                    && program.items.iter().any(|item| {
-                        let hir::Item::Class(declaration) = item else {
-                            return false;
-                        };
-                        class_ids.get(&declaration.name) == Some(&class)
-                            && declaration.members.iter().any(|member| {
-                                matches!(
-                                    member,
-                                    hir::ClassMember::Property(hir::PropertyDecl {
-                                        is_static: false,
-                                        initializer: Some(initializer),
-                                        ..
-                                    }) if span.0 >= initializer.span().start
-                                        && span.1 <= initializer.span().end
-                                )
-                            })
-                    })
-            });
-            if !in_function && !in_property_initializer {
+            if !in_function {
                 continue;
             }
-            let Some(target) = semantic_info.call_targets.get(span) else {
-                continue;
-            };
-            let target_declaration = match target {
-                CallableTarget::Function { name } => functions.get(name).copied(),
-                CallableTarget::Method {
-                    class_name,
-                    method_name,
-                } => class_ids
-                    .get(class_name)
-                    .and_then(|class| methods.get(&(*class, method_name.clone())))
-                    .copied(),
-            }
-            .ok_or_else(|| {
-                vec![Diagnostic::new(
-                    "I2401",
-                    "checked generic call has no callable declaration",
-                    Span::new(span.0, span.1),
-                )]
-            })?;
-            let arguments = specialization
-                .arguments
-                .iter()
-                .map(|argument| substitute_generic_argument(argument, &substitutions))
-                .collect::<Vec<_>>();
-            if arguments.iter().any(generic_argument_is_symbolic) {
-                return Err(vec![Diagnostic::new(
-                    "I2401",
-                    "generic specialization retained an unresolved type parameter",
-                    Span::new(span.0, span.1),
-                )]);
-            }
-            let target = CallableInstance {
-                declaration: target_declaration,
-                arguments,
-            };
+            let target = specialize_callable_instance(
+                span,
+                specialization,
+                &substitutions,
+                &functions,
+                &methods,
+                class_ids,
+                semantic_info,
+            )?;
             if !ids.contains_key(&target) {
+                if specialization_expands_recursively(&instances, &parents, instance_index, &target)
+                {
+                    let name = &declarations[target.declaration].function.name;
+                    return Err(vec![Diagnostic::new(
+                        "E0539",
+                        format!(
+                            "generic specialization of `{name}` recursively expands its type arguments and has no finite monomorphization"
+                        ),
+                        Span::new(span.0, span.1),
+                    )
+                    .with_help(
+                        "keep recursive generic calls at the same concrete type, or move the type-changing step outside the recursion",
+                    )]);
+                }
                 ids.insert(target.clone(), instances.len());
                 instances.push(target);
+                parents.push(Some(instance_index));
             }
         }
     }
@@ -212,10 +299,49 @@ fn collect_callable_instances(
     Ok(instances)
 }
 
+fn specialization_expands_recursively(
+    instances: &[CallableInstance],
+    parents: &[Option<usize>],
+    current: usize,
+    target: &CallableInstance,
+) -> bool {
+    // One type-changing recursive step can still converge (for example, T -> int).
+    // Two consecutive increases for the same declaration establish an expanding
+    // specialization chain while keeping bounded type changes valid.
+    let mut matching_ancestors = Vec::new();
+    let mut cursor = Some(current);
+    while let Some(index) = cursor {
+        if instances[index].declaration == target.declaration {
+            matching_ancestors.push(&instances[index]);
+            if matching_ancestors.len() == 2 {
+                break;
+            }
+        }
+        cursor = parents[index];
+    }
+    let [nearest, previous] = matching_ancestors.as_slice() else {
+        return false;
+    };
+    specialization_complexity(&target.arguments) > specialization_complexity(&nearest.arguments)
+        && specialization_complexity(&nearest.arguments)
+            > specialization_complexity(&previous.arguments)
+}
+
+fn specialization_complexity(arguments: &[GenericArgument]) -> usize {
+    arguments
+        .iter()
+        .map(|argument| {
+            let GenericArgument::Type(ty) = argument;
+            resolved_type_complexity(ty)
+        })
+        .sum()
+}
+
 fn type_substitutions(
-    function: &hir::FunctionDecl,
+    callable: CallableDecl<'_>,
     arguments: &[GenericArgument],
 ) -> DiagnosticResult<HashMap<String, crate::types::ResolvedType>> {
+    let function = callable.function;
     if function.type_params.len() != arguments.len() {
         return Err(vec![Diagnostic::new(
             "I2401",
@@ -228,15 +354,19 @@ fn type_substitutions(
             function.span,
         )]);
     }
-    Ok(function
-        .type_params
+    let mut substitutions = callable
+        .class_type_params
         .iter()
-        .zip(arguments)
-        .map(|(parameter, argument)| {
+        .zip(callable.class_arguments)
+        .map(|(parameter, argument)| (parameter.name.clone(), argument.clone()))
+        .collect::<HashMap<_, _>>();
+    substitutions.extend(function.type_params.iter().zip(arguments).map(
+        |(parameter, argument)| {
             let GenericArgument::Type(ty) = argument;
             (parameter.name.clone(), ty.clone())
-        })
-        .collect())
+        },
+    ));
+    Ok(substitutions)
 }
 
 fn substitute_generic_argument(
@@ -270,6 +400,17 @@ fn resolved_type_is_symbolic(ty: &crate::types::ResolvedType) -> bool {
     }
 }
 
+/// Wrap `inner` in a nullable, collapsing `?(?X)` to `?X`. Substituting a `?T`
+/// field's parameter with a nullable argument must not yield a doubly-nullable
+/// type, which has no downstream representation.
+fn nullable_of(inner: crate::types::ResolvedType) -> crate::types::ResolvedType {
+    if matches!(inner, crate::types::ResolvedType::Nullable(_)) {
+        inner
+    } else {
+        crate::types::ResolvedType::Nullable(Box::new(inner))
+    }
+}
+
 fn substitute_resolved_type(
     ty: &crate::types::ResolvedType,
     substitutions: &HashMap<String, crate::types::ResolvedType>,
@@ -281,7 +422,7 @@ fn substitute_resolved_type(
             .cloned()
             .unwrap_or_else(|| ty.clone()),
         ResolvedType::Nullable(inner) => {
-            ResolvedType::Nullable(Box::new(substitute_resolved_type(inner, substitutions)))
+            nullable_of(substitute_resolved_type(inner, substitutions))
         }
         ResolvedType::TypedArray(inner) => {
             ResolvedType::TypedArray(Box::new(substitute_resolved_type(inner, substitutions)))
@@ -296,6 +437,14 @@ fn substitute_resolved_type(
         ResolvedType::Set(inner) => {
             ResolvedType::Set(Box::new(substitute_resolved_type(inner, substitutions)))
         }
+        ResolvedType::Class(class) => ResolvedType::Class(ClassType::new(
+            class.name.clone(),
+            class
+                .arguments
+                .iter()
+                .map(|argument| substitute_resolved_type(argument, substitutions))
+                .collect(),
+        )),
         _ => ty.clone(),
     }
 }
@@ -305,33 +454,53 @@ pub fn lower_program(program: &hir::Program) -> DiagnosticResult<mir::Program> {
         .semantic_info
         .classes
         .iter()
-        .map(|class| (class.name.clone(), class.id))
+        .map(|class| {
+            (
+                ClassType::new(class.declaration_name.clone(), class.arguments.clone()),
+                class.id,
+            )
+        })
         .collect::<HashMap<_, _>>();
     let mut collection_registry = CollectionRegistry::default();
     let mut static_ids = HashMap::new();
     let mut statics = Vec::new();
-    for class in program.items.iter().filter_map(|item| match item {
-        hir::Item::Class(class) => Some(class),
-        _ => None,
-    }) {
-        let class_id = class_ids[&class.name];
+    for class_info in &program.semantic_info.classes {
+        let class = program
+            .items
+            .iter()
+            .find_map(|item| match item {
+                hir::Item::Class(class) if class.name == class_info.declaration_name => Some(class),
+                _ => None,
+            })
+            .expect("specialized class has a declaration");
+        let class_id = class_info.id;
+        let substitutions = class
+            .type_params
+            .iter()
+            .zip(&class_info.arguments)
+            .map(|(parameter, argument)| (parameter.name.clone(), argument.clone()))
+            .collect::<HashMap<_, _>>();
         for property in class.members.iter().filter_map(|member| match member {
             hir::ClassMember::Property(property) if property.is_static => Some(property),
             _ => None,
         }) {
             let id = mir::StaticId(statics.len());
-            let ty = mir_type_ref(&property.ty, &class_ids, &mut collection_registry).ok_or_else(
-                || {
-                    vec![unsupported_native_type(
-                        &property.ty,
-                        property.span,
-                        format!(
+            let ty = mir_type_ref_with_substitutions(
+                &property.ty,
+                &class_ids,
+                &mut collection_registry,
+                &substitutions,
+            )
+            .ok_or_else(|| {
+                vec![unsupported_native_type(
+                    &property.ty,
+                    property.span,
+                    format!(
                         "static property `{}::{}` has a type not supported by native compilation",
                         class.name, property.name
                     ),
-                    )]
-                },
-            )?;
+                )]
+            })?;
             let key = crate::const_eval::ConstKey::Static {
                 class_name: class.name.clone(),
                 name: property.name.clone(),
@@ -351,7 +520,7 @@ pub fn lower_program(program: &hir::Program) -> DiagnosticResult<mir::Program> {
                     )]
                 })?;
             let initializer = lower_static_value(&evaluated.value, ty, property.span)?;
-            static_ids.insert((class_id, property.name.clone()), id);
+            static_ids.insert((class_id, property.name.clone()), (id, ty));
             statics.push(mir::StaticProperty {
                 id,
                 class: class_id,
@@ -363,30 +532,42 @@ pub fn lower_program(program: &hir::Program) -> DiagnosticResult<mir::Program> {
         }
     }
     let property_initializers = program
-        .items
+        .semantic_info
+        .classes
         .iter()
-        .filter_map(|item| match item {
-            hir::Item::Class(class) => Some(class),
-            _ => None,
-        })
-        .flat_map(|class| {
-            let class_id = class_ids[&class.name];
+        .flat_map(|class_info| {
+            let class = program
+                .items
+                .iter()
+                .find_map(|item| match item {
+                    hir::Item::Class(class) if class.name == class_info.declaration_name => {
+                        Some(class)
+                    }
+                    _ => None,
+                })
+                .expect("specialized class has a declaration");
+            let substitutions = class
+                .type_params
+                .iter()
+                .zip(&class_info.arguments)
+                .map(|(parameter, argument)| (parameter.name.clone(), argument.clone()))
+                .collect::<HashMap<_, _>>();
             class.members.iter().filter_map(move |member| match member {
                 hir::ClassMember::Property(property) if !property.is_static => {
                     property.initializer.clone().map(|value| {
-                        let property_id = program
-                            .semantic_info
-                            .classes
+                        let property_id = class_info
+                            .properties
                             .iter()
-                            .find(|info| info.id == class_id)
-                            .and_then(|info| {
-                                info.properties
-                                    .iter()
-                                    .find(|info| info.name == property.name)
-                            })
+                            .find(|info| info.name == property.name)
                             .expect("checked property has a stable identity")
                             .id;
-                        (property_id, value)
+                        (
+                            property_id,
+                            PropertyInitializer {
+                                expression: value,
+                                type_substitutions: substitutions.clone(),
+                            },
+                        )
                     })
                 }
                 hir::ClassMember::Property(_)
@@ -396,27 +577,24 @@ pub fn lower_program(program: &hir::Program) -> DiagnosticResult<mir::Program> {
         })
         .collect::<HashMap<_, _>>();
     let mut constructor_body_initializers = HashSet::new();
-    for class in program.items.iter().filter_map(|item| match item {
-        hir::Item::Class(class) => Some(class),
-        _ => None,
-    }) {
-        let class_id = class_ids[&class.name];
+    for class_info in &program.semantic_info.classes {
+        let class = program
+            .items
+            .iter()
+            .find_map(|item| match item {
+                hir::Item::Class(class) if class.name == class_info.declaration_name => Some(class),
+                _ => None,
+            })
+            .expect("specialized class has a declaration");
         if !class.members.iter().any(|member| {
             matches!(member, hir::ClassMember::Method(method) if method.name == "__construct")
         }) {
             continue;
         }
 
-        if let Some(class_info) = program
-            .semantic_info
-            .classes
-            .iter()
-            .find(|info| info.id == class_id)
-        {
-            for property in &class_info.properties {
-                if !property.promoted && !property_initializers.contains_key(&property.id) {
-                    constructor_body_initializers.insert(property.id);
-                }
+        for property in &class_info.properties {
+            if !property.promoted && !property_initializers.contains_key(&property.id) {
+                constructor_body_initializers.insert(property.id);
             }
         }
     }
@@ -428,18 +606,26 @@ pub fn lower_program(program: &hir::Program) -> DiagnosticResult<mir::Program> {
                 function,
                 class: None,
                 receiver: None,
+                class_type_params: &[],
+                class_arguments: &[],
             }),
             hir::Item::Class(class_decl) => {
-                let class = *class_ids
-                    .get(&class_decl.name)
-                    .expect("checked class has a stable identity");
-                for member in &class_decl.members {
-                    if let hir::ClassMember::Method(method) = member {
-                        declarations.push(CallableDecl {
-                            function: method,
-                            class: Some(class),
-                            receiver: (!method.is_static).then_some(class),
-                        });
+                for class_info in program
+                    .semantic_info
+                    .classes
+                    .iter()
+                    .filter(|info| info.declaration_name == class_decl.name)
+                {
+                    for member in &class_decl.members {
+                        if let hir::ClassMember::Method(method) = member {
+                            declarations.push(CallableDecl {
+                                function: method,
+                                class: Some(class_info.id),
+                                receiver: (!method.is_static).then_some(class_info.id),
+                                class_type_params: &class_decl.type_params,
+                                class_arguments: &class_info.arguments,
+                            });
+                        }
                     }
                 }
             }
@@ -479,7 +665,7 @@ pub fn lower_program(program: &hir::Program) -> DiagnosticResult<mir::Program> {
     for (index, instance) in instances.iter().enumerate() {
         let declaration = declarations[instance.declaration];
         let function = declaration.function;
-        let substitutions = type_substitutions(function, &instance.arguments)?;
+        let substitutions = type_substitutions(declaration, &instance.arguments)?;
         intern_block_collection_types(
             &function.body,
             &class_ids,
@@ -587,9 +773,13 @@ pub fn lower_program(program: &hir::Program) -> DiagnosticResult<mir::Program> {
                     Ok(mir::Property {
                         id: property.id,
                         name: property.name.clone(),
-                        ty: mir_type_ref(&property.ty, &class_ids, &mut collection_registry).ok_or_else(|| {
-                            vec![unsupported_native_type(
-                                &property.ty,
+                        ty: intern_resolved_collection_types(
+                            &property.ty,
+                            &class_ids,
+                            &mut collection_registry,
+                        )
+                        .ok_or_else(|| {
+                            vec![unsupported(
                                 Span::default(),
                                 format!(
                                     "property `${}` has a type that is not supported by native class compilation",
@@ -643,7 +833,7 @@ pub fn lower_program(program: &hir::Program) -> DiagnosticResult<mir::Program> {
 
 fn intern_resolved_collection_types(
     ty: &crate::types::ResolvedType,
-    class_ids: &HashMap<String, ClassId>,
+    class_ids: &ClassIds,
     collections: &mut CollectionRegistry,
 ) -> Option<mir::Type> {
     use crate::types::ResolvedType;
@@ -654,7 +844,7 @@ fn intern_resolved_collection_types(
         ResolvedType::String => mir::Type::String,
         ResolvedType::Bytes => mir::Type::Collection(intern_bytes_type(collections)),
         ResolvedType::Mixed => mir::Type::Mixed,
-        ResolvedType::Class(name) => mir::Type::Class(*class_ids.get(name)?),
+        ResolvedType::Class(class) => mir::Type::Class(*class_ids.get(class)?),
         ResolvedType::TypedArray(value) => {
             let value = intern_resolved_collection_types(value, class_ids, collections)?;
             mir::Type::Collection(collections.intern(mir::CollectionKind::TypedArray, None, value))
@@ -699,7 +889,7 @@ fn intern_resolved_collection_types(
 
 fn intern_block_collection_types(
     block: &hir::Block,
-    class_ids: &HashMap<String, ClassId>,
+    class_ids: &ClassIds,
     collections: &mut CollectionRegistry,
     substitutions: &HashMap<String, crate::types::ResolvedType>,
 ) {
@@ -771,7 +961,7 @@ fn intern_block_collection_types(
 
 fn intern_if_collection_types(
     statement: &hir::IfStmt,
-    class_ids: &HashMap<String, ClassId>,
+    class_ids: &ClassIds,
     collections: &mut CollectionRegistry,
     substitutions: &HashMap<String, crate::types::ResolvedType>,
 ) {
@@ -829,7 +1019,7 @@ fn lower_static_value(
 fn collect_function_signature(
     function: &hir::FunctionDecl,
     id: mir::FunctionId,
-    class_ids: &HashMap<String, ClassId>,
+    class_ids: &ClassIds,
     semantic_info: &SemanticInfo,
     collection_registry: &mut CollectionRegistry,
     substitutions: &HashMap<String, crate::types::ResolvedType>,
@@ -1020,88 +1210,59 @@ fn mir_return_borrow(borrow: crate::symbols::ReturnBorrow) -> mir::ReturnBorrow 
     }
 }
 
-fn mir_type_ref(
-    ty: &crate::types::TypeRef,
-    class_ids: &HashMap<String, ClassId>,
-    collection_registry: &mut CollectionRegistry,
-) -> Option<mir::Type> {
-    mir_type_ref_with_substitutions(ty, class_ids, collection_registry, &HashMap::new())
-}
-
 fn mir_type_ref_with_substitutions(
     ty: &crate::types::TypeRef,
-    class_ids: &HashMap<String, ClassId>,
+    class_ids: &ClassIds,
     collection_registry: &mut CollectionRegistry,
     substitutions: &HashMap<String, crate::types::ResolvedType>,
 ) -> Option<mir::Type> {
+    let resolved = resolved_type_ref_with_substitutions(ty, substitutions)?;
+    intern_resolved_collection_types(&resolved, class_ids, collection_registry)
+}
+
+fn resolved_type_ref_with_substitutions(
+    ty: &crate::types::TypeRef,
+    substitutions: &HashMap<String, ResolvedType>,
+) -> Option<ResolvedType> {
     let mut plain = ty.clone();
     plain.nullable = false;
-    let base = substitutions
-        .get(&plain.name)
-        .filter(|_| plain.args.is_empty())
-        .and_then(|resolved| {
-            intern_resolved_collection_types(resolved, class_ids, collection_registry)
-        })
-        .or_else(|| scalar_type_ref(&plain).map(mir::Type::Scalar))
-        .or_else(|| is_plain_type(&plain, "string").then_some(mir::Type::String))
-        .or_else(|| is_plain_type(&plain, "mixed").then_some(mir::Type::Mixed))
-        .or_else(|| {
-            is_plain_type(&plain, "Bytes")
-                .then(|| mir::Type::Collection(intern_bytes_type(collection_registry)))
-        })
-        .or_else(|| {
-            let (kind, key_ref, value_ref) = match plain.name.as_str() {
-                "[]" if plain.args.len() == 1 => {
-                    (mir::CollectionKind::TypedArray, None, &plain.args[0])
-                }
-                "List" if plain.args.len() == 1 => {
-                    (mir::CollectionKind::List, None, &plain.args[0])
-                }
-                "Dictionary" if plain.args.len() == 2 => (
-                    mir::CollectionKind::Dictionary,
-                    Some(&plain.args[0]),
-                    &plain.args[1],
-                ),
-                "Set" if plain.args.len() == 1 => (mir::CollectionKind::Set, None, &plain.args[0]),
-                _ => return None,
-            };
-            let key = match key_ref {
-                Some(key) => Some(mir_type_ref_with_substitutions(
-                    key,
-                    class_ids,
-                    collection_registry,
-                    substitutions,
-                )?),
-                None => None,
-            };
-            let value = mir_type_ref_with_substitutions(
-                value_ref,
-                class_ids,
-                collection_registry,
-                substitutions,
-            )?;
-            Some(mir::Type::Collection(
-                collection_registry.intern(kind, key, value),
-            ))
-        })
-        .or_else(|| {
-            ty.args
-                .is_empty()
-                .then(|| class_ids.get(&ty.name).copied().map(mir::Type::Class))
-                .flatten()
-        })?;
+    let base = if plain.arguments.is_empty() {
+        if let Some(substitution) = substitutions.get(&plain.name) {
+            substitution.clone()
+        } else if let Some(integer) = IntegerType::from_source_name(&plain.name) {
+            ResolvedType::Integer(integer)
+        } else if let Some(float) = FloatType::from_source_name(&plain.name) {
+            ResolvedType::Float(float)
+        } else {
+            match plain.name.as_str() {
+                "void" => ResolvedType::Void,
+                "string" => ResolvedType::String,
+                "Bytes" => ResolvedType::Bytes,
+                "bool" => ResolvedType::Bool,
+                "mixed" => ResolvedType::Mixed,
+                _ => ResolvedType::Class(ClassType::new(plain.name, Vec::new())),
+            }
+        }
+    } else {
+        let arguments = plain
+            .type_arguments()
+            .map(|argument| resolved_type_ref_with_substitutions(argument, substitutions))
+            .collect::<Option<Vec<_>>>()?;
+        match plain.name.as_str() {
+            "[]" if arguments.len() == 1 => {
+                ResolvedType::TypedArray(Box::new(arguments[0].clone()))
+            }
+            "List" if arguments.len() == 1 => ResolvedType::List(Box::new(arguments[0].clone())),
+            "Dictionary" if arguments.len() == 2 => ResolvedType::Dictionary(
+                Box::new(arguments[0].clone()),
+                Box::new(arguments[1].clone()),
+            ),
+            "Set" if arguments.len() == 1 => ResolvedType::Set(Box::new(arguments[0].clone())),
+            _ => ResolvedType::Class(ClassType::new(plain.name, arguments)),
+        }
+    };
     if ty.nullable {
-        Some(match base {
-            mir::Type::Scalar(ty) => mir::Type::NullableScalar(ty),
-            mir::Type::String => mir::Type::NullableString,
-            mir::Type::Mixed => mir::Type::NullableMixed,
-            mir::Type::Class(class) => mir::Type::NullableClass(class),
-            mir::Type::Collection(_) => return None,
-            mir::Type::NullableScalar(_)
-            | mir::Type::NullableString
-            | mir::Type::NullableMixed
-            | mir::Type::NullableClass(_) => return None,
-        })
+        Some(nullable_of(base))
     } else {
         Some(base)
     }
@@ -1135,7 +1296,7 @@ fn field_type(ty: mir::Type) -> Option<FieldType> {
 
 fn integer_type_ref(ty: &crate::types::TypeRef) -> Option<IntegerType> {
     (!ty.nullable).then_some(()).and_then(|()| {
-        ty.args
+        ty.arguments
             .is_empty()
             .then(|| IntegerType::from_source_name(&ty.name))
             .flatten()
@@ -1144,7 +1305,7 @@ fn integer_type_ref(ty: &crate::types::TypeRef) -> Option<IntegerType> {
 
 fn float_type_ref(ty: &crate::types::TypeRef) -> Option<FloatType> {
     (!ty.nullable).then_some(()).and_then(|()| {
-        ty.args
+        ty.arguments
             .is_empty()
             .then(|| FloatType::from_source_name(&ty.name))
             .flatten()
@@ -1159,20 +1320,20 @@ fn scalar_type_ref(ty: &crate::types::TypeRef) -> Option<mir::ScalarType> {
 }
 
 fn is_plain_type(ty: &crate::types::TypeRef, name: &str) -> bool {
-    !ty.nullable && ty.name == name && ty.args.is_empty()
+    !ty.nullable && ty.name == name && ty.arguments.is_empty()
 }
 
 fn is_nullable_string_type(ty: &crate::types::TypeRef) -> bool {
-    ty.nullable && ty.name == "string" && ty.args.is_empty()
+    ty.nullable && ty.name == "string" && ty.arguments.is_empty()
 }
 
 struct FunctionLoweringInputs<'a> {
     signatures: &'a HashMap<FunctionInstanceKey, FunctionSignature>,
     method_signatures: &'a HashMap<MethodInstanceKey, FunctionSignature>,
     semantic_info: &'a SemanticInfo,
-    property_initializers: &'a HashMap<crate::class_layout::PropertyId, hir::Expr>,
+    property_initializers: &'a HashMap<crate::class_layout::PropertyId, PropertyInitializer>,
     constructor_body_initializers: &'a HashSet<crate::class_layout::PropertyId>,
-    static_ids: &'a HashMap<(ClassId, String), mir::StaticId>,
+    static_ids: &'a HashMap<(ClassId, String), (mir::StaticId, mir::Type)>,
     collection_registry: &'a CollectionRegistry,
     type_substitutions: &'a HashMap<String, crate::types::ResolvedType>,
 }
@@ -1185,6 +1346,7 @@ fn lower_function(
     receiver: Option<ClassId>,
 ) -> DiagnosticResult<mir::Function> {
     let mut context = LoweringContext::new(&inputs);
+    context.current_class = class;
     context.return_borrow = signature.return_borrow;
     let mut params = Vec::new();
     if let Some(class) = receiver {
@@ -2166,11 +2328,12 @@ struct LoweringContext<'semantic> {
     signatures: HashMap<FunctionInstanceKey, FunctionSignature>,
     method_signatures: HashMap<MethodInstanceKey, FunctionSignature>,
     semantic_info: &'semantic SemanticInfo,
-    property_initializers: HashMap<crate::class_layout::PropertyId, hir::Expr>,
+    property_initializers: HashMap<crate::class_layout::PropertyId, PropertyInitializer>,
     constructor_body_initializers: HashSet<crate::class_layout::PropertyId>,
-    static_ids: HashMap<(ClassId, String), mir::StaticId>,
+    static_ids: HashMap<(ClassId, String), (mir::StaticId, mir::Type)>,
     collection_registry: CollectionRegistry,
     type_substitutions: HashMap<String, crate::types::ResolvedType>,
+    current_class: Option<ClassId>,
     locals: Vec<mir::Local>,
     local_scopes: Vec<HashMap<String, mir::LocalId>>,
     materialized_collection_places: HashMap<(usize, usize), mir::LocalId>,
@@ -2201,6 +2364,7 @@ impl<'semantic> LoweringContext<'semantic> {
             static_ids: inputs.static_ids.clone(),
             collection_registry: inputs.collection_registry.clone(),
             type_substitutions: inputs.type_substitutions.clone(),
+            current_class: None,
             locals: Vec::new(),
             local_scopes: vec![HashMap::new()],
             materialized_collection_places: HashMap::new(),
@@ -2521,8 +2685,47 @@ impl<'semantic> LoweringContext<'semantic> {
         self.semantic_info
             .classes
             .iter()
-            .find(|class| class.name == name)
+            .find(|class| {
+                class.name == name || (class.declaration_name == name && class.arguments.is_empty())
+            })
             .map(|class| class.id)
+    }
+
+    fn class_id_for_static_access(&self, name: &str) -> Option<ClassId> {
+        self.class_id_for_name(name).or_else(|| {
+            let class = self.current_class?;
+            self.class_info(class)
+                .is_some_and(|info| info.declaration_name == name)
+                .then_some(class)
+        })
+    }
+
+    fn class_id_for_type(&self, class_type: &ClassType<ResolvedType>) -> Option<ClassId> {
+        self.semantic_info
+            .classes
+            .iter()
+            .find(|class| {
+                class.declaration_name == class_type.name && class.arguments == class_type.arguments
+            })
+            .map(|class| class.id)
+    }
+
+    fn call_target_class_id(&self, span: Span) -> Option<ClassId> {
+        let CallableTarget::Method { class_type, .. } = self
+            .semantic_info
+            .call_targets
+            .get(&(span.start, span.end))?
+        else {
+            return None;
+        };
+        let specialized = substitute_resolved_type(
+            &ResolvedType::Class(class_type.clone()),
+            &self.type_substitutions,
+        );
+        let ResolvedType::Class(class_type) = specialized else {
+            return None;
+        };
+        self.class_id_for_type(&class_type)
     }
 
     fn class_info(&self, id: ClassId) -> Option<&crate::semantics::ClassSemanticInfo> {
@@ -2611,9 +2814,9 @@ impl<'semantic> LoweringContext<'semantic> {
         span: Span,
     ) -> DiagnosticResult<(mir::StaticId, mir::Type)> {
         let class = self
-            .class_id_for_name(class_name)
+            .class_id_for_static_access(class_name)
             .ok_or_else(|| vec![unsupported(span, format!("unknown class `{class_name}`"))])?;
-        let id = self
+        let (id, ty) = self
             .static_ids
             .get(&(class, member.to_string()))
             .copied()
@@ -2623,88 +2826,12 @@ impl<'semantic> LoweringContext<'semantic> {
                     format!("unknown static property `{class_name}::{member}`"),
                 )]
             })?;
-        let key = crate::const_eval::ConstKey::Static {
-            class_name: class_name.to_string(),
-            name: member.to_string(),
-        };
-        let const_ty = self
-            .semantic_info
-            .const_evaluation
-            .values
-            .get(&key)
-            .expect("checked static has evaluated metadata")
-            .ty;
-        let ty = native_const_type(const_ty).expect("checked static has a native type");
         Ok((id, ty))
     }
 
     fn native_type_ref(&self, ty: &crate::types::TypeRef) -> Option<mir::Type> {
-        let mut plain = ty.clone();
-        plain.nullable = false;
-        let base = self
-            .type_substitutions
-            .get(&plain.name)
-            .filter(|_| plain.args.is_empty())
-            .and_then(|resolved| self.mir_resolved_type(resolved))
-            .or_else(|| scalar_type_ref(&plain).map(mir::Type::Scalar))
-            .or_else(|| is_plain_type(&plain, "string").then_some(mir::Type::String))
-            .or_else(|| is_plain_type(&plain, "mixed").then_some(mir::Type::Mixed))
-            .or_else(|| {
-                let key = match plain.name.as_str() {
-                    "Bytes" if plain.args.is_empty() => (
-                        mir::CollectionKind::Bytes,
-                        None,
-                        mir::Type::Scalar(mir::ScalarType::Integer(IntegerType::UInt8)),
-                    ),
-                    "[]" if plain.args.len() == 1 => (
-                        mir::CollectionKind::TypedArray,
-                        None,
-                        self.native_type_ref(&plain.args[0])?,
-                    ),
-                    "List" if plain.args.len() == 1 => (
-                        mir::CollectionKind::List,
-                        None,
-                        self.native_type_ref(&plain.args[0])?,
-                    ),
-                    "Dictionary" if plain.args.len() == 2 => (
-                        mir::CollectionKind::Dictionary,
-                        Some(self.native_type_ref(&plain.args[0])?),
-                        self.native_type_ref(&plain.args[1])?,
-                    ),
-                    "Set" if plain.args.len() == 1 => (
-                        mir::CollectionKind::Set,
-                        None,
-                        self.native_type_ref(&plain.args[0])?,
-                    ),
-                    _ => return None,
-                };
-                self.collection_registry
-                    .ids
-                    .get(&key)
-                    .copied()
-                    .map(mir::Type::Collection)
-            })
-            .or_else(|| {
-                ty.args
-                    .is_empty()
-                    .then(|| self.class_id_for_name(&ty.name).map(mir::Type::Class))
-                    .flatten()
-            })?;
-        if ty.nullable {
-            Some(match base {
-                mir::Type::Scalar(ty) => mir::Type::NullableScalar(ty),
-                mir::Type::String => mir::Type::NullableString,
-                mir::Type::Mixed => mir::Type::NullableMixed,
-                mir::Type::Class(class) => mir::Type::NullableClass(class),
-                mir::Type::Collection(_) => return None,
-                mir::Type::NullableScalar(_)
-                | mir::Type::NullableString
-                | mir::Type::NullableMixed
-                | mir::Type::NullableClass(_) => return None,
-            })
-        } else {
-            Some(base)
-        }
+        let resolved = resolved_type_ref_with_substitutions(ty, &self.type_substitutions)?;
+        self.mir_resolved_type(&resolved)
     }
 
     fn lookup_function(&self, name: &str, span: Span) -> DiagnosticResult<FunctionSignature> {
@@ -2779,7 +2906,8 @@ impl<'semantic> LoweringContext<'semantic> {
                     expr.span(),
                 )]
             })?;
-        self.mir_resolved_type(resolved).ok_or_else(|| {
+        let resolved = substitute_resolved_type(resolved, &self.type_substitutions);
+        self.mir_resolved_type(&resolved).ok_or_else(|| {
             vec![unsupported(
                 expr.span(),
                 format!("resolved type `{resolved:?}` has no native representation"),
@@ -2854,7 +2982,7 @@ impl<'semantic> LoweringContext<'semantic> {
                 ))
                 .copied()
                 .map(mir::Type::Collection),
-            ResolvedType::Class(name) => self.class_id_for_name(name).map(mir::Type::Class),
+            ResolvedType::Class(class) => self.class_id_for_type(class).map(mir::Type::Class),
             ResolvedType::TypedArray(value) => self
                 .mir_resolved_type(value)
                 .and_then(|value| {
@@ -2898,7 +3026,13 @@ impl<'semantic> LoweringContext<'semantic> {
                 mir::Type::String => Some(mir::Type::NullableString),
                 mir::Type::Mixed => Some(mir::Type::NullableMixed),
                 mir::Type::Class(class) => Some(mir::Type::NullableClass(class)),
-                _ => None,
+                // `?(?X)` collapses to `?X`: a `?T` field substituted with a
+                // nullable argument is already nullable, not doubly-nullable.
+                already @ (mir::Type::NullableScalar(_)
+                | mir::Type::NullableString
+                | mir::Type::NullableMixed
+                | mir::Type::NullableClass(_)) => Some(already),
+                mir::Type::Collection(_) => None,
             },
             ResolvedType::Void | ResolvedType::Null | ResolvedType::Unsupported => None,
         }
@@ -2923,30 +3057,6 @@ impl<'semantic> LoweringContext<'semantic> {
                 Span::default(),
             )]),
         }
-    }
-}
-
-fn native_const_type(ty: crate::const_eval::ConstType) -> Option<mir::Type> {
-    match ty {
-        crate::const_eval::ConstType::Integer(ty) => {
-            Some(mir::Type::Scalar(mir::ScalarType::Integer(ty)))
-        }
-        crate::const_eval::ConstType::NullableInteger(ty) => {
-            Some(mir::Type::NullableScalar(mir::ScalarType::Integer(ty)))
-        }
-        crate::const_eval::ConstType::Float(ty) => {
-            Some(mir::Type::Scalar(mir::ScalarType::Float(ty)))
-        }
-        crate::const_eval::ConstType::NullableFloat(ty) => {
-            Some(mir::Type::NullableScalar(mir::ScalarType::Float(ty)))
-        }
-        crate::const_eval::ConstType::String => Some(mir::Type::String),
-        crate::const_eval::ConstType::Bool => Some(mir::Type::Scalar(mir::ScalarType::Bool)),
-        crate::const_eval::ConstType::NullableBool => {
-            Some(mir::Type::NullableScalar(mir::ScalarType::Bool))
-        }
-        crate::const_eval::ConstType::NullableString => Some(mir::Type::NullableString),
-        crate::const_eval::ConstType::Null => None,
     }
 }
 
@@ -3710,8 +3820,18 @@ fn lower_string_expression(
             method,
             args,
             span,
-            ..
+            null_safe,
         } => {
+            if method == "toString"
+                && args.is_empty()
+                && !null_safe
+                && context
+                    .semantic_info
+                    .constrained_display_calls
+                    .contains(&(span.start, span.end))
+            {
+                return lower_display_string_expression(object, context);
+            }
             let (signature, args) =
                 lower_instance_method_call(object, method, args, *span, context)?;
             if signature.return_type != mir::ReturnType::Value(mir::Type::String) {
@@ -4576,12 +4696,14 @@ fn lower_null_safe_property(
             format!("class#{} has no property `${property}`", class.0),
         )]
     })?;
-    let ty = context.native_type_ref(&property_info.ty).ok_or_else(|| {
-        vec![unsupported(
-            span,
-            format!("property `${property}` is not native-lowerable"),
-        )]
-    })?;
+    let ty = context
+        .mir_resolved_type(&property_info.ty)
+        .ok_or_else(|| {
+            vec![unsupported(
+                span,
+                format!("property `${property}` is not native-lowerable"),
+            )]
+        })?;
     let property_id = property_info.id;
     Ok((
         lower_nullable_class_expression(object, class, false, context)?,
@@ -5225,7 +5347,8 @@ fn lower_static_method_call(
     context: &mut LoweringContext,
 ) -> DiagnosticResult<(FunctionSignature, Vec<mir::Rvalue>)> {
     let class = context
-        .class_id_for_name(class_name)
+        .call_target_class_id(span)
+        .or_else(|| context.class_id_for_name(class_name))
         .ok_or_else(|| vec![unsupported(span, format!("unknown class `{class_name}`"))])?;
     let signature = context.lookup_method(class, method, span)?;
     if signature.receiver_mode.is_some() {
@@ -7490,13 +7613,23 @@ fn lower_class_expression(
             })
         }
         hir::Expr::New {
-            class_name,
+            class_type,
             args,
             span,
         } => {
-            let class = context
-                .class_id_for_name(class_name)
-                .ok_or_else(|| vec![unsupported(*span, format!("unknown class `{class_name}`"))])?;
+            let class_name = &class_type.name;
+            let mir::Type::Class(class) = context.native_type_ref(class_type).ok_or_else(|| {
+                vec![unsupported(
+                    *span,
+                    format!("unknown class instantiation `{class_type}`"),
+                )]
+            })?
+            else {
+                return Err(vec![unsupported(
+                    *span,
+                    format!("`{class_type}` is not a native class type"),
+                )]);
+            };
             if class != expected {
                 return Err(vec![unsupported(
                     *span,
@@ -7662,12 +7795,14 @@ fn lower_property_place(
             format!("class#{} has no property `${property}`", class.0),
         )]
     })?;
-    let property_type = context.native_type_ref(&property_info.ty).ok_or_else(|| {
-        vec![unsupported(
-            *span,
-            format!("property `${property}` is not native-lowerable"),
-        )]
-    })?;
+    let property_type = context
+        .mir_resolved_type(&property_info.ty)
+        .ok_or_else(|| {
+            vec![unsupported(
+                *span,
+                format!("property `${property}` is not native-lowerable"),
+            )]
+        })?;
     Ok((object_local, property_info.id, property_type))
 }
 
@@ -7705,19 +7840,22 @@ fn lower_new_property_values(
                 });
             }
             if let Some(initializer) = context.property_initializers.get(&property.id).cloned() {
-                let property_type = context.native_type_ref(&property.ty).ok_or_else(|| {
+                let property_type = context.mir_resolved_type(&property.ty).ok_or_else(|| {
                     vec![unsupported(
-                        initializer.span(),
+                        initializer.expression.span(),
                         format!("property `${}` is not native-lowerable", property.name),
                     )]
                 })?;
+                let caller_substitutions = std::mem::replace(
+                    &mut context.type_substitutions,
+                    initializer.type_substitutions,
+                );
+                let source =
+                    lower_rvalue_as_expected(&initializer.expression, property_type, context);
+                context.type_substitutions = caller_substitutions;
                 return Ok(mir::PropertyValue {
                     property: property.id,
-                    source: mir::PropertyValueSource::Expression(lower_rvalue_as_expected(
-                        &initializer,
-                        property_type,
-                        context,
-                    )?),
+                    source: mir::PropertyValueSource::Expression(source?),
                 });
             }
             if context
@@ -8567,5 +8705,5 @@ fn unsupported_native_type(
 }
 
 fn type_ref_contains_mixed(ty: &crate::types::TypeRef) -> bool {
-    ty.name == "mixed" || ty.args.iter().any(type_ref_contains_mixed)
+    ty.name == "mixed" || ty.type_arguments().any(type_ref_contains_mixed)
 }

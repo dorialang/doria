@@ -5520,11 +5520,7 @@ fn lower_condition_to_branch(
                 mir::ScalarType::Float(_) => {
                     builder.ins().fcmp(float_compare_code(*op), left, right)
                 }
-                mir::ScalarType::Bool => match op {
-                    mir::CompareOp::Equal => builder.ins().icmp(IntCC::Equal, left, right),
-                    mir::CompareOp::NotEqual => builder.ins().icmp(IntCC::NotEqual, left, right),
-                    _ => return Err(malformed_mir("ordered bool comparison is invalid")),
-                },
+                mir::ScalarType::Bool => builder.ins().icmp(bool_compare_code(*op), left, right),
             };
             builder.ins().brif(value, then_block, &[], else_block, &[]);
         }
@@ -5847,6 +5843,17 @@ fn compare_code(op: mir::CompareOp, ty: IntegerType) -> IntCC {
         mir::CompareOp::Greater if ty.is_signed() => IntCC::SignedGreaterThan,
         mir::CompareOp::Greater => IntCC::UnsignedGreaterThan,
         mir::CompareOp::GreaterEqual if ty.is_signed() => IntCC::SignedGreaterThanOrEqual,
+        mir::CompareOp::GreaterEqual => IntCC::UnsignedGreaterThanOrEqual,
+    }
+}
+
+fn bool_compare_code(op: mir::CompareOp) -> IntCC {
+    match op {
+        mir::CompareOp::Equal => IntCC::Equal,
+        mir::CompareOp::NotEqual => IntCC::NotEqual,
+        mir::CompareOp::Less => IntCC::UnsignedLessThan,
+        mir::CompareOp::LessEqual => IntCC::UnsignedLessThanOrEqual,
+        mir::CompareOp::Greater => IntCC::UnsignedGreaterThan,
         mir::CompareOp::GreaterEqual => IntCC::UnsignedGreaterThanOrEqual,
     }
 }

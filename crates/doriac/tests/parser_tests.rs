@@ -2,6 +2,7 @@ use doriac::ast::{
     AssignOp, BinaryOp, ClassMember, ElseBranch, Expr, ForIncrement, ForInitializer, IncrementOp,
     IncrementPosition, InterpolatedStringPart, Item, MemberAccess, Stmt, UnaryOp,
 };
+use doriac::types::TypeArgumentRef;
 
 #[test]
 fn parses_class_workflow_and_qualified_type_syntax_before_semantics_land() {
@@ -102,7 +103,9 @@ int[] $numbers = [1, 2, 3];
             if !decl.writable
                 && decl.name == "numbers"
                 && matches!(decl.ty.as_ref(), Some(ty)
-                    if ty.name == "[]" && ty.args.len() == 1 && ty.args[0].name == "int")
+                    if ty.name == "[]"
+                        && ty.type_argument_count() == 1
+                        && ty.type_argument(0).is_some_and(|argument| argument.name == "int"))
     ));
 }
 
@@ -203,8 +206,34 @@ fn parses_adjacent_nested_generic_type_closers_after_shift_tokens_are_added() {
     };
     let ty = decl.ty.as_ref().expect("expected explicit type");
     assert_eq!(ty.name, "Dictionary");
-    assert_eq!(ty.args[1].name, "List");
-    assert_eq!(ty.args[1].args[0].name, "uint64");
+    let list = ty.type_argument(1).expect("second type argument");
+    assert_eq!(list.name, "List");
+    assert_eq!(
+        list.type_argument(0).expect("list element type").name,
+        "uint64"
+    );
+}
+
+#[test]
+fn preserves_mixed_generic_argument_kinds_in_source_order() {
+    let program = doriac::parse_source(
+        "test.doria",
+        "function consume(Buffer<4096, float32> $buffer): void {}",
+    )
+    .expect("reserved value arguments should parse");
+    let Item::Function(function) = &program.items[0] else {
+        panic!("expected function declaration");
+    };
+    let ty = &function.params[0].ty;
+    assert_eq!(ty.to_string(), "Buffer<4096, float32>");
+    assert!(matches!(
+        &ty.arguments[0],
+        TypeArgumentRef::Value(value) if value == "4096"
+    ));
+    assert!(matches!(
+        &ty.arguments[1],
+        TypeArgumentRef::Type(argument) if argument.name == "float32"
+    ));
 }
 
 fn parse_echo_expr(source: &str) -> Expr {
@@ -1109,6 +1138,29 @@ function main(): void
         names,
         vec![Some("name"), Some("name"), Some("name"), Some("name")]
     );
+}
+
+#[test]
+fn constructor_targets_must_be_non_nullable_class_types() {
+    doriac::parse_source(
+        "test.doria",
+        "function main(): void { new Box<int>(); new Box<?string>(); }",
+    )
+    .expect("generic class targets and nullable generic arguments should parse");
+
+    for target in ["?Box<int>", "Box<int>[]"] {
+        let diagnostics = doriac::parse_source(
+            "test.doria",
+            format!("function main(): void {{ new {target}(); }}"),
+        )
+        .expect_err("nullable and array-shaped constructor targets must be rejected");
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.code.starts_with('P')
+                && diagnostic
+                    .message
+                    .contains("requires a non-nullable class type")
+        }));
+    }
 }
 
 #[test]

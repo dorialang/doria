@@ -678,6 +678,13 @@ impl Evaluator {
                 BinaryOp::Xor => Ok(ConstValue::Bool(left ^ right)),
                 BinaryOp::Equal => Ok(ConstValue::Bool(left == right)),
                 BinaryOp::NotEqual => Ok(ConstValue::Bool(left != right)),
+                // Canonical `false < true` ordering (false = 0, true = 1),
+                // matching the concrete-`bool` relational operators in ordinary
+                // (non-const) expressions.
+                BinaryOp::Less => Ok(ConstValue::Bool((left as u8) < (right as u8))),
+                BinaryOp::LessEqual => Ok(ConstValue::Bool((left as u8) <= (right as u8))),
+                BinaryOp::Greater => Ok(ConstValue::Bool((left as u8) > (right as u8))),
+                BinaryOp::GreaterEqual => Ok(ConstValue::Bool((left as u8) >= (right as u8))),
                 _ => Err("invalid boolean operation in constant expression"),
             },
             (ConstValue::String(left), ConstValue::String(right)) => match op {
@@ -951,7 +958,7 @@ impl fmt::Display for ConstType {
 }
 
 fn const_type(ty: &TypeRef) -> Option<ConstType> {
-    if ty.args.is_empty() {
+    if ty.arguments.is_empty() {
         if let Some(integer) = IntegerType::from_source_name(&ty.name) {
             return Some(if ty.nullable {
                 ConstType::NullableInteger(integer)
@@ -967,7 +974,7 @@ fn const_type(ty: &TypeRef) -> Option<ConstType> {
             });
         }
     }
-    match (ty.nullable, ty.name.as_str(), ty.args.is_empty()) {
+    match (ty.nullable, ty.name.as_str(), ty.arguments.is_empty()) {
         (false, "string", true) => Some(ConstType::String),
         (true, "string", true) => Some(ConstType::NullableString),
         (false, "bool", true) => Some(ConstType::Bool),

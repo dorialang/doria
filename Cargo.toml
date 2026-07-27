@@ -14,5 +14,9 @@ ryu = { version = "=1.0.23", default-features = false }
 [profile.dev]
 panic = "abort"
 
+[profile.test]
+debug = "line-tables-only"
+incremental = false
+
 [profile.release]
 panic = "abort"

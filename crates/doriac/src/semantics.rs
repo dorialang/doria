@@ -10,9 +10,11 @@ use crate::source::Span;
 use crate::symbols::{
     Binding, BorrowSource, ClassInfo, ConstantInfo, FunctionInfo, MemberDeclaration, MemberKind,
     MethodInfo, ParamInfo, PropertyInfo, PropertyInitState, ReceiverMode, ReturnBorrow, ScopeStack,
-    StaticPropertyInfo,
+    StaticPropertyInfo, TypeParamInfo,
 };
-use crate::types::{ResolvedType, TypeId, TypeKind, TypeRef, TypeRegistry};
+use crate::types::{
+    resolved_type_complexity, ClassType, ResolvedType, TypeId, TypeKind, TypeRef, TypeRegistry,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DictionaryProjection {
@@ -42,6 +44,9 @@ pub struct SemanticInfo {
     /// arguments, while future compile-time value parameters can add another
     /// variant without changing specialization identity.
     pub generic_call_specializations: HashMap<(usize, usize), GenericSpecialization>,
+    /// Calls to compiler-known `Displayable::toString` through a constrained
+    /// type parameter. MIR specializes these directly for each concrete type.
+    pub(crate) constrained_display_calls: HashSet<(usize, usize)>,
     /// Stable nominal class identities and the total Stage 19 property order.
     pub classes: Vec<ClassSemanticInfo>,
     /// Values produced by the bounded Stage 20 constant evaluator.
@@ -72,7 +77,7 @@ pub enum CallableTarget {
         name: String,
     },
     Method {
-        class_name: String,
+        class_type: ClassType<ResolvedType>,
         method_name: String,
     },
 }
@@ -86,7 +91,9 @@ pub struct SemanticAnalysis {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClassSemanticInfo {
     pub id: ClassId,
+    pub declaration_name: String,
     pub name: String,
+    pub arguments: Vec<ResolvedType>,
     pub implements_displayable: bool,
     pub properties: Vec<PropertySemanticInfo>,
 }
@@ -95,7 +102,7 @@ pub struct ClassSemanticInfo {
 pub struct PropertySemanticInfo {
     pub id: PropertyId,
     pub name: String,
-    pub ty: TypeRef,
+    pub ty: ResolvedType,
     pub writable: bool,
     pub promoted: bool,
 }
@@ -177,6 +184,7 @@ pub fn analyze_program_for_ide(program: &Program) -> SemanticAnalysis {
         .iter()
         .filter_map(|(span, signature)| signature.return_borrow.map(|borrow| (*span, borrow)))
         .collect();
+    let classes = collect_ordered_class_semantics(program, &mut checker);
     SemanticAnalysis {
         info: SemanticInfo {
             integer_expression_types: checker.integer_expression_types,
@@ -185,7 +193,8 @@ pub fn analyze_program_for_ide(program: &Program) -> SemanticAnalysis {
             type_test_types: checker.type_test_types,
             call_targets: checker.call_targets,
             generic_call_specializations: checker.generic_call_specializations,
-            classes: collect_ordered_class_semantics(program),
+            constrained_display_calls: checker.constrained_display_calls,
+            classes,
             const_evaluation: checker.const_evaluation,
             parameter_defaults: checker.parameter_defaults,
             return_borrows,
@@ -195,39 +204,91 @@ pub fn analyze_program_for_ide(program: &Program) -> SemanticAnalysis {
     }
 }
 
-fn collect_ordered_class_semantics(program: &Program) -> Vec<ClassSemanticInfo> {
-    program
-        .items
+fn collect_ordered_class_semantics(
+    program: &Program,
+    checker: &mut Checker<'_>,
+) -> Vec<ClassSemanticInfo> {
+    let mut expanded_classes = HashSet::new();
+    loop {
+        let previous_count = checker.class_instantiations.len();
+        collect_callable_class_instantiations(program, checker);
+        expand_class_instantiations(program, checker, &mut expanded_classes);
+        if checker.class_instantiations.len() == previous_count {
+            break;
+        }
+    }
+
+    let mut instances = checker
+        .class_instantiations
         .iter()
-        .filter_map(|item| match item {
-            Item::Class(class) => Some(class),
-            _ => None,
+        .filter(|class| {
+            !class
+                .arguments
+                .iter()
+                .any(|argument| checker.type_is_symbolic(*argument))
         })
-        .enumerate()
-        .map(|(class_index, class)| {
-            let id = ClassId(class_index);
-            let explicit = class.members.iter().filter_map(|member| match member {
-                ClassMember::Property(property) if !property.is_static => Some((
-                    property.name.clone(),
-                    property.ty.resolve_self_in(&class.name),
-                    property.writable,
-                    false,
-                )),
-                ClassMember::Property(_) | ClassMember::Method(_) | ClassMember::Constant(_) => {
-                    None
-                }
-            });
-            let promoted = class.members.iter().find_map(|member| match member {
+        .cloned()
+        .collect::<Vec<_>>();
+    instances.sort_by_key(|class| {
+        (
+            class.name.clone(),
+            class
+                .arguments
+                .iter()
+                .map(|argument| checker.types.display(*argument))
+                .collect::<Vec<_>>(),
+        )
+    });
+    let concrete_instances = instances.into_iter().collect::<HashSet<_>>();
+
+    let declarations = program.items.iter().filter_map(|item| match item {
+        Item::Class(class) => Some(class),
+        _ => None,
+    });
+    let mut classes = Vec::new();
+    for declaration in declarations {
+        let Some(class_info) = checker.classes.get(&declaration.name).cloned() else {
+            continue;
+        };
+        let mut instances = if declaration.type_params.is_empty() {
+            vec![ClassType::new(declaration.name.clone(), Vec::new())]
+        } else {
+            concrete_instances
+                .iter()
+                .filter(|class| class.name == declaration.name)
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        instances.sort_by_key(|class| {
+            class
+                .arguments
+                .iter()
+                .map(|argument| checker.types.display(*argument))
+                .collect::<Vec<_>>()
+                .join("\u{0}")
+        });
+
+        for instance in instances {
+            let id = ClassId(classes.len());
+            let substitutions = checker.class_type_substitutions(&instance);
+            let explicit = declaration
+                .members
+                .iter()
+                .filter_map(|member| match member {
+                    ClassMember::Property(property) if !property.is_static => {
+                        Some((property.name.clone(), property.writable, false))
+                    }
+                    ClassMember::Property(_)
+                    | ClassMember::Method(_)
+                    | ClassMember::Constant(_) => None,
+                });
+            let promoted = declaration.members.iter().find_map(|member| match member {
                 ClassMember::Method(method) if method.name == "__construct" => {
                     Some(method.params.iter().filter_map(|param| {
-                        param.promoted_access.as_ref().map(|_| {
-                            (
-                                param.name.clone(),
-                                param.ty.resolve_self_in(&class.name),
-                                param.writable,
-                                true,
-                            )
-                        })
+                        param
+                            .promoted_access
+                            .as_ref()
+                            .map(|_| (param.name.clone(), param.writable, true))
                     }))
                 }
                 _ => None,
@@ -236,29 +297,435 @@ fn collect_ordered_class_semantics(program: &Program) -> Vec<ClassSemanticInfo> 
             if let Some(promoted) = promoted {
                 properties.extend(promoted);
             }
-            ClassSemanticInfo {
+            let class_type_id = checker.types.intern(TypeKind::Class(instance.clone()));
+            classes.push(ClassSemanticInfo {
                 id,
-                name: class.name.clone(),
-                implements_displayable: class
+                declaration_name: declaration.name.clone(),
+                name: checker.types.display(class_type_id),
+                arguments: instance
+                    .arguments
+                    .iter()
+                    .map(|argument| checker.types.resolved(*argument))
+                    .collect(),
+                implements_displayable: declaration
                     .implements
                     .iter()
                     .any(|interface| interface == "Displayable"),
                 properties: properties
                     .into_iter()
                     .enumerate()
-                    .map(
-                        |(index, (name, ty, writable, promoted))| PropertySemanticInfo {
+                    .filter_map(|(index, (name, writable, promoted))| {
+                        let property = class_info.properties.get(&name)?;
+                        let ty = checker.substitute_type_id(property.ty, &substitutions);
+                        Some(PropertySemanticInfo {
                             id: PropertyId { class: id, index },
                             name,
-                            ty,
+                            ty: checker.types.resolved(ty),
                             writable,
                             promoted,
-                        },
-                    )
+                        })
+                    })
                     .collect(),
+            });
+        }
+    }
+    classes
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct SemanticCallableInstance {
+    declaration: usize,
+    bindings: Vec<(String, TypeId)>,
+}
+
+impl SemanticCallableInstance {
+    fn new(declaration: usize, bindings: HashMap<String, TypeId>) -> Self {
+        let mut bindings = bindings.into_iter().collect::<Vec<_>>();
+        bindings.sort_by(|left, right| left.0.cmp(&right.0));
+        Self {
+            declaration,
+            bindings,
+        }
+    }
+
+    fn substitutions(&self) -> HashMap<String, TypeId> {
+        self.bindings.iter().cloned().collect()
+    }
+}
+
+fn enqueue_callable_instance(
+    instance: SemanticCallableInstance,
+    parent: Option<usize>,
+    instances: &mut Vec<SemanticCallableInstance>,
+    parents: &mut Vec<Option<usize>>,
+    ids: &mut HashMap<SemanticCallableInstance, usize>,
+) {
+    if ids.contains_key(&instance) {
+        return;
+    }
+    let index = instances.len();
+    ids.insert(instance.clone(), index);
+    instances.push(instance);
+    parents.push(parent);
+}
+
+fn collect_callable_class_instantiations(program: &Program, checker: &mut Checker<'_>) {
+    let mut declarations = HashMap::new();
+    for item in &program.items {
+        match item {
+            Item::Function(function) => {
+                declarations.insert(function.span.start, (function, None));
             }
+            Item::Class(class) => {
+                for member in &class.members {
+                    if let ClassMember::Method(method) = member {
+                        declarations.insert(method.span.start, (method, Some(class)));
+                    }
+                }
+            }
+            Item::Interface(_) | Item::Trait(_) | Item::Constant(_) | Item::Statement(_) => {}
+        }
+    }
+
+    let mut instances = Vec::new();
+    let mut parents = Vec::new();
+    let mut ids = HashMap::new();
+
+    for (declaration, (function, class)) in &declarations {
+        if !function.type_params.is_empty() {
+            continue;
+        }
+        match class {
+            None => {
+                enqueue_callable_instance(
+                    SemanticCallableInstance::new(*declaration, HashMap::new()),
+                    None,
+                    &mut instances,
+                    &mut parents,
+                    &mut ids,
+                );
+            }
+            Some(class) if class.type_params.is_empty() => {
+                enqueue_callable_instance(
+                    SemanticCallableInstance::new(*declaration, HashMap::new()),
+                    None,
+                    &mut instances,
+                    &mut parents,
+                    &mut ids,
+                );
+            }
+            Some(class) => {
+                let concrete_classes = checker
+                    .class_instantiations
+                    .iter()
+                    .filter(|instance| {
+                        instance.name == class.name
+                            && !instance
+                                .arguments
+                                .iter()
+                                .any(|argument| checker.type_is_symbolic(*argument))
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                for instance in concrete_classes {
+                    enqueue_callable_instance(
+                        SemanticCallableInstance::new(
+                            *declaration,
+                            checker.class_type_substitutions(&instance),
+                        ),
+                        None,
+                        &mut instances,
+                        &mut parents,
+                        &mut ids,
+                    );
+                }
+            }
+        }
+    }
+
+    let mut calls = checker
+        .pending_generic_calls
+        .iter()
+        .filter(|(span, _)| checker.generic_call_specializations.contains_key(span))
+        .map(|(span, pending)| (*span, pending.clone()))
+        .collect::<Vec<_>>();
+    calls.sort_by_key(|(span, _)| *span);
+    for (_, pending) in &calls {
+        if pending
+            .bindings
+            .values()
+            .any(|argument| checker.type_is_symbolic(*argument))
+        {
+            continue;
+        }
+        enqueue_callable_instance(
+            SemanticCallableInstance::new(pending.declaration, pending.bindings.clone()),
+            None,
+            &mut instances,
+            &mut parents,
+            &mut ids,
+        );
+    }
+
+    let mut cursor = 0;
+    while cursor < instances.len() {
+        let instance_index = cursor;
+        let instance = instances[cursor].clone();
+        cursor += 1;
+        let Some((function, _)) = declarations.get(&instance.declaration) else {
+            continue;
+        };
+        let substitutions = instance.substitutions();
+
+        if let Some(templates) = checker
+            .callable_class_instantiation_templates
+            .get(&instance.declaration)
+            .cloned()
+        {
+            for template in templates {
+                let arguments = template
+                    .arguments
+                    .iter()
+                    .map(|argument| checker.substitute_type_id(*argument, &substitutions))
+                    .collect::<Vec<_>>();
+                if arguments
+                    .iter()
+                    .any(|argument| checker.type_is_symbolic(*argument))
+                {
+                    continue;
+                }
+                let class = ClassType::new(template.name, arguments);
+                checker.check_concrete_class_constraints(&class, function.span);
+                checker.class_instantiations.insert(class);
+            }
+        }
+
+        for (span, pending) in &calls {
+            if span.0 < function.span.start || span.1 > function.span.end {
+                continue;
+            }
+            let bindings = pending
+                .bindings
+                .iter()
+                .map(|(name, ty)| {
+                    (
+                        name.clone(),
+                        checker.substitute_type_id(*ty, &substitutions),
+                    )
+                })
+                .collect::<HashMap<_, _>>();
+            if bindings
+                .values()
+                .any(|argument| checker.type_is_symbolic(*argument))
+            {
+                continue;
+            }
+            let target = SemanticCallableInstance::new(pending.declaration, bindings);
+            if ids.contains_key(&target) {
+                continue;
+            }
+            if callable_specialization_expands_recursively(
+                &instances,
+                &parents,
+                instance_index,
+                &target,
+                &checker.types,
+            ) {
+                let name = declarations
+                    .get(&target.declaration)
+                    .map(|(function, _)| function.name.as_str())
+                    .unwrap_or(pending.callee.as_str());
+                let message = format!(
+                    "generic specialization of `{name}` recursively expands its type arguments and has no finite monomorphization"
+                );
+                if !checker
+                    .diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.code == "E0539" && diagnostic.message == message)
+                {
+                    checker.diagnostics.push(
+                        Diagnostic::new("E0539", message, Span::new(span.0, span.1)).with_help(
+                            "keep recursive generic calls at the same concrete type, or move the type-changing step outside the recursion",
+                        ),
+                    );
+                }
+                continue;
+            }
+            enqueue_callable_instance(
+                target,
+                Some(instance_index),
+                &mut instances,
+                &mut parents,
+                &mut ids,
+            );
+        }
+    }
+}
+
+fn callable_specialization_expands_recursively(
+    instances: &[SemanticCallableInstance],
+    parents: &[Option<usize>],
+    current: usize,
+    target: &SemanticCallableInstance,
+    types: &TypeRegistry,
+) -> bool {
+    let mut matching_ancestors = Vec::new();
+    let mut cursor = Some(current);
+    while let Some(index) = cursor {
+        if instances[index].declaration == target.declaration {
+            matching_ancestors.push(&instances[index]);
+            if matching_ancestors.len() == 2 {
+                break;
+            }
+        }
+        cursor = parents[index];
+    }
+    let [nearest, previous] = matching_ancestors.as_slice() else {
+        return false;
+    };
+    callable_specialization_complexity(target, types)
+        > callable_specialization_complexity(nearest, types)
+        && callable_specialization_complexity(nearest, types)
+            > callable_specialization_complexity(previous, types)
+}
+
+fn callable_specialization_complexity(
+    instance: &SemanticCallableInstance,
+    types: &TypeRegistry,
+) -> usize {
+    instance
+        .bindings
+        .iter()
+        .map(|(_, ty)| resolved_type_complexity(&types.resolved(*ty)))
+        .sum()
+}
+
+fn expand_class_instantiations(
+    program: &Program,
+    checker: &mut Checker<'_>,
+    expanded: &mut HashSet<ClassType<TypeId>>,
+) {
+    let mut instances = checker
+        .class_instantiations
+        .iter()
+        .filter(|class| {
+            !expanded.contains(*class)
+                && !class
+                    .arguments
+                    .iter()
+                    .any(|argument| checker.type_is_symbolic(*argument))
         })
-        .collect()
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut parents = vec![None; instances.len()];
+    let mut ids = checker
+        .class_instantiations
+        .iter()
+        .cloned()
+        .collect::<HashSet<_>>();
+    let mut cursor = 0;
+    while cursor < instances.len() {
+        let instance_index = cursor;
+        let instance = instances[cursor].clone();
+        cursor += 1;
+        expanded.insert(instance.clone());
+        let Some(templates) = checker
+            .class_instantiation_templates
+            .get(&instance.name)
+            .cloned()
+        else {
+            continue;
+        };
+        let substitutions = checker.class_type_substitutions(&instance);
+        for template in templates {
+            let arguments = template
+                .arguments
+                .iter()
+                .map(|argument| checker.substitute_type_id(*argument, &substitutions))
+                .collect::<Vec<_>>();
+            if arguments
+                .iter()
+                .any(|argument| checker.type_is_symbolic(*argument))
+            {
+                continue;
+            }
+            let specialized = ClassType::new(template.name, arguments);
+            if ids.contains(&specialized) {
+                continue;
+            }
+            let span = program
+                .items
+                .iter()
+                .find_map(|item| match item {
+                    Item::Class(class) if class.name == specialized.name => Some(class.span),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            if class_specialization_expands_recursively(
+                &instances,
+                &parents,
+                instance_index,
+                &specialized,
+                &checker.types,
+            ) {
+                let message = format!(
+                    "generic specialization of class `{}` recursively expands its type arguments and has no finite monomorphization",
+                    specialized.name
+                );
+                if !checker
+                    .diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.code == "E0539" && diagnostic.message == message)
+                {
+                    checker.diagnostics.push(
+                        Diagnostic::new("E0539", message, span).with_help(
+                            "keep recursive class references at the same concrete type, or move the type-changing step outside the recursive class",
+                        ),
+                    );
+                }
+                continue;
+            }
+            checker.check_concrete_class_constraints(&specialized, span);
+            ids.insert(specialized.clone());
+            checker.class_instantiations.insert(specialized.clone());
+            instances.push(specialized);
+            parents.push(Some(instance_index));
+        }
+    }
+}
+
+fn class_specialization_expands_recursively(
+    instances: &[ClassType<TypeId>],
+    parents: &[Option<usize>],
+    current: usize,
+    target: &ClassType<TypeId>,
+    types: &TypeRegistry,
+) -> bool {
+    let mut matching_ancestors = Vec::new();
+    let mut cursor = Some(current);
+    while let Some(index) = cursor {
+        if instances[index].name == target.name {
+            matching_ancestors.push(&instances[index]);
+            if matching_ancestors.len() == 2 {
+                break;
+            }
+        }
+        cursor = parents[index];
+    }
+    let [nearest, previous] = matching_ancestors.as_slice() else {
+        return false;
+    };
+    class_specialization_complexity(target, types) > class_specialization_complexity(nearest, types)
+        && class_specialization_complexity(nearest, types)
+            > class_specialization_complexity(previous, types)
+}
+
+fn class_specialization_complexity(class: &ClassType<TypeId>, types: &TypeRegistry) -> usize {
+    class
+        .arguments
+        .iter()
+        .map(|argument| resolved_type_complexity(&types.resolved(*argument)))
+        .sum()
 }
 
 pub fn check_program(program: &Program) -> DiagnosticResult<()> {
@@ -307,8 +774,13 @@ struct Checker<'program> {
     type_test_types: HashMap<(usize, usize), ResolvedType>,
     call_targets: HashMap<(usize, usize), CallableTarget>,
     generic_call_specializations: HashMap<(usize, usize), GenericSpecialization>,
+    constrained_display_calls: HashSet<(usize, usize)>,
     pending_generic_calls: HashMap<(usize, usize), PendingGenericCall>,
-    type_parameter_scopes: Vec<HashSet<String>>,
+    type_parameter_scopes: Vec<HashMap<String, Vec<TypeRef>>>,
+    class_instantiations: HashSet<ClassType<TypeId>>,
+    class_instantiation_templates: HashMap<String, HashSet<ClassType<TypeId>>>,
+    callable_class_instantiation_templates: HashMap<usize, HashSet<ClassType<TypeId>>>,
+    current_callable: Option<usize>,
     integer_literals: HashMap<(usize, usize), u128>,
     negative_integer_literals: HashMap<(usize, usize), u128>,
     negated_integer_literal_operands: HashSet<(usize, usize)>,
@@ -323,6 +795,13 @@ struct MethodContext {
     class_name: String,
     receiver_mode: Option<ReceiverMode>,
     this_available: bool,
+}
+
+fn type_parameter_scope(params: &[TypeParamDecl]) -> HashMap<String, Vec<TypeRef>> {
+    params
+        .iter()
+        .map(|param| (param.name.clone(), param.constraints.clone()))
+        .collect()
 }
 
 /// The callee facts a call site needs to resolve a returned borrow back to the
@@ -340,7 +819,8 @@ struct CallSite<'a> {
 #[derive(Debug, Clone)]
 struct PendingGenericCall {
     callee: String,
-    type_params: Vec<String>,
+    declaration: usize,
+    type_params: Vec<TypeParamInfo>,
     bindings: HashMap<String, TypeId>,
     return_ty: TypeId,
 }
@@ -488,8 +968,13 @@ impl<'program> Checker<'program> {
             type_test_types: HashMap::new(),
             call_targets: HashMap::new(),
             generic_call_specializations: HashMap::new(),
+            constrained_display_calls: HashSet::new(),
             pending_generic_calls: HashMap::new(),
             type_parameter_scopes: Vec::new(),
+            class_instantiations: HashSet::new(),
+            class_instantiation_templates: HashMap::new(),
+            callable_class_instantiation_templates: HashMap::new(),
+            current_callable: None,
             integer_literals: HashMap::new(),
             negative_integer_literals: HashMap::new(),
             negated_integer_literal_operands: HashSet::new(),
@@ -563,6 +1048,14 @@ impl<'program> Checker<'program> {
             self.classes.insert(
                 class_decl.name.clone(),
                 ClassInfo {
+                    type_params: class_decl
+                        .type_params
+                        .iter()
+                        .map(|param| TypeParamInfo {
+                            name: param.name.clone(),
+                            constraints: param.constraints.clone(),
+                        })
+                        .collect(),
                     implements_displayable: false,
                     properties: HashMap::new(),
                     static_properties: HashMap::new(),
@@ -575,7 +1068,18 @@ impl<'program> Checker<'program> {
         }
 
         for class_decl in declared_classes {
+            self.check_class_type_parameter_declarations(class_decl);
+            self.type_parameter_scopes
+                .push(type_parameter_scope(&class_decl.type_params));
             let mut info = ClassInfo {
+                type_params: class_decl
+                    .type_params
+                    .iter()
+                    .map(|param| TypeParamInfo {
+                        name: param.name.clone(),
+                        constraints: param.constraints.clone(),
+                    })
+                    .collect(),
                 implements_displayable: class_decl
                     .implements
                     .iter()
@@ -647,6 +1151,7 @@ impl<'program> Checker<'program> {
                             info.methods.insert(
                                 method.name.clone(),
                                 MethodInfo {
+                                    declaration: signature.declaration,
                                     access: method.access.clone(),
                                     receiver_mode: (!method.is_static).then_some(
                                         if method.writable_this
@@ -660,6 +1165,7 @@ impl<'program> Checker<'program> {
                                     ),
                                     return_borrow: signature.return_borrow,
                                     is_static: method.is_static,
+                                    enclosing_type_bindings: HashMap::new(),
                                     type_params: signature.type_params,
                                     params: signature.params,
                                     return_ty: signature.return_ty,
@@ -684,8 +1190,16 @@ impl<'program> Checker<'program> {
 
             self.check_class_interfaces(class_decl, &info);
 
+            self.type_parameter_scopes.pop();
             self.classes.insert(class_decl.name.clone(), info);
         }
+    }
+
+    fn check_class_type_parameter_declarations(&mut self, class: &ClassDecl) {
+        self.check_type_parameter_declarations(
+            &class.type_params,
+            &format!("class `{}`", class.name),
+        );
     }
 
     fn check_class_interfaces(&mut self, class_decl: &ClassDecl, info: &ClassInfo) {
@@ -742,6 +1256,7 @@ impl<'program> Checker<'program> {
         let valid = method.access == MemberAccess::External
             && method.receiver_mode == Some(ReceiverMode::Readonly)
             && !method.is_static
+            && method.type_params.is_empty()
             && method.params.is_empty()
             && matches!(self.types.kind(method.return_ty), TypeKind::String);
         if !valid {
@@ -950,29 +1465,45 @@ impl<'program> Checker<'program> {
         function: &FunctionDecl,
         declaring_class: Option<&str>,
     ) -> FunctionInfo {
-        self.check_type_parameter_declarations(function);
-        self.type_parameter_scopes.push(
-            function
-                .type_params
-                .iter()
-                .map(|param| param.name.clone())
-                .collect(),
-        );
+        self.check_function_type_parameter_declarations(function, declaring_class);
+        let previous_callable = self.current_callable.replace(function.span.start);
+        self.type_parameter_scopes
+            .push(type_parameter_scope(&function.type_params));
         let params = self.resolve_param_infos(function, declaring_class);
         let return_ty = self.resolve_function_return_type(function, declaring_class);
         self.type_parameter_scopes.pop();
+        self.current_callable = previous_callable;
         let return_borrow = matches!(
             self.types.kind(return_ty),
             TypeKind::Class(_) | TypeKind::TypeParameter(_)
         )
-        .then(|| crate::ownership::function_return_borrow(function))
+        .then(|| {
+            let enclosing_type_params = declaring_class
+                .and_then(|class_name| {
+                    self.program.items.iter().find_map(|item| match item {
+                        Item::Class(class) if class.name == class_name => Some(&class.type_params),
+                        _ => None,
+                    })
+                })
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            crate::ownership::function_return_borrow_in_context(
+                function,
+                enclosing_type_params,
+                &mut |_| None,
+            )
+        })
         .flatten();
 
         FunctionInfo {
+            declaration: function.span.start,
             type_params: function
                 .type_params
                 .iter()
-                .map(|param| param.name.clone())
+                .map(|param| TypeParamInfo {
+                    name: param.name.clone(),
+                    constraints: param.constraints.clone(),
+                })
                 .collect(),
             params,
             return_ty,
@@ -980,8 +1511,11 @@ impl<'program> Checker<'program> {
         }
     }
 
-    fn check_type_parameter_declarations(&mut self, function: &FunctionDecl) {
-        let mut names = HashSet::new();
+    fn check_function_type_parameter_declarations(
+        &mut self,
+        function: &FunctionDecl,
+        declaring_class: Option<&str>,
+    ) {
         if !function.type_params.is_empty()
             && matches!(
                 function.name.as_str(),
@@ -1000,7 +1534,45 @@ impl<'program> Checker<'program> {
                 .with_help("move the generic behavior into a regular function or method"),
             );
         }
-        for param in &function.type_params {
+        if let Some(class_name) = declaring_class {
+            let enclosing_parameters = self.program.items.iter().find_map(|item| match item {
+                Item::Class(class) if class.name == class_name => Some(&class.type_params),
+                _ => None,
+            });
+            if let Some(enclosing_parameters) = enclosing_parameters {
+                for parameter in &function.type_params {
+                    if enclosing_parameters
+                        .iter()
+                        .any(|enclosing| enclosing.name == parameter.name)
+                    {
+                        self.diagnostics.push(
+                            Diagnostic::new(
+                                "E0530",
+                                format!(
+                                    "type parameter `{}` on method `{class_name}::{}` shadows the enclosing class type parameter",
+                                    parameter.name, function.name
+                                ),
+                                parameter.span,
+                            )
+                            .with_help(
+                                "rename the method type parameter so class and method substitutions remain distinct",
+                            ),
+                        );
+                    }
+                }
+            }
+        }
+        self.check_type_parameter_declarations(
+            &function.type_params,
+            &format!("function `{}`", function.name),
+        );
+    }
+
+    fn check_type_parameter_declarations(&mut self, params: &[TypeParamDecl], owner: &str) {
+        let mut names = HashSet::new();
+        self.type_parameter_scopes
+            .push(type_parameter_scope(params));
+        for param in params {
             let valid_name =
                 param.name.len() == 1 && param.name.bytes().all(|byte| byte.is_ascii_uppercase());
             if !valid_name {
@@ -1023,17 +1595,70 @@ impl<'program> Checker<'program> {
                     param.span,
                 ));
             }
-            if !param.constraints.is_empty() {
+            if param.default_type.is_some() {
                 self.diagnostics.push(Diagnostic::unsupported_stage(
-                    "E0533",
+                    "E0534",
                     format!(
-                        "constraint checking for type parameter `{}` is pending until Stage 35",
+                        "{owner} cannot give type parameter `{}` a default type; decision 0105 reserves default type arguments beyond v1.0",
                         param.name
                     ),
                     param.span,
                 ));
             }
+            for constraint in &param.constraints {
+                if Self::is_compiler_known_constraint(&constraint.name) {
+                    self.check_compiler_known_constraint_declaration(param, constraint);
+                } else {
+                    self.diagnostics.push(Diagnostic::unsupported_stage(
+                        "E0533",
+                        format!(
+                            "constraint `{constraint}` on type parameter `{}` requires Stage 35 user-defined interfaces",
+                            param.name
+                        ),
+                        param.span,
+                    ));
+                }
+            }
         }
+        self.type_parameter_scopes.pop();
+    }
+
+    fn check_compiler_known_constraint_declaration(
+        &mut self,
+        param: &TypeParamDecl,
+        constraint: &TypeRef,
+    ) {
+        let type_arguments = constraint.type_argument_count();
+        let valid_arity = match constraint.name.as_str() {
+            "Hashable" | "Displayable" => type_arguments == 0,
+            "Comparable" | "Equatable" => type_arguments <= 1,
+            _ => unreachable!("caller filters compiler-known constraints"),
+        };
+        if !valid_arity || constraint.has_value_arguments() {
+            let expected = match constraint.name.as_str() {
+                "Hashable" | "Displayable" => "no type arguments",
+                "Comparable" | "Equatable" => "zero or one type argument",
+                _ => unreachable!("caller filters compiler-known constraints"),
+            };
+            self.diagnostics.push(Diagnostic::new(
+                "E0530",
+                format!(
+                    "constraint `{}` on type parameter `{}` expects {expected}",
+                    constraint.name, param.name
+                ),
+                param.span,
+            ));
+        }
+        for argument in constraint.type_arguments() {
+            self.resolve_type_ref_in_position(argument, param.span, TypePosition::Value, None);
+        }
+    }
+
+    fn is_compiler_known_constraint(name: &str) -> bool {
+        matches!(
+            name,
+            "Comparable" | "Hashable" | "Equatable" | "Displayable"
+        )
     }
 
     fn infer_return_borrow_signatures(&mut self) {
@@ -1101,10 +1726,22 @@ impl<'program> Checker<'program> {
                     }),
                     this_available: !function.is_static,
                 });
-                let inferred =
-                    crate::ownership::function_return_borrow_with_calls(function, &mut |call| {
-                        self.call_return_borrow(call, &scopes, method_context.as_ref())
-                    });
+                let enclosing_type_params = declaring_class
+                    .as_ref()
+                    .and_then(|class_name| {
+                        self.program.items.iter().find_map(|item| match item {
+                            Item::Class(class) if &class.name == class_name => {
+                                Some(class.type_params.clone())
+                            }
+                            _ => None,
+                        })
+                    })
+                    .unwrap_or_default();
+                let inferred = crate::ownership::function_return_borrow_in_context(
+                    function,
+                    &enclosing_type_params,
+                    &mut |call| self.call_return_borrow(call, &scopes, method_context.as_ref()),
+                );
                 if inferred.is_some() && inferred != signature.return_borrow {
                     self.set_return_borrow(function, declaring_class.as_deref(), inferred);
                     changed = true;
@@ -1827,7 +2464,7 @@ impl<'program> Checker<'program> {
                 self.types.intern(TypeKind::Nullable(inner))
             };
         }
-        if ty.args.is_empty() {
+        if ty.arguments.is_empty() {
             if let Some(integer) = IntegerType::from_source_name(&ty.name) {
                 return self.types.intern(TypeKind::Integer(integer));
             }
@@ -1836,35 +2473,46 @@ impl<'program> Checker<'program> {
             }
         }
         match ty.name.as_str() {
-            "void" if ty.args.is_empty() => self.types.intern(TypeKind::Void),
-            "string" if ty.args.is_empty() => self.types.intern(TypeKind::String),
-            "bool" if ty.args.is_empty() => self.types.intern(TypeKind::Bool),
-            "mixed" if ty.args.is_empty() => self.types.intern(TypeKind::Mixed),
-            "[]" if ty.args.len() == 1 => {
-                let element = self.resolve_type_ref_for_return_inference(&ty.args[0]);
+            "void" if ty.arguments.is_empty() => self.types.intern(TypeKind::Void),
+            "string" if ty.arguments.is_empty() => self.types.intern(TypeKind::String),
+            "bool" if ty.arguments.is_empty() => self.types.intern(TypeKind::Bool),
+            "mixed" if ty.arguments.is_empty() => self.types.intern(TypeKind::Mixed),
+            "[]" if ty.type_argument_count() == 1 && !ty.has_value_arguments() => {
+                let element =
+                    self.resolve_type_ref_for_return_inference(ty.type_argument(0).unwrap());
                 self.types.intern(TypeKind::TypedArray(element))
             }
-            "List" if ty.args.len() == 1 => {
-                let element = self.resolve_type_ref_for_return_inference(&ty.args[0]);
+            "List" if ty.type_argument_count() == 1 && !ty.has_value_arguments() => {
+                let element =
+                    self.resolve_type_ref_for_return_inference(ty.type_argument(0).unwrap());
                 self.types.intern(TypeKind::List(element))
             }
-            "Dictionary" if ty.args.len() == 2 => {
-                let key = self.resolve_type_ref_for_return_inference(&ty.args[0]);
-                let value = self.resolve_type_ref_for_return_inference(&ty.args[1]);
+            "Dictionary" if ty.type_argument_count() == 2 && !ty.has_value_arguments() => {
+                let key = self.resolve_type_ref_for_return_inference(ty.type_argument(0).unwrap());
+                let value =
+                    self.resolve_type_ref_for_return_inference(ty.type_argument(1).unwrap());
                 self.types.intern(TypeKind::Dictionary(key, value))
             }
-            "Set" if ty.args.len() == 1 => {
-                let element = self.resolve_type_ref_for_return_inference(&ty.args[0]);
+            "Set" if ty.type_argument_count() == 1 && !ty.has_value_arguments() => {
+                let element =
+                    self.resolve_type_ref_for_return_inference(ty.type_argument(0).unwrap());
                 self.types.intern(TypeKind::Set(element))
             }
-            name if ty.args.is_empty() && self.classes.contains_key(name) => {
-                self.types.intern(TypeKind::Class(name.to_string()))
+            name if self.classes.contains_key(name) && !ty.has_value_arguments() => {
+                let arguments = ty
+                    .type_arguments()
+                    .map(|argument| self.resolve_type_ref_for_return_inference(argument))
+                    .collect();
+                self.types
+                    .intern(TypeKind::Class(ClassType::new(name, arguments)))
             }
             _ => self.types.unknown(),
         }
     }
 
     fn check_class(&mut self, class_decl: &ClassDecl) {
+        self.type_parameter_scopes
+            .push(type_parameter_scope(&class_decl.type_params));
         if class_decl.parent.is_some() {
             self.diagnostics.push(Diagnostic::new(
                 "E0476",
@@ -1905,6 +2553,7 @@ impl<'program> Checker<'program> {
                 }
             }
         }
+        self.type_parameter_scopes.pop();
     }
 
     fn check_constant_initializer(&mut self, initializer: &Expr, class_name: Option<&str>) {
@@ -2192,13 +2841,9 @@ impl<'program> Checker<'program> {
     }
 
     fn check_function(&mut self, function: &FunctionDecl, method_context: Option<MethodContext>) {
-        self.type_parameter_scopes.push(
-            function
-                .type_params
-                .iter()
-                .map(|param| param.name.clone())
-                .collect(),
-        );
+        let previous_callable = self.current_callable.replace(function.span.start);
+        self.type_parameter_scopes
+            .push(type_parameter_scope(&function.type_params));
         let mut scopes = ScopeStack::new();
         let signature = self.current_function_signature(function);
         if method_context.is_none()
@@ -2288,6 +2933,7 @@ impl<'program> Checker<'program> {
         );
         self.check_missing_final_return(function, &return_context);
         self.type_parameter_scopes.pop();
+        self.current_callable = previous_callable;
     }
 
     fn check_parameter_default_support(
@@ -2681,7 +3327,7 @@ impl<'program> Checker<'program> {
                         .value
                         .ty
                         .as_ref()
-                        .and_then(|ty| ty.args.is_empty().then_some(ty))
+                        .and_then(|ty| ty.arguments.is_empty().then_some(ty))
                         .and_then(|ty| IntegerType::from_source_name(&ty.name))
                     {
                         self.contextualize_range_literals(&foreach.iterable, integer);
@@ -3470,12 +4116,17 @@ impl<'program> Checker<'program> {
                 );
             }
             Expr::New {
-                class_name,
+                class_type,
                 args,
                 span,
             } => {
+                let class_name = &class_type.name;
                 let qualified = class_name.contains('\\');
-                let class_exists = !qualified && self.classes.contains_key(class_name);
+                let is_current_class = class_name == "self"
+                    && class_type.arguments.is_empty()
+                    && method_context.is_some();
+                let class_exists =
+                    !qualified && (is_current_class || self.classes.contains_key(class_name));
                 if qualified {
                     self.report_deferred_qualified_name(class_name, *span);
                 } else if !class_exists {
@@ -3489,7 +4140,20 @@ impl<'program> Checker<'program> {
                     self.check_expr(&arg.value, scopes, method_context);
                 }
                 if class_exists {
-                    self.check_constructor_call(class_name, args, *span, scopes, method_context);
+                    let resolved = self.resolve_type_ref_with_class(
+                        class_type,
+                        *span,
+                        method_context.map(|context| context.class_name.as_str()),
+                    );
+                    if let Some(class_type) = self.class_type(resolved) {
+                        self.check_constructor_call(
+                            &class_type,
+                            args,
+                            *span,
+                            scopes,
+                            method_context,
+                        );
+                    }
                 }
             }
             Expr::Grouped { expr, .. } => {
@@ -3971,8 +4635,13 @@ impl<'program> Checker<'program> {
                     (TypeKind::String, TypeKind::String)
                 ) || matches!(
                     (self.types.kind(left_ty), self.types.kind(right_ty)),
-                    (TypeKind::Unknown, _) | (_, TypeKind::Unknown)
-                ) {
+                    (TypeKind::Bool, TypeKind::Bool)
+                ) || self.constrained_relational_operands(left_ty, right_ty)
+                    || matches!(
+                        (self.types.kind(left_ty), self.types.kind(right_ty)),
+                        (TypeKind::Unknown, _) | (_, TypeKind::Unknown)
+                    )
+                {
                     return;
                 }
                 self.report_integer_operand_mismatch(left_ty, right_ty, span, "comparison");
@@ -4088,6 +4757,31 @@ impl<'program> Checker<'program> {
     ) {
         let (left_ty, right_ty) =
             self.infer_contextual_binary_operand_types(left, right, scopes, method_context);
+        let left_kind = self.types.kind(left_ty).clone();
+        let right_kind = self.types.kind(right_ty).clone();
+        if self.constrained_equality_operands(left_ty, right_ty) {
+            return;
+        }
+        if let Some(parameter) = match (&left_kind, &right_kind) {
+            (TypeKind::TypeParameter(parameter), _) | (_, TypeKind::TypeParameter(parameter)) => {
+                Some(parameter)
+            }
+            _ => None,
+        } {
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "E0537",
+                    format!(
+                        "equality is not guaranteed by the constraints on type parameter `{parameter}`"
+                    ),
+                    span,
+                )
+                .with_help(format!(
+                    "declare `{parameter} implements Equatable` before comparing values of this type"
+                )),
+            );
+            return;
+        }
         let left_collection = self.is_runtime_collection_type(left_ty);
         let right_collection = self.is_runtime_collection_type(right_ty);
         if left_collection || right_collection {
@@ -4193,10 +4887,10 @@ impl<'program> Checker<'program> {
             TypeKind::String | TypeKind::Integer(_) | TypeKind::Float(_) | TypeKind::Bool => {
                 DisplayConversionKind::Primitive
             }
-            TypeKind::Class(name) => {
+            TypeKind::Class(class) => {
                 if self
                     .classes
-                    .get(name)
+                    .get(&class.name)
                     .is_some_and(|class| class.implements_displayable)
                 {
                     DisplayConversionKind::DisplayableClass
@@ -4422,6 +5116,7 @@ impl<'program> Checker<'program> {
         match self.types.kind(ty) {
             TypeKind::Nullable(inner) => self.type_is_move_type(*inner),
             TypeKind::Class(_)
+            | TypeKind::TypeParameter(_)
             | TypeKind::Bytes
             | TypeKind::Mixed
             | TypeKind::TypedArray(_)
@@ -4432,6 +5127,120 @@ impl<'program> Checker<'program> {
             | TypeKind::Heterogeneous => true,
             _ => false,
         }
+    }
+
+    fn type_is_symbolic(&self, ty: TypeId) -> bool {
+        match self.types.kind(ty) {
+            TypeKind::TypeParameter(_) => true,
+            TypeKind::Nullable(inner)
+            | TypeKind::TypedArray(inner)
+            | TypeKind::List(inner)
+            | TypeKind::Set(inner) => self.type_is_symbolic(*inner),
+            TypeKind::Dictionary(key, value) => {
+                self.type_is_symbolic(*key) || self.type_is_symbolic(*value)
+            }
+            TypeKind::Class(class) => class
+                .arguments
+                .iter()
+                .any(|argument| self.type_is_symbolic(*argument)),
+            _ => false,
+        }
+    }
+
+    fn class_type(&self, ty: TypeId) -> Option<ClassType<TypeId>> {
+        match self.types.kind(ty) {
+            TypeKind::Class(class) => Some(class.clone()),
+            TypeKind::Nullable(inner) => self.class_type(*inner),
+            _ => None,
+        }
+    }
+
+    fn class_type_substitutions(&self, class: &ClassType<TypeId>) -> HashMap<String, TypeId> {
+        self.classes
+            .get(&class.name)
+            .map(|info| {
+                info.type_params
+                    .iter()
+                    .zip(&class.arguments)
+                    .map(|(param, argument)| (param.name.clone(), *argument))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn substitute_type_id(
+        &mut self,
+        ty: TypeId,
+        substitutions: &HashMap<String, TypeId>,
+    ) -> TypeId {
+        match self.types.kind(ty).clone() {
+            TypeKind::TypeParameter(name) => substitutions.get(&name).copied().unwrap_or(ty),
+            TypeKind::Nullable(inner) => {
+                let inner = self.substitute_type_id(inner, substitutions);
+                // `?(?X)` collapses to `?X`: a `?T` member substituted with a
+                // nullable argument is already nullable, not doubly-nullable.
+                if matches!(self.types.kind(inner), TypeKind::Nullable(_)) {
+                    inner
+                } else {
+                    self.types.intern(TypeKind::Nullable(inner))
+                }
+            }
+            TypeKind::TypedArray(element) => {
+                let element = self.substitute_type_id(element, substitutions);
+                self.types.intern(TypeKind::TypedArray(element))
+            }
+            TypeKind::List(element) => {
+                let element = self.substitute_type_id(element, substitutions);
+                self.types.intern(TypeKind::List(element))
+            }
+            TypeKind::Dictionary(key, value) => {
+                let key = self.substitute_type_id(key, substitutions);
+                let value = self.substitute_type_id(value, substitutions);
+                self.types.intern(TypeKind::Dictionary(key, value))
+            }
+            TypeKind::Set(element) => {
+                let element = self.substitute_type_id(element, substitutions);
+                self.types.intern(TypeKind::Set(element))
+            }
+            TypeKind::Class(class) => {
+                let arguments = class
+                    .arguments
+                    .into_iter()
+                    .map(|argument| self.substitute_type_id(argument, substitutions))
+                    .collect();
+                self.types
+                    .intern(TypeKind::Class(ClassType::new(class.name, arguments)))
+            }
+            _ => ty,
+        }
+    }
+
+    fn specialize_method_for_class(
+        &mut self,
+        method: &MethodInfo,
+        class: &ClassType<TypeId>,
+    ) -> MethodInfo {
+        let substitutions = self.class_type_substitutions(class);
+        let mut specialized = method.clone();
+        specialized
+            .enclosing_type_bindings
+            .extend(substitutions.clone());
+        for param in &mut specialized.params {
+            param.ty = self.substitute_type_id(param.ty, &substitutions);
+        }
+        specialized.return_ty = self.substitute_type_id(method.return_ty, &substitutions);
+        specialized
+    }
+
+    fn specialize_property_for_class(
+        &mut self,
+        property: &PropertyInfo,
+        class: &ClassType<TypeId>,
+    ) -> PropertyInfo {
+        let mut specialized = property.clone();
+        specialized.ty =
+            self.substitute_type_id(property.ty, &self.class_type_substitutions(class));
+        specialized
     }
 
     fn report_mixed_operation(&mut self, span: Span, operation: &'static str) {
@@ -5168,9 +5977,32 @@ impl<'program> Checker<'program> {
         scopes: &ScopeStack,
         method_context: Option<&MethodContext>,
     ) {
-        let Some(class_name) = self.expr_class_name(object, scopes, method_context) else {
+        let object_ty = self.infer_expr_type(object, scopes, method_context);
+        if let TypeKind::TypeParameter(parameter) = self.types.kind(object_ty).clone() {
+            if method == "toString"
+                && args.is_empty()
+                && self.type_parameter_has_constraint(&parameter, "Displayable")
+            {
+                self.constrained_display_calls
+                    .insert((span.start, span.end));
+                return;
+            }
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "E0537",
+                    format!(
+                        "method `{method}` is not guaranteed by the constraints on type parameter `{parameter}`"
+                    ),
+                    span,
+                )
+                .with_help("add a compiler-known constraint that declares this method"),
+            );
+            return;
+        }
+        let Some(class_type) = self.expr_class_type(object, scopes, method_context) else {
             return;
         };
+        let class_name = class_type.name.clone();
         let Some(class_info) = self.classes.get(&class_name).cloned() else {
             self.diagnostics.push(Diagnostic::new(
                 "E0305",
@@ -5179,7 +6011,7 @@ impl<'program> Checker<'program> {
             ));
             return;
         };
-        let Some(method_info) = class_info.methods.get(method) else {
+        let Some(method_info) = class_info.methods.get(method).cloned() else {
             self.diagnostics.push(Diagnostic::new(
                 "E0304",
                 format!("unknown method `{class_name}::{method}`"),
@@ -5188,10 +6020,14 @@ impl<'program> Checker<'program> {
             return;
         };
 
+        let class_type_id = self.types.intern(TypeKind::Class(class_type.clone()));
+        let ResolvedType::Class(resolved_class_type) = self.types.resolved(class_type_id) else {
+            unreachable!("interned class type must resolve as a class");
+        };
         self.call_targets.insert(
             (span.start, span.end),
             CallableTarget::Method {
-                class_name: class_name.clone(),
+                class_type: resolved_class_type,
                 method_name: method.to_string(),
             },
         );
@@ -5232,9 +6068,10 @@ impl<'program> Checker<'program> {
             ));
         }
 
+        let method_info = self.specialize_method_for_class(&method_info, &class_type);
         let method_info = self.instantiate_generic_method_call(
             &format!("method `{class_name}::{method}`"),
-            method_info,
+            &method_info,
             args,
             span,
             scopes,
@@ -5469,10 +6306,19 @@ impl<'program> Checker<'program> {
             return;
         };
 
+        let target_class = if matches!(access.qualifier, StaticQualifier::SelfType) {
+            let class_type = self.symbolic_class_type(class_name);
+            match self.types.resolved(class_type) {
+                ResolvedType::Class(class_type) => class_type,
+                _ => unreachable!("symbolic declaring class type must resolve as a class"),
+            }
+        } else {
+            ClassType::new(class_name, Vec::new())
+        };
         self.call_targets.insert(
             (access.span.start, access.span.end),
             CallableTarget::Method {
-                class_name: class_name.to_string(),
+                class_type: target_class,
                 method_name: access.member.to_string(),
             },
         );
@@ -5628,6 +6474,27 @@ impl<'program> Checker<'program> {
         }
 
         match access.qualifier {
+            StaticQualifier::Class(name)
+                if self
+                    .classes
+                    .get(name)
+                    .is_some_and(|class| !class.type_params.is_empty()) =>
+            {
+                self.diagnostics.push(
+                    Diagnostic::new(
+                        "E0540",
+                        format!(
+                            "static access through generic class `{name}` does not identify a concrete specialization"
+                        ),
+                        access.qualifier_span,
+                    )
+                    .with_help(format!(
+                        "use `self::{}` inside `{name}<...>`, or move the operation to a free generic function",
+                        access.member
+                    )),
+                );
+                None
+            }
             StaticQualifier::Class(name) => Some(name.clone()),
             StaticQualifier::SelfType => method_context
                 .map(|context| context.class_name.clone())
@@ -5817,17 +6684,18 @@ impl<'program> Checker<'program> {
 
     fn check_constructor_call(
         &mut self,
-        class_name: &str,
+        class_type: &ClassType<TypeId>,
         args: &[Argument],
         span: Span,
         scopes: &ScopeStack,
         method_context: Option<&MethodContext>,
     ) {
+        let class_name = class_type.name.as_str();
         let Some(class_info) = self.classes.get(class_name).cloned() else {
             return;
         };
 
-        let Some(constructor) = class_info.methods.get("__construct") else {
+        let Some(constructor) = class_info.methods.get("__construct").cloned() else {
             if !args.is_empty() {
                 self.report_argument_count_mismatch(
                     &format!("constructor `{class_name}::__construct`"),
@@ -5850,6 +6718,7 @@ impl<'program> Checker<'program> {
             ));
         }
 
+        let constructor = self.specialize_method_for_class(&constructor, class_type);
         self.check_call_arguments(
             &format!("constructor `{class_name}::__construct`"),
             &constructor.params,
@@ -6000,8 +6869,11 @@ impl<'program> Checker<'program> {
             scopes,
             method_context,
             function.return_ty,
+            function.declaration,
+            &HashMap::new(),
         );
         FunctionInfo {
+            declaration: function.declaration,
             type_params: function.type_params.clone(),
             params: function
                 .params
@@ -6034,12 +6906,16 @@ impl<'program> Checker<'program> {
             scopes,
             method_context,
             method.return_ty,
+            method.declaration,
+            &method.enclosing_type_bindings,
         );
         MethodInfo {
+            declaration: method.declaration,
             access: method.access.clone(),
             receiver_mode: method.receiver_mode,
             return_borrow: method.return_borrow,
             is_static: method.is_static,
+            enclosing_type_bindings: method.enclosing_type_bindings.clone(),
             type_params: method.type_params.clone(),
             params: method
                 .params
@@ -6054,13 +6930,15 @@ impl<'program> Checker<'program> {
     fn infer_generic_call_bindings(
         &mut self,
         callee: &str,
-        type_params: &[String],
+        type_params: &[TypeParamInfo],
         params: &[ParamInfo],
         args: &[Argument],
         span: Span,
         scopes: &ScopeStack,
         method_context: Option<&MethodContext>,
         return_ty: TypeId,
+        declaration: usize,
+        initial_bindings: &HashMap<String, TypeId>,
     ) -> HashMap<String, TypeId> {
         let param_names = params
             .iter()
@@ -6076,7 +6954,7 @@ impl<'program> Checker<'program> {
             .collect::<Vec<_>>();
         let bound =
             crate::arg_binding::bind_arguments(&param_names, &param_has_default, &arg_names);
-        let mut bindings = HashMap::new();
+        let mut bindings = initial_bindings.clone();
         for (param_index, param) in params.iter().enumerate() {
             let Some(arg_index) = bound.param_to_arg[param_index] else {
                 continue;
@@ -6096,6 +6974,7 @@ impl<'program> Checker<'program> {
             key,
             PendingGenericCall {
                 callee: callee.to_string(),
+                declaration,
                 type_params: type_params.to_vec(),
                 bindings: bindings.clone(),
                 return_ty,
@@ -6117,6 +6996,40 @@ impl<'program> Checker<'program> {
             self.types.kind(pattern).clone(),
             self.types.kind(actual).clone(),
         ) {
+            (TypeKind::TypeParameter(name), TypeKind::Null) => {
+                let message = format!(
+                    "cannot infer type parameter `{name}` of {callee} from `null`; `null` requires a nullable expected type"
+                );
+                if !self.diagnostics.iter().any(|diagnostic| {
+                    diagnostic.code == "E0538"
+                        && diagnostic.span == span
+                        && diagnostic.message == message
+                }) {
+                    self.diagnostics
+                        .push(Diagnostic::new("E0538", message, span).with_help(
+                            "pass a value with a concrete type or use a nullable parameter shape",
+                        ));
+                }
+                let unknown = self.types.unknown();
+                bindings.entry(name).or_insert(unknown);
+            }
+            (TypeKind::TypeParameter(name), TypeKind::Void) => {
+                let message = format!(
+                    "cannot infer type parameter `{name}` of {callee} from a `void` expression"
+                );
+                if !self.diagnostics.iter().any(|diagnostic| {
+                    diagnostic.code == "E0538"
+                        && diagnostic.span == span
+                        && diagnostic.message == message
+                }) {
+                    self.diagnostics.push(
+                        Diagnostic::new("E0538", message, span)
+                            .with_help("pass an expression that produces a value"),
+                    );
+                }
+                let unknown = self.types.unknown();
+                bindings.entry(name).or_insert(unknown);
+            }
             (TypeKind::TypeParameter(name), TypeKind::Unknown | TypeKind::EmptyCollection) => {
                 let _ = name;
             }
@@ -6169,6 +7082,14 @@ impl<'program> Checker<'program> {
                     bindings,
                 );
             }
+            (TypeKind::Class(pattern), TypeKind::Class(actual))
+                if pattern.name == actual.name
+                    && pattern.arguments.len() == actual.arguments.len() =>
+            {
+                for (pattern, actual) in pattern.arguments.into_iter().zip(actual.arguments) {
+                    self.infer_type_parameter_bindings(callee, pattern, actual, span, bindings);
+                }
+            }
             _ => {}
         }
     }
@@ -6211,6 +7132,22 @@ impl<'program> Checker<'program> {
                 let element = self.substitute_type(element, bindings);
                 self.types.intern(TypeKind::Set(element))
             }
+            TypeKind::Class(class) => {
+                let arguments = class
+                    .arguments
+                    .into_iter()
+                    .map(|argument| self.substitute_type(argument, bindings))
+                    .collect::<Vec<_>>();
+                let class = ClassType::new(class.name, arguments);
+                if !class
+                    .arguments
+                    .iter()
+                    .any(|argument| self.type_is_symbolic(*argument))
+                {
+                    self.class_instantiations.insert(class.clone());
+                }
+                self.types.intern(TypeKind::Class(class))
+            }
             _ => ty,
         }
     }
@@ -6222,16 +7159,25 @@ impl<'program> Checker<'program> {
         let Some(arguments) = pending
             .type_params
             .iter()
-            .map(|name| {
+            .map(|param| {
                 pending
                     .bindings
-                    .get(name)
+                    .get(&param.name)
                     .map(|ty| GenericArgument::Type(self.types.resolved(*ty)))
             })
             .collect::<Option<Vec<_>>>()
         else {
             return;
         };
+        let callee = pending.callee.clone();
+        let type_params = pending.type_params.clone();
+        let bindings = pending.bindings.clone();
+        self.check_generic_type_constraints(
+            &callee,
+            &type_params,
+            &bindings,
+            Span::new(key.0, key.1),
+        );
         self.generic_call_specializations
             .insert(key, GenericSpecialization { arguments });
     }
@@ -6272,7 +7218,7 @@ impl<'program> Checker<'program> {
         if pending
             .type_params
             .iter()
-            .all(|name| pending.bindings.contains_key(name))
+            .all(|param| pending.bindings.contains_key(&param.name))
         {
             return self.substitute_type(pending.return_ty, &pending.bindings);
         }
@@ -6286,14 +7232,14 @@ impl<'program> Checker<'program> {
             let missing_names = pending
                 .type_params
                 .iter()
-                .filter(|name| !pending.bindings.contains_key(*name))
+                .filter(|param| !pending.bindings.contains_key(&param.name))
                 .collect::<Vec<_>>();
             if missing_names.is_empty() {
                 continue;
             }
             let missing = missing_names
                 .iter()
-                .map(|name| format!("`{name}`"))
+                .map(|param| format!("`{}`", param.name))
                 .collect::<Vec<_>>()
                 .join(", ");
             let plural = if missing_names.len() == 1 { "" } else { "s" };
@@ -6471,41 +7417,45 @@ impl<'program> Checker<'program> {
             Expr::Index { collection, .. } => {
                 self.is_writable_object_path(collection, scopes, method_context)
             }
-            Expr::FunctionCall { name, args, .. } => {
-                self.functions.get(name).cloned().is_some_and(|function| {
-                    self.call_result_is_writable(
-                        CallSite {
-                            return_ty: function.return_ty,
-                            return_borrow: function.return_borrow,
-                            params: &function.params,
-                            args,
-                        },
-                        None,
-                        scopes,
-                        method_context,
-                    )
-                })
-            }
+            Expr::FunctionCall {
+                name, args, span, ..
+            } => self.functions.get(name).cloned().is_some_and(|function| {
+                let return_ty = self.generic_call_result_type(*span, function.return_ty);
+                self.call_result_is_writable(
+                    CallSite {
+                        return_ty,
+                        return_borrow: function.return_borrow,
+                        params: &function.params,
+                        args,
+                    },
+                    None,
+                    scopes,
+                    method_context,
+                )
+            }),
             Expr::MethodCall {
                 object,
                 method,
                 args,
+                span,
                 ..
             } => {
-                let Some(class_name) = self.expr_class_name(object, scopes, method_context) else {
+                let Some(class_type) = self.expr_class_type(object, scopes, method_context) else {
                     return false;
                 };
                 let Some(method_info) = self
                     .classes
-                    .get(&class_name)
+                    .get(&class_type.name)
                     .and_then(|class_info| class_info.methods.get(method))
                     .cloned()
                 else {
                     return false;
                 };
+                let method_info = self.specialize_method_for_class(&method_info, &class_type);
+                let return_ty = self.generic_call_result_type(*span, method_info.return_ty);
                 self.call_result_is_writable(
                     CallSite {
-                        return_ty: method_info.return_ty,
+                        return_ty,
                         return_borrow: method_info.return_borrow,
                         params: &method_info.params,
                         args,
@@ -6519,6 +7469,7 @@ impl<'program> Checker<'program> {
                 qualifier,
                 method,
                 args,
+                span,
                 ..
             } => {
                 let class_name = match qualifier {
@@ -6535,9 +7486,10 @@ impl<'program> Checker<'program> {
                 else {
                     return false;
                 };
+                let return_ty = self.generic_call_result_type(*span, method_info.return_ty);
                 self.call_result_is_writable(
                     CallSite {
-                        return_ty: method_info.return_ty,
+                        return_ty,
                         return_borrow: method_info.return_borrow,
                         params: &method_info.params,
                         args,
@@ -6661,7 +7613,22 @@ impl<'program> Checker<'program> {
         scopes: &ScopeStack,
         method_context: Option<&MethodContext>,
     ) -> Option<(String, PropertyInfo)> {
-        let class_name = self.expr_class_name(object, scopes, method_context)?;
+        let object_ty = self.infer_expr_type(object, scopes, method_context);
+        if let TypeKind::TypeParameter(parameter) = self.types.kind(object_ty) {
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "E0537",
+                    format!(
+                        "property `{property}` is not guaranteed by the constraints on type parameter `{parameter}`"
+                    ),
+                    span,
+                )
+                .with_help("type-parameter bodies may use only members guaranteed by their constraints"),
+            );
+            return None;
+        }
+        let class_type = self.expr_class_type(object, scopes, method_context)?;
+        let class_name = class_type.name.clone();
         let Some(class_info) = self.classes.get(&class_name) else {
             self.diagnostics.push(Diagnostic::new(
                 "E0305",
@@ -6670,7 +7637,7 @@ impl<'program> Checker<'program> {
             ));
             return None;
         };
-        let Some(property_info) = class_info.properties.get(property) else {
+        let Some(property_info) = class_info.properties.get(property).cloned() else {
             self.diagnostics.push(Diagnostic::new(
                 "E0303",
                 format!("unknown property `{class_name}::{property}`"),
@@ -6679,7 +7646,7 @@ impl<'program> Checker<'program> {
             return None;
         };
 
-        let property_info = property_info.clone();
+        let property_info = self.specialize_property_for_class(&property_info, &class_type);
         if matches!(property_info.access, MemberAccess::Internal)
             && !self.can_access_internal_member(&class_name, method_context)
         {
@@ -6701,6 +7668,109 @@ impl<'program> Checker<'program> {
         method_context
             .map(|context| context.class_name == declaring_class)
             .unwrap_or(false)
+    }
+
+    fn type_parameter_has_constraint(&self, parameter: &str, required: &str) -> bool {
+        self.type_parameter_scopes
+            .iter()
+            .rev()
+            .find_map(|scope| scope.get(parameter))
+            .is_some_and(|constraints| {
+                constraints
+                    .iter()
+                    .any(|constraint| constraint.name == required)
+            })
+    }
+
+    fn constrained_relational_operands(&mut self, left: TypeId, right: TypeId) -> bool {
+        self.constrained_binary_operands(left, right, "Comparable")
+    }
+
+    fn constrained_equality_operands(&mut self, left: TypeId, right: TypeId) -> bool {
+        self.constrained_binary_operands(left, right, "Equatable")
+    }
+
+    fn constrained_binary_operands(
+        &mut self,
+        left: TypeId,
+        right: TypeId,
+        constraint_name: &str,
+    ) -> bool {
+        let left_kind = self.types.kind(left).clone();
+        let right_kind = self.types.kind(right).clone();
+        matches!(left_kind, TypeKind::TypeParameter(ref parameter)
+        if self.type_parameter_accepts_constraint_operand(
+            parameter,
+            constraint_name,
+            right
+        )) || matches!(right_kind, TypeKind::TypeParameter(ref parameter)
+        if self.type_parameter_accepts_constraint_operand(
+            parameter,
+            constraint_name,
+            left
+        ))
+    }
+
+    fn type_parameter_accepts_constraint_operand(
+        &mut self,
+        parameter: &str,
+        constraint_name: &str,
+        operand: TypeId,
+    ) -> bool {
+        let constraints = self
+            .type_parameter_scopes
+            .iter()
+            .rev()
+            .find_map(|scope| scope.get(parameter))
+            .into_iter()
+            .flatten()
+            .filter(|constraint| constraint.name == constraint_name)
+            .cloned()
+            .collect::<Vec<_>>();
+
+        constraints.into_iter().any(|constraint| {
+            if matches!(
+                self.types.kind(operand),
+                TypeKind::TypeParameter(other) if other == parameter
+            ) {
+                return true;
+            }
+            if constraint.arguments.is_empty() {
+                return false;
+            }
+            if constraint.has_value_arguments() || constraint.type_argument_count() != 1 {
+                return false;
+            }
+            constraint
+                .type_argument(0)
+                .and_then(|argument| self.resolve_constraint_operand_type(argument))
+                == Some(operand)
+        })
+    }
+
+    fn resolve_constraint_operand_type(&mut self, ty: &TypeRef) -> Option<TypeId> {
+        if ty.nullable || !ty.arguments.is_empty() {
+            return None;
+        }
+        if self
+            .type_parameter_scopes
+            .iter()
+            .rev()
+            .any(|scope| scope.contains_key(&ty.name))
+        {
+            return Some(self.types.intern(TypeKind::TypeParameter(ty.name.clone())));
+        }
+        if let Some(integer) = IntegerType::from_source_name(&ty.name) {
+            return Some(self.types.intern(TypeKind::Integer(integer)));
+        }
+        if let Some(float) = FloatType::from_source_name(&ty.name) {
+            return Some(self.types.intern(TypeKind::Float(float)));
+        }
+        match ty.name.as_str() {
+            "string" => Some(self.types.intern(TypeKind::String)),
+            "bool" => Some(self.types.intern(TypeKind::Bool)),
+            _ => None,
+        }
     }
 
     fn report_deferred_qualified_name(&mut self, name: &str, span: Span) {
@@ -6760,8 +7830,26 @@ impl<'program> Checker<'program> {
         position: TypePosition,
         declaring_class: Option<&str>,
     ) -> TypeId {
+        if ty.has_value_arguments() {
+            for argument in ty.type_arguments() {
+                self.resolve_type_ref_in_position(
+                    argument,
+                    span,
+                    TypePosition::Value,
+                    declaring_class,
+                );
+            }
+            self.diagnostics.push(Diagnostic::unsupported_stage(
+                "E0536",
+                format!(
+                    "compile-time value arguments in `{ty}` are reserved by decision 0105 but are not available in v1.0"
+                ),
+                span,
+            ));
+            return self.types.unknown();
+        }
         if ty.name.contains('\\') {
-            for arg in &ty.args {
+            for arg in ty.type_arguments() {
                 self.resolve_type_ref_in_position(arg, span, TypePosition::Value, declaring_class);
             }
             self.report_deferred_qualified_name(&ty.name, span);
@@ -6816,18 +7904,19 @@ impl<'program> Checker<'program> {
         if let Some(float) = FloatType::from_source_name(&ty.name) {
             return self.resolve_zero_arg_type(ty, span, TypeKind::Float(float));
         }
-        if ty.args.is_empty()
+        if ty.arguments.is_empty()
             && self
                 .type_parameter_scopes
-                .last()
-                .is_some_and(|params| params.contains(&ty.name))
+                .iter()
+                .rev()
+                .any(|params| params.contains_key(&ty.name))
         {
             return self.types.intern(TypeKind::TypeParameter(ty.name.clone()));
         }
 
         match ty.name.as_str() {
-            "self" if ty.args.is_empty() => match declaring_class {
-                Some(class_name) => self.types.intern(TypeKind::Class(class_name.to_string())),
+            "self" if ty.arguments.is_empty() => match declaring_class {
+                Some(class_name) => self.symbolic_class_type(class_name),
                 None => self.reject_type_ref(
                     ty,
                     span,
@@ -6901,61 +7990,100 @@ impl<'program> Checker<'program> {
             }
             "[]" => {
                 if !self.expect_type_arg_count(ty, 1, span) {
-                    for arg in &ty.args {
+                    for arg in ty.type_arguments() {
                         self.resolve_type_ref_in_position(arg, span, TypePosition::Value, declaring_class);
                     }
                     return self.types.unknown();
                 }
                 let element =
-                    self.resolve_type_ref_in_position(&ty.args[0], span, TypePosition::Value, declaring_class);
+                    self.resolve_type_ref_in_position(ty.type_argument(0).unwrap(), span, TypePosition::Value, declaring_class);
                 self.types.intern(TypeKind::TypedArray(element))
             }
             "List" => {
                 if !self.expect_type_arg_count(ty, 1, span) {
-                    for arg in &ty.args {
+                    for arg in ty.type_arguments() {
                         self.resolve_type_ref_in_position(arg, span, TypePosition::Value, declaring_class);
                     }
                     return self.types.unknown();
                 }
                 let element =
-                    self.resolve_type_ref_in_position(&ty.args[0], span, TypePosition::Value, declaring_class);
+                    self.resolve_type_ref_in_position(ty.type_argument(0).unwrap(), span, TypePosition::Value, declaring_class);
                 self.types.intern(TypeKind::List(element))
             }
             "Dictionary" => {
                 if !self.expect_type_arg_count(ty, 2, span) {
-                    for arg in &ty.args {
+                    for arg in ty.type_arguments() {
                         self.resolve_type_ref_in_position(arg, span, TypePosition::Value, declaring_class);
                     }
                     return self.types.unknown();
                 }
-                let key = self.resolve_type_ref_in_position(&ty.args[0], span, TypePosition::Value, declaring_class);
+                let key = self.resolve_type_ref_in_position(ty.type_argument(0).unwrap(), span, TypePosition::Value, declaring_class);
                 let value =
-                    self.resolve_type_ref_in_position(&ty.args[1], span, TypePosition::Value, declaring_class);
+                    self.resolve_type_ref_in_position(ty.type_argument(1).unwrap(), span, TypePosition::Value, declaring_class);
                 self.check_stage23_hashable_type(key, span, "Dictionary key");
                 self.types.intern(TypeKind::Dictionary(key, value))
             }
             "Set" => {
                 if !self.expect_type_arg_count(ty, 1, span) {
-                    for arg in &ty.args {
+                    for arg in ty.type_arguments() {
                         self.resolve_type_ref_in_position(arg, span, TypePosition::Value, declaring_class);
                     }
                     return self.types.unknown();
                 }
                 let element =
-                    self.resolve_type_ref_in_position(&ty.args[0], span, TypePosition::Value, declaring_class);
+                    self.resolve_type_ref_in_position(ty.type_argument(0).unwrap(), span, TypePosition::Value, declaring_class);
                 self.check_stage23_hashable_type(element, span, "Set element");
                 self.types.intern(TypeKind::Set(element))
             }
             name if self.classes.contains_key(name) => {
-                if !self.expect_type_arg_count(ty, 0, span) {
-                    for arg in &ty.args {
+                let type_params = self
+                    .classes
+                    .get(name)
+                    .map(|class| class.type_params.clone())
+                    .unwrap_or_default();
+                if !self.expect_type_arg_count(ty, type_params.len(), span) {
+                    for arg in ty.type_arguments() {
                         self.resolve_type_ref_in_position(arg, span, TypePosition::Value, declaring_class);
                     }
+                    return self.types.unknown();
                 }
-                self.types.intern(TypeKind::Class(name.to_string()))
+                let arguments = ty
+                    .type_arguments()
+                    .map(|argument| {
+                        self.resolve_type_ref_in_position(
+                            argument,
+                            span,
+                            TypePosition::Value,
+                            declaring_class,
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                self.check_class_type_constraints(name, &type_params, &arguments, span);
+                let class = ClassType::new(name, arguments);
+                if class
+                    .arguments
+                    .iter()
+                    .any(|argument| self.type_is_symbolic(*argument))
+                {
+                    if let Some(owner) = declaring_class {
+                        self.class_instantiation_templates
+                            .entry(owner.to_string())
+                            .or_default()
+                            .insert(class.clone());
+                    }
+                    if let Some(callable) = self.current_callable {
+                        self.callable_class_instantiation_templates
+                            .entry(callable)
+                            .or_default()
+                            .insert(class.clone());
+                    }
+                } else {
+                    self.class_instantiations.insert(class.clone());
+                }
+                self.types.intern(TypeKind::Class(class))
             }
             name => {
-                for arg in &ty.args {
+                for arg in ty.type_arguments() {
                     self.resolve_type_ref_in_position(arg, span, TypePosition::Value, declaring_class);
                 }
                 self.diagnostics.push(Diagnostic::new(
@@ -6968,17 +8096,52 @@ impl<'program> Checker<'program> {
         }
     }
 
+    fn symbolic_class_type(&mut self, class_name: &str) -> TypeId {
+        let parameter_names = self
+            .classes
+            .get(class_name)
+            .map(|class| {
+                class
+                    .type_params
+                    .iter()
+                    .map(|param| param.name.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let arguments = parameter_names
+            .into_iter()
+            .map(|name| self.types.intern(TypeKind::TypeParameter(name)))
+            .collect();
+        self.types
+            .intern(TypeKind::Class(ClassType::new(class_name, arguments)))
+    }
+
     fn check_stage23_hashable_type(&mut self, ty: TypeId, span: Span, role: &str) {
         let diagnostic = match self.types.kind(ty) {
             TypeKind::Integer(_)
             | TypeKind::String
             | TypeKind::Bool
-            | TypeKind::TypeParameter(_)
             | TypeKind::Unknown => return,
-            TypeKind::Class(name) => Diagnostic::unsupported_stage(
+            TypeKind::TypeParameter(parameter)
+                if self.type_parameter_has_constraint(parameter, "Hashable") =>
+            {
+                return;
+            }
+            TypeKind::TypeParameter(parameter) => Diagnostic::new(
+                "E0537",
+                format!(
+                    "{role} type parameter `{parameter}` is not guaranteed to implement `Hashable`"
+                ),
+                span,
+            )
+            .with_help(format!(
+                "declare `{parameter} implements Hashable` before using it as a hash key or set element"
+            )),
+            TypeKind::Class(_) => Diagnostic::unsupported_stage(
                 "E0523",
                 format!(
-                    "{role} type `{name}` requires Stage 35 user-defined `Hashable` conformance"
+                    "{role} type `{}` requires Stage 35 user-defined `Hashable` conformance",
+                    self.types.display(ty)
                 ),
                 span,
             ),
@@ -7006,7 +8169,7 @@ impl<'program> Checker<'program> {
         code: &'static str,
         message: impl Into<String>,
     ) -> TypeId {
-        for arg in &ty.args {
+        for arg in ty.type_arguments() {
             self.resolve_type_ref_in_position(arg, span, TypePosition::Value, None);
         }
         self.diagnostics.push(Diagnostic::new(code, message, span));
@@ -7021,7 +8184,7 @@ impl<'program> Checker<'program> {
         message: impl Into<String>,
         help: impl Into<String>,
     ) -> TypeId {
-        for arg in &ty.args {
+        for arg in ty.type_arguments() {
             self.resolve_type_ref_in_position(arg, span, TypePosition::Value, None);
         }
         self.diagnostics
@@ -7031,15 +8194,15 @@ impl<'program> Checker<'program> {
 
     fn resolve_zero_arg_type(&mut self, ty: &TypeRef, span: Span, kind: TypeKind) -> TypeId {
         self.expect_type_arg_count(ty, 0, span);
-        for arg in &ty.args {
+        for arg in ty.type_arguments() {
             self.resolve_type_ref(arg, span);
         }
         self.types.intern(kind)
     }
 
     fn expect_type_arg_count(&mut self, ty: &TypeRef, expected: usize, span: Span) -> bool {
-        let found = ty.args.len();
-        if found == expected {
+        let found = ty.type_argument_count();
+        if found == expected && !ty.has_value_arguments() {
             return true;
         }
 
@@ -7055,6 +8218,153 @@ impl<'program> Checker<'program> {
             span,
         ));
         false
+    }
+
+    fn check_class_type_constraints(
+        &mut self,
+        class_name: &str,
+        params: &[TypeParamInfo],
+        arguments: &[TypeId],
+        span: Span,
+    ) {
+        let bindings = params
+            .iter()
+            .zip(arguments)
+            .map(|(param, argument)| (param.name.clone(), *argument))
+            .collect::<HashMap<_, _>>();
+        for (param, argument) in params.iter().zip(arguments) {
+            for constraint in &param.constraints {
+                if !Self::is_compiler_known_constraint(&constraint.name)
+                    || self.type_is_symbolic(*argument)
+                {
+                    continue;
+                }
+                if self.constraint_accepts_type_argument(constraint, *argument, &bindings, span) {
+                    continue;
+                }
+                let message = format!(
+                    "type argument `{}` for `{class_name}<...>` does not satisfy required constraint `{}`",
+                    self.types.display(*argument),
+                    constraint
+                );
+                if !self.diagnostics.iter().any(|diagnostic| {
+                    diagnostic.code == "E0535"
+                        && diagnostic.span == span
+                        && diagnostic.message == message
+                }) {
+                    self.diagnostics
+                        .push(Diagnostic::new("E0535", message, span));
+                }
+            }
+        }
+    }
+
+    fn check_concrete_class_constraints(&mut self, class: &ClassType<TypeId>, span: Span) {
+        let params = self
+            .classes
+            .get(&class.name)
+            .map(|info| info.type_params.clone())
+            .unwrap_or_default();
+        self.check_class_type_constraints(&class.name, &params, &class.arguments, span);
+    }
+
+    fn check_generic_type_constraints(
+        &mut self,
+        callee: &str,
+        params: &[TypeParamInfo],
+        bindings: &HashMap<String, TypeId>,
+        span: Span,
+    ) {
+        for param in params {
+            let Some(argument) = bindings.get(&param.name).copied() else {
+                continue;
+            };
+            for constraint in &param.constraints {
+                if !Self::is_compiler_known_constraint(&constraint.name)
+                    || self.type_is_symbolic(argument)
+                    || self.constraint_accepts_type_argument(constraint, argument, bindings, span)
+                {
+                    continue;
+                }
+                let message = format!(
+                    "type argument `{}` for {callee} does not satisfy required constraint `{constraint}`",
+                    self.types.display(argument)
+                );
+                if !self.diagnostics.iter().any(|diagnostic| {
+                    diagnostic.code == "E0535"
+                        && diagnostic.span == span
+                        && diagnostic.message == message
+                }) {
+                    self.diagnostics
+                        .push(Diagnostic::new("E0535", message, span));
+                }
+            }
+        }
+    }
+
+    fn constraint_accepts_type_argument(
+        &mut self,
+        constraint: &TypeRef,
+        argument: TypeId,
+        bindings: &HashMap<String, TypeId>,
+        span: Span,
+    ) -> bool {
+        if !self.type_satisfies_compiler_constraint(argument, &constraint.name) {
+            return false;
+        }
+        if constraint.arguments.is_empty() {
+            return true;
+        }
+        if !matches!(constraint.name.as_str(), "Equatable" | "Comparable")
+            || constraint.has_value_arguments()
+            || constraint.type_argument_count() != 1
+        {
+            return false;
+        }
+
+        let scope = bindings
+            .keys()
+            .map(|name| (name.clone(), Vec::new()))
+            .collect::<HashMap<_, _>>();
+        self.type_parameter_scopes.push(scope);
+        let required = self.resolve_type_ref_in_position(
+            constraint.type_argument(0).unwrap(),
+            span,
+            TypePosition::Value,
+            None,
+        );
+        self.type_parameter_scopes.pop();
+        self.substitute_type_id(required, bindings) == argument
+    }
+
+    fn type_satisfies_compiler_constraint(&self, ty: TypeId, constraint: &str) -> bool {
+        match constraint {
+            "Equatable" => matches!(
+                self.types.kind(ty),
+                TypeKind::Integer(_)
+                    | TypeKind::Float(_)
+                    | TypeKind::Bool
+                    | TypeKind::String
+                    | TypeKind::Unknown
+            ),
+            "Comparable" | "Hashable" => matches!(
+                self.types.kind(ty),
+                TypeKind::Integer(_) | TypeKind::Bool | TypeKind::String | TypeKind::Unknown
+            ),
+            "Displayable" => match self.types.kind(ty) {
+                TypeKind::Integer(_)
+                | TypeKind::Float(_)
+                | TypeKind::Bool
+                | TypeKind::String
+                | TypeKind::Unknown => true,
+                TypeKind::Class(class) => self
+                    .classes
+                    .get(&class.name)
+                    .is_some_and(|info| info.implements_displayable),
+                _ => false,
+            },
+            _ => false,
+        }
     }
 
     fn check_assignable(
@@ -7554,13 +8864,13 @@ impl<'program> Checker<'program> {
             }
             Expr::Bool { .. } => self.types.intern(TypeKind::Bool),
             Expr::Null { .. } => self.types.intern(TypeKind::Null),
-            Expr::New { class_name, .. } => {
-                if self.classes.contains_key(class_name) {
-                    self.types.intern(TypeKind::Class(class_name.clone()))
-                } else {
-                    self.types.unknown()
-                }
-            }
+            Expr::New {
+                class_type, span, ..
+            } => self.resolve_type_ref_with_class(
+                class_type,
+                *span,
+                method_context.map(|context| context.class_name.as_str()),
+            ),
             Expr::Array { elements, .. } => self.infer_array_type(elements, scopes, method_context),
             Expr::ArrayRepeat { value, .. } => {
                 let element = self.infer_expr_type(value, scopes, method_context);
@@ -7611,10 +8921,8 @@ impl<'program> Checker<'program> {
             }
             Expr::This { .. } => method_context
                 .filter(|context| context.this_available)
-                .map(|context| {
-                    self.types
-                        .intern(TypeKind::Class(context.class_name.clone()))
-                })
+                .map(|context| context.class_name.clone())
+                .map(|class_name| self.symbolic_class_type(&class_name))
                 .unwrap_or_else(|| self.types.unknown()),
             Expr::PropertyAccess {
                 object,
@@ -7627,14 +8935,19 @@ impl<'program> Checker<'program> {
                 {
                     return result;
                 }
-                let Some(class_name) = self.expr_class_name(object, scopes, method_context) else {
+                let Some(class_type) = self.expr_class_type(object, scopes, method_context) else {
                     return self.types.unknown();
                 };
-                let result = self
+                let property = self
                     .classes
-                    .get(&class_name)
+                    .get(&class_type.name)
                     .and_then(|class_info| class_info.properties.get(property))
-                    .map(|property| property.ty)
+                    .cloned();
+                let result = property
+                    .map(|property| {
+                        self.specialize_property_for_class(&property, &class_type)
+                            .ty
+                    })
                     .unwrap_or_else(|| self.types.unknown());
                 if *null_safe
                     && !matches!(self.types.kind(result), TypeKind::Void | TypeKind::Unknown)
@@ -7660,14 +8973,28 @@ impl<'program> Checker<'program> {
                 {
                     return result;
                 }
-                let Some(class_name) = self.expr_class_name(object, scopes, method_context) else {
+                let object_ty = self.infer_expr_type(object, scopes, method_context);
+                if let TypeKind::TypeParameter(parameter) = self.types.kind(object_ty) {
+                    if method == "toString"
+                        && self.type_parameter_has_constraint(parameter, "Displayable")
+                    {
+                        return self.types.intern(TypeKind::String);
+                    }
+                    return self.types.unknown();
+                }
+                let Some(class_type) = self.expr_class_type(object, scopes, method_context) else {
                     return self.types.unknown();
                 };
-                let result = self
+                let method_info = self
                     .classes
-                    .get(&class_name)
+                    .get(&class_type.name)
                     .and_then(|class_info| class_info.methods.get(method))
-                    .map(|method| method.return_ty)
+                    .cloned();
+                let result = method_info
+                    .map(|method| {
+                        self.specialize_method_for_class(&method, &class_type)
+                            .return_ty
+                    })
                     .unwrap_or_else(|| self.types.unknown());
                 let result = self.generic_call_result_type(*span, result);
                 if *null_safe
@@ -8119,10 +9446,11 @@ impl<'program> Checker<'program> {
             | TypeKind::String
             | TypeKind::Bool
             | TypeKind::Unknown => {}
-            TypeKind::Class(name) => self.diagnostics.push(Diagnostic::unsupported_stage(
+            TypeKind::Class(_) => self.diagnostics.push(Diagnostic::unsupported_stage(
                 "E0524",
                 format!(
-                    "List::contains for `{name}` requires Stage 35 user-defined `Equatable` conformance"
+                    "List::contains for `{}` requires Stage 35 user-defined `Equatable` conformance",
+                    self.types.display(ty)
                 ),
                 span,
             )),
@@ -8353,6 +9681,9 @@ impl<'program> Checker<'program> {
         if let Some(recovery) = self.recovery_binary_type(left, right) {
             return recovery;
         }
+        if self.constrained_relational_operands(left, right) {
+            return self.types.intern(TypeKind::Bool);
+        }
 
         let left_kind = self.types.kind(left).clone();
         let right_kind = self.types.kind(right).clone();
@@ -8364,6 +9695,7 @@ impl<'program> Checker<'program> {
                 self.types.intern(TypeKind::Bool)
             }
             (TypeKind::String, TypeKind::String) => self.types.intern(TypeKind::Bool),
+            (TypeKind::Bool, TypeKind::Bool) => self.types.intern(TypeKind::Bool),
             _ => self.types.intern(TypeKind::Heterogeneous),
         }
     }
@@ -8570,18 +9902,24 @@ impl<'program> Checker<'program> {
         )
     }
 
+    fn expr_class_type(
+        &mut self,
+        expr: &Expr,
+        scopes: &ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) -> Option<ClassType<TypeId>> {
+        let ty = self.infer_expr_type(expr, scopes, method_context);
+        self.class_type(ty)
+    }
+
     fn expr_class_name(
         &mut self,
         expr: &Expr,
         scopes: &ScopeStack,
         method_context: Option<&MethodContext>,
     ) -> Option<String> {
-        let ty = self.infer_expr_type(expr, scopes, method_context);
-        match self.types.kind(ty) {
-            TypeKind::Class(name) => Some(name.clone()),
-            TypeKind::Nullable(inner) => self.types.class_name(*inner).map(ToOwned::to_owned),
-            _ => None,
-        }
+        self.expr_class_type(expr, scopes, method_context)
+            .map(|class| class.name)
     }
 
     fn check_nullable_member_access(

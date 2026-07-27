@@ -125,6 +125,7 @@ examples/native/main_stage23c_negative_fill_panic.doria
 examples/native/main_stage23c_oversized_fill_panic.doria
 examples/native/main_stage23c_sequence_fill.doria
 examples/native/main_stage24_generic_first.doria
+examples/native/main_stage25_generic_classes.doria
 examples/native/main_string_concat_hello.doria
 examples/native/main_string_comparison_42.doria
 examples/native/main_string_local_hello.doria
