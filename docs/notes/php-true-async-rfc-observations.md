@@ -123,16 +123,26 @@ Doria-side cancellation semantics meet at a boundary that supports neither.
 
 ### B3. Interleaving breaks the linear-request assumption behind handles
 This is the one I think we genuinely missed. `#[PHPExport]` classes are marshaled
-as opaque handles rooted as `Shared<T>`, with the generated PHP stub releasing in
+as opaque handles rooted as `SharedReference<T>`, with the generated PHP stub releasing in
 its `__destruct`. That model was designed against PHP's linear request lifecycle.
 With coroutines, **one PHP request can interleave**: coroutine A takes a handle
 and suspends; coroutine B mutates through another handle to the same Doria
 object; A resumes with stale assumptions. There is no thread involved, so no
 `Sendable` check fires — but the aliasing hazard is real.
-*Questions:* Do exported mutable handles need to route through `SharedMut<T>` so
+*Questions:* Do exported mutable handles need to route through `WritableSharedReference<T>` so
 the runtime overlapping-access check catches interleaved mutation? Or does the
 bridge declare exported handles single-owner-per-coroutine? Either way, the
 handle model needs re-examining against a non-linear caller.
+
+*Amendment (Stage 25a):* the premise above — that exported instances are rooted
+through the public shared-reference family — is **superseded**. Stage 25a made the
+readonly and writable shared-ownership families disjoint, and §10.3 now roots
+`#[PHPExport]` instances in transport-neutral **opaque bridge handles** that belong
+to neither family and convert to neither. The first question is therefore answered
+in the negative: routing through `WritableSharedReference<T>` is not the mechanism.
+The hazard this note identifies is untouched and still open — interleaved coroutines
+aliasing one bridge-owned instance is a real reentrancy problem, and reentrancy
+behavior is explicitly owned by the future php-lib bridge decision and Stage 41.
 
 ### B4. Two runtimes, one process
 If a Doria export ever wants internal async I/O, it would need its own executor

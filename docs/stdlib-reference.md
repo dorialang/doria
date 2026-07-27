@@ -31,9 +31,13 @@ Primitives conform to `Equatable`/`Comparable`/`Hashable` by compiler-known conf
 ### Shared ownership
 The escape hatch when single ownership does not fit (caches, graphs, back-references). Details: §3.3, the shared-ownership decision (ships with the borrow checker).
 
-- **`Shared<T>`** — refcounted shared owner (Rust `Rc`); `->clone()` copies the handle; access is readonly.
-- **`Weak<T>`** — non-owning weak handle (breaks cycles).
-- **`SharedMut<T>`** — shared mutable owner; emits dynamic access checks (the one place runtime borrow checks appear).
+- **`SharedReference<T>`** — an owning reference that may share responsibility for keeping one value alive with other `SharedReference<T>` values. Constructed with `shared new T(...)`. `share()` creates another owning reference (distinct from `Cloneable`'s `clone()`, which duplicates the value); `createWeakReference()` derives a `WeakReference<T>`; gives direct readonly access to `T`. Reference counting is the implementation mechanism; the source-level model is ownership and lifetime responsibility.
+- **`WeakReference<T>`** — a non-owning reference to a shared value; it does not keep the value alive. `acquire()` returns `?SharedReference<T>` — a live owner, or `null` once the last owner is released (breaks cycles).
+- **`WritableSharedReference<T>`** — a shared owning reference permitting runtime-checked writable access, built with an ordinary ownership-taking constructor (`new WritableSharedReference(new T())`). `share()` returns another `WritableSharedReference<T>`; `createWeakReference()` returns a `WritableWeakReference<T>`. It never forwards direct access to `T`: `acquireReadonlyAccess()` / `acquireWritableAccess()` return the access objects below, and overlapping incompatible access causes a clear panic (the one place runtime borrow checks appear).
+- **`WritableWeakReference<T>`** — the non-owning form of `WritableSharedReference<T>`; `acquire()` returns `?WritableSharedReference<T>`, so breaking a cycle in a writable shared graph retains the writable capability.
+The readonly and writable families are disjoint: no conversion exists either way between `SharedReference<T>` and `WritableSharedReference<T>`, the weak forms preserve their family, and no readonly-family and writable-family handle ever refer to the same allocation. All `WritableSharedReference<T>` handles to one allocation share a single runtime access state.
+
+- **`ReadonlySharedReferenceAccess<T>` / `WritableSharedReferenceAccess<T>`** — temporary access objects returned by `WritableSharedReference<T>`; member and indexed access forward to the underlying `T`. The readonly form permits only readonly operations, the writable form both; neither may move out or consume `T`. Each retains an owning reference to the allocation. They are move types — returnable, storable, passable — but never directly constructible by user code, and the access releases deterministically when the object is destroyed (moving it transfers that obligation).
 
 ### Iteration
 - **`Iterable<T>` / `Iterator<T>`** — the public iteration protocol that makes user types work with `foreach`; user conformance lands at Stage 35 (built-in collections use compiler-internal iteration earlier, Phase D).
