@@ -265,6 +265,8 @@ pub(crate) fn check_program_with_inferred_move_returns(
                                         &property.ty,
                                         &classes,
                                         Some(&class.name),
+                                        &class.type_params,
+                                        &[],
                                     ),
                                     mixed: property.ty.name == "mixed",
                                     move_type,
@@ -308,6 +310,8 @@ pub(crate) fn check_program_with_inferred_move_returns(
                                                     &param.ty,
                                                     &classes,
                                                     Some(&class.name),
+                                                    &class.type_params,
+                                                    &[],
                                                 ),
                                                 mixed: param.ty.name == "mixed",
                                                 move_type,
@@ -338,6 +342,7 @@ pub(crate) fn check_program_with_inferred_move_returns(
         resolved_types,
         receiver_class: None,
         receiver_writable: false,
+        current_type_params: Vec::new(),
         current_return_borrow: None,
         active_assignment_writes: HashSet::new(),
         active_assignment_targets: HashSet::new(),
@@ -801,12 +806,23 @@ fn signature(
             .return_type
             .as_ref()
             .and_then(|ty| type_ref_class_name(ty, classes, receiver_class)),
-        returns_collection: function
-            .return_type
-            .as_ref()
-            .and_then(|ty| type_ref_collection_info(ty, classes, receiver_class)),
+        returns_collection: function.return_type.as_ref().and_then(|ty| {
+            type_ref_collection_info(
+                ty,
+                classes,
+                receiver_class,
+                &function.type_params,
+                enclosing_type_params,
+            )
+        }),
         returns_move_type: function.return_type.as_ref().is_some_and(|ty| {
-            type_ref_is_move_type(ty, classes, receiver_class) && return_borrow.is_none()
+            (type_ref_is_move_type(ty, classes, receiver_class)
+                || type_ref_mentions_potential_move_parameter(
+                    ty,
+                    &function.type_params,
+                    enclosing_type_params,
+                ))
+                && return_borrow.is_none()
         }) || (function.return_type.is_none()
             && inferred_move_returns.contains(&function.span.start)),
         return_borrow,
@@ -834,6 +850,24 @@ fn type_ref_mentions_any_parameter(
 ) -> bool {
     type_ref_mentions_parameter(ty, function_params)
         || type_ref_mentions_parameter(ty, enclosing_params)
+}
+
+fn type_ref_mentions_potential_move_parameter(
+    ty: &crate::types::TypeRef,
+    function_params: &[ast::TypeParamDecl],
+    enclosing_params: &[ast::TypeParamDecl],
+) -> bool {
+    function_params.iter().chain(enclosing_params).any(|param| {
+        param.name == ty.name
+            && !param.constraints.iter().any(|constraint| {
+                matches!(
+                    constraint.name.as_str(),
+                    "Comparable" | "Equatable" | "Hashable"
+                )
+            })
+    }) || ty.type_arguments().any(|argument| {
+        type_ref_mentions_potential_move_parameter(argument, function_params, enclosing_params)
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -896,6 +930,7 @@ struct Checker<'a> {
     resolved_types: &'a HashMap<(usize, usize), crate::types::ResolvedType>,
     receiver_class: Option<String>,
     receiver_writable: bool,
+    current_type_params: Vec<ast::TypeParamDecl>,
     current_return_borrow: Option<UseMode>,
     active_assignment_writes: HashSet<String>,
     active_assignment_targets: HashSet<String>,
@@ -914,6 +949,10 @@ impl Checker<'_> {
             std::mem::replace(&mut self.receiver_class, receiver_class.map(str::to_owned));
         let previous_receiver_writable =
             std::mem::replace(&mut self.receiver_writable, function.writable_this);
+        let mut current_type_params = function.type_params.clone();
+        current_type_params.extend(enclosing_type_params.clone());
+        let previous_type_params =
+            std::mem::replace(&mut self.current_type_params, current_type_params);
         let previous_return_borrow = self.current_return_borrow;
         self.current_return_borrow = function
             .return_type
@@ -966,6 +1005,8 @@ impl Checker<'_> {
                             &param.ty,
                             &self.classes,
                             self.receiver_class.as_deref(),
+                            &self.current_type_params,
+                            &[],
                         ),
                         mixed,
                         borrowed_place: !param.take,
@@ -982,12 +1023,14 @@ impl Checker<'_> {
             }
         }
         let return_move_type = function.return_type.as_ref().is_some_and(|ty| {
-            type_ref_is_move_type(ty, &self.classes, self.receiver_class.as_deref())
+            (type_ref_is_move_type(ty, &self.classes, self.receiver_class.as_deref())
+                || type_ref_mentions_potential_move_parameter(ty, &self.current_type_params, &[]))
                 && self.current_return_borrow.is_none()
         }) || (function.return_type.is_none()
             && self.inferred_move_returns.contains(&function.span.start));
         self.check_block(&function.body, &mut scopes, return_move_type, false);
         self.current_return_borrow = previous_return_borrow;
+        self.current_type_params = previous_type_params;
         self.receiver_writable = previous_receiver_writable;
         self.receiver_class = previous_receiver;
     }
@@ -1087,6 +1130,8 @@ impl Checker<'_> {
                                         ty,
                                         &self.classes,
                                         self.receiver_class.as_deref(),
+                                        &self.current_type_params,
+                                        &[],
                                     )
                                 })
                                 .or_else(|| self.expr_collection_info(&decl.initializer, scopes)),
@@ -1464,6 +1509,8 @@ impl Checker<'_> {
                     ty,
                     &self.classes,
                     self.receiver_class.as_deref(),
+                    &self.current_type_params,
+                    &[],
                 ),
                 mixed: ty.name == "mixed",
                 borrowed_place: true,
@@ -3060,7 +3107,8 @@ fn resolved_collection_info(ty: &crate::types::ResolvedType) -> Option<Collectio
     };
     Some(CollectionInfo {
         family,
-        value_move: resolved_type_is_move_type(value),
+        value_move: resolved_type_is_move_type(value)
+            || resolved_type_requires_conservative_move(value),
         value_mixed: resolved_type_is_mixed(value),
         value_class: resolved_type_class(value).map(str::to_string),
         value_collection: resolved_collection_info(value).map(Box::new),
@@ -3079,6 +3127,8 @@ fn type_ref_collection_info(
     ty: &crate::types::TypeRef,
     classes: &HashSet<String>,
     receiver_class: Option<&str>,
+    type_params: &[ast::TypeParamDecl],
+    enclosing_type_params: &[ast::TypeParamDecl],
 ) -> Option<CollectionInfo> {
     if ty.name == "Bytes" && ty.arguments.is_empty() {
         return Some(bytes_collection_info());
@@ -3096,10 +3146,22 @@ fn type_ref_collection_info(
     };
     Some(CollectionInfo {
         family,
-        value_move: type_ref_is_move_type(value, classes, receiver_class),
+        value_move: type_ref_is_move_type(value, classes, receiver_class)
+            || type_ref_mentions_potential_move_parameter(
+                value,
+                type_params,
+                enclosing_type_params,
+            ),
         value_mixed: value.name == "mixed",
         value_class: type_ref_class_name(value, classes, receiver_class),
-        value_collection: type_ref_collection_info(value, classes, receiver_class).map(Box::new),
+        value_collection: type_ref_collection_info(
+            value,
+            classes,
+            receiver_class,
+            type_params,
+            enclosing_type_params,
+        )
+        .map(Box::new),
     })
 }
 

@@ -1051,3 +1051,28 @@ function main(): void {}
                 .contains("direct moves out of owned properties")
     }));
 }
+
+#[test]
+fn ownership_propagates_symbolic_move_types_into_collection_elements() {
+    let errors = diagnostics(
+        r#"
+class Token {}
+class Box<T>
+{
+    List<T> $items = [];
+
+    function first(): T
+    {
+        return $this->items[0];
+    }
+}
+function main(): void {}
+"#,
+    );
+    assert!(errors.iter().any(|diagnostic| {
+        diagnostic.code == "E0478"
+            && diagnostic
+                .message
+                .contains("borrowed result cannot satisfy an owning return")
+    }));
+}
