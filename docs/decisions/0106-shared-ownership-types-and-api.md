@@ -270,25 +270,60 @@ Cannot Acquire Writable Access While Writable Access Is Active
 
 `SharedReference<T>` owns `share()` and `createWeakReference()` while also
 forwarding readonly member access to `T`. When `T` declares a member of the same
-name, `$ref->share()` is ambiguous. The same applies to the access types, which own
-no members but forward everything.
+name, `$ref->share()` would be ambiguous.
 
-**Rule: wrapper-owned members win, and the collision is reported.** A call to a
-wrapper-owned name resolves to the wrapper member; when the payload type also
-declares that name, the compiler emits a diagnostic naming both candidates rather
-than silently choosing. No new escape syntax is introduced in this stage — there is
-deliberately no way to spell "the payload's `share()`" through a shared reference,
-because inventing one commits a public spelling that a later, better mechanism
-(explicit unwrapping, or Stage 31-era qualification) would have to keep forever.
+The rule:
 
-The affected surface is small and enumerable: `share`, `createWeakReference`,
-`acquire`, `acquireReadonlyAccess`, `acquireWritableAccess`. A payload wanting one
-of those names as its own member is reachable only by acquiring it through a plain
-owned value.
+1. Compiler-known members of `SharedReference<T>` take precedence on the direct
+   receiver.
+2. Non-conflicting members continue to forward transparently to `T`.
+3. A compiler-known readonly property `referencedValue` provides explicit access to
+   the underlying `T` when a collision exists.
+4. A collision does **not** make `SharedReference<T>` invalid.
+5. No new operator or qualification syntax is introduced.
 
-This is the one genuinely novel public rule in this record, and it is the narrowest
-option available: it never silently misroutes a call, it never invents syntax, and
-it leaves the escape hatch unspent.
+```doria
+class Document
+{
+    function share(): void
+    {
+        // Domain operation.
+    }
+}
+
+let $document = shared new Document();
+
+let $anotherOwner = $document->share();   // SharedReference<Document>::share()
+$document->referencedValue->share();      // Document::share()
+
+echo $document->title;                    // ordinary transparent forwarding
+$document->render();
+```
+
+`referencedValue` produces a **readonly place** referring to the underlying `T`. It
+allocates nothing, neither copies nor moves `T`, does not change the strong or weak
+count, transfers no ownership, cannot be assigned to, and cannot be used to move or
+consume `T`. Writable methods and writable property/index operations through it stay
+rejected, and it participates in ordinary temporary readonly borrowing. It is an
+explicit disambiguation path, not a mandatory `.value` wrapper — the normal spelling
+remains `$document->title`, not `$document->referencedValue->title`.
+
+If `T` itself declares a member named `referencedValue`, it stays reachable after the
+explicit projection: `$reference->referencedValue->referencedValue`, where the first
+is the compiler-known projection and the second belongs to `T`.
+
+`referencedValue` exists **only** on `SharedReference<T>`. `WeakReference<T>` has no
+live payload access until `acquire()` succeeds. `WritableSharedReference<T>`
+deliberately performs no direct payload forwarding, so callers acquire an access
+object instead. The access-object types have no source-visible control members
+competing with forwarded payload members, so they do not carry it for symmetry; that
+is revisited only if a concrete collision appears.
+
+The earlier provisional rule — wrapper wins and a payload collision is an error — was
+rejected: it would reserve ordinary domain names such as `share()` across every type
+placed inside a `SharedReference<T>`, making legitimate payload APIs unreachable.
+This rule keeps both reachable, never silently misroutes a call, and spends no new
+syntax.
 
 ## Alternatives considered
 
