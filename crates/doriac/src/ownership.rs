@@ -1651,11 +1651,11 @@ impl Checker<'_> {
                 self.use_call_args(None, args, &signature, CallExecution::Always, scopes);
             }
             Expr::New {
-                class_name, args, ..
+                class_type, args, ..
             } => {
                 let signature = self
                     .constructors
-                    .get(class_name)
+                    .get(&class_type.name)
                     .cloned()
                     .unwrap_or_default();
                 self.use_call_args(None, args, &signature, CallExecution::Always, scopes);
@@ -2051,11 +2051,11 @@ impl Checker<'_> {
                 self.activate_nested_call_property_borrows(None, args, &signature, scopes);
             }
             Expr::New {
-                class_name, args, ..
+                class_type, args, ..
             } => {
                 let signature = self
                     .constructors
-                    .get(class_name)
+                    .get(&class_type.name)
                     .cloned()
                     .unwrap_or_default();
                 self.activate_nested_call_property_borrows(None, args, &signature, scopes);
@@ -2455,7 +2455,7 @@ impl Checker<'_> {
             Expr::Grouped { expr, .. } => self.expr_is_move_value(expr, scopes),
             Expr::Array { .. } => true,
             Expr::ArrayRepeat { .. } => true,
-            Expr::New { class_name, .. } => self.classes.contains(class_name),
+            Expr::New { class_type, .. } => self.classes.contains(&class_type.name),
             Expr::FunctionCall { name, .. } => {
                 Builtin::from_name(name).is_some_and(Builtin::returns_owned_bytes)
                     || self
@@ -2626,8 +2626,8 @@ impl Checker<'_> {
             Expr::Variable { name, .. } => {
                 scopes.get(name).and_then(|binding| binding.class.clone())
             }
-            Expr::New { class_name, .. } if self.classes.contains(class_name) => {
-                Some(class_name.clone())
+            Expr::New { class_type, .. } if self.classes.contains(&class_type.name) => {
+                Some(class_type.name.clone())
             }
             Expr::FunctionCall { name, .. } => self
                 .signatures
@@ -2920,7 +2920,7 @@ fn type_ref_class_name(
 
 fn resolved_type_class(ty: &crate::types::ResolvedType) -> Option<&str> {
     match ty {
-        crate::types::ResolvedType::Class(name) => Some(name),
+        crate::types::ResolvedType::Class(class) => Some(&class.name),
         crate::types::ResolvedType::Nullable(inner) => resolved_type_class(inner),
         _ => None,
     }

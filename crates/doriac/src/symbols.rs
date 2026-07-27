@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use crate::ast::MemberAccess;
 use crate::numeric::IntegerValue;
-use crate::types::TypeId;
+use crate::types::{TypeId, TypeRef};
 
 #[derive(Debug, Clone)]
 pub struct Binding {
@@ -15,12 +15,19 @@ pub struct Binding {
 
 #[derive(Debug, Clone)]
 pub struct ClassInfo {
+    pub type_params: Vec<TypeParamInfo>,
     pub implements_displayable: bool,
     pub properties: HashMap<String, PropertyInfo>,
     pub static_properties: HashMap<String, StaticPropertyInfo>,
     pub constants: HashMap<String, ConstantInfo>,
     pub methods: HashMap<String, MethodInfo>,
     pub members: HashMap<String, MemberDeclaration>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TypeParamInfo {
+    pub name: String,
+    pub constraints: Vec<TypeRef>,
 }
 
 #[derive(Debug, Clone)]
@@ -91,7 +98,8 @@ pub struct ParamInfo {
 
 #[derive(Debug, Clone)]
 pub struct FunctionInfo {
-    pub type_params: Vec<String>,
+    pub declaration: usize,
+    pub type_params: Vec<TypeParamInfo>,
     pub params: Vec<ParamInfo>,
     pub return_ty: TypeId,
     pub return_borrow: Option<ReturnBorrow>,
@@ -99,11 +107,13 @@ pub struct FunctionInfo {
 
 #[derive(Debug, Clone)]
 pub struct MethodInfo {
+    pub declaration: usize,
     pub access: MemberAccess,
     pub receiver_mode: Option<ReceiverMode>,
     pub return_borrow: Option<ReturnBorrow>,
     pub is_static: bool,
-    pub type_params: Vec<String>,
+    pub enclosing_type_bindings: HashMap<String, TypeId>,
+    pub type_params: Vec<TypeParamInfo>,
     pub params: Vec<ParamInfo>,
     pub return_ty: TypeId,
 }

@@ -911,10 +911,10 @@ function main(): void {}
         .iter()
         .find(|class| class.name == "Node")
         .expect("Node semantic layout");
-    assert!(node
-        .properties
-        .iter()
-        .all(|property| property.ty.name == "Node"));
+    assert!(node.properties.iter().all(|property| matches!(
+        &property.ty,
+        doriac::types::ResolvedType::Class(class) if class.name == "Node"
+    )));
     doriac::mir_lowering::lower_program(&hir).expect("canonical self properties should reach MIR");
 }
 

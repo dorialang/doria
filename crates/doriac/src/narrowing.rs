@@ -925,12 +925,12 @@ fn kill_mutated_call_arguments(
             );
         }
         Expr::New {
-            class_name, args, ..
+            class_type, args, ..
         } => {
             kill_calls_in_arguments(args, state, resolution, mutations);
             kill_arguments_for_modes(
                 args,
-                mutations.constructor_modes(class_name),
+                mutations.constructor_modes(&class_type.name),
                 state,
                 resolution,
             );
@@ -1412,12 +1412,12 @@ fn collect_expr(
             state
         }
         Expr::New {
-            class_name, args, ..
+            class_type, args, ..
         } => {
             let mut state = collect_expr_sequence(args, state, resolution, mutations, facts);
             kill_arguments_for_modes(
                 args,
-                mutations.constructor_modes(class_name),
+                mutations.constructor_modes(&class_type.name),
                 &mut state,
                 resolution,
             );
@@ -1560,7 +1560,7 @@ fn expression_class_name(
     state: Option<&State>,
 ) -> Option<String> {
     match ungroup(expr) {
-        Expr::New { class_name, .. } => Some(class_name.clone()),
+        Expr::New { class_type, .. } => Some(class_type.name.clone()),
         Expr::This { .. } => resolution.current_class.clone(),
         Expr::Variable { .. } => {
             let binding = variable_binding(expr, resolution)?;

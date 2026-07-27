@@ -52,6 +52,11 @@ fn lower_item(item: &ast::Item) -> Result<hir::Item, Diagnostic> {
 fn lower_class(class_decl: &ast::ClassDecl) -> hir::ClassDecl {
     hir::ClassDecl {
         name: class_decl.name.clone(),
+        type_params: class_decl
+            .type_params
+            .iter()
+            .map(|param| lower_type_param(param, Some(&class_decl.name)))
+            .collect(),
         parent: class_decl.parent.clone(),
         parent_span: class_decl.parent_span,
         implements: class_decl.implements.clone(),
@@ -115,15 +120,7 @@ fn lower_function(function: &ast::FunctionDecl, class_name: Option<&str>) -> hir
         type_params: function
             .type_params
             .iter()
-            .map(|param| hir::TypeParamDecl {
-                name: param.name.clone(),
-                constraints: param
-                    .constraints
-                    .iter()
-                    .map(|constraint| lower_type_ref(constraint, class_name))
-                    .collect(),
-                span: param.span,
-            })
+            .map(|param| lower_type_param(param, class_name))
             .collect(),
         params: function
             .params
@@ -136,6 +133,22 @@ fn lower_function(function: &ast::FunctionDecl, class_name: Option<&str>) -> hir
             .map(|ty| lower_type_ref(ty, class_name)),
         body: lower_block(&function.body, class_name),
         span: function.span,
+    }
+}
+
+fn lower_type_param(param: &ast::TypeParamDecl, class_name: Option<&str>) -> hir::TypeParamDecl {
+    hir::TypeParamDecl {
+        name: param.name.clone(),
+        constraints: param
+            .constraints
+            .iter()
+            .map(|constraint| lower_type_ref(constraint, class_name))
+            .collect(),
+        default_type: param
+            .default_type
+            .as_ref()
+            .map(|default| lower_type_ref(default, class_name)),
+        span: param.span,
     }
 }
 
@@ -444,11 +457,11 @@ fn lower_expr(expr: &ast::Expr, class_name: Option<&str>) -> hir::Expr {
             span: *span,
         },
         ast::Expr::New {
-            class_name: constructed_class,
+            class_type: constructed_class,
             args,
             span,
         } => hir::Expr::New {
-            class_name: constructed_class.clone(),
+            class_type: lower_type_ref(constructed_class, class_name),
             args: args
                 .iter()
                 .map(|arg| lower_argument(arg, class_name))

@@ -39,6 +39,7 @@ pub struct InterfaceDecl {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ClassDecl {
     pub name: String,
+    pub type_params: Vec<TypeParamDecl>,
     pub parent: Option<String>,
     pub parent_span: Option<Span>,
     pub implements: Vec<String>,
@@ -98,6 +99,7 @@ pub struct FunctionDecl {
 pub struct TypeParamDecl {
     pub name: String,
     pub constraints: Vec<TypeRef>,
+    pub default_type: Option<TypeRef>,
     pub span: Span,
 }
 
@@ -364,7 +366,7 @@ pub enum Expr {
         span: Span,
     },
     New {
-        class_name: String,
+        class_type: TypeRef,
         args: Vec<Argument>,
         span: Span,
     },

@@ -7,6 +7,10 @@ pub use crate::numeric::{FloatType, IntegerType};
 pub struct TypeRef {
     pub name: String,
     pub args: Vec<TypeRef>,
+    /// Parsed non-type generic arguments. Decision 0105 reserves this argument
+    /// kind so accepting its syntax does not force the semantic model to
+    /// pretend every future generic argument is a type.
+    pub value_args: Vec<String>,
     pub nullable: bool,
 }
 
@@ -15,6 +19,7 @@ impl TypeRef {
         Self {
             name: name.into(),
             args: Vec::new(),
+            value_args: Vec::new(),
             nullable: false,
         }
     }
@@ -23,6 +28,20 @@ impl TypeRef {
         Self {
             name: name.into(),
             args,
+            value_args: Vec::new(),
+            nullable: false,
+        }
+    }
+
+    pub fn generic_with_values(
+        name: impl Into<String>,
+        args: Vec<TypeRef>,
+        value_args: Vec<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            args,
+            value_args,
             nullable: false,
         }
     }
@@ -52,6 +71,7 @@ impl TypeRef {
                 .iter()
                 .map(|argument| argument.resolve_self_in(class_name))
                 .collect(),
+            value_args: self.value_args.clone(),
             nullable: self.nullable,
         }
     }
@@ -77,22 +97,37 @@ impl fmt::Display for TypeRef {
             return write!(formatter, "{}[]", self.args[0]);
         }
 
-        if self.args.is_empty() {
+        if self.args.is_empty() && self.value_args.is_empty() {
             write!(formatter, "{}", self.name)
         } else {
-            let args = self
+            let mut args = self
                 .args
                 .iter()
                 .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join(", ");
-            write!(formatter, "{}<{}>", self.name, args)
+                .collect::<Vec<_>>();
+            args.extend(self.value_args.iter().cloned());
+            write!(formatter, "{}<{}>", self.name, args.join(", "))
         }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TypeId(usize);
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ClassType<T> {
+    pub name: String,
+    pub arguments: Vec<T>,
+}
+
+impl<T> ClassType<T> {
+    pub fn new(name: impl Into<String>, arguments: Vec<T>) -> Self {
+        Self {
+            name: name.into(),
+            arguments,
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum TypeKind {
@@ -110,7 +145,7 @@ pub enum TypeKind {
     Heterogeneous,
     EmptyCollection,
     TypeParameter(String),
-    Class(String),
+    Class(ClassType<TypeId>),
     List(TypeId),
     Dictionary(TypeId, TypeId),
     Set(TypeId),
@@ -128,7 +163,7 @@ pub enum ResolvedType {
     Mixed,
     TypeParameter(String),
     Nullable(Box<ResolvedType>),
-    Class(String),
+    Class(ClassType<ResolvedType>),
     TypedArray(Box<ResolvedType>),
     List(Box<ResolvedType>),
     Dictionary(Box<ResolvedType>, Box<ResolvedType>),
@@ -168,7 +203,7 @@ impl TypeRegistry {
 
     pub fn class_name(&self, id: TypeId) -> Option<&str> {
         match self.kind(id) {
-            TypeKind::Class(name) => Some(name),
+            TypeKind::Class(class) => Some(&class.name),
             _ => None,
         }
     }
@@ -189,7 +224,22 @@ impl TypeRegistry {
             TypeKind::Heterogeneous => "heterogeneous".to_string(),
             TypeKind::EmptyCollection => "[]".to_string(),
             TypeKind::TypeParameter(name) => name.clone(),
-            TypeKind::Class(name) => name.clone(),
+            TypeKind::Class(class) => {
+                if class.arguments.is_empty() {
+                    class.name.clone()
+                } else {
+                    format!(
+                        "{}<{}>",
+                        class.name,
+                        class
+                            .arguments
+                            .iter()
+                            .map(|argument| self.display(*argument))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                }
+            }
             TypeKind::List(element) => format!("List<{}>", self.display(*element)),
             TypeKind::Dictionary(key, value) => {
                 format!(
@@ -214,7 +264,14 @@ impl TypeRegistry {
             TypeKind::Mixed => ResolvedType::Mixed,
             TypeKind::TypeParameter(name) => ResolvedType::TypeParameter(name.clone()),
             TypeKind::Nullable(inner) => ResolvedType::Nullable(Box::new(self.resolved(*inner))),
-            TypeKind::Class(name) => ResolvedType::Class(name.clone()),
+            TypeKind::Class(class) => ResolvedType::Class(ClassType::new(
+                class.name.clone(),
+                class
+                    .arguments
+                    .iter()
+                    .map(|argument| self.resolved(*argument))
+                    .collect(),
+            )),
             TypeKind::TypedArray(element) => {
                 ResolvedType::TypedArray(Box::new(self.resolved(*element)))
             }

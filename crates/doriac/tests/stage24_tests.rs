@@ -45,16 +45,37 @@ class Box {
 }
 
 #[test]
-fn constraints_are_carried_but_named_as_pending_until_stage_35() {
-    let errors = diagnostics(
+fn compiler_known_constraints_are_checked_and_user_constraints_wait_for_stage_35() {
+    doriac::check_source(
+        "stage24-constraint-ok.doria",
         r#"
 function constrained<T implements Displayable>(T $value): T { return $value; }
+function main(): int { return constrained(42); }
+"#,
+    )
+    .expect("compiler-known constraints should accept conforming type arguments");
+
+    let unsatisfied = diagnostics(
+        r#"
+function constrained<T implements Comparable<T>>(T $value): T { return $value; }
+function main(): float { return constrained(1.5); }
+"#,
+    );
+    assert!(unsatisfied.iter().any(|diagnostic| {
+        diagnostic.code == "E0535"
+            && diagnostic.message.contains("float")
+            && diagnostic.message.contains("Comparable")
+    }));
+
+    let errors = diagnostics(
+        r#"
+function constrained<T implements UserComparable>(T $value): T { return $value; }
 function main(): void {}
 "#,
     );
     assert!(errors.iter().any(|diagnostic| {
         diagnostic.code == "E0533"
-            && diagnostic.message.contains("constraint checking")
+            && diagnostic.message.contains("UserComparable")
             && diagnostic.message.contains("Stage 35")
     }));
 }

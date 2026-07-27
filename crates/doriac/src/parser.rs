@@ -82,6 +82,7 @@ impl Parser {
     fn parse_class(&mut self) -> Option<ClassDecl> {
         let start = self.previous().span.start;
         let name = self.expect_type_declaration_name("expected class name")?;
+        let type_params = self.parse_type_params()?;
         let (parent, parent_span) = if self.match_kind(&TokenKind::Extends) {
             let parent_start = self.previous().span.start;
             let parent = self.expect_qualified_name("expected parent class after `extends`")?;
@@ -121,6 +122,7 @@ impl Parser {
 
         Some(ClassDecl {
             name,
+            type_params,
             parent,
             parent_span,
             implements,
@@ -242,7 +244,7 @@ impl Parser {
     ) -> Option<FunctionDecl> {
         let start = start_span.start;
         let name = self.expect_identifier("expected function name")?;
-        let type_params = self.parse_function_type_params()?;
+        let type_params = self.parse_type_params()?;
         self.expect(TokenKind::LeftParen, "expected `(` after function name")?;
 
         let mut params = Vec::new();
@@ -283,7 +285,7 @@ impl Parser {
         })
     }
 
-    fn parse_function_type_params(&mut self) -> Option<Vec<TypeParamDecl>> {
+    fn parse_type_params(&mut self) -> Option<Vec<TypeParamDecl>> {
         if !self.match_kind(&TokenKind::Less) {
             return Some(Vec::new());
         }
@@ -295,7 +297,7 @@ impl Parser {
             let mut constraints = Vec::new();
             if self.match_kind(&TokenKind::Implements) {
                 loop {
-                    constraints.push(self.parse_type_ref()?);
+                    constraints.push(self.parse_type_ref_inner()?);
                     // A comma followed by `Name implements` starts the next
                     // parameter. Without that second `implements`,
                     // `<T implements A, U>` remains the documented
@@ -315,13 +317,22 @@ impl Parser {
                     self.advance();
                 }
             }
+            let default_type = if self.match_kind(&TokenKind::Equals) {
+                Some(self.parse_type_ref_inner()?)
+            } else {
+                None
+            };
             let end = self.previous().span.end;
             params.push(TypeParamDecl {
                 name,
                 constraints,
+                default_type,
                 span: Span::new(start, end),
             });
 
+            if self.pending_type_argument_close.take().is_some() {
+                break;
+            }
             if self.check(&TokenKind::Greater) {
                 self.advance();
                 break;
@@ -1460,12 +1471,12 @@ impl Parser {
     }
 
     fn parse_new(&mut self, start: usize) -> Option<Expr> {
-        let class_name = self.expect_qualified_name("expected class name after `new`")?;
+        let class_type = self.parse_type_ref()?;
         self.expect(TokenKind::LeftParen, "expected `(` after class name")?;
         let args = self.parse_argument_list_after_open()?;
         let span = Span::new(start, self.previous().span.end);
         Some(Expr::New {
-            class_name,
+            class_type,
             args,
             span,
         })
@@ -1688,9 +1699,23 @@ impl Parser {
         };
 
         let mut args = Vec::new();
+        let mut value_args = Vec::new();
         if self.match_kind(&TokenKind::Less) {
             loop {
-                args.push(self.parse_type_ref_inner()?);
+                let negative = self.match_kind(&TokenKind::Minus);
+                if let TokenKind::IntLiteral(value) = self.peek().kind.clone() {
+                    self.advance();
+                    value_args.push(if negative { format!("-{value}") } else { value });
+                } else {
+                    if negative {
+                        self.error(
+                            "expected integer compile-time value after `-`",
+                            self.peek().span,
+                        );
+                        return None;
+                    }
+                    args.push(self.parse_type_ref_inner()?);
+                }
                 if !self.match_kind(&TokenKind::Comma) {
                     break;
                 }
@@ -1698,10 +1723,10 @@ impl Parser {
             self.expect_type_argument_close()?;
         }
 
-        let mut ty = if args.is_empty() {
+        let mut ty = if args.is_empty() && value_args.is_empty() {
             TypeRef::named(name)
         } else {
-            TypeRef::generic(name, args)
+            TypeRef::generic_with_values(name, args, value_args)
         };
 
         while self.pending_type_argument_close.is_none() && self.match_kind(&TokenKind::LeftBracket)

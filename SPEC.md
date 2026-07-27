@@ -517,9 +517,9 @@ The semantic model also has an internal `Unknown` recovery type for diagnostics 
 
 Lowercase primitive names are type-position names: `int`, `int8`, `int16`, `int32`, `int64`, `uint8`, `uint16`, `uint32`, `uint64`, `float`, `float32`, `float64`, `string`, and `bool`. PascalCase names are expression-level standard-library/helper or compiler-known companion APIs, not primitive type spellings or namespaces.
 
-### Generic functions and methods
+### Generics
 
-Free functions, instance methods, and static methods may declare type parameters after their name:
+Free functions, methods, and classes may declare type parameters after their name:
 
 ```doria
 function first<T>(List<T> $items): ?T
@@ -531,11 +531,23 @@ function pair<T, U>(T $left, U $right): U
 {
     return $right;
 }
+
+class Box<T>
+{
+    function __construct(take T $value) {}
+
+    function get(): T
+    {
+        return $this->value;
+    }
+}
 ```
 
 Calls infer type arguments from the arguments after ordinary positional/named binding. If arguments do not determine every parameter, a typed declaration may supply the expected result type. Doria has no explicit call-site turbofish syntax. Native compilation monomorphizes reachable calls and deduplicates identical concrete specializations.
 
-Constraint declarations use `<T implements A, B>`. The grammar is accepted and retained, but nominal constraint enforcement remains pending until Stage 35. Generic classes remain Stage 25. The generics decision is still unauthored.
+Generic classes are instantiated in type positions and construction expressions with concrete type arguments, including nested forms such as `List<Box<int>>`. Every instantiation is a distinct monomorphized type with specialized field layout, methods, and drop glue. A class remains an owned move type regardless of its arguments; substituting only Copy fields does not turn it into a user-defined Copy aggregate.
+
+Constraint declarations use `<T implements A, B>`, and constraints may themselves be generic. Compiler-known `Comparable`, `Hashable`, `Equatable`, and `Displayable` constraints are checked at instantiation without boxing primitives. User-defined interface constraints use the same surface once general interfaces land. Type parameters are invariant. Doria v1.0 has no default type arguments, compile-time value arguments, call-site turbofish, or runtime generic reflection.
 
 ### Fixed-width integers
 
