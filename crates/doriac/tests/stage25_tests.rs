@@ -391,6 +391,81 @@ function main(): int
 }
 
 #[test]
+fn promoted_generic_parameters_require_ownership_transfer() {
+    let source = "class Box<T> { function __construct(T $value) {} }";
+    let errors = doriac::check_source("stage25-generic-promotion.doria", source)
+        .expect_err("a promoted T may specialize to a move type");
+    let diagnostic = errors
+        .iter()
+        .find(|diagnostic| diagnostic.code == "E0468")
+        .expect("generic promotion should require take");
+    assert_eq!(
+        diagnostic
+            .fix
+            .as_ref()
+            .expect("generic promotion should offer a fix")
+            .replacement,
+        "take "
+    );
+
+    doriac::check_source(
+        "stage25-generic-promotion-take.doria",
+        "class Box<T> { function __construct(take T $value) {} }",
+    )
+    .expect("take makes generic property promotion ownership-safe");
+}
+
+#[test]
+fn generic_property_initializer_calls_do_not_require_an_explicit_constructor() {
+    let mir = doriac::lower_source_to_mir(
+        "stage25-implicit-constructor-initializer.doria",
+        r#"
+function empty<T>(): List<T> { return []; }
+class History<T>
+{
+    List<T> $entries = empty();
+}
+function main(): int
+{
+    let $history = new History<int>();
+    return $history->entries->count;
+}
+"#,
+    )
+    .expect("concrete class instances should seed generic property-initializer calls");
+    let output = doriac::mir_interpreter::interpret(&mir)
+        .expect("the implicit constructor should execute the specialized initializer");
+    assert_eq!(output.exit_status, 0);
+}
+
+#[test]
+fn external_static_access_requires_a_concrete_generic_class_identity() {
+    let errors = diagnostics(
+        r#"
+class Box<T>
+{
+    static int $count = 42;
+    static function answer(): int { return self::count; }
+}
+function main(): int
+{
+    let $box = new Box<int>();
+    return Box::answer();
+}
+"#,
+    );
+    let diagnostic = errors
+        .iter()
+        .find(|diagnostic| diagnostic.code == "E0540")
+        .expect("bare generic static access should be rejected before MIR");
+    assert!(diagnostic.message.contains("concrete specialization"));
+    assert!(diagnostic
+        .help
+        .as_deref()
+        .is_some_and(|help| help.contains("self::answer")));
+}
+
+#[test]
 fn substituted_nested_class_instantiations_recheck_constraints() {
     let errors = diagnostics(
         r#"

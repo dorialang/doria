@@ -4,7 +4,7 @@ use crate::class_layout::{compute_class_layout, ClassId, FieldType, PropertyId};
 use crate::diagnostics::{Diagnostic, DiagnosticResult};
 use crate::format_string::{self, FormatConversion, FormatPiece};
 use crate::numeric::{parse_decimal_magnitude, FloatType, FloatValue, IntegerType, IntegerValue};
-use crate::semantics::{CallableTarget, GenericArgument, SemanticInfo};
+use crate::semantics::{CallableTarget, GenericArgument, GenericSpecialization, SemanticInfo};
 use crate::source::Span;
 use crate::types::{resolved_type_complexity, ClassType, ResolvedType};
 use crate::{hir, mir};
@@ -83,6 +83,12 @@ struct MethodInstanceKey {
     arguments: Vec<GenericArgument>,
 }
 
+#[derive(Clone)]
+struct PropertyInitializer {
+    expression: hir::Expr,
+    type_substitutions: HashMap<String, ResolvedType>,
+}
+
 #[derive(Clone, Copy)]
 struct CallableDecl<'a> {
     function: &'a hir::FunctionDecl,
@@ -96,6 +102,64 @@ impl CallableDecl<'_> {
     fn is_top_level(self) -> bool {
         self.class.is_none()
     }
+}
+
+fn specialize_callable_instance(
+    span: &(usize, usize),
+    specialization: &GenericSpecialization,
+    substitutions: &HashMap<String, ResolvedType>,
+    functions: &HashMap<String, usize>,
+    methods: &HashMap<(ClassId, String), usize>,
+    class_ids: &ClassIds,
+    semantic_info: &SemanticInfo,
+) -> DiagnosticResult<CallableInstance> {
+    let Some(target) = semantic_info.call_targets.get(span) else {
+        return Err(vec![Diagnostic::new(
+            "I2401",
+            "checked generic call has no callable target",
+            Span::new(span.0, span.1),
+        )]);
+    };
+    let declaration = match target {
+        CallableTarget::Function { name } => functions.get(name).copied(),
+        CallableTarget::Method {
+            class_type,
+            method_name,
+        } => {
+            let specialized =
+                substitute_resolved_type(&ResolvedType::Class(class_type.clone()), substitutions);
+            let ResolvedType::Class(class_type) = specialized else {
+                unreachable!("class target substitution must remain a class");
+            };
+            class_ids
+                .get(&class_type)
+                .and_then(|class| methods.get(&(*class, method_name.clone())))
+                .copied()
+        }
+    }
+    .ok_or_else(|| {
+        vec![Diagnostic::new(
+            "I2401",
+            "checked generic call has no callable declaration",
+            Span::new(span.0, span.1),
+        )]
+    })?;
+    let arguments = specialization
+        .arguments
+        .iter()
+        .map(|argument| substitute_generic_argument(argument, substitutions))
+        .collect::<Vec<_>>();
+    if arguments.iter().any(generic_argument_is_symbolic) {
+        return Err(vec![Diagnostic::new(
+            "I2401",
+            "generic specialization retained an unresolved type parameter",
+            Span::new(span.0, span.1),
+        )]);
+    }
+    Ok(CallableInstance {
+        declaration,
+        arguments,
+    })
 }
 
 fn collect_callable_instances(
@@ -141,6 +205,53 @@ fn collect_callable_instances(
         .collect::<Vec<_>>();
     calls.sort_by_key(|(span, _)| **span);
 
+    for item in &program.items {
+        let hir::Item::Class(class) = item else {
+            continue;
+        };
+        for class_info in semantic_info
+            .classes
+            .iter()
+            .filter(|info| info.declaration_name == class.name)
+        {
+            let substitutions = class
+                .type_params
+                .iter()
+                .zip(&class_info.arguments)
+                .map(|(parameter, argument)| (parameter.name.clone(), argument.clone()))
+                .collect::<HashMap<_, _>>();
+            for member in &class.members {
+                let hir::ClassMember::Property(hir::PropertyDecl {
+                    is_static: false,
+                    initializer: Some(initializer),
+                    ..
+                }) = member
+                else {
+                    continue;
+                };
+                for (span, specialization) in &calls {
+                    if span.0 < initializer.span().start || span.1 > initializer.span().end {
+                        continue;
+                    }
+                    let target = specialize_callable_instance(
+                        span,
+                        specialization,
+                        &substitutions,
+                        &functions,
+                        &methods,
+                        class_ids,
+                        semantic_info,
+                    )?;
+                    if !ids.contains_key(&target) {
+                        ids.insert(target.clone(), instances.len());
+                        instances.push(target);
+                        parents.push(None);
+                    }
+                }
+            }
+        }
+    }
+
     let mut cursor = 0;
     while cursor < instances.len() {
         let instance_index = cursor;
@@ -151,75 +262,18 @@ fn collect_callable_instances(
         for (span, specialization) in &calls {
             let in_function =
                 span.0 >= callable.function.span.start && span.1 <= callable.function.span.end;
-            let in_property_initializer = callable.class.is_some_and(|class| {
-                callable.function.name == "__construct"
-                    && program.items.iter().any(|item| {
-                        let hir::Item::Class(declaration) = item else {
-                            return false;
-                        };
-                        semantic_info.classes.iter().any(|info| {
-                            info.id == class && info.declaration_name == declaration.name
-                        }) && declaration.members.iter().any(|member| {
-                            matches!(
-                                member,
-                                hir::ClassMember::Property(hir::PropertyDecl {
-                                    is_static: false,
-                                    initializer: Some(initializer),
-                                    ..
-                                }) if span.0 >= initializer.span().start
-                                    && span.1 <= initializer.span().end
-                            )
-                        })
-                    })
-            });
-            if !in_function && !in_property_initializer {
+            if !in_function {
                 continue;
             }
-            let Some(target) = semantic_info.call_targets.get(span) else {
-                continue;
-            };
-            let target_declaration = match target {
-                CallableTarget::Function { name } => functions.get(name).copied(),
-                CallableTarget::Method {
-                    class_type,
-                    method_name,
-                } => {
-                    let specialized = substitute_resolved_type(
-                        &ResolvedType::Class(class_type.clone()),
-                        &substitutions,
-                    );
-                    let ResolvedType::Class(class_type) = specialized else {
-                        unreachable!("class target substitution must remain a class");
-                    };
-                    class_ids
-                        .get(&class_type)
-                        .and_then(|class| methods.get(&(*class, method_name.clone())))
-                        .copied()
-                }
-            }
-            .ok_or_else(|| {
-                vec![Diagnostic::new(
-                    "I2401",
-                    "checked generic call has no callable declaration",
-                    Span::new(span.0, span.1),
-                )]
-            })?;
-            let arguments = specialization
-                .arguments
-                .iter()
-                .map(|argument| substitute_generic_argument(argument, &substitutions))
-                .collect::<Vec<_>>();
-            if arguments.iter().any(generic_argument_is_symbolic) {
-                return Err(vec![Diagnostic::new(
-                    "I2401",
-                    "generic specialization retained an unresolved type parameter",
-                    Span::new(span.0, span.1),
-                )]);
-            }
-            let target = CallableInstance {
-                declaration: target_declaration,
-                arguments,
-            };
+            let target = specialize_callable_instance(
+                span,
+                specialization,
+                &substitutions,
+                &functions,
+                &methods,
+                class_ids,
+                semantic_info,
+            )?;
             if !ids.contains_key(&target) {
                 if specialization_expands_recursively(&instances, &parents, instance_index, &target)
                 {
@@ -481,6 +535,12 @@ pub fn lower_program(program: &hir::Program) -> DiagnosticResult<mir::Program> {
                     _ => None,
                 })
                 .expect("specialized class has a declaration");
+            let substitutions = class
+                .type_params
+                .iter()
+                .zip(&class_info.arguments)
+                .map(|(parameter, argument)| (parameter.name.clone(), argument.clone()))
+                .collect::<HashMap<_, _>>();
             class.members.iter().filter_map(move |member| match member {
                 hir::ClassMember::Property(property) if !property.is_static => {
                     property.initializer.clone().map(|value| {
@@ -490,7 +550,13 @@ pub fn lower_program(program: &hir::Program) -> DiagnosticResult<mir::Program> {
                             .find(|info| info.name == property.name)
                             .expect("checked property has a stable identity")
                             .id;
-                        (property_id, value)
+                        (
+                            property_id,
+                            PropertyInitializer {
+                                expression: value,
+                                type_substitutions: substitutions.clone(),
+                            },
+                        )
                     })
                 }
                 hir::ClassMember::Property(_)
@@ -1254,7 +1320,7 @@ struct FunctionLoweringInputs<'a> {
     signatures: &'a HashMap<FunctionInstanceKey, FunctionSignature>,
     method_signatures: &'a HashMap<MethodInstanceKey, FunctionSignature>,
     semantic_info: &'a SemanticInfo,
-    property_initializers: &'a HashMap<crate::class_layout::PropertyId, hir::Expr>,
+    property_initializers: &'a HashMap<crate::class_layout::PropertyId, PropertyInitializer>,
     constructor_body_initializers: &'a HashSet<crate::class_layout::PropertyId>,
     static_ids: &'a HashMap<(ClassId, String), (mir::StaticId, mir::Type)>,
     collection_registry: &'a CollectionRegistry,
@@ -2251,7 +2317,7 @@ struct LoweringContext<'semantic> {
     signatures: HashMap<FunctionInstanceKey, FunctionSignature>,
     method_signatures: HashMap<MethodInstanceKey, FunctionSignature>,
     semantic_info: &'semantic SemanticInfo,
-    property_initializers: HashMap<crate::class_layout::PropertyId, hir::Expr>,
+    property_initializers: HashMap<crate::class_layout::PropertyId, PropertyInitializer>,
     constructor_body_initializers: HashSet<crate::class_layout::PropertyId>,
     static_ids: HashMap<(ClassId, String), (mir::StaticId, mir::Type)>,
     collection_registry: CollectionRegistry,
@@ -7759,17 +7825,20 @@ fn lower_new_property_values(
             if let Some(initializer) = context.property_initializers.get(&property.id).cloned() {
                 let property_type = context.mir_resolved_type(&property.ty).ok_or_else(|| {
                     vec![unsupported(
-                        initializer.span(),
+                        initializer.expression.span(),
                         format!("property `${}` is not native-lowerable", property.name),
                     )]
                 })?;
+                let caller_substitutions = std::mem::replace(
+                    &mut context.type_substitutions,
+                    initializer.type_substitutions,
+                );
+                let source =
+                    lower_rvalue_as_expected(&initializer.expression, property_type, context);
+                context.type_substitutions = caller_substitutions;
                 return Ok(mir::PropertyValue {
                     property: property.id,
-                    source: mir::PropertyValueSource::Expression(lower_rvalue_as_expected(
-                        &initializer,
-                        property_type,
-                        context,
-                    )?),
+                    source: mir::PropertyValueSource::Expression(source?),
                 });
             }
             if context

@@ -5080,6 +5080,7 @@ impl<'program> Checker<'program> {
         match self.types.kind(ty) {
             TypeKind::Nullable(inner) => self.type_is_move_type(*inner),
             TypeKind::Class(_)
+            | TypeKind::TypeParameter(_)
             | TypeKind::Bytes
             | TypeKind::Mixed
             | TypeKind::TypedArray(_)
@@ -6431,6 +6432,27 @@ impl<'program> Checker<'program> {
         }
 
         match access.qualifier {
+            StaticQualifier::Class(name)
+                if self
+                    .classes
+                    .get(name)
+                    .is_some_and(|class| !class.type_params.is_empty()) =>
+            {
+                self.diagnostics.push(
+                    Diagnostic::new(
+                        "E0540",
+                        format!(
+                            "static access through generic class `{name}` does not identify a concrete specialization"
+                        ),
+                        access.qualifier_span,
+                    )
+                    .with_help(format!(
+                        "use `self::{}` inside `{name}<...>`, or move the operation to a free generic function",
+                        access.member
+                    )),
+                );
+                None
+            }
             StaticQualifier::Class(name) => Some(name.clone()),
             StaticQualifier::SelfType => method_context
                 .map(|context| context.class_name.clone())
