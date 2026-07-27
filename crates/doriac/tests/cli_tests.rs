@@ -9,6 +9,15 @@ use std::ffi::OsString;
 use std::os::unix::ffi::OsStringExt;
 
 #[test]
+fn development_launcher_builds_the_runtime_from_source() {
+    let launcher = include_str!("../../../bin/doriac");
+    assert!(
+        !launcher.contains("--no-default-features"),
+        "the development launcher must keep doriac's bundled-runtime default enabled"
+    );
+}
+
+#[test]
 fn version_uses_canonical_toolchain_calver() {
     let output = Command::new(doriac_bin())
         .arg("--version")

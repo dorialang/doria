@@ -359,6 +359,38 @@ function main(): int
 }
 
 #[test]
+fn generic_callable_instantiations_follow_transitive_calls() {
+    let mir = doriac::lower_source_to_mir(
+        "stage25-callable-chain.doria",
+        r#"
+class Holder<T>
+{
+    function __construct(take T $value) {}
+    function get(): T { return $this->value; }
+}
+function inner<U>(take U $value): Holder<U>
+{
+    return new Holder<U>($value);
+}
+function outer<T>(take T $value): Holder<T>
+{
+    return inner($value);
+}
+function main(): int
+{
+    let $holder = outer(42);
+    return $holder->get();
+}
+"#,
+    )
+    .expect("concrete generic calls should specialize class templates in transitive callees");
+    let output = doriac::mir_interpreter::interpret(&mir)
+        .expect("transitively-specialized generic callable bodies should execute");
+    assert_eq!(output.exit_status, 42);
+    assert!(mir.classes.iter().any(|class| class.name == "Holder<int>"));
+}
+
+#[test]
 fn substituted_nested_class_instantiations_recheck_constraints() {
     let errors = diagnostics(
         r#"

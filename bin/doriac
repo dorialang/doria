@@ -7,20 +7,15 @@ declare(strict_types=1);
 //
 // Two build choices make the from-source `doriac` behave like a real toolchain:
 //
-//   --no-default-features   drops the `bundled-runtime` feature so build.rs
-//                           compiles doria-rt fresh from source on every runtime
-//                           change. Without this, `--release` links a stale
-//                           bundled `libdoria_rt.a` and fails with undefined
-//                           runtime symbols after the runtime changes.
+//   bundled-runtime         remains enabled so build.rs compiles doria-rt from
+//                           source and publishes the fresh archive path used by
+//                           native links. This is Cargo's default feature set.
 //
 //   --features llvm-backend added only when an LLVM 18 toolchain is present, so
 //                           `doriac compile --release` (the LLVM profile) works.
 //                           Without LLVM the launcher still builds (Cranelift
 //                           only) and `--release` reports the usual clear error.
 //
-// Both are applied unconditionally-consistently, so the cached build never
-// thrashes between feature sets.
-
 $repositoryRoot = dirname(__DIR__);
 
 $environment = getenv();
@@ -29,7 +24,7 @@ if (!is_array($environment)) {
 }
 $environment['CLICOLOR_FORCE'] = '1';
 
-$features = ['--no-default-features'];
+$features = [];
 $llvmPrefix = detect_llvm18_prefix();
 if ($llvmPrefix !== null) {
     $features[] = '--features';

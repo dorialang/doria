@@ -208,6 +208,16 @@ fn collect_ordered_class_semantics(
     program: &Program,
     checker: &mut Checker<'_>,
 ) -> Vec<ClassSemanticInfo> {
+    let mut expanded_classes = HashSet::new();
+    loop {
+        let previous_count = checker.class_instantiations.len();
+        collect_callable_class_instantiations(program, checker);
+        expand_class_instantiations(program, checker, &mut expanded_classes);
+        if checker.class_instantiations.len() == previous_count {
+            break;
+        }
+    }
+
     let mut instances = checker
         .class_instantiations
         .iter()
@@ -229,80 +239,6 @@ fn collect_ordered_class_semantics(
                 .collect::<Vec<_>>(),
         )
     });
-    let mut parents = vec![None; instances.len()];
-    let mut ids = instances
-        .iter()
-        .cloned()
-        .enumerate()
-        .map(|(index, instance)| (instance, index))
-        .collect::<HashMap<_, _>>();
-    let mut cursor = 0;
-    while cursor < instances.len() {
-        let instance_index = cursor;
-        let instance = instances[cursor].clone();
-        cursor += 1;
-        let Some(templates) = checker
-            .class_instantiation_templates
-            .get(&instance.name)
-            .cloned()
-        else {
-            continue;
-        };
-        let substitutions = checker.class_type_substitutions(&instance);
-        for template in templates {
-            let arguments = template
-                .arguments
-                .iter()
-                .map(|argument| checker.substitute_type_id(*argument, &substitutions))
-                .collect::<Vec<_>>();
-            if arguments
-                .iter()
-                .any(|argument| checker.type_is_symbolic(*argument))
-            {
-                continue;
-            }
-            let specialized = ClassType::new(template.name, arguments);
-            if ids.contains_key(&specialized) {
-                continue;
-            }
-            let span = program
-                .items
-                .iter()
-                .find_map(|item| match item {
-                    Item::Class(class) if class.name == specialized.name => Some(class.span),
-                    _ => None,
-                })
-                .unwrap_or_default();
-            if class_specialization_expands_recursively(
-                &instances,
-                &parents,
-                instance_index,
-                &specialized,
-                &checker.types,
-            ) {
-                let message = format!(
-                    "generic specialization of class `{}` recursively expands its type arguments and has no finite monomorphization",
-                    specialized.name
-                );
-                if !checker
-                    .diagnostics
-                    .iter()
-                    .any(|diagnostic| diagnostic.code == "E0539" && diagnostic.message == message)
-                {
-                    checker.diagnostics.push(
-                        Diagnostic::new("E0539", message, span).with_help(
-                            "keep recursive class references at the same concrete type, or move the type-changing step outside the recursive class",
-                        ),
-                    );
-                }
-                continue;
-            }
-            checker.check_concrete_class_constraints(&specialized, span);
-            ids.insert(specialized.clone(), instances.len());
-            instances.push(specialized);
-            parents.push(Some(instance_index));
-        }
-    }
     let concrete_instances = instances.into_iter().collect::<HashSet<_>>();
 
     let declarations = program.items.iter().filter_map(|item| match item {
@@ -394,6 +330,368 @@ fn collect_ordered_class_semantics(
         }
     }
     classes
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct SemanticCallableInstance {
+    declaration: usize,
+    bindings: Vec<(String, TypeId)>,
+}
+
+impl SemanticCallableInstance {
+    fn new(declaration: usize, bindings: HashMap<String, TypeId>) -> Self {
+        let mut bindings = bindings.into_iter().collect::<Vec<_>>();
+        bindings.sort_by(|left, right| left.0.cmp(&right.0));
+        Self {
+            declaration,
+            bindings,
+        }
+    }
+
+    fn substitutions(&self) -> HashMap<String, TypeId> {
+        self.bindings.iter().cloned().collect()
+    }
+}
+
+fn enqueue_callable_instance(
+    instance: SemanticCallableInstance,
+    parent: Option<usize>,
+    instances: &mut Vec<SemanticCallableInstance>,
+    parents: &mut Vec<Option<usize>>,
+    ids: &mut HashMap<SemanticCallableInstance, usize>,
+) {
+    if ids.contains_key(&instance) {
+        return;
+    }
+    let index = instances.len();
+    ids.insert(instance.clone(), index);
+    instances.push(instance);
+    parents.push(parent);
+}
+
+fn collect_callable_class_instantiations(program: &Program, checker: &mut Checker<'_>) {
+    let mut declarations = HashMap::new();
+    for item in &program.items {
+        match item {
+            Item::Function(function) => {
+                declarations.insert(function.span.start, (function, None));
+            }
+            Item::Class(class) => {
+                for member in &class.members {
+                    if let ClassMember::Method(method) = member {
+                        declarations.insert(method.span.start, (method, Some(class)));
+                    }
+                }
+            }
+            Item::Interface(_) | Item::Trait(_) | Item::Constant(_) | Item::Statement(_) => {}
+        }
+    }
+
+    let mut instances = Vec::new();
+    let mut parents = Vec::new();
+    let mut ids = HashMap::new();
+
+    for (declaration, (function, class)) in &declarations {
+        if !function.type_params.is_empty() {
+            continue;
+        }
+        match class {
+            None => {
+                enqueue_callable_instance(
+                    SemanticCallableInstance::new(*declaration, HashMap::new()),
+                    None,
+                    &mut instances,
+                    &mut parents,
+                    &mut ids,
+                );
+            }
+            Some(class) if class.type_params.is_empty() => {
+                enqueue_callable_instance(
+                    SemanticCallableInstance::new(*declaration, HashMap::new()),
+                    None,
+                    &mut instances,
+                    &mut parents,
+                    &mut ids,
+                );
+            }
+            Some(class) => {
+                let concrete_classes = checker
+                    .class_instantiations
+                    .iter()
+                    .filter(|instance| {
+                        instance.name == class.name
+                            && !instance
+                                .arguments
+                                .iter()
+                                .any(|argument| checker.type_is_symbolic(*argument))
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                for instance in concrete_classes {
+                    enqueue_callable_instance(
+                        SemanticCallableInstance::new(
+                            *declaration,
+                            checker.class_type_substitutions(&instance),
+                        ),
+                        None,
+                        &mut instances,
+                        &mut parents,
+                        &mut ids,
+                    );
+                }
+            }
+        }
+    }
+
+    let mut calls = checker
+        .pending_generic_calls
+        .iter()
+        .filter(|(span, _)| checker.generic_call_specializations.contains_key(span))
+        .map(|(span, pending)| (*span, pending.clone()))
+        .collect::<Vec<_>>();
+    calls.sort_by_key(|(span, _)| *span);
+    for (_, pending) in &calls {
+        if pending
+            .bindings
+            .values()
+            .any(|argument| checker.type_is_symbolic(*argument))
+        {
+            continue;
+        }
+        enqueue_callable_instance(
+            SemanticCallableInstance::new(pending.declaration, pending.bindings.clone()),
+            None,
+            &mut instances,
+            &mut parents,
+            &mut ids,
+        );
+    }
+
+    let mut cursor = 0;
+    while cursor < instances.len() {
+        let instance_index = cursor;
+        let instance = instances[cursor].clone();
+        cursor += 1;
+        let Some((function, _)) = declarations.get(&instance.declaration) else {
+            continue;
+        };
+        let substitutions = instance.substitutions();
+
+        if let Some(templates) = checker
+            .callable_class_instantiation_templates
+            .get(&instance.declaration)
+            .cloned()
+        {
+            for template in templates {
+                let arguments = template
+                    .arguments
+                    .iter()
+                    .map(|argument| checker.substitute_type_id(*argument, &substitutions))
+                    .collect::<Vec<_>>();
+                if arguments
+                    .iter()
+                    .any(|argument| checker.type_is_symbolic(*argument))
+                {
+                    continue;
+                }
+                let class = ClassType::new(template.name, arguments);
+                checker.check_concrete_class_constraints(&class, function.span);
+                checker.class_instantiations.insert(class);
+            }
+        }
+
+        for (span, pending) in &calls {
+            if span.0 < function.span.start || span.1 > function.span.end {
+                continue;
+            }
+            let bindings = pending
+                .bindings
+                .iter()
+                .map(|(name, ty)| {
+                    (
+                        name.clone(),
+                        checker.substitute_type_id(*ty, &substitutions),
+                    )
+                })
+                .collect::<HashMap<_, _>>();
+            if bindings
+                .values()
+                .any(|argument| checker.type_is_symbolic(*argument))
+            {
+                continue;
+            }
+            let target = SemanticCallableInstance::new(pending.declaration, bindings);
+            if ids.contains_key(&target) {
+                continue;
+            }
+            if callable_specialization_expands_recursively(
+                &instances,
+                &parents,
+                instance_index,
+                &target,
+                &checker.types,
+            ) {
+                let name = declarations
+                    .get(&target.declaration)
+                    .map(|(function, _)| function.name.as_str())
+                    .unwrap_or(pending.callee.as_str());
+                let message = format!(
+                    "generic specialization of `{name}` recursively expands its type arguments and has no finite monomorphization"
+                );
+                if !checker
+                    .diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.code == "E0539" && diagnostic.message == message)
+                {
+                    checker.diagnostics.push(
+                        Diagnostic::new("E0539", message, Span::new(span.0, span.1)).with_help(
+                            "keep recursive generic calls at the same concrete type, or move the type-changing step outside the recursion",
+                        ),
+                    );
+                }
+                continue;
+            }
+            enqueue_callable_instance(
+                target,
+                Some(instance_index),
+                &mut instances,
+                &mut parents,
+                &mut ids,
+            );
+        }
+    }
+}
+
+fn callable_specialization_expands_recursively(
+    instances: &[SemanticCallableInstance],
+    parents: &[Option<usize>],
+    current: usize,
+    target: &SemanticCallableInstance,
+    types: &TypeRegistry,
+) -> bool {
+    let mut matching_ancestors = Vec::new();
+    let mut cursor = Some(current);
+    while let Some(index) = cursor {
+        if instances[index].declaration == target.declaration {
+            matching_ancestors.push(&instances[index]);
+            if matching_ancestors.len() == 2 {
+                break;
+            }
+        }
+        cursor = parents[index];
+    }
+    let [nearest, previous] = matching_ancestors.as_slice() else {
+        return false;
+    };
+    callable_specialization_complexity(target, types)
+        > callable_specialization_complexity(nearest, types)
+        && callable_specialization_complexity(nearest, types)
+            > callable_specialization_complexity(previous, types)
+}
+
+fn callable_specialization_complexity(
+    instance: &SemanticCallableInstance,
+    types: &TypeRegistry,
+) -> usize {
+    instance
+        .bindings
+        .iter()
+        .map(|(_, ty)| resolved_type_complexity(&types.resolved(*ty)))
+        .sum()
+}
+
+fn expand_class_instantiations(
+    program: &Program,
+    checker: &mut Checker<'_>,
+    expanded: &mut HashSet<ClassType<TypeId>>,
+) {
+    let mut instances = checker
+        .class_instantiations
+        .iter()
+        .filter(|class| {
+            !expanded.contains(*class)
+                && !class
+                    .arguments
+                    .iter()
+                    .any(|argument| checker.type_is_symbolic(*argument))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut parents = vec![None; instances.len()];
+    let mut ids = checker
+        .class_instantiations
+        .iter()
+        .cloned()
+        .collect::<HashSet<_>>();
+    let mut cursor = 0;
+    while cursor < instances.len() {
+        let instance_index = cursor;
+        let instance = instances[cursor].clone();
+        cursor += 1;
+        expanded.insert(instance.clone());
+        let Some(templates) = checker
+            .class_instantiation_templates
+            .get(&instance.name)
+            .cloned()
+        else {
+            continue;
+        };
+        let substitutions = checker.class_type_substitutions(&instance);
+        for template in templates {
+            let arguments = template
+                .arguments
+                .iter()
+                .map(|argument| checker.substitute_type_id(*argument, &substitutions))
+                .collect::<Vec<_>>();
+            if arguments
+                .iter()
+                .any(|argument| checker.type_is_symbolic(*argument))
+            {
+                continue;
+            }
+            let specialized = ClassType::new(template.name, arguments);
+            if ids.contains(&specialized) {
+                continue;
+            }
+            let span = program
+                .items
+                .iter()
+                .find_map(|item| match item {
+                    Item::Class(class) if class.name == specialized.name => Some(class.span),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            if class_specialization_expands_recursively(
+                &instances,
+                &parents,
+                instance_index,
+                &specialized,
+                &checker.types,
+            ) {
+                let message = format!(
+                    "generic specialization of class `{}` recursively expands its type arguments and has no finite monomorphization",
+                    specialized.name
+                );
+                if !checker
+                    .diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.code == "E0539" && diagnostic.message == message)
+                {
+                    checker.diagnostics.push(
+                        Diagnostic::new("E0539", message, span).with_help(
+                            "keep recursive class references at the same concrete type, or move the type-changing step outside the recursive class",
+                        ),
+                    );
+                }
+                continue;
+            }
+            checker.check_concrete_class_constraints(&specialized, span);
+            ids.insert(specialized.clone());
+            checker.class_instantiations.insert(specialized.clone());
+            instances.push(specialized);
+            parents.push(Some(instance_index));
+        }
+    }
 }
 
 fn class_specialization_expands_recursively(
@@ -6808,7 +7106,6 @@ impl<'program> Checker<'program> {
             return;
         };
         let callee = pending.callee.clone();
-        let declaration = pending.declaration;
         let type_params = pending.type_params.clone();
         let bindings = pending.bindings.clone();
         self.check_generic_type_constraints(
@@ -6817,28 +7114,6 @@ impl<'program> Checker<'program> {
             &bindings,
             Span::new(key.0, key.1),
         );
-        if let Some(templates) = self
-            .callable_class_instantiation_templates
-            .get(&declaration)
-            .cloned()
-        {
-            for template in templates {
-                let arguments = template
-                    .arguments
-                    .iter()
-                    .map(|argument| self.substitute_type_id(*argument, &bindings))
-                    .collect::<Vec<_>>();
-                if arguments
-                    .iter()
-                    .any(|argument| self.type_is_symbolic(*argument))
-                {
-                    continue;
-                }
-                let class = ClassType::new(template.name, arguments);
-                self.check_concrete_class_constraints(&class, Span::new(key.0, key.1));
-                self.class_instantiations.insert(class);
-            }
-        }
         self.generic_call_specializations
             .insert(key, GenericSpecialization { arguments });
     }
