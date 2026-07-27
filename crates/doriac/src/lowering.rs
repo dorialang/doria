@@ -1,6 +1,24 @@
 use crate::diagnostics::{Diagnostic, DiagnosticResult};
 use crate::{ast, hir};
 
+#[derive(Clone, Copy)]
+struct ClassContext<'a> {
+    name: &'a str,
+    type_params: &'a [ast::TypeParamDecl],
+}
+
+impl ClassContext<'_> {
+    fn self_type(self) -> crate::types::TypeRef {
+        crate::types::TypeRef::generic(
+            self.name,
+            self.type_params
+                .iter()
+                .map(|param| crate::types::TypeRef::named(&param.name))
+                .collect(),
+        )
+    }
+}
+
 pub fn lower_program(program: &ast::Program) -> DiagnosticResult<hir::Program> {
     lower_program_with_semantics(program, crate::semantics::SemanticInfo::default())
 }
@@ -50,12 +68,16 @@ fn lower_item(item: &ast::Item) -> Result<hir::Item, Diagnostic> {
 }
 
 fn lower_class(class_decl: &ast::ClassDecl) -> hir::ClassDecl {
+    let class_context = ClassContext {
+        name: &class_decl.name,
+        type_params: &class_decl.type_params,
+    };
     hir::ClassDecl {
         name: class_decl.name.clone(),
         type_params: class_decl
             .type_params
             .iter()
-            .map(|param| lower_type_param(param, Some(&class_decl.name)))
+            .map(|param| lower_type_param(param, Some(class_context)))
             .collect(),
         parent: class_decl.parent.clone(),
         parent_span: class_decl.parent_span,
@@ -63,13 +85,13 @@ fn lower_class(class_decl: &ast::ClassDecl) -> hir::ClassDecl {
         members: class_decl
             .members
             .iter()
-            .map(|member| lower_class_member(member, &class_decl.name))
+            .map(|member| lower_class_member(member, class_context))
             .collect(),
         span: class_decl.span,
     }
 }
 
-fn lower_class_member(member: &ast::ClassMember, class_name: &str) -> hir::ClassMember {
+fn lower_class_member(member: &ast::ClassMember, class_name: ClassContext<'_>) -> hir::ClassMember {
     match member {
         ast::ClassMember::Property(property) => {
             hir::ClassMember::Property(lower_property(property, Some(class_name)))
@@ -83,7 +105,10 @@ fn lower_class_member(member: &ast::ClassMember, class_name: &str) -> hir::Class
     }
 }
 
-fn lower_property(property: &ast::PropertyDecl, class_name: Option<&str>) -> hir::PropertyDecl {
+fn lower_property(
+    property: &ast::PropertyDecl,
+    class_name: Option<ClassContext<'_>>,
+) -> hir::PropertyDecl {
     hir::PropertyDecl {
         access: property.access.clone(),
         is_static: property.is_static,
@@ -98,7 +123,10 @@ fn lower_property(property: &ast::PropertyDecl, class_name: Option<&str>) -> hir
     }
 }
 
-fn lower_constant(constant: &ast::ConstDecl, class_name: Option<&str>) -> hir::ConstDecl {
+fn lower_constant(
+    constant: &ast::ConstDecl,
+    class_name: Option<ClassContext<'_>>,
+) -> hir::ConstDecl {
     hir::ConstDecl {
         access: constant.access.clone(),
         ty: constant
@@ -111,7 +139,10 @@ fn lower_constant(constant: &ast::ConstDecl, class_name: Option<&str>) -> hir::C
     }
 }
 
-fn lower_function(function: &ast::FunctionDecl, class_name: Option<&str>) -> hir::FunctionDecl {
+fn lower_function(
+    function: &ast::FunctionDecl,
+    class_name: Option<ClassContext<'_>>,
+) -> hir::FunctionDecl {
     hir::FunctionDecl {
         access: function.access.clone(),
         writable_this: function.writable_this,
@@ -136,7 +167,10 @@ fn lower_function(function: &ast::FunctionDecl, class_name: Option<&str>) -> hir
     }
 }
 
-fn lower_type_param(param: &ast::TypeParamDecl, class_name: Option<&str>) -> hir::TypeParamDecl {
+fn lower_type_param(
+    param: &ast::TypeParamDecl,
+    class_name: Option<ClassContext<'_>>,
+) -> hir::TypeParamDecl {
     hir::TypeParamDecl {
         name: param.name.clone(),
         constraints: param
@@ -152,7 +186,7 @@ fn lower_type_param(param: &ast::TypeParamDecl, class_name: Option<&str>) -> hir
     }
 }
 
-fn lower_param(param: &ast::Param, class_name: Option<&str>) -> hir::Param {
+fn lower_param(param: &ast::Param, class_name: Option<ClassContext<'_>>) -> hir::Param {
     hir::Param {
         promoted_access: param.promoted_access.clone(),
         take: param.take,
@@ -167,7 +201,7 @@ fn lower_param(param: &ast::Param, class_name: Option<&str>) -> hir::Param {
     }
 }
 
-fn lower_block(block: &ast::Block, class_name: Option<&str>) -> hir::Block {
+fn lower_block(block: &ast::Block, class_name: Option<ClassContext<'_>>) -> hir::Block {
     hir::Block {
         statements: block
             .statements
@@ -178,7 +212,7 @@ fn lower_block(block: &ast::Block, class_name: Option<&str>) -> hir::Block {
     }
 }
 
-fn lower_stmt(statement: &ast::Stmt, class_name: Option<&str>) -> hir::Stmt {
+fn lower_stmt(statement: &ast::Stmt, class_name: Option<ClassContext<'_>>) -> hir::Stmt {
     match statement {
         ast::Stmt::VarDecl(decl) => hir::Stmt::VarDecl(hir::VarDecl {
             writable: decl.writable,
@@ -250,7 +284,7 @@ fn lower_stmt(statement: &ast::Stmt, class_name: Option<&str>) -> hir::Stmt {
 
 fn lower_for_initializer(
     initializer: &ast::ForInitializer,
-    class_name: Option<&str>,
+    class_name: Option<ClassContext<'_>>,
 ) -> hir::ForInitializer {
     match initializer {
         ast::ForInitializer::VarDecl(decl) => hir::ForInitializer::VarDecl(hir::VarDecl {
@@ -273,7 +307,7 @@ fn lower_for_initializer(
 
 fn lower_for_increment(
     increment: &ast::ForIncrement,
-    class_name: Option<&str>,
+    class_name: Option<ClassContext<'_>>,
 ) -> hir::ForIncrement {
     match increment {
         ast::ForIncrement::Increment(increment) => {
@@ -295,7 +329,7 @@ fn lower_for_increment(
     }
 }
 
-fn lower_if_stmt(if_stmt: &ast::IfStmt, class_name: Option<&str>) -> hir::IfStmt {
+fn lower_if_stmt(if_stmt: &ast::IfStmt, class_name: Option<ClassContext<'_>>) -> hir::IfStmt {
     hir::IfStmt {
         condition: lower_expr(&if_stmt.condition, class_name),
         then_block: lower_block(&if_stmt.then_block, class_name),
@@ -307,7 +341,10 @@ fn lower_if_stmt(if_stmt: &ast::IfStmt, class_name: Option<&str>) -> hir::IfStmt
     }
 }
 
-fn lower_else_branch(branch: &ast::ElseBranch, class_name: Option<&str>) -> hir::ElseBranch {
+fn lower_else_branch(
+    branch: &ast::ElseBranch,
+    class_name: Option<ClassContext<'_>>,
+) -> hir::ElseBranch {
     match branch {
         ast::ElseBranch::If(if_stmt) => {
             hir::ElseBranch::If(Box::new(lower_if_stmt(if_stmt, class_name)))
@@ -318,7 +355,7 @@ fn lower_else_branch(branch: &ast::ElseBranch, class_name: Option<&str>) -> hir:
 
 fn lower_foreach_binding(
     binding: &ast::ForeachBinding,
-    class_name: Option<&str>,
+    class_name: Option<ClassContext<'_>>,
 ) -> hir::ForeachBinding {
     hir::ForeachBinding {
         writable: binding.writable,
@@ -327,7 +364,7 @@ fn lower_foreach_binding(
     }
 }
 
-fn lower_argument(argument: &ast::Argument, class_name: Option<&str>) -> hir::Argument {
+fn lower_argument(argument: &ast::Argument, class_name: Option<ClassContext<'_>>) -> hir::Argument {
     hir::Argument {
         name: argument.name.clone(),
         value: lower_expr(&argument.value, class_name),
@@ -335,7 +372,7 @@ fn lower_argument(argument: &ast::Argument, class_name: Option<&str>) -> hir::Ar
     }
 }
 
-fn lower_expr(expr: &ast::Expr, class_name: Option<&str>) -> hir::Expr {
+fn lower_expr(expr: &ast::Expr, class_name: Option<ClassContext<'_>>) -> hir::Expr {
     match expr {
         ast::Expr::Variable { name, span } => hir::Expr::Variable {
             name: name.clone(),
@@ -504,7 +541,7 @@ fn lower_expr(expr: &ast::Expr, class_name: Option<&str>) -> hir::Expr {
 
 fn lower_interpolated_string_part(
     part: &ast::InterpolatedStringPart,
-    class_name: Option<&str>,
+    class_name: Option<ClassContext<'_>>,
 ) -> hir::InterpolatedStringPart {
     match part {
         ast::InterpolatedStringPart::Text { value, span } => hir::InterpolatedStringPart::Text {
@@ -517,18 +554,25 @@ fn lower_interpolated_string_part(
     }
 }
 
-fn lower_array_element(element: &ast::ArrayElement, class_name: Option<&str>) -> hir::ArrayElement {
+fn lower_array_element(
+    element: &ast::ArrayElement,
+    class_name: Option<ClassContext<'_>>,
+) -> hir::ArrayElement {
     hir::ArrayElement {
         key: element.key.as_ref().map(|key| lower_expr(key, class_name)),
         value: lower_expr(&element.value, class_name),
     }
 }
 
-fn resolved_qualifier_name(qualifier: &ast::StaticQualifier, class_name: Option<&str>) -> String {
+fn resolved_qualifier_name(
+    qualifier: &ast::StaticQualifier,
+    class_name: Option<ClassContext<'_>>,
+) -> String {
     match qualifier {
         ast::StaticQualifier::Class(name) => name.clone(),
         ast::StaticQualifier::SelfType => class_name
             .expect("checked `self::` access has a declaring class")
+            .name
             .to_string(),
         ast::StaticQualifier::Parent | ast::StaticQualifier::InvalidStatic => {
             unreachable!("rejected or unsupported qualifier must not reach Doria IR lowering")
@@ -536,6 +580,12 @@ fn resolved_qualifier_name(qualifier: &ast::StaticQualifier, class_name: Option<
     }
 }
 
-fn lower_type_ref(ty: &crate::types::TypeRef, class_name: Option<&str>) -> crate::types::TypeRef {
-    class_name.map_or_else(|| ty.clone(), |class_name| ty.resolve_self_in(class_name))
+fn lower_type_ref(
+    ty: &crate::types::TypeRef,
+    class_name: Option<ClassContext<'_>>,
+) -> crate::types::TypeRef {
+    class_name.map_or_else(
+        || ty.clone(),
+        |class_context| ty.resolve_self_in(&class_context.self_type()),
+    )
 }

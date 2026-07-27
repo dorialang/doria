@@ -6,7 +6,7 @@ use crate::format_string::{self, FormatConversion, FormatPiece};
 use crate::numeric::{parse_decimal_magnitude, FloatType, FloatValue, IntegerType, IntegerValue};
 use crate::semantics::{CallableTarget, GenericArgument, SemanticInfo};
 use crate::source::Span;
-use crate::types::{ClassType, ResolvedType};
+use crate::types::{resolved_type_complexity, ClassType, ResolvedType};
 use crate::{hir, mir};
 
 type ClassIds = HashMap<ClassType<ResolvedType>, ClassId>;
@@ -281,35 +281,6 @@ fn specialization_complexity(arguments: &[GenericArgument]) -> usize {
             resolved_type_complexity(ty)
         })
         .sum()
-}
-
-fn resolved_type_complexity(ty: &ResolvedType) -> usize {
-    match ty {
-        ResolvedType::Nullable(inner)
-        | ResolvedType::TypedArray(inner)
-        | ResolvedType::List(inner)
-        | ResolvedType::Set(inner) => 1 + resolved_type_complexity(inner),
-        ResolvedType::Dictionary(key, value) => {
-            1 + resolved_type_complexity(key) + resolved_type_complexity(value)
-        }
-        ResolvedType::Class(class) => {
-            1 + class
-                .arguments
-                .iter()
-                .map(resolved_type_complexity)
-                .sum::<usize>()
-        }
-        ResolvedType::Integer(_)
-        | ResolvedType::Float(_)
-        | ResolvedType::Bool
-        | ResolvedType::String
-        | ResolvedType::Bytes
-        | ResolvedType::Mixed
-        | ResolvedType::Void
-        | ResolvedType::Null
-        | ResolvedType::TypeParameter(_)
-        | ResolvedType::Unsupported => 1,
-    }
 }
 
 fn type_substitutions(
@@ -1178,7 +1149,7 @@ fn resolved_type_ref_with_substitutions(
 ) -> Option<ResolvedType> {
     let mut plain = ty.clone();
     plain.nullable = false;
-    let base = if plain.args.is_empty() {
+    let base = if plain.arguments.is_empty() {
         if let Some(substitution) = substitutions.get(&plain.name) {
             substitution.clone()
         } else if let Some(integer) = IntegerType::from_source_name(&plain.name) {
@@ -1197,8 +1168,7 @@ fn resolved_type_ref_with_substitutions(
         }
     } else {
         let arguments = plain
-            .args
-            .iter()
+            .type_arguments()
             .map(|argument| resolved_type_ref_with_substitutions(argument, substitutions))
             .collect::<Option<Vec<_>>>()?;
         match plain.name.as_str() {
@@ -1249,7 +1219,7 @@ fn field_type(ty: mir::Type) -> Option<FieldType> {
 
 fn integer_type_ref(ty: &crate::types::TypeRef) -> Option<IntegerType> {
     (!ty.nullable).then_some(()).and_then(|()| {
-        ty.args
+        ty.arguments
             .is_empty()
             .then(|| IntegerType::from_source_name(&ty.name))
             .flatten()
@@ -1258,7 +1228,7 @@ fn integer_type_ref(ty: &crate::types::TypeRef) -> Option<IntegerType> {
 
 fn float_type_ref(ty: &crate::types::TypeRef) -> Option<FloatType> {
     (!ty.nullable).then_some(()).and_then(|()| {
-        ty.args
+        ty.arguments
             .is_empty()
             .then(|| FloatType::from_source_name(&ty.name))
             .flatten()
@@ -1273,11 +1243,11 @@ fn scalar_type_ref(ty: &crate::types::TypeRef) -> Option<mir::ScalarType> {
 }
 
 fn is_plain_type(ty: &crate::types::TypeRef, name: &str) -> bool {
-    !ty.nullable && ty.name == name && ty.args.is_empty()
+    !ty.nullable && ty.name == name && ty.arguments.is_empty()
 }
 
 fn is_nullable_string_type(ty: &crate::types::TypeRef) -> bool {
-    ty.nullable && ty.name == "string" && ty.args.is_empty()
+    ty.nullable && ty.name == "string" && ty.arguments.is_empty()
 }
 
 struct FunctionLoweringInputs<'a> {
@@ -2649,6 +2619,24 @@ impl<'semantic> LoweringContext<'semantic> {
                 class.declaration_name == class_type.name && class.arguments == class_type.arguments
             })
             .map(|class| class.id)
+    }
+
+    fn call_target_class_id(&self, span: Span) -> Option<ClassId> {
+        let CallableTarget::Method { class_type, .. } = self
+            .semantic_info
+            .call_targets
+            .get(&(span.start, span.end))?
+        else {
+            return None;
+        };
+        let specialized = substitute_resolved_type(
+            &ResolvedType::Class(class_type.clone()),
+            &self.type_substitutions,
+        );
+        let ResolvedType::Class(class_type) = specialized else {
+            return None;
+        };
+        self.class_id_for_type(&class_type)
     }
 
     fn class_info(&self, id: ClassId) -> Option<&crate::semantics::ClassSemanticInfo> {
@@ -5300,7 +5288,8 @@ fn lower_static_method_call(
     context: &mut LoweringContext,
 ) -> DiagnosticResult<(FunctionSignature, Vec<mir::Rvalue>)> {
     let class = context
-        .class_id_for_name(class_name)
+        .call_target_class_id(span)
+        .or_else(|| context.class_id_for_name(class_name))
         .ok_or_else(|| vec![unsupported(span, format!("unknown class `{class_name}`"))])?;
     let signature = context.lookup_method(class, method, span)?;
     if signature.receiver_mode.is_some() {
@@ -8654,5 +8643,5 @@ fn unsupported_native_type(
 }
 
 fn type_ref_contains_mixed(ty: &crate::types::TypeRef) -> bool {
-    ty.name == "mixed" || ty.args.iter().any(type_ref_contains_mixed)
+    ty.name == "mixed" || ty.type_arguments().any(type_ref_contains_mixed)
 }

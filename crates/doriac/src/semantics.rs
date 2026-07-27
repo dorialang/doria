@@ -12,7 +12,9 @@ use crate::symbols::{
     MethodInfo, ParamInfo, PropertyInfo, PropertyInitState, ReceiverMode, ReturnBorrow, ScopeStack,
     StaticPropertyInfo, TypeParamInfo,
 };
-use crate::types::{ClassType, ResolvedType, TypeId, TypeKind, TypeRef, TypeRegistry};
+use crate::types::{
+    resolved_type_complexity, ClassType, ResolvedType, TypeId, TypeKind, TypeRef, TypeRegistry,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DictionaryProjection {
@@ -206,7 +208,7 @@ fn collect_ordered_class_semantics(
     program: &Program,
     checker: &mut Checker<'_>,
 ) -> Vec<ClassSemanticInfo> {
-    let mut concrete_instances = checker
+    let mut instances = checker
         .class_instantiations
         .iter()
         .filter(|class| {
@@ -216,52 +218,92 @@ fn collect_ordered_class_semantics(
                 .any(|argument| checker.type_is_symbolic(*argument))
         })
         .cloned()
-        .collect::<HashSet<_>>();
-    loop {
-        let mut discovered = Vec::new();
-        for instance in concrete_instances.iter().cloned().collect::<Vec<_>>() {
-            let Some(templates) = checker
-                .class_instantiation_templates
-                .get(&instance.name)
-                .cloned()
-            else {
+        .collect::<Vec<_>>();
+    instances.sort_by_key(|class| {
+        (
+            class.name.clone(),
+            class
+                .arguments
+                .iter()
+                .map(|argument| checker.types.display(*argument))
+                .collect::<Vec<_>>(),
+        )
+    });
+    let mut parents = vec![None; instances.len()];
+    let mut ids = instances
+        .iter()
+        .cloned()
+        .enumerate()
+        .map(|(index, instance)| (instance, index))
+        .collect::<HashMap<_, _>>();
+    let mut cursor = 0;
+    while cursor < instances.len() {
+        let instance_index = cursor;
+        let instance = instances[cursor].clone();
+        cursor += 1;
+        let Some(templates) = checker
+            .class_instantiation_templates
+            .get(&instance.name)
+            .cloned()
+        else {
+            continue;
+        };
+        let substitutions = checker.class_type_substitutions(&instance);
+        for template in templates {
+            let arguments = template
+                .arguments
+                .iter()
+                .map(|argument| checker.substitute_type_id(*argument, &substitutions))
+                .collect::<Vec<_>>();
+            if arguments
+                .iter()
+                .any(|argument| checker.type_is_symbolic(*argument))
+            {
                 continue;
-            };
-            let substitutions = checker.class_type_substitutions(&instance);
-            for template in templates {
-                let arguments = template
-                    .arguments
-                    .iter()
-                    .map(|argument| checker.substitute_type_id(*argument, &substitutions))
-                    .collect::<Vec<_>>();
-                if arguments
-                    .iter()
-                    .any(|argument| checker.type_is_symbolic(*argument))
-                {
-                    continue;
-                }
-                let specialized = ClassType::new(template.name, arguments);
-                if !concrete_instances.contains(&specialized) {
-                    let span = program
-                        .items
-                        .iter()
-                        .find_map(|item| match item {
-                            Item::Class(class) if class.name == specialized.name => {
-                                Some(class.span)
-                            }
-                            _ => None,
-                        })
-                        .unwrap_or_default();
-                    checker.check_concrete_class_constraints(&specialized, span);
-                    discovered.push(specialized);
-                }
             }
+            let specialized = ClassType::new(template.name, arguments);
+            if ids.contains_key(&specialized) {
+                continue;
+            }
+            let span = program
+                .items
+                .iter()
+                .find_map(|item| match item {
+                    Item::Class(class) if class.name == specialized.name => Some(class.span),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            if class_specialization_expands_recursively(
+                &instances,
+                &parents,
+                instance_index,
+                &specialized,
+                &checker.types,
+            ) {
+                let message = format!(
+                    "generic specialization of class `{}` recursively expands its type arguments and has no finite monomorphization",
+                    specialized.name
+                );
+                if !checker
+                    .diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.code == "E0539" && diagnostic.message == message)
+                {
+                    checker.diagnostics.push(
+                        Diagnostic::new("E0539", message, span).with_help(
+                            "keep recursive class references at the same concrete type, or move the type-changing step outside the recursive class",
+                        ),
+                    );
+                }
+                continue;
+            }
+            checker.check_concrete_class_constraints(&specialized, span);
+            ids.insert(specialized.clone(), instances.len());
+            instances.push(specialized);
+            parents.push(Some(instance_index));
         }
-        if discovered.is_empty() {
-            break;
-        }
-        concrete_instances.extend(discovered);
     }
+    let concrete_instances = instances.into_iter().collect::<HashSet<_>>();
 
     let declarations = program.items.iter().filter_map(|item| match item {
         Item::Class(class) => Some(class),
@@ -352,6 +394,40 @@ fn collect_ordered_class_semantics(
         }
     }
     classes
+}
+
+fn class_specialization_expands_recursively(
+    instances: &[ClassType<TypeId>],
+    parents: &[Option<usize>],
+    current: usize,
+    target: &ClassType<TypeId>,
+    types: &TypeRegistry,
+) -> bool {
+    let mut matching_ancestors = Vec::new();
+    let mut cursor = Some(current);
+    while let Some(index) = cursor {
+        if instances[index].name == target.name {
+            matching_ancestors.push(&instances[index]);
+            if matching_ancestors.len() == 2 {
+                break;
+            }
+        }
+        cursor = parents[index];
+    }
+    let [nearest, previous] = matching_ancestors.as_slice() else {
+        return false;
+    };
+    class_specialization_complexity(target, types) > class_specialization_complexity(nearest, types)
+        && class_specialization_complexity(nearest, types)
+            > class_specialization_complexity(previous, types)
+}
+
+fn class_specialization_complexity(class: &ClassType<TypeId>, types: &TypeRegistry) -> usize {
+    class
+        .arguments
+        .iter()
+        .map(|argument| resolved_type_complexity(&types.resolved(*argument)))
+        .sum()
 }
 
 pub fn check_program(program: &Program) -> DiagnosticResult<()> {
@@ -1091,7 +1167,7 @@ impl<'program> Checker<'program> {
         function: &FunctionDecl,
         declaring_class: Option<&str>,
     ) -> FunctionInfo {
-        self.check_function_type_parameter_declarations(function);
+        self.check_function_type_parameter_declarations(function, declaring_class);
         let previous_callable = self.current_callable.replace(function.span.start);
         self.type_parameter_scopes
             .push(type_parameter_scope(&function.type_params));
@@ -1103,7 +1179,22 @@ impl<'program> Checker<'program> {
             self.types.kind(return_ty),
             TypeKind::Class(_) | TypeKind::TypeParameter(_)
         )
-        .then(|| crate::ownership::function_return_borrow(function))
+        .then(|| {
+            let enclosing_type_params = declaring_class
+                .and_then(|class_name| {
+                    self.program.items.iter().find_map(|item| match item {
+                        Item::Class(class) if class.name == class_name => Some(&class.type_params),
+                        _ => None,
+                    })
+                })
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            crate::ownership::function_return_borrow_in_context(
+                function,
+                enclosing_type_params,
+                &mut |_| None,
+            )
+        })
         .flatten();
 
         FunctionInfo {
@@ -1122,7 +1213,11 @@ impl<'program> Checker<'program> {
         }
     }
 
-    fn check_function_type_parameter_declarations(&mut self, function: &FunctionDecl) {
+    fn check_function_type_parameter_declarations(
+        &mut self,
+        function: &FunctionDecl,
+        declaring_class: Option<&str>,
+    ) {
         if !function.type_params.is_empty()
             && matches!(
                 function.name.as_str(),
@@ -1140,6 +1235,34 @@ impl<'program> Checker<'program> {
                 )
                 .with_help("move the generic behavior into a regular function or method"),
             );
+        }
+        if let Some(class_name) = declaring_class {
+            let enclosing_parameters = self.program.items.iter().find_map(|item| match item {
+                Item::Class(class) if class.name == class_name => Some(&class.type_params),
+                _ => None,
+            });
+            if let Some(enclosing_parameters) = enclosing_parameters {
+                for parameter in &function.type_params {
+                    if enclosing_parameters
+                        .iter()
+                        .any(|enclosing| enclosing.name == parameter.name)
+                    {
+                        self.diagnostics.push(
+                            Diagnostic::new(
+                                "E0530",
+                                format!(
+                                    "type parameter `{}` on method `{class_name}::{}` shadows the enclosing class type parameter",
+                                    parameter.name, function.name
+                                ),
+                                parameter.span,
+                            )
+                            .with_help(
+                                "rename the method type parameter so class and method substitutions remain distinct",
+                            ),
+                        );
+                    }
+                }
+            }
         }
         self.check_type_parameter_declarations(
             &function.type_params,
@@ -1269,10 +1392,22 @@ impl<'program> Checker<'program> {
                     }),
                     this_available: !function.is_static,
                 });
-                let inferred =
-                    crate::ownership::function_return_borrow_with_calls(function, &mut |call| {
-                        self.call_return_borrow(call, &scopes, method_context.as_ref())
-                    });
+                let enclosing_type_params = declaring_class
+                    .as_ref()
+                    .and_then(|class_name| {
+                        self.program.items.iter().find_map(|item| match item {
+                            Item::Class(class) if &class.name == class_name => {
+                                Some(class.type_params.clone())
+                            }
+                            _ => None,
+                        })
+                    })
+                    .unwrap_or_default();
+                let inferred = crate::ownership::function_return_borrow_in_context(
+                    function,
+                    &enclosing_type_params,
+                    &mut |call| self.call_return_borrow(call, &scopes, method_context.as_ref()),
+                );
                 if inferred.is_some() && inferred != signature.return_borrow {
                     self.set_return_borrow(function, declaring_class.as_deref(), inferred);
                     changed = true;
@@ -1995,7 +2130,7 @@ impl<'program> Checker<'program> {
                 self.types.intern(TypeKind::Nullable(inner))
             };
         }
-        if ty.args.is_empty() {
+        if ty.arguments.is_empty() {
             if let Some(integer) = IntegerType::from_source_name(&ty.name) {
                 return self.types.intern(TypeKind::Integer(integer));
             }
@@ -2004,28 +2139,32 @@ impl<'program> Checker<'program> {
             }
         }
         match ty.name.as_str() {
-            "void" if ty.args.is_empty() => self.types.intern(TypeKind::Void),
-            "string" if ty.args.is_empty() => self.types.intern(TypeKind::String),
-            "bool" if ty.args.is_empty() => self.types.intern(TypeKind::Bool),
-            "mixed" if ty.args.is_empty() => self.types.intern(TypeKind::Mixed),
-            "[]" if ty.args.len() == 1 => {
-                let element = self.resolve_type_ref_for_return_inference(&ty.args[0]);
+            "void" if ty.arguments.is_empty() => self.types.intern(TypeKind::Void),
+            "string" if ty.arguments.is_empty() => self.types.intern(TypeKind::String),
+            "bool" if ty.arguments.is_empty() => self.types.intern(TypeKind::Bool),
+            "mixed" if ty.arguments.is_empty() => self.types.intern(TypeKind::Mixed),
+            "[]" if ty.type_argument_count() == 1 && !ty.has_value_arguments() => {
+                let element =
+                    self.resolve_type_ref_for_return_inference(ty.type_argument(0).unwrap());
                 self.types.intern(TypeKind::TypedArray(element))
             }
-            "List" if ty.args.len() == 1 => {
-                let element = self.resolve_type_ref_for_return_inference(&ty.args[0]);
+            "List" if ty.type_argument_count() == 1 && !ty.has_value_arguments() => {
+                let element =
+                    self.resolve_type_ref_for_return_inference(ty.type_argument(0).unwrap());
                 self.types.intern(TypeKind::List(element))
             }
-            "Dictionary" if ty.args.len() == 2 => {
-                let key = self.resolve_type_ref_for_return_inference(&ty.args[0]);
-                let value = self.resolve_type_ref_for_return_inference(&ty.args[1]);
+            "Dictionary" if ty.type_argument_count() == 2 && !ty.has_value_arguments() => {
+                let key = self.resolve_type_ref_for_return_inference(ty.type_argument(0).unwrap());
+                let value =
+                    self.resolve_type_ref_for_return_inference(ty.type_argument(1).unwrap());
                 self.types.intern(TypeKind::Dictionary(key, value))
             }
-            "Set" if ty.args.len() == 1 => {
-                let element = self.resolve_type_ref_for_return_inference(&ty.args[0]);
+            "Set" if ty.type_argument_count() == 1 && !ty.has_value_arguments() => {
+                let element =
+                    self.resolve_type_ref_for_return_inference(ty.type_argument(0).unwrap());
                 self.types.intern(TypeKind::Set(element))
             }
-            name if ty.args.is_empty() && self.classes.contains_key(name) => self
+            name if ty.arguments.is_empty() && self.classes.contains_key(name) => self
                 .types
                 .intern(TypeKind::Class(ClassType::new(name, Vec::new()))),
             _ => self.types.unknown(),
@@ -2849,7 +2988,7 @@ impl<'program> Checker<'program> {
                         .value
                         .ty
                         .as_ref()
-                        .and_then(|ty| ty.args.is_empty().then_some(ty))
+                        .and_then(|ty| ty.arguments.is_empty().then_some(ty))
                         .and_then(|ty| IntegerType::from_source_name(&ty.name))
                     {
                         self.contextualize_range_literals(&foreach.iterable, integer);
@@ -4151,10 +4290,12 @@ impl<'program> Checker<'program> {
                 ) || matches!(
                     (self.types.kind(left_ty), self.types.kind(right_ty)),
                     (TypeKind::String, TypeKind::String)
-                ) || matches!(
-                    (self.types.kind(left_ty), self.types.kind(right_ty)),
-                    (TypeKind::Unknown, _) | (_, TypeKind::Unknown)
-                ) {
+                ) || self.matching_constrained_type_parameters(left_ty, right_ty, "Comparable")
+                    || matches!(
+                        (self.types.kind(left_ty), self.types.kind(right_ty)),
+                        (TypeKind::Unknown, _) | (_, TypeKind::Unknown)
+                    )
+                {
                     return;
                 }
                 self.report_integer_operand_mismatch(left_ty, right_ty, span, "comparison");
@@ -5816,10 +5957,19 @@ impl<'program> Checker<'program> {
             return;
         };
 
+        let target_class = if matches!(access.qualifier, StaticQualifier::SelfType) {
+            let class_type = self.symbolic_class_type(class_name);
+            match self.types.resolved(class_type) {
+                ResolvedType::Class(class_type) => class_type,
+                _ => unreachable!("symbolic declaring class type must resolve as a class"),
+            }
+        } else {
+            ClassType::new(class_name, Vec::new())
+        };
         self.call_targets.insert(
             (access.span.start, access.span.end),
             CallableTarget::Method {
-                class_type: ClassType::new(class_name, Vec::new()),
+                class_type: target_class,
                 method_name: access.member.to_string(),
             },
         );
@@ -7179,6 +7329,19 @@ impl<'program> Checker<'program> {
             })
     }
 
+    fn matching_constrained_type_parameters(
+        &self,
+        left: TypeId,
+        right: TypeId,
+        required: &str,
+    ) -> bool {
+        matches!(
+            (self.types.kind(left), self.types.kind(right)),
+            (TypeKind::TypeParameter(left), TypeKind::TypeParameter(right))
+                if left == right && self.type_parameter_has_constraint(left, required)
+        )
+    }
+
     fn report_deferred_qualified_name(&mut self, name: &str, span: Span) {
         self.diagnostics.push(Diagnostic::new(
             "E0475",
@@ -7236,8 +7399,8 @@ impl<'program> Checker<'program> {
         position: TypePosition,
         declaring_class: Option<&str>,
     ) -> TypeId {
-        if !ty.value_args.is_empty() {
-            for argument in &ty.args {
+        if ty.has_value_arguments() {
+            for argument in ty.type_arguments() {
                 self.resolve_type_ref_in_position(
                     argument,
                     span,
@@ -7255,7 +7418,7 @@ impl<'program> Checker<'program> {
             return self.types.unknown();
         }
         if ty.name.contains('\\') {
-            for arg in &ty.args {
+            for arg in ty.type_arguments() {
                 self.resolve_type_ref_in_position(arg, span, TypePosition::Value, declaring_class);
             }
             self.report_deferred_qualified_name(&ty.name, span);
@@ -7310,8 +7473,7 @@ impl<'program> Checker<'program> {
         if let Some(float) = FloatType::from_source_name(&ty.name) {
             return self.resolve_zero_arg_type(ty, span, TypeKind::Float(float));
         }
-        if ty.args.is_empty()
-            && ty.value_args.is_empty()
+        if ty.arguments.is_empty()
             && self
                 .type_parameter_scopes
                 .iter()
@@ -7322,7 +7484,7 @@ impl<'program> Checker<'program> {
         }
 
         match ty.name.as_str() {
-            "self" if ty.args.is_empty() => match declaring_class {
+            "self" if ty.arguments.is_empty() => match declaring_class {
                 Some(class_name) => self.symbolic_class_type(class_name),
                 None => self.reject_type_ref(
                     ty,
@@ -7397,48 +7559,48 @@ impl<'program> Checker<'program> {
             }
             "[]" => {
                 if !self.expect_type_arg_count(ty, 1, span) {
-                    for arg in &ty.args {
+                    for arg in ty.type_arguments() {
                         self.resolve_type_ref_in_position(arg, span, TypePosition::Value, declaring_class);
                     }
                     return self.types.unknown();
                 }
                 let element =
-                    self.resolve_type_ref_in_position(&ty.args[0], span, TypePosition::Value, declaring_class);
+                    self.resolve_type_ref_in_position(ty.type_argument(0).unwrap(), span, TypePosition::Value, declaring_class);
                 self.types.intern(TypeKind::TypedArray(element))
             }
             "List" => {
                 if !self.expect_type_arg_count(ty, 1, span) {
-                    for arg in &ty.args {
+                    for arg in ty.type_arguments() {
                         self.resolve_type_ref_in_position(arg, span, TypePosition::Value, declaring_class);
                     }
                     return self.types.unknown();
                 }
                 let element =
-                    self.resolve_type_ref_in_position(&ty.args[0], span, TypePosition::Value, declaring_class);
+                    self.resolve_type_ref_in_position(ty.type_argument(0).unwrap(), span, TypePosition::Value, declaring_class);
                 self.types.intern(TypeKind::List(element))
             }
             "Dictionary" => {
                 if !self.expect_type_arg_count(ty, 2, span) {
-                    for arg in &ty.args {
+                    for arg in ty.type_arguments() {
                         self.resolve_type_ref_in_position(arg, span, TypePosition::Value, declaring_class);
                     }
                     return self.types.unknown();
                 }
-                let key = self.resolve_type_ref_in_position(&ty.args[0], span, TypePosition::Value, declaring_class);
+                let key = self.resolve_type_ref_in_position(ty.type_argument(0).unwrap(), span, TypePosition::Value, declaring_class);
                 let value =
-                    self.resolve_type_ref_in_position(&ty.args[1], span, TypePosition::Value, declaring_class);
+                    self.resolve_type_ref_in_position(ty.type_argument(1).unwrap(), span, TypePosition::Value, declaring_class);
                 self.check_stage23_hashable_type(key, span, "Dictionary key");
                 self.types.intern(TypeKind::Dictionary(key, value))
             }
             "Set" => {
                 if !self.expect_type_arg_count(ty, 1, span) {
-                    for arg in &ty.args {
+                    for arg in ty.type_arguments() {
                         self.resolve_type_ref_in_position(arg, span, TypePosition::Value, declaring_class);
                     }
                     return self.types.unknown();
                 }
                 let element =
-                    self.resolve_type_ref_in_position(&ty.args[0], span, TypePosition::Value, declaring_class);
+                    self.resolve_type_ref_in_position(ty.type_argument(0).unwrap(), span, TypePosition::Value, declaring_class);
                 self.check_stage23_hashable_type(element, span, "Set element");
                 self.types.intern(TypeKind::Set(element))
             }
@@ -7449,14 +7611,13 @@ impl<'program> Checker<'program> {
                     .map(|class| class.type_params.clone())
                     .unwrap_or_default();
                 if !self.expect_type_arg_count(ty, type_params.len(), span) {
-                    for arg in &ty.args {
+                    for arg in ty.type_arguments() {
                         self.resolve_type_ref_in_position(arg, span, TypePosition::Value, declaring_class);
                     }
                     return self.types.unknown();
                 }
                 let arguments = ty
-                    .args
-                    .iter()
+                    .type_arguments()
                     .map(|argument| {
                         self.resolve_type_ref_in_position(
                             argument,
@@ -7491,7 +7652,7 @@ impl<'program> Checker<'program> {
                 self.types.intern(TypeKind::Class(class))
             }
             name => {
-                for arg in &ty.args {
+                for arg in ty.type_arguments() {
                     self.resolve_type_ref_in_position(arg, span, TypePosition::Value, declaring_class);
                 }
                 self.diagnostics.push(Diagnostic::new(
@@ -7577,7 +7738,7 @@ impl<'program> Checker<'program> {
         code: &'static str,
         message: impl Into<String>,
     ) -> TypeId {
-        for arg in &ty.args {
+        for arg in ty.type_arguments() {
             self.resolve_type_ref_in_position(arg, span, TypePosition::Value, None);
         }
         self.diagnostics.push(Diagnostic::new(code, message, span));
@@ -7592,7 +7753,7 @@ impl<'program> Checker<'program> {
         message: impl Into<String>,
         help: impl Into<String>,
     ) -> TypeId {
-        for arg in &ty.args {
+        for arg in ty.type_arguments() {
             self.resolve_type_ref_in_position(arg, span, TypePosition::Value, None);
         }
         self.diagnostics
@@ -7602,15 +7763,15 @@ impl<'program> Checker<'program> {
 
     fn resolve_zero_arg_type(&mut self, ty: &TypeRef, span: Span, kind: TypeKind) -> TypeId {
         self.expect_type_arg_count(ty, 0, span);
-        for arg in &ty.args {
+        for arg in ty.type_arguments() {
             self.resolve_type_ref(arg, span);
         }
         self.types.intern(kind)
     }
 
     fn expect_type_arg_count(&mut self, ty: &TypeRef, expected: usize, span: Span) -> bool {
-        let found = ty.args.len();
-        if found == expected {
+        let found = ty.type_argument_count();
+        if found == expected && !ty.has_value_arguments() {
             return true;
         }
 
@@ -7635,6 +7796,11 @@ impl<'program> Checker<'program> {
         arguments: &[TypeId],
         span: Span,
     ) {
+        let bindings = params
+            .iter()
+            .zip(arguments)
+            .map(|(param, argument)| (param.name.clone(), *argument))
+            .collect::<HashMap<_, _>>();
         for (param, argument) in params.iter().zip(arguments) {
             for constraint in &param.constraints {
                 if !Self::is_compiler_known_constraint(&constraint.name)
@@ -7642,11 +7808,11 @@ impl<'program> Checker<'program> {
                 {
                     continue;
                 }
-                if self.type_satisfies_compiler_constraint(*argument, &constraint.name) {
+                if self.constraint_accepts_type_argument(constraint, *argument, &bindings, span) {
                     continue;
                 }
                 let message = format!(
-                    "type argument `{}` for `{class_name}<...>` does not implement required interface `{}`",
+                    "type argument `{}` for `{class_name}<...>` does not satisfy required constraint `{}`",
                     self.types.display(*argument),
                     constraint
                 );
@@ -7685,12 +7851,12 @@ impl<'program> Checker<'program> {
             for constraint in &param.constraints {
                 if !Self::is_compiler_known_constraint(&constraint.name)
                     || self.type_is_symbolic(argument)
-                    || self.type_satisfies_compiler_constraint(argument, &constraint.name)
+                    || self.constraint_accepts_type_argument(constraint, argument, bindings, span)
                 {
                     continue;
                 }
                 let message = format!(
-                    "type argument `{}` for {callee} does not implement required interface `{constraint}`",
+                    "type argument `{}` for {callee} does not satisfy required constraint `{constraint}`",
                     self.types.display(argument)
                 );
                 if !self.diagnostics.iter().any(|diagnostic| {
@@ -7703,6 +7869,41 @@ impl<'program> Checker<'program> {
                 }
             }
         }
+    }
+
+    fn constraint_accepts_type_argument(
+        &mut self,
+        constraint: &TypeRef,
+        argument: TypeId,
+        bindings: &HashMap<String, TypeId>,
+        span: Span,
+    ) -> bool {
+        if !self.type_satisfies_compiler_constraint(argument, &constraint.name) {
+            return false;
+        }
+        if constraint.arguments.is_empty() {
+            return true;
+        }
+        if !matches!(constraint.name.as_str(), "Equatable" | "Comparable")
+            || constraint.has_value_arguments()
+            || constraint.type_argument_count() != 1
+        {
+            return false;
+        }
+
+        let scope = bindings
+            .keys()
+            .map(|name| (name.clone(), Vec::new()))
+            .collect::<HashMap<_, _>>();
+        self.type_parameter_scopes.push(scope);
+        let required = self.resolve_type_ref_in_position(
+            constraint.type_argument(0).unwrap(),
+            span,
+            TypePosition::Value,
+            None,
+        );
+        self.type_parameter_scopes.pop();
+        self.substitute_type_id(required, bindings) == argument
     }
 
     fn type_satisfies_compiler_constraint(&self, ty: TypeId, constraint: &str) -> bool {
@@ -9060,6 +9261,12 @@ impl<'program> Checker<'program> {
                 self.types.intern(TypeKind::Bool)
             }
             (TypeKind::String, TypeKind::String) => self.types.intern(TypeKind::Bool),
+            (TypeKind::TypeParameter(left_parameter), TypeKind::TypeParameter(right_parameter))
+                if left_parameter == right_parameter
+                    && self.type_parameter_has_constraint(&left_parameter, "Comparable") =>
+            {
+                self.types.intern(TypeKind::Bool)
+            }
             _ => self.types.intern(TypeKind::Heterogeneous),
         }
     }

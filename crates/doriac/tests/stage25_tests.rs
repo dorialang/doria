@@ -467,3 +467,176 @@ function main(): void {}
         diagnostic.code == "E0537" && diagnostic.message.contains("equality is not guaranteed")
     }));
 }
+
+#[test]
+fn generic_method_parameters_cannot_shadow_class_parameters() {
+    let errors = diagnostics(
+        r#"
+class Box<T>
+{
+    function choose<T>(T $value): T { return $value; }
+}
+function main(): void {}
+"#,
+    );
+    assert!(errors.iter().any(|diagnostic| {
+        diagnostic.code == "E0530"
+            && diagnostic.message.contains("shadows")
+            && diagnostic.message.contains("Box::choose")
+    }));
+}
+
+#[test]
+fn compiler_known_constraint_arguments_are_substituted_and_checked() {
+    doriac::check_source(
+        "stage25-constraint-self.doria",
+        r#"
+function constrained<T implements Comparable<T>>(T $value): T { return $value; }
+function main(): int { return constrained(42); }
+"#,
+    )
+    .expect("the constrained type itself should satisfy Comparable<T>");
+
+    let errors = diagnostics(
+        r#"
+function constrained<T implements Comparable<string>>(T $value): T { return $value; }
+function main(): int { return constrained(42); }
+"#,
+    );
+    assert!(errors.iter().any(|diagnostic| {
+        diagnostic.code == "E0535"
+            && diagnostic.message.contains("int")
+            && diagnostic.message.contains("Comparable<string>")
+    }));
+
+    let class_errors = diagnostics(
+        r#"
+class Sorted<T implements Comparable<string>> {}
+function main(): void { let $sorted = new Sorted<int>(); }
+"#,
+    );
+    assert!(class_errors.iter().any(|diagnostic| {
+        diagnostic.code == "E0535"
+            && diagnostic.message.contains("int")
+            && diagnostic.message.contains("Comparable<string>")
+    }));
+}
+
+#[test]
+fn comparable_constraints_enable_relational_operators() {
+    let mir = doriac::lower_source_to_mir(
+        "stage25-comparable.doria",
+        r#"
+function maximum<T implements Comparable<T>>(T $left, T $right): T
+{
+    if ($left >= $right) { return $left; }
+    return $right;
+}
+function main(): int { return maximum(42, 7); }
+"#,
+    )
+    .expect("Comparable<T> should guarantee relational operators");
+    let output = doriac::mir_interpreter::interpret(&mir)
+        .expect("the specialized comparison should execute");
+    assert_eq!(output.exit_status, 42);
+}
+
+#[test]
+fn recursively_expanding_class_specializations_are_rejected() {
+    let errors = diagnostics(
+        r#"
+class Node<T>
+{
+    ?Node<List<T>> $next = null;
+}
+function main(): void
+{
+    let $node = new Node<int>();
+}
+"#,
+    );
+    assert!(errors.iter().any(|diagnostic| {
+        diagnostic.code == "E0539"
+            && diagnostic.message.contains("Node")
+            && diagnostic.message.contains("no finite monomorphization")
+    }));
+}
+
+#[test]
+fn self_types_and_static_calls_preserve_the_enclosing_specialization() {
+    let source = r#"
+class Box<T>
+{
+    function __construct(take T $value) {}
+
+    static function identity(T $value): T { return $value; }
+
+    function same(): self { return $this; }
+
+    function choose(T $value): T
+    {
+        return self::identity($value);
+    }
+}
+function main(): int
+{
+    let $box = new Box<int>(40);
+    return $box->value + $box->choose(2);
+}
+"#;
+    let hir = doriac::lower_source("stage25-self.doria", source)
+        .expect("self should retain Box<T> through HIR");
+    let doriac::hir::Item::Class(class) = &hir.items[0] else {
+        panic!("expected generic class");
+    };
+    let same = class
+        .members
+        .iter()
+        .find_map(|member| match member {
+            doriac::hir::ClassMember::Method(method) if method.name == "same" => Some(method),
+            _ => None,
+        })
+        .expect("same method");
+    assert_eq!(
+        same.return_type
+            .as_ref()
+            .map(ToString::to_string)
+            .as_deref(),
+        Some("Box<T>")
+    );
+
+    let mir = doriac::lower_source_to_mir("stage25-self.doria", source)
+        .expect("self should retain Box<T> through HIR and static call lowering");
+    let output =
+        doriac::mir_interpreter::interpret(&mir).expect("specialized self calls should execute");
+    assert_eq!(output.exit_status, 42);
+}
+
+#[test]
+fn ownership_checks_class_type_parameters_in_method_signatures() {
+    let errors = diagnostics(
+        r#"
+class Token
+{
+    function __construct(string $name) {}
+}
+class Sink<T>
+{
+    function consume(take T $value): void {}
+}
+function main(): void
+{
+    let $token = new Token("owned");
+    let $sink = new Sink<Token>();
+    $sink->consume($token);
+    echo $token->name;
+}
+"#,
+    );
+    assert!(errors.iter().any(|diagnostic| {
+        diagnostic.code == "E0470"
+            && diagnostic
+                .message
+                .contains("after its value was given away")
+    }));
+}

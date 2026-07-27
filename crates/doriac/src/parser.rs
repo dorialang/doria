@@ -1698,14 +1698,17 @@ impl Parser {
             }
         };
 
-        let mut args = Vec::new();
-        let mut value_args = Vec::new();
+        let mut arguments = Vec::new();
         if self.match_kind(&TokenKind::Less) {
             loop {
                 let negative = self.match_kind(&TokenKind::Minus);
                 if let TokenKind::IntLiteral(value) = self.peek().kind.clone() {
                     self.advance();
-                    value_args.push(if negative { format!("-{value}") } else { value });
+                    arguments.push(crate::types::TypeArgumentRef::Value(if negative {
+                        format!("-{value}")
+                    } else {
+                        value
+                    }));
                 } else {
                     if negative {
                         self.error(
@@ -1714,7 +1717,9 @@ impl Parser {
                         );
                         return None;
                     }
-                    args.push(self.parse_type_ref_inner()?);
+                    arguments.push(crate::types::TypeArgumentRef::Type(
+                        self.parse_type_ref_inner()?,
+                    ));
                 }
                 if !self.match_kind(&TokenKind::Comma) {
                     break;
@@ -1723,10 +1728,10 @@ impl Parser {
             self.expect_type_argument_close()?;
         }
 
-        let mut ty = if args.is_empty() && value_args.is_empty() {
+        let mut ty = if arguments.is_empty() {
             TypeRef::named(name)
         } else {
-            TypeRef::generic_with_values(name, args, value_args)
+            TypeRef::generic_with_arguments(name, arguments)
         };
 
         while self.pending_type_argument_close.is_none() && self.match_kind(&TokenKind::LeftBracket)

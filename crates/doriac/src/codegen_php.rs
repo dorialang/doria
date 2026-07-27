@@ -372,7 +372,7 @@ fn validate_type(ty: &TypeRef, span: Span) -> Result<(), BackendError> {
             ));
         }
     }
-    for argument in &ty.args {
+    for argument in ty.type_arguments() {
         validate_type(argument, span)?;
     }
     Ok(())

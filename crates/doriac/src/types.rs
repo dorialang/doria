@@ -6,20 +6,24 @@ pub use crate::numeric::{FloatType, IntegerType};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TypeRef {
     pub name: String,
-    pub args: Vec<TypeRef>,
-    /// Parsed non-type generic arguments. Decision 0105 reserves this argument
-    /// kind so accepting its syntax does not force the semantic model to
-    /// pretend every future generic argument is a type.
-    pub value_args: Vec<String>,
+    /// Generic arguments in source order. Decision 0105 reserves value
+    /// arguments, so the syntax tree must preserve both their kind and their
+    /// position without pretending every argument is a type.
+    pub arguments: Vec<TypeArgumentRef>,
     pub nullable: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TypeArgumentRef {
+    Type(TypeRef),
+    Value(String),
 }
 
 impl TypeRef {
     pub fn named(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
-            args: Vec::new(),
-            value_args: Vec::new(),
+            arguments: Vec::new(),
             nullable: false,
         }
     }
@@ -27,21 +31,18 @@ impl TypeRef {
     pub fn generic(name: impl Into<String>, args: Vec<TypeRef>) -> Self {
         Self {
             name: name.into(),
-            args,
-            value_args: Vec::new(),
+            arguments: args.into_iter().map(TypeArgumentRef::Type).collect(),
             nullable: false,
         }
     }
 
-    pub fn generic_with_values(
+    pub fn generic_with_arguments(
         name: impl Into<String>,
-        args: Vec<TypeRef>,
-        value_args: Vec<String>,
+        arguments: Vec<TypeArgumentRef>,
     ) -> Self {
         Self {
             name: name.into(),
-            args,
-            value_args,
+            arguments,
             nullable: false,
         }
     }
@@ -59,19 +60,46 @@ impl TypeRef {
         self
     }
 
-    pub fn resolve_self_in(&self, class_name: &str) -> Self {
+    pub fn type_arguments(&self) -> impl Iterator<Item = &TypeRef> {
+        self.arguments.iter().filter_map(|argument| match argument {
+            TypeArgumentRef::Type(ty) => Some(ty),
+            TypeArgumentRef::Value(_) => None,
+        })
+    }
+
+    pub fn type_argument(&self, index: usize) -> Option<&TypeRef> {
+        self.type_arguments().nth(index)
+    }
+
+    pub fn type_argument_count(&self) -> usize {
+        self.type_arguments().count()
+    }
+
+    pub fn has_value_arguments(&self) -> bool {
+        self.arguments
+            .iter()
+            .any(|argument| matches!(argument, TypeArgumentRef::Value(_)))
+    }
+
+    pub fn resolve_self_in(&self, self_type: &TypeRef) -> Self {
+        if self.name == "self" {
+            let mut resolved = self_type.clone();
+            resolved.nullable |= self.nullable;
+            return resolved;
+        }
+
         Self {
-            name: if self.name == "self" {
-                class_name.to_string()
-            } else {
-                self.name.clone()
-            },
-            args: self
-                .args
+            name: self.name.clone(),
+            arguments: self
+                .arguments
                 .iter()
-                .map(|argument| argument.resolve_self_in(class_name))
+                .map(|argument| match argument {
+                    TypeArgumentRef::Type(ty) => {
+                        TypeArgumentRef::Type(ty.resolve_self_in(self_type))
+                    }
+                    TypeArgumentRef::Value(value) => TypeArgumentRef::Value(value.clone()),
+                })
                 .collect(),
-            value_args: self.value_args.clone(),
             nullable: self.nullable,
         }
     }
@@ -93,19 +121,23 @@ impl fmt::Display for TypeRef {
         if self.nullable {
             write!(formatter, "?")?;
         }
-        if self.name == "[]" && self.args.len() == 1 {
-            return write!(formatter, "{}[]", self.args[0]);
+        if self.name == "[]" && self.arguments.len() == 1 {
+            if let TypeArgumentRef::Type(element) = &self.arguments[0] {
+                return write!(formatter, "{element}[]");
+            }
         }
 
-        if self.args.is_empty() && self.value_args.is_empty() {
+        if self.arguments.is_empty() {
             write!(formatter, "{}", self.name)
         } else {
-            let mut args = self
-                .args
+            let args = self
+                .arguments
                 .iter()
-                .map(ToString::to_string)
+                .map(|argument| match argument {
+                    TypeArgumentRef::Type(ty) => ty.to_string(),
+                    TypeArgumentRef::Value(value) => value.clone(),
+                })
                 .collect::<Vec<_>>();
-            args.extend(self.value_args.iter().cloned());
             write!(formatter, "{}<{}>", self.name, args.join(", "))
         }
     }
@@ -169,6 +201,35 @@ pub enum ResolvedType {
     Dictionary(Box<ResolvedType>, Box<ResolvedType>),
     Set(Box<ResolvedType>),
     Unsupported,
+}
+
+pub(crate) fn resolved_type_complexity(ty: &ResolvedType) -> usize {
+    match ty {
+        ResolvedType::Nullable(inner)
+        | ResolvedType::TypedArray(inner)
+        | ResolvedType::List(inner)
+        | ResolvedType::Set(inner) => 1 + resolved_type_complexity(inner),
+        ResolvedType::Dictionary(key, value) => {
+            1 + resolved_type_complexity(key) + resolved_type_complexity(value)
+        }
+        ResolvedType::Class(class) => {
+            1 + class
+                .arguments
+                .iter()
+                .map(resolved_type_complexity)
+                .sum::<usize>()
+        }
+        ResolvedType::Integer(_)
+        | ResolvedType::Float(_)
+        | ResolvedType::Bool
+        | ResolvedType::String
+        | ResolvedType::Bytes
+        | ResolvedType::Mixed
+        | ResolvedType::Void
+        | ResolvedType::Null
+        | ResolvedType::TypeParameter(_)
+        | ResolvedType::Unsupported => 1,
+    }
 }
 
 #[derive(Debug, Default)]

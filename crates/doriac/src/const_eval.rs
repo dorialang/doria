@@ -951,7 +951,7 @@ impl fmt::Display for ConstType {
 }
 
 fn const_type(ty: &TypeRef) -> Option<ConstType> {
-    if ty.args.is_empty() {
+    if ty.arguments.is_empty() {
         if let Some(integer) = IntegerType::from_source_name(&ty.name) {
             return Some(if ty.nullable {
                 ConstType::NullableInteger(integer)
@@ -967,7 +967,7 @@ fn const_type(ty: &TypeRef) -> Option<ConstType> {
             });
         }
     }
-    match (ty.nullable, ty.name.as_str(), ty.args.is_empty()) {
+    match (ty.nullable, ty.name.as_str(), ty.arguments.is_empty()) {
         (false, "string", true) => Some(ConstType::String),
         (true, "string", true) => Some(ConstType::NullableString),
         (false, "bool", true) => Some(ConstType::Bool),

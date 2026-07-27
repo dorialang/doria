@@ -210,6 +210,14 @@ pub(crate) fn check_program_with_inferred_move_returns(
             _ => None,
         })
         .collect::<HashSet<_>>();
+    let class_type_params = program
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            Item::Class(class) => Some((class.name.clone(), class.type_params.clone())),
+            _ => None,
+        })
+        .collect::<HashMap<_, _>>();
     let mut signatures = HashMap::new();
     let mut constructors = HashMap::new();
     let mut methods = HashMap::new();
@@ -227,6 +235,7 @@ pub(crate) fn check_program_with_inferred_move_returns(
                         inferred_move_returns,
                         return_borrows,
                         None,
+                        &[],
                     ),
                 );
             }
@@ -267,6 +276,7 @@ pub(crate) fn check_program_with_inferred_move_returns(
                                 inferred_move_returns,
                                 return_borrows,
                                 Some(&class.name),
+                                &class.type_params,
                             );
                             methods.insert(
                                 (class.name.clone(), method.name.clone()),
@@ -310,6 +320,7 @@ pub(crate) fn check_program_with_inferred_move_returns(
 
     let mut checker = Checker {
         classes,
+        class_type_params,
         signatures,
         constructors,
         methods,
@@ -376,8 +387,19 @@ pub(crate) fn check_program_with_inferred_move_returns(
     checker.diagnostics
 }
 
-pub(crate) fn function_return_borrow(function: &ast::FunctionDecl) -> Option<ReturnBorrow> {
-    function_return_borrow_with_calls(function, &mut |_| None)
+pub(crate) fn function_return_borrow_in_context(
+    function: &ast::FunctionDecl,
+    enclosing_type_params: &[ast::TypeParamDecl],
+    resolve_call: &mut dyn FnMut(&Expr) -> Option<ReturnBorrow>,
+) -> Option<ReturnBorrow> {
+    if enclosing_type_params.is_empty() {
+        return function_return_borrow_with_calls(function, resolve_call);
+    }
+    let mut scoped_function = function.clone();
+    scoped_function
+        .type_params
+        .extend_from_slice(enclosing_type_params);
+    function_return_borrow_with_calls(&scoped_function, resolve_call)
 }
 
 pub(crate) fn function_return_borrow_with_calls(
@@ -611,7 +633,7 @@ fn expr_return_borrow(
                                 param.name == *name
                                     && !param.take
                                     && param.ty.name == "List"
-                                    && param.ty.args.len() == 1
+                                    && param.ty.type_argument_count() == 1
                             })
                         {
                             return Some(ReturnBorrow {
@@ -730,15 +752,22 @@ fn signature(
     inferred_move_returns: &HashSet<usize>,
     return_borrows: &HashMap<usize, ReturnBorrow>,
     receiver_class: Option<&str>,
+    enclosing_type_params: &[ast::TypeParamDecl],
 ) -> Signature {
     let return_borrow = return_borrows
         .get(&function.span.start)
         .copied()
-        .or_else(|| function_return_borrow(function))
+        .or_else(|| {
+            function_return_borrow_in_context(function, enclosing_type_params, &mut |_| None)
+        })
         .filter(|_| {
             function.return_type.as_ref().is_some_and(|ty| {
                 type_ref_class_name(ty, classes, receiver_class).is_some()
-                    || type_ref_mentions_parameter(ty, &function.type_params)
+                    || type_ref_mentions_any_parameter(
+                        ty,
+                        &function.type_params,
+                        enclosing_type_params,
+                    )
             })
         });
     Signature {
@@ -749,7 +778,11 @@ fn signature(
                 name: param.name.clone(),
                 move_type: type_ref_is_move_type(&param.ty, classes, receiver_class),
                 class_type: type_ref_class_name(&param.ty, classes, receiver_class).is_some(),
-                generic: type_ref_mentions_parameter(&param.ty, &function.type_params),
+                generic: type_ref_mentions_any_parameter(
+                    &param.ty,
+                    &function.type_params,
+                    enclosing_type_params,
+                ),
                 take: param.take,
                 writable: param.writable,
             })
@@ -780,9 +813,17 @@ fn signature(
 fn type_ref_mentions_parameter(ty: &crate::types::TypeRef, params: &[ast::TypeParamDecl]) -> bool {
     params.iter().any(|param| param.name == ty.name)
         || ty
-            .args
-            .iter()
+            .type_arguments()
             .any(|argument| type_ref_mentions_parameter(argument, params))
+}
+
+fn type_ref_mentions_any_parameter(
+    ty: &crate::types::TypeRef,
+    function_params: &[ast::TypeParamDecl],
+    enclosing_params: &[ast::TypeParamDecl],
+) -> bool {
+    type_ref_mentions_parameter(ty, function_params)
+        || type_ref_mentions_parameter(ty, enclosing_params)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -834,6 +875,7 @@ impl Flow {
 
 struct Checker<'a> {
     classes: HashSet<String>,
+    class_type_params: HashMap<String, Vec<ast::TypeParamDecl>>,
     signatures: HashMap<String, Signature>,
     constructors: HashMap<String, Signature>,
     methods: HashMap<(String, String), Signature>,
@@ -854,6 +896,10 @@ struct Checker<'a> {
 
 impl Checker<'_> {
     fn check_function(&mut self, function: &ast::FunctionDecl, receiver_class: Option<&str>) {
+        let enclosing_type_params = receiver_class
+            .and_then(|class| self.class_type_params.get(class))
+            .cloned()
+            .unwrap_or_default();
         let previous_receiver =
             std::mem::replace(&mut self.receiver_class, receiver_class.map(str::to_owned));
         let previous_receiver_writable =
@@ -864,13 +910,23 @@ impl Checker<'_> {
             .as_ref()
             .is_some_and(|ty| {
                 type_ref_class_name(ty, &self.classes, self.receiver_class.as_deref()).is_some()
-                    || type_ref_mentions_parameter(ty, &function.type_params)
+                    || type_ref_mentions_any_parameter(
+                        ty,
+                        &function.type_params,
+                        &enclosing_type_params,
+                    )
             })
             .then(|| {
                 self.return_borrows
                     .get(&function.span.start)
                     .copied()
-                    .or_else(|| function_return_borrow(function))
+                    .or_else(|| {
+                        function_return_borrow_in_context(
+                            function,
+                            &enclosing_type_params,
+                            &mut |_| None,
+                        )
+                    })
             })
             .flatten()
             .map(|borrow| {
@@ -886,7 +942,11 @@ impl Checker<'_> {
                 type_ref_class_name(&param.ty, &self.classes, self.receiver_class.as_deref());
             let mixed = param.ty.name == "mixed";
             if type_ref_is_move_type(&param.ty, &self.classes, self.receiver_class.as_deref())
-                || type_ref_mentions_parameter(&param.ty, &function.type_params)
+                || type_ref_mentions_any_parameter(
+                    &param.ty,
+                    &function.type_params,
+                    &enclosing_type_params,
+                )
             {
                 scopes.declare(
                     param.name.clone(),
@@ -2980,14 +3040,18 @@ fn type_ref_collection_info(
     classes: &HashSet<String>,
     receiver_class: Option<&str>,
 ) -> Option<CollectionInfo> {
-    if ty.name == "Bytes" && ty.args.is_empty() {
+    if ty.name == "Bytes" && ty.arguments.is_empty() {
         return Some(bytes_collection_info());
     }
     let (family, value) = match ty.name.as_str() {
-        "[]" if ty.args.len() == 1 => (CollectionFamily::TypedArray, &ty.args[0]),
-        "List" if ty.args.len() == 1 => (CollectionFamily::List, &ty.args[0]),
-        "Dictionary" if ty.args.len() == 2 => (CollectionFamily::Dictionary, &ty.args[1]),
-        "Set" if ty.args.len() == 1 => (CollectionFamily::Set, &ty.args[0]),
+        "[]" if ty.type_argument_count() == 1 => {
+            (CollectionFamily::TypedArray, ty.type_argument(0)?)
+        }
+        "List" if ty.type_argument_count() == 1 => (CollectionFamily::List, ty.type_argument(0)?),
+        "Dictionary" if ty.type_argument_count() == 2 => {
+            (CollectionFamily::Dictionary, ty.type_argument(1)?)
+        }
+        "Set" if ty.type_argument_count() == 1 => (CollectionFamily::Set, ty.type_argument(0)?),
         _ => return None,
     };
     Some(CollectionInfo {
