@@ -2197,7 +2197,17 @@ impl Checker<'_> {
                     self.call_arg_mode(signature, param, arg)
                 });
             self.activate_place_input_borrows(arg, scopes);
-            if matches!(mode, UseMode::Read | UseMode::Write) {
+            let result_continues_argument_borrow = bound
+                .arg_to_param
+                .get(index)
+                .copied()
+                .flatten()
+                .is_some_and(|param| {
+                    signature
+                        .return_borrow
+                        .is_some_and(|borrow| borrow.source == BorrowSource::Parameter(param))
+                });
+            if matches!(mode, UseMode::Read | UseMode::Write) && !result_continues_argument_borrow {
                 self.activate_call_borrow(arg, mode, scopes);
             }
         }
@@ -2513,11 +2523,10 @@ impl Checker<'_> {
     }
 
     fn expr_is_move_value(&self, expr: &Expr, scopes: &Scopes) -> bool {
-        if self
-            .resolved_type(expr)
-            .is_some_and(resolved_type_is_move_type)
-        {
-            return true;
+        if let Some(ty) = self.resolved_type(expr) {
+            if !resolved_type_requires_conservative_move(ty) {
+                return resolved_type_is_move_type(ty);
+            }
         }
         match expr {
             Expr::Variable { name, .. } => scopes.get(name).is_some(),
@@ -3005,6 +3014,27 @@ fn resolved_type_is_move_type(ty: &crate::types::ResolvedType) -> bool {
         | crate::types::ResolvedType::Dictionary(_, _)
         | crate::types::ResolvedType::Set(_) => true,
         crate::types::ResolvedType::Nullable(inner) => resolved_type_is_move_type(inner),
+        _ => false,
+    }
+}
+
+fn resolved_type_requires_conservative_move(ty: &crate::types::ResolvedType) -> bool {
+    match ty {
+        crate::types::ResolvedType::TypeParameter(_) | crate::types::ResolvedType::Unsupported => {
+            true
+        }
+        crate::types::ResolvedType::Nullable(inner)
+        | crate::types::ResolvedType::TypedArray(inner)
+        | crate::types::ResolvedType::List(inner)
+        | crate::types::ResolvedType::Set(inner) => resolved_type_requires_conservative_move(inner),
+        crate::types::ResolvedType::Dictionary(key, value) => {
+            resolved_type_requires_conservative_move(key)
+                || resolved_type_requires_conservative_move(value)
+        }
+        crate::types::ResolvedType::Class(class) => class
+            .arguments
+            .iter()
+            .any(resolved_type_requires_conservative_move),
         _ => false,
     }
 }

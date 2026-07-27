@@ -1570,6 +1570,8 @@ impl<'program> Checker<'program> {
 
     fn check_type_parameter_declarations(&mut self, params: &[TypeParamDecl], owner: &str) {
         let mut names = HashSet::new();
+        self.type_parameter_scopes
+            .push(type_parameter_scope(params));
         for param in params {
             let valid_name =
                 param.name.len() == 1 && param.name.bytes().all(|byte| byte.is_ascii_uppercase());
@@ -1604,7 +1606,9 @@ impl<'program> Checker<'program> {
                 ));
             }
             for constraint in &param.constraints {
-                if !Self::is_compiler_known_constraint(&constraint.name) {
+                if Self::is_compiler_known_constraint(&constraint.name) {
+                    self.check_compiler_known_constraint_declaration(param, constraint);
+                } else {
                     self.diagnostics.push(Diagnostic::unsupported_stage(
                         "E0533",
                         format!(
@@ -1615,6 +1619,38 @@ impl<'program> Checker<'program> {
                     ));
                 }
             }
+        }
+        self.type_parameter_scopes.pop();
+    }
+
+    fn check_compiler_known_constraint_declaration(
+        &mut self,
+        param: &TypeParamDecl,
+        constraint: &TypeRef,
+    ) {
+        let type_arguments = constraint.type_argument_count();
+        let valid_arity = match constraint.name.as_str() {
+            "Hashable" | "Displayable" => type_arguments == 0,
+            "Comparable" | "Equatable" => type_arguments <= 1,
+            _ => unreachable!("caller filters compiler-known constraints"),
+        };
+        if !valid_arity || constraint.has_value_arguments() {
+            let expected = match constraint.name.as_str() {
+                "Hashable" | "Displayable" => "no type arguments",
+                "Comparable" | "Equatable" => "zero or one type argument",
+                _ => unreachable!("caller filters compiler-known constraints"),
+            };
+            self.diagnostics.push(Diagnostic::new(
+                "E0530",
+                format!(
+                    "constraint `{}` on type parameter `{}` expects {expected}",
+                    constraint.name, param.name
+                ),
+                param.span,
+            ));
+        }
+        for argument in constraint.type_arguments() {
+            self.resolve_type_ref_in_position(argument, param.span, TypePosition::Value, None);
         }
     }
 
@@ -7375,41 +7411,45 @@ impl<'program> Checker<'program> {
             Expr::Index { collection, .. } => {
                 self.is_writable_object_path(collection, scopes, method_context)
             }
-            Expr::FunctionCall { name, args, .. } => {
-                self.functions.get(name).cloned().is_some_and(|function| {
-                    self.call_result_is_writable(
-                        CallSite {
-                            return_ty: function.return_ty,
-                            return_borrow: function.return_borrow,
-                            params: &function.params,
-                            args,
-                        },
-                        None,
-                        scopes,
-                        method_context,
-                    )
-                })
-            }
+            Expr::FunctionCall {
+                name, args, span, ..
+            } => self.functions.get(name).cloned().is_some_and(|function| {
+                let return_ty = self.generic_call_result_type(*span, function.return_ty);
+                self.call_result_is_writable(
+                    CallSite {
+                        return_ty,
+                        return_borrow: function.return_borrow,
+                        params: &function.params,
+                        args,
+                    },
+                    None,
+                    scopes,
+                    method_context,
+                )
+            }),
             Expr::MethodCall {
                 object,
                 method,
                 args,
+                span,
                 ..
             } => {
-                let Some(class_name) = self.expr_class_name(object, scopes, method_context) else {
+                let Some(class_type) = self.expr_class_type(object, scopes, method_context) else {
                     return false;
                 };
                 let Some(method_info) = self
                     .classes
-                    .get(&class_name)
+                    .get(&class_type.name)
                     .and_then(|class_info| class_info.methods.get(method))
                     .cloned()
                 else {
                     return false;
                 };
+                let method_info = self.specialize_method_for_class(&method_info, &class_type);
+                let return_ty = self.generic_call_result_type(*span, method_info.return_ty);
                 self.call_result_is_writable(
                     CallSite {
-                        return_ty: method_info.return_ty,
+                        return_ty,
                         return_borrow: method_info.return_borrow,
                         params: &method_info.params,
                         args,
@@ -7423,6 +7463,7 @@ impl<'program> Checker<'program> {
                 qualifier,
                 method,
                 args,
+                span,
                 ..
             } => {
                 let class_name = match qualifier {
@@ -7439,9 +7480,10 @@ impl<'program> Checker<'program> {
                 else {
                     return false;
                 };
+                let return_ty = self.generic_call_result_type(*span, method_info.return_ty);
                 self.call_result_is_writable(
                     CallSite {
-                        return_ty: method_info.return_ty,
+                        return_ty,
                         return_borrow: method_info.return_borrow,
                         params: &method_info.params,
                         args,

@@ -53,6 +53,56 @@ function main(): int
 }
 
 #[test]
+fn concrete_copy_property_reads_do_not_inherit_symbolic_move_classification() {
+    let mir = doriac::lower_source_to_mir(
+        "stage25-copy-property.doria",
+        r#"
+class Box<T>
+{
+    function __construct(take T $value) {}
+}
+function main(): int
+{
+    let $box = new Box<int>(42);
+    int $number = $box->value;
+    return $number;
+}
+"#,
+    )
+    .expect("a concrete Copy specialization should read its property without moving it");
+    let output = doriac::mir_interpreter::interpret(&mir)
+        .expect("the specialized Copy property read should execute");
+    assert_eq!(output.exit_status, 42);
+}
+
+#[test]
+fn writable_paths_specialize_generic_method_returns() {
+    doriac::check_source(
+        "stage25-writable-generic-return.doria",
+        r#"
+class Child
+{
+    writable function touch(): void {}
+}
+class Box<T>
+{
+    function value(writable T $candidate): T
+    {
+        return $candidate;
+    }
+}
+function main(): void
+{
+    let $box = new Box<Child>();
+    writable Child $child = new Child();
+    $box->value($child)->touch();
+}
+"#,
+    )
+    .expect("a writable borrow of concrete T should retain the class specialization");
+}
+
+#[test]
 fn class_constraints_are_checked_at_instantiation() {
     let errors = diagnostics(
         r#"
@@ -630,6 +680,43 @@ function main(): void { let $sorted = new Sorted<int>(); }
             && diagnostic.message.contains("int")
             && diagnostic.message.contains("Comparable<string>")
     }));
+}
+
+#[test]
+fn compiler_known_constraint_declarations_validate_argument_shape_and_types() {
+    let errors = diagnostics(
+        r#"
+function invalidHash<T implements Hashable<T>>(T $value): T { return $value; }
+function invalidDisplay<T implements Displayable<int>>(T $value): T { return $value; }
+function invalidCompare<T implements Comparable<Missing>>(T $value): T { return $value; }
+function main(): void {}
+"#,
+    );
+    assert!(errors.iter().any(|diagnostic| {
+        diagnostic.code == "E0530"
+            && diagnostic.message.contains("Hashable")
+            && diagnostic.message.contains("no type arguments")
+    }));
+    assert!(errors.iter().any(|diagnostic| {
+        diagnostic.code == "E0530"
+            && diagnostic.message.contains("Displayable")
+            && diagnostic.message.contains("no type arguments")
+    }));
+    assert!(errors.iter().any(|diagnostic| {
+        diagnostic.code == "E0401" && diagnostic.message.contains("Missing")
+    }));
+
+    doriac::check_source(
+        "stage25-valid-constraint-declarations.doria",
+        r#"
+function hash<T implements Hashable>(T $value): T { return $value; }
+function display<T implements Displayable>(T $value): T { return $value; }
+function compare<T implements Comparable<T>>(T $value): T { return $value; }
+function equal<T implements Equatable<int>>(T $value): T { return $value; }
+function main(): void {}
+"#,
+    )
+    .expect("valid compiler-known constraint declarations should remain accepted");
 }
 
 #[test]
