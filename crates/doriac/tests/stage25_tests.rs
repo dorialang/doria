@@ -652,6 +652,45 @@ function main(): int { return maximum(42, 7); }
 }
 
 #[test]
+fn comparable_constraints_honor_their_declared_operand_type() {
+    let mir = doriac::lower_source_to_mir(
+        "stage25-comparable-operand.doria",
+        r#"
+function below<T implements Comparable<int>>(T $value): bool
+{
+    return $value < 0;
+}
+function above<T implements Comparable<int>>(T $value): bool
+{
+    return 0 < $value;
+}
+function main(): int
+{
+    if (below(-1) && above(1)) { return 42; }
+    return 1;
+}
+"#,
+    )
+    .expect("Comparable<int> should guarantee comparisons with int operands");
+    let output = doriac::mir_interpreter::interpret(&mir)
+        .expect("the specialized comparisons should execute");
+    assert_eq!(output.exit_status, 42);
+
+    let errors = diagnostics(
+        r#"
+function invalid<T implements Comparable<int>>(T $value): bool
+{
+    return $value < "not an int";
+}
+function main(): void {}
+"#,
+    );
+    assert!(errors
+        .iter()
+        .any(|diagnostic| diagnostic.code == "E0441" && diagnostic.message.contains("comparison")));
+}
+
+#[test]
 fn bool_comparable_specializations_use_the_canonical_false_before_true_order() {
     let mir = doriac::lower_source_to_mir(
         "stage25-bool-comparable.doria",

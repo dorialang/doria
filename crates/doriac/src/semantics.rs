@@ -4596,7 +4596,7 @@ impl<'program> Checker<'program> {
                 ) || matches!(
                     (self.types.kind(left_ty), self.types.kind(right_ty)),
                     (TypeKind::Bool, TypeKind::Bool)
-                ) || self.matching_constrained_type_parameters(left_ty, right_ty, "Comparable")
+                ) || self.constrained_relational_operands(left_ty, right_ty)
                     || matches!(
                         (self.types.kind(left_ty), self.types.kind(right_ty)),
                         (TypeKind::Unknown, _) | (_, TypeKind::Unknown)
@@ -7634,17 +7634,71 @@ impl<'program> Checker<'program> {
             })
     }
 
-    fn matching_constrained_type_parameters(
-        &self,
-        left: TypeId,
-        right: TypeId,
-        required: &str,
+    fn constrained_relational_operands(&mut self, left: TypeId, right: TypeId) -> bool {
+        let left_kind = self.types.kind(left).clone();
+        let right_kind = self.types.kind(right).clone();
+        matches!(left_kind, TypeKind::TypeParameter(ref parameter)
+            if self.type_parameter_accepts_comparable_operand(parameter, right))
+            || matches!(right_kind, TypeKind::TypeParameter(ref parameter)
+                if self.type_parameter_accepts_comparable_operand(parameter, left))
+    }
+
+    fn type_parameter_accepts_comparable_operand(
+        &mut self,
+        parameter: &str,
+        operand: TypeId,
     ) -> bool {
-        matches!(
-            (self.types.kind(left), self.types.kind(right)),
-            (TypeKind::TypeParameter(left), TypeKind::TypeParameter(right))
-                if left == right && self.type_parameter_has_constraint(left, required)
-        )
+        let constraints = self
+            .type_parameter_scopes
+            .iter()
+            .rev()
+            .find_map(|scope| scope.get(parameter))
+            .into_iter()
+            .flatten()
+            .filter(|constraint| constraint.name == "Comparable")
+            .cloned()
+            .collect::<Vec<_>>();
+
+        constraints.into_iter().any(|constraint| {
+            if constraint.arguments.is_empty() {
+                return matches!(
+                    self.types.kind(operand),
+                    TypeKind::TypeParameter(other) if other == parameter
+                );
+            }
+            if constraint.has_value_arguments() || constraint.type_argument_count() != 1 {
+                return false;
+            }
+            constraint
+                .type_argument(0)
+                .and_then(|argument| self.resolve_constraint_operand_type(argument))
+                == Some(operand)
+        })
+    }
+
+    fn resolve_constraint_operand_type(&mut self, ty: &TypeRef) -> Option<TypeId> {
+        if ty.nullable || !ty.arguments.is_empty() {
+            return None;
+        }
+        if self
+            .type_parameter_scopes
+            .iter()
+            .rev()
+            .any(|scope| scope.contains_key(&ty.name))
+        {
+            return Some(self.types.intern(TypeKind::TypeParameter(ty.name.clone())));
+        }
+        if let Some(integer) = IntegerType::from_source_name(&ty.name) {
+            return Some(self.types.intern(TypeKind::Integer(integer)));
+        }
+        if let Some(float) = FloatType::from_source_name(&ty.name) {
+            return Some(self.types.intern(TypeKind::Float(float)));
+        }
+        match ty.name.as_str() {
+            "string" => Some(self.types.intern(TypeKind::String)),
+            "bool" => Some(self.types.intern(TypeKind::Bool)),
+            _ => None,
+        }
     }
 
     fn report_deferred_qualified_name(&mut self, name: &str, span: Span) {
@@ -9555,6 +9609,9 @@ impl<'program> Checker<'program> {
         if let Some(recovery) = self.recovery_binary_type(left, right) {
             return recovery;
         }
+        if self.constrained_relational_operands(left, right) {
+            return self.types.intern(TypeKind::Bool);
+        }
 
         let left_kind = self.types.kind(left).clone();
         let right_kind = self.types.kind(right).clone();
@@ -9567,12 +9624,6 @@ impl<'program> Checker<'program> {
             }
             (TypeKind::String, TypeKind::String) => self.types.intern(TypeKind::Bool),
             (TypeKind::Bool, TypeKind::Bool) => self.types.intern(TypeKind::Bool),
-            (TypeKind::TypeParameter(left_parameter), TypeKind::TypeParameter(right_parameter))
-                if left_parameter == right_parameter
-                    && self.type_parameter_has_constraint(&left_parameter, "Comparable") =>
-            {
-                self.types.intern(TypeKind::Bool)
-            }
             _ => self.types.intern(TypeKind::Heterogeneous),
         }
     }
