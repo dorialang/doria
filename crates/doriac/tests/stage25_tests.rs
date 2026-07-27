@@ -1,5 +1,6 @@
 use doriac::ast::Item;
 use doriac::backend::BackendTarget;
+use doriac::const_eval::{ConstKey, ConstValue};
 
 fn diagnostics(source: &str) -> Vec<doriac::diagnostics::Diagnostic> {
     doriac::check_source("stage25.doria", source).expect_err("source should be rejected")
@@ -1075,4 +1076,79 @@ function main(): void {}
                 .message
                 .contains("borrowed result cannot satisfy an owning return")
     }));
+}
+
+#[test]
+fn nullable_field_instantiated_with_a_nullable_argument_collapses_to_a_single_nullable() {
+    // `?T` where `T = ?int` must normalize to `?int`, not a doubly-nullable
+    // type that native lowering cannot represent.
+    let mir = doriac::lower_source_to_mir(
+        "stage25-nested-nullable.doria",
+        r#"
+class Maybe<T>
+{
+    ?T $value = null;
+}
+function main(): int
+{
+    let $maybe = new Maybe<?int>();
+    if ($maybe->value == null) { return 42; }
+    return 1;
+}
+"#,
+    )
+    .expect("`?T` instantiated with a nullable argument should lower");
+    let output =
+        doriac::mir_interpreter::interpret(&mir).expect("collapsed nullable field should execute");
+    assert_eq!(output.exit_status, 42);
+}
+
+#[test]
+fn constant_bool_relational_comparisons_use_the_canonical_false_before_true_order() {
+    // Relational operators over concrete `bool` operands are accepted in
+    // functions; constant evaluation must agree with `false < true`.
+    let hir = doriac::lower_source(
+        "stage25-const-bool-order.doria",
+        r#"
+const bool ORDERED = false < true;
+const bool NOT_AFTER = true <= true;
+const bool DESCENDING = true > false;
+"#,
+    )
+    .expect("constant bool relational comparisons should evaluate");
+    let values = &hir.semantic_info.const_evaluation.values;
+    for name in ["ORDERED", "NOT_AFTER", "DESCENDING"] {
+        assert!(
+            matches!(
+                values[&ConstKey::TopLevel(name.to_string())].value,
+                ConstValue::Bool(true)
+            ),
+            "{name} should evaluate to true"
+        );
+    }
+}
+
+#[test]
+fn generic_field_nullability_is_specialized_for_coalesce_fallback() {
+    // A promoted `T $value` instantiated as `Box<?int>` can hold `null`, so the
+    // `??` fallback must survive lowering rather than being pruned by a stale
+    // non-null flow fact derived from the unspecialized syntax.
+    let mir = doriac::lower_source_to_mir(
+        "stage25-generic-nullable-coalesce.doria",
+        r#"
+class Box<T>
+{
+    function __construct(take T $value) {}
+}
+function main(): int
+{
+    let $box = new Box<?int>(null);
+    return $box->value ?? 42;
+}
+"#,
+    )
+    .expect("generic nullable field coalesce should lower");
+    let output = doriac::mir_interpreter::interpret(&mir)
+        .expect("generic nullable field coalesce should execute");
+    assert_eq!(output.exit_status, 42);
 }

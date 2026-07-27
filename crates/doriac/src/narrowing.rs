@@ -214,7 +214,7 @@ impl NullabilityCatalog {
                                         catalog.record_property(
                                             &class.name,
                                             &parameter.name,
-                                            !parameter.ty.nullable,
+                                            member_is_non_null(&parameter.ty, &class.type_params),
                                         );
                                     }
                                 }
@@ -223,7 +223,7 @@ impl NullabilityCatalog {
                                 catalog.record_property(
                                     &class.name,
                                     &property.name,
-                                    !property.ty.nullable,
+                                    member_is_non_null(&property.ty, &class.type_params),
                                 );
                             }
                             crate::ast::ClassMember::Constant(_) => {}
@@ -323,6 +323,25 @@ impl NullabilityCatalog {
 
 fn declared_return_is_non_null(function: &FunctionDecl) -> Option<bool> {
     function.return_type.as_ref().map(|ty| !ty.nullable)
+}
+
+/// A member whose declared type is a bare class type parameter can become
+/// nullable once the class is instantiated (e.g. `Box<?int>` for `T $value`),
+/// so its nullability cannot be established from the unspecialized syntax.
+fn type_ref_is_type_param(
+    ty: &crate::types::TypeRef,
+    type_params: &[crate::ast::TypeParamDecl],
+) -> bool {
+    type_params.iter().any(|param| param.name == ty.name)
+}
+
+/// Non-null guarantee for a class member, treating members typed by a bare
+/// type parameter conservatively (never guaranteed non-null).
+fn member_is_non_null(
+    ty: &crate::types::TypeRef,
+    type_params: &[crate::ast::TypeParamDecl],
+) -> bool {
+    !ty.nullable && !type_ref_is_type_param(ty, type_params)
 }
 
 fn merge_guarantee(entry: std::collections::hash_map::Entry<'_, String, bool>, incoming: bool) {

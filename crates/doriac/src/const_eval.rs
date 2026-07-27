@@ -678,6 +678,13 @@ impl Evaluator {
                 BinaryOp::Xor => Ok(ConstValue::Bool(left ^ right)),
                 BinaryOp::Equal => Ok(ConstValue::Bool(left == right)),
                 BinaryOp::NotEqual => Ok(ConstValue::Bool(left != right)),
+                // Canonical `false < true` ordering (false = 0, true = 1),
+                // matching the concrete-`bool` relational operators in ordinary
+                // (non-const) expressions.
+                BinaryOp::Less => Ok(ConstValue::Bool((left as u8) < (right as u8))),
+                BinaryOp::LessEqual => Ok(ConstValue::Bool((left as u8) <= (right as u8))),
+                BinaryOp::Greater => Ok(ConstValue::Bool((left as u8) > (right as u8))),
+                BinaryOp::GreaterEqual => Ok(ConstValue::Bool((left as u8) >= (right as u8))),
                 _ => Err("invalid boolean operation in constant expression"),
             },
             (ConstValue::String(left), ConstValue::String(right)) => match op {

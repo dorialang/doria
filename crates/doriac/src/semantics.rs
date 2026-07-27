@@ -5177,7 +5177,13 @@ impl<'program> Checker<'program> {
             TypeKind::TypeParameter(name) => substitutions.get(&name).copied().unwrap_or(ty),
             TypeKind::Nullable(inner) => {
                 let inner = self.substitute_type_id(inner, substitutions);
-                self.types.intern(TypeKind::Nullable(inner))
+                // `?(?X)` collapses to `?X`: a `?T` member substituted with a
+                // nullable argument is already nullable, not doubly-nullable.
+                if matches!(self.types.kind(inner), TypeKind::Nullable(_)) {
+                    inner
+                } else {
+                    self.types.intern(TypeKind::Nullable(inner))
+                }
             }
             TypeKind::TypedArray(element) => {
                 let element = self.substitute_type_id(element, substitutions);

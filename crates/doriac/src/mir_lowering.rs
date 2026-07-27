@@ -400,6 +400,17 @@ fn resolved_type_is_symbolic(ty: &crate::types::ResolvedType) -> bool {
     }
 }
 
+/// Wrap `inner` in a nullable, collapsing `?(?X)` to `?X`. Substituting a `?T`
+/// field's parameter with a nullable argument must not yield a doubly-nullable
+/// type, which has no downstream representation.
+fn nullable_of(inner: crate::types::ResolvedType) -> crate::types::ResolvedType {
+    if matches!(inner, crate::types::ResolvedType::Nullable(_)) {
+        inner
+    } else {
+        crate::types::ResolvedType::Nullable(Box::new(inner))
+    }
+}
+
 fn substitute_resolved_type(
     ty: &crate::types::ResolvedType,
     substitutions: &HashMap<String, crate::types::ResolvedType>,
@@ -411,7 +422,7 @@ fn substitute_resolved_type(
             .cloned()
             .unwrap_or_else(|| ty.clone()),
         ResolvedType::Nullable(inner) => {
-            ResolvedType::Nullable(Box::new(substitute_resolved_type(inner, substitutions)))
+            nullable_of(substitute_resolved_type(inner, substitutions))
         }
         ResolvedType::TypedArray(inner) => {
             ResolvedType::TypedArray(Box::new(substitute_resolved_type(inner, substitutions)))
@@ -1251,7 +1262,7 @@ fn resolved_type_ref_with_substitutions(
         }
     };
     if ty.nullable {
-        Some(ResolvedType::Nullable(Box::new(base)))
+        Some(nullable_of(base))
     } else {
         Some(base)
     }
@@ -3015,7 +3026,13 @@ impl<'semantic> LoweringContext<'semantic> {
                 mir::Type::String => Some(mir::Type::NullableString),
                 mir::Type::Mixed => Some(mir::Type::NullableMixed),
                 mir::Type::Class(class) => Some(mir::Type::NullableClass(class)),
-                _ => None,
+                // `?(?X)` collapses to `?X`: a `?T` field substituted with a
+                // nullable argument is already nullable, not doubly-nullable.
+                already @ (mir::Type::NullableScalar(_)
+                | mir::Type::NullableString
+                | mir::Type::NullableMixed
+                | mir::Type::NullableClass(_)) => Some(already),
+                mir::Type::Collection(_) => None,
             },
             ResolvedType::Void | ResolvedType::Null | ResolvedType::Unsupported => None,
         }
