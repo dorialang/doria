@@ -1471,7 +1471,12 @@ impl Parser {
     }
 
     fn parse_new(&mut self, start: usize) -> Option<Expr> {
+        let type_start = self.peek().span.start;
         let class_type = self.parse_type_ref()?;
+        let type_span = Span::new(type_start, self.previous().span.end);
+        if class_type.nullable || class_type.name == "[]" {
+            self.error("`new` requires a non-nullable class type", type_span);
+        }
         self.expect(TokenKind::LeftParen, "expected `(` after class name")?;
         let args = self.parse_argument_list_after_open()?;
         let span = Span::new(start, self.previous().span.end);

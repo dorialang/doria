@@ -2164,9 +2164,14 @@ impl<'program> Checker<'program> {
                     self.resolve_type_ref_for_return_inference(ty.type_argument(0).unwrap());
                 self.types.intern(TypeKind::Set(element))
             }
-            name if ty.arguments.is_empty() && self.classes.contains_key(name) => self
-                .types
-                .intern(TypeKind::Class(ClassType::new(name, Vec::new()))),
+            name if self.classes.contains_key(name) && !ty.has_value_arguments() => {
+                let arguments = ty
+                    .type_arguments()
+                    .map(|argument| self.resolve_type_ref_for_return_inference(argument))
+                    .collect();
+                self.types
+                    .intern(TypeKind::Class(ClassType::new(name, arguments)))
+            }
             _ => self.types.unknown(),
         }
     }

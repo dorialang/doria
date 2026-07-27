@@ -1141,6 +1141,29 @@ function main(): void
 }
 
 #[test]
+fn constructor_targets_must_be_non_nullable_class_types() {
+    doriac::parse_source(
+        "test.doria",
+        "function main(): void { new Box<int>(); new Box<?string>(); }",
+    )
+    .expect("generic class targets and nullable generic arguments should parse");
+
+    for target in ["?Box<int>", "Box<int>[]"] {
+        let diagnostics = doriac::parse_source(
+            "test.doria",
+            format!("function main(): void {{ new {target}(); }}"),
+        )
+        .expect_err("nullable and array-shaped constructor targets must be rejected");
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.code.starts_with('P')
+                && diagnostic
+                    .message
+                    .contains("requires a non-nullable class type")
+        }));
+    }
+}
+
+#[test]
 fn positional_argument_after_named_argument_is_rejected() {
     let diagnostics = doriac::parse_source(
         "test.doria",

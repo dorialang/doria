@@ -252,7 +252,11 @@ pub(crate) fn check_program_with_inferred_move_returns(
                             let property_class =
                                 type_ref_class_name(&property.ty, &classes, Some(&class.name));
                             let move_type =
-                                type_ref_is_move_type(&property.ty, &classes, Some(&class.name));
+                                type_ref_is_move_type(&property.ty, &classes, Some(&class.name))
+                                    || type_ref_mentions_parameter(
+                                        &property.ty,
+                                        &class.type_params,
+                                    );
                             properties.insert(
                                 (class.name.clone(), property.name.clone()),
                                 PropertyInfo {
@@ -291,6 +295,9 @@ pub(crate) fn check_program_with_inferred_move_returns(
                                         &param.ty,
                                         &classes,
                                         Some(&class.name),
+                                    ) || type_ref_mentions_parameter(
+                                        &param.ty,
+                                        &class.type_params,
                                     );
                                     if param.promoted_access.is_some() {
                                         properties.insert(
@@ -355,6 +362,9 @@ pub(crate) fn check_program_with_inferred_move_returns(
                                     &property.ty,
                                     &checker.classes,
                                     Some(&class.name),
+                                ) || type_ref_mentions_parameter(
+                                    &property.ty,
+                                    &class.type_params,
                                 ) {
                                     checker.reject_borrowed_result(
                                         initializer,

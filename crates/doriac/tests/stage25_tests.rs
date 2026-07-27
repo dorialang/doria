@@ -697,3 +697,24 @@ function main(): void
                 .contains("after its value was given away")
     }));
 }
+
+#[test]
+fn ownership_treats_class_type_parameter_properties_as_potential_move_values() {
+    let errors = diagnostics(
+        r#"
+function discard<T>(take T $value): void {}
+class Box<T>
+{
+    function __construct(take T $value) {}
+    function discardValue(): void { discard($this->value); }
+}
+function main(): void {}
+"#,
+    );
+    assert!(errors.iter().any(|diagnostic| {
+        diagnostic.code == "E0472"
+            && diagnostic
+                .message
+                .contains("direct moves out of owned properties")
+    }));
+}
