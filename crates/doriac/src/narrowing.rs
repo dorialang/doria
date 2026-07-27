@@ -1672,7 +1672,7 @@ impl Resolver {
             .expect("scope")
             .insert(name.to_string(), id);
         self.resolution.declarations.insert(span_start, id);
-        if let Some(ty) = ty.as_ref().filter(|ty| ty.arguments.is_empty()) {
+        if let Some(ty) = ty.as_ref() {
             let class_name = if ty.name == "self" {
                 self.resolution
                     .current_class

@@ -103,6 +103,34 @@ function main(): void
 }
 
 #[test]
+fn narrowing_retains_generic_class_identity_for_method_effects() {
+    doriac::check_source(
+        "stage25-generic-narrowing.doria",
+        r#"
+class Box<T>
+{
+    function touch(mixed $value): void {}
+}
+class Other
+{
+    function touch(writable mixed $value): void {}
+}
+function consumeString(string $value): void {}
+function main(): void
+{
+    Box<int> $box = new Box<int>();
+    mixed $value = "narrowed";
+    if ($value is string) {
+        $box->touch($value);
+        consumeString($value);
+    }
+}
+"#,
+    )
+    .expect("an unrelated same-named writable method must not invalidate a generic class call");
+}
+
+#[test]
 fn class_constraints_are_checked_at_instantiation() {
     let errors = diagnostics(
         r#"
