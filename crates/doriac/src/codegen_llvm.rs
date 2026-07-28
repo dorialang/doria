@@ -681,6 +681,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     mir::Type::SharedReference(_)
                     | mir::Type::WeakReference(_)
                     | mir::Type::NullableSharedReference(_)
+                    | mir::Type::NullableWeakReference(_)
                         if local.owned =>
                     {
                         Some((
@@ -702,7 +703,10 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                         self.drop_collection_value(old, collection)?;
                     } else if matches!(local.ty, mir::Type::Mixed | mir::Type::NullableMixed) {
                         self.drop_mixed_value(old)?;
-                    } else if matches!(local.ty, mir::Type::WeakReference(_)) {
+                    } else if matches!(
+                        local.ty,
+                        mir::Type::WeakReference(_) | mir::Type::NullableWeakReference(_)
+                    ) {
                         self.drop_shared_value(old, true)?;
                     } else if matches!(
                         local.ty,
@@ -2350,6 +2354,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 | mir::Type::SharedReference(_)
                 | mir::Type::WeakReference(_)
                 | mir::Type::NullableSharedReference(_)
+                | mir::Type::NullableWeakReference(_)
                 | mir::Type::Collection(_)
                 | mir::Type::Mixed
                 | mir::Type::NullableMixed
@@ -3108,6 +3113,26 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 }
                 Ok(acquired)
             }
+            mir::NullableSharedReferenceExpression::NullSafeShare { value, .. } => {
+                let owned = value.owned_temporary().is_some();
+                let value = self.lower_nullable_shared_reference_expression(value)?;
+                let result =
+                    self.lower_null_safe_shared_call(value, SHARED_RETAIN, "shared retain")?;
+                if owned {
+                    self.defer_or_drop_shared_temporary(value, false)?;
+                }
+                Ok(result)
+            }
+            mir::NullableSharedReferenceExpression::NullSafeAcquire { value, .. } => {
+                let owned = value.owned_temporary().is_some();
+                let value = self.lower_nullable_weak_reference_expression(value)?;
+                let result =
+                    self.lower_null_safe_shared_call(value, SHARED_ACQUIRE, "weak acquisition")?;
+                if owned {
+                    self.defer_or_drop_shared_temporary(value, true)?;
+                }
+                Ok(result)
+            }
             mir::NullableSharedReferenceExpression::DictionaryGet {
                 class,
                 collection,
@@ -3136,6 +3161,56 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 .lower_collection_index(*collection, index, *remove)?
                 .into_pointer_value()),
         }
+    }
+
+    fn lower_null_safe_shared_call(
+        &mut self,
+        value: PointerValue<'ctx>,
+        symbol: &'static str,
+        operation: &'static str,
+    ) -> Result<PointerValue<'ctx>, BackendError> {
+        let pointer = self.context.ptr_type(AddressSpace::default());
+        let function = current_function(&self.builder)?;
+        let some = self
+            .context
+            .append_basic_block(function, "shared.null_safe.some");
+        let none = self
+            .context
+            .append_basic_block(function, "shared.null_safe.none");
+        let done = self
+            .context
+            .append_basic_block(function, "shared.null_safe.done");
+        let present = build(
+            self.builder
+                .build_is_not_null(value, "shared.null_safe.present"),
+        )?;
+        build(self.builder.build_conditional_branch(present, some, none))?;
+        self.builder.position_at_end(some);
+        let result = self
+            .call_runtime(
+                symbol,
+                &[pointer.into(), pointer.into()],
+                Some(pointer.into()),
+                &[self.current_frame.into(), value.into()],
+            )?
+            .ok_or_else(|| backend_failure(format!("null-safe {operation} produced no result")))?
+            .into_pointer_value();
+        build(self.builder.build_unconditional_branch(done))?;
+        let some_end = self
+            .builder
+            .get_insert_block()
+            .expect("null-safe shared some block");
+        self.builder.position_at_end(none);
+        build(self.builder.build_unconditional_branch(done))?;
+        let none_end = self
+            .builder
+            .get_insert_block()
+            .expect("null-safe shared none block");
+        self.builder.position_at_end(done);
+        let phi = build(self.builder.build_phi(pointer, "shared.null_safe"))?;
+        let null = pointer.const_null();
+        phi.add_incoming(&[(&result, some_end), (&null, none_end)]);
+        Ok(phi.as_basic_value().into_pointer_value())
     }
 
     fn lower_nullable_weak_reference_expression(
@@ -3174,6 +3249,16 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 .lower_call(*function, args, true)?
                 .ok_or_else(|| malformed_mir("nullable weak call produced no result"))?
                 .into_pointer_value()),
+            mir::NullableWeakReferenceExpression::NullSafeCreate { value, .. } => {
+                let owned = value.owned_temporary().is_some();
+                let value = self.lower_nullable_shared_reference_expression(value)?;
+                let result =
+                    self.lower_null_safe_shared_call(value, SHARED_CREATE_WEAK, "weak creation")?;
+                if owned {
+                    self.defer_or_drop_shared_temporary(value, false)?;
+                }
+                Ok(result)
+            }
             mir::NullableWeakReferenceExpression::DictionaryGet {
                 class,
                 collection,

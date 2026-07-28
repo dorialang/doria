@@ -8799,6 +8799,34 @@ fn lower_nullable_shared_reference_expression(
             object,
             method,
             args,
+            null_safe: true,
+            ..
+        } if method == "share" && args.is_empty() => {
+            let value =
+                lower_nullable_shared_reference_expression(object, expected, false, context)?;
+            Ok(mir::NullableSharedReferenceExpression::NullSafeShare {
+                class: expected,
+                value: Box::new(value),
+            })
+        }
+        hir::Expr::MethodCall {
+            object,
+            method,
+            args,
+            null_safe: true,
+            ..
+        } if method == "acquire" && args.is_empty() => {
+            let value = lower_nullable_weak_reference_expression(object, expected, false, context)?;
+            Ok(mir::NullableSharedReferenceExpression::NullSafeAcquire {
+                class: expected,
+                value: Box::new(value),
+            })
+        }
+        hir::Expr::MethodCall {
+            object,
+            method,
+            args,
+            null_safe: false,
             ..
         } if method == "acquire" && args.is_empty() => {
             let value = lower_weak_reference_expression(object, expected, false, context)?;
@@ -9073,6 +9101,20 @@ fn lower_nullable_weak_reference_expression(
                     "function has another weak-reference return type",
                 )]),
             }
+        }
+        hir::Expr::MethodCall {
+            object,
+            method,
+            args,
+            null_safe: true,
+            ..
+        } if method == "createWeakReference" && args.is_empty() => {
+            let value =
+                lower_nullable_shared_reference_expression(object, expected, false, context)?;
+            Ok(mir::NullableWeakReferenceExpression::NullSafeCreate {
+                class: expected,
+                value: Box::new(value),
+            })
         }
         hir::Expr::MethodCall {
             object,

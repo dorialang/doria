@@ -4074,7 +4074,15 @@ impl<'program> Checker<'program> {
                     scopes,
                     method_context,
                 ) {
-                    self.check_method_call(object, method, args, *span, scopes, method_context);
+                    self.check_method_call(
+                        object,
+                        method,
+                        args,
+                        *null_safe,
+                        *span,
+                        scopes,
+                        method_context,
+                    );
                 }
             }
             Expr::IsType { expr, ty, span } => {
@@ -4140,7 +4148,15 @@ impl<'program> Checker<'program> {
                     for arg in args {
                         self.check_expr(&arg.value, scopes, method_context);
                     }
-                    self.check_shared_handle_construction(kind, class_type, args, *shared, *span);
+                    self.check_shared_handle_construction(
+                        kind,
+                        class_type,
+                        args,
+                        *shared,
+                        *span,
+                        scopes,
+                        method_context,
+                    );
                     return;
                 }
                 if *shared && !self.check_shared_new_payload(class_type, *span) {
@@ -5997,17 +6013,19 @@ impl<'program> Checker<'program> {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn check_method_call(
         &mut self,
         object: &Expr,
         method: &str,
         args: &[Argument],
+        null_safe: bool,
         span: Span,
         scopes: &ScopeStack,
         method_context: Option<&MethodContext>,
     ) {
         let object_ty = self.infer_expr_type(object, scopes, method_context);
-        if let TypeKind::SharedHandle(kind, payload) = *self.types.kind(object_ty) {
+        if let Some((kind, payload)) = self.shared_handle_type(object_ty, null_safe) {
             for arg in args {
                 self.check_expr(&arg.value, scopes, method_context);
             }
@@ -7443,6 +7461,10 @@ impl<'program> Checker<'program> {
         scopes: &ScopeStack,
         method_context: Option<&MethodContext>,
     ) -> bool {
+        let ty = self.infer_expr_type(expr, scopes, method_context);
+        if let TypeKind::SharedHandle(kind, _) = self.types.kind(ty) {
+            return *kind == SharedHandleKind::WritableSharedReferenceAccess;
+        }
         match expr {
             Expr::Grouped { expr, .. } => {
                 self.is_writable_object_path(expr, scopes, method_context)
@@ -9129,12 +9151,12 @@ impl<'program> Checker<'program> {
                 span,
                 ..
             } => {
-                if let Some((kind, payload)) = self.shared_handle_of(object, scopes, method_context)
-                {
+                let object_ty = self.infer_expr_type(object, scopes, method_context);
+                if let Some((kind, payload)) = self.shared_handle_type(object_ty, *null_safe) {
                     if let Some(result) =
                         self.shared_handle_member_return_type(kind, payload, method)
                     {
-                        return result;
+                        return self.null_safe_result_type(result, *null_safe);
                     }
                     if !Self::shared_handle_forwards(kind) {
                         return self.types.unknown();
@@ -9145,7 +9167,6 @@ impl<'program> Checker<'program> {
                 {
                     return result;
                 }
-                let object_ty = self.infer_expr_type(object, scopes, method_context);
                 if let TypeKind::TypeParameter(parameter) = self.types.kind(object_ty) {
                     if method == "toString"
                         && self.type_parameter_has_constraint(parameter, "Displayable")
@@ -9423,6 +9444,34 @@ impl<'program> Checker<'program> {
         }
     }
 
+    fn shared_handle_type(
+        &self,
+        ty: TypeId,
+        unwrap_nullable: bool,
+    ) -> Option<(SharedHandleKind, TypeId)> {
+        match self.types.kind(ty) {
+            TypeKind::SharedHandle(kind, payload) => Some((*kind, *payload)),
+            TypeKind::Nullable(inner) if unwrap_nullable => match self.types.kind(*inner) {
+                TypeKind::SharedHandle(kind, payload) => Some((*kind, *payload)),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    fn null_safe_result_type(&mut self, result: TypeId, null_safe: bool) -> TypeId {
+        if !null_safe
+            || matches!(
+                self.types.kind(result),
+                TypeKind::Void | TypeKind::Unknown | TypeKind::Nullable(_)
+            )
+        {
+            result
+        } else {
+            self.types.intern(TypeKind::Nullable(result))
+        }
+    }
+
     /// Return type of a compiler-known member on a shared-ownership handle
     /// (record 0106). Returns `None` when the name is not owned by the wrapper, so
     /// callers can fall through to transparent payload forwarding.
@@ -9529,6 +9578,7 @@ impl<'program> Checker<'program> {
     /// Construction rules for the six compiler-known shared-ownership types
     /// (record 0106). Only `WritableSharedReference<T>` is built with `new`, and
     /// `shared new` never names one of these types.
+    #[allow(clippy::too_many_arguments)]
     fn check_shared_handle_construction(
         &mut self,
         kind: SharedHandleKind,
@@ -9536,6 +9586,8 @@ impl<'program> Checker<'program> {
         args: &[Argument],
         shared: bool,
         span: Span,
+        scopes: &ScopeStack,
+        method_context: Option<&MethodContext>,
     ) {
         let name = kind.source_name();
         if shared {
@@ -9604,7 +9656,32 @@ impl<'program> Checker<'program> {
                     "write `new {name}(new T(...))`; the constructor parameter is named `value`"
                 )),
             );
+            return;
         }
+
+        let payload = match class_type.arguments.as_slice() {
+            [crate::types::TypeArgumentRef::Type(payload)] => self.resolve_type_ref_with_class(
+                payload,
+                span,
+                method_context.map(|context| context.class_name.as_str()),
+            ),
+            [] => self.infer_expr_type(&args[0].value, scopes, method_context),
+            _ => return,
+        };
+        self.check_call_arguments(
+            &format!("constructor `{name}::__construct`"),
+            &[ParamInfo {
+                name: "value".to_string(),
+                ty: payload,
+                take: true,
+                writable: false,
+                has_default: false,
+            }],
+            args,
+            span,
+            scopes,
+            method_context,
+        );
     }
 
     /// `shared new T(...)` requires an ordinary class payload.
@@ -10395,7 +10472,10 @@ impl<'program> Checker<'program> {
         let ty = self.infer_expr_type(object, scopes, method_context);
         match self.types.kind(ty) {
             TypeKind::Nullable(inner) => {
-                if !matches!(self.types.kind(*inner), TypeKind::Class(_)) {
+                if !matches!(
+                    self.types.kind(*inner),
+                    TypeKind::Class(_) | TypeKind::SharedHandle(_, _)
+                ) {
                     self.diagnostics.push(Diagnostic::new(
                         "E0507",
                         format!("{operation} requires a class value"),
@@ -10416,7 +10496,7 @@ impl<'program> Checker<'program> {
             _ if null_safe => self.diagnostics.push(
                 Diagnostic::new(
                     "E0507",
-                    "null-safe access requires a nullable class receiver",
+                    "null-safe access requires a nullable class or shared-reference receiver",
                     object.span(),
                 )
                 .with_help("use `->` after the value has been narrowed to a non-null class"),

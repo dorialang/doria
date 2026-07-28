@@ -56,6 +56,21 @@ impl Signature {
     }
 }
 
+fn writable_shared_constructor_signature() -> Signature {
+    Signature {
+        params: vec![Parameter {
+            name: "value".to_string(),
+            move_type: true,
+            class_type: false,
+            generic: true,
+            take: true,
+            writable: false,
+        }],
+        returns_move_type: true,
+        ..Signature::default()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum State {
     Borrowed,
@@ -1769,11 +1784,14 @@ impl Checker<'_> {
             Expr::New {
                 class_type, args, ..
             } => {
-                let signature = self
-                    .constructors
-                    .get(&class_type.name)
-                    .cloned()
-                    .unwrap_or_default();
+                let signature = if class_type.name == "WritableSharedReference" {
+                    writable_shared_constructor_signature()
+                } else {
+                    self.constructors
+                        .get(&class_type.name)
+                        .cloned()
+                        .unwrap_or_default()
+                };
                 self.use_call_args(None, args, &signature, CallExecution::Always, scopes);
             }
             Expr::MethodCall {

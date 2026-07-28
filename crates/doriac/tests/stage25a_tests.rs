@@ -10,8 +10,10 @@ class Node
     writable int $count = 0;
 
     function describe(): string { return $this->name; }
-    function rename(): void {}
+    writable function rename(): void {}
 }
+
+class Other {}
 "#;
 
 fn check(body: &str) -> Result<(), Vec<Diagnostic>> {
@@ -189,7 +191,24 @@ fn weak_and_access_types_cannot_be_constructed_directly() {
 #[test]
 fn writable_shared_reference_takes_exactly_one_owned_value() {
     accepted("let $settings = new WritableSharedReference(new Node());");
+    accepted("let $settings = new WritableSharedReference(value: new Node());");
     assert_code("let $bad = new WritableSharedReference();", "E0544");
+    assert_code(
+        "let $bad = new WritableSharedReference<Node>(new Other());",
+        "E0408",
+    );
+    assert_code(
+        "let $bad = new WritableSharedReference<Node>(payload: new Node());",
+        "E0516",
+    );
+    assert_code(
+        r#"
+    let $node = new Node();
+    let $settings = new WritableSharedReference<Node>($node);
+    echo $node->name;
+"#,
+        "E0470",
+    );
 }
 
 #[test]
@@ -361,6 +380,62 @@ fn writes_through_a_shared_reference_are_rejected() {
 "#,
         "E0201",
     );
+    assert_code(
+        r#"
+    let writable $node = shared new Node();
+    $node->count = 5;
+"#,
+        "E0201",
+    );
+    assert_code(
+        r#"
+    let writable $node = shared new Node();
+    $node->rename();
+"#,
+        "E0203",
+    );
+}
+
+#[test]
+fn nullable_shared_members_are_lazy_and_preserve_handle_families() {
+    let source = r#"
+class Node
+{
+    function __construct(string $name) {}
+    function __destruct() { echo "drop " . $this->name . "\n"; }
+}
+
+function main(): void
+{
+    let $root = shared new Node("root");
+    ?SharedReference<Node> $present = $root->share();
+    ?SharedReference<Node> $missing = null;
+    ?WeakReference<Node> $presentWeak = $present?->createWeakReference();
+    ?WeakReference<Node> $missingWeak = $missing?->createWeakReference();
+    ?SharedReference<Node> $sharedAgain = $present?->share();
+    ?SharedReference<Node> $absentShare = $missing?->share();
+    ?SharedReference<Node> $acquired = $presentWeak?->acquire();
+    ?SharedReference<Node> $absentAcquire = $missingWeak?->acquire();
+
+    if ($sharedAgain != null) { echo $sharedAgain->name . "\n"; }
+    if ($absentShare == null) { echo "no share\n"; }
+    if ($acquired != null) { echo $acquired->name . "\n"; }
+    if ($absentAcquire == null) { echo "no acquire\n"; }
+}
+"#;
+    let program = doriac::lower_source_to_mir("stage25a-null-safe-shared.doria", source)
+        .expect("nullable shared members should lower lazily");
+    let output = doriac::mir_interpreter::interpret(&program)
+        .expect("nullable shared members should interpret");
+    assert_eq!(
+        output.stdout,
+        b"root\nno share\nroot\nno acquire\ndrop root\n"
+    );
+    doriac::codegen_cranelift::lower_mir_to_object(&program)
+        .expect("nullable shared members should lower through Cranelift");
+    #[cfg(feature = "llvm-backend")]
+    doriac::codegen_llvm::lower_mir_to_object(&program)
+        .expect("nullable shared members should lower through LLVM");
 }
 
 // --- Family disjointness -------------------------------------------------

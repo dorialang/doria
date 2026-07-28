@@ -3403,6 +3403,36 @@ fn lower_nullable_shared_reference_expression(
             }
             Ok(acquired)
         }
+        mir::NullableSharedReferenceExpression::NullSafeShare { value, .. } => {
+            let owned = value.owned_temporary().is_some();
+            let value = lower_nullable_shared_reference_expression(builder, value, resources)?;
+            let result = lower_null_safe_shared_call(
+                builder,
+                value,
+                SHARED_RETAIN,
+                "null-safe shared retain",
+                resources,
+            )?;
+            if owned {
+                defer_or_drop_shared_temporary(builder, value, false, resources)?;
+            }
+            Ok(result)
+        }
+        mir::NullableSharedReferenceExpression::NullSafeAcquire { value, .. } => {
+            let owned = value.owned_temporary().is_some();
+            let value = lower_nullable_weak_reference_expression(builder, value, resources)?;
+            let result = lower_null_safe_shared_call(
+                builder,
+                value,
+                SHARED_ACQUIRE,
+                "null-safe weak acquisition",
+                resources,
+            )?;
+            if owned {
+                defer_or_drop_shared_temporary(builder, value, true, resources)?;
+            }
+            Ok(result)
+        }
         mir::NullableSharedReferenceExpression::DictionaryGet {
             class,
             collection,
@@ -3431,6 +3461,38 @@ fn lower_nullable_shared_reference_expression(
             ..
         } => lower_collection_index(builder, *collection, index, *remove, resources),
     }
+}
+
+fn lower_null_safe_shared_call(
+    builder: &mut FunctionBuilder,
+    value: Value,
+    symbol: &'static str,
+    operation: &'static str,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<Value, BackendError> {
+    let pointer = resources.module.target_config().pointer_type();
+    let zero = builder.ins().iconst(pointer, 0);
+    let present = builder.ins().icmp(IntCC::NotEqual, value, zero);
+    let some = builder.create_block();
+    let none = builder.create_block();
+    let done = builder.create_block();
+    builder.append_block_param(done, pointer);
+    builder.ins().brif(present, some, &[], none, &[]);
+    builder.switch_to_block(some);
+    let result = runtime_call(
+        builder,
+        symbol,
+        &[pointer, pointer],
+        Some(pointer),
+        &[resources.current_frame, value],
+        resources,
+    )?
+    .ok_or_else(|| backend_failure(format!("{operation} produced no result")))?;
+    builder.ins().jump(done, &[BlockArg::Value(result)]);
+    builder.switch_to_block(none);
+    builder.ins().jump(done, &[BlockArg::Value(zero)]);
+    builder.switch_to_block(done);
+    Ok(builder.block_params(done)[0])
 }
 
 fn lower_nullable_weak_reference_expression(
@@ -3470,6 +3532,21 @@ fn lower_nullable_weak_reference_expression(
             lower_function_call(builder, *function, args, resources)?
                 .ok_or_else(|| malformed_mir("nullable weak call produced no result"))?
                 .single()
+        }
+        mir::NullableWeakReferenceExpression::NullSafeCreate { value, .. } => {
+            let owned = value.owned_temporary().is_some();
+            let value = lower_nullable_shared_reference_expression(builder, value, resources)?;
+            let result = lower_null_safe_shared_call(
+                builder,
+                value,
+                SHARED_CREATE_WEAK,
+                "null-safe weak creation",
+                resources,
+            )?;
+            if owned {
+                defer_or_drop_shared_temporary(builder, value, false, resources)?;
+            }
+            Ok(result)
         }
         mir::NullableWeakReferenceExpression::DictionaryGet {
             class,

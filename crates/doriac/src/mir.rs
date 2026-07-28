@@ -624,6 +624,14 @@ pub enum NullableSharedReferenceExpression {
         class: ClassId,
         value: Box<WeakReferenceExpression>,
     },
+    NullSafeShare {
+        class: ClassId,
+        value: Box<NullableSharedReferenceExpression>,
+    },
+    NullSafeAcquire {
+        class: ClassId,
+        value: Box<NullableWeakReferenceExpression>,
+    },
     DictionaryGet {
         class: ClassId,
         collection: LocalId,
@@ -647,6 +655,8 @@ impl NullableSharedReferenceExpression {
             | Self::Property { class, .. }
             | Self::Call { class, .. }
             | Self::Acquire { class, .. }
+            | Self::NullSafeShare { class, .. }
+            | Self::NullSafeAcquire { class, .. }
             | Self::DictionaryGet { class, .. }
             | Self::CollectionIndex { class, .. } => *class,
             Self::Shared(value) => value.class(),
@@ -671,6 +681,9 @@ impl NullableSharedReferenceExpression {
                 }
             }
             Self::Acquire { .. } => Some(OwnedSharedTemporary::Strong),
+            Self::NullSafeShare { .. } | Self::NullSafeAcquire { .. } => {
+                Some(OwnedSharedTemporary::Strong)
+            }
             Self::DictionaryGet { access, .. } => {
                 if matches!(
                     access,
@@ -713,6 +726,10 @@ pub enum NullableWeakReferenceExpression {
         args: Vec<Rvalue>,
         return_borrow: Option<ReturnBorrow>,
     },
+    NullSafeCreate {
+        class: ClassId,
+        value: Box<NullableSharedReferenceExpression>,
+    },
     DictionaryGet {
         class: ClassId,
         collection: LocalId,
@@ -735,6 +752,7 @@ impl NullableWeakReferenceExpression {
             | Self::Local { class, .. }
             | Self::Property { class, .. }
             | Self::Call { class, .. }
+            | Self::NullSafeCreate { class, .. }
             | Self::DictionaryGet { class, .. }
             | Self::CollectionIndex { class, .. } => *class,
             Self::Weak(value) => value.class(),
@@ -758,6 +776,7 @@ impl NullableWeakReferenceExpression {
                     None
                 }
             }
+            Self::NullSafeCreate { .. } => Some(OwnedSharedTemporary::Weak),
             Self::DictionaryGet { access, .. } => {
                 if matches!(
                     access,
@@ -1962,6 +1981,12 @@ fn nullable_shared_class_temporary_capacity(value: &NullableSharedReferenceExpre
         NullableSharedReferenceExpression::Acquire { value, .. } => {
             weak_class_temporary_capacity(value)
         }
+        NullableSharedReferenceExpression::NullSafeShare { value, .. } => {
+            nullable_shared_class_temporary_capacity(value)
+        }
+        NullableSharedReferenceExpression::NullSafeAcquire { value, .. } => {
+            nullable_weak_class_temporary_capacity(value)
+        }
         NullableSharedReferenceExpression::DictionaryGet { key, .. } => {
             rvalue_class_temporary_capacity(key)
         }
@@ -1979,6 +2004,9 @@ fn nullable_weak_class_temporary_capacity(value: &NullableWeakReferenceExpressio
         NullableWeakReferenceExpression::Weak(value) => weak_class_temporary_capacity(value),
         NullableWeakReferenceExpression::Call { args, .. } => {
             args.iter().map(rvalue_class_temporary_capacity).sum()
+        }
+        NullableWeakReferenceExpression::NullSafeCreate { value, .. } => {
+            nullable_shared_class_temporary_capacity(value)
         }
         NullableWeakReferenceExpression::DictionaryGet { key, .. } => {
             rvalue_class_temporary_capacity(key)
@@ -2689,6 +2717,10 @@ impl fmt::Display for NullableSharedReferenceExpression {
             } => write!(formatter, "local{}->property{}", object.0, property.index),
             Self::Call { function, args, .. } => write_call(formatter, *function, args),
             Self::Acquire { value, .. } => write!(formatter, "acquire({value})"),
+            Self::NullSafeShare { value, .. } => write!(formatter, "null_safe_share({value})"),
+            Self::NullSafeAcquire { value, .. } => {
+                write!(formatter, "null_safe_acquire({value})")
+            }
             Self::DictionaryGet {
                 collection, key, ..
             } => write!(formatter, "local{}.get({key})", collection.0),
@@ -2709,6 +2741,9 @@ impl fmt::Display for NullableWeakReferenceExpression {
                 object, property, ..
             } => write!(formatter, "local{}->property{}", object.0, property.index),
             Self::Call { function, args, .. } => write_call(formatter, *function, args),
+            Self::NullSafeCreate { value, .. } => {
+                write!(formatter, "null_safe_create_weak({value})")
+            }
             Self::DictionaryGet {
                 collection, key, ..
             } => write!(formatter, "local{}.get({key})", collection.0),

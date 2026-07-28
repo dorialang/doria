@@ -227,6 +227,9 @@ enum EvaluationTask {
     FinishSharedShare(crate::class_layout::ClassId, bool),
     FinishWeakCreation(crate::class_layout::ClassId, bool),
     FinishWeakAcquire(crate::class_layout::ClassId, bool),
+    FinishNullSafeShare(crate::class_layout::ClassId, bool),
+    FinishNullSafeWeakCreation(crate::class_layout::ClassId, bool),
+    FinishNullSafeWeakAcquire(crate::class_layout::ClassId, bool),
     FinishSharedPayload(crate::class_layout::ClassId, bool),
     Collection(mir::CollectionExpression),
     BuildCollection {
@@ -1325,6 +1328,117 @@ impl Interpreter<'_> {
                     .values
                     .push(EvaluationValue::NullableSharedReference {
                         control: acquired.then_some(control),
+                        class,
+                    });
+            }
+            EvaluationTask::FinishNullSafeShare(class, drop_receiver) => {
+                let value = self.pop_local_value()?;
+                let LocalValue::NullableSharedReference {
+                    control,
+                    class: actual,
+                } = value
+                else {
+                    return Err(InterpreterError::new(
+                        "null-safe share received a non-nullable strong handle",
+                    ));
+                };
+                if actual != class {
+                    return Err(InterpreterError::new(
+                        "null-safe share changed payload class",
+                    ));
+                }
+                if let Some(control) = &control {
+                    let mut state = control.borrow_mut();
+                    state.strong = state
+                        .strong
+                        .checked_add(1)
+                        .ok_or_else(|| InterpreterError::new("shared-reference count overflow"))?;
+                }
+                if drop_receiver {
+                    if let Some(control) = &control {
+                        self.current_frame_mut()?
+                            .statement_temporary_drops
+                            .push(OwnedDrop::Shared(control.clone()));
+                    }
+                }
+                self.current_frame_mut()?
+                    .values
+                    .push(EvaluationValue::NullableSharedReference { control, class });
+            }
+            EvaluationTask::FinishNullSafeWeakCreation(class, drop_receiver) => {
+                let value = self.pop_local_value()?;
+                let LocalValue::NullableSharedReference {
+                    control,
+                    class: actual,
+                } = value
+                else {
+                    return Err(InterpreterError::new(
+                        "null-safe weak creation received a non-nullable strong handle",
+                    ));
+                };
+                if actual != class {
+                    return Err(InterpreterError::new(
+                        "null-safe weak creation changed payload class",
+                    ));
+                }
+                if let Some(control) = &control {
+                    let mut state = control.borrow_mut();
+                    state.weak = state
+                        .weak
+                        .checked_add(1)
+                        .ok_or_else(|| InterpreterError::new("weak-reference count overflow"))?;
+                }
+                if drop_receiver {
+                    if let Some(control) = &control {
+                        self.current_frame_mut()?
+                            .statement_temporary_drops
+                            .push(OwnedDrop::Shared(control.clone()));
+                    }
+                }
+                self.current_frame_mut()?
+                    .values
+                    .push(EvaluationValue::NullableWeakReference { control, class });
+            }
+            EvaluationTask::FinishNullSafeWeakAcquire(class, drop_receiver) => {
+                let value = self.pop_local_value()?;
+                let LocalValue::NullableWeakReference {
+                    control,
+                    class: actual,
+                } = value
+                else {
+                    return Err(InterpreterError::new(
+                        "null-safe acquire received a non-nullable weak handle",
+                    ));
+                };
+                if actual != class {
+                    return Err(InterpreterError::new(
+                        "null-safe acquire changed payload class",
+                    ));
+                }
+                let acquired = if let Some(control) = &control {
+                    let mut state = control.borrow_mut();
+                    if state.strong == 0 {
+                        None
+                    } else {
+                        state.strong = state.strong.checked_add(1).ok_or_else(|| {
+                            InterpreterError::new("shared-reference count overflow")
+                        })?;
+                        Some(control.clone())
+                    }
+                } else {
+                    None
+                };
+                if drop_receiver {
+                    if let Some(control) = &control {
+                        self.current_frame_mut()?
+                            .statement_temporary_drops
+                            .push(OwnedDrop::Weak(control.clone()));
+                    }
+                }
+                self.current_frame_mut()?
+                    .values
+                    .push(EvaluationValue::NullableSharedReference {
+                        control: acquired,
                         class,
                     });
             }
@@ -4245,6 +4359,27 @@ impl Interpreter<'_> {
                     .push(EvaluationTask::FinishWeakAcquire(class, drop_receiver));
                 frame.tasks.push(EvaluationTask::WeakReference(*value));
             }
+            mir::NullableSharedReferenceExpression::NullSafeShare { class, value } => {
+                let drop_receiver = value.owned_temporary().is_some();
+                let frame = self.current_frame_mut()?;
+                frame
+                    .tasks
+                    .push(EvaluationTask::FinishNullSafeShare(class, drop_receiver));
+                frame
+                    .tasks
+                    .push(EvaluationTask::NullableSharedReference(*value));
+            }
+            mir::NullableSharedReferenceExpression::NullSafeAcquire { class, value } => {
+                let drop_receiver = value.owned_temporary().is_some();
+                let frame = self.current_frame_mut()?;
+                frame.tasks.push(EvaluationTask::FinishNullSafeWeakAcquire(
+                    class,
+                    drop_receiver,
+                ));
+                frame
+                    .tasks
+                    .push(EvaluationTask::NullableWeakReference(*value));
+            }
             mir::NullableSharedReferenceExpression::DictionaryGet {
                 class,
                 collection,
@@ -4362,6 +4497,17 @@ impl Interpreter<'_> {
                 args,
                 ReturnExpectation::Value(mir::Type::NullableWeakReference(class)),
             )?,
+            mir::NullableWeakReferenceExpression::NullSafeCreate { class, value } => {
+                let drop_receiver = value.owned_temporary().is_some();
+                let frame = self.current_frame_mut()?;
+                frame.tasks.push(EvaluationTask::FinishNullSafeWeakCreation(
+                    class,
+                    drop_receiver,
+                ));
+                frame
+                    .tasks
+                    .push(EvaluationTask::NullableSharedReference(*value));
+            }
             mir::NullableWeakReferenceExpression::DictionaryGet {
                 class,
                 collection,

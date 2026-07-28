@@ -1525,6 +1525,20 @@ fn validate_nullable_shared_reference_expression(
             }
             validate_weak_reference_expression(program, function, value)
         }
+        mir::NullableSharedReferenceExpression::NullSafeShare { value, .. } => {
+            if value.class() != class {
+                return Err(malformed_mir("null-safe share changes payload class"));
+            }
+            validate_nullable_shared_reference_expression(program, function, value)
+        }
+        mir::NullableSharedReferenceExpression::NullSafeAcquire { value, .. } => {
+            if value.class() != class {
+                return Err(malformed_mir(
+                    "null-safe weak acquisition changes payload class",
+                ));
+            }
+            validate_nullable_weak_reference_expression(program, function, value)
+        }
         mir::NullableSharedReferenceExpression::DictionaryGet {
             collection,
             key,
@@ -1625,6 +1639,14 @@ fn validate_nullable_weak_reference_expression(
                 ));
             }
             validate_call_args(program, function, callee, args)
+        }
+        mir::NullableWeakReferenceExpression::NullSafeCreate { value, .. } => {
+            if value.class() != class {
+                return Err(malformed_mir(
+                    "null-safe weak creation changes payload class",
+                ));
+            }
+            validate_nullable_shared_reference_expression(program, function, value)
         }
         mir::NullableWeakReferenceExpression::DictionaryGet {
             collection,
@@ -3246,6 +3268,12 @@ fn collect_nullable_shared_reference_class_local_accesses<'a>(
         mir::NullableSharedReferenceExpression::Acquire { value, .. } => {
             collect_weak_reference_class_local_accesses(value, accesses)
         }
+        mir::NullableSharedReferenceExpression::NullSafeShare { value, .. } => {
+            collect_nullable_shared_reference_class_local_accesses(value, accesses)
+        }
+        mir::NullableSharedReferenceExpression::NullSafeAcquire { value, .. } => {
+            collect_nullable_weak_reference_class_local_accesses(value, accesses)
+        }
         mir::NullableSharedReferenceExpression::DictionaryGet { key, .. } => {
             collect_rvalue_class_local_accesses(key, accesses)
         }
@@ -3270,6 +3298,9 @@ fn collect_nullable_weak_reference_class_local_accesses<'a>(
             accesses.begin_call();
             collect_rvalue_args_class_local_accesses(args, accesses);
             accesses.call(*function, args);
+        }
+        mir::NullableWeakReferenceExpression::NullSafeCreate { value, .. } => {
+            collect_nullable_shared_reference_class_local_accesses(value, accesses)
         }
         mir::NullableWeakReferenceExpression::DictionaryGet { key, .. } => {
             collect_rvalue_class_local_accesses(key, accesses)
@@ -5380,6 +5411,12 @@ fn nullable_shared_reference_observes_property(
         mir::NullableSharedReferenceExpression::Acquire { value, .. } => {
             weak_reference_observes_property(value, receiver, property)
         }
+        mir::NullableSharedReferenceExpression::NullSafeShare { value, .. } => {
+            nullable_shared_reference_observes_property(value, receiver, property)
+        }
+        mir::NullableSharedReferenceExpression::NullSafeAcquire { value, .. } => {
+            nullable_weak_reference_observes_property(value, receiver, property)
+        }
         mir::NullableSharedReferenceExpression::DictionaryGet { key, .. } => {
             rvalue_observes_property(key, receiver, property)
         }
@@ -5408,6 +5445,9 @@ fn nullable_weak_reference_observes_property(
         mir::NullableWeakReferenceExpression::Call { args, .. } => args
             .iter()
             .any(|value| rvalue_observes_property(value, receiver, property)),
+        mir::NullableWeakReferenceExpression::NullSafeCreate { value, .. } => {
+            nullable_shared_reference_observes_property(value, receiver, property)
+        }
         mir::NullableWeakReferenceExpression::DictionaryGet { key, .. } => {
             rvalue_observes_property(key, receiver, property)
         }
