@@ -2715,6 +2715,9 @@ fn lower_drop_value_if(
         ty,
         mir::Type::String
             | mir::Type::Class(_)
+            | mir::Type::SharedReference(_)
+            | mir::Type::WeakReference(_)
+            | mir::Type::NullableSharedReference(_)
             | mir::Type::Collection(_)
             | mir::Type::Mixed
             | mir::Type::NullableMixed
@@ -3130,8 +3133,9 @@ fn lower_class_expression(
             lower_mixed_payload(builder, *mixed, mir::MixedTag::Class(*class), resources)
         }
         mir::ClassExpression::SharedPayload { reference, .. } => {
+            let owned = reference.owned_temporary().is_some();
             let control = lower_shared_reference_expression(builder, reference, resources)?;
-            runtime_call(
+            let payload = runtime_call(
                 builder,
                 SHARED_PAYLOAD,
                 &[pointer_type],
@@ -3139,7 +3143,11 @@ fn lower_class_expression(
                 &[control],
                 resources,
             )?
-            .ok_or_else(|| backend_failure("shared payload projection produced no result"))
+            .ok_or_else(|| backend_failure("shared payload projection produced no result"))?;
+            if owned {
+                defer_or_drop_shared_temporary(builder, control, false, resources)?;
+            }
+            Ok(payload)
         }
     }
 }
@@ -3200,8 +3208,9 @@ fn lower_shared_reference_expression(
                 .single()
         }
         mir::SharedReferenceExpression::Share { value, .. } => {
+            let owned = value.owned_temporary().is_some();
             let value = lower_shared_reference_expression(builder, value, resources)?;
-            runtime_call(
+            let shared = runtime_call(
                 builder,
                 SHARED_RETAIN,
                 &[pointer, pointer],
@@ -3209,7 +3218,11 @@ fn lower_shared_reference_expression(
                 &[resources.current_frame, value],
                 resources,
             )?
-            .ok_or_else(|| backend_failure("shared retain produced no result"))
+            .ok_or_else(|| backend_failure("shared retain produced no result"))?;
+            if owned {
+                defer_or_drop_shared_temporary(builder, value, false, resources)?;
+            }
+            Ok(shared)
         }
         mir::SharedReferenceExpression::CollectionIndex {
             collection,
@@ -3255,8 +3268,9 @@ fn lower_weak_reference_expression(
                 .single()
         }
         mir::WeakReferenceExpression::Create { value, .. } => {
+            let owned = value.owned_temporary().is_some();
             let value = lower_shared_reference_expression(builder, value, resources)?;
-            runtime_call(
+            let weak = runtime_call(
                 builder,
                 SHARED_CREATE_WEAK,
                 &[pointer, pointer],
@@ -3264,7 +3278,11 @@ fn lower_weak_reference_expression(
                 &[resources.current_frame, value],
                 resources,
             )?
-            .ok_or_else(|| backend_failure("weak-reference creation produced no result"))
+            .ok_or_else(|| backend_failure("weak-reference creation produced no result"))?;
+            if owned {
+                defer_or_drop_shared_temporary(builder, value, false, resources)?;
+            }
+            Ok(weak)
         }
         mir::WeakReferenceExpression::CollectionIndex {
             collection,
@@ -3314,8 +3332,9 @@ fn lower_nullable_shared_reference_expression(
                 .single()
         }
         mir::NullableSharedReferenceExpression::Acquire { value, .. } => {
+            let owned = value.owned_temporary().is_some();
             let value = lower_weak_reference_expression(builder, value, resources)?;
-            runtime_call(
+            let acquired = runtime_call(
                 builder,
                 SHARED_ACQUIRE,
                 &[pointer, pointer],
@@ -3323,7 +3342,11 @@ fn lower_nullable_shared_reference_expression(
                 &[resources.current_frame, value],
                 resources,
             )?
-            .ok_or_else(|| backend_failure("weak acquisition produced no result"))
+            .ok_or_else(|| backend_failure("weak acquisition produced no result"))?;
+            if owned {
+                defer_or_drop_shared_temporary(builder, value, true, resources)?;
+            }
+            Ok(acquired)
         }
         mir::NullableSharedReferenceExpression::DictionaryGet {
             class,

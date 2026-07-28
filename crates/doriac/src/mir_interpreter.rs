@@ -214,10 +214,10 @@ enum EvaluationTask {
     NullableSharedReference(mir::NullableSharedReferenceExpression),
     BuildSharedReference(crate::class_layout::ClassId),
     BuildNullableSharedSome(crate::class_layout::ClassId),
-    FinishSharedShare(crate::class_layout::ClassId),
-    FinishWeakCreation(crate::class_layout::ClassId),
-    FinishWeakAcquire(crate::class_layout::ClassId),
-    FinishSharedPayload(crate::class_layout::ClassId),
+    FinishSharedShare(crate::class_layout::ClassId, bool),
+    FinishWeakCreation(crate::class_layout::ClassId, bool),
+    FinishWeakAcquire(crate::class_layout::ClassId, bool),
+    FinishSharedPayload(crate::class_layout::ClassId, bool),
     Collection(mir::CollectionExpression),
     BuildCollection {
         collection: mir::CollectionTypeId,
@@ -1180,7 +1180,7 @@ impl Interpreter<'_> {
                         class,
                     });
             }
-            EvaluationTask::FinishSharedShare(class) => {
+            EvaluationTask::FinishSharedShare(class, drop_receiver) => {
                 let value = self.pop_local_value()?;
                 let LocalValue::SharedReference {
                     control,
@@ -1198,11 +1198,16 @@ impl Interpreter<'_> {
                     .checked_add(1)
                     .ok_or_else(|| InterpreterError::new("shared-reference count overflow"))?;
                 drop(state);
+                if drop_receiver {
+                    self.current_frame_mut()?
+                        .statement_temporary_drops
+                        .push(OwnedDrop::Shared(control.clone()));
+                }
                 self.current_frame_mut()?
                     .values
                     .push(EvaluationValue::SharedReference { control, class });
             }
-            EvaluationTask::FinishWeakCreation(class) => {
+            EvaluationTask::FinishWeakCreation(class, drop_receiver) => {
                 let value = self.pop_local_value()?;
                 let LocalValue::SharedReference {
                     control,
@@ -1222,11 +1227,16 @@ impl Interpreter<'_> {
                     .checked_add(1)
                     .ok_or_else(|| InterpreterError::new("weak-reference count overflow"))?;
                 drop(state);
+                if drop_receiver {
+                    self.current_frame_mut()?
+                        .statement_temporary_drops
+                        .push(OwnedDrop::Shared(control.clone()));
+                }
                 self.current_frame_mut()?
                     .values
                     .push(EvaluationValue::WeakReference { control, class });
             }
-            EvaluationTask::FinishWeakAcquire(class) => {
+            EvaluationTask::FinishWeakAcquire(class, drop_receiver) => {
                 let value = self.pop_local_value()?;
                 let LocalValue::WeakReference {
                     control,
@@ -1249,6 +1259,11 @@ impl Interpreter<'_> {
                         true
                     }
                 };
+                if drop_receiver {
+                    self.current_frame_mut()?
+                        .statement_temporary_drops
+                        .push(OwnedDrop::Weak(control.clone()));
+                }
                 self.current_frame_mut()?
                     .values
                     .push(EvaluationValue::NullableSharedReference {
@@ -1256,7 +1271,7 @@ impl Interpreter<'_> {
                         class,
                     });
             }
-            EvaluationTask::FinishSharedPayload(class) => {
+            EvaluationTask::FinishSharedPayload(class, drop_receiver) => {
                 let value = self.pop_local_value()?;
                 let LocalValue::SharedReference {
                     control,
@@ -1276,6 +1291,11 @@ impl Interpreter<'_> {
                     .borrow()
                     .payload
                     .ok_or_else(|| InterpreterError::new("strong handle has no live payload"))?;
+                if drop_receiver {
+                    self.current_frame_mut()?
+                        .statement_temporary_drops
+                        .push(OwnedDrop::Shared(control));
+                }
                 self.current_frame_mut()?
                     .values
                     .push(EvaluationValue::Class {
@@ -3735,8 +3755,11 @@ impl Interpreter<'_> {
                     .push(EvaluationValue::Class { object, class });
             }
             mir::ClassExpression::SharedPayload { class, reference } => {
+                let drop_receiver = reference.owned_temporary().is_some();
                 let frame = self.current_frame_mut()?;
-                frame.tasks.push(EvaluationTask::FinishSharedPayload(class));
+                frame
+                    .tasks
+                    .push(EvaluationTask::FinishSharedPayload(class, drop_receiver));
                 frame
                     .tasks
                     .push(EvaluationTask::SharedReference(*reference));
@@ -3843,8 +3866,11 @@ impl Interpreter<'_> {
                 ReturnExpectation::Value(mir::Type::SharedReference(class)),
             )?,
             mir::SharedReferenceExpression::Share { class, value } => {
+                let drop_receiver = value.owned_temporary().is_some();
                 let frame = self.current_frame_mut()?;
-                frame.tasks.push(EvaluationTask::FinishSharedShare(class));
+                frame
+                    .tasks
+                    .push(EvaluationTask::FinishSharedShare(class, drop_receiver));
                 frame.tasks.push(EvaluationTask::SharedReference(*value));
             }
             mir::SharedReferenceExpression::CollectionIndex {
@@ -3929,8 +3955,11 @@ impl Interpreter<'_> {
                 ReturnExpectation::Value(mir::Type::WeakReference(class)),
             )?,
             mir::WeakReferenceExpression::Create { class, value } => {
+                let drop_receiver = value.owned_temporary().is_some();
                 let frame = self.current_frame_mut()?;
-                frame.tasks.push(EvaluationTask::FinishWeakCreation(class));
+                frame
+                    .tasks
+                    .push(EvaluationTask::FinishWeakCreation(class, drop_receiver));
                 frame.tasks.push(EvaluationTask::SharedReference(*value));
             }
             mir::WeakReferenceExpression::CollectionIndex {
@@ -4032,8 +4061,11 @@ impl Interpreter<'_> {
                 ReturnExpectation::Value(mir::Type::NullableSharedReference(class)),
             )?,
             mir::NullableSharedReferenceExpression::Acquire { class, value } => {
+                let drop_receiver = value.owned_temporary().is_some();
                 let frame = self.current_frame_mut()?;
-                frame.tasks.push(EvaluationTask::FinishWeakAcquire(class));
+                frame
+                    .tasks
+                    .push(EvaluationTask::FinishWeakAcquire(class, drop_receiver));
                 frame.tasks.push(EvaluationTask::WeakReference(*value));
             }
             mir::NullableSharedReferenceExpression::DictionaryGet {

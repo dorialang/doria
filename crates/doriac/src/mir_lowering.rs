@@ -3306,7 +3306,8 @@ fn lower_var_decl(decl: &hir::VarDecl, context: &mut LoweringContext) -> Diagnos
     if let mir::Type::NullableSharedReference(class) = ty {
         let value =
             lower_nullable_shared_reference_expression(&decl.initializer, class, true, context)?;
-        let local = context.declare_user_local(&decl.name, decl.writable, ty);
+        let owned = value.owned_temporary().is_some();
+        let local = context.declare_user_local_owned(&decl.name, decl.writable, ty, owned);
         context.push_statement(mir::Statement::AssignLocal {
             target: local,
             value: mir::Rvalue::NullableSharedReference(value),
@@ -8183,10 +8184,10 @@ fn lower_shared_reference_expression(
                 property,
             })
         }
-        hir::Expr::New { shared: true, .. } => {
-            let mut ordinary = expr.clone();
+        value @ hir::Expr::New { shared: true, .. } => {
+            let mut ordinary = value.clone();
             let hir::Expr::New { shared, .. } = &mut ordinary else {
-                unreachable!()
+                unreachable!("the matched shared construction must remain a construction")
             };
             *shared = false;
             let value = lower_class_expression(&ordinary, expected, true, context)?;

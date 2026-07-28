@@ -502,6 +502,76 @@ function main(): void
 }
 
 #[test]
+fn derived_shared_operations_preserve_and_release_owned_receivers() {
+    let source = r#"
+class Node
+{
+    function __construct(string $name) {}
+    function label(): string { return $this->name; }
+    function __destruct() { echo "drop " . $this->name . "\n"; }
+}
+
+function makeStrong(string $name): SharedReference<Node>
+{
+    return shared new Node($name);
+}
+
+function makeWeak(string $name): WeakReference<Node>
+{
+    return makeStrong($name)->createWeakReference();
+}
+
+function main(): void
+{
+    let $shared = makeStrong("shared")->share();
+    echo $shared->name . "\n";
+    let $weak = makeStrong("weak")->createWeakReference();
+    let $expired = $weak->acquire();
+    if ($expired == null) { echo "expired\n"; }
+    let $acquired = makeWeak("acquire")->acquire();
+    if ($acquired == null) { echo "missing\n"; }
+    echo makeStrong("payload")->referencedValue->label() . "\n";
+}
+"#;
+    let program = doriac::lower_source_to_mir("stage25a-derived-temporaries.doria", source)
+        .expect("derived shared operations should lower with explicit owner temporaries");
+    let output = doriac::mir_interpreter::interpret(&program)
+        .expect("derived shared operations should execute without leaking owners");
+    assert_eq!(
+        output.stdout,
+        b"shared\ndrop weak\nexpired\ndrop acquire\nmissing\npayload\ndrop payload\ndrop shared\n"
+    );
+    doriac::codegen_cranelift::lower_mir_to_object(&program)
+        .expect("derived shared operations should lower through Cranelift");
+    #[cfg(feature = "llvm-backend")]
+    doriac::codegen_llvm::lower_mir_to_object(&program)
+        .expect("derived shared operations should lower through LLVM");
+}
+
+#[test]
+fn borrowed_dictionary_shared_results_do_not_acquire_cleanup_obligations() {
+    let source = r#"
+class Node
+{
+    function __destruct() { echo "drop\n"; }
+}
+
+function main(): void
+{
+    let $root = shared new Node();
+    Dictionary<string, SharedReference<Node>> $values = ["node" => $root->share()];
+    let $borrowed = $values->get("node");
+    if ($borrowed != null) { echo "found\n"; }
+}
+"#;
+    let diagnostics = doriac::check_source("stage25a-borrowed-dictionary.doria", source)
+        .expect_err("stored collection borrows remain rejected until lifetime tracking lands");
+    assert!(diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == "E0478" && diagnostic.message.contains("borrowed result")
+    }));
+}
+
+#[test]
 fn weak_reference_survives_payload_destruction_without_resurrection() {
     let source = r#"
 class Node

@@ -8,6 +8,11 @@ class Node
     {
         echo "drop {$this->name}\n";
     }
+
+    function label(): string
+    {
+        return $this->name;
+    }
 }
 
 function inspect(SharedReference<Node> $node): void
@@ -32,6 +37,16 @@ function makeExpiredWeak(): WeakReference<Node>
     return $strong->createWeakReference();
 }
 
+function makeStrong(string $name): SharedReference<Node>
+{
+    return shared new Node($name);
+}
+
+function makeTemporaryWeak(): WeakReference<Node>
+{
+    return makeStrong("temporary")->createWeakReference();
+}
+
 function main(): void
 {
     let $expiredWeak = makeExpiredWeak();
@@ -39,6 +54,15 @@ function main(): void
     if ($expired == null) {
         echo "expired\n";
     }
+
+    let $temporaryWeak = makeTemporaryWeak();
+    if ($temporaryWeak->acquire() == null) {
+        echo "temporary expired\n";
+    }
+
+    let $chained = makeStrong("chained")->share();
+    inspect($chained);
+    echo makeStrong("payload")->referencedValue->label() . "\n";
 
     let $root = shared new Node("root");
     let $weak = $root->createWeakReference();
@@ -55,6 +79,11 @@ function main(): void
     if ($named->get("root") != null) {
         echo "found\n";
     }
+
+    writable Dictionary<string, SharedReference<Node>> $replace = [
+        "node" => shared new Node("old"),
+    ];
+    $replace->set("node", shared new Node("new"));
 
     let $live = $weak->acquire();
     if ($live != null) {

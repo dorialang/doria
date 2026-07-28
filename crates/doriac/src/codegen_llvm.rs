@@ -2339,6 +2339,9 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             ty,
             mir::Type::String
                 | mir::Type::Class(_)
+                | mir::Type::SharedReference(_)
+                | mir::Type::WeakReference(_)
+                | mir::Type::NullableSharedReference(_)
                 | mir::Type::Collection(_)
                 | mir::Type::Mixed
                 | mir::Type::NullableMixed
@@ -2584,8 +2587,9 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             ))?
             .into_pointer_value()),
             mir::ClassExpression::SharedPayload { reference, .. } => {
+                let owned = reference.owned_temporary().is_some();
                 let control = self.lower_shared_reference_expression(reference)?;
-                Ok(self
+                let payload = self
                     .call_runtime(
                         SHARED_PAYLOAD,
                         &[pointer.into()],
@@ -2593,7 +2597,11 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                         &[control.into()],
                     )?
                     .ok_or_else(|| backend_failure("shared payload projection produced no result"))?
-                    .into_pointer_value())
+                    .into_pointer_value();
+                if owned {
+                    self.defer_or_drop_shared_temporary(control, false)?;
+                }
+                Ok(payload)
             }
             mir::ClassExpression::Call { function, args, .. } => Ok(self
                 .lower_call(*function, args, true)?
@@ -2915,8 +2923,9 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 .ok_or_else(|| malformed_mir("shared-reference call produced no result"))?
                 .into_pointer_value()),
             mir::SharedReferenceExpression::Share { value, .. } => {
+                let owned = value.owned_temporary().is_some();
                 let value = self.lower_shared_reference_expression(value)?;
-                Ok(self
+                let shared = self
                     .call_runtime(
                         SHARED_RETAIN,
                         &[pointer.into(), pointer.into()],
@@ -2924,7 +2933,11 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                         &[self.current_frame.into(), value.into()],
                     )?
                     .ok_or_else(|| backend_failure("shared retain produced no result"))?
-                    .into_pointer_value())
+                    .into_pointer_value();
+                if owned {
+                    self.defer_or_drop_shared_temporary(value, false)?;
+                }
+                Ok(shared)
             }
             mir::SharedReferenceExpression::CollectionIndex {
                 collection,
@@ -2967,8 +2980,9 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 .ok_or_else(|| malformed_mir("weak-reference call produced no result"))?
                 .into_pointer_value()),
             mir::WeakReferenceExpression::Create { value, .. } => {
+                let owned = value.owned_temporary().is_some();
                 let value = self.lower_shared_reference_expression(value)?;
-                Ok(self
+                let weak = self
                     .call_runtime(
                         SHARED_CREATE_WEAK,
                         &[pointer.into(), pointer.into()],
@@ -2976,7 +2990,11 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                         &[self.current_frame.into(), value.into()],
                     )?
                     .ok_or_else(|| backend_failure("weak-reference creation produced no result"))?
-                    .into_pointer_value())
+                    .into_pointer_value();
+                if owned {
+                    self.defer_or_drop_shared_temporary(value, false)?;
+                }
+                Ok(weak)
             }
             mir::WeakReferenceExpression::CollectionIndex {
                 collection,
@@ -3026,8 +3044,9 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 .ok_or_else(|| malformed_mir("nullable shared call produced no result"))?
                 .into_pointer_value()),
             mir::NullableSharedReferenceExpression::Acquire { value, .. } => {
+                let owned = value.owned_temporary().is_some();
                 let value = self.lower_weak_reference_expression(value)?;
-                Ok(self
+                let acquired = self
                     .call_runtime(
                         SHARED_ACQUIRE,
                         &[pointer.into(), pointer.into()],
@@ -3035,7 +3054,11 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                         &[self.current_frame.into(), value.into()],
                     )?
                     .ok_or_else(|| backend_failure("weak acquisition produced no result"))?
-                    .into_pointer_value())
+                    .into_pointer_value();
+                if owned {
+                    self.defer_or_drop_shared_temporary(value, true)?;
+                }
+                Ok(acquired)
             }
             mir::NullableSharedReferenceExpression::DictionaryGet {
                 class,
