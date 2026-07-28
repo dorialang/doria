@@ -1197,6 +1197,28 @@ fn rejects_take_on_move_parameters_in_php() {
 }
 
 #[test]
+fn php_backend_rejects_shared_ownership_in_every_declared_type_position() {
+    for source in [
+        "class Node {} function inspect(SharedReference<Node> $node): void {}",
+        "class Node {} function make(): SharedReference<Node> { return shared new Node(); }",
+        "class Node {} class Box { ?SharedReference<Node> $node = null; }",
+        "class Node {} function main(): void { ?SharedReference<Node> $node = null; }",
+    ] {
+        let diagnostics = doriac::compile_source_to_php("shared-type.doria", source)
+            .expect_err("PHP must reject shared ownership at the type boundary");
+        assert!(
+            diagnostics.iter().any(|diagnostic| {
+                diagnostic.code == "B2301"
+                    && diagnostic
+                        .message
+                        .contains("cannot preserve Doria shared ownership")
+            }),
+            "expected shared-ownership capability diagnostic, got {diagnostics:?}"
+        );
+    }
+}
+
+#[test]
 fn rejects_static_lifecycle_methods_before_php_emission() {
     let err = doriac::compile_source_to_php(
         "test.doria",

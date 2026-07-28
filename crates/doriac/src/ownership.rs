@@ -3065,6 +3065,9 @@ fn resolved_type_class(ty: &crate::types::ResolvedType) -> Option<&str> {
     match ty {
         crate::types::ResolvedType::Class(class) => Some(&class.name),
         crate::types::ResolvedType::Nullable(inner) => resolved_type_class(inner),
+        crate::types::ResolvedType::SharedHandle(kind, payload) if kind.forwards_payload() => {
+            resolved_type_class(payload)
+        }
         _ => None,
     }
 }

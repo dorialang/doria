@@ -215,6 +215,17 @@ impl SharedHandleKind {
             .find(|kind| kind.source_name() == name)
     }
 
+    /// Whether ordinary member lookup is forwarded to the payload value.
+    /// Writable-family handles require an access object before forwarding.
+    pub const fn forwards_payload(self) -> bool {
+        matches!(
+            self,
+            Self::SharedReference
+                | Self::ReadonlySharedReferenceAccess
+                | Self::WritableSharedReferenceAccess
+        )
+    }
+
     pub fn family(self) -> SharedFamily {
         match self {
             SharedHandleKind::SharedReference | SharedHandleKind::WeakReference => {

@@ -347,6 +347,9 @@ fn is_move_type(ty: &TypeRef, semantic_info: &SemanticInfo) -> bool {
 }
 
 fn validate_type(ty: &TypeRef, span: Span) -> Result<(), BackendError> {
+    if crate::types::SharedHandleKind::from_source_name(&ty.name).is_some() {
+        return Err(unsupported_shared_ownership(span));
+    }
     if ty.name == "Bytes" {
         return Err(unsupported_collection_shape(
             span,
@@ -376,6 +379,14 @@ fn validate_type(ty: &TypeRef, span: Span) -> Result<(), BackendError> {
         validate_type(argument, span)?;
     }
     Ok(())
+}
+
+fn unsupported_shared_ownership(span: Span) -> BackendError {
+    BackendError::from_diagnostics(vec![Diagnostic::unsupported_stage(
+        PHP_COLLECTION_UNSUPPORTED_CODE,
+        "PHP compatibility backend cannot preserve Doria shared ownership; use the `native` or `debug` target for this valid Doria program",
+        span,
+    )])
 }
 
 fn validate_block(block: &Block, semantic_info: &SemanticInfo) -> Result<(), BackendError> {
@@ -644,13 +655,7 @@ fn validate_expr(expr: &Expr, semantic_info: &SemanticInfo) -> Result<(), Backen
             if *shared
                 || crate::types::SharedHandleKind::from_source_name(&class_type.name).is_some()
             {
-                return Err(BackendError::from_diagnostics(vec![
-                    Diagnostic::unsupported_stage(
-                        PHP_COLLECTION_UNSUPPORTED_CODE,
-                        "PHP compatibility backend cannot preserve Doria shared ownership; use the `native` or `debug` target for this valid Doria program",
-                        *span,
-                    ),
-                ]));
+                return Err(unsupported_shared_ownership(*span));
             }
             validate_arguments(args, semantic_info)
         }

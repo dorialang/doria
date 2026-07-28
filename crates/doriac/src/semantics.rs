@@ -9537,12 +9537,7 @@ impl<'program> Checker<'program> {
     /// Whether a handle forwards member access to its payload at all. The writable
     /// family deliberately does not: access must be acquired first.
     fn shared_handle_forwards(kind: SharedHandleKind) -> bool {
-        matches!(
-            kind,
-            SharedHandleKind::SharedReference
-                | SharedHandleKind::ReadonlySharedReferenceAccess
-                | SharedHandleKind::WritableSharedReferenceAccess
-        )
+        kind.forwards_payload()
     }
 
     /// Diagnostic for member access on a handle that does not forward.

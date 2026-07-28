@@ -267,6 +267,36 @@ fn non_conflicting_members_forward_transparently_to_the_payload() {
 }
 
 #[test]
+fn forwarded_payload_methods_preserve_take_parameters_in_ownership_analysis() {
+    let source = r#"
+class Child {}
+
+class Consumer
+{
+    function consume(take Child $child): void {}
+}
+
+function consumeAgain(take Child $child): void {}
+
+function main(): void
+{
+    let $consumer = shared new Consumer();
+    let $child = new Child();
+    $consumer->consume($child);
+    consumeAgain($child);
+}
+"#;
+    let diagnostics = doriac::check_source("stage25a-forwarded-take.doria", source)
+        .expect_err("forwarded payload calls must preserve ownership signatures");
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E0470"),
+        "expected use-after-move through forwarded payload method, got {diagnostics:?}"
+    );
+}
+
+#[test]
 fn access_objects_forward_without_a_value_wrapper() {
     accepted(
         r#"
