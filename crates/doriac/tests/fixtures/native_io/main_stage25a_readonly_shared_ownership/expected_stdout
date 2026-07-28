@@ -1,10 +1,14 @@
+drop old current
+inspect current
 drop expired
 expired
 drop temporary
 temporary expired
+inspect fallback
 inspect chained
 payload
 drop payload
+inspect root
 inspect root
 inspect root
 marker
@@ -16,3 +20,5 @@ inspect root
 drop new
 drop root
 drop chained
+drop fallback
+drop current

@@ -3224,6 +3224,25 @@ fn lower_shared_reference_expression(
             }
             Ok(shared)
         }
+        mir::SharedReferenceExpression::Coalesce { left, right, .. } => {
+            let left = lower_nullable_shared_reference_expression(builder, left, resources)?;
+            let zero = builder.ins().iconst(pointer, 0);
+            let present = builder.ins().icmp(IntCC::NotEqual, left, zero);
+            let left_block = builder.create_block();
+            let right_block = builder.create_block();
+            let done = builder.create_block();
+            builder.append_block_param(done, pointer);
+            builder
+                .ins()
+                .brif(present, left_block, &[], right_block, &[]);
+            builder.switch_to_block(left_block);
+            builder.ins().jump(done, &[BlockArg::Value(left)]);
+            builder.switch_to_block(right_block);
+            let right = lower_shared_reference_expression(builder, right, resources)?;
+            builder.ins().jump(done, &[BlockArg::Value(right)]);
+            builder.switch_to_block(done);
+            Ok(builder.block_params(done)[0])
+        }
         mir::SharedReferenceExpression::CollectionIndex {
             collection,
             index,

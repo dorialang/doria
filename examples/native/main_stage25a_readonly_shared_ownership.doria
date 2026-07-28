@@ -49,6 +49,10 @@ function makeTemporaryWeak(): WeakReference<Node>
 
 function main(): void
 {
+    let writable $current = shared new Node("old current");
+    $current = shared new Node("current");
+    inspect($current);
+
     let $expiredWeak = makeExpiredWeak();
     let $expired = $expiredWeak->acquire();
     if ($expired == null) {
@@ -59,6 +63,8 @@ function main(): void
     if ($temporaryWeak->acquire() == null) {
         echo "temporary expired\n";
     }
+    let $fallback = $temporaryWeak->acquire() ?? shared new Node("fallback");
+    inspect($fallback);
 
     let $chained = makeStrong("chained")->share();
     inspect($chained);
@@ -73,6 +79,9 @@ function main(): void
     ];
 
     inspect($root);
+    foreach ($list as SharedReference<Node> $item) {
+        inspect($item);
+    }
     inspect($list[0]);
     inspectNamed(node: $list[0], marker: marker());
     inspect($array[0]);

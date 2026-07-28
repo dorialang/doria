@@ -438,6 +438,11 @@ pub enum SharedReferenceExpression {
         class: ClassId,
         value: Box<SharedReferenceExpression>,
     },
+    Coalesce {
+        class: ClassId,
+        left: Box<NullableSharedReferenceExpression>,
+        right: Box<SharedReferenceExpression>,
+    },
     CollectionIndex {
         class: ClassId,
         collection: LocalId,
@@ -455,13 +460,16 @@ impl SharedReferenceExpression {
             | Self::Property { class, .. }
             | Self::Call { class, .. }
             | Self::Share { class, .. }
+            | Self::Coalesce { class, .. }
             | Self::CollectionIndex { class, .. } => *class,
         }
     }
 
     pub const fn owned_temporary(&self) -> Option<OwnedSharedTemporary> {
         match self {
-            Self::New { .. } | Self::Share { .. } => Some(OwnedSharedTemporary::Strong),
+            Self::New { .. } | Self::Share { .. } | Self::Coalesce { .. } => {
+                Some(OwnedSharedTemporary::Strong)
+            }
             Self::Local { transfer, .. } | Self::NullableLocalAssumeNonNull { transfer, .. } => {
                 if *transfer {
                     Some(OwnedSharedTemporary::Strong)
@@ -1794,6 +1802,10 @@ fn shared_class_temporary_capacity(value: &SharedReferenceExpression) -> usize {
             args.iter().map(rvalue_class_temporary_capacity).sum()
         }
         SharedReferenceExpression::Share { value, .. } => shared_class_temporary_capacity(value),
+        SharedReferenceExpression::Coalesce { left, right, .. } => {
+            nullable_shared_class_temporary_capacity(left)
+                .max(shared_class_temporary_capacity(right))
+        }
         SharedReferenceExpression::CollectionIndex { index, .. } => {
             rvalue_class_temporary_capacity(index)
         }
@@ -2473,6 +2485,7 @@ impl fmt::Display for SharedReferenceExpression {
             ),
             Self::Call { function, args, .. } => write_call(formatter, *function, args),
             Self::Share { value, .. } => write!(formatter, "share({value})"),
+            Self::Coalesce { left, right, .. } => write!(formatter, "({left} ?? {right})"),
             Self::CollectionIndex {
                 collection, index, ..
             } => write!(formatter, "local{}[{index}]", collection.0),

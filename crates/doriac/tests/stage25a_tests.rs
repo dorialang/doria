@@ -549,6 +549,59 @@ function main(): void
 }
 
 #[test]
+fn shared_rebinding_coalescing_and_foreach_preserve_handle_ownership() {
+    let source = r#"
+class Node
+{
+    function __construct(string $name) {}
+    function __destruct() { echo "drop " . $this->name . "\n"; }
+}
+
+function show(SharedReference<Node> $node): void
+{
+    echo $node->name . "\n";
+}
+
+function main(): void
+{
+    let writable $current = shared new Node("old");
+    $current = shared new Node("current");
+
+    let $expired = (shared new Node("expired"))->createWeakReference();
+    let $fallback = $expired->acquire() ?? shared new Node("fallback");
+    show($fallback);
+
+    let writable $weak = $current->createWeakReference();
+    $weak = $fallback->createWeakReference();
+    writable ?SharedReference<Node> $maybe = null;
+    $maybe = $current->share();
+
+    let $first = shared new Node("first");
+    let $second = shared new Node("second");
+    SharedReference<Node>[] $nodes = [$first->share(), $second->share()];
+    foreach ($nodes as SharedReference<Node> $node) {
+        show($node);
+    }
+    show($first);
+    show($second);
+}
+"#;
+    let program = doriac::lower_source_to_mir("stage25a-composition.doria", source)
+        .expect("shared ownership composition fixture should lower");
+    let output = doriac::mir_interpreter::interpret(&program)
+        .expect("shared ownership composition fixture should interpret");
+    assert_eq!(
+        output.stdout,
+        b"drop old\ndrop expired\nfallback\nfirst\nsecond\nfirst\nsecond\ndrop second\ndrop first\ndrop fallback\ndrop current\n"
+    );
+    doriac::codegen_cranelift::lower_mir_to_object(&program)
+        .expect("shared ownership composition should lower through Cranelift");
+    #[cfg(feature = "llvm-backend")]
+    doriac::codegen_llvm::lower_mir_to_object(&program)
+        .expect("shared ownership composition should lower through LLVM");
+}
+
+#[test]
 fn borrowed_dictionary_shared_results_do_not_acquire_cleanup_obligations() {
     let source = r#"
 class Node

@@ -316,6 +316,7 @@ enum EvaluationTask {
         transfer: bool,
     },
     FinishNullableClassCoalesceRight(Option<crate::class_layout::ClassId>),
+    AfterSharedCoalesce(mir::SharedReferenceExpression),
     AfterNullSafeProperty {
         property: crate::class_layout::PropertyId,
         result: mir::Type,
@@ -2191,6 +2192,23 @@ impl Interpreter<'_> {
                 }
                 self.push_nullable_class(class, object)?;
             }
+            EvaluationTask::AfterSharedCoalesce(right) => {
+                let value = self.pop_local_value()?;
+                let LocalValue::NullableSharedReference { control, class } = value else {
+                    return Err(InterpreterError::new(
+                        "shared coalesce left operand was not a nullable shared reference",
+                    ));
+                };
+                if let Some(control) = control {
+                    self.current_frame_mut()?
+                        .values
+                        .push(EvaluationValue::SharedReference { control, class });
+                } else {
+                    self.current_frame_mut()?
+                        .tasks
+                        .push(EvaluationTask::SharedReference(right));
+                }
+            }
             EvaluationTask::AfterNullSafeProperty {
                 property,
                 result,
@@ -2531,14 +2549,17 @@ impl Interpreter<'_> {
             EvaluationTask::Assign(target) => {
                 let value = self.pop_local_value()?;
                 let function = function_in(self.program, self.current_frame()?.function)?;
+                let owned = local_in(function, target)?.owned;
                 let old = assign_local(
                     &function.locals,
                     &mut self.current_frame_mut()?.locals,
                     target,
                     value,
                 )?;
-                if let Some(value) = old {
-                    self.queue_value_drops(value)?;
+                if owned {
+                    if let Some(value) = old {
+                        self.queue_value_drops(value)?;
+                    }
                 }
             }
             EvaluationTask::AssignStatic(target) => {
@@ -3872,6 +3893,15 @@ impl Interpreter<'_> {
                     .tasks
                     .push(EvaluationTask::FinishSharedShare(class, drop_receiver));
                 frame.tasks.push(EvaluationTask::SharedReference(*value));
+            }
+            mir::SharedReferenceExpression::Coalesce { left, right, .. } => {
+                let frame = self.current_frame_mut()?;
+                frame
+                    .tasks
+                    .push(EvaluationTask::AfterSharedCoalesce(*right));
+                frame
+                    .tasks
+                    .push(EvaluationTask::NullableSharedReference(*left));
             }
             mir::SharedReferenceExpression::CollectionIndex {
                 class,

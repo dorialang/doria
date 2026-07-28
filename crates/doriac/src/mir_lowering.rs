@@ -3306,7 +3306,7 @@ fn lower_var_decl(decl: &hir::VarDecl, context: &mut LoweringContext) -> Diagnos
     if let mir::Type::NullableSharedReference(class) = ty {
         let value =
             lower_nullable_shared_reference_expression(&decl.initializer, class, true, context)?;
-        let owned = value.owned_temporary().is_some();
+        let owned = decl.writable || value.owned_temporary().is_some();
         let local = context.declare_user_local_owned(&decl.name, decl.writable, ty, owned);
         context.push_statement(mir::Statement::AssignLocal {
             target: local,
@@ -3720,6 +3720,51 @@ fn lower_assignment(
             true,
             context,
         )?);
+        context.push_statement(mir::Statement::AssignLocal { target, value });
+        return Ok(());
+    }
+    if let mir::Type::SharedReference(class) = context.local_type(target) {
+        if !context.local_owns(target) {
+            return Err(vec![unsupported(
+                assignment.span,
+                "this compiler version cannot replace a borrowed shared reference",
+            )]);
+        }
+        let value = mir::Rvalue::SharedReference(lower_shared_reference_expression(
+            &assignment.value,
+            class,
+            true,
+            context,
+        )?);
+        context.push_statement(mir::Statement::AssignLocal { target, value });
+        return Ok(());
+    }
+    if let mir::Type::WeakReference(class) = context.local_type(target) {
+        if !context.local_owns(target) {
+            return Err(vec![unsupported(
+                assignment.span,
+                "this compiler version cannot replace a borrowed weak reference",
+            )]);
+        }
+        let value = mir::Rvalue::WeakReference(lower_weak_reference_expression(
+            &assignment.value,
+            class,
+            true,
+            context,
+        )?);
+        context.push_statement(mir::Statement::AssignLocal { target, value });
+        return Ok(());
+    }
+    if let mir::Type::NullableSharedReference(class) = context.local_type(target) {
+        if !context.local_owns(target) {
+            return Err(vec![unsupported(
+                assignment.span,
+                "this compiler version cannot replace a borrowed nullable shared reference",
+            )]);
+        }
+        let value = mir::Rvalue::NullableSharedReference(
+            lower_nullable_shared_reference_expression(&assignment.value, class, true, context)?,
+        );
         context.push_statement(mir::Statement::AssignLocal { target, value });
         return Ok(());
     }
@@ -8270,6 +8315,28 @@ fn lower_shared_reference_expression(
                 args,
             })
         }
+        hir::Expr::Binary {
+            left,
+            op: hir::BinaryOp::Coalesce,
+            right,
+            ..
+        } => match context.coalesce_selection(left) {
+            CoalesceSelection::Left => {
+                lower_shared_reference_expression(left, expected, transfer, context)
+            }
+            CoalesceSelection::Right => {
+                lower_shared_reference_expression(right, expected, transfer, context)
+            }
+            CoalesceSelection::Dynamic => Ok(mir::SharedReferenceExpression::Coalesce {
+                class: expected,
+                left: Box::new(lower_nullable_shared_reference_expression(
+                    left, expected, true, context,
+                )?),
+                right: Box::new(lower_shared_reference_expression(
+                    right, expected, true, context,
+                )?),
+            }),
+        },
         hir::Expr::Index {
             collection,
             index,

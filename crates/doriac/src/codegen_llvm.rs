@@ -2939,6 +2939,41 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 }
                 Ok(shared)
             }
+            mir::SharedReferenceExpression::Coalesce { left, right, .. } => {
+                let left = self.lower_nullable_shared_reference_expression(left)?;
+                let function = current_function(&self.builder)?;
+                let some = self
+                    .context
+                    .append_basic_block(function, "shared.coalesce.some");
+                let none = self
+                    .context
+                    .append_basic_block(function, "shared.coalesce.none");
+                let done = self
+                    .context
+                    .append_basic_block(function, "shared.coalesce.done");
+                let present = build(
+                    self.builder
+                        .build_is_not_null(left, "shared.coalesce.present"),
+                )?;
+                build(self.builder.build_conditional_branch(present, some, none))?;
+                self.builder.position_at_end(some);
+                build(self.builder.build_unconditional_branch(done))?;
+                let some_end = self
+                    .builder
+                    .get_insert_block()
+                    .expect("shared coalesce some block");
+                self.builder.position_at_end(none);
+                let right = self.lower_shared_reference_expression(right)?;
+                build(self.builder.build_unconditional_branch(done))?;
+                let none_end = self
+                    .builder
+                    .get_insert_block()
+                    .expect("shared coalesce none block");
+                self.builder.position_at_end(done);
+                let phi = build(self.builder.build_phi(pointer, "shared.coalesce"))?;
+                phi.add_incoming(&[(&left, some_end), (&right, none_end)]);
+                Ok(phi.as_basic_value().into_pointer_value())
+            }
             mir::SharedReferenceExpression::CollectionIndex {
                 collection,
                 index,
