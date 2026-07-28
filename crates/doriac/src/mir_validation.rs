@@ -2316,6 +2316,9 @@ fn require_owned_nullable_class_expression(
         mir::NullableClassExpression::Class(value) => {
             require_owned_class_expression(value, destination)
         }
+        mir::NullableClassExpression::SharedPayload { .. } => Err(malformed_mir(format!(
+            "{destination} receives a borrowed nullable shared-reference payload"
+        ))),
         mir::NullableClassExpression::Call {
             return_borrow: None,
             ..
@@ -2435,6 +2438,9 @@ fn infer_nullable_expression_return_borrow(
         mir::NullableClassExpression::Class(expression) => {
             infer_expression_return_borrow(program, function, expression)
         }
+        mir::NullableClassExpression::SharedPayload { .. } => Err(malformed_mir(
+            "returning a borrow through a nullable shared-reference payload is not supported",
+        )),
         mir::NullableClassExpression::Local {
             local,
             transfer: false,
@@ -2943,6 +2949,7 @@ fn require_writable_nullable_class_expression(
 ) -> Result<(), BackendError> {
     let writable = match expression {
         mir::NullableClassExpression::Null(_) => false,
+        mir::NullableClassExpression::SharedPayload { .. } => false,
         mir::NullableClassExpression::Class(value) => {
             require_writable_class_expression(program, function, value, destination).is_ok()
         }
@@ -3012,6 +3019,7 @@ fn nullable_class_expression_transfers_receiver(expression: &mir::NullableClassE
         mir::NullableClassExpression::Local { transfer, .. }
         | mir::NullableClassExpression::Coalesce { transfer, .. } => *transfer,
         mir::NullableClassExpression::Null(_)
+        | mir::NullableClassExpression::SharedPayload { .. }
         | mir::NullableClassExpression::Property { .. }
         | mir::NullableClassExpression::Call { .. }
         | mir::NullableClassExpression::NullSafeProperty { .. }
@@ -3846,6 +3854,9 @@ fn collect_nullable_class_local_accesses<'a>(
         mir::NullableClassExpression::Class(value) => {
             collect_class_expression_local_accesses(value, accesses)
         }
+        mir::NullableClassExpression::SharedPayload { reference, .. } => {
+            collect_nullable_shared_reference_class_local_accesses(reference, accesses)
+        }
         mir::NullableClassExpression::Local {
             local,
             transfer: true,
@@ -4438,6 +4449,7 @@ fn nullable_class_expression_is_present(
 ) -> bool {
     match expression {
         mir::NullableClassExpression::Class(_) => true,
+        mir::NullableClassExpression::SharedPayload { .. } => false,
         mir::NullableClassExpression::Local { local, .. } => present.contains(local),
         mir::NullableClassExpression::Coalesce { left, right, .. } => {
             nullable_class_expression_is_present(left, present)
@@ -5887,6 +5899,7 @@ fn nullable_class_observes_property(
         mir::NullableClassExpression::Class(value) => {
             class_observes_property(value, receiver, property)
         }
+        mir::NullableClassExpression::SharedPayload { .. } => false,
         mir::NullableClassExpression::Local { local, .. } => *local == receiver,
         mir::NullableClassExpression::Property {
             object,
@@ -6437,6 +6450,7 @@ fn escaping_nullable_class_expression_local_borrows(
         mir::NullableClassExpression::Class(expression) => {
             escaping_class_expression_local_borrows(program, expression)
         }
+        mir::NullableClassExpression::SharedPayload { .. } => Ok(Vec::new()),
         mir::NullableClassExpression::Local {
             local,
             transfer: false,
@@ -7134,6 +7148,14 @@ fn validate_nullable_class_expression(
     class_in(program, class)?;
     match expression {
         mir::NullableClassExpression::Null(_) => Ok(()),
+        mir::NullableClassExpression::SharedPayload { reference, .. } => {
+            if reference.class() != class {
+                return Err(malformed_mir(
+                    "nullable shared payload projection changes class",
+                ));
+            }
+            validate_nullable_shared_reference_expression(program, function, reference)
+        }
         mir::NullableClassExpression::Class(value) if value.class() == class => {
             validate_class_expression(program, function, value)
         }

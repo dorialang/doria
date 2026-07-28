@@ -231,6 +231,7 @@ enum EvaluationTask {
     FinishNullSafeWeakCreation(crate::class_layout::ClassId, bool),
     FinishNullSafeWeakAcquire(crate::class_layout::ClassId, bool),
     FinishSharedPayload(crate::class_layout::ClassId, bool),
+    FinishNullableSharedPayload(crate::class_layout::ClassId, bool),
     Collection(mir::CollectionExpression),
     BuildCollection {
         collection: mir::CollectionTypeId,
@@ -1484,6 +1485,39 @@ impl Interpreter<'_> {
                         object,
                         class: actual,
                     });
+            }
+            EvaluationTask::FinishNullableSharedPayload(class, drop_receiver) => {
+                let value = self.pop_local_value()?;
+                let LocalValue::NullableSharedReference {
+                    control,
+                    class: actual,
+                } = value
+                else {
+                    return Err(InterpreterError::new(
+                        "nullable payload projection received another type",
+                    ));
+                };
+                if actual != class {
+                    return Err(InterpreterError::new(
+                        "nullable payload projection changed payload class",
+                    ));
+                }
+                let object = control
+                    .as_ref()
+                    .map(|control| {
+                        control.borrow().payload.ok_or_else(|| {
+                            InterpreterError::new("strong handle has no live payload")
+                        })
+                    })
+                    .transpose()?;
+                if drop_receiver {
+                    if let Some(control) = control {
+                        self.current_frame_mut()?
+                            .statement_temporary_drops
+                            .push(OwnedDrop::Shared(control));
+                    }
+                }
+                self.push_nullable_class(class, object.map(|(object, _)| object))?;
             }
             EvaluationTask::Collection(expression) => {
                 self.expand_collection_expression(expression)?
@@ -4892,6 +4926,19 @@ impl Interpreter<'_> {
                     .tasks
                     .push(EvaluationTask::BuildNullableClassSome(class));
                 frame.tasks.push(EvaluationTask::Class(value));
+            }
+            mir::NullableClassExpression::SharedPayload { reference, .. } => {
+                let drop_receiver = reference.owned_temporary().is_some();
+                let frame = self.current_frame_mut()?;
+                frame
+                    .tasks
+                    .push(EvaluationTask::FinishNullableSharedPayload(
+                        class,
+                        drop_receiver,
+                    ));
+                frame
+                    .tasks
+                    .push(EvaluationTask::NullableSharedReference(*reference));
             }
             mir::NullableClassExpression::Local {
                 local, transfer, ..

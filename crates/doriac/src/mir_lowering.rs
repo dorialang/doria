@@ -4938,11 +4938,15 @@ fn lower_null_safe_property(
     span: Span,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<(mir::NullableClassExpression, PropertyId, mir::Type)> {
-    let mir::Type::NullableClass(class) = context.expression_type(object)? else {
-        return Err(vec![unsupported(
-            object.span(),
-            "null-safe receiver is not a nullable class",
-        )]);
+    let object_type = context.expression_type(object)?;
+    let class = match object_type {
+        mir::Type::NullableClass(class) | mir::Type::NullableSharedReference(class) => class,
+        _ => {
+            return Err(vec![unsupported(
+                object.span(),
+                "null-safe receiver is not a nullable class or shared reference",
+            )]);
+        }
     };
     let property_info = context.property_info(class, property).ok_or_else(|| {
         vec![unsupported(
@@ -4960,7 +4964,7 @@ fn lower_null_safe_property(
         })?;
     let property_id = property_info.id;
     Ok((
-        lower_nullable_class_expression(object, class, false, context)?,
+        lower_nullable_payload_expression(object, class, context)?,
         property_id,
         ty,
     ))
@@ -4977,11 +4981,15 @@ fn lower_null_safe_method_call(
     FunctionSignature,
     Vec<mir::Rvalue>,
 )> {
-    let mir::Type::NullableClass(class) = context.expression_type(object)? else {
-        return Err(vec![unsupported(
-            object.span(),
-            "null-safe receiver is not a nullable class",
-        )]);
+    let object_type = context.expression_type(object)?;
+    let class = match object_type {
+        mir::Type::NullableClass(class) | mir::Type::NullableSharedReference(class) => class,
+        _ => {
+            return Err(vec![unsupported(
+                object.span(),
+                "null-safe receiver is not a nullable class or shared reference",
+            )]);
+        }
     };
     let signature = context.lookup_method(class, method, span)?;
     if signature.receiver_mode.is_none() {
@@ -4992,10 +5000,34 @@ fn lower_null_safe_method_call(
     }
     let args = lower_call_args_with_ownership(method, args, signature.clone(), span, context)?;
     Ok((
-        lower_nullable_class_expression(object, class, false, context)?,
+        lower_nullable_payload_expression(object, class, context)?,
         signature,
         args,
     ))
+}
+
+fn lower_nullable_payload_expression(
+    object: &hir::Expr,
+    class: ClassId,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<mir::NullableClassExpression> {
+    match context.expression_type(object)? {
+        mir::Type::NullableClass(actual) if actual == class => {
+            lower_nullable_class_expression(object, class, false, context)
+        }
+        mir::Type::NullableSharedReference(actual) if actual == class => {
+            Ok(mir::NullableClassExpression::SharedPayload {
+                class,
+                reference: Box::new(lower_nullable_shared_reference_expression(
+                    object, class, false, context,
+                )?),
+            })
+        }
+        _ => Err(vec![unsupported(
+            object.span(),
+            "null-safe receiver payload has another class type",
+        )]),
+    }
 }
 
 fn lower_format_expression(

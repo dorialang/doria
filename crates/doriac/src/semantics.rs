@@ -10442,11 +10442,18 @@ impl<'program> Checker<'program> {
         // Compiler-known place behavior (record 0106): a forwarding handle resolves
         // member access against its payload class. Deliberately closed to these
         // types — this is not a general proxy or dynamic-lookup mechanism.
-        if let TypeKind::SharedHandle(kind, payload) = *self.types.kind(ty) {
-            if Self::shared_handle_forwards(kind) {
-                return self.class_type(payload);
-            }
-            return None;
+        let handle = match *self.types.kind(ty) {
+            TypeKind::SharedHandle(kind, payload) => Some((kind, payload)),
+            TypeKind::Nullable(inner) => match *self.types.kind(inner) {
+                TypeKind::SharedHandle(kind, payload) => Some((kind, payload)),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some((kind, payload)) = handle {
+            return Self::shared_handle_forwards(kind)
+                .then(|| self.class_type(payload))
+                .flatten();
         }
         self.class_type(ty)
     }

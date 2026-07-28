@@ -8,6 +8,11 @@ class Node
     {
         echo "drop {$this->name}\n";
     }
+
+    function label(): string
+    {
+        return $this->name;
+    }
 }
 
 function makeStrong(string $name): SharedReference<Node>
@@ -36,6 +41,8 @@ function main(): void
     let $weak = $owner->createWeakReference();
     let $maybe = $weak->acquire();
 
+    echo "nullable property " . ($maybe?->name ?? "missing") . "\n";
+    echo "nullable method " . ($maybe?->label() ?? "missing") . "\n";
     inspect($maybe ?? makeStrong("unused"));
     if ($maybe != null) {
         echo "maybe {$maybe->name}\n";
@@ -43,6 +50,8 @@ function main(): void
     echo "owner {$owner->name}\n";
 
     ?SharedReference<Node> $absentStrong = null;
+    echo "absent property " . ($absentStrong?->name ?? "missing") . "\n";
+    echo "absent method " . ($absentStrong?->label() ?? "missing") . "\n";
     inspect($absentStrong ?? makeStrong("Fallback"));
 
     ?WeakReference<Node> $presentWeak = $weak;

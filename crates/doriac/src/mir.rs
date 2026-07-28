@@ -1528,6 +1528,10 @@ pub enum NullableStringExpression {
 pub enum NullableClassExpression {
     Null(ClassId),
     Class(ClassExpression),
+    SharedPayload {
+        class: ClassId,
+        reference: Box<NullableSharedReferenceExpression>,
+    },
     Local {
         class: ClassId,
         local: LocalId,
@@ -1574,6 +1578,7 @@ impl NullableClassExpression {
     pub const fn class(&self) -> ClassId {
         match self {
             Self::Null(class)
+            | Self::SharedPayload { class, .. }
             | Self::Local { class, .. }
             | Self::Property { class, .. }
             | Self::Call { class, .. }
@@ -1604,6 +1609,7 @@ impl NullableClassExpression {
                 ..
             } => Some(*class),
             Self::Null(_)
+            | Self::SharedPayload { .. }
             | Self::Local {
                 transfer: false, ..
             }
@@ -1627,6 +1633,7 @@ impl NullableClassExpression {
             Self::Class(value) => value.borrows_class_value(),
             Self::Local { transfer, .. } | Self::Coalesce { transfer, .. } => !*transfer,
             Self::Property { .. }
+            | Self::SharedPayload { .. }
             | Self::NullSafeProperty { .. }
             | Self::Call {
                 return_borrow: Some(_),
@@ -2283,6 +2290,7 @@ fn nullable_class_temporary_capacity(value: &NullableClassExpression) -> usize {
         }
         NullableClassExpression::DictionaryGet { key, .. } => rvalue_class_temporary_capacity(key),
         NullableClassExpression::Null(_)
+        | NullableClassExpression::SharedPayload { .. }
         | NullableClassExpression::Local { .. }
         | NullableClassExpression::Property { .. } => 0,
     }
@@ -3233,6 +3241,9 @@ impl fmt::Display for NullableClassExpression {
         match self {
             Self::Null(class) => write!(formatter, "null: ?class#{}", class.0),
             Self::Class(value) => write!(formatter, "some({value})"),
+            Self::SharedPayload { reference, .. } => {
+                write!(formatter, "shared_payload({reference})")
+            }
             Self::Local { local, .. } => write!(formatter, "local{}", local.0),
             Self::Property {
                 object, property, ..

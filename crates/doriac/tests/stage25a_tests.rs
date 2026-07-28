@@ -403,6 +403,7 @@ class Node
 {
     function __construct(string $name) {}
     function __destruct() { echo "drop " . $this->name . "\n"; }
+    function label(): string { return $this->name; }
 }
 
 function main(): void
@@ -417,6 +418,10 @@ function main(): void
     ?SharedReference<Node> $acquired = $presentWeak?->acquire();
     ?SharedReference<Node> $absentAcquire = $missingWeak?->acquire();
 
+    echo ($present?->name ?? "missing") . "\n";
+    echo ($missing?->name ?? "missing") . "\n";
+    echo ($present?->label() ?? "missing") . "\n";
+    echo ($missing?->label() ?? "missing") . "\n";
     if ($sharedAgain != null) { echo $sharedAgain->name . "\n"; }
     if ($absentShare == null) { echo "no share\n"; }
     if ($acquired != null) { echo $acquired->name . "\n"; }
@@ -429,7 +434,7 @@ function main(): void
         .expect("nullable shared members should interpret");
     assert_eq!(
         output.stdout,
-        b"root\nno share\nroot\nno acquire\ndrop root\n"
+        b"root\nmissing\nroot\nmissing\nroot\nno share\nroot\nno acquire\ndrop root\n"
     );
     doriac::codegen_cranelift::lower_mir_to_object(&program)
         .expect("nullable shared members should lower through Cranelift");

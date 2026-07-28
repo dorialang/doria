@@ -3194,7 +3194,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 let owned = value.owned_temporary().is_some();
                 let value = self.lower_nullable_shared_reference_expression(value)?;
                 let result =
-                    self.lower_null_safe_shared_call(value, SHARED_RETAIN, "shared retain")?;
+                    self.lower_null_safe_shared_call(value, SHARED_RETAIN, "shared retain", true)?;
                 if owned {
                     self.defer_or_drop_shared_temporary(value, false)?;
                 }
@@ -3203,8 +3203,12 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             mir::NullableSharedReferenceExpression::NullSafeAcquire { value, .. } => {
                 let owned = value.owned_temporary().is_some();
                 let value = self.lower_nullable_weak_reference_expression(value)?;
-                let result =
-                    self.lower_null_safe_shared_call(value, SHARED_ACQUIRE, "weak acquisition")?;
+                let result = self.lower_null_safe_shared_call(
+                    value,
+                    SHARED_ACQUIRE,
+                    "weak acquisition",
+                    true,
+                )?;
                 if owned {
                     self.defer_or_drop_shared_temporary(value, true)?;
                 }
@@ -3245,6 +3249,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         value: PointerValue<'ctx>,
         symbol: &'static str,
         operation: &'static str,
+        takes_frame: bool,
     ) -> Result<PointerValue<'ctx>, BackendError> {
         let pointer = self.context.ptr_type(AddressSpace::default());
         let function = current_function(&self.builder)?;
@@ -3263,13 +3268,16 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         )?;
         build(self.builder.build_conditional_branch(present, some, none))?;
         self.builder.position_at_end(some);
-        let result = self
-            .call_runtime(
-                symbol,
+        let (params, values): (&[_], &[_]) = if takes_frame {
+            (
                 &[pointer.into(), pointer.into()],
-                Some(pointer.into()),
                 &[self.current_frame.into(), value.into()],
-            )?
+            )
+        } else {
+            (&[pointer.into()], &[value.into()])
+        };
+        let result = self
+            .call_runtime(symbol, params, Some(pointer.into()), values)?
             .ok_or_else(|| backend_failure(format!("null-safe {operation} produced no result")))?
             .into_pointer_value();
         build(self.builder.build_unconditional_branch(done))?;
@@ -3329,8 +3337,12 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             mir::NullableWeakReferenceExpression::NullSafeCreate { value, .. } => {
                 let owned = value.owned_temporary().is_some();
                 let value = self.lower_nullable_shared_reference_expression(value)?;
-                let result =
-                    self.lower_null_safe_shared_call(value, SHARED_CREATE_WEAK, "weak creation")?;
+                let result = self.lower_null_safe_shared_call(
+                    value,
+                    SHARED_CREATE_WEAK,
+                    "weak creation",
+                    true,
+                )?;
                 if owned {
                     self.defer_or_drop_shared_temporary(value, false)?;
                 }
@@ -3374,6 +3386,20 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         match expression {
             mir::NullableClassExpression::Null(_) => Ok(pointer.const_null()),
             mir::NullableClassExpression::Class(value) => self.lower_class_expression(value),
+            mir::NullableClassExpression::SharedPayload { reference, .. } => {
+                let owned = reference.owned_temporary().is_some();
+                let control = self.lower_nullable_shared_reference_expression(reference)?;
+                let payload = self.lower_null_safe_shared_call(
+                    control,
+                    SHARED_PAYLOAD,
+                    "nullable shared payload projection",
+                    false,
+                )?;
+                if owned {
+                    self.defer_or_drop_shared_temporary(control, false)?;
+                }
+                Ok(payload)
+            }
             mir::NullableClassExpression::Local {
                 local, transfer, ..
             } => {

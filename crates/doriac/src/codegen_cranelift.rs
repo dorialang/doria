@@ -3488,6 +3488,7 @@ fn lower_nullable_shared_reference_expression(
                 value,
                 SHARED_RETAIN,
                 "null-safe shared retain",
+                true,
                 resources,
             )?;
             if owned {
@@ -3503,6 +3504,7 @@ fn lower_nullable_shared_reference_expression(
                 value,
                 SHARED_ACQUIRE,
                 "null-safe weak acquisition",
+                true,
                 resources,
             )?;
             if owned {
@@ -3545,6 +3547,7 @@ fn lower_null_safe_shared_call(
     value: Value,
     symbol: &'static str,
     operation: &'static str,
+    takes_frame: bool,
     resources: &mut LoweringResources<'_, '_>,
 ) -> Result<Value, BackendError> {
     let pointer = resources.module.target_config().pointer_type();
@@ -3556,15 +3559,13 @@ fn lower_null_safe_shared_call(
     builder.append_block_param(done, pointer);
     builder.ins().brif(present, some, &[], none, &[]);
     builder.switch_to_block(some);
-    let result = runtime_call(
-        builder,
-        symbol,
-        &[pointer, pointer],
-        Some(pointer),
-        &[resources.current_frame, value],
-        resources,
-    )?
-    .ok_or_else(|| backend_failure(format!("{operation} produced no result")))?;
+    let (params, values): (&[_], &[_]) = if takes_frame {
+        (&[pointer, pointer], &[resources.current_frame, value])
+    } else {
+        (&[pointer], &[value])
+    };
+    let result = runtime_call(builder, symbol, params, Some(pointer), values, resources)?
+        .ok_or_else(|| backend_failure(format!("{operation} produced no result")))?;
     builder.ins().jump(done, &[BlockArg::Value(result)]);
     builder.switch_to_block(none);
     builder.ins().jump(done, &[BlockArg::Value(zero)]);
@@ -3618,6 +3619,7 @@ fn lower_nullable_weak_reference_expression(
                 value,
                 SHARED_CREATE_WEAK,
                 "null-safe weak creation",
+                true,
                 resources,
             )?;
             if owned {
@@ -3671,6 +3673,23 @@ fn lower_nullable_class_expression(
         mir::NullableClassExpression::Null(_) => Ok(builder.ins().iconst(pointer, 0)),
         mir::NullableClassExpression::Class(value) => {
             lower_class_expression(builder, value, resources)
+        }
+        mir::NullableClassExpression::SharedPayload { reference, .. } => {
+            let owned = reference.owned_temporary().is_some();
+            let control =
+                lower_nullable_shared_reference_expression(builder, reference, resources)?;
+            let payload = lower_null_safe_shared_call(
+                builder,
+                control,
+                SHARED_PAYLOAD,
+                "nullable shared payload projection",
+                false,
+                resources,
+            )?;
+            if owned {
+                defer_or_drop_shared_temporary(builder, control, false, resources)?;
+            }
+            Ok(payload)
         }
         mir::NullableClassExpression::Local {
             local, transfer, ..

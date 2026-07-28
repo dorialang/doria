@@ -1,6 +1,10 @@
+nullable property Existing
+nullable method Existing
 inspect Existing
 maybe Existing
 owner Existing
+absent property missing
+absent method missing
 make strong Fallback
 inspect Fallback
 drop Fallback
