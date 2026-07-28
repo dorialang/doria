@@ -483,16 +483,8 @@ impl SharedReferenceExpression {
     pub const fn owned_temporary(&self) -> Option<OwnedSharedTemporary> {
         match self {
             Self::New { .. } | Self::Share { .. } => Some(OwnedSharedTemporary::Strong),
-            Self::Coalesce {
-                left,
-                right,
-                transfer,
-                ..
-            } => {
-                if *transfer
-                    || left.owned_temporary().is_some()
-                    || right.owned_temporary().is_some()
-                {
+            Self::Coalesce { transfer, .. } => {
+                if *transfer {
                     Some(OwnedSharedTemporary::Strong)
                 } else {
                     None
@@ -551,6 +543,12 @@ pub enum WeakReferenceExpression {
         class: ClassId,
         value: Box<SharedReferenceExpression>,
     },
+    Coalesce {
+        class: ClassId,
+        left: Box<NullableWeakReferenceExpression>,
+        right: Box<WeakReferenceExpression>,
+        transfer: bool,
+    },
     CollectionIndex {
         class: ClassId,
         collection: LocalId,
@@ -567,6 +565,7 @@ impl WeakReferenceExpression {
             | Self::Property { class, .. }
             | Self::Call { class, .. }
             | Self::Create { class, .. }
+            | Self::Coalesce { class, .. }
             | Self::CollectionIndex { class, .. } => *class,
         }
     }
@@ -574,6 +573,13 @@ impl WeakReferenceExpression {
     pub const fn owned_temporary(&self) -> Option<OwnedSharedTemporary> {
         match self {
             Self::Create { .. } => Some(OwnedSharedTemporary::Weak),
+            Self::Coalesce { transfer, .. } => {
+                if *transfer {
+                    Some(OwnedSharedTemporary::Weak)
+                } else {
+                    None
+                }
+            }
             Self::Local { transfer, .. } | Self::NullableLocalAssumeNonNull { transfer, .. } => {
                 if *transfer {
                     Some(OwnedSharedTemporary::Weak)
@@ -1963,6 +1969,9 @@ fn weak_class_temporary_capacity(value: &WeakReferenceExpression) -> usize {
             args.iter().map(rvalue_class_temporary_capacity).sum()
         }
         WeakReferenceExpression::Create { value, .. } => shared_class_temporary_capacity(value),
+        WeakReferenceExpression::Coalesce { left, right, .. } => {
+            nullable_weak_class_temporary_capacity(left).max(weak_class_temporary_capacity(right))
+        }
         WeakReferenceExpression::CollectionIndex { index, .. } => {
             rvalue_class_temporary_capacity(index)
         }
@@ -2699,6 +2708,7 @@ impl fmt::Display for WeakReferenceExpression {
             ),
             Self::Call { function, args, .. } => write_call(formatter, *function, args),
             Self::Create { value, .. } => write!(formatter, "weak({value})"),
+            Self::Coalesce { left, right, .. } => write!(formatter, "({left} ?? {right})"),
             Self::CollectionIndex {
                 collection, index, ..
             } => write!(formatter, "local{}[{index}]", collection.0),

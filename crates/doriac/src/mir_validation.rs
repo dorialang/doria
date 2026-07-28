@@ -1435,6 +1435,24 @@ fn validate_weak_reference_expression(
             }
             validate_shared_reference_expression(program, function, value)
         }
+        mir::WeakReferenceExpression::Coalesce {
+            left,
+            right,
+            transfer,
+            ..
+        } => {
+            if left.class() != class || right.class() != class {
+                return Err(malformed_mir("weak coalesce changes payload class"));
+            }
+            if *transfer && (left.owned_temporary().is_none() || right.owned_temporary().is_none())
+            {
+                return Err(malformed_mir(
+                    "weak coalesce operands must transfer owned handles",
+                ));
+            }
+            validate_nullable_weak_reference_expression(program, function, left)?;
+            validate_weak_reference_expression(program, function, right)
+        }
         mir::WeakReferenceExpression::CollectionIndex {
             collection,
             index,
@@ -3240,6 +3258,10 @@ fn collect_weak_reference_class_local_accesses<'a>(
         }
         mir::WeakReferenceExpression::Create { value, .. } => {
             collect_shared_reference_class_local_accesses(value, accesses)
+        }
+        mir::WeakReferenceExpression::Coalesce { left, right, .. } => {
+            collect_nullable_weak_reference_class_local_accesses(left, accesses);
+            collect_weak_reference_class_local_accesses(right, accesses);
         }
         mir::WeakReferenceExpression::CollectionIndex { index, .. } => {
             collect_rvalue_class_local_accesses(index, accesses)
@@ -5382,6 +5404,10 @@ fn weak_reference_observes_property(
             .any(|value| rvalue_observes_property(value, receiver, property)),
         mir::WeakReferenceExpression::Create { value, .. } => {
             shared_reference_observes_property(value, receiver, property)
+        }
+        mir::WeakReferenceExpression::Coalesce { left, right, .. } => {
+            nullable_weak_reference_observes_property(left, receiver, property)
+                || weak_reference_observes_property(right, receiver, property)
         }
         mir::WeakReferenceExpression::CollectionIndex { index, .. } => {
             rvalue_observes_property(index, receiver, property)

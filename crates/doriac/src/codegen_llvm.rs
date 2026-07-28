@@ -2954,7 +2954,14 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 }
                 Ok(shared)
             }
-            mir::SharedReferenceExpression::Coalesce { left, right, .. } => {
+            mir::SharedReferenceExpression::Coalesce {
+                left,
+                right,
+                transfer,
+                ..
+            } => {
+                let left_owned = left.owned_temporary().is_some();
+                let right_owned = right.owned_temporary().is_some();
                 let left = self.lower_nullable_shared_reference_expression(left)?;
                 let function = current_function(&self.builder)?;
                 let some = self
@@ -2987,7 +2994,21 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 self.builder.position_at_end(done);
                 let phi = build(self.builder.build_phi(pointer, "shared.coalesce"))?;
                 phi.add_incoming(&[(&left, some_end), (&right, none_end)]);
-                Ok(phi.as_basic_value().into_pointer_value())
+                let result = phi.as_basic_value().into_pointer_value();
+                if !transfer && (left_owned || right_owned) {
+                    let temporary =
+                        build(self.builder.build_phi(pointer, "shared.coalesce.temporary"))?;
+                    let null = pointer.const_null();
+                    let left_temporary = if left_owned { left } else { null };
+                    let right_temporary = if right_owned { right } else { null };
+                    temporary
+                        .add_incoming(&[(&left_temporary, some_end), (&right_temporary, none_end)]);
+                    self.defer_or_drop_shared_temporary(
+                        temporary.as_basic_value().into_pointer_value(),
+                        false,
+                    )?;
+                }
+                Ok(result)
             }
             mir::SharedReferenceExpression::CollectionIndex {
                 collection,
@@ -3048,6 +3069,62 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     self.defer_or_drop_shared_temporary(value, false)?;
                 }
                 Ok(weak)
+            }
+            mir::WeakReferenceExpression::Coalesce {
+                left,
+                right,
+                transfer,
+                ..
+            } => {
+                let left_owned = left.owned_temporary().is_some();
+                let right_owned = right.owned_temporary().is_some();
+                let left = self.lower_nullable_weak_reference_expression(left)?;
+                let function = current_function(&self.builder)?;
+                let some = self
+                    .context
+                    .append_basic_block(function, "weak.coalesce.some");
+                let none = self
+                    .context
+                    .append_basic_block(function, "weak.coalesce.none");
+                let done = self
+                    .context
+                    .append_basic_block(function, "weak.coalesce.done");
+                let present = build(
+                    self.builder
+                        .build_is_not_null(left, "weak.coalesce.present"),
+                )?;
+                build(self.builder.build_conditional_branch(present, some, none))?;
+                self.builder.position_at_end(some);
+                build(self.builder.build_unconditional_branch(done))?;
+                let some_end = self
+                    .builder
+                    .get_insert_block()
+                    .expect("weak coalesce some block");
+                self.builder.position_at_end(none);
+                let right = self.lower_weak_reference_expression(right)?;
+                build(self.builder.build_unconditional_branch(done))?;
+                let none_end = self
+                    .builder
+                    .get_insert_block()
+                    .expect("weak coalesce none block");
+                self.builder.position_at_end(done);
+                let phi = build(self.builder.build_phi(pointer, "weak.coalesce"))?;
+                phi.add_incoming(&[(&left, some_end), (&right, none_end)]);
+                let result = phi.as_basic_value().into_pointer_value();
+                if !transfer && (left_owned || right_owned) {
+                    let temporary =
+                        build(self.builder.build_phi(pointer, "weak.coalesce.temporary"))?;
+                    let null = pointer.const_null();
+                    let left_temporary = if left_owned { left } else { null };
+                    let right_temporary = if right_owned { right } else { null };
+                    temporary
+                        .add_incoming(&[(&left_temporary, some_end), (&right_temporary, none_end)]);
+                    self.defer_or_drop_shared_temporary(
+                        temporary.as_basic_value().into_pointer_value(),
+                        true,
+                    )?;
+                }
+                Ok(result)
             }
             mir::WeakReferenceExpression::CollectionIndex {
                 collection,

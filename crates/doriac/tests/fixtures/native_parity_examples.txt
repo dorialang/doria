@@ -127,6 +127,7 @@ examples/native/main_stage23c_sequence_fill.doria
 examples/native/main_stage24_generic_first.doria
 examples/native/main_stage25_generic_classes.doria
 examples/native/main_stage25a_readonly_shared_ownership.doria
+examples/native/main_stage25a_shared_coalesce_ownership.doria
 examples/native/main_string_concat_hello.doria
 examples/native/main_string_comparison_42.doria
 examples/native/main_string_local_hello.doria

@@ -729,6 +729,77 @@ function main(): void
 }
 
 #[test]
+fn shared_coalesces_cleanup_only_the_selected_owned_branch() {
+    let source = r#"
+class Node
+{
+    function __construct(string $name) {}
+    function __destruct() { echo "drop " . $this->name . "\n"; }
+}
+
+function makeStrong(string $name): SharedReference<Node>
+{
+    echo "make strong " . $name . "\n";
+    return shared new Node($name);
+}
+
+function makeWeak(
+    SharedReference<Node> $strong,
+    string $label,
+): WeakReference<Node>
+{
+    echo "make weak " . $label . "\n";
+    return $strong->createWeakReference();
+}
+
+function inspect(SharedReference<Node> $node): void
+{
+    echo "inspect " . $node->name . "\n";
+}
+
+function main(): void
+{
+    let $owner = shared new Node("Existing");
+    let $weak = $owner->createWeakReference();
+    let $maybe = $weak->acquire();
+
+    inspect($maybe ?? makeStrong("unused"));
+    if ($maybe != null) { echo "maybe " . $maybe->name . "\n"; }
+    echo "owner " . $owner->name . "\n";
+
+    ?SharedReference<Node> $absentStrong = null;
+    inspect($absentStrong ?? makeStrong("Fallback"));
+
+    ?WeakReference<Node> $presentWeak = $weak;
+    let $selectedPresent = $presentWeak
+        ?? makeWeak($owner, "unused");
+
+    ?WeakReference<Node> $absentWeak = null;
+    let $selectedFallback = $absentWeak
+        ?? makeWeak($owner, "fallback");
+
+    let $presentLive = $selectedPresent->acquire();
+    if ($presentLive != null) { echo "present " . $presentLive->name . "\n"; }
+    let $fallbackLive = $selectedFallback->acquire();
+    if ($fallbackLive != null) { echo "fallback " . $fallbackLive->name . "\n"; }
+}
+"#;
+    let program = doriac::lower_source_to_mir("stage25a-coalesce-ownership.doria", source)
+        .expect("strong and weak coalesces should preserve selected-branch ownership");
+    let output = doriac::mir_interpreter::interpret(&program)
+        .expect("strong and weak coalesces should execute without ownership loss");
+    assert_eq!(
+        output.stdout,
+        b"inspect Existing\nmaybe Existing\nowner Existing\nmake strong Fallback\ninspect Fallback\ndrop Fallback\nmake weak fallback\npresent Existing\nfallback Existing\ndrop Existing\n"
+    );
+    doriac::codegen_cranelift::lower_mir_to_object(&program)
+        .expect("coalesce ownership should lower through Cranelift");
+    #[cfg(feature = "llvm-backend")]
+    doriac::codegen_llvm::lower_mir_to_object(&program)
+        .expect("coalesce ownership should lower through LLVM");
+}
+
+#[test]
 fn borrowed_dictionary_shared_results_do_not_acquire_cleanup_obligations() {
     let source = r#"
 class Node

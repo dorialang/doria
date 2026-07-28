@@ -3257,7 +3257,14 @@ fn lower_shared_reference_expression(
             }
             Ok(shared)
         }
-        mir::SharedReferenceExpression::Coalesce { left, right, .. } => {
+        mir::SharedReferenceExpression::Coalesce {
+            left,
+            right,
+            transfer,
+            ..
+        } => {
+            let left_owned = left.owned_temporary().is_some();
+            let right_owned = right.owned_temporary().is_some();
             let left = lower_nullable_shared_reference_expression(builder, left, resources)?;
             let zero = builder.ins().iconst(pointer, 0);
             let present = builder.ins().icmp(IntCC::NotEqual, left, zero);
@@ -3265,16 +3272,38 @@ fn lower_shared_reference_expression(
             let right_block = builder.create_block();
             let done = builder.create_block();
             builder.append_block_param(done, pointer);
+            builder.append_block_param(done, pointer);
             builder
                 .ins()
                 .brif(present, left_block, &[], right_block, &[]);
             builder.switch_to_block(left_block);
-            builder.ins().jump(done, &[BlockArg::Value(left)]);
+            let left_temporary = if left_owned && !transfer { left } else { zero };
+            builder.ins().jump(
+                done,
+                &[BlockArg::Value(left), BlockArg::Value(left_temporary)],
+            );
             builder.switch_to_block(right_block);
             let right = lower_shared_reference_expression(builder, right, resources)?;
-            builder.ins().jump(done, &[BlockArg::Value(right)]);
+            let right_temporary = if right_owned && !transfer {
+                right
+            } else {
+                zero
+            };
+            builder.ins().jump(
+                done,
+                &[BlockArg::Value(right), BlockArg::Value(right_temporary)],
+            );
             builder.switch_to_block(done);
-            Ok(builder.block_params(done)[0])
+            let result = builder.block_params(done)[0];
+            if !transfer && (left_owned || right_owned) {
+                defer_or_drop_shared_temporary(
+                    builder,
+                    builder.block_params(done)[1],
+                    false,
+                    resources,
+                )?;
+            }
+            Ok(result)
         }
         mir::SharedReferenceExpression::CollectionIndex {
             collection,
@@ -3338,6 +3367,54 @@ fn lower_weak_reference_expression(
                 defer_or_drop_shared_temporary(builder, value, false, resources)?;
             }
             Ok(weak)
+        }
+        mir::WeakReferenceExpression::Coalesce {
+            left,
+            right,
+            transfer,
+            ..
+        } => {
+            let left_owned = left.owned_temporary().is_some();
+            let right_owned = right.owned_temporary().is_some();
+            let left = lower_nullable_weak_reference_expression(builder, left, resources)?;
+            let zero = builder.ins().iconst(pointer, 0);
+            let present = builder.ins().icmp(IntCC::NotEqual, left, zero);
+            let left_block = builder.create_block();
+            let right_block = builder.create_block();
+            let done = builder.create_block();
+            builder.append_block_param(done, pointer);
+            builder.append_block_param(done, pointer);
+            builder
+                .ins()
+                .brif(present, left_block, &[], right_block, &[]);
+            builder.switch_to_block(left_block);
+            let left_temporary = if left_owned && !transfer { left } else { zero };
+            builder.ins().jump(
+                done,
+                &[BlockArg::Value(left), BlockArg::Value(left_temporary)],
+            );
+            builder.switch_to_block(right_block);
+            let right = lower_weak_reference_expression(builder, right, resources)?;
+            let right_temporary = if right_owned && !transfer {
+                right
+            } else {
+                zero
+            };
+            builder.ins().jump(
+                done,
+                &[BlockArg::Value(right), BlockArg::Value(right_temporary)],
+            );
+            builder.switch_to_block(done);
+            let result = builder.block_params(done)[0];
+            if !transfer && (left_owned || right_owned) {
+                defer_or_drop_shared_temporary(
+                    builder,
+                    builder.block_params(done)[1],
+                    true,
+                    resources,
+                )?;
+            }
+            Ok(result)
         }
         mir::WeakReferenceExpression::CollectionIndex {
             collection,

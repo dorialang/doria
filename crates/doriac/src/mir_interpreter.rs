@@ -330,7 +330,18 @@ enum EvaluationTask {
         transfer: bool,
     },
     FinishNullableClassCoalesceRight(Option<crate::class_layout::ClassId>),
-    AfterSharedCoalesce(mir::SharedReferenceExpression),
+    AfterSharedCoalesce {
+        right: mir::SharedReferenceExpression,
+        left_owned: bool,
+        transfer: bool,
+    },
+    FinishSharedCoalesceRight(bool),
+    AfterWeakCoalesce {
+        right: mir::WeakReferenceExpression,
+        left_owned: bool,
+        transfer: bool,
+    },
+    FinishWeakCoalesceRight(bool),
     AfterNullSafeProperty {
         property: crate::class_layout::PropertyId,
         result: mir::Type,
@@ -2415,7 +2426,11 @@ impl Interpreter<'_> {
                 }
                 self.push_nullable_class(class, object)?;
             }
-            EvaluationTask::AfterSharedCoalesce(right) => {
+            EvaluationTask::AfterSharedCoalesce {
+                right,
+                left_owned,
+                transfer,
+            } => {
                 let value = self.pop_local_value()?;
                 let LocalValue::NullableSharedReference { control, class } = value else {
                     return Err(InterpreterError::new(
@@ -2423,14 +2438,81 @@ impl Interpreter<'_> {
                     ));
                 };
                 if let Some(control) = control {
+                    if left_owned && !transfer {
+                        self.current_frame_mut()?
+                            .statement_temporary_drops
+                            .push(OwnedDrop::Shared(control.clone()));
+                    }
                     self.current_frame_mut()?
                         .values
                         .push(EvaluationValue::SharedReference { control, class });
                 } else {
-                    self.current_frame_mut()?
+                    let right_owned = !transfer && right.owned_temporary().is_some();
+                    let frame = self.current_frame_mut()?;
+                    frame
                         .tasks
-                        .push(EvaluationTask::SharedReference(right));
+                        .push(EvaluationTask::FinishSharedCoalesceRight(right_owned));
+                    frame.tasks.push(EvaluationTask::SharedReference(right));
                 }
+            }
+            EvaluationTask::FinishSharedCoalesceRight(owned) => {
+                let LocalValue::SharedReference { control, class } = self.pop_local_value()? else {
+                    return Err(InterpreterError::new(
+                        "shared coalesce fallback produced another value type",
+                    ));
+                };
+                if owned {
+                    self.current_frame_mut()?
+                        .statement_temporary_drops
+                        .push(OwnedDrop::Shared(control.clone()));
+                }
+                self.current_frame_mut()?
+                    .values
+                    .push(EvaluationValue::SharedReference { control, class });
+            }
+            EvaluationTask::AfterWeakCoalesce {
+                right,
+                left_owned,
+                transfer,
+            } => {
+                let value = self.pop_local_value()?;
+                let LocalValue::NullableWeakReference { control, class } = value else {
+                    return Err(InterpreterError::new(
+                        "weak coalesce left operand was not a nullable weak reference",
+                    ));
+                };
+                if let Some(control) = control {
+                    if left_owned && !transfer {
+                        self.current_frame_mut()?
+                            .statement_temporary_drops
+                            .push(OwnedDrop::Weak(control.clone()));
+                    }
+                    self.current_frame_mut()?
+                        .values
+                        .push(EvaluationValue::WeakReference { control, class });
+                } else {
+                    let right_owned = !transfer && right.owned_temporary().is_some();
+                    let frame = self.current_frame_mut()?;
+                    frame
+                        .tasks
+                        .push(EvaluationTask::FinishWeakCoalesceRight(right_owned));
+                    frame.tasks.push(EvaluationTask::WeakReference(right));
+                }
+            }
+            EvaluationTask::FinishWeakCoalesceRight(owned) => {
+                let LocalValue::WeakReference { control, class } = self.pop_local_value()? else {
+                    return Err(InterpreterError::new(
+                        "weak coalesce fallback produced another value type",
+                    ));
+                };
+                if owned {
+                    self.current_frame_mut()?
+                        .statement_temporary_drops
+                        .push(OwnedDrop::Weak(control.clone()));
+                }
+                self.current_frame_mut()?
+                    .values
+                    .push(EvaluationValue::WeakReference { control, class });
             }
             EvaluationTask::AfterNullSafeProperty {
                 property,
@@ -4128,11 +4210,19 @@ impl Interpreter<'_> {
                     .push(EvaluationTask::FinishSharedShare(class, drop_receiver));
                 frame.tasks.push(EvaluationTask::SharedReference(*value));
             }
-            mir::SharedReferenceExpression::Coalesce { left, right, .. } => {
+            mir::SharedReferenceExpression::Coalesce {
+                left,
+                right,
+                transfer,
+                ..
+            } => {
+                let left_owned = left.owned_temporary().is_some();
                 let frame = self.current_frame_mut()?;
-                frame
-                    .tasks
-                    .push(EvaluationTask::AfterSharedCoalesce(*right));
+                frame.tasks.push(EvaluationTask::AfterSharedCoalesce {
+                    right: *right,
+                    left_owned,
+                    transfer,
+                });
                 frame
                     .tasks
                     .push(EvaluationTask::NullableSharedReference(*left));
@@ -4252,6 +4342,23 @@ impl Interpreter<'_> {
                     .tasks
                     .push(EvaluationTask::FinishWeakCreation(class, drop_receiver));
                 frame.tasks.push(EvaluationTask::SharedReference(*value));
+            }
+            mir::WeakReferenceExpression::Coalesce {
+                left,
+                right,
+                transfer,
+                ..
+            } => {
+                let left_owned = left.owned_temporary().is_some();
+                let frame = self.current_frame_mut()?;
+                frame.tasks.push(EvaluationTask::AfterWeakCoalesce {
+                    right: *right,
+                    left_owned,
+                    transfer,
+                });
+                frame
+                    .tasks
+                    .push(EvaluationTask::NullableWeakReference(*left));
             }
             mir::WeakReferenceExpression::CollectionIndex {
                 class,

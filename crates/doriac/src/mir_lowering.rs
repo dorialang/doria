@@ -8654,6 +8654,29 @@ fn lower_weak_reference_expression(
                 args,
             })
         }
+        hir::Expr::Binary {
+            left,
+            op: hir::BinaryOp::Coalesce,
+            right,
+            ..
+        } => match context.coalesce_selection(left) {
+            CoalesceSelection::Left => {
+                lower_weak_reference_expression(left, expected, transfer, context)
+            }
+            CoalesceSelection::Right => {
+                lower_weak_reference_expression(right, expected, transfer, context)
+            }
+            CoalesceSelection::Dynamic => Ok(mir::WeakReferenceExpression::Coalesce {
+                class: expected,
+                left: Box::new(lower_nullable_weak_reference_expression(
+                    left, expected, transfer, context,
+                )?),
+                right: Box::new(lower_weak_reference_expression(
+                    right, expected, transfer, context,
+                )?),
+                transfer,
+            }),
+        },
         _ => Err(vec![unsupported(
             expr.span(),
             "this weak-reference expression is not supported by native compilation",
