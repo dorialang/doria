@@ -628,7 +628,7 @@ pub unsafe extern "C" fn dr_v1_shared_create(
 ) -> *mut DrSharedControlV1 {
     let control = allocate(mem::size_of::<DrSharedControlV1>()).cast::<DrSharedControlV1>();
     if control.is_null() {
-        panic_static(current_frame, b"shared-reference allocation failed");
+        panic_static(current_frame, b"Shared-Reference Allocation Failed");
     }
     control.write(DrSharedControlV1 {
         strong_references: 1,
@@ -650,7 +650,7 @@ pub unsafe extern "C" fn dr_v1_shared_retain(
     control: *mut DrSharedControlV1,
 ) -> *mut DrSharedControlV1 {
     let Some(next) = (*control).strong_references.checked_add(1) else {
-        panic_static(current_frame, b"shared-reference count overflow");
+        panic_static(current_frame, b"Shared-Reference Count Overflowed");
     };
     (*control).strong_references = next;
     control
@@ -694,7 +694,7 @@ pub unsafe extern "C" fn dr_v1_shared_create_weak(
     control: *mut DrSharedControlV1,
 ) -> *mut DrSharedControlV1 {
     let Some(next) = (*control).weak_references.checked_add(1) else {
-        panic_static(current_frame, b"weak-reference count overflow");
+        panic_static(current_frame, b"Weak-Reference Count Overflowed");
     };
     (*control).weak_references = next;
     control

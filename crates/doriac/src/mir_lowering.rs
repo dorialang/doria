@@ -8183,11 +8183,7 @@ fn lower_shared_reference_expression(
                 property,
             })
         }
-        hir::Expr::New {
-            shared: true,
-            span: _,
-            ..
-        } => {
+        hir::Expr::New { shared: true, .. } => {
             let mut ordinary = expr.clone();
             let hir::Expr::New { shared, .. } = &mut ordinary else {
                 unreachable!()
