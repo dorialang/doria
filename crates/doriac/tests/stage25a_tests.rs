@@ -518,7 +518,7 @@ function makeStrong(string $name): SharedReference<Node>
 
 function makeWeak(string $name): WeakReference<Node>
 {
-    return makeStrong($name)->createWeakReference();
+    return (shared new Node($name))->createWeakReference();
 }
 
 function main(): void

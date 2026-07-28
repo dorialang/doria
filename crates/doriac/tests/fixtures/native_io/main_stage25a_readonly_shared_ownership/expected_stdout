@@ -1,10 +1,18 @@
 drop expired
 expired
+drop temporary
+temporary expired
+inspect chained
+payload
+drop payload
 inspect root
 inspect root
 marker
 7:root
 inspect root
 found
+drop old
 inspect root
+drop new
 drop root
+drop chained
