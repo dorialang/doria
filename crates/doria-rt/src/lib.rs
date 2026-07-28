@@ -29,6 +29,18 @@ pub struct DrStackFrameV1 {
     pub function_name_length: usize,
 }
 
+/// Opaque shared-ownership control block.
+///
+/// The class payload remains a separately allocated, headerless native class
+/// value. Weak references keep this block alive after the payload is destroyed.
+#[repr(C)]
+pub struct DrSharedControlV1 {
+    strong_references: usize,
+    weak_references: usize,
+    payload: *mut u8,
+    drop_payload: unsafe extern "C" fn(*const DrStackFrameV1, *mut u8),
+}
+
 /// Opaque outside doria-rt. Bytes immediately follow this header.
 #[repr(C)]
 pub struct DrStringV1 {
@@ -599,6 +611,138 @@ pub unsafe extern "C" fn dr_v1_class_free(payload: *mut u8) {
     if !payload.is_null() {
         deallocate(payload);
     }
+}
+
+/// Creates the first strong reference for an already-constructed class payload.
+///
+/// # Safety
+///
+/// `payload` must be a uniquely owned live class payload and `drop_payload` must
+/// be its matching generated drop glue. Ownership transfers to the returned
+/// control block.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_shared_create(
+    current_frame: *const DrStackFrameV1,
+    payload: *mut u8,
+    drop_payload: unsafe extern "C" fn(*const DrStackFrameV1, *mut u8),
+) -> *mut DrSharedControlV1 {
+    let control = allocate(mem::size_of::<DrSharedControlV1>()).cast::<DrSharedControlV1>();
+    if control.is_null() {
+        panic_static(current_frame, b"shared-reference allocation failed");
+    }
+    control.write(DrSharedControlV1 {
+        strong_references: 1,
+        weak_references: 0,
+        payload,
+        drop_payload,
+    });
+    control
+}
+
+/// Creates one additional strong owner.
+///
+/// # Safety
+///
+/// `control` must point to a live control block with a live payload.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_shared_retain(
+    current_frame: *const DrStackFrameV1,
+    control: *mut DrSharedControlV1,
+) -> *mut DrSharedControlV1 {
+    let Some(next) = (*control).strong_references.checked_add(1) else {
+        panic_static(current_frame, b"shared-reference count overflow");
+    };
+    (*control).strong_references = next;
+    control
+}
+
+/// Releases one strong owner and destroys the payload exactly once.
+///
+/// # Safety
+///
+/// `control` must be null or hold a live strong reference. The released handle
+/// must not be used afterward.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_shared_release(
+    current_frame: *const DrStackFrameV1,
+    control: *mut DrSharedControlV1,
+) {
+    if control.is_null() {
+        return;
+    }
+    debug_assert!((*control).strong_references != 0);
+    (*control).strong_references -= 1;
+    if (*control).strong_references != 0 {
+        return;
+    }
+    let payload = (*control).payload;
+    (*control).payload = ptr::null_mut();
+    ((*control).drop_payload)(current_frame, payload);
+    if (*control).weak_references == 0 {
+        deallocate(control.cast());
+    }
+}
+
+/// Creates one weak reference without retaining the payload.
+///
+/// # Safety
+///
+/// `control` must point to a live control block with a strong reference.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_shared_create_weak(
+    current_frame: *const DrStackFrameV1,
+    control: *mut DrSharedControlV1,
+) -> *mut DrSharedControlV1 {
+    let Some(next) = (*control).weak_references.checked_add(1) else {
+        panic_static(current_frame, b"weak-reference count overflow");
+    };
+    (*control).weak_references = next;
+    control
+}
+
+/// Releases one weak reference.
+///
+/// # Safety
+///
+/// `control` must hold a live weak reference. The released handle must not be
+/// used afterward.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_shared_release_weak(control: *mut DrSharedControlV1) {
+    debug_assert!(!control.is_null());
+    debug_assert!((*control).weak_references != 0);
+    (*control).weak_references -= 1;
+    if (*control).weak_references == 0 && (*control).strong_references == 0 {
+        deallocate(control.cast());
+    }
+}
+
+/// Attempts to create a strong owner from a weak reference.
+///
+/// # Safety
+///
+/// `control` must hold a live weak reference.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_shared_acquire(
+    current_frame: *const DrStackFrameV1,
+    control: *mut DrSharedControlV1,
+) -> *mut DrSharedControlV1 {
+    if (*control).strong_references == 0 {
+        return ptr::null_mut();
+    }
+    dr_v1_shared_retain(current_frame, control)
+}
+
+/// Returns the live class payload behind a strong reference.
+///
+/// # Safety
+///
+/// `control` must point to a live control block with a strong reference.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_shared_payload(control: *const DrSharedControlV1) -> *mut u8 {
+    debug_assert!(!control.is_null());
+    debug_assert!((*control).strong_references != 0);
+    debug_assert!(!(*control).payload.is_null());
+    (*control).payload
 }
 
 /// Invokes a generated Doria integer entry function and maps its result to a process status.
@@ -2012,6 +2156,17 @@ pub extern "C" fn rust_eh_personality() {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    static SHARED_PAYLOAD_DROPS: AtomicUsize = AtomicUsize::new(0);
+
+    unsafe extern "C" fn drop_test_shared_payload(
+        _current_frame: *const DrStackFrameV1,
+        payload: *mut u8,
+    ) {
+        SHARED_PAYLOAD_DROPS.fetch_add(1, Ordering::SeqCst);
+        dr_v1_class_free(payload);
+    }
 
     unsafe fn bytes(string: *const DrStringV1) -> &'static [u8] {
         core::slice::from_raw_parts(dr_v1_string_data(string), dr_v1_string_length(string))
@@ -2043,6 +2198,38 @@ mod tests {
                 }
                 dr_v1_class_free(payload);
             }
+        }
+    }
+
+    #[test]
+    fn shared_control_drops_payload_once_and_outlives_it_for_weak_references() {
+        unsafe {
+            SHARED_PAYLOAD_DROPS.store(0, Ordering::SeqCst);
+            let payload = dr_v1_class_allocate(ptr::null(), 8, 8);
+            let control = dr_v1_shared_create(ptr::null(), payload, drop_test_shared_payload);
+
+            assert_eq!((*control).strong_references, 1);
+            assert_eq!((*control).weak_references, 0);
+            assert_eq!(dr_v1_shared_payload(control), payload);
+
+            assert_eq!(dr_v1_shared_retain(ptr::null(), control), control);
+            assert_eq!(dr_v1_shared_create_weak(ptr::null(), control), control);
+            assert_eq!((*control).strong_references, 2);
+            assert_eq!((*control).weak_references, 1);
+
+            dr_v1_shared_release(ptr::null(), control);
+            let acquired = dr_v1_shared_acquire(ptr::null(), control);
+            assert_eq!(acquired, control);
+            assert_eq!((*control).strong_references, 2);
+
+            dr_v1_shared_release(ptr::null(), acquired);
+            dr_v1_shared_release(ptr::null(), control);
+            assert_eq!(SHARED_PAYLOAD_DROPS.load(Ordering::SeqCst), 1);
+            assert_eq!((*control).strong_references, 0);
+            assert!((*control).payload.is_null());
+            assert!(dr_v1_shared_acquire(ptr::null(), control).is_null());
+
+            dr_v1_shared_release_weak(control);
         }
     }
 

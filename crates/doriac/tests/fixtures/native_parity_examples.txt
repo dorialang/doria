@@ -1,5 +1,5 @@
 # Durable executable source of truth for accepted native behavior.
-# Highest completed stage: Stage 24
+# Highest completed stage: Stage 25a Slice 2
 examples/native/main_add_overflow_panic.doria
 examples/native/main_arithmetic_42.doria
 examples/native/main_bitwise_42.doria
@@ -126,6 +126,7 @@ examples/native/main_stage23c_oversized_fill_panic.doria
 examples/native/main_stage23c_sequence_fill.doria
 examples/native/main_stage24_generic_first.doria
 examples/native/main_stage25_generic_classes.doria
+examples/native/main_stage25a_readonly_shared_ownership.doria
 examples/native/main_string_concat_hello.doria
 examples/native/main_string_comparison_42.doria
 examples/native/main_string_local_hello.doria

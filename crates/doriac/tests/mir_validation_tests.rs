@@ -4,9 +4,10 @@ use doriac::mir::{
     BasicBlock, BlockId, Class, ClassExpression, CollectionExpression, CollectionKind,
     CollectionType, CollectionTypeId, FloatBinaryOp, FloatExpression, FormatArgument,
     FormatExpression, Function, FunctionId, IntegerExpression, Local, LocalId,
-    NullableClassExpression, NullableStringExpression, Operand, Program, Property, PropertyValue,
-    PropertyValueSource, ReturnType, Rvalue, ScalarType, ScalarValue, Statement, StaticId,
-    StaticProperty, StaticValue, StringExpression, Terminator, Type, ValueExpression,
+    NullableClassExpression, NullableSharedReferenceExpression, NullableStringExpression, Operand,
+    Program, Property, PropertyValue, PropertyValueSource, ReturnType, Rvalue, ScalarType,
+    ScalarValue, SharedReferenceExpression, Statement, StaticId, StaticProperty, StaticValue,
+    StringExpression, Terminator, Type, ValueExpression, WeakReferenceExpression,
 };
 use doriac::numeric::{FloatType, FloatValue, IntegerType, IntegerValue};
 
@@ -2858,6 +2859,124 @@ fn shared_validator_rejects_cleanup_and_assignment_of_borrowed_class_locals() {
     assert!(error
         .message
         .contains("assignment targets borrowed local local0"));
+}
+
+#[test]
+fn shared_validator_rejects_mismatched_shared_reference_operations() {
+    let mut program = class_program();
+    program.functions.push(Function {
+        id: FunctionId(1),
+        name: "wrongShare".to_string(),
+        method: None,
+        receiver_mode: None,
+        params: vec![LocalId(0)],
+        return_type: ReturnType::Value(Type::SharedReference(ClassId(1))),
+        locals: vec![Local {
+            id: LocalId(0),
+            name: "value".to_string(),
+            ty: Type::SharedReference(ClassId(0)),
+            writable: false,
+            synthetic: false,
+            owned: false,
+        }],
+        blocks: vec![BasicBlock {
+            id: BlockId(0),
+            statements: vec![],
+            terminator: Terminator::Return(Rvalue::SharedReference(
+                SharedReferenceExpression::Share {
+                    class: ClassId(1),
+                    value: Box::new(SharedReferenceExpression::Local {
+                        class: ClassId(0),
+                        local: LocalId(0),
+                        transfer: false,
+                    }),
+                },
+            )),
+        }],
+        entry_block: BlockId(0),
+    });
+
+    let error = doriac::mir_validation::validate_program(&program)
+        .expect_err("share must preserve the payload class identity");
+    assert!(error.message.contains("share changes payload class"));
+}
+
+#[test]
+fn shared_validator_rejects_mismatched_weak_acquisition_and_drop() {
+    let mut program = class_program();
+    program.functions[0].locals.push(Local {
+        id: LocalId(0),
+        name: "weak".to_string(),
+        ty: Type::WeakReference(ClassId(0)),
+        writable: false,
+        synthetic: false,
+        owned: true,
+    });
+    program.functions[0].blocks[0]
+        .statements
+        .push(Statement::AssignLocal {
+            target: LocalId(0),
+            value: Rvalue::WeakReference(WeakReferenceExpression::Create {
+                class: ClassId(0),
+                value: Box::new(SharedReferenceExpression::New {
+                    class: ClassId(0),
+                    value: Box::new(ClassExpression::New {
+                        class: ClassId(0),
+                        properties: vec![],
+                        constructor: None,
+                        args: vec![],
+                    }),
+                }),
+            }),
+        });
+    program.functions[0].blocks[0]
+        .statements
+        .push(Statement::DropWeakReference {
+            local: LocalId(0),
+            class: ClassId(1),
+        });
+
+    let error = doriac::mir_validation::validate_program(&program)
+        .expect_err("weak-reference drop must use its handle's payload class");
+    assert!(error.message.contains("weak-reference drop"));
+
+    let mut acquire = class_program();
+    acquire.functions.push(Function {
+        id: FunctionId(1),
+        name: "wrongAcquire".to_string(),
+        method: None,
+        receiver_mode: None,
+        params: vec![LocalId(0)],
+        return_type: ReturnType::Value(Type::NullableSharedReference(ClassId(1))),
+        locals: vec![Local {
+            id: LocalId(0),
+            name: "weak".to_string(),
+            ty: Type::WeakReference(ClassId(0)),
+            writable: false,
+            synthetic: false,
+            owned: false,
+        }],
+        blocks: vec![BasicBlock {
+            id: BlockId(0),
+            statements: vec![],
+            terminator: Terminator::Return(Rvalue::NullableSharedReference(
+                NullableSharedReferenceExpression::Acquire {
+                    class: ClassId(1),
+                    value: Box::new(WeakReferenceExpression::Local {
+                        class: ClassId(0),
+                        local: LocalId(0),
+                        transfer: false,
+                    }),
+                },
+            )),
+        }],
+        entry_block: BlockId(0),
+    });
+    let error = doriac::mir_validation::validate_program(&acquire)
+        .expect_err("weak acquisition must preserve the payload class identity");
+    assert!(error
+        .message
+        .contains("weak acquisition changes payload class"));
 }
 
 fn decimal_spec() -> FormatSpec {

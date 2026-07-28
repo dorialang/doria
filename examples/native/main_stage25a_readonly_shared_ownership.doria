@@ -1,0 +1,63 @@
+class Node
+{
+    function __construct(string $name)
+    {
+    }
+
+    function __destruct()
+    {
+        echo "drop {$this->name}\n";
+    }
+}
+
+function inspect(SharedReference<Node> $node): void
+{
+    echo "inspect {$node->name}\n";
+}
+
+function marker(): int
+{
+    echo "marker\n";
+    return 7;
+}
+
+function inspectNamed(int $marker, SharedReference<Node> $node): void
+{
+    echo "{$marker}:{$node->name}\n";
+}
+
+function makeExpiredWeak(): WeakReference<Node>
+{
+    let $strong = shared new Node("expired");
+    return $strong->createWeakReference();
+}
+
+function main(): void
+{
+    let $expiredWeak = makeExpiredWeak();
+    let $expired = $expiredWeak->acquire();
+    if ($expired == null) {
+        echo "expired\n";
+    }
+
+    let $root = shared new Node("root");
+    let $weak = $root->createWeakReference();
+    List<SharedReference<Node>> $list = [$root->share()];
+    SharedReference<Node>[] $array = [$root->share()];
+    Dictionary<string, SharedReference<Node>> $named = [
+        "root" => $root->share(),
+    ];
+
+    inspect($root);
+    inspect($list[0]);
+    inspectNamed(node: $list[0], marker: marker());
+    inspect($array[0]);
+    if ($named->get("root") != null) {
+        echo "found\n";
+    }
+
+    let $live = $weak->acquire();
+    if ($live != null) {
+        inspect($live);
+    }
+}

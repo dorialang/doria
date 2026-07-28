@@ -3056,6 +3056,7 @@ fn resolved_type_is_move_type(ty: &crate::types::ResolvedType) -> bool {
         crate::types::ResolvedType::Bytes
         | crate::types::ResolvedType::Mixed
         | crate::types::ResolvedType::Class(_)
+        | crate::types::ResolvedType::SharedHandle(_, _)
         | crate::types::ResolvedType::TypedArray(_)
         | crate::types::ResolvedType::List(_)
         | crate::types::ResolvedType::Dictionary(_, _)
@@ -3082,6 +3083,9 @@ fn resolved_type_requires_conservative_move(ty: &crate::types::ResolvedType) -> 
             .arguments
             .iter()
             .any(resolved_type_requires_conservative_move),
+        crate::types::ResolvedType::SharedHandle(_, payload) => {
+            resolved_type_requires_conservative_move(payload)
+        }
         _ => false,
     }
 }

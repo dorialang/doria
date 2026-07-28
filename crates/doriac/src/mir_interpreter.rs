@@ -7,6 +7,14 @@ use crate::mir;
 use crate::numeric::{FloatType, FloatValue, IntegerPanic, IntegerType, IntegerValue};
 
 type SharedString = Rc<str>;
+type SharedControl = Rc<RefCell<SharedControlValue>>;
+
+#[derive(Debug, PartialEq, Eq)]
+struct SharedControlValue {
+    strong: usize,
+    weak: usize,
+    payload: Option<(usize, crate::class_layout::ClassId)>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InterpreterOutput {
@@ -67,7 +75,29 @@ enum LocalValue {
         object: Option<usize>,
         class: crate::class_layout::ClassId,
     },
+    SharedReference {
+        control: SharedControl,
+        class: crate::class_layout::ClassId,
+    },
+    WeakReference {
+        control: SharedControl,
+        class: crate::class_layout::ClassId,
+    },
+    NullableSharedReference {
+        control: Option<SharedControl>,
+        class: crate::class_layout::ClassId,
+    },
     Collection(CollectionValue),
+}
+
+#[derive(Debug, Clone)]
+enum OwnedDrop {
+    Class {
+        object: usize,
+        class: crate::class_layout::ClassId,
+    },
+    Shared(SharedControl),
+    Weak(SharedControl),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -87,6 +117,18 @@ enum EvaluationValue {
     },
     NullableClass {
         object: Option<usize>,
+        class: crate::class_layout::ClassId,
+    },
+    SharedReference {
+        control: SharedControl,
+        class: crate::class_layout::ClassId,
+    },
+    WeakReference {
+        control: SharedControl,
+        class: crate::class_layout::ClassId,
+    },
+    NullableSharedReference {
+        control: Option<SharedControl>,
         class: crate::class_layout::ClassId,
     },
     Collection(CollectionValue),
@@ -167,6 +209,15 @@ enum EvaluationTask {
     NullableMixed(mir::NullableMixedExpression),
     Class(mir::ClassExpression),
     NullableClass(mir::NullableClassExpression),
+    SharedReference(mir::SharedReferenceExpression),
+    WeakReference(mir::WeakReferenceExpression),
+    NullableSharedReference(mir::NullableSharedReferenceExpression),
+    BuildSharedReference(crate::class_layout::ClassId),
+    BuildNullableSharedSome(crate::class_layout::ClassId),
+    FinishSharedShare(crate::class_layout::ClassId),
+    FinishWeakCreation(crate::class_layout::ClassId),
+    FinishWeakAcquire(crate::class_layout::ClassId),
+    FinishSharedPayload(crate::class_layout::ClassId),
     Collection(mir::CollectionExpression),
     BuildCollection {
         collection: mir::CollectionTypeId,
@@ -206,6 +257,13 @@ enum EvaluationTask {
         class: crate::class_layout::ClassId,
         transfer: bool,
     },
+    CollectionIndexShared {
+        collection: mir::LocalId,
+        class: crate::class_layout::ClassId,
+        weak: bool,
+        nullable: bool,
+        transfer: bool,
+    },
     BuildClassNew {
         class: crate::class_layout::ClassId,
         properties: Vec<mir::PropertyValue>,
@@ -234,6 +292,7 @@ enum EvaluationTask {
     OwnNullableMixed(mir::MixedOwnership),
     NullableScalarIsPresent,
     NullableClassIsPresent(Option<crate::class_layout::ClassId>),
+    NullableSharedReferenceIsPresent(bool),
     NullableMixedIsPresent(mir::MixedOwnership),
     MixedIs {
         tag: mir::MixedTag,
@@ -316,7 +375,7 @@ enum EvaluationTask {
         temporary_arg_drops: Vec<usize>,
     },
     FinishStatement,
-    DropTemporaryClasses(Vec<(usize, crate::class_layout::ClassId)>),
+    DropTemporaryValues(Vec<OwnedDrop>),
     Assign(mir::LocalId),
     AssignStatic(mir::StaticId),
     AssignProperty {
@@ -324,6 +383,10 @@ enum EvaluationTask {
         property: crate::class_layout::PropertyId,
     },
     DropClass(mir::LocalId),
+    DropShared(mir::LocalId),
+    DropWeak(mir::LocalId),
+    ReleaseShared(SharedControl),
+    ReleaseWeak(SharedControl),
     DropCollection(mir::LocalId),
     DropObject {
         object: usize,
@@ -354,7 +417,7 @@ struct CallFrame {
     locals: Vec<Option<LocalValue>>,
     tasks: Vec<EvaluationTask>,
     values: Vec<EvaluationValue>,
-    statement_temporary_drops: Vec<(usize, crate::class_layout::ClassId)>,
+    statement_temporary_drops: Vec<OwnedDrop>,
     caller_expectation: Option<ReturnExpectation>,
 }
 
@@ -489,6 +552,12 @@ fn interpret_internal(
                         object: None,
                         class,
                     },
+                    mir::Type::NullableSharedReference(class) => {
+                        LocalValue::NullableSharedReference {
+                            control: None,
+                            class,
+                        }
+                    }
                     _ => LocalValue::NullableString(None),
                 },
             })
@@ -677,6 +746,44 @@ impl Interpreter<'_> {
                             "MIR class local received a non-class value",
                         ));
                     }
+                    (
+                        mir::Type::SharedReference(expected),
+                        mir::Rvalue::SharedReference(expression),
+                    ) if expression.class() == expected => {
+                        let frame = self.current_frame_mut()?;
+                        frame.tasks.push(EvaluationTask::Assign(target));
+                        frame
+                            .tasks
+                            .push(EvaluationTask::SharedReference(expression));
+                    }
+                    (
+                        mir::Type::WeakReference(expected),
+                        mir::Rvalue::WeakReference(expression),
+                    ) if expression.class() == expected => {
+                        let frame = self.current_frame_mut()?;
+                        frame.tasks.push(EvaluationTask::Assign(target));
+                        frame.tasks.push(EvaluationTask::WeakReference(expression));
+                    }
+                    (
+                        mir::Type::NullableSharedReference(expected),
+                        mir::Rvalue::NullableSharedReference(expression),
+                    ) if expression.class() == expected => {
+                        let frame = self.current_frame_mut()?;
+                        frame.tasks.push(EvaluationTask::Assign(target));
+                        frame
+                            .tasks
+                            .push(EvaluationTask::NullableSharedReference(expression));
+                    }
+                    (
+                        mir::Type::SharedReference(_)
+                        | mir::Type::WeakReference(_)
+                        | mir::Type::NullableSharedReference(_),
+                        _,
+                    ) => {
+                        return Err(InterpreterError::new(
+                            "MIR shared-handle local received another value type",
+                        ));
+                    }
                     (mir::Type::Collection(expected), mir::Rvalue::Collection(expression))
                         if expression.collection() == expected =>
                     {
@@ -785,6 +892,16 @@ impl Interpreter<'_> {
                 self.current_frame_mut()?
                     .tasks
                     .push(EvaluationTask::DropClass(local));
+            }
+            mir::Statement::DropSharedReference { local, .. } => {
+                self.current_frame_mut()?
+                    .tasks
+                    .push(EvaluationTask::DropShared(local));
+            }
+            mir::Statement::DropWeakReference { local, .. } => {
+                self.current_frame_mut()?
+                    .tasks
+                    .push(EvaluationTask::DropWeak(local));
             }
             mir::Statement::DropString { local } => {
                 let value = self
@@ -957,6 +1074,18 @@ impl Interpreter<'_> {
                     .current_frame_mut()?
                     .tasks
                     .push(EvaluationTask::NullableClass(value)),
+                mir::Rvalue::SharedReference(value) => self
+                    .current_frame_mut()?
+                    .tasks
+                    .push(EvaluationTask::SharedReference(value)),
+                mir::Rvalue::WeakReference(value) => self
+                    .current_frame_mut()?
+                    .tasks
+                    .push(EvaluationTask::WeakReference(value)),
+                mir::Rvalue::NullableSharedReference(value) => self
+                    .current_frame_mut()?
+                    .tasks
+                    .push(EvaluationTask::NullableSharedReference(value)),
                 mir::Rvalue::Collection(value) => self
                     .current_frame_mut()?
                     .tasks
@@ -993,6 +1122,166 @@ impl Interpreter<'_> {
             EvaluationTask::Class(expression) => self.expand_class_expression(expression)?,
             EvaluationTask::NullableClass(expression) => {
                 self.expand_nullable_class_expression(expression)?
+            }
+            EvaluationTask::SharedReference(expression) => {
+                self.expand_shared_reference_expression(expression)?
+            }
+            EvaluationTask::WeakReference(expression) => {
+                self.expand_weak_reference_expression(expression)?
+            }
+            EvaluationTask::NullableSharedReference(expression) => {
+                self.expand_nullable_shared_reference_expression(expression)?
+            }
+            EvaluationTask::BuildSharedReference(class) => {
+                let value = self.pop_local_value()?;
+                let LocalValue::Class {
+                    object,
+                    class: actual,
+                } = value
+                else {
+                    return Err(InterpreterError::new(
+                        "shared construction did not produce a class payload",
+                    ));
+                };
+                if actual != class {
+                    return Err(InterpreterError::new(
+                        "shared construction produced another payload class",
+                    ));
+                }
+                let control = Rc::new(RefCell::new(SharedControlValue {
+                    strong: 1,
+                    weak: 0,
+                    payload: Some((object, class)),
+                }));
+                self.current_frame_mut()?
+                    .values
+                    .push(EvaluationValue::SharedReference { control, class });
+            }
+            EvaluationTask::BuildNullableSharedSome(class) => {
+                let value = self.pop_local_value()?;
+                let LocalValue::SharedReference {
+                    control,
+                    class: actual,
+                } = value
+                else {
+                    return Err(InterpreterError::new(
+                        "nullable shared construction received another value type",
+                    ));
+                };
+                if actual != class {
+                    return Err(InterpreterError::new(
+                        "nullable shared construction changed payload class",
+                    ));
+                }
+                self.current_frame_mut()?
+                    .values
+                    .push(EvaluationValue::NullableSharedReference {
+                        control: Some(control),
+                        class,
+                    });
+            }
+            EvaluationTask::FinishSharedShare(class) => {
+                let value = self.pop_local_value()?;
+                let LocalValue::SharedReference {
+                    control,
+                    class: actual,
+                } = value
+                else {
+                    return Err(InterpreterError::new("share received a non-strong handle"));
+                };
+                if actual != class {
+                    return Err(InterpreterError::new("share changed payload class"));
+                }
+                let mut state = control.borrow_mut();
+                state.strong = state
+                    .strong
+                    .checked_add(1)
+                    .ok_or_else(|| InterpreterError::new("shared-reference count overflow"))?;
+                drop(state);
+                self.current_frame_mut()?
+                    .values
+                    .push(EvaluationValue::SharedReference { control, class });
+            }
+            EvaluationTask::FinishWeakCreation(class) => {
+                let value = self.pop_local_value()?;
+                let LocalValue::SharedReference {
+                    control,
+                    class: actual,
+                } = value
+                else {
+                    return Err(InterpreterError::new(
+                        "weak creation received a non-strong handle",
+                    ));
+                };
+                if actual != class {
+                    return Err(InterpreterError::new("weak creation changed payload class"));
+                }
+                let mut state = control.borrow_mut();
+                state.weak = state
+                    .weak
+                    .checked_add(1)
+                    .ok_or_else(|| InterpreterError::new("weak-reference count overflow"))?;
+                drop(state);
+                self.current_frame_mut()?
+                    .values
+                    .push(EvaluationValue::WeakReference { control, class });
+            }
+            EvaluationTask::FinishWeakAcquire(class) => {
+                let value = self.pop_local_value()?;
+                let LocalValue::WeakReference {
+                    control,
+                    class: actual,
+                } = value
+                else {
+                    return Err(InterpreterError::new("acquire received a non-weak handle"));
+                };
+                if actual != class {
+                    return Err(InterpreterError::new("acquire changed payload class"));
+                }
+                let acquired = {
+                    let mut state = control.borrow_mut();
+                    if state.strong == 0 {
+                        false
+                    } else {
+                        state.strong = state.strong.checked_add(1).ok_or_else(|| {
+                            InterpreterError::new("shared-reference count overflow")
+                        })?;
+                        true
+                    }
+                };
+                self.current_frame_mut()?
+                    .values
+                    .push(EvaluationValue::NullableSharedReference {
+                        control: acquired.then_some(control),
+                        class,
+                    });
+            }
+            EvaluationTask::FinishSharedPayload(class) => {
+                let value = self.pop_local_value()?;
+                let LocalValue::SharedReference {
+                    control,
+                    class: actual,
+                } = value
+                else {
+                    return Err(InterpreterError::new(
+                        "payload projection received a non-strong handle",
+                    ));
+                };
+                if actual != class {
+                    return Err(InterpreterError::new(
+                        "payload projection changed payload class",
+                    ));
+                }
+                let (object, actual) = control
+                    .borrow()
+                    .payload
+                    .ok_or_else(|| InterpreterError::new("strong handle has no live payload"))?;
+                self.current_frame_mut()?
+                    .values
+                    .push(EvaluationValue::Class {
+                        object,
+                        class: actual,
+                    });
             }
             EvaluationTask::Collection(expression) => {
                 self.expand_collection_expression(expression)?
@@ -1044,10 +1333,8 @@ impl Interpreter<'_> {
                         entries.push((key, value));
                     }
                 }
-                for (object, class) in drops {
-                    self.current_frame_mut()?
-                        .tasks
-                        .push(EvaluationTask::DropObject { object, class });
+                for drop in drops {
+                    self.push_owned_drop_task(drop)?;
                 }
                 self.current_frame_mut()?
                     .values
@@ -1382,6 +1669,42 @@ impl Interpreter<'_> {
                     (mir::Type::Class(class), None) => {
                         self.push_nullable_class(class, None)?;
                     }
+                    (
+                        mir::Type::SharedReference(class),
+                        Some(LocalValue::SharedReference {
+                            control,
+                            class: actual,
+                        }),
+                    ) if class == actual => self.current_frame_mut()?.values.push(
+                        EvaluationValue::NullableSharedReference {
+                            control: Some(control),
+                            class,
+                        },
+                    ),
+                    (mir::Type::SharedReference(class), None) => self
+                        .current_frame_mut()?
+                        .values
+                        .push(EvaluationValue::NullableSharedReference {
+                            control: None,
+                            class,
+                        }),
+                    (
+                        mir::Type::NullableSharedReference(class),
+                        Some(LocalValue::NullableSharedReference {
+                            control,
+                            class: actual,
+                        }),
+                    ) if class == actual => self
+                        .current_frame_mut()?
+                        .values
+                        .push(EvaluationValue::NullableSharedReference { control, class }),
+                    (mir::Type::NullableSharedReference(class), None) => self
+                        .current_frame_mut()?
+                        .values
+                        .push(EvaluationValue::NullableSharedReference {
+                            control: None,
+                            class,
+                        }),
                     _ => {
                         return Err(InterpreterError::new(
                             "Dictionary::get produced another value type",
@@ -1416,6 +1739,53 @@ impl Interpreter<'_> {
                 self.current_frame_mut()?
                     .values
                     .push(EvaluationValue::Class { object, class });
+            }
+            EvaluationTask::CollectionIndexShared {
+                collection,
+                class,
+                weak,
+                nullable,
+                transfer,
+            } => {
+                let index = self.pop_local_value()?;
+                let value = match self.collection_value_at(collection, &index, transfer) {
+                    Ok(value) => value,
+                    Err(message) => return Ok(StepOutcome::Panic(message)),
+                };
+                let value = match (weak, nullable, value) {
+                    (
+                        false,
+                        false,
+                        LocalValue::SharedReference {
+                            control,
+                            class: actual,
+                        },
+                    ) if actual == class => EvaluationValue::SharedReference { control, class },
+                    (
+                        true,
+                        false,
+                        LocalValue::WeakReference {
+                            control,
+                            class: actual,
+                        },
+                    ) if actual == class => EvaluationValue::WeakReference { control, class },
+                    (
+                        false,
+                        true,
+                        LocalValue::NullableSharedReference {
+                            control,
+                            class: actual,
+                        },
+                    ) if actual == class => {
+                        EvaluationValue::NullableSharedReference { control, class }
+                    }
+                    _ => {
+                        return Err(InterpreterError::new(
+                            "MIR indexed shared handle has another type",
+                        ))
+                    }
+                };
+                self.current_frame_mut()?.values.push(value);
             }
             EvaluationTask::BuildClassNew {
                 class,
@@ -1609,9 +1979,26 @@ impl Interpreter<'_> {
                 if let (Some(object), Some(_)) = (object, owned) {
                     self.current_frame_mut()?
                         .statement_temporary_drops
-                        .push((object, class));
+                        .push(OwnedDrop::Class { object, class });
                 }
                 self.push_scalar(mir::ScalarValue::Bool(object.is_some()))?;
+            }
+            EvaluationTask::NullableSharedReferenceIsPresent(owned) => {
+                let LocalValue::NullableSharedReference { control, .. } = self.pop_local_value()?
+                else {
+                    return Err(InterpreterError::new(
+                        "nullable shared presence test produced another value type",
+                    ));
+                };
+                let present = control.is_some();
+                if owned {
+                    if let Some(control) = control {
+                        self.current_frame_mut()?
+                            .statement_temporary_drops
+                            .push(OwnedDrop::Shared(control));
+                    }
+                }
+                self.push_scalar(mir::ScalarValue::Bool(present))?;
             }
             EvaluationTask::NullableMixedIsPresent(ownership) => {
                 let value = self.pop_nullable_mixed()?;
@@ -1701,7 +2088,7 @@ impl Interpreter<'_> {
                     if left_owned && !transfer {
                         self.current_frame_mut()?
                             .statement_temporary_drops
-                            .push((object, class));
+                            .push(OwnedDrop::Class { object, class });
                     }
                     self.current_frame_mut()?
                         .values
@@ -1724,7 +2111,7 @@ impl Interpreter<'_> {
                 if owned.is_some() {
                     self.current_frame_mut()?
                         .statement_temporary_drops
-                        .push((object, class));
+                        .push(OwnedDrop::Class { object, class });
                 }
                 self.current_frame_mut()?
                     .values
@@ -1740,7 +2127,7 @@ impl Interpreter<'_> {
                     if left_owned && !transfer {
                         self.current_frame_mut()?
                             .statement_temporary_drops
-                            .push((object, class));
+                            .push(OwnedDrop::Class { object, class });
                     }
                     self.push_nullable_class(class, Some(object))?;
                 } else {
@@ -1780,7 +2167,7 @@ impl Interpreter<'_> {
                 if let (Some(object), Some(_)) = (object, owned) {
                     self.current_frame_mut()?
                         .statement_temporary_drops
-                        .push((object, class));
+                        .push(OwnedDrop::Class { object, class });
                 }
                 self.push_nullable_class(class, object)?;
             }
@@ -1794,7 +2181,7 @@ impl Interpreter<'_> {
                     if owned_receiver.is_some() {
                         self.current_frame_mut()?
                             .statement_temporary_drops
-                            .push((object, class));
+                            .push(OwnedDrop::Class { object, class });
                     }
                     let value = self.read_object_property(object, property)?;
                     self.push_nullable_from_value(result, value)?;
@@ -1813,7 +2200,7 @@ impl Interpreter<'_> {
                     if owned_receiver.is_some() {
                         self.current_frame_mut()?
                             .statement_temporary_drops
-                            .push((object, class));
+                            .push(OwnedDrop::Class { object, class });
                     }
                     self.queue_null_safe_call(object, class, function, args, result)?;
                 } else {
@@ -1830,7 +2217,7 @@ impl Interpreter<'_> {
                     if owned_receiver.is_some() {
                         self.current_frame_mut()?
                             .statement_temporary_drops
-                            .push((object, class));
+                            .push(OwnedDrop::Class { object, class });
                     }
                     self.queue_null_safe_statement_call(object, class, function, args)?;
                 }
@@ -2113,15 +2500,12 @@ impl Interpreter<'_> {
                 if !drops.is_empty() {
                     self.current_frame_mut()?
                         .tasks
-                        .push(EvaluationTask::DropTemporaryClasses(drops));
+                        .push(EvaluationTask::DropTemporaryValues(drops));
                 }
             }
-            EvaluationTask::DropTemporaryClasses(drops) => {
-                let frame = self.current_frame_mut()?;
-                for (object, class) in drops {
-                    frame
-                        .tasks
-                        .push(EvaluationTask::DropObject { object, class });
+            EvaluationTask::DropTemporaryValues(drops) => {
+                for drop in drops {
+                    self.push_owned_drop_task(drop)?;
                 }
             }
             EvaluationTask::Assign(target) => {
@@ -2134,19 +2518,7 @@ impl Interpreter<'_> {
                     value,
                 )?;
                 if let Some(value) = old {
-                    if let Some((object, class)) = owned_object(&value) {
-                        self.current_frame_mut()?
-                            .tasks
-                            .push(EvaluationTask::DropObject { object, class });
-                    } else if let LocalValue::Collection(collection) = value {
-                        let mut drops = Vec::new();
-                        collect_owned_objects_from_collection(collection, &mut drops);
-                        for (object, class) in drops {
-                            self.current_frame_mut()?
-                                .tasks
-                                .push(EvaluationTask::DropObject { object, class });
-                        }
-                    }
+                    self.queue_value_drops(value)?;
                 }
             }
             EvaluationTask::AssignStatic(target) => {
@@ -2159,23 +2531,43 @@ impl Interpreter<'_> {
             EvaluationTask::AssignProperty { object, property } => {
                 let value = self.pop_local_value()?;
                 if let Some(old) = self.assign_property(object, property, value)? {
-                    if let Some((object, class)) = owned_object(&old) {
-                        self.current_frame_mut()?
-                            .tasks
-                            .push(EvaluationTask::DropObject { object, class });
-                    } else if let LocalValue::Collection(collection) = old {
-                        let mut drops = Vec::new();
-                        collect_owned_objects_from_collection(collection, &mut drops);
-                        for (object, class) in drops {
-                            self.current_frame_mut()?
-                                .tasks
-                                .push(EvaluationTask::DropObject { object, class });
-                        }
-                    }
+                    self.queue_value_drops(old)?;
                 }
             }
             EvaluationTask::DropClass(local) => {
                 self.drop_class_local(local)?;
+            }
+            EvaluationTask::DropShared(local) => {
+                self.drop_shared_local(local, false)?;
+            }
+            EvaluationTask::DropWeak(local) => {
+                self.drop_shared_local(local, true)?;
+            }
+            EvaluationTask::ReleaseShared(control) => {
+                let payload = {
+                    let mut state = control.borrow_mut();
+                    if state.strong == 0 {
+                        return Err(InterpreterError::new(
+                            "MIR released an exhausted strong handle",
+                        ));
+                    }
+                    state.strong -= 1;
+                    (state.strong == 0).then(|| state.payload.take()).flatten()
+                };
+                if let Some((object, class)) = payload {
+                    self.current_frame_mut()?
+                        .tasks
+                        .push(EvaluationTask::DropObject { object, class });
+                }
+            }
+            EvaluationTask::ReleaseWeak(control) => {
+                let mut state = control.borrow_mut();
+                if state.weak == 0 {
+                    return Err(InterpreterError::new(
+                        "MIR released an exhausted weak handle",
+                    ));
+                }
+                state.weak -= 1;
             }
             EvaluationTask::DropCollection(local) => {
                 self.drop_collection_local(local)?;
@@ -2424,6 +2816,16 @@ impl Interpreter<'_> {
                     .push(EvaluationTask::NullableClassIsPresent(owned));
                 frame.tasks.push(EvaluationTask::NullableClass(*value));
             }
+            mir::BoolExpression::NullableSharedReferenceIsPresent(value) => {
+                let owned = value.owned_temporary().is_some();
+                let frame = self.current_frame_mut()?;
+                frame
+                    .tasks
+                    .push(EvaluationTask::NullableSharedReferenceIsPresent(owned));
+                frame
+                    .tasks
+                    .push(EvaluationTask::NullableSharedReference(*value));
+            }
             mir::BoolExpression::NullableMixedIsPresent(value) => {
                 let ownership = value.ownership();
                 let frame = self.current_frame_mut()?;
@@ -2542,6 +2944,14 @@ impl Interpreter<'_> {
                     LocalValue::NullableScalar { .. } | LocalValue::NullableClass { .. } => {
                         return Err(InterpreterError::new(format!(
                             "MIR nullable local local{} was used as a string value",
+                            id.0
+                        )))
+                    }
+                    LocalValue::SharedReference { .. }
+                    | LocalValue::WeakReference { .. }
+                    | LocalValue::NullableSharedReference { .. } => {
+                        return Err(InterpreterError::new(format!(
+                            "MIR shared handle local local{} was used as a string value",
                             id.0
                         )))
                     }
@@ -3324,6 +3734,343 @@ impl Interpreter<'_> {
                     .values
                     .push(EvaluationValue::Class { object, class });
             }
+            mir::ClassExpression::SharedPayload { class, reference } => {
+                let frame = self.current_frame_mut()?;
+                frame.tasks.push(EvaluationTask::FinishSharedPayload(class));
+                frame
+                    .tasks
+                    .push(EvaluationTask::SharedReference(*reference));
+            }
+        }
+        Ok(())
+    }
+
+    fn expand_shared_reference_expression(
+        &mut self,
+        expression: mir::SharedReferenceExpression,
+    ) -> Result<(), InterpreterError> {
+        match expression {
+            mir::SharedReferenceExpression::New { class, value } => {
+                let frame = self.current_frame_mut()?;
+                frame
+                    .tasks
+                    .push(EvaluationTask::BuildSharedReference(class));
+                frame.tasks.push(EvaluationTask::Class(*value));
+            }
+            mir::SharedReferenceExpression::Local {
+                class,
+                local,
+                transfer,
+            } => {
+                let value = self.read_or_take_local(local, transfer)?;
+                let LocalValue::SharedReference {
+                    control,
+                    class: actual,
+                } = value
+                else {
+                    return Err(InterpreterError::new(
+                        "shared expression read another local type",
+                    ));
+                };
+                if actual != class {
+                    return Err(InterpreterError::new(
+                        "shared expression changed payload class",
+                    ));
+                }
+                self.current_frame_mut()?
+                    .values
+                    .push(EvaluationValue::SharedReference { control, class });
+            }
+            mir::SharedReferenceExpression::NullableLocalAssumeNonNull {
+                class,
+                local,
+                transfer,
+            } => {
+                let value = self.read_or_take_local(local, transfer)?;
+                let LocalValue::NullableSharedReference {
+                    control,
+                    class: actual,
+                } = value
+                else {
+                    return Err(InterpreterError::new(
+                        "nonnull shared expression read another local type",
+                    ));
+                };
+                if actual != class {
+                    return Err(InterpreterError::new(
+                        "nonnull shared expression changed payload class",
+                    ));
+                }
+                let control = control.ok_or_else(|| {
+                    InterpreterError::new("nonnull shared expression received null")
+                })?;
+                self.current_frame_mut()?
+                    .values
+                    .push(EvaluationValue::SharedReference { control, class });
+            }
+            mir::SharedReferenceExpression::Property {
+                class,
+                object,
+                property,
+            } => {
+                let value = self.read_property(object, property)?;
+                let LocalValue::SharedReference {
+                    control,
+                    class: actual,
+                } = value
+                else {
+                    return Err(InterpreterError::new(
+                        "shared property read another value type",
+                    ));
+                };
+                if actual != class {
+                    return Err(InterpreterError::new(
+                        "shared property changed payload class",
+                    ));
+                }
+                self.current_frame_mut()?
+                    .values
+                    .push(EvaluationValue::SharedReference { control, class });
+            }
+            mir::SharedReferenceExpression::Call {
+                class,
+                function,
+                args,
+                ..
+            } => self.queue_call(
+                function,
+                args,
+                ReturnExpectation::Value(mir::Type::SharedReference(class)),
+            )?,
+            mir::SharedReferenceExpression::Share { class, value } => {
+                let frame = self.current_frame_mut()?;
+                frame.tasks.push(EvaluationTask::FinishSharedShare(class));
+                frame.tasks.push(EvaluationTask::SharedReference(*value));
+            }
+            mir::SharedReferenceExpression::CollectionIndex {
+                class,
+                collection,
+                index,
+                remove,
+            } => {
+                let frame = self.current_frame_mut()?;
+                frame.tasks.push(EvaluationTask::CollectionIndexShared {
+                    collection,
+                    class,
+                    weak: false,
+                    nullable: false,
+                    transfer: remove,
+                });
+                frame.tasks.push(EvaluationTask::Rvalue(*index));
+            }
+        }
+        Ok(())
+    }
+
+    fn expand_weak_reference_expression(
+        &mut self,
+        expression: mir::WeakReferenceExpression,
+    ) -> Result<(), InterpreterError> {
+        match expression {
+            mir::WeakReferenceExpression::Local {
+                class,
+                local,
+                transfer,
+            } => {
+                let value = self.read_or_take_local(local, transfer)?;
+                let LocalValue::WeakReference {
+                    control,
+                    class: actual,
+                } = value
+                else {
+                    return Err(InterpreterError::new(
+                        "weak expression read another local type",
+                    ));
+                };
+                if actual != class {
+                    return Err(InterpreterError::new(
+                        "weak expression changed payload class",
+                    ));
+                }
+                self.current_frame_mut()?
+                    .values
+                    .push(EvaluationValue::WeakReference { control, class });
+            }
+            mir::WeakReferenceExpression::Property {
+                class,
+                object,
+                property,
+            } => {
+                let value = self.read_property(object, property)?;
+                let LocalValue::WeakReference {
+                    control,
+                    class: actual,
+                } = value
+                else {
+                    return Err(InterpreterError::new(
+                        "weak property read another value type",
+                    ));
+                };
+                if actual != class {
+                    return Err(InterpreterError::new("weak property changed payload class"));
+                }
+                self.current_frame_mut()?
+                    .values
+                    .push(EvaluationValue::WeakReference { control, class });
+            }
+            mir::WeakReferenceExpression::Call {
+                class,
+                function,
+                args,
+                ..
+            } => self.queue_call(
+                function,
+                args,
+                ReturnExpectation::Value(mir::Type::WeakReference(class)),
+            )?,
+            mir::WeakReferenceExpression::Create { class, value } => {
+                let frame = self.current_frame_mut()?;
+                frame.tasks.push(EvaluationTask::FinishWeakCreation(class));
+                frame.tasks.push(EvaluationTask::SharedReference(*value));
+            }
+            mir::WeakReferenceExpression::CollectionIndex {
+                class,
+                collection,
+                index,
+                remove,
+            } => {
+                let frame = self.current_frame_mut()?;
+                frame.tasks.push(EvaluationTask::CollectionIndexShared {
+                    collection,
+                    class,
+                    weak: true,
+                    nullable: false,
+                    transfer: remove,
+                });
+                frame.tasks.push(EvaluationTask::Rvalue(*index));
+            }
+        }
+        Ok(())
+    }
+
+    fn expand_nullable_shared_reference_expression(
+        &mut self,
+        expression: mir::NullableSharedReferenceExpression,
+    ) -> Result<(), InterpreterError> {
+        match expression {
+            mir::NullableSharedReferenceExpression::Null(class) => self
+                .current_frame_mut()?
+                .values
+                .push(EvaluationValue::NullableSharedReference {
+                    control: None,
+                    class,
+                }),
+            mir::NullableSharedReferenceExpression::Shared(value) => {
+                let class = value.class();
+                let frame = self.current_frame_mut()?;
+                frame
+                    .tasks
+                    .push(EvaluationTask::BuildNullableSharedSome(class));
+                frame.tasks.push(EvaluationTask::SharedReference(value));
+            }
+            mir::NullableSharedReferenceExpression::Local {
+                class,
+                local,
+                transfer,
+            } => {
+                let value = self.read_or_take_local(local, transfer)?;
+                let LocalValue::NullableSharedReference {
+                    control,
+                    class: actual,
+                } = value
+                else {
+                    return Err(InterpreterError::new(
+                        "nullable shared expression read another local type",
+                    ));
+                };
+                if actual != class {
+                    return Err(InterpreterError::new(
+                        "nullable shared expression changed payload class",
+                    ));
+                }
+                self.current_frame_mut()?
+                    .values
+                    .push(EvaluationValue::NullableSharedReference { control, class });
+            }
+            mir::NullableSharedReferenceExpression::Property {
+                class,
+                object,
+                property,
+            } => {
+                let value = self.read_property(object, property)?;
+                let LocalValue::NullableSharedReference {
+                    control,
+                    class: actual,
+                } = value
+                else {
+                    return Err(InterpreterError::new(
+                        "nullable shared property read another value type",
+                    ));
+                };
+                if actual != class {
+                    return Err(InterpreterError::new(
+                        "nullable shared property changed payload class",
+                    ));
+                }
+                self.current_frame_mut()?
+                    .values
+                    .push(EvaluationValue::NullableSharedReference { control, class });
+            }
+            mir::NullableSharedReferenceExpression::Call {
+                class,
+                function,
+                args,
+                ..
+            } => self.queue_call(
+                function,
+                args,
+                ReturnExpectation::Value(mir::Type::NullableSharedReference(class)),
+            )?,
+            mir::NullableSharedReferenceExpression::Acquire { class, value } => {
+                let frame = self.current_frame_mut()?;
+                frame.tasks.push(EvaluationTask::FinishWeakAcquire(class));
+                frame.tasks.push(EvaluationTask::WeakReference(*value));
+            }
+            mir::NullableSharedReferenceExpression::DictionaryGet {
+                class,
+                collection,
+                key,
+                access,
+                stored_nullable,
+            } => {
+                let frame = self.current_frame_mut()?;
+                frame.tasks.push(EvaluationTask::DictionaryGet {
+                    collection,
+                    expected: if stored_nullable {
+                        mir::Type::NullableSharedReference(class)
+                    } else {
+                        mir::Type::SharedReference(class)
+                    },
+                    access,
+                });
+                frame.tasks.push(EvaluationTask::Rvalue(*key));
+            }
+            mir::NullableSharedReferenceExpression::CollectionIndex {
+                class,
+                collection,
+                index,
+                remove,
+            } => {
+                let frame = self.current_frame_mut()?;
+                frame.tasks.push(EvaluationTask::CollectionIndexShared {
+                    collection,
+                    class,
+                    weak: false,
+                    nullable: true,
+                    transfer: remove,
+                });
+                frame.tasks.push(EvaluationTask::Rvalue(*index));
+            }
         }
         Ok(())
     }
@@ -3509,10 +4256,8 @@ impl Interpreter<'_> {
                         collect_owned_objects_from_value(value, &mut drops);
                     }
                 }
-                for (object, class) in drops {
-                    self.current_frame_mut()?
-                        .tasks
-                        .push(EvaluationTask::DropObject { object, class });
+                for drop in drops {
+                    self.push_owned_drop_task(drop)?;
                 }
                 self.current_frame_mut()?
                     .values
@@ -3886,6 +4631,15 @@ impl Interpreter<'_> {
                     LocalValue::NullableClass { object, class } => {
                         EvaluationValue::NullableClass { object, class }
                     }
+                    LocalValue::SharedReference { control, class } => {
+                        EvaluationValue::SharedReference { control, class }
+                    }
+                    LocalValue::WeakReference { control, class } => {
+                        EvaluationValue::WeakReference { control, class }
+                    }
+                    LocalValue::NullableSharedReference { control, class } => {
+                        EvaluationValue::NullableSharedReference { control, class }
+                    }
                     LocalValue::Collection(value) => EvaluationValue::Collection(value),
                 });
             }
@@ -3952,6 +4706,15 @@ impl Interpreter<'_> {
                 EvaluationValue::NullableClass { object, class } => {
                     Ok(LocalValue::NullableClass { object, class })
                 }
+                EvaluationValue::SharedReference { control, class } => {
+                    Ok(LocalValue::SharedReference { control, class })
+                }
+                EvaluationValue::WeakReference { control, class } => {
+                    Ok(LocalValue::WeakReference { control, class })
+                }
+                EvaluationValue::NullableSharedReference { control, class } => {
+                    Ok(LocalValue::NullableSharedReference { control, class })
+                }
                 EvaluationValue::Collection(value) => Ok(LocalValue::Collection(value)),
             })
             .collect()
@@ -3982,6 +4745,11 @@ impl Interpreter<'_> {
             )),
             Some(EvaluationValue::Class { .. }) => Err(InterpreterError::new(
                 "MIR scalar evaluation produced a class",
+            )),
+            Some(EvaluationValue::SharedReference { .. })
+            | Some(EvaluationValue::WeakReference { .. })
+            | Some(EvaluationValue::NullableSharedReference { .. }) => Err(InterpreterError::new(
+                "MIR scalar evaluation produced a shared handle",
             )),
             Some(EvaluationValue::Collection(_)) => Err(InterpreterError::new(
                 "MIR scalar evaluation produced a collection",
@@ -4017,6 +4785,11 @@ impl Interpreter<'_> {
             )),
             Some(EvaluationValue::Class { .. }) => Err(InterpreterError::new(
                 "MIR string evaluation produced a class",
+            )),
+            Some(EvaluationValue::SharedReference { .. })
+            | Some(EvaluationValue::WeakReference { .. })
+            | Some(EvaluationValue::NullableSharedReference { .. }) => Err(InterpreterError::new(
+                "MIR string evaluation produced a shared handle",
             )),
             Some(EvaluationValue::Collection(_)) => Err(InterpreterError::new(
                 "MIR string evaluation produced a collection",
@@ -4209,6 +4982,15 @@ impl Interpreter<'_> {
             Some(EvaluationValue::NullableClass { object, class }) => {
                 Ok(LocalValue::NullableClass { object, class })
             }
+            Some(EvaluationValue::SharedReference { control, class }) => {
+                Ok(LocalValue::SharedReference { control, class })
+            }
+            Some(EvaluationValue::WeakReference { control, class }) => {
+                Ok(LocalValue::WeakReference { control, class })
+            }
+            Some(EvaluationValue::NullableSharedReference { control, class }) => {
+                Ok(LocalValue::NullableSharedReference { control, class })
+            }
             Some(EvaluationValue::Collection(value)) => Ok(LocalValue::Collection(value)),
             None => Err(InterpreterError::new("MIR evaluation produced no value")),
         }
@@ -4227,6 +5009,15 @@ impl Interpreter<'_> {
             LocalValue::Class { object, class } => EvaluationValue::Class { object, class },
             LocalValue::NullableClass { object, class } => {
                 EvaluationValue::NullableClass { object, class }
+            }
+            LocalValue::SharedReference { control, class } => {
+                EvaluationValue::SharedReference { control, class }
+            }
+            LocalValue::WeakReference { control, class } => {
+                EvaluationValue::WeakReference { control, class }
+            }
+            LocalValue::NullableSharedReference { control, class } => {
+                EvaluationValue::NullableSharedReference { control, class }
             }
             LocalValue::Collection(value) => EvaluationValue::Collection(value),
         };
@@ -4329,6 +5120,14 @@ impl Interpreter<'_> {
                     "MIR class local local{} was used as a scalar value",
                     id.0
                 ))),
+                LocalValue::SharedReference { .. }
+                | LocalValue::WeakReference { .. }
+                | LocalValue::NullableSharedReference { .. } => {
+                    Err(InterpreterError::new(format!(
+                        "MIR shared handle local local{} was used as a scalar value",
+                        id.0
+                    )))
+                }
                 LocalValue::Collection(_) => Err(InterpreterError::new(format!(
                     "MIR collection local local{} was used as a scalar value",
                     id.0
@@ -4507,6 +5306,74 @@ impl Interpreter<'_> {
         Ok(())
     }
 
+    fn read_or_take_local(
+        &mut self,
+        local: mir::LocalId,
+        transfer: bool,
+    ) -> Result<LocalValue, InterpreterError> {
+        if transfer {
+            return self
+                .current_frame_mut()?
+                .locals
+                .get_mut(local.0)
+                .ok_or_else(|| {
+                    InterpreterError::new(format!("MIR local local{} does not exist", local.0))
+                })?
+                .take()
+                .ok_or_else(|| {
+                    InterpreterError::new(format!(
+                        "MIR local local{} was moved before use",
+                        local.0
+                    ))
+                });
+        }
+        Ok(read_local(&self.current_frame()?.locals, local)?.clone())
+    }
+
+    fn drop_shared_local(
+        &mut self,
+        local: mir::LocalId,
+        weak: bool,
+    ) -> Result<(), InterpreterError> {
+        let Some(value) = self
+            .current_frame_mut()?
+            .locals
+            .get_mut(local.0)
+            .ok_or_else(|| {
+                InterpreterError::new(format!("MIR local local{} does not exist", local.0))
+            })?
+            .take()
+        else {
+            return Ok(());
+        };
+        let control = match (weak, value) {
+            (false, LocalValue::SharedReference { control, .. })
+            | (
+                false,
+                LocalValue::NullableSharedReference {
+                    control: Some(control),
+                    ..
+                },
+            ) => Some(control),
+            (false, LocalValue::NullableSharedReference { control: None, .. }) => None,
+            (true, LocalValue::WeakReference { control, .. }) => Some(control),
+            _ => {
+                return Err(InterpreterError::new(format!(
+                    "MIR shared drop local{} contained another value type",
+                    local.0
+                )))
+            }
+        };
+        if let Some(control) = control {
+            self.current_frame_mut()?.tasks.push(if weak {
+                EvaluationTask::ReleaseWeak(control)
+            } else {
+                EvaluationTask::ReleaseShared(control)
+            });
+        }
+        Ok(())
+    }
+
     fn queue_object_drop(
         &mut self,
         object: usize,
@@ -4560,10 +5427,12 @@ impl Interpreter<'_> {
             }
         }
         let frame = self.current_frame_mut()?;
-        for (object, class) in drops.into_iter().rev() {
-            frame
-                .tasks
-                .push(EvaluationTask::DropObject { object, class });
+        for drop in drops.into_iter().rev() {
+            frame.tasks.push(match drop {
+                OwnedDrop::Class { object, class } => EvaluationTask::DropObject { object, class },
+                OwnedDrop::Shared(control) => EvaluationTask::ReleaseShared(control),
+                OwnedDrop::Weak(control) => EvaluationTask::ReleaseWeak(control),
+            });
         }
         Ok(())
     }
@@ -4786,10 +5655,8 @@ impl Interpreter<'_> {
         if let Some(LocalValue::Collection(collection)) = value {
             let mut drops = Vec::new();
             collect_owned_objects_from_collection(collection, &mut drops);
-            for (object, class) in drops {
-                self.current_frame_mut()?
-                    .tasks
-                    .push(EvaluationTask::DropObject { object, class });
+            for drop in drops {
+                self.push_owned_drop_task(drop)?;
             }
         }
         Ok(())
@@ -4811,11 +5678,18 @@ impl Interpreter<'_> {
     fn queue_value_drops(&mut self, value: LocalValue) -> Result<(), InterpreterError> {
         let mut drops = Vec::new();
         collect_owned_objects_from_value(value, &mut drops);
-        for (object, class) in drops {
-            self.current_frame_mut()?
-                .tasks
-                .push(EvaluationTask::DropObject { object, class });
+        for drop in drops {
+            self.push_owned_drop_task(drop)?;
         }
+        Ok(())
+    }
+
+    fn push_owned_drop_task(&mut self, drop: OwnedDrop) -> Result<(), InterpreterError> {
+        self.current_frame_mut()?.tasks.push(match drop {
+            OwnedDrop::Class { object, class } => EvaluationTask::DropObject { object, class },
+            OwnedDrop::Shared(control) => EvaluationTask::ReleaseShared(control),
+            OwnedDrop::Weak(control) => EvaluationTask::ReleaseWeak(control),
+        });
         Ok(())
     }
 
@@ -5001,6 +5875,11 @@ fn local_value_type(value: &LocalValue) -> mir::Type {
         LocalValue::NullableMixed(_) => mir::Type::NullableMixed,
         LocalValue::Class { class, .. } => mir::Type::Class(*class),
         LocalValue::NullableClass { class, .. } => mir::Type::NullableClass(*class),
+        LocalValue::SharedReference { class, .. } => mir::Type::SharedReference(*class),
+        LocalValue::WeakReference { class, .. } => mir::Type::WeakReference(*class),
+        LocalValue::NullableSharedReference { class, .. } => {
+            mir::Type::NullableSharedReference(*class)
+        }
         LocalValue::Collection(value) => mir::Type::Collection(value.ty),
     }
 }
@@ -5011,6 +5890,7 @@ fn non_nullable_type(ty: mir::Type) -> Option<mir::Type> {
         mir::Type::NullableString => Some(mir::Type::String),
         mir::Type::NullableMixed => Some(mir::Type::Mixed),
         mir::Type::NullableClass(class) => Some(mir::Type::Class(class)),
+        mir::Type::NullableSharedReference(class) => Some(mir::Type::SharedReference(class)),
         mir::Type::Collection(_) => None,
         _ => None,
     }
@@ -5056,10 +5936,7 @@ fn retain_mixed_claim(value: &mut MixedValue, ownership: mir::MixedOwnership) {
     }
 }
 
-fn collect_owned_objects_from_collection(
-    collection: CollectionValue,
-    drops: &mut Vec<(usize, crate::class_layout::ClassId)>,
-) {
+fn collect_owned_objects_from_collection(collection: CollectionValue, drops: &mut Vec<OwnedDrop>) {
     for (key, value) in collection.entries().iter().cloned() {
         if let Some(key) = key {
             collect_owned_objects_from_value(key, drops);
@@ -5068,14 +5945,22 @@ fn collect_owned_objects_from_collection(
     }
 }
 
-fn collect_owned_objects_from_value(
-    value: LocalValue,
-    drops: &mut Vec<(usize, crate::class_layout::ClassId)>,
-) {
-    if let Some(object) = owned_object(&value) {
-        drops.push(object);
-    } else if let LocalValue::Collection(collection) = value {
-        collect_owned_objects_from_collection(collection, drops);
+fn collect_owned_objects_from_value(value: LocalValue, drops: &mut Vec<OwnedDrop>) {
+    match value {
+        LocalValue::SharedReference { control, .. } => drops.push(OwnedDrop::Shared(control)),
+        LocalValue::WeakReference { control, .. } => drops.push(OwnedDrop::Weak(control)),
+        LocalValue::NullableSharedReference {
+            control: Some(control),
+            ..
+        } => drops.push(OwnedDrop::Shared(control)),
+        LocalValue::Collection(collection) => {
+            collect_owned_objects_from_collection(collection, drops)
+        }
+        value => {
+            if let Some((object, class)) = owned_object(&value) {
+                drops.push(OwnedDrop::Class { object, class });
+            }
+        }
     }
 }
 
@@ -5290,6 +6175,15 @@ fn assign_local(
         (mir::Type::NullableClass(expected), LocalValue::NullableClass { class, .. }) if expected == *class
     ) || matches!(
         (definition.ty, &value),
+        (mir::Type::SharedReference(expected), LocalValue::SharedReference { class, .. }) if expected == *class
+    ) || matches!(
+        (definition.ty, &value),
+        (mir::Type::WeakReference(expected), LocalValue::WeakReference { class, .. }) if expected == *class
+    ) || matches!(
+        (definition.ty, &value),
+        (mir::Type::NullableSharedReference(expected), LocalValue::NullableSharedReference { class, .. }) if expected == *class
+    ) || matches!(
+        (definition.ty, &value),
         (mir::Type::Collection(expected), LocalValue::Collection(collection)) if expected == collection.ty
     );
     if !compatible {
@@ -5306,6 +6200,9 @@ fn assign_local(
             LocalValue::NullableMixed(_) => "?mixed",
             LocalValue::Class { .. } => "class",
             LocalValue::NullableClass { .. } => "nullable class",
+            LocalValue::SharedReference { .. } => "shared reference",
+            LocalValue::WeakReference { .. } => "weak reference",
+            LocalValue::NullableSharedReference { .. } => "nullable shared reference",
             LocalValue::Collection(_) => "collection",
         };
         return Err(InterpreterError::new(format!(
@@ -5370,6 +6267,7 @@ fn temporary_argument_drop_order(
     for (index, argument) in args.iter().enumerate() {
         let temporary = argument.owned_temporary_class().is_some()
             || argument.owned_temporary_collection().is_some()
+            || argument.owned_temporary_shared().is_some()
             || argument.mixed_ownership() == mir::MixedOwnership::Owned;
         if !temporary || promoted(index) {
             continue;

@@ -44,6 +44,13 @@ pub const STRING_FROM_F64: &str = "dr_v1_string_from_f64";
 pub const STRING_FROM_BOOL: &str = "dr_v1_string_from_bool";
 pub const CLASS_ALLOCATE: &str = "dr_v1_class_allocate";
 pub const CLASS_FREE: &str = "dr_v1_class_free";
+pub const SHARED_CREATE: &str = "dr_v1_shared_create";
+pub const SHARED_RETAIN: &str = "dr_v1_shared_retain";
+pub const SHARED_RELEASE: &str = "dr_v1_shared_release";
+pub const SHARED_CREATE_WEAK: &str = "dr_v1_shared_create_weak";
+pub const SHARED_RELEASE_WEAK: &str = "dr_v1_shared_release_weak";
+pub const SHARED_ACQUIRE: &str = "dr_v1_shared_acquire";
+pub const SHARED_PAYLOAD: &str = "dr_v1_shared_payload";
 pub const MIXED_NEW: &str = "dr_v1_mixed_new";
 pub const MIXED_NEW_BORROWED: &str = "dr_v1_mixed_new_borrowed";
 pub const MIXED_CLONE_OWNED: &str = "dr_v1_mixed_clone_owned";
@@ -107,9 +114,13 @@ pub const fn collection_value_width(ty: mir::Type, pointer_width: u8) -> Option<
         mir::Type::Scalar(mir::ScalarType::Integer(ty)) => Some(ty.storage_bytes() as u8),
         mir::Type::Scalar(mir::ScalarType::Float(crate::numeric::FloatType::Float32)) => Some(4),
         mir::Type::Scalar(mir::ScalarType::Float(crate::numeric::FloatType::Float64)) => Some(8),
-        mir::Type::String | mir::Type::Mixed | mir::Type::Class(_) | mir::Type::Collection(_) => {
-            Some(pointer_width)
-        }
+        mir::Type::String
+        | mir::Type::Mixed
+        | mir::Type::Class(_)
+        | mir::Type::SharedReference(_)
+        | mir::Type::WeakReference(_)
+        | mir::Type::NullableSharedReference(_)
+        | mir::Type::Collection(_) => Some(pointer_width),
         mir::Type::NullableScalar(_)
         | mir::Type::NullableString
         | mir::Type::NullableMixed
