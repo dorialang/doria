@@ -198,9 +198,10 @@ fn clif_scalar_type(ty: mir::ScalarType) -> ClifType {
 fn scalar_abi_param(ty: mir::ScalarType) -> AbiParam {
     match ty {
         mir::ScalarType::Integer(ty) => integer_abi_param(ty),
-        // Doria-to-Doria calls carry float32 as its exact IEEE bit pattern.
-        // This private ABI avoids platform C ABI register-slot differences.
+        // The private Doria ABI uses full register slots for narrow values so
+        // platform C ABI extension rules cannot change internal calls.
         mir::ScalarType::Float(FloatType::Float32) => AbiParam::new(types::I32),
+        mir::ScalarType::Bool => AbiParam::new(types::I32),
         _ => AbiParam::new(clif_scalar_type(ty)),
     }
 }
@@ -285,20 +286,29 @@ fn value_to_doria_abi(
                 .ins()
                 .bitcast(types::I32, MemFlagsData::new(), payload),
         },
+        (LoweredValue::Single(value), mir::Type::Scalar(mir::ScalarType::Bool)) => {
+            LoweredValue::Single(builder.ins().uextend(types::I32, value))
+        }
+        (
+            LoweredValue::Nullable { present, payload },
+            mir::Type::NullableScalar(mir::ScalarType::Bool),
+        ) => LoweredValue::Nullable {
+            present,
+            payload: builder.ins().uextend(types::I32, payload),
+        },
         (value, _) => value,
     }
 }
 
 fn value_from_doria_abi(builder: &mut FunctionBuilder, value: Value, ty: mir::Type) -> Value {
-    if matches!(
-        ty,
-        mir::Type::Scalar(mir::ScalarType::Float(FloatType::Float32))
-    ) {
-        builder
-            .ins()
-            .bitcast(types::F32, MemFlagsData::new(), value)
-    } else {
-        value
+    match ty {
+        mir::Type::Scalar(mir::ScalarType::Float(FloatType::Float32)) => {
+            builder
+                .ins()
+                .bitcast(types::F32, MemFlagsData::new(), value)
+        }
+        mir::Type::Scalar(mir::ScalarType::Bool) => builder.ins().ireduce(types::I8, value),
+        _ => value,
     }
 }
 
@@ -307,15 +317,14 @@ fn nullable_payload_from_doria_abi(
     payload: Value,
     ty: mir::Type,
 ) -> Value {
-    if matches!(
-        ty,
-        mir::Type::NullableScalar(mir::ScalarType::Float(FloatType::Float32))
-    ) {
-        builder
+    match ty {
+        mir::Type::NullableScalar(mir::ScalarType::Float(FloatType::Float32)) => builder
             .ins()
-            .bitcast(types::F32, MemFlagsData::new(), payload)
-    } else {
-        payload
+            .bitcast(types::F32, MemFlagsData::new(), payload),
+        mir::Type::NullableScalar(mir::ScalarType::Bool) => {
+            builder.ins().ireduce(types::I8, payload)
+        }
+        _ => payload,
     }
 }
 
