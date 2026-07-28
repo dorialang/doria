@@ -1148,6 +1148,55 @@ function main(): void
 }
 
 #[test]
+fn nullable_weak_temporaries_transfer_through_reordered_calls_and_cleanup_returns() {
+    let source = r#"
+class Node
+{
+    function __construct(string $name) {}
+    function __destruct() { echo "drop " . $this->name . "\n"; }
+}
+
+class Cleanup
+{
+    function __destruct() { echo "cleanup\n"; }
+}
+
+function marker(): int
+{
+    echo "marker\n";
+    return 7;
+}
+
+function makeWeak(SharedReference<Node> $node): ?WeakReference<Node>
+{
+    let $cleanup = new Cleanup();
+    return $node->createWeakReference();
+}
+
+function consume(int $marker, take ?WeakReference<Node> $weak): void
+{
+    if ($weak != null) { echo "{$marker}:alive\n"; }
+}
+
+function main(): void
+{
+    let $node = shared new Node("root");
+    consume(weak: makeWeak($node), marker: marker());
+}
+"#;
+    let program = doriac::lower_source_to_mir("stage25a-nullable-weak-transfer.doria", source)
+        .expect("nullable weak temporaries should transfer through cleanup and reordered calls");
+    let output = doriac::mir_interpreter::interpret(&program)
+        .expect("nullable weak temporary ownership should remain balanced");
+    assert_eq!(output.stdout, b"cleanup\nmarker\n7:alive\ndrop root\n");
+    doriac::codegen_cranelift::lower_mir_to_object(&program)
+        .expect("nullable weak temporary ownership should lower through Cranelift");
+    #[cfg(feature = "llvm-backend")]
+    doriac::codegen_llvm::lower_mir_to_object(&program)
+        .expect("nullable weak temporary ownership should lower through LLVM");
+}
+
+#[test]
 fn readonly_family_rejects_concrete_non_class_payloads() {
     // Record 0106: the readonly family accepts class payloads only in v1.0.
     for declaration in [

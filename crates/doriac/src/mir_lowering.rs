@@ -5565,18 +5565,7 @@ fn hoist_argument_temporary(
 
 /// Read a temporary local back as an rvalue of its own type.
 fn read_local_as_rvalue(local: mir::LocalId, ty: mir::Type, transfer_owned: bool) -> mir::Rvalue {
-    let transfer = transfer_owned
-        && matches!(
-            ty,
-            mir::Type::Mixed
-                | mir::Type::NullableMixed
-                | mir::Type::Class(_)
-                | mir::Type::NullableClass(_)
-                | mir::Type::SharedReference(_)
-                | mir::Type::WeakReference(_)
-                | mir::Type::NullableSharedReference(_)
-                | mir::Type::Collection(_)
-        );
+    let transfer = transfer_owned && ty.has_move_ownership();
     local_rvalue(local, ty, transfer)
 }
 
@@ -5756,17 +5745,7 @@ fn lower_return(
                 )]);
             }
             if context.has_cleanup_obligations() {
-                let result_owns = match expected {
-                    mir::Type::Class(_)
-                    | mir::Type::NullableClass(_)
-                    | mir::Type::SharedReference(_)
-                    | mir::Type::WeakReference(_)
-                    | mir::Type::NullableSharedReference(_)
-                    | mir::Type::Collection(_)
-                    | mir::Type::Mixed
-                    | mir::Type::NullableMixed => !borrowed_move,
-                    _ => false,
-                };
+                let result_owns = expected.has_move_ownership() && !borrowed_move;
                 let result = context.declare_return_temp(expected, result_owns);
                 context.push_statement(mir::Statement::AssignLocal {
                     target: result,

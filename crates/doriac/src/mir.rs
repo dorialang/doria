@@ -183,6 +183,23 @@ pub enum Type {
     Collection(CollectionTypeId),
 }
 
+impl Type {
+    pub const fn has_move_ownership(self) -> bool {
+        matches!(
+            self,
+            Self::Mixed
+                | Self::NullableMixed
+                | Self::Class(_)
+                | Self::NullableClass(_)
+                | Self::SharedReference(_)
+                | Self::WeakReference(_)
+                | Self::NullableSharedReference(_)
+                | Self::NullableWeakReference(_)
+                | Self::Collection(_)
+        )
+    }
+}
+
 impl From<ScalarType> for Type {
     fn from(value: ScalarType) -> Self {
         Self::Scalar(value)
