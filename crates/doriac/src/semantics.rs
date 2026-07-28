@@ -630,6 +630,15 @@ fn expand_class_instantiations(
         let instance = instances[cursor].clone();
         cursor += 1;
         expanded.insert(instance.clone());
+        let instance_span = program
+            .items
+            .iter()
+            .find_map(|item| match item {
+                Item::Class(class) if class.name == instance.name => Some(class.span),
+                _ => None,
+            })
+            .unwrap_or_default();
+        checker.check_specialized_class_shared_payloads(&instance, instance_span);
         let Some(templates) = checker
             .class_instantiation_templates
             .get(&instance.name)
@@ -4030,7 +4039,8 @@ impl<'program> Checker<'program> {
                     scopes,
                     method_context,
                 );
-                if let Some((kind, _)) = self.shared_handle_of(object, scopes, method_context) {
+                let object_ty = self.infer_expr_type(object, scopes, method_context);
+                if let Some((kind, _)) = self.shared_handle_type(object_ty, *null_safe) {
                     if kind == SharedHandleKind::SharedReference && property == "referencedValue" {
                         // The compiler-known readonly projection; nothing to look up.
                     } else if !Self::shared_handle_forwards(kind) {
@@ -5180,7 +5190,8 @@ impl<'program> Checker<'program> {
             TypeKind::Nullable(inner)
             | TypeKind::TypedArray(inner)
             | TypeKind::List(inner)
-            | TypeKind::Set(inner) => self.type_is_symbolic(*inner),
+            | TypeKind::Set(inner)
+            | TypeKind::SharedHandle(_, inner) => self.type_is_symbolic(*inner),
             TypeKind::Dictionary(key, value) => {
                 self.type_is_symbolic(*key) || self.type_is_symbolic(*value)
             }
@@ -5246,6 +5257,10 @@ impl<'program> Checker<'program> {
             TypeKind::Set(element) => {
                 let element = self.substitute_type_id(element, substitutions);
                 self.types.intern(TypeKind::Set(element))
+            }
+            TypeKind::SharedHandle(kind, payload) => {
+                let payload = self.substitute_type_id(payload, substitutions);
+                self.types.intern(TypeKind::SharedHandle(kind, payload))
             }
             TypeKind::Class(class) => {
                 let arguments = class
@@ -6946,7 +6961,7 @@ impl<'program> Checker<'program> {
             function.declaration,
             &HashMap::new(),
         );
-        FunctionInfo {
+        let specialized = FunctionInfo {
             declaration: function.declaration,
             type_params: function.type_params.clone(),
             params: function
@@ -6956,7 +6971,12 @@ impl<'program> Checker<'program> {
                 .collect(),
             return_ty: self.substitute_type(function.return_ty, &bindings),
             return_borrow: function.return_borrow,
+        };
+        for param in &specialized.params {
+            self.check_specialized_shared_payloads(param.ty, span);
         }
+        self.check_specialized_shared_payloads(specialized.return_ty, span);
+        specialized
     }
 
     fn instantiate_generic_method_call(
@@ -6983,7 +7003,7 @@ impl<'program> Checker<'program> {
             method.declaration,
             &method.enclosing_type_bindings,
         );
-        MethodInfo {
+        let specialized = MethodInfo {
             declaration: method.declaration,
             access: method.access.clone(),
             receiver_mode: method.receiver_mode,
@@ -6997,7 +7017,12 @@ impl<'program> Checker<'program> {
                 .map(|param| self.substitute_param_info(param, &bindings))
                 .collect(),
             return_ty: self.substitute_type(method.return_ty, &bindings),
+        };
+        for param in &specialized.params {
+            self.check_specialized_shared_payloads(param.ty, span);
         }
+        self.check_specialized_shared_payloads(specialized.return_ty, span);
+        specialized
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -7214,6 +7239,10 @@ impl<'program> Checker<'program> {
             TypeKind::Set(element) => {
                 let element = self.substitute_type(element, bindings);
                 self.types.intern(TypeKind::Set(element))
+            }
+            TypeKind::SharedHandle(kind, payload) => {
+                let payload = self.substitute_type(payload, bindings);
+                self.types.intern(TypeKind::SharedHandle(kind, payload))
             }
             TypeKind::Class(class) => {
                 let arguments = class
@@ -9103,12 +9132,17 @@ impl<'program> Checker<'program> {
                 null_safe,
                 ..
             } => {
-                if let Some(result) =
-                    self.shared_handle_property_type(object, property, scopes, method_context)
-                {
+                if let Some(result) = self.shared_handle_property_type(
+                    object,
+                    property,
+                    *null_safe,
+                    scopes,
+                    method_context,
+                ) {
                     return result;
                 }
-                if let Some((kind, _)) = self.shared_handle_of(object, scopes, method_context) {
+                let object_ty = self.infer_expr_type(object, scopes, method_context);
+                if let Some((kind, _)) = self.shared_handle_type(object_ty, *null_safe) {
                     if !Self::shared_handle_forwards(kind) {
                         return self.types.unknown();
                     }
@@ -9430,20 +9464,6 @@ impl<'program> Checker<'program> {
         }
     }
 
-    /// The shared-ownership handle an expression evaluates to, if any.
-    fn shared_handle_of(
-        &mut self,
-        expr: &Expr,
-        scopes: &ScopeStack,
-        method_context: Option<&MethodContext>,
-    ) -> Option<(SharedHandleKind, TypeId)> {
-        let ty = self.infer_expr_type(expr, scopes, method_context);
-        match self.types.kind(ty) {
-            TypeKind::SharedHandle(kind, payload) => Some((*kind, *payload)),
-            _ => None,
-        }
-    }
-
     fn shared_handle_type(
         &self,
         ty: TypeId,
@@ -9526,12 +9546,16 @@ impl<'program> Checker<'program> {
         &mut self,
         object: &Expr,
         property: &str,
+        null_safe: bool,
         scopes: &ScopeStack,
         method_context: Option<&MethodContext>,
     ) -> Option<TypeId> {
-        let (kind, payload) = self.shared_handle_of(object, scopes, method_context)?;
-        (kind == SharedHandleKind::SharedReference && property == "referencedValue")
-            .then_some(payload)
+        let object_ty = self.infer_expr_type(object, scopes, method_context);
+        let (kind, payload) = self.shared_handle_type(object_ty, null_safe)?;
+        if kind != SharedHandleKind::SharedReference || property != "referencedValue" {
+            return None;
+        }
+        Some(self.null_safe_result_type(payload, null_safe))
     }
 
     /// Whether a handle forwards member access to its payload at all. The writable
@@ -9721,6 +9745,54 @@ impl<'program> Checker<'program> {
         )
     }
 
+    fn check_specialized_shared_payloads(&mut self, ty: TypeId, span: Span) {
+        match self.types.kind(ty).clone() {
+            TypeKind::Nullable(inner)
+            | TypeKind::TypedArray(inner)
+            | TypeKind::List(inner)
+            | TypeKind::Set(inner) => self.check_specialized_shared_payloads(inner, span),
+            TypeKind::Dictionary(key, value) => {
+                self.check_specialized_shared_payloads(key, span);
+                self.check_specialized_shared_payloads(value, span);
+            }
+            TypeKind::Class(class) => {
+                for argument in class.arguments {
+                    self.check_specialized_shared_payloads(argument, span);
+                }
+            }
+            TypeKind::SharedHandle(kind, payload) => {
+                if !self.shared_handle_payload_is_supported(kind, payload) {
+                    self.report_shared_handle_payload(kind, payload, span);
+                }
+                self.check_specialized_shared_payloads(payload, span);
+            }
+            _ => {}
+        }
+    }
+
+    fn check_specialized_class_shared_payloads(&mut self, class: &ClassType<TypeId>, span: Span) {
+        let Some(info) = self.classes.get(&class.name).cloned() else {
+            return;
+        };
+        let substitutions = self.class_type_substitutions(class);
+        let mut types = Vec::new();
+        types.extend(
+            info.properties
+                .values()
+                .map(|property| property.ty)
+                .chain(info.static_properties.values().map(|property| property.ty))
+                .chain(info.constants.values().map(|constant| constant.ty)),
+        );
+        for method in info.methods.values() {
+            types.extend(method.params.iter().map(|param| param.ty));
+            types.push(method.return_ty);
+        }
+        for ty in types {
+            let specialized = self.substitute_type_id(ty, &substitutions);
+            self.check_specialized_shared_payloads(specialized, span);
+        }
+    }
+
     fn report_shared_handle_payload(
         &mut self,
         kind: SharedHandleKind,
@@ -9729,18 +9801,19 @@ impl<'program> Checker<'program> {
     ) {
         let name = kind.source_name();
         let payload = self.types.display(payload);
-        self.diagnostics.push(
-            Diagnostic::new(
-                "E0545",
-                format!("`{name}<{payload}>` Requires A Class Payload"),
-                span,
-            )
-            .with_help(format!(
-                "the readonly shared-ownership family accepts class payloads in v1.0; wrap \
-                 `{payload}` in a class, or use `WritableSharedReference<{payload}>`, whose \
-                 access objects forward member and indexed operations"
-            )),
-        );
+        let message = format!("`{name}<{payload}>` Requires A Class Payload");
+        if !self
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E0545" && diagnostic.message == message)
+        {
+            self.diagnostics
+                .push(Diagnostic::new("E0545", message, span).with_help(format!(
+                    "the readonly shared-ownership family accepts class payloads in v1.0; wrap \
+                     `{payload}` in a class, or use `WritableSharedReference<{payload}>`, whose \
+                     access objects forward member and indexed operations"
+                )));
+        }
     }
 
     fn report_shared_handle_arity(&mut self, kind: SharedHandleKind, found: usize, span: Span) {

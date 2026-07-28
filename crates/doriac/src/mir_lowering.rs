@@ -437,6 +437,10 @@ fn substitute_resolved_type(
         ResolvedType::Set(inner) => {
             ResolvedType::Set(Box::new(substitute_resolved_type(inner, substitutions)))
         }
+        ResolvedType::SharedHandle(kind, payload) => ResolvedType::SharedHandle(
+            *kind,
+            Box::new(substitute_resolved_type(payload, substitutions)),
+        ),
         ResolvedType::Class(class) => ResolvedType::Class(ClassType::new(
             class.name.clone(),
             class
@@ -4744,6 +4748,22 @@ fn lower_nullable_class_expression(
                     "expected nullable class expression",
                 )]),
             }
+        }
+        hir::Expr::PropertyAccess {
+            object,
+            property,
+            null_safe: true,
+            ..
+        } if property == "referencedValue"
+            && context.expression_type(object).ok()
+                == Some(mir::Type::NullableSharedReference(expected)) =>
+        {
+            Ok(mir::NullableClassExpression::SharedPayload {
+                class: expected,
+                reference: Box::new(lower_nullable_shared_reference_expression(
+                    object, expected, false, context,
+                )?),
+            })
         }
         hir::Expr::PropertyAccess {
             object,

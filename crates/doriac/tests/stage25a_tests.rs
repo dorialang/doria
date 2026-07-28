@@ -447,11 +447,12 @@ function main(): void
     ?SharedReference<Node> $absentShare = $missing?->share();
     ?SharedReference<Node> $acquired = $presentWeak?->acquire();
     ?SharedReference<Node> $absentAcquire = $missingWeak?->acquire();
-
     echo ($present?->name ?? "missing") . "\n";
     echo ($missing?->name ?? "missing") . "\n";
     echo ($present?->label() ?? "missing") . "\n";
     echo ($missing?->label() ?? "missing") . "\n";
+    echo ($present?->referencedValue?->name ?? "missing") . "\n";
+    echo ($missing?->referencedValue?->name ?? "missing") . "\n";
     if ($sharedAgain != null) { echo $sharedAgain->name . "\n"; }
     if ($absentShare == null) { echo "no share\n"; }
     if ($acquired != null) { echo $acquired->name . "\n"; }
@@ -464,7 +465,7 @@ function main(): void
         .expect("nullable shared members should interpret");
     assert_eq!(
         output.stdout,
-        b"root\nmissing\nroot\nmissing\nroot\nno share\nroot\nno acquire\ndrop root\n"
+        b"root\nmissing\nroot\nmissing\nroot\nmissing\nroot\nno share\nroot\nno acquire\ndrop root\n"
     );
     doriac::codegen_cranelift::lower_mir_to_object(&program)
         .expect("nullable shared members should lower through Cranelift");
@@ -1090,6 +1091,61 @@ function main(): void
 }
 
 // --- Payload domains -----------------------------------------------------
+
+#[test]
+fn generic_shared_handle_payloads_specialize_before_mir_lowering() {
+    let source = r#"
+class Node
+{
+    function __construct(string $name) {}
+}
+
+function identity<T>(
+    take SharedReference<T> $value,
+): SharedReference<T>
+{
+    return $value;
+}
+
+function main(): void
+{
+    let $node = identity(shared new Node("generic"));
+    echo $node->name . "\n";
+}
+"#;
+    let program = doriac::lower_source_to_mir("stage25a-generic-handle.doria", source)
+        .expect("generic shared-handle payload should specialize to Node");
+    let output = doriac::mir_interpreter::interpret(&program)
+        .expect("specialized generic shared handle should interpret");
+    assert_eq!(output.stdout, b"generic\n");
+    doriac::codegen_cranelift::lower_mir_to_object(&program)
+        .expect("specialized generic shared handle should lower through Cranelift");
+    #[cfg(feature = "llvm-backend")]
+    doriac::codegen_llvm::lower_mir_to_object(&program)
+        .expect("specialized generic shared handle should lower through LLVM");
+}
+
+#[test]
+fn generic_class_shared_handle_payloads_are_revalidated_after_specialization() {
+    let source = r#"
+class Box<T>
+{
+    ?SharedReference<T> $value = null;
+}
+
+function main(): void
+{
+    let $box = new Box<int>();
+}
+"#;
+    let error = doriac::lower_source_to_mir("stage25a-generic-handle-reject.doria", source)
+        .expect_err("a concrete readonly shared-handle payload must be a class");
+    assert!(
+        error.iter().any(|diagnostic| diagnostic.code == "E0545"
+            && diagnostic.message.contains("SharedReference<int>")),
+        "{error:?}"
+    );
+}
 
 #[test]
 fn readonly_family_rejects_concrete_non_class_payloads() {
