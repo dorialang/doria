@@ -922,6 +922,39 @@ function main(): void
 }
 
 #[test]
+fn shared_handle_statics_report_the_native_capability_boundary() {
+    for handle in ["SharedReference", "WeakReference"] {
+        let source = format!(
+            r#"
+class Node {{}}
+
+class Store
+{{
+    static writable ?{handle}<Node> $value = null;
+}}
+
+function main(): void {{}}
+"#
+        );
+        let diagnostics = doriac::check_source("stage25a-shared-static.doria", &source)
+            .expect_err("owned static storage is deferred pending its concurrency model");
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "E0486"
+                    && diagnostic.message.contains("cannot use owned type")),
+            "{diagnostics:?}"
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.code != "E0483"),
+            "the owned-static diagnostic should not be obscured by const evaluation: {diagnostics:?}"
+        );
+    }
+}
+
+#[test]
 fn borrowed_dictionary_shared_results_do_not_acquire_cleanup_obligations() {
     let source = r#"
 class Node
