@@ -179,6 +179,7 @@ pub enum Type {
     SharedReference(ClassId),
     WeakReference(ClassId),
     NullableSharedReference(ClassId),
+    NullableWeakReference(ClassId),
     Collection(CollectionTypeId),
 }
 
@@ -234,6 +235,7 @@ pub enum Rvalue {
     SharedReference(SharedReferenceExpression),
     WeakReference(WeakReferenceExpression),
     NullableSharedReference(NullableSharedReferenceExpression),
+    NullableWeakReference(NullableWeakReferenceExpression),
     Collection(CollectionExpression),
 }
 
@@ -257,6 +259,7 @@ impl Rvalue {
             Self::SharedReference(value) => Type::SharedReference(value.class()),
             Self::WeakReference(value) => Type::WeakReference(value.class()),
             Self::NullableSharedReference(value) => Type::NullableSharedReference(value.class()),
+            Self::NullableWeakReference(value) => Type::NullableWeakReference(value.class()),
             Self::Collection(value) => Type::Collection(value.collection()),
         }
     }
@@ -274,7 +277,8 @@ impl Rvalue {
             | Self::NullableString(_)
             | Self::SharedReference(_)
             | Self::WeakReference(_)
-            | Self::NullableSharedReference(_) => None,
+            | Self::NullableSharedReference(_)
+            | Self::NullableWeakReference(_) => None,
         }
     }
 
@@ -291,7 +295,8 @@ impl Rvalue {
             | Self::NullableClass(_)
             | Self::SharedReference(_)
             | Self::WeakReference(_)
-            | Self::NullableSharedReference(_) => None,
+            | Self::NullableSharedReference(_)
+            | Self::NullableWeakReference(_) => None,
         }
     }
 
@@ -300,6 +305,7 @@ impl Rvalue {
             Self::SharedReference(value) => value.owned_temporary(),
             Self::WeakReference(value) => value.owned_temporary(),
             Self::NullableSharedReference(value) => value.owned_temporary(),
+            Self::NullableWeakReference(value) => value.owned_temporary(),
             Self::Value(_)
             | Self::String(_)
             | Self::Mixed(_)
@@ -325,7 +331,8 @@ impl Rvalue {
             | Self::Collection(_)
             | Self::SharedReference(_)
             | Self::WeakReference(_)
-            | Self::NullableSharedReference(_) => false,
+            | Self::NullableSharedReference(_)
+            | Self::NullableWeakReference(_) => false,
         }
     }
 
@@ -373,6 +380,11 @@ impl Rvalue {
                 local,
                 transfer: true,
                 ..
+            })
+            | Self::NullableWeakReference(NullableWeakReferenceExpression::Local {
+                local,
+                transfer: true,
+                ..
             }) => Some(*local),
             Self::Value(_)
             | Self::String(_)
@@ -385,7 +397,8 @@ impl Rvalue {
             | Self::Collection(_)
             | Self::SharedReference(_)
             | Self::WeakReference(_)
-            | Self::NullableSharedReference(_) => None,
+            | Self::NullableSharedReference(_)
+            | Self::NullableWeakReference(_) => None,
         }
     }
 
@@ -402,7 +415,8 @@ impl Rvalue {
             | Self::Collection(_)
             | Self::SharedReference(_)
             | Self::WeakReference(_)
-            | Self::NullableSharedReference(_) => MixedOwnership::None,
+            | Self::NullableSharedReference(_)
+            | Self::NullableWeakReference(_) => MixedOwnership::None,
         }
     }
 }
@@ -442,6 +456,7 @@ pub enum SharedReferenceExpression {
         class: ClassId,
         left: Box<NullableSharedReferenceExpression>,
         right: Box<SharedReferenceExpression>,
+        transfer: bool,
     },
     CollectionIndex {
         class: ClassId,
@@ -467,8 +482,21 @@ impl SharedReferenceExpression {
 
     pub const fn owned_temporary(&self) -> Option<OwnedSharedTemporary> {
         match self {
-            Self::New { .. } | Self::Share { .. } | Self::Coalesce { .. } => {
-                Some(OwnedSharedTemporary::Strong)
+            Self::New { .. } | Self::Share { .. } => Some(OwnedSharedTemporary::Strong),
+            Self::Coalesce {
+                left,
+                right,
+                transfer,
+                ..
+            } => {
+                if *transfer
+                    || left.owned_temporary().is_some()
+                    || right.owned_temporary().is_some()
+                {
+                    Some(OwnedSharedTemporary::Strong)
+                } else {
+                    None
+                }
             }
             Self::Local { transfer, .. } | Self::NullableLocalAssumeNonNull { transfer, .. } => {
                 if *transfer {
@@ -503,6 +531,11 @@ pub enum WeakReferenceExpression {
         local: LocalId,
         transfer: bool,
     },
+    NullableLocalAssumeNonNull {
+        class: ClassId,
+        local: LocalId,
+        transfer: bool,
+    },
     Property {
         class: ClassId,
         object: LocalId,
@@ -530,6 +563,7 @@ impl WeakReferenceExpression {
     pub const fn class(&self) -> ClassId {
         match self {
             Self::Local { class, .. }
+            | Self::NullableLocalAssumeNonNull { class, .. }
             | Self::Property { class, .. }
             | Self::Call { class, .. }
             | Self::Create { class, .. }
@@ -540,7 +574,7 @@ impl WeakReferenceExpression {
     pub const fn owned_temporary(&self) -> Option<OwnedSharedTemporary> {
         match self {
             Self::Create { .. } => Some(OwnedSharedTemporary::Weak),
-            Self::Local { transfer, .. } => {
+            Self::Local { transfer, .. } | Self::NullableLocalAssumeNonNull { transfer, .. } => {
                 if *transfer {
                     Some(OwnedSharedTemporary::Weak)
                 } else {
@@ -650,6 +684,93 @@ impl NullableSharedReferenceExpression {
             Self::CollectionIndex { remove, .. } => {
                 if *remove {
                     Some(OwnedSharedTemporary::Strong)
+                } else {
+                    None
+                }
+            }
+            Self::Null(_) | Self::Property { .. } => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NullableWeakReferenceExpression {
+    Null(ClassId),
+    Weak(WeakReferenceExpression),
+    Local {
+        class: ClassId,
+        local: LocalId,
+        transfer: bool,
+    },
+    Property {
+        class: ClassId,
+        object: LocalId,
+        property: PropertyId,
+    },
+    Call {
+        class: ClassId,
+        function: FunctionId,
+        args: Vec<Rvalue>,
+        return_borrow: Option<ReturnBorrow>,
+    },
+    DictionaryGet {
+        class: ClassId,
+        collection: LocalId,
+        key: Box<Rvalue>,
+        access: NullableCollectionAccess,
+        stored_nullable: bool,
+    },
+    CollectionIndex {
+        class: ClassId,
+        collection: LocalId,
+        index: Box<Rvalue>,
+        remove: bool,
+    },
+}
+
+impl NullableWeakReferenceExpression {
+    pub const fn class(&self) -> ClassId {
+        match self {
+            Self::Null(class)
+            | Self::Local { class, .. }
+            | Self::Property { class, .. }
+            | Self::Call { class, .. }
+            | Self::DictionaryGet { class, .. }
+            | Self::CollectionIndex { class, .. } => *class,
+            Self::Weak(value) => value.class(),
+        }
+    }
+
+    pub const fn owned_temporary(&self) -> Option<OwnedSharedTemporary> {
+        match self {
+            Self::Weak(value) => value.owned_temporary(),
+            Self::Local { transfer, .. } => {
+                if *transfer {
+                    Some(OwnedSharedTemporary::Weak)
+                } else {
+                    None
+                }
+            }
+            Self::Call { return_borrow, .. } => {
+                if return_borrow.is_none() {
+                    Some(OwnedSharedTemporary::Weak)
+                } else {
+                    None
+                }
+            }
+            Self::DictionaryGet { access, .. } => {
+                if matches!(
+                    access,
+                    NullableCollectionAccess::Remove | NullableCollectionAccess::Pop
+                ) {
+                    Some(OwnedSharedTemporary::Weak)
+                } else {
+                    None
+                }
+            }
+            Self::CollectionIndex { remove, .. } => {
+                if *remove {
+                    Some(OwnedSharedTemporary::Weak)
                 } else {
                     None
                 }
@@ -1543,6 +1664,7 @@ pub enum BoolExpression {
     NullableScalarIsPresent(Box<NullableScalarExpression>),
     NullableClassIsPresent(Box<NullableClassExpression>),
     NullableSharedReferenceIsPresent(Box<NullableSharedReferenceExpression>),
+    NullableWeakReferenceIsPresent(Box<NullableWeakReferenceExpression>),
     NullableMixedIsPresent(Box<NullableMixedExpression>),
     Not(Box<BoolExpression>),
     Binary {
@@ -1791,6 +1913,7 @@ fn rvalue_class_temporary_capacity(value: &Rvalue) -> usize {
             Rvalue::NullableSharedReference(value) => {
                 nullable_shared_class_temporary_capacity(value)
             }
+            Rvalue::NullableWeakReference(value) => nullable_weak_class_temporary_capacity(value),
             Rvalue::Collection(value) => collection_class_temporary_capacity(value),
         }
 }
@@ -1824,7 +1947,9 @@ fn weak_class_temporary_capacity(value: &WeakReferenceExpression) -> usize {
         WeakReferenceExpression::CollectionIndex { index, .. } => {
             rvalue_class_temporary_capacity(index)
         }
-        WeakReferenceExpression::Local { .. } | WeakReferenceExpression::Property { .. } => 0,
+        WeakReferenceExpression::Local { .. }
+        | WeakReferenceExpression::NullableLocalAssumeNonNull { .. }
+        | WeakReferenceExpression::Property { .. } => 0,
     }
 }
 
@@ -1846,6 +1971,24 @@ fn nullable_shared_class_temporary_capacity(value: &NullableSharedReferenceExpre
         NullableSharedReferenceExpression::Null(_)
         | NullableSharedReferenceExpression::Local { .. }
         | NullableSharedReferenceExpression::Property { .. } => 0,
+    }
+}
+
+fn nullable_weak_class_temporary_capacity(value: &NullableWeakReferenceExpression) -> usize {
+    match value {
+        NullableWeakReferenceExpression::Weak(value) => weak_class_temporary_capacity(value),
+        NullableWeakReferenceExpression::Call { args, .. } => {
+            args.iter().map(rvalue_class_temporary_capacity).sum()
+        }
+        NullableWeakReferenceExpression::DictionaryGet { key, .. } => {
+            rvalue_class_temporary_capacity(key)
+        }
+        NullableWeakReferenceExpression::CollectionIndex { index, .. } => {
+            rvalue_class_temporary_capacity(index)
+        }
+        NullableWeakReferenceExpression::Null(_)
+        | NullableWeakReferenceExpression::Local { .. }
+        | NullableWeakReferenceExpression::Property { .. } => 0,
     }
 }
 
@@ -2128,6 +2271,9 @@ pub(crate) fn bool_class_temporary_capacity(value: &BoolExpression) -> usize {
         BoolExpression::NullableSharedReferenceIsPresent(value) => {
             nullable_shared_class_temporary_capacity(value)
         }
+        BoolExpression::NullableWeakReferenceIsPresent(value) => {
+            nullable_weak_class_temporary_capacity(value)
+        }
         BoolExpression::NullableMixedIsPresent(value) => {
             nullable_mixed_class_temporary_capacity(value)
         }
@@ -2249,6 +2395,9 @@ impl fmt::Display for Type {
             Type::NullableSharedReference(class) => {
                 write!(formatter, "?shared<class#{}>", class.0)
             }
+            Type::NullableWeakReference(class) => {
+                write!(formatter, "?weak<class#{}>", class.0)
+            }
             Type::Collection(collection) => write!(formatter, "collection#{}", collection.0),
         }
     }
@@ -2310,6 +2459,7 @@ impl fmt::Display for Rvalue {
             Rvalue::SharedReference(value) => write!(formatter, "{value}"),
             Rvalue::WeakReference(value) => write!(formatter, "{value}"),
             Rvalue::NullableSharedReference(value) => write!(formatter, "{value}"),
+            Rvalue::NullableWeakReference(value) => write!(formatter, "{value}"),
             Rvalue::Collection(value) => write!(formatter, "{value}"),
         }
     }
@@ -2504,6 +2654,14 @@ impl fmt::Display for WeakReferenceExpression {
                 if *transfer { "move" } else { "borrow" },
                 local.0
             ),
+            Self::NullableLocalAssumeNonNull {
+                local, transfer, ..
+            } => write!(
+                formatter,
+                "{} present nullable weak local{}",
+                if *transfer { "move" } else { "borrow" },
+                local.0
+            ),
             Self::Property {
                 object, property, ..
             } => write!(
@@ -2531,6 +2689,26 @@ impl fmt::Display for NullableSharedReferenceExpression {
             } => write!(formatter, "local{}->property{}", object.0, property.index),
             Self::Call { function, args, .. } => write_call(formatter, *function, args),
             Self::Acquire { value, .. } => write!(formatter, "acquire({value})"),
+            Self::DictionaryGet {
+                collection, key, ..
+            } => write!(formatter, "local{}.get({key})", collection.0),
+            Self::CollectionIndex {
+                collection, index, ..
+            } => write!(formatter, "local{}[{index}]", collection.0),
+        }
+    }
+}
+
+impl fmt::Display for NullableWeakReferenceExpression {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Null(class) => write!(formatter, "null: ?weak<class#{}>", class.0),
+            Self::Weak(value) => write!(formatter, "some({value})"),
+            Self::Local { local, .. } => write!(formatter, "local{}", local.0),
+            Self::Property {
+                object, property, ..
+            } => write!(formatter, "local{}->property{}", object.0, property.index),
+            Self::Call { function, args, .. } => write_call(formatter, *function, args),
             Self::DictionaryGet {
                 collection, key, ..
             } => write!(formatter, "local{}.get({key})", collection.0),
@@ -2939,6 +3117,9 @@ impl fmt::Display for BoolExpression {
             Self::NullableScalarIsPresent(value) => write!(formatter, "present({value})"),
             Self::NullableClassIsPresent(value) => write!(formatter, "present({value})"),
             Self::NullableSharedReferenceIsPresent(value) => {
+                write!(formatter, "present({value})")
+            }
+            Self::NullableWeakReferenceIsPresent(value) => {
                 write!(formatter, "present({value})")
             }
             Self::NullableMixedIsPresent(value) => write!(formatter, "present({value})"),

@@ -120,6 +120,7 @@ pub const fn collection_value_width(ty: mir::Type, pointer_width: u8) -> Option<
         | mir::Type::SharedReference(_)
         | mir::Type::WeakReference(_)
         | mir::Type::NullableSharedReference(_)
+        | mir::Type::NullableWeakReference(_)
         | mir::Type::Collection(_) => Some(pointer_width),
         mir::Type::NullableScalar(_)
         | mir::Type::NullableString

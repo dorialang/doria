@@ -217,6 +217,7 @@ fn append_type_abi_params(params: &mut Vec<AbiParam>, ty: mir::Type, pointer_typ
         | mir::Type::SharedReference(_)
         | mir::Type::WeakReference(_)
         | mir::Type::NullableSharedReference(_)
+        | mir::Type::NullableWeakReference(_)
         | mir::Type::Collection(_) => {
             params.push(AbiParam::new(pointer_type));
         }
@@ -488,6 +489,7 @@ fn define_function(
                 | mir::Type::SharedReference(_)
                 | mir::Type::WeakReference(_)
                 | mir::Type::NullableSharedReference(_)
+                | mir::Type::NullableWeakReference(_)
                 | mir::Type::Collection(_) => {
                     Some(builder.create_sized_stack_slot(StackSlotData::new(
                         StackSlotKind::ExplicitSlot,
@@ -680,6 +682,7 @@ fn initialize_locals(
             | mir::Type::SharedReference(_)
             | mir::Type::WeakReference(_)
             | mir::Type::NullableSharedReference(_)
+            | mir::Type::NullableWeakReference(_)
             | mir::Type::Collection(_) => builder.ins().iconst(pointer_type, 0),
             mir::Type::NullableScalar(_) | mir::Type::NullableString => {
                 let zero = builder.ins().iconst(pointer_type, 0);
@@ -1175,10 +1178,14 @@ fn lower_statement(
                         None,
                     ))
                 }
-                mir::Type::WeakReference(_) if definition.owned => Some((
-                    load_lowered_from_stack(builder, definition.ty, slot, pointer).single()?,
-                    None,
-                )),
+                mir::Type::WeakReference(_) | mir::Type::NullableWeakReference(_)
+                    if definition.owned =>
+                {
+                    Some((
+                        load_lowered_from_stack(builder, definition.ty, slot, pointer).single()?,
+                        None,
+                    ))
+                }
                 mir::Type::Collection(_) if definition.owned => Some((
                     load_lowered_from_stack(builder, definition.ty, slot, pointer).single()?,
                     None,
@@ -1194,7 +1201,10 @@ fn lower_statement(
                     mir::Type::SharedReference(_) | mir::Type::NullableSharedReference(_)
                 ) {
                     lower_drop_shared_value(builder, old, false, resources)?;
-                } else if matches!(definition.ty, mir::Type::WeakReference(_)) {
+                } else if matches!(
+                    definition.ty,
+                    mir::Type::WeakReference(_) | mir::Type::NullableWeakReference(_)
+                ) {
                     lower_drop_shared_value(builder, old, true, resources)?;
                 } else if let Some(class) = class {
                     lower_drop_class_value_checked(builder, old, class, resources)?;
@@ -1334,6 +1344,7 @@ fn lower_statement(
                 | mir::Type::SharedReference(_)
                 | mir::Type::WeakReference(_)
                 | mir::Type::NullableSharedReference(_)
+                | mir::Type::NullableWeakReference(_)
                 | mir::Type::Collection(_) => Some(
                     load_lowered_from_address(
                         builder,
@@ -1376,9 +1387,10 @@ fn lower_statement(
                     mir::Type::SharedReference(_) | mir::Type::NullableSharedReference(_),
                     Some(old_value),
                 ) => lower_drop_shared_value(builder, old_value, false, resources)?,
-                (mir::Type::WeakReference(_), Some(old_value)) => {
-                    lower_drop_shared_value(builder, old_value, true, resources)?
-                }
+                (
+                    mir::Type::WeakReference(_) | mir::Type::NullableWeakReference(_),
+                    Some(old_value),
+                ) => lower_drop_shared_value(builder, old_value, true, resources)?,
                 (mir::Type::Mixed | mir::Type::NullableMixed, Some(old_value)) => {
                     lower_drop_mixed_value(builder, old_value, resources)?;
                 }
@@ -1544,6 +1556,7 @@ fn load_lowered_from_stack(
         | mir::Type::SharedReference(_)
         | mir::Type::WeakReference(_)
         | mir::Type::NullableSharedReference(_)
+        | mir::Type::NullableWeakReference(_)
         | mir::Type::Collection(_) => {
             LoweredValue::Single(builder.ins().stack_load(pointer, pointer, slot, 0))
         }
@@ -1609,6 +1622,7 @@ fn load_lowered_from_address(
         | mir::Type::SharedReference(_)
         | mir::Type::WeakReference(_)
         | mir::Type::NullableSharedReference(_)
+        | mir::Type::NullableWeakReference(_)
         | mir::Type::Collection(_) => {
             LoweredValue::Single(builder.ins().load(pointer, flags, address, 0))
         }
@@ -1785,6 +1799,10 @@ fn lower_rvalue(
             lower_nullable_shared_reference_expression(builder, value, resources)
                 .map(LoweredValue::Single)
         }
+        mir::Rvalue::NullableWeakReference(value) => {
+            lower_nullable_weak_reference_expression(builder, value, resources)
+                .map(LoweredValue::Single)
+        }
         mir::Rvalue::Collection(value) => {
             lower_collection_expression(builder, value, resources).map(LoweredValue::Single)
         }
@@ -1817,6 +1835,7 @@ fn collection_compare_kind(ty: mir::Type) -> Result<i64, BackendError> {
         | mir::Type::SharedReference(_)
         | mir::Type::WeakReference(_)
         | mir::Type::NullableSharedReference(_)
+        | mir::Type::NullableWeakReference(_)
         | mir::Type::Collection(_) => Ok(i64::from(COLLECTION_COMPARE_WORD)),
         mir::Type::NullableScalar(_)
         | mir::Type::NullableString
@@ -1859,6 +1878,7 @@ fn value_to_collection_word(
         | mir::Type::SharedReference(_)
         | mir::Type::WeakReference(_)
         | mir::Type::NullableSharedReference(_)
+        | mir::Type::NullableWeakReference(_)
         | mir::Type::Collection(_) => {
             if pointer == types::I64 {
                 value
@@ -1906,6 +1926,7 @@ fn collection_word_to_value(
         | mir::Type::SharedReference(_)
         | mir::Type::WeakReference(_)
         | mir::Type::NullableSharedReference(_)
+        | mir::Type::NullableWeakReference(_)
         | mir::Type::Collection(_) => {
             if pointer == types::I64 {
                 word
@@ -2727,6 +2748,7 @@ fn lower_drop_value_if(
             | mir::Type::SharedReference(_)
             | mir::Type::WeakReference(_)
             | mir::Type::NullableSharedReference(_)
+            | mir::Type::NullableWeakReference(_)
             | mir::Type::Collection(_)
             | mir::Type::Mixed
             | mir::Type::NullableMixed
@@ -2770,7 +2792,9 @@ fn lower_drop_stored_value(
         mir::Type::SharedReference(_) | mir::Type::NullableSharedReference(_) => {
             lower_drop_shared_value(builder, value, false, resources)
         }
-        mir::Type::WeakReference(_) => lower_drop_shared_value(builder, value, true, resources),
+        mir::Type::WeakReference(_) | mir::Type::NullableWeakReference(_) => {
+            lower_drop_shared_value(builder, value, true, resources)
+        }
         mir::Type::Collection(collection) => {
             lower_drop_collection_value(builder, value, collection, resources)
         }
@@ -3270,6 +3294,9 @@ fn lower_weak_reference_expression(
     match expression {
         mir::WeakReferenceExpression::Local {
             local, transfer, ..
+        }
+        | mir::WeakReferenceExpression::NullableLocalAssumeNonNull {
+            local, transfer, ..
         } => {
             let slot = local_slot(resources.local_slots, *local)?;
             let value = builder.ins().stack_load(pointer, pointer, slot, 0);
@@ -3398,6 +3425,74 @@ fn lower_nullable_shared_reference_expression(
             Ok(payload)
         }
         mir::NullableSharedReferenceExpression::CollectionIndex {
+            collection,
+            index,
+            remove,
+            ..
+        } => lower_collection_index(builder, *collection, index, *remove, resources),
+    }
+}
+
+fn lower_nullable_weak_reference_expression(
+    builder: &mut FunctionBuilder,
+    expression: &mir::NullableWeakReferenceExpression,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<Value, BackendError> {
+    let pointer = resources.module.target_config().pointer_type();
+    match expression {
+        mir::NullableWeakReferenceExpression::Null(_) => Ok(builder.ins().iconst(pointer, 0)),
+        mir::NullableWeakReferenceExpression::Weak(value) => {
+            lower_weak_reference_expression(builder, value, resources)
+        }
+        mir::NullableWeakReferenceExpression::Local {
+            local, transfer, ..
+        } => {
+            let slot = local_slot(resources.local_slots, *local)?;
+            let value = builder.ins().stack_load(pointer, pointer, slot, 0);
+            if *transfer {
+                let zero = builder.ins().iconst(pointer, 0);
+                builder.ins().stack_store(pointer, zero, slot, 0);
+            }
+            Ok(value)
+        }
+        mir::NullableWeakReferenceExpression::Property {
+            object, property, ..
+        } => {
+            let address = lower_property_address(builder, *object, *property, resources)?;
+            Ok(builder.ins().load(
+                pointer,
+                cranelift_codegen::ir::MachMemFlags::trusted(),
+                address,
+                0,
+            ))
+        }
+        mir::NullableWeakReferenceExpression::Call { function, args, .. } => {
+            lower_function_call(builder, *function, args, resources)?
+                .ok_or_else(|| malformed_mir("nullable weak call produced no result"))?
+                .single()
+        }
+        mir::NullableWeakReferenceExpression::DictionaryGet {
+            class,
+            collection,
+            key,
+            access,
+            stored_nullable,
+        } => {
+            let (_, payload) = lower_dictionary_get(
+                builder,
+                *collection,
+                key,
+                if *stored_nullable {
+                    mir::Type::NullableWeakReference(*class)
+                } else {
+                    mir::Type::WeakReference(*class)
+                },
+                *access,
+                resources,
+            )?;
+            Ok(payload)
+        }
+        mir::NullableWeakReferenceExpression::CollectionIndex {
             collection,
             index,
             remove,
@@ -3686,7 +3781,7 @@ fn lower_drop_class_value(
                 );
                 lower_drop_shared_value(builder, value, false, resources)?;
             }
-            mir::Type::WeakReference(_) => {
+            mir::Type::WeakReference(_) | mir::Type::NullableWeakReference(_) => {
                 let value = builder.ins().load(
                     pointer_type,
                     cranelift_codegen::ir::MachMemFlags::trusted(),
@@ -6195,6 +6290,19 @@ fn lower_condition_to_branch(
             let value = lower_nullable_shared_reference_expression(builder, value, resources)?;
             if owned {
                 defer_or_drop_shared_temporary(builder, value, false, resources)?;
+            }
+            let pointer = resources.module.target_config().pointer_type();
+            let zero = builder.ins().iconst(pointer, 0);
+            let present = builder.ins().icmp(IntCC::NotEqual, value, zero);
+            builder
+                .ins()
+                .brif(present, then_block, &[], else_block, &[]);
+        }
+        mir::BoolExpression::NullableWeakReferenceIsPresent(value) => {
+            let owned = value.owned_temporary().is_some();
+            let value = lower_nullable_weak_reference_expression(builder, value, resources)?;
+            if owned {
+                defer_or_drop_shared_temporary(builder, value, true, resources)?;
             }
             let pointer = resources.module.target_config().pointer_type();
             let zero = builder.ins().iconst(pointer, 0);

@@ -304,6 +304,7 @@ fn field_type(ty: mir::Type) -> FieldType {
         mir::Type::SharedReference(class) => FieldType::SharedReference(class),
         mir::Type::WeakReference(class) => FieldType::WeakReference(class),
         mir::Type::NullableSharedReference(class) => FieldType::NullableSharedReference(class),
+        mir::Type::NullableWeakReference(class) => FieldType::WeakReference(class),
         mir::Type::Collection(_) => FieldType::Collection,
     }
 }
@@ -351,7 +352,8 @@ fn validate_type(program: &mir::Program, ty: mir::Type) -> Result<(), BackendErr
     | mir::Type::NullableClass(class)
     | mir::Type::SharedReference(class)
     | mir::Type::WeakReference(class)
-    | mir::Type::NullableSharedReference(class) = ty
+    | mir::Type::NullableSharedReference(class)
+    | mir::Type::NullableWeakReference(class) = ty
     {
         class_in(program, class)?;
     } else if let mir::Type::Collection(collection) = ty {
@@ -615,16 +617,24 @@ fn validate_statement(
                     validate_nullable_shared_reference_expression(program, function, expression)
                 }
                 (
+                    mir::Type::NullableWeakReference(expected),
+                    mir::Rvalue::NullableWeakReference(expression),
+                ) if expression.class() == expected => {
+                    validate_nullable_weak_reference_expression(program, function, expression)
+                }
+                (
                     mir::Type::SharedReference(_)
                     | mir::Type::WeakReference(_)
-                    | mir::Type::NullableSharedReference(_),
+                    | mir::Type::NullableSharedReference(_)
+                    | mir::Type::NullableWeakReference(_),
                     _,
                 )
                 | (
                     _,
                     mir::Rvalue::SharedReference(_)
                     | mir::Rvalue::WeakReference(_)
-                    | mir::Rvalue::NullableSharedReference(_),
+                    | mir::Rvalue::NullableSharedReference(_)
+                    | mir::Rvalue::NullableWeakReference(_),
                 ) => Err(malformed_mir(format!(
                     "local local{} receives a mismatched shared-handle rvalue",
                     target.0
@@ -833,7 +843,12 @@ fn validate_statement(
         }
         mir::Statement::DropWeakReference { local, class } => {
             let definition = local_in(function, *local)?;
-            if definition.ty != mir::Type::WeakReference(*class) || !definition.owned {
+            if !matches!(
+                definition.ty,
+                mir::Type::WeakReference(found)
+                    | mir::Type::NullableWeakReference(found) if found == *class
+            ) || !definition.owned
+            {
                 return Err(malformed_mir(format!(
                     "weak-reference drop references local{} with type {}",
                     local.0, definition.ty
@@ -1207,6 +1222,9 @@ fn validate_rvalue(
         mir::Rvalue::NullableSharedReference(value) => {
             validate_nullable_shared_reference_expression(program, function, value)
         }
+        mir::Rvalue::NullableWeakReference(value) => {
+            validate_nullable_weak_reference_expression(program, function, value)
+        }
         mir::Rvalue::Collection(value) => validate_collection_expression(program, function, value),
     }?;
     let mut accesses = ClassLocalAccesses::default();
@@ -1302,11 +1320,17 @@ fn validate_shared_reference_expression(
             }
             validate_shared_reference_expression(program, function, value)
         }
-        mir::SharedReferenceExpression::Coalesce { left, right, .. } => {
+        mir::SharedReferenceExpression::Coalesce {
+            left,
+            right,
+            transfer,
+            ..
+        } => {
             if left.class() != class || right.class() != class {
                 return Err(malformed_mir("shared coalesce changes payload class"));
             }
-            if left.owned_temporary().is_none() || right.owned_temporary().is_none() {
+            if *transfer && (left.owned_temporary().is_none() || right.owned_temporary().is_none())
+            {
                 return Err(malformed_mir(
                     "shared coalesce operands must transfer owned handles",
                 ));
@@ -1361,6 +1385,18 @@ fn validate_weak_reference_expression(
             }
             if *transfer && !definition.owned {
                 return Err(malformed_mir("weak-reference move reads a borrowed local"));
+            }
+            Ok(())
+        }
+        mir::WeakReferenceExpression::NullableLocalAssumeNonNull {
+            local, transfer, ..
+        } => {
+            let definition = local_in(function, *local)?;
+            if definition.ty != mir::Type::NullableWeakReference(class) {
+                return Err(malformed_mir("nonnull weak read has another handle type"));
+            }
+            if *transfer && !definition.owned {
+                return Err(malformed_mir("nonnull weak move reads a borrowed local"));
             }
             Ok(())
         }
@@ -1528,6 +1564,107 @@ fn validate_nullable_shared_reference_expression(
             if *remove && !local.writable {
                 return Err(malformed_mir(
                     "nullable shared removal uses a readonly collection",
+                ));
+            }
+            validate_rvalue(program, function, index)
+        }
+    }
+}
+
+fn validate_nullable_weak_reference_expression(
+    program: &mir::Program,
+    function: &mir::Function,
+    expression: &mir::NullableWeakReferenceExpression,
+) -> Result<(), BackendError> {
+    let class = expression.class();
+    class_in(program, class)?;
+    match expression {
+        mir::NullableWeakReferenceExpression::Null(_) => Ok(()),
+        mir::NullableWeakReferenceExpression::Weak(value) => {
+            if value.class() != class {
+                return Err(malformed_mir("nullable weak value changes payload class"));
+            }
+            validate_weak_reference_expression(program, function, value)
+        }
+        mir::NullableWeakReferenceExpression::Local {
+            local, transfer, ..
+        } => {
+            let definition = local_in(function, *local)?;
+            if definition.ty != mir::Type::NullableWeakReference(class) {
+                return Err(malformed_mir("nullable weak local read has another type"));
+            }
+            if *transfer && !definition.owned {
+                return Err(malformed_mir("nullable weak move reads a borrowed local"));
+            }
+            Ok(())
+        }
+        mir::NullableWeakReferenceExpression::Property {
+            object, property, ..
+        } => {
+            let object = local_in(function, *object)?;
+            let mir::Type::Class(object_class) = object.ty else {
+                return Err(malformed_mir(
+                    "nullable weak property read uses a non-class object",
+                ));
+            };
+            let property = property_in(program, object_class, *property)?;
+            (property.ty == mir::Type::NullableWeakReference(class))
+                .then_some(())
+                .ok_or_else(|| malformed_mir("nullable weak property has another type"))
+        }
+        mir::NullableWeakReferenceExpression::Call {
+            function: callee,
+            args,
+            ..
+        } => {
+            let callee = function_in(program, *callee)?;
+            if callee.return_type != mir::ReturnType::Value(mir::Type::NullableWeakReference(class))
+            {
+                return Err(malformed_mir(
+                    "nullable weak call returns another handle type",
+                ));
+            }
+            validate_call_args(program, function, callee, args)
+        }
+        mir::NullableWeakReferenceExpression::DictionaryGet {
+            collection,
+            key,
+            access,
+            stored_nullable,
+            ..
+        } => validate_dictionary_get(
+            program,
+            function,
+            *collection,
+            key,
+            if *stored_nullable {
+                mir::Type::NullableWeakReference(class)
+            } else {
+                mir::Type::WeakReference(class)
+            },
+            *access,
+        ),
+        mir::NullableWeakReferenceExpression::CollectionIndex {
+            collection,
+            index,
+            remove,
+            ..
+        } => {
+            let local = local_in(function, *collection)?;
+            let mir::Type::Collection(collection) = local.ty else {
+                return Err(malformed_mir(
+                    "nullable weak index uses a non-collection local",
+                ));
+            };
+            let definition = collection_in(program, collection)?;
+            if definition.value != mir::Type::NullableWeakReference(class) {
+                return Err(malformed_mir(
+                    "nullable weak index collection has another element type",
+                ));
+            }
+            if *remove && !local.writable {
+                return Err(malformed_mir(
+                    "nullable weak removal uses a readonly collection",
                 ));
             }
             validate_rvalue(program, function, index)
@@ -3032,6 +3169,9 @@ fn collect_rvalue_class_local_accesses<'a>(
         mir::Rvalue::NullableSharedReference(value) => {
             collect_nullable_shared_reference_class_local_accesses(value, accesses)
         }
+        mir::Rvalue::NullableWeakReference(value) => {
+            collect_nullable_weak_reference_class_local_accesses(value, accesses)
+        }
     }
 }
 
@@ -3082,6 +3222,9 @@ fn collect_weak_reference_class_local_accesses<'a>(
         mir::WeakReferenceExpression::CollectionIndex { index, .. } => {
             collect_rvalue_class_local_accesses(index, accesses)
         }
+        mir::WeakReferenceExpression::NullableLocalAssumeNonNull { local, .. } => {
+            accesses.assume_nullable_present(*local)
+        }
         mir::WeakReferenceExpression::Local { .. }
         | mir::WeakReferenceExpression::Property { .. } => {}
     }
@@ -3112,6 +3255,31 @@ fn collect_nullable_shared_reference_class_local_accesses<'a>(
         mir::NullableSharedReferenceExpression::Null(_)
         | mir::NullableSharedReferenceExpression::Local { .. }
         | mir::NullableSharedReferenceExpression::Property { .. } => {}
+    }
+}
+
+fn collect_nullable_weak_reference_class_local_accesses<'a>(
+    value: &'a mir::NullableWeakReferenceExpression,
+    accesses: &mut ClassLocalAccesses<'a>,
+) {
+    match value {
+        mir::NullableWeakReferenceExpression::Weak(value) => {
+            collect_weak_reference_class_local_accesses(value, accesses)
+        }
+        mir::NullableWeakReferenceExpression::Call { function, args, .. } => {
+            accesses.begin_call();
+            collect_rvalue_args_class_local_accesses(args, accesses);
+            accesses.call(*function, args);
+        }
+        mir::NullableWeakReferenceExpression::DictionaryGet { key, .. } => {
+            collect_rvalue_class_local_accesses(key, accesses)
+        }
+        mir::NullableWeakReferenceExpression::CollectionIndex { index, .. } => {
+            collect_rvalue_class_local_accesses(index, accesses)
+        }
+        mir::NullableWeakReferenceExpression::Null(_)
+        | mir::NullableWeakReferenceExpression::Local { .. }
+        | mir::NullableWeakReferenceExpression::Property { .. } => {}
     }
 }
 
@@ -3532,6 +3700,9 @@ fn collect_bool_class_local_accesses<'a>(
         }
         mir::BoolExpression::NullableSharedReferenceIsPresent(value) => {
             collect_nullable_shared_reference_class_local_accesses(value, accesses);
+        }
+        mir::BoolExpression::NullableWeakReferenceIsPresent(value) => {
+            collect_nullable_weak_reference_class_local_accesses(value, accesses);
         }
         mir::BoolExpression::NullableMixedIsPresent(value) => {
             collect_nullable_mixed_class_local_accesses(value, accesses);
@@ -4290,6 +4461,11 @@ fn apply_nullable_presence_condition(
         }
         mir::BoolExpression::NullableSharedReferenceIsPresent(value) => {
             if let mir::NullableSharedReferenceExpression::Local { local, .. } = value.as_ref() {
+                set_nullable_presence(*local, when_true, present);
+            }
+        }
+        mir::BoolExpression::NullableWeakReferenceIsPresent(value) => {
+            if let mir::NullableWeakReferenceExpression::Local { local, .. } = value.as_ref() {
                 set_nullable_presence(*local, when_true, present);
             }
         }
@@ -5121,6 +5297,9 @@ fn rvalue_observes_property(
         mir::Rvalue::NullableSharedReference(value) => {
             nullable_shared_reference_observes_property(value, receiver, property)
         }
+        mir::Rvalue::NullableWeakReference(value) => {
+            nullable_weak_reference_observes_property(value, receiver, property)
+        }
     }
 }
 
@@ -5176,7 +5355,8 @@ fn weak_reference_observes_property(
         mir::WeakReferenceExpression::CollectionIndex { index, .. } => {
             rvalue_observes_property(index, receiver, property)
         }
-        mir::WeakReferenceExpression::Local { .. } => false,
+        mir::WeakReferenceExpression::Local { .. }
+        | mir::WeakReferenceExpression::NullableLocalAssumeNonNull { .. } => false,
     }
 }
 
@@ -5208,6 +5388,34 @@ fn nullable_shared_reference_observes_property(
         }
         mir::NullableSharedReferenceExpression::Null(_)
         | mir::NullableSharedReferenceExpression::Local { .. } => false,
+    }
+}
+
+fn nullable_weak_reference_observes_property(
+    value: &mir::NullableWeakReferenceExpression,
+    receiver: mir::LocalId,
+    property: crate::class_layout::PropertyId,
+) -> bool {
+    match value {
+        mir::NullableWeakReferenceExpression::Weak(value) => {
+            weak_reference_observes_property(value, receiver, property)
+        }
+        mir::NullableWeakReferenceExpression::Property {
+            object,
+            property: observed,
+            ..
+        } => *object == receiver && *observed == property,
+        mir::NullableWeakReferenceExpression::Call { args, .. } => args
+            .iter()
+            .any(|value| rvalue_observes_property(value, receiver, property)),
+        mir::NullableWeakReferenceExpression::DictionaryGet { key, .. } => {
+            rvalue_observes_property(key, receiver, property)
+        }
+        mir::NullableWeakReferenceExpression::CollectionIndex { index, .. } => {
+            rvalue_observes_property(index, receiver, property)
+        }
+        mir::NullableWeakReferenceExpression::Null(_)
+        | mir::NullableWeakReferenceExpression::Local { .. } => false,
     }
 }
 
@@ -5532,6 +5740,9 @@ fn bool_observes_property(
         }
         mir::BoolExpression::NullableSharedReferenceIsPresent(value) => {
             nullable_shared_reference_observes_property(value, receiver, property)
+        }
+        mir::BoolExpression::NullableWeakReferenceIsPresent(value) => {
+            nullable_weak_reference_observes_property(value, receiver, property)
         }
         mir::BoolExpression::NullableMixedIsPresent(value) => {
             nullable_mixed_observes_property(value, receiver, property)
@@ -6364,6 +6575,9 @@ fn validate_condition(
         mir::BoolExpression::NullableSharedReferenceIsPresent(value) => {
             validate_nullable_shared_reference_expression(program, function, value)
         }
+        mir::BoolExpression::NullableWeakReferenceIsPresent(value) => {
+            validate_nullable_weak_reference_expression(program, function, value)
+        }
         mir::BoolExpression::NullableMixedIsPresent(value) => {
             validate_nullable_mixed_expression(program, function, value)
         }
@@ -6981,6 +7195,7 @@ fn validate_null_safe_call(
         mir::Type::Mixed => mir::Type::NullableMixed,
         mir::Type::Class(class) => mir::Type::NullableClass(class),
         mir::Type::SharedReference(class) => mir::Type::NullableSharedReference(class),
+        mir::Type::WeakReference(class) => mir::Type::NullableWeakReference(class),
         mir::Type::Collection(_) => {
             return Err(malformed_mir(
                 "null-safe calls cannot return collections before nullable collections exist",
@@ -6990,8 +7205,8 @@ fn validate_null_safe_call(
         | mir::Type::NullableString
         | mir::Type::NullableMixed
         | mir::Type::NullableClass(_)
-        | mir::Type::WeakReference(_)
-        | mir::Type::NullableSharedReference(_) => {
+        | mir::Type::NullableSharedReference(_)
+        | mir::Type::NullableWeakReference(_) => {
             return Err(malformed_mir(
                 "null-safe call validator requires a non-null result type",
             ))

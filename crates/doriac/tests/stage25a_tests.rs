@@ -602,6 +602,58 @@ function main(): void
 }
 
 #[test]
+fn borrowed_coalesces_type_tests_and_temporary_receivers_preserve_lifetimes() {
+    let source = r#"
+class Node
+{
+    function __construct(string $name) {}
+    function label(): string { return $this->name; }
+    function __destruct() { echo "drop " . $this->name . "\n"; }
+}
+
+function makeStrong(string $name): SharedReference<Node>
+{
+    echo "make " . $name . "\n";
+    return shared new Node($name);
+}
+
+function inspect(?SharedReference<Node> $candidate, SharedReference<Node> $fallback): void
+{
+    echo ($candidate ?? $fallback)->name . "\n";
+    echo $fallback->name . "\n";
+}
+
+function main(): void
+{
+    let $fallback = makeStrong("fallback");
+    ?SharedReference<Node> $missing = null;
+    inspect($missing, $fallback);
+
+    if (makeStrong("tested") is Node) {
+        echo "tested\n";
+    }
+
+    echo makeStrong("call")->name . "\n";
+    let $root = makeStrong("root");
+    echo $root->share()->label() . "\n";
+}
+"#;
+    let program = doriac::lower_source_to_mir("stage25a-borrowed-composition.doria", source)
+        .expect("borrowed shared composition should lower");
+    let output = doriac::mir_interpreter::interpret(&program)
+        .expect("borrowed shared composition should execute");
+    assert_eq!(
+        output.stdout,
+        b"make fallback\nfallback\nfallback\nmake tested\ndrop tested\nmake call\ncall\nmake root\nroot\ndrop root\ndrop call\ndrop fallback\n"
+    );
+    doriac::codegen_cranelift::lower_mir_to_object(&program)
+        .expect("borrowed shared composition should lower through Cranelift");
+    #[cfg(feature = "llvm-backend")]
+    doriac::codegen_llvm::lower_mir_to_object(&program)
+        .expect("borrowed shared composition should lower through LLVM");
+}
+
+#[test]
 fn borrowed_dictionary_shared_results_do_not_acquire_cleanup_obligations() {
     let source = r#"
 class Node
@@ -651,6 +703,62 @@ function main(): void
     let output = doriac::mir_interpreter::interpret(&program)
         .expect("weak lifetime fixture should interpret");
     assert_eq!(output.stdout, b"drop Expired\nexpired\n");
+}
+
+#[test]
+fn nullable_weak_references_preserve_weak_ownership_across_storage_paths() {
+    let source = r#"
+class Node
+{
+    function __construct(string $name) {}
+    function __destruct() { echo "drop " . $this->name . "\n"; }
+}
+
+class Holder
+{
+    function __construct(take ?WeakReference<Node> $weak) {}
+}
+
+function maybeWeak(SharedReference<Node> $root): ?WeakReference<Node>
+{
+    return $root->createWeakReference();
+}
+
+function main(): void
+{
+    let $root = shared new Node("root");
+    writable ?WeakReference<Node> $maybe = null;
+    if ($maybe == null) { echo "empty\n"; }
+
+    $maybe = maybeWeak($root);
+    if ($maybe != null) {
+        let $live = $maybe->acquire();
+        if ($live != null) { echo $live->name . "\n"; }
+    }
+
+    let $holder = new Holder($root->createWeakReference());
+    if ($holder->weak != null) { echo "stored\n"; }
+
+    Dictionary<string, WeakReference<Node>> $refs = [
+        "root" => $root->createWeakReference(),
+    ];
+    if ($refs->get("root") != null) { echo "found\n"; }
+    if ($refs->get("missing") == null) { echo "missing\n"; }
+}
+"#;
+    let program = doriac::lower_source_to_mir("stage25a-nullable-weak.doria", source)
+        .expect("nullable weak references should lower across supported storage paths");
+    let output = doriac::mir_interpreter::interpret(&program)
+        .expect("nullable weak references should interpret without acquiring strong ownership");
+    assert_eq!(
+        output.stdout,
+        b"empty\nroot\nstored\nfound\nmissing\ndrop root\n"
+    );
+    doriac::codegen_cranelift::lower_mir_to_object(&program)
+        .expect("nullable weak references should lower through Cranelift");
+    #[cfg(feature = "llvm-backend")]
+    doriac::codegen_llvm::lower_mir_to_object(&program)
+        .expect("nullable weak references should lower through LLVM");
 }
 
 #[test]
