@@ -8760,6 +8760,29 @@ fn lower_nullable_shared_reference_expression(
         hir::Expr::Grouped { expr, .. } => {
             lower_nullable_shared_reference_expression(expr, expected, transfer, context)
         }
+        hir::Expr::Binary {
+            left,
+            op: hir::BinaryOp::Coalesce,
+            right,
+            ..
+        } => match context.coalesce_selection(left) {
+            CoalesceSelection::Left => {
+                lower_nullable_shared_reference_expression(left, expected, transfer, context)
+            }
+            CoalesceSelection::Right => {
+                lower_nullable_shared_reference_expression(right, expected, transfer, context)
+            }
+            CoalesceSelection::Dynamic => Ok(mir::NullableSharedReferenceExpression::Coalesce {
+                class: expected,
+                left: Box::new(lower_nullable_shared_reference_expression(
+                    left, expected, transfer, context,
+                )?),
+                right: Box::new(lower_nullable_shared_reference_expression(
+                    right, expected, transfer, context,
+                )?),
+                transfer,
+            }),
+        },
         hir::Expr::Null { .. } => Ok(mir::NullableSharedReferenceExpression::Null(expected)),
         hir::Expr::Variable { name, span } => {
             let local = context.lookup_local(name, *span)?;
@@ -9067,6 +9090,29 @@ fn lower_nullable_weak_reference_expression(
         hir::Expr::Grouped { expr, .. } => {
             lower_nullable_weak_reference_expression(expr, expected, transfer, context)
         }
+        hir::Expr::Binary {
+            left,
+            op: hir::BinaryOp::Coalesce,
+            right,
+            ..
+        } => match context.coalesce_selection(left) {
+            CoalesceSelection::Left => {
+                lower_nullable_weak_reference_expression(left, expected, transfer, context)
+            }
+            CoalesceSelection::Right => {
+                lower_nullable_weak_reference_expression(right, expected, transfer, context)
+            }
+            CoalesceSelection::Dynamic => Ok(mir::NullableWeakReferenceExpression::Coalesce {
+                class: expected,
+                left: Box::new(lower_nullable_weak_reference_expression(
+                    left, expected, transfer, context,
+                )?),
+                right: Box::new(lower_nullable_weak_reference_expression(
+                    right, expected, transfer, context,
+                )?),
+                transfer,
+            }),
+        },
         hir::Expr::Null { .. } => Ok(mir::NullableWeakReferenceExpression::Null(expected)),
         hir::Expr::Variable { name, span } => {
             let local = context.lookup_local(name, *span)?;

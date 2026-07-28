@@ -1557,6 +1557,28 @@ fn validate_nullable_shared_reference_expression(
             }
             validate_nullable_weak_reference_expression(program, function, value)
         }
+        mir::NullableSharedReferenceExpression::Coalesce {
+            left,
+            right,
+            transfer,
+            ..
+        } => {
+            if left.class() != class || right.class() != class {
+                return Err(malformed_mir(
+                    "nullable shared coalesce changes payload class",
+                ));
+            }
+            if *transfer
+                && (!nullable_shared_transfer_source_is_owned(left)
+                    || !nullable_shared_transfer_source_is_owned(right))
+            {
+                return Err(malformed_mir(
+                    "nullable shared coalesce operands must transfer owned handles",
+                ));
+            }
+            validate_nullable_shared_reference_expression(program, function, left)?;
+            validate_nullable_shared_reference_expression(program, function, right)
+        }
         mir::NullableSharedReferenceExpression::DictionaryGet {
             collection,
             key,
@@ -1665,6 +1687,28 @@ fn validate_nullable_weak_reference_expression(
                 ));
             }
             validate_nullable_shared_reference_expression(program, function, value)
+        }
+        mir::NullableWeakReferenceExpression::Coalesce {
+            left,
+            right,
+            transfer,
+            ..
+        } => {
+            if left.class() != class || right.class() != class {
+                return Err(malformed_mir(
+                    "nullable weak coalesce changes payload class",
+                ));
+            }
+            if *transfer
+                && (!nullable_weak_transfer_source_is_owned(left)
+                    || !nullable_weak_transfer_source_is_owned(right))
+            {
+                return Err(malformed_mir(
+                    "nullable weak coalesce operands must transfer owned handles",
+                ));
+            }
+            validate_nullable_weak_reference_expression(program, function, left)?;
+            validate_nullable_weak_reference_expression(program, function, right)
         }
         mir::NullableWeakReferenceExpression::DictionaryGet {
             collection,
@@ -3304,6 +3348,10 @@ fn collect_nullable_shared_reference_class_local_accesses<'a>(
         mir::NullableSharedReferenceExpression::NullSafeAcquire { value, .. } => {
             collect_nullable_weak_reference_class_local_accesses(value, accesses)
         }
+        mir::NullableSharedReferenceExpression::Coalesce { left, right, .. } => {
+            collect_nullable_shared_reference_class_local_accesses(left, accesses);
+            collect_nullable_shared_reference_class_local_accesses(right, accesses);
+        }
         mir::NullableSharedReferenceExpression::DictionaryGet { key, .. } => {
             collect_rvalue_class_local_accesses(key, accesses)
         }
@@ -3331,6 +3379,10 @@ fn collect_nullable_weak_reference_class_local_accesses<'a>(
         }
         mir::NullableWeakReferenceExpression::NullSafeCreate { value, .. } => {
             collect_nullable_shared_reference_class_local_accesses(value, accesses)
+        }
+        mir::NullableWeakReferenceExpression::Coalesce { left, right, .. } => {
+            collect_nullable_weak_reference_class_local_accesses(left, accesses);
+            collect_nullable_weak_reference_class_local_accesses(right, accesses);
         }
         mir::NullableWeakReferenceExpression::DictionaryGet { key, .. } => {
             collect_rvalue_class_local_accesses(key, accesses)
@@ -5455,6 +5507,10 @@ fn nullable_shared_reference_observes_property(
         mir::NullableSharedReferenceExpression::NullSafeAcquire { value, .. } => {
             nullable_weak_reference_observes_property(value, receiver, property)
         }
+        mir::NullableSharedReferenceExpression::Coalesce { left, right, .. } => {
+            nullable_shared_reference_observes_property(left, receiver, property)
+                || nullable_shared_reference_observes_property(right, receiver, property)
+        }
         mir::NullableSharedReferenceExpression::DictionaryGet { key, .. } => {
             rvalue_observes_property(key, receiver, property)
         }
@@ -5485,6 +5541,10 @@ fn nullable_weak_reference_observes_property(
             .any(|value| rvalue_observes_property(value, receiver, property)),
         mir::NullableWeakReferenceExpression::NullSafeCreate { value, .. } => {
             nullable_shared_reference_observes_property(value, receiver, property)
+        }
+        mir::NullableWeakReferenceExpression::Coalesce { left, right, .. } => {
+            nullable_weak_reference_observes_property(left, receiver, property)
+                || nullable_weak_reference_observes_property(right, receiver, property)
         }
         mir::NullableWeakReferenceExpression::DictionaryGet { key, .. } => {
             rvalue_observes_property(key, receiver, property)
@@ -7137,6 +7197,20 @@ fn validate_nullable_scalar_expression(
             Err(malformed_mir("nullable scalar wraps another scalar type"))
         }
     }
+}
+
+fn nullable_shared_transfer_source_is_owned(
+    expression: &mir::NullableSharedReferenceExpression,
+) -> bool {
+    matches!(expression, mir::NullableSharedReferenceExpression::Null(_))
+        || expression.owned_temporary().is_some()
+}
+
+fn nullable_weak_transfer_source_is_owned(
+    expression: &mir::NullableWeakReferenceExpression,
+) -> bool {
+    matches!(expression, mir::NullableWeakReferenceExpression::Null(_))
+        || expression.owned_temporary().is_some()
 }
 
 fn validate_nullable_class_expression(

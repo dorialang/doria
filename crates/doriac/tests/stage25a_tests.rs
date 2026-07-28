@@ -836,6 +836,92 @@ function main(): void
 }
 
 #[test]
+fn nullable_shared_coalesces_preserve_nullable_results_and_owned_branches() {
+    let source = r#"
+class Node
+{
+    function __construct(string $name) {}
+    function __destruct() { echo "drop " . $this->name . "\n"; }
+}
+
+function chooseStrong(
+    take ?SharedReference<Node> $left,
+    take ?SharedReference<Node> $right,
+): ?SharedReference<Node>
+{
+    return $left ?? $right;
+}
+
+function chooseWeak(
+    take ?WeakReference<Node> $left,
+    take ?WeakReference<Node> $right,
+): ?WeakReference<Node>
+{
+    return $left ?? $right;
+}
+
+function chooseStrongOrNull(
+    take ?SharedReference<Node> $value,
+): ?SharedReference<Node>
+{
+    return $value ?? null;
+}
+
+function chooseWeakOrNull(
+    take ?WeakReference<Node> $value,
+): ?WeakReference<Node>
+{
+    return $value ?? null;
+}
+
+function main(): void
+{
+    let $left = shared new Node("left");
+    let $right = shared new Node("right");
+
+    let $strongFallback = chooseStrong(null, $right->share());
+    if ($strongFallback != null) {
+        echo "strong fallback " . $strongFallback->name . "\n";
+    }
+
+    let $strongPresent = chooseStrong($left->share(), null);
+    if ($strongPresent != null) {
+        echo "strong present " . $strongPresent->name . "\n";
+    }
+
+    let $weakFallback = chooseWeak(null, $right->createWeakReference());
+    if ($weakFallback != null) {
+        echo "weak fallback\n";
+    }
+
+    let $weakPresent = chooseWeak($left->createWeakReference(), null);
+    if ($weakPresent != null) {
+        echo "weak present\n";
+    }
+
+    let $strongNull = chooseStrongOrNull(null);
+    let $weakNull = chooseWeakOrNull(null);
+    if ($strongNull == null && $weakNull == null) {
+        echo "null fallbacks\n";
+    }
+}
+"#;
+    let program = doriac::lower_source_to_mir("stage25a-nullable-coalesce.doria", source)
+        .expect("nullable strong and weak coalesces should lower to shared MIR");
+    let output = doriac::mir_interpreter::interpret(&program)
+        .expect("nullable strong and weak coalesces should preserve ownership");
+    assert_eq!(
+        output.stdout,
+        b"strong fallback right\nstrong present left\nweak fallback\nweak present\nnull fallbacks\ndrop right\ndrop left\n"
+    );
+    doriac::codegen_cranelift::lower_mir_to_object(&program)
+        .expect("nullable shared coalesces should lower through Cranelift");
+    #[cfg(feature = "llvm-backend")]
+    doriac::codegen_llvm::lower_mir_to_object(&program)
+        .expect("nullable shared coalesces should lower through LLVM");
+}
+
+#[test]
 fn borrowed_dictionary_shared_results_do_not_acquire_cleanup_obligations() {
     let source = r#"
 class Node

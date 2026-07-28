@@ -337,12 +337,24 @@ enum EvaluationTask {
         transfer: bool,
     },
     FinishSharedCoalesceRight(bool),
+    AfterNullableSharedCoalesce {
+        right: mir::NullableSharedReferenceExpression,
+        left_owned: bool,
+        transfer: bool,
+    },
+    FinishNullableSharedCoalesceRight(bool),
     AfterWeakCoalesce {
         right: mir::WeakReferenceExpression,
         left_owned: bool,
         transfer: bool,
     },
     FinishWeakCoalesceRight(bool),
+    AfterNullableWeakCoalesce {
+        right: mir::NullableWeakReferenceExpression,
+        left_owned: bool,
+        transfer: bool,
+    },
+    FinishNullableWeakCoalesceRight(bool),
     AfterNullSafeProperty {
         property: crate::class_layout::PropertyId,
         result: mir::Type,
@@ -2504,6 +2516,48 @@ impl Interpreter<'_> {
                     .values
                     .push(EvaluationValue::SharedReference { control, class });
             }
+            EvaluationTask::AfterNullableSharedCoalesce {
+                right,
+                left_owned,
+                transfer,
+            } => {
+                let (class, control) = self.pop_nullable_shared_reference()?;
+                if let Some(control) = control {
+                    if left_owned && !transfer {
+                        self.current_frame_mut()?
+                            .statement_temporary_drops
+                            .push(OwnedDrop::Shared(control.clone()));
+                    }
+                    self.current_frame_mut()?.values.push(
+                        EvaluationValue::NullableSharedReference {
+                            control: Some(control),
+                            class,
+                        },
+                    );
+                } else {
+                    let right_owned = !transfer && right.owned_temporary().is_some();
+                    let frame = self.current_frame_mut()?;
+                    frame
+                        .tasks
+                        .push(EvaluationTask::FinishNullableSharedCoalesceRight(
+                            right_owned,
+                        ));
+                    frame
+                        .tasks
+                        .push(EvaluationTask::NullableSharedReference(right));
+                }
+            }
+            EvaluationTask::FinishNullableSharedCoalesceRight(owned) => {
+                let (class, control) = self.pop_nullable_shared_reference()?;
+                if let (Some(control), true) = (&control, owned) {
+                    self.current_frame_mut()?
+                        .statement_temporary_drops
+                        .push(OwnedDrop::Shared(control.clone()));
+                }
+                self.current_frame_mut()?
+                    .values
+                    .push(EvaluationValue::NullableSharedReference { control, class });
+            }
             EvaluationTask::AfterWeakCoalesce {
                 right,
                 left_owned,
@@ -2547,6 +2601,46 @@ impl Interpreter<'_> {
                 self.current_frame_mut()?
                     .values
                     .push(EvaluationValue::WeakReference { control, class });
+            }
+            EvaluationTask::AfterNullableWeakCoalesce {
+                right,
+                left_owned,
+                transfer,
+            } => {
+                let (class, control) = self.pop_nullable_weak_reference()?;
+                if let Some(control) = control {
+                    if left_owned && !transfer {
+                        self.current_frame_mut()?
+                            .statement_temporary_drops
+                            .push(OwnedDrop::Weak(control.clone()));
+                    }
+                    self.current_frame_mut()?
+                        .values
+                        .push(EvaluationValue::NullableWeakReference {
+                            control: Some(control),
+                            class,
+                        });
+                } else {
+                    let right_owned = !transfer && right.owned_temporary().is_some();
+                    let frame = self.current_frame_mut()?;
+                    frame
+                        .tasks
+                        .push(EvaluationTask::FinishNullableWeakCoalesceRight(right_owned));
+                    frame
+                        .tasks
+                        .push(EvaluationTask::NullableWeakReference(right));
+                }
+            }
+            EvaluationTask::FinishNullableWeakCoalesceRight(owned) => {
+                let (class, control) = self.pop_nullable_weak_reference()?;
+                if let (Some(control), true) = (&control, owned) {
+                    self.current_frame_mut()?
+                        .statement_temporary_drops
+                        .push(OwnedDrop::Weak(control.clone()));
+                }
+                self.current_frame_mut()?
+                    .values
+                    .push(EvaluationValue::NullableWeakReference { control, class });
             }
             EvaluationTask::AfterNullSafeProperty {
                 property,
@@ -4521,6 +4615,25 @@ impl Interpreter<'_> {
                     .tasks
                     .push(EvaluationTask::NullableWeakReference(*value));
             }
+            mir::NullableSharedReferenceExpression::Coalesce {
+                left,
+                right,
+                transfer,
+                ..
+            } => {
+                let left_owned = left.owned_temporary().is_some();
+                let frame = self.current_frame_mut()?;
+                frame
+                    .tasks
+                    .push(EvaluationTask::AfterNullableSharedCoalesce {
+                        right: *right,
+                        left_owned,
+                        transfer,
+                    });
+                frame
+                    .tasks
+                    .push(EvaluationTask::NullableSharedReference(*left));
+            }
             mir::NullableSharedReferenceExpression::DictionaryGet {
                 class,
                 collection,
@@ -4648,6 +4761,23 @@ impl Interpreter<'_> {
                 frame
                     .tasks
                     .push(EvaluationTask::NullableSharedReference(*value));
+            }
+            mir::NullableWeakReferenceExpression::Coalesce {
+                left,
+                right,
+                transfer,
+                ..
+            } => {
+                let left_owned = left.owned_temporary().is_some();
+                let frame = self.current_frame_mut()?;
+                frame.tasks.push(EvaluationTask::AfterNullableWeakCoalesce {
+                    right: *right,
+                    left_owned,
+                    transfer,
+                });
+                frame
+                    .tasks
+                    .push(EvaluationTask::NullableWeakReference(*left));
             }
             mir::NullableWeakReferenceExpression::DictionaryGet {
                 class,
@@ -5530,6 +5660,36 @@ impl Interpreter<'_> {
                 "nullable class produced another value type",
             )),
             None => Err(InterpreterError::new("nullable class produced no value")),
+        }
+    }
+
+    fn pop_nullable_shared_reference(
+        &mut self,
+    ) -> Result<(crate::class_layout::ClassId, Option<SharedControl>), InterpreterError> {
+        match self.current_frame_mut()?.values.pop() {
+            Some(EvaluationValue::NullableSharedReference { control, class }) => {
+                Ok((class, control))
+            }
+            Some(_) => Err(InterpreterError::new(
+                "nullable shared reference produced another value type",
+            )),
+            None => Err(InterpreterError::new(
+                "nullable shared reference produced no value",
+            )),
+        }
+    }
+
+    fn pop_nullable_weak_reference(
+        &mut self,
+    ) -> Result<(crate::class_layout::ClassId, Option<SharedControl>), InterpreterError> {
+        match self.current_frame_mut()?.values.pop() {
+            Some(EvaluationValue::NullableWeakReference { control, class }) => Ok((class, control)),
+            Some(_) => Err(InterpreterError::new(
+                "nullable weak reference produced another value type",
+            )),
+            None => Err(InterpreterError::new(
+                "nullable weak reference produced no value",
+            )),
         }
     }
 
