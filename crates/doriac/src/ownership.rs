@@ -3190,7 +3190,10 @@ pub(crate) fn type_ref_is_move_type(
     classes: &HashSet<String>,
     receiver_class: Option<&str>,
 ) -> bool {
-    type_ref_class_name(ty, classes, receiver_class).is_some()
+    // Every Stage 25a handle and access object is a move type (record 0106):
+    // plain assignment transfers the handle and never silently retains.
+    crate::types::SharedHandleKind::from_source_name(&ty.name).is_some()
+        || type_ref_class_name(ty, classes, receiver_class).is_some()
         || matches!(
             ty.name.as_str(),
             "mixed" | "Bytes" | "[]" | "List" | "Dictionary" | "Set"

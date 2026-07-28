@@ -632,7 +632,28 @@ fn validate_expr(expr: &Expr, semantic_info: &SemanticInfo) -> Result<(), Backen
             }
             Ok(())
         }
-        Expr::New { args, .. } => validate_arguments(args, semantic_info),
+        Expr::New {
+            class_type,
+            args,
+            shared,
+            span,
+        } => {
+            // The PHP compatibility backend cannot express Doria's shared-ownership
+            // families: PHP object references are not `SharedReference<T>`, and PHP's
+            // refcounting does not implement the writable family's access rules.
+            if *shared
+                || crate::types::SharedHandleKind::from_source_name(&class_type.name).is_some()
+            {
+                return Err(BackendError::from_diagnostics(vec![
+                    Diagnostic::unsupported_stage(
+                        PHP_COLLECTION_UNSUPPORTED_CODE,
+                        "PHP compatibility backend cannot preserve Doria shared ownership; use the `native` or `debug` target for this valid Doria program",
+                        *span,
+                    ),
+                ]));
+            }
+            validate_arguments(args, semantic_info)
+        }
         Expr::StaticCall {
             class_name,
             method,
