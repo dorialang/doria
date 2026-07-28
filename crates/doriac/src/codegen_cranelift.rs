@@ -198,6 +198,9 @@ fn clif_scalar_type(ty: mir::ScalarType) -> ClifType {
 fn scalar_abi_param(ty: mir::ScalarType) -> AbiParam {
     match ty {
         mir::ScalarType::Integer(ty) => integer_abi_param(ty),
+        // Doria-to-Doria calls carry float32 as its exact IEEE bit pattern.
+        // This private ABI avoids platform C ABI register-slot differences.
+        mir::ScalarType::Float(FloatType::Float32) => AbiParam::new(types::I32),
         _ => AbiParam::new(clif_scalar_type(ty)),
     }
 }
@@ -256,6 +259,63 @@ impl LoweredValue {
                 values.push(payload);
             }
         }
+    }
+}
+
+fn value_to_doria_abi(
+    builder: &mut FunctionBuilder,
+    value: LoweredValue,
+    ty: mir::Type,
+) -> LoweredValue {
+    match (value, ty) {
+        (
+            LoweredValue::Single(value),
+            mir::Type::Scalar(mir::ScalarType::Float(FloatType::Float32)),
+        ) => LoweredValue::Single(
+            builder
+                .ins()
+                .bitcast(types::I32, MemFlagsData::new(), value),
+        ),
+        (
+            LoweredValue::Nullable { present, payload },
+            mir::Type::NullableScalar(mir::ScalarType::Float(FloatType::Float32)),
+        ) => LoweredValue::Nullable {
+            present,
+            payload: builder
+                .ins()
+                .bitcast(types::I32, MemFlagsData::new(), payload),
+        },
+        (value, _) => value,
+    }
+}
+
+fn value_from_doria_abi(builder: &mut FunctionBuilder, value: Value, ty: mir::Type) -> Value {
+    if matches!(
+        ty,
+        mir::Type::Scalar(mir::ScalarType::Float(FloatType::Float32))
+    ) {
+        builder
+            .ins()
+            .bitcast(types::F32, MemFlagsData::new(), value)
+    } else {
+        value
+    }
+}
+
+fn nullable_payload_from_doria_abi(
+    builder: &mut FunctionBuilder,
+    payload: Value,
+    ty: mir::Type,
+) -> Value {
+    if matches!(
+        ty,
+        mir::Type::NullableScalar(mir::ScalarType::Float(FloatType::Float32))
+    ) {
+        builder
+            .ins()
+            .bitcast(types::F32, MemFlagsData::new(), payload)
+    } else {
+        payload
     }
 }
 
@@ -643,11 +703,13 @@ fn bind_parameters(
         let first = params
             .next()
             .ok_or_else(|| malformed_mir("function parameter is missing an ABI value"))?;
+        let first = value_from_doria_abi(builder, first, ty);
         builder.ins().stack_store(pointer_type, first, slot, 0);
         if matches!(ty, mir::Type::NullableScalar(_) | mir::Type::NullableString) {
             let payload = params.next().ok_or_else(|| {
                 malformed_mir("nullable function parameter is missing its ABI payload")
             })?;
+            let payload = nullable_payload_from_doria_abi(builder, payload, ty);
             let payload_offset = builder.func.dfg.value_type(first).bytes() as i32;
             builder
                 .ins()
@@ -1583,7 +1645,7 @@ fn lower_terminator(
             cleanup_class_locals(builder, resources)?;
             cleanup_string_locals(builder, resources)?;
             let mut values = Vec::with_capacity(2);
-            value.append_to(&mut values);
+            value_to_doria_abi(builder, value, expression.ty()).append_to(&mut values);
             builder.ins().return_(&values);
         }
         mir::Terminator::ReturnVoid => {
@@ -5711,7 +5773,7 @@ fn lower_call_args(
         if ownership.has_shell() {
             temporary_mixed.push((index, value.single()?, ownership));
         }
-        value.append_to(&mut abi_values);
+        value_to_doria_abi(builder, value, argument.ty()).append_to(&mut abi_values);
         arguments.push(value);
     }
     Ok(LoweredCallArgs {
@@ -5738,19 +5800,30 @@ fn lower_function_call(
     let result = match callee_definition.return_type {
         mir::ReturnType::Void => None,
         mir::ReturnType::Value(mir::Type::NullableScalar(_) | mir::Type::NullableString) => {
+            let ty = match callee_definition.return_type {
+                mir::ReturnType::Value(ty) => ty,
+                mir::ReturnType::Void => unreachable!(),
+            };
             Some(LoweredValue::Nullable {
                 present: *results
                     .first()
                     .ok_or_else(|| malformed_mir("nullable call produced no presence result"))?,
-                payload: *results
-                    .get(1)
-                    .ok_or_else(|| malformed_mir("nullable call produced no payload result"))?,
+                payload: nullable_payload_from_doria_abi(
+                    builder,
+                    *results
+                        .get(1)
+                        .ok_or_else(|| malformed_mir("nullable call produced no payload result"))?,
+                    ty,
+                ),
             })
         }
-        mir::ReturnType::Value(_) => {
-            Some(LoweredValue::Single(*results.first().ok_or_else(|| {
-                malformed_mir("value call produced no result")
-            })?))
+        mir::ReturnType::Value(ty) => {
+            let value = *results
+                .first()
+                .ok_or_else(|| malformed_mir("value call produced no result"))?;
+            Some(LoweredValue::Single(value_from_doria_abi(
+                builder, value, ty,
+            )))
         }
     };
     for (_, string) in lowered.owned_strings {
@@ -5821,20 +5894,31 @@ fn lower_method_call_with_receiver(
     let result = match definition.return_type {
         mir::ReturnType::Void => None,
         mir::ReturnType::Value(mir::Type::NullableScalar(_) | mir::Type::NullableString) => {
+            let ty = match definition.return_type {
+                mir::ReturnType::Value(ty) => ty,
+                mir::ReturnType::Void => unreachable!(),
+            };
             Some(LoweredValue::Nullable {
                 present: *results
                     .first()
                     .ok_or_else(|| malformed_mir("nullable method call has no presence result"))?,
-                payload: *results
-                    .get(1)
-                    .ok_or_else(|| malformed_mir("nullable method call has no payload result"))?,
+                payload: nullable_payload_from_doria_abi(
+                    builder,
+                    *results.get(1).ok_or_else(|| {
+                        malformed_mir("nullable method call has no payload result")
+                    })?,
+                    ty,
+                ),
             })
         }
-        mir::ReturnType::Value(_) => Some(LoweredValue::Single(
-            *results
+        mir::ReturnType::Value(ty) => {
+            let value = *results
                 .first()
-                .ok_or_else(|| malformed_mir("method call has no result"))?,
-        )),
+                .ok_or_else(|| malformed_mir("method call has no result"))?;
+            Some(LoweredValue::Single(value_from_doria_abi(
+                builder, value, ty,
+            )))
+        }
     };
     for (_, string) in lowered.owned_strings {
         release_string(builder, string, resources)?;
