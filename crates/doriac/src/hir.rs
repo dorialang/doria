@@ -303,6 +303,9 @@ pub enum Expr {
     New {
         class_type: TypeRef,
         args: Vec<Argument>,
+        /// See `ast::Expr::New::shared` — preserved through lowering so the
+        /// checker never infers shared construction from context.
+        shared: bool,
         span: Span,
     },
     Grouped {

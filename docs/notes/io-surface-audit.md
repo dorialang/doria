@@ -109,7 +109,7 @@ Format per item: **Status · Options · Tradeoffs · Recommendation (marked) · 
 
 ### D7 — concurrency: sendable streams, cross-task handles, stdout synchronization [DEFER · flag as design cases]
 - **Status.** Unaddressed. DDO already flags "connections are not `Sendable`."
-- **Recommendation → defer to the async/`Sendable`/`Shareable` decision, but flag three explicit design cases:** (1) is a `File` handle `Sendable` (movable across tasks)? (2) is shared stream access allowed only via `SharedMut`? (3) is stdout writing synchronized across concurrent tasks (interleaving hazard)? Lean: stdout writes should be process-globally synchronized so concurrent `echo` cannot interleave mid-write. **Reopen trigger:** async decision. **Blast radius:** async-decision design cases; no current impact.
+- **Recommendation → defer to the async/`Sendable`/`Shareable` decision, but flag three explicit design cases:** (1) is a `File` handle `Sendable` (movable across tasks)? (2) is shared stream access allowed only via `WritableSharedReference`? (3) is stdout writing synchronized across concurrent tasks (interleaving hazard)? Lean: stdout writes should be process-globally synchronized so concurrent `echo` cannot interleave mid-write. **Reopen trigger:** async decision. **Blast radius:** async-decision design cases; no current impact.
 
 ### D8 — seek/tell/truncate/metadata + the `Doria\Std\Io` vs `Doria\Std\Fs` line [OPEN — draw the line]
 - **Status.** The stream tier mentions seek; tell, truncate-in-place, size, existence, permissions, timestamps, directory ops are unplaced. The plan lists both `Io` and `Fs` without a boundary.

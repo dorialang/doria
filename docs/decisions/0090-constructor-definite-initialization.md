@@ -139,8 +139,9 @@ interpreter, Cranelift fast profile, and LLVM release profile, including exact
 destructor output. New diagnostics require coordinated no-false-diagnostics
 coverage in the separate `dorialang/doria-language-server` repository.
 
-This decision does not settle or implement `Shared<T>`, `Weak<T>`, or
-`SharedMut<T>`. Their public API remains a separately unauthored decision subject
+This decision does not settle or implement `SharedReference<T>`,
+`WeakReference<T>`, or `WritableSharedReference<T>`. Their public API remains a
+separately unauthored decision subject
 rescheduled to Stage 25a, so it is outside the Stage 21 acceptance criterion.
 
 ## Invalidated elsewhere

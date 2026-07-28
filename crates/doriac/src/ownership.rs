@@ -56,6 +56,21 @@ impl Signature {
     }
 }
 
+fn writable_shared_constructor_signature() -> Signature {
+    Signature {
+        params: vec![Parameter {
+            name: "value".to_string(),
+            move_type: true,
+            class_type: false,
+            generic: true,
+            take: true,
+            writable: false,
+        }],
+        returns_move_type: true,
+        ..Signature::default()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum State {
     Borrowed,
@@ -1769,11 +1784,14 @@ impl Checker<'_> {
             Expr::New {
                 class_type, args, ..
             } => {
-                let signature = self
-                    .constructors
-                    .get(&class_type.name)
-                    .cloned()
-                    .unwrap_or_default();
+                let signature = if class_type.name == "WritableSharedReference" {
+                    writable_shared_constructor_signature()
+                } else {
+                    self.constructors
+                        .get(&class_type.name)
+                        .cloned()
+                        .unwrap_or_default()
+                };
                 self.use_call_args(None, args, &signature, CallExecution::Always, scopes);
             }
             Expr::MethodCall {
@@ -3047,6 +3065,9 @@ fn resolved_type_class(ty: &crate::types::ResolvedType) -> Option<&str> {
     match ty {
         crate::types::ResolvedType::Class(class) => Some(&class.name),
         crate::types::ResolvedType::Nullable(inner) => resolved_type_class(inner),
+        crate::types::ResolvedType::SharedHandle(kind, payload) if kind.forwards_payload() => {
+            resolved_type_class(payload)
+        }
         _ => None,
     }
 }
@@ -3056,6 +3077,7 @@ fn resolved_type_is_move_type(ty: &crate::types::ResolvedType) -> bool {
         crate::types::ResolvedType::Bytes
         | crate::types::ResolvedType::Mixed
         | crate::types::ResolvedType::Class(_)
+        | crate::types::ResolvedType::SharedHandle(_, _)
         | crate::types::ResolvedType::TypedArray(_)
         | crate::types::ResolvedType::List(_)
         | crate::types::ResolvedType::Dictionary(_, _)
@@ -3082,6 +3104,9 @@ fn resolved_type_requires_conservative_move(ty: &crate::types::ResolvedType) -> 
             .arguments
             .iter()
             .any(resolved_type_requires_conservative_move),
+        crate::types::ResolvedType::SharedHandle(_, payload) => {
+            resolved_type_requires_conservative_move(payload)
+        }
         _ => false,
     }
 }
@@ -3190,7 +3215,10 @@ pub(crate) fn type_ref_is_move_type(
     classes: &HashSet<String>,
     receiver_class: Option<&str>,
 ) -> bool {
-    type_ref_class_name(ty, classes, receiver_class).is_some()
+    // Every Stage 25a handle and access object is a move type (record 0106):
+    // plain assignment transfers the handle and never silently retains.
+    crate::types::SharedHandleKind::from_source_name(&ty.name).is_some()
+        || type_ref_class_name(ty, classes, receiver_class).is_some()
         || matches!(
             ty.name.as_str(),
             "mixed" | "Bytes" | "[]" | "List" | "Dictionary" | "Set"

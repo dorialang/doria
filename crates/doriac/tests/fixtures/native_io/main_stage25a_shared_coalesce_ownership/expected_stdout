@@ -1,0 +1,14 @@
+nullable property Existing
+nullable method Existing
+inspect Existing
+maybe Existing
+owner Existing
+absent property missing
+absent method missing
+make strong Fallback
+inspect Fallback
+drop Fallback
+make weak fallback
+present Existing
+fallback Existing
+drop Existing

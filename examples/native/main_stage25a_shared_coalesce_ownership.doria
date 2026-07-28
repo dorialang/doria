@@ -1,0 +1,73 @@
+class Node
+{
+    function __construct(string $name)
+    {
+    }
+
+    function __destruct()
+    {
+        echo "drop {$this->name}\n";
+    }
+
+    function label(): string
+    {
+        return $this->name;
+    }
+}
+
+function makeStrong(string $name): SharedReference<Node>
+{
+    echo "make strong {$name}\n";
+    return shared new Node($name);
+}
+
+function makeWeak(
+    SharedReference<Node> $strong,
+    string $label,
+): WeakReference<Node>
+{
+    echo "make weak {$label}\n";
+    return $strong->createWeakReference();
+}
+
+function inspect(SharedReference<Node> $node): void
+{
+    echo "inspect {$node->name}\n";
+}
+
+function main(): void
+{
+    let $owner = shared new Node("Existing");
+    let $weak = $owner->createWeakReference();
+    let $maybe = $weak->acquire();
+
+    echo "nullable property " . ($maybe?->name ?? "missing") . "\n";
+    echo "nullable method " . ($maybe?->label() ?? "missing") . "\n";
+    inspect($maybe ?? makeStrong("unused"));
+    if ($maybe != null) {
+        echo "maybe {$maybe->name}\n";
+    }
+    echo "owner {$owner->name}\n";
+
+    ?SharedReference<Node> $absentStrong = null;
+    echo "absent property " . ($absentStrong?->name ?? "missing") . "\n";
+    echo "absent method " . ($absentStrong?->label() ?? "missing") . "\n";
+    inspect($absentStrong ?? makeStrong("Fallback"));
+
+    ?WeakReference<Node> $presentWeak = $weak;
+    let $selectedPresent = $presentWeak
+        ?? makeWeak($owner, "unused");
+
+    ?WeakReference<Node> $absentWeak = null;
+    let $selectedFallback = $absentWeak
+        ?? makeWeak($owner, "fallback");
+
+    let $presentLive = $selectedPresent->acquire();
+    if ($presentLive != null) {
+        echo "present {$presentLive->name}\n";
+    }
+    let $fallbackLive = $selectedFallback->acquire();
+    if ($fallbackLive != null) {
+        echo "fallback {$fallbackLive->name}\n";
+    }
+}

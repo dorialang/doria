@@ -314,7 +314,7 @@ impl Evaluator {
         self.stack.push(key.clone());
         let expected = node.annotation.as_ref().and_then(const_type);
         if let Some(annotation) = &node.annotation {
-            if expected.is_none() {
+            if expected.is_none() && !matches!(node.key, ConstKey::Static { .. }) {
                 self.diagnostics.push(Diagnostic::new(
                     "E0483",
                     format!("`{annotation}` is not a supported constant or static type"),

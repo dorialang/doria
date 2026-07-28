@@ -160,6 +160,13 @@ jobs:
           cargo run -p doriac -- compile examples/native/main_stage25_generic_classes.doria --out build/native/main_stage25_generic_classes
           valgrind --leak-check=full --show-leak-kinds=all --errors-for-leak-kinds=definite,indirect --track-origins=yes --error-exitcode=1 build/native/main_stage25_generic_classes
 
+      - name: Leak-check Stage 25a readonly shared ownership with Cranelift
+        run: |
+          cargo run -p doriac -- compile examples/native/main_stage25a_readonly_shared_ownership.doria --out build/native/main_stage25a_readonly_shared_ownership
+          valgrind --leak-check=full --show-leak-kinds=all --errors-for-leak-kinds=definite,indirect --track-origins=yes --error-exitcode=1 build/native/main_stage25a_readonly_shared_ownership
+          cargo run -p doriac -- compile examples/native/main_stage25a_shared_coalesce_ownership.doria --out build/native/main_stage25a_shared_coalesce_ownership
+          valgrind --leak-check=full --show-leak-kinds=all --errors-for-leak-kinds=definite,indirect --track-origins=yes --error-exitcode=1 build/native/main_stage25a_shared_coalesce_ownership
+
       - name: Smoke signed and unsigned narrow-width native fixtures
         run: |
           cargo run -p doriac -- compile examples/native/main_integer_div_mod_42.doria --target native --out build/native/main_integer_div_mod_42
@@ -392,6 +399,15 @@ jobs:
         run: |
           cargo run -p doriac --features llvm-backend -- compile examples/native/main_stage25_generic_classes.doria --release --out build/native/main_stage25_generic_classes_release
           valgrind --leak-check=full --show-leak-kinds=all --errors-for-leak-kinds=definite,indirect --track-origins=yes --error-exitcode=1 build/native/main_stage25_generic_classes_release
+
+      - name: Leak-check Stage 25a readonly shared ownership with LLVM
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          cargo run -p doriac --features llvm-backend -- compile examples/native/main_stage25a_readonly_shared_ownership.doria --release --out build/native/main_stage25a_readonly_shared_ownership_release
+          valgrind --leak-check=full --show-leak-kinds=all --errors-for-leak-kinds=definite,indirect --track-origins=yes --error-exitcode=1 build/native/main_stage25a_readonly_shared_ownership_release
+          cargo run -p doriac --features llvm-backend -- compile examples/native/main_stage25a_shared_coalesce_ownership.doria --release --out build/native/main_stage25a_shared_coalesce_ownership_release
+          valgrind --leak-check=full --show-leak-kinds=all --errors-for-leak-kinds=definite,indirect --track-origins=yes --error-exitcode=1 build/native/main_stage25a_shared_coalesce_ownership_release
 
       - name: Smoke LLVM release profile and panic parity on Unix
         if: runner.os != 'Windows'
