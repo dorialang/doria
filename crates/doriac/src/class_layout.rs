@@ -28,6 +28,9 @@ pub enum FieldType {
     NullableMixed,
     Class(ClassId),
     NullableClass(ClassId),
+    SharedReference(ClassId),
+    WeakReference(ClassId),
+    NullableSharedReference(ClassId),
     Collection,
 }
 
@@ -106,6 +109,9 @@ pub const fn field_size_align(ty: FieldType, pointer_size: u32) -> (u32, u32) {
         | FieldType::NullableMixed
         | FieldType::Class(_)
         | FieldType::NullableClass(_)
+        | FieldType::SharedReference(_)
+        | FieldType::WeakReference(_)
+        | FieldType::NullableSharedReference(_)
         | FieldType::Collection => (pointer_size, pointer_size),
     }
 }

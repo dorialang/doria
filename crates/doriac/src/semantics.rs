@@ -5144,6 +5144,7 @@ impl<'program> Checker<'program> {
         match self.types.kind(ty) {
             TypeKind::Nullable(inner) => self.type_is_move_type(*inner),
             TypeKind::Class(_)
+            | TypeKind::SharedHandle(_, _)
             | TypeKind::TypeParameter(_)
             | TypeKind::Bytes
             | TypeKind::Mixed

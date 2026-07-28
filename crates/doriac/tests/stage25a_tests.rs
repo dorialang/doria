@@ -1,8 +1,5 @@
-//! Stage 25a Slice 1 — shared-ownership grammar and type model (record 0106).
-//!
-//! Slice 1 lands the surface and the type model only. The reference-counted
-//! runtime arrives in the following slices, so these tests assert the static
-//! model and the stage-named runtime diagnostic, never runtime behavior.
+//! Stage 25a — shared-ownership grammar, type model, and readonly runtime family
+//! (record 0106).
 
 use doriac::diagnostics::Diagnostic;
 
@@ -446,26 +443,469 @@ fn sharing_is_explicit_rather_than_implicit_retention() {
     );
 }
 
-// --- Two clocks ----------------------------------------------------------
+#[test]
+fn shared_handle_returns_transfer_instead_of_extending_a_borrow() {
+    let source = r#"
+class Node {}
+
+function invalid(SharedReference<Node> $value): SharedReference<Node>
+{
+    return $value;
+}
+"#;
+    let diagnostics = doriac::check_source("stage25a-return.doria", source)
+        .expect_err("a borrowed handle cannot become an owning return");
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E0474"),
+        "expected an ownership-return diagnostic, got {diagnostics:?}"
+    );
+}
+
+// --- Readonly runtime family ---------------------------------------------
 
 #[test]
-fn native_lowering_reports_the_stage_named_runtime_diagnostic() {
-    let source = format!("{NODE}\nfunction main(): void {{ let $node = shared new Node(); }}\n");
-    let diagnostics = doriac::lower_source_to_mir("stage25a-runtime.doria", &source)
-        .expect_err("Stage 25a runtime support is not implemented in Slice 1");
-    let message = diagnostics
+fn readonly_shared_family_lowers_and_interprets() {
+    let source = r#"
+class Node
+{
+    string $name = "Root";
+
+    function __destruct() { echo "drop " . $this->name . "\n"; }
+    function describe(): string { return $this->name; }
+}
+
+function consume(take SharedReference<Node> $value): void {}
+
+function main(): void
+{
+    let $first = shared new Node();
+    let $weak = $first->createWeakReference();
+    let $second = $first->share();
+    echo $first->name . " " . $second->referencedValue->describe() . "\n";
+    consume($second);
+    let $live = $weak->acquire();
+    if ($live != null) { echo $live->name . "\n"; }
+}
+"#;
+    let program = doriac::lower_source_to_mir("stage25a-runtime.doria", source)
+        .expect("readonly shared ownership should lower to MIR");
+    let output =
+        doriac::mir_interpreter::interpret(&program).expect("readonly shared MIR should interpret");
+    assert_eq!(output.stdout, b"Root Root\nRoot\ndrop Root\n");
+    doriac::codegen_cranelift::lower_mir_to_object(&program)
+        .expect("readonly shared MIR should lower through Cranelift");
+    #[cfg(feature = "llvm-backend")]
+    doriac::codegen_llvm::lower_mir_to_object(&program)
+        .expect("readonly shared MIR should lower through LLVM");
+}
+
+#[test]
+fn derived_shared_operations_preserve_and_release_owned_receivers() {
+    let source = r#"
+class Node
+{
+    function __construct(string $name) {}
+    function label(): string { return $this->name; }
+    function __destruct() { echo "drop " . $this->name . "\n"; }
+}
+
+function makeStrong(string $name): SharedReference<Node>
+{
+    return shared new Node($name);
+}
+
+function makeWeak(string $name): WeakReference<Node>
+{
+    return (shared new Node($name))->createWeakReference();
+}
+
+function main(): void
+{
+    let $shared = makeStrong("shared")->share();
+    echo $shared->name . "\n";
+    let $weak = makeStrong("weak")->createWeakReference();
+    let $expired = $weak->acquire();
+    if ($expired == null) { echo "expired\n"; }
+    let $acquired = makeWeak("acquire")->acquire();
+    if ($acquired == null) { echo "missing\n"; }
+    echo makeStrong("payload")->referencedValue->label() . "\n";
+}
+"#;
+    let program = doriac::lower_source_to_mir("stage25a-derived-temporaries.doria", source)
+        .expect("derived shared operations should lower with explicit owner temporaries");
+    let output = doriac::mir_interpreter::interpret(&program)
+        .expect("derived shared operations should execute without leaking owners");
+    assert_eq!(
+        output.stdout,
+        b"shared\ndrop weak\nexpired\ndrop acquire\nmissing\npayload\ndrop payload\ndrop shared\n"
+    );
+    doriac::codegen_cranelift::lower_mir_to_object(&program)
+        .expect("derived shared operations should lower through Cranelift");
+    #[cfg(feature = "llvm-backend")]
+    doriac::codegen_llvm::lower_mir_to_object(&program)
+        .expect("derived shared operations should lower through LLVM");
+}
+
+#[test]
+fn shared_rebinding_coalescing_and_foreach_preserve_handle_ownership() {
+    let source = r#"
+class Node
+{
+    function __construct(string $name) {}
+    function __destruct() { echo "drop " . $this->name . "\n"; }
+}
+
+function show(SharedReference<Node> $node): void
+{
+    echo $node->name . "\n";
+}
+
+function main(): void
+{
+    let writable $current = shared new Node("old");
+    $current = shared new Node("current");
+
+    let $expired = (shared new Node("expired"))->createWeakReference();
+    let $fallback = $expired->acquire() ?? shared new Node("fallback");
+    show($fallback);
+
+    let writable $weak = $current->createWeakReference();
+    $weak = $fallback->createWeakReference();
+    writable ?SharedReference<Node> $maybe = null;
+    $maybe = $current->share();
+
+    let $first = shared new Node("first");
+    let $second = shared new Node("second");
+    SharedReference<Node>[] $nodes = [$first->share(), $second->share()];
+    foreach ($nodes as SharedReference<Node> $node) {
+        show($node);
+    }
+    show($first);
+    show($second);
+}
+"#;
+    let program = doriac::lower_source_to_mir("stage25a-composition.doria", source)
+        .expect("shared ownership composition fixture should lower");
+    let output = doriac::mir_interpreter::interpret(&program)
+        .expect("shared ownership composition fixture should interpret");
+    assert_eq!(
+        output.stdout,
+        b"drop old\ndrop expired\nfallback\nfirst\nsecond\nfirst\nsecond\ndrop second\ndrop first\ndrop fallback\ndrop current\n"
+    );
+    doriac::codegen_cranelift::lower_mir_to_object(&program)
+        .expect("shared ownership composition should lower through Cranelift");
+    #[cfg(feature = "llvm-backend")]
+    doriac::codegen_llvm::lower_mir_to_object(&program)
+        .expect("shared ownership composition should lower through LLVM");
+}
+
+#[test]
+fn borrowed_coalesces_type_tests_and_temporary_receivers_preserve_lifetimes() {
+    let source = r#"
+class Node
+{
+    function __construct(string $name) {}
+    function label(): string { return $this->name; }
+    function __destruct() { echo "drop " . $this->name . "\n"; }
+}
+
+function makeStrong(string $name): SharedReference<Node>
+{
+    echo "make " . $name . "\n";
+    return shared new Node($name);
+}
+
+function inspect(?SharedReference<Node> $candidate, SharedReference<Node> $fallback): void
+{
+    echo ($candidate ?? $fallback)->name . "\n";
+    echo $fallback->name . "\n";
+}
+
+function main(): void
+{
+    let $fallback = makeStrong("fallback");
+    ?SharedReference<Node> $missing = null;
+    inspect($missing, $fallback);
+
+    if (makeStrong("tested") is Node) {
+        echo "tested\n";
+    }
+
+    echo makeStrong("call")->name . "\n";
+    let $root = makeStrong("root");
+    echo $root->share()->label() . "\n";
+}
+"#;
+    let program = doriac::lower_source_to_mir("stage25a-borrowed-composition.doria", source)
+        .expect("borrowed shared composition should lower");
+    let output = doriac::mir_interpreter::interpret(&program)
+        .expect("borrowed shared composition should execute");
+    assert_eq!(
+        output.stdout,
+        b"make fallback\nfallback\nfallback\nmake tested\ndrop tested\nmake call\ncall\nmake root\nroot\ndrop root\ndrop call\ndrop fallback\n"
+    );
+    doriac::codegen_cranelift::lower_mir_to_object(&program)
+        .expect("borrowed shared composition should lower through Cranelift");
+    #[cfg(feature = "llvm-backend")]
+    doriac::codegen_llvm::lower_mir_to_object(&program)
+        .expect("borrowed shared composition should lower through LLVM");
+}
+
+#[test]
+fn borrowed_dictionary_shared_results_do_not_acquire_cleanup_obligations() {
+    let source = r#"
+class Node
+{
+    function __destruct() { echo "drop\n"; }
+}
+
+function main(): void
+{
+    let $root = shared new Node();
+    Dictionary<string, SharedReference<Node>> $values = ["node" => $root->share()];
+    let $borrowed = $values->get("node");
+    if ($borrowed != null) { echo "found\n"; }
+}
+"#;
+    let diagnostics = doriac::check_source("stage25a-borrowed-dictionary.doria", source)
+        .expect_err("stored collection borrows remain rejected until lifetime tracking lands");
+    assert!(diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == "E0478" && diagnostic.message.contains("borrowed result")
+    }));
+}
+
+#[test]
+fn weak_reference_survives_payload_destruction_without_resurrection() {
+    let source = r#"
+class Node
+{
+    function __construct(string $name) {}
+    function __destruct() { echo "drop " . $this->name . "\n"; }
+}
+
+function makeWeak(): WeakReference<Node>
+{
+    let $strong = shared new Node("Expired");
+    return $strong->createWeakReference();
+}
+
+function main(): void
+{
+    let $weak = makeWeak();
+    let $live = $weak->acquire();
+    if ($live == null) { echo "expired\n"; }
+}
+"#;
+    let program = doriac::lower_source_to_mir("stage25a-expired.doria", source)
+        .expect("weak lifetime fixture should lower");
+    let output = doriac::mir_interpreter::interpret(&program)
+        .expect("weak lifetime fixture should interpret");
+    assert_eq!(output.stdout, b"drop Expired\nexpired\n");
+}
+
+#[test]
+fn nullable_weak_references_preserve_weak_ownership_across_storage_paths() {
+    let source = r#"
+class Node
+{
+    function __construct(string $name) {}
+    function __destruct() { echo "drop " . $this->name . "\n"; }
+}
+
+class Holder
+{
+    function __construct(take ?WeakReference<Node> $weak) {}
+}
+
+function maybeWeak(SharedReference<Node> $root): ?WeakReference<Node>
+{
+    return $root->createWeakReference();
+}
+
+function main(): void
+{
+    let $root = shared new Node("root");
+    writable ?WeakReference<Node> $maybe = null;
+    if ($maybe == null) { echo "empty\n"; }
+
+    $maybe = maybeWeak($root);
+    if ($maybe != null) {
+        let $live = $maybe->acquire();
+        if ($live != null) { echo $live->name . "\n"; }
+    }
+
+    let $holder = new Holder($root->createWeakReference());
+    if ($holder->weak != null) { echo "stored\n"; }
+
+    Dictionary<string, WeakReference<Node>> $refs = [
+        "root" => $root->createWeakReference(),
+    ];
+    if ($refs->get("root") != null) { echo "found\n"; }
+    if ($refs->get("missing") == null) { echo "missing\n"; }
+}
+"#;
+    let program = doriac::lower_source_to_mir("stage25a-nullable-weak.doria", source)
+        .expect("nullable weak references should lower across supported storage paths");
+    let output = doriac::mir_interpreter::interpret(&program)
+        .expect("nullable weak references should interpret without acquiring strong ownership");
+    assert_eq!(
+        output.stdout,
+        b"empty\nroot\nstored\nfound\nmissing\ndrop root\n"
+    );
+    doriac::codegen_cranelift::lower_mir_to_object(&program)
+        .expect("nullable weak references should lower through Cranelift");
+    #[cfg(feature = "llvm-backend")]
+    doriac::codegen_llvm::lower_mir_to_object(&program)
+        .expect("nullable weak references should lower through LLVM");
+}
+
+#[test]
+fn shared_handles_flow_through_borrowed_calls_collections_and_generics() {
+    let source = r#"
+class Node
+{
+    function __construct(string $name) {}
+    function __destruct() { echo "drop " . $this->name . "\n"; }
+}
+
+class Box<T>
+{
+    function __construct(take T $value) {}
+}
+
+function inspect(SharedReference<Node> $node): void { echo $node->name . "\n"; }
+function inspectNamed(int $marker, SharedReference<Node> $node): void
+{
+    echo "{$marker}:{$node->name}\n";
+}
+function marker(): int { echo "marker\n"; return 7; }
+function consume(take SharedReference<Node> $node): void {}
+function identity<T>(take T $value): T { return $value; }
+
+function main(): void
+{
+    let $root = shared new Node("Root");
+    inspect($root->share());
+    List<SharedReference<Node>> $values = [$root->share()];
+    inspect($values[0]);
+    inspectNamed(node: $values[0], marker: marker());
+    let writable $moving = $values;
+    consume($moving->removeAt(0));
+    let $box = new Box<SharedReference<Node>>($root->share());
+    let $returned = identity($root->share());
+    inspect($returned);
+}
+"#;
+    let program = doriac::lower_source_to_mir("stage25a-storage.doria", source)
+        .expect("shared storage fixture should lower");
+    let output =
+        doriac::mir_interpreter::interpret(&program).expect("shared storage should interpret");
+    assert_eq!(
+        output.stdout,
+        b"Root\nRoot\nmarker\n7:Root\nRoot\ndrop Root\n"
+    );
+    doriac::codegen_cranelift::lower_mir_to_object(&program)
+        .expect("shared storage should lower through Cranelift");
+}
+
+#[test]
+fn shared_handles_flow_through_properties_arrays_and_dictionary_values() {
+    let source = r#"
+class Node
+{
+    function __construct(string $name) {}
+    function __destruct() { echo "drop " . $this->name . "\n"; }
+}
+
+class Holder
+{
+    function __construct(
+        take SharedReference<Node> $strong,
+        take WeakReference<Node> $weak,
+        take ?SharedReference<Node> $optional,
+    ) {}
+}
+
+function inspect(SharedReference<Node> $node): void { echo $node->name . "\n"; }
+
+function main(): void
+{
+    let $root = shared new Node("stored");
+    let $holder = new Holder(
+        $root->share(),
+        $root->createWeakReference(),
+        $root->share(),
+    );
+    inspect($holder->strong);
+    let $fromWeak = $holder->weak->acquire();
+    if ($fromWeak != null) { inspect($fromWeak); }
+    if ($holder->optional != null) { echo "optional\n"; }
+
+    SharedReference<Node>[] $array = [$root->share()];
+    inspect($array[0]);
+
+    Dictionary<string, SharedReference<Node>> $named = [
+        "node" => $root->share(),
+    ];
+    if ($named->get("node") != null) { echo "found\n"; }
+}
+"#;
+    let program = doriac::lower_source_to_mir("stage25a-properties.doria", source)
+        .expect("shared property and collection storage fixture should lower");
+    let output = doriac::mir_interpreter::interpret(&program)
+        .expect("shared property and collection storage fixture should interpret");
+    assert_eq!(
+        output.stdout,
+        b"stored\nstored\noptional\nstored\nfound\ndrop stored\n"
+    );
+    doriac::codegen_cranelift::lower_mir_to_object(&program)
+        .expect("shared property and collection storage should lower through Cranelift");
+    #[cfg(feature = "llvm-backend")]
+    doriac::codegen_llvm::lower_mir_to_object(&program)
+        .expect("shared property and collection storage should lower through LLVM");
+}
+
+#[test]
+fn shared_handles_do_not_gain_implicit_hash_identity() {
+    let diagnostics = rejected(
+        r#"
+    Dictionary<SharedReference<Node>, int> $named = [];
+    Set<WeakReference<Node>> $weak = [];
+"#,
+    );
+    assert_eq!(
+        diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == "E0523")
+            .count(),
+        2
+    );
+    assert!(diagnostics
         .iter()
-        .map(|entry| entry.message.clone())
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert!(
-        message.contains("Stage 25a Shared-Ownership Runtime Support Is Not Yet Implemented"),
-        "expected the stage-named runtime diagnostic, got: {message}"
-    );
-    assert!(
-        !message.contains("SharedHandle("),
-        "the diagnostic must not leak an internal type representation: {message}"
-    );
+        .filter(|diagnostic| diagnostic.code == "E0523")
+        .all(|diagnostic| diagnostic.message.contains("Hashable")));
+}
+
+#[test]
+fn mixed_boundary_reports_runtime_pending_instead_of_losing_handle_ownership() {
+    let source = r#"
+class Node {}
+
+function main(): void
+{
+    let $node = shared new Node();
+    mixed $boxed = $node;
+}
+"#;
+    let diagnostics = doriac::lower_source_to_mir("stage25a-mixed.doria", source)
+        .expect_err("shared handles through mixed require an explicit runtime representation");
+    let diagnostic = diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.code == "M1102")
+        .expect("the mixed boundary should keep its Stage 25a runtime-pending diagnostic");
+    assert!(diagnostic.message.contains("Through mixed"));
 }
 
 // --- Payload domains -----------------------------------------------------
