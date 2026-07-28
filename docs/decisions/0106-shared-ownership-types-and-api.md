@@ -207,6 +207,47 @@ writable-method rules for user classes. The returned
 `WritableSharedReferenceAccess<T>` binding must be `writable` to mutate through it,
 preserving the rule that the whole write path permits writing.
 
+## Payload domains
+
+The two families accept different payloads, because they expose payload access
+differently.
+
+**The readonly family accepts class payloads only in v1.0.** `SharedReference<T>`
+and `WeakReference<T>` require `T` to resolve to a class, so `shared new T(...)`
+requires `T` to be a class. Concrete `SharedReference<int>`,
+`SharedReference<string>`, `SharedReference<List<int>>` and the corresponding
+`WeakReference` forms are rejected, as is `shared new List<int>()`.
+
+The reason is the forwarding model, not a general claim about sharing. The readonly
+family forwards readonly member access to its payload *directly* and has no access
+object to route indexed or collection operations through, so a collection or scalar
+payload would have no coherent surface. `shared new` is Doria's readonly shared
+**class-construction** surface; it must not become a special collection constructor
+when `new List<T>()` is not part of Doria's collection vocabulary at all.
+
+A symbolic generic declaration may carry an unresolved type-parameter payload
+(`SharedReference<T>` inside a generic class); each concrete specialization must
+satisfy the class-payload requirement where it is written.
+
+This is a **v1.0 domain restriction, not a permanent language rule.** A later
+readonly-sharing construction design may widen it — for example by giving the
+readonly family its own access projection, or by admitting a narrower set of
+compiler-known payloads. Nothing here forecloses sharing collections readonly in a
+future Doria version; it declines to invent that surface now.
+
+**The writable family carries no such restriction.** `WritableSharedReference<T>`
+accepts supported owned collection move types through its ownership-taking
+constructor, precisely because its access objects explicitly support member *and
+indexed* forwarding:
+
+```doria
+let $values = [1, 2, 3];
+let $sharedValues = new WritableSharedReference($values);
+
+let writable $access = $sharedValues->acquireWritableAccess();
+$access[0] = 10;
+```
+
 ## Family disjointness
 
 The two families are permanently disjoint in v1.0:
@@ -352,6 +393,13 @@ directly, and Doria prefers the plain spelling where it works.
 **Allowing writable→readonly capability weakening.** Rejected: it would let one
 allocation be reachable from both families, which breaks the invariant that lets
 readonly allocations carry no access state.
+
+**Allowing collection payloads in the readonly family.** Rejected for v1.0: with no
+access object, `SharedReference<List<int>>` would need either a bespoke indexed
+forwarding surface on the readonly family or a `shared new List<int>()` spelling
+that contradicts Doria's collection vocabulary. The writable family already answers
+the shared-collection use case through its access objects. Deliberately left open
+for a later readonly-sharing design rather than declared impossible.
 
 ## Consequences
 

@@ -467,3 +467,114 @@ fn native_lowering_reports_the_stage_named_runtime_diagnostic() {
         "the diagnostic must not leak an internal type representation: {message}"
     );
 }
+
+// --- Payload domains -----------------------------------------------------
+
+#[test]
+fn readonly_family_rejects_concrete_non_class_payloads() {
+    // Record 0106: the readonly family accepts class payloads only in v1.0.
+    for declaration in [
+        "SharedReference<int> $bad = shared new Node();",
+        "SharedReference<string> $bad = shared new Node();",
+        "SharedReference<List<int>> $bad = shared new Node();",
+        "WeakReference<int> $bad = shared new Node();",
+        "WeakReference<string> $bad = shared new Node();",
+        "WeakReference<List<int>> $bad = shared new Node();",
+    ] {
+        assert_code(declaration, "E0545");
+    }
+}
+
+#[test]
+fn shared_new_requires_a_class_payload() {
+    assert_code("let $bad = shared new List<int>();", "E0545");
+    assert_code("let $bad = shared new Bytes();", "E0545");
+}
+
+#[test]
+fn shared_new_of_a_collection_does_not_also_report_an_unknown_class() {
+    let diagnostics = rejected("let $bad = shared new List<int>();");
+    assert!(
+        !codes(&diagnostics).contains(&"E0305"),
+        "the payload-domain rule should not also report an unknown class: {:?}",
+        codes(&diagnostics)
+    );
+}
+
+#[test]
+fn readonly_family_accepts_class_payloads() {
+    accepted(
+        r#"
+    SharedReference<Node> $shared = shared new Node();
+    WeakReference<Node> $weak = $shared->createWeakReference();
+"#,
+    );
+}
+
+#[test]
+fn a_symbolic_payload_is_deferred_to_its_concrete_specialization() {
+    // An unresolved type parameter may stand in a generic declaration; the
+    // class-payload requirement is checked where a concrete type is written.
+    let source = r#"
+class Node { string $name = ""; }
+
+function keep<T>(SharedReference<T> $value): void {}
+
+function main(): void
+{
+    let $node = shared new Node();
+    keep($node);
+}
+"#;
+    doriac::check_source("stage25a-symbolic-payload.doria", source)
+        .expect("a symbolic payload must be accepted in a generic declaration");
+}
+
+#[test]
+fn writable_family_accepts_collection_payloads() {
+    // The writable family has access objects that forward member and indexed
+    // operations, so it carries no class-payload restriction.
+    accepted(
+        r#"
+    let $values = [1, 2, 3];
+    let $sharedValues = new WritableSharedReference($values);
+    WritableSharedReference<List<int>> $typed = new WritableSharedReference([4, 5]);
+"#,
+    );
+}
+
+#[test]
+fn writable_access_forwards_indexed_operations_to_a_collection_payload() {
+    accepted(
+        r#"
+    let $values = [1, 2, 3];
+    let $sharedValues = new WritableSharedReference($values);
+    let writable $access = $sharedValues->acquireWritableAccess();
+    $access[0] = 10;
+    echo $access[0];
+"#,
+    );
+}
+
+#[test]
+fn readonly_access_forwards_indexed_reads_to_a_collection_payload() {
+    accepted(
+        r#"
+    let $values = [1, 2, 3];
+    let $sharedValues = new WritableSharedReference($values);
+    let $access = $sharedValues->acquireReadonlyAccess();
+    echo $access[0];
+"#,
+    );
+}
+
+#[test]
+fn writable_weak_family_also_accepts_collection_payloads() {
+    accepted(
+        r#"
+    let $sharedValues = new WritableSharedReference([1, 2, 3]);
+    WritableWeakReference<List<int>> $weak = $sharedValues->createWeakReference();
+    ?WritableSharedReference<List<int>> $live = $weak->acquire();
+"#,
+    );
+}

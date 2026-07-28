@@ -4143,8 +4143,11 @@ impl<'program> Checker<'program> {
                     self.check_shared_handle_construction(kind, class_type, args, *shared, *span);
                     return;
                 }
-                if *shared {
-                    self.check_shared_new_payload(class_type, *span);
+                if *shared && !self.check_shared_new_payload(class_type, *span) {
+                    for arg in args {
+                        self.check_expr(&arg.value, scopes, method_context);
+                    }
+                    return;
                 }
                 let qualified = class_name.contains('\\');
                 let is_current_class = class_name == "self"
@@ -7121,6 +7124,15 @@ impl<'program> Checker<'program> {
             | (TypeKind::Set(pattern), TypeKind::Set(actual)) => {
                 self.infer_type_parameter_bindings(callee, pattern, actual, span, bindings);
             }
+            // A shared handle unifies with the same handle kind, through its payload:
+            // `SharedReference<T>` against `SharedReference<Node>` binds `T = Node`.
+            // The kinds must match, so unification never crosses the family boundary.
+            (
+                TypeKind::SharedHandle(pattern_kind, pattern),
+                TypeKind::SharedHandle(actual_kind, actual),
+            ) if pattern_kind == actual_kind => {
+                self.infer_type_parameter_bindings(callee, pattern, actual, span, bindings);
+            }
             (
                 TypeKind::Dictionary(pattern_key, pattern_value),
                 TypeKind::Dictionary(actual_key, actual_value),
@@ -8095,6 +8107,10 @@ impl<'program> Checker<'program> {
                     TypePosition::Value,
                     declaring_class,
                 );
+                if !self.shared_handle_payload_is_supported(kind, payload) {
+                    self.report_shared_handle_payload(kind, payload, span);
+                    return self.types.unknown();
+                }
                 self.types.intern(TypeKind::SharedHandle(kind, payload))
             }
             "Dictionary" => {
@@ -8893,6 +8909,18 @@ impl<'program> Checker<'program> {
                     && self.is_assignable(target_value, value_value)
             }
             (TypeKind::Set(target), TypeKind::Set(value)) => self.is_assignable(target, value),
+            // Shared handles are assignable only within the same handle kind, so the
+            // families stay disjoint (record 0106) while a symbolic payload still
+            // matches its concrete specialization.
+            (
+                TypeKind::SharedHandle(target_kind, target),
+                TypeKind::SharedHandle(value_kind, value),
+            ) if target_kind == value_kind => {
+                // An unresolved payload parameter matches its concrete
+                // specialization; the binding itself is checked by inference.
+                matches!(self.types.kind(target), TypeKind::TypeParameter(_))
+                    || self.is_assignable(target, value)
+            }
             (TypeKind::TypeParameter(target), TypeKind::TypeParameter(value)) => target == value,
             _ => false,
         }
@@ -9285,7 +9313,14 @@ impl<'program> Checker<'program> {
         scopes: &ScopeStack,
         method_context: Option<&MethodContext>,
     ) -> Option<(TypeId, TypeId)> {
-        let collection_ty = self.infer_expr_type(collection, scopes, method_context);
+        let mut collection_ty = self.infer_expr_type(collection, scopes, method_context);
+        // Access objects forward indexed operations to their payload (record 0106),
+        // which is why the writable family may hold collection payloads.
+        if let TypeKind::SharedHandle(kind, payload) = *self.types.kind(collection_ty) {
+            if kind.is_access() {
+                collection_ty = payload;
+            }
+        }
         let int = self.types.intern(TypeKind::Integer(IntegerType::Int64));
         match self.types.kind(collection_ty).clone() {
             TypeKind::TypedArray(value) | TypeKind::List(value) => Some((int, value)),
@@ -9572,24 +9607,67 @@ impl<'program> Checker<'program> {
     }
 
     /// `shared new T(...)` requires an ordinary class payload.
-    fn check_shared_new_payload(&mut self, class_type: &crate::types::TypeRef, span: Span) {
-        let name = &class_type.name;
-        if matches!(
-            name.as_str(),
-            "List" | "Dictionary" | "Set" | "Bytes" | "[]"
-        ) {
-            self.diagnostics.push(
-                Diagnostic::new(
-                    "E0545",
-                    format!("`shared new` Requires A Class Payload, But Found `{class_type}`"),
-                    span,
-                )
-                .with_help(
-                    "shared ownership wraps a class instance; store a collection in a class, \
-                     or keep the collection as an ordinary owned value",
-                ),
-            );
+    fn check_shared_new_payload(&mut self, class_type: &crate::types::TypeRef, span: Span) -> bool {
+        if class_type.name == "self" || class_type.as_class_name().is_some() {
+            return true;
         }
+        self.diagnostics.push(
+            Diagnostic::new(
+                "E0545",
+                format!("`shared new` Requires A Class Payload, But Found `{class_type}`"),
+                span,
+            )
+            .with_help(
+                "the readonly shared-ownership family accepts class payloads in v1.0; wrap the \
+                 value in a class, keep it as an ordinary owned value, or use \
+                 `new WritableSharedReference(...)`, whose access objects forward member and \
+                 indexed operations",
+            ),
+        );
+        false
+    }
+
+    /// Whether a resolved payload is acceptable for a shared-handle family.
+    ///
+    /// The readonly family (`SharedReference<T>` / `WeakReference<T>`) accepts class
+    /// payloads only in v1.0 (record 0106): it forwards readonly member access
+    /// directly and has no access object to route indexed or collection operations
+    /// through. The writable family carries no such restriction — its access objects
+    /// explicitly support member and indexed forwarding, so supported owned
+    /// collection move types may be shared through `new WritableSharedReference(...)`.
+    ///
+    /// A symbolic payload (an unresolved type parameter) is accepted here; every
+    /// concrete specialization is checked where it is written.
+    fn shared_handle_payload_is_supported(&self, kind: SharedHandleKind, payload: TypeId) -> bool {
+        if kind.family() != crate::types::SharedFamily::Readonly {
+            return true;
+        }
+        matches!(
+            self.types.kind(payload),
+            TypeKind::Class(_) | TypeKind::TypeParameter(_) | TypeKind::Unknown
+        )
+    }
+
+    fn report_shared_handle_payload(
+        &mut self,
+        kind: SharedHandleKind,
+        payload: TypeId,
+        span: Span,
+    ) {
+        let name = kind.source_name();
+        let payload = self.types.display(payload);
+        self.diagnostics.push(
+            Diagnostic::new(
+                "E0545",
+                format!("`{name}<{payload}>` Requires A Class Payload"),
+                span,
+            )
+            .with_help(format!(
+                "the readonly shared-ownership family accepts class payloads in v1.0; wrap \
+                 `{payload}` in a class, or use `WritableSharedReference<{payload}>`, whose \
+                 access objects forward member and indexed operations"
+            )),
+        );
     }
 
     fn report_shared_handle_arity(&mut self, kind: SharedHandleKind, found: usize, span: Span) {
