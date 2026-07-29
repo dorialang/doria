@@ -1054,8 +1054,9 @@ function main(): void {}
 }
 
 #[test]
-fn ownership_propagates_symbolic_move_types_into_collection_elements() {
-    let errors = diagnostics(
+fn symbolic_collection_element_returns_preserve_receiver_borrows() {
+    doriac::check_source(
+        "stage25-symbolic-element-borrow.doria",
         r#"
 class Token {}
 class Box<T>
@@ -1069,12 +1070,33 @@ class Box<T>
 }
 function main(): void {}
 "#,
+    )
+    .expect("generic collection element returns should preserve their receiver borrow");
+
+    let errors = diagnostics(
+        r#"
+class Token {}
+class Box<T>
+{
+    List<T> $items = [];
+
+    function first(): T
+    {
+        return $this->items[0];
+    }
+}
+function main(): void
+{
+    let $box = new Box<Token>();
+    Token $owned = $box->first();
+}
+"#,
     );
     assert!(errors.iter().any(|diagnostic| {
         diagnostic.code == "E0478"
             && diagnostic
                 .message
-                .contains("borrowed result cannot satisfy an owning return")
+                .contains("borrowed result cannot initialize owning")
     }));
 }
 
