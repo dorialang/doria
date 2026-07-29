@@ -488,6 +488,7 @@ fn statement_return_borrow(
     borrow: &mut Option<ReturnBorrow>,
 ) -> Option<bool> {
     match statement {
+        Stmt::Block(block) => block_return_borrow(block, function, resolve_call, shadowed, borrow),
         Stmt::Return {
             expr: Some(expr), ..
         } => {
@@ -1083,6 +1084,7 @@ impl Checker<'_> {
         return_move_type: bool,
     ) -> Flow {
         match statement {
+            Stmt::Block(block) => self.check_block(block, scopes, return_move_type, true),
             Stmt::VarDecl(decl) => {
                 let declared_class = decl.ty.as_ref().and_then(|ty| {
                     type_ref_class_name(ty, &self.classes, self.receiver_class.as_deref())

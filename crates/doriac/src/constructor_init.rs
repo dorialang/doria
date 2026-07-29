@@ -307,6 +307,11 @@ fn inspect_statement(
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     match statement {
+        Stmt::Block(block) => {
+            for statement in &block.statements {
+                inspect_statement(class, properties, state, statement, repeatable, diagnostics);
+            }
+        }
         Stmt::VarDecl(declaration) => inspect_expr(
             class,
             properties,

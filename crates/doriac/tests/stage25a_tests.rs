@@ -1625,3 +1625,99 @@ class Box
         );
     }
 }
+
+#[test]
+fn standalone_blocks_are_lexical_scopes_and_cleanup_boundaries() {
+    let source = r#"
+class Marker
+{
+    function __construct(string $name) {}
+    function __destruct() { echo "drop {$this->name}\n"; }
+}
+
+function returnFromBlock(): void
+{
+    {
+        let $marker = new Marker("return");
+        return;
+    }
+}
+
+function main(): void
+{
+    {
+        let $outer = new Marker("outer");
+        {
+            let $inner = new Marker("inner");
+            echo "inside\n";
+        }
+        echo "after inner\n";
+    }
+
+    returnFromBlock();
+
+    let writable $iteration = 0;
+    while ($iteration < 2) {
+        {
+            let $loop = new Marker("loop {$iteration}");
+            $iteration++;
+            if ($iteration == 1) { continue; }
+            break;
+        }
+    }
+    echo "done\n";
+}
+"#;
+    let program = doriac::lower_source_to_mir("stage25a-lexical-block-cleanup.doria", source)
+        .expect("standalone blocks should lower through the ordinary scope machinery");
+    let output = doriac::mir_interpreter::interpret(&program)
+        .expect("standalone block cleanup should execute");
+    assert_eq!(
+        output.stdout,
+        b"inside\ndrop inner\nafter inner\ndrop outer\ndrop return\ndrop loop 0\ndrop loop 1\ndone\n"
+    );
+
+    let diagnostics = doriac::check_source(
+        "stage25a-lexical-block-scope.doria",
+        r#"
+function main(): void
+{
+    { let $hidden = 1; }
+    echo "{$hidden}";
+}
+"#,
+    )
+    .expect_err("a binding declared in a standalone block must not escape it");
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("undeclared variable")),
+        "{diagnostics:#?}"
+    );
+}
+
+#[test]
+fn standalone_blocks_end_writable_shared_access_before_readonly_access() {
+    let source = r#"
+class Settings
+{
+    function __construct(writable string $theme) {}
+}
+
+function main(): void
+{
+    let $settings = new WritableSharedReference(new Settings("light"));
+    {
+        let writable $access = $settings->acquireWritableAccess();
+        $access->theme = "dark";
+    }
+    let $readonly = $settings->acquireReadonlyAccess();
+    echo $readonly->theme;
+}
+"#;
+    let program = doriac::lower_source_to_mir("stage25a-access-block.doria", source)
+        .expect("a lexical block should delimit writable access");
+    let output = doriac::mir_interpreter::interpret(&program)
+        .expect("readonly access should succeed after block cleanup");
+    assert_eq!(output.stdout, b"dark");
+}

@@ -3154,6 +3154,19 @@ impl<'program> Checker<'program> {
         loop_depth: usize,
     ) {
         match statement {
+            Stmt::Block(block) => {
+                let mut nested_constructor_init_context = constructor_init_context
+                    .as_deref()
+                    .map(ConstructorInitContext::nested);
+                self.check_block(
+                    block,
+                    scopes,
+                    method_context,
+                    nested_constructor_init_context.as_mut(),
+                    return_context,
+                    loop_depth,
+                );
+            }
             Stmt::VarDecl(decl) => {
                 self.check_expr(&decl.initializer, scopes, method_context);
                 let value_ty = self.infer_expr_type(&decl.initializer, scopes, method_context);

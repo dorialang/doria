@@ -961,6 +961,9 @@ fn intern_block_collection_types(
 ) {
     for statement in &block.statements {
         match statement {
+            hir::Stmt::Block(block) => {
+                intern_block_collection_types(block, class_ids, collections, substitutions);
+            }
             hir::Stmt::VarDecl(declaration) => {
                 if let Some(ty) = &declaration.ty {
                     let _ =
@@ -1553,6 +1556,12 @@ fn lower_statement_sequence(
         }
 
         match statement {
+            hir::Stmt::Block(block) => {
+                context.push_scope();
+                let result = lower_statement_sequence(&block.statements, return_type, context);
+                context.pop_scope();
+                result?;
+            }
             hir::Stmt::Echo { expr, .. } => {
                 let echo = lower_echo(expr, context)?;
                 context.push_statement(echo);
@@ -11833,6 +11842,7 @@ fn unsupported_int_expr(expr: &hir::Expr) -> Diagnostic {
 
 fn stmt_span(statement: &hir::Stmt) -> Span {
     match statement {
+        hir::Stmt::Block(block) => block.span,
         hir::Stmt::VarDecl(decl) => decl.span,
         hir::Stmt::Assignment(assignment) => assignment.span,
         hir::Stmt::Echo { span, .. } | hir::Stmt::Return { span, .. } => *span,

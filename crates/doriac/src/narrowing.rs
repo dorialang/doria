@@ -539,6 +539,7 @@ pub fn analyze_program(program: &Program) -> FactsByUse {
 
 fn statement_span(statement: &Stmt) -> Span {
     match statement {
+        Stmt::Block(block) => block.span,
         Stmt::VarDecl(declaration) => declaration.span,
         Stmt::Assignment(assignment) => assignment.span,
         Stmt::Echo { span, .. }
@@ -762,6 +763,7 @@ fn transfer_statement(
     nullability: &NullabilityCatalog,
 ) {
     match statement {
+        Stmt::Block(_) => {}
         Stmt::VarDecl(declaration) => transfer_declaration(
             declaration.span,
             &declaration.initializer,
@@ -1329,6 +1331,7 @@ fn collect_statement(
     facts: &mut FactsByUse,
 ) {
     match statement {
+        Stmt::Block(_) => {}
         Stmt::VarDecl(declaration) => {
             collect_expr(
                 &declaration.initializer,
@@ -1720,6 +1723,7 @@ impl Resolver {
 
     fn resolve_statement(&mut self, statement: &Stmt) {
         match statement {
+            Stmt::Block(block) => self.resolve_block(block),
             Stmt::VarDecl(declaration) => {
                 self.resolve_expr(&declaration.initializer);
                 let inferred_class = self.resolved_expr_class(&declaration.initializer);
