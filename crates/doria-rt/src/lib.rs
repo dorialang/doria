@@ -2414,15 +2414,25 @@ pub extern "C" fn rust_eh_personality() {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use core::sync::atomic::{AtomicUsize, Ordering};
+    use core::cell::Cell;
 
-    static SHARED_PAYLOAD_DROPS: AtomicUsize = AtomicUsize::new(0);
+    std::thread_local! {
+        static SHARED_PAYLOAD_DROPS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    fn reset_shared_payload_drops() {
+        SHARED_PAYLOAD_DROPS.set(0);
+    }
+
+    fn shared_payload_drops() -> usize {
+        SHARED_PAYLOAD_DROPS.get()
+    }
 
     unsafe extern "C" fn drop_test_shared_payload(
         _current_frame: *const DrStackFrameV1,
         payload: *mut u8,
     ) {
-        SHARED_PAYLOAD_DROPS.fetch_add(1, Ordering::SeqCst);
+        SHARED_PAYLOAD_DROPS.set(SHARED_PAYLOAD_DROPS.get() + 1);
         dr_v1_class_free(payload);
     }
 
@@ -2462,7 +2472,7 @@ mod tests {
     #[test]
     fn shared_control_drops_payload_once_and_outlives_it_for_weak_references() {
         unsafe {
-            SHARED_PAYLOAD_DROPS.store(0, Ordering::SeqCst);
+            reset_shared_payload_drops();
             let payload = dr_v1_class_allocate(ptr::null(), 8, 8);
             let control = dr_v1_shared_create(ptr::null(), payload, drop_test_shared_payload);
 
@@ -2482,7 +2492,7 @@ mod tests {
 
             dr_v1_shared_release(ptr::null(), acquired);
             dr_v1_shared_release(ptr::null(), control);
-            assert_eq!(SHARED_PAYLOAD_DROPS.load(Ordering::SeqCst), 1);
+            assert_eq!(shared_payload_drops(), 1);
             assert_eq!((*control).strong_references, 0);
             assert!((*control).payload.is_null());
             assert!(dr_v1_shared_acquire(ptr::null(), control).is_null());
@@ -2494,7 +2504,7 @@ mod tests {
     #[test]
     fn writable_shared_control_tracks_ownership_access_and_payload_lifetime() {
         unsafe {
-            SHARED_PAYLOAD_DROPS.store(0, Ordering::SeqCst);
+            reset_shared_payload_drops();
             let payload = dr_v1_class_allocate(ptr::null(), 8, 8);
             let control =
                 dr_v1_writable_shared_create(ptr::null(), payload, drop_test_shared_payload);
@@ -2539,7 +2549,7 @@ mod tests {
             dr_v1_writable_shared_release(ptr::null(), acquired);
             dr_v1_writable_shared_release(ptr::null(), control);
 
-            assert_eq!(SHARED_PAYLOAD_DROPS.load(Ordering::SeqCst), 1);
+            assert_eq!(shared_payload_drops(), 1);
             assert_eq!((*control).strong_references, 0);
             assert!((*control).payload.is_null());
             assert!(dr_v1_writable_shared_acquire(ptr::null(), control).is_null());
@@ -2551,7 +2561,7 @@ mod tests {
     #[test]
     fn writable_access_object_can_be_the_final_strong_owner() {
         unsafe {
-            SHARED_PAYLOAD_DROPS.store(0, Ordering::SeqCst);
+            reset_shared_payload_drops();
             let payload = dr_v1_class_allocate(ptr::null(), 8, 8);
             let control =
                 dr_v1_writable_shared_create(ptr::null(), payload, drop_test_shared_payload);
@@ -2562,10 +2572,10 @@ mod tests {
             let acquired = dr_v1_writable_shared_acquire(ptr::null(), weak);
             assert_eq!(acquired, control);
             dr_v1_writable_shared_release(ptr::null(), acquired);
-            assert_eq!(SHARED_PAYLOAD_DROPS.load(Ordering::SeqCst), 0);
+            assert_eq!(shared_payload_drops(), 0);
 
             dr_v1_writable_shared_release_readonly_access(ptr::null(), access);
-            assert_eq!(SHARED_PAYLOAD_DROPS.load(Ordering::SeqCst), 1);
+            assert_eq!(shared_payload_drops(), 1);
             assert!(dr_v1_writable_shared_acquire(ptr::null(), weak).is_null());
             dr_v1_writable_shared_release_weak(weak);
         }

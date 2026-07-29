@@ -52,6 +52,47 @@ impl InterpreterError {
     }
 }
 
+fn register_shared_access(
+    control: &WritableSharedControl,
+    writable: bool,
+) -> Result<Option<&'static str>, InterpreterError> {
+    let mut state = control.borrow_mut();
+    if writable {
+        if state.readonly_accesses != 0 {
+            return Ok(Some(
+                "Cannot Acquire Writable Access While Readonly Access Is Active",
+            ));
+        }
+        if state.writable_access_active {
+            return Ok(Some(
+                "Cannot Acquire Writable Access While Writable Access Is Active",
+            ));
+        }
+        state.strong = state
+            .strong
+            .checked_add(1)
+            .ok_or_else(|| InterpreterError::new("writable shared-reference count overflow"))?;
+        state.writable_access_active = true;
+    } else {
+        if state.writable_access_active {
+            return Ok(Some(
+                "Cannot Acquire Readonly Access While Writable Access Is Active",
+            ));
+        }
+        let next_readonly = state
+            .readonly_accesses
+            .checked_add(1)
+            .ok_or_else(|| InterpreterError::new("readonly shared-access count overflow"))?;
+        let next_strong = state
+            .strong
+            .checked_add(1)
+            .ok_or_else(|| InterpreterError::new("writable shared-reference count overflow"))?;
+        state.readonly_accesses = next_readonly;
+        state.strong = next_strong;
+    }
+    Ok(None)
+}
+
 impl fmt::Display for InterpreterError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(&self.message)
@@ -119,6 +160,11 @@ enum LocalValue {
     },
     SharedReferenceAccess {
         control: WritableSharedControl,
+        payload: mir::WritableSharedPayload,
+        writable: bool,
+    },
+    NullableSharedReferenceAccess {
+        control: Option<WritableSharedControl>,
         payload: mir::WritableSharedPayload,
         writable: bool,
     },
@@ -201,6 +247,11 @@ enum EvaluationValue {
     },
     SharedReferenceAccess {
         control: WritableSharedControl,
+        payload: mir::WritableSharedPayload,
+        writable: bool,
+    },
+    NullableSharedReferenceAccess {
+        control: Option<WritableSharedControl>,
         payload: mir::WritableSharedPayload,
         writable: bool,
     },
@@ -291,6 +342,7 @@ enum EvaluationTask {
     NullableWritableSharedReference(mir::NullableWritableSharedReferenceExpression),
     NullableWritableWeakReference(mir::NullableWritableWeakReferenceExpression),
     SharedReferenceAccess(mir::SharedReferenceAccessExpression),
+    NullableSharedReferenceAccess(mir::NullableSharedReferenceAccessExpression),
     BuildSharedReference(crate::class_layout::ClassId),
     BuildNullableSharedSome(crate::class_layout::ClassId),
     BuildNullableWeakSome(crate::class_layout::ClassId),
@@ -312,6 +364,11 @@ enum EvaluationTask {
     FinishWritableNullSafeWeakCreation(mir::WritableSharedPayload, bool),
     FinishWritableNullSafeWeakAcquire(mir::WritableSharedPayload, bool),
     FinishSharedAccessAcquire {
+        payload: mir::WritableSharedPayload,
+        writable: bool,
+        drop_receiver: bool,
+    },
+    FinishNullableSharedAccessAcquire {
         payload: mir::WritableSharedPayload,
         writable: bool,
         drop_receiver: bool,
@@ -373,6 +430,7 @@ enum EvaluationTask {
         collection: mir::LocalId,
         payload: mir::WritableSharedPayload,
         writable: bool,
+        nullable: bool,
     },
     BuildClassNew {
         class: crate::class_layout::ClassId,
@@ -406,6 +464,10 @@ enum EvaluationTask {
     NullableWeakReferenceIsPresent(bool),
     NullableWritableSharedReferenceIsPresent(bool),
     NullableWritableWeakReferenceIsPresent(bool),
+    NullableSharedReferenceAccessIsPresent {
+        owned: bool,
+        writable: bool,
+    },
     NullableMixedIsPresent(mir::MixedOwnership),
     MixedIs {
         tag: mir::MixedTag,
@@ -1019,6 +1081,26 @@ impl Interpreter<'_> {
                             .push(EvaluationTask::SharedReferenceAccess(expression));
                     }
                     (
+                        mir::Type::NullableReadonlySharedReferenceAccess(expected),
+                        mir::Rvalue::NullableSharedReferenceAccess(expression),
+                    ) if expression.payload() == expected && !expression.writable() => {
+                        let frame = self.current_frame_mut()?;
+                        frame.tasks.push(EvaluationTask::Assign(target));
+                        frame
+                            .tasks
+                            .push(EvaluationTask::NullableSharedReferenceAccess(expression));
+                    }
+                    (
+                        mir::Type::NullableWritableSharedReferenceAccess(expected),
+                        mir::Rvalue::NullableSharedReferenceAccess(expression),
+                    ) if expression.payload() == expected && expression.writable() => {
+                        let frame = self.current_frame_mut()?;
+                        frame.tasks.push(EvaluationTask::Assign(target));
+                        frame
+                            .tasks
+                            .push(EvaluationTask::NullableSharedReferenceAccess(expression));
+                    }
+                    (
                         mir::Type::SharedReference(_)
                         | mir::Type::WeakReference(_)
                         | mir::Type::NullableSharedReference(_)
@@ -1028,7 +1110,9 @@ impl Interpreter<'_> {
                         | mir::Type::NullableWritableSharedReference(_)
                         | mir::Type::NullableWritableWeakReference(_)
                         | mir::Type::ReadonlySharedReferenceAccess(_)
-                        | mir::Type::WritableSharedReferenceAccess(_),
+                        | mir::Type::WritableSharedReferenceAccess(_)
+                        | mir::Type::NullableReadonlySharedReferenceAccess(_)
+                        | mir::Type::NullableWritableSharedReferenceAccess(_),
                         _,
                     ) => {
                         return Err(InterpreterError::new(
@@ -1376,6 +1460,10 @@ impl Interpreter<'_> {
                     .current_frame_mut()?
                     .tasks
                     .push(EvaluationTask::SharedReferenceAccess(value)),
+                mir::Rvalue::NullableSharedReferenceAccess(value) => self
+                    .current_frame_mut()?
+                    .tasks
+                    .push(EvaluationTask::NullableSharedReferenceAccess(value)),
                 mir::Rvalue::Collection(value) => self
                     .current_frame_mut()?
                     .tasks
@@ -1439,6 +1527,9 @@ impl Interpreter<'_> {
             }
             EvaluationTask::SharedReferenceAccess(expression) => {
                 self.expand_shared_reference_access_expression(expression)?
+            }
+            EvaluationTask::NullableSharedReferenceAccess(expression) => {
+                self.expand_nullable_shared_reference_access_expression(expression)?
             }
             EvaluationTask::BuildSharedReference(class) => {
                 let value = self.pop_local_value()?;
@@ -1989,35 +2080,7 @@ impl Interpreter<'_> {
                         "shared access acquisition changed payload type",
                     ));
                 }
-                let conflict = {
-                    let mut state = control.borrow_mut();
-                    if writable {
-                        if state.readonly_accesses != 0 {
-                            Some("Cannot Acquire Writable Access While Readonly Access Is Active")
-                        } else if state.writable_access_active {
-                            Some("Cannot Acquire Writable Access While Writable Access Is Active")
-                        } else {
-                            state.strong = state.strong.checked_add(1).ok_or_else(|| {
-                                InterpreterError::new("writable shared-reference count overflow")
-                            })?;
-                            state.writable_access_active = true;
-                            None
-                        }
-                    } else if state.writable_access_active {
-                        Some("Cannot Acquire Readonly Access While Writable Access Is Active")
-                    } else {
-                        let next_readonly =
-                            state.readonly_accesses.checked_add(1).ok_or_else(|| {
-                                InterpreterError::new("readonly shared-access count overflow")
-                            })?;
-                        let next_strong = state.strong.checked_add(1).ok_or_else(|| {
-                            InterpreterError::new("writable shared-reference count overflow")
-                        })?;
-                        state.readonly_accesses = next_readonly;
-                        state.strong = next_strong;
-                        None
-                    }
-                };
+                let conflict = register_shared_access(&control, writable)?;
                 if let Some(message) = conflict {
                     return Ok(StepOutcome::Panic(message.to_string()));
                 }
@@ -2033,6 +2096,44 @@ impl Interpreter<'_> {
                         payload,
                         writable,
                     });
+            }
+            EvaluationTask::FinishNullableSharedAccessAcquire {
+                payload,
+                writable,
+                drop_receiver,
+            } => {
+                let (control, actual) = self.pop_nullable_writable_shared_reference()?;
+                if actual != payload {
+                    return Err(InterpreterError::new(
+                        "nullable shared access acquisition changed payload type",
+                    ));
+                }
+                let Some(control) = control else {
+                    self.current_frame_mut()?.values.push(
+                        EvaluationValue::NullableSharedReferenceAccess {
+                            control: None,
+                            payload,
+                            writable,
+                        },
+                    );
+                    return Ok(StepOutcome::Continue);
+                };
+                let conflict = register_shared_access(&control, writable)?;
+                if let Some(message) = conflict {
+                    return Ok(StepOutcome::Panic(message.to_string()));
+                }
+                if drop_receiver {
+                    self.current_frame_mut()?
+                        .statement_temporary_drops
+                        .push(OwnedDrop::WritableShared(control.clone()));
+                }
+                self.current_frame_mut()?.values.push(
+                    EvaluationValue::NullableSharedReferenceAccess {
+                        control: Some(control),
+                        payload,
+                        writable,
+                    },
+                );
             }
             EvaluationTask::Collection(expression) => {
                 self.expand_collection_expression(expression)?
@@ -2649,34 +2750,49 @@ impl Interpreter<'_> {
                 collection,
                 payload,
                 writable,
+                nullable,
             } => {
                 let index = self.pop_local_value()?;
                 let value = match self.collection_value_at(collection, &index, false) {
                     Ok(value) => value,
                     Err(message) => return Ok(StepOutcome::Panic(message)),
                 };
-                let LocalValue::SharedReferenceAccess {
-                    control,
-                    payload: actual_payload,
-                    writable: actual_writable,
-                } = value
-                else {
-                    return Err(InterpreterError::new(
-                        "MIR indexed shared access produced another value type",
-                    ));
+                let result = match (nullable, value) {
+                    (
+                        false,
+                        LocalValue::SharedReferenceAccess {
+                            control,
+                            payload: actual,
+                            writable: actual_writable,
+                        },
+                    ) if actual == payload && actual_writable == writable => {
+                        EvaluationValue::SharedReferenceAccess {
+                            control,
+                            payload,
+                            writable,
+                        }
+                    }
+                    (
+                        true,
+                        LocalValue::NullableSharedReferenceAccess {
+                            control,
+                            payload: actual,
+                            writable: actual_writable,
+                        },
+                    ) if actual == payload && actual_writable == writable => {
+                        EvaluationValue::NullableSharedReferenceAccess {
+                            control,
+                            payload,
+                            writable,
+                        }
+                    }
+                    _ => {
+                        return Err(InterpreterError::new(
+                            "MIR indexed shared access produced another value type",
+                        ))
+                    }
                 };
-                if actual_payload != payload || actual_writable != writable {
-                    return Err(InterpreterError::new(
-                        "MIR indexed shared access changed access type",
-                    ));
-                }
-                self.current_frame_mut()?
-                    .values
-                    .push(EvaluationValue::SharedReferenceAccess {
-                        control,
-                        payload,
-                        writable,
-                    });
+                self.current_frame_mut()?.values.push(result);
             }
             EvaluationTask::BuildClassNew {
                 class,
@@ -2928,6 +3044,32 @@ impl Interpreter<'_> {
                         self.current_frame_mut()?
                             .statement_temporary_drops
                             .push(OwnedDrop::WritableWeak(control));
+                    }
+                }
+                self.push_scalar(mir::ScalarValue::Bool(present))?;
+            }
+            EvaluationTask::NullableSharedReferenceAccessIsPresent { owned, writable } => {
+                let LocalValue::NullableSharedReferenceAccess {
+                    control,
+                    writable: actual_writable,
+                    ..
+                } = self.pop_local_value()?
+                else {
+                    return Err(InterpreterError::new(
+                        "nullable shared access presence test produced another value type",
+                    ));
+                };
+                if actual_writable != writable {
+                    return Err(InterpreterError::new(
+                        "nullable shared access presence test changed access type",
+                    ));
+                }
+                let present = control.is_some();
+                if owned {
+                    if let Some(control) = control {
+                        self.current_frame_mut()?
+                            .statement_temporary_drops
+                            .push(OwnedDrop::SharedAccess { control, writable });
                     }
                 }
                 self.push_scalar(mir::ScalarValue::Bool(present))?;
@@ -4181,6 +4323,20 @@ impl Interpreter<'_> {
                     .tasks
                     .push(EvaluationTask::NullableWritableWeakReference(*value));
             }
+            mir::BoolExpression::NullableSharedReferenceAccessIsPresent(value) => {
+                let owned = value.owned_temporary();
+                let writable = value.writable();
+                let frame = self.current_frame_mut()?;
+                frame
+                    .tasks
+                    .push(EvaluationTask::NullableSharedReferenceAccessIsPresent {
+                        owned,
+                        writable,
+                    });
+                frame
+                    .tasks
+                    .push(EvaluationTask::NullableSharedReferenceAccess(*value));
+            }
             mir::BoolExpression::NullableMixedIsPresent(value) => {
                 let ownership = value.ownership();
                 let frame = self.current_frame_mut()?;
@@ -4310,7 +4466,8 @@ impl Interpreter<'_> {
                     | LocalValue::WritableWeakReference { .. }
                     | LocalValue::NullableWritableSharedReference { .. }
                     | LocalValue::NullableWritableWeakReference { .. }
-                    | LocalValue::SharedReferenceAccess { .. } => {
+                    | LocalValue::SharedReferenceAccess { .. }
+                    | LocalValue::NullableSharedReferenceAccess { .. } => {
                         return Err(InterpreterError::new(format!(
                             "MIR shared handle local local{} was used as a string value",
                             id.0
@@ -6336,6 +6493,39 @@ impl Interpreter<'_> {
                         writable,
                     });
             }
+            mir::SharedReferenceAccessExpression::NullableLocalAssumeNonNull {
+                payload,
+                local,
+                writable,
+                transfer,
+            } => {
+                let value = self.read_or_take_local(local, transfer)?;
+                let LocalValue::NullableSharedReferenceAccess {
+                    control,
+                    payload: actual,
+                    writable: actual_writable,
+                } = value
+                else {
+                    return Err(InterpreterError::new(
+                        "shared access narrowing read another local type",
+                    ));
+                };
+                let control = control.ok_or_else(|| {
+                    InterpreterError::new("shared access narrowing assumed an absent value")
+                })?;
+                if actual != payload || actual_writable != writable {
+                    return Err(InterpreterError::new(
+                        "shared access narrowing changed access type",
+                    ));
+                }
+                self.current_frame_mut()?
+                    .values
+                    .push(EvaluationValue::SharedReferenceAccess {
+                        control,
+                        payload,
+                        writable,
+                    });
+            }
             mir::SharedReferenceAccessExpression::Property {
                 payload,
                 object,
@@ -6379,6 +6569,7 @@ impl Interpreter<'_> {
                         collection,
                         payload,
                         writable,
+                        nullable: false,
                     });
                 frame.tasks.push(EvaluationTask::Rvalue(*index));
             }
@@ -6411,6 +6602,145 @@ impl Interpreter<'_> {
                 frame
                     .tasks
                     .push(EvaluationTask::WritableSharedReference(*value));
+            }
+        }
+        Ok(())
+    }
+
+    fn expand_nullable_shared_reference_access_expression(
+        &mut self,
+        expression: mir::NullableSharedReferenceAccessExpression,
+    ) -> Result<(), InterpreterError> {
+        match expression {
+            mir::NullableSharedReferenceAccessExpression::Null { payload, writable } => {
+                self.current_frame_mut()?.values.push(
+                    EvaluationValue::NullableSharedReferenceAccess {
+                        control: None,
+                        payload,
+                        writable,
+                    },
+                );
+            }
+            mir::NullableSharedReferenceAccessExpression::Access(value) => {
+                let ty = if value.writable() {
+                    mir::Type::NullableWritableSharedReferenceAccess(value.payload())
+                } else {
+                    mir::Type::NullableReadonlySharedReferenceAccess(value.payload())
+                };
+                let frame = self.current_frame_mut()?;
+                frame.tasks.push(EvaluationTask::WrapNullable(ty));
+                frame
+                    .tasks
+                    .push(EvaluationTask::SharedReferenceAccess(*value));
+            }
+            mir::NullableSharedReferenceAccessExpression::Local {
+                payload,
+                local,
+                writable,
+                transfer,
+            } => {
+                let value = self.read_or_take_local(local, transfer)?;
+                let LocalValue::NullableSharedReferenceAccess {
+                    control,
+                    payload: actual,
+                    writable: actual_writable,
+                } = value
+                else {
+                    return Err(InterpreterError::new(
+                        "nullable shared access expression read another local type",
+                    ));
+                };
+                if actual != payload || actual_writable != writable {
+                    return Err(InterpreterError::new(
+                        "nullable shared access expression changed access type",
+                    ));
+                }
+                self.current_frame_mut()?.values.push(
+                    EvaluationValue::NullableSharedReferenceAccess {
+                        control,
+                        payload,
+                        writable,
+                    },
+                );
+            }
+            mir::NullableSharedReferenceAccessExpression::Property {
+                payload,
+                object,
+                property,
+                writable,
+            } => {
+                let value = self.read_property(object, property)?;
+                let LocalValue::NullableSharedReferenceAccess {
+                    control,
+                    payload: actual,
+                    writable: actual_writable,
+                } = value
+                else {
+                    return Err(InterpreterError::new(
+                        "nullable shared access property read another value type",
+                    ));
+                };
+                if actual != payload || actual_writable != writable {
+                    return Err(InterpreterError::new(
+                        "nullable shared access property changed access type",
+                    ));
+                }
+                self.current_frame_mut()?.values.push(
+                    EvaluationValue::NullableSharedReferenceAccess {
+                        control,
+                        payload,
+                        writable,
+                    },
+                );
+            }
+            mir::NullableSharedReferenceAccessExpression::CollectionIndex {
+                payload,
+                collection,
+                index,
+                writable,
+            } => {
+                let frame = self.current_frame_mut()?;
+                frame
+                    .tasks
+                    .push(EvaluationTask::CollectionIndexSharedAccess {
+                        collection,
+                        payload,
+                        writable,
+                        nullable: true,
+                    });
+                frame.tasks.push(EvaluationTask::Rvalue(*index));
+            }
+            mir::NullableSharedReferenceAccessExpression::Call {
+                payload,
+                function,
+                args,
+                writable,
+                ..
+            } => {
+                let ty = if writable {
+                    mir::Type::NullableWritableSharedReferenceAccess(payload)
+                } else {
+                    mir::Type::NullableReadonlySharedReferenceAccess(payload)
+                };
+                self.queue_call(function, args, ReturnExpectation::Value(ty))?;
+            }
+            mir::NullableSharedReferenceAccessExpression::NullSafeAcquire {
+                payload,
+                value,
+                writable,
+            } => {
+                let drop_receiver = value.owned_temporary();
+                let frame = self.current_frame_mut()?;
+                frame
+                    .tasks
+                    .push(EvaluationTask::FinishNullableSharedAccessAcquire {
+                        payload,
+                        writable,
+                        drop_receiver,
+                    });
+                frame
+                    .tasks
+                    .push(EvaluationTask::NullableWritableSharedReference(*value));
             }
         }
         Ok(())
@@ -7088,6 +7418,15 @@ impl Interpreter<'_> {
                     payload,
                     writable,
                 }),
+                EvaluationValue::NullableSharedReferenceAccess {
+                    control,
+                    payload,
+                    writable,
+                } => Ok(LocalValue::NullableSharedReferenceAccess {
+                    control,
+                    payload,
+                    writable,
+                }),
                 EvaluationValue::Collection(value) => Ok(LocalValue::Collection(value)),
             })
             .collect()
@@ -7127,9 +7466,10 @@ impl Interpreter<'_> {
             | Some(EvaluationValue::WritableWeakReference { .. })
             | Some(EvaluationValue::NullableWritableSharedReference { .. })
             | Some(EvaluationValue::NullableWritableWeakReference { .. })
-            | Some(EvaluationValue::SharedReferenceAccess { .. }) => Err(InterpreterError::new(
-                "MIR scalar evaluation produced a shared handle",
-            )),
+            | Some(EvaluationValue::SharedReferenceAccess { .. })
+            | Some(EvaluationValue::NullableSharedReferenceAccess { .. }) => Err(
+                InterpreterError::new("MIR scalar evaluation produced a shared handle"),
+            ),
             Some(EvaluationValue::Collection(_)) => Err(InterpreterError::new(
                 "MIR scalar evaluation produced a collection",
             )),
@@ -7173,9 +7513,10 @@ impl Interpreter<'_> {
             | Some(EvaluationValue::WritableWeakReference { .. })
             | Some(EvaluationValue::NullableWritableSharedReference { .. })
             | Some(EvaluationValue::NullableWritableWeakReference { .. })
-            | Some(EvaluationValue::SharedReferenceAccess { .. }) => Err(InterpreterError::new(
-                "MIR string evaluation produced a shared handle",
-            )),
+            | Some(EvaluationValue::SharedReferenceAccess { .. })
+            | Some(EvaluationValue::NullableSharedReferenceAccess { .. }) => Err(
+                InterpreterError::new("MIR string evaluation produced a shared handle"),
+            ),
             Some(EvaluationValue::Collection(_)) => Err(InterpreterError::new(
                 "MIR string evaluation produced a collection",
             )),
@@ -7420,6 +7761,17 @@ impl Interpreter<'_> {
                 );
                 Ok(())
             }
+            mir::Type::NullableReadonlySharedReferenceAccess(payload)
+            | mir::Type::NullableWritableSharedReferenceAccess(payload) => {
+                self.current_frame_mut()?.values.push(
+                    EvaluationValue::NullableSharedReferenceAccess {
+                        control: None,
+                        payload,
+                        writable: matches!(ty, mir::Type::NullableWritableSharedReferenceAccess(_)),
+                    },
+                );
+                Ok(())
+            }
             _ => Err(InterpreterError::new(
                 "null result does not have nullable type",
             )),
@@ -7510,6 +7862,34 @@ impl Interpreter<'_> {
                 );
                 Ok(())
             }
+            (
+                mir::Type::NullableReadonlySharedReferenceAccess(expected),
+                LocalValue::SharedReferenceAccess {
+                    control,
+                    payload,
+                    writable: false,
+                },
+            )
+            | (
+                mir::Type::NullableWritableSharedReferenceAccess(expected),
+                LocalValue::SharedReferenceAccess {
+                    control,
+                    payload,
+                    writable: true,
+                },
+            ) if expected == payload => {
+                self.current_frame_mut()?.values.push(
+                    EvaluationValue::NullableSharedReferenceAccess {
+                        control: Some(control),
+                        payload,
+                        writable: matches!(
+                            nullable,
+                            mir::Type::NullableWritableSharedReferenceAccess(_)
+                        ),
+                    },
+                );
+                Ok(())
+            }
             _ => Err(InterpreterError::new(
                 "cannot wrap value in requested nullable type",
             )),
@@ -7578,6 +7958,15 @@ impl Interpreter<'_> {
                 payload,
                 writable,
             }),
+            Some(EvaluationValue::NullableSharedReferenceAccess {
+                control,
+                payload,
+                writable,
+            }) => Ok(LocalValue::NullableSharedReferenceAccess {
+                control,
+                payload,
+                writable,
+            }),
             Some(EvaluationValue::Collection(value)) => Ok(LocalValue::Collection(value)),
             None => Err(InterpreterError::new("MIR evaluation produced no value")),
         }
@@ -7626,6 +8015,15 @@ impl Interpreter<'_> {
                 payload,
                 writable,
             } => EvaluationValue::SharedReferenceAccess {
+                control,
+                payload,
+                writable,
+            },
+            LocalValue::NullableSharedReferenceAccess {
+                control,
+                payload,
+                writable,
+            } => EvaluationValue::NullableSharedReferenceAccess {
                 control,
                 payload,
                 writable,
@@ -7739,10 +8137,13 @@ impl Interpreter<'_> {
                 | LocalValue::WritableWeakReference { .. }
                 | LocalValue::NullableWritableSharedReference { .. }
                 | LocalValue::NullableWritableWeakReference { .. }
-                | LocalValue::SharedReferenceAccess { .. } => Err(InterpreterError::new(format!(
-                    "MIR shared handle local local{} was used as a scalar value",
-                    id.0
-                ))),
+                | LocalValue::SharedReferenceAccess { .. }
+                | LocalValue::NullableSharedReferenceAccess { .. } => {
+                    Err(InterpreterError::new(format!(
+                        "MIR shared handle local local{} was used as a scalar value",
+                        id.0
+                    )))
+                }
                 LocalValue::Collection(_) => Err(InterpreterError::new(format!(
                     "MIR collection local local{} was used as a scalar value",
                     id.0
@@ -8044,6 +8445,18 @@ impl Interpreter<'_> {
                     control, writable, ..
                 },
             ) => Some(EvaluationTask::ReleaseSharedAccess { control, writable }),
+            (
+                WritableDropKind::Access,
+                LocalValue::NullableSharedReferenceAccess {
+                    control: Some(control),
+                    writable,
+                    ..
+                },
+            ) => Some(EvaluationTask::ReleaseSharedAccess { control, writable }),
+            (
+                WritableDropKind::Access,
+                LocalValue::NullableSharedReferenceAccess { control: None, .. },
+            ) => None,
             _ => {
                 return Err(InterpreterError::new(format!(
                     "MIR writable shared drop local{} contained another value type",
@@ -8613,6 +9026,15 @@ fn local_value_type(value: &LocalValue) -> mir::Type {
                 mir::Type::ReadonlySharedReferenceAccess(*payload)
             }
         }
+        LocalValue::NullableSharedReferenceAccess {
+            payload, writable, ..
+        } => {
+            if *writable {
+                mir::Type::NullableWritableSharedReferenceAccess(*payload)
+            } else {
+                mir::Type::NullableReadonlySharedReferenceAccess(*payload)
+            }
+        }
         LocalValue::Collection(value) => mir::Type::Collection(value.ty),
     }
 }
@@ -8720,6 +9142,11 @@ fn collect_owned_objects_from_value(value: LocalValue, drops: &mut Vec<OwnedDrop
         } => drops.push(OwnedDrop::WritableWeak(control)),
         LocalValue::SharedReferenceAccess {
             control, writable, ..
+        } => drops.push(OwnedDrop::SharedAccess { control, writable }),
+        LocalValue::NullableSharedReferenceAccess {
+            control: Some(control),
+            writable,
+            ..
         } => drops.push(OwnedDrop::SharedAccess { control, writable }),
         LocalValue::Collection(collection) => {
             collect_owned_objects_from_collection(collection, drops)
@@ -8978,6 +9405,26 @@ fn assign_local(
     ) || matches!(
         (definition.ty, &value),
         (
+            mir::Type::NullableReadonlySharedReferenceAccess(expected),
+            LocalValue::NullableSharedReferenceAccess {
+                payload,
+                writable: false,
+                ..
+            }
+        ) if expected == *payload
+    ) || matches!(
+        (definition.ty, &value),
+        (
+            mir::Type::NullableWritableSharedReferenceAccess(expected),
+            LocalValue::NullableSharedReferenceAccess {
+                payload,
+                writable: true,
+                ..
+            }
+        ) if expected == *payload
+    ) || matches!(
+        (definition.ty, &value),
+        (
             mir::Type::WritableSharedReferenceAccess(expected),
             LocalValue::SharedReferenceAccess {
                 payload,
@@ -9017,6 +9464,12 @@ fn assign_local(
                 writable: false, ..
             } => "readonly shared access",
             LocalValue::SharedReferenceAccess { writable: true, .. } => "writable shared access",
+            LocalValue::NullableSharedReferenceAccess {
+                writable: false, ..
+            } => "nullable readonly shared access",
+            LocalValue::NullableSharedReferenceAccess { writable: true, .. } => {
+                "nullable writable shared access"
+            }
             LocalValue::Collection(_) => "collection",
         };
         return Err(InterpreterError::new(format!(

@@ -150,6 +150,7 @@ These are identity, not scope deferral. They do not become available later, and 
 - Treat supporting specification, notes, and decision files as subordinate where they conflict with the end-to-end plan.
 - Treat `docs/doria-end-to-end-plan.md`, `docs/decisions/`, `SPEC.md`, `README.md`, `AGENTS.md`, and `docs/information-architecture.md` according to the documentation authority model. Supporting design notes are subordinate to the end-to-end plan and accepted decisions.
 - Doria has a real ownership/borrow checker model in Doria spelling: readonly is shared borrow, writable is exclusive borrow, and `take` transfers ownership.
+- Stage 25a's readonly and writable shared-ownership families are permanently disjoint. Keep their control blocks and ABI release operations distinct; access-object destruction releases its access registration before its strong ownership claim, including values stored in properties and collections.
 - `use` is namespace import/alias, `uses` is trait composition, and `with` is closure capture. These three keywords are not interchangeable.
 - Keep compiler work incremental and tested, but never use incremental delivery as an excuse to make unsound language decisions.
 - Do not make PHP the public identity of Doria. PHP is development context, migration context, and one optional compatibility backend; Doria should be described as its own native-first language.

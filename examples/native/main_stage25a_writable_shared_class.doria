@@ -1,0 +1,41 @@
+class Counter
+{
+    writable int $value = 0;
+
+    writable function add(int $amount): void
+    {
+        $this->value += $amount;
+    }
+
+    function current(): int
+    {
+        return $this->value;
+    }
+
+    function __destruct()
+    {
+        echo "drop counter\n";
+    }
+}
+
+function update(WritableSharedReference<Counter> $counter): void
+{
+    let writable $access = $counter->acquireWritableAccess();
+    $access->value++;
+    $access->add(6);
+}
+
+function inspect(WritableSharedReference<Counter> $counter): void
+{
+    let $first = $counter->acquireReadonlyAccess();
+    let $second = $counter->acquireReadonlyAccess();
+    echo "{$first->current()}:{$second->value}\n";
+}
+
+function main(): void
+{
+    let $counter = new WritableSharedReference(new Counter());
+    let $second = $counter->share();
+    update($counter);
+    inspect($second);
+}

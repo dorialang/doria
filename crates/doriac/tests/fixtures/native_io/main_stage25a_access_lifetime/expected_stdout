@@ -1,0 +1,4 @@
+access guarded
+live through access
+drop guarded
+expired after access

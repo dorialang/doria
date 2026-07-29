@@ -1,0 +1,33 @@
+class Node
+{
+    function __construct(string $name)
+    {
+    }
+
+    function __destruct()
+    {
+        echo "drop {$this->name}\n";
+    }
+}
+
+function expired(): WritableWeakReference<Node>
+{
+    let $node = new WritableSharedReference(new Node("expired"));
+    return $node->createWeakReference();
+}
+
+function main(): void
+{
+    let $root = new WritableSharedReference(new Node("root"));
+    let $weak = $root->createWeakReference();
+    let $access = $root->acquireReadonlyAccess();
+    let $live = $weak->acquire();
+    if ($live != null) {
+        echo "live {$access->name}\n";
+    }
+
+    let $dead = expired();
+    if ($dead->acquire() == null) {
+        echo "expired\n";
+    }
+}

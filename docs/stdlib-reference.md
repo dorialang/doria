@@ -29,7 +29,7 @@ Details: decision 0096 (primitive conformance), the interfaces/traits decision (
 Primitives conform to `Equatable`/`Comparable`/`Hashable` by compiler-known conformance and satisfy generic constraints with no boxing (0096).
 
 ### Shared ownership
-The escape hatch when single ownership does not fit (caches, graphs, back-references). Details: §3.3, decision 0106. Landing across four Stage 25a slices; the grammar/type model and readonly `SharedReference<T>` / `WeakReference<T>` runtime family are implemented, while the writable family and access guards follow.
+The escape hatch when single ownership does not fit (caches, graphs, back-references). Details: §3.3, decision 0106. Stage 25a Slices 1 through 3 implement the grammar/type model, readonly family, writable family, and runtime-checked access guards. Final integration remains in Slice 4.
 
 - **`SharedReference<T>`** — an owning reference that may share responsibility for keeping one value alive with other `SharedReference<T>` values. Constructed with `shared new T(...)`. `share()` creates another owning reference (distinct from `Cloneable`'s `clone()`, which duplicates the value); `createWeakReference()` derives a `WeakReference<T>`; gives direct readonly access to `T`. Reference counting is the implementation mechanism; the source-level model is ownership and lifetime responsibility.
 - **`WeakReference<T>`** — a non-owning reference to a shared value; it does not keep the value alive. `acquire()` returns `?SharedReference<T>` — a live owner, or `null` once the last owner is released (breaks cycles).

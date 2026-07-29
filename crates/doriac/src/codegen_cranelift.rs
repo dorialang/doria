@@ -266,6 +266,8 @@ fn append_type_abi_params(params: &mut Vec<AbiParam>, ty: mir::Type, pointer_typ
         | mir::Type::NullableWritableWeakReference(_)
         | mir::Type::ReadonlySharedReferenceAccess(_)
         | mir::Type::WritableSharedReferenceAccess(_)
+        | mir::Type::NullableReadonlySharedReferenceAccess(_)
+        | mir::Type::NullableWritableSharedReferenceAccess(_)
         | mir::Type::Collection(_) => {
             params.push(AbiParam::new(pointer_type));
         }
@@ -545,6 +547,8 @@ fn define_function(
                 | mir::Type::NullableWritableWeakReference(_)
                 | mir::Type::ReadonlySharedReferenceAccess(_)
                 | mir::Type::WritableSharedReferenceAccess(_)
+                | mir::Type::NullableReadonlySharedReferenceAccess(_)
+                | mir::Type::NullableWritableSharedReferenceAccess(_)
                 | mir::Type::Collection(_) => {
                     Some(builder.create_sized_stack_slot(StackSlotData::new(
                         StackSlotKind::ExplicitSlot,
@@ -803,6 +807,8 @@ fn initialize_locals(
             | mir::Type::NullableWritableWeakReference(_)
             | mir::Type::ReadonlySharedReferenceAccess(_)
             | mir::Type::WritableSharedReferenceAccess(_)
+            | mir::Type::NullableReadonlySharedReferenceAccess(_)
+            | mir::Type::NullableWritableSharedReferenceAccess(_)
             | mir::Type::Collection(_) => builder.ins().iconst(pointer_type, 0),
             mir::Type::NullableScalar(_) | mir::Type::NullableString => {
                 let zero = builder.ins().iconst(pointer_type, 0);
@@ -1333,6 +1339,8 @@ fn lower_statement(
                 | mir::Type::NullableWritableWeakReference(_)
                 | mir::Type::ReadonlySharedReferenceAccess(_)
                 | mir::Type::WritableSharedReferenceAccess(_)
+                | mir::Type::NullableReadonlySharedReferenceAccess(_)
+                | mir::Type::NullableWritableSharedReferenceAccess(_)
                     if definition.owned =>
                 {
                     Some((
@@ -1357,16 +1365,11 @@ fn lower_statement(
                     lower_drop_shared_value(builder, old, false, resources)?;
                 } else if matches!(
                     definition.ty,
-                    mir::Type::WeakReference(_)
-                        | mir::Type::NullableWeakReference(_)
-                        | mir::Type::WritableSharedReference(_)
-                        | mir::Type::WritableWeakReference(_)
-                        | mir::Type::NullableWritableSharedReference(_)
-                        | mir::Type::NullableWritableWeakReference(_)
-                        | mir::Type::ReadonlySharedReferenceAccess(_)
-                        | mir::Type::WritableSharedReferenceAccess(_)
+                    mir::Type::WeakReference(_) | mir::Type::NullableWeakReference(_)
                 ) {
                     lower_drop_shared_value(builder, old, true, resources)?;
+                } else if let Some(symbol) = writable_shared_release_symbol(definition.ty) {
+                    lower_drop_writable_shared_value(builder, old, symbol, resources)?;
                 } else if let Some(class) = class {
                     lower_drop_class_value_checked(builder, old, class, resources)?;
                 } else {
@@ -1512,6 +1515,8 @@ fn lower_statement(
                 | mir::Type::NullableWritableWeakReference(_)
                 | mir::Type::ReadonlySharedReferenceAccess(_)
                 | mir::Type::WritableSharedReferenceAccess(_)
+                | mir::Type::NullableReadonlySharedReferenceAccess(_)
+                | mir::Type::NullableWritableSharedReferenceAccess(_)
                 | mir::Type::Collection(_) => Some(
                     load_lowered_from_address(
                         builder,
@@ -1791,6 +1796,8 @@ fn load_lowered_from_stack(
         | mir::Type::NullableWritableWeakReference(_)
         | mir::Type::ReadonlySharedReferenceAccess(_)
         | mir::Type::WritableSharedReferenceAccess(_)
+        | mir::Type::NullableReadonlySharedReferenceAccess(_)
+        | mir::Type::NullableWritableSharedReferenceAccess(_)
         | mir::Type::Collection(_) => {
             LoweredValue::Single(builder.ins().stack_load(pointer, pointer, slot, 0))
         }
@@ -1863,6 +1870,8 @@ fn load_lowered_from_address(
         | mir::Type::NullableWritableWeakReference(_)
         | mir::Type::ReadonlySharedReferenceAccess(_)
         | mir::Type::WritableSharedReferenceAccess(_)
+        | mir::Type::NullableReadonlySharedReferenceAccess(_)
+        | mir::Type::NullableWritableSharedReferenceAccess(_)
         | mir::Type::Collection(_) => {
             LoweredValue::Single(builder.ins().load(pointer, flags, address, 0))
         }
@@ -2063,6 +2072,10 @@ fn lower_rvalue(
             lower_shared_reference_access_expression(builder, value, resources)
                 .map(LoweredValue::Single)
         }
+        mir::Rvalue::NullableSharedReferenceAccess(value) => {
+            lower_nullable_shared_reference_access_expression(builder, value, resources)
+                .map(LoweredValue::Single)
+        }
         mir::Rvalue::Collection(value) => {
             lower_collection_expression(builder, value, resources).map(LoweredValue::Single)
         }
@@ -2102,6 +2115,8 @@ fn collection_compare_kind(ty: mir::Type) -> Result<i64, BackendError> {
         | mir::Type::NullableWritableWeakReference(_)
         | mir::Type::ReadonlySharedReferenceAccess(_)
         | mir::Type::WritableSharedReferenceAccess(_)
+        | mir::Type::NullableReadonlySharedReferenceAccess(_)
+        | mir::Type::NullableWritableSharedReferenceAccess(_)
         | mir::Type::Collection(_) => Ok(i64::from(COLLECTION_COMPARE_WORD)),
         mir::Type::NullableScalar(_)
         | mir::Type::NullableString
@@ -2151,6 +2166,8 @@ fn value_to_collection_word(
         | mir::Type::NullableWritableWeakReference(_)
         | mir::Type::ReadonlySharedReferenceAccess(_)
         | mir::Type::WritableSharedReferenceAccess(_)
+        | mir::Type::NullableReadonlySharedReferenceAccess(_)
+        | mir::Type::NullableWritableSharedReferenceAccess(_)
         | mir::Type::Collection(_) => {
             if pointer == types::I64 {
                 value
@@ -2205,6 +2222,8 @@ fn collection_word_to_value(
         | mir::Type::NullableWritableWeakReference(_)
         | mir::Type::ReadonlySharedReferenceAccess(_)
         | mir::Type::WritableSharedReferenceAccess(_)
+        | mir::Type::NullableReadonlySharedReferenceAccess(_)
+        | mir::Type::NullableWritableSharedReferenceAccess(_)
         | mir::Type::Collection(_) => {
             if pointer == types::I64 {
                 word
@@ -3036,6 +3055,8 @@ fn lower_drop_value_if(
             | mir::Type::NullableWritableWeakReference(_)
             | mir::Type::ReadonlySharedReferenceAccess(_)
             | mir::Type::WritableSharedReferenceAccess(_)
+            | mir::Type::NullableReadonlySharedReferenceAccess(_)
+            | mir::Type::NullableWritableSharedReferenceAccess(_)
             | mir::Type::Collection(_)
             | mir::Type::Mixed
             | mir::Type::NullableMixed
@@ -3087,7 +3108,9 @@ fn lower_drop_stored_value(
         | mir::Type::NullableWritableSharedReference(_)
         | mir::Type::NullableWritableWeakReference(_)
         | mir::Type::ReadonlySharedReferenceAccess(_)
-        | mir::Type::WritableSharedReferenceAccess(_) => {
+        | mir::Type::WritableSharedReferenceAccess(_)
+        | mir::Type::NullableReadonlySharedReferenceAccess(_)
+        | mir::Type::NullableWritableSharedReferenceAccess(_) => {
             let symbol = writable_shared_release_symbol(ty)
                 .ok_or_else(|| malformed_mir("writable shared release symbol is missing"))?;
             lower_drop_writable_shared_value(builder, value, symbol, resources)
@@ -4460,6 +4483,11 @@ fn lower_shared_reference_access_expression(
     match expression {
         mir::SharedReferenceAccessExpression::Local {
             local, transfer, ..
+        }
+        | mir::SharedReferenceAccessExpression::NullableLocalAssumeNonNull {
+            local,
+            transfer,
+            ..
         } => lower_pointer_local(builder, *local, *transfer, resources),
         mir::SharedReferenceAccessExpression::Property {
             object, property, ..
@@ -4504,6 +4532,65 @@ fn lower_shared_reference_access_expression(
     }
 }
 
+fn lower_nullable_shared_reference_access_expression(
+    builder: &mut FunctionBuilder,
+    expression: &mir::NullableSharedReferenceAccessExpression,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<Value, BackendError> {
+    let pointer = resources.module.target_config().pointer_type();
+    match expression {
+        mir::NullableSharedReferenceAccessExpression::Null { .. } => {
+            Ok(builder.ins().iconst(pointer, 0))
+        }
+        mir::NullableSharedReferenceAccessExpression::Access(value) => {
+            lower_shared_reference_access_expression(builder, value, resources)
+        }
+        mir::NullableSharedReferenceAccessExpression::Local {
+            local, transfer, ..
+        } => lower_pointer_local(builder, *local, *transfer, resources),
+        mir::NullableSharedReferenceAccessExpression::Property {
+            object, property, ..
+        } => lower_pointer_property(builder, *object, *property, resources),
+        mir::NullableSharedReferenceAccessExpression::CollectionIndex {
+            collection, index, ..
+        } => lower_collection_index(builder, *collection, index, false, resources),
+        mir::NullableSharedReferenceAccessExpression::Call { function, args, .. } => {
+            lower_function_call(builder, *function, args, resources)?
+                .ok_or_else(|| malformed_mir("nullable shared access call produced no result"))?
+                .single()
+        }
+        mir::NullableSharedReferenceAccessExpression::NullSafeAcquire {
+            value, writable, ..
+        } => {
+            let owned = value.owned_temporary();
+            let control =
+                lower_nullable_writable_shared_reference_expression(builder, value, resources)?;
+            let symbol = if *writable {
+                WRITABLE_SHARED_ACQUIRE_WRITABLE_ACCESS
+            } else {
+                WRITABLE_SHARED_ACQUIRE_READONLY_ACCESS
+            };
+            let result = lower_null_safe_shared_call(
+                builder,
+                control,
+                symbol,
+                "null-safe shared access acquisition",
+                true,
+                resources,
+            )?;
+            if owned {
+                defer_or_drop_writable_shared_temporary(
+                    builder,
+                    control,
+                    WRITABLE_SHARED_RELEASE,
+                    resources,
+                )?;
+            }
+            Ok(result)
+        }
+    }
+}
+
 fn lower_pointer_local(
     builder: &mut FunctionBuilder,
     local: mir::LocalId,
@@ -4536,8 +4623,7 @@ fn lower_pointer_property(
     ))
 }
 
-fn finish_writable_pointer_coalesce(
-    builder: &mut FunctionBuilder,
+struct WritablePointerCoalesce {
     left: Value,
     left_owned: bool,
     right: Value,
@@ -4547,8 +4633,24 @@ fn finish_writable_pointer_coalesce(
     left_block: Block,
     right_block: Block,
     done: Block,
+}
+
+fn finish_writable_pointer_coalesce(
+    builder: &mut FunctionBuilder,
+    coalesce: WritablePointerCoalesce,
     resources: &mut LoweringResources<'_, '_>,
 ) -> Result<Value, BackendError> {
+    let WritablePointerCoalesce {
+        left,
+        left_owned,
+        right,
+        right_owned,
+        transfer,
+        release,
+        left_block,
+        right_block,
+        done,
+    } = coalesce;
     let pointer = resources.module.target_config().pointer_type();
     let zero = builder.ins().iconst(pointer, 0);
     builder.switch_to_block(left_block);
@@ -4616,15 +4718,17 @@ fn lower_writable_shared_coalesce(
     let right_value = lower_writable_shared_reference_expression(builder, right, resources)?;
     finish_writable_pointer_coalesce(
         builder,
-        left_value,
-        left_owned,
-        right_value,
-        right_owned,
-        transfer,
-        release,
-        left_block,
-        right_block,
-        done,
+        WritablePointerCoalesce {
+            left: left_value,
+            left_owned,
+            right: right_value,
+            right_owned,
+            transfer,
+            release,
+            left_block,
+            right_block,
+            done,
+        },
         resources,
     )
 }
@@ -4647,15 +4751,17 @@ fn lower_nullable_writable_shared_coalesce(
         lower_nullable_writable_shared_reference_expression(builder, right, resources)?;
     finish_writable_pointer_coalesce(
         builder,
-        left_value,
-        left_owned,
-        right_value,
-        right_owned,
-        transfer,
-        release,
-        left_block,
-        right_block,
-        done,
+        WritablePointerCoalesce {
+            left: left_value,
+            left_owned,
+            right: right_value,
+            right_owned,
+            transfer,
+            release,
+            left_block,
+            right_block,
+            done,
+        },
         resources,
     )
 }
@@ -4677,15 +4783,17 @@ fn lower_writable_weak_coalesce(
     let right_value = lower_writable_weak_reference_expression(builder, right, resources)?;
     finish_writable_pointer_coalesce(
         builder,
-        left_value,
-        left_owned,
-        right_value,
-        right_owned,
-        transfer,
-        release,
-        left_block,
-        right_block,
-        done,
+        WritablePointerCoalesce {
+            left: left_value,
+            left_owned,
+            right: right_value,
+            right_owned,
+            transfer,
+            release,
+            left_block,
+            right_block,
+            done,
+        },
         resources,
     )
 }
@@ -4707,15 +4815,17 @@ fn lower_nullable_writable_weak_coalesce(
     let right_value = lower_nullable_writable_weak_reference_expression(builder, right, resources)?;
     finish_writable_pointer_coalesce(
         builder,
-        left_value,
-        left_owned,
-        right_value,
-        right_owned,
-        transfer,
-        release,
-        left_block,
-        right_block,
-        done,
+        WritablePointerCoalesce {
+            left: left_value,
+            left_owned,
+            right: right_value,
+            right_owned,
+            transfer,
+            release,
+            left_block,
+            right_block,
+            done,
+        },
         resources,
     )
 }
@@ -5031,7 +5141,9 @@ fn lower_drop_class_value(
             | mir::Type::WritableWeakReference(_)
             | mir::Type::NullableWritableWeakReference(_)
             | mir::Type::ReadonlySharedReferenceAccess(_)
-            | mir::Type::WritableSharedReferenceAccess(_) => {
+            | mir::Type::WritableSharedReferenceAccess(_)
+            | mir::Type::NullableReadonlySharedReferenceAccess(_)
+            | mir::Type::NullableWritableSharedReferenceAccess(_) => {
                 let value = builder.ins().load(
                     pointer_type,
                     cranelift_codegen::ir::MachMemFlags::trusted(),
@@ -5043,10 +5155,12 @@ fn lower_drop_class_value(
                     | mir::Type::NullableWritableSharedReference(_) => WRITABLE_SHARED_RELEASE,
                     mir::Type::WritableWeakReference(_)
                     | mir::Type::NullableWritableWeakReference(_) => WRITABLE_SHARED_RELEASE_WEAK,
-                    mir::Type::ReadonlySharedReferenceAccess(_) => {
+                    mir::Type::ReadonlySharedReferenceAccess(_)
+                    | mir::Type::NullableReadonlySharedReferenceAccess(_) => {
                         WRITABLE_SHARED_RELEASE_READONLY_ACCESS
                     }
-                    mir::Type::WritableSharedReferenceAccess(_) => {
+                    mir::Type::WritableSharedReferenceAccess(_)
+                    | mir::Type::NullableWritableSharedReferenceAccess(_) => {
                         WRITABLE_SHARED_RELEASE_WRITABLE_ACCESS
                     }
                     _ => unreachable!(),
@@ -7686,6 +7800,25 @@ fn lower_condition_to_branch(
                 .ins()
                 .brif(present, then_block, &[], else_block, &[]);
         }
+        mir::BoolExpression::NullableSharedReferenceAccessIsPresent(value) => {
+            let owned = value.owned_temporary();
+            let lowered =
+                lower_nullable_shared_reference_access_expression(builder, value, resources)?;
+            if owned {
+                let symbol = if value.writable() {
+                    WRITABLE_SHARED_RELEASE_WRITABLE_ACCESS
+                } else {
+                    WRITABLE_SHARED_RELEASE_READONLY_ACCESS
+                };
+                defer_or_drop_writable_shared_temporary(builder, lowered, symbol, resources)?;
+            }
+            let pointer = resources.module.target_config().pointer_type();
+            let zero = builder.ins().iconst(pointer, 0);
+            let present = builder.ins().icmp(IntCC::NotEqual, lowered, zero);
+            builder
+                .ins()
+                .brif(present, then_block, &[], else_block, &[]);
+        }
         mir::BoolExpression::NullableMixedIsPresent(value) => {
             let ownership = value.ownership();
             let value = lower_nullable_mixed_expression(builder, value, resources)?;
@@ -8361,10 +8494,12 @@ fn writable_shared_release_symbol(ty: mir::Type) -> Option<&'static str> {
         mir::Type::WritableWeakReference(_) | mir::Type::NullableWritableWeakReference(_) => {
             Some(WRITABLE_SHARED_RELEASE_WEAK)
         }
-        mir::Type::ReadonlySharedReferenceAccess(_) => {
+        mir::Type::ReadonlySharedReferenceAccess(_)
+        | mir::Type::NullableReadonlySharedReferenceAccess(_) => {
             Some(WRITABLE_SHARED_RELEASE_READONLY_ACCESS)
         }
-        mir::Type::WritableSharedReferenceAccess(_) => {
+        mir::Type::WritableSharedReferenceAccess(_)
+        | mir::Type::NullableWritableSharedReferenceAccess(_) => {
             Some(WRITABLE_SHARED_RELEASE_WRITABLE_ACCESS)
         }
         _ => None,

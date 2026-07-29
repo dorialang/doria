@@ -924,6 +924,12 @@ fn intern_resolved_collection_types(
                 mir::Type::WritableWeakReference(payload) => {
                     mir::Type::NullableWritableWeakReference(payload)
                 }
+                mir::Type::ReadonlySharedReferenceAccess(payload) => {
+                    mir::Type::NullableReadonlySharedReferenceAccess(payload)
+                }
+                mir::Type::WritableSharedReferenceAccess(payload) => {
+                    mir::Type::NullableWritableSharedReferenceAccess(payload)
+                }
                 mir::Type::Collection(_)
                 | mir::Type::NullableScalar(_)
                 | mir::Type::NullableString
@@ -933,8 +939,8 @@ fn intern_resolved_collection_types(
                 | mir::Type::NullableWeakReference(_)
                 | mir::Type::NullableWritableSharedReference(_)
                 | mir::Type::NullableWritableWeakReference(_)
-                | mir::Type::ReadonlySharedReferenceAccess(_)
-                | mir::Type::WritableSharedReferenceAccess(_) => return None,
+                | mir::Type::NullableReadonlySharedReferenceAccess(_)
+                | mir::Type::NullableWritableSharedReferenceAccess(_) => return None,
             }
         }
         // Stage 25a Slice 1 lands the surface and type model only; shared handles
@@ -1376,7 +1382,11 @@ fn field_type(ty: mir::Type) -> Option<FieldType> {
             Some(FieldType::NullableWritableWeakReference)
         }
         mir::Type::ReadonlySharedReferenceAccess(_)
-        | mir::Type::WritableSharedReferenceAccess(_) => Some(FieldType::SharedReferenceAccess),
+        | mir::Type::WritableSharedReferenceAccess(_)
+        | mir::Type::NullableReadonlySharedReferenceAccess(_)
+        | mir::Type::NullableWritableSharedReferenceAccess(_) => {
+            Some(FieldType::SharedReferenceAccess)
+        }
         mir::Type::Collection(_) => Some(FieldType::Collection),
     }
 }
@@ -2080,6 +2090,8 @@ fn lower_collection_foreach_in_scope(
             | mir::Type::WritableWeakReference(_)
             | mir::Type::ReadonlySharedReferenceAccess(_)
             | mir::Type::WritableSharedReferenceAccess(_)
+            | mir::Type::NullableReadonlySharedReferenceAccess(_)
+            | mir::Type::NullableWritableSharedReferenceAccess(_)
             | mir::Type::Mixed
             | mir::Type::Collection(_) => {}
             mir::Type::NullableScalar(_)
@@ -2244,7 +2256,9 @@ fn collection_value_rvalue(
         | mir::Type::NullableWritableSharedReference(_)
         | mir::Type::NullableWritableWeakReference(_)
         | mir::Type::ReadonlySharedReferenceAccess(_)
-        | mir::Type::WritableSharedReferenceAccess(_) => Err(vec![unsupported(
+        | mir::Type::WritableSharedReferenceAccess(_)
+        | mir::Type::NullableReadonlySharedReferenceAccess(_)
+        | mir::Type::NullableWritableSharedReferenceAccess(_) => Err(vec![unsupported(
             Span::new(0, 0),
             "nullable collection elements are deferred beyond Stage 23 Slice 3",
         )]),
@@ -2734,6 +2748,8 @@ impl<'semantic> LoweringContext<'semantic> {
                 | mir::Type::NullableWritableWeakReference(_)
                 | mir::Type::ReadonlySharedReferenceAccess(_)
                 | mir::Type::WritableSharedReferenceAccess(_)
+                | mir::Type::NullableReadonlySharedReferenceAccess(_)
+                | mir::Type::NullableWritableSharedReferenceAccess(_)
                 | mir::Type::Mixed
                 | mir::Type::NullableMixed
                 | mir::Type::Collection(_)
@@ -2779,10 +2795,12 @@ impl<'semantic> LoweringContext<'semantic> {
                 | mir::Type::NullableWritableWeakReference(payload) => {
                     DropObligation::WritableWeak(id, payload)
                 }
-                mir::Type::ReadonlySharedReferenceAccess(payload) => {
+                mir::Type::ReadonlySharedReferenceAccess(payload)
+                | mir::Type::NullableReadonlySharedReferenceAccess(payload) => {
                     DropObligation::SharedAccess(id, payload, false)
                 }
-                mir::Type::WritableSharedReferenceAccess(payload) => {
+                mir::Type::WritableSharedReferenceAccess(payload)
+                | mir::Type::NullableWritableSharedReferenceAccess(payload) => {
                     DropObligation::SharedAccess(id, payload, true)
                 }
                 mir::Type::Mixed | mir::Type::NullableMixed => DropObligation::Mixed(id),
@@ -3318,6 +3336,12 @@ impl<'semantic> LoweringContext<'semantic> {
                 mir::Type::WritableWeakReference(payload) => {
                     Some(mir::Type::NullableWritableWeakReference(payload))
                 }
+                mir::Type::ReadonlySharedReferenceAccess(payload) => {
+                    Some(mir::Type::NullableReadonlySharedReferenceAccess(payload))
+                }
+                mir::Type::WritableSharedReferenceAccess(payload) => {
+                    Some(mir::Type::NullableWritableSharedReferenceAccess(payload))
+                }
                 // `?(?X)` collapses to `?X`: a `?T` field substituted with a
                 // nullable argument is already nullable, not doubly-nullable.
                 already @ (mir::Type::NullableScalar(_)
@@ -3327,10 +3351,10 @@ impl<'semantic> LoweringContext<'semantic> {
                 | mir::Type::NullableSharedReference(_)
                 | mir::Type::NullableWeakReference(_)
                 | mir::Type::NullableWritableSharedReference(_)
-                | mir::Type::NullableWritableWeakReference(_)) => Some(already),
-                mir::Type::Collection(_)
-                | mir::Type::ReadonlySharedReferenceAccess(_)
-                | mir::Type::WritableSharedReferenceAccess(_) => None,
+                | mir::Type::NullableWritableWeakReference(_)
+                | mir::Type::NullableReadonlySharedReferenceAccess(_)
+                | mir::Type::NullableWritableSharedReferenceAccess(_)) => Some(already),
+                mir::Type::Collection(_) => None,
             },
             ResolvedType::Void | ResolvedType::Null | ResolvedType::Unsupported => None,
         }
@@ -3369,6 +3393,8 @@ impl<'semantic> LoweringContext<'semantic> {
             | mir::Type::NullableWritableWeakReference(_)
             | mir::Type::ReadonlySharedReferenceAccess(_)
             | mir::Type::WritableSharedReferenceAccess(_)
+            | mir::Type::NullableReadonlySharedReferenceAccess(_)
+            | mir::Type::NullableWritableSharedReferenceAccess(_)
             | mir::Type::Collection(_) => Err(vec![Diagnostic::new(
                 "I1401",
                 format!(
@@ -3582,6 +3608,24 @@ fn lower_var_decl(decl: &hir::VarDecl, context: &mut LoweringContext) -> Diagnos
         context.push_statement(mir::Statement::AssignLocal {
             target: local,
             value: mir::Rvalue::SharedReferenceAccess(value),
+        });
+        return Ok(());
+    }
+    if let mir::Type::NullableReadonlySharedReferenceAccess(payload)
+    | mir::Type::NullableWritableSharedReferenceAccess(payload) = ty
+    {
+        let writable = matches!(ty, mir::Type::NullableWritableSharedReferenceAccess(_));
+        let value = lower_nullable_shared_reference_access_expression(
+            &decl.initializer,
+            payload,
+            writable,
+            true,
+            context,
+        )?;
+        let local = context.declare_user_local_owned(&decl.name, decl.writable, ty, true);
+        context.push_statement(mir::Statement::AssignLocal {
+            target: local,
+            value: mir::Rvalue::NullableSharedReferenceAccess(value),
         });
         return Ok(());
     }
@@ -5400,7 +5444,9 @@ fn lower_display_string_expression(
             )])
         }
         mir::Type::ReadonlySharedReferenceAccess(_)
-        | mir::Type::WritableSharedReferenceAccess(_) => Err(vec![unsupported(
+        | mir::Type::WritableSharedReferenceAccess(_)
+        | mir::Type::NullableReadonlySharedReferenceAccess(_)
+        | mir::Type::NullableWritableSharedReferenceAccess(_) => Err(vec![unsupported(
             expr.span(),
             "a complete shared-access payload does not have an implicit display representation",
         )]),
@@ -5811,6 +5857,8 @@ fn hoist_argument_temporary(
             | mir::Type::NullableWritableWeakReference(_)
             | mir::Type::ReadonlySharedReferenceAccess(_)
             | mir::Type::WritableSharedReferenceAccess(_)
+            | mir::Type::NullableReadonlySharedReferenceAccess(_)
+            | mir::Type::NullableWritableSharedReferenceAccess(_)
     ) && value.owned_temporary_shared().is_none();
     let borrowed_move_value = borrowed_class_value || borrowed_shared_value;
     let local = match ty {
@@ -5830,6 +5878,8 @@ fn hoist_argument_temporary(
         | mir::Type::NullableWritableWeakReference(_)
         | mir::Type::ReadonlySharedReferenceAccess(_)
         | mir::Type::WritableSharedReferenceAccess(_)
+        | mir::Type::NullableReadonlySharedReferenceAccess(_)
+        | mir::Type::NullableWritableSharedReferenceAccess(_)
             if borrowed_move_value =>
         {
             context.declare_borrowed_temp(ty, false)
@@ -5848,6 +5898,8 @@ fn hoist_argument_temporary(
         | mir::Type::NullableWritableWeakReference(_)
         | mir::Type::ReadonlySharedReferenceAccess(_)
         | mir::Type::WritableSharedReferenceAccess(_)
+        | mir::Type::NullableReadonlySharedReferenceAccess(_)
+        | mir::Type::NullableWritableSharedReferenceAccess(_)
         | mir::Type::Collection(_) => context.declare_owned_temp(ty),
     };
     context.push_statement(mir::Statement::AssignLocal {
@@ -6170,6 +6222,17 @@ fn local_rvalue(local: mir::LocalId, ty: mir::Type, transfer: bool) -> mir::Rval
                 writable: matches!(ty, mir::Type::WritableSharedReferenceAccess(_)),
                 transfer,
             })
+        }
+        mir::Type::NullableReadonlySharedReferenceAccess(payload)
+        | mir::Type::NullableWritableSharedReferenceAccess(payload) => {
+            mir::Rvalue::NullableSharedReferenceAccess(
+                mir::NullableSharedReferenceAccessExpression::Local {
+                    payload,
+                    local,
+                    writable: matches!(ty, mir::Type::NullableWritableSharedReferenceAccess(_)),
+                    transfer,
+                },
+            )
         }
         mir::Type::Collection(collection) => {
             mir::Rvalue::Collection(mir::CollectionExpression::Local {
@@ -6569,6 +6632,18 @@ fn lower_null_comparison(
                 lower_nullable_writable_weak_reference_expression(value, payload, false, context)?,
             ))
         }
+        mir::Type::NullableReadonlySharedReferenceAccess(payload)
+        | mir::Type::NullableWritableSharedReferenceAccess(payload) => {
+            let writable = matches!(
+                value_type,
+                mir::Type::NullableWritableSharedReferenceAccess(_)
+            );
+            mir::BoolExpression::NullableSharedReferenceAccessIsPresent(Box::new(
+                lower_nullable_shared_reference_access_expression(
+                    value, payload, writable, false, context,
+                )?,
+            ))
+        }
         mir::Type::NullableMixed => {
             let present = mir::BoolExpression::NullableMixedIsPresent(Box::new(
                 lower_nullable_mixed_presence_subject(value, context)?,
@@ -6660,6 +6735,24 @@ fn lower_is_condition(
                 lower_nullable_writable_weak_reference_expression(expr, payload, false, context)?,
             ))
         }
+        mir::Type::NullableReadonlySharedReferenceAccess(payload)
+            if tested_type == mir::Type::ReadonlySharedReferenceAccess(payload) =>
+        {
+            mir::BoolExpression::NullableSharedReferenceAccessIsPresent(Box::new(
+                lower_nullable_shared_reference_access_expression(
+                    expr, payload, false, false, context,
+                )?,
+            ))
+        }
+        mir::Type::NullableWritableSharedReferenceAccess(payload)
+            if tested_type == mir::Type::WritableSharedReferenceAccess(payload) =>
+        {
+            mir::BoolExpression::NullableSharedReferenceAccessIsPresent(Box::new(
+                lower_nullable_shared_reference_access_expression(
+                    expr, payload, true, false, context,
+                )?,
+            ))
+        }
         mir::Type::Mixed => mir::BoolExpression::MixedIs {
             mixed: Box::new(lower_mixed_expression(expr, false, context)?),
             tag: mixed_tag_for_type(tested_type, type_test_span)?,
@@ -6707,7 +6800,9 @@ fn lower_is_condition(
         | mir::Type::WritableSharedReference(_)
         | mir::Type::WritableWeakReference(_)
         | mir::Type::ReadonlySharedReferenceAccess(_)
-        | mir::Type::WritableSharedReferenceAccess(_) => {
+        | mir::Type::WritableSharedReferenceAccess(_)
+        | mir::Type::NullableReadonlySharedReferenceAccess(_)
+        | mir::Type::NullableWritableSharedReferenceAccess(_) => {
             let evaluated = lower_concrete_is_presence(expr, value_type, context)?;
             if value_type == tested_type {
                 evaluated
@@ -6928,7 +7023,9 @@ fn lower_concrete_is_presence(
         | mir::Type::NullableSharedReference(_)
         | mir::Type::NullableWeakReference(_)
         | mir::Type::NullableWritableSharedReference(_)
-        | mir::Type::NullableWritableWeakReference(_) => {
+        | mir::Type::NullableWritableWeakReference(_)
+        | mir::Type::NullableReadonlySharedReferenceAccess(_)
+        | mir::Type::NullableWritableSharedReferenceAccess(_) => {
             unreachable!("concrete `is` value type")
         }
         mir::Type::Collection(_) => Ok(mir::BoolExpression::Use {
@@ -7102,6 +7199,14 @@ fn lower_rvalue_as_expected(
         mir::Type::WritableSharedReferenceAccess(payload) => {
             lower_shared_reference_access_expression(expr, payload, true, true, context)
                 .map(mir::Rvalue::SharedReferenceAccess)
+        }
+        mir::Type::NullableReadonlySharedReferenceAccess(payload) => {
+            lower_nullable_shared_reference_access_expression(expr, payload, false, true, context)
+                .map(mir::Rvalue::NullableSharedReferenceAccess)
+        }
+        mir::Type::NullableWritableSharedReferenceAccess(payload) => {
+            lower_nullable_shared_reference_access_expression(expr, payload, true, true, context)
+                .map(mir::Rvalue::NullableSharedReferenceAccess)
         }
         mir::Type::Collection(collection) => {
             lower_collection_expression(expr, collection, true, context)
@@ -7317,7 +7422,9 @@ fn lower_mixed_expression(
         | mir::Type::NullableWritableSharedReference(_)
         | mir::Type::NullableWritableWeakReference(_)
         | mir::Type::ReadonlySharedReferenceAccess(_)
-        | mir::Type::WritableSharedReferenceAccess(_) => {
+        | mir::Type::WritableSharedReferenceAccess(_)
+        | mir::Type::NullableReadonlySharedReferenceAccess(_)
+        | mir::Type::NullableWritableSharedReferenceAccess(_) => {
             Err(vec![shared_ownership_mixed_runtime_unsupported(
                 expr.span(),
             )])
@@ -7348,7 +7455,9 @@ fn mixed_tag_for_type(ty: mir::Type, span: Span) -> DiagnosticResult<mir::MixedT
         | mir::Type::NullableWritableSharedReference(_)
         | mir::Type::NullableWritableWeakReference(_)
         | mir::Type::ReadonlySharedReferenceAccess(_)
-        | mir::Type::WritableSharedReferenceAccess(_) => {
+        | mir::Type::WritableSharedReferenceAccess(_)
+                | mir::Type::NullableReadonlySharedReferenceAccess(_)
+                | mir::Type::NullableWritableSharedReferenceAccess(_) => {
             Err(vec![shared_ownership_mixed_runtime_unsupported(span)])
         }
         mir::Type::Class(class) => Ok(mir::MixedTag::Class(class)),
@@ -7927,7 +8036,9 @@ fn collection_remove_at_rvalue(
         | mir::Type::NullableWritableSharedReference(_)
         | mir::Type::NullableWritableWeakReference(_)
         | mir::Type::ReadonlySharedReferenceAccess(_)
-        | mir::Type::WritableSharedReferenceAccess(_) => Err(vec![unsupported(
+        | mir::Type::WritableSharedReferenceAccess(_)
+        | mir::Type::NullableReadonlySharedReferenceAccess(_)
+        | mir::Type::NullableWritableSharedReferenceAccess(_) => Err(vec![unsupported(
             Span::new(0, 0),
             "removing nullable collection elements is deferred beyond Stage 23 Slice 3",
         )]),
@@ -8479,6 +8590,8 @@ fn nullable_collection_access_rvalue(
         mir::Type::Collection(_)
         | mir::Type::ReadonlySharedReferenceAccess(_)
         | mir::Type::WritableSharedReferenceAccess(_)
+                | mir::Type::NullableReadonlySharedReferenceAccess(_)
+                | mir::Type::NullableWritableSharedReferenceAccess(_)
         | mir::Type::NullableScalar(_)
         | mir::Type::NullableString
         | mir::Type::NullableMixed
@@ -8501,7 +8614,9 @@ fn lower_discarded_rvalue(value: mir::Rvalue, context: &mut LoweringContext) {
         | mir::Type::NullableWritableSharedReference(_)
         | mir::Type::NullableWritableWeakReference(_)
         | mir::Type::ReadonlySharedReferenceAccess(_)
-        | mir::Type::WritableSharedReferenceAccess(_) => {
+        | mir::Type::WritableSharedReferenceAccess(_)
+        | mir::Type::NullableReadonlySharedReferenceAccess(_)
+        | mir::Type::NullableWritableSharedReferenceAccess(_) => {
             value.owned_temporary_shared().is_some()
                 || matches!(
                     value,
@@ -8574,6 +8689,8 @@ fn lower_discarded_rvalue(value: mir::Rvalue, context: &mut LoweringContext) {
         | mir::Type::NullableWritableWeakReference(_)
         | mir::Type::ReadonlySharedReferenceAccess(_)
         | mir::Type::WritableSharedReferenceAccess(_)
+        | mir::Type::NullableReadonlySharedReferenceAccess(_)
+        | mir::Type::NullableWritableSharedReferenceAccess(_)
         | mir::Type::Scalar(_)
         | mir::Type::String
         | mir::Type::NullableScalar(_)
@@ -9662,7 +9779,13 @@ fn lower_shared_reference_access_expression(
             } else {
                 mir::Type::ReadonlySharedReferenceAccess(expected)
             };
-            if context.local_type(local) != expected_ty {
+            let nullable_ty = if writable {
+                mir::Type::NullableWritableSharedReferenceAccess(expected)
+            } else {
+                mir::Type::NullableReadonlySharedReferenceAccess(expected)
+            };
+            let actual_ty = context.local_type(local);
+            if actual_ty != expected_ty && actual_ty != nullable_ty {
                 return Err(vec![unsupported(
                     *span,
                     format!("local `${name}` does not have the expected shared access type"),
@@ -9674,12 +9797,23 @@ fn lower_shared_reference_access_expression(
                     format!("borrowed shared-access local `${name}` cannot be given away"),
                 )]);
             }
-            Ok(mir::SharedReferenceAccessExpression::Local {
-                payload: expected,
-                local,
-                writable,
-                transfer,
-            })
+            if actual_ty == nullable_ty {
+                Ok(
+                    mir::SharedReferenceAccessExpression::NullableLocalAssumeNonNull {
+                        payload: expected,
+                        local,
+                        writable,
+                        transfer,
+                    },
+                )
+            } else {
+                Ok(mir::SharedReferenceAccessExpression::Local {
+                    payload: expected,
+                    local,
+                    writable,
+                    transfer,
+                })
+            }
         }
         hir::Expr::PropertyAccess { span, .. } => {
             if transfer {
@@ -9774,6 +9908,63 @@ fn lower_shared_reference_access_expression(
             expr.span(),
             "this shared-access expression is not supported by native compilation",
         )]),
+    }
+}
+
+fn lower_nullable_shared_reference_access_expression(
+    expr: &hir::Expr,
+    expected: mir::WritableSharedPayload,
+    writable: bool,
+    transfer: bool,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<mir::NullableSharedReferenceAccessExpression> {
+    let nullable_ty = if writable {
+        mir::Type::NullableWritableSharedReferenceAccess(expected)
+    } else {
+        mir::Type::NullableReadonlySharedReferenceAccess(expected)
+    };
+    match unparenthesized_place(expr) {
+        hir::Expr::Null { .. } => Ok(mir::NullableSharedReferenceAccessExpression::Null {
+            payload: expected,
+            writable,
+        }),
+        hir::Expr::Variable { name, span }
+            if context.local_type(context.lookup_local(name, *span)?) == nullable_ty =>
+        {
+            let local = context.lookup_local(name, *span)?;
+            Ok(mir::NullableSharedReferenceAccessExpression::Local {
+                payload: expected,
+                local,
+                writable,
+                transfer,
+            })
+        }
+        hir::Expr::MethodCall {
+            object,
+            method,
+            args,
+            null_safe: true,
+            ..
+        } if args.is_empty()
+            && ((!writable && method == "acquireReadonlyAccess")
+                || (writable && method == "acquireWritableAccess")) =>
+        {
+            let value = lower_nullable_writable_shared_reference_expression(
+                object, expected, false, context,
+            )?;
+            Ok(
+                mir::NullableSharedReferenceAccessExpression::NullSafeAcquire {
+                    payload: expected,
+                    value: Box::new(value),
+                    writable,
+                },
+            )
+        }
+        _ => Ok(mir::NullableSharedReferenceAccessExpression::Access(
+            Box::new(lower_shared_reference_access_expression(
+                expr, expected, writable, transfer, context,
+            )?),
+        )),
     }
 }
 
@@ -10703,6 +10894,45 @@ fn lower_property_place(
             object_local = payload;
             class
         }
+        mir::Type::NullableReadonlySharedReferenceAccess(mir::WritableSharedPayload::Class(
+            class,
+        ))
+        | mir::Type::NullableWritableSharedReferenceAccess(mir::WritableSharedPayload::Class(
+            class,
+        )) => {
+            let writable = matches!(
+                context.local_type(object_local),
+                mir::Type::NullableWritableSharedReferenceAccess(_)
+            );
+            let access_type = if writable {
+                mir::Type::WritableSharedReferenceAccess(mir::WritableSharedPayload::Class(class))
+            } else {
+                mir::Type::ReadonlySharedReferenceAccess(mir::WritableSharedPayload::Class(class))
+            };
+            let access = context.declare_borrowed_temp(access_type, writable);
+            context.push_statement(mir::Statement::AssignLocal {
+                target: access,
+                value: mir::Rvalue::SharedReferenceAccess(
+                    mir::SharedReferenceAccessExpression::NullableLocalAssumeNonNull {
+                        payload: mir::WritableSharedPayload::Class(class),
+                        local: object_local,
+                        writable,
+                        transfer: false,
+                    },
+                ),
+            });
+            let payload = context.declare_borrowed_temp(mir::Type::Class(class), writable);
+            context.push_statement(mir::Statement::AssignLocal {
+                target: payload,
+                value: mir::Rvalue::Class(mir::ClassExpression::SharedAccessPayload {
+                    class,
+                    access,
+                    writable,
+                }),
+            });
+            object_local = payload;
+            class
+        }
         mir::Type::ReadonlySharedReferenceAccess(mir::WritableSharedPayload::Class(class))
         | mir::Type::WritableSharedReferenceAccess(mir::WritableSharedPayload::Class(class)) => {
             let writable = matches!(
@@ -11627,13 +11857,13 @@ fn unsupported(span: Span, detail: impl Into<String>) -> Diagnostic {
     Diagnostic::new("M1101", detail, span)
 }
 
-/// The writable family and its dynamic access guards land in the next Stage 25a
-/// implementation slice. Accepted syntax reaches this stage-named diagnostic
-/// rather than a parser, unknown-type, or internal compiler error.
+/// Accepted shared-ownership spellings whose payload lacks a native
+/// representation reach a stage-named diagnostic rather than losing their type
+/// identity or failing as an internal compiler error.
 pub(crate) fn shared_ownership_runtime_unsupported(span: Span) -> Diagnostic {
     Diagnostic::unsupported_stage(
         "M1102",
-        "Stage 25a Writable Shared-Ownership Runtime Support Is Not Yet Implemented",
+        "Stage 25a Shared-Ownership Payload Is Not Yet Supported By The Native Runtime",
         span,
     )
 }

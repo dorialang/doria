@@ -1,0 +1,8 @@
+class Value {}
+
+function main(): void
+{
+    let $shared = new WritableSharedReference(new Value());
+    let $readonly = $shared->acquireReadonlyAccess();
+    let writable $writable = $shared->acquireWritableAccess();
+}

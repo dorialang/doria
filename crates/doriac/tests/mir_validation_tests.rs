@@ -146,6 +146,69 @@ function main(): void
 }
 
 #[test]
+fn shared_validator_rejects_nullable_access_family_mismatches() {
+    let mut program =
+        doriac::lower_source_to_mir("nullable-access-family.doria", nullable_access_source())
+            .expect("valid nullable access should lower");
+    let main = program
+        .functions
+        .iter_mut()
+        .find(|function| function.name == "main")
+        .expect("main should exist");
+    let access = main
+        .locals
+        .iter_mut()
+        .find(|local| local.name == "access")
+        .expect("access local should exist");
+    let Type::NullableReadonlySharedReferenceAccess(payload) = access.ty else {
+        panic!("expected nullable readonly access, got {}", access.ty);
+    };
+    access.ty = Type::NullableWritableSharedReferenceAccess(payload);
+
+    let error = doriac::mir_validation::validate_program(&program)
+        .expect_err("nullable access families must match exactly");
+    assert!(error.message.contains("mismatched shared-handle rvalue"));
+}
+
+#[test]
+fn shared_validator_requires_presence_proof_for_nullable_access_unwraps() {
+    let mut program =
+        doriac::lower_source_to_mir("nullable-access-proof.doria", nullable_access_source())
+            .expect("valid nullable access should lower");
+    let main = program
+        .functions
+        .iter_mut()
+        .find(|function| function.name == "main")
+        .expect("main should exist");
+    let branch =
+        main.blocks
+            .iter_mut()
+            .find(|block| {
+                matches!(
+                    block.terminator,
+                    Terminator::Branch {
+                        condition:
+                            doriac::mir::BoolExpression::NullableSharedReferenceAccessIsPresent(_),
+                        ..
+                    }
+                )
+            })
+            .expect("nullable access presence branch should exist");
+    let Terminator::Branch { condition, .. } = &mut branch.terminator else {
+        unreachable!("branch was selected above");
+    };
+    *condition = doriac::mir::BoolExpression::Use {
+        operand: Operand::Scalar(ScalarValue::Bool(true)),
+    };
+
+    let error = doriac::mir_validation::validate_program(&program)
+        .expect_err("nullable access unwraps require a dominating presence proof");
+    assert!(error
+        .message
+        .contains("without a dominating presence proof"));
+}
+
+#[test]
 fn shared_validator_rejects_noncanonical_bytes_storage() {
     let mut program = valid_void_program();
     program.collection_types.push(CollectionType {
@@ -159,6 +222,25 @@ fn shared_validator_rejects_noncanonical_bytes_storage() {
         .expect_err("Bytes must always use the packed uint8 element contract");
     assert!(error.message.contains("Bytes collection"));
     assert!(error.message.contains("packed uint8"));
+}
+
+fn nullable_access_source() -> &'static str {
+    r#"
+class Value
+{
+    int $number = 1;
+}
+
+function main(): void
+{
+    ?WritableSharedReference<Value> $source = null;
+    ?ReadonlySharedReferenceAccess<Value> $access =
+        $source?->acquireReadonlyAccess();
+    if ($access != null) {
+        echo "{$access->number}";
+    }
+}
+"#
 }
 
 #[test]
