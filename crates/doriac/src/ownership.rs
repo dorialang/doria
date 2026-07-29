@@ -1122,7 +1122,22 @@ impl Checker<'_> {
                     && !borrowed_mixed_index
                     && (initializer_moves || class.is_some() || mixed || declared_move_type);
                 let invalid_borrow = borrowed_owning_value && borrow_root.is_none();
-                if invalid_borrow {
+                let explicit_owning_borrow = borrowed_initializer && declared_move_type;
+                if explicit_owning_borrow {
+                    self.diagnostics.push(
+                        Diagnostic::new(
+                            "E0478",
+                            format!(
+                                "borrowed result cannot initialize owning `${}`",
+                                decl.name
+                            ),
+                            decl.initializer.span(),
+                        )
+                        .with_help(
+                            "use an inferred readonly `let` binding for a borrow, or initialize this declaration with an independently owned value",
+                        ),
+                    );
+                } else if invalid_borrow {
                     self.diagnostics.push(
                         Diagnostic::new(
                             "E0478",
