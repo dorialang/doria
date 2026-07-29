@@ -51,6 +51,22 @@ pub const SHARED_CREATE_WEAK: &str = "dr_v1_shared_create_weak";
 pub const SHARED_RELEASE_WEAK: &str = "dr_v1_shared_release_weak";
 pub const SHARED_ACQUIRE: &str = "dr_v1_shared_acquire";
 pub const SHARED_PAYLOAD: &str = "dr_v1_shared_payload";
+pub const WRITABLE_SHARED_CREATE: &str = "dr_v1_writable_shared_create";
+pub const WRITABLE_SHARED_RETAIN: &str = "dr_v1_writable_shared_retain";
+pub const WRITABLE_SHARED_RELEASE: &str = "dr_v1_writable_shared_release";
+pub const WRITABLE_SHARED_CREATE_WEAK: &str = "dr_v1_writable_shared_create_weak";
+pub const WRITABLE_SHARED_RELEASE_WEAK: &str = "dr_v1_writable_shared_release_weak";
+pub const WRITABLE_SHARED_ACQUIRE: &str = "dr_v1_writable_shared_acquire";
+pub const WRITABLE_SHARED_ACQUIRE_READONLY_ACCESS: &str =
+    "dr_v1_writable_shared_acquire_readonly_access";
+pub const WRITABLE_SHARED_ACQUIRE_WRITABLE_ACCESS: &str =
+    "dr_v1_writable_shared_acquire_writable_access";
+pub const WRITABLE_SHARED_RELEASE_READONLY_ACCESS: &str =
+    "dr_v1_writable_shared_release_readonly_access";
+pub const WRITABLE_SHARED_RELEASE_WRITABLE_ACCESS: &str =
+    "dr_v1_writable_shared_release_writable_access";
+pub const WRITABLE_SHARED_READONLY_PAYLOAD: &str = "dr_v1_writable_shared_readonly_payload";
+pub const WRITABLE_SHARED_WRITABLE_PAYLOAD: &str = "dr_v1_writable_shared_writable_payload";
 pub const MIXED_NEW: &str = "dr_v1_mixed_new";
 pub const MIXED_NEW_BORROWED: &str = "dr_v1_mixed_new_borrowed";
 pub const MIXED_CLONE_OWNED: &str = "dr_v1_mixed_clone_owned";

@@ -41,6 +41,20 @@ pub struct DrSharedControlV1 {
     drop_payload: unsafe extern "C" fn(*const DrStackFrameV1, *mut u8),
 }
 
+/// Opaque writable shared-ownership control block.
+///
+/// Unlike the readonly family, every writable-family handle and access object
+/// observes the access state stored in this single per-allocation block.
+#[repr(C)]
+pub struct DrWritableSharedControlV1 {
+    strong_references: usize,
+    weak_references: usize,
+    readonly_accesses: usize,
+    writable_access_active: bool,
+    payload: *mut u8,
+    drop_payload: unsafe extern "C" fn(*const DrStackFrameV1, *mut u8),
+}
+
 /// Opaque outside doria-rt. Bytes immediately follow this header.
 #[repr(C)]
 pub struct DrStringV1 {
@@ -741,6 +755,250 @@ pub unsafe extern "C" fn dr_v1_shared_acquire(
 pub unsafe extern "C" fn dr_v1_shared_payload(control: *const DrSharedControlV1) -> *mut u8 {
     debug_assert!(!control.is_null());
     debug_assert!((*control).strong_references != 0);
+    debug_assert!(!(*control).payload.is_null());
+    (*control).payload
+}
+
+/// Creates the first writable-family strong reference for an owned payload.
+///
+/// # Safety
+///
+/// `payload` must be uniquely owned and live, and `drop_payload` must match it.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_writable_shared_create(
+    current_frame: *const DrStackFrameV1,
+    payload: *mut u8,
+    drop_payload: unsafe extern "C" fn(*const DrStackFrameV1, *mut u8),
+) -> *mut DrWritableSharedControlV1 {
+    let control =
+        allocate(mem::size_of::<DrWritableSharedControlV1>()).cast::<DrWritableSharedControlV1>();
+    if control.is_null() {
+        panic_static(
+            current_frame,
+            b"Writable Shared-Reference Allocation Failed",
+        );
+    }
+    control.write(DrWritableSharedControlV1 {
+        strong_references: 1,
+        weak_references: 0,
+        readonly_accesses: 0,
+        writable_access_active: false,
+        payload,
+        drop_payload,
+    });
+    control
+}
+
+/// Creates one additional writable-family strong owner.
+///
+/// # Safety
+///
+/// `control` must point to a live writable control block with a live payload.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_writable_shared_retain(
+    current_frame: *const DrStackFrameV1,
+    control: *mut DrWritableSharedControlV1,
+) -> *mut DrWritableSharedControlV1 {
+    let Some(next) = (*control).strong_references.checked_add(1) else {
+        panic_static(current_frame, b"Writable Shared-Reference Count Overflowed");
+    };
+    (*control).strong_references = next;
+    control
+}
+
+/// Releases one writable-family strong owner.
+///
+/// # Safety
+///
+/// `control` must be null or hold a live strong reference.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_writable_shared_release(
+    current_frame: *const DrStackFrameV1,
+    control: *mut DrWritableSharedControlV1,
+) {
+    if control.is_null() {
+        return;
+    }
+    debug_assert!((*control).strong_references != 0);
+    (*control).strong_references -= 1;
+    if (*control).strong_references != 0 {
+        return;
+    }
+    debug_assert_eq!((*control).readonly_accesses, 0);
+    debug_assert!(!(*control).writable_access_active);
+    let payload = (*control).payload;
+    (*control).payload = ptr::null_mut();
+    ((*control).drop_payload)(current_frame, payload);
+    if (*control).weak_references == 0 {
+        deallocate(control.cast());
+    }
+}
+
+/// Creates one writable-family weak reference.
+///
+/// # Safety
+///
+/// `control` must point to a live writable control block with a strong owner.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_writable_shared_create_weak(
+    current_frame: *const DrStackFrameV1,
+    control: *mut DrWritableSharedControlV1,
+) -> *mut DrWritableSharedControlV1 {
+    let Some(next) = (*control).weak_references.checked_add(1) else {
+        panic_static(current_frame, b"Writable Weak-Reference Count Overflowed");
+    };
+    (*control).weak_references = next;
+    control
+}
+
+/// Releases one writable-family weak reference.
+///
+/// # Safety
+///
+/// `control` must hold a live weak reference.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_writable_shared_release_weak(
+    control: *mut DrWritableSharedControlV1,
+) {
+    debug_assert!(!control.is_null());
+    debug_assert!((*control).weak_references != 0);
+    (*control).weak_references -= 1;
+    if (*control).weak_references == 0 && (*control).strong_references == 0 {
+        deallocate(control.cast());
+    }
+}
+
+/// Attempts to create a writable-family strong owner from a weak reference.
+///
+/// # Safety
+///
+/// `control` must hold a live writable-family weak reference.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_writable_shared_acquire(
+    current_frame: *const DrStackFrameV1,
+    control: *mut DrWritableSharedControlV1,
+) -> *mut DrWritableSharedControlV1 {
+    if (*control).strong_references == 0 {
+        return ptr::null_mut();
+    }
+    dr_v1_writable_shared_retain(current_frame, control)
+}
+
+/// Acquires one readonly access object and its strong ownership claim.
+///
+/// # Safety
+///
+/// `control` must point to a live writable control block.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_writable_shared_acquire_readonly_access(
+    current_frame: *const DrStackFrameV1,
+    control: *mut DrWritableSharedControlV1,
+) -> *mut DrWritableSharedControlV1 {
+    if (*control).writable_access_active {
+        panic_static(
+            current_frame,
+            b"Cannot Acquire Readonly Access While Writable Access Is Active",
+        );
+    }
+    let Some(next_accesses) = (*control).readonly_accesses.checked_add(1) else {
+        panic_static(current_frame, b"Readonly Access Count Overflowed");
+    };
+    let Some(next_strong) = (*control).strong_references.checked_add(1) else {
+        panic_static(current_frame, b"Writable Shared-Reference Count Overflowed");
+    };
+    (*control).readonly_accesses = next_accesses;
+    (*control).strong_references = next_strong;
+    control
+}
+
+/// Acquires one exclusive writable access object and its strong ownership claim.
+///
+/// # Safety
+///
+/// `control` must point to a live writable control block.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_writable_shared_acquire_writable_access(
+    current_frame: *const DrStackFrameV1,
+    control: *mut DrWritableSharedControlV1,
+) -> *mut DrWritableSharedControlV1 {
+    if (*control).readonly_accesses != 0 {
+        panic_static(
+            current_frame,
+            b"Cannot Acquire Writable Access While Readonly Access Is Active",
+        );
+    }
+    if (*control).writable_access_active {
+        panic_static(
+            current_frame,
+            b"Cannot Acquire Writable Access While Writable Access Is Active",
+        );
+    }
+    let Some(next_strong) = (*control).strong_references.checked_add(1) else {
+        panic_static(current_frame, b"Writable Shared-Reference Count Overflowed");
+    };
+    (*control).strong_references = next_strong;
+    (*control).writable_access_active = true;
+    control
+}
+
+/// Releases a readonly access registration, then its strong ownership claim.
+///
+/// # Safety
+///
+/// `control` must hold a live readonly access registration.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_writable_shared_release_readonly_access(
+    current_frame: *const DrStackFrameV1,
+    control: *mut DrWritableSharedControlV1,
+) {
+    debug_assert!(!control.is_null());
+    debug_assert!((*control).readonly_accesses != 0);
+    (*control).readonly_accesses -= 1;
+    dr_v1_writable_shared_release(current_frame, control);
+}
+
+/// Releases a writable access registration, then its strong ownership claim.
+///
+/// # Safety
+///
+/// `control` must hold the active writable access registration.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_writable_shared_release_writable_access(
+    current_frame: *const DrStackFrameV1,
+    control: *mut DrWritableSharedControlV1,
+) {
+    debug_assert!(!control.is_null());
+    debug_assert!((*control).writable_access_active);
+    (*control).writable_access_active = false;
+    dr_v1_writable_shared_release(current_frame, control);
+}
+
+/// Returns the payload behind a live readonly access object.
+///
+/// # Safety
+///
+/// `control` must hold a live readonly access registration.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_writable_shared_readonly_payload(
+    control: *const DrWritableSharedControlV1,
+) -> *mut u8 {
+    debug_assert!(!control.is_null());
+    debug_assert!((*control).readonly_accesses != 0);
+    debug_assert!(!(*control).payload.is_null());
+    (*control).payload
+}
+
+/// Returns the payload behind a live writable access object.
+///
+/// # Safety
+///
+/// `control` must hold the active writable access registration.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_writable_shared_writable_payload(
+    control: *const DrWritableSharedControlV1,
+) -> *mut u8 {
+    debug_assert!(!control.is_null());
+    debug_assert!((*control).writable_access_active);
     debug_assert!(!(*control).payload.is_null());
     (*control).payload
 }
@@ -2230,6 +2488,86 @@ mod tests {
             assert!(dr_v1_shared_acquire(ptr::null(), control).is_null());
 
             dr_v1_shared_release_weak(control);
+        }
+    }
+
+    #[test]
+    fn writable_shared_control_tracks_ownership_access_and_payload_lifetime() {
+        unsafe {
+            SHARED_PAYLOAD_DROPS.store(0, Ordering::SeqCst);
+            let payload = dr_v1_class_allocate(ptr::null(), 8, 8);
+            let control =
+                dr_v1_writable_shared_create(ptr::null(), payload, drop_test_shared_payload);
+
+            assert_eq!((*control).strong_references, 1);
+            assert_eq!((*control).weak_references, 0);
+            assert_eq!((*control).readonly_accesses, 0);
+            assert!(!(*control).writable_access_active);
+
+            assert_eq!(dr_v1_writable_shared_retain(ptr::null(), control), control);
+            assert_eq!(
+                dr_v1_writable_shared_create_weak(ptr::null(), control),
+                control
+            );
+            assert_eq!((*control).strong_references, 2);
+            assert_eq!((*control).weak_references, 1);
+
+            let first = dr_v1_writable_shared_acquire_readonly_access(ptr::null(), control);
+            let second = dr_v1_writable_shared_acquire_readonly_access(ptr::null(), control);
+            assert_eq!(first, control);
+            assert_eq!(second, control);
+            assert_eq!((*control).strong_references, 4);
+            assert_eq!((*control).readonly_accesses, 2);
+            assert_eq!(dr_v1_writable_shared_readonly_payload(first), payload);
+
+            dr_v1_writable_shared_release_readonly_access(ptr::null(), first);
+            dr_v1_writable_shared_release_readonly_access(ptr::null(), second);
+            assert_eq!((*control).strong_references, 2);
+            assert_eq!((*control).readonly_accesses, 0);
+
+            let writable = dr_v1_writable_shared_acquire_writable_access(ptr::null(), control);
+            assert_eq!((*control).strong_references, 3);
+            assert!((*control).writable_access_active);
+            assert_eq!(dr_v1_writable_shared_writable_payload(writable), payload);
+            dr_v1_writable_shared_release_writable_access(ptr::null(), writable);
+            assert_eq!((*control).strong_references, 2);
+            assert!(!(*control).writable_access_active);
+
+            dr_v1_writable_shared_release(ptr::null(), control);
+            let acquired = dr_v1_writable_shared_acquire(ptr::null(), control);
+            assert_eq!(acquired, control);
+            dr_v1_writable_shared_release(ptr::null(), acquired);
+            dr_v1_writable_shared_release(ptr::null(), control);
+
+            assert_eq!(SHARED_PAYLOAD_DROPS.load(Ordering::SeqCst), 1);
+            assert_eq!((*control).strong_references, 0);
+            assert!((*control).payload.is_null());
+            assert!(dr_v1_writable_shared_acquire(ptr::null(), control).is_null());
+
+            dr_v1_writable_shared_release_weak(control);
+        }
+    }
+
+    #[test]
+    fn writable_access_object_can_be_the_final_strong_owner() {
+        unsafe {
+            SHARED_PAYLOAD_DROPS.store(0, Ordering::SeqCst);
+            let payload = dr_v1_class_allocate(ptr::null(), 8, 8);
+            let control =
+                dr_v1_writable_shared_create(ptr::null(), payload, drop_test_shared_payload);
+            let weak = dr_v1_writable_shared_create_weak(ptr::null(), control);
+            let access = dr_v1_writable_shared_acquire_readonly_access(ptr::null(), control);
+
+            dr_v1_writable_shared_release(ptr::null(), control);
+            let acquired = dr_v1_writable_shared_acquire(ptr::null(), weak);
+            assert_eq!(acquired, control);
+            dr_v1_writable_shared_release(ptr::null(), acquired);
+            assert_eq!(SHARED_PAYLOAD_DROPS.load(Ordering::SeqCst), 0);
+
+            dr_v1_writable_shared_release_readonly_access(ptr::null(), access);
+            assert_eq!(SHARED_PAYLOAD_DROPS.load(Ordering::SeqCst), 1);
+            assert!(dr_v1_writable_shared_acquire(ptr::null(), weak).is_null());
+            dr_v1_writable_shared_release_weak(weak);
         }
     }
 
