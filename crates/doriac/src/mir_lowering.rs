@@ -3461,15 +3461,7 @@ fn lower_var_decl(decl: &hir::VarDecl, context: &mut LoweringContext) -> Diagnos
     }
     if let mir::Type::NullableClass(class) = ty {
         let value = lower_nullable_class_expression(&decl.initializer, class, true, context)?;
-        let owned = !matches!(
-            value,
-            mir::NullableClassExpression::DictionaryGet {
-                access: mir::NullableCollectionAccess::Get
-                    | mir::NullableCollectionAccess::First
-                    | mir::NullableCollectionAccess::Last,
-                ..
-            }
-        );
+        let owned = !value.borrows_class_value();
         let local = context.declare_user_local_owned(&decl.name, decl.writable, ty, owned);
         context.push_statement(mir::Statement::AssignLocal {
             target: local,
@@ -3498,7 +3490,8 @@ fn lower_var_decl(decl: &hir::VarDecl, context: &mut LoweringContext) -> Diagnos
     }
     if let mir::Type::Class(class) = ty {
         let value = lower_class_expression(&decl.initializer, class, true, context)?;
-        let local = context.declare_user_local(&decl.name, decl.writable, ty);
+        let owned = !value.borrows_class_value();
+        let local = context.declare_user_local_owned(&decl.name, decl.writable, ty, owned);
         context.push_statement(mir::Statement::AssignLocal {
             target: local,
             value: mir::Rvalue::Class(value),

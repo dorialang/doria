@@ -1778,11 +1778,23 @@ impl<'program> Checker<'program> {
             Expr::FunctionCall { name, .. } => {
                 self.functions.get(name).and_then(|info| info.return_borrow)
             }
-            Expr::MethodCall { object, method, .. } => self
-                .expr_class_name(object, scopes, method_context)
-                .and_then(|class_name| self.classes.get(&class_name))
-                .and_then(|class| class.methods.get(method))
-                .and_then(|info| info.return_borrow),
+            Expr::MethodCall { object, method, .. } => {
+                let object_ty = self.infer_expr_type(object, scopes, method_context);
+                let object_ty = self.forwarded_access_payload_type(object_ty);
+                if matches!(
+                    (self.types.kind(object_ty), method.as_str()),
+                    (TypeKind::Dictionary(_, _), "get")
+                ) {
+                    return Some(ReturnBorrow {
+                        source: BorrowSource::Receiver,
+                        writable: false,
+                    });
+                }
+                self.expr_class_name(object, scopes, method_context)
+                    .and_then(|class_name| self.classes.get(&class_name))
+                    .and_then(|class| class.methods.get(method))
+                    .and_then(|info| info.return_borrow)
+            }
             Expr::StaticCall {
                 qualifier, method, ..
             } => Self::static_qualifier_class_name(qualifier, method_context)

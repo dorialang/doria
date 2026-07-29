@@ -344,6 +344,7 @@ fn validate_function(program: &mir::Program, function: &mir::Function) -> Result
         }
     }
     let (reachable, _) = reachable_blocks_and_predecessors(function, true)?;
+    validate_borrowed_user_locals(function, &reachable)?;
     for block in &function.blocks {
         for statement in &block.statements {
             validate_statement(program, function, statement)?;
@@ -353,6 +354,51 @@ fn validate_function(program: &mir::Program, function: &mir::Function) -> Result
     validate_nullable_presence(program, function)?;
     validate_mixed_tag_proofs(program, function)?;
     validate_class_local_lifetimes(function)
+}
+
+fn validate_borrowed_user_locals(
+    function: &mir::Function,
+    reachable: &[bool],
+) -> Result<(), BackendError> {
+    for local in function.locals.iter().filter(|local| {
+        !local.owned
+            && !local.synthetic
+            && !function.params.contains(&local.id)
+            && matches!(
+                local.ty,
+                mir::Type::Class(_)
+                    | mir::Type::NullableClass(_)
+                    | mir::Type::Collection(_)
+                    | mir::Type::Mixed
+                    | mir::Type::NullableMixed
+            )
+    }) {
+        if local.writable {
+            return Err(malformed_mir(format!(
+                "borrowed user local local{} cannot be writable",
+                local.id.0
+            )));
+        }
+        let assignments = function
+            .blocks
+            .iter()
+            .filter(|block| reachable[block.id.0])
+            .flat_map(|block| &block.statements)
+            .filter(|statement| {
+                matches!(
+                    statement,
+                    mir::Statement::AssignLocal { target, .. } if *target == local.id
+                )
+            })
+            .count();
+        if assignments != 1 {
+            return Err(malformed_mir(format!(
+                "borrowed user local local{} must have exactly one reachable initializer",
+                local.id.0
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn validate_type(program: &mir::Program, ty: mir::Type) -> Result<(), BackendError> {
@@ -432,21 +478,15 @@ fn validate_statement(
                 {
                     validate_nullable_class_expression(program, function, expression)?;
                     if !local.owned {
-                        if !local.synthetic {
-                            return Err(malformed_mir(format!(
-                                "nullable class assignment targets borrowed local local{}",
-                                target.0
-                            )));
-                        }
                         if nullable_class_expression_accesses_local(expression, *target) {
                             return Err(malformed_mir(format!(
-                                "borrowed nullable class temporary local{} reads its own uninitialized value",
+                                "borrowed nullable class local{} reads its own uninitialized value",
                                 target.0
                             )));
                         }
                         if !expression.borrows_class_value() {
                             return Err(malformed_mir(format!(
-                                "borrowed nullable class temporary local{} receives an owning value",
+                                "borrowed nullable class local{} receives an owning value",
                                 target.0
                             )));
                         }
@@ -540,22 +580,16 @@ fn validate_statement(
                         ) {
                             return validate_class_expression(program, function, expression);
                         }
-                        if !local.synthetic {
-                            return Err(malformed_mir(format!(
-                                "class assignment targets borrowed local local{}",
-                                target.0
-                            )));
-                        }
                         if class_expression_accesses_local(expression, *target) {
                             return Err(malformed_mir(format!(
-                                "borrowed class temporary local{} reads its own uninitialized value",
+                                "borrowed class local{} reads its own uninitialized value",
                                 target.0
                             )));
                         }
                         validate_class_expression(program, function, expression)?;
                         if !expression.borrows_class_value() {
                             return Err(malformed_mir(format!(
-                                "borrowed class temporary local{} receives an owning value",
+                                "borrowed class local{} receives an owning value",
                                 target.0
                             )));
                         }
@@ -3351,9 +3385,9 @@ fn infer_nullable_expression_return_borrow(
             Some(borrow) => Ok(Some(borrow)),
             None => infer_synthetic_local_return_borrow(program, function, *local),
         },
-        mir::NullableClassExpression::Property { object, .. } => Ok(borrow_from_parameter(
-            function, *object,
-        )
+        mir::NullableClassExpression::Property { object, .. } => Ok(infer_local_return_borrow(
+            program, function, *object,
+        )?
         .map(|borrow| mir::ReturnBorrow {
             writable: false,
             ..borrow
@@ -3430,9 +3464,11 @@ fn infer_nullable_expression_return_borrow(
             }
         }
         mir::NullableClassExpression::DictionaryGet { collection, .. } => Ok(
-            borrow_from_parameter(function, *collection).map(|borrow| mir::ReturnBorrow {
-                writable: false,
-                ..borrow
+            infer_local_return_borrow(program, function, *collection)?.map(|borrow| {
+                mir::ReturnBorrow {
+                    writable: false,
+                    ..borrow
+                }
             }),
         ),
     }
@@ -3503,9 +3539,9 @@ fn infer_collection_expression_return_borrow(
             Some(borrow) => Ok(Some(borrow)),
             None => infer_synthetic_local_return_borrow(program, function, *local),
         },
-        mir::CollectionExpression::Property { object, .. } => Ok(borrow_from_parameter(
-            function, *object,
-        )
+        mir::CollectionExpression::Property { object, .. } => Ok(infer_local_return_borrow(
+            program, function, *object,
+        )?
         .map(|borrow| mir::ReturnBorrow {
             writable: false,
             ..borrow
@@ -3513,9 +3549,11 @@ fn infer_collection_expression_return_borrow(
         mir::CollectionExpression::SharedAccessPayload {
             access, writable, ..
         } => Ok(
-            borrow_from_parameter(function, *access).map(|borrow| mir::ReturnBorrow {
-                writable: borrow.writable && *writable,
-                ..borrow
+            infer_local_return_borrow(program, function, *access)?.map(|borrow| {
+                mir::ReturnBorrow {
+                    writable: borrow.writable && *writable,
+                    ..borrow
+                }
             }),
         ),
         mir::CollectionExpression::Index {
@@ -3523,9 +3561,11 @@ fn infer_collection_expression_return_borrow(
             transfer: false,
             ..
         } => Ok(
-            borrow_from_parameter(function, *source).map(|borrow| mir::ReturnBorrow {
-                writable: false,
-                ..borrow
+            infer_local_return_borrow(program, function, *source)?.map(|borrow| {
+                mir::ReturnBorrow {
+                    writable: false,
+                    ..borrow
+                }
             }),
         ),
         mir::CollectionExpression::Call {
@@ -3563,9 +3603,9 @@ fn infer_mixed_expression_return_borrow(
             Some(borrow) => Ok(Some(borrow)),
             None => infer_synthetic_local_return_borrow(program, function, *local),
         },
-        mir::MixedExpression::Property { object, .. } => Ok(borrow_from_parameter(
-            function, *object,
-        )
+        mir::MixedExpression::Property { object, .. } => Ok(infer_local_return_borrow(
+            program, function, *object,
+        )?
         .map(|borrow| mir::ReturnBorrow {
             writable: false,
             ..borrow
@@ -3575,9 +3615,11 @@ fn infer_mixed_expression_return_borrow(
             transfer: false,
             ..
         } => Ok(
-            borrow_from_parameter(function, *collection).map(|borrow| mir::ReturnBorrow {
-                writable: false,
-                ..borrow
+            infer_local_return_borrow(program, function, *collection)?.map(|borrow| {
+                mir::ReturnBorrow {
+                    writable: false,
+                    ..borrow
+                }
             }),
         ),
         mir::MixedExpression::Call {
@@ -3614,9 +3656,9 @@ fn infer_nullable_mixed_expression_return_borrow(
             Some(borrow) => Ok(Some(borrow)),
             None => infer_synthetic_local_return_borrow(program, function, *local),
         },
-        mir::NullableMixedExpression::Property { object, .. } => Ok(borrow_from_parameter(
-            function, *object,
-        )
+        mir::NullableMixedExpression::Property { object, .. } => Ok(infer_local_return_borrow(
+            program, function, *object,
+        )?
         .map(|borrow| mir::ReturnBorrow {
             writable: false,
             ..borrow
@@ -3682,9 +3724,9 @@ fn infer_expression_return_borrow(
             Some(borrow) => Ok(Some(borrow)),
             None => infer_synthetic_local_return_borrow(program, function, *local),
         },
-        mir::ClassExpression::Property { object, .. } => Ok(borrow_from_parameter(
-            function, *object,
-        )
+        mir::ClassExpression::Property { object, .. } => Ok(infer_local_return_borrow(
+            program, function, *object,
+        )?
         .map(|borrow| mir::ReturnBorrow {
             writable: false,
             ..borrow
@@ -3692,12 +3734,22 @@ fn infer_expression_return_borrow(
         mir::ClassExpression::SharedAccessPayload {
             access, writable, ..
         } => Ok(
-            borrow_from_parameter(function, *access).map(|borrow| mir::ReturnBorrow {
-                writable: borrow.writable && *writable,
-                ..borrow
+            infer_local_return_borrow(program, function, *access)?.map(|borrow| {
+                mir::ReturnBorrow {
+                    writable: borrow.writable && *writable,
+                    ..borrow
+                }
             }),
         ),
-        mir::ClassExpression::CollectionIndex { .. } => Ok(None),
+        mir::ClassExpression::CollectionIndex { collection, .. } => Ok(infer_local_return_borrow(
+            program,
+            function,
+            *collection,
+        )?
+        .map(|borrow| mir::ReturnBorrow {
+            writable: false,
+            ..borrow
+        })),
         mir::ClassExpression::Call {
             function: callee,
             args,
@@ -3733,7 +3785,7 @@ fn infer_synthetic_local_return_borrow(
     local: mir::LocalId,
 ) -> Result<Option<mir::ReturnBorrow>, BackendError> {
     let definition = local_in(function, local)?;
-    if definition.owned || !definition.synthetic {
+    if definition.owned {
         return Ok(None);
     }
 
@@ -3756,11 +3808,24 @@ fn infer_synthetic_local_return_borrow(
                     infer_nullable_expression_return_borrow(program, function, expression)?,
                     nullable_class_expression_accesses_local(expression, local),
                 ),
+                mir::Rvalue::Collection(expression) => (
+                    infer_collection_expression_return_borrow(program, function, expression)?,
+                    matches!(
+                        expression,
+                        mir::CollectionExpression::Local {
+                            local: source,
+                            ..
+                        } | mir::CollectionExpression::Index {
+                            source,
+                            ..
+                        } if *source == local
+                    ),
+                ),
                 _ => continue,
             };
             if inferred.is_some() || recursive {
                 return Err(malformed_mir(format!(
-                    "borrowed class temporary local{} must have one non-recursive assignment",
+                    "borrowed local{} must have one non-recursive assignment",
                     local.0
                 )));
             }
@@ -3770,10 +3835,21 @@ fn infer_synthetic_local_return_borrow(
     match inferred {
         Some(Some(borrow)) => Ok(Some(borrow)),
         Some(None) => Err(malformed_mir(format!(
-            "borrowed class temporary local{} receives an owning value",
+            "borrowed local{} receives an owning value",
             local.0
         ))),
         None => Ok(None),
+    }
+}
+
+fn infer_local_return_borrow(
+    program: &mir::Program,
+    function: &mir::Function,
+    local: mir::LocalId,
+) -> Result<Option<mir::ReturnBorrow>, BackendError> {
+    match borrow_from_parameter(function, local) {
+        Some(borrow) => Ok(Some(borrow)),
+        None => infer_synthetic_local_return_borrow(program, function, local),
     }
 }
 

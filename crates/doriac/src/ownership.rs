@@ -93,6 +93,7 @@ struct Binding {
     collection: Option<CollectionInfo>,
     mixed: bool,
     borrowed_place: bool,
+    borrow_root: Option<String>,
     writable: bool,
     state: State,
 }
@@ -156,6 +157,14 @@ impl Scopes {
             .iter_mut()
             .rev()
             .find_map(|scope| scope.get_mut(name))
+    }
+
+    fn borrowed_from(&self, root: &str) -> Option<&str> {
+        self.0.iter().rev().find_map(|scope| {
+            scope.iter().find_map(|(name, binding)| {
+                (binding.borrow_root.as_deref() == Some(root)).then_some(name.as_str())
+            })
+        })
     }
 
     fn merge_from(&mut self, left: &Self, right: &Self) {
@@ -623,7 +632,11 @@ fn expr_return_borrow(
                 && (function.params.iter().any(|param| {
                     param.name == *name
                         && !param.take
-                        && type_ref_mentions_parameter(&param.ty, &function.type_params)
+                        && (type_ref_mentions_parameter(&param.ty, &function.type_params)
+                            || matches!(
+                                param.ty.name.as_str(),
+                                "List" | "Dictionary" | "Set" | "Bytes" | "[]"
+                            ))
                 }) || function
                     .params
                     .iter()
@@ -648,36 +661,16 @@ fn expr_return_borrow(
             right,
             ..
         } => coalesced_return_borrow(left, right, function, resolve_call, shadowed),
-        Expr::PropertyAccess {
-            object, property, ..
-        } => {
-            let mut direct_object = object.as_ref();
-            while let Expr::Grouped { expr, .. } = direct_object {
-                direct_object = expr;
-            }
-            if matches!(property.as_str(), "first" | "last") {
-                if let Expr::Variable { name, .. } = direct_object {
-                    if !shadowed.contains(name) {
-                        if let Some((index, param)) =
-                            function.params.iter().enumerate().find(|(_, param)| {
-                                param.name == *name
-                                    && !param.take
-                                    && param.ty.name == "List"
-                                    && param.ty.type_argument_count() == 1
-                            })
-                        {
-                            return Some(ReturnBorrow {
-                                source: BorrowSource::Parameter(index),
-                                writable: param.writable,
-                            });
-                        }
-                    }
-                }
-            }
-            if !matches!(direct_object, Expr::Variable { .. } | Expr::This { .. }) {
-                return None;
-            }
+        Expr::PropertyAccess { object, .. } => {
             expr_return_borrow(object, function, resolve_call, shadowed).map(|borrow| {
+                ReturnBorrow {
+                    writable: false,
+                    ..borrow
+                }
+            })
+        }
+        Expr::Index { collection, .. } => {
+            expr_return_borrow(collection, function, resolve_call, shadowed).map(|borrow| {
                 ReturnBorrow {
                     writable: false,
                     ..borrow
@@ -1025,6 +1018,7 @@ impl Checker<'_> {
                         ),
                         mixed,
                         borrowed_place: !param.take,
+                        borrow_root: None,
                         writable: param.writable,
                         state: if param.take && param.promoted_access.is_some() {
                             State::Given { at: param.span }
@@ -1097,6 +1091,9 @@ impl Checker<'_> {
                 let borrowed_initializer = self.expr_returns_borrow(&decl.initializer, scopes);
                 let borrowed_mixed_index = borrowed_initializer
                     && self.expr_is_mixed_collection_index(&decl.initializer, scopes);
+                let borrow_root = borrowed_initializer
+                    .then(|| self.borrow_root_key(&decl.initializer, scopes))
+                    .flatten();
                 let initializer_moves = self.expr_is_move_value(&decl.initializer, scopes);
                 let mixed = decl.ty.as_ref().is_some_and(|ty| ty.name == "mixed")
                     || (decl.ty.is_none() && class.is_none() && initializer_moves);
@@ -1106,18 +1103,31 @@ impl Checker<'_> {
                 let borrowed_owning_value = borrowed_initializer
                     && !borrowed_mixed_index
                     && (initializer_moves || class.is_some() || mixed || declared_move_type);
-                if borrowed_owning_value {
+                let invalid_borrow = borrowed_owning_value && borrow_root.is_none();
+                if invalid_borrow {
                     self.diagnostics.push(
                         Diagnostic::new(
                             "E0478",
                             format!(
-                                "borrowed result cannot initialize owning `${}`",
+                                "borrowed result from a temporary cannot initialize `${}`",
                                 decl.name
                             ),
                             decl.initializer.span(),
                         )
                         .with_help(
-                            "keep using the result in the current expression, or bind an independently owned value",
+                            "keep the borrowed owner in a local for at least as long as this binding",
+                        ),
+                    );
+                }
+                if borrowed_owning_value && decl.writable {
+                    self.diagnostics.push(
+                        Diagnostic::new(
+                            "E0478",
+                            format!("borrowed binding `${}` cannot be writable", decl.name),
+                            decl.span,
+                        )
+                        .with_help(
+                            "remove `writable`; mutate through an explicitly writable borrowed parameter instead",
                         ),
                     );
                 }
@@ -1151,9 +1161,14 @@ impl Checker<'_> {
                                 })
                                 .or_else(|| self.expr_collection_info(&decl.initializer, scopes)),
                             mixed,
-                            borrowed_place: false,
+                            borrowed_place: borrowed_owning_value,
+                            borrow_root,
                             writable: decl.writable,
-                            state: State::Owned,
+                            state: if borrowed_owning_value {
+                                State::Borrowed
+                            } else {
+                                State::Owned
+                            },
                         },
                     );
                 }
@@ -1563,6 +1578,7 @@ impl Checker<'_> {
                 ),
                 mixed: ty.name == "mixed",
                 borrowed_place: true,
+                borrow_root: None,
                 writable: binding.writable,
                 state: State::Borrowed,
             },
@@ -1706,6 +1722,22 @@ impl Checker<'_> {
     fn use_expr(&mut self, expr: &Expr, scopes: &mut Scopes, mode: UseMode) {
         match expr {
             Expr::Variable { name, span } => {
+                if matches!(mode, UseMode::Write | UseMode::Give) {
+                    if let Some(alias) = scopes.borrowed_from(name) {
+                        self.diagnostics.push(
+                            Diagnostic::new(
+                                "E0477",
+                                format!(
+                                    "`${name}` cannot be used as writable while `${alias}` borrows from it"
+                                ),
+                                *span,
+                            )
+                            .with_help(
+                                "finish using the borrowed binding or place it in a shorter lexical block before mutating its owner",
+                            ),
+                        );
+                    }
+                }
                 if matches!(mode, UseMode::Read | UseMode::Write) {
                     self.check_active_borrow_conflict(name, mode, *span);
                 } else if mode == UseMode::Give {
@@ -2142,6 +2174,23 @@ impl Checker<'_> {
         let Some(root) = self.borrow_root_key(expr, scopes) else {
             return;
         };
+        if mode == UseMode::Write {
+            if let Some(alias) = scopes.borrowed_from(&root) {
+                self.diagnostics.push(
+                    Diagnostic::new(
+                        "E0477",
+                        format!(
+                            "`{}` cannot be used as writable while `${alias}` borrows from it",
+                            display_borrow_root(&root)
+                        ),
+                        expr.span(),
+                    )
+                    .with_help(
+                        "finish using the borrowed binding or place it in a shorter lexical block before mutating its owner",
+                    ),
+                );
+            }
+        }
         self.check_active_borrow_conflict(&root, mode, expr.span());
         self.active_borrows.push(ActiveBorrow {
             root,
@@ -2443,10 +2492,13 @@ impl Checker<'_> {
     fn borrow_root_key(&self, expr: &Expr, scopes: &Scopes) -> Option<String> {
         match expr {
             Expr::This { .. } if self.receiver_class.is_some() => Some("$this".to_string()),
-            Expr::Variable { name, .. } if scopes.get(name).is_some() => Some(name.clone()),
+            Expr::Variable { name, .. } => scopes
+                .get(name)
+                .map(|binding| binding.borrow_root.clone().unwrap_or_else(|| name.clone())),
             Expr::PropertyAccess { object, .. } | Expr::Grouped { expr: object, .. } => {
                 self.borrow_root_key(object, scopes)
             }
+            Expr::Index { collection, .. } => self.borrow_root_key(collection, scopes),
             Expr::StaticMember {
                 qualifier, member, ..
             } => self.qualifier_class(qualifier).and_then(|class| {
@@ -2465,6 +2517,14 @@ impl Checker<'_> {
                 args,
                 ..
             } => {
+                if self
+                    .expr_collection_info(object, scopes)
+                    .is_some_and(|collection| {
+                        collection.family == CollectionFamily::Dictionary && method == "get"
+                    })
+                {
+                    return self.borrow_root_key(object, scopes);
+                }
                 let class = self.expr_class(object, scopes)?;
                 let signature = self.methods.get(&(class, method.clone()))?;
                 let borrow = signature.return_borrow?;

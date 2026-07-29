@@ -1013,11 +1013,54 @@ function main(): void
     if ($borrowed != null) { echo "found\n"; }
 }
 "#;
-    let diagnostics = doriac::check_source("stage25a-borrowed-dictionary.doria", source)
-        .expect_err("stored collection borrows remain rejected until lifetime tracking lands");
-    assert!(diagnostics.iter().any(|diagnostic| {
-        diagnostic.code == "E0478" && diagnostic.message.contains("borrowed result")
-    }));
+    let program = doriac::lower_source_to_mir("stage25a-borrowed-dictionary.doria", source)
+        .expect("a borrowed collection result may be bound while its owner remains live");
+    let output = doriac::mir_interpreter::interpret(&program)
+        .expect("a borrowed collection result must not gain a cleanup obligation");
+    assert_eq!(output.stdout, b"found\ndrop\n");
+}
+
+#[test]
+fn generic_repository_returns_transitive_borrows_from_its_receiver() {
+    let source = r#"
+class Repository<T>
+{
+    internal writable Dictionary<string, T> $items = [];
+
+    writable function save(string $id, take T $item): void
+    {
+        $this->items[$id] = $item;
+    }
+
+    function find(string $id): ?T
+    {
+        return $this->items->get($id);
+    }
+}
+
+class Customer { function __construct(string $name) {} }
+class Invoice { function __construct(string $number) {} }
+
+function main(): void
+{
+    let writable $customers = new Repository<Customer>();
+    let writable $invoices = new Repository<Invoice>();
+    $customers->save("42", new Customer("Maya"));
+    $invoices->save("42", new Invoice("INV-42"));
+
+    let $customer = $customers->find("42");
+    let $invoice = $invoices->find("42");
+    echo ($customer?->name ?? "missing") . "\n";
+    echo ($invoice?->number ?? "missing") . "\n";
+}
+"#;
+    let program = doriac::lower_source_to_mir("stage25a-generic-repository.doria", source)
+        .expect("property and collection projections must preserve receiver borrow provenance");
+    doriac::mir_validation::validate_program(&program)
+        .expect("transitive returned borrows must produce valid shared MIR");
+    let output =
+        doriac::mir_interpreter::interpret(&program).expect("generic repository should execute");
+    assert_eq!(output.stdout, b"Maya\nINV-42\n");
 }
 
 #[test]
