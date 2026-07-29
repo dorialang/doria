@@ -309,6 +309,49 @@ fn access_objects_forward_without_a_value_wrapper() {
 }
 
 #[test]
+fn writable_access_mutates_the_shared_class_payload() {
+    let source = format!(
+        "{NODE}
+function main(): void
+{{
+    let $shared = new WritableSharedReference(new Node());
+    let writable $write = $shared->acquireWritableAccess();
+    $write->count = 7;
+    echo \"{{$write->count}}\\n\";
+}}
+"
+    );
+    let program = doriac::lower_source_to_mir("stage25a-writable-access.doria", &source)
+        .expect("writable class access should lower");
+    let output = doriac::mir_interpreter::interpret(&program)
+        .expect("writable class access should interpret");
+    assert_eq!(output.stdout, b"7\n");
+    doriac::codegen_cranelift::lower_mir_to_object(&program)
+        .expect("writable class access should lower through Cranelift");
+}
+
+#[test]
+fn writable_access_mutates_the_shared_collection_payload() {
+    let source = r#"
+function main(): void
+{
+    let $shared = new WritableSharedReference([1, 2, 3]);
+    let writable $access = $shared->acquireWritableAccess();
+    $access[0] = 10;
+    $access->add(4);
+    echo "{$access[0]}:{$access->count}\n";
+}
+"#;
+    let program = doriac::lower_source_to_mir("stage25a-writable-collection.doria", source)
+        .expect("writable collection access should lower");
+    let output = doriac::mir_interpreter::interpret(&program)
+        .expect("writable collection access should interpret");
+    assert_eq!(output.stdout, b"10:4\n");
+    doriac::codegen_cranelift::lower_mir_to_object(&program)
+        .expect("writable collection access should lower through Cranelift");
+}
+
+#[test]
 fn writable_shared_reference_does_not_forward_directly() {
     assert_code(
         r#"
@@ -1422,4 +1465,31 @@ fn writable_weak_family_also_accepts_collection_payloads() {
     ?WritableSharedReference<List<int>> $live = $weak->acquire();
 "#,
     );
+}
+
+#[test]
+fn writable_access_objects_flow_through_returns_properties_and_collection_slots() {
+    for (name, source, expected) in [
+        (
+            "access-lifetime",
+            include_str!("../../../examples/native/main_stage25a_access_lifetime.doria"),
+            b"access guarded\nlive through access\ndrop guarded\nexpired after access\n".as_slice(),
+        ),
+        (
+            "stored-access",
+            include_str!("../../../examples/native/main_stage25a_stored_access.doria"),
+            b"stored read 1\nstored write 5\nstored list 1\ndrop item\ndrop item\n".as_slice(),
+        ),
+    ] {
+        let program = doriac::lower_source_to_mir(format!("{name}.doria"), source)
+            .expect("writable access storage fixture should lower");
+        let output = doriac::mir_interpreter::interpret(&program)
+            .expect("writable access storage fixture should interpret");
+        assert_eq!(output.stdout, expected);
+        doriac::codegen_cranelift::lower_mir_to_object(&program)
+            .expect("writable access storage fixture should lower through Cranelift");
+        #[cfg(feature = "llvm-backend")]
+        doriac::codegen_llvm::lower_mir_to_object(&program)
+            .expect("writable access storage fixture should lower through LLVM");
+    }
 }

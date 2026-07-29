@@ -8,12 +8,22 @@ use crate::numeric::{FloatType, FloatValue, IntegerPanic, IntegerType, IntegerVa
 
 type SharedString = Rc<str>;
 type SharedControl = Rc<RefCell<SharedControlValue>>;
+type WritableSharedControl = Rc<RefCell<WritableSharedControlValue>>;
 
 #[derive(Debug, PartialEq, Eq)]
 struct SharedControlValue {
     strong: usize,
     weak: usize,
     payload: Option<(usize, crate::class_layout::ClassId)>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct WritableSharedControlValue {
+    strong: usize,
+    weak: usize,
+    payload: Option<LocalValue>,
+    readonly_accesses: usize,
+    writable_access_active: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -91,6 +101,27 @@ enum LocalValue {
         control: Option<SharedControl>,
         class: crate::class_layout::ClassId,
     },
+    WritableSharedReference {
+        control: WritableSharedControl,
+        payload: mir::WritableSharedPayload,
+    },
+    WritableWeakReference {
+        control: WritableSharedControl,
+        payload: mir::WritableSharedPayload,
+    },
+    NullableWritableSharedReference {
+        control: Option<WritableSharedControl>,
+        payload: mir::WritableSharedPayload,
+    },
+    NullableWritableWeakReference {
+        control: Option<WritableSharedControl>,
+        payload: mir::WritableSharedPayload,
+    },
+    SharedReferenceAccess {
+        control: WritableSharedControl,
+        payload: mir::WritableSharedPayload,
+        writable: bool,
+    },
     Collection(CollectionValue),
 }
 
@@ -102,6 +133,19 @@ enum OwnedDrop {
     },
     Shared(SharedControl),
     Weak(SharedControl),
+    WritableShared(WritableSharedControl),
+    WritableWeak(WritableSharedControl),
+    SharedAccess {
+        control: WritableSharedControl,
+        writable: bool,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WritableDropKind {
+    Strong,
+    Weak,
+    Access,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -138,6 +182,27 @@ enum EvaluationValue {
     NullableWeakReference {
         control: Option<SharedControl>,
         class: crate::class_layout::ClassId,
+    },
+    WritableSharedReference {
+        control: WritableSharedControl,
+        payload: mir::WritableSharedPayload,
+    },
+    WritableWeakReference {
+        control: WritableSharedControl,
+        payload: mir::WritableSharedPayload,
+    },
+    NullableWritableSharedReference {
+        control: Option<WritableSharedControl>,
+        payload: mir::WritableSharedPayload,
+    },
+    NullableWritableWeakReference {
+        control: Option<WritableSharedControl>,
+        payload: mir::WritableSharedPayload,
+    },
+    SharedReferenceAccess {
+        control: WritableSharedControl,
+        payload: mir::WritableSharedPayload,
+        writable: bool,
     },
     Collection(CollectionValue),
 }
@@ -221,6 +286,11 @@ enum EvaluationTask {
     WeakReference(mir::WeakReferenceExpression),
     NullableSharedReference(mir::NullableSharedReferenceExpression),
     NullableWeakReference(mir::NullableWeakReferenceExpression),
+    WritableSharedReference(mir::WritableSharedReferenceExpression),
+    WritableWeakReference(mir::WritableWeakReferenceExpression),
+    NullableWritableSharedReference(mir::NullableWritableSharedReferenceExpression),
+    NullableWritableWeakReference(mir::NullableWritableWeakReferenceExpression),
+    SharedReferenceAccess(mir::SharedReferenceAccessExpression),
     BuildSharedReference(crate::class_layout::ClassId),
     BuildNullableSharedSome(crate::class_layout::ClassId),
     BuildNullableWeakSome(crate::class_layout::ClassId),
@@ -232,6 +302,20 @@ enum EvaluationTask {
     FinishNullSafeWeakAcquire(crate::class_layout::ClassId, bool),
     FinishSharedPayload(crate::class_layout::ClassId, bool),
     FinishNullableSharedPayload(crate::class_layout::ClassId, bool),
+    BuildWritableSharedReference(mir::WritableSharedPayload),
+    BuildNullableWritableSharedSome(mir::WritableSharedPayload),
+    BuildNullableWritableWeakSome(mir::WritableSharedPayload),
+    FinishWritableSharedShare(mir::WritableSharedPayload, bool),
+    FinishWritableWeakCreation(mir::WritableSharedPayload, bool),
+    FinishWritableWeakAcquire(mir::WritableSharedPayload, bool),
+    FinishWritableNullSafeShare(mir::WritableSharedPayload, bool),
+    FinishWritableNullSafeWeakCreation(mir::WritableSharedPayload, bool),
+    FinishWritableNullSafeWeakAcquire(mir::WritableSharedPayload, bool),
+    FinishSharedAccessAcquire {
+        payload: mir::WritableSharedPayload,
+        writable: bool,
+        drop_receiver: bool,
+    },
     Collection(mir::CollectionExpression),
     BuildCollection {
         collection: mir::CollectionTypeId,
@@ -278,6 +362,18 @@ enum EvaluationTask {
         nullable: bool,
         transfer: bool,
     },
+    CollectionIndexWritableShared {
+        collection: mir::LocalId,
+        payload: mir::WritableSharedPayload,
+        weak: bool,
+        nullable: bool,
+        transfer: bool,
+    },
+    CollectionIndexSharedAccess {
+        collection: mir::LocalId,
+        payload: mir::WritableSharedPayload,
+        writable: bool,
+    },
     BuildClassNew {
         class: crate::class_layout::ClassId,
         properties: Vec<mir::PropertyValue>,
@@ -308,6 +404,8 @@ enum EvaluationTask {
     NullableClassIsPresent(Option<crate::class_layout::ClassId>),
     NullableSharedReferenceIsPresent(bool),
     NullableWeakReferenceIsPresent(bool),
+    NullableWritableSharedReferenceIsPresent(bool),
+    NullableWritableWeakReferenceIsPresent(bool),
     NullableMixedIsPresent(mir::MixedOwnership),
     MixedIs {
         tag: mir::MixedTag,
@@ -355,6 +453,30 @@ enum EvaluationTask {
         transfer: bool,
     },
     FinishNullableWeakCoalesceRight(bool),
+    AfterWritableSharedCoalesce {
+        right: mir::WritableSharedReferenceExpression,
+        left_owned: bool,
+        transfer: bool,
+    },
+    FinishWritableSharedCoalesceRight(bool),
+    AfterNullableWritableSharedCoalesce {
+        right: mir::NullableWritableSharedReferenceExpression,
+        left_owned: bool,
+        transfer: bool,
+    },
+    FinishNullableWritableSharedCoalesceRight(bool),
+    AfterWritableWeakCoalesce {
+        right: mir::WritableWeakReferenceExpression,
+        left_owned: bool,
+        transfer: bool,
+    },
+    FinishWritableWeakCoalesceRight(bool),
+    AfterNullableWritableWeakCoalesce {
+        right: mir::NullableWritableWeakReferenceExpression,
+        left_owned: bool,
+        transfer: bool,
+    },
+    FinishNullableWritableWeakCoalesceRight(bool),
     AfterNullSafeProperty {
         property: crate::class_layout::PropertyId,
         result: mir::Type,
@@ -424,8 +546,17 @@ enum EvaluationTask {
     DropClass(mir::LocalId),
     DropShared(mir::LocalId),
     DropWeak(mir::LocalId),
+    DropWritableShared(mir::LocalId),
+    DropWritableWeak(mir::LocalId),
+    DropSharedAccess(mir::LocalId),
     ReleaseShared(SharedControl),
     ReleaseWeak(SharedControl),
+    ReleaseWritableShared(WritableSharedControl),
+    ReleaseWritableWeak(WritableSharedControl),
+    ReleaseSharedAccess {
+        control: WritableSharedControl,
+        writable: bool,
+    },
     DropCollection(mir::LocalId),
     DropObject {
         object: usize,
@@ -828,10 +959,76 @@ impl Interpreter<'_> {
                             .push(EvaluationTask::NullableWeakReference(expression));
                     }
                     (
+                        mir::Type::WritableSharedReference(expected),
+                        mir::Rvalue::WritableSharedReference(expression),
+                    ) if expression.payload() == expected => {
+                        let frame = self.current_frame_mut()?;
+                        frame.tasks.push(EvaluationTask::Assign(target));
+                        frame
+                            .tasks
+                            .push(EvaluationTask::WritableSharedReference(expression));
+                    }
+                    (
+                        mir::Type::WritableWeakReference(expected),
+                        mir::Rvalue::WritableWeakReference(expression),
+                    ) if expression.payload() == expected => {
+                        let frame = self.current_frame_mut()?;
+                        frame.tasks.push(EvaluationTask::Assign(target));
+                        frame
+                            .tasks
+                            .push(EvaluationTask::WritableWeakReference(expression));
+                    }
+                    (
+                        mir::Type::NullableWritableSharedReference(expected),
+                        mir::Rvalue::NullableWritableSharedReference(expression),
+                    ) if expression.payload() == expected => {
+                        let frame = self.current_frame_mut()?;
+                        frame.tasks.push(EvaluationTask::Assign(target));
+                        frame
+                            .tasks
+                            .push(EvaluationTask::NullableWritableSharedReference(expression));
+                    }
+                    (
+                        mir::Type::NullableWritableWeakReference(expected),
+                        mir::Rvalue::NullableWritableWeakReference(expression),
+                    ) if expression.payload() == expected => {
+                        let frame = self.current_frame_mut()?;
+                        frame.tasks.push(EvaluationTask::Assign(target));
+                        frame
+                            .tasks
+                            .push(EvaluationTask::NullableWritableWeakReference(expression));
+                    }
+                    (
+                        mir::Type::ReadonlySharedReferenceAccess(expected),
+                        mir::Rvalue::SharedReferenceAccess(expression),
+                    ) if expression.payload() == expected && !expression.writable() => {
+                        let frame = self.current_frame_mut()?;
+                        frame.tasks.push(EvaluationTask::Assign(target));
+                        frame
+                            .tasks
+                            .push(EvaluationTask::SharedReferenceAccess(expression));
+                    }
+                    (
+                        mir::Type::WritableSharedReferenceAccess(expected),
+                        mir::Rvalue::SharedReferenceAccess(expression),
+                    ) if expression.payload() == expected && expression.writable() => {
+                        let frame = self.current_frame_mut()?;
+                        frame.tasks.push(EvaluationTask::Assign(target));
+                        frame
+                            .tasks
+                            .push(EvaluationTask::SharedReferenceAccess(expression));
+                    }
+                    (
                         mir::Type::SharedReference(_)
                         | mir::Type::WeakReference(_)
                         | mir::Type::NullableSharedReference(_)
-                        | mir::Type::NullableWeakReference(_),
+                        | mir::Type::NullableWeakReference(_)
+                        | mir::Type::WritableSharedReference(_)
+                        | mir::Type::WritableWeakReference(_)
+                        | mir::Type::NullableWritableSharedReference(_)
+                        | mir::Type::NullableWritableWeakReference(_)
+                        | mir::Type::ReadonlySharedReferenceAccess(_)
+                        | mir::Type::WritableSharedReferenceAccess(_),
                         _,
                     ) => {
                         return Err(InterpreterError::new(
@@ -956,6 +1153,21 @@ impl Interpreter<'_> {
                 self.current_frame_mut()?
                     .tasks
                     .push(EvaluationTask::DropWeak(local));
+            }
+            mir::Statement::DropWritableSharedReference { local, .. } => {
+                self.current_frame_mut()?
+                    .tasks
+                    .push(EvaluationTask::DropWritableShared(local));
+            }
+            mir::Statement::DropWritableWeakReference { local, .. } => {
+                self.current_frame_mut()?
+                    .tasks
+                    .push(EvaluationTask::DropWritableWeak(local));
+            }
+            mir::Statement::DropSharedReferenceAccess { local, .. } => {
+                self.current_frame_mut()?
+                    .tasks
+                    .push(EvaluationTask::DropSharedAccess(local));
             }
             mir::Statement::DropString { local } => {
                 let value = self
@@ -1144,6 +1356,26 @@ impl Interpreter<'_> {
                     .current_frame_mut()?
                     .tasks
                     .push(EvaluationTask::NullableWeakReference(value)),
+                mir::Rvalue::WritableSharedReference(value) => self
+                    .current_frame_mut()?
+                    .tasks
+                    .push(EvaluationTask::WritableSharedReference(value)),
+                mir::Rvalue::WritableWeakReference(value) => self
+                    .current_frame_mut()?
+                    .tasks
+                    .push(EvaluationTask::WritableWeakReference(value)),
+                mir::Rvalue::NullableWritableSharedReference(value) => self
+                    .current_frame_mut()?
+                    .tasks
+                    .push(EvaluationTask::NullableWritableSharedReference(value)),
+                mir::Rvalue::NullableWritableWeakReference(value) => self
+                    .current_frame_mut()?
+                    .tasks
+                    .push(EvaluationTask::NullableWritableWeakReference(value)),
+                mir::Rvalue::SharedReferenceAccess(value) => self
+                    .current_frame_mut()?
+                    .tasks
+                    .push(EvaluationTask::SharedReferenceAccess(value)),
                 mir::Rvalue::Collection(value) => self
                     .current_frame_mut()?
                     .tasks
@@ -1192,6 +1424,21 @@ impl Interpreter<'_> {
             }
             EvaluationTask::NullableWeakReference(expression) => {
                 self.expand_nullable_weak_reference_expression(expression)?
+            }
+            EvaluationTask::WritableSharedReference(expression) => {
+                self.expand_writable_shared_reference_expression(expression)?
+            }
+            EvaluationTask::WritableWeakReference(expression) => {
+                self.expand_writable_weak_reference_expression(expression)?
+            }
+            EvaluationTask::NullableWritableSharedReference(expression) => {
+                self.expand_nullable_writable_shared_reference_expression(expression)?
+            }
+            EvaluationTask::NullableWritableWeakReference(expression) => {
+                self.expand_nullable_writable_weak_reference_expression(expression)?
+            }
+            EvaluationTask::SharedReferenceAccess(expression) => {
+                self.expand_shared_reference_access_expression(expression)?
             }
             EvaluationTask::BuildSharedReference(class) => {
                 let value = self.pop_local_value()?;
@@ -1530,6 +1777,262 @@ impl Interpreter<'_> {
                     }
                 }
                 self.push_nullable_class(class, object.map(|(object, _)| object))?;
+            }
+            EvaluationTask::BuildWritableSharedReference(payload) => {
+                let value = self.pop_local_value()?;
+                if local_value_type(&value) != writable_payload_type(payload) {
+                    return Err(InterpreterError::new(
+                        "writable shared construction produced another payload type",
+                    ));
+                }
+                let control = Rc::new(RefCell::new(WritableSharedControlValue {
+                    strong: 1,
+                    weak: 0,
+                    payload: Some(value),
+                    readonly_accesses: 0,
+                    writable_access_active: false,
+                }));
+                self.current_frame_mut()?
+                    .values
+                    .push(EvaluationValue::WritableSharedReference { control, payload });
+            }
+            EvaluationTask::BuildNullableWritableSharedSome(payload) => {
+                let (control, actual) = self.pop_writable_shared_reference()?;
+                if actual != payload {
+                    return Err(InterpreterError::new(
+                        "nullable writable shared construction changed payload type",
+                    ));
+                }
+                self.current_frame_mut()?.values.push(
+                    EvaluationValue::NullableWritableSharedReference {
+                        control: Some(control),
+                        payload,
+                    },
+                );
+            }
+            EvaluationTask::BuildNullableWritableWeakSome(payload) => {
+                let (control, actual) = self.pop_writable_weak_reference()?;
+                if actual != payload {
+                    return Err(InterpreterError::new(
+                        "nullable writable weak construction changed payload type",
+                    ));
+                }
+                self.current_frame_mut()?.values.push(
+                    EvaluationValue::NullableWritableWeakReference {
+                        control: Some(control),
+                        payload,
+                    },
+                );
+            }
+            EvaluationTask::FinishWritableSharedShare(payload, drop_receiver) => {
+                let (control, actual) = self.pop_writable_shared_reference()?;
+                if actual != payload {
+                    return Err(InterpreterError::new("writable share changed payload type"));
+                }
+                {
+                    let mut state = control.borrow_mut();
+                    state.strong = state.strong.checked_add(1).ok_or_else(|| {
+                        InterpreterError::new("writable shared-reference count overflow")
+                    })?;
+                }
+                if drop_receiver {
+                    self.current_frame_mut()?
+                        .statement_temporary_drops
+                        .push(OwnedDrop::WritableShared(control.clone()));
+                }
+                self.current_frame_mut()?
+                    .values
+                    .push(EvaluationValue::WritableSharedReference { control, payload });
+            }
+            EvaluationTask::FinishWritableWeakCreation(payload, drop_receiver) => {
+                let (control, actual) = self.pop_writable_shared_reference()?;
+                if actual != payload {
+                    return Err(InterpreterError::new(
+                        "writable weak creation changed payload type",
+                    ));
+                }
+                {
+                    let mut state = control.borrow_mut();
+                    state.weak = state.weak.checked_add(1).ok_or_else(|| {
+                        InterpreterError::new("writable weak-reference count overflow")
+                    })?;
+                }
+                if drop_receiver {
+                    self.current_frame_mut()?
+                        .statement_temporary_drops
+                        .push(OwnedDrop::WritableShared(control.clone()));
+                }
+                self.current_frame_mut()?
+                    .values
+                    .push(EvaluationValue::WritableWeakReference { control, payload });
+            }
+            EvaluationTask::FinishWritableWeakAcquire(payload, drop_receiver) => {
+                let (control, actual) = self.pop_writable_weak_reference()?;
+                if actual != payload {
+                    return Err(InterpreterError::new(
+                        "writable weak acquisition changed payload type",
+                    ));
+                }
+                let acquired = {
+                    let mut state = control.borrow_mut();
+                    if state.strong == 0 {
+                        false
+                    } else {
+                        state.strong = state.strong.checked_add(1).ok_or_else(|| {
+                            InterpreterError::new("writable shared-reference count overflow")
+                        })?;
+                        true
+                    }
+                };
+                if drop_receiver {
+                    self.current_frame_mut()?
+                        .statement_temporary_drops
+                        .push(OwnedDrop::WritableWeak(control.clone()));
+                }
+                self.current_frame_mut()?.values.push(
+                    EvaluationValue::NullableWritableSharedReference {
+                        control: acquired.then_some(control),
+                        payload,
+                    },
+                );
+            }
+            EvaluationTask::FinishWritableNullSafeShare(payload, drop_receiver) => {
+                let (control, actual) = self.pop_nullable_writable_shared_reference()?;
+                if actual != payload {
+                    return Err(InterpreterError::new(
+                        "null-safe writable share changed payload type",
+                    ));
+                }
+                if let Some(control) = &control {
+                    let mut state = control.borrow_mut();
+                    state.strong = state.strong.checked_add(1).ok_or_else(|| {
+                        InterpreterError::new("writable shared-reference count overflow")
+                    })?;
+                }
+                if drop_receiver {
+                    if let Some(control) = &control {
+                        self.current_frame_mut()?
+                            .statement_temporary_drops
+                            .push(OwnedDrop::WritableShared(control.clone()));
+                    }
+                }
+                self.current_frame_mut()?
+                    .values
+                    .push(EvaluationValue::NullableWritableSharedReference { control, payload });
+            }
+            EvaluationTask::FinishWritableNullSafeWeakCreation(payload, drop_receiver) => {
+                let (control, actual) = self.pop_nullable_writable_shared_reference()?;
+                if actual != payload {
+                    return Err(InterpreterError::new(
+                        "null-safe writable weak creation changed payload type",
+                    ));
+                }
+                if let Some(control) = &control {
+                    let mut state = control.borrow_mut();
+                    state.weak = state.weak.checked_add(1).ok_or_else(|| {
+                        InterpreterError::new("writable weak-reference count overflow")
+                    })?;
+                }
+                if drop_receiver {
+                    if let Some(control) = &control {
+                        self.current_frame_mut()?
+                            .statement_temporary_drops
+                            .push(OwnedDrop::WritableShared(control.clone()));
+                    }
+                }
+                self.current_frame_mut()?
+                    .values
+                    .push(EvaluationValue::NullableWritableWeakReference { control, payload });
+            }
+            EvaluationTask::FinishWritableNullSafeWeakAcquire(payload, drop_receiver) => {
+                let (control, actual) = self.pop_nullable_writable_weak_reference()?;
+                if actual != payload {
+                    return Err(InterpreterError::new(
+                        "null-safe writable weak acquisition changed payload type",
+                    ));
+                }
+                let acquired = if let Some(control) = &control {
+                    let mut state = control.borrow_mut();
+                    if state.strong == 0 {
+                        None
+                    } else {
+                        state.strong = state.strong.checked_add(1).ok_or_else(|| {
+                            InterpreterError::new("writable shared-reference count overflow")
+                        })?;
+                        Some(control.clone())
+                    }
+                } else {
+                    None
+                };
+                if drop_receiver {
+                    if let Some(control) = &control {
+                        self.current_frame_mut()?
+                            .statement_temporary_drops
+                            .push(OwnedDrop::WritableWeak(control.clone()));
+                    }
+                }
+                self.current_frame_mut()?.values.push(
+                    EvaluationValue::NullableWritableSharedReference {
+                        control: acquired,
+                        payload,
+                    },
+                );
+            }
+            EvaluationTask::FinishSharedAccessAcquire {
+                payload,
+                writable,
+                drop_receiver,
+            } => {
+                let (control, actual) = self.pop_writable_shared_reference()?;
+                if actual != payload {
+                    return Err(InterpreterError::new(
+                        "shared access acquisition changed payload type",
+                    ));
+                }
+                let conflict = {
+                    let mut state = control.borrow_mut();
+                    if writable {
+                        if state.readonly_accesses != 0 {
+                            Some("Cannot Acquire Writable Access While Readonly Access Is Active")
+                        } else if state.writable_access_active {
+                            Some("Cannot Acquire Writable Access While Writable Access Is Active")
+                        } else {
+                            state.strong = state.strong.checked_add(1).ok_or_else(|| {
+                                InterpreterError::new("writable shared-reference count overflow")
+                            })?;
+                            state.writable_access_active = true;
+                            None
+                        }
+                    } else if state.writable_access_active {
+                        Some("Cannot Acquire Readonly Access While Writable Access Is Active")
+                    } else {
+                        let next_readonly =
+                            state.readonly_accesses.checked_add(1).ok_or_else(|| {
+                                InterpreterError::new("readonly shared-access count overflow")
+                            })?;
+                        let next_strong = state.strong.checked_add(1).ok_or_else(|| {
+                            InterpreterError::new("writable shared-reference count overflow")
+                        })?;
+                        state.readonly_accesses = next_readonly;
+                        state.strong = next_strong;
+                        None
+                    }
+                };
+                if let Some(message) = conflict {
+                    return Ok(StepOutcome::Panic(message.to_string()));
+                }
+                if drop_receiver {
+                    self.current_frame_mut()?
+                        .statement_temporary_drops
+                        .push(OwnedDrop::WritableShared(control.clone()));
+                }
+                self.current_frame_mut()?
+                    .values
+                    .push(EvaluationValue::SharedReferenceAccess {
+                        control,
+                        payload,
+                        writable,
+                    });
             }
             EvaluationTask::Collection(expression) => {
                 self.expand_collection_expression(expression)?
@@ -2063,6 +2566,16 @@ impl Interpreter<'_> {
                     ) if actual == class => {
                         EvaluationValue::NullableSharedReference { control, class }
                     }
+                    (
+                        true,
+                        true,
+                        LocalValue::NullableWeakReference {
+                            control,
+                            class: actual,
+                        },
+                    ) if actual == class => {
+                        EvaluationValue::NullableWeakReference { control, class }
+                    }
                     _ => {
                         return Err(InterpreterError::new(
                             "MIR indexed shared handle has another type",
@@ -2070,6 +2583,100 @@ impl Interpreter<'_> {
                     }
                 };
                 self.current_frame_mut()?.values.push(value);
+            }
+            EvaluationTask::CollectionIndexWritableShared {
+                collection,
+                payload,
+                weak,
+                nullable,
+                transfer,
+            } => {
+                let index = self.pop_local_value()?;
+                let value = match self.collection_value_at(collection, &index, transfer) {
+                    Ok(value) => value,
+                    Err(message) => return Ok(StepOutcome::Panic(message)),
+                };
+                let value = match (weak, nullable, value) {
+                    (
+                        false,
+                        false,
+                        LocalValue::WritableSharedReference {
+                            control,
+                            payload: actual,
+                        },
+                    ) if actual == payload => {
+                        EvaluationValue::WritableSharedReference { control, payload }
+                    }
+                    (
+                        true,
+                        false,
+                        LocalValue::WritableWeakReference {
+                            control,
+                            payload: actual,
+                        },
+                    ) if actual == payload => {
+                        EvaluationValue::WritableWeakReference { control, payload }
+                    }
+                    (
+                        false,
+                        true,
+                        LocalValue::NullableWritableSharedReference {
+                            control,
+                            payload: actual,
+                        },
+                    ) if actual == payload => {
+                        EvaluationValue::NullableWritableSharedReference { control, payload }
+                    }
+                    (
+                        true,
+                        true,
+                        LocalValue::NullableWritableWeakReference {
+                            control,
+                            payload: actual,
+                        },
+                    ) if actual == payload => {
+                        EvaluationValue::NullableWritableWeakReference { control, payload }
+                    }
+                    _ => {
+                        return Err(InterpreterError::new(
+                            "MIR indexed writable shared handle has another type",
+                        ))
+                    }
+                };
+                self.current_frame_mut()?.values.push(value);
+            }
+            EvaluationTask::CollectionIndexSharedAccess {
+                collection,
+                payload,
+                writable,
+            } => {
+                let index = self.pop_local_value()?;
+                let value = match self.collection_value_at(collection, &index, false) {
+                    Ok(value) => value,
+                    Err(message) => return Ok(StepOutcome::Panic(message)),
+                };
+                let LocalValue::SharedReferenceAccess {
+                    control,
+                    payload: actual_payload,
+                    writable: actual_writable,
+                } = value
+                else {
+                    return Err(InterpreterError::new(
+                        "MIR indexed shared access produced another value type",
+                    ));
+                };
+                if actual_payload != payload || actual_writable != writable {
+                    return Err(InterpreterError::new(
+                        "MIR indexed shared access changed access type",
+                    ));
+                }
+                self.current_frame_mut()?
+                    .values
+                    .push(EvaluationValue::SharedReferenceAccess {
+                        control,
+                        payload,
+                        writable,
+                    });
             }
             EvaluationTask::BuildClassNew {
                 class,
@@ -2297,6 +2904,30 @@ impl Interpreter<'_> {
                         self.current_frame_mut()?
                             .statement_temporary_drops
                             .push(OwnedDrop::Weak(control));
+                    }
+                }
+                self.push_scalar(mir::ScalarValue::Bool(present))?;
+            }
+            EvaluationTask::NullableWritableSharedReferenceIsPresent(owned) => {
+                let (control, _) = self.pop_nullable_writable_shared_reference()?;
+                let present = control.is_some();
+                if owned {
+                    if let Some(control) = control {
+                        self.current_frame_mut()?
+                            .statement_temporary_drops
+                            .push(OwnedDrop::WritableShared(control));
+                    }
+                }
+                self.push_scalar(mir::ScalarValue::Bool(present))?;
+            }
+            EvaluationTask::NullableWritableWeakReferenceIsPresent(owned) => {
+                let (control, _) = self.pop_nullable_writable_weak_reference()?;
+                let present = control.is_some();
+                if owned {
+                    if let Some(control) = control {
+                        self.current_frame_mut()?
+                            .statement_temporary_drops
+                            .push(OwnedDrop::WritableWeak(control));
                     }
                 }
                 self.push_scalar(mir::ScalarValue::Bool(present))?;
@@ -2641,6 +3272,166 @@ impl Interpreter<'_> {
                 self.current_frame_mut()?
                     .values
                     .push(EvaluationValue::NullableWeakReference { control, class });
+            }
+            EvaluationTask::AfterWritableSharedCoalesce {
+                right,
+                left_owned,
+                transfer,
+            } => {
+                let (control, payload) = self.pop_nullable_writable_shared_reference()?;
+                if let Some(control) = control {
+                    if left_owned && !transfer {
+                        self.current_frame_mut()?
+                            .statement_temporary_drops
+                            .push(OwnedDrop::WritableShared(control.clone()));
+                    }
+                    self.current_frame_mut()?
+                        .values
+                        .push(EvaluationValue::WritableSharedReference { control, payload });
+                } else {
+                    let right_owned = !transfer && right.owned_temporary();
+                    let frame = self.current_frame_mut()?;
+                    frame
+                        .tasks
+                        .push(EvaluationTask::FinishWritableSharedCoalesceRight(
+                            right_owned,
+                        ));
+                    frame
+                        .tasks
+                        .push(EvaluationTask::WritableSharedReference(right));
+                }
+            }
+            EvaluationTask::FinishWritableSharedCoalesceRight(owned) => {
+                let (control, payload) = self.pop_writable_shared_reference()?;
+                if owned {
+                    self.current_frame_mut()?
+                        .statement_temporary_drops
+                        .push(OwnedDrop::WritableShared(control.clone()));
+                }
+                self.current_frame_mut()?
+                    .values
+                    .push(EvaluationValue::WritableSharedReference { control, payload });
+            }
+            EvaluationTask::AfterNullableWritableSharedCoalesce {
+                right,
+                left_owned,
+                transfer,
+            } => {
+                let (control, payload) = self.pop_nullable_writable_shared_reference()?;
+                if let Some(control) = control {
+                    if left_owned && !transfer {
+                        self.current_frame_mut()?
+                            .statement_temporary_drops
+                            .push(OwnedDrop::WritableShared(control.clone()));
+                    }
+                    self.current_frame_mut()?.values.push(
+                        EvaluationValue::NullableWritableSharedReference {
+                            control: Some(control),
+                            payload,
+                        },
+                    );
+                } else {
+                    let right_owned = !transfer && right.owned_temporary();
+                    let frame = self.current_frame_mut()?;
+                    frame
+                        .tasks
+                        .push(EvaluationTask::FinishNullableWritableSharedCoalesceRight(
+                            right_owned,
+                        ));
+                    frame
+                        .tasks
+                        .push(EvaluationTask::NullableWritableSharedReference(right));
+                }
+            }
+            EvaluationTask::FinishNullableWritableSharedCoalesceRight(owned) => {
+                let (control, payload) = self.pop_nullable_writable_shared_reference()?;
+                if let (Some(control), true) = (&control, owned) {
+                    self.current_frame_mut()?
+                        .statement_temporary_drops
+                        .push(OwnedDrop::WritableShared(control.clone()));
+                }
+                self.current_frame_mut()?
+                    .values
+                    .push(EvaluationValue::NullableWritableSharedReference { control, payload });
+            }
+            EvaluationTask::AfterWritableWeakCoalesce {
+                right,
+                left_owned,
+                transfer,
+            } => {
+                let (control, payload) = self.pop_nullable_writable_weak_reference()?;
+                if let Some(control) = control {
+                    if left_owned && !transfer {
+                        self.current_frame_mut()?
+                            .statement_temporary_drops
+                            .push(OwnedDrop::WritableWeak(control.clone()));
+                    }
+                    self.current_frame_mut()?
+                        .values
+                        .push(EvaluationValue::WritableWeakReference { control, payload });
+                } else {
+                    let right_owned = !transfer && right.owned_temporary();
+                    let frame = self.current_frame_mut()?;
+                    frame
+                        .tasks
+                        .push(EvaluationTask::FinishWritableWeakCoalesceRight(right_owned));
+                    frame
+                        .tasks
+                        .push(EvaluationTask::WritableWeakReference(right));
+                }
+            }
+            EvaluationTask::FinishWritableWeakCoalesceRight(owned) => {
+                let (control, payload) = self.pop_writable_weak_reference()?;
+                if owned {
+                    self.current_frame_mut()?
+                        .statement_temporary_drops
+                        .push(OwnedDrop::WritableWeak(control.clone()));
+                }
+                self.current_frame_mut()?
+                    .values
+                    .push(EvaluationValue::WritableWeakReference { control, payload });
+            }
+            EvaluationTask::AfterNullableWritableWeakCoalesce {
+                right,
+                left_owned,
+                transfer,
+            } => {
+                let (control, payload) = self.pop_nullable_writable_weak_reference()?;
+                if let Some(control) = control {
+                    if left_owned && !transfer {
+                        self.current_frame_mut()?
+                            .statement_temporary_drops
+                            .push(OwnedDrop::WritableWeak(control.clone()));
+                    }
+                    self.current_frame_mut()?.values.push(
+                        EvaluationValue::NullableWritableWeakReference {
+                            control: Some(control),
+                            payload,
+                        },
+                    );
+                } else {
+                    let right_owned = !transfer && right.owned_temporary();
+                    let frame = self.current_frame_mut()?;
+                    frame
+                        .tasks
+                        .push(EvaluationTask::FinishNullableWritableWeakCoalesceRight(
+                            right_owned,
+                        ));
+                    frame
+                        .tasks
+                        .push(EvaluationTask::NullableWritableWeakReference(right));
+                }
+            }
+            EvaluationTask::FinishNullableWritableWeakCoalesceRight(owned) => {
+                let (control, payload) = self.pop_nullable_writable_weak_reference()?;
+                if let (Some(control), true) = (&control, owned) {
+                    self.current_frame_mut()?
+                        .statement_temporary_drops
+                        .push(OwnedDrop::WritableWeak(control.clone()));
+                }
+                self.current_frame_mut()?
+                    .values
+                    .push(EvaluationValue::NullableWritableWeakReference { control, payload });
             }
             EvaluationTask::AfterNullSafeProperty {
                 property,
@@ -3017,6 +3808,15 @@ impl Interpreter<'_> {
             EvaluationTask::DropWeak(local) => {
                 self.drop_shared_local(local, true)?;
             }
+            EvaluationTask::DropWritableShared(local) => {
+                self.drop_writable_shared_local(local, WritableDropKind::Strong)?;
+            }
+            EvaluationTask::DropWritableWeak(local) => {
+                self.drop_writable_shared_local(local, WritableDropKind::Weak)?;
+            }
+            EvaluationTask::DropSharedAccess(local) => {
+                self.drop_writable_shared_local(local, WritableDropKind::Access)?;
+            }
             EvaluationTask::ReleaseShared(control) => {
                 let payload = {
                     let mut state = control.borrow_mut();
@@ -3042,6 +3842,53 @@ impl Interpreter<'_> {
                     ));
                 }
                 state.weak -= 1;
+            }
+            EvaluationTask::ReleaseWritableShared(control) => {
+                let payload = {
+                    let mut state = control.borrow_mut();
+                    if state.strong == 0 {
+                        return Err(InterpreterError::new(
+                            "MIR released an exhausted writable strong handle",
+                        ));
+                    }
+                    state.strong -= 1;
+                    (state.strong == 0).then(|| state.payload.take()).flatten()
+                };
+                if let Some(payload) = payload {
+                    self.queue_value_drops(payload)?;
+                }
+            }
+            EvaluationTask::ReleaseWritableWeak(control) => {
+                let mut state = control.borrow_mut();
+                if state.weak == 0 {
+                    return Err(InterpreterError::new(
+                        "MIR released an exhausted writable weak handle",
+                    ));
+                }
+                state.weak -= 1;
+            }
+            EvaluationTask::ReleaseSharedAccess { control, writable } => {
+                {
+                    let mut state = control.borrow_mut();
+                    if writable {
+                        if !state.writable_access_active {
+                            return Err(InterpreterError::new(
+                                "MIR released an inactive writable shared access",
+                            ));
+                        }
+                        state.writable_access_active = false;
+                    } else {
+                        if state.readonly_accesses == 0 {
+                            return Err(InterpreterError::new(
+                                "MIR released an exhausted readonly shared access",
+                            ));
+                        }
+                        state.readonly_accesses -= 1;
+                    }
+                }
+                self.current_frame_mut()?
+                    .tasks
+                    .push(EvaluationTask::ReleaseWritableShared(control));
             }
             EvaluationTask::DropCollection(local) => {
                 self.drop_collection_local(local)?;
@@ -3310,6 +4157,30 @@ impl Interpreter<'_> {
                     .tasks
                     .push(EvaluationTask::NullableWeakReference(*value));
             }
+            mir::BoolExpression::NullableWritableSharedReferenceIsPresent(value) => {
+                let owned = value.owned_temporary();
+                let frame = self.current_frame_mut()?;
+                frame
+                    .tasks
+                    .push(EvaluationTask::NullableWritableSharedReferenceIsPresent(
+                        owned,
+                    ));
+                frame
+                    .tasks
+                    .push(EvaluationTask::NullableWritableSharedReference(*value));
+            }
+            mir::BoolExpression::NullableWritableWeakReferenceIsPresent(value) => {
+                let owned = value.owned_temporary();
+                let frame = self.current_frame_mut()?;
+                frame
+                    .tasks
+                    .push(EvaluationTask::NullableWritableWeakReferenceIsPresent(
+                        owned,
+                    ));
+                frame
+                    .tasks
+                    .push(EvaluationTask::NullableWritableWeakReference(*value));
+            }
             mir::BoolExpression::NullableMixedIsPresent(value) => {
                 let ownership = value.ownership();
                 let frame = self.current_frame_mut()?;
@@ -3434,7 +4305,12 @@ impl Interpreter<'_> {
                     LocalValue::SharedReference { .. }
                     | LocalValue::WeakReference { .. }
                     | LocalValue::NullableSharedReference { .. }
-                    | LocalValue::NullableWeakReference { .. } => {
+                    | LocalValue::NullableWeakReference { .. }
+                    | LocalValue::WritableSharedReference { .. }
+                    | LocalValue::WritableWeakReference { .. }
+                    | LocalValue::NullableWritableSharedReference { .. }
+                    | LocalValue::NullableWritableWeakReference { .. }
+                    | LocalValue::SharedReferenceAccess { .. } => {
                         return Err(InterpreterError::new(format!(
                             "MIR shared handle local local{} was used as a string value",
                             id.0
@@ -4229,6 +5105,26 @@ impl Interpreter<'_> {
                     .tasks
                     .push(EvaluationTask::SharedReference(*reference));
             }
+            mir::ClassExpression::SharedAccessPayload { class, access, .. } => {
+                let value = self.shared_access_payload(access)?;
+                let LocalValue::Class {
+                    object,
+                    class: actual,
+                } = value
+                else {
+                    return Err(InterpreterError::new(
+                        "MIR shared access payload is not a class",
+                    ));
+                };
+                if actual != class {
+                    return Err(InterpreterError::new(
+                        "MIR shared access payload has another class",
+                    ));
+                }
+                self.current_frame_mut()?
+                    .values
+                    .push(EvaluationValue::Class { object, class });
+            }
         }
         Ok(())
     }
@@ -4818,6 +5714,708 @@ impl Interpreter<'_> {
         Ok(())
     }
 
+    fn expand_writable_shared_reference_expression(
+        &mut self,
+        expression: mir::WritableSharedReferenceExpression,
+    ) -> Result<(), InterpreterError> {
+        match expression {
+            mir::WritableSharedReferenceExpression::New { payload, value } => {
+                let frame = self.current_frame_mut()?;
+                frame
+                    .tasks
+                    .push(EvaluationTask::BuildWritableSharedReference(payload));
+                frame.tasks.push(EvaluationTask::Rvalue(*value));
+            }
+            mir::WritableSharedReferenceExpression::Local {
+                payload,
+                local,
+                transfer,
+            } => {
+                let value = self.read_or_take_local(local, transfer)?;
+                let LocalValue::WritableSharedReference {
+                    control,
+                    payload: actual,
+                } = value
+                else {
+                    return Err(InterpreterError::new(
+                        "writable shared expression read another local type",
+                    ));
+                };
+                if actual != payload {
+                    return Err(InterpreterError::new(
+                        "writable shared expression changed payload type",
+                    ));
+                }
+                self.current_frame_mut()?
+                    .values
+                    .push(EvaluationValue::WritableSharedReference { control, payload });
+            }
+            mir::WritableSharedReferenceExpression::NullableLocalAssumeNonNull {
+                payload,
+                local,
+                transfer,
+            } => {
+                let value = self.read_or_take_local(local, transfer)?;
+                let LocalValue::NullableWritableSharedReference {
+                    control,
+                    payload: actual,
+                } = value
+                else {
+                    return Err(InterpreterError::new(
+                        "nonnull writable shared expression read another local type",
+                    ));
+                };
+                if actual != payload {
+                    return Err(InterpreterError::new(
+                        "nonnull writable shared expression changed payload type",
+                    ));
+                }
+                let control = control.ok_or_else(|| {
+                    InterpreterError::new("nonnull writable shared expression received null")
+                })?;
+                self.current_frame_mut()?
+                    .values
+                    .push(EvaluationValue::WritableSharedReference { control, payload });
+            }
+            mir::WritableSharedReferenceExpression::Property {
+                payload,
+                object,
+                property,
+            } => {
+                let value = self.read_property(object, property)?;
+                let LocalValue::WritableSharedReference {
+                    control,
+                    payload: actual,
+                } = value
+                else {
+                    return Err(InterpreterError::new(
+                        "writable shared property read another value type",
+                    ));
+                };
+                if actual != payload {
+                    return Err(InterpreterError::new(
+                        "writable shared property changed payload type",
+                    ));
+                }
+                self.current_frame_mut()?
+                    .values
+                    .push(EvaluationValue::WritableSharedReference { control, payload });
+            }
+            mir::WritableSharedReferenceExpression::Call {
+                payload,
+                function,
+                args,
+                ..
+            } => self.queue_call(
+                function,
+                args,
+                ReturnExpectation::Value(mir::Type::WritableSharedReference(payload)),
+            )?,
+            mir::WritableSharedReferenceExpression::Share { payload, value } => {
+                let drop_receiver = value.owned_temporary();
+                let frame = self.current_frame_mut()?;
+                frame.tasks.push(EvaluationTask::FinishWritableSharedShare(
+                    payload,
+                    drop_receiver,
+                ));
+                frame
+                    .tasks
+                    .push(EvaluationTask::WritableSharedReference(*value));
+            }
+            mir::WritableSharedReferenceExpression::Coalesce {
+                left,
+                right,
+                transfer,
+                ..
+            } => {
+                let left_owned = left.owned_temporary();
+                let frame = self.current_frame_mut()?;
+                frame
+                    .tasks
+                    .push(EvaluationTask::AfterWritableSharedCoalesce {
+                        right: *right,
+                        left_owned,
+                        transfer,
+                    });
+                frame
+                    .tasks
+                    .push(EvaluationTask::NullableWritableSharedReference(*left));
+            }
+            mir::WritableSharedReferenceExpression::CollectionIndex {
+                payload,
+                collection,
+                index,
+                remove,
+            } => {
+                let frame = self.current_frame_mut()?;
+                frame
+                    .tasks
+                    .push(EvaluationTask::CollectionIndexWritableShared {
+                        collection,
+                        payload,
+                        weak: false,
+                        nullable: false,
+                        transfer: remove,
+                    });
+                frame.tasks.push(EvaluationTask::Rvalue(*index));
+            }
+        }
+        Ok(())
+    }
+
+    fn expand_writable_weak_reference_expression(
+        &mut self,
+        expression: mir::WritableWeakReferenceExpression,
+    ) -> Result<(), InterpreterError> {
+        match expression {
+            mir::WritableWeakReferenceExpression::Local {
+                payload,
+                local,
+                transfer,
+            } => {
+                let value = self.read_or_take_local(local, transfer)?;
+                let LocalValue::WritableWeakReference {
+                    control,
+                    payload: actual,
+                } = value
+                else {
+                    return Err(InterpreterError::new(
+                        "writable weak expression read another local type",
+                    ));
+                };
+                if actual != payload {
+                    return Err(InterpreterError::new(
+                        "writable weak expression changed payload type",
+                    ));
+                }
+                self.current_frame_mut()?
+                    .values
+                    .push(EvaluationValue::WritableWeakReference { control, payload });
+            }
+            mir::WritableWeakReferenceExpression::NullableLocalAssumeNonNull {
+                payload,
+                local,
+                transfer,
+            } => {
+                let value = self.read_or_take_local(local, transfer)?;
+                let LocalValue::NullableWritableWeakReference {
+                    control,
+                    payload: actual,
+                } = value
+                else {
+                    return Err(InterpreterError::new(
+                        "nonnull writable weak expression read another local type",
+                    ));
+                };
+                if actual != payload {
+                    return Err(InterpreterError::new(
+                        "nonnull writable weak expression changed payload type",
+                    ));
+                }
+                let control = control.ok_or_else(|| {
+                    InterpreterError::new("nonnull writable weak expression received null")
+                })?;
+                self.current_frame_mut()?
+                    .values
+                    .push(EvaluationValue::WritableWeakReference { control, payload });
+            }
+            mir::WritableWeakReferenceExpression::Property {
+                payload,
+                object,
+                property,
+            } => {
+                let value = self.read_property(object, property)?;
+                let LocalValue::WritableWeakReference {
+                    control,
+                    payload: actual,
+                } = value
+                else {
+                    return Err(InterpreterError::new(
+                        "writable weak property read another value type",
+                    ));
+                };
+                if actual != payload {
+                    return Err(InterpreterError::new(
+                        "writable weak property changed payload type",
+                    ));
+                }
+                self.current_frame_mut()?
+                    .values
+                    .push(EvaluationValue::WritableWeakReference { control, payload });
+            }
+            mir::WritableWeakReferenceExpression::Call {
+                payload,
+                function,
+                args,
+                ..
+            } => self.queue_call(
+                function,
+                args,
+                ReturnExpectation::Value(mir::Type::WritableWeakReference(payload)),
+            )?,
+            mir::WritableWeakReferenceExpression::Create { payload, value } => {
+                let drop_receiver = value.owned_temporary();
+                let frame = self.current_frame_mut()?;
+                frame.tasks.push(EvaluationTask::FinishWritableWeakCreation(
+                    payload,
+                    drop_receiver,
+                ));
+                frame
+                    .tasks
+                    .push(EvaluationTask::WritableSharedReference(*value));
+            }
+            mir::WritableWeakReferenceExpression::Coalesce {
+                left,
+                right,
+                transfer,
+                ..
+            } => {
+                let left_owned = left.owned_temporary();
+                let frame = self.current_frame_mut()?;
+                frame.tasks.push(EvaluationTask::AfterWritableWeakCoalesce {
+                    right: *right,
+                    left_owned,
+                    transfer,
+                });
+                frame
+                    .tasks
+                    .push(EvaluationTask::NullableWritableWeakReference(*left));
+            }
+            mir::WritableWeakReferenceExpression::CollectionIndex {
+                payload,
+                collection,
+                index,
+                remove,
+            } => {
+                let frame = self.current_frame_mut()?;
+                frame
+                    .tasks
+                    .push(EvaluationTask::CollectionIndexWritableShared {
+                        collection,
+                        payload,
+                        weak: true,
+                        nullable: false,
+                        transfer: remove,
+                    });
+                frame.tasks.push(EvaluationTask::Rvalue(*index));
+            }
+        }
+        Ok(())
+    }
+
+    fn expand_nullable_writable_shared_reference_expression(
+        &mut self,
+        expression: mir::NullableWritableSharedReferenceExpression,
+    ) -> Result<(), InterpreterError> {
+        match expression {
+            mir::NullableWritableSharedReferenceExpression::Null(payload) => {
+                self.current_frame_mut()?.values.push(
+                    EvaluationValue::NullableWritableSharedReference {
+                        control: None,
+                        payload,
+                    },
+                );
+            }
+            mir::NullableWritableSharedReferenceExpression::Strong(value) => {
+                let payload = value.payload();
+                let frame = self.current_frame_mut()?;
+                frame
+                    .tasks
+                    .push(EvaluationTask::BuildNullableWritableSharedSome(payload));
+                frame
+                    .tasks
+                    .push(EvaluationTask::WritableSharedReference(value));
+            }
+            mir::NullableWritableSharedReferenceExpression::Local {
+                payload,
+                local,
+                transfer,
+            } => {
+                let value = self.read_or_take_local(local, transfer)?;
+                let LocalValue::NullableWritableSharedReference {
+                    control,
+                    payload: actual,
+                } = value
+                else {
+                    return Err(InterpreterError::new(
+                        "nullable writable shared expression read another local type",
+                    ));
+                };
+                if actual != payload {
+                    return Err(InterpreterError::new(
+                        "nullable writable shared expression changed payload type",
+                    ));
+                }
+                self.current_frame_mut()?
+                    .values
+                    .push(EvaluationValue::NullableWritableSharedReference { control, payload });
+            }
+            mir::NullableWritableSharedReferenceExpression::Property {
+                payload,
+                object,
+                property,
+            } => {
+                let value = self.read_property(object, property)?;
+                let LocalValue::NullableWritableSharedReference {
+                    control,
+                    payload: actual,
+                } = value
+                else {
+                    return Err(InterpreterError::new(
+                        "nullable writable shared property read another value type",
+                    ));
+                };
+                if actual != payload {
+                    return Err(InterpreterError::new(
+                        "nullable writable shared property changed payload type",
+                    ));
+                }
+                self.current_frame_mut()?
+                    .values
+                    .push(EvaluationValue::NullableWritableSharedReference { control, payload });
+            }
+            mir::NullableWritableSharedReferenceExpression::Call {
+                payload,
+                function,
+                args,
+                ..
+            } => self.queue_call(
+                function,
+                args,
+                ReturnExpectation::Value(mir::Type::NullableWritableSharedReference(payload)),
+            )?,
+            mir::NullableWritableSharedReferenceExpression::Acquire { payload, value } => {
+                let drop_receiver = value.owned_temporary();
+                let frame = self.current_frame_mut()?;
+                frame.tasks.push(EvaluationTask::FinishWritableWeakAcquire(
+                    payload,
+                    drop_receiver,
+                ));
+                frame
+                    .tasks
+                    .push(EvaluationTask::WritableWeakReference(*value));
+            }
+            mir::NullableWritableSharedReferenceExpression::NullSafeShare { payload, value } => {
+                let drop_receiver = value.owned_temporary();
+                let frame = self.current_frame_mut()?;
+                frame
+                    .tasks
+                    .push(EvaluationTask::FinishWritableNullSafeShare(
+                        payload,
+                        drop_receiver,
+                    ));
+                frame
+                    .tasks
+                    .push(EvaluationTask::NullableWritableSharedReference(*value));
+            }
+            mir::NullableWritableSharedReferenceExpression::NullSafeAcquire { payload, value } => {
+                let drop_receiver = value.owned_temporary();
+                let frame = self.current_frame_mut()?;
+                frame
+                    .tasks
+                    .push(EvaluationTask::FinishWritableNullSafeWeakAcquire(
+                        payload,
+                        drop_receiver,
+                    ));
+                frame
+                    .tasks
+                    .push(EvaluationTask::NullableWritableWeakReference(*value));
+            }
+            mir::NullableWritableSharedReferenceExpression::Coalesce {
+                left,
+                right,
+                transfer,
+                ..
+            } => {
+                let left_owned = left.owned_temporary();
+                let frame = self.current_frame_mut()?;
+                frame
+                    .tasks
+                    .push(EvaluationTask::AfterNullableWritableSharedCoalesce {
+                        right: *right,
+                        left_owned,
+                        transfer,
+                    });
+                frame
+                    .tasks
+                    .push(EvaluationTask::NullableWritableSharedReference(*left));
+            }
+            mir::NullableWritableSharedReferenceExpression::DictionaryGet {
+                payload,
+                collection,
+                key,
+                access,
+                stored_nullable,
+            } => {
+                let expected = if stored_nullable {
+                    mir::Type::NullableWritableSharedReference(payload)
+                } else {
+                    mir::Type::WritableSharedReference(payload)
+                };
+                let frame = self.current_frame_mut()?;
+                frame.tasks.push(EvaluationTask::DictionaryGet {
+                    collection,
+                    expected,
+                    access,
+                });
+                frame.tasks.push(EvaluationTask::Rvalue(*key));
+            }
+        }
+        Ok(())
+    }
+
+    fn expand_nullable_writable_weak_reference_expression(
+        &mut self,
+        expression: mir::NullableWritableWeakReferenceExpression,
+    ) -> Result<(), InterpreterError> {
+        match expression {
+            mir::NullableWritableWeakReferenceExpression::Null(payload) => {
+                self.current_frame_mut()?.values.push(
+                    EvaluationValue::NullableWritableWeakReference {
+                        control: None,
+                        payload,
+                    },
+                );
+            }
+            mir::NullableWritableWeakReferenceExpression::Weak(value) => {
+                let payload = value.payload();
+                let frame = self.current_frame_mut()?;
+                frame
+                    .tasks
+                    .push(EvaluationTask::BuildNullableWritableWeakSome(payload));
+                frame
+                    .tasks
+                    .push(EvaluationTask::WritableWeakReference(value));
+            }
+            mir::NullableWritableWeakReferenceExpression::Local {
+                payload,
+                local,
+                transfer,
+            } => {
+                let value = self.read_or_take_local(local, transfer)?;
+                let LocalValue::NullableWritableWeakReference {
+                    control,
+                    payload: actual,
+                } = value
+                else {
+                    return Err(InterpreterError::new(
+                        "nullable writable weak expression read another local type",
+                    ));
+                };
+                if actual != payload {
+                    return Err(InterpreterError::new(
+                        "nullable writable weak expression changed payload type",
+                    ));
+                }
+                self.current_frame_mut()?
+                    .values
+                    .push(EvaluationValue::NullableWritableWeakReference { control, payload });
+            }
+            mir::NullableWritableWeakReferenceExpression::Property {
+                payload,
+                object,
+                property,
+            } => {
+                let value = self.read_property(object, property)?;
+                let LocalValue::NullableWritableWeakReference {
+                    control,
+                    payload: actual,
+                } = value
+                else {
+                    return Err(InterpreterError::new(
+                        "nullable writable weak property read another value type",
+                    ));
+                };
+                if actual != payload {
+                    return Err(InterpreterError::new(
+                        "nullable writable weak property changed payload type",
+                    ));
+                }
+                self.current_frame_mut()?
+                    .values
+                    .push(EvaluationValue::NullableWritableWeakReference { control, payload });
+            }
+            mir::NullableWritableWeakReferenceExpression::Call {
+                payload,
+                function,
+                args,
+                ..
+            } => self.queue_call(
+                function,
+                args,
+                ReturnExpectation::Value(mir::Type::NullableWritableWeakReference(payload)),
+            )?,
+            mir::NullableWritableWeakReferenceExpression::NullSafeCreate { payload, value } => {
+                let drop_receiver = value.owned_temporary();
+                let frame = self.current_frame_mut()?;
+                frame
+                    .tasks
+                    .push(EvaluationTask::FinishWritableNullSafeWeakCreation(
+                        payload,
+                        drop_receiver,
+                    ));
+                frame
+                    .tasks
+                    .push(EvaluationTask::NullableWritableSharedReference(*value));
+            }
+            mir::NullableWritableWeakReferenceExpression::Coalesce {
+                left,
+                right,
+                transfer,
+                ..
+            } => {
+                let left_owned = left.owned_temporary();
+                let frame = self.current_frame_mut()?;
+                frame
+                    .tasks
+                    .push(EvaluationTask::AfterNullableWritableWeakCoalesce {
+                        right: *right,
+                        left_owned,
+                        transfer,
+                    });
+                frame
+                    .tasks
+                    .push(EvaluationTask::NullableWritableWeakReference(*left));
+            }
+            mir::NullableWritableWeakReferenceExpression::DictionaryGet {
+                payload,
+                collection,
+                key,
+                access,
+                stored_nullable,
+            } => {
+                let expected = if stored_nullable {
+                    mir::Type::NullableWritableWeakReference(payload)
+                } else {
+                    mir::Type::WritableWeakReference(payload)
+                };
+                let frame = self.current_frame_mut()?;
+                frame.tasks.push(EvaluationTask::DictionaryGet {
+                    collection,
+                    expected,
+                    access,
+                });
+                frame.tasks.push(EvaluationTask::Rvalue(*key));
+            }
+        }
+        Ok(())
+    }
+
+    fn expand_shared_reference_access_expression(
+        &mut self,
+        expression: mir::SharedReferenceAccessExpression,
+    ) -> Result<(), InterpreterError> {
+        match expression {
+            mir::SharedReferenceAccessExpression::Local {
+                payload,
+                local,
+                writable,
+                transfer,
+            } => {
+                let value = self.read_or_take_local(local, transfer)?;
+                let LocalValue::SharedReferenceAccess {
+                    control,
+                    payload: actual,
+                    writable: actual_writable,
+                } = value
+                else {
+                    return Err(InterpreterError::new(
+                        "shared access expression read another local type",
+                    ));
+                };
+                if actual != payload || actual_writable != writable {
+                    return Err(InterpreterError::new(
+                        "shared access expression changed access type",
+                    ));
+                }
+                self.current_frame_mut()?
+                    .values
+                    .push(EvaluationValue::SharedReferenceAccess {
+                        control,
+                        payload,
+                        writable,
+                    });
+            }
+            mir::SharedReferenceAccessExpression::Property {
+                payload,
+                object,
+                property,
+                writable,
+            } => {
+                let value = self.read_property(object, property)?;
+                let LocalValue::SharedReferenceAccess {
+                    control,
+                    payload: actual,
+                    writable: actual_writable,
+                } = value
+                else {
+                    return Err(InterpreterError::new(
+                        "shared access property read another value type",
+                    ));
+                };
+                if actual != payload || actual_writable != writable {
+                    return Err(InterpreterError::new(
+                        "shared access property changed access type",
+                    ));
+                }
+                self.current_frame_mut()?
+                    .values
+                    .push(EvaluationValue::SharedReferenceAccess {
+                        control,
+                        payload,
+                        writable,
+                    });
+            }
+            mir::SharedReferenceAccessExpression::CollectionIndex {
+                payload,
+                collection,
+                index,
+                writable,
+            } => {
+                let frame = self.current_frame_mut()?;
+                frame
+                    .tasks
+                    .push(EvaluationTask::CollectionIndexSharedAccess {
+                        collection,
+                        payload,
+                        writable,
+                    });
+                frame.tasks.push(EvaluationTask::Rvalue(*index));
+            }
+            mir::SharedReferenceAccessExpression::Call {
+                payload,
+                function,
+                args,
+                writable,
+                ..
+            } => {
+                let ty = if writable {
+                    mir::Type::WritableSharedReferenceAccess(payload)
+                } else {
+                    mir::Type::ReadonlySharedReferenceAccess(payload)
+                };
+                self.queue_call(function, args, ReturnExpectation::Value(ty))?;
+            }
+            mir::SharedReferenceAccessExpression::Acquire {
+                payload,
+                value,
+                writable,
+            } => {
+                let drop_receiver = value.owned_temporary();
+                let frame = self.current_frame_mut()?;
+                frame.tasks.push(EvaluationTask::FinishSharedAccessAcquire {
+                    payload,
+                    writable,
+                    drop_receiver,
+                });
+                frame
+                    .tasks
+                    .push(EvaluationTask::WritableSharedReference(*value));
+            }
+        }
+        Ok(())
+    }
+
     fn expand_collection_expression(
         &mut self,
         expression: mir::CollectionExpression,
@@ -4915,6 +6513,24 @@ impl Interpreter<'_> {
                 if value.ty != collection {
                     return Err(InterpreterError::new(
                         "MIR collection property has another collection type",
+                    ));
+                }
+                self.current_frame_mut()?
+                    .values
+                    .push(EvaluationValue::Collection(value));
+            }
+            mir::CollectionExpression::SharedAccessPayload {
+                collection, access, ..
+            } => {
+                let value = self.shared_access_payload(access)?;
+                let LocalValue::Collection(value) = value else {
+                    return Err(InterpreterError::new(
+                        "MIR shared access payload is not a collection",
+                    ));
+                };
+                if value.ty != collection {
+                    return Err(InterpreterError::new(
+                        "MIR shared access payload has another collection type",
                     ));
                 }
                 self.current_frame_mut()?
@@ -5374,33 +6990,7 @@ impl Interpreter<'_> {
                         local_value_type(&value)
                     )));
                 }
-                self.current_frame_mut()?.values.push(match value {
-                    LocalValue::Scalar(value) => EvaluationValue::Scalar(value),
-                    LocalValue::String(value) => EvaluationValue::String(value),
-                    LocalValue::Mixed(value) => EvaluationValue::Mixed(value),
-                    LocalValue::NullableScalar { ty, value } => {
-                        EvaluationValue::NullableScalar { ty, value }
-                    }
-                    LocalValue::NullableString(value) => EvaluationValue::NullableString(value),
-                    LocalValue::NullableMixed(value) => EvaluationValue::NullableMixed(value),
-                    LocalValue::Class { object, class } => EvaluationValue::Class { object, class },
-                    LocalValue::NullableClass { object, class } => {
-                        EvaluationValue::NullableClass { object, class }
-                    }
-                    LocalValue::SharedReference { control, class } => {
-                        EvaluationValue::SharedReference { control, class }
-                    }
-                    LocalValue::WeakReference { control, class } => {
-                        EvaluationValue::WeakReference { control, class }
-                    }
-                    LocalValue::NullableSharedReference { control, class } => {
-                        EvaluationValue::NullableSharedReference { control, class }
-                    }
-                    LocalValue::NullableWeakReference { control, class } => {
-                        EvaluationValue::NullableWeakReference { control, class }
-                    }
-                    LocalValue::Collection(value) => EvaluationValue::Collection(value),
-                });
+                self.push_local_value(value)?;
             }
             (ReturnExpectation::Discard(expected), FunctionOutcome::Value(value)) => {
                 if local_value_type(&value) != expected {
@@ -5477,6 +7067,27 @@ impl Interpreter<'_> {
                 EvaluationValue::NullableWeakReference { control, class } => {
                     Ok(LocalValue::NullableWeakReference { control, class })
                 }
+                EvaluationValue::WritableSharedReference { control, payload } => {
+                    Ok(LocalValue::WritableSharedReference { control, payload })
+                }
+                EvaluationValue::WritableWeakReference { control, payload } => {
+                    Ok(LocalValue::WritableWeakReference { control, payload })
+                }
+                EvaluationValue::NullableWritableSharedReference { control, payload } => {
+                    Ok(LocalValue::NullableWritableSharedReference { control, payload })
+                }
+                EvaluationValue::NullableWritableWeakReference { control, payload } => {
+                    Ok(LocalValue::NullableWritableWeakReference { control, payload })
+                }
+                EvaluationValue::SharedReferenceAccess {
+                    control,
+                    payload,
+                    writable,
+                } => Ok(LocalValue::SharedReferenceAccess {
+                    control,
+                    payload,
+                    writable,
+                }),
                 EvaluationValue::Collection(value) => Ok(LocalValue::Collection(value)),
             })
             .collect()
@@ -5511,7 +7122,12 @@ impl Interpreter<'_> {
             Some(EvaluationValue::SharedReference { .. })
             | Some(EvaluationValue::WeakReference { .. })
             | Some(EvaluationValue::NullableSharedReference { .. })
-            | Some(EvaluationValue::NullableWeakReference { .. }) => Err(InterpreterError::new(
+            | Some(EvaluationValue::NullableWeakReference { .. })
+            | Some(EvaluationValue::WritableSharedReference { .. })
+            | Some(EvaluationValue::WritableWeakReference { .. })
+            | Some(EvaluationValue::NullableWritableSharedReference { .. })
+            | Some(EvaluationValue::NullableWritableWeakReference { .. })
+            | Some(EvaluationValue::SharedReferenceAccess { .. }) => Err(InterpreterError::new(
                 "MIR scalar evaluation produced a shared handle",
             )),
             Some(EvaluationValue::Collection(_)) => Err(InterpreterError::new(
@@ -5552,7 +7168,12 @@ impl Interpreter<'_> {
             Some(EvaluationValue::SharedReference { .. })
             | Some(EvaluationValue::WeakReference { .. })
             | Some(EvaluationValue::NullableSharedReference { .. })
-            | Some(EvaluationValue::NullableWeakReference { .. }) => Err(InterpreterError::new(
+            | Some(EvaluationValue::NullableWeakReference { .. })
+            | Some(EvaluationValue::WritableSharedReference { .. })
+            | Some(EvaluationValue::WritableWeakReference { .. })
+            | Some(EvaluationValue::NullableWritableSharedReference { .. })
+            | Some(EvaluationValue::NullableWritableWeakReference { .. })
+            | Some(EvaluationValue::SharedReferenceAccess { .. }) => Err(InterpreterError::new(
                 "MIR string evaluation produced a shared handle",
             )),
             Some(EvaluationValue::Collection(_)) => Err(InterpreterError::new(
@@ -5693,6 +7314,70 @@ impl Interpreter<'_> {
         }
     }
 
+    fn pop_writable_shared_reference(
+        &mut self,
+    ) -> Result<(WritableSharedControl, mir::WritableSharedPayload), InterpreterError> {
+        match self.current_frame_mut()?.values.pop() {
+            Some(EvaluationValue::WritableSharedReference { control, payload }) => {
+                Ok((control, payload))
+            }
+            Some(_) => Err(InterpreterError::new(
+                "writable shared reference produced another value type",
+            )),
+            None => Err(InterpreterError::new(
+                "writable shared reference produced no value",
+            )),
+        }
+    }
+
+    fn pop_writable_weak_reference(
+        &mut self,
+    ) -> Result<(WritableSharedControl, mir::WritableSharedPayload), InterpreterError> {
+        match self.current_frame_mut()?.values.pop() {
+            Some(EvaluationValue::WritableWeakReference { control, payload }) => {
+                Ok((control, payload))
+            }
+            Some(_) => Err(InterpreterError::new(
+                "writable weak reference produced another value type",
+            )),
+            None => Err(InterpreterError::new(
+                "writable weak reference produced no value",
+            )),
+        }
+    }
+
+    fn pop_nullable_writable_shared_reference(
+        &mut self,
+    ) -> Result<(Option<WritableSharedControl>, mir::WritableSharedPayload), InterpreterError> {
+        match self.current_frame_mut()?.values.pop() {
+            Some(EvaluationValue::NullableWritableSharedReference { control, payload }) => {
+                Ok((control, payload))
+            }
+            Some(_) => Err(InterpreterError::new(
+                "nullable writable shared reference produced another value type",
+            )),
+            None => Err(InterpreterError::new(
+                "nullable writable shared reference produced no value",
+            )),
+        }
+    }
+
+    fn pop_nullable_writable_weak_reference(
+        &mut self,
+    ) -> Result<(Option<WritableSharedControl>, mir::WritableSharedPayload), InterpreterError> {
+        match self.current_frame_mut()?.values.pop() {
+            Some(EvaluationValue::NullableWritableWeakReference { control, payload }) => {
+                Ok((control, payload))
+            }
+            Some(_) => Err(InterpreterError::new(
+                "nullable writable weak reference produced another value type",
+            )),
+            None => Err(InterpreterError::new(
+                "nullable writable weak reference produced no value",
+            )),
+        }
+    }
+
     fn push_null(&mut self, ty: mir::Type) -> Result<(), InterpreterError> {
         match ty {
             mir::Type::NullableScalar(ty) => self.push_nullable_scalar(ty, None),
@@ -5715,6 +7400,24 @@ impl Interpreter<'_> {
                         control: None,
                         class,
                     });
+                Ok(())
+            }
+            mir::Type::NullableWritableSharedReference(payload) => {
+                self.current_frame_mut()?.values.push(
+                    EvaluationValue::NullableWritableSharedReference {
+                        control: None,
+                        payload,
+                    },
+                );
+                Ok(())
+            }
+            mir::Type::NullableWritableWeakReference(payload) => {
+                self.current_frame_mut()?.values.push(
+                    EvaluationValue::NullableWritableWeakReference {
+                        control: None,
+                        payload,
+                    },
+                );
                 Ok(())
             }
             _ => Err(InterpreterError::new(
@@ -5783,6 +7486,30 @@ impl Interpreter<'_> {
                     });
                 Ok(())
             }
+            (
+                mir::Type::NullableWritableSharedReference(expected),
+                LocalValue::WritableSharedReference { control, payload },
+            ) if expected == payload => {
+                self.current_frame_mut()?.values.push(
+                    EvaluationValue::NullableWritableSharedReference {
+                        control: Some(control),
+                        payload,
+                    },
+                );
+                Ok(())
+            }
+            (
+                mir::Type::NullableWritableWeakReference(expected),
+                LocalValue::WritableWeakReference { control, payload },
+            ) if expected == payload => {
+                self.current_frame_mut()?.values.push(
+                    EvaluationValue::NullableWritableWeakReference {
+                        control: Some(control),
+                        payload,
+                    },
+                );
+                Ok(())
+            }
             _ => Err(InterpreterError::new(
                 "cannot wrap value in requested nullable type",
             )),
@@ -5830,6 +7557,27 @@ impl Interpreter<'_> {
             Some(EvaluationValue::NullableWeakReference { control, class }) => {
                 Ok(LocalValue::NullableWeakReference { control, class })
             }
+            Some(EvaluationValue::WritableSharedReference { control, payload }) => {
+                Ok(LocalValue::WritableSharedReference { control, payload })
+            }
+            Some(EvaluationValue::WritableWeakReference { control, payload }) => {
+                Ok(LocalValue::WritableWeakReference { control, payload })
+            }
+            Some(EvaluationValue::NullableWritableSharedReference { control, payload }) => {
+                Ok(LocalValue::NullableWritableSharedReference { control, payload })
+            }
+            Some(EvaluationValue::NullableWritableWeakReference { control, payload }) => {
+                Ok(LocalValue::NullableWritableWeakReference { control, payload })
+            }
+            Some(EvaluationValue::SharedReferenceAccess {
+                control,
+                payload,
+                writable,
+            }) => Ok(LocalValue::SharedReferenceAccess {
+                control,
+                payload,
+                writable,
+            }),
             Some(EvaluationValue::Collection(value)) => Ok(LocalValue::Collection(value)),
             None => Err(InterpreterError::new("MIR evaluation produced no value")),
         }
@@ -5861,6 +7609,27 @@ impl Interpreter<'_> {
             LocalValue::NullableWeakReference { control, class } => {
                 EvaluationValue::NullableWeakReference { control, class }
             }
+            LocalValue::WritableSharedReference { control, payload } => {
+                EvaluationValue::WritableSharedReference { control, payload }
+            }
+            LocalValue::WritableWeakReference { control, payload } => {
+                EvaluationValue::WritableWeakReference { control, payload }
+            }
+            LocalValue::NullableWritableSharedReference { control, payload } => {
+                EvaluationValue::NullableWritableSharedReference { control, payload }
+            }
+            LocalValue::NullableWritableWeakReference { control, payload } => {
+                EvaluationValue::NullableWritableWeakReference { control, payload }
+            }
+            LocalValue::SharedReferenceAccess {
+                control,
+                payload,
+                writable,
+            } => EvaluationValue::SharedReferenceAccess {
+                control,
+                payload,
+                writable,
+            },
             LocalValue::Collection(value) => EvaluationValue::Collection(value),
         };
         self.current_frame_mut()?.values.push(value);
@@ -5965,7 +7734,12 @@ impl Interpreter<'_> {
                 LocalValue::SharedReference { .. }
                 | LocalValue::WeakReference { .. }
                 | LocalValue::NullableSharedReference { .. }
-                | LocalValue::NullableWeakReference { .. } => Err(InterpreterError::new(format!(
+                | LocalValue::NullableWeakReference { .. }
+                | LocalValue::WritableSharedReference { .. }
+                | LocalValue::WritableWeakReference { .. }
+                | LocalValue::NullableWritableSharedReference { .. }
+                | LocalValue::NullableWritableWeakReference { .. }
+                | LocalValue::SharedReferenceAccess { .. } => Err(InterpreterError::new(format!(
                     "MIR shared handle local local{} was used as a scalar value",
                     id.0
                 ))),
@@ -6223,6 +7997,66 @@ impl Interpreter<'_> {
         Ok(())
     }
 
+    fn drop_writable_shared_local(
+        &mut self,
+        local: mir::LocalId,
+        kind: WritableDropKind,
+    ) -> Result<(), InterpreterError> {
+        let Some(value) = self
+            .current_frame_mut()?
+            .locals
+            .get_mut(local.0)
+            .ok_or_else(|| {
+                InterpreterError::new(format!("MIR local local{} does not exist", local.0))
+            })?
+            .take()
+        else {
+            return Ok(());
+        };
+        let task = match (kind, value) {
+            (WritableDropKind::Strong, LocalValue::WritableSharedReference { control, .. })
+            | (
+                WritableDropKind::Strong,
+                LocalValue::NullableWritableSharedReference {
+                    control: Some(control),
+                    ..
+                },
+            ) => Some(EvaluationTask::ReleaseWritableShared(control)),
+            (
+                WritableDropKind::Strong,
+                LocalValue::NullableWritableSharedReference { control: None, .. },
+            ) => None,
+            (WritableDropKind::Weak, LocalValue::WritableWeakReference { control, .. })
+            | (
+                WritableDropKind::Weak,
+                LocalValue::NullableWritableWeakReference {
+                    control: Some(control),
+                    ..
+                },
+            ) => Some(EvaluationTask::ReleaseWritableWeak(control)),
+            (
+                WritableDropKind::Weak,
+                LocalValue::NullableWritableWeakReference { control: None, .. },
+            ) => None,
+            (
+                WritableDropKind::Access,
+                LocalValue::SharedReferenceAccess {
+                    control, writable, ..
+                },
+            ) => Some(EvaluationTask::ReleaseSharedAccess { control, writable }),
+            _ => {
+                return Err(InterpreterError::new(format!(
+                    "MIR writable shared drop local{} contained another value type",
+                    local.0
+                )))
+            }
+        };
+        if let Some(task) = task {
+            self.current_frame_mut()?.tasks.push(task);
+        }
+        Ok(())
+    }
+
     fn queue_object_drop(
         &mut self,
         object: usize,
@@ -6281,6 +8115,13 @@ impl Interpreter<'_> {
                 OwnedDrop::Class { object, class } => EvaluationTask::DropObject { object, class },
                 OwnedDrop::Shared(control) => EvaluationTask::ReleaseShared(control),
                 OwnedDrop::Weak(control) => EvaluationTask::ReleaseWeak(control),
+                OwnedDrop::WritableShared(control) => {
+                    EvaluationTask::ReleaseWritableShared(control)
+                }
+                OwnedDrop::WritableWeak(control) => EvaluationTask::ReleaseWritableWeak(control),
+                OwnedDrop::SharedAccess { control, writable } => {
+                    EvaluationTask::ReleaseSharedAccess { control, writable }
+                }
             });
         }
         Ok(())
@@ -6361,6 +8202,22 @@ impl Interpreter<'_> {
                 local.0
             ))),
         }
+    }
+
+    fn shared_access_payload(&self, local: mir::LocalId) -> Result<LocalValue, InterpreterError> {
+        let LocalValue::SharedReferenceAccess { control, .. } =
+            read_local(&self.current_frame()?.locals, local)?
+        else {
+            return Err(InterpreterError::new(format!(
+                "MIR local local{} is not a shared access object",
+                local.0
+            )));
+        };
+        control
+            .borrow()
+            .payload
+            .clone()
+            .ok_or_else(|| InterpreterError::new("shared access payload is no longer alive"))
     }
 
     fn byte_collection(&self, local: mir::LocalId) -> Result<Vec<u8>, InterpreterError> {
@@ -6538,6 +8395,11 @@ impl Interpreter<'_> {
             OwnedDrop::Class { object, class } => EvaluationTask::DropObject { object, class },
             OwnedDrop::Shared(control) => EvaluationTask::ReleaseShared(control),
             OwnedDrop::Weak(control) => EvaluationTask::ReleaseWeak(control),
+            OwnedDrop::WritableShared(control) => EvaluationTask::ReleaseWritableShared(control),
+            OwnedDrop::WritableWeak(control) => EvaluationTask::ReleaseWritableWeak(control),
+            OwnedDrop::SharedAccess { control, writable } => {
+                EvaluationTask::ReleaseSharedAccess { control, writable }
+            }
         });
         Ok(())
     }
@@ -6730,7 +8592,35 @@ fn local_value_type(value: &LocalValue) -> mir::Type {
             mir::Type::NullableSharedReference(*class)
         }
         LocalValue::NullableWeakReference { class, .. } => mir::Type::NullableWeakReference(*class),
+        LocalValue::WritableSharedReference { payload, .. } => {
+            mir::Type::WritableSharedReference(*payload)
+        }
+        LocalValue::WritableWeakReference { payload, .. } => {
+            mir::Type::WritableWeakReference(*payload)
+        }
+        LocalValue::NullableWritableSharedReference { payload, .. } => {
+            mir::Type::NullableWritableSharedReference(*payload)
+        }
+        LocalValue::NullableWritableWeakReference { payload, .. } => {
+            mir::Type::NullableWritableWeakReference(*payload)
+        }
+        LocalValue::SharedReferenceAccess {
+            payload, writable, ..
+        } => {
+            if *writable {
+                mir::Type::WritableSharedReferenceAccess(*payload)
+            } else {
+                mir::Type::ReadonlySharedReferenceAccess(*payload)
+            }
+        }
         LocalValue::Collection(value) => mir::Type::Collection(value.ty),
+    }
+}
+
+fn writable_payload_type(payload: mir::WritableSharedPayload) -> mir::Type {
+    match payload {
+        mir::WritableSharedPayload::Class(class) => mir::Type::Class(class),
+        mir::WritableSharedPayload::Collection(collection) => mir::Type::Collection(collection),
     }
 }
 
@@ -6742,6 +8632,12 @@ fn non_nullable_type(ty: mir::Type) -> Option<mir::Type> {
         mir::Type::NullableClass(class) => Some(mir::Type::Class(class)),
         mir::Type::NullableSharedReference(class) => Some(mir::Type::SharedReference(class)),
         mir::Type::NullableWeakReference(class) => Some(mir::Type::WeakReference(class)),
+        mir::Type::NullableWritableSharedReference(payload) => {
+            Some(mir::Type::WritableSharedReference(payload))
+        }
+        mir::Type::NullableWritableWeakReference(payload) => {
+            Some(mir::Type::WritableWeakReference(payload))
+        }
         mir::Type::Collection(_) => None,
         _ => None,
     }
@@ -6808,6 +8704,23 @@ fn collect_owned_objects_from_value(value: LocalValue, drops: &mut Vec<OwnedDrop
             control: Some(control),
             ..
         } => drops.push(OwnedDrop::Weak(control)),
+        LocalValue::WritableSharedReference { control, .. } => {
+            drops.push(OwnedDrop::WritableShared(control))
+        }
+        LocalValue::WritableWeakReference { control, .. } => {
+            drops.push(OwnedDrop::WritableWeak(control))
+        }
+        LocalValue::NullableWritableSharedReference {
+            control: Some(control),
+            ..
+        } => drops.push(OwnedDrop::WritableShared(control)),
+        LocalValue::NullableWritableWeakReference {
+            control: Some(control),
+            ..
+        } => drops.push(OwnedDrop::WritableWeak(control)),
+        LocalValue::SharedReferenceAccess {
+            control, writable, ..
+        } => drops.push(OwnedDrop::SharedAccess { control, writable }),
         LocalValue::Collection(collection) => {
             collect_owned_objects_from_collection(collection, drops)
         }
@@ -7042,6 +8955,38 @@ fn assign_local(
         (mir::Type::NullableWeakReference(expected), LocalValue::NullableWeakReference { class, .. }) if expected == *class
     ) || matches!(
         (definition.ty, &value),
+        (mir::Type::WritableSharedReference(expected), LocalValue::WritableSharedReference { payload, .. }) if expected == *payload
+    ) || matches!(
+        (definition.ty, &value),
+        (mir::Type::WritableWeakReference(expected), LocalValue::WritableWeakReference { payload, .. }) if expected == *payload
+    ) || matches!(
+        (definition.ty, &value),
+        (mir::Type::NullableWritableSharedReference(expected), LocalValue::NullableWritableSharedReference { payload, .. }) if expected == *payload
+    ) || matches!(
+        (definition.ty, &value),
+        (mir::Type::NullableWritableWeakReference(expected), LocalValue::NullableWritableWeakReference { payload, .. }) if expected == *payload
+    ) || matches!(
+        (definition.ty, &value),
+        (
+            mir::Type::ReadonlySharedReferenceAccess(expected),
+            LocalValue::SharedReferenceAccess {
+                payload,
+                writable: false,
+                ..
+            }
+        ) if expected == *payload
+    ) || matches!(
+        (definition.ty, &value),
+        (
+            mir::Type::WritableSharedReferenceAccess(expected),
+            LocalValue::SharedReferenceAccess {
+                payload,
+                writable: true,
+                ..
+            }
+        ) if expected == *payload
+    ) || matches!(
+        (definition.ty, &value),
         (mir::Type::Collection(expected), LocalValue::Collection(collection)) if expected == collection.ty
     );
     if !compatible {
@@ -7062,6 +9007,16 @@ fn assign_local(
             LocalValue::WeakReference { .. } => "weak reference",
             LocalValue::NullableSharedReference { .. } => "nullable shared reference",
             LocalValue::NullableWeakReference { .. } => "nullable weak reference",
+            LocalValue::WritableSharedReference { .. } => "writable shared reference",
+            LocalValue::WritableWeakReference { .. } => "writable weak reference",
+            LocalValue::NullableWritableSharedReference { .. } => {
+                "nullable writable shared reference"
+            }
+            LocalValue::NullableWritableWeakReference { .. } => "nullable writable weak reference",
+            LocalValue::SharedReferenceAccess {
+                writable: false, ..
+            } => "readonly shared access",
+            LocalValue::SharedReferenceAccess { writable: true, .. } => "writable shared access",
             LocalValue::Collection(_) => "collection",
         };
         return Err(InterpreterError::new(format!(

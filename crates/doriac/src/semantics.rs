@@ -9437,6 +9437,7 @@ impl<'program> Checker<'program> {
         method_context: Option<&MethodContext>,
     ) -> Option<TypeId> {
         let ty = self.infer_expr_type(object, scopes, method_context);
+        let ty = self.forwarded_access_payload_type(ty);
         let int = self.types.intern(TypeKind::Integer(IntegerType::Int64));
         let bool_ty = self.types.intern(TypeKind::Bool);
         match (self.types.kind(ty), property) {
@@ -9476,6 +9477,13 @@ impl<'program> Checker<'program> {
                 _ => None,
             },
             _ => None,
+        }
+    }
+
+    fn forwarded_access_payload_type(&self, ty: TypeId) -> TypeId {
+        match self.types.kind(ty) {
+            TypeKind::SharedHandle(kind, payload) if kind.is_access() => *payload,
+            _ => ty,
         }
     }
 
@@ -9836,6 +9844,7 @@ impl<'program> Checker<'program> {
         method_context: Option<&MethodContext>,
     ) -> Option<TypeId> {
         let ty = self.infer_expr_type(object, scopes, method_context);
+        let ty = self.forwarded_access_payload_type(ty);
         let void = self.types.intern(TypeKind::Void);
         let bool_ty = self.types.intern(TypeKind::Bool);
         match (self.types.kind(ty).clone(), method) {
@@ -9881,6 +9890,7 @@ impl<'program> Checker<'program> {
         method_context: Option<&MethodContext>,
     ) {
         let ty = self.infer_expr_type(object, scopes, method_context);
+        let ty = self.forwarded_access_payload_type(ty);
         let supported = matches!(
             (self.types.kind(ty), property),
             (TypeKind::TypedArray(_), "length")
@@ -9934,6 +9944,7 @@ impl<'program> Checker<'program> {
         method_context: Option<&MethodContext>,
     ) -> bool {
         let ty = self.infer_expr_type(object, scopes, method_context);
+        let ty = self.forwarded_access_payload_type(ty);
         let kind = self.types.kind(ty).clone();
         let is_collection = matches!(
             kind,

@@ -66,6 +66,86 @@ fn shared_validator_rejects_noncanonical_bool_operands() {
 }
 
 #[test]
+fn shared_validator_rejects_writable_access_projection_from_a_strong_handle() {
+    let source = r#"
+class Value
+{
+    writable int $number = 0;
+}
+
+function main(): void
+{
+    let $shared = new WritableSharedReference(new Value());
+    let writable $access = $shared->acquireWritableAccess();
+    $access->number = 1;
+}
+"#;
+    let mut program = doriac::lower_source_to_mir("malformed-writable-access.doria", source)
+        .expect("valid writable access should lower");
+    let main = program
+        .functions
+        .iter_mut()
+        .find(|function| function.name == "main")
+        .expect("main should exist");
+    let access = main
+        .locals
+        .iter()
+        .find(|local| local.name == "access")
+        .expect("access local should exist")
+        .id;
+    let payload = match main
+        .locals
+        .iter()
+        .find(|local| local.id == access)
+        .expect("access local should exist")
+        .ty
+    {
+        Type::WritableSharedReferenceAccess(payload) => payload,
+        other => panic!("expected writable access, got {other}"),
+    };
+    main.locals[access.0].ty = Type::WritableSharedReference(payload);
+
+    let error = doriac::mir_validation::validate_program(&program)
+        .expect_err("a strong handle cannot stand in for an access object");
+    assert!(error.message.contains("mismatched shared-handle rvalue"));
+}
+
+#[test]
+fn shared_validator_rejects_writable_operations_over_the_readonly_family() {
+    let source = r#"
+class Value {}
+
+function main(): void
+{
+    let $shared = new WritableSharedReference(new Value());
+    let $second = $shared->share();
+}
+"#;
+    let mut program = doriac::lower_source_to_mir("malformed-writable-family.doria", source)
+        .expect("valid writable sharing should lower");
+    let main = program
+        .functions
+        .iter_mut()
+        .find(|function| function.name == "main")
+        .expect("main should exist");
+    let strong = main
+        .locals
+        .iter()
+        .find(|local| local.name == "shared")
+        .expect("strong local should exist")
+        .id;
+    let class = match main.locals[strong.0].ty {
+        Type::WritableSharedReference(doriac::mir::WritableSharedPayload::Class(class)) => class,
+        other => panic!("expected writable class handle, got {other}"),
+    };
+    main.locals[strong.0].ty = Type::SharedReference(class);
+
+    let error = doriac::mir_validation::validate_program(&program)
+        .expect_err("writable retain must reject a readonly-family local");
+    assert!(error.message.contains("mismatched shared-handle rvalue"));
+}
+
+#[test]
 fn shared_validator_rejects_noncanonical_bytes_storage() {
     let mut program = valid_void_program();
     program.collection_types.push(CollectionType {
