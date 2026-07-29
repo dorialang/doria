@@ -23,6 +23,9 @@ if (!is_array($environment)) {
     $environment = [];
 }
 $environment['CLICOLOR_FORCE'] = '1';
+if (!isset($environment['CARGO_TARGET_DIR']) || $environment['CARGO_TARGET_DIR'] === '') {
+    $environment['CARGO_TARGET_DIR'] = development_target_directory($repositoryRoot);
+}
 
 $features = [];
 $llvmPrefix = detect_llvm18_prefix();
@@ -109,4 +112,24 @@ function llvm_config_is_18(string $prefix): bool
     proc_close($process);
 
     return str_starts_with(trim($version), '18');
+}
+
+function development_target_directory(string $repositoryRoot): string
+{
+    $home = getenv(PHP_OS_FAMILY === 'Windows' ? 'USERPROFILE' : 'HOME');
+    $home = is_string($home) && $home !== '' ? $home : sys_get_temp_dir();
+    $cacheRoot = match (PHP_OS_FAMILY) {
+        'Windows' => getenv('LOCALAPPDATA') ?: $home . DIRECTORY_SEPARATOR . 'AppData'
+            . DIRECTORY_SEPARATOR . 'Local',
+        'Darwin' => $home . DIRECTORY_SEPARATOR . 'Library' . DIRECTORY_SEPARATOR . 'Caches',
+        default => getenv('XDG_CACHE_HOME') ?: $home . DIRECTORY_SEPARATOR . '.cache',
+    };
+
+    return $cacheRoot
+        . DIRECTORY_SEPARATOR
+        . 'Doria'
+        . DIRECTORY_SEPARATOR
+        . 'source-launcher'
+        . DIRECTORY_SEPARATOR
+        . substr(hash('sha256', $repositoryRoot), 0, 16);
 }

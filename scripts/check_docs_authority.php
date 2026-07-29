@@ -650,6 +650,36 @@ if ($agents !== false && str_contains($agents, 'Every stage that activates synta
     $failures[] = "{$agentsPath}: contains stale in-repo LSP test ownership guidance";
 }
 
+// Delivered compiler work must refresh the installed compiler and language
+// server together. Keep this mechanical so a stale IDE cannot silently test a
+// different compiler commit from the one just delivered.
+$refreshPath = 'scripts/refresh_development_toolchain.php';
+$refresh = file_get_contents($root . '/' . $refreshPath);
+$launcherPath = 'bin/doriac';
+$launcher = file_get_contents($root . '/' . $launcherPath);
+if (
+    $agents === false
+    || !str_contains($agents, 'Installed tooling refresh (every delivered work unit)')
+    || !str_contains($agents, 'php scripts/refresh_development_toolchain.php')
+) {
+    $failures[] = "{$agentsPath}: missing the delivered-work-unit installed tooling refresh";
+}
+if (
+    $refresh === false
+    || !str_contains($refresh, "'compilerCommit'")
+    || !str_contains($refresh, "require_unshadowed('doriac'")
+    || !str_contains($refresh, "require_unshadowed('doria-lsp'")
+) {
+    $failures[] = "{$refreshPath}: must verify compiler/LSP identity and reject PATH shadowing";
+}
+if (
+    $launcher === false
+    || !str_contains($launcher, "\$environment['CARGO_TARGET_DIR']")
+    || !str_contains($launcher, 'development_target_directory')
+) {
+    $failures[] = "{$launcherPath}: source launcher must use an isolated Cargo target directory";
+}
+
 if ($failures !== []) {
     fwrite(STDERR, "docs authority check failed:\n");
     foreach ($failures as $failure) {

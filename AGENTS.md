@@ -112,6 +112,18 @@ The blast radius does not stop at this repository's edge. `../doria-language-ser
 
 Report the language-server work under its own heading, listing the pin revision, every string corrected, and every hover added. "No language-server impact" is a valid answer only when stated explicitly and checked.
 
+### Installed tooling refresh (every delivered work unit)
+
+A delivered stage, slice, or beat is not complete while developer-facing binaries still represent the previous compiler. After the compiler and coordinated language-server changes are committed and both worktrees are clean, run:
+
+```bash
+php scripts/refresh_development_toolchain.php --language-server ../doria-language-server
+```
+
+The refresh installs compiled `doriac` and `doria-lsp` artifacts into Cargo's platform-neutral install root, verifies that both embed the delivered compiler commit, and rejects `PATH` entries that shadow them. Editor clients and Baton must consume these installed artifacts (or explicit/bundled release artifacts), never an implicitly discovered workspace `target/debug` executable.
+
+`bin/doriac` remains an explicit from-source compiler-development launcher. It uses an isolated Cargo target directory and must never be linked, copied, or renamed into a machine-global `doriac`. On Windows, stop a running language-server process before refreshing if the OS prevents replacement of the installed executable; a failed replacement is a failed refresh, not permission to keep using the stale binary.
+
 Locally-correct fixes are this project's dominant defect source. Every recorded instance was caught late — by review or by acceptance testing — at the most expensive moment available.
 
 ## Verifying claims
