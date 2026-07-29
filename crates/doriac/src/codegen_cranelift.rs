@@ -29,8 +29,8 @@ use crate::native_abi::{
     MIXED_NEW_BORROWED, MIXED_PAYLOAD, MIXED_RELEASE_OWNED, MIXED_TAG, MIXED_TAG_BOOL,
     MIXED_TAG_CLASS, MIXED_TAG_FLOAT32, MIXED_TAG_FLOAT64, MIXED_TAG_INT16, MIXED_TAG_INT32,
     MIXED_TAG_INT64, MIXED_TAG_INT8, MIXED_TAG_STRING, MIXED_TAG_UINT16, MIXED_TAG_UINT32,
-    MIXED_TAG_UINT64, MIXED_TAG_UINT8, MIXED_TYPE_ID, NULLABLE_STRING_EQUAL, READ_FILE,
-    READ_FILE_BYTES, READ_STDIN_BYTES, READ_STDIN_LINE, SHARED_ACQUIRE, SHARED_CREATE,
+    MIXED_TAG_UINT64, MIXED_TAG_UINT8, MIXED_TYPE_ID, NULLABLE_STRING_EQUAL, PROCESS_EXIT,
+    READ_FILE, READ_FILE_BYTES, READ_STDIN_BYTES, READ_STDIN_LINE, SHARED_ACQUIRE, SHARED_CREATE,
     SHARED_CREATE_WEAK, SHARED_PAYLOAD, SHARED_RELEASE, SHARED_RELEASE_WEAK, SHARED_RETAIN,
     STRING_COMPARE, STRING_CONCAT, STRING_DATA, STRING_FROM_BOOL, STRING_FROM_F32, STRING_FROM_F64,
     STRING_FROM_I64, STRING_FROM_U64, STRING_FROM_UTF8, STRING_LENGTH, STRING_RELEASE,
@@ -1181,7 +1181,20 @@ fn define_process_main(
             builder.ins().call(runtime, &[entry_pointer])
         };
         let status = builder.inst_results(call)[0];
-        builder.ins().return_(&[status]);
+        if cfg!(windows) {
+            let mut exit_signature = module.make_signature();
+            exit_signature.params.push(AbiParam::new(types::I32));
+            let exit_id = module
+                .declare_function(PROCESS_EXIT, Linkage::Import, &exit_signature)
+                .map_err(|error| backend_failure(error.to_string()))?;
+            let exit = module.declare_func_in_func(exit_id, builder.func);
+            builder.ins().call(exit, &[status]);
+            builder
+                .ins()
+                .trap(TrapCode::unwrap_user(RUNTIME_RETURNED_TRAP));
+        } else {
+            builder.ins().return_(&[status]);
+        }
         builder.finalize(module.target_config());
     }
 

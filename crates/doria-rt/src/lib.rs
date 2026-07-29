@@ -1081,6 +1081,15 @@ pub unsafe extern "C" fn dr_v1_main_void(entry: DrMainVoidV1) -> i32 {
     0
 }
 
+/// Terminates a CRT-free native process with the supplied status.
+///
+/// Windows process wrappers call this instead of returning from the custom PE
+/// entrypoint. Unix process wrappers return through their C startup code.
+#[no_mangle]
+pub extern "C" fn dr_v1_exit_process(status: i32) -> ! {
+    unsafe { exit_process(status) }
+}
+
 /// Writes an exact byte sequence to stdout.
 ///
 /// A closed downstream pipe exits cleanly with status 0. Other write failures panic.

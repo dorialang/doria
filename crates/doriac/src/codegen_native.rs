@@ -161,8 +161,10 @@ fn linker_arguments(
 ) -> Vec<OsString> {
     if windows && ((msvc_host && !cc_is_set) || is_msvc_style_compiler_driver(linker)) {
         // Cranelift-generated objects do not carry MSVC /DEFAULTLIB directives.
-        // For the current generated process wrapper, make Doria's main the executable
-        // entrypoint instead of relying on CRT startup to discover and call it.
+        // Make Doria's process wrapper the executable entrypoint instead of
+        // relying on CRT startup. On normal completion the wrapper calls
+        // dr_v1_exit_process, so Windows does not rely on return-from-entrypoint
+        // behavior to preserve the Doria process status.
         // doria-rt owns the small MSVC support surface used by generated code,
         // including LLVM's x86-64 stack-probe helper, so no C runtime is linked.
         return vec![

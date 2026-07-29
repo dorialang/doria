@@ -3,6 +3,7 @@
 use crate::mir;
 
 pub const STRING_FROM_UTF8: &str = "dr_v1_string_from_utf8";
+pub const PROCESS_EXIT: &str = "dr_v1_exit_process";
 pub const STRING_RETAIN: &str = "dr_v1_string_retain";
 pub const STRING_RELEASE: &str = "dr_v1_string_release";
 pub const STRING_CONCAT: &str = "dr_v1_string_concat";
