@@ -1493,3 +1493,92 @@ fn writable_access_objects_flow_through_returns_properties_and_collection_slots(
             .expect("writable access storage fixture should lower through LLVM");
     }
 }
+
+#[test]
+fn property_rooted_collection_slots_accept_owned_values_and_replace_once() {
+    let source = r#"
+class Customer
+{
+    function __construct(string $name) {}
+    function __destruct() { echo "drop {$this->name}\n"; }
+}
+
+class Repository<T>
+{
+    internal writable Dictionary<string, T> $items = [];
+
+    writable function save(string $id, take T $item): void
+    {
+        $this->items[$id] = $item;
+    }
+}
+
+function main(): void
+{
+    let writable $repository = new Repository<Customer>();
+    $repository->save("42", new Customer("first"));
+    $repository->save("42", new Customer("second"));
+    echo "done\n";
+}
+"#;
+    let program = doriac::lower_source_to_mir("stage25a-indexed-property-move.doria", source)
+        .expect("an indexed slot write must not be treated as complete-property replacement");
+    let output = doriac::mir_interpreter::interpret(&program)
+        .expect("property-rooted collection replacement should execute");
+    assert_eq!(output.stdout, b"drop first\ndone\ndrop second\n");
+}
+
+#[test]
+fn property_rooted_collection_slots_consume_move_values() {
+    let diagnostics = doriac::check_source(
+        "stage25a-indexed-property-use-after-move.doria",
+        r#"
+class Customer { function __construct(string $name) {} }
+class Repository
+{
+    internal writable Dictionary<string, Customer> $items = [];
+    writable function save(string $id, take Customer $item): void
+    {
+        $this->items[$id] = $item;
+        echo $item->name;
+    }
+}
+"#,
+    )
+    .expect_err("the value stored in an owning slot must be moved");
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E0470"),
+        "{diagnostics:#?}"
+    );
+}
+
+#[test]
+fn indexed_slot_writes_require_a_writable_root_and_property_path() {
+    for source in [
+        r#"
+class Box
+{
+    writable List<int> $items = [1];
+}
+function update(Box $box): void { $box->items[0] = 2; }
+"#,
+        r#"
+class Box
+{
+    List<int> $items = [1];
+    writable function update(): void { $this->items[0] = 2; }
+}
+"#,
+    ] {
+        let diagnostics = doriac::check_source("stage25a-indexed-readonly-path.doria", source)
+            .expect_err("every segment of an indexed write path must be writable");
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| matches!(diagnostic.code, "E0201" | "E0202" | "E0479")),
+            "{diagnostics:#?}"
+        );
+    }
+}

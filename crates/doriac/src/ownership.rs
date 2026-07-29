@@ -1240,6 +1240,40 @@ impl Checker<'_> {
                         self.use_expr(&assignment.value, scopes, UseMode::Read);
                     }
                 } else {
+                    let indexed_slot = match ungroup_expr(&assignment.target) {
+                        Expr::Index { collection, .. } => {
+                            self.expr_collection_info(collection, scopes)
+                        }
+                        _ => None,
+                    };
+                    if let Some(slot) = indexed_slot {
+                        let borrowed_value = self.expr_returns_borrow(&assignment.value, scopes);
+                        if borrowed_value && slot.value_move && !slot.value_mixed {
+                            self.diagnostics.push(
+                                Diagnostic::new(
+                                    "E0478",
+                                    "borrowed result cannot be stored in an owning collection slot",
+                                    assignment.value.span(),
+                                )
+                                .with_help(
+                                    "store an independently owned value in the collection instead",
+                                ),
+                            );
+                        }
+                        self.use_assignment_operands_with_mode(
+                            &assignment.target,
+                            &assignment.value,
+                            scopes,
+                            if borrowed_value {
+                                UseMode::Read
+                            } else if slot.value_move || slot.value_mixed {
+                                UseMode::Give
+                            } else {
+                                UseMode::Read
+                            },
+                        );
+                        return Flow::fallthrough();
+                    }
                     let mixed_property = self
                         .assignment_property_info(&assignment.target, scopes)
                         .is_some_and(|property| property.mixed);
