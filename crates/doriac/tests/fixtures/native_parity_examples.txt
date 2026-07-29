@@ -136,6 +136,9 @@ examples/native/main_stage25a_writable_shared_collection.doria
 examples/native/main_stage25a_writable_shared_domains.doria
 examples/native/main_stage25a_writable_weak_reference.doria
 examples/native/main_stage25a_access_lifetime.doria
+examples/native/main_stage25a_generic_repository.doria
+examples/native/main_stage25a_lexical_block_cleanup.doria
+examples/native/main_stage25a_shared_playground.doria
 examples/native/main_stage25a_stored_access.doria
 examples/native/main_string_concat_hello.doria
 examples/native/main_string_comparison_42.doria

@@ -1,0 +1,43 @@
+class Settings
+{
+    function __construct(writable string $theme)
+    {
+    }
+}
+
+function main(): void
+{
+    let $settings =
+        new WritableSharedReference(
+            new Settings("light"),
+        );
+
+    let $toolbarSettings =
+        $settings->share();
+
+    {
+        let writable $access =
+            $settings->acquireWritableAccess();
+
+        $access->theme = "dark";
+    }
+
+    let $access =
+        $toolbarSettings->acquireReadonlyAccess();
+
+    echo "toolbar: {$access->theme}\n";
+
+    List<int> $initialScores = [8, 13, 21];
+
+    let $scores =
+        new WritableSharedReference(
+            $initialScores,
+        );
+
+    let writable $scoresAccess =
+        $scores->acquireWritableAccess();
+
+    $scoresAccess[0] = 10;
+
+    echo "first score: {$scoresAccess[0]}\n";
+}
