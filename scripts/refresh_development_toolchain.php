@@ -4,11 +4,14 @@
 declare(strict_types=1);
 
 $root = dirname(__DIR__);
-$languageServerRoot = dirname($root) . DIRECTORY_SEPARATOR . 'doria-language-server';
+$languageServerRoot = null;
 
 for ($index = 1; $index < count($argv); $index++) {
     if ($argv[$index] !== '--language-server') {
         fail("unknown option `{$argv[$index]}`");
+    }
+    if ($languageServerRoot !== null) {
+        fail('--language-server may only be specified once');
     }
     $index++;
     if (!isset($argv[$index]) || $argv[$index] === '') {
@@ -17,6 +20,13 @@ for ($index = 1; $index < count($argv); $index++) {
     $languageServerRoot = absolute_path($argv[$index], getcwd() ?: $root);
 }
 
+if ($languageServerRoot === null) {
+    fail(
+        "missing --language-server <path>\n\n"
+            . 'Repository layout is not inferred; provide the Doria language-server '
+            . 'repository used in this environment.'
+    );
+}
 $languageServerRoot = realpath($languageServerRoot) ?: $languageServerRoot;
 if (!is_file($languageServerRoot . DIRECTORY_SEPARATOR . 'scripts' . DIRECTORY_SEPARATOR . 'build.php')) {
     fail("Doria language-server repository not found at:\n    {$languageServerRoot}");

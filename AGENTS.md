@@ -36,7 +36,7 @@ The accepted project-tool name is Baton. Baton is the planned user-facing projec
 - `doria` is the compiler repository and the subject of these instructions.
 - `doria-website` is a separate repository. It hosts the documentation site and a playground that invokes `doriac` against user source, plus per-stage examples used for acceptance testing. Do not modify, clone, scaffold, or make assumptions about it from compiler work.
 - Playground acceptance testing has repeatedly found language-design gaps before implementation calcified them. When a compiler change alters an accepted surface, report it as an "Invalidated elsewhere" item so the website can follow. Do not schedule website work from a compiler prompt.
-- `doria-language-server` is a separate repository that is **in scope for compiler work**, unlike `doria-website`. It sits beside this one on disk (`../doria-language-server`) and pins `doriac` by git revision in its root `Cargo.toml`. Because it restates language facts in hover text, diagnostics, and highlighting, it goes stale the moment a stage lands — and a stale language server tells the user their valid code is wrong, which is worse than no language server. "Coordinate" in the rules below means **do the work in that repository in the same beat**, not mention it in a report. See "Language-server sweep".
+- `doria-language-server` is a separate repository that is **in scope for compiler work**, unlike `doria-website`, and pins `doriac` by git revision in its root `Cargo.toml`. Never infer where its checkout lives; developers and automation provide its path explicitly. Because it restates language facts in hover text, diagnostics, and highlighting, it goes stale the moment a stage lands — and a stale language server tells the user their valid code is wrong, which is worse than no language server. "Coordinate" in the rules below means **do the work in that repository in the same beat**, not mention it in a report. See "Language-server sweep".
 - Andrew is the language designer and sole developer. He reviews and approves before anything advances.
 
 ## Non-negotiable engineering guardrails
@@ -102,7 +102,7 @@ The procedure is deliberately mechanical, because judgment is what fails here. G
 
 ### Language-server sweep (every stage or slice that changes user-visible language)
 
-The blast radius does not stop at this repository's edge. `../doria-language-server` restates language facts and must be swept in the same beat, then reported as a distinct section. The sweep is:
+The blast radius does not stop at this repository's edge. The explicitly selected `dorialang/doria-language-server` checkout restates language facts and must be swept in the same beat, then reported as a distinct section. The sweep is:
 
 - **Bump the `doriac` pin** in `doria-language-server/Cargo.toml` (`rev = "…"`) to the compiler commit this work lands, and confirm the workspace still builds. A pin left on an older revision is drift by definition.
 - **Grep the hover/description tables** (`server/src/lib.rs`) for every fact the change touches, plus any claim that is now false regardless of whether this change caused it. Phrases scoped to a superseded stage — "this compiler currently supports…", "represents the EOF result of…", "alias" for a now-implemented type — are the signature of drift.
@@ -117,7 +117,8 @@ Report the language-server work under its own heading, listing the pin revision,
 A delivered stage, slice, or beat is not complete while developer-facing binaries still represent the previous compiler. After the compiler and coordinated language-server changes are committed and both worktrees are clean, run:
 
 ```bash
-php scripts/refresh_development_toolchain.php --language-server ../doria-language-server
+php scripts/refresh_development_toolchain.php \
+    --language-server /absolute/path/to/doria-language-server
 ```
 
 The refresh installs compiled `doriac` and `doria-lsp` artifacts into Cargo's platform-neutral install root, verifies that both embed the delivered compiler commit, and rejects `PATH` entries that shadow them. Editor clients and Baton must consume these installed artifacts (or explicit/bundled release artifacts), never an implicitly discovered workspace `target/debug` executable.
