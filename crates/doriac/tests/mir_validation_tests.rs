@@ -3020,7 +3020,7 @@ fn shared_validator_rejects_cleanup_and_assignment_of_borrowed_class_locals() {
         .expect_err("borrowed class slots cannot become owners through assignment");
     assert!(error
         .message
-        .contains("assignment targets borrowed local local0"));
+        .contains("borrowed class local0 receives an owning value"));
 }
 
 #[test]

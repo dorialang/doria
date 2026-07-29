@@ -344,13 +344,13 @@ fn validate_function(program: &mir::Program, function: &mir::Function) -> Result
         }
     }
     let (reachable, _) = reachable_blocks_and_predecessors(function, true)?;
-    validate_borrowed_user_locals(function, &reachable)?;
     for block in &function.blocks {
         for statement in &block.statements {
             validate_statement(program, function, statement)?;
         }
         validate_terminator(program, function, &block.terminator, reachable[block.id.0])?;
     }
+    validate_borrowed_user_locals(function, &reachable)?;
     validate_nullable_presence(program, function)?;
     validate_mixed_tag_proofs(program, function)?;
     validate_class_local_lifetimes(function)
@@ -363,22 +363,10 @@ fn validate_borrowed_user_locals(
     for local in function.locals.iter().filter(|local| {
         !local.owned
             && !local.synthetic
+            && !local.writable
             && !function.params.contains(&local.id)
-            && matches!(
-                local.ty,
-                mir::Type::Class(_)
-                    | mir::Type::NullableClass(_)
-                    | mir::Type::Collection(_)
-                    | mir::Type::Mixed
-                    | mir::Type::NullableMixed
-            )
+            && matches!(local.ty, mir::Type::Class(_) | mir::Type::NullableClass(_))
     }) {
-        if local.writable {
-            return Err(malformed_mir(format!(
-                "borrowed user local local{} cannot be writable",
-                local.id.0
-            )));
-        }
         let assignments = function
             .blocks
             .iter()
