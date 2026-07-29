@@ -192,6 +192,8 @@ Moving an access object transfers both the owning claim and the responsibility t
 release the registered access; the moved-from object is inert. Because access
 objects are storable, one parked in a long-lived structure holds its access open
 for that lifetime — deterministic and visible, and the caller's responsibility.
+Decision 0107's standalone lexical block is the ordinary source-level way to end
+that lifetime early without introducing a helper function.
 
 `ReadonlySharedReferenceAccess<T>` permits property reads, indexed reads, readonly
 method calls, and readonly iteration; it rejects writes, writable method calls,

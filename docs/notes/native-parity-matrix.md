@@ -36,6 +36,7 @@ Source of truth for sequencing remains `docs/doria-end-to-end-plan.md`. The dura
 | `if` / `else if` / `else` | Covered | Covered | Covered | Covered | Includes returning and fallthrough branches. |
 | `while` | Covered | Covered | Covered | Covered | MIR CFG backedges lower directly; long finite loops exceed the former interpreter budget. |
 | `break` / `continue` | Covered | Covered | Covered | Covered | Nested loop targets and loop-specific continue blocks are covered. |
+| Standalone lexical blocks | Covered | Covered | Covered | Covered | Nested scopes and shared-access boundaries clean up on fallthrough and every structured exit; panic remains abort-only. |
 | Traditional `for` | Covered | Covered | Covered | Covered | `continue` reaches the increment block. |
 | Integer range `foreach` | Covered | Covered | Covered | Covered | Inclusive/exclusive ranges and terminal overflow guards are covered. |
 | Top-level integer helpers | Covered | Covered | Covered | Covered | Parameters and returns preserve every declared width and signedness. |
@@ -58,9 +59,12 @@ Source of truth for sequencing remains `docs/doria-end-to-end-plan.md`. The dura
 | Constructor definite initialization | Covered | Covered | Covered | Covered | Decision 0090 merges reachable per-property states, excludes panic-only paths, and rejects incomplete normal exits before MIR execution. |
 | Conditional constructor execution | Covered | Covered | Covered | Covered | `main_stage21_conditional_constructor.doria` initializes multiple readonly properties on both branches and compares exact method/destructor output. |
 | Class-valued locals, calls, and returns | Covered | Covered | Covered | Covered | Pointer-sized values preserve owning transfers and inferred returned borrows through free-function ABI boundaries. |
+| Transitive returned collection borrows | Covered | Covered | Covered | Covered | Generic repository results preserve `$this` provenance through property projection and `Dictionary::get` without acquiring ownership. |
 | Readonly shared ownership | Covered | Covered | Covered | Covered | `SharedReference<T>`, `WeakReference<T>`, nullable acquisition, forwarding, generic/property/collection storage, and exact final-strong destruction use a separate non-atomic control block without changing class payload layout. |
+| Writable shared ownership and access | Covered | Covered | Covered | Covered | Class/collection/`Bytes` payloads, disjoint strong/weak families, owned access objects, conflict panics, forwarding, and deterministic access-before-strong release share one validated MIR/runtime contract. |
 | `take` ownership transfer | Covered | Covered | Covered | Covered | Transfer invalidates the caller slot and cleanup becomes the callee's obligation. |
 | Property loads and Stage 19 assignments | Covered | Covered | Covered | Covered | Shared class metadata supplies checked types and compiler-known offsets. |
+| Property-rooted indexed move-in | Covered | Covered | Covered | Covered | Writable paths mutate a contained collection slot, move the element once, and drop a replaced value without replacing the collection property. |
 | Deterministic class destruction | Covered | Covered | Covered | Covered | Lifecycle body runs first, owned properties drop in reverse order, allocation frees last. |
 | Structured-exit cleanup | Covered | Covered | Covered | Covered | Fallthrough, return, break, and continue drop still-owned locals; panic intentionally does not unwind. |
 | Statement class temporaries | Covered | Covered | Covered | Covered | Borrowed and transferred temporaries are released exactly once at their accepted ownership boundary. |

@@ -160,6 +160,22 @@ Doria does not add separate PHP-style `require`, `require_once`, or `include_onc
 
 `continue` jumps to the next iteration of the nearest enclosing loop. PHP-style numeric continue levels such as `continue 2;` are not accepted by the namespace/directive decision. Labeled continue may be evaluated later if needed.
 
+A bare braced block is a statement and creates a lexical scope:
+
+```doria
+{
+    let $value = createValue();
+    useValue($value);
+}
+```
+
+It may nest, produces no value, and requires no trailing semicolon. Bindings
+declared inside are unavailable after the closing brace. Still-owned values drop
+in reverse acquisition order on fallthrough, `return`, `break`, and `continue`;
+fatal panic remains abort-only and runs no cleanup. Borrow extent remains
+non-lexical under Decision 0089, so an ordinary borrow may end at its final use
+before the block closes. Doria does not use a `scope` keyword for lexical blocks.
+
 Traditional `for` loops are accepted for explicit counter/index iteration:
 
 ```doria
