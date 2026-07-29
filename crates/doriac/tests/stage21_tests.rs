@@ -206,6 +206,28 @@ function route(Guard $guard): void
 }
 
 #[test]
+fn borrowed_local_ends_at_its_final_use() {
+    doriac::check_source(
+        "stage21-borrowed-let-final-use.doria",
+        r#"
+class Guard
+{
+    function inspect(): self { return $this; }
+    writable function touch(): void {}
+}
+
+function route(writable Guard $guard): void
+{
+    let $alias = $guard->inspect();
+    $alias->inspect();
+    $guard->touch();
+}
+"#,
+    )
+    .expect("a borrowed local should stop blocking its owner after its final use");
+}
+
+#[test]
 fn property_assignment_holds_writable_access_while_evaluating_the_value() {
     assert_diagnostic(
         r#"

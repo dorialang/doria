@@ -167,6 +167,21 @@ impl Scopes {
         })
     }
 
+    fn release_unused_borrows(&mut self, remaining: &[Stmt], current_scope_only: bool) {
+        let start = if current_scope_only {
+            self.0.len().saturating_sub(1)
+        } else {
+            0
+        };
+        for scope in &mut self.0[start..] {
+            for (name, binding) in scope {
+                if binding.borrow_root.is_some() && !statements_use_variable(remaining, name) {
+                    binding.borrow_root = None;
+                }
+            }
+        }
+    }
+
     fn merge_from(&mut self, left: &Self, right: &Self) {
         for (index, scope) in self.0.iter_mut().enumerate() {
             for (name, binding) in scope {
@@ -1056,10 +1071,11 @@ impl Checker<'_> {
             scopes.push();
         }
         let mut flow = Flow::fallthrough();
-        for statement in &block.statements {
+        for (index, statement) in block.statements.iter().enumerate() {
             if !flow.falls_through {
                 break;
             }
+            scopes.release_unused_borrows(&block.statements[index..], nested);
             let statement_flow = self.check_statement(statement, scopes, return_move_type);
             flow.falls_through = statement_flow.falls_through;
             flow.backedges.extend(statement_flow.backedges);
@@ -3142,6 +3158,145 @@ fn display_borrow_root(root: &str) -> String {
     } else {
         format!("${root}")
     }
+}
+
+fn statements_use_variable(statements: &[Stmt], name: &str) -> bool {
+    statements
+        .iter()
+        .any(|statement| statement_uses_variable(statement, name))
+}
+
+fn statement_uses_variable(statement: &Stmt, name: &str) -> bool {
+    match statement {
+        Stmt::Block(block) => statements_use_variable(&block.statements, name),
+        Stmt::VarDecl(declaration) => expr_uses_variable(&declaration.initializer, name),
+        Stmt::Assignment(assignment) => {
+            expr_uses_variable(&assignment.target, name)
+                || expr_uses_variable(&assignment.value, name)
+        }
+        Stmt::Echo { expr, .. } | Stmt::Expr { expr, .. } => expr_uses_variable(expr, name),
+        Stmt::Return { expr, .. } => expr
+            .as_ref()
+            .is_some_and(|expr| expr_uses_variable(expr, name)),
+        Stmt::If(statement) => {
+            expr_uses_variable(&statement.condition, name)
+                || statements_use_variable(&statement.then_block.statements, name)
+                || statement
+                    .else_branch
+                    .as_ref()
+                    .is_some_and(|branch| match branch {
+                        ast::ElseBranch::If(statement) => {
+                            statement_uses_variable(&Stmt::If((**statement).clone()), name)
+                        }
+                        ast::ElseBranch::Block(block) => {
+                            statements_use_variable(&block.statements, name)
+                        }
+                    })
+        }
+        Stmt::While(statement) => {
+            expr_uses_variable(&statement.condition, name)
+                || statements_use_variable(&statement.body.statements, name)
+        }
+        Stmt::For(statement) => {
+            statement
+                .initializer
+                .as_ref()
+                .is_some_and(|initializer| for_initializer_uses_variable(initializer, name))
+                || statement
+                    .condition
+                    .as_ref()
+                    .is_some_and(|expr| expr_uses_variable(expr, name))
+                || statement
+                    .increment
+                    .as_ref()
+                    .is_some_and(|increment| for_increment_uses_variable(increment, name))
+                || statements_use_variable(&statement.body.statements, name)
+        }
+        Stmt::Break { .. } | Stmt::Continue { .. } => false,
+        Stmt::Foreach(statement) => {
+            expr_uses_variable(&statement.iterable, name)
+                || statements_use_variable(&statement.body.statements, name)
+        }
+        Stmt::Increment(statement) => expr_uses_variable(&statement.target, name),
+    }
+}
+
+fn for_initializer_uses_variable(initializer: &ast::ForInitializer, name: &str) -> bool {
+    match initializer {
+        ast::ForInitializer::VarDecl(declaration) => {
+            expr_uses_variable(&declaration.initializer, name)
+        }
+        ast::ForInitializer::Assignment(assignment) => {
+            expr_uses_variable(&assignment.target, name)
+                || expr_uses_variable(&assignment.value, name)
+        }
+    }
+}
+
+fn for_increment_uses_variable(increment: &ast::ForIncrement, name: &str) -> bool {
+    match increment {
+        ast::ForIncrement::Increment(increment) => expr_uses_variable(&increment.target, name),
+        ast::ForIncrement::Assignment(assignment) => {
+            expr_uses_variable(&assignment.target, name)
+                || expr_uses_variable(&assignment.value, name)
+        }
+    }
+}
+
+fn expr_uses_variable(expr: &Expr, name: &str) -> bool {
+    match expr {
+        Expr::Variable {
+            name: candidate, ..
+        } => candidate == name,
+        Expr::InterpolatedString { parts, .. } => parts.iter().any(|part| match part {
+            ast::InterpolatedStringPart::Text { .. } => false,
+            ast::InterpolatedStringPart::Expr(expr) => expr_uses_variable(expr, name),
+        }),
+        Expr::Array { elements, .. } => elements.iter().any(|element| {
+            element
+                .key
+                .as_ref()
+                .is_some_and(|key| expr_uses_variable(key, name))
+                || expr_uses_variable(&element.value, name)
+        }),
+        Expr::ArrayRepeat { value, count, .. } => {
+            expr_uses_variable(value, name) || expr_uses_variable(count, name)
+        }
+        Expr::Index {
+            collection, index, ..
+        } => expr_uses_variable(collection, name) || expr_uses_variable(index, name),
+        Expr::PropertyAccess { object, .. }
+        | Expr::MethodCall { object, .. }
+        | Expr::IsType { expr: object, .. }
+        | Expr::Grouped { expr: object, .. }
+        | Expr::Unary { expr: object, .. } => {
+            expr_uses_variable(object, name)
+                || matches!(expr, Expr::MethodCall { args, .. } if arguments_use_variable(args, name))
+        }
+        Expr::FunctionCall { args, .. }
+        | Expr::StaticCall { args, .. }
+        | Expr::New { args, .. } => arguments_use_variable(args, name),
+        Expr::Binary { left, right, .. }
+        | Expr::Range {
+            start: left,
+            end: right,
+            ..
+        } => expr_uses_variable(left, name) || expr_uses_variable(right, name),
+        Expr::This { .. }
+        | Expr::Identifier { .. }
+        | Expr::String { .. }
+        | Expr::Int { .. }
+        | Expr::Float { .. }
+        | Expr::Bool { .. }
+        | Expr::Null { .. }
+        | Expr::StaticMember { .. } => false,
+    }
+}
+
+fn arguments_use_variable(arguments: &[Argument], name: &str) -> bool {
+    arguments
+        .iter()
+        .any(|argument| expr_uses_variable(&argument.value, name))
 }
 
 fn type_ref_class_name(
