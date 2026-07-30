@@ -1,0 +1,113 @@
+class Item
+{
+    writable int $value = 1;
+
+    function __destruct()
+    {
+        echo "drop item\n";
+    }
+}
+
+function makeReadProperty(): ?ReadonlySharedReferenceAccess<Item>
+{
+    let $owner = new WritableSharedReference(new Item());
+    return $owner->acquireReadonlyAccess();
+}
+
+function makeWriteProperty(): ?WritableSharedReferenceAccess<Item>
+{
+    let $owner = new WritableSharedReference(new Item());
+    return $owner->acquireWritableAccess();
+}
+
+class AccessHolder
+{
+    writable ?ReadonlySharedReferenceAccess<Item> $read = makeReadProperty();
+    writable ?WritableSharedReferenceAccess<Item> $write = makeWriteProperty();
+
+    function inspect(): void
+    {
+        inspectRead($this->read);
+        inspectWrite($this->write);
+    }
+
+    writable function clear(): void
+    {
+        $this->read = null;
+        $this->write = null;
+    }
+}
+
+function inspectRead(?ReadonlySharedReferenceAccess<Item> $access): void
+{
+    if ($access != null) {
+        echo "property read {$access->value}\n";
+    }
+}
+
+function inspectWrite(?WritableSharedReferenceAccess<Item> $access): void
+{
+    if ($access != null) {
+        echo "property write {$access->value}\n";
+    }
+}
+
+function maybeRead(
+    ?WritableSharedReference<Item> $source,
+): ?ReadonlySharedReferenceAccess<Item> {
+    return $source?->acquireReadonlyAccess();
+}
+
+function maybeWrite(
+    ?WritableSharedReference<Item> $source,
+): ?WritableSharedReferenceAccess<Item> {
+    return $source?->acquireWritableAccess();
+}
+
+function reacquire(
+    ?WritableWeakReference<Item> $source,
+): ?WritableSharedReference<Item> {
+    return $source?->acquire();
+}
+
+function main(): void
+{
+    let writable $holder = new AccessHolder();
+    $holder->inspect();
+    $holder->clear();
+
+    echo "replacement released\n";
+
+    let $calledReadOwner = new WritableSharedReference(new Item());
+    let $calledRead = maybeRead($calledReadOwner);
+    if ($calledRead != null) {
+        echo "called read {$calledRead->value}\n";
+    }
+
+    let $calledWriteOwner = new WritableSharedReference(new Item());
+    let $calledWrite = maybeWrite($calledWriteOwner);
+    echo "called write\n";
+
+    let $weakOwner = new WritableSharedReference(new Item());
+    let $weak = $weakOwner->createWeakReference();
+    let $calledStrong = reacquire($weak);
+    echo "called strong\n";
+
+    let $listOwner = new WritableSharedReference(new Item());
+    let writable $reads = [$listOwner->acquireReadonlyAccess()];
+    let $removedRead = $reads->removeAt(0);
+    echo "removed read {$removedRead->value}\n";
+
+    let $writeListOwner = new WritableSharedReference(new Item());
+    let writable $writes = [$writeListOwner->acquireWritableAccess()];
+    let writable $removedWrite = $writes->removeAt(0);
+    $removedWrite->value = 4;
+    echo "removed write {$removedWrite->value}\n";
+
+    let $nullableListOwner = new WritableSharedReference(new Item());
+    let writable $nullableReads = [maybeRead($nullableListOwner)];
+    let $removedNullableRead = $nullableReads->removeAt(0);
+    if ($removedNullableRead != null) {
+        echo "removed nullable {$removedNullableRead->value}\n";
+    }
+}

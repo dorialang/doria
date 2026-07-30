@@ -8023,10 +8023,7 @@ fn collection_remove_at_rvalue(
         }
         mir::Type::NullableReadonlySharedReferenceAccess(payload)
         | mir::Type::NullableWritableSharedReferenceAccess(payload) => {
-            let writable = matches!(
-                ty,
-                mir::Type::NullableWritableSharedReferenceAccess(_)
-            );
+            let writable = matches!(ty, mir::Type::NullableWritableSharedReferenceAccess(_));
             Ok(mir::Rvalue::NullableSharedReferenceAccess(
                 mir::NullableSharedReferenceAccessExpression::CollectionIndex {
                     payload,
@@ -9670,9 +9667,7 @@ fn lower_nullable_writable_shared_reference_expression(
                 })
             } else {
                 Ok(mir::NullableWritableSharedReferenceExpression::Strong(
-                    lower_writable_shared_reference_expression(
-                        expr, expected, transfer, context,
-                    )?,
+                    lower_writable_shared_reference_expression(expr, expected, transfer, context)?,
                 ))
             }
         }
@@ -9762,6 +9757,13 @@ fn lower_nullable_writable_shared_reference_expression(
             span,
             ..
         } => {
+            if context.expression_type(expr)?
+                != mir::Type::NullableWritableSharedReference(expected)
+            {
+                return Ok(mir::NullableWritableSharedReferenceExpression::Strong(
+                    lower_writable_shared_reference_expression(expr, expected, transfer, context)?,
+                ));
+            }
             let (signature, args) =
                 lower_instance_method_call(object, method, args, *span, context)?;
             match signature.return_type {
@@ -9799,6 +9801,13 @@ fn lower_nullable_writable_shared_reference_expression(
             args,
             span,
         } => {
+            if context.expression_type(expr)?
+                != mir::Type::NullableWritableSharedReference(expected)
+            {
+                return Ok(mir::NullableWritableSharedReferenceExpression::Strong(
+                    lower_writable_shared_reference_expression(expr, expected, transfer, context)?,
+                ));
+            }
             let (signature, args) =
                 lower_static_method_call(class_name, method, args, *span, context)?;
             match signature.return_type {
@@ -9836,16 +9845,12 @@ fn lower_nullable_writable_shared_reference_expression(
             right,
             ..
         } => match context.coalesce_selection(left) {
-            CoalesceSelection::Left => {
-                lower_nullable_writable_shared_reference_expression(
-                    left, expected, transfer, context,
-                )
-            }
-            CoalesceSelection::Right => {
-                lower_nullable_writable_shared_reference_expression(
-                    right, expected, transfer, context,
-                )
-            }
+            CoalesceSelection::Left => lower_nullable_writable_shared_reference_expression(
+                left, expected, transfer, context,
+            ),
+            CoalesceSelection::Right => lower_nullable_writable_shared_reference_expression(
+                right, expected, transfer, context,
+            ),
             CoalesceSelection::Dynamic => {
                 Ok(mir::NullableWritableSharedReferenceExpression::Coalesce {
                     payload: expected,
@@ -9947,6 +9952,26 @@ fn lower_shared_reference_access_expression(
     transfer: bool,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::SharedReferenceAccessExpression> {
+    if let Some((collection, index, value_type)) = lower_list_remove_at(expr, context)? {
+        let expected_ty = if writable {
+            mir::Type::WritableSharedReferenceAccess(expected)
+        } else {
+            mir::Type::ReadonlySharedReferenceAccess(expected)
+        };
+        if value_type != expected_ty {
+            return Err(vec![unsupported(
+                expr.span(),
+                "List::removeAt result has another shared access type",
+            )]);
+        }
+        return Ok(mir::SharedReferenceAccessExpression::CollectionIndex {
+            payload: expected,
+            collection,
+            index: Box::new(index),
+            writable,
+            remove: true,
+        });
+    }
     match unparenthesized_place(expr) {
         hir::Expr::Variable { name, span } => {
             let local = context.lookup_local(name, *span)?;
@@ -10155,6 +10180,23 @@ fn lower_nullable_shared_reference_access_expression(
     } else {
         mir::Type::NullableReadonlySharedReferenceAccess(expected)
     };
+    if let Some((collection, index, value_type)) = lower_list_remove_at(expr, context)? {
+        if value_type != nullable_ty {
+            return Err(vec![unsupported(
+                expr.span(),
+                "List::removeAt result has another nullable shared access type",
+            )]);
+        }
+        return Ok(
+            mir::NullableSharedReferenceAccessExpression::CollectionIndex {
+                payload: expected,
+                collection,
+                index: Box::new(index),
+                writable,
+                remove: true,
+            },
+        );
+    }
     match unparenthesized_place(expr) {
         hir::Expr::Null { .. } => Ok(mir::NullableSharedReferenceAccessExpression::Null {
             payload: expected,

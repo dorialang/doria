@@ -1848,3 +1848,22 @@ function main(): void
     doriac::codegen_llvm::lower_mir_to_object(&program)
         .expect("reordered nullable access temporaries should lower through LLVM");
 }
+
+#[test]
+fn nullable_ownership_paths_preserve_transfer_and_cleanup() {
+    let source =
+        include_str!("../../../examples/native/main_stage25a_nullable_ownership_paths.doria");
+    let program = doriac::lower_source_to_mir("stage25a-nullable-ownership-paths.doria", source)
+        .expect("nullable ownership paths should lower");
+    let output = doriac::mir_interpreter::interpret(&program)
+        .expect("nullable ownership paths should execute with balanced cleanup");
+    assert_eq!(
+        output.stdout,
+        include_bytes!("fixtures/native_io/main_stage25a_nullable_ownership_paths/expected_stdout")
+    );
+    doriac::codegen_cranelift::lower_mir_to_object(&program)
+        .expect("nullable ownership paths should lower through Cranelift");
+    #[cfg(feature = "llvm-backend")]
+    doriac::codegen_llvm::lower_mir_to_object(&program)
+        .expect("nullable ownership paths should lower through LLVM");
+}
