@@ -63,4 +63,15 @@ impl SourceFile {
             .unwrap_or(self.text.len());
         self.text[start..end].trim_end_matches(['\n', '\r'])
     }
+
+    pub fn line_count(&self) -> usize {
+        self.line_starts.len()
+    }
+
+    pub fn line_start(&self, line: usize) -> usize {
+        self.line_starts
+            .get(line.saturating_sub(1))
+            .copied()
+            .unwrap_or(self.text.len())
+    }
 }
