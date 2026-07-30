@@ -89,6 +89,7 @@ enum CallExecution {
 
 #[derive(Debug, Clone)]
 struct Binding {
+    id: BindingId,
     class: Option<String>,
     collection: Option<CollectionInfo>,
     mixed: bool,
@@ -97,6 +98,9 @@ struct Binding {
     writable: bool,
     state: State,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct BindingId(usize);
 
 #[derive(Debug, Clone)]
 struct PropertyInfo {
@@ -387,6 +391,7 @@ pub(crate) fn check_program_with_inferred_move_returns(
         active_assignment_targets: HashSet::new(),
         active_borrows: Vec::new(),
         flow_facts,
+        next_binding_id: 0,
         diagnostics: Vec::new(),
     };
     let mut top_level_scopes = Scopes::new();
@@ -960,10 +965,17 @@ struct Checker<'a> {
     active_assignment_targets: HashSet<String>,
     active_borrows: Vec<ActiveBorrow>,
     flow_facts: &'a FactsByUse,
+    next_binding_id: usize,
     diagnostics: Vec<Diagnostic>,
 }
 
 impl Checker<'_> {
+    fn next_binding_id(&mut self) -> BindingId {
+        let id = BindingId(self.next_binding_id);
+        self.next_binding_id += 1;
+        id
+    }
+
     fn check_function(&mut self, function: &ast::FunctionDecl, receiver_class: Option<&str>) {
         let enclosing_type_params = receiver_class
             .and_then(|class| self.class_type_params.get(class))
@@ -1024,6 +1036,7 @@ impl Checker<'_> {
                 scopes.declare(
                     param.name.clone(),
                     Binding {
+                        id: self.next_binding_id(),
                         class,
                         collection: type_ref_collection_info(
                             &param.ty,
@@ -1179,6 +1192,7 @@ impl Checker<'_> {
                     scopes.declare(
                         decl.name.clone(),
                         Binding {
+                            id: self.next_binding_id(),
                             class,
                             collection: decl
                                 .ty
@@ -1591,7 +1605,7 @@ impl Checker<'_> {
         flow
     }
 
-    fn declare_foreach_binding(&self, binding: &ast::ForeachBinding, scopes: &mut Scopes) {
+    fn declare_foreach_binding(&mut self, binding: &ast::ForeachBinding, scopes: &mut Scopes) {
         let Some(ty) = &binding.ty else {
             return;
         };
@@ -1601,6 +1615,7 @@ impl Checker<'_> {
         scopes.declare(
             binding.name.clone(),
             Binding {
+                id: self.next_binding_id(),
                 class: type_ref_class_name(ty, &self.classes, self.receiver_class.as_deref()),
                 collection: type_ref_collection_info(
                     ty,
@@ -1755,8 +1770,10 @@ impl Checker<'_> {
     fn use_expr(&mut self, expr: &Expr, scopes: &mut Scopes, mode: UseMode) {
         match expr {
             Expr::Variable { name, span } => {
+                let root = scopes.get(name).map(|binding| binding_root(binding, name));
                 if matches!(mode, UseMode::Write | UseMode::Give) {
-                    if let Some(alias) = scopes.borrowed_from(name) {
+                    if let Some(alias) = root.as_deref().and_then(|root| scopes.borrowed_from(root))
+                    {
                         self.diagnostics.push(
                             Diagnostic::new(
                                 "E0477",
@@ -1771,13 +1788,16 @@ impl Checker<'_> {
                         );
                     }
                 }
-                if matches!(mode, UseMode::Read | UseMode::Write) {
-                    self.check_active_borrow_conflict(name, mode, *span);
-                } else if mode == UseMode::Give {
-                    self.check_give_against_active_borrows(name, *span);
+                if let Some(root) = root.as_deref() {
+                    if matches!(mode, UseMode::Read | UseMode::Write) {
+                        self.check_active_borrow_conflict(root, mode, *span);
+                    } else if mode == UseMode::Give {
+                        self.check_give_against_active_borrows(root, *span);
+                    }
                 }
-                if self.check_assignment_write_conflict(name, mode, *span) && mode == UseMode::Give
-                {
+                if root.as_deref().is_some_and(|root| {
+                    self.check_assignment_write_conflict(root, mode, *span) && mode == UseMode::Give
+                }) {
                     return;
                 }
                 let Some(binding) = scopes.get_mut(name) else {
@@ -2155,23 +2175,26 @@ impl Checker<'_> {
                     self.use_expr(arg, scopes, UseMode::Read);
                     continue;
                 }
-                if let Some(name) = ownership_root_name(arg).filter(|name| {
+                if let Some(root) = self.borrow_root_key(arg, scopes).filter(|root| {
                     self.active_borrows
                         .iter()
                         .skip(borrow_depth)
-                        .any(|borrow| borrow.root == *name)
+                        .any(|borrow| borrow.root == *root)
                 }) {
                     self.diagnostics.push(
                         Diagnostic::new(
                             "E0471",
-                            format!("`${name}` cannot be borrowed and given away in the same call"),
+                            format!(
+                                "`{}` cannot be borrowed and given away in the same call",
+                                display_borrow_root(&root)
+                            ),
                             arg.span(),
                         )
                         .with_help("pass distinct owners for borrowed and ownership-taking inputs"),
                     );
                 }
-                if let Some(name) = ownership_root_name(arg) {
-                    self.check_give_against_active_borrows(name, arg.span());
+                if let Some(root) = self.borrow_root_key(arg, scopes) {
+                    self.check_give_against_active_borrows(&root, arg.span());
                 }
             }
             self.use_expr(arg, scopes, mode);
@@ -2525,9 +2548,9 @@ impl Checker<'_> {
     fn borrow_root_key(&self, expr: &Expr, scopes: &Scopes) -> Option<String> {
         match expr {
             Expr::This { .. } if self.receiver_class.is_some() => Some("$this".to_string()),
-            Expr::Variable { name, .. } => scopes
-                .get(name)
-                .map(|binding| binding.borrow_root.clone().unwrap_or_else(|| name.clone())),
+            Expr::Variable { name, .. } => {
+                scopes.get(name).map(|binding| binding_root(binding, name))
+            }
             Expr::PropertyAccess { object, .. } | Expr::Grouped { expr: object, .. } => {
                 self.borrow_root_key(object, scopes)
             }
@@ -2581,7 +2604,9 @@ impl Checker<'_> {
     fn assignment_place_key(&self, expr: &Expr, scopes: &Scopes) -> Option<String> {
         match expr {
             Expr::This { .. } if self.receiver_class.is_some() => Some("$this".to_string()),
-            Expr::Variable { name, .. } if scopes.get(name).is_some() => Some(name.clone()),
+            Expr::Variable { name, .. } => scopes
+                .get(name)
+                .map(|binding| binding_identity_key(binding.id, name)),
             Expr::Grouped { expr, .. } => self.assignment_place_key(expr, scopes),
             Expr::PropertyAccess {
                 object, property, ..
@@ -3146,16 +3171,6 @@ fn variable_name(expr: &Expr) -> Option<&str> {
     }
 }
 
-fn ownership_root_name(expr: &Expr) -> Option<&str> {
-    match expr {
-        Expr::Variable { name, .. } => Some(name),
-        Expr::PropertyAccess { object, .. } | Expr::Grouped { expr: object, .. } => {
-            ownership_root_name(object)
-        }
-        _ => None,
-    }
-}
-
 fn borrow_modes_conflict(existing: UseMode, requested: UseMode) -> bool {
     matches!(
         (existing, requested),
@@ -3165,11 +3180,27 @@ fn borrow_modes_conflict(existing: UseMode, requested: UseMode) -> bool {
     )
 }
 
+fn binding_identity_key(id: BindingId, name: &str) -> String {
+    format!("binding:{}:{name}", id.0)
+}
+
+fn binding_root(binding: &Binding, name: &str) -> String {
+    binding
+        .borrow_root
+        .clone()
+        .unwrap_or_else(|| binding_identity_key(binding.id, name))
+}
+
 fn display_borrow_root(root: &str) -> String {
     if root == "$this" {
         root.to_string()
     } else if let Some(member) = root.strip_prefix("static:") {
         member.to_string()
+    } else if let Some(binding) = root
+        .strip_prefix("binding:")
+        .and_then(|root| root.split_once(':').map(|(_, binding)| binding))
+    {
+        format!("${binding}")
     } else {
         format!("${root}")
     }

@@ -1965,4 +1965,30 @@ function route(writable Guard $guard): void
 "#,
     )
     .expect("a nested shadow must end liveness of an inaccessible outer borrow");
+
+    doriac::check_source(
+        "stage25a-shadowed-owner-identity.doria",
+        r#"
+class Guard
+{
+    writable int $value = 0;
+    writable function mutate(): void { $this->value++; }
+}
+
+function identity(Guard $guard): Guard { return $guard; }
+function consume(take Guard $guard): void {}
+
+function route(writable Guard $guard): void
+{
+    let $alias = identity($guard);
+    {
+        let writable $guard = new Guard();
+        $guard->mutate();
+        consume($guard);
+        echo "{$alias->value}";
+    }
+}
+"#,
+    )
+    .expect("borrow conflicts must follow binding identity through nested shadows");
 }

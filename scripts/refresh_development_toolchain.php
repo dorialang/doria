@@ -44,6 +44,7 @@ $languageServer = $cargoRoot . DIRECTORY_SEPARATOR . 'bin' . DIRECTORY_SEPARATOR
     . $executableSuffix;
 
 $environment = current_environment();
+$environment['CARGO_INSTALL_ROOT'] = $cargoRoot;
 $environment['CARGO_TARGET_DIR'] = $cargoRoot
     . DIRECTORY_SEPARATOR
     . 'doria'
@@ -60,6 +61,8 @@ $installCompiler = [
     $root . DIRECTORY_SEPARATOR . 'crates' . DIRECTORY_SEPARATOR . 'doriac',
     '--locked',
     '--force',
+    '--root',
+    $cargoRoot,
 ];
 $llvmPrefix = detect_llvm18_prefix();
 if ($llvmPrefix !== null) {

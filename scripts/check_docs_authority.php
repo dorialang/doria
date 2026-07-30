@@ -668,10 +668,12 @@ if (
     $refresh === false
     || !str_contains($refresh, "'compilerCommit'")
     || !str_contains($refresh, 'missing --language-server <path>')
+    || !str_contains($refresh, "\$environment['CARGO_INSTALL_ROOT'] = \$cargoRoot;")
+    || !str_contains($refresh, "'--root'")
     || !str_contains($refresh, "require_unshadowed('doriac'")
     || !str_contains($refresh, "require_unshadowed('doria-lsp'")
 ) {
-    $failures[] = "{$refreshPath}: must require an explicit LSP path, verify identities, and reject PATH shadowing";
+    $failures[] = "{$refreshPath}: must require an explicit LSP path, use one explicit Cargo install root, verify identities, and reject PATH shadowing";
 }
 if (
     $refresh !== false
