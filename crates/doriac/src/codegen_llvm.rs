@@ -5157,14 +5157,18 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     Kind::LastIndexOfIgnoreCase => (STRING_LAST_INDEX_OF_IGNORE_CASE, true),
                     _ => unreachable!(),
                 };
-                let mut params = Vec::with_capacity(4);
+                let mut params: Vec<BasicMetadataTypeEnum<'ctx>> = Vec::with_capacity(4);
                 let mut values = Vec::with_capacity(4);
                 if with_frame {
                     params.push(pointer.into());
                     values.push(self.current_frame.into());
                 }
-                params.extend([pointer.into(), pointer.into(), pointer.into()]);
-                values.extend([argument(0)?.into(), argument(1)?.into(), found_slot.into()]);
+                params.push(pointer.into());
+                params.push(pointer.into());
+                params.push(pointer.into());
+                values.push(argument(0)?.into());
+                values.push(argument(1)?.into());
+                values.push(found_slot.into());
                 let payload = self
                     .call_runtime(name, &params, Some(i64_type.into()), &values)?
                     .ok_or_else(|| backend_failure("String search produced no result"))?;
