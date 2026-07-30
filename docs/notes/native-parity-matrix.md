@@ -84,6 +84,10 @@ Source of truth for sequencing remains `docs/doria-end-to-end-plan.md`. The dura
 | PHP `Displayable` subset | N/A | N/A | N/A | Covered | Generated private interface invokes Doria `toString` exactly once and never relies on `__toString`. |
 | Parser fuzzing | Frontend | Frontend | Frontend | Covered | Bounded CI fuzzing seeds nested strings, braces, malformed expressions, and UTF-8 offsets. |
 | String equality and ordering | Covered | Covered | Covered | Covered | Equality is exact-byte and ordering is unsigned byte-lexicographic. |
+| String intrinsic measurements and bytes | Covered | Covered | Covered | Covered | Grapheme length, UTF-8 byte length, empty test, copied `Bytes`, and UTF-8-validating `fromBytes` share one validated MIR/runtime contract. |
+| Unicode String transforms and predicates | Covered | Covered | Covered | Covered | Unicode whitespace, default and first-grapheme casing, full folding, and boundary-aligned case-sensitive/case-insensitive contains/starts/ends behavior use the shared Unicode implementation. |
+| Grapheme-indexed String search and transforms | Covered | Covered | Covered | Covered | Case-sensitive/case-insensitive search, non-overlapping occurrence counting, replacement, split/join, slice, repeat, and padding preserve exact stdout and returned values across all three paths. |
+| String intrinsic panic contracts | Covered | Covered | Covered | Covered | Negative slice/repeat/padding inputs and required empty padding preserve exact Title Case panic text and status 101. |
 | String echo in int-returning functions | Covered | Covered | Covered | Covered | Statement validity is independent of function return type. |
 | Short-circuit conditions with helper calls | Covered | Covered | Covered | Covered | `and`/`or` short-circuit; `xor` evaluates both in order. |
 | Process exit boundary | Covered | Covered | Covered | Covered | Only `main(): int` is restricted to `0..125`. |

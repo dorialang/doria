@@ -7,7 +7,8 @@ use doriac::mir::{
     NullableClassExpression, NullableSharedReferenceExpression, NullableStringExpression, Operand,
     Program, Property, PropertyValue, PropertyValueSource, ReturnType, Rvalue, ScalarType,
     ScalarValue, SharedReferenceExpression, Statement, StaticId, StaticProperty, StaticValue,
-    StringExpression, Terminator, Type, ValueExpression, WeakReferenceExpression,
+    StringExpression, StringIntrinsicCall, StringIntrinsicKind, Terminator, Type, ValueExpression,
+    WeakReferenceExpression,
 };
 use doriac::numeric::{FloatType, FloatValue, IntegerType, IntegerValue};
 
@@ -63,6 +64,193 @@ fn shared_validator_rejects_noncanonical_bool_operands() {
     assert!(error
         .message
         .contains("bool expression has an incompatible operand"));
+}
+
+#[test]
+fn shared_validator_rejects_malformed_string_intrinsic_signatures() {
+    let malformed = [
+        StringIntrinsicCall {
+            kind: StringIntrinsicKind::Trim,
+            args: vec![],
+            result: Type::String,
+            span: Default::default(),
+        },
+        StringIntrinsicCall {
+            kind: StringIntrinsicKind::Repeat,
+            args: vec![
+                Rvalue::String(StringExpression::Literal("x".to_string())),
+                Rvalue::String(StringExpression::Literal("2".to_string())),
+            ],
+            result: Type::String,
+            span: Default::default(),
+        },
+        StringIntrinsicCall {
+            kind: StringIntrinsicKind::Upper,
+            args: vec![Rvalue::String(StringExpression::Literal("x".to_string()))],
+            result: Type::Scalar(ScalarType::Bool),
+            span: Default::default(),
+        },
+        StringIntrinsicCall {
+            kind: StringIntrinsicKind::LowerFirst,
+            args: vec![Rvalue::String(StringExpression::Literal("x".to_string()))],
+            result: Type::Scalar(ScalarType::Bool),
+            span: Default::default(),
+        },
+        StringIntrinsicCall {
+            kind: StringIntrinsicKind::ContainsIgnoreCase,
+            args: vec![Rvalue::String(StringExpression::Literal("x".to_string()))],
+            result: Type::Scalar(ScalarType::Bool),
+            span: Default::default(),
+        },
+        StringIntrinsicCall {
+            kind: StringIntrinsicKind::IndexOfIgnoreCase,
+            args: vec![
+                Rvalue::String(StringExpression::Literal("x".to_string())),
+                Rvalue::String(StringExpression::Literal("x".to_string())),
+            ],
+            result: Type::String,
+            span: Default::default(),
+        },
+        StringIntrinsicCall {
+            kind: StringIntrinsicKind::CountOccurrences,
+            args: vec![
+                Rvalue::String(StringExpression::Literal("x".to_string())),
+                Rvalue::String(StringExpression::Literal("x".to_string())),
+            ],
+            result: Type::Scalar(ScalarType::Bool),
+            span: Default::default(),
+        },
+    ];
+
+    for call in malformed {
+        let mut program = valid_void_program();
+        program.functions[0].blocks[0]
+            .statements
+            .push(Statement::EchoString(StringExpression::Intrinsic(
+                Box::new(call),
+            )));
+        let error = doriac::mir_validation::validate_program(&program)
+            .expect_err("malformed String intrinsic signatures must be rejected");
+        assert!(error.message.contains("String "));
+    }
+}
+
+#[test]
+fn shared_validator_rejects_confused_string_intrinsic_collection_shapes() {
+    let mut program = valid_void_program();
+    program.collection_types.push(CollectionType {
+        id: CollectionTypeId(0),
+        kind: CollectionKind::List,
+        key: None,
+        value: Type::String,
+    });
+    program.functions[0].locals.push(Local {
+        id: LocalId(0),
+        name: "bytes".to_string(),
+        ty: Type::Collection(CollectionTypeId(0)),
+        writable: false,
+        synthetic: true,
+        owned: true,
+    });
+    program.functions[0].blocks[0].statements = vec![
+        Statement::AssignLocal {
+            target: LocalId(0),
+            value: Rvalue::Collection(CollectionExpression::StringIntrinsic(Box::new(
+                StringIntrinsicCall {
+                    kind: StringIntrinsicKind::ToBytes,
+                    args: vec![Rvalue::String(StringExpression::Literal("x".to_string()))],
+                    result: Type::Collection(CollectionTypeId(0)),
+                    span: Default::default(),
+                },
+            ))),
+        },
+        Statement::DropCollection {
+            local: LocalId(0),
+            collection: CollectionTypeId(0),
+        },
+    ];
+
+    let error = doriac::mir_validation::validate_program(&program)
+        .expect_err("String bytes must not masquerade as List<string>");
+    assert!(error.message.contains("wrong shape"));
+}
+
+#[test]
+fn shared_validator_rejects_wrong_nullable_string_intrinsic_representation() {
+    let mut program = valid_void_program();
+    program.functions[0].locals.push(Local {
+        id: LocalId(0),
+        name: "found".to_string(),
+        ty: Type::NullableString,
+        writable: false,
+        synthetic: true,
+        owned: true,
+    });
+    program.functions[0].blocks[0]
+        .statements
+        .push(Statement::AssignLocal {
+            target: LocalId(0),
+            value: Rvalue::NullableString(NullableStringExpression::Intrinsic(Box::new(
+                StringIntrinsicCall {
+                    kind: StringIntrinsicKind::IndexOf,
+                    args: vec![
+                        Rvalue::String(StringExpression::Literal("text".to_string())),
+                        Rvalue::String(StringExpression::Literal("needle".to_string())),
+                    ],
+                    result: Type::NullableString,
+                    span: Default::default(),
+                },
+            ))),
+        });
+
+    let error = doriac::mir_validation::validate_program(&program)
+        .expect_err("String search must use the nullable integer representation");
+    assert!(error.message.contains("expected ?int"));
+}
+
+#[test]
+fn shared_validator_rejects_consuming_string_intrinsic_collection_inputs() {
+    let mut program = valid_void_program();
+    program.collection_types.push(CollectionType {
+        id: CollectionTypeId(0),
+        kind: CollectionKind::List,
+        key: None,
+        value: Type::String,
+    });
+    program.functions[0].locals.push(Local {
+        id: LocalId(0),
+        name: "parts".to_string(),
+        ty: Type::Collection(CollectionTypeId(0)),
+        writable: false,
+        synthetic: false,
+        owned: true,
+    });
+    program.functions[0].blocks[0].statements = vec![
+        Statement::AssignLocal {
+            target: LocalId(0),
+            value: Rvalue::Collection(CollectionExpression::Literal {
+                collection: CollectionTypeId(0),
+                entries: vec![],
+            }),
+        },
+        Statement::EchoString(StringExpression::Intrinsic(Box::new(StringIntrinsicCall {
+            kind: StringIntrinsicKind::Join,
+            args: vec![
+                Rvalue::String(StringExpression::Literal(",".to_string())),
+                Rvalue::Collection(CollectionExpression::Local {
+                    collection: CollectionTypeId(0),
+                    local: LocalId(0),
+                    transfer: true,
+                }),
+            ],
+            result: Type::String,
+            span: Default::default(),
+        }))),
+    ];
+
+    let error = doriac::mir_validation::validate_program(&program)
+        .expect_err("String::join must borrow rather than consume List<string>");
+    assert!(error.message.contains("borrowed collection"));
 }
 
 #[test]

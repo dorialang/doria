@@ -1,0 +1,34 @@
+function main(): void
+{
+    let $family = "👨‍👩‍👧‍👦";
+    echo "length: {$family->length}\n";
+    echo "bytes: {$family->byteLength}\n";
+
+    let $text = "  Dória 👍🏾  ";
+    echo String::trim($text) . "\n";
+    echo String::upper("Straße") . "\n";
+    echo String::lowerFirst("DORIA") . "\n";
+    echo String::upperFirst("doria") . "\n";
+
+    echo String::startsWith("Doria", "Dor") . "\n";
+    echo String::indexOf("a👍🏾b", "👍🏾") ?? -1;
+    echo "\n";
+    echo String::containsIgnoreCase("Straße", "STRASSE") . "\n";
+    echo String::startsWithIgnoreCase("Dória", "DÓR") . "\n";
+    echo String::endsWithIgnoreCase("aStraße", "STRASSE") . "\n";
+    echo String::indexOfIgnoreCase("aStraße", "STRASSE") ?? -1;
+    echo "\n";
+    echo String::lastIndexOfIgnoreCase("Straße x STRASSE", "straße") ?? -1;
+    echo "\n";
+    echo String::countOccurrences("a👍🏾a👍🏾", "👍🏾") . "\n";
+
+    let $parts = String::split("one,two,three", ",");
+    echo String::join(" | ", $parts) . "\n";
+
+    echo String::slice("a👍🏾bc", 1, 2) . "\n";
+    echo String::padEnd("Doria", 8, ".") . "\n";
+
+    let $bytes = "Doria"->bytes;
+    echo String::fromBytes($bytes) ?? "invalid";
+    echo "\n";
+}
