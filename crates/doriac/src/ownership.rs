@@ -1860,7 +1860,7 @@ impl Checker<'_> {
                             )
                             .with_related(at, "Value Given Here")
                             .with_help(
-                                "Restructure the code so the final use happens before ownership is transferred.",
+                                "A value cannot be used afterward; make its final use happen before ownership is transferred.",
                             ),
                         );
                     }
