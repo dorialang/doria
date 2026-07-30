@@ -40,14 +40,18 @@ Documentation role: working note. This file prevents duplicated in-flight work. 
   `$string->` is reserved for intrinsic measurements and views; `String::` owns
   every string-specific operation; and the former public `str_*` family is
   removed. `length` is defined in Unicode grapheme units, while `byteLength`
-  reports UTF-8 bytes. This is settled authority only: the Minimum String
-  Runtime Surface is the next implementation beat, and current runtime
-  machinery has not been relabeled as that surface.
+  reports UTF-8 bytes.
+- The String API Completeness Audit Against PHP is implemented as a checked-in
+  181-row inventory covering the official core string, mbstring, and current
+  released grapheme capabilities. It changes no accepted API or compiler
+  behavior. Andrew's Decision 0103 Completeness Review is required before
+  runtime implementation resumes.
 - The durable manifest supports raw stdin, isolated seeded files, declared program arguments, and exact interpreter/Cranelift/LLVM stdout, stderr, status, generated-file, and class-lifetime comparison.
 
 ## Next
 
-- Minimum String Runtime Surface.
+- Decision 0103 Completeness Review.
+- Minimum String Runtime Surface is blocked pending that review.
 - Interactive Line-Input Amendment follows it.
 - Do not proceed directly to Stage 25a Slice 4.
 

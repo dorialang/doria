@@ -66,10 +66,17 @@ text views remain scheduled with the traversal surface. Integer indexing on
 
 ### The `String` companion
 
-Every operation whose meaning is specifically about strings belongs to the
-`String` companion. This includes transforms, trimming, casing, predicates,
-search, comparison, replacement, splitting, joining, slicing, padding,
-repetition, and explicit construction or validation.
+Every accepted operation whose meaning is specifically about strings belongs
+to the `String` companion. The families listed below establish the accepted
+boundary and seed surface. This operation list does not yet constitute a
+reviewed exhaustive v1 inventory.
+
+The [String API completeness audit](../notes/string-api-completeness-audit.md)
+accounts for PHP's core string, mbstring, and grapheme capabilities, identifies
+non-String owners, and presents proposed additions separately for designer
+review. None of those proposals expands this accepted list until this record is
+amended deliberately. The Minimum String Runtime Surface is blocked until that
+review is complete.
 
 #### Trimming and casing
 
@@ -274,12 +281,16 @@ make the rejected split permanent.
 
 - The prior three-spelling division in this record is superseded.
 - `$string->` owns only intrinsic measurements and views.
-- `String::` owns the complete string-specific vocabulary.
+- `String::` is the exclusive home for accepted string-specific vocabulary.
+- The operation list in this record is not an exhaustively reviewed v1
+  inventory; the completeness audit prepares that review without accepting its
+  proposals.
 - String-specific free functions and instance-method aliases are not Doria.
 - PHP migration tooling rewrites PHP spellings to companion calls while warning
   when grapheme-based Doria semantics differ from byte-based PHP behavior.
 - The Minimum String Runtime Surface selects and implements the first executable
-  subset. This decision does not implement any member or companion operation.
+  subset after the completeness review. This decision does not implement any
+  member or companion operation.
 
 ## Invalidated elsewhere
 

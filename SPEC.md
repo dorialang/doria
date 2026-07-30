@@ -509,8 +509,10 @@ bytes. Search indices, slicing, and padding lengths use grapheme units.
 `string` is not permitted. The canonical string-operation families are
 `String::trim`/`trimStart`/`trimEnd`, `lower`/`upper`, predicates and search,
 replacement, `split`/`join`, `slice`, `repeat`, padding, `fromBytes`, and
-comparison. Decision 0103 defines their complete planned contracts; the
-Minimum String Runtime Surface remains the next implementation beat.
+comparison. Decision 0103 defines the accepted boundary and seed surface; its
+operation list is not yet an exhaustively reviewed v1 inventory. The String API
+completeness audit prepares Andrew's required review, and the Minimum String
+Runtime Surface is blocked until that review is complete.
 
 ## 7. Basic type system
 

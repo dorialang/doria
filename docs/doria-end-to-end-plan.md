@@ -632,7 +632,7 @@ Rooted at the reserved `Doria\Std` namespace (the namespace-model decision); per
 
 `Doria\Std\Term` is **capability-based** on the crossterm model — raw mode, non-blocking input decoded to payload enums (`KeyEvent::Char(string $char)`, `KeyEvent::Up`, resize events), cursor positioning, styling/colour, screen size and clearing — with per-platform backends (Windows Console API / VT processing; Unix termios + escape emission) hidden behind the API. Raw ANSI is a Unix-backend implementation detail, never the public surface. The canonical high-level API is the **`Console` class** — a static facade so the user never checks what macOS/Linux/Windows supports — covering terminal info (size, interactivity, colour capability), screen (clear, title; alternate screen later), cursor (position, move, show/hide), styled output, and input (blocking `readKey`, non-blocking `pollKey`, resize events); the full method inventory is in the [reference](stdlib-reference.md) and settled in the Console/terminal decision (TermUtil as reference input; a source-derived mapping note accompanies this plan). Raw mode is entered through an ownership guard whose `__destruct` restores the terminal on every structured exit — RAII closing the classic wedged-terminal bug (an abort-only panic in raw mode runs no cleanup per record 0081; a panic-hook restoration is possible future work). `Console`'s design ancestor is the designer's TermUtil PHP library, improved upon, not copied (TermUtil is ANSI-powered by definition; `Console` is capability-based by definition). Two binding constraints from that source review: **no `Doria\Std\Term` public type may carry escape sequences or platform encodings** in its values or API (TermUtil's `Color` enum was ANSI-backed — the exact pattern that made it unportable; Doria's `Color` means colours, and each backend renders them), and the terminal is **stateless** — there is no separate `ScreenBuffer` std type; a diffing/back-buffer renderer is userland (the ported engines are the widget layer, per §14), not a std primitive. The `Console` name is reserved in the stdlib namespace from now.
 
-**Formatted I/O — the v1.0 minimal set (record 0074).** Doria ships a deliberately small, PHP-familiar formatted-I/O surface in the free-function layer; the broader PHP string-function catalogue (php.net's `ref.strings`) is a post-1.0 expansion, imported case by case under the §9.1 charter with regularized names, never wholesale.
+**Formatted I/O — the v1.0 minimal set (record 0074).** Doria ships a deliberately small, PHP-familiar formatted-I/O surface in the free-function layer. PHP's broader text-processing catalogues are comparison inventories, not a surface to import wholesale: the String API completeness audit classifies every core string, mbstring, and grapheme entry by its Doria owner, while Andrew's Decision 0103 completeness review decides which genuinely core omissions belong in v1.
 
 - **`sprintf` and `printf`** are compiler-known functions whose first parameter is a literal `string $format`; the remaining operands are typed and checked against that format rather than declared through an untyped userland variadic parameter. `sprintf` returns `string` and `printf` returns `void`. The compiler verifies specifier/argument count and types — `%d` against a non-integer is a compile error, not a runtime surprise. This is Rust's checked-`format!` guarantee delivered through a PHP spelling, and it is the reason format strings are safe to have at all in a language with Doria's discipline. v1.0 specifier subset: `%s` (any display-convertible value, §4.6), `%d` (int/uint family), `%f` with `%.Nf` precision (float family), `%x`/`%X`/`%o`/`%b` (integer bases), width / `-` left-align / `0` zero-pad flags, and `%%`. Everything else (`%e`, `%g`, positional `%1$s`, dynamic format strings) is deferred with a specifier-not-supported diagnostic. `printf` returns `void` — PHP's returns-byte-count behavior is dropped as charter noise.
 - **`read_line(): ?string`** reads one line from stdin, strips the trailing newline, and returns `null` at EOF (never PHP's `false`). v1.0 takes no prompt argument; print prompts with `echo`. Richer stdin APIs live on the post-Stage-29 `Doria\Std\Io` stream types. The free-function family is charter-uniform verb_noun throughout: `read_line`, `read_file`, `write_file`, `append_file`, `write_stderr` — **not** PHP's `readline`, which is a `strlen`-style fusion (and, fittingly, ships from ext/readline, absent on Windows PHP — the exact gap Doria closes). `append_file` is specified now and implemented in Stage 23 Slice 2; it does not change truncate-only `write_file`. `sprintf`/`printf` are *not* counterexamples: they are whitelisted as industry-universal single lexemes (C, PHP, Go, Java all spell them this way), the same whitelist tier as `id` and `json`; `readline` has no such cross-language standing and does not qualify.
@@ -918,15 +918,24 @@ AC: legal/illegal borrow and ctor fixture matrix; borrow-conflict diagnostic sna
   internal-error envelope; the language server and website consume the same
   structure. This checkpoint does not complete Stage 25a Slice 4.
 - **String API Decision Amendment — Implemented.** Decision 0103 now establishes
-  one complete canonical boundary: `$string->` owns intrinsic measurements and
+  one canonical boundary: `$string->` owns intrinsic measurements and
   views, `String::` owns all string-specific operations, and capabilities
   without a natural type owner may remain free functions. The public `str_*`
   family and `$string->chars` are removed; `length` is grapheme-counted and
   `byteLength` is explicit. This is an authority change only and does not claim
   runtime support.
-- **Minimum String Runtime Surface — Next.** Select and implement the first
-  executable subset of Decision 0103 across shared MIR, interpreter, Cranelift,
-  LLVM, diagnostics, tests, and coordinated tooling.
+- **String API Completeness Audit Against PHP — Implemented.** The checked-in
+  offline inventory classifies every official PHP core string, mbstring, and
+  grapheme capability as String, Bytes, another domain, derivable, deferred,
+  rejected, not applicable, or an unresolved design fork. It proposes no API
+  silently and changes no compiler behavior.
+- **Decision 0103 Completeness Review — Required.** Andrew reviews the audit's
+  compact decision table and deliberately accepts, rejects, or defers each
+  proposed addition before the accepted String surface expands.
+- **Minimum String Runtime Surface — Blocked Pending Review.** After the
+  completeness review, select and implement the first executable subset of
+  Decision 0103 across shared MIR, interpreter, Cranelift, LLVM, diagnostics,
+  tests, and coordinated tooling.
 - **Interactive Line-Input Amendment — Pending.** This follows the Minimum
   String Runtime Surface and precedes Stage 25a Slice 4.
 - **Stage 26 — Remaining collection family.** Stage 23 ships Decision 0100's default `List`/`Dictionary`/`Set`/`T[]` surface. Stage 26 adds the authored non-closure surface with `SortedDictionary`, `SortedSet`, `PriorityQueue`, and `Deque`; `map`/`filter`/`reduce` remain Stage 30 because they require closures. Before Stage 31 include/multi-file support, required stdlib fragments are compiler-bundled or prelude-style rather than source-included. AC: the remaining non-closure collection family compiles and runs from the compiler-provided stdlib surface.

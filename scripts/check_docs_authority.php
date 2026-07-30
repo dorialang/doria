@@ -2,6 +2,10 @@
 
 declare(strict_types=1);
 
+(static function (): void {
+    require __DIR__ . '/check_string_api_completeness.php';
+})();
+
 $root = dirname(__DIR__);
 $failures = [];
 
@@ -670,7 +674,9 @@ if ($namingAuthority !== false) {
 
     foreach ([
         'String API Decision Amendment — Implemented',
-        'Minimum String Runtime Surface — Next',
+        'String API Completeness Audit Against PHP — Implemented',
+        'Decision 0103 Completeness Review — Required',
+        'Minimum String Runtime Surface — Blocked Pending Review',
         'Interactive Line-Input Amendment — Pending',
     ] as $guidance) {
         if (!str_contains($namingAuthority, $guidance)) {
@@ -681,9 +687,11 @@ if ($namingAuthority !== false) {
     if (
         $pipeline === false
         || !str_contains($pipeline, 'The String API Decision Amendment is implemented')
+        || !str_contains($pipeline, 'The String API Completeness Audit Against PHP is implemented')
+        || !str_contains($pipeline, 'Minimum String Runtime Surface is blocked pending that review')
         || !str_contains($pipeline, 'Stage 25a remains incomplete until Slice 4')
     ) {
-        $failures[] = "{$pipelinePath}: must keep the String amendment implemented, the runtime surface next, and Stage 25a incomplete";
+        $failures[] = "{$pipelinePath}: must keep the String amendment and audit implemented, the runtime surface blocked for review, and Stage 25a incomplete";
     }
 
     if (
@@ -801,6 +809,48 @@ if ($namingAuthority !== false) {
 
 if ($agents !== false && str_contains($agents, 'Every stage that activates syntax ships an LSP no-false-diagnostics test')) {
     $failures[] = "{$agentsPath}: contains stale in-repo LSP test ownership guidance";
+}
+
+// The String completeness audit is a checked-in, offline decision gate. Keep
+// its human artifact, machine inventory, guard, and plan status together so a
+// later wording edit cannot silently unblock runtime implementation.
+$stringAuditPath = 'docs/notes/string-api-completeness-audit.md';
+$stringInventoryPath = 'docs/notes/php-string-capability-inventory.json';
+$stringGuardPath = 'scripts/check_string_api_completeness.php';
+$stringAudit = file_get_contents($root . '/' . $stringAuditPath);
+$stringInventory = file_get_contents($root . '/' . $stringInventoryPath);
+$stringGuard = file_get_contents($root . '/' . $stringGuardPath);
+if (
+    $stringAudit === false
+    || !str_contains($stringAudit, '## Designer Review')
+    || !str_contains($stringAudit, '## Invalidated Elsewhere')
+    || !str_contains($stringAudit, 'Andrew reviews the designer-review table')
+) {
+    $failures[] = "{$stringAuditPath}: missing the designer review, blast-radius, or next-action contract";
+}
+if (
+    $stringInventory === false
+    || !str_contains($stringInventory, '"phpSurface"')
+    || !str_contains($stringInventory, '"doriaClassification"')
+    || !str_contains($stringInventory, '"migrationAction"')
+) {
+    $failures[] = "{$stringInventoryPath}: missing the machine-checkable capability inventory";
+}
+if (
+    $stringGuard === false
+    || !str_contains($stringGuard, 'expectedNames')
+    || !str_contains($stringGuard, 'duplicate capability row')
+    || !str_contains($stringGuard, 'Minimum String Runtime Surface — Blocked Pending Review')
+) {
+    $failures[] = "{$stringGuardPath}: must verify exact catalogue coverage, duplicates, and the runtime block";
+}
+if (
+    $namingAuthority === false
+    || !str_contains($namingAuthority, 'String API Completeness Audit Against PHP — Implemented')
+    || !str_contains($namingAuthority, 'Decision 0103 Completeness Review — Required')
+    || !str_contains($namingAuthority, 'Minimum String Runtime Surface — Blocked Pending Review')
+) {
+    $failures[] = "{$namingAuthorityPath}: missing the String audit and review sequence";
 }
 
 // Delivered compiler work must refresh the installed compiler and language
