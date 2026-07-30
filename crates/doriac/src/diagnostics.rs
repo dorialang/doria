@@ -650,7 +650,12 @@ fn render_human(
             block.push_str("\nCaused By: ");
             block.push_str(cause);
         }
-        if diagnostic.kind == DiagnosticKind::InternalCompiler {
+        if matches!(
+            diagnostic.kind,
+            DiagnosticKind::Backend
+                | DiagnosticKind::ExternalTool
+                | DiagnosticKind::InternalCompiler
+        ) {
             if let Some(details) = &diagnostic.developer_details {
                 block.push_str("\nNote: developer details are available in JSON diagnostics.");
                 if std::env::var_os("DORIA_DIAGNOSTIC_DEBUG").is_some() {
@@ -1121,29 +1126,7 @@ fn to_title_case(message: &str) -> String {
             let Some(first) = characters.next() else {
                 return word.to_string();
             };
-            let minor = matches!(
-                rest.trim_end(),
-                "a" | "an"
-                    | "and"
-                    | "as"
-                    | "at"
-                    | "but"
-                    | "by"
-                    | "for"
-                    | "from"
-                    | "in"
-                    | "into"
-                    | "nor"
-                    | "of"
-                    | "on"
-                    | "or"
-                    | "per"
-                    | "the"
-                    | "to"
-                    | "via"
-                    | "with"
-                    | "without"
-            );
+            let minor = is_minor_title_word(rest.trim_end());
             if index > 0 && minor {
                 word.to_string()
             } else {
@@ -1157,17 +1140,52 @@ pub fn is_title_case(title: &str) -> bool {
     if title.is_empty() || title.contains(['\n', '\r']) || title.ends_with('.') {
         return false;
     }
+    let mut prose = String::with_capacity(title.len());
     let mut in_code = false;
     for character in title.chars() {
-        if character == '`' {
-            in_code = !in_code;
-            continue;
-        }
-        if !in_code && character.is_ascii_alphabetic() {
-            return character.is_ascii_uppercase();
+        match character {
+            '`' => in_code = !in_code,
+            _ if in_code => prose.push(' '),
+            _ => prose.push(character),
         }
     }
-    true
+    if in_code {
+        return false;
+    }
+    prose
+        .split_whitespace()
+        .filter_map(|word| {
+            let word = word.trim_matches(|character: char| !character.is_ascii_alphabetic());
+            (!word.is_empty() && !is_minor_title_word(word)).then_some(word)
+        })
+        .next()
+        .is_none_or(|word| word.as_bytes()[0].is_ascii_uppercase())
+}
+
+fn is_minor_title_word(word: &str) -> bool {
+    matches!(
+        word,
+        "a" | "an"
+            | "and"
+            | "as"
+            | "at"
+            | "but"
+            | "by"
+            | "for"
+            | "from"
+            | "in"
+            | "into"
+            | "nor"
+            | "of"
+            | "on"
+            | "or"
+            | "per"
+            | "the"
+            | "to"
+            | "via"
+            | "with"
+            | "without"
+    )
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1277,6 +1295,11 @@ mod tests {
         assert!(rendered.starts_with("Error[E0201]: Unknown Variable `unknown`"));
         assert!(rendered.ends_with("Compilation Failed: 1 Error"));
         assert!(is_title_case("Internal Compiler Error"));
+        assert!(is_title_case(
+            "`when`, `given`, and Control-flow `finally` Are Accepted Syntax"
+        ));
+        assert!(!is_title_case("`when` is not available"));
+        assert!(!is_title_case("Unclosed `syntax"));
     }
 
     #[test]
@@ -1377,6 +1400,22 @@ mod tests {
             ansi.replace("\u{1b}[31;1m", "").replace("\u{1b}[0m", ""),
             plain
         );
+    }
+
+    #[test]
+    fn backend_failures_advertise_protected_developer_details() {
+        let source = SourceFile::new("main.doria", "");
+        let rendered = render_diagnostics(
+            &source,
+            &[Diagnostic::new("B0001", "linker failed", Span::default())
+                .with_developer_details("complete linker output")],
+            RenderOptions {
+                color: ColorChoice::Never,
+                ..RenderOptions::default()
+            },
+        );
+        assert!(rendered.contains("Note: developer details are available in JSON diagnostics."));
+        assert!(!rendered.contains("complete linker output"));
     }
 
     #[test]
