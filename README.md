@@ -34,9 +34,14 @@ Doria's memory model is built on ownership: every value has exactly one owner, a
 - **`writable`** grants exclusive access: mutation with a compile-time guarantee that nobody else is watching.
 - **`take`** hands ownership over entirely — the signature says so, and the compiler holds everyone to it.
 
-There are no annotations to sprinkle, no sigils to memorize, and no jargon in the diagnostics. When something's wrong, the compiler says so in plain language:
+There are no annotations to sprinkle, no sigils to memorize, and no jargon in
+the diagnostics. When something is wrong, the compiler names the problem,
+labels every relevant source location, explains the Doria rule, and offers only
+fixes whose safety is explicit:
 
-> `$user was given to store() on line 12, so it can no longer be used here — clone it first if you need a copy.`
+> `Error[E0470]: Value Used After Ownership Transfer`
+>
+> `$user` was given away here and cannot be used afterward.
 
 Use-after-free, data races, double-frees, null surprises: these are compile errors in Doria, not production incidents.
 
@@ -46,11 +51,14 @@ properties are initialized exactly once, writable properties may be changed
 after their first initialization, and a branch that ends in a fatal panic does
 not produce a partially initialized object.
 
+Bare `{ ... }` blocks provide an explicit shorter lifetime boundary when a value
+or access guard should be cleaned up before the surrounding function continues.
+
 ## Design principles
 
 - **Contracts are written down.** Every parameter is explicitly typed — always. Nothing silently defaults to a dynamic type, and nullability is spelled `?T` and enforced.
 - **One word, one meaning.** `use` imports. `uses` composes traits. `with` captures in closures. No keyword in Doria ever has two jobs.
-- **A standard library with one voice.** Built-in functions follow one uniform naming law — full words, predictable pairs, no cryptic contractions (`str_case_compare`, never `strcasecmp`), the same argument order everywhere.
+- **A standard library with one voice.** Type-specific operations live on companions such as `String::startsWith`, while cross-domain capabilities use fully worded free functions such as `read_line`. Each operation has one canonical spelling.
 - **Honest defaults.** Booleans print as `true` and `false`. Integer overflow is an error, not a wraparound. Format strings are checked at compile time. Errors are declared with `throws` and handled with `try`/`catch` — the compiler makes sure of it.
 - **Small language, sharp edges filed off.** Where a familiar construct is a known footgun, Doria deliberately does the safer thing instead.
 
@@ -68,6 +76,18 @@ Doria was created by a PHP developer who wanted compile-time safety and native p
 ## Tooling
 
 Official language-server and editor integrations are developed separately in [`dorialang/doria-language-server`](https://github.com/dorialang/doria-language-server), which consumes reusable `doriac` frontend services without duplicating compiler semantics.
+
+The CLI supports human, concise, and versioned JSON diagnostics. Human and
+concise output go to stderr; JSON goes to stdout for tools:
+
+```console
+doriac check main.doria --diagnostic-format human
+doriac check main.doria --diagnostic-format concise
+doriac check main.doria --diagnostic-format json
+```
+
+Color is controlled independently with
+`--diagnostic-color auto|always|never`; automatic color honors `NO_COLOR`.
 
 ---
 

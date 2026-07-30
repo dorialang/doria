@@ -56,12 +56,20 @@ Baton currently builds Doria projects.
 
 Website examples must follow the naming charter:
 
-- Use `snake_case` only for built-in free functions, such as `get_time()` and `str_starts_with()`.
+- Use `snake_case` only for built-in free functions, such as `read_line()` and `get_time()`.
 - Use `camelCase` for userland free functions, methods, static/companion APIs, properties, parameters, and named arguments.
 - Use `PascalCase` for types and enum cases, `SCREAMING_SNAKE_CASE` for constants, and single Pascal capitals for type parameters.
 - Keep `__construct` and `__destruct` in their inherited PHP-shaped spelling.
 
 Member examples should look like `Int::wrappingAdd()`, `$s->isEmpty()`, `$message->tenantId`, `$message->retryAfter(seconds: 30)`, and `$repository->findById($id)`.
+
+String examples follow Decision 0103's one-spelling rule. Use `$text->` only
+for intrinsic data and views such as `length`, `byteLength`, `isEmpty`, `bytes`,
+`graphemes`, and `codePoints`. Use `String::` for every string-specific
+operation, including `String::trim()` and `String::startsWith()`. Do not publish
+canonical Doria examples using a `str_*` free function or a string-operation
+instance method. PHP migration examples may show PHP spellings when they are
+clearly identified as PHP input.
 
 ## Constructor Examples
 

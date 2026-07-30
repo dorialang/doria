@@ -309,6 +309,49 @@ fn access_objects_forward_without_a_value_wrapper() {
 }
 
 #[test]
+fn writable_access_mutates_the_shared_class_payload() {
+    let source = format!(
+        "{NODE}
+function main(): void
+{{
+    let $shared = new WritableSharedReference(new Node());
+    let writable $write = $shared->acquireWritableAccess();
+    $write->count = 7;
+    echo \"{{$write->count}}\\n\";
+}}
+"
+    );
+    let program = doriac::lower_source_to_mir("stage25a-writable-access.doria", &source)
+        .expect("writable class access should lower");
+    let output = doriac::mir_interpreter::interpret(&program)
+        .expect("writable class access should interpret");
+    assert_eq!(output.stdout, b"7\n");
+    doriac::codegen_cranelift::lower_mir_to_object(&program)
+        .expect("writable class access should lower through Cranelift");
+}
+
+#[test]
+fn writable_access_mutates_the_shared_collection_payload() {
+    let source = r#"
+function main(): void
+{
+    let $shared = new WritableSharedReference([1, 2, 3]);
+    let writable $access = $shared->acquireWritableAccess();
+    $access[0] = 10;
+    $access->add(4);
+    echo "{$access[0]}:{$access->count}\n";
+}
+"#;
+    let program = doriac::lower_source_to_mir("stage25a-writable-collection.doria", source)
+        .expect("writable collection access should lower");
+    let output = doriac::mir_interpreter::interpret(&program)
+        .expect("writable collection access should interpret");
+    assert_eq!(output.stdout, b"10:4\n");
+    doriac::codegen_cranelift::lower_mir_to_object(&program)
+        .expect("writable collection access should lower through Cranelift");
+}
+
+#[test]
 fn writable_shared_reference_does_not_forward_directly() {
     assert_code(
         r#"
@@ -755,7 +798,7 @@ function main(): void
         .expect("borrowed shared composition should execute");
     assert_eq!(
         output.stdout,
-        b"make fallback\nfallback\nfallback\nmake tested\ndrop tested\nmake call\ncall\nmake root\nroot\ndrop root\ndrop call\ndrop fallback\n"
+        b"make fallback\nfallback\nfallback\nmake tested\ndrop tested\nmake call\ncall\ndrop call\nmake root\nroot\ndrop root\ndrop fallback\n"
     );
     doriac::codegen_cranelift::lower_mir_to_object(&program)
         .expect("borrowed shared composition should lower through Cranelift");
@@ -970,11 +1013,54 @@ function main(): void
     if ($borrowed != null) { echo "found\n"; }
 }
 "#;
-    let diagnostics = doriac::check_source("stage25a-borrowed-dictionary.doria", source)
-        .expect_err("stored collection borrows remain rejected until lifetime tracking lands");
-    assert!(diagnostics.iter().any(|diagnostic| {
-        diagnostic.code == "E0478" && diagnostic.message.contains("borrowed result")
-    }));
+    let program = doriac::lower_source_to_mir("stage25a-borrowed-dictionary.doria", source)
+        .expect("a borrowed collection result may be bound while its owner remains live");
+    let output = doriac::mir_interpreter::interpret(&program)
+        .expect("a borrowed collection result must not gain a cleanup obligation");
+    assert_eq!(output.stdout, b"found\ndrop\n");
+}
+
+#[test]
+fn generic_repository_returns_transitive_borrows_from_its_receiver() {
+    let source = r#"
+class Repository<T>
+{
+    internal writable Dictionary<string, T> $items = [];
+
+    writable function save(string $id, take T $item): void
+    {
+        $this->items[$id] = $item;
+    }
+
+    function find(string $id): ?T
+    {
+        return $this->items->get($id);
+    }
+}
+
+class Customer { function __construct(string $name) {} }
+class Invoice { function __construct(string $number) {} }
+
+function main(): void
+{
+    let writable $customers = new Repository<Customer>();
+    let writable $invoices = new Repository<Invoice>();
+    $customers->save("42", new Customer("Maya"));
+    $invoices->save("42", new Invoice("INV-42"));
+
+    let $customer = $customers->find("42");
+    let $invoice = $invoices->find("42");
+    echo ($customer?->name ?? "missing") . "\n";
+    echo ($invoice?->number ?? "missing") . "\n";
+}
+"#;
+    let program = doriac::lower_source_to_mir("stage25a-generic-repository.doria", source)
+        .expect("property and collection projections must preserve receiver borrow provenance");
+    doriac::mir_validation::validate_program(&program)
+        .expect("transitive returned borrows must produce valid shared MIR");
+    let output =
+        doriac::mir_interpreter::interpret(&program).expect("generic repository should execute");
+    assert_eq!(output.stdout, b"Maya\nINV-42\n");
 }
 
 #[test]
@@ -1422,4 +1508,487 @@ fn writable_weak_family_also_accepts_collection_payloads() {
     ?WritableSharedReference<List<int>> $live = $weak->acquire();
 "#,
     );
+}
+
+#[test]
+fn writable_access_objects_flow_through_returns_properties_and_collection_slots() {
+    for (name, source, expected) in [
+        (
+            "access-lifetime",
+            include_str!("../../../examples/native/main_stage25a_access_lifetime.doria"),
+            b"access guarded\nlive through access\ndrop guarded\nexpired after access\n".as_slice(),
+        ),
+        (
+            "stored-access",
+            include_str!("../../../examples/native/main_stage25a_stored_access.doria"),
+            b"stored read 1\nstored write 5\nstored list 1\ndrop item\ndrop item\n".as_slice(),
+        ),
+    ] {
+        let program = doriac::lower_source_to_mir(format!("{name}.doria"), source)
+            .expect("writable access storage fixture should lower");
+        let output = doriac::mir_interpreter::interpret(&program)
+            .expect("writable access storage fixture should interpret");
+        assert_eq!(output.stdout, expected);
+        doriac::codegen_cranelift::lower_mir_to_object(&program)
+            .expect("writable access storage fixture should lower through Cranelift");
+        #[cfg(feature = "llvm-backend")]
+        doriac::codegen_llvm::lower_mir_to_object(&program)
+            .expect("writable access storage fixture should lower through LLVM");
+    }
+}
+
+#[test]
+fn property_rooted_collection_slots_accept_owned_values_and_replace_once() {
+    let source = r#"
+class Customer
+{
+    function __construct(string $name) {}
+    function __destruct() { echo "drop {$this->name}\n"; }
+}
+
+class Repository<T>
+{
+    internal writable Dictionary<string, T> $items = [];
+
+    writable function save(string $id, take T $item): void
+    {
+        $this->items[$id] = $item;
+    }
+}
+
+function main(): void
+{
+    let writable $repository = new Repository<Customer>();
+    $repository->save("42", new Customer("first"));
+    $repository->save("42", new Customer("second"));
+    echo "done\n";
+}
+"#;
+    let program = doriac::lower_source_to_mir("stage25a-indexed-property-move.doria", source)
+        .expect("an indexed slot write must not be treated as complete-property replacement");
+    let output = doriac::mir_interpreter::interpret(&program)
+        .expect("property-rooted collection replacement should execute");
+    assert_eq!(output.stdout, b"drop first\ndone\ndrop second\n");
+}
+
+#[test]
+fn property_rooted_collection_slots_consume_move_values() {
+    let diagnostics = doriac::check_source(
+        "stage25a-indexed-property-use-after-move.doria",
+        r#"
+class Customer { function __construct(string $name) {} }
+class Repository
+{
+    internal writable Dictionary<string, Customer> $items = [];
+    writable function save(string $id, take Customer $item): void
+    {
+        $this->items[$id] = $item;
+        echo $item->name;
+    }
+}
+"#,
+    )
+    .expect_err("the value stored in an owning slot must be moved");
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E0470"),
+        "{diagnostics:#?}"
+    );
+}
+
+#[test]
+fn indexed_slot_writes_require_a_writable_root_and_property_path() {
+    for source in [
+        r#"
+class Box
+{
+    writable List<int> $items = [1];
+}
+function update(Box $box): void { $box->items[0] = 2; }
+"#,
+        r#"
+class Box
+{
+    List<int> $items = [1];
+    writable function update(): void { $this->items[0] = 2; }
+}
+"#,
+    ] {
+        let diagnostics = doriac::check_source("stage25a-indexed-readonly-path.doria", source)
+            .expect_err("every segment of an indexed write path must be writable");
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| matches!(diagnostic.code, "E0201" | "E0202" | "E0479")),
+            "{diagnostics:#?}"
+        );
+    }
+}
+
+#[test]
+fn standalone_blocks_are_lexical_scopes_and_cleanup_boundaries() {
+    let source = r#"
+class Marker
+{
+    function __construct(string $name) {}
+    function __destruct() { echo "drop {$this->name}\n"; }
+}
+
+function returnFromBlock(): void
+{
+    {
+        let $marker = new Marker("return");
+        return;
+    }
+}
+
+function main(): void
+{
+    {
+        let $outer = new Marker("outer");
+        {
+            let $inner = new Marker("inner");
+            echo "inside\n";
+        }
+        echo "after inner\n";
+    }
+
+    returnFromBlock();
+
+    let writable $iteration = 0;
+    while ($iteration < 2) {
+        {
+            let $loop = new Marker("loop {$iteration}");
+            $iteration++;
+            if ($iteration == 1) { continue; }
+            break;
+        }
+    }
+    echo "done\n";
+}
+"#;
+    let program = doriac::lower_source_to_mir("stage25a-lexical-block-cleanup.doria", source)
+        .expect("standalone blocks should lower through the ordinary scope machinery");
+    let output = doriac::mir_interpreter::interpret(&program)
+        .expect("standalone block cleanup should execute");
+    assert_eq!(
+        output.stdout,
+        b"inside\ndrop inner\nafter inner\ndrop outer\ndrop return\ndrop loop 0\ndrop loop 1\ndone\n"
+    );
+
+    let diagnostics = doriac::check_source(
+        "stage25a-lexical-block-scope.doria",
+        r#"
+function main(): void
+{
+    { let $hidden = 1; }
+    echo "{$hidden}";
+}
+"#,
+    )
+    .expect_err("a binding declared in a standalone block must not escape it");
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("undeclared variable")),
+        "{diagnostics:#?}"
+    );
+}
+
+#[test]
+fn standalone_blocks_end_writable_shared_access_before_readonly_access() {
+    let source = r#"
+class Settings
+{
+    function __construct(writable string $theme) {}
+}
+
+function main(): void
+{
+    let $settings = new WritableSharedReference(new Settings("light"));
+    {
+        let writable $access = $settings->acquireWritableAccess();
+        $access->theme = "dark";
+    }
+    let $readonly = $settings->acquireReadonlyAccess();
+    echo $readonly->theme;
+}
+"#;
+    let program = doriac::lower_source_to_mir("stage25a-access-block.doria", source)
+        .expect("a lexical block should delimit writable access");
+    let output = doriac::mir_interpreter::interpret(&program)
+        .expect("readonly access should succeed after block cleanup");
+    assert_eq!(output.stdout, b"dark");
+}
+
+#[test]
+fn nullable_access_parameters_borrow_unless_declared_take() {
+    let source = r#"
+class Counter
+{
+    function __construct(string $name, writable int $value = 0) {}
+}
+
+function inspect(
+    ?ReadonlySharedReferenceAccess<Counter> $access,
+): void
+{
+    if ($access != null) {
+        echo "inspect {$access->name}\n";
+    }
+}
+
+function increment(
+    ?WritableSharedReferenceAccess<Counter> $access,
+): void
+{
+    if ($access != null) {
+        $access->value++;
+    }
+}
+
+function main(): void
+{
+    let $readShared = new WritableSharedReference(new Counter("read"));
+    ?ReadonlySharedReferenceAccess<Counter> $read =
+        $readShared->acquireReadonlyAccess();
+    inspect($read);
+    if ($read != null) {
+        echo "after {$read->name}\n";
+    }
+
+    let $writeShared = new WritableSharedReference(new Counter("write"));
+    ?WritableSharedReferenceAccess<Counter> $write =
+        $writeShared->acquireWritableAccess();
+    increment($write);
+    if ($write != null) {
+        $write->value++;
+        echo "value {$write->value}\n";
+    }
+}
+"#;
+    let program = doriac::lower_source_to_mir("stage25a-nullable-access-borrow.doria", source)
+        .expect("nullable access parameters should preserve default borrowing");
+    let output = doriac::mir_interpreter::interpret(&program)
+        .expect("borrowed nullable access parameters should remain live after calls");
+    assert_eq!(output.stdout, b"inspect read\nafter read\nvalue 2\n");
+    doriac::codegen_cranelift::lower_mir_to_object(&program)
+        .expect("borrowed nullable access parameters should lower through Cranelift");
+    #[cfg(feature = "llvm-backend")]
+    doriac::codegen_llvm::lower_mir_to_object(&program)
+        .expect("borrowed nullable access parameters should lower through LLVM");
+}
+
+#[test]
+fn reordered_nullable_access_temporaries_transfer_with_balanced_cleanup() {
+    let source = r#"
+class Counter
+{
+    function __construct(string $name, writable int $value = 0) {}
+}
+
+function marker(string $name): int
+{
+    echo "marker {$name}\n";
+    return 7;
+}
+
+function consumeReadonly(
+    int $marker,
+    take ?ReadonlySharedReferenceAccess<Counter> $access,
+): void
+{
+    if ($access != null) {
+        echo "{$marker}:{$access->name}\n";
+    }
+}
+
+function consumeWritable(
+    int $marker,
+    take ?WritableSharedReferenceAccess<Counter> $access,
+): void
+{
+    if ($access != null) {
+        echo "{$marker}:{$access->name}:{$access->value}\n";
+    }
+}
+
+function exerciseReordering(
+    ?WritableSharedReference<Counter> $source,
+): void
+{
+    consumeReadonly(
+        access: $source?->acquireReadonlyAccess(),
+        marker: marker("read"),
+    );
+    consumeWritable(
+        access: $source?->acquireWritableAccess(),
+        marker: marker("write"),
+    );
+}
+
+function main(): void
+{
+    let $owner = new WritableSharedReference(new Counter("owned"));
+    exerciseReordering($owner);
+}
+"#;
+    let program = doriac::lower_source_to_mir("stage25a-nullable-access-reorder.doria", source)
+        .expect("reordered nullable access temporaries should lower without panicking");
+    let output = doriac::mir_interpreter::interpret(&program)
+        .expect("reordered nullable access temporaries should transfer exactly once");
+    assert_eq!(
+        output.stdout,
+        b"marker read\n7:owned\nmarker write\n7:owned:0\n"
+    );
+    doriac::codegen_cranelift::lower_mir_to_object(&program)
+        .expect("reordered nullable access temporaries should lower through Cranelift");
+    #[cfg(feature = "llvm-backend")]
+    doriac::codegen_llvm::lower_mir_to_object(&program)
+        .expect("reordered nullable access temporaries should lower through LLVM");
+}
+
+#[test]
+fn nullable_ownership_paths_preserve_transfer_and_cleanup() {
+    let source =
+        include_str!("../../../examples/native/main_stage25a_nullable_ownership_paths.doria");
+    let program = doriac::lower_source_to_mir("stage25a-nullable-ownership-paths.doria", source)
+        .expect("nullable ownership paths should lower");
+    let output = doriac::mir_interpreter::interpret(&program)
+        .expect("nullable ownership paths should execute with balanced cleanup");
+    assert_eq!(
+        output.stdout,
+        include_bytes!("fixtures/native_io/main_stage25a_nullable_ownership_paths/expected_stdout")
+    );
+    doriac::codegen_cranelift::lower_mir_to_object(&program)
+        .expect("nullable ownership paths should lower through Cranelift");
+    #[cfg(feature = "llvm-backend")]
+    doriac::codegen_llvm::lower_mir_to_object(&program)
+        .expect("nullable ownership paths should lower through LLVM");
+}
+
+#[test]
+fn nullable_collection_access_forwards_lazily() {
+    let source =
+        include_str!("../../../examples/native/main_stage25a_nullable_collection_access.doria");
+    let program = doriac::lower_source_to_mir("stage25a-nullable-collection-access.doria", source)
+        .expect("nullable collection accesses should lower through presence-guarded forwarding");
+    let output = doriac::mir_interpreter::interpret(&program)
+        .expect("nullable collection accesses should execute lazily");
+    assert_eq!(
+        output.stdout,
+        include_bytes!(
+            "fixtures/native_io/main_stage25a_nullable_collection_access/expected_stdout"
+        )
+    );
+    doriac::codegen_cranelift::lower_mir_to_object(&program)
+        .expect("nullable collection accesses should lower through Cranelift");
+    #[cfg(feature = "llvm-backend")]
+    doriac::codegen_llvm::lower_mir_to_object(&program)
+        .expect("nullable collection accesses should lower through LLVM");
+}
+
+#[test]
+fn forwarded_access_temporaries_end_with_their_statement() {
+    let source =
+        include_str!("../../../examples/native/main_stage25a_temporary_access_cleanup.doria");
+    let program = doriac::lower_source_to_mir("stage25a-temporary-access-cleanup.doria", source)
+        .expect("forwarded access temporaries should lower with statement cleanup");
+    let output = doriac::mir_interpreter::interpret(&program)
+        .expect("the next statement should be able to acquire incompatible access");
+    assert_eq!(
+        output.stdout,
+        include_bytes!("fixtures/native_io/main_stage25a_temporary_access_cleanup/expected_stdout")
+    );
+    doriac::codegen_cranelift::lower_mir_to_object(&program)
+        .expect("statement access cleanup should lower through Cranelift");
+    #[cfg(feature = "llvm-backend")]
+    doriac::codegen_llvm::lower_mir_to_object(&program)
+        .expect("statement access cleanup should lower through LLVM");
+}
+
+#[test]
+fn forwarded_access_temporaries_live_through_the_complete_statement() {
+    let source = r#"
+function acquireWritable(WritableSharedReference<List<int>> $owner): bool
+{
+    let writable $access = $owner->acquireWritableAccess();
+    return true;
+}
+
+function main(): void
+{
+    let $owner = new WritableSharedReference<List<int>>([1]);
+    if (
+        $owner->acquireReadonlyAccess()->contains(1)
+        && acquireWritable($owner)
+    ) {
+        echo "unreachable\n";
+    }
+}
+"#;
+    let program = doriac::lower_source_to_mir("stage25a-statement-access-lifetime.doria", source)
+        .expect("forwarded access lifetime fixture should lower");
+    let output = doriac::mir_interpreter::interpret(&program)
+        .expect("incompatible access should use Doria's abort-only panic path");
+    assert_eq!(output.exit_status, 101);
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("Cannot Acquire Writable Access While Readonly Access Is Active"),
+        "the readonly expression temporary must remain active through the entire condition"
+    );
+}
+
+#[test]
+fn nested_shadows_do_not_extend_outer_borrow_lifetimes() {
+    doriac::check_source(
+        "stage25a-shadowed-borrow-liveness.doria",
+        r#"
+class Guard
+{
+    writable int $value = 0;
+    writable function mutate(): void { $this->value++; }
+}
+
+function identity(Guard $guard): Guard { return $guard; }
+
+function route(writable Guard $guard): void
+{
+    let $alias = identity($guard);
+    {
+        let $alias = new Guard();
+        echo "{$alias->value}";
+        $guard->mutate();
+    }
+}
+"#,
+    )
+    .expect("a nested shadow must end liveness of an inaccessible outer borrow");
+
+    doriac::check_source(
+        "stage25a-shadowed-owner-identity.doria",
+        r#"
+class Guard
+{
+    writable int $value = 0;
+    writable function mutate(): void { $this->value++; }
+}
+
+function identity(Guard $guard): Guard { return $guard; }
+function consume(take Guard $guard): void {}
+
+function route(writable Guard $guard): void
+{
+    let $alias = identity($guard);
+    {
+        let writable $guard = new Guard();
+        $guard->mutate();
+        consume($guard);
+        echo "{$alias->value}";
+    }
+}
+"#,
+    )
+    .expect("borrow conflicts must follow binding identity through nested shadows");
 }

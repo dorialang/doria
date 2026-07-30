@@ -36,7 +36,7 @@ The accepted project-tool name is Baton. Baton is the planned user-facing projec
 - `doria` is the compiler repository and the subject of these instructions.
 - `doria-website` is a separate repository. It hosts the documentation site and a playground that invokes `doriac` against user source, plus per-stage examples used for acceptance testing. Do not modify, clone, scaffold, or make assumptions about it from compiler work.
 - Playground acceptance testing has repeatedly found language-design gaps before implementation calcified them. When a compiler change alters an accepted surface, report it as an "Invalidated elsewhere" item so the website can follow. Do not schedule website work from a compiler prompt.
-- `doria-language-server` is a separate repository that is **in scope for compiler work**, unlike `doria-website`. It sits beside this one on disk (`../doria-language-server`) and pins `doriac` by git revision in its root `Cargo.toml`. Because it restates language facts in hover text, diagnostics, and highlighting, it goes stale the moment a stage lands — and a stale language server tells the user their valid code is wrong, which is worse than no language server. "Coordinate" in the rules below means **do the work in that repository in the same beat**, not mention it in a report. See "Language-server sweep".
+- `doria-language-server` is a separate repository that is **in scope for compiler work**, unlike `doria-website`, and pins `doriac` by git revision in its root `Cargo.toml`. Never infer where its checkout lives; developers and automation provide its path explicitly. Because it restates language facts in hover text, diagnostics, and highlighting, it goes stale the moment a stage lands — and a stale language server tells the user their valid code is wrong, which is worse than no language server. "Coordinate" in the rules below means **do the work in that repository in the same beat**, not mention it in a report. See "Language-server sweep".
 - Andrew is the language designer and sole developer. He reviews and approves before anything advances.
 
 ## Non-negotiable engineering guardrails
@@ -51,6 +51,18 @@ The accepted project-tool name is Baton. Baton is the planned user-facing projec
 - When stopping for a design decision, report the question, viable options, tradeoffs, affected files, and a recommendation clearly marked as a recommendation.
 - Do not implement a workaround that makes the current backend pass while leaving Doria semantics ambiguous.
 - Prefer clear unsupported-feature diagnostics over permissive behavior that may become wrong.
+- Treat diagnostics as a public language interface. Follow
+  `docs/diagnostic-style.md`: user-facing headings, prefixes, and titles are
+  Title Case; explanations use plain Doria vocabulary; every source location
+  and suggested edit stays structured. Do not make a consumer parse rendered
+  terminal prose.
+- Add every new diagnostic code to the compiler catalogue and run
+  `php scripts/check_diagnostic_style.php`. Automatic editor actions are limited
+  to machine-applicable fixes; requires-review and informational fixes remain
+  guidance.
+- Backend, external-tool, and internal failures must cross public boundaries as
+  structured diagnostics. Preserve complete developer details without exposing
+  raw tool output, Rust panic text, or backtraces by default.
 - Preserve the ability to lower Doria to native code safely, even if the immediate task only touches frontend code or a compatibility backend.
 - Do not silently rename or replace Baton.
 - Do not claim Baton is implemented until it exists.
@@ -102,7 +114,7 @@ The procedure is deliberately mechanical, because judgment is what fails here. G
 
 ### Language-server sweep (every stage or slice that changes user-visible language)
 
-The blast radius does not stop at this repository's edge. `../doria-language-server` restates language facts and must be swept in the same beat, then reported as a distinct section. The sweep is:
+The blast radius does not stop at this repository's edge. The explicitly selected `dorialang/doria-language-server` checkout restates language facts and must be swept in the same beat, then reported as a distinct section. The sweep is:
 
 - **Bump the `doriac` pin** in `doria-language-server/Cargo.toml` (`rev = "…"`) to the compiler commit this work lands, and confirm the workspace still builds. A pin left on an older revision is drift by definition.
 - **Grep the hover/description tables** (`server/src/lib.rs`) for every fact the change touches, plus any claim that is now false regardless of whether this change caused it. Phrases scoped to a superseded stage — "this compiler currently supports…", "represents the EOF result of…", "alias" for a now-implemented type — are the signature of drift.
@@ -111,6 +123,19 @@ The blast radius does not stop at this repository's edge. `../doria-language-ser
 - **Sweep syntax highlighting and shared editor fixtures** for the new keywords, types, and intrinsics.
 
 Report the language-server work under its own heading, listing the pin revision, every string corrected, and every hover added. "No language-server impact" is a valid answer only when stated explicitly and checked.
+
+### Installed tooling refresh (every delivered work unit)
+
+A delivered stage, slice, or beat is not complete while developer-facing binaries still represent the previous compiler. After the compiler and coordinated language-server changes are committed and both worktrees are clean, run:
+
+```bash
+php scripts/refresh_development_toolchain.php \
+    --language-server /absolute/path/to/doria-language-server
+```
+
+The refresh installs compiled `doriac` and `doria-lsp` artifacts into Cargo's platform-neutral install root, verifies that both embed the delivered compiler commit, and rejects `PATH` entries that shadow them. Editor clients and Baton must consume these installed artifacts (or explicit/bundled release artifacts), never an implicitly discovered workspace `target/debug` executable.
+
+`bin/doriac` remains an explicit from-source compiler-development launcher. It uses an isolated Cargo target directory and must never be linked, copied, or renamed into a machine-global `doriac`. On Windows, stop a running language-server process before refreshing if the OS prevents replacement of the installed executable; a failed replacement is a failed refresh, not permission to keep using the stale binary.
 
 Locally-correct fixes are this project's dominant defect source. Every recorded instance was caught late — by review or by acceptance testing — at the most expensive moment available.
 
@@ -150,6 +175,7 @@ These are identity, not scope deferral. They do not become available later, and 
 - Treat supporting specification, notes, and decision files as subordinate where they conflict with the end-to-end plan.
 - Treat `docs/doria-end-to-end-plan.md`, `docs/decisions/`, `SPEC.md`, `README.md`, `AGENTS.md`, and `docs/information-architecture.md` according to the documentation authority model. Supporting design notes are subordinate to the end-to-end plan and accepted decisions.
 - Doria has a real ownership/borrow checker model in Doria spelling: readonly is shared borrow, writable is exclusive borrow, and `take` transfers ownership.
+- Stage 25a's readonly and writable shared-ownership families are permanently disjoint. Keep their control blocks and ABI release operations distinct; access-object destruction releases its access registration before its strong ownership claim, including values stored in properties and collections.
 - `use` is namespace import/alias, `uses` is trait composition, and `with` is closure capture. These three keywords are not interchangeable.
 - Keep compiler work incremental and tested, but never use incremental delivery as an excuse to make unsound language decisions.
 - Do not make PHP the public identity of Doria. PHP is development context, migration context, and one optional compatibility backend; Doria should be described as its own native-first language.
@@ -185,7 +211,8 @@ These are identity, not scope deferral. They do not become available later, and 
 - Do not treat accepted PHP-shaped OOP syntax as permission to import all PHP runtime behavior.
 - Do not make PHP output the semantic oracle for Doria OOP behavior.
 - Preserve Doria's naming charter by category: built-in free functions use `snake_case`; userland free functions, methods, static methods, companion/type APIs, properties, parameters, and named arguments use `camelCase`. Classes, interfaces, traits, enums, and enum cases use `PascalCase`; constants use `SCREAMING_SNAKE_CASE`; type parameters use single Pascal capitals such as `T`, `K`, and `V`. Namespace segments are `PascalCase` with acronyms folded (`Doria\Std\Io`, `Doria\Std\Http` — never `IO` or `HTTP`). Keep the inherited magic-method spellings `__construct` and `__destruct`.
-- Built-in free-function names are fully worded and never fused: `str_case_compare`, not `strcasecmp`. Whitelisted abbreviations are only those more recognizable than their expansions, plus industry-universal single lexemes such as `printf`. Whitelisting is always explicit and documented in the plan's naming charter.
+- Built-in free-function names are fully worded and never fused: `read_line`, not `readline`. Whitelisted abbreviations are only those more recognizable than their expansions, plus industry-universal single lexemes such as `printf`. Whitelisting is always explicit and documented in the plan's naming charter.
+- Keep type-coupled vocabulary on the type companion. For strings, `$string->` is limited to intrinsic data, measurements, and views, while every string-specific operation is a camelCase `String::` companion member. Doria has no public `str_*` family or string-operation instance-method aliases.
 - Keep PHP-to-Doria spelling suggestions in shared compiler data so the future `doriac migrate php` command reuses one table rather than maintaining a second.
 - Prefer nouns as properties and verbs as methods in Doria APIs and examples. Use property hooks for computed, validated, lazy, or guarded values instead of vague zero-argument noun methods such as `body()`.
 
@@ -221,6 +248,7 @@ These are identity, not scope deferral. They do not become available later, and 
 ### Control flow and errors
 
 - Treat basic `if` / `else if` / `else`, `while`, traditional `for`, integer range `foreach`, standalone `++` / `--`, and unlabeled `break;` / `continue;` as MVP control flow. `if` is statement control flow and does not return a value; `when` is the planned value-returning conditional/control construct. `for` is the explicit counter/index loop; `foreach` is preferred for collections and ranges. `0..10` is inclusive, `0..<10` is exclusive-end, and range `foreach` bindings are readonly per iteration. `break` exits the nearest enclosing loop, and `continue` jumps to the next nearest-loop iteration.
+- A bare `{ ... }` block is a statement-level lexical scope and explicit cleanup boundary. It produces no value, needs no semicolon, and participates in fallthrough/return/break/continue cleanup. Do not introduce a `scope` keyword for this; `scope` remains reserved for concurrency vocabulary.
 - Read-modify-write works on any writable place, not only locals: `$this->value++`, `$counter->value += 2`, `self::next += self::STEP`, and indexed places once collections land. Each desugars to a read-modify-write over the place-borrow rule, so a writable place is required and the ordinary one-writer rule applies. Value-producing `++` / `--` expression semantics remain future work; statement position only.
 - Do not treat the native `0..125` process-exit range as the range of Doria integer values.
 - Do not require `main` to return `int`. `main(): void` is valid; falling through or using bare `return;` means successful process status `0`.

@@ -56,6 +56,18 @@ If an implementation task reaches a design fork not answered by this specificati
 
 Temporary backend limitations may produce unsupported-feature diagnostics. They must not redefine Doria.
 
+Compiler diagnostics use the shared human-first model defined by the compiler
+diagnostic authority. Every diagnostic has a stable code, severity, kind, Title
+Case title, one or more source-identified labels, and optional explanation,
+notes, help, applicability-classified multi-edit fixes, causal identity, and
+documentation metadata. Human and concise CLI presentations write to stderr;
+schema-version-1 structured JSON writes to stdout and contains no ANSI.
+Language-server and website consumers use that structure rather than parsing
+terminal prose. Backend/external/internal failures preserve full developer
+details but do not expose raw tool or Rust panic output by default. Runtime
+panic remains a separate status-101 contract whose `Panic` and `Stack Trace`
+headings are Title Case and byte-identical across enabled backends.
+
 ## 2. What Doria is not
 
 Doria is not PHP++ and is not required to parse every valid PHP program.
@@ -66,7 +78,7 @@ Valid PHP should be easy to migrate to Doria, but Doria-specific syntax does not
 
 Doria does not use `public`, `protected`, or `private` as member visibility modifiers. Class members are externally accessible by default, and `internal` marks implementation details.
 
-The current compiler implementation lowers the accepted native subset through validated typed MIR. The debug interpreter, default Cranelift fast profile, and `--release` LLVM profile consume that same MIR, and the durable executable parity manifest compares exact stdin-driven stdout bytes, stderr bytes, process status, declared file side effects, and class lifetime behavior across all three paths. The supported subset includes top-level free functions; int/void `main` with either no parameters or one readonly borrowed `List<string>` argument; structured control flow and recursion; fixed-width numerics and bool; const-evaluable defaults for Copy scalars and readonly strings; immutable UTF-8 strings; expression interpolation; general nullable scalar, string, concrete-class, and `mixed` values with flow narrowing, `??`, `?->`, and exact `is`; checked formatting; UTF-8 line/file I/O; exact stdout/stderr; fatal panic; native class construction with path-sensitive definite initialization, property initialization/access, class-valued locals/arguments/returns, `take` transfer, compile-time non-lexical borrowing and returned-borrow elision, lifecycle bodies, recursive property destruction, and deterministic normal-exit cleanup; statically resolved instance and static methods; class/top-level constants; Copy-type static properties; complete `internal` checking; concrete native `Displayable::toString()` calls; Stage 23 Slice 1 typed arrays plus `List`/`Dictionary`/`Set` runtime collections with contextual literals, insertion-ordered iteration, indexed mutation, move-in/removal ownership, and Decision 0100's default members; Stage 23 Slice 2 `Bytes`, exact binary file/standard-stream I/O, and text append; Stage 23 Slice 3 boxed `mixed` runtime values and runtime mixed collection values; Stage 24 monomorphized generic functions and methods; Stage 25 monomorphized generic classes; and the Stage 25a readonly `SharedReference<T>` / `WeakReference<T>` family for class payloads, including nullable weak acquisition, readonly forwarding, generic/property/collection storage, and deterministic strong/weak release. Native strings are private non-atomic refcounted buffers and are Copy at the source level. Native classes, collections, `Bytes`, `mixed` boxes, and shared-reference handles are pointer-sized move values whose payload layout is compiler-known. A shared-reference control block is separate from its unchanged headerless class payload; the final strong release destroys that payload once, while weak references may keep only the control block alive. `main(): int` crosses the accepted `0..125` process boundary and `main(): void` maps normal completion to status `0`. Release optimization does not change observable semantics. `doria-rt` owns process entry, class/collection/byte-buffer/mixed-box/shared-control allocation and free, runtime strings, raw standard-device I/O, line discipline, text/binary file I/O, exact output, panic formatting, and Doria stack traces. The Stage 25a writable family, shared handles through `mixed`, and interface-typed values remain unsupported. The former Stage 7-10 native smoke module remains retired.
+The current compiler implementation lowers the accepted native subset through validated typed MIR. The debug interpreter, default Cranelift fast profile, and `--release` LLVM profile consume that same MIR, and the durable executable parity manifest compares exact stdin-driven stdout bytes, stderr bytes, process status, declared file side effects, and class lifetime behavior across all three paths. The supported subset includes top-level free functions; int/void `main` with either no parameters or one readonly borrowed `List<string>` argument; structured control flow and recursion; fixed-width numerics and bool; const-evaluable defaults for Copy scalars and readonly strings; immutable UTF-8 strings; expression interpolation; general nullable scalar, string, concrete-class, and `mixed` values with flow narrowing, `??`, `?->`, and exact `is`; checked formatting; UTF-8 line/file I/O; exact stdout/stderr; fatal panic; native classes, methods, statics, constants, complete `internal` checking, deterministic ownership, and compile-time borrowing; Stage 23 collections, typed arrays, `Bytes`, binary I/O, and boxed `mixed`; Stage 24 generic functions and methods; Stage 25 generic classes; and both Stage 25a shared-ownership families. The readonly `SharedReference<T>` / `WeakReference<T>` family supports class payloads. The writable family supports class, typed-array, `List<T>`, `Dictionary<K, V>`, `Set<T>`, and `Bytes` payloads through `WritableSharedReference<T>` / `WritableWeakReference<T>` and owned readonly/writable access objects. It includes nullable weak acquisition, lazy nullable operations, generic/property/collection storage, deterministic strong/weak/access release, and one per-allocation many-readonly-XOR-one-writable access state. Native strings are private non-atomic refcounted buffers and are Copy at the source level. Native classes, collections, `Bytes`, `mixed` boxes, and shared-reference handles are pointer-sized move values whose payload layout is compiler-known. Shared-reference control blocks are separate from unchanged payload layouts; the final strong release destroys the payload once, while weak references may keep only the control block alive. `main(): int` crosses the accepted `0..125` process boundary and `main(): void` maps normal completion to status `0`. Release optimization does not change observable semantics. `doria-rt` owns process entry, class/collection/byte-buffer/mixed-box/shared-control allocation and free, runtime strings, raw standard-device I/O, line discipline, text/binary file I/O, exact output, panic formatting, and Doria stack traces. Scalar/string writable-shared payload access, shared handles through `mixed`, and interface-typed values remain unsupported. The former Stage 7-10 native smoke module remains retired.
 
 Doria is not a Rust language. Rust is the current bootstrap implementation language for `doriac`, not the permanent identity of the compiler.
 
@@ -159,6 +171,22 @@ Doria does not add separate PHP-style `require`, `require_once`, or `include_onc
 `break` exits the nearest enclosing loop. PHP-style numeric break levels such as `break 2;` are not accepted by the namespace/directive decision. Labeled break may be evaluated later if needed.
 
 `continue` jumps to the next iteration of the nearest enclosing loop. PHP-style numeric continue levels such as `continue 2;` are not accepted by the namespace/directive decision. Labeled continue may be evaluated later if needed.
+
+A bare braced block is a statement and creates a lexical scope:
+
+```doria
+{
+    let $value = createValue();
+    useValue($value);
+}
+```
+
+It may nest, produces no value, and requires no trailing semicolon. Bindings
+declared inside are unavailable after the closing brace. Still-owned values drop
+in reverse acquisition order on fallthrough, `return`, `break`, and `continue`;
+fatal panic remains abort-only and runs no cleanup. Borrow extent remains
+non-lexical under Decision 0089, so an ordinary borrow may end at its final use
+before the block closes. Doria does not use a `scope` keyword for lexical blocks.
 
 Traditional `for` loops are accepted for explicit counter/index iteration:
 
@@ -448,7 +476,7 @@ See `docs/api-design-guidelines.md` for the detailed design notes.
 
 Doria chooses casing by API category, not by whether an implementation is built into the language:
 
-- Built-in free functions use `snake_case`, such as `get_time()` and `str_starts_with()`.
+- Built-in free functions use `snake_case`, such as `read_line()` and `get_time()`.
 - Userland free functions, instance methods, static methods, companion/type APIs, properties, parameters, and named arguments use `camelCase`.
 - Classes, interfaces, traits, enums, and enum cases use `PascalCase`.
 - Constants use `SCREAMING_SNAKE_CASE`.
@@ -459,13 +487,30 @@ Free-function casing and member/companion casing are intentionally different:
 
 ```doria
 let $now = get_time();
-let $matches = str_starts_with($name, "Dor");
+let $matches = String::startsWith($name, "Dor");
 let $wrapped = Int::wrappingAdd(1, 2);
 let $empty = $s->isEmpty();
 let $tenant = $message->tenantId;
 $message->retryAfter(seconds: 30);
 let $person = $repository->findById($id);
 ```
+
+Type-coupled vocabulary belongs to the type companion. For `string`,
+`$text->length`, `$text->byteLength`, `$text->isEmpty`, `$text->bytes`,
+`$text->graphemes`, and `$text->codePoints` are intrinsic properties or views;
+all string-specific operations use the `String::` companion. Doria has no
+public `str_*` family and no instance-method aliases such as `$text->trim()`.
+
+A Doria `string` always contains valid UTF-8. `$text->length` counts Unicode
+extended grapheme clusters, while `$text->byteLength` reports exact UTF-8
+bytes. Search indices, slicing, and padding lengths use grapheme units.
+`$text->graphemes` traverses extended grapheme clusters and
+`$text->codePoints` traverses Unicode scalar values. Integer indexing on a
+`string` is not permitted. The canonical string-operation families are
+`String::trim`/`trimStart`/`trimEnd`, `lower`/`upper`, predicates and search,
+replacement, `split`/`join`, `slice`, `repeat`, padding, `fromBytes`, and
+comparison. Decision 0103 defines their complete planned contracts; the
+Minimum String Runtime Surface remains the next implementation beat.
 
 ## 7. Basic type system
 
@@ -1246,7 +1291,7 @@ As native code generation matures, Doria IR may lower into a simpler native-orie
 
 MIR is Doria's native-oriented, backend-independent control-flow representation for the executable subset. It contains typed scalar, string, nullable-string, and class locals, parameters, calls and returns; class allocation, compiler-known property initialization/load/store, explicit ownership transfer and drops; method identities with explicit receiver operands and receiver modes; static data operations; runtime string literal/local/call/concatenation/display expressions; string comparison; basic blocks; checked numeric operations/conversions; and panic termination. Constants are typed and evaluated before MIR, so consumers receive folded values rather than a second evaluator. The debug interpreter uses safe private string and class values, an explicit heap-backed Doria frame stack, per-program static storage, and exact stdout/stderr buffers. It models source value and lifetime behavior, not native pointer/refcount layout. Ordinary interpretation has no fixed execution-fuel or call-depth cap and does not reject repeated states.
 
-Native is the primary target. Checked HIR lowers to typed MIR, shared MIR validation gates both native lowerers, Cranelift emits the default fast object, LLVM 18 emits the O3 `--release` object, and the host linker combines either object with `doria-rt`. Native compilation has no interpreter preflight, fallback IR, or release-to-fast fallback. `doria-rt` owns entry policy, headerless class payload allocation/free, typed-array/collection/byte-buffer/mixed-box/shared-control storage, immutable refcounted runtime strings, text and binary I/O, formatting support, exact stdout/stderr writes, abort-only panic formatting, stack traversal, and status 101. Both lowerers share scalar, opaque string, pointer-sized class/collection/`Bytes`/`mixed`/shared-handle, and Decision 0093 nullable ABI conventions. Normal cleanup drops still-owned class, collection, mixed, strong-reference, weak-reference, and nullable-strong locals and statement temporaries on fallthrough, `return`, `break`, and `continue`; invokes `__destruct` before reverse-order owned-property/element cleanup; and frees the relevant payload or control block last. Ordinary instance/static calls preserve those obligations. Owning class, collection, mixed, shared-handle, nullable-class, nullable-mixed, and nullable-strong returns transfer ownership, while Decision 0089 returned-borrow elision preserves an inferred readonly or writable alias to `$this` or exactly one borrowed parameter; only explicit `take` parameters and collection ingestion consume move arguments. Copy-type statics are private compiler-generated data symbols; compile-time string statics use an immortal private runtime representation and remain Copy at the Doria surface. Ownership transfer suppresses source cleanup, assignment acquires the replacement before dropping the old value, and abort-only panic runs no cleanup. Constructor definite initialization follows Decision 0090: semantic dataflow checks every reachable normal path, and MIR validation independently rejects incomplete or multiply initialized readonly property state before either native backend runs. Runtime failures use the shared panic path, except that an ordinary program write to a closed stdout or stderr pipe exits cleanly with status 0 under Decision 0091; panic reporting remains fatal even when its stderr sink is unavailable. Only canonical int/void entry results cross the process boundary. Unsupported coverage remains for the Stage 25a writable family, shared handles through `mixed`, dynamic dispatch, and general interfaces.
+Native is the primary target. Checked HIR lowers to typed MIR, shared MIR validation gates both native lowerers, Cranelift emits the default fast object, LLVM 18 emits the O3 `--release` object, and the host linker combines either object with `doria-rt`. Native compilation has no interpreter preflight, fallback IR, or release-to-fast fallback. `doria-rt` owns entry policy, headerless class payload allocation/free, typed-array/collection/byte-buffer/mixed-box/shared-control storage, immutable refcounted runtime strings, text and binary I/O, formatting support, exact stdout/stderr writes, abort-only panic formatting, stack traversal, and status 101. Both lowerers share scalar, opaque string, pointer-sized class/collection/`Bytes`/`mixed`/shared-handle, and Decision 0093 nullable ABI conventions. Normal cleanup drops still-owned class, collection, mixed, strong-reference, weak-reference, access-object, and nullable-strong locals and statement temporaries on fallthrough, `return`, `break`, and `continue`; invokes `__destruct` before reverse-order owned-property/element cleanup; releases writable-family access registrations before their strong claims; and frees the relevant payload or control block last. Ordinary instance/static calls preserve those obligations. Owning class, collection, mixed, shared-handle, access-object, nullable-class, nullable-mixed, and nullable-strong returns transfer ownership, while Decision 0089 returned-borrow elision preserves an inferred readonly or writable alias to `$this` or exactly one borrowed parameter; only explicit `take` parameters and collection ingestion consume move arguments. Copy-type statics are private compiler-generated data symbols; compile-time string statics use an immortal private runtime representation and remain Copy at the Doria surface. Ownership transfer suppresses source cleanup, assignment acquires the replacement before dropping the old value, and abort-only panic runs no cleanup. Constructor definite initialization follows Decision 0090: semantic dataflow checks every reachable normal path, and MIR validation independently rejects incomplete or multiply initialized readonly property state before either native backend runs. Runtime failures use the shared panic path, except that an ordinary program write to a closed stdout or stderr pipe exits cleanly with status 0 under Decision 0091; panic reporting remains fatal even when its stderr sink is unavailable. Only canonical int/void entry results cross the process boundary. Unsupported coverage remains for scalar/string writable-shared payload access, shared handles through `mixed`, dynamic dispatch, and general interfaces.
 
 The PHP backend is currently implemented as a compatibility/debugging backend. It emits `<?php` and lowers Doria-only syntax away:
 

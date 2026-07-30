@@ -1,0 +1,43 @@
+class Item
+{
+    writable int $value = 1;
+
+    function __destruct()
+    {
+        echo "drop item\n";
+    }
+}
+
+class ReadHolder
+{
+    function __construct(
+        take ReadonlySharedReferenceAccess<Item> $access,
+    ) {
+    }
+}
+
+class WriteHolder
+{
+    function __construct(
+        take WritableSharedReferenceAccess<Item> $access,
+    ) {
+    }
+}
+
+function main(): void
+{
+    let $readShared = new WritableSharedReference(new Item());
+    let $readHolder = new ReadHolder($readShared->acquireReadonlyAccess());
+    echo "stored read {$readHolder->access->value}\n";
+
+    let $writeShared = new WritableSharedReference(new Item());
+    let writable $writeHolder =
+        new WriteHolder($writeShared->acquireWritableAccess());
+    $writeHolder->access->value += 4;
+    echo "stored write {$writeHolder->access->value}\n";
+
+    List<ReadonlySharedReferenceAccess<Item>> $accesses = [
+        $readShared->acquireReadonlyAccess(),
+    ];
+    echo "stored list {$accesses[0]->value}\n";
+}

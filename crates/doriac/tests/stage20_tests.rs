@@ -37,13 +37,13 @@ fn diagnostic_snapshot(source: &str, code: &str) -> String {
         diagnostic.span.start,
         diagnostic.span.end,
     );
-    if let Some(fix) = diagnostic.fix {
+    if let Some(fix) = &diagnostic.fix {
         snapshot.push_str(&format!(
             "fix: {}..{} -> {:?}\n",
             fix.span.start, fix.span.end, fix.replacement
         ));
     }
-    for related in diagnostic.related {
+    for related in &diagnostic.related {
         snapshot.push_str(&format!(
             "related: {}..{}: {}\n",
             related.span.start, related.span.end, related.message

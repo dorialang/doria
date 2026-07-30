@@ -1,0 +1,27 @@
+class Token
+{
+    function __construct(string $name)
+    {
+    }
+
+    function __destruct()
+    {
+        echo "drop {$this->name}\n";
+    }
+}
+
+function main(): void
+{
+    {
+        let $outer = new Token("outer");
+
+        {
+            let $inner = new Token("inner");
+            echo "inside\n";
+        }
+
+        echo "after inner\n";
+    }
+
+    echo "done\n";
+}

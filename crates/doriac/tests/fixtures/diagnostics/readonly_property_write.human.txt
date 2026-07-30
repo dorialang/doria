@@ -1,0 +1,21 @@
+Error[E0202]: Cannot Write to Readonly Property `value`
+  --> readonly_property_write.doria:3:5
+   |
+  2 | {
+  3 |     int $value = 0;
+    |     --------------- `value` Is Readonly Here
+  4 |
+  --> readonly_property_write.doria:7:9
+   |
+  6 |     {
+  7 |         $this->value = 1;
+    |         ^^^^^^^^^^^^ This Operation Needs Writable Access
+  8 |     }
+
+Why:
+  This assignment changes a property whose declaration does not grant
+  writable access.
+Help:
+  Mark the property writable: `writable int $value;`
+
+Compilation Failed: 1 Error

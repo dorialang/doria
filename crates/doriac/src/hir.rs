@@ -109,6 +109,7 @@ pub struct Block {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Stmt {
+    Block(Block),
     VarDecl(VarDecl),
     Assignment(Assignment),
     Echo { expr: Expr, span: Span },

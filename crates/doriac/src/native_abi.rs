@@ -3,6 +3,7 @@
 use crate::mir;
 
 pub const STRING_FROM_UTF8: &str = "dr_v1_string_from_utf8";
+pub const PROCESS_EXIT: &str = "dr_v1_exit_process";
 pub const STRING_RETAIN: &str = "dr_v1_string_retain";
 pub const STRING_RELEASE: &str = "dr_v1_string_release";
 pub const STRING_CONCAT: &str = "dr_v1_string_concat";
@@ -51,6 +52,22 @@ pub const SHARED_CREATE_WEAK: &str = "dr_v1_shared_create_weak";
 pub const SHARED_RELEASE_WEAK: &str = "dr_v1_shared_release_weak";
 pub const SHARED_ACQUIRE: &str = "dr_v1_shared_acquire";
 pub const SHARED_PAYLOAD: &str = "dr_v1_shared_payload";
+pub const WRITABLE_SHARED_CREATE: &str = "dr_v1_writable_shared_create";
+pub const WRITABLE_SHARED_RETAIN: &str = "dr_v1_writable_shared_retain";
+pub const WRITABLE_SHARED_RELEASE: &str = "dr_v1_writable_shared_release";
+pub const WRITABLE_SHARED_CREATE_WEAK: &str = "dr_v1_writable_shared_create_weak";
+pub const WRITABLE_SHARED_RELEASE_WEAK: &str = "dr_v1_writable_shared_release_weak";
+pub const WRITABLE_SHARED_ACQUIRE: &str = "dr_v1_writable_shared_acquire";
+pub const WRITABLE_SHARED_ACQUIRE_READONLY_ACCESS: &str =
+    "dr_v1_writable_shared_acquire_readonly_access";
+pub const WRITABLE_SHARED_ACQUIRE_WRITABLE_ACCESS: &str =
+    "dr_v1_writable_shared_acquire_writable_access";
+pub const WRITABLE_SHARED_RELEASE_READONLY_ACCESS: &str =
+    "dr_v1_writable_shared_release_readonly_access";
+pub const WRITABLE_SHARED_RELEASE_WRITABLE_ACCESS: &str =
+    "dr_v1_writable_shared_release_writable_access";
+pub const WRITABLE_SHARED_READONLY_PAYLOAD: &str = "dr_v1_writable_shared_readonly_payload";
+pub const WRITABLE_SHARED_WRITABLE_PAYLOAD: &str = "dr_v1_writable_shared_writable_payload";
 pub const MIXED_NEW: &str = "dr_v1_mixed_new";
 pub const MIXED_NEW_BORROWED: &str = "dr_v1_mixed_new_borrowed";
 pub const MIXED_CLONE_OWNED: &str = "dr_v1_mixed_clone_owned";
@@ -121,6 +138,14 @@ pub const fn collection_value_width(ty: mir::Type, pointer_width: u8) -> Option<
         | mir::Type::WeakReference(_)
         | mir::Type::NullableSharedReference(_)
         | mir::Type::NullableWeakReference(_)
+        | mir::Type::WritableSharedReference(_)
+        | mir::Type::WritableWeakReference(_)
+        | mir::Type::NullableWritableSharedReference(_)
+        | mir::Type::NullableWritableWeakReference(_)
+        | mir::Type::ReadonlySharedReferenceAccess(_)
+        | mir::Type::WritableSharedReferenceAccess(_)
+        | mir::Type::NullableReadonlySharedReferenceAccess(_)
+        | mir::Type::NullableWritableSharedReferenceAccess(_)
         | mir::Type::Collection(_) => Some(pointer_width),
         mir::Type::NullableScalar(_)
         | mir::Type::NullableString

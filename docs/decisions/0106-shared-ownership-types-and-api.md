@@ -192,6 +192,8 @@ Moving an access object transfers both the owning claim and the responsibility t
 release the registered access; the moved-from object is inert. Because access
 objects are storable, one parked in a long-lived structure holds its access open
 for that lifetime — deterministic and visible, and the caller's responsibility.
+Decision 0107's standalone lexical block is the ordinary source-level way to end
+that lifetime early without introducing a helper function.
 
 `ReadonlySharedReferenceAccess<T>` permits property reads, indexed reads, readonly
 method calls, and readonly iteration; it rejects writes, writable method calls,
@@ -401,6 +403,30 @@ that contradicts Doria's collection vocabulary. The writable family already answ
 the shared-collection use case through its access objects. Deliberately left open
 for a later readonly-sharing design rather than declared impossible.
 
+## Implementation clarification
+
+Stage 25a Slice 3 implements the writable control structure and access guards
+without changing this decision's surface. Class, generic-class, typed-array,
+`List<T>`, `Dictionary<K, V>`, `Set<T>`, and `Bytes` payloads execute through the
+interpreter, Cranelift, and LLVM. Access objects retain their registration while
+stored in parameters, returns, properties, and collection value slots. Every
+cleanup path selects its release operation from the complete semantic type:
+writable strong, writable weak, readonly access, and writable access are never
+collapsed into one generic pointer cleanup. Access destruction releases the
+registration before its strong claim.
+
+Null-safe access acquisition preserves the access family in
+`?ReadonlySharedReferenceAccess<T>` and `?WritableSharedReferenceAccess<T>`.
+Presence-tested access objects forward the same class and indexed operations as
+their non-null forms, and absent values acquire no registration and require no
+release.
+
+Scalar and string writable-shared payload spellings retain their accepted type
+identity, but runtime construction remains behind a Stage 25a diagnostic until a
+complete-value access surface is accepted. Shared handles through `mixed` remain
+pending because preserving family identity and drop obligations requires explicit
+mixed runtime tags.
+
 ## Consequences
 
 - Shared ownership exists as an opt-in escape hatch without changing the default
@@ -449,8 +475,11 @@ differential parity manifest, leak-check jobs, and the external
 - **Phase H thread-safe variants** must preserve family disjointness rather than
   introducing a cross-family bridge, and must not retrofit atomics onto these
   non-atomic counts.
-- **The language server** must add all six types and five members to completion and
-  hover, and must not offer the superseded names as valid surface.
+- **The language server** adds all six types and five members to completion and
+  hover, and does not offer the superseded names as valid surface.
 - **Stage 26 and later collection work** may store these handles in collections;
   collection element move classification already covers them, but any future
   Copy-element optimization must exclude them.
+- **Native collection cleanup** must dispatch writable-family stored values by
+  their exact semantic type; readonly-family weak release is never a valid common
+  fallback for writable strong, writable weak, or either access-object type.

@@ -39,7 +39,7 @@ pub const BUILD_COMMIT: &str = env!("DORIA_BUILD_COMMIT");
 
 use ast::Program;
 use backend::{BackendTarget, CompileOptions};
-use diagnostics::{Diagnostic, DiagnosticResult};
+use diagnostics::{Diagnostic, DiagnosticFormat, DiagnosticResult, RenderOptions};
 use source::{SourceFile, Span};
 
 pub fn lex_source(
@@ -123,9 +123,21 @@ pub fn compile_source_with_options(
 ) -> Result<backend::BackendOutput, Vec<Diagnostic>> {
     let hir = lower_source(path, text)?;
     backend::emit_with_options(&hir, options).map_err(|error| {
-        error
-            .diagnostics
-            .unwrap_or_else(|| vec![Diagnostic::new("B0001", error.message, Span::default())])
+        error.diagnostics.unwrap_or_else(|| {
+            let summary = error
+                .message
+                .lines()
+                .next()
+                .unwrap_or("the backend did not provide an error summary")
+                .to_string();
+            vec![
+                Diagnostic::new("B0001", error.message, Span::default())
+                    .with_note(summary)
+                    .with_help(
+                        "use `--diagnostic-format json` or set `DORIA_DIAGNOSTIC_DEBUG=1` for complete developer details",
+                    ),
+            ]
+        })
     })
 }
 
@@ -140,35 +152,27 @@ pub fn render_diagnostics(
     diagnostics: &[Diagnostic],
 ) -> String {
     let source = SourceFile::new(path, text);
-    diagnostics
-        .iter()
-        .map(|diagnostic| diagnostic.render(&source))
-        .collect::<Vec<_>>()
-        .join("\n")
+    diagnostics::render_diagnostics(&source, diagnostics, RenderOptions::default())
 }
 
 pub fn diagnostics_json(diagnostics: &[Diagnostic]) -> String {
-    let values = diagnostics
-        .iter()
-        .map(|diagnostic| {
-            serde_json::json!({
-                "code": diagnostic.code,
-                "message": diagnostic.message,
-                "help": diagnostic.help,
-                "span": {
-                    "start": diagnostic.span.start,
-                    "end": diagnostic.span.end,
-                },
-                "fix": diagnostic.fix.as_ref().map(|fix| serde_json::json!({
-                    "span": { "start": fix.span.start, "end": fix.span.end },
-                    "replacement": fix.replacement,
-                })),
-                "related": diagnostic.related.iter().map(|related| serde_json::json!({
-                    "span": { "start": related.span.start, "end": related.span.end },
-                    "message": related.message,
-                })).collect::<Vec<_>>(),
-            })
-        })
-        .collect::<Vec<_>>();
-    serde_json::to_string_pretty(&values).expect("diagnostics are JSON serializable")
+    render_diagnostics_with_options(
+        "<unknown>",
+        "",
+        diagnostics,
+        RenderOptions {
+            format: DiagnosticFormat::Json,
+            ..RenderOptions::default()
+        },
+    )
+}
+
+pub fn render_diagnostics_with_options(
+    path: impl Into<String>,
+    text: impl Into<String>,
+    diagnostics: &[Diagnostic],
+    options: RenderOptions,
+) -> String {
+    let source = SourceFile::new(path, text);
+    diagnostics::render_diagnostics(&source, diagnostics, options)
 }

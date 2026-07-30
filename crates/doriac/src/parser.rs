@@ -455,6 +455,9 @@ impl Parser {
     }
 
     fn parse_statement(&mut self) -> Option<Stmt> {
+        if self.check(&TokenKind::LeftBrace) {
+            return self.parse_block().map(Stmt::Block);
+        }
         if matches!(&self.peek().kind, TokenKind::Identifier(name) if name == "print") {
             let span = self.advance().span;
             self.diagnostics.push(

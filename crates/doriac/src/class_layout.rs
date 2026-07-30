@@ -31,6 +31,11 @@ pub enum FieldType {
     SharedReference(ClassId),
     WeakReference(ClassId),
     NullableSharedReference(ClassId),
+    WritableSharedReference,
+    WritableWeakReference,
+    NullableWritableSharedReference,
+    NullableWritableWeakReference,
+    SharedReferenceAccess,
     Collection,
 }
 
@@ -112,6 +117,11 @@ pub const fn field_size_align(ty: FieldType, pointer_size: u32) -> (u32, u32) {
         | FieldType::SharedReference(_)
         | FieldType::WeakReference(_)
         | FieldType::NullableSharedReference(_)
+        | FieldType::WritableSharedReference
+        | FieldType::WritableWeakReference
+        | FieldType::NullableWritableSharedReference
+        | FieldType::NullableWritableWeakReference
+        | FieldType::SharedReferenceAccess
         | FieldType::Collection => (pointer_size, pointer_size),
     }
 }

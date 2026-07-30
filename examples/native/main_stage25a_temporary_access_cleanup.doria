@@ -1,0 +1,43 @@
+class Box
+{
+    writable int $value = 1;
+}
+
+function main(): void
+{
+    let $owner = new WritableSharedReference<List<int>>([1, 2, 3]);
+
+    int $directCount = $owner->acquireReadonlyAccess()->count;
+    {
+        let writable $write = $owner->acquireWritableAccess();
+        $write->add(4);
+    }
+
+    ?WritableSharedReference<List<int>> $maybeOwner = $owner->share();
+    int $nullableCount =
+        $maybeOwner?->acquireReadonlyAccess()?->count ?? -1;
+    {
+        let writable $write = $owner->acquireWritableAccess();
+        $write->add(5);
+    }
+
+    if ($owner->acquireReadonlyAccess()->contains(5)) {
+        echo "condition\n";
+    }
+    {
+        let writable $write = $owner->acquireWritableAccess();
+        $write->add(6);
+    }
+
+    let $boxOwner = new WritableSharedReference(new Box());
+    int $boxValue = $boxOwner->acquireReadonlyAccess()->value;
+    {
+        let writable $write = $boxOwner->acquireWritableAccess();
+        $write->value++;
+    }
+
+    echo "direct {$directCount}\n";
+    echo "nullable {$nullableCount}\n";
+    echo "list {$owner->acquireReadonlyAccess()->count}\n";
+    echo "box {$boxValue}:{$boxOwner->acquireReadonlyAccess()->value}\n";
+}

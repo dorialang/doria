@@ -1,0 +1,46 @@
+class Node
+{
+    function __construct(string $name)
+    {
+    }
+
+    function __destruct()
+    {
+        echo "drop {$this->name}\n";
+    }
+}
+
+function acquire(
+    WritableSharedReference<Node> $shared,
+): ReadonlySharedReferenceAccess<Node>
+{
+    return $shared->acquireReadonlyAccess();
+}
+
+function inspect(ReadonlySharedReferenceAccess<Node> $access): void
+{
+    echo "access {$access->name}\n";
+}
+
+function keepAlive(): WritableWeakReference<Node>
+{
+    let $shared = new WritableSharedReference(new Node("guarded"));
+    let $weak = $shared->createWeakReference();
+    let $access = acquire($shared);
+    inspect($access);
+
+    let $live = $weak->acquire();
+    if ($live != null) {
+        echo "live through access\n";
+    }
+
+    return $weak;
+}
+
+function main(): void
+{
+    let $weak = keepAlive();
+    if ($weak->acquire() == null) {
+        echo "expired after access\n";
+    }
+}

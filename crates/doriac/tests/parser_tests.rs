@@ -5,6 +5,33 @@ use doriac::ast::{
 use doriac::types::TypeArgumentRef;
 
 #[test]
+fn parses_standalone_lexical_blocks_as_statements() {
+    let program = doriac::parse_source(
+        "test.doria",
+        r#"
+function main(): void
+{
+    {
+        let $value = 1;
+        {
+            echo "{$value}";
+        }
+    }
+}
+"#,
+    )
+    .expect("standalone lexical blocks should parse as statements");
+
+    let Item::Function(function) = &program.items[0] else {
+        panic!("expected function declaration");
+    };
+    let Stmt::Block(outer) = &function.body.statements[0] else {
+        panic!("expected outer standalone block");
+    };
+    assert!(matches!(outer.statements[1], Stmt::Block(_)));
+}
+
+#[test]
 fn parses_class_workflow_and_qualified_type_syntax_before_semantics_land() {
     let program = doriac::parse_source(
         "test.doria",

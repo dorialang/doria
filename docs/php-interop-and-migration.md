@@ -188,6 +188,32 @@ $count += 1;
 
 The converter can infer `writable` when it sees later assignments.
 
+### String API mapping
+
+PHP string functions migrate to Decision 0103's canonical `String::` companion
+surface. PHP input such as `trim`, `str_contains`, `str_starts_with`, `strpos`,
+`str_replace`, `explode`, `implode`, `substr`, `str_repeat`, `str_pad`, and
+`strcasecmp` does not establish a Doria free-function family.
+
+Representative mappings:
+
+| PHP input | Doria output |
+| --- | --- |
+| `trim($text)` | `String::trim($text)` |
+| `str_contains($text, $needle)` | `String::contains($text, $needle)` |
+| `str_starts_with($text, $prefix)` | `String::startsWith($text, $prefix)` |
+| `strpos($text, $needle)` | `String::indexOf($text, $needle)` |
+| `str_replace($search, $replacement, $text)` | `String::replace($text, $search, $replacement)` |
+| `explode($separator, $text)` | `String::split($text, $separator)` |
+| `implode($separator, $values)` | `String::join($separator, $values)` |
+| `substr($text, $start, $length)` | `String::slice($text, $start, $length)` |
+| `strcasecmp($left, $right)` | `String::compareIgnoreCase($left, $right)` |
+
+Migration tooling must flag semantic differences rather than claiming automatic
+equivalence: Doria search indices, slicing, padding, and `length` use Unicode
+grapheme units, while the corresponding PHP operations are commonly
+byte-oriented.
+
 ---
 
 ## 6. Migration modes

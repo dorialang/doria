@@ -42,6 +42,15 @@ through the Stage 22 flow model. Naming follows the §9.1 charter.
   writable in a writable indexed place (`$l[i]++`, `$l[i] = x`) or through
   `foreach ... as writable`. A borrow cannot outlive its collection. Where access
   can miss, the borrow is nullable (`?T`) and narrows via Stage 22 flow.
+  Returning one through a readonly property or method preserves its transitive
+  owner provenance under Decision 0089; it never silently becomes an owned `T`.
+- **Indexed writes mutate the slot, not the containing property.** A complete
+  writable path may be rooted through a local, parameter, writable `$this`,
+  writable property path, or writable shared access object. For a move value,
+  `$this->items[$key] = $value` transfers the value into the slot, releases the
+  replaced slot exactly once, and leaves the collection itself owned by
+  `$this`. This is distinct from replacing `$this->items` with another complete
+  collection.
 - **Removal hands ownership back.** `removeAt`, `pop`, `remove`, and the
   `pop*`/`popFront`/`popBack` family **move the element out** of the collection
   and transfer **owned** ownership to the caller — nullable (`?T`) where the
@@ -239,3 +248,5 @@ fixtures. SPEC is updated when the members are implemented, not now.
   authored default surface here, no longer a pre-authorization minimum.
 - Any assumption that built-in collection mutators might be fluent — they return
   `void`; fluency lives in userland via 0088.
+- Any ownership rule that classifies a property-rooted indexed write as a
+  complete-property move, or loses the borrow root of `get`/`first`/`last`.

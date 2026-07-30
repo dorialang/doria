@@ -7,18 +7,77 @@ use std::process::{Command, ExitCode, ExitStatus};
 use std::str::FromStr;
 
 use doriac::backend::{BackendOutput, BackendTarget, CompileOptions, NativeProfile};
+use doriac::diagnostics::{ColorChoice, Diagnostic, DiagnosticFormat, RenderOptions};
+
+enum CliError {
+    Message(String),
+    Diagnostics {
+        path: String,
+        text: String,
+        diagnostics: Vec<Diagnostic>,
+        options: RenderOptions,
+    },
+}
+
+impl CliError {
+    fn diagnostics(
+        path: String,
+        text: String,
+        diagnostics: Vec<Diagnostic>,
+        options: RenderOptions,
+    ) -> Self {
+        Self::Diagnostics {
+            path,
+            text,
+            diagnostics,
+            options,
+        }
+    }
+
+    fn emit(self) {
+        match self {
+            Self::Message(message) => eprintln!("Error: {message}"),
+            Self::Diagnostics {
+                path,
+                text,
+                diagnostics,
+                options,
+            } => {
+                let rendered =
+                    doriac::render_diagnostics_with_options(path, text, &diagnostics, options);
+                if options.format == DiagnosticFormat::Json {
+                    println!("{rendered}");
+                } else {
+                    eprintln!("{rendered}");
+                }
+            }
+        }
+    }
+}
+
+impl From<String> for CliError {
+    fn from(message: String) -> Self {
+        Self::Message(message)
+    }
+}
+
+impl From<&str> for CliError {
+    fn from(message: &str) -> Self {
+        Self::Message(message.to_string())
+    }
+}
 
 fn main() -> ExitCode {
     match run() {
         Ok(exit_code) => exit_code,
-        Err(message) => {
-            eprintln!("{message}");
+        Err(error) => {
+            error.emit();
             ExitCode::FAILURE
         }
     }
 }
 
-fn run() -> Result<ExitCode, String> {
+fn run() -> Result<ExitCode, CliError> {
     let args = env::args_os().skip(1).collect::<Vec<_>>();
     let Some(command) = args.first() else {
         print_help();
@@ -32,7 +91,7 @@ fn run() -> Result<ExitCode, String> {
         return Ok(ExitCode::SUCCESS);
     }
     if command == "--version" || command == "-V" {
-        return version_command(&args[1..]);
+        return version_command(&args[1..]).map_err(Into::into);
     }
     if command == "run" {
         return run_command(&args[1..]);
@@ -41,29 +100,27 @@ fn run() -> Result<ExitCode, String> {
     let args = utf8_cli_arguments(&args)?;
     match command {
         "check" => {
+            let (args, options) = parse_diagnostic_options(&args[1..])?;
             let input = args
-                .get(1)
+                .first()
                 .ok_or_else(|| "missing input file".to_string())?;
-            let json = match args.get(2).map(String::as_str) {
-                None => false,
-                Some("--json") => true,
-                Some(option) => return Err(format!("unknown check option `{option}`")),
-            };
-            if let Some(option) = args.get(3) {
-                return Err(format!("unknown check option `{option}`"));
+            if let Some(option) = args.get(1) {
+                return Err(format!("unknown check option `{option}`").into());
             }
             let (path, text) = read_source(input)?;
             match doriac::check_source(path.clone(), text.clone()) {
                 Ok(_) => {
-                    if json {
-                        println!("[]");
+                    if options.format == DiagnosticFormat::Json {
+                        println!(
+                            "{}",
+                            doriac::render_diagnostics_with_options(path, text, &[], options)
+                        );
                     } else {
                         println!("OK");
                     }
                     Ok(ExitCode::SUCCESS)
                 }
-                Err(diagnostics) if json => Err(doriac::diagnostics_json(&diagnostics)),
-                Err(diagnostics) => Err(doriac::render_diagnostics(path, text, &diagnostics)),
+                Err(diagnostics) => Err(CliError::diagnostics(path, text, diagnostics, options)),
             }
         }
         "ast" => ast_command(&args[1..]).map(|()| ExitCode::SUCCESS),
@@ -76,10 +133,9 @@ fn run() -> Result<ExitCode, String> {
              doriac compile {command} --out <file>   # build a native executable\n    \
              doriac run {command}                    # compile and run it\n\n\
              Run `doriac --help` for all commands."
-        )),
-        command => Err(format!(
-            "unknown command `{command}`\n\nRun `doriac --help`."
-        )),
+        )
+        .into()),
+        command => Err(format!("unknown command `{command}`\n\nRun `doriac --help`.").into()),
     }
 }
 
@@ -141,7 +197,8 @@ fn utf8_cli_arguments(args: &[OsString]) -> Result<Vec<String>, String> {
         .collect()
 }
 
-fn compile_command(args: &[String]) -> Result<(), String> {
+fn compile_command(args: &[String]) -> Result<(), CliError> {
+    let (args, diagnostic_options) = parse_diagnostic_options(args)?;
     let input = args
         .first()
         .ok_or_else(|| "missing input file".to_string())?;
@@ -171,12 +228,12 @@ fn compile_command(args: &[String]) -> Result<(), String> {
                 release = true;
                 index += 1;
             }
-            flag => return Err(format!("unknown compile option `{flag}`")),
+            flag => return Err(format!("unknown compile option `{flag}`").into()),
         }
     }
 
     if release && target != BackendTarget::Native {
-        return Err("--release is only valid for the native target".to_string());
+        return Err("--release is only valid for the native target".into());
     }
 
     if !target.is_available() {
@@ -184,7 +241,8 @@ fn compile_command(args: &[String]) -> Result<(), String> {
             "target `{}` ({}) is planned but not implemented yet; available targets are `native`, `php`, and `debug`",
             target.name(),
             target.description()
-        ));
+        )
+        .into());
     }
 
     let (path, text) = read_source(input)?;
@@ -200,43 +258,50 @@ fn compile_command(args: &[String]) -> Result<(), String> {
             NativeProfile::Fast
         },
     };
-    let output = doriac::compile_source_with_options(path.clone(), text.clone(), options)
-        .map_err(|diagnostics| doriac::render_diagnostics(path, text, &diagnostics))?;
+    let output = doriac::compile_source_with_options(path.clone(), text.clone(), options).map_err(
+        |diagnostics| CliError::diagnostics(path, text, diagnostics, diagnostic_options),
+    )?;
 
     write_backend_output(&out_path, output)?;
     println!("{}", out_path.display());
     Ok(())
 }
 
-fn ast_command(args: &[String]) -> Result<(), String> {
+fn ast_command(args: &[String]) -> Result<(), CliError> {
+    let (args, diagnostic_options) = parse_diagnostic_options(args)?;
     let input = args
         .first()
         .ok_or_else(|| "missing input file".to_string())?;
     let (path, text) = read_source(input)?;
-    let ast = doriac::parse_source(path.clone(), text.clone())
-        .map_err(|diagnostics| doriac::render_diagnostics(path, text, &diagnostics))?;
+    let ast = doriac::parse_source(path.clone(), text.clone()).map_err(|diagnostics| {
+        CliError::diagnostics(path, text, diagnostics, diagnostic_options)
+    })?;
     println!("{ast:#?}");
     Ok(())
 }
 
-fn hir_command(args: &[String]) -> Result<(), String> {
+fn hir_command(args: &[String]) -> Result<(), CliError> {
+    let (args, diagnostic_options) = parse_diagnostic_options(args)?;
     let input = args
         .first()
         .ok_or_else(|| "missing input file".to_string())?;
     let (path, text) = read_source(input)?;
-    let hir = doriac::lower_source(path.clone(), text.clone())
-        .map_err(|diagnostics| doriac::render_diagnostics(path, text, &diagnostics))?;
+    let hir = doriac::lower_source(path.clone(), text.clone()).map_err(|diagnostics| {
+        CliError::diagnostics(path, text, diagnostics, diagnostic_options)
+    })?;
     println!("{hir:#?}");
     Ok(())
 }
 
-fn mir_command(args: &[String]) -> Result<(), String> {
+fn mir_command(args: &[String]) -> Result<(), CliError> {
+    let (args, diagnostic_options) = parse_diagnostic_options(args)?;
     let input = args
         .first()
         .ok_or_else(|| "missing input file".to_string())?;
     let (path, text) = read_source(input)?;
-    let mir = doriac::lower_source_to_mir(path.clone(), text.clone())
-        .map_err(|diagnostics| doriac::render_diagnostics(path, text, &diagnostics))?;
+    let mir = doriac::lower_source_to_mir(path.clone(), text.clone()).map_err(|diagnostics| {
+        CliError::diagnostics(path, text, diagnostics, diagnostic_options)
+    })?;
     print!("{mir}");
     Ok(())
 }
@@ -328,7 +393,7 @@ fn default_output_extension(target: BackendTarget) -> &'static str {
     }
 }
 
-fn run_command(args: &[OsString]) -> Result<ExitCode, String> {
+fn run_command(args: &[OsString]) -> Result<ExitCode, CliError> {
     let separator = args
         .iter()
         .position(|argument| argument == OsStr::new("--"));
@@ -337,6 +402,7 @@ fn run_command(args: &[OsString]) -> Result<ExitCode, String> {
         None => (args, &[][..]),
     };
     let compiler_args = utf8_cli_arguments(compiler_args)?;
+    let (compiler_args, diagnostic_options) = parse_diagnostic_options(&compiler_args)?;
     let input = compiler_args
         .first()
         .ok_or_else(|| "missing input file".to_string())?;
@@ -346,7 +412,7 @@ fn run_command(args: &[OsString]) -> Result<ExitCode, String> {
     for option in &compiler_args[1..] {
         match option.as_str() {
             "--release" => release = true,
-            option => return Err(format!("unknown run option `{option}`")),
+            option => return Err(format!("unknown run option `{option}`").into()),
         }
     }
 
@@ -361,7 +427,7 @@ fn run_command(args: &[OsString]) -> Result<ExitCode, String> {
         text.clone(),
         CompileOptions::native(profile),
     )
-    .map_err(|diagnostics| doriac::render_diagnostics(path, text, &diagnostics))?;
+    .map_err(|diagnostics| CliError::diagnostics(path, text, diagnostics, diagnostic_options))?;
 
     let temp_path = temp_run_executable_path(input);
     write_backend_output(&temp_path, output)
@@ -378,7 +444,7 @@ fn run_command(args: &[OsString]) -> Result<ExitCode, String> {
         })?;
 
     let _ = fs::remove_file(&temp_path);
-    exit_code_from_status(status)
+    Ok(exit_code_from_status(status)?)
 }
 
 fn temp_run_executable_path(input: &str) -> PathBuf {
@@ -436,9 +502,56 @@ fn direct_executable_hint(path: &Path) -> String {
 
 fn print_help() {
     println!(
-        "doriac {}\n\nUSAGE:\n    doriac check <source.doria> [--json]\n    doriac ast <source.doria>\n    doriac hir <source.doria>\n    doriac mir <source.doria>\n    doriac compile <source.doria> [--release] [--out <file>]\n    doriac compile <source.doria> --target php [--out <file>]\n    doriac run <source.doria> [--release] [-- <program args>...]\n\nNATIVE PROFILES:\n    fast       default Cranelift profile for rapid local feedback\n    release    LLVM optimized profile selected with --release\n\nTARGETS:\n    native    default target for standalone executables\n    php       compatibility and inspection backend\n    debug     MIR interpreter debug artifact\n    wasm      planned WebAssembly backend",
+        "doriac {}\n\nUSAGE:\n    doriac check <source.doria> [diagnostic options]\n    doriac ast <source.doria> [diagnostic options]\n    doriac hir <source.doria> [diagnostic options]\n    doriac mir <source.doria> [diagnostic options]\n    doriac compile <source.doria> [--release] [--out <file>] [diagnostic options]\n    doriac compile <source.doria> --target php [--out <file>] [diagnostic options]\n    doriac run <source.doria> [--release] [diagnostic options] [-- <program args>...]\n\nDIAGNOSTIC OPTIONS:\n    --diagnostic-format human|concise|json    default: human\n    --diagnostic-color auto|always|never      default: auto; NO_COLOR disables auto color\n\nHuman and concise diagnostics are written to stderr. Versioned JSON diagnostics are written to stdout.\n\nNATIVE PROFILES:\n    fast       default Cranelift profile for rapid local feedback\n    release    LLVM optimized profile selected with --release\n\nTARGETS:\n    native    default target for standalone executables\n    php       compatibility and inspection backend\n    debug     MIR interpreter debug artifact\n    wasm      planned WebAssembly backend",
         doriac::TOOLCHAIN_VERSION
     );
+}
+
+fn parse_diagnostic_options(args: &[String]) -> Result<(Vec<String>, RenderOptions), String> {
+    let mut options = RenderOptions {
+        terminal_width: env::var("COLUMNS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(100),
+        ..RenderOptions::default()
+    };
+    let mut positional = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--json" => {
+                options.format = DiagnosticFormat::Json;
+                index += 1;
+            }
+            "--diagnostic-format" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "missing value for --diagnostic-format".to_string())?;
+                options.format = DiagnosticFormat::parse(value).ok_or_else(|| {
+                    format!(
+                        "unknown diagnostic format `{value}`; expected `human`, `concise`, or `json`"
+                    )
+                })?;
+                index += 2;
+            }
+            "--diagnostic-color" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "missing value for --diagnostic-color".to_string())?;
+                options.color = ColorChoice::parse(value).ok_or_else(|| {
+                    format!(
+                        "unknown diagnostic color `{value}`; expected `auto`, `always`, or `never`"
+                    )
+                })?;
+                index += 2;
+            }
+            argument => {
+                positional.push(argument.to_string());
+                index += 1;
+            }
+        }
+    }
+    Ok((positional, options))
 }
 
 #[cfg(unix)]

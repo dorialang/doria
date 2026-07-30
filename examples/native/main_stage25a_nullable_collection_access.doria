@@ -1,0 +1,52 @@
+function marker(): int
+{
+    echo "argument\n";
+    return 2;
+}
+
+function maybeRead(
+    ?WritableSharedReference<List<int>> $owner,
+): ?ReadonlySharedReferenceAccess<List<int>> {
+    return $owner?->acquireReadonlyAccess();
+}
+
+function maybeWrite(
+    ?WritableSharedReference<Set<int>> $owner,
+): ?WritableSharedReferenceAccess<Set<int>> {
+    return $owner?->acquireWritableAccess();
+}
+
+function main(): void
+{
+    let $listOwner = new WritableSharedReference<List<int>>([1, 2, 3]);
+    ?WritableSharedReference<List<int>> $missingListOwner = null;
+    let $presentList = maybeRead($listOwner);
+    let $missingList = maybeRead($missingListOwner);
+
+    int $presentCount = $presentList?->count ?? -1;
+    int $presentFirst = $presentList?->first ?? -1;
+    bool $presentContains = $presentList?->contains(marker()) ?? false;
+    int $missingCount = $missingList?->count ?? -1;
+    int $missingFirst = $missingList?->first ?? -1;
+    bool $missingContains = $missingList?->contains(marker()) ?? false;
+
+    echo "present count {$presentCount}\n";
+    echo "present first {$presentFirst}\n";
+    if ($presentContains) {
+        echo "present contains\n";
+    }
+    echo "missing count {$missingCount}\n";
+    echo "missing first {$missingFirst}\n";
+    if (!$missingContains) {
+        echo "missing skipped\n";
+    }
+
+    let $setOwner = new WritableSharedReference<Set<int>>(Set::from([1]));
+    writable ?WritableSharedReferenceAccess<Set<int>> $set = maybeWrite($setOwner);
+    bool $added = $set?->add(2) ?? false;
+    int $setCount = $set?->count ?? -1;
+    if ($added) {
+        echo "added\n";
+    }
+    echo "set count {$setCount}\n";
+}

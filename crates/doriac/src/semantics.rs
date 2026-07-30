@@ -1778,11 +1778,23 @@ impl<'program> Checker<'program> {
             Expr::FunctionCall { name, .. } => {
                 self.functions.get(name).and_then(|info| info.return_borrow)
             }
-            Expr::MethodCall { object, method, .. } => self
-                .expr_class_name(object, scopes, method_context)
-                .and_then(|class_name| self.classes.get(&class_name))
-                .and_then(|class| class.methods.get(method))
-                .and_then(|info| info.return_borrow),
+            Expr::MethodCall { object, method, .. } => {
+                let object_ty = self.infer_expr_type(object, scopes, method_context);
+                let object_ty = self.forwarded_access_payload_type(object_ty);
+                if matches!(
+                    (self.types.kind(object_ty), method.as_str()),
+                    (TypeKind::Dictionary(_, _), "get")
+                ) {
+                    return Some(ReturnBorrow {
+                        source: BorrowSource::Receiver,
+                        writable: false,
+                    });
+                }
+                self.expr_class_name(object, scopes, method_context)
+                    .and_then(|class_name| self.classes.get(&class_name))
+                    .and_then(|class| class.methods.get(method))
+                    .and_then(|info| info.return_borrow)
+            }
             Expr::StaticCall {
                 qualifier, method, ..
             } => Self::static_qualifier_class_name(qualifier, method_context)
@@ -2641,6 +2653,7 @@ impl<'program> Checker<'program> {
                 } else {
                     PropertyInitState::Uninitialized
                 },
+                declaration_span: property.span,
             },
         );
     }
@@ -2743,6 +2756,7 @@ impl<'program> Checker<'program> {
                 writable: param.writable,
                 ty,
                 init_state: PropertyInitState::PromotedParameter,
+                declaration_span: param.span,
             },
         );
     }
@@ -3142,6 +3156,19 @@ impl<'program> Checker<'program> {
         loop_depth: usize,
     ) {
         match statement {
+            Stmt::Block(block) => {
+                let mut nested_constructor_init_context = constructor_init_context
+                    .as_deref()
+                    .map(ConstructorInitContext::nested);
+                self.check_block(
+                    block,
+                    scopes,
+                    method_context,
+                    nested_constructor_init_context.as_mut(),
+                    return_context,
+                    loop_depth,
+                );
+            }
             Stmt::VarDecl(decl) => {
                 self.check_expr(&decl.initializer, scopes, method_context);
                 let value_ty = self.infer_expr_type(&decl.initializer, scopes, method_context);
@@ -4049,7 +4076,7 @@ impl<'program> Checker<'program> {
                         self.lookup_property(object, property, *span, scopes, method_context);
                     }
                 } else if self
-                    .collection_property_type(object, property, scopes, method_context)
+                    .collection_property_type(object, property, *null_safe, scopes, method_context)
                     .is_some()
                 {
                     self.check_collection_property(object, property, *span, scopes, method_context);
@@ -5499,8 +5526,13 @@ impl<'program> Checker<'program> {
                                 format!("cannot assign to readonly variable `${name}`"),
                                 *span,
                             )
+                            .with_title("Cannot Write to Readonly Binding")
+                            .with_primary_label("This Assignment Needs Writable Access")
+                            .with_explanation(
+                                "Readonly bindings may be initialized once but cannot be assigned another value.",
+                            )
                             .with_help(format!(
-                                "declare it as `let writable ${name} = ...` if mutation is intended"
+                                "Declare it as `let writable ${name} = ...` if mutation is intended."
                             )),
                         );
                     }
@@ -5600,8 +5632,19 @@ impl<'program> Checker<'program> {
                                     ),
                                     *span,
                                 )
+                                .with_title(format!(
+                                    "Cannot Write to Readonly Property `{property}`"
+                                ))
+                                .with_primary_label("This Operation Needs Writable Access")
+                                .with_explanation(
+                                    "This assignment changes a property whose declaration does not grant writable access.",
+                                )
+                                .with_related(
+                                    property_info.declaration_span,
+                                    format!("`{property}` Is Readonly Here"),
+                                )
                                 .with_help(format!(
-                                    "mark the property writable: `writable {} ${property};`",
+                                    "Mark the property writable: `writable {} ${property};`",
                                     self.types.display(property_info.ty)
                                 )),
                             );
@@ -6871,11 +6914,37 @@ impl<'program> Checker<'program> {
                 .name
                 .as_ref()
                 .expect("an unknown-named argument always carries a name");
-            self.diagnostics.push(Diagnostic::new(
+            let mut diagnostic = Diagnostic::new(
                 "E0516",
                 format!("{callee} has no parameter named `{}`", name.text),
                 name.span,
+            )
+            .with_title("Unknown Named Argument")
+            .with_primary_label("No Parameter Has This Name")
+            .with_explanation(
+                "Named arguments must match a parameter name in the called declaration.",
+            )
+            .with_help(format!(
+                "Available parameter names: {}.",
+                param_names
+                    .iter()
+                    .map(|name| format!("`{name}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ));
+            if let Some(suggestion) =
+                crate::arg_binding::unambiguous_name_suggestion(&name.text, &param_names)
+            {
+                diagnostic = diagnostic.with_help(format!("Did you mean `{suggestion}`?"));
+                let suggestion_is_unbound = param_names
+                    .iter()
+                    .position(|candidate| *candidate == suggestion)
+                    .is_some_and(|index| bound.param_to_arg[index].is_none());
+                if suggestion_is_unbound {
+                    diagnostic = diagnostic.with_fix(name.span, suggestion);
+                }
+            }
+            self.diagnostics.push(diagnostic);
             fatal = true;
         }
         for &arg_index in &bound.duplicate {
@@ -8543,8 +8612,15 @@ impl<'program> Checker<'program> {
             ),
         };
 
-        self.diagnostics
-            .push(Diagnostic::new("E0403", message, span));
+        self.diagnostics.push(
+            Diagnostic::new("E0403", message, span)
+                .with_title("Type Mismatch")
+                .with_primary_label("This Value Has the Wrong Type")
+                .with_explanation(format!(
+                    "This position requires `{target_name}`, but the expression produces `{value_name}`."
+                ))
+                .with_help("Change the expression or the declared destination type."),
+        );
     }
 
     fn check_expr_assignable(
@@ -9147,9 +9223,13 @@ impl<'program> Checker<'program> {
                         return self.types.unknown();
                     }
                 }
-                if let Some(result) =
-                    self.collection_property_type(object, property, scopes, method_context)
-                {
+                if let Some(result) = self.collection_property_type(
+                    object,
+                    property,
+                    *null_safe,
+                    scopes,
+                    method_context,
+                ) {
                     return result;
                 }
                 let Some(class_type) = self.expr_class_type(object, scopes, method_context) else {
@@ -9196,9 +9276,13 @@ impl<'program> Checker<'program> {
                         return self.types.unknown();
                     }
                 }
-                if let Some(result) =
-                    self.collection_method_return_type(object, method, scopes, method_context)
-                {
+                if let Some(result) = self.collection_method_return_type(
+                    object,
+                    method,
+                    *null_safe,
+                    scopes,
+                    method_context,
+                ) {
                     return result;
                 }
                 if let TypeKind::TypeParameter(parameter) = self.types.kind(object_ty) {
@@ -9433,13 +9517,18 @@ impl<'program> Checker<'program> {
         &mut self,
         object: &Expr,
         property: &str,
+        null_safe: bool,
         scopes: &ScopeStack,
         method_context: Option<&MethodContext>,
     ) -> Option<TypeId> {
         let ty = self.infer_expr_type(object, scopes, method_context);
+        let nullable_access = self
+            .forwarded_access_payload(ty)
+            .is_some_and(|(_, nullable)| nullable);
+        let ty = self.forwarded_access_payload_type(ty);
         let int = self.types.intern(TypeKind::Integer(IntegerType::Int64));
         let bool_ty = self.types.intern(TypeKind::Bool);
-        match (self.types.kind(ty), property) {
+        let result = match (self.types.kind(ty), property) {
             (TypeKind::TypedArray(_), "length") => Some(int),
             (TypeKind::Bytes, "length") => Some(int),
             (TypeKind::List(_) | TypeKind::Dictionary(_, _) | TypeKind::Set(_), "count") => {
@@ -9461,7 +9550,8 @@ impl<'program> Checker<'program> {
                 _,
             ) => Some(self.types.unknown()),
             _ => None,
-        }
+        }?;
+        Some(self.null_safe_result_type(result, null_safe && nullable_access))
     }
 
     fn shared_handle_type(
@@ -9473,6 +9563,23 @@ impl<'program> Checker<'program> {
             TypeKind::SharedHandle(kind, payload) => Some((*kind, *payload)),
             TypeKind::Nullable(inner) if unwrap_nullable => match self.types.kind(*inner) {
                 TypeKind::SharedHandle(kind, payload) => Some((*kind, *payload)),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    fn forwarded_access_payload_type(&self, ty: TypeId) -> TypeId {
+        self.forwarded_access_payload(ty)
+            .map(|(payload, _)| payload)
+            .unwrap_or(ty)
+    }
+
+    fn forwarded_access_payload(&self, ty: TypeId) -> Option<(TypeId, bool)> {
+        match self.types.kind(ty) {
+            TypeKind::SharedHandle(kind, payload) if kind.is_access() => Some((*payload, false)),
+            TypeKind::Nullable(inner) => match self.types.kind(*inner) {
+                TypeKind::SharedHandle(kind, payload) if kind.is_access() => Some((*payload, true)),
                 _ => None,
             },
             _ => None,
@@ -9832,13 +9939,18 @@ impl<'program> Checker<'program> {
         &mut self,
         object: &Expr,
         method: &str,
+        null_safe: bool,
         scopes: &ScopeStack,
         method_context: Option<&MethodContext>,
     ) -> Option<TypeId> {
         let ty = self.infer_expr_type(object, scopes, method_context);
+        let nullable_access = self
+            .forwarded_access_payload(ty)
+            .is_some_and(|(_, nullable)| nullable);
+        let ty = self.forwarded_access_payload_type(ty);
         let void = self.types.intern(TypeKind::Void);
         let bool_ty = self.types.intern(TypeKind::Bool);
-        match (self.types.kind(ty).clone(), method) {
+        let result = match (self.types.kind(ty).clone(), method) {
             (TypeKind::List(_), "add" | "insertAt") | (TypeKind::Dictionary(_, _), "set") => {
                 Some(void)
             }
@@ -9869,7 +9981,8 @@ impl<'program> Checker<'program> {
                 _,
             ) => Some(self.types.unknown()),
             _ => None,
-        }
+        }?;
+        Some(self.null_safe_result_type(result, null_safe && nullable_access))
     }
 
     fn check_collection_property(
@@ -9881,6 +9994,7 @@ impl<'program> Checker<'program> {
         method_context: Option<&MethodContext>,
     ) {
         let ty = self.infer_expr_type(object, scopes, method_context);
+        let ty = self.forwarded_access_payload_type(ty);
         let supported = matches!(
             (self.types.kind(ty), property),
             (TypeKind::TypedArray(_), "length")
@@ -9934,6 +10048,7 @@ impl<'program> Checker<'program> {
         method_context: Option<&MethodContext>,
     ) -> bool {
         let ty = self.infer_expr_type(object, scopes, method_context);
+        let ty = self.forwarded_access_payload_type(ty);
         let kind = self.types.kind(ty).clone();
         let is_collection = matches!(
             kind,

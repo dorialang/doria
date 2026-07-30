@@ -164,6 +164,7 @@ impl Builder {
 
     fn build_statement(&mut self, statement: &Stmt, incoming: Vec<NodeId>) -> Vec<NodeId> {
         match statement {
+            Stmt::Block(block) => self.build_statements(&block.statements, incoming),
             Stmt::Return { span, .. } => {
                 self.terminal(
                     NodeKind::ReturnExit,
@@ -403,6 +404,7 @@ fn is_panic_call(expr: &Expr) -> bool {
 
 fn statement_span(statement: &Stmt) -> Span {
     match statement {
+        Stmt::Block(block) => block.span,
         Stmt::VarDecl(decl) => decl.span,
         Stmt::Assignment(assignment) => assignment.span,
         Stmt::Echo { span, .. } | Stmt::Return { span, .. } | Stmt::Expr { span, .. } => *span,

@@ -1,0 +1,25 @@
+property read 1
+property write 1
+drop item
+drop item
+replacement released
+called read 1
+called write
+discarded read released 2
+discarded write released 1
+called strong
+removed read 1
+removed write 4
+removed nullable 1
+popped read 1
+removed dictionary write 6
+drop item
+drop item
+drop item
+drop item
+drop item
+drop item
+drop item
+drop item
+drop item
+drop item

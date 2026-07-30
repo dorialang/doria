@@ -849,19 +849,46 @@ fn intern_resolved_collection_types(
         ResolvedType::Bytes => mir::Type::Collection(intern_bytes_type(collections)),
         ResolvedType::Mixed => mir::Type::Mixed,
         ResolvedType::Class(class) => mir::Type::Class(*class_ids.get(class)?),
-        ResolvedType::SharedHandle(kind, payload) => {
-            let ResolvedType::Class(class) = payload.as_ref() else {
-                return None;
-            };
-            let class = *class_ids.get(class)?;
-            match kind {
-                crate::types::SharedHandleKind::SharedReference => {
-                    mir::Type::SharedReference(class)
-                }
-                crate::types::SharedHandleKind::WeakReference => mir::Type::WeakReference(class),
-                _ => return None,
+        ResolvedType::SharedHandle(kind, payload) => match kind {
+            crate::types::SharedHandleKind::SharedReference => {
+                let ResolvedType::Class(class) = payload.as_ref() else {
+                    return None;
+                };
+                let class = *class_ids.get(class)?;
+                mir::Type::SharedReference(class)
             }
-        }
+            crate::types::SharedHandleKind::WeakReference => {
+                let ResolvedType::Class(class) = payload.as_ref() else {
+                    return None;
+                };
+                mir::Type::WeakReference(*class_ids.get(class)?)
+            }
+            kind => {
+                let payload =
+                    match intern_resolved_collection_types(payload, class_ids, collections)? {
+                        mir::Type::Class(class) => mir::WritableSharedPayload::Class(class),
+                        mir::Type::Collection(collection) => {
+                            mir::WritableSharedPayload::Collection(collection)
+                        }
+                        _ => return None,
+                    };
+                match kind {
+                    crate::types::SharedHandleKind::WritableSharedReference => {
+                        mir::Type::WritableSharedReference(payload)
+                    }
+                    crate::types::SharedHandleKind::WritableWeakReference => {
+                        mir::Type::WritableWeakReference(payload)
+                    }
+                    crate::types::SharedHandleKind::ReadonlySharedReferenceAccess => {
+                        mir::Type::ReadonlySharedReferenceAccess(payload)
+                    }
+                    crate::types::SharedHandleKind::WritableSharedReferenceAccess => {
+                        mir::Type::WritableSharedReferenceAccess(payload)
+                    }
+                    _ => return None,
+                }
+            }
+        },
         ResolvedType::TypedArray(value) => {
             let value = intern_resolved_collection_types(value, class_ids, collections)?;
             mir::Type::Collection(collections.intern(mir::CollectionKind::TypedArray, None, value))
@@ -891,13 +918,29 @@ fn intern_resolved_collection_types(
                 mir::Type::Class(class) => mir::Type::NullableClass(class),
                 mir::Type::SharedReference(class) => mir::Type::NullableSharedReference(class),
                 mir::Type::WeakReference(class) => mir::Type::NullableWeakReference(class),
+                mir::Type::WritableSharedReference(payload) => {
+                    mir::Type::NullableWritableSharedReference(payload)
+                }
+                mir::Type::WritableWeakReference(payload) => {
+                    mir::Type::NullableWritableWeakReference(payload)
+                }
+                mir::Type::ReadonlySharedReferenceAccess(payload) => {
+                    mir::Type::NullableReadonlySharedReferenceAccess(payload)
+                }
+                mir::Type::WritableSharedReferenceAccess(payload) => {
+                    mir::Type::NullableWritableSharedReferenceAccess(payload)
+                }
                 mir::Type::Collection(_)
                 | mir::Type::NullableScalar(_)
                 | mir::Type::NullableString
                 | mir::Type::NullableMixed
                 | mir::Type::NullableClass(_)
                 | mir::Type::NullableSharedReference(_)
-                | mir::Type::NullableWeakReference(_) => return None,
+                | mir::Type::NullableWeakReference(_)
+                | mir::Type::NullableWritableSharedReference(_)
+                | mir::Type::NullableWritableWeakReference(_)
+                | mir::Type::NullableReadonlySharedReferenceAccess(_)
+                | mir::Type::NullableWritableSharedReferenceAccess(_) => return None,
             }
         }
         // Stage 25a Slice 1 lands the surface and type model only; shared handles
@@ -918,6 +961,9 @@ fn intern_block_collection_types(
 ) {
     for statement in &block.statements {
         match statement {
+            hir::Stmt::Block(block) => {
+                intern_block_collection_types(block, class_ids, collections, substitutions);
+            }
             hir::Stmt::VarDecl(declaration) => {
                 if let Some(ty) = &declaration.ty {
                     let _ =
@@ -1330,6 +1376,20 @@ fn field_type(ty: mir::Type) -> Option<FieldType> {
             Some(FieldType::NullableSharedReference(class))
         }
         mir::Type::NullableWeakReference(class) => Some(FieldType::WeakReference(class)),
+        mir::Type::WritableSharedReference(_) => Some(FieldType::WritableSharedReference),
+        mir::Type::WritableWeakReference(_) => Some(FieldType::WritableWeakReference),
+        mir::Type::NullableWritableSharedReference(_) => {
+            Some(FieldType::NullableWritableSharedReference)
+        }
+        mir::Type::NullableWritableWeakReference(_) => {
+            Some(FieldType::NullableWritableWeakReference)
+        }
+        mir::Type::ReadonlySharedReferenceAccess(_)
+        | mir::Type::WritableSharedReferenceAccess(_)
+        | mir::Type::NullableReadonlySharedReferenceAccess(_)
+        | mir::Type::NullableWritableSharedReferenceAccess(_) => {
+            Some(FieldType::SharedReferenceAccess)
+        }
         mir::Type::Collection(_) => Some(FieldType::Collection),
     }
 }
@@ -1496,17 +1556,39 @@ fn lower_statement_sequence(
         }
 
         match statement {
+            hir::Stmt::Block(block) => {
+                context.push_scope();
+                let result = lower_statement_sequence(&block.statements, return_type, context);
+                context.pop_scope();
+                result?;
+            }
             hir::Stmt::Echo { expr, .. } => {
-                let echo = lower_echo(expr, context)?;
-                context.push_statement(echo);
+                lower_with_statement_temporaries(context, |context| {
+                    let echo = lower_echo(expr, context)?;
+                    context.push_statement(echo);
+                    Ok(())
+                })?;
             }
             hir::Stmt::Return { expr, span } => {
-                let terminator = lower_return(expr.as_ref(), *span, return_type, context)?;
-                context.terminate_current(terminator);
+                lower_with_statement_temporaries(context, |context| {
+                    let terminator = lower_return(expr.as_ref(), *span, return_type, context)?;
+                    context.terminate_current(terminator);
+                    Ok(())
+                })?;
             }
-            hir::Stmt::VarDecl(decl) => lower_var_decl(decl, context)?,
-            hir::Stmt::Assignment(assignment) => lower_assignment(assignment, context)?,
-            hir::Stmt::Increment(increment) => lower_increment(increment, context)?,
+            hir::Stmt::VarDecl(decl) => {
+                lower_with_statement_temporaries(context, |context| lower_var_decl(decl, context))?;
+            }
+            hir::Stmt::Assignment(assignment) => {
+                lower_with_statement_temporaries(context, |context| {
+                    lower_assignment(assignment, context)
+                })?;
+            }
+            hir::Stmt::Increment(increment) => {
+                lower_with_statement_temporaries(context, |context| {
+                    lower_increment(increment, context)
+                })?;
+            }
             hir::Stmt::If(if_stmt) => lower_if_statement(if_stmt, return_type, context)?,
             hir::Stmt::While(while_stmt) => {
                 lower_while_statement(while_stmt, return_type, context)?;
@@ -1522,123 +1604,140 @@ fn lower_statement_sequence(
                 lower_loop_control(*span, LoopControl::Continue, context)?;
             }
             hir::Stmt::Expr { expr, span } => {
-                if let hir::Expr::FunctionCall {
-                    name,
-                    args,
-                    span: call_span,
-                } = expr
-                {
-                    if lower_byte_file_write_statement(name, args, *call_span, context)? {
-                        continue;
-                    }
-                }
-                materialize_nested_collection_places(expr, false, context)?;
-                if let hir::Expr::MethodCall {
-                    object,
-                    method,
-                    args,
-                    span: call_span,
-                    null_safe,
-                } = expr
-                {
-                    if !*null_safe
-                        && lower_collection_method_statement(object, method, args, context)?
-                    {
-                        continue;
-                    }
-                    let statement = if *null_safe {
-                        let (object, signature, args) =
-                            lower_null_safe_method_call(object, method, args, *call_span, context)?;
-                        discarded_null_safe_call_statement(object, signature, args, *span)?
-                    } else {
-                        let (signature, args) =
-                            lower_instance_method_call(object, method, args, *call_span, context)?;
-                        discarded_call_statement("method", signature, args, *span)?
-                    };
-                    context.push_statement(statement);
-                    continue;
-                }
-                if let hir::Expr::StaticCall {
-                    class_name,
-                    method,
-                    args,
-                    span: call_span,
-                } = expr
-                {
-                    let (signature, args) =
-                        lower_static_method_call(class_name, method, args, *call_span, context)?;
-                    let statement =
-                        discarded_call_statement("static method", signature, args, *span)?;
-                    context.push_statement(statement);
-                    continue;
-                }
-                if let hir::Expr::FunctionCall {
-                    name,
-                    args,
-                    span: call_span,
-                } = expr
-                {
-                    if name == "panic" {
-                        let message = lower_panic_message(args, *call_span, context)?;
-                        context.terminate_current(mir::Terminator::Panic(message));
-                    } else if name == "printf" {
-                        let format = lower_format_expression(args, *call_span, context)?;
-                        context.push_statement(mir::Statement::Printf(format));
-                    } else if name == "write_file" {
-                        let [path, contents] = argument_values(args)[..] else {
-                            return Err(vec![unsupported(
-                                *call_span,
-                                "write_file expects 2 arguments",
-                            )]);
-                        };
-                        let path = lower_string_expression(path, context)?;
-                        let contents = lower_string_expression(contents, context)?;
-                        context.push_statement(mir::Statement::WriteFile { path, contents });
-                    } else if name == "append_file" {
-                        let [path, contents] = argument_values(args)[..] else {
-                            return Err(vec![unsupported(
-                                *call_span,
-                                "append_file expects 2 arguments",
-                            )]);
-                        };
-                        let path = lower_string_expression(path, context)?;
-                        let contents = lower_string_expression(contents, context)?;
-                        context.push_statement(mir::Statement::AppendFile { path, contents });
-                    } else if matches!(name.as_str(), "write_stdout_bytes" | "write_stderr_bytes") {
-                        let [contents] = argument_values(args)[..] else {
-                            return Err(vec![unsupported(
-                                *call_span,
-                                format!("{name} expects 1 argument"),
-                            )]);
-                        };
-                        let contents = lower_bytes_local(contents, context)?.0;
-                        context.push_statement(mir::Statement::WriteStreamBytes {
-                            contents,
-                            stderr: name == "write_stderr_bytes",
-                        });
-                    } else if name == "write_stderr" {
-                        let [value] = argument_values(args)[..] else {
-                            return Err(vec![unsupported(
-                                *call_span,
-                                "write_stderr expects 1 argument",
-                            )]);
-                        };
-                        let value = lower_string_expression(value, context)?;
-                        context.push_statement(mir::Statement::WriteStderr(value));
-                    } else {
-                        let call = lower_statement_call(name, args, *call_span, context)?;
-                        context.push_statement(call);
-                    }
-                } else {
-                    return Err(vec![unsupported(
-                        *span,
-                        "only calls to void free functions can be used as expression statements in native compilation",
-                    )]);
-                }
+                lower_with_statement_temporaries(context, |context| {
+                    lower_expression_statement(expr, *span, context)
+                })?;
             }
         }
     }
 
+    Ok(())
+}
+
+fn lower_with_statement_temporaries(
+    context: &mut LoweringContext,
+    lower: impl FnOnce(&mut LoweringContext) -> DiagnosticResult<()>,
+) -> DiagnosticResult<()> {
+    context.begin_statement_temporaries();
+    let result = lower(context);
+    context.finish_statement_temporaries(result.is_ok());
+    result
+}
+
+fn lower_expression_statement(
+    expr: &hir::Expr,
+    span: Span,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<()> {
+    if let hir::Expr::FunctionCall {
+        name,
+        args,
+        span: call_span,
+    } = expr
+    {
+        if lower_byte_file_write_statement(name, args, *call_span, context)? {
+            return Ok(());
+        }
+    }
+    materialize_nested_collection_places(expr, false, context)?;
+    if let hir::Expr::MethodCall {
+        object,
+        method,
+        args,
+        span: call_span,
+        null_safe,
+    } = expr
+    {
+        if !*null_safe && lower_collection_method_statement(object, method, args, context)? {
+            return Ok(());
+        }
+        let statement = if *null_safe {
+            let (object, signature, args) =
+                lower_null_safe_method_call(object, method, args, *call_span, context)?;
+            discarded_null_safe_call_statement(object, signature, args, span)?
+        } else {
+            let (signature, args) =
+                lower_instance_method_call(object, method, args, *call_span, context)?;
+            discarded_call_statement("method", signature, args, span)?
+        };
+        context.push_statement(statement);
+        return Ok(());
+    }
+    if let hir::Expr::StaticCall {
+        class_name,
+        method,
+        args,
+        span: call_span,
+    } = expr
+    {
+        let (signature, args) =
+            lower_static_method_call(class_name, method, args, *call_span, context)?;
+        let statement = discarded_call_statement("static method", signature, args, span)?;
+        context.push_statement(statement);
+        return Ok(());
+    }
+    let hir::Expr::FunctionCall {
+        name,
+        args,
+        span: call_span,
+    } = expr
+    else {
+        return Err(vec![unsupported(
+            span,
+            "only calls to void free functions can be used as expression statements in native compilation",
+        )]);
+    };
+    if name == "panic" {
+        let message = lower_panic_message(args, *call_span, context)?;
+        context.terminate_current(mir::Terminator::Panic(message));
+    } else if name == "printf" {
+        let format = lower_format_expression(args, *call_span, context)?;
+        context.push_statement(mir::Statement::Printf(format));
+    } else if name == "write_file" {
+        let [path, contents] = argument_values(args)[..] else {
+            return Err(vec![unsupported(
+                *call_span,
+                "write_file expects 2 arguments",
+            )]);
+        };
+        let path = lower_string_expression(path, context)?;
+        let contents = lower_string_expression(contents, context)?;
+        context.push_statement(mir::Statement::WriteFile { path, contents });
+    } else if name == "append_file" {
+        let [path, contents] = argument_values(args)[..] else {
+            return Err(vec![unsupported(
+                *call_span,
+                "append_file expects 2 arguments",
+            )]);
+        };
+        let path = lower_string_expression(path, context)?;
+        let contents = lower_string_expression(contents, context)?;
+        context.push_statement(mir::Statement::AppendFile { path, contents });
+    } else if matches!(name.as_str(), "write_stdout_bytes" | "write_stderr_bytes") {
+        let [contents] = argument_values(args)[..] else {
+            return Err(vec![unsupported(
+                *call_span,
+                format!("{name} expects 1 argument"),
+            )]);
+        };
+        let contents = lower_bytes_local(contents, context)?.0;
+        context.push_statement(mir::Statement::WriteStreamBytes {
+            contents,
+            stderr: name == "write_stderr_bytes",
+        });
+    } else if name == "write_stderr" {
+        let [value] = argument_values(args)[..] else {
+            return Err(vec![unsupported(
+                *call_span,
+                "write_stderr expects 1 argument",
+            )]);
+        };
+        let value = lower_string_expression(value, context)?;
+        context.push_statement(mir::Statement::WriteStderr(value));
+    } else {
+        let call = lower_statement_call(name, args, *call_span, context)?;
+        context.push_statement(call);
+    }
     Ok(())
 }
 
@@ -1736,12 +1835,10 @@ fn lower_for_statement_in_scope(
     context: &mut LoweringContext,
 ) -> DiagnosticResult<()> {
     if let Some(initializer) = &for_stmt.initializer {
-        match initializer {
-            hir::ForInitializer::VarDecl(decl) => lower_var_decl(decl, context)?,
-            hir::ForInitializer::Assignment(assignment) => {
-                lower_assignment(assignment, context)?;
-            }
-        }
+        lower_with_statement_temporaries(context, |context| match initializer {
+            hir::ForInitializer::VarDecl(decl) => lower_var_decl(decl, context),
+            hir::ForInitializer::Assignment(assignment) => lower_assignment(assignment, context),
+        })?;
     }
 
     let header_block = context.create_block();
@@ -1778,12 +1875,10 @@ fn lower_for_statement_in_scope(
 
     context.current_block = Some(increment_block);
     if let Some(increment) = &for_stmt.increment {
-        match increment {
-            hir::ForIncrement::Increment(increment) => lower_increment(increment, context)?,
-            hir::ForIncrement::Assignment(assignment) => {
-                lower_assignment(assignment, context)?;
-            }
-        }
+        lower_with_statement_temporaries(context, |context| match increment {
+            hir::ForIncrement::Increment(increment) => lower_increment(increment, context),
+            hir::ForIncrement::Assignment(assignment) => lower_assignment(assignment, context),
+        })?;
     }
     context.terminate_current(mir::Terminator::Jump(header_block));
     context.current_block = context.is_reachable(exit_block).then_some(exit_block);
@@ -2029,6 +2124,12 @@ fn lower_collection_foreach_in_scope(
             mir::Type::Class(_)
             | mir::Type::SharedReference(_)
             | mir::Type::WeakReference(_)
+            | mir::Type::WritableSharedReference(_)
+            | mir::Type::WritableWeakReference(_)
+            | mir::Type::ReadonlySharedReferenceAccess(_)
+            | mir::Type::WritableSharedReferenceAccess(_)
+            | mir::Type::NullableReadonlySharedReferenceAccess(_)
+            | mir::Type::NullableWritableSharedReferenceAccess(_)
             | mir::Type::Mixed
             | mir::Type::Collection(_) => {}
             mir::Type::NullableScalar(_)
@@ -2036,7 +2137,9 @@ fn lower_collection_foreach_in_scope(
             | mir::Type::NullableMixed
             | mir::Type::NullableClass(_)
             | mir::Type::NullableSharedReference(_)
-            | mir::Type::NullableWeakReference(_) => {
+            | mir::Type::NullableWeakReference(_)
+            | mir::Type::NullableWritableSharedReference(_)
+            | mir::Type::NullableWritableWeakReference(_) => {
                 return Err(vec![unsupported(
                     foreach.span,
                     "nullable collection elements are deferred beyond Stage 23 Slice 1",
@@ -2154,6 +2257,22 @@ fn collection_value_rvalue(
                 remove: false,
             },
         )),
+        mir::Type::WritableSharedReference(payload) => Ok(mir::Rvalue::WritableSharedReference(
+            mir::WritableSharedReferenceExpression::CollectionIndex {
+                payload,
+                collection,
+                index: Box::new(index),
+                remove: false,
+            },
+        )),
+        mir::Type::WritableWeakReference(payload) => Ok(mir::Rvalue::WritableWeakReference(
+            mir::WritableWeakReferenceExpression::CollectionIndex {
+                payload,
+                collection,
+                index: Box::new(index),
+                remove: false,
+            },
+        )),
         mir::Type::Mixed => Ok(mir::Rvalue::Mixed(mir::MixedExpression::CollectionIndex {
             collection,
             index: Box::new(index),
@@ -2171,7 +2290,13 @@ fn collection_value_rvalue(
         mir::Type::NullableScalar(_)
         | mir::Type::NullableString
         | mir::Type::NullableMixed
-        | mir::Type::NullableClass(_) => Err(vec![unsupported(
+        | mir::Type::NullableClass(_)
+        | mir::Type::NullableWritableSharedReference(_)
+        | mir::Type::NullableWritableWeakReference(_)
+        | mir::Type::ReadonlySharedReferenceAccess(_)
+        | mir::Type::WritableSharedReferenceAccess(_)
+        | mir::Type::NullableReadonlySharedReferenceAccess(_)
+        | mir::Type::NullableWritableSharedReferenceAccess(_) => Err(vec![unsupported(
             Span::new(0, 0),
             "nullable collection elements are deferred beyond Stage 23 Slice 3",
         )]),
@@ -2444,6 +2569,7 @@ struct LoweringContext<'semantic> {
     local_scopes: Vec<HashMap<String, mir::LocalId>>,
     materialized_collection_places: HashMap<(usize, usize), mir::LocalId>,
     scope_owned_locals: Vec<Vec<DropObligation>>,
+    statement_owned_locals: Vec<Vec<DropObligation>>,
     temp_counter: usize,
     blocks: Vec<BlockBuilder>,
     reachable_blocks: Vec<bool>,
@@ -2457,8 +2583,39 @@ enum DropObligation {
     Class(mir::LocalId, ClassId),
     Shared(mir::LocalId, ClassId),
     Weak(mir::LocalId, ClassId),
+    WritableShared(mir::LocalId, mir::WritableSharedPayload),
+    WritableWeak(mir::LocalId, mir::WritableSharedPayload),
+    SharedAccess(mir::LocalId, mir::WritableSharedPayload, bool),
     Mixed(mir::LocalId),
     Collection(mir::LocalId, mir::CollectionTypeId),
+}
+
+fn drop_obligation_for_owned_local(local: mir::LocalId, ty: mir::Type) -> DropObligation {
+    if let Some(access) = ty.shared_access() {
+        return DropObligation::SharedAccess(local, access.payload, access.writable);
+    }
+    match ty {
+        mir::Type::Class(class) | mir::Type::NullableClass(class) => {
+            DropObligation::Class(local, class)
+        }
+        mir::Type::SharedReference(class) | mir::Type::NullableSharedReference(class) => {
+            DropObligation::Shared(local, class)
+        }
+        mir::Type::WeakReference(class) | mir::Type::NullableWeakReference(class) => {
+            DropObligation::Weak(local, class)
+        }
+        mir::Type::WritableSharedReference(payload)
+        | mir::Type::NullableWritableSharedReference(payload) => {
+            DropObligation::WritableShared(local, payload)
+        }
+        mir::Type::WritableWeakReference(payload)
+        | mir::Type::NullableWritableWeakReference(payload) => {
+            DropObligation::WritableWeak(local, payload)
+        }
+        mir::Type::Mixed | mir::Type::NullableMixed => DropObligation::Mixed(local),
+        mir::Type::Collection(collection) => DropObligation::Collection(local, collection),
+        _ => unreachable!("only move locals may own native drop obligations"),
+    }
 }
 
 impl<'semantic> LoweringContext<'semantic> {
@@ -2477,6 +2634,7 @@ impl<'semantic> LoweringContext<'semantic> {
             local_scopes: vec![HashMap::new()],
             materialized_collection_places: HashMap::new(),
             scope_owned_locals: vec![Vec::new()],
+            statement_owned_locals: Vec::new(),
             temp_counter: 0,
             blocks: vec![BlockBuilder {
                 id: mir::BlockId(0),
@@ -2588,12 +2746,56 @@ impl<'semantic> LoweringContext<'semantic> {
     }
 
     fn cleanup_scopes_from(&mut self, depth: usize) {
+        self.cleanup_active_statement_temporaries();
         let cleanup = self.scope_owned_locals[depth..]
             .iter()
-            .rev()
-            .flat_map(|scope| scope.iter().rev().copied())
+            .flat_map(|scope| scope.iter().copied())
             .collect::<Vec<_>>();
-        for obligation in cleanup {
+        self.emit_drop_obligations(&cleanup);
+    }
+
+    fn has_cleanup_obligations(&self) -> bool {
+        self.scope_owned_locals
+            .iter()
+            .any(|scope| !scope.is_empty())
+            || self
+                .statement_owned_locals
+                .iter()
+                .any(|statement| !statement.is_empty())
+    }
+
+    fn begin_statement_temporaries(&mut self) {
+        self.statement_owned_locals.push(Vec::new());
+    }
+
+    fn finish_statement_temporaries(&mut self, emit_cleanup: bool) {
+        let cleanup = self
+            .statement_owned_locals
+            .pop()
+            .expect("MIR lowering must have an active statement-temporary scope");
+        if emit_cleanup && self.current_block.is_some() {
+            self.emit_drop_obligations(&cleanup);
+        }
+        self.materialized_collection_places.clear();
+    }
+
+    fn take_statement_temporaries(&mut self) -> Vec<DropObligation> {
+        self.statement_owned_locals
+            .pop()
+            .expect("MIR lowering must have an active statement-temporary scope")
+    }
+
+    fn cleanup_active_statement_temporaries(&mut self) {
+        let cleanup = self
+            .statement_owned_locals
+            .iter_mut()
+            .flat_map(|statement| statement.drain(..))
+            .collect::<Vec<_>>();
+        self.emit_drop_obligations(&cleanup);
+    }
+
+    fn emit_drop_obligations(&mut self, cleanup: &[DropObligation]) {
+        for obligation in cleanup.iter().rev().copied() {
             self.push_statement(match obligation {
                 DropObligation::Class(local, class) => mir::Statement::DropClass { local, class },
                 DropObligation::Shared(local, class) => {
@@ -2602,18 +2804,25 @@ impl<'semantic> LoweringContext<'semantic> {
                 DropObligation::Weak(local, class) => {
                     mir::Statement::DropWeakReference { local, class }
                 }
+                DropObligation::WritableShared(local, payload) => {
+                    mir::Statement::DropWritableSharedReference { local, payload }
+                }
+                DropObligation::WritableWeak(local, payload) => {
+                    mir::Statement::DropWritableWeakReference { local, payload }
+                }
+                DropObligation::SharedAccess(local, payload, writable) => {
+                    mir::Statement::DropSharedReferenceAccess {
+                        local,
+                        payload,
+                        writable,
+                    }
+                }
                 DropObligation::Mixed(local) => mir::Statement::DropMixed { local },
                 DropObligation::Collection(local, collection) => {
                     mir::Statement::DropCollection { local, collection }
                 }
             });
         }
-    }
-
-    fn has_cleanup_obligations(&self) -> bool {
-        self.scope_owned_locals
-            .iter()
-            .any(|scope| !scope.is_empty())
     }
 
     fn push_loop_targets(&mut self, targets: LoopTargets) {
@@ -2638,6 +2847,15 @@ impl<'semantic> LoweringContext<'semantic> {
                 | mir::Type::SharedReference(_)
                 | mir::Type::WeakReference(_)
                 | mir::Type::NullableSharedReference(_)
+                | mir::Type::NullableWeakReference(_)
+                | mir::Type::WritableSharedReference(_)
+                | mir::Type::WritableWeakReference(_)
+                | mir::Type::NullableWritableSharedReference(_)
+                | mir::Type::NullableWritableWeakReference(_)
+                | mir::Type::ReadonlySharedReferenceAccess(_)
+                | mir::Type::WritableSharedReferenceAccess(_)
+                | mir::Type::NullableReadonlySharedReferenceAccess(_)
+                | mir::Type::NullableWritableSharedReferenceAccess(_)
                 | mir::Type::Mixed
                 | mir::Type::NullableMixed
                 | mir::Type::Collection(_)
@@ -2666,19 +2884,7 @@ impl<'semantic> LoweringContext<'semantic> {
             .expect("MIR lowering must have a local scope")
             .insert(name.to_string(), id);
         if owned {
-            let obligation = match ty {
-                mir::Type::Class(class) | mir::Type::NullableClass(class) => {
-                    DropObligation::Class(id, class)
-                }
-                mir::Type::SharedReference(class) | mir::Type::NullableSharedReference(class) => {
-                    DropObligation::Shared(id, class)
-                }
-                mir::Type::WeakReference(class) => DropObligation::Weak(id, class),
-                mir::Type::NullableWeakReference(class) => DropObligation::Weak(id, class),
-                mir::Type::Mixed | mir::Type::NullableMixed => DropObligation::Mixed(id),
-                mir::Type::Collection(collection) => DropObligation::Collection(id, collection),
-                _ => unreachable!("only move locals may own native drop obligations"),
-            };
+            let obligation = drop_obligation_for_owned_local(id, ty);
             self.scope_owned_locals
                 .last_mut()
                 .expect("MIR lowering must have an ownership scope")
@@ -2759,23 +2965,15 @@ impl<'semantic> LoweringContext<'semantic> {
             owned: true,
             synthetic: true,
         });
-        let obligation = match ty {
-            mir::Type::Class(class) | mir::Type::NullableClass(class) => {
-                DropObligation::Class(id, class)
-            }
-            mir::Type::SharedReference(class) | mir::Type::NullableSharedReference(class) => {
-                DropObligation::Shared(id, class)
-            }
-            mir::Type::WeakReference(class) => DropObligation::Weak(id, class),
-            mir::Type::NullableWeakReference(class) => DropObligation::Weak(id, class),
-            mir::Type::Mixed | mir::Type::NullableMixed => DropObligation::Mixed(id),
-            mir::Type::Collection(collection) => DropObligation::Collection(id, collection),
-            _ => unreachable!("only move locals may own native drop obligations"),
-        };
-        self.scope_owned_locals
-            .last_mut()
-            .expect("MIR lowering must have an ownership scope")
-            .push(obligation);
+        let obligation = drop_obligation_for_owned_local(id, ty);
+        if let Some(statement) = self.statement_owned_locals.last_mut() {
+            statement.push(obligation);
+        } else {
+            self.scope_owned_locals
+                .last_mut()
+                .expect("MIR lowering must have an ownership scope")
+                .push(obligation);
+        }
         id
     }
 
@@ -3113,21 +3311,34 @@ impl<'semantic> LoweringContext<'semantic> {
                 .copied()
                 .map(mir::Type::Collection),
             ResolvedType::Class(class) => self.class_id_for_type(class).map(mir::Type::Class),
-            ResolvedType::SharedHandle(kind, payload) => {
-                let ResolvedType::Class(class) = payload.as_ref() else {
-                    return None;
-                };
-                let class = self.class_id_for_type(class)?;
-                match kind {
-                    crate::types::SharedHandleKind::SharedReference => {
-                        Some(mir::Type::SharedReference(class))
-                    }
-                    crate::types::SharedHandleKind::WeakReference => {
-                        Some(mir::Type::WeakReference(class))
-                    }
-                    _ => None,
+            ResolvedType::SharedHandle(kind, payload) => match kind {
+                crate::types::SharedHandleKind::SharedReference => {
+                    let ResolvedType::Class(class) = payload.as_ref() else {
+                        return None;
+                    };
+                    let class = self.class_id_for_type(class)?;
+                    Some(mir::Type::SharedReference(class))
                 }
-            }
+                crate::types::SharedHandleKind::WeakReference => {
+                    let ResolvedType::Class(class) = payload.as_ref() else {
+                        return None;
+                    };
+                    let class = self.class_id_for_type(class)?;
+                    Some(mir::Type::WeakReference(class))
+                }
+                crate::types::SharedHandleKind::WritableSharedReference => self
+                    .mir_writable_shared_payload(payload)
+                    .map(mir::Type::WritableSharedReference),
+                crate::types::SharedHandleKind::WritableWeakReference => self
+                    .mir_writable_shared_payload(payload)
+                    .map(mir::Type::WritableWeakReference),
+                crate::types::SharedHandleKind::ReadonlySharedReferenceAccess => self
+                    .mir_writable_shared_payload(payload)
+                    .map(mir::Type::ReadonlySharedReferenceAccess),
+                crate::types::SharedHandleKind::WritableSharedReferenceAccess => self
+                    .mir_writable_shared_payload(payload)
+                    .map(mir::Type::WritableSharedReferenceAccess),
+            },
             ResolvedType::TypedArray(value) => self
                 .mir_resolved_type(value)
                 .and_then(|value| {
@@ -3175,6 +3386,18 @@ impl<'semantic> LoweringContext<'semantic> {
                     Some(mir::Type::NullableSharedReference(class))
                 }
                 mir::Type::WeakReference(class) => Some(mir::Type::NullableWeakReference(class)),
+                mir::Type::WritableSharedReference(payload) => {
+                    Some(mir::Type::NullableWritableSharedReference(payload))
+                }
+                mir::Type::WritableWeakReference(payload) => {
+                    Some(mir::Type::NullableWritableWeakReference(payload))
+                }
+                mir::Type::ReadonlySharedReferenceAccess(payload) => {
+                    Some(mir::Type::NullableReadonlySharedReferenceAccess(payload))
+                }
+                mir::Type::WritableSharedReferenceAccess(payload) => {
+                    Some(mir::Type::NullableWritableSharedReferenceAccess(payload))
+                }
                 // `?(?X)` collapses to `?X`: a `?T` field substituted with a
                 // nullable argument is already nullable, not doubly-nullable.
                 already @ (mir::Type::NullableScalar(_)
@@ -3182,10 +3405,27 @@ impl<'semantic> LoweringContext<'semantic> {
                 | mir::Type::NullableMixed
                 | mir::Type::NullableClass(_)
                 | mir::Type::NullableSharedReference(_)
-                | mir::Type::NullableWeakReference(_)) => Some(already),
+                | mir::Type::NullableWeakReference(_)
+                | mir::Type::NullableWritableSharedReference(_)
+                | mir::Type::NullableWritableWeakReference(_)
+                | mir::Type::NullableReadonlySharedReferenceAccess(_)
+                | mir::Type::NullableWritableSharedReferenceAccess(_)) => Some(already),
                 mir::Type::Collection(_) => None,
             },
             ResolvedType::Void | ResolvedType::Null | ResolvedType::Unsupported => None,
+        }
+    }
+
+    fn mir_writable_shared_payload(
+        &self,
+        payload: &crate::types::ResolvedType,
+    ) -> Option<mir::WritableSharedPayload> {
+        match self.mir_resolved_type(payload)? {
+            mir::Type::Class(class) => Some(mir::WritableSharedPayload::Class(class)),
+            mir::Type::Collection(collection) => {
+                Some(mir::WritableSharedPayload::Collection(collection))
+            }
+            _ => None,
         }
     }
 
@@ -3203,6 +3443,14 @@ impl<'semantic> LoweringContext<'semantic> {
             | mir::Type::WeakReference(_)
             | mir::Type::NullableSharedReference(_)
             | mir::Type::NullableWeakReference(_)
+            | mir::Type::WritableSharedReference(_)
+            | mir::Type::WritableWeakReference(_)
+            | mir::Type::NullableWritableSharedReference(_)
+            | mir::Type::NullableWritableWeakReference(_)
+            | mir::Type::ReadonlySharedReferenceAccess(_)
+            | mir::Type::WritableSharedReferenceAccess(_)
+            | mir::Type::NullableReadonlySharedReferenceAccess(_)
+            | mir::Type::NullableWritableSharedReferenceAccess(_)
             | mir::Type::Collection(_) => Err(vec![Diagnostic::new(
                 "I1401",
                 format!(
@@ -3269,15 +3517,7 @@ fn lower_var_decl(decl: &hir::VarDecl, context: &mut LoweringContext) -> Diagnos
     }
     if let mir::Type::NullableClass(class) = ty {
         let value = lower_nullable_class_expression(&decl.initializer, class, true, context)?;
-        let owned = !matches!(
-            value,
-            mir::NullableClassExpression::DictionaryGet {
-                access: mir::NullableCollectionAccess::Get
-                    | mir::NullableCollectionAccess::First
-                    | mir::NullableCollectionAccess::Last,
-                ..
-            }
-        );
+        let owned = !value.borrows_class_value();
         let local = context.declare_user_local_owned(&decl.name, decl.writable, ty, owned);
         context.push_statement(mir::Statement::AssignLocal {
             target: local,
@@ -3306,7 +3546,8 @@ fn lower_var_decl(decl: &hir::VarDecl, context: &mut LoweringContext) -> Diagnos
     }
     if let mir::Type::Class(class) = ty {
         let value = lower_class_expression(&decl.initializer, class, true, context)?;
-        let local = context.declare_user_local(&decl.name, decl.writable, ty);
+        let owned = !value.borrows_class_value();
+        let local = context.declare_user_local_owned(&decl.name, decl.writable, ty, owned);
         context.push_statement(mir::Statement::AssignLocal {
             target: local,
             value: mir::Rvalue::Class(value),
@@ -3353,6 +3594,90 @@ fn lower_var_decl(decl: &hir::VarDecl, context: &mut LoweringContext) -> Diagnos
         });
         return Ok(());
     }
+    if let mir::Type::WritableSharedReference(payload) = ty {
+        let value =
+            lower_writable_shared_reference_expression(&decl.initializer, payload, true, context)?;
+        let local = context.declare_user_local(&decl.name, decl.writable, ty);
+        context.push_statement(mir::Statement::AssignLocal {
+            target: local,
+            value: mir::Rvalue::WritableSharedReference(value),
+        });
+        return Ok(());
+    }
+    if let mir::Type::WritableWeakReference(payload) = ty {
+        let value =
+            lower_writable_weak_reference_expression(&decl.initializer, payload, true, context)?;
+        let local = context.declare_user_local(&decl.name, decl.writable, ty);
+        context.push_statement(mir::Statement::AssignLocal {
+            target: local,
+            value: mir::Rvalue::WritableWeakReference(value),
+        });
+        return Ok(());
+    }
+    if let mir::Type::NullableWritableSharedReference(payload) = ty {
+        let value = lower_nullable_writable_shared_reference_expression(
+            &decl.initializer,
+            payload,
+            true,
+            context,
+        )?;
+        let local = context.declare_user_local_owned(&decl.name, decl.writable, ty, true);
+        context.push_statement(mir::Statement::AssignLocal {
+            target: local,
+            value: mir::Rvalue::NullableWritableSharedReference(value),
+        });
+        return Ok(());
+    }
+    if let mir::Type::NullableWritableWeakReference(payload) = ty {
+        let value = lower_nullable_writable_weak_reference_expression(
+            &decl.initializer,
+            payload,
+            true,
+            context,
+        )?;
+        let local = context.declare_user_local_owned(&decl.name, decl.writable, ty, true);
+        context.push_statement(mir::Statement::AssignLocal {
+            target: local,
+            value: mir::Rvalue::NullableWritableWeakReference(value),
+        });
+        return Ok(());
+    }
+    if let mir::Type::ReadonlySharedReferenceAccess(payload)
+    | mir::Type::WritableSharedReferenceAccess(payload) = ty
+    {
+        let writable = matches!(ty, mir::Type::WritableSharedReferenceAccess(_));
+        let value = lower_shared_reference_access_expression(
+            &decl.initializer,
+            payload,
+            writable,
+            true,
+            context,
+        )?;
+        let local = context.declare_user_local(&decl.name, decl.writable, ty);
+        context.push_statement(mir::Statement::AssignLocal {
+            target: local,
+            value: mir::Rvalue::SharedReferenceAccess(value),
+        });
+        return Ok(());
+    }
+    if let mir::Type::NullableReadonlySharedReferenceAccess(payload)
+    | mir::Type::NullableWritableSharedReferenceAccess(payload) = ty
+    {
+        let writable = matches!(ty, mir::Type::NullableWritableSharedReferenceAccess(_));
+        let value = lower_nullable_shared_reference_access_expression(
+            &decl.initializer,
+            payload,
+            writable,
+            true,
+            context,
+        )?;
+        let local = context.declare_user_local_owned(&decl.name, decl.writable, ty, true);
+        context.push_statement(mir::Statement::AssignLocal {
+            target: local,
+            value: mir::Rvalue::NullableSharedReferenceAccess(value),
+        });
+        return Ok(());
+    }
     if let mir::Type::Collection(collection) = ty {
         let value = lower_collection_expression(&decl.initializer, collection, true, context)?;
         let local = context.declare_user_local(&decl.name, decl.writable, ty);
@@ -3382,6 +3707,10 @@ fn inferred_class_type(expr: &hir::Expr, context: &mut LoweringContext) -> Optio
         mir::Type::Class(class)
         | mir::Type::NullableClass(class)
         | mir::Type::SharedReference(class) => Some(class),
+        mir::Type::ReadonlySharedReferenceAccess(mir::WritableSharedPayload::Class(class))
+        | mir::Type::WritableSharedReferenceAccess(mir::WritableSharedPayload::Class(class)) => {
+            Some(class)
+        }
         _ => None,
     }
 }
@@ -4380,6 +4709,9 @@ fn lower_nullable_scalar_expression(
     expected: mir::ScalarType,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::NullableScalarExpression> {
+    if let Some(value) = lower_null_safe_collection_scalar(expr, expected, context)? {
+        return Ok(value);
+    }
     if let Some((collection, key, value_type, access)) =
         lower_collection_nullable_property(expr, context)?
     {
@@ -5140,7 +5472,9 @@ fn lower_display_string_expression(
         | mir::Type::NullableMixed
         | mir::Type::NullableClass(_)
         | mir::Type::NullableSharedReference(_)
-        | mir::Type::NullableWeakReference(_) => Err(vec![unsupported(
+        | mir::Type::NullableWeakReference(_)
+        | mir::Type::NullableWritableSharedReference(_)
+        | mir::Type::NullableWritableWeakReference(_) => Err(vec![unsupported(
             expr.span(),
             "nullable values must be narrowed or defaulted before display",
         )]),
@@ -5154,6 +5488,19 @@ fn lower_display_string_expression(
         mir::Type::Collection(_) => Err(vec![unsupported(
             expr.span(),
             "collection values do not have an implicit display representation",
+        )]),
+        mir::Type::WritableSharedReference(_) | mir::Type::WritableWeakReference(_) => {
+            Err(vec![unsupported(
+                expr.span(),
+                "writable shared handles do not provide direct payload display",
+            )])
+        }
+        mir::Type::ReadonlySharedReferenceAccess(_)
+        | mir::Type::WritableSharedReferenceAccess(_)
+        | mir::Type::NullableReadonlySharedReferenceAccess(_)
+        | mir::Type::NullableWritableSharedReferenceAccess(_) => Err(vec![unsupported(
+            expr.span(),
+            "a complete shared-access payload does not have an implicit display representation",
         )]),
     }
 }
@@ -5428,6 +5775,32 @@ fn lower_call_args_with_ownership(
             mir::Type::NullableWeakReference(class) => mir::Rvalue::NullableWeakReference(
                 lower_nullable_weak_reference_expression(value, class, transfers, context)?,
             ),
+            mir::Type::WritableSharedReference(payload) => mir::Rvalue::WritableSharedReference(
+                lower_writable_shared_reference_expression(value, payload, transfers, context)?,
+            ),
+            mir::Type::WritableWeakReference(payload) => mir::Rvalue::WritableWeakReference(
+                lower_writable_weak_reference_expression(value, payload, transfers, context)?,
+            ),
+            mir::Type::NullableWritableSharedReference(payload) => {
+                mir::Rvalue::NullableWritableSharedReference(
+                    lower_nullable_writable_shared_reference_expression(
+                        value, payload, transfers, context,
+                    )?,
+                )
+            }
+            mir::Type::NullableWritableWeakReference(payload) => {
+                mir::Rvalue::NullableWritableWeakReference(
+                    lower_nullable_writable_weak_reference_expression(
+                        value, payload, transfers, context,
+                    )?,
+                )
+            }
+            ty @ (mir::Type::ReadonlySharedReferenceAccess(_)
+            | mir::Type::WritableSharedReferenceAccess(_)
+            | mir::Type::NullableReadonlySharedReferenceAccess(_)
+            | mir::Type::NullableWritableSharedReferenceAccess(_)) => {
+                lower_shared_access_rvalue(value, ty, transfers, context)?
+            }
             _ => lower_rvalue_as_expected(value, expected, context)?,
         };
         if lowered.ty() != expected {
@@ -5529,6 +5902,14 @@ fn hoist_argument_temporary(
             | mir::Type::WeakReference(_)
             | mir::Type::NullableSharedReference(_)
             | mir::Type::NullableWeakReference(_)
+            | mir::Type::WritableSharedReference(_)
+            | mir::Type::WritableWeakReference(_)
+            | mir::Type::NullableWritableSharedReference(_)
+            | mir::Type::NullableWritableWeakReference(_)
+            | mir::Type::ReadonlySharedReferenceAccess(_)
+            | mir::Type::WritableSharedReferenceAccess(_)
+            | mir::Type::NullableReadonlySharedReferenceAccess(_)
+            | mir::Type::NullableWritableSharedReferenceAccess(_)
     ) && value.owned_temporary_shared().is_none();
     let borrowed_move_value = borrowed_class_value || borrowed_shared_value;
     let local = match ty {
@@ -5542,6 +5923,14 @@ fn hoist_argument_temporary(
         | mir::Type::WeakReference(_)
         | mir::Type::NullableSharedReference(_)
         | mir::Type::NullableWeakReference(_)
+        | mir::Type::WritableSharedReference(_)
+        | mir::Type::WritableWeakReference(_)
+        | mir::Type::NullableWritableSharedReference(_)
+        | mir::Type::NullableWritableWeakReference(_)
+        | mir::Type::ReadonlySharedReferenceAccess(_)
+        | mir::Type::WritableSharedReferenceAccess(_)
+        | mir::Type::NullableReadonlySharedReferenceAccess(_)
+        | mir::Type::NullableWritableSharedReferenceAccess(_)
             if borrowed_move_value =>
         {
             context.declare_borrowed_temp(ty, false)
@@ -5554,6 +5943,14 @@ fn hoist_argument_temporary(
         | mir::Type::WeakReference(_)
         | mir::Type::NullableSharedReference(_)
         | mir::Type::NullableWeakReference(_)
+        | mir::Type::WritableSharedReference(_)
+        | mir::Type::WritableWeakReference(_)
+        | mir::Type::NullableWritableSharedReference(_)
+        | mir::Type::NullableWritableWeakReference(_)
+        | mir::Type::ReadonlySharedReferenceAccess(_)
+        | mir::Type::WritableSharedReferenceAccess(_)
+        | mir::Type::NullableReadonlySharedReferenceAccess(_)
+        | mir::Type::NullableWritableSharedReferenceAccess(_)
         | mir::Type::Collection(_) => context.declare_owned_temp(ty),
     };
     context.push_statement(mir::Statement::AssignLocal {
@@ -5836,6 +6233,58 @@ fn local_rvalue(local: mir::LocalId, ty: mir::Type, transfer: bool) -> mir::Rval
                 transfer,
             })
         }
+        mir::Type::WritableSharedReference(payload) => {
+            mir::Rvalue::WritableSharedReference(mir::WritableSharedReferenceExpression::Local {
+                payload,
+                local,
+                transfer,
+            })
+        }
+        mir::Type::WritableWeakReference(payload) => {
+            mir::Rvalue::WritableWeakReference(mir::WritableWeakReferenceExpression::Local {
+                payload,
+                local,
+                transfer,
+            })
+        }
+        mir::Type::NullableWritableSharedReference(payload) => {
+            mir::Rvalue::NullableWritableSharedReference(
+                mir::NullableWritableSharedReferenceExpression::Local {
+                    payload,
+                    local,
+                    transfer,
+                },
+            )
+        }
+        mir::Type::NullableWritableWeakReference(payload) => {
+            mir::Rvalue::NullableWritableWeakReference(
+                mir::NullableWritableWeakReferenceExpression::Local {
+                    payload,
+                    local,
+                    transfer,
+                },
+            )
+        }
+        mir::Type::ReadonlySharedReferenceAccess(payload)
+        | mir::Type::WritableSharedReferenceAccess(payload) => {
+            mir::Rvalue::SharedReferenceAccess(mir::SharedReferenceAccessExpression::Local {
+                payload,
+                local,
+                writable: matches!(ty, mir::Type::WritableSharedReferenceAccess(_)),
+                transfer,
+            })
+        }
+        mir::Type::NullableReadonlySharedReferenceAccess(payload)
+        | mir::Type::NullableWritableSharedReferenceAccess(payload) => {
+            mir::Rvalue::NullableSharedReferenceAccess(
+                mir::NullableSharedReferenceAccessExpression::Local {
+                    payload,
+                    local,
+                    writable: matches!(ty, mir::Type::NullableWritableSharedReferenceAccess(_)),
+                    transfer,
+                },
+            )
+        }
         mir::Type::Collection(collection) => {
             mir::Rvalue::Collection(mir::CollectionExpression::Local {
                 collection,
@@ -5852,12 +6301,88 @@ fn lower_condition_to_blocks(
     else_block: mir::BlockId,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<()> {
+    context.begin_statement_temporaries();
+    let condition_entry = context.current_block();
+    let first_generated_block = context.blocks.len();
+    let result = lower_condition_to_blocks_inner(expr, then_block, else_block, context);
+    if let Err(diagnostics) = result {
+        context.finish_statement_temporaries(false);
+        return Err(diagnostics);
+    }
+    let cleanup = context.take_statement_temporaries();
+    context.materialized_collection_places.clear();
+    if cleanup.is_empty() {
+        return Ok(());
+    }
+
+    let last_condition_block = context.blocks.len();
+    let then_cleanup = context.create_block();
+    let else_cleanup = context.create_block();
+    let condition_blocks = std::iter::once(condition_entry).chain(
+        (first_generated_block..last_condition_block)
+            .map(mir::BlockId)
+            .filter(|block| *block != then_block && *block != else_block),
+    );
+    for block in condition_blocks {
+        let Some(terminator) = context.blocks[block.0].terminator.as_mut() else {
+            continue;
+        };
+        reroute_condition_target(terminator, then_block, then_cleanup);
+        reroute_condition_target(terminator, else_block, else_cleanup);
+    }
+
+    context.current_block = Some(then_cleanup);
+    context.emit_drop_obligations(&cleanup);
+    context.terminate_current(mir::Terminator::Jump(then_block));
+
+    context.current_block = Some(else_cleanup);
+    context.emit_drop_obligations(&cleanup);
+    context.terminate_current(mir::Terminator::Jump(else_block));
+    Ok(())
+}
+
+fn reroute_condition_target(
+    terminator: &mut mir::Terminator,
+    from: mir::BlockId,
+    to: mir::BlockId,
+) {
+    match terminator {
+        mir::Terminator::Jump(target) => {
+            if *target == from {
+                *target = to;
+            }
+        }
+        mir::Terminator::Branch {
+            then_block,
+            else_block,
+            ..
+        } => {
+            if *then_block == from {
+                *then_block = to;
+            }
+            if *else_block == from {
+                *else_block = to;
+            }
+        }
+        mir::Terminator::Return(_)
+        | mir::Terminator::ReturnVoid
+        | mir::Terminator::Panic(_)
+        | mir::Terminator::Unreachable => {}
+    }
+}
+
+fn lower_condition_to_blocks_inner(
+    expr: &hir::Expr,
+    then_block: mir::BlockId,
+    else_block: mir::BlockId,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<()> {
     match unparenthesized_place(expr) {
         hir::Expr::Unary {
             op: hir::UnaryOp::Not,
             expr,
             ..
-        } => lower_condition_to_blocks(expr, else_block, then_block, context),
+        } => lower_condition_to_blocks_inner(expr, else_block, then_block, context),
         hir::Expr::Binary {
             left,
             op: hir::BinaryOp::And,
@@ -5865,9 +6390,9 @@ fn lower_condition_to_blocks(
             ..
         } => {
             let right_block = context.create_block();
-            lower_condition_to_blocks(left, right_block, else_block, context)?;
+            lower_condition_to_blocks_inner(left, right_block, else_block, context)?;
             context.current_block = Some(right_block);
-            lower_condition_to_blocks(right, then_block, else_block, context)
+            lower_condition_to_blocks_inner(right, then_block, else_block, context)
         }
         hir::Expr::Binary {
             left,
@@ -5876,9 +6401,9 @@ fn lower_condition_to_blocks(
             ..
         } => {
             let right_block = context.create_block();
-            lower_condition_to_blocks(left, then_block, right_block, context)?;
+            lower_condition_to_blocks_inner(left, then_block, right_block, context)?;
             context.current_block = Some(right_block);
-            lower_condition_to_blocks(right, then_block, else_block, context)
+            lower_condition_to_blocks_inner(right, then_block, else_block, context)
         }
         _ => {
             materialize_nested_collection_places(expr, false, context)?;
@@ -6222,6 +6747,30 @@ fn lower_null_comparison(
                 lower_nullable_weak_reference_expression(value, class, false, context)?,
             ))
         }
+        mir::Type::NullableWritableSharedReference(payload) => {
+            mir::BoolExpression::NullableWritableSharedReferenceIsPresent(Box::new(
+                lower_nullable_writable_shared_reference_expression(
+                    value, payload, false, context,
+                )?,
+            ))
+        }
+        mir::Type::NullableWritableWeakReference(payload) => {
+            mir::BoolExpression::NullableWritableWeakReferenceIsPresent(Box::new(
+                lower_nullable_writable_weak_reference_expression(value, payload, false, context)?,
+            ))
+        }
+        mir::Type::NullableReadonlySharedReferenceAccess(payload)
+        | mir::Type::NullableWritableSharedReferenceAccess(payload) => {
+            let writable = matches!(
+                value_type,
+                mir::Type::NullableWritableSharedReferenceAccess(_)
+            );
+            mir::BoolExpression::NullableSharedReferenceAccessIsPresent(Box::new(
+                lower_nullable_shared_reference_access_expression(
+                    value, payload, writable, false, context,
+                )?,
+            ))
+        }
         mir::Type::NullableMixed => {
             let present = mir::BoolExpression::NullableMixedIsPresent(Box::new(
                 lower_nullable_mixed_presence_subject(value, context)?,
@@ -6299,6 +6848,38 @@ fn lower_is_condition(
                 lower_nullable_weak_reference_expression(expr, class, false, context)?,
             ))
         }
+        mir::Type::NullableWritableSharedReference(payload)
+            if tested_type == mir::Type::WritableSharedReference(payload) =>
+        {
+            mir::BoolExpression::NullableWritableSharedReferenceIsPresent(Box::new(
+                lower_nullable_writable_shared_reference_expression(expr, payload, false, context)?,
+            ))
+        }
+        mir::Type::NullableWritableWeakReference(payload)
+            if tested_type == mir::Type::WritableWeakReference(payload) =>
+        {
+            mir::BoolExpression::NullableWritableWeakReferenceIsPresent(Box::new(
+                lower_nullable_writable_weak_reference_expression(expr, payload, false, context)?,
+            ))
+        }
+        mir::Type::NullableReadonlySharedReferenceAccess(payload)
+            if tested_type == mir::Type::ReadonlySharedReferenceAccess(payload) =>
+        {
+            mir::BoolExpression::NullableSharedReferenceAccessIsPresent(Box::new(
+                lower_nullable_shared_reference_access_expression(
+                    expr, payload, false, false, context,
+                )?,
+            ))
+        }
+        mir::Type::NullableWritableSharedReferenceAccess(payload)
+            if tested_type == mir::Type::WritableSharedReferenceAccess(payload) =>
+        {
+            mir::BoolExpression::NullableSharedReferenceAccessIsPresent(Box::new(
+                lower_nullable_shared_reference_access_expression(
+                    expr, payload, true, false, context,
+                )?,
+            ))
+        }
         mir::Type::Mixed => mir::BoolExpression::MixedIs {
             mixed: Box::new(lower_mixed_expression(expr, false, context)?),
             tag: mixed_tag_for_type(tested_type, type_test_span)?,
@@ -6341,7 +6922,14 @@ fn lower_is_condition(
                 lower_nullable_class_presence_subject(expr, class, context)?,
             )))
         }
-        mir::Type::SharedReference(_) | mir::Type::WeakReference(_) => {
+        mir::Type::SharedReference(_)
+        | mir::Type::WeakReference(_)
+        | mir::Type::WritableSharedReference(_)
+        | mir::Type::WritableWeakReference(_)
+        | mir::Type::ReadonlySharedReferenceAccess(_)
+        | mir::Type::WritableSharedReferenceAccess(_)
+        | mir::Type::NullableReadonlySharedReferenceAccess(_)
+        | mir::Type::NullableWritableSharedReferenceAccess(_) => {
             let evaluated = lower_concrete_is_presence(expr, value_type, context)?;
             if value_type == tested_type {
                 evaluated
@@ -6357,6 +6945,16 @@ fn lower_is_condition(
         mir::Type::NullableWeakReference(class) => evaluate_then_false(
             mir::BoolExpression::NullableWeakReferenceIsPresent(Box::new(
                 lower_nullable_weak_reference_expression(expr, class, false, context)?,
+            )),
+        ),
+        mir::Type::NullableWritableSharedReference(payload) => evaluate_then_false(
+            mir::BoolExpression::NullableWritableSharedReferenceIsPresent(Box::new(
+                lower_nullable_writable_shared_reference_expression(expr, payload, false, context)?,
+            )),
+        ),
+        mir::Type::NullableWritableWeakReference(payload) => evaluate_then_false(
+            mir::BoolExpression::NullableWritableWeakReferenceIsPresent(Box::new(
+                lower_nullable_writable_weak_reference_expression(expr, payload, false, context)?,
             )),
         ),
         mir::Type::Collection(_) => {
@@ -6507,6 +7105,41 @@ fn lower_concrete_is_presence(
                 operand: mir::Operand::Scalar(mir::ScalarValue::Bool(true)),
             })
         }
+        mir::Type::WritableSharedReference(payload) => {
+            lower_discarded_rvalue(
+                mir::Rvalue::WritableSharedReference(lower_writable_shared_reference_expression(
+                    expr, payload, false, context,
+                )?),
+                context,
+            );
+            Ok(mir::BoolExpression::Use {
+                operand: mir::Operand::Scalar(mir::ScalarValue::Bool(true)),
+            })
+        }
+        mir::Type::WritableWeakReference(payload) => {
+            lower_discarded_rvalue(
+                mir::Rvalue::WritableWeakReference(lower_writable_weak_reference_expression(
+                    expr, payload, false, context,
+                )?),
+                context,
+            );
+            Ok(mir::BoolExpression::Use {
+                operand: mir::Operand::Scalar(mir::ScalarValue::Bool(true)),
+            })
+        }
+        mir::Type::ReadonlySharedReferenceAccess(payload)
+        | mir::Type::WritableSharedReferenceAccess(payload) => {
+            let writable = matches!(value_type, mir::Type::WritableSharedReferenceAccess(_));
+            lower_discarded_rvalue(
+                mir::Rvalue::SharedReferenceAccess(lower_shared_reference_access_expression(
+                    expr, payload, writable, false, context,
+                )?),
+                context,
+            );
+            Ok(mir::BoolExpression::Use {
+                operand: mir::Operand::Scalar(mir::ScalarValue::Bool(true)),
+            })
+        }
         mir::Type::Mixed => Ok(mir::BoolExpression::NullableMixedIsPresent(Box::new(
             mir::NullableMixedExpression::Mixed(lower_mixed_expression(expr, false, context)?),
         ))),
@@ -6515,7 +7148,13 @@ fn lower_concrete_is_presence(
         | mir::Type::NullableMixed
         | mir::Type::NullableClass(_)
         | mir::Type::NullableSharedReference(_)
-        | mir::Type::NullableWeakReference(_) => unreachable!("concrete `is` value type"),
+        | mir::Type::NullableWeakReference(_)
+        | mir::Type::NullableWritableSharedReference(_)
+        | mir::Type::NullableWritableWeakReference(_)
+        | mir::Type::NullableReadonlySharedReferenceAccess(_)
+        | mir::Type::NullableWritableSharedReferenceAccess(_) => {
+            unreachable!("concrete `is` value type")
+        }
         mir::Type::Collection(_) => Ok(mir::BoolExpression::Use {
             operand: mir::Operand::Scalar(mir::ScalarValue::Bool(true)),
         }),
@@ -6614,6 +7253,36 @@ fn value_expression_from_operand(
     }
 }
 
+fn lower_shared_access_rvalue(
+    expr: &hir::Expr,
+    expected: mir::Type,
+    transfer: bool,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<mir::Rvalue> {
+    let Some(access) = expected.shared_access() else {
+        unreachable!("shared access lowering requires a shared access MIR type");
+    };
+    if access.nullable {
+        lower_nullable_shared_reference_access_expression(
+            expr,
+            access.payload,
+            access.writable,
+            transfer,
+            context,
+        )
+        .map(mir::Rvalue::NullableSharedReferenceAccess)
+    } else {
+        lower_shared_reference_access_expression(
+            expr,
+            access.payload,
+            access.writable,
+            transfer,
+            context,
+        )
+        .map(mir::Rvalue::SharedReferenceAccess)
+    }
+}
+
 fn lower_rvalue_as_expected(
     expr: &hir::Expr,
     expected: mir::Type,
@@ -6664,6 +7333,28 @@ fn lower_rvalue_as_expected(
             lower_nullable_weak_reference_expression(expr, class, true, context)
                 .map(mir::Rvalue::NullableWeakReference)
         }
+        mir::Type::WritableSharedReference(payload) => {
+            lower_writable_shared_reference_expression(expr, payload, true, context)
+                .map(mir::Rvalue::WritableSharedReference)
+        }
+        mir::Type::WritableWeakReference(payload) => {
+            lower_writable_weak_reference_expression(expr, payload, true, context)
+                .map(mir::Rvalue::WritableWeakReference)
+        }
+        mir::Type::NullableWritableSharedReference(payload) => {
+            lower_nullable_writable_shared_reference_expression(expr, payload, true, context)
+                .map(mir::Rvalue::NullableWritableSharedReference)
+        }
+        mir::Type::NullableWritableWeakReference(payload) => {
+            lower_nullable_writable_weak_reference_expression(expr, payload, true, context)
+                .map(mir::Rvalue::NullableWritableWeakReference)
+        }
+        ty @ (mir::Type::ReadonlySharedReferenceAccess(_)
+        | mir::Type::WritableSharedReferenceAccess(_)
+        | mir::Type::NullableReadonlySharedReferenceAccess(_)
+        | mir::Type::NullableWritableSharedReferenceAccess(_)) => {
+            lower_shared_access_rvalue(expr, ty, true, context)
+        }
         mir::Type::Collection(collection) => {
             lower_collection_expression(expr, collection, true, context)
                 .map(mir::Rvalue::Collection)
@@ -6699,6 +7390,28 @@ fn lower_rvalue_as_borrowed(
         mir::Type::NullableWeakReference(class) => {
             lower_nullable_weak_reference_expression(expr, class, false, context)
                 .map(mir::Rvalue::NullableWeakReference)
+        }
+        mir::Type::WritableSharedReference(payload) => {
+            lower_writable_shared_reference_expression(expr, payload, false, context)
+                .map(mir::Rvalue::WritableSharedReference)
+        }
+        mir::Type::WritableWeakReference(payload) => {
+            lower_writable_weak_reference_expression(expr, payload, false, context)
+                .map(mir::Rvalue::WritableWeakReference)
+        }
+        mir::Type::NullableWritableSharedReference(payload) => {
+            lower_nullable_writable_shared_reference_expression(expr, payload, false, context)
+                .map(mir::Rvalue::NullableWritableSharedReference)
+        }
+        mir::Type::NullableWritableWeakReference(payload) => {
+            lower_nullable_writable_weak_reference_expression(expr, payload, false, context)
+                .map(mir::Rvalue::NullableWritableWeakReference)
+        }
+        ty @ (mir::Type::ReadonlySharedReferenceAccess(_)
+        | mir::Type::WritableSharedReferenceAccess(_)
+        | mir::Type::NullableReadonlySharedReferenceAccess(_)
+        | mir::Type::NullableWritableSharedReferenceAccess(_)) => {
+            lower_shared_access_rvalue(expr, ty, false, context)
         }
         mir::Type::Collection(collection) => {
             lower_collection_expression(expr, collection, false, context)
@@ -6848,7 +7561,15 @@ fn lower_mixed_expression(
         mir::Type::SharedReference(_)
         | mir::Type::WeakReference(_)
         | mir::Type::NullableSharedReference(_)
-        | mir::Type::NullableWeakReference(_) => {
+        | mir::Type::NullableWeakReference(_)
+        | mir::Type::WritableSharedReference(_)
+        | mir::Type::WritableWeakReference(_)
+        | mir::Type::NullableWritableSharedReference(_)
+        | mir::Type::NullableWritableWeakReference(_)
+        | mir::Type::ReadonlySharedReferenceAccess(_)
+        | mir::Type::WritableSharedReferenceAccess(_)
+        | mir::Type::NullableReadonlySharedReferenceAccess(_)
+        | mir::Type::NullableWritableSharedReferenceAccess(_) => {
             Err(vec![shared_ownership_mixed_runtime_unsupported(
                 expr.span(),
             )])
@@ -6873,7 +7594,15 @@ fn mixed_tag_for_type(ty: mir::Type, span: Span) -> DiagnosticResult<mir::MixedT
         mir::Type::SharedReference(_)
         | mir::Type::WeakReference(_)
         | mir::Type::NullableSharedReference(_)
-        | mir::Type::NullableWeakReference(_) => {
+        | mir::Type::NullableWeakReference(_)
+        | mir::Type::WritableSharedReference(_)
+        | mir::Type::WritableWeakReference(_)
+        | mir::Type::NullableWritableSharedReference(_)
+        | mir::Type::NullableWritableWeakReference(_)
+        | mir::Type::ReadonlySharedReferenceAccess(_)
+        | mir::Type::WritableSharedReferenceAccess(_)
+                | mir::Type::NullableReadonlySharedReferenceAccess(_)
+                | mir::Type::NullableWritableSharedReferenceAccess(_) => {
             Err(vec![shared_ownership_mixed_runtime_unsupported(span)])
         }
         mir::Type::Class(class) => Ok(mir::MixedTag::Class(class)),
@@ -6975,6 +7704,23 @@ fn lower_collection_expression(
     transfer: bool,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::CollectionExpression> {
+    if let Some((access, writable)) = lower_shared_access_payload_local(
+        expr,
+        mir::WritableSharedPayload::Collection(expected),
+        context,
+    )? {
+        if transfer {
+            return Err(vec![unsupported(
+                expr.span(),
+                "the complete payload cannot be moved out of a shared access object",
+            )]);
+        }
+        return Ok(mir::CollectionExpression::SharedAccessPayload {
+            collection: expected,
+            access,
+            writable,
+        });
+    }
     if let Some((collection, index, value_type)) = lower_list_remove_at(expr, context)? {
         if value_type != mir::Type::Collection(expected) {
             return Err(vec![unsupported(
@@ -7398,6 +8144,48 @@ fn collection_remove_at_rvalue(
                 remove: true,
             },
         )),
+        mir::Type::WritableSharedReference(payload) => Ok(mir::Rvalue::WritableSharedReference(
+            mir::WritableSharedReferenceExpression::CollectionIndex {
+                payload,
+                collection,
+                index: Box::new(index),
+                remove: true,
+            },
+        )),
+        mir::Type::WritableWeakReference(payload) => Ok(mir::Rvalue::WritableWeakReference(
+            mir::WritableWeakReferenceExpression::CollectionIndex {
+                payload,
+                collection,
+                index: Box::new(index),
+                remove: true,
+            },
+        )),
+        mir::Type::ReadonlySharedReferenceAccess(payload)
+        | mir::Type::WritableSharedReferenceAccess(payload) => {
+            let writable = matches!(ty, mir::Type::WritableSharedReferenceAccess(_));
+            Ok(mir::Rvalue::SharedReferenceAccess(
+                mir::SharedReferenceAccessExpression::CollectionIndex {
+                    payload,
+                    collection,
+                    index: Box::new(index),
+                    writable,
+                    remove: true,
+                },
+            ))
+        }
+        mir::Type::NullableReadonlySharedReferenceAccess(payload)
+        | mir::Type::NullableWritableSharedReferenceAccess(payload) => {
+            let writable = matches!(ty, mir::Type::NullableWritableSharedReferenceAccess(_));
+            Ok(mir::Rvalue::NullableSharedReferenceAccess(
+                mir::NullableSharedReferenceAccessExpression::CollectionIndex {
+                    payload,
+                    collection,
+                    index: Box::new(index),
+                    writable,
+                    remove: true,
+                },
+            ))
+        }
         mir::Type::Mixed => Ok(mir::Rvalue::Mixed(mir::MixedExpression::CollectionIndex {
             collection,
             index: Box::new(index),
@@ -7415,7 +8203,9 @@ fn collection_remove_at_rvalue(
         mir::Type::NullableScalar(_)
         | mir::Type::NullableString
         | mir::Type::NullableMixed
-        | mir::Type::NullableClass(_) => Err(vec![unsupported(
+        | mir::Type::NullableClass(_)
+        | mir::Type::NullableWritableSharedReference(_)
+        | mir::Type::NullableWritableWeakReference(_) => Err(vec![unsupported(
             Span::new(0, 0),
             "removing nullable collection elements is deferred beyond Stage 23 Slice 3",
         )]),
@@ -7606,6 +8396,38 @@ fn lower_collection_local(
         };
         return Ok((local, collection));
     }
+    let access_payload = match context.expression_type(expr)? {
+        mir::Type::ReadonlySharedReferenceAccess(mir::WritableSharedPayload::Collection(
+            collection,
+        ))
+        | mir::Type::WritableSharedReferenceAccess(mir::WritableSharedPayload::Collection(
+            collection,
+        )) => Some(collection),
+        _ => None,
+    };
+    if let Some(collection) = access_payload {
+        let Some((access, writable)) = lower_shared_access_payload_local(
+            expr,
+            mir::WritableSharedPayload::Collection(collection),
+            context,
+        )?
+        else {
+            unreachable!("shared collection access type must produce an access local");
+        };
+        let local = context.declare_borrowed_temp(mir::Type::Collection(collection), writable);
+        context.push_statement(mir::Statement::AssignLocal {
+            target: local,
+            value: mir::Rvalue::Collection(mir::CollectionExpression::SharedAccessPayload {
+                collection,
+                access,
+                writable,
+            }),
+        });
+        context
+            .materialized_collection_places
+            .insert((expr.span().start, expr.span().end), local);
+        return Ok((local, collection));
+    }
     match expr {
         hir::Expr::Variable { name, span } => {
             let local = context.lookup_local(name, *span)?;
@@ -7622,6 +8444,311 @@ fn lower_collection_local(
             "collection access requires a materialized collection place",
         )]),
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct NullableCollectionAccessReceiver {
+    local: mir::LocalId,
+    collection: mir::CollectionTypeId,
+    writable: bool,
+}
+
+fn lower_nullable_collection_access_receiver(
+    expr: &hir::Expr,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<Option<NullableCollectionAccessReceiver>> {
+    let ty = context.expression_type(expr)?;
+    let access = ty.shared_access();
+    let Some(access) = access.filter(|access| access.nullable) else {
+        return Ok(None);
+    };
+    let mir::WritableSharedPayload::Collection(collection) = access.payload else {
+        return Ok(None);
+    };
+
+    let local = if let hir::Expr::Variable { name, span } = unparenthesized_place(expr) {
+        context.lookup_local(name, *span)?
+    } else {
+        let value = lower_nullable_shared_reference_access_expression(
+            expr,
+            access.payload,
+            access.writable,
+            false,
+            context,
+        )?;
+        let local = if value.owned_temporary() {
+            context.declare_owned_temp(ty)
+        } else {
+            context.declare_borrowed_temp(ty, false)
+        };
+        context.push_statement(mir::Statement::AssignLocal {
+            target: local,
+            value: mir::Rvalue::NullableSharedReferenceAccess(value),
+        });
+        local
+    };
+
+    Ok(Some(NullableCollectionAccessReceiver {
+        local,
+        collection,
+        writable: access.writable,
+    }))
+}
+
+fn lower_present_collection_access(
+    receiver: NullableCollectionAccessReceiver,
+    context: &mut LoweringContext,
+) -> mir::LocalId {
+    let payload = mir::WritableSharedPayload::Collection(receiver.collection);
+    let access_type = if receiver.writable {
+        mir::Type::WritableSharedReferenceAccess(payload)
+    } else {
+        mir::Type::ReadonlySharedReferenceAccess(payload)
+    };
+    let access = context.declare_borrowed_temp(access_type, receiver.writable);
+    context.push_statement(mir::Statement::AssignLocal {
+        target: access,
+        value: mir::Rvalue::SharedReferenceAccess(
+            mir::SharedReferenceAccessExpression::NullableLocalAssumeNonNull {
+                payload,
+                local: receiver.local,
+                writable: receiver.writable,
+                transfer: false,
+            },
+        ),
+    });
+
+    let collection = context.declare_borrowed_temp(
+        mir::Type::Collection(receiver.collection),
+        receiver.writable,
+    );
+    context.push_statement(mir::Statement::AssignLocal {
+        target: collection,
+        value: mir::Rvalue::Collection(mir::CollectionExpression::SharedAccessPayload {
+            collection: receiver.collection,
+            access,
+            writable: receiver.writable,
+        }),
+    });
+    collection
+}
+
+fn lower_null_safe_collection_scalar(
+    expr: &hir::Expr,
+    expected: mir::ScalarType,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<Option<mir::NullableScalarExpression>> {
+    let (object, operation) = match unparenthesized_place(expr) {
+        hir::Expr::PropertyAccess {
+            object,
+            property,
+            null_safe: true,
+            ..
+        } => (
+            object.as_ref(),
+            NullableCollectionScalarOperation::Property(property.as_str()),
+        ),
+        hir::Expr::MethodCall {
+            object,
+            method,
+            args,
+            null_safe: true,
+            ..
+        } => (
+            object.as_ref(),
+            NullableCollectionScalarOperation::Method(method.as_str(), args),
+        ),
+        _ => return Ok(None),
+    };
+    let Some(receiver) = lower_nullable_collection_access_receiver(object, context)? else {
+        return Ok(None);
+    };
+    let definition = context.collection_type(receiver.collection).clone();
+    if !operation.matches(&definition, expected) {
+        return Ok(None);
+    }
+
+    let result_type = mir::Type::NullableScalar(expected);
+    let result = context.declare_borrowed_temp(result_type, false);
+    let present_block = context.create_block();
+    let absent_block = context.create_block();
+    let join_block = context.create_block();
+    context.terminate_condition(
+        mir::BoolExpression::NullableSharedReferenceAccessIsPresent(Box::new(
+            mir::NullableSharedReferenceAccessExpression::Local {
+                payload: mir::WritableSharedPayload::Collection(receiver.collection),
+                local: receiver.local,
+                writable: receiver.writable,
+                transfer: false,
+            },
+        )),
+        present_block,
+        absent_block,
+    );
+
+    context.current_block = Some(present_block);
+    let collection = lower_present_collection_access(receiver, context);
+    let value = operation.lower(collection, &definition, expected, context)?;
+    context.push_statement(mir::Statement::AssignLocal {
+        target: result,
+        value: mir::Rvalue::NullableScalar(value),
+    });
+    context.terminate_current(mir::Terminator::Jump(join_block));
+
+    context.current_block = Some(absent_block);
+    context.push_statement(mir::Statement::AssignLocal {
+        target: result,
+        value: mir::Rvalue::NullableScalar(mir::NullableScalarExpression::Null(expected)),
+    });
+    context.terminate_current(mir::Terminator::Jump(join_block));
+
+    context.current_block = Some(join_block);
+    Ok(Some(mir::NullableScalarExpression::Local {
+        ty: expected,
+        local: result,
+    }))
+}
+
+enum NullableCollectionScalarOperation<'a> {
+    Property(&'a str),
+    Method(&'a str, &'a [hir::Argument]),
+}
+
+impl NullableCollectionScalarOperation<'_> {
+    fn matches(&self, definition: &mir::CollectionType, expected: mir::ScalarType) -> bool {
+        match self {
+            Self::Property("length" | "count") => {
+                expected == mir::ScalarType::Integer(IntegerType::Int64)
+            }
+            Self::Property("isEmpty") => expected == mir::ScalarType::Bool,
+            Self::Property("first" | "last") => {
+                definition.kind == mir::CollectionKind::List
+                    && definition.value == mir::Type::Scalar(expected)
+            }
+            Self::Method("contains", [_]) => {
+                expected == mir::ScalarType::Bool
+                    && matches!(
+                        definition.kind,
+                        mir::CollectionKind::List | mir::CollectionKind::Set
+                    )
+            }
+            Self::Method("has", [_]) => {
+                expected == mir::ScalarType::Bool
+                    && definition.kind == mir::CollectionKind::Dictionary
+            }
+            Self::Method("add" | "remove", [_]) => {
+                (expected == mir::ScalarType::Bool && definition.kind == mir::CollectionKind::Set)
+                    || (definition.value == mir::Type::Scalar(expected)
+                        && definition.kind == mir::CollectionKind::Dictionary)
+            }
+            Self::Method("get", [_]) => {
+                definition.kind == mir::CollectionKind::Dictionary
+                    && definition.value == mir::Type::Scalar(expected)
+            }
+            Self::Method("removeAt", [_]) | Self::Method("pop", []) => {
+                definition.kind == mir::CollectionKind::List
+                    && definition.value == mir::Type::Scalar(expected)
+            }
+            _ => false,
+        }
+    }
+
+    fn lower(
+        &self,
+        collection: mir::LocalId,
+        definition: &mir::CollectionType,
+        expected: mir::ScalarType,
+        context: &mut LoweringContext,
+    ) -> DiagnosticResult<mir::NullableScalarExpression> {
+        match self {
+            Self::Property("length" | "count") => Ok(mir::NullableScalarExpression::Value(
+                value_expression_from_operand(expected, mir::Operand::CollectionLength(collection)),
+            )),
+            Self::Property("isEmpty") => Ok(mir::NullableScalarExpression::Value(
+                mir::ValueExpression::Bool(mir::BoolExpression::CollectionIsEmpty { collection }),
+            )),
+            Self::Property(property @ ("first" | "last")) => {
+                Ok(mir::NullableScalarExpression::DictionaryGet {
+                    ty: expected,
+                    collection,
+                    key: Box::new(zero_int_rvalue()),
+                    access: if *property == "first" {
+                        mir::NullableCollectionAccess::First
+                    } else {
+                        mir::NullableCollectionAccess::Last
+                    },
+                })
+            }
+            Self::Method("get" | "remove", [key]) => {
+                let key_type = definition
+                    .key
+                    .expect("dictionary collection has a key type");
+                Ok(mir::NullableScalarExpression::DictionaryGet {
+                    ty: expected,
+                    collection,
+                    key: Box::new(lower_rvalue_as_borrowed(&key.value, key_type, context)?),
+                    access: if matches!(self, Self::Method("get", _)) {
+                        mir::NullableCollectionAccess::Get
+                    } else {
+                        mir::NullableCollectionAccess::Remove
+                    },
+                })
+            }
+            Self::Method("pop", []) => Ok(mir::NullableScalarExpression::DictionaryGet {
+                ty: expected,
+                collection,
+                key: Box::new(zero_int_rvalue()),
+                access: mir::NullableCollectionAccess::Pop,
+            }),
+            Self::Method("removeAt", [index]) => {
+                let index = lower_rvalue_as_expected(
+                    &index.value,
+                    mir::Type::Scalar(mir::ScalarType::Integer(IntegerType::Int64)),
+                    context,
+                )?;
+                Ok(mir::NullableScalarExpression::Value(
+                    value_expression_from_operand(
+                        expected,
+                        mir::Operand::CollectionIndex {
+                            collection,
+                            index: Box::new(index),
+                            remove: true,
+                        },
+                    ),
+                ))
+            }
+            Self::Method(method, [argument]) => {
+                let op = match *method {
+                    "contains" | "has" => mir::CollectionMembershipOp::Contains,
+                    "add" => mir::CollectionMembershipOp::Add,
+                    "remove" => mir::CollectionMembershipOp::Remove,
+                    _ => unreachable!("operation was checked before lowering"),
+                };
+                let value_type = definition.key.unwrap_or(definition.value);
+                let value = if op == mir::CollectionMembershipOp::Add {
+                    lower_rvalue_as_expected(&argument.value, value_type, context)?
+                } else {
+                    lower_rvalue_as_borrowed(&argument.value, value_type, context)?
+                };
+                Ok(mir::NullableScalarExpression::Value(
+                    mir::ValueExpression::Bool(mir::BoolExpression::CollectionHas {
+                        collection,
+                        value: Box::new(value),
+                        op,
+                    }),
+                ))
+            }
+            _ => unreachable!("operation was checked before lowering"),
+        }
+    }
+}
+
+fn zero_int_rvalue() -> mir::Rvalue {
+    mir::Rvalue::Value(mir::ValueExpression::Integer(
+        mir::IntegerExpression::constant(
+            IntegerValue::from_i128(IntegerType::Int64, 0).expect("zero is a valid int"),
+        ),
+    ))
 }
 
 fn lower_bytes_local(
@@ -7883,6 +9010,66 @@ fn nullable_collection_access_rvalue(
                 stored_nullable: true,
             },
         )),
+        mir::Type::WritableSharedReference(payload) => {
+            Ok(mir::Rvalue::NullableWritableSharedReference(
+                mir::NullableWritableSharedReferenceExpression::DictionaryGet {
+                    payload,
+                    collection,
+                    key,
+                    access,
+                    stored_nullable: false,
+                },
+            ))
+        }
+        mir::Type::NullableWritableSharedReference(payload) => {
+            Ok(mir::Rvalue::NullableWritableSharedReference(
+                mir::NullableWritableSharedReferenceExpression::DictionaryGet {
+                    payload,
+                    collection,
+                    key,
+                    access,
+                    stored_nullable: true,
+                },
+            ))
+        }
+        mir::Type::WritableWeakReference(payload) => {
+            Ok(mir::Rvalue::NullableWritableWeakReference(
+                mir::NullableWritableWeakReferenceExpression::DictionaryGet {
+                    payload,
+                    collection,
+                    key,
+                    access,
+                    stored_nullable: false,
+                },
+            ))
+        }
+        mir::Type::NullableWritableWeakReference(payload) => {
+            Ok(mir::Rvalue::NullableWritableWeakReference(
+                mir::NullableWritableWeakReferenceExpression::DictionaryGet {
+                    payload,
+                    collection,
+                    key,
+                    access,
+                    stored_nullable: true,
+                },
+            ))
+        }
+        ty @ (mir::Type::ReadonlySharedReferenceAccess(_)
+        | mir::Type::WritableSharedReferenceAccess(_)
+        | mir::Type::NullableReadonlySharedReferenceAccess(_)
+        | mir::Type::NullableWritableSharedReferenceAccess(_)) => {
+            let shared_access = ty
+                .shared_access()
+                .expect("matched shared access collection element");
+            Ok(mir::Rvalue::NullableSharedReferenceAccess(
+                mir::NullableSharedReferenceAccessExpression::CollectionGet {
+                    collection,
+                    key,
+                    access,
+                    stored: shared_access,
+                },
+            ))
+        }
         mir::Type::Mixed => Err(vec![Diagnostic::unsupported_stage(
             "M1101",
             "nullable accessors returning `?mixed` from collections land with the next mixed collection slice",
@@ -7905,7 +9092,23 @@ fn lower_discarded_rvalue(value: mir::Rvalue, context: &mut LoweringContext) {
         mir::Type::SharedReference(_)
         | mir::Type::WeakReference(_)
         | mir::Type::NullableSharedReference(_)
-        | mir::Type::NullableWeakReference(_) => value.owned_temporary_shared().is_some(),
+        | mir::Type::NullableWeakReference(_)
+        | mir::Type::WritableSharedReference(_)
+        | mir::Type::WritableWeakReference(_)
+        | mir::Type::NullableWritableSharedReference(_)
+        | mir::Type::NullableWritableWeakReference(_)
+        | mir::Type::ReadonlySharedReferenceAccess(_)
+        | mir::Type::WritableSharedReferenceAccess(_)
+        | mir::Type::NullableReadonlySharedReferenceAccess(_)
+        | mir::Type::NullableWritableSharedReferenceAccess(_) => {
+            value.owned_temporary_shared().is_some()
+                || matches!(
+                    value,
+                    mir::Rvalue::SharedReferenceAccess(_)
+                        | mir::Rvalue::NullableWritableSharedReference(_)
+                        | mir::Rvalue::NullableWritableWeakReference(_)
+                )
+        }
         mir::Type::Class(_)
         | mir::Type::NullableClass(_)
         | mir::Type::Mixed
@@ -7918,6 +9121,16 @@ fn lower_discarded_rvalue(value: mir::Rvalue, context: &mut LoweringContext) {
         target: local,
         value,
     });
+    if owned {
+        if let Some(access) = ty.shared_access() {
+            context.push_statement(mir::Statement::DropSharedReferenceAccess {
+                local,
+                payload: access.payload,
+                writable: access.writable,
+            });
+            return;
+        }
+    }
     match ty {
         mir::Type::Class(class) | mir::Type::NullableClass(class) => {
             context.push_statement(mir::Statement::DropClass { local, class });
@@ -7927,6 +9140,18 @@ fn lower_discarded_rvalue(value: mir::Rvalue, context: &mut LoweringContext) {
         }
         mir::Type::WeakReference(class) | mir::Type::NullableWeakReference(class) if owned => {
             context.push_statement(mir::Statement::DropWeakReference { local, class });
+        }
+        mir::Type::WritableSharedReference(payload)
+        | mir::Type::NullableWritableSharedReference(payload)
+            if owned =>
+        {
+            context.push_statement(mir::Statement::DropWritableSharedReference { local, payload });
+        }
+        mir::Type::WritableWeakReference(payload)
+        | mir::Type::NullableWritableWeakReference(payload)
+            if owned =>
+        {
+            context.push_statement(mir::Statement::DropWritableWeakReference { local, payload });
         }
         mir::Type::Collection(collection) => {
             context.push_statement(mir::Statement::DropCollection { local, collection });
@@ -7938,6 +9163,14 @@ fn lower_discarded_rvalue(value: mir::Rvalue, context: &mut LoweringContext) {
         | mir::Type::WeakReference(_)
         | mir::Type::NullableSharedReference(_)
         | mir::Type::NullableWeakReference(_)
+        | mir::Type::WritableSharedReference(_)
+        | mir::Type::WritableWeakReference(_)
+        | mir::Type::NullableWritableSharedReference(_)
+        | mir::Type::NullableWritableWeakReference(_)
+        | mir::Type::ReadonlySharedReferenceAccess(_)
+        | mir::Type::WritableSharedReferenceAccess(_)
+        | mir::Type::NullableReadonlySharedReferenceAccess(_)
+        | mir::Type::NullableWritableSharedReferenceAccess(_)
         | mir::Type::Scalar(_)
         | mir::Type::String
         | mir::Type::NullableScalar(_)
@@ -8040,6 +9273,23 @@ fn lower_class_expression(
     transfer: bool,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::ClassExpression> {
+    if let Some((access, writable)) = lower_shared_access_payload_local(
+        expr,
+        mir::WritableSharedPayload::Class(expected),
+        context,
+    )? {
+        if transfer {
+            return Err(vec![unsupported(
+                expr.span(),
+                "the complete payload cannot be moved out of a shared access object",
+            )]);
+        }
+        return Ok(mir::ClassExpression::SharedAccessPayload {
+            class: expected,
+            access,
+            writable,
+        });
+    }
     if !matches!(
         unparenthesized_place(expr),
         hir::Expr::New { shared: false, .. }
@@ -8540,6 +9790,1085 @@ fn lower_shared_reference_expression(
             expr.span(),
             "this shared-reference expression is not supported by native compilation",
         )]),
+    }
+}
+
+fn writable_payload_type(payload: mir::WritableSharedPayload) -> mir::Type {
+    match payload {
+        mir::WritableSharedPayload::Class(class) => mir::Type::Class(class),
+        mir::WritableSharedPayload::Collection(collection) => mir::Type::Collection(collection),
+    }
+}
+
+fn lower_writable_shared_reference_expression(
+    expr: &hir::Expr,
+    expected: mir::WritableSharedPayload,
+    transfer: bool,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<mir::WritableSharedReferenceExpression> {
+    match unparenthesized_place(expr) {
+        hir::Expr::Variable { name, span } => {
+            let local = context.lookup_local(name, *span)?;
+            let ty = context.local_type(local);
+            if ty != mir::Type::WritableSharedReference(expected)
+                && ty != mir::Type::NullableWritableSharedReference(expected)
+            {
+                return Err(vec![unsupported(
+                    *span,
+                    format!(
+                        "local `${name}` does not have the expected writable shared-reference type"
+                    ),
+                )]);
+            }
+            if transfer && !context.local_owns(local) {
+                return Err(vec![unsupported(
+                    *span,
+                    format!(
+                        "borrowed writable shared-reference local `${name}` cannot be given away"
+                    ),
+                )]);
+            }
+            if ty == mir::Type::NullableWritableSharedReference(expected) {
+                Ok(
+                    mir::WritableSharedReferenceExpression::NullableLocalAssumeNonNull {
+                        payload: expected,
+                        local,
+                        transfer,
+                    },
+                )
+            } else {
+                Ok(mir::WritableSharedReferenceExpression::Local {
+                    payload: expected,
+                    local,
+                    transfer,
+                })
+            }
+        }
+        hir::Expr::PropertyAccess { span, .. } => {
+            if transfer {
+                return Err(vec![unsupported(
+                    *span,
+                    "moving directly out of an owned class property is not supported",
+                )]);
+            }
+            let (object, property, ty) = lower_property_place(expr, context)?;
+            if ty != mir::Type::WritableSharedReference(expected) {
+                return Err(vec![unsupported(
+                    *span,
+                    "property does not have the expected writable shared-reference type",
+                )]);
+            }
+            Ok(mir::WritableSharedReferenceExpression::Property {
+                payload: expected,
+                object,
+                property,
+            })
+        }
+        hir::Expr::New {
+            class_type,
+            args,
+            shared: false,
+            span,
+        } if class_type.name == "WritableSharedReference" => {
+            let Some(argument) = args.first() else {
+                return Err(vec![shared_ownership_runtime_unsupported(*span)]);
+            };
+            let value = lower_rvalue_as_expected(
+                &argument.value,
+                writable_payload_type(expected),
+                context,
+            )?;
+            Ok(mir::WritableSharedReferenceExpression::New {
+                payload: expected,
+                value: Box::new(value),
+            })
+        }
+        hir::Expr::FunctionCall { name, args, span } => {
+            let signature = context.lookup_function(name, *span)?;
+            if signature.return_type
+                != mir::ReturnType::Value(mir::Type::WritableSharedReference(expected))
+            {
+                return Err(vec![unsupported(
+                    *span,
+                    format!(
+                        "function `{name}` does not return the expected writable shared reference"
+                    ),
+                )]);
+            }
+            Ok(mir::WritableSharedReferenceExpression::Call {
+                payload: expected,
+                function: signature.id,
+                return_borrow: signature.return_borrow,
+                args: lower_call_args_with_ownership(name, args, signature, *span, context)?,
+            })
+        }
+        hir::Expr::MethodCall {
+            object,
+            method,
+            args,
+            ..
+        } if method == "share" && args.is_empty() => {
+            let value =
+                lower_writable_shared_reference_expression(object, expected, false, context)?;
+            Ok(mir::WritableSharedReferenceExpression::Share {
+                payload: expected,
+                value: Box::new(value),
+            })
+        }
+        hir::Expr::MethodCall {
+            object,
+            method,
+            args,
+            span,
+            ..
+        } => {
+            let (signature, args) =
+                lower_instance_method_call(object, method, args, *span, context)?;
+            if signature.return_type
+                != mir::ReturnType::Value(mir::Type::WritableSharedReference(expected))
+            {
+                return Err(vec![unsupported(
+                    *span,
+                    "method does not return the expected writable shared reference",
+                )]);
+            }
+            Ok(mir::WritableSharedReferenceExpression::Call {
+                payload: expected,
+                function: signature.id,
+                return_borrow: signature.return_borrow,
+                args,
+            })
+        }
+        hir::Expr::StaticCall {
+            class_name,
+            method,
+            args,
+            span,
+        } => {
+            let (signature, args) =
+                lower_static_method_call(class_name, method, args, *span, context)?;
+            if signature.return_type
+                != mir::ReturnType::Value(mir::Type::WritableSharedReference(expected))
+            {
+                return Err(vec![unsupported(
+                    *span,
+                    "static method does not return the expected writable shared reference",
+                )]);
+            }
+            Ok(mir::WritableSharedReferenceExpression::Call {
+                payload: expected,
+                function: signature.id,
+                return_borrow: signature.return_borrow,
+                args,
+            })
+        }
+        hir::Expr::Binary {
+            left,
+            op: hir::BinaryOp::Coalesce,
+            right,
+            ..
+        } => match context.coalesce_selection(left) {
+            CoalesceSelection::Left => {
+                lower_writable_shared_reference_expression(left, expected, transfer, context)
+            }
+            CoalesceSelection::Right => {
+                lower_writable_shared_reference_expression(right, expected, transfer, context)
+            }
+            CoalesceSelection::Dynamic => Ok(mir::WritableSharedReferenceExpression::Coalesce {
+                payload: expected,
+                left: Box::new(lower_nullable_writable_shared_reference_expression(
+                    left, expected, transfer, context,
+                )?),
+                right: Box::new(lower_writable_shared_reference_expression(
+                    right, expected, transfer, context,
+                )?),
+                transfer,
+            }),
+        },
+        _ => Err(vec![unsupported(
+            expr.span(),
+            "this writable shared-reference expression is not supported by native compilation",
+        )]),
+    }
+}
+
+fn lower_writable_weak_reference_expression(
+    expr: &hir::Expr,
+    expected: mir::WritableSharedPayload,
+    transfer: bool,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<mir::WritableWeakReferenceExpression> {
+    match unparenthesized_place(expr) {
+        hir::Expr::Variable { name, span } => {
+            let local = context.lookup_local(name, *span)?;
+            let ty = context.local_type(local);
+            if ty != mir::Type::WritableWeakReference(expected)
+                && ty != mir::Type::NullableWritableWeakReference(expected)
+            {
+                return Err(vec![unsupported(
+                    *span,
+                    format!(
+                        "local `${name}` does not have the expected writable weak-reference type"
+                    ),
+                )]);
+            }
+            if transfer && !context.local_owns(local) {
+                return Err(vec![unsupported(
+                    *span,
+                    format!(
+                        "borrowed writable weak-reference local `${name}` cannot be given away"
+                    ),
+                )]);
+            }
+            if ty == mir::Type::NullableWritableWeakReference(expected) {
+                Ok(
+                    mir::WritableWeakReferenceExpression::NullableLocalAssumeNonNull {
+                        payload: expected,
+                        local,
+                        transfer,
+                    },
+                )
+            } else {
+                Ok(mir::WritableWeakReferenceExpression::Local {
+                    payload: expected,
+                    local,
+                    transfer,
+                })
+            }
+        }
+        hir::Expr::PropertyAccess { span, .. } => {
+            if transfer {
+                return Err(vec![unsupported(
+                    *span,
+                    "moving directly out of an owned class property is not supported",
+                )]);
+            }
+            let (object, property, ty) = lower_property_place(expr, context)?;
+            if ty != mir::Type::WritableWeakReference(expected) {
+                return Err(vec![unsupported(
+                    *span,
+                    "property does not have the expected writable weak-reference type",
+                )]);
+            }
+            Ok(mir::WritableWeakReferenceExpression::Property {
+                payload: expected,
+                object,
+                property,
+            })
+        }
+        hir::Expr::MethodCall {
+            object,
+            method,
+            args,
+            ..
+        } if method == "createWeakReference" && args.is_empty() => {
+            let value =
+                lower_writable_shared_reference_expression(object, expected, false, context)?;
+            Ok(mir::WritableWeakReferenceExpression::Create {
+                payload: expected,
+                value: Box::new(value),
+            })
+        }
+        hir::Expr::FunctionCall { name, args, span } => {
+            let signature = context.lookup_function(name, *span)?;
+            if signature.return_type
+                != mir::ReturnType::Value(mir::Type::WritableWeakReference(expected))
+            {
+                return Err(vec![unsupported(
+                    *span,
+                    format!(
+                        "function `{name}` does not return the expected writable weak reference"
+                    ),
+                )]);
+            }
+            Ok(mir::WritableWeakReferenceExpression::Call {
+                payload: expected,
+                function: signature.id,
+                return_borrow: signature.return_borrow,
+                args: lower_call_args_with_ownership(name, args, signature, *span, context)?,
+            })
+        }
+        _ => Err(vec![unsupported(
+            expr.span(),
+            "this writable weak-reference expression is not supported by native compilation",
+        )]),
+    }
+}
+
+fn lower_nullable_writable_shared_reference_expression(
+    expr: &hir::Expr,
+    expected: mir::WritableSharedPayload,
+    transfer: bool,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<mir::NullableWritableSharedReferenceExpression> {
+    match unparenthesized_place(expr) {
+        hir::Expr::Null { .. } => Ok(mir::NullableWritableSharedReferenceExpression::Null(
+            expected,
+        )),
+        hir::Expr::Variable { name, span }
+            if context.local_type(context.lookup_local(name, *span)?)
+                == mir::Type::NullableWritableSharedReference(expected) =>
+        {
+            let local = context.lookup_local(name, *span)?;
+            Ok(mir::NullableWritableSharedReferenceExpression::Local {
+                payload: expected,
+                local,
+                transfer,
+            })
+        }
+        hir::Expr::PropertyAccess { span, .. } => {
+            if transfer {
+                return Err(vec![unsupported(
+                    *span,
+                    "moving directly out of an owned nullable writable shared-reference property is not supported",
+                )]);
+            }
+            let (object, property, ty) = lower_property_place(expr, context)?;
+            if ty == mir::Type::NullableWritableSharedReference(expected) {
+                Ok(mir::NullableWritableSharedReferenceExpression::Property {
+                    payload: expected,
+                    object,
+                    property,
+                })
+            } else {
+                Ok(mir::NullableWritableSharedReferenceExpression::Strong(
+                    lower_writable_shared_reference_expression(expr, expected, transfer, context)?,
+                ))
+            }
+        }
+        hir::Expr::FunctionCall { name, args, span } => {
+            let signature = context.lookup_function(name, *span)?;
+            match signature.return_type {
+                mir::ReturnType::Value(mir::Type::NullableWritableSharedReference(payload))
+                    if payload == expected =>
+                {
+                    Ok(mir::NullableWritableSharedReferenceExpression::Call {
+                        payload: expected,
+                        function: signature.id,
+                        return_borrow: signature.return_borrow,
+                        args: lower_call_args_with_ownership(
+                            name, args, signature, *span, context,
+                        )?,
+                    })
+                }
+                mir::ReturnType::Value(mir::Type::WritableSharedReference(payload))
+                    if payload == expected =>
+                {
+                    Ok(mir::NullableWritableSharedReferenceExpression::Strong(
+                        lower_writable_shared_reference_expression(
+                            expr, expected, transfer, context,
+                        )?,
+                    ))
+                }
+                _ => Err(vec![unsupported(
+                    *span,
+                    format!(
+                        "function `{name}` does not return the expected nullable writable shared reference"
+                    ),
+                )]),
+            }
+        }
+        hir::Expr::MethodCall {
+            object,
+            method,
+            args,
+            null_safe: true,
+            ..
+        } if method == "acquire" && args.is_empty() => {
+            let value = lower_nullable_writable_weak_reference_expression(
+                object, expected, false, context,
+            )?;
+            Ok(
+                mir::NullableWritableSharedReferenceExpression::NullSafeAcquire {
+                    payload: expected,
+                    value: Box::new(value),
+                },
+            )
+        }
+        hir::Expr::MethodCall {
+            object,
+            method,
+            args,
+            null_safe: false,
+            ..
+        } if method == "acquire" && args.is_empty() => {
+            let value = lower_writable_weak_reference_expression(object, expected, false, context)?;
+            Ok(mir::NullableWritableSharedReferenceExpression::Acquire {
+                payload: expected,
+                value: Box::new(value),
+            })
+        }
+        hir::Expr::MethodCall {
+            object,
+            method,
+            args,
+            null_safe: true,
+            ..
+        } if method == "share" && args.is_empty() => {
+            let value = lower_nullable_writable_shared_reference_expression(
+                object, expected, false, context,
+            )?;
+            Ok(
+                mir::NullableWritableSharedReferenceExpression::NullSafeShare {
+                    payload: expected,
+                    value: Box::new(value),
+                },
+            )
+        }
+        hir::Expr::MethodCall {
+            object,
+            method,
+            args,
+            span,
+            ..
+        } => {
+            if context.expression_type(expr)?
+                != mir::Type::NullableWritableSharedReference(expected)
+            {
+                return Ok(mir::NullableWritableSharedReferenceExpression::Strong(
+                    lower_writable_shared_reference_expression(expr, expected, transfer, context)?,
+                ));
+            }
+            let (signature, args) =
+                lower_instance_method_call(object, method, args, *span, context)?;
+            match signature.return_type {
+                mir::ReturnType::Value(mir::Type::NullableWritableSharedReference(payload))
+                    if payload == expected =>
+                {
+                    Ok(mir::NullableWritableSharedReferenceExpression::Call {
+                        payload: expected,
+                        function: signature.id,
+                        return_borrow: signature.return_borrow,
+                        args,
+                    })
+                }
+                mir::ReturnType::Value(mir::Type::WritableSharedReference(payload))
+                    if payload == expected =>
+                {
+                    Ok(mir::NullableWritableSharedReferenceExpression::Strong(
+                        mir::WritableSharedReferenceExpression::Call {
+                            payload: expected,
+                            function: signature.id,
+                            return_borrow: signature.return_borrow,
+                            args,
+                        },
+                    ))
+                }
+                _ => Err(vec![unsupported(
+                    *span,
+                    "method does not return the expected nullable writable shared reference",
+                )]),
+            }
+        }
+        hir::Expr::StaticCall {
+            class_name,
+            method,
+            args,
+            span,
+        } => {
+            if context.expression_type(expr)?
+                != mir::Type::NullableWritableSharedReference(expected)
+            {
+                return Ok(mir::NullableWritableSharedReferenceExpression::Strong(
+                    lower_writable_shared_reference_expression(expr, expected, transfer, context)?,
+                ));
+            }
+            let (signature, args) =
+                lower_static_method_call(class_name, method, args, *span, context)?;
+            match signature.return_type {
+                mir::ReturnType::Value(mir::Type::NullableWritableSharedReference(payload))
+                    if payload == expected =>
+                {
+                    Ok(mir::NullableWritableSharedReferenceExpression::Call {
+                        payload: expected,
+                        function: signature.id,
+                        return_borrow: signature.return_borrow,
+                        args,
+                    })
+                }
+                mir::ReturnType::Value(mir::Type::WritableSharedReference(payload))
+                    if payload == expected =>
+                {
+                    Ok(mir::NullableWritableSharedReferenceExpression::Strong(
+                        mir::WritableSharedReferenceExpression::Call {
+                            payload: expected,
+                            function: signature.id,
+                            return_borrow: signature.return_borrow,
+                            args,
+                        },
+                    ))
+                }
+                _ => Err(vec![unsupported(
+                    *span,
+                    "static method does not return the expected nullable writable shared reference",
+                )]),
+            }
+        }
+        hir::Expr::Binary {
+            left,
+            op: hir::BinaryOp::Coalesce,
+            right,
+            ..
+        } => match context.coalesce_selection(left) {
+            CoalesceSelection::Left => lower_nullable_writable_shared_reference_expression(
+                left, expected, transfer, context,
+            ),
+            CoalesceSelection::Right => lower_nullable_writable_shared_reference_expression(
+                right, expected, transfer, context,
+            ),
+            CoalesceSelection::Dynamic => {
+                Ok(mir::NullableWritableSharedReferenceExpression::Coalesce {
+                    payload: expected,
+                    left: Box::new(lower_nullable_writable_shared_reference_expression(
+                        left, expected, transfer, context,
+                    )?),
+                    right: Box::new(lower_nullable_writable_shared_reference_expression(
+                        right, expected, transfer, context,
+                    )?),
+                    transfer,
+                })
+            }
+        },
+        _ => Ok(mir::NullableWritableSharedReferenceExpression::Strong(
+            lower_writable_shared_reference_expression(expr, expected, transfer, context)?,
+        )),
+    }
+}
+
+fn lower_nullable_writable_weak_reference_expression(
+    expr: &hir::Expr,
+    expected: mir::WritableSharedPayload,
+    transfer: bool,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<mir::NullableWritableWeakReferenceExpression> {
+    match unparenthesized_place(expr) {
+        hir::Expr::Null { .. } => Ok(mir::NullableWritableWeakReferenceExpression::Null(expected)),
+        hir::Expr::Variable { name, span }
+            if context.local_type(context.lookup_local(name, *span)?)
+                == mir::Type::NullableWritableWeakReference(expected) =>
+        {
+            let local = context.lookup_local(name, *span)?;
+            Ok(mir::NullableWritableWeakReferenceExpression::Local {
+                payload: expected,
+                local,
+                transfer,
+            })
+        }
+        hir::Expr::MethodCall {
+            object,
+            method,
+            args,
+            null_safe: true,
+            ..
+        } if method == "createWeakReference" && args.is_empty() => {
+            let value = lower_nullable_writable_shared_reference_expression(
+                object, expected, false, context,
+            )?;
+            Ok(
+                mir::NullableWritableWeakReferenceExpression::NullSafeCreate {
+                    payload: expected,
+                    value: Box::new(value),
+                },
+            )
+        }
+        _ => Ok(mir::NullableWritableWeakReferenceExpression::Weak(
+            lower_writable_weak_reference_expression(expr, expected, transfer, context)?,
+        )),
+    }
+}
+
+fn lower_shared_access_payload_local(
+    expr: &hir::Expr,
+    expected: mir::WritableSharedPayload,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<Option<(mir::LocalId, bool)>> {
+    // Contextually typed expressions such as an empty collection literal can
+    // intentionally have no standalone native type. Access forwarding is only
+    // applicable when the checker resolved an access-object type.
+    let Ok(ty) = context.expression_type(expr) else {
+        return Ok(None);
+    };
+    let writable = match ty {
+        mir::Type::ReadonlySharedReferenceAccess(payload) if payload == expected => false,
+        mir::Type::WritableSharedReferenceAccess(payload) if payload == expected => true,
+        _ => return Ok(None),
+    };
+    if let hir::Expr::Variable { name, span } = unparenthesized_place(expr) {
+        return Ok(Some((context.lookup_local(name, *span)?, writable)));
+    }
+    let value = lower_shared_reference_access_expression(expr, expected, writable, false, context)?;
+    let owned = value.owned_temporary();
+    let local = if owned {
+        context.declare_owned_temp(ty)
+    } else {
+        context.declare_borrowed_temp(ty, false)
+    };
+    context.push_statement(mir::Statement::AssignLocal {
+        target: local,
+        value: mir::Rvalue::SharedReferenceAccess(value),
+    });
+    Ok(Some((local, writable)))
+}
+
+fn lower_shared_reference_access_expression(
+    expr: &hir::Expr,
+    expected: mir::WritableSharedPayload,
+    writable: bool,
+    transfer: bool,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<mir::SharedReferenceAccessExpression> {
+    if let Some((collection, index, value_type)) = lower_list_remove_at(expr, context)? {
+        let expected_ty = if writable {
+            mir::Type::WritableSharedReferenceAccess(expected)
+        } else {
+            mir::Type::ReadonlySharedReferenceAccess(expected)
+        };
+        if value_type != expected_ty {
+            return Err(vec![unsupported(
+                expr.span(),
+                "List::removeAt result has another shared access type",
+            )]);
+        }
+        return Ok(mir::SharedReferenceAccessExpression::CollectionIndex {
+            payload: expected,
+            collection,
+            index: Box::new(index),
+            writable,
+            remove: true,
+        });
+    }
+    match unparenthesized_place(expr) {
+        hir::Expr::Variable { name, span } => {
+            let local = context.lookup_local(name, *span)?;
+            let expected_ty = if writable {
+                mir::Type::WritableSharedReferenceAccess(expected)
+            } else {
+                mir::Type::ReadonlySharedReferenceAccess(expected)
+            };
+            let nullable_ty = if writable {
+                mir::Type::NullableWritableSharedReferenceAccess(expected)
+            } else {
+                mir::Type::NullableReadonlySharedReferenceAccess(expected)
+            };
+            let actual_ty = context.local_type(local);
+            if actual_ty != expected_ty && actual_ty != nullable_ty {
+                return Err(vec![unsupported(
+                    *span,
+                    format!("local `${name}` does not have the expected shared access type"),
+                )]);
+            }
+            if transfer && !context.local_owns(local) {
+                return Err(vec![unsupported(
+                    *span,
+                    format!("borrowed shared-access local `${name}` cannot be given away"),
+                )]);
+            }
+            if actual_ty == nullable_ty {
+                Ok(
+                    mir::SharedReferenceAccessExpression::NullableLocalAssumeNonNull {
+                        payload: expected,
+                        local,
+                        writable,
+                        transfer,
+                    },
+                )
+            } else {
+                Ok(mir::SharedReferenceAccessExpression::Local {
+                    payload: expected,
+                    local,
+                    writable,
+                    transfer,
+                })
+            }
+        }
+        hir::Expr::PropertyAccess { span, .. } => {
+            if transfer {
+                return Err(vec![unsupported(
+                    *span,
+                    "moving directly out of an owned class property is not supported",
+                )]);
+            }
+            let (object, property, ty) = lower_property_place(expr, context)?;
+            let expected_ty = if writable {
+                mir::Type::WritableSharedReferenceAccess(expected)
+            } else {
+                mir::Type::ReadonlySharedReferenceAccess(expected)
+            };
+            if ty != expected_ty {
+                return Err(vec![unsupported(
+                    *span,
+                    "property does not have the expected shared access type",
+                )]);
+            }
+            Ok(mir::SharedReferenceAccessExpression::Property {
+                payload: expected,
+                object,
+                property,
+                writable,
+            })
+        }
+        hir::Expr::Index {
+            collection,
+            index,
+            span,
+        } => {
+            if transfer {
+                return Err(vec![unsupported(
+                    *span,
+                    "indexed shared access objects are borrowed and cannot be moved out",
+                )]);
+            }
+            let expected_ty = if writable {
+                mir::Type::WritableSharedReferenceAccess(expected)
+            } else {
+                mir::Type::ReadonlySharedReferenceAccess(expected)
+            };
+            let (collection, index) =
+                lower_collection_index_operand(collection, index, expected_ty, context)?;
+            Ok(mir::SharedReferenceAccessExpression::CollectionIndex {
+                payload: expected,
+                collection,
+                index: Box::new(index),
+                writable,
+                remove: false,
+            })
+        }
+        hir::Expr::MethodCall {
+            object,
+            method,
+            args,
+            ..
+        } if args.is_empty()
+            && ((!writable && method == "acquireReadonlyAccess")
+                || (writable && method == "acquireWritableAccess")) =>
+        {
+            let value =
+                lower_writable_shared_reference_expression(object, expected, false, context)?;
+            Ok(mir::SharedReferenceAccessExpression::Acquire {
+                payload: expected,
+                value: Box::new(value),
+                writable,
+            })
+        }
+        hir::Expr::FunctionCall { name, args, span } => {
+            let signature = context.lookup_function(name, *span)?;
+            let expected_ty = if writable {
+                mir::Type::WritableSharedReferenceAccess(expected)
+            } else {
+                mir::Type::ReadonlySharedReferenceAccess(expected)
+            };
+            if signature.return_type != mir::ReturnType::Value(expected_ty) {
+                return Err(vec![unsupported(
+                    *span,
+                    format!("function `{name}` does not return the expected shared access type"),
+                )]);
+            }
+            Ok(mir::SharedReferenceAccessExpression::Call {
+                payload: expected,
+                function: signature.id,
+                return_borrow: signature.return_borrow,
+                args: lower_call_args_with_ownership(name, args, signature, *span, context)?,
+                writable,
+            })
+        }
+        hir::Expr::MethodCall {
+            object,
+            method,
+            args,
+            span,
+            ..
+        } => {
+            let (signature, args) =
+                lower_instance_method_call(object, method, args, *span, context)?;
+            let expected_ty = if writable {
+                mir::Type::WritableSharedReferenceAccess(expected)
+            } else {
+                mir::Type::ReadonlySharedReferenceAccess(expected)
+            };
+            if signature.return_type != mir::ReturnType::Value(expected_ty) {
+                return Err(vec![unsupported(
+                    *span,
+                    "method does not return the expected shared access type",
+                )]);
+            }
+            Ok(mir::SharedReferenceAccessExpression::Call {
+                payload: expected,
+                function: signature.id,
+                return_borrow: signature.return_borrow,
+                args,
+                writable,
+            })
+        }
+        hir::Expr::StaticCall {
+            class_name,
+            method,
+            args,
+            span,
+        } => {
+            let (signature, args) =
+                lower_static_method_call(class_name, method, args, *span, context)?;
+            let expected_ty = if writable {
+                mir::Type::WritableSharedReferenceAccess(expected)
+            } else {
+                mir::Type::ReadonlySharedReferenceAccess(expected)
+            };
+            if signature.return_type != mir::ReturnType::Value(expected_ty) {
+                return Err(vec![unsupported(
+                    *span,
+                    "static method does not return the expected shared access type",
+                )]);
+            }
+            Ok(mir::SharedReferenceAccessExpression::Call {
+                payload: expected,
+                function: signature.id,
+                return_borrow: signature.return_borrow,
+                args,
+                writable,
+            })
+        }
+        _ => Err(vec![unsupported(
+            expr.span(),
+            "this shared-access expression is not supported by native compilation",
+        )]),
+    }
+}
+
+fn lower_nullable_shared_reference_access_expression(
+    expr: &hir::Expr,
+    expected: mir::WritableSharedPayload,
+    writable: bool,
+    transfer: bool,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<mir::NullableSharedReferenceAccessExpression> {
+    let nullable_ty = if writable {
+        mir::Type::NullableWritableSharedReferenceAccess(expected)
+    } else {
+        mir::Type::NullableReadonlySharedReferenceAccess(expected)
+    };
+    if let Some((collection, index, value_type)) = lower_list_remove_at(expr, context)? {
+        if value_type != nullable_ty {
+            return Err(vec![unsupported(
+                expr.span(),
+                "List::removeAt result has another nullable shared access type",
+            )]);
+        }
+        return Ok(
+            mir::NullableSharedReferenceAccessExpression::CollectionIndex {
+                payload: expected,
+                collection,
+                index: Box::new(index),
+                writable,
+                remove: true,
+            },
+        );
+    }
+    match unparenthesized_place(expr) {
+        hir::Expr::Null { .. } => Ok(mir::NullableSharedReferenceAccessExpression::Null {
+            payload: expected,
+            writable,
+        }),
+        hir::Expr::Variable { name, span }
+            if context.local_type(context.lookup_local(name, *span)?) == nullable_ty =>
+        {
+            let local = context.lookup_local(name, *span)?;
+            Ok(mir::NullableSharedReferenceAccessExpression::Local {
+                payload: expected,
+                local,
+                writable,
+                transfer,
+            })
+        }
+        hir::Expr::PropertyAccess { span, .. } => {
+            if transfer {
+                return Err(vec![unsupported(
+                    *span,
+                    "moving directly out of an owned nullable shared-access property is not supported",
+                )]);
+            }
+            let (object, property, ty) = lower_property_place(expr, context)?;
+            if ty != nullable_ty {
+                return Ok(mir::NullableSharedReferenceAccessExpression::Access(
+                    Box::new(lower_shared_reference_access_expression(
+                        expr, expected, writable, transfer, context,
+                    )?),
+                ));
+            }
+            Ok(mir::NullableSharedReferenceAccessExpression::Property {
+                payload: expected,
+                object,
+                property,
+                writable,
+            })
+        }
+        hir::Expr::Index {
+            collection,
+            index,
+            span,
+        } => {
+            if transfer {
+                return Err(vec![unsupported(
+                    *span,
+                    "indexed nullable shared access objects are borrowed and cannot be moved out",
+                )]);
+            }
+            let (collection, index) =
+                lower_collection_index_operand(collection, index, nullable_ty, context)?;
+            Ok(
+                mir::NullableSharedReferenceAccessExpression::CollectionIndex {
+                    payload: expected,
+                    collection,
+                    index: Box::new(index),
+                    writable,
+                    remove: false,
+                },
+            )
+        }
+        hir::Expr::FunctionCall { name, args, span } => {
+            let signature = context.lookup_function(name, *span)?;
+            if signature.return_type != mir::ReturnType::Value(nullable_ty) {
+                return Ok(mir::NullableSharedReferenceAccessExpression::Access(
+                    Box::new(lower_shared_reference_access_expression(
+                        expr, expected, writable, transfer, context,
+                    )?),
+                ));
+            }
+            Ok(mir::NullableSharedReferenceAccessExpression::Call {
+                payload: expected,
+                function: signature.id,
+                return_borrow: signature.return_borrow,
+                args: lower_call_args_with_ownership(name, args, signature, *span, context)?,
+                writable,
+            })
+        }
+        hir::Expr::MethodCall {
+            object,
+            method,
+            args,
+            null_safe: true,
+            ..
+        } if args.is_empty()
+            && ((!writable && method == "acquireReadonlyAccess")
+                || (writable && method == "acquireWritableAccess")) =>
+        {
+            let value = lower_nullable_writable_shared_reference_expression(
+                object, expected, false, context,
+            )?;
+            Ok(
+                mir::NullableSharedReferenceAccessExpression::NullSafeAcquire {
+                    payload: expected,
+                    value: Box::new(value),
+                    writable,
+                },
+            )
+        }
+        hir::Expr::MethodCall {
+            object,
+            method,
+            args,
+            span,
+            ..
+        } => {
+            if let Some((collection, key, value_type, access)) =
+                lower_dictionary_get(object, method, args, context)?
+            {
+                let stored_nullable = match value_type {
+                    mir::Type::ReadonlySharedReferenceAccess(payload)
+                        if payload == expected && !writable =>
+                    {
+                        false
+                    }
+                    mir::Type::WritableSharedReferenceAccess(payload)
+                        if payload == expected && writable =>
+                    {
+                        false
+                    }
+                    mir::Type::NullableReadonlySharedReferenceAccess(payload)
+                        if payload == expected && !writable =>
+                    {
+                        true
+                    }
+                    mir::Type::NullableWritableSharedReferenceAccess(payload)
+                        if payload == expected && writable =>
+                    {
+                        true
+                    }
+                    _ => {
+                        return Err(vec![unsupported(
+                            *span,
+                            "collection accessor has another shared access type",
+                        )])
+                    }
+                };
+                return Ok(
+                    mir::NullableSharedReferenceAccessExpression::CollectionGet {
+                        collection,
+                        key: Box::new(key),
+                        access,
+                        stored: mir::SharedAccessType {
+                            payload: expected,
+                            writable,
+                            nullable: stored_nullable,
+                        },
+                    },
+                );
+            }
+            if context.expression_type(expr)? != nullable_ty {
+                return Ok(mir::NullableSharedReferenceAccessExpression::Access(
+                    Box::new(lower_shared_reference_access_expression(
+                        expr, expected, writable, transfer, context,
+                    )?),
+                ));
+            }
+            let (signature, args) =
+                lower_instance_method_call(object, method, args, *span, context)?;
+            if signature.return_type != mir::ReturnType::Value(nullable_ty) {
+                return Err(vec![unsupported(
+                    *span,
+                    "method does not return the expected nullable shared access type",
+                )]);
+            }
+            Ok(mir::NullableSharedReferenceAccessExpression::Call {
+                payload: expected,
+                function: signature.id,
+                return_borrow: signature.return_borrow,
+                args,
+                writable,
+            })
+        }
+        hir::Expr::StaticCall {
+            class_name,
+            method,
+            args,
+            span,
+        } => {
+            if context.expression_type(expr)? != nullable_ty {
+                return Ok(mir::NullableSharedReferenceAccessExpression::Access(
+                    Box::new(lower_shared_reference_access_expression(
+                        expr, expected, writable, transfer, context,
+                    )?),
+                ));
+            }
+            let (signature, args) =
+                lower_static_method_call(class_name, method, args, *span, context)?;
+            if signature.return_type != mir::ReturnType::Value(nullable_ty) {
+                return Err(vec![unsupported(
+                    *span,
+                    "static method does not return the expected nullable shared access type",
+                )]);
+            }
+            Ok(mir::NullableSharedReferenceAccessExpression::Call {
+                payload: expected,
+                function: signature.id,
+                return_borrow: signature.return_borrow,
+                args,
+                writable,
+            })
+        }
+        _ => Ok(mir::NullableSharedReferenceAccessExpression::Access(
+            Box::new(lower_shared_reference_access_expression(
+                expr, expected, writable, transfer, context,
+            )?),
+        )),
     }
 }
 
@@ -9385,6 +11714,15 @@ fn lower_property_place(
         hir::Expr::Variable { name, span } => context.lookup_local(name, *span)?,
         hir::Expr::This { span } => context.lookup_local("this", *span)?,
         _ => match context.expression_type(object)? {
+            mir::Type::Class(class) => {
+                let value = lower_class_expression(object, class, false, context)?;
+                let owner = context.declare_borrowed_temp(mir::Type::Class(class), false);
+                context.push_statement(mir::Statement::AssignLocal {
+                    target: owner,
+                    value: mir::Rvalue::Class(value),
+                });
+                owner
+            }
             mir::Type::SharedReference(class) => {
                 let value = lower_shared_reference_expression(object, class, false, context)?;
                 let owned = value.owned_temporary().is_some();
@@ -9396,6 +11734,31 @@ fn lower_property_place(
                 context.push_statement(mir::Statement::AssignLocal {
                     target: owner,
                     value: mir::Rvalue::SharedReference(value),
+                });
+                owner
+            }
+            mir::Type::ReadonlySharedReferenceAccess(payload)
+            | mir::Type::WritableSharedReferenceAccess(payload) => {
+                let writable = matches!(
+                    context.expression_type(object)?,
+                    mir::Type::WritableSharedReferenceAccess(_)
+                );
+                let value = lower_shared_reference_access_expression(
+                    object, payload, writable, false, context,
+                )?;
+                let owner_type = if writable {
+                    mir::Type::WritableSharedReferenceAccess(payload)
+                } else {
+                    mir::Type::ReadonlySharedReferenceAccess(payload)
+                };
+                let owner = if value.owned_temporary() {
+                    context.declare_owned_temp(owner_type)
+                } else {
+                    context.declare_borrowed_temp(owner_type, writable)
+                };
+                context.push_statement(mir::Statement::AssignLocal {
+                    target: owner,
+                    value: mir::Rvalue::SharedReferenceAccess(value),
                 });
                 owner
             }
@@ -9432,6 +11795,63 @@ fn lower_property_place(
                 value: mir::Rvalue::Class(mir::ClassExpression::SharedPayload {
                     class,
                     reference: Box::new(reference),
+                }),
+            });
+            object_local = payload;
+            class
+        }
+        mir::Type::NullableReadonlySharedReferenceAccess(mir::WritableSharedPayload::Class(
+            class,
+        ))
+        | mir::Type::NullableWritableSharedReferenceAccess(mir::WritableSharedPayload::Class(
+            class,
+        )) => {
+            let writable = matches!(
+                context.local_type(object_local),
+                mir::Type::NullableWritableSharedReferenceAccess(_)
+            );
+            let access_type = if writable {
+                mir::Type::WritableSharedReferenceAccess(mir::WritableSharedPayload::Class(class))
+            } else {
+                mir::Type::ReadonlySharedReferenceAccess(mir::WritableSharedPayload::Class(class))
+            };
+            let access = context.declare_borrowed_temp(access_type, writable);
+            context.push_statement(mir::Statement::AssignLocal {
+                target: access,
+                value: mir::Rvalue::SharedReferenceAccess(
+                    mir::SharedReferenceAccessExpression::NullableLocalAssumeNonNull {
+                        payload: mir::WritableSharedPayload::Class(class),
+                        local: object_local,
+                        writable,
+                        transfer: false,
+                    },
+                ),
+            });
+            let payload = context.declare_borrowed_temp(mir::Type::Class(class), writable);
+            context.push_statement(mir::Statement::AssignLocal {
+                target: payload,
+                value: mir::Rvalue::Class(mir::ClassExpression::SharedAccessPayload {
+                    class,
+                    access,
+                    writable,
+                }),
+            });
+            object_local = payload;
+            class
+        }
+        mir::Type::ReadonlySharedReferenceAccess(mir::WritableSharedPayload::Class(class))
+        | mir::Type::WritableSharedReferenceAccess(mir::WritableSharedPayload::Class(class)) => {
+            let writable = matches!(
+                context.local_type(object_local),
+                mir::Type::WritableSharedReferenceAccess(_)
+            );
+            let payload = context.declare_borrowed_temp(mir::Type::Class(class), writable);
+            context.push_statement(mir::Statement::AssignLocal {
+                target: payload,
+                value: mir::Rvalue::Class(mir::ClassExpression::SharedAccessPayload {
+                    class,
+                    access: object_local,
+                    writable,
                 }),
             });
             object_local = payload;
@@ -10326,6 +12746,7 @@ fn unsupported_int_expr(expr: &hir::Expr) -> Diagnostic {
 
 fn stmt_span(statement: &hir::Stmt) -> Span {
     match statement {
+        hir::Stmt::Block(block) => block.span,
         hir::Stmt::VarDecl(decl) => decl.span,
         hir::Stmt::Assignment(assignment) => assignment.span,
         hir::Stmt::Echo { span, .. } | hir::Stmt::Return { span, .. } => *span,
@@ -10343,13 +12764,13 @@ fn unsupported(span: Span, detail: impl Into<String>) -> Diagnostic {
     Diagnostic::new("M1101", detail, span)
 }
 
-/// The writable family and its dynamic access guards land in the next Stage 25a
-/// implementation slice. Accepted syntax reaches this stage-named diagnostic
-/// rather than a parser, unknown-type, or internal compiler error.
+/// Accepted shared-ownership spellings whose payload lacks a native
+/// representation reach a stage-named diagnostic rather than losing their type
+/// identity or failing as an internal compiler error.
 pub(crate) fn shared_ownership_runtime_unsupported(span: Span) -> Diagnostic {
     Diagnostic::unsupported_stage(
         "M1102",
-        "Stage 25a Writable Shared-Ownership Runtime Support Is Not Yet Implemented",
+        "Stage 25a Shared-Ownership Payload Is Not Yet Supported By The Native Runtime",
         span,
     )
 }

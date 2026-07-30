@@ -1,0 +1,85 @@
+class Box<T>
+{
+    function __construct(take T $value)
+    {
+    }
+}
+
+function inspectBox(WritableSharedReference<Box<int>> $box): void
+{
+    let $boxAccess = $box->acquireReadonlyAccess();
+    echo "generic class {$boxAccess->value}\n";
+}
+
+function inspectBoxes(
+    WritableSharedReference<List<Box<int>>> $boxes,
+): void
+{
+    let $boxesAccess = $boxes->acquireReadonlyAccess();
+    echo "generic collection {$boxesAccess[0]->value}\n";
+}
+
+function mutateBytes(WritableSharedReference<Bytes> $bytes): void
+{
+    let writable $bytesAccess = $bytes->acquireWritableAccess();
+    $bytesAccess[1] += 5;
+    echo "bytes {$bytesAccess[1]}:{$bytesAccess->length}\n";
+}
+
+function inspectMaybeWritable(
+    ?WritableSharedReference<Box<int>> $source,
+): void
+{
+    ?WritableSharedReferenceAccess<Box<int>> $access =
+        $source?->acquireWritableAccess();
+    if ($access != null) {
+        echo "nullable writable access {$access->value}\n";
+    }
+}
+
+function main(): void
+{
+    let $box = new WritableSharedReference(new Box<int>(1));
+    inspectBox($box);
+
+    let $boxes = new WritableSharedReference<List<Box<int>>>([
+        new Box<int>(3),
+    ]);
+    inspectBoxes($boxes);
+
+    let $bytes = new WritableSharedReference(
+        Bytes::fromArray([1, 2, 3]),
+    );
+    mutateBytes($bytes);
+
+    ?WritableSharedReference<Box<int>> $present = $box->share();
+    ?WritableSharedReference<Box<int>> $missing = null;
+    ?WritableWeakReference<Box<int>> $presentWeak =
+        $present?->createWeakReference();
+    ?WritableWeakReference<Box<int>> $missingWeak =
+        $missing?->createWeakReference();
+    ?WritableSharedReference<Box<int>> $live = $presentWeak?->acquire();
+    ?WritableSharedReference<Box<int>> $absent = $missingWeak?->acquire();
+    ?ReadonlySharedReferenceAccess<Box<int>> $maybeAccess =
+        $present?->acquireReadonlyAccess();
+    ?ReadonlySharedReferenceAccess<Box<int>> $missingAccess =
+        $missing?->acquireReadonlyAccess();
+    let $selected = $missing ?? $box->share();
+
+    if ($live != null) {
+        echo "nullable live\n";
+    }
+    if ($absent == null) {
+        echo "nullable absent\n";
+    }
+    if ($maybeAccess != null) {
+        echo "nullable access {$maybeAccess->value}\n";
+    }
+    if ($missingAccess == null) {
+        echo "nullable access absent\n";
+    }
+    inspectMaybeWritable(new WritableSharedReference(new Box<int>(4)));
+
+    let $selectedAccess = $selected->acquireReadonlyAccess();
+    echo "coalesce {$selectedAccess->value}\n";
+}

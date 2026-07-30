@@ -180,7 +180,39 @@ pub enum Type {
     WeakReference(ClassId),
     NullableSharedReference(ClassId),
     NullableWeakReference(ClassId),
+    WritableSharedReference(WritableSharedPayload),
+    WritableWeakReference(WritableSharedPayload),
+    NullableWritableSharedReference(WritableSharedPayload),
+    NullableWritableWeakReference(WritableSharedPayload),
+    ReadonlySharedReferenceAccess(WritableSharedPayload),
+    WritableSharedReferenceAccess(WritableSharedPayload),
+    NullableReadonlySharedReferenceAccess(WritableSharedPayload),
+    NullableWritableSharedReferenceAccess(WritableSharedPayload),
     Collection(CollectionTypeId),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum WritableSharedPayload {
+    Class(ClassId),
+    Collection(CollectionTypeId),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SharedAccessType {
+    pub payload: WritableSharedPayload,
+    pub writable: bool,
+    pub nullable: bool,
+}
+
+impl SharedAccessType {
+    pub const fn into_type(self) -> Type {
+        match (self.nullable, self.writable) {
+            (false, false) => Type::ReadonlySharedReferenceAccess(self.payload),
+            (false, true) => Type::WritableSharedReferenceAccess(self.payload),
+            (true, false) => Type::NullableReadonlySharedReferenceAccess(self.payload),
+            (true, true) => Type::NullableWritableSharedReferenceAccess(self.payload),
+        }
+    }
 }
 
 impl Type {
@@ -195,8 +227,42 @@ impl Type {
                 | Self::WeakReference(_)
                 | Self::NullableSharedReference(_)
                 | Self::NullableWeakReference(_)
+                | Self::WritableSharedReference(_)
+                | Self::WritableWeakReference(_)
+                | Self::NullableWritableSharedReference(_)
+                | Self::NullableWritableWeakReference(_)
+                | Self::ReadonlySharedReferenceAccess(_)
+                | Self::WritableSharedReferenceAccess(_)
+                | Self::NullableReadonlySharedReferenceAccess(_)
+                | Self::NullableWritableSharedReferenceAccess(_)
                 | Self::Collection(_)
         )
+    }
+
+    pub const fn shared_access(self) -> Option<SharedAccessType> {
+        match self {
+            Self::ReadonlySharedReferenceAccess(payload) => Some(SharedAccessType {
+                payload,
+                writable: false,
+                nullable: false,
+            }),
+            Self::WritableSharedReferenceAccess(payload) => Some(SharedAccessType {
+                payload,
+                writable: true,
+                nullable: false,
+            }),
+            Self::NullableReadonlySharedReferenceAccess(payload) => Some(SharedAccessType {
+                payload,
+                writable: false,
+                nullable: true,
+            }),
+            Self::NullableWritableSharedReferenceAccess(payload) => Some(SharedAccessType {
+                payload,
+                writable: true,
+                nullable: true,
+            }),
+            _ => None,
+        }
     }
 }
 
@@ -253,6 +319,12 @@ pub enum Rvalue {
     WeakReference(WeakReferenceExpression),
     NullableSharedReference(NullableSharedReferenceExpression),
     NullableWeakReference(NullableWeakReferenceExpression),
+    WritableSharedReference(WritableSharedReferenceExpression),
+    WritableWeakReference(WritableWeakReferenceExpression),
+    NullableWritableSharedReference(NullableWritableSharedReferenceExpression),
+    NullableWritableWeakReference(NullableWritableWeakReferenceExpression),
+    SharedReferenceAccess(SharedReferenceAccessExpression),
+    NullableSharedReferenceAccess(NullableSharedReferenceAccessExpression),
     Collection(CollectionExpression),
 }
 
@@ -260,6 +332,10 @@ pub enum Rvalue {
 pub enum OwnedSharedTemporary {
     Strong,
     Weak,
+    WritableStrong,
+    WritableWeak,
+    ReadonlyAccess,
+    WritableAccess,
 }
 
 impl Rvalue {
@@ -277,6 +353,16 @@ impl Rvalue {
             Self::WeakReference(value) => Type::WeakReference(value.class()),
             Self::NullableSharedReference(value) => Type::NullableSharedReference(value.class()),
             Self::NullableWeakReference(value) => Type::NullableWeakReference(value.class()),
+            Self::WritableSharedReference(value) => Type::WritableSharedReference(value.payload()),
+            Self::WritableWeakReference(value) => Type::WritableWeakReference(value.payload()),
+            Self::NullableWritableSharedReference(value) => {
+                Type::NullableWritableSharedReference(value.payload())
+            }
+            Self::NullableWritableWeakReference(value) => {
+                Type::NullableWritableWeakReference(value.payload())
+            }
+            Self::SharedReferenceAccess(value) => value.ty(),
+            Self::NullableSharedReferenceAccess(value) => value.ty(),
             Self::Collection(value) => Type::Collection(value.collection()),
         }
     }
@@ -295,7 +381,13 @@ impl Rvalue {
             | Self::SharedReference(_)
             | Self::WeakReference(_)
             | Self::NullableSharedReference(_)
-            | Self::NullableWeakReference(_) => None,
+            | Self::NullableWeakReference(_)
+            | Self::WritableSharedReference(_)
+            | Self::WritableWeakReference(_)
+            | Self::NullableWritableSharedReference(_)
+            | Self::NullableWritableWeakReference(_)
+            | Self::SharedReferenceAccess(_)
+            | Self::NullableSharedReferenceAccess(_) => None,
         }
     }
 
@@ -313,16 +405,56 @@ impl Rvalue {
             | Self::SharedReference(_)
             | Self::WeakReference(_)
             | Self::NullableSharedReference(_)
-            | Self::NullableWeakReference(_) => None,
+            | Self::NullableWeakReference(_)
+            | Self::WritableSharedReference(_)
+            | Self::WritableWeakReference(_)
+            | Self::NullableWritableSharedReference(_)
+            | Self::NullableWritableWeakReference(_)
+            | Self::SharedReferenceAccess(_)
+            | Self::NullableSharedReferenceAccess(_) => None,
         }
     }
 
-    pub const fn owned_temporary_shared(&self) -> Option<OwnedSharedTemporary> {
+    pub fn owned_temporary_shared(&self) -> Option<OwnedSharedTemporary> {
         match self {
             Self::SharedReference(value) => value.owned_temporary(),
             Self::WeakReference(value) => value.owned_temporary(),
             Self::NullableSharedReference(value) => value.owned_temporary(),
             Self::NullableWeakReference(value) => value.owned_temporary(),
+            Self::WritableSharedReference(value) => {
+                if value.owned_temporary() {
+                    Some(OwnedSharedTemporary::WritableStrong)
+                } else {
+                    None
+                }
+            }
+            Self::WritableWeakReference(value) => {
+                if value.owned_temporary() {
+                    Some(OwnedSharedTemporary::WritableWeak)
+                } else {
+                    None
+                }
+            }
+            Self::NullableWritableSharedReference(value) => value
+                .owned_temporary()
+                .then_some(OwnedSharedTemporary::WritableStrong),
+            Self::NullableWritableWeakReference(value) => value
+                .owned_temporary()
+                .then_some(OwnedSharedTemporary::WritableWeak),
+            Self::SharedReferenceAccess(value) => {
+                value.owned_temporary().then_some(if value.writable() {
+                    OwnedSharedTemporary::WritableAccess
+                } else {
+                    OwnedSharedTemporary::ReadonlyAccess
+                })
+            }
+            Self::NullableSharedReferenceAccess(value) => {
+                value.owned_temporary().then_some(if value.writable() {
+                    OwnedSharedTemporary::WritableAccess
+                } else {
+                    OwnedSharedTemporary::ReadonlyAccess
+                })
+            }
             Self::Value(_)
             | Self::String(_)
             | Self::Mixed(_)
@@ -349,7 +481,13 @@ impl Rvalue {
             | Self::SharedReference(_)
             | Self::WeakReference(_)
             | Self::NullableSharedReference(_)
-            | Self::NullableWeakReference(_) => false,
+            | Self::NullableWeakReference(_)
+            | Self::WritableSharedReference(_)
+            | Self::WritableWeakReference(_)
+            | Self::NullableWritableSharedReference(_)
+            | Self::NullableWritableWeakReference(_)
+            | Self::SharedReferenceAccess(_)
+            | Self::NullableSharedReferenceAccess(_) => false,
         }
     }
 
@@ -402,7 +540,50 @@ impl Rvalue {
                 local,
                 transfer: true,
                 ..
-            }) => Some(*local),
+            })
+            | Self::WritableSharedReference(WritableSharedReferenceExpression::Local {
+                local,
+                transfer: true,
+                ..
+            })
+            | Self::WritableSharedReference(
+                WritableSharedReferenceExpression::NullableLocalAssumeNonNull {
+                    local,
+                    transfer: true,
+                    ..
+                },
+            )
+            | Self::WritableWeakReference(WritableWeakReferenceExpression::Local {
+                local,
+                transfer: true,
+                ..
+            })
+            | Self::NullableWritableSharedReference(
+                NullableWritableSharedReferenceExpression::Local {
+                    local,
+                    transfer: true,
+                    ..
+                },
+            )
+            | Self::NullableWritableWeakReference(
+                NullableWritableWeakReferenceExpression::Local {
+                    local,
+                    transfer: true,
+                    ..
+                },
+            )
+            | Self::SharedReferenceAccess(SharedReferenceAccessExpression::Local {
+                local,
+                transfer: true,
+                ..
+            })
+            | Self::NullableSharedReferenceAccess(
+                NullableSharedReferenceAccessExpression::Local {
+                    local,
+                    transfer: true,
+                    ..
+                },
+            ) => Some(*local),
             Self::Value(_)
             | Self::String(_)
             | Self::Mixed(_)
@@ -415,7 +596,13 @@ impl Rvalue {
             | Self::SharedReference(_)
             | Self::WeakReference(_)
             | Self::NullableSharedReference(_)
-            | Self::NullableWeakReference(_) => None,
+            | Self::NullableWeakReference(_)
+            | Self::WritableSharedReference(_)
+            | Self::WritableWeakReference(_)
+            | Self::NullableWritableSharedReference(_)
+            | Self::NullableWritableWeakReference(_)
+            | Self::SharedReferenceAccess(_)
+            | Self::NullableSharedReferenceAccess(_) => None,
         }
     }
 
@@ -433,7 +620,13 @@ impl Rvalue {
             | Self::SharedReference(_)
             | Self::WeakReference(_)
             | Self::NullableSharedReference(_)
-            | Self::NullableWeakReference(_) => MixedOwnership::None,
+            | Self::NullableWeakReference(_)
+            | Self::WritableSharedReference(_)
+            | Self::WritableWeakReference(_)
+            | Self::NullableWritableSharedReference(_)
+            | Self::NullableWritableWeakReference(_)
+            | Self::SharedReferenceAccess(_)
+            | Self::NullableSharedReferenceAccess(_) => MixedOwnership::None,
         }
     }
 }
@@ -851,6 +1044,475 @@ impl NullableWeakReferenceExpression {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WritableSharedReferenceExpression {
+    New {
+        payload: WritableSharedPayload,
+        value: Box<Rvalue>,
+    },
+    Local {
+        payload: WritableSharedPayload,
+        local: LocalId,
+        transfer: bool,
+    },
+    NullableLocalAssumeNonNull {
+        payload: WritableSharedPayload,
+        local: LocalId,
+        transfer: bool,
+    },
+    Property {
+        payload: WritableSharedPayload,
+        object: LocalId,
+        property: PropertyId,
+    },
+    Call {
+        payload: WritableSharedPayload,
+        function: FunctionId,
+        args: Vec<Rvalue>,
+        return_borrow: Option<ReturnBorrow>,
+    },
+    Share {
+        payload: WritableSharedPayload,
+        value: Box<WritableSharedReferenceExpression>,
+    },
+    Coalesce {
+        payload: WritableSharedPayload,
+        left: Box<NullableWritableSharedReferenceExpression>,
+        right: Box<WritableSharedReferenceExpression>,
+        transfer: bool,
+    },
+    CollectionIndex {
+        payload: WritableSharedPayload,
+        collection: LocalId,
+        index: Box<Rvalue>,
+        remove: bool,
+    },
+}
+
+impl WritableSharedReferenceExpression {
+    pub const fn payload(&self) -> WritableSharedPayload {
+        match self {
+            Self::New { payload, .. }
+            | Self::Local { payload, .. }
+            | Self::NullableLocalAssumeNonNull { payload, .. }
+            | Self::Property { payload, .. }
+            | Self::Call { payload, .. }
+            | Self::Share { payload, .. }
+            | Self::Coalesce { payload, .. }
+            | Self::CollectionIndex { payload, .. } => *payload,
+        }
+    }
+
+    pub const fn owned_temporary(&self) -> bool {
+        match self {
+            Self::New { .. } | Self::Share { .. } => true,
+            Self::Local { transfer, .. }
+            | Self::NullableLocalAssumeNonNull { transfer, .. }
+            | Self::Coalesce { transfer, .. } => *transfer,
+            Self::Call { return_borrow, .. } => return_borrow.is_none(),
+            Self::CollectionIndex { remove, .. } => *remove,
+            Self::Property { .. } => false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WritableWeakReferenceExpression {
+    Local {
+        payload: WritableSharedPayload,
+        local: LocalId,
+        transfer: bool,
+    },
+    NullableLocalAssumeNonNull {
+        payload: WritableSharedPayload,
+        local: LocalId,
+        transfer: bool,
+    },
+    Property {
+        payload: WritableSharedPayload,
+        object: LocalId,
+        property: PropertyId,
+    },
+    Call {
+        payload: WritableSharedPayload,
+        function: FunctionId,
+        args: Vec<Rvalue>,
+        return_borrow: Option<ReturnBorrow>,
+    },
+    Create {
+        payload: WritableSharedPayload,
+        value: Box<WritableSharedReferenceExpression>,
+    },
+    Coalesce {
+        payload: WritableSharedPayload,
+        left: Box<NullableWritableWeakReferenceExpression>,
+        right: Box<WritableWeakReferenceExpression>,
+        transfer: bool,
+    },
+    CollectionIndex {
+        payload: WritableSharedPayload,
+        collection: LocalId,
+        index: Box<Rvalue>,
+        remove: bool,
+    },
+}
+
+impl WritableWeakReferenceExpression {
+    pub const fn payload(&self) -> WritableSharedPayload {
+        match self {
+            Self::Local { payload, .. }
+            | Self::NullableLocalAssumeNonNull { payload, .. }
+            | Self::Property { payload, .. }
+            | Self::Call { payload, .. }
+            | Self::Create { payload, .. }
+            | Self::Coalesce { payload, .. }
+            | Self::CollectionIndex { payload, .. } => *payload,
+        }
+    }
+
+    pub const fn owned_temporary(&self) -> bool {
+        match self {
+            Self::Create { .. } => true,
+            Self::Local { transfer, .. }
+            | Self::NullableLocalAssumeNonNull { transfer, .. }
+            | Self::Coalesce { transfer, .. } => *transfer,
+            Self::Call { return_borrow, .. } => return_borrow.is_none(),
+            Self::CollectionIndex { remove, .. } => *remove,
+            Self::Property { .. } => false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NullableWritableSharedReferenceExpression {
+    Null(WritableSharedPayload),
+    Strong(WritableSharedReferenceExpression),
+    Local {
+        payload: WritableSharedPayload,
+        local: LocalId,
+        transfer: bool,
+    },
+    Property {
+        payload: WritableSharedPayload,
+        object: LocalId,
+        property: PropertyId,
+    },
+    Call {
+        payload: WritableSharedPayload,
+        function: FunctionId,
+        args: Vec<Rvalue>,
+        return_borrow: Option<ReturnBorrow>,
+    },
+    Acquire {
+        payload: WritableSharedPayload,
+        value: Box<WritableWeakReferenceExpression>,
+    },
+    NullSafeShare {
+        payload: WritableSharedPayload,
+        value: Box<NullableWritableSharedReferenceExpression>,
+    },
+    NullSafeAcquire {
+        payload: WritableSharedPayload,
+        value: Box<NullableWritableWeakReferenceExpression>,
+    },
+    Coalesce {
+        payload: WritableSharedPayload,
+        left: Box<NullableWritableSharedReferenceExpression>,
+        right: Box<NullableWritableSharedReferenceExpression>,
+        transfer: bool,
+    },
+    DictionaryGet {
+        payload: WritableSharedPayload,
+        collection: LocalId,
+        key: Box<Rvalue>,
+        access: NullableCollectionAccess,
+        stored_nullable: bool,
+    },
+}
+
+impl NullableWritableSharedReferenceExpression {
+    pub const fn payload(&self) -> WritableSharedPayload {
+        match self {
+            Self::Null(payload)
+            | Self::Local { payload, .. }
+            | Self::Property { payload, .. }
+            | Self::Call { payload, .. }
+            | Self::Acquire { payload, .. }
+            | Self::NullSafeShare { payload, .. }
+            | Self::NullSafeAcquire { payload, .. }
+            | Self::Coalesce { payload, .. }
+            | Self::DictionaryGet { payload, .. } => *payload,
+            Self::Strong(value) => value.payload(),
+        }
+    }
+
+    pub const fn owned_temporary(&self) -> bool {
+        match self {
+            Self::Strong(value) => value.owned_temporary(),
+            Self::Local { transfer, .. } | Self::Coalesce { transfer, .. } => *transfer,
+            Self::Call { return_borrow, .. } => return_borrow.is_none(),
+            Self::Acquire { .. } | Self::NullSafeShare { .. } | Self::NullSafeAcquire { .. } => {
+                true
+            }
+            Self::DictionaryGet { access, .. } => matches!(
+                access,
+                NullableCollectionAccess::Remove | NullableCollectionAccess::Pop
+            ),
+            Self::Null(_) | Self::Property { .. } => false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NullableWritableWeakReferenceExpression {
+    Null(WritableSharedPayload),
+    Weak(WritableWeakReferenceExpression),
+    Local {
+        payload: WritableSharedPayload,
+        local: LocalId,
+        transfer: bool,
+    },
+    Property {
+        payload: WritableSharedPayload,
+        object: LocalId,
+        property: PropertyId,
+    },
+    Call {
+        payload: WritableSharedPayload,
+        function: FunctionId,
+        args: Vec<Rvalue>,
+        return_borrow: Option<ReturnBorrow>,
+    },
+    NullSafeCreate {
+        payload: WritableSharedPayload,
+        value: Box<NullableWritableSharedReferenceExpression>,
+    },
+    Coalesce {
+        payload: WritableSharedPayload,
+        left: Box<NullableWritableWeakReferenceExpression>,
+        right: Box<NullableWritableWeakReferenceExpression>,
+        transfer: bool,
+    },
+    DictionaryGet {
+        payload: WritableSharedPayload,
+        collection: LocalId,
+        key: Box<Rvalue>,
+        access: NullableCollectionAccess,
+        stored_nullable: bool,
+    },
+}
+
+impl NullableWritableWeakReferenceExpression {
+    pub const fn payload(&self) -> WritableSharedPayload {
+        match self {
+            Self::Null(payload)
+            | Self::Local { payload, .. }
+            | Self::Property { payload, .. }
+            | Self::Call { payload, .. }
+            | Self::NullSafeCreate { payload, .. }
+            | Self::Coalesce { payload, .. }
+            | Self::DictionaryGet { payload, .. } => *payload,
+            Self::Weak(value) => value.payload(),
+        }
+    }
+
+    pub const fn owned_temporary(&self) -> bool {
+        match self {
+            Self::Weak(value) => value.owned_temporary(),
+            Self::Local { transfer, .. } | Self::Coalesce { transfer, .. } => *transfer,
+            Self::Call { return_borrow, .. } => return_borrow.is_none(),
+            Self::NullSafeCreate { .. } => true,
+            Self::DictionaryGet { access, .. } => matches!(
+                access,
+                NullableCollectionAccess::Remove | NullableCollectionAccess::Pop
+            ),
+            Self::Null(_) | Self::Property { .. } => false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SharedReferenceAccessExpression {
+    Local {
+        payload: WritableSharedPayload,
+        local: LocalId,
+        writable: bool,
+        transfer: bool,
+    },
+    NullableLocalAssumeNonNull {
+        payload: WritableSharedPayload,
+        local: LocalId,
+        writable: bool,
+        transfer: bool,
+    },
+    Property {
+        payload: WritableSharedPayload,
+        object: LocalId,
+        property: PropertyId,
+        writable: bool,
+    },
+    CollectionIndex {
+        payload: WritableSharedPayload,
+        collection: LocalId,
+        index: Box<Rvalue>,
+        writable: bool,
+        remove: bool,
+    },
+    Call {
+        payload: WritableSharedPayload,
+        function: FunctionId,
+        args: Vec<Rvalue>,
+        return_borrow: Option<ReturnBorrow>,
+        writable: bool,
+    },
+    Acquire {
+        payload: WritableSharedPayload,
+        value: Box<WritableSharedReferenceExpression>,
+        writable: bool,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NullableSharedReferenceAccessExpression {
+    Null {
+        payload: WritableSharedPayload,
+        writable: bool,
+    },
+    Access(Box<SharedReferenceAccessExpression>),
+    Local {
+        payload: WritableSharedPayload,
+        local: LocalId,
+        writable: bool,
+        transfer: bool,
+    },
+    Property {
+        payload: WritableSharedPayload,
+        object: LocalId,
+        property: PropertyId,
+        writable: bool,
+    },
+    CollectionIndex {
+        payload: WritableSharedPayload,
+        collection: LocalId,
+        index: Box<Rvalue>,
+        writable: bool,
+        remove: bool,
+    },
+    CollectionGet {
+        collection: LocalId,
+        key: Box<Rvalue>,
+        access: NullableCollectionAccess,
+        stored: SharedAccessType,
+    },
+    Call {
+        payload: WritableSharedPayload,
+        function: FunctionId,
+        args: Vec<Rvalue>,
+        return_borrow: Option<ReturnBorrow>,
+        writable: bool,
+    },
+    NullSafeAcquire {
+        payload: WritableSharedPayload,
+        value: Box<NullableWritableSharedReferenceExpression>,
+        writable: bool,
+    },
+}
+
+impl NullableSharedReferenceAccessExpression {
+    pub const fn payload(&self) -> WritableSharedPayload {
+        match self {
+            Self::Null { payload, .. }
+            | Self::Local { payload, .. }
+            | Self::Property { payload, .. }
+            | Self::CollectionIndex { payload, .. }
+            | Self::Call { payload, .. }
+            | Self::NullSafeAcquire { payload, .. } => *payload,
+            Self::CollectionGet { stored, .. } => stored.payload,
+            Self::Access(value) => value.payload(),
+        }
+    }
+
+    pub const fn writable(&self) -> bool {
+        match self {
+            Self::Null { writable, .. }
+            | Self::Local { writable, .. }
+            | Self::Property { writable, .. }
+            | Self::CollectionIndex { writable, .. }
+            | Self::Call { writable, .. }
+            | Self::NullSafeAcquire { writable, .. } => *writable,
+            Self::CollectionGet { stored, .. } => stored.writable,
+            Self::Access(value) => value.writable(),
+        }
+    }
+
+    pub const fn ty(&self) -> Type {
+        if self.writable() {
+            Type::NullableWritableSharedReferenceAccess(self.payload())
+        } else {
+            Type::NullableReadonlySharedReferenceAccess(self.payload())
+        }
+    }
+
+    pub const fn owned_temporary(&self) -> bool {
+        match self {
+            Self::Access(value) => value.owned_temporary(),
+            Self::Local { transfer, .. } => *transfer,
+            Self::Call { return_borrow, .. } => return_borrow.is_none(),
+            Self::NullSafeAcquire { .. } => true,
+            Self::CollectionIndex { remove, .. } => *remove,
+            Self::CollectionGet { access, .. } => matches!(
+                access,
+                NullableCollectionAccess::Remove | NullableCollectionAccess::Pop
+            ),
+            Self::Null { .. } | Self::Property { .. } => false,
+        }
+    }
+}
+
+impl SharedReferenceAccessExpression {
+    pub const fn payload(&self) -> WritableSharedPayload {
+        match self {
+            Self::Local { payload, .. }
+            | Self::NullableLocalAssumeNonNull { payload, .. }
+            | Self::Property { payload, .. }
+            | Self::CollectionIndex { payload, .. }
+            | Self::Call { payload, .. }
+            | Self::Acquire { payload, .. } => *payload,
+        }
+    }
+
+    pub const fn writable(&self) -> bool {
+        match self {
+            Self::Local { writable, .. }
+            | Self::NullableLocalAssumeNonNull { writable, .. }
+            | Self::Property { writable, .. }
+            | Self::CollectionIndex { writable, .. }
+            | Self::Call { writable, .. }
+            | Self::Acquire { writable, .. } => *writable,
+        }
+    }
+
+    pub const fn ty(&self) -> Type {
+        if self.writable() {
+            Type::WritableSharedReferenceAccess(self.payload())
+        } else {
+            Type::ReadonlySharedReferenceAccess(self.payload())
+        }
+    }
+
+    pub const fn owned_temporary(&self) -> bool {
+        match self {
+            Self::Acquire { .. } => true,
+            Self::Local { transfer, .. } | Self::NullableLocalAssumeNonNull { transfer, .. } => {
+                *transfer
+            }
+            Self::Call { return_borrow, .. } => return_borrow.is_none(),
+            Self::CollectionIndex { remove, .. } => *remove,
+            Self::Property { .. } => false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CollectionExpression {
     Local {
         collection: CollectionTypeId,
@@ -876,6 +1538,11 @@ pub enum CollectionExpression {
         collection: CollectionTypeId,
         object: LocalId,
         property: PropertyId,
+    },
+    SharedAccessPayload {
+        collection: CollectionTypeId,
+        access: LocalId,
+        writable: bool,
     },
     SetFrom {
         collection: CollectionTypeId,
@@ -930,6 +1597,7 @@ impl CollectionExpression {
             | Self::Fill { collection, .. }
             | Self::Index { collection, .. }
             | Self::Property { collection, .. }
+            | Self::SharedAccessPayload { collection, .. }
             | Self::SetFrom { collection, .. }
             | Self::FromBytes { collection, .. }
             | Self::BytesFromArray { collection, .. }
@@ -970,6 +1638,7 @@ impl CollectionExpression {
                 transfer: false, ..
             }
             | Self::Property { .. }
+            | Self::SharedAccessPayload { .. }
             | Self::Call {
                 return_borrow: Some(_),
                 ..
@@ -1249,6 +1918,11 @@ pub enum ClassExpression {
         class: ClassId,
         reference: Box<SharedReferenceExpression>,
     },
+    SharedAccessPayload {
+        class: ClassId,
+        access: LocalId,
+        writable: bool,
+    },
 }
 
 impl ClassExpression {
@@ -1262,7 +1936,8 @@ impl ClassExpression {
             | Self::Coalesce { class, .. }
             | Self::CollectionIndex { class, .. }
             | Self::MixedPayload { class, .. }
-            | Self::SharedPayload { class, .. } => *class,
+            | Self::SharedPayload { class, .. }
+            | Self::SharedAccessPayload { class, .. } => *class,
         }
     }
 
@@ -1288,6 +1963,7 @@ impl ClassExpression {
             | Self::CollectionIndex { .. }
             | Self::MixedPayload { .. }
             | Self::SharedPayload { .. }
+            | Self::SharedAccessPayload { .. }
             | Self::Call {
                 return_borrow: Some(_),
                 ..
@@ -1304,6 +1980,7 @@ impl ClassExpression {
             | Self::MixedPayload { transfer, .. } => !*transfer,
             Self::Property { .. }
             | Self::SharedPayload { .. }
+            | Self::SharedAccessPayload { .. }
             | Self::Call {
                 return_borrow: Some(_),
                 ..
@@ -1742,6 +2419,9 @@ pub enum BoolExpression {
     NullableClassIsPresent(Box<NullableClassExpression>),
     NullableSharedReferenceIsPresent(Box<NullableSharedReferenceExpression>),
     NullableWeakReferenceIsPresent(Box<NullableWeakReferenceExpression>),
+    NullableWritableSharedReferenceIsPresent(Box<NullableWritableSharedReferenceExpression>),
+    NullableWritableWeakReferenceIsPresent(Box<NullableWritableWeakReferenceExpression>),
+    NullableSharedReferenceAccessIsPresent(Box<NullableSharedReferenceAccessExpression>),
     NullableMixedIsPresent(Box<NullableMixedExpression>),
     Not(Box<BoolExpression>),
     Binary {
@@ -1860,6 +2540,19 @@ pub enum Statement {
         local: LocalId,
         class: ClassId,
     },
+    DropWritableSharedReference {
+        local: LocalId,
+        payload: WritableSharedPayload,
+    },
+    DropWritableWeakReference {
+        local: LocalId,
+        payload: WritableSharedPayload,
+    },
+    DropSharedReferenceAccess {
+        local: LocalId,
+        payload: WritableSharedPayload,
+        writable: bool,
+    },
     DropString {
         local: LocalId,
     },
@@ -1940,6 +2633,9 @@ fn statement_class_temporary_capacity(statement: &Statement) -> usize {
         | Statement::DropClass { .. }
         | Statement::DropSharedReference { .. }
         | Statement::DropWeakReference { .. }
+        | Statement::DropWritableSharedReference { .. }
+        | Statement::DropWritableWeakReference { .. }
+        | Statement::DropSharedReferenceAccess { .. }
         | Statement::DropString { .. }
         | Statement::DropMixed { .. }
         | Statement::DropCollection { .. }
@@ -1991,8 +2687,206 @@ fn rvalue_class_temporary_capacity(value: &Rvalue) -> usize {
                 nullable_shared_class_temporary_capacity(value)
             }
             Rvalue::NullableWeakReference(value) => nullable_weak_class_temporary_capacity(value),
+            Rvalue::WritableSharedReference(value) => match value {
+                WritableSharedReferenceExpression::New { value, .. } => {
+                    rvalue_class_temporary_capacity(value)
+                }
+                WritableSharedReferenceExpression::Call { args, .. } => {
+                    args.iter().map(rvalue_class_temporary_capacity).sum()
+                }
+                WritableSharedReferenceExpression::Share { value, .. } => {
+                    writable_shared_class_temporary_capacity(value)
+                }
+                WritableSharedReferenceExpression::Coalesce { left, right, .. } => {
+                    nullable_writable_shared_class_temporary_capacity(left)
+                        + writable_shared_class_temporary_capacity(right)
+                }
+                WritableSharedReferenceExpression::CollectionIndex { index, .. } => {
+                    rvalue_class_temporary_capacity(index)
+                }
+                WritableSharedReferenceExpression::Local { .. }
+                | WritableSharedReferenceExpression::NullableLocalAssumeNonNull { .. }
+                | WritableSharedReferenceExpression::Property { .. } => 0,
+            },
+            Rvalue::WritableWeakReference(value) => match value {
+                WritableWeakReferenceExpression::Call { args, .. } => {
+                    args.iter().map(rvalue_class_temporary_capacity).sum()
+                }
+                WritableWeakReferenceExpression::Create { value, .. } => {
+                    writable_shared_class_temporary_capacity(value)
+                }
+                WritableWeakReferenceExpression::Coalesce { left, right, .. } => {
+                    nullable_writable_weak_class_temporary_capacity(left)
+                        + writable_weak_class_temporary_capacity(right)
+                }
+                WritableWeakReferenceExpression::CollectionIndex { index, .. } => {
+                    rvalue_class_temporary_capacity(index)
+                }
+                WritableWeakReferenceExpression::Local { .. }
+                | WritableWeakReferenceExpression::NullableLocalAssumeNonNull { .. }
+                | WritableWeakReferenceExpression::Property { .. } => 0,
+            },
+            Rvalue::NullableWritableSharedReference(value) => {
+                nullable_writable_shared_class_temporary_capacity(value)
+            }
+            Rvalue::NullableWritableWeakReference(value) => {
+                nullable_writable_weak_class_temporary_capacity(value)
+            }
+            Rvalue::SharedReferenceAccess(value) => match value {
+                SharedReferenceAccessExpression::Call { args, .. } => {
+                    args.iter().map(rvalue_class_temporary_capacity).sum()
+                }
+                SharedReferenceAccessExpression::Acquire { value, .. } => {
+                    writable_shared_class_temporary_capacity(value)
+                }
+                SharedReferenceAccessExpression::CollectionIndex { index, .. } => {
+                    rvalue_class_temporary_capacity(index)
+                }
+                SharedReferenceAccessExpression::Local { .. }
+                | SharedReferenceAccessExpression::NullableLocalAssumeNonNull { .. }
+                | SharedReferenceAccessExpression::Property { .. } => 0,
+            },
+            Rvalue::NullableSharedReferenceAccess(value) => {
+                nullable_shared_access_class_temporary_capacity(value)
+            }
             Rvalue::Collection(value) => collection_class_temporary_capacity(value),
         }
+}
+
+fn nullable_shared_access_class_temporary_capacity(
+    value: &NullableSharedReferenceAccessExpression,
+) -> usize {
+    match value {
+        NullableSharedReferenceAccessExpression::Access(value) => match value.as_ref() {
+            SharedReferenceAccessExpression::Call { args, .. } => {
+                args.iter().map(rvalue_class_temporary_capacity).sum()
+            }
+            SharedReferenceAccessExpression::Acquire { value, .. } => {
+                writable_shared_class_temporary_capacity(value)
+            }
+            SharedReferenceAccessExpression::CollectionIndex { index, .. } => {
+                rvalue_class_temporary_capacity(index)
+            }
+            SharedReferenceAccessExpression::Local { .. }
+            | SharedReferenceAccessExpression::NullableLocalAssumeNonNull { .. }
+            | SharedReferenceAccessExpression::Property { .. } => 0,
+        },
+        NullableSharedReferenceAccessExpression::Call { args, .. } => {
+            args.iter().map(rvalue_class_temporary_capacity).sum()
+        }
+        NullableSharedReferenceAccessExpression::NullSafeAcquire { value, .. } => {
+            nullable_writable_shared_class_temporary_capacity(value)
+        }
+        NullableSharedReferenceAccessExpression::CollectionIndex { index, .. } => {
+            rvalue_class_temporary_capacity(index)
+        }
+        NullableSharedReferenceAccessExpression::CollectionGet { key, .. } => {
+            rvalue_class_temporary_capacity(key)
+        }
+        NullableSharedReferenceAccessExpression::Null { .. }
+        | NullableSharedReferenceAccessExpression::Local { .. }
+        | NullableSharedReferenceAccessExpression::Property { .. } => 0,
+    }
+}
+
+fn writable_shared_class_temporary_capacity(value: &WritableSharedReferenceExpression) -> usize {
+    match value {
+        WritableSharedReferenceExpression::New { value, .. } => {
+            rvalue_class_temporary_capacity(value)
+        }
+        WritableSharedReferenceExpression::Call { args, .. } => {
+            args.iter().map(rvalue_class_temporary_capacity).sum()
+        }
+        WritableSharedReferenceExpression::Share { value, .. } => {
+            writable_shared_class_temporary_capacity(value)
+        }
+        WritableSharedReferenceExpression::Coalesce { left, right, .. } => {
+            nullable_writable_shared_class_temporary_capacity(left)
+                .max(writable_shared_class_temporary_capacity(right))
+        }
+        WritableSharedReferenceExpression::CollectionIndex { index, .. } => {
+            rvalue_class_temporary_capacity(index)
+        }
+        WritableSharedReferenceExpression::Local { .. }
+        | WritableSharedReferenceExpression::NullableLocalAssumeNonNull { .. }
+        | WritableSharedReferenceExpression::Property { .. } => 0,
+    }
+}
+
+fn writable_weak_class_temporary_capacity(value: &WritableWeakReferenceExpression) -> usize {
+    match value {
+        WritableWeakReferenceExpression::Call { args, .. } => {
+            args.iter().map(rvalue_class_temporary_capacity).sum()
+        }
+        WritableWeakReferenceExpression::Create { value, .. } => {
+            writable_shared_class_temporary_capacity(value)
+        }
+        WritableWeakReferenceExpression::Coalesce { left, right, .. } => {
+            nullable_writable_weak_class_temporary_capacity(left)
+                .max(writable_weak_class_temporary_capacity(right))
+        }
+        WritableWeakReferenceExpression::CollectionIndex { index, .. } => {
+            rvalue_class_temporary_capacity(index)
+        }
+        WritableWeakReferenceExpression::Local { .. }
+        | WritableWeakReferenceExpression::NullableLocalAssumeNonNull { .. }
+        | WritableWeakReferenceExpression::Property { .. } => 0,
+    }
+}
+
+fn nullable_writable_shared_class_temporary_capacity(
+    value: &NullableWritableSharedReferenceExpression,
+) -> usize {
+    match value {
+        NullableWritableSharedReferenceExpression::Strong(value) => {
+            writable_shared_class_temporary_capacity(value)
+        }
+        NullableWritableSharedReferenceExpression::Call { args, .. } => {
+            args.iter().map(rvalue_class_temporary_capacity).sum()
+        }
+        NullableWritableSharedReferenceExpression::Acquire { value, .. } => {
+            writable_weak_class_temporary_capacity(value)
+        }
+        NullableWritableSharedReferenceExpression::NullSafeShare { value, .. }
+        | NullableWritableSharedReferenceExpression::Coalesce { left: value, .. } => {
+            nullable_writable_shared_class_temporary_capacity(value)
+        }
+        NullableWritableSharedReferenceExpression::NullSafeAcquire { value, .. } => {
+            nullable_writable_weak_class_temporary_capacity(value)
+        }
+        NullableWritableSharedReferenceExpression::DictionaryGet { key, .. } => {
+            rvalue_class_temporary_capacity(key)
+        }
+        NullableWritableSharedReferenceExpression::Null(_)
+        | NullableWritableSharedReferenceExpression::Local { .. }
+        | NullableWritableSharedReferenceExpression::Property { .. } => 0,
+    }
+}
+
+fn nullable_writable_weak_class_temporary_capacity(
+    value: &NullableWritableWeakReferenceExpression,
+) -> usize {
+    match value {
+        NullableWritableWeakReferenceExpression::Weak(value) => {
+            writable_weak_class_temporary_capacity(value)
+        }
+        NullableWritableWeakReferenceExpression::Call { args, .. } => {
+            args.iter().map(rvalue_class_temporary_capacity).sum()
+        }
+        NullableWritableWeakReferenceExpression::NullSafeCreate { value, .. } => {
+            nullable_writable_shared_class_temporary_capacity(value)
+        }
+        NullableWritableWeakReferenceExpression::Coalesce { left, right, .. } => {
+            nullable_writable_weak_class_temporary_capacity(left)
+                .max(nullable_writable_weak_class_temporary_capacity(right))
+        }
+        NullableWritableWeakReferenceExpression::DictionaryGet { key, .. } => {
+            rvalue_class_temporary_capacity(key)
+        }
+        NullableWritableWeakReferenceExpression::Null(_)
+        | NullableWritableWeakReferenceExpression::Local { .. }
+        | NullableWritableWeakReferenceExpression::Property { .. } => 0,
+    }
 }
 
 fn shared_class_temporary_capacity(value: &SharedReferenceExpression) -> usize {
@@ -2143,7 +3037,8 @@ fn collection_class_temporary_capacity(value: &CollectionExpression) -> usize {
                 rvalue_class_temporary_capacity(value) + integer_class_temporary_capacity(count)
             }
             CollectionExpression::Index { index, .. } => rvalue_class_temporary_capacity(index),
-            CollectionExpression::Property { .. } => 0,
+            CollectionExpression::Property { .. }
+            | CollectionExpression::SharedAccessPayload { .. } => 0,
             CollectionExpression::ReadFileBytes { path, .. } => {
                 string_class_temporary_capacity(path)
             }
@@ -2252,7 +3147,8 @@ fn class_expression_temporary_capacity(value: &ClassExpression) -> usize {
         ClassExpression::Local { .. }
         | ClassExpression::Property { .. }
         | ClassExpression::NullableLocalAssumeNonNull { .. }
-        | ClassExpression::MixedPayload { .. } => 0,
+        | ClassExpression::MixedPayload { .. }
+        | ClassExpression::SharedAccessPayload { .. } => 0,
         ClassExpression::SharedPayload { reference, .. } => {
             shared_class_temporary_capacity(reference)
         }
@@ -2371,6 +3267,15 @@ pub(crate) fn bool_class_temporary_capacity(value: &BoolExpression) -> usize {
         }
         BoolExpression::NullableWeakReferenceIsPresent(value) => {
             nullable_weak_class_temporary_capacity(value)
+        }
+        BoolExpression::NullableWritableSharedReferenceIsPresent(value) => {
+            nullable_writable_shared_class_temporary_capacity(value)
+        }
+        BoolExpression::NullableWritableWeakReferenceIsPresent(value) => {
+            nullable_writable_weak_class_temporary_capacity(value)
+        }
+        BoolExpression::NullableSharedReferenceAccessIsPresent(value) => {
+            nullable_shared_access_class_temporary_capacity(value)
         }
         BoolExpression::NullableMixedIsPresent(value) => {
             nullable_mixed_class_temporary_capacity(value)
@@ -2496,7 +3401,40 @@ impl fmt::Display for Type {
             Type::NullableWeakReference(class) => {
                 write!(formatter, "?weak<class#{}>", class.0)
             }
+            Type::WritableSharedReference(payload) => {
+                write!(formatter, "writable-shared<{payload}>")
+            }
+            Type::WritableWeakReference(payload) => {
+                write!(formatter, "writable-weak<{payload}>")
+            }
+            Type::NullableWritableSharedReference(payload) => {
+                write!(formatter, "?writable-shared<{payload}>")
+            }
+            Type::NullableWritableWeakReference(payload) => {
+                write!(formatter, "?writable-weak<{payload}>")
+            }
+            Type::ReadonlySharedReferenceAccess(payload) => {
+                write!(formatter, "readonly-shared-access<{payload}>")
+            }
+            Type::WritableSharedReferenceAccess(payload) => {
+                write!(formatter, "writable-shared-access<{payload}>")
+            }
+            Type::NullableReadonlySharedReferenceAccess(payload) => {
+                write!(formatter, "?readonly-shared-access<{payload}>")
+            }
+            Type::NullableWritableSharedReferenceAccess(payload) => {
+                write!(formatter, "?writable-shared-access<{payload}>")
+            }
             Type::Collection(collection) => write!(formatter, "collection#{}", collection.0),
+        }
+    }
+}
+
+impl fmt::Display for WritableSharedPayload {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Class(class) => write!(formatter, "class#{}", class.0),
+            Self::Collection(collection) => write!(formatter, "collection#{}", collection.0),
         }
     }
 }
@@ -2558,6 +3496,24 @@ impl fmt::Display for Rvalue {
             Rvalue::WeakReference(value) => write!(formatter, "{value}"),
             Rvalue::NullableSharedReference(value) => write!(formatter, "{value}"),
             Rvalue::NullableWeakReference(value) => write!(formatter, "{value}"),
+            Rvalue::WritableSharedReference(value) => {
+                write!(formatter, "writable_shared<{:?}>", value.payload())
+            }
+            Rvalue::WritableWeakReference(value) => {
+                write!(formatter, "writable_weak<{:?}>", value.payload())
+            }
+            Rvalue::NullableWritableSharedReference(value) => {
+                write!(formatter, "?writable_shared<{:?}>", value.payload())
+            }
+            Rvalue::NullableWritableWeakReference(value) => {
+                write!(formatter, "?writable_weak<{:?}>", value.payload())
+            }
+            Rvalue::SharedReferenceAccess(value) => {
+                write!(formatter, "shared_access<{:?}>", value.payload())
+            }
+            Rvalue::NullableSharedReferenceAccess(value) => {
+                write!(formatter, "?shared_access<{:?}>", value.payload())
+            }
             Rvalue::Collection(value) => write!(formatter, "{value}"),
         }
     }
@@ -2614,6 +3570,17 @@ impl fmt::Display for CollectionExpression {
                 formatter,
                 "borrow local{}->property{}",
                 object.0, property.index
+            ),
+            Self::SharedAccessPayload {
+                collection,
+                access,
+                writable,
+            } => write!(
+                formatter,
+                "{}_access_payload(local{}): collection#{}",
+                if *writable { "writable" } else { "readonly" },
+                access.0,
+                collection.0
             ),
             Self::SetFrom {
                 source, transfer, ..
@@ -2700,6 +3667,17 @@ impl fmt::Display for ClassExpression {
             Self::SharedPayload { class, reference } => {
                 write!(formatter, "payload({reference}): class#{}", class.0)
             }
+            Self::SharedAccessPayload {
+                class,
+                access,
+                writable,
+            } => write!(
+                formatter,
+                "{}_access_payload(local{}): class#{}",
+                if *writable { "writable" } else { "readonly" },
+                access.0,
+                class.0
+            ),
         }
     }
 }
@@ -3230,6 +4208,15 @@ impl fmt::Display for BoolExpression {
             Self::NullableWeakReferenceIsPresent(value) => {
                 write!(formatter, "present({value})")
             }
+            Self::NullableWritableSharedReferenceIsPresent(value) => {
+                write!(formatter, "present(?writable-shared<{}>)", value.payload())
+            }
+            Self::NullableWritableWeakReferenceIsPresent(value) => {
+                write!(formatter, "present(?writable-weak<{}>)", value.payload())
+            }
+            Self::NullableSharedReferenceAccessIsPresent(value) => {
+                write!(formatter, "present(?shared-access<{}>)", value.payload())
+            }
             Self::NullableMixedIsPresent(value) => write!(formatter, "present({value})"),
             Self::MixedIs { mixed, tag } => write!(formatter, "{mixed} is {tag}"),
             Self::Not(condition) => write!(formatter, "!({condition})"),
@@ -3427,6 +4414,26 @@ impl fmt::Display for Statement {
             Statement::DropWeakReference { local, class } => {
                 write!(formatter, "drop weak<class#{}> local{}", class.0, local.0)
             }
+            Statement::DropWritableSharedReference { local, payload } => {
+                write!(
+                    formatter,
+                    "drop writable-shared<{payload}> local{}",
+                    local.0
+                )
+            }
+            Statement::DropWritableWeakReference { local, payload } => {
+                write!(formatter, "drop writable-weak<{payload}> local{}", local.0)
+            }
+            Statement::DropSharedReferenceAccess {
+                local,
+                payload,
+                writable,
+            } => write!(
+                formatter,
+                "drop {}-shared-access<{payload}> local{}",
+                if *writable { "writable" } else { "readonly" },
+                local.0
+            ),
             Statement::DropString { local } => write!(formatter, "drop string local{}", local.0),
             Statement::DropMixed { local } => write!(formatter, "drop mixed local{}", local.0),
             Statement::CollectionAdd {

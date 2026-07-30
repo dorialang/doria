@@ -1,4 +1,4 @@
 code: E0516
 message: function `save` has no parameter named `nmae`
-help: 
+help: Did you mean `name`?
 span: 94..98

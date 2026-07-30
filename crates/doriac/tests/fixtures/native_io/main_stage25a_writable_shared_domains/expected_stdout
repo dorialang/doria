@@ -1,0 +1,9 @@
+generic class 1
+generic collection 3
+bytes 7:3
+nullable live
+nullable absent
+nullable access 1
+nullable access absent
+nullable writable access 4
+coalesce 1

@@ -1,0 +1,6 @@
+function save(string $name, int $size): void {}
+
+function main(): void
+{
+    save(name: "Ada", sie: 1);
+}
