@@ -466,7 +466,10 @@ fn mixed_rejects_operations_until_is_narrows_the_value() {
             .find(|diagnostic| diagnostic.code == expected_code)
             .unwrap_or_else(|| panic!("expected {expected_code} for `{operation}`"));
         if expected_code == "E0433" {
-            assert!(diagnostic.help.is_some_and(|help| help.contains("`is`")));
+            assert!(diagnostic
+                .help
+                .as_ref()
+                .is_some_and(|help| help.contains("`is`")));
         }
     }
 

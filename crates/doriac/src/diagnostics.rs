@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::io::IsTerminal;
+use std::ops::{Deref, DerefMut};
 
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -148,13 +149,18 @@ pub struct DiagnosticDocumentation {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Diagnostic {
     pub code: &'static str,
+    pub severity: DiagnosticSeverity,
+    pub kind: DiagnosticKind,
+    pub span: Span,
+    details: Box<DiagnosticDetails>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiagnosticDetails {
     /// Original semantic detail retained for compatibility and developer tooling.
     pub message: String,
     /// Canonical, user-facing Title Case summary.
     pub title: String,
-    pub severity: DiagnosticSeverity,
-    pub kind: DiagnosticKind,
-    pub span: Span,
     pub labels: Vec<DiagnosticLabel>,
     pub explanation: Option<String>,
     pub notes: Vec<String>,
@@ -172,6 +178,20 @@ pub struct Diagnostic {
     pub help: Option<String>,
     pub fix: Option<Box<FixIt>>,
     pub related: Vec<RelatedSpan>,
+}
+
+impl Deref for Diagnostic {
+    type Target = DiagnosticDetails;
+
+    fn deref(&self) -> &Self::Target {
+        &self.details
+    }
+}
+
+impl DerefMut for Diagnostic {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.details
+    }
 }
 
 impl Diagnostic {
@@ -220,60 +240,62 @@ impl Diagnostic {
         );
         let mut diagnostic = Self {
             code,
-            title,
             severity: metadata.severity,
             kind,
             span,
-            labels: vec![DiagnosticLabel {
-                source: DiagnosticSource::Current,
-                span,
-                role: LabelRole::Primary,
-                message: if matches!(
-                    kind,
-                    DiagnosticKind::Backend
-                        | DiagnosticKind::ExternalTool
-                        | DiagnosticKind::InternalCompiler
-                ) {
-                    String::new()
-                } else {
-                    message.clone()
+            details: Box::new(DiagnosticDetails {
+                title,
+                labels: vec![DiagnosticLabel {
+                    source: DiagnosticSource::Current,
+                    span,
+                    role: LabelRole::Primary,
+                    message: if matches!(
+                        kind,
+                        DiagnosticKind::Backend
+                            | DiagnosticKind::ExternalTool
+                            | DiagnosticKind::InternalCompiler
+                    ) {
+                        String::new()
+                    } else {
+                        message.clone()
+                    },
+                }],
+                explanation: match kind {
+                    DiagnosticKind::InternalCompiler => Some(
+                        "The compiler reached an unexpected internal state. This is a compiler defect, not a problem with your program."
+                            .to_string(),
+                    ),
+                    DiagnosticKind::Backend | DiagnosticKind::ExternalTool => Some(
+                        "The program passed language checking, but a code-generation or external tool step could not complete."
+                            .to_string(),
+                    ),
+                    _ => None,
                 },
-            }],
-            explanation: match kind {
-                DiagnosticKind::InternalCompiler => Some(
-                    "The compiler reached an unexpected internal state. This is a compiler defect, not a problem with your program."
-                        .to_string(),
-                ),
-                DiagnosticKind::Backend | DiagnosticKind::ExternalTool => Some(
-                    "The program passed language checking, but a code-generation or external tool step could not complete."
-                        .to_string(),
-                ),
-                _ => None,
-            },
-            notes: Vec::new(),
-            helps: Vec::new(),
-            fixes: Vec::new(),
-            cause_id: None,
-            is_consequence: false,
-            development_only: metadata.development_only,
-            documentation: Some(DiagnosticDocumentation {
-                slug: code.to_ascii_lowercase(),
-                url: Some(format!(
-                    "https://dorialang.org/docs/diagnostics/{}",
-                    code.to_ascii_lowercase()
-                )),
+                notes: Vec::new(),
+                helps: Vec::new(),
+                fixes: Vec::new(),
+                cause_id: None,
+                is_consequence: false,
+                development_only: metadata.development_only,
+                documentation: Some(DiagnosticDocumentation {
+                    slug: code.to_ascii_lowercase(),
+                    url: Some(format!(
+                        "https://dorialang.org/docs/diagnostics/{}",
+                        code.to_ascii_lowercase()
+                    )),
+                }),
+                developer_details: matches!(
+                    kind,
+                    DiagnosticKind::InternalCompiler
+                        | DiagnosticKind::Backend
+                        | DiagnosticKind::ExternalTool
+                )
+                .then(|| message.clone()),
+                message,
+                help: None,
+                fix: None,
+                related: Vec::new(),
             }),
-            developer_details: matches!(
-                kind,
-                DiagnosticKind::InternalCompiler
-                    | DiagnosticKind::Backend
-                    | DiagnosticKind::ExternalTool
-            )
-            .then(|| message.clone()),
-            message,
-            help: None,
-            fix: None,
-            related: Vec::new(),
         };
         if kind == DiagnosticKind::InternalCompiler {
             diagnostic.notes.push(format!(
@@ -401,6 +423,7 @@ impl Diagnostic {
 
     pub fn with_primary_label(mut self, message: impl Into<String>) -> Self {
         let message = message.into();
+        let span = self.span;
         if let Some(primary) = self
             .labels
             .iter_mut()
@@ -410,7 +433,7 @@ impl Diagnostic {
         } else {
             self.labels.push(DiagnosticLabel {
                 source: DiagnosticSource::Current,
-                span: self.span,
+                span,
                 role: LabelRole::Primary,
                 message,
             });
@@ -912,22 +935,20 @@ pub fn prepare_diagnostics(diagnostics: &[Diagnostic]) -> Vec<Diagnostic> {
         let Some(&root_index) = roots.get(cause) else {
             continue;
         };
+        let details = *consequence.details;
         let root = &mut prepared[root_index];
         root.labels
-            .extend(consequence.labels.into_iter().map(|mut label| {
+            .extend(details.labels.into_iter().map(|mut label| {
                 label.role = LabelRole::Secondary;
                 label
             }));
         root.notes.push(format!(
             "{}: {}",
-            consequence.title,
-            consequence
-                .explanation
-                .as_deref()
-                .unwrap_or(&consequence.message)
+            details.title,
+            details.explanation.as_deref().unwrap_or(&details.message)
         ));
-        root.helps.extend(consequence.helps);
-        root.fixes.extend(consequence.fixes);
+        root.helps.extend(details.helps);
+        root.fixes.extend(details.fixes);
     }
     prepared.retain(|diagnostic| {
         !diagnostic.is_consequence
