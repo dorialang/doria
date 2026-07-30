@@ -660,6 +660,14 @@ if ($namingAuthority !== false) {
         'String::padStart',
         'String::fromBytes',
         'String::compareIgnoreCase',
+        'String::containsIgnoreCase',
+        'String::startsWithIgnoreCase',
+        'String::endsWithIgnoreCase',
+        'String::indexOfIgnoreCase',
+        'String::lastIndexOfIgnoreCase',
+        'String::lowerFirst',
+        'String::upperFirst',
+        'String::countOccurrences',
         'The public Doria API has no `str_*`',
     ];
     if ($stringDecision === false) {
@@ -675,9 +683,9 @@ if ($namingAuthority !== false) {
     foreach ([
         'String API Decision Amendment — Implemented',
         'String API Completeness Audit Against PHP — Implemented',
-        'Decision 0103 Completeness Review — Required',
-        'Minimum String Runtime Surface — Blocked Pending Review',
-        'Interactive Line-Input Amendment — Pending',
+        'Decision 0103 Completeness Review — Implemented',
+        'Minimum String Runtime Surface — Implemented',
+        'Interactive Line-Input Amendment — Next',
     ] as $guidance) {
         if (!str_contains($namingAuthority, $guidance)) {
             $failures[] = "{$namingAuthorityPath}: missing String checkpoint status {$guidance}";
@@ -688,19 +696,37 @@ if ($namingAuthority !== false) {
         $pipeline === false
         || !str_contains($pipeline, 'The String API Decision Amendment is implemented')
         || !str_contains($pipeline, 'The String API Completeness Audit Against PHP is implemented')
-        || !str_contains($pipeline, 'Minimum String Runtime Surface is blocked pending that review')
+        || !str_contains($pipeline, 'Andrew approved the audit')
+        || !str_contains($pipeline, 'The Minimum String Runtime Surface is implemented')
+        || !str_contains($pipeline, 'Interactive Line-Input Amendment')
         || !str_contains($pipeline, 'Stage 25a remains incomplete until Slice 4')
     ) {
-        $failures[] = "{$pipelinePath}: must keep the String amendment and audit implemented, the runtime surface blocked for review, and Stage 25a incomplete";
+        $failures[] = "{$pipelinePath}: must keep the String audit review and runtime surface implemented, line input sequenced, and Stage 25a incomplete";
     }
 
     if (
         $stdlib === false
         || !str_contains($stdlib, '$s->byteLength')
+        || !str_contains($stdlib, 'executable intrinsic properties')
+        || !str_contains($stdlib, 'containsIgnoreCase')
+        || !str_contains($stdlib, 'countOccurrences')
+        || !str_contains($stdlib, 'await the public traversal protocol')
         || !str_contains($stdlib, 'There is no public `str_*` family')
-        || !str_contains($stdlib, 'Minimum String Runtime Surface')
     ) {
-        $failures[] = "{$stdlibPath}: missing canonical planned String inventory or implementation-status boundary";
+        $failures[] = "{$stdlibPath}: missing canonical executable and deferred String inventory";
+    }
+
+    $unicodeNotePath = 'docs/notes/unicode-string-runtime.md';
+    $unicodeNote = file_get_contents($root . '/' . $unicodeNotePath);
+    foreach ([
+        'Unicode 17.0.0',
+        'extended grapheme-cluster boundaries',
+        'no implicit normalization',
+        '`doria-unicode`',
+    ] as $guidance) {
+        if ($unicodeNote === false || !str_contains($unicodeNote, $guidance)) {
+            $failures[] = "{$unicodeNotePath}: missing Unicode runtime guidance {$guidance}";
+        }
     }
 
     $staleStringAssertions = [
@@ -812,8 +838,8 @@ if ($agents !== false && str_contains($agents, 'Every stage that activates synta
 }
 
 // The String completeness audit is a checked-in, offline decision gate. Keep
-// its human artifact, machine inventory, guard, and plan status together so a
-// later wording edit cannot silently unblock runtime implementation.
+// its human artifact, machine inventory, review resolution, and guard together
+// so later wording edits cannot lose the accepted/deferred boundary.
 $stringAuditPath = 'docs/notes/string-api-completeness-audit.md';
 $stringInventoryPath = 'docs/notes/php-string-capability-inventory.json';
 $stringGuardPath = 'scripts/check_string_api_completeness.php';
@@ -824,7 +850,7 @@ if (
     $stringAudit === false
     || !str_contains($stringAudit, '## Designer Review')
     || !str_contains($stringAudit, '## Invalidated Elsewhere')
-    || !str_contains($stringAudit, 'Andrew reviews the designer-review table')
+    || !str_contains($stringAudit, 'approved on 2026-07-31')
 ) {
     $failures[] = "{$stringAuditPath}: missing the designer review, blast-radius, or next-action contract";
 }
@@ -833,6 +859,7 @@ if (
     || !str_contains($stringInventory, '"phpSurface"')
     || !str_contains($stringInventory, '"doriaClassification"')
     || !str_contains($stringInventory, '"migrationAction"')
+    || !str_contains($stringInventory, '"reviewResolution"')
 ) {
     $failures[] = "{$stringInventoryPath}: missing the machine-checkable capability inventory";
 }
@@ -840,17 +867,17 @@ if (
     $stringGuard === false
     || !str_contains($stringGuard, 'expectedNames')
     || !str_contains($stringGuard, 'duplicate capability row')
-    || !str_contains($stringGuard, 'Minimum String Runtime Surface — Blocked Pending Review')
+    || !str_contains($stringGuard, 'Minimum String Runtime Surface — Implemented')
 ) {
     $failures[] = "{$stringGuardPath}: must verify exact catalogue coverage, duplicates, and the runtime block";
 }
 if (
     $namingAuthority === false
     || !str_contains($namingAuthority, 'String API Completeness Audit Against PHP — Implemented')
-    || !str_contains($namingAuthority, 'Decision 0103 Completeness Review — Required')
-    || !str_contains($namingAuthority, 'Minimum String Runtime Surface — Blocked Pending Review')
+    || !str_contains($namingAuthority, 'Decision 0103 Completeness Review — Implemented')
+    || !str_contains($namingAuthority, 'Minimum String Runtime Surface — Implemented')
 ) {
-    $failures[] = "{$namingAuthorityPath}: missing the String audit and review sequence";
+    $failures[] = "{$namingAuthorityPath}: missing the completed String audit, review, and runtime sequence";
 }
 
 // Delivered compiler work must refresh the installed compiler and language

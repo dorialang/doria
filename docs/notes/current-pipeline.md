@@ -43,16 +43,26 @@ Documentation role: working note. This file prevents duplicated in-flight work. 
   reports UTF-8 bytes.
 - The String API Completeness Audit Against PHP is implemented as a checked-in
   181-row inventory covering the official core string, mbstring, and current
-  released grapheme capabilities. It changes no accepted API or compiler
-  behavior. Andrew's Decision 0103 Completeness Review is required before
-  runtime implementation resumes.
+  released grapheme capabilities.
+- Andrew approved the audit's recommended path on 2026-07-31. Decision 0103's
+  v1 inventory now includes the symmetric ignore-case search family,
+  first-grapheme casing, and occurrence counting; every other proposed item is
+  explicitly deferred under its recorded dependency or domain.
+- The Minimum String Runtime Surface is implemented. Intrinsic
+  `length`/`byteLength`/`isEmpty`/`bytes` and the selected trimming, casing,
+  predicate, search, replacement, split/join, slice, repeat, padding, and
+  `fromBytes` companion operations lower through validated MIR to the
+  interpreter and the shared `doria-rt` ABI used by Cranelift and LLVM.
+  Unicode 17.0 data drives locale-independent grapheme, whitespace, casing,
+  and full-fold behavior. Grapheme/code-point views remain pending on the
+  traversal protocol, and ordering comparisons remain pending on `Ordering`.
+  The approved ignore-case search family, first-grapheme casing, and
+  occurrence counting are included in this executable surface.
 - The durable manifest supports raw stdin, isolated seeded files, declared program arguments, and exact interpreter/Cranelift/LLVM stdout, stderr, status, generated-file, and class-lifetime comparison.
 
 ## Next
 
-- Decision 0103 Completeness Review.
-- Minimum String Runtime Surface is blocked pending that review.
-- Interactive Line-Input Amendment follows it.
+- Implement the Interactive Line-Input Amendment.
 - Do not proceed directly to Stage 25a Slice 4.
 
 ## Do not duplicate

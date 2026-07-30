@@ -929,14 +929,18 @@ AC: legal/illegal borrow and ctor fixture matrix; borrow-conflict diagnostic sna
   grapheme capability as String, Bytes, another domain, derivable, deferred,
   rejected, not applicable, or an unresolved design fork. It proposes no API
   silently and changes no compiler behavior.
-- **Decision 0103 Completeness Review — Required.** Andrew reviews the audit's
-  compact decision table and deliberately accepts, rejects, or defers each
-  proposed addition before the accepted String surface expands.
-- **Minimum String Runtime Surface — Blocked Pending Review.** After the
-  completeness review, select and implement the first executable subset of
-  Decision 0103 across shared MIR, interpreter, Cranelift, LLVM, diagnostics,
-  tests, and coordinated tooling.
-- **Interactive Line-Input Amendment — Pending.** This follows the Minimum
+- **Decision 0103 Completeness Review — Implemented.** Andrew approved the
+  audit's recommended path on 2026-07-31. The symmetric ignore-case search
+  family, first-grapheme casing, and occurrence counting join the v1 inventory;
+  review/defer rows remain named later furnishings with their dependencies.
+- **Minimum String Runtime Surface — Implemented.** The selected Decision 0103
+  subset uses one shared Unicode implementation across the interpreter and
+  `doria-rt`; Cranelift and LLVM lower the same validated String MIR intrinsics
+  to that runtime ABI. The approved ignore-case search family, first-grapheme
+  casing, and occurrence counting are included. Grapheme and code-point views
+  remain traversal work, and ordering comparisons remain blocked on executable
+  `Ordering`.
+- **Interactive Line-Input Amendment — Next.** This follows the completed
   String Runtime Surface and precedes Stage 25a Slice 4.
 - **Stage 26 — Remaining collection family.** Stage 23 ships Decision 0100's default `List`/`Dictionary`/`Set`/`T[]` surface. Stage 26 adds the authored non-closure surface with `SortedDictionary`, `SortedSet`, `PriorityQueue`, and `Deque`; `map`/`filter`/`reduce` remain Stage 30 because they require closures. Before Stage 31 include/multi-file support, required stdlib fragments are compiler-bundled or prelude-style rather than source-included. AC: the remaining non-closure collection family compiles and runs from the compiler-provided stdlib surface.
 

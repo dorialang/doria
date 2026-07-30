@@ -117,6 +117,31 @@ if (!preg_match('/\b20\d{2}\b/', (string) ($audit['phpManualCopyright'] ?? '')))
     fail($failures, 'PHP manual copyright year is missing');
 }
 
+$reviewResolution = $manifest['reviewResolution'] ?? null;
+if (!is_array($reviewResolution)) {
+    fail($failures, 'manifest reviewResolution metadata is missing');
+    $reviewResolution = [];
+}
+if (($reviewResolution['date'] ?? null) !== '2026-07-31') {
+    fail($failures, 'reviewResolution must record the 2026-07-31 approval');
+}
+$approvedStringOperations = $reviewResolution['approvedCanonicalStringOperations'] ?? [];
+$requiredApprovedStringOperations = [
+    'String::containsIgnoreCase',
+    'String::startsWithIgnoreCase',
+    'String::endsWithIgnoreCase',
+    'String::indexOfIgnoreCase',
+    'String::lastIndexOfIgnoreCase',
+    'String::lowerFirst',
+    'String::upperFirst',
+    'String::countOccurrences',
+];
+foreach ($requiredApprovedStringOperations as $operation) {
+    if (!is_array($approvedStringOperations) || !in_array($operation, $approvedStringOperations, true)) {
+        fail($failures, "reviewResolution is missing approved operation {$operation}");
+    }
+}
+
 $entries = $manifest['entries'] ?? null;
 if (!is_array($entries)) {
     fail($failures, 'manifest entries must be an array');
@@ -254,17 +279,22 @@ foreach (['Normalizer', 'Collator', 'Transliterator', 'BreakIterator', 'IntlChar
 
 $decision = (string) file_get_contents($decisionPath);
 $plan = (string) file_get_contents($planPath);
-if (preg_match('/does not yet constitute\s+a\s+reviewed exhaustive v1 inventory/', $decision) !== 1) {
-    fail($failures, 'Decision 0103 still lacks the non-exhaustiveness statement');
+if (!str_contains($decision, 'reviewed v1 inventory')) {
+    fail($failures, 'Decision 0103 does not record the completed review');
 }
 if (!str_contains($decision, 'string-api-completeness-audit.md')) {
     fail($failures, 'Decision 0103 does not link the completeness audit');
 }
-if (!str_contains($plan, 'Minimum String Runtime Surface — Blocked Pending Review')) {
-    fail($failures, 'Minimum String Runtime Surface is not blocked pending review');
+foreach ($requiredApprovedStringOperations as $operation) {
+    if (!str_contains($decision, $operation)) {
+        fail($failures, "Decision 0103 is missing approved operation {$operation}");
+    }
 }
-if (!str_contains($plan, 'Decision 0103 Completeness Review — Required')) {
-    fail($failures, 'the required Decision 0103 completeness review is missing');
+if (!str_contains($plan, 'Minimum String Runtime Surface — Implemented')) {
+    fail($failures, 'Minimum String Runtime Surface is not recorded as implemented');
+}
+if (!str_contains($plan, 'Decision 0103 Completeness Review — Implemented')) {
+    fail($failures, 'the completed Decision 0103 completeness review is missing');
 }
 
 if ($failures !== []) {

@@ -1,6 +1,6 @@
 # Decision 0103: Canonical String API And Companion Boundary
 
-**Status:** Accepted (amended after Stage 25a Slice 3)
+**Status:** Accepted (amended by the Minimum String Runtime Surface)
 
 ## Context
 
@@ -67,16 +67,15 @@ text views remain scheduled with the traversal surface. Integer indexing on
 ### The `String` companion
 
 Every accepted operation whose meaning is specifically about strings belongs
-to the `String` companion. The families listed below establish the accepted
-boundary and seed surface. This operation list does not yet constitute a
-reviewed exhaustive v1 inventory.
+to the `String` companion. The families listed below establish the reviewed v1
+inventory.
 
 The [String API completeness audit](../notes/string-api-completeness-audit.md)
 accounts for PHP's core string, mbstring, and grapheme capabilities, identifies
-non-String owners, and presents proposed additions separately for designer
-review. None of those proposals expands this accepted list until this record is
-amended deliberately. The Minimum String Runtime Surface is blocked until that
-review is complete.
+non-String owners, and presents the recommendations Andrew approved on
+2026-07-31. This amendment accepts only the recommendations marked for v1 and
+keeps every review/defer item named below rather than silently importing PHP's
+catalogue.
 
 #### Trimming and casing
 
@@ -86,11 +85,15 @@ String::trimStart($text)
 String::trimEnd($text)
 String::lower($text)
 String::upper($text)
+String::lowerFirst($text)
+String::upperFirst($text)
 ```
 
 Trimming uses Unicode whitespace. Casing is Unicode-aware,
 locale-independent, and returns a new string without changing the original.
 Runtime sharing optimizations may occur only when unobservable.
+`lowerFirst` and `upperFirst` apply default Unicode casing to the first extended
+grapheme cluster and leave the remainder unchanged. They do not normalize.
 
 #### Predicates
 
@@ -98,24 +101,37 @@ Runtime sharing optimizations may occur only when unobservable.
 String::contains($text, $needle)
 String::startsWith($text, $prefix)
 String::endsWith($text, $suffix)
+String::containsIgnoreCase($text, $needle)
+String::startsWithIgnoreCase($text, $prefix)
+String::endsWithIgnoreCase($text, $suffix)
 String::equalsIgnoreCase($left, $right)
 ```
 
 `contains`, `startsWith`, and `endsWith` are case-sensitive.
 `equalsIgnoreCase` uses Unicode case folding rather than ASCII-only lowercasing.
 Case-insensitive behavior is explicit rather than selected by a boolean flag.
-The runtime implementation must document empty-needle behavior consistently
-with the search contract.
+Matches must begin and end on extended grapheme-cluster boundaries. No operation
+normalizes either operand. The empty needle is contained by every string, starts
+and ends every string, has first index `0`, and has last index equal to the
+string's grapheme count.
 
 #### Search
 
 ```doria
 String::indexOf($text, $needle)
 String::lastIndexOf($text, $needle)
+String::indexOfIgnoreCase($text, $needle)
+String::lastIndexOfIgnoreCase($text, $needle)
+String::countOccurrences($text, $needle)
 ```
 
-Both return `?int`; absence is `null`. Indices use grapheme units, not UTF-8
-byte offsets. Byte-level searching belongs to `Bytes`.
+The four index operations return `?int`; absence is `null`.
+`countOccurrences` returns the number of non-overlapping left-to-right matches.
+For an empty needle it returns the number of grapheme boundaries, which is
+`$text->length + 1`. Indices use grapheme units, not UTF-8 byte offsets. A match
+beginning or ending inside a grapheme is not a match. Ignore-case operations use
+full default Unicode case folding without normalization and report positions in
+the original text. Byte-level searching belongs to `Bytes`.
 
 #### Replacement
 
@@ -125,7 +141,10 @@ String::replace($text, $search, $replacement)
 
 Replacement is literal, not regular-expression based. It replaces all
 non-overlapping occurrences from left to right. Regular expressions require a
-separately designed API.
+separately designed API. Matches are grapheme-boundary aligned. An empty search
+inserts the replacement at every grapheme boundary, including the beginning and
+end; replacing an empty search in an empty string therefore returns one
+replacement.
 
 #### Splitting and joining
 
@@ -136,7 +155,10 @@ String::join(string $separator, List<string> $values): string
 
 Splitting is literal, not regular-expression based. `join` may generalize to
 `Iterable<string>` after the public iteration protocol lands without breaking
-existing `List<string>` callers.
+existing `List<string>` callers. A non-empty separator matches only at grapheme
+boundaries and preserves empty fields. An empty separator splits into extended
+grapheme clusters; splitting an empty string by an empty separator yields an
+empty list.
 
 #### Slicing
 
@@ -151,9 +173,12 @@ String::slice(
 ): string
 ```
 
-The implementation beat must settle and test the exact accepted argument
-behavior before activation. This record does not invent a nameable `Range`
-parameter.
+A negative start counts backward from the grapheme count and clamps to zero; a
+start beyond the end returns an empty string. An absent length returns the
+remainder, zero returns an empty string, and a positive length returns at most
+that many graphemes. A negative length panics with
+`String Slice Length Cannot Be Negative`. This record does not invent a
+nameable `Range` parameter.
 
 #### Repetition and padding
 
@@ -163,9 +188,13 @@ String::padStart($text, $length, $padding)
 String::padEnd($text, $length, $padding)
 ```
 
-Padding targets use grapheme units. The implementation must define or reject an
-empty padding string and must not silently wrap negative repetition counts or
-padding targets.
+Padding targets use grapheme units. `repeat` returns empty for zero and panics
+on a negative count with `String Repetition Count Cannot Be Negative`. Padding
+returns the source when the target is no larger than its grapheme count.
+Otherwise it repeats and grapheme-truncates the padding text to the exact
+target. Negative targets panic with `String Padding Length Cannot Be Negative`;
+empty padding panics with `String Padding Text Cannot Be Empty` only when
+padding is required.
 
 #### Explicit construction from bytes
 
@@ -282,15 +311,23 @@ make the rejected split permanent.
 - The prior three-spelling division in this record is superseded.
 - `$string->` owns only intrinsic measurements and views.
 - `String::` is the exclusive home for accepted string-specific vocabulary.
-- The operation list in this record is not an exhaustively reviewed v1
-  inventory; the completeness audit prepares that review without accepting its
-  proposals.
+- The operation list in this record is the reviewed v1 inventory. The approved
+  completeness additions are the symmetric ignore-case search family,
+  `lowerFirst`, `upperFirst`, and `countOccurrences`.
+- Case-insensitive replacement, grapheme reversal, range replacement,
+  code-point construction/inspection, explicit normalization, title casing,
+  custom trim characters, chunking, multi-replacement, natural comparison,
+  edit-distance/similarity, segmentation, and display-width/wrapping remain
+  named later furnishings under the owners and dependencies recorded by the
+  audit.
 - String-specific free functions and instance-method aliases are not Doria.
 - PHP migration tooling rewrites PHP spellings to companion calls while warning
   when grapheme-based Doria semantics differ from byte-based PHP behavior.
-- The Minimum String Runtime Surface selects and implements the first executable
-  subset after the completeness review. This decision does not implement any
-  member or companion operation.
+- The executable subset includes the four intrinsic properties, every
+  pre-audit companion operation above except the traversal views and
+  `compare`/`compareIgnoreCase`, and the approved completeness additions.
+- Interpreter and native execution share one pinned Unicode implementation;
+  backends do not define String semantics.
 
 ## Invalidated elsewhere
 

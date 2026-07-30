@@ -3,7 +3,7 @@
 **Audit date:** 2026-07-30  
 **PHP release current at audit:** 8.5.9  
 **PHP manual copyright:** 2001-2026 The PHP Documentation Group  
-**Status:** Implemented audit; recommendations require Andrew's review
+**Status:** Implemented audit; recommended path approved 2026-07-31
 
 ## Purpose
 
@@ -17,9 +17,11 @@ The machine-readable row-by-row result is
 Every row names its semantic unit, Doria owner or unresolved owning domain,
 migration action, dependencies, and whether a designer decision remains.
 
-This is a design checkpoint only. It accepts no proposed operation, changes no
-compiler behavior, and blocks the Minimum String Runtime Surface until Andrew
-reviews the proposed completeness amendment.
+This was a design checkpoint only and changed no compiler behavior. Andrew
+approved its recommended path on 2026-07-31. The approval accepts the symmetric
+ignore-case search family, first-grapheme casing, and occurrence counting for
+v1; the review/defer rows remain named later furnishings under their recorded
+dependencies.
 
 ## Official Sources
 
@@ -80,8 +82,8 @@ Decision 0103 currently accepts this boundary:
 - Doria has no public `str_*` family, string-operation instance aliases,
   integer string indexing, or `$text->chars`.
 
-This remains the accepted surface. It is a coherent seed, not a reviewed
-exhaustive v1 inventory.
+This was the accepted surface at audit time. The 2026-07-31 review resolution
+amends it as recorded below.
 
 ## Inventory Findings
 
@@ -517,20 +519,23 @@ Each item below is a recommendation for review, not an accepted API.
   semantics; designer decision required only when the text-analysis domain is
   designed.
 
-## Proposed Completeness Amendment
+## Approved Completeness Resolution
 
-### Recommended additions to String
+### Accepted additions to String
 
-Subject to Andrew's review:
+Andrew approved:
 
-- accept the symmetric case-insensitive search family:
+- the symmetric case-insensitive search family:
   `containsIgnoreCase`, `startsWithIgnoreCase`, `endsWithIgnoreCase`,
   `indexOfIgnoreCase`, and `lastIndexOfIgnoreCase`;
-- consider `replaceIgnoreCase`, `countOccurrences`, `lowerFirst`,
-  `upperFirst`, grapheme `reverse`, and grapheme `replaceSlice` for v1;
-- defer title casing, chunks, custom trimming, code-point APIs, natural
-  comparison, and multi-replacement until their dependencies and units are
-  settled.
+- `countOccurrences`;
+- `lowerFirst` and `upperFirst`.
+
+Case-insensitive replacement, grapheme reversal, and grapheme range
+replacement remain explicit follow-up candidates rather than accepted
+operations. Title casing, chunks, custom trimming, code-point APIs, natural
+comparison, and multi-replacement remain deferred until their dependencies and
+units are settled.
 
 ### Recommended non-String owners
 
@@ -556,9 +561,9 @@ Subject to Andrew's review:
 - Route `strip_tags` to real HTML parsing rather than reproducing unsafe text
   stripping.
 
-### Proposed final Decision 0103 outline
+### Final Decision 0103 amendment outline
 
-After designer review, Decision 0103 should:
+The reviewed Decision 0103 amendment:
 
 1. preserve the accepted instance/companion/free-function boundary;
 2. enumerate the accepted v1 String operation families;
@@ -567,7 +572,8 @@ After designer review, Decision 0103 should:
 5. identify non-String domain owners without inventing unresolved module names;
 6. leave post-v1 additions explicitly named rather than silently absent.
 
-The accepted Decision 0103 list is not expanded by this audit.
+The audit itself did not expand Decision 0103. Andrew's 2026-07-31 review
+resolution did, and Decision 0103 now records that accepted delta.
 
 ## Migration Findings
 
@@ -586,6 +592,10 @@ a warning, convert PHP `false` to a Doria integer sentinel, or send users to an
 unimplemented Doria method.
 
 ## Designer Review
+
+**Resolution:** approved on 2026-07-31. Rows whose suggested status was
+`Accept` are accepted. `Review` and `Defer` rows remain named later
+furnishings; approval did not silently settle their unresolved semantics.
 
 | Decision                             | Recommendation                                              | Alternatives                            | Why It Matters                              | Runtime Impact                              | Migration Impact                         | Suggested v1 Status |
 | ------------------------------------ | ----------------------------------------------------------- | --------------------------------------- | ------------------------------------------- | ------------------------------------------- | ---------------------------------------- | ------------------- |
@@ -622,6 +632,6 @@ unimplemented Doria method.
 
 ## Next Required Action
 
-Andrew reviews the designer-review table and either accepts, rejects, or defers
-each Decision 0103 completeness recommendation. Only then may the Minimum
-String Runtime Surface resume.
+Implement the Interactive Line-Input Amendment. The selected Minimum String
+Runtime Surface and the approved completeness additions are implemented; do not
+pull in the explicitly deferred domain and dependency work.

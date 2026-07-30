@@ -245,6 +245,39 @@
             }
         ]
     },
+    "reviewResolution": {
+        "date": "2026-07-31",
+        "approvedBy": "Andrew Masiye",
+        "approvedCanonicalStringOperations": [
+            "String::containsIgnoreCase",
+            "String::startsWithIgnoreCase",
+            "String::endsWithIgnoreCase",
+            "String::indexOfIgnoreCase",
+            "String::lastIndexOfIgnoreCase",
+            "String::lowerFirst",
+            "String::upperFirst",
+            "String::countOccurrences"
+        ],
+        "deferredCandidateOperations": [
+            "String::replaceIgnoreCase",
+            "String::toTitleCase",
+            "String::reverse",
+            "String::chunks",
+            "String::replaceSlice",
+            "String::replaceMany",
+            "String::trimCharacters"
+        ],
+        "domainOwnedOrDependencyDeferred": [
+            "code-point construction and inspection",
+            "normalization",
+            "natural and locale-aware comparison",
+            "edit distance and similarity",
+            "word, sentence, and line segmentation",
+            "display width and wrapping",
+            "phonetic keys"
+        ],
+        "note": "The entry rows preserve the 2026-07-30 audit classification. This resolution is the authoritative approval overlay."
+    },
     "entries": [
         {
             "phpSurface": "core",
