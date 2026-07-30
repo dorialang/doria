@@ -1869,6 +1869,27 @@ fn nullable_ownership_paths_preserve_transfer_and_cleanup() {
 }
 
 #[test]
+fn nullable_collection_access_forwards_lazily() {
+    let source =
+        include_str!("../../../examples/native/main_stage25a_nullable_collection_access.doria");
+    let program = doriac::lower_source_to_mir("stage25a-nullable-collection-access.doria", source)
+        .expect("nullable collection accesses should lower through presence-guarded forwarding");
+    let output = doriac::mir_interpreter::interpret(&program)
+        .expect("nullable collection accesses should execute lazily");
+    assert_eq!(
+        output.stdout,
+        include_bytes!(
+            "fixtures/native_io/main_stage25a_nullable_collection_access/expected_stdout"
+        )
+    );
+    doriac::codegen_cranelift::lower_mir_to_object(&program)
+        .expect("nullable collection accesses should lower through Cranelift");
+    #[cfg(feature = "llvm-backend")]
+    doriac::codegen_llvm::lower_mir_to_object(&program)
+        .expect("nullable collection accesses should lower through LLVM");
+}
+
+#[test]
 fn nested_shadows_do_not_extend_outer_borrow_lifetimes() {
     doriac::check_source(
         "stage25a-shadowed-borrow-liveness.doria",

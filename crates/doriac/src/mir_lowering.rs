@@ -4636,6 +4636,9 @@ fn lower_nullable_scalar_expression(
     expected: mir::ScalarType,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::NullableScalarExpression> {
+    if let Some(value) = lower_null_safe_collection_scalar(expr, expected, context)? {
+        return Ok(value);
+    }
     if let Some((collection, key, value_type, access)) =
         lower_collection_nullable_property(expr, context)?
     {
@@ -8292,6 +8295,311 @@ fn lower_collection_local(
             "collection access requires a materialized collection place",
         )]),
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct NullableCollectionAccessReceiver {
+    local: mir::LocalId,
+    collection: mir::CollectionTypeId,
+    writable: bool,
+}
+
+fn lower_nullable_collection_access_receiver(
+    expr: &hir::Expr,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<Option<NullableCollectionAccessReceiver>> {
+    let ty = context.expression_type(expr)?;
+    let access = ty.shared_access();
+    let Some(access) = access.filter(|access| access.nullable) else {
+        return Ok(None);
+    };
+    let mir::WritableSharedPayload::Collection(collection) = access.payload else {
+        return Ok(None);
+    };
+
+    let local = if let hir::Expr::Variable { name, span } = unparenthesized_place(expr) {
+        context.lookup_local(name, *span)?
+    } else {
+        let value = lower_nullable_shared_reference_access_expression(
+            expr,
+            access.payload,
+            access.writable,
+            false,
+            context,
+        )?;
+        let local = if value.owned_temporary() {
+            context.declare_owned_temp(ty)
+        } else {
+            context.declare_borrowed_temp(ty, false)
+        };
+        context.push_statement(mir::Statement::AssignLocal {
+            target: local,
+            value: mir::Rvalue::NullableSharedReferenceAccess(value),
+        });
+        local
+    };
+
+    Ok(Some(NullableCollectionAccessReceiver {
+        local,
+        collection,
+        writable: access.writable,
+    }))
+}
+
+fn lower_present_collection_access(
+    receiver: NullableCollectionAccessReceiver,
+    context: &mut LoweringContext,
+) -> mir::LocalId {
+    let payload = mir::WritableSharedPayload::Collection(receiver.collection);
+    let access_type = if receiver.writable {
+        mir::Type::WritableSharedReferenceAccess(payload)
+    } else {
+        mir::Type::ReadonlySharedReferenceAccess(payload)
+    };
+    let access = context.declare_borrowed_temp(access_type, receiver.writable);
+    context.push_statement(mir::Statement::AssignLocal {
+        target: access,
+        value: mir::Rvalue::SharedReferenceAccess(
+            mir::SharedReferenceAccessExpression::NullableLocalAssumeNonNull {
+                payload,
+                local: receiver.local,
+                writable: receiver.writable,
+                transfer: false,
+            },
+        ),
+    });
+
+    let collection = context.declare_borrowed_temp(
+        mir::Type::Collection(receiver.collection),
+        receiver.writable,
+    );
+    context.push_statement(mir::Statement::AssignLocal {
+        target: collection,
+        value: mir::Rvalue::Collection(mir::CollectionExpression::SharedAccessPayload {
+            collection: receiver.collection,
+            access,
+            writable: receiver.writable,
+        }),
+    });
+    collection
+}
+
+fn lower_null_safe_collection_scalar(
+    expr: &hir::Expr,
+    expected: mir::ScalarType,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<Option<mir::NullableScalarExpression>> {
+    let (object, operation) = match unparenthesized_place(expr) {
+        hir::Expr::PropertyAccess {
+            object,
+            property,
+            null_safe: true,
+            ..
+        } => (
+            object.as_ref(),
+            NullableCollectionScalarOperation::Property(property.as_str()),
+        ),
+        hir::Expr::MethodCall {
+            object,
+            method,
+            args,
+            null_safe: true,
+            ..
+        } => (
+            object.as_ref(),
+            NullableCollectionScalarOperation::Method(method.as_str(), args),
+        ),
+        _ => return Ok(None),
+    };
+    let Some(receiver) = lower_nullable_collection_access_receiver(object, context)? else {
+        return Ok(None);
+    };
+    let definition = context.collection_type(receiver.collection).clone();
+    if !operation.matches(&definition, expected) {
+        return Ok(None);
+    }
+
+    let result_type = mir::Type::NullableScalar(expected);
+    let result = context.declare_borrowed_temp(result_type, false);
+    let present_block = context.create_block();
+    let absent_block = context.create_block();
+    let join_block = context.create_block();
+    context.terminate_condition(
+        mir::BoolExpression::NullableSharedReferenceAccessIsPresent(Box::new(
+            mir::NullableSharedReferenceAccessExpression::Local {
+                payload: mir::WritableSharedPayload::Collection(receiver.collection),
+                local: receiver.local,
+                writable: receiver.writable,
+                transfer: false,
+            },
+        )),
+        present_block,
+        absent_block,
+    );
+
+    context.current_block = Some(present_block);
+    let collection = lower_present_collection_access(receiver, context);
+    let value = operation.lower(collection, &definition, expected, context)?;
+    context.push_statement(mir::Statement::AssignLocal {
+        target: result,
+        value: mir::Rvalue::NullableScalar(value),
+    });
+    context.terminate_current(mir::Terminator::Jump(join_block));
+
+    context.current_block = Some(absent_block);
+    context.push_statement(mir::Statement::AssignLocal {
+        target: result,
+        value: mir::Rvalue::NullableScalar(mir::NullableScalarExpression::Null(expected)),
+    });
+    context.terminate_current(mir::Terminator::Jump(join_block));
+
+    context.current_block = Some(join_block);
+    Ok(Some(mir::NullableScalarExpression::Local {
+        ty: expected,
+        local: result,
+    }))
+}
+
+enum NullableCollectionScalarOperation<'a> {
+    Property(&'a str),
+    Method(&'a str, &'a [hir::Argument]),
+}
+
+impl NullableCollectionScalarOperation<'_> {
+    fn matches(&self, definition: &mir::CollectionType, expected: mir::ScalarType) -> bool {
+        match self {
+            Self::Property("length" | "count") => {
+                expected == mir::ScalarType::Integer(IntegerType::Int64)
+            }
+            Self::Property("isEmpty") => expected == mir::ScalarType::Bool,
+            Self::Property("first" | "last") => {
+                definition.kind == mir::CollectionKind::List
+                    && definition.value == mir::Type::Scalar(expected)
+            }
+            Self::Method("contains", [_]) => {
+                expected == mir::ScalarType::Bool
+                    && matches!(
+                        definition.kind,
+                        mir::CollectionKind::List | mir::CollectionKind::Set
+                    )
+            }
+            Self::Method("has", [_]) => {
+                expected == mir::ScalarType::Bool
+                    && definition.kind == mir::CollectionKind::Dictionary
+            }
+            Self::Method("add" | "remove", [_]) => {
+                (expected == mir::ScalarType::Bool && definition.kind == mir::CollectionKind::Set)
+                    || (definition.value == mir::Type::Scalar(expected)
+                        && definition.kind == mir::CollectionKind::Dictionary)
+            }
+            Self::Method("get", [_]) => {
+                definition.kind == mir::CollectionKind::Dictionary
+                    && definition.value == mir::Type::Scalar(expected)
+            }
+            Self::Method("removeAt", [_]) | Self::Method("pop", []) => {
+                definition.kind == mir::CollectionKind::List
+                    && definition.value == mir::Type::Scalar(expected)
+            }
+            _ => false,
+        }
+    }
+
+    fn lower(
+        &self,
+        collection: mir::LocalId,
+        definition: &mir::CollectionType,
+        expected: mir::ScalarType,
+        context: &mut LoweringContext,
+    ) -> DiagnosticResult<mir::NullableScalarExpression> {
+        match self {
+            Self::Property("length" | "count") => Ok(mir::NullableScalarExpression::Value(
+                value_expression_from_operand(expected, mir::Operand::CollectionLength(collection)),
+            )),
+            Self::Property("isEmpty") => Ok(mir::NullableScalarExpression::Value(
+                mir::ValueExpression::Bool(mir::BoolExpression::CollectionIsEmpty { collection }),
+            )),
+            Self::Property(property @ ("first" | "last")) => {
+                Ok(mir::NullableScalarExpression::DictionaryGet {
+                    ty: expected,
+                    collection,
+                    key: Box::new(zero_int_rvalue()),
+                    access: if *property == "first" {
+                        mir::NullableCollectionAccess::First
+                    } else {
+                        mir::NullableCollectionAccess::Last
+                    },
+                })
+            }
+            Self::Method("get" | "remove", [key]) => {
+                let key_type = definition
+                    .key
+                    .expect("dictionary collection has a key type");
+                Ok(mir::NullableScalarExpression::DictionaryGet {
+                    ty: expected,
+                    collection,
+                    key: Box::new(lower_rvalue_as_borrowed(&key.value, key_type, context)?),
+                    access: if matches!(self, Self::Method("get", _)) {
+                        mir::NullableCollectionAccess::Get
+                    } else {
+                        mir::NullableCollectionAccess::Remove
+                    },
+                })
+            }
+            Self::Method("pop", []) => Ok(mir::NullableScalarExpression::DictionaryGet {
+                ty: expected,
+                collection,
+                key: Box::new(zero_int_rvalue()),
+                access: mir::NullableCollectionAccess::Pop,
+            }),
+            Self::Method("removeAt", [index]) => {
+                let index = lower_rvalue_as_expected(
+                    &index.value,
+                    mir::Type::Scalar(mir::ScalarType::Integer(IntegerType::Int64)),
+                    context,
+                )?;
+                Ok(mir::NullableScalarExpression::Value(
+                    value_expression_from_operand(
+                        expected,
+                        mir::Operand::CollectionIndex {
+                            collection,
+                            index: Box::new(index),
+                            remove: true,
+                        },
+                    ),
+                ))
+            }
+            Self::Method(method, [argument]) => {
+                let op = match *method {
+                    "contains" | "has" => mir::CollectionMembershipOp::Contains,
+                    "add" => mir::CollectionMembershipOp::Add,
+                    "remove" => mir::CollectionMembershipOp::Remove,
+                    _ => unreachable!("operation was checked before lowering"),
+                };
+                let value_type = definition.key.unwrap_or(definition.value);
+                let value = if op == mir::CollectionMembershipOp::Add {
+                    lower_rvalue_as_expected(&argument.value, value_type, context)?
+                } else {
+                    lower_rvalue_as_borrowed(&argument.value, value_type, context)?
+                };
+                Ok(mir::NullableScalarExpression::Value(
+                    mir::ValueExpression::Bool(mir::BoolExpression::CollectionHas {
+                        collection,
+                        value: Box::new(value),
+                        op,
+                    }),
+                ))
+            }
+            _ => unreachable!("operation was checked before lowering"),
+        }
+    }
+}
+
+fn zero_int_rvalue() -> mir::Rvalue {
+    mir::Rvalue::Value(mir::ValueExpression::Integer(
+        mir::IntegerExpression::constant(
+            IntegerValue::from_i128(IntegerType::Int64, 0).expect("zero is a valid int"),
+        ),
+    ))
 }
 
 fn lower_bytes_local(

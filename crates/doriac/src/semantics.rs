@@ -4074,7 +4074,7 @@ impl<'program> Checker<'program> {
                         self.lookup_property(object, property, *span, scopes, method_context);
                     }
                 } else if self
-                    .collection_property_type(object, property, scopes, method_context)
+                    .collection_property_type(object, property, *null_safe, scopes, method_context)
                     .is_some()
                 {
                     self.check_collection_property(object, property, *span, scopes, method_context);
@@ -9172,9 +9172,13 @@ impl<'program> Checker<'program> {
                         return self.types.unknown();
                     }
                 }
-                if let Some(result) =
-                    self.collection_property_type(object, property, scopes, method_context)
-                {
+                if let Some(result) = self.collection_property_type(
+                    object,
+                    property,
+                    *null_safe,
+                    scopes,
+                    method_context,
+                ) {
                     return result;
                 }
                 let Some(class_type) = self.expr_class_type(object, scopes, method_context) else {
@@ -9221,9 +9225,13 @@ impl<'program> Checker<'program> {
                         return self.types.unknown();
                     }
                 }
-                if let Some(result) =
-                    self.collection_method_return_type(object, method, scopes, method_context)
-                {
+                if let Some(result) = self.collection_method_return_type(
+                    object,
+                    method,
+                    *null_safe,
+                    scopes,
+                    method_context,
+                ) {
                     return result;
                 }
                 if let TypeKind::TypeParameter(parameter) = self.types.kind(object_ty) {
@@ -9458,14 +9466,18 @@ impl<'program> Checker<'program> {
         &mut self,
         object: &Expr,
         property: &str,
+        null_safe: bool,
         scopes: &ScopeStack,
         method_context: Option<&MethodContext>,
     ) -> Option<TypeId> {
         let ty = self.infer_expr_type(object, scopes, method_context);
+        let nullable_access = self
+            .forwarded_access_payload(ty)
+            .is_some_and(|(_, nullable)| nullable);
         let ty = self.forwarded_access_payload_type(ty);
         let int = self.types.intern(TypeKind::Integer(IntegerType::Int64));
         let bool_ty = self.types.intern(TypeKind::Bool);
-        match (self.types.kind(ty), property) {
+        let result = match (self.types.kind(ty), property) {
             (TypeKind::TypedArray(_), "length") => Some(int),
             (TypeKind::Bytes, "length") => Some(int),
             (TypeKind::List(_) | TypeKind::Dictionary(_, _) | TypeKind::Set(_), "count") => {
@@ -9487,7 +9499,8 @@ impl<'program> Checker<'program> {
                 _,
             ) => Some(self.types.unknown()),
             _ => None,
-        }
+        }?;
+        Some(self.null_safe_result_type(result, null_safe && nullable_access))
     }
 
     fn shared_handle_type(
@@ -9506,9 +9519,19 @@ impl<'program> Checker<'program> {
     }
 
     fn forwarded_access_payload_type(&self, ty: TypeId) -> TypeId {
+        self.forwarded_access_payload(ty)
+            .map(|(payload, _)| payload)
+            .unwrap_or(ty)
+    }
+
+    fn forwarded_access_payload(&self, ty: TypeId) -> Option<(TypeId, bool)> {
         match self.types.kind(ty) {
-            TypeKind::SharedHandle(kind, payload) if kind.is_access() => *payload,
-            _ => ty,
+            TypeKind::SharedHandle(kind, payload) if kind.is_access() => Some((*payload, false)),
+            TypeKind::Nullable(inner) => match self.types.kind(*inner) {
+                TypeKind::SharedHandle(kind, payload) if kind.is_access() => Some((*payload, true)),
+                _ => None,
+            },
+            _ => None,
         }
     }
 
@@ -9865,14 +9888,18 @@ impl<'program> Checker<'program> {
         &mut self,
         object: &Expr,
         method: &str,
+        null_safe: bool,
         scopes: &ScopeStack,
         method_context: Option<&MethodContext>,
     ) -> Option<TypeId> {
         let ty = self.infer_expr_type(object, scopes, method_context);
+        let nullable_access = self
+            .forwarded_access_payload(ty)
+            .is_some_and(|(_, nullable)| nullable);
         let ty = self.forwarded_access_payload_type(ty);
         let void = self.types.intern(TypeKind::Void);
         let bool_ty = self.types.intern(TypeKind::Bool);
-        match (self.types.kind(ty).clone(), method) {
+        let result = match (self.types.kind(ty).clone(), method) {
             (TypeKind::List(_), "add" | "insertAt") | (TypeKind::Dictionary(_, _), "set") => {
                 Some(void)
             }
@@ -9903,7 +9930,8 @@ impl<'program> Checker<'program> {
                 _,
             ) => Some(self.types.unknown()),
             _ => None,
-        }
+        }?;
+        Some(self.null_safe_result_type(result, null_safe && nullable_access))
     }
 
     fn check_collection_property(
