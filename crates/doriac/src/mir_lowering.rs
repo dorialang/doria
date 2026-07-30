@@ -1563,16 +1563,32 @@ fn lower_statement_sequence(
                 result?;
             }
             hir::Stmt::Echo { expr, .. } => {
-                let echo = lower_echo(expr, context)?;
-                context.push_statement(echo);
+                lower_with_statement_temporaries(context, |context| {
+                    let echo = lower_echo(expr, context)?;
+                    context.push_statement(echo);
+                    Ok(())
+                })?;
             }
             hir::Stmt::Return { expr, span } => {
-                let terminator = lower_return(expr.as_ref(), *span, return_type, context)?;
-                context.terminate_current(terminator);
+                lower_with_statement_temporaries(context, |context| {
+                    let terminator = lower_return(expr.as_ref(), *span, return_type, context)?;
+                    context.terminate_current(terminator);
+                    Ok(())
+                })?;
             }
-            hir::Stmt::VarDecl(decl) => lower_var_decl(decl, context)?,
-            hir::Stmt::Assignment(assignment) => lower_assignment(assignment, context)?,
-            hir::Stmt::Increment(increment) => lower_increment(increment, context)?,
+            hir::Stmt::VarDecl(decl) => {
+                lower_with_statement_temporaries(context, |context| lower_var_decl(decl, context))?;
+            }
+            hir::Stmt::Assignment(assignment) => {
+                lower_with_statement_temporaries(context, |context| {
+                    lower_assignment(assignment, context)
+                })?;
+            }
+            hir::Stmt::Increment(increment) => {
+                lower_with_statement_temporaries(context, |context| {
+                    lower_increment(increment, context)
+                })?;
+            }
             hir::Stmt::If(if_stmt) => lower_if_statement(if_stmt, return_type, context)?,
             hir::Stmt::While(while_stmt) => {
                 lower_while_statement(while_stmt, return_type, context)?;
@@ -1588,123 +1604,140 @@ fn lower_statement_sequence(
                 lower_loop_control(*span, LoopControl::Continue, context)?;
             }
             hir::Stmt::Expr { expr, span } => {
-                if let hir::Expr::FunctionCall {
-                    name,
-                    args,
-                    span: call_span,
-                } = expr
-                {
-                    if lower_byte_file_write_statement(name, args, *call_span, context)? {
-                        continue;
-                    }
-                }
-                materialize_nested_collection_places(expr, false, context)?;
-                if let hir::Expr::MethodCall {
-                    object,
-                    method,
-                    args,
-                    span: call_span,
-                    null_safe,
-                } = expr
-                {
-                    if !*null_safe
-                        && lower_collection_method_statement(object, method, args, context)?
-                    {
-                        continue;
-                    }
-                    let statement = if *null_safe {
-                        let (object, signature, args) =
-                            lower_null_safe_method_call(object, method, args, *call_span, context)?;
-                        discarded_null_safe_call_statement(object, signature, args, *span)?
-                    } else {
-                        let (signature, args) =
-                            lower_instance_method_call(object, method, args, *call_span, context)?;
-                        discarded_call_statement("method", signature, args, *span)?
-                    };
-                    context.push_statement(statement);
-                    continue;
-                }
-                if let hir::Expr::StaticCall {
-                    class_name,
-                    method,
-                    args,
-                    span: call_span,
-                } = expr
-                {
-                    let (signature, args) =
-                        lower_static_method_call(class_name, method, args, *call_span, context)?;
-                    let statement =
-                        discarded_call_statement("static method", signature, args, *span)?;
-                    context.push_statement(statement);
-                    continue;
-                }
-                if let hir::Expr::FunctionCall {
-                    name,
-                    args,
-                    span: call_span,
-                } = expr
-                {
-                    if name == "panic" {
-                        let message = lower_panic_message(args, *call_span, context)?;
-                        context.terminate_current(mir::Terminator::Panic(message));
-                    } else if name == "printf" {
-                        let format = lower_format_expression(args, *call_span, context)?;
-                        context.push_statement(mir::Statement::Printf(format));
-                    } else if name == "write_file" {
-                        let [path, contents] = argument_values(args)[..] else {
-                            return Err(vec![unsupported(
-                                *call_span,
-                                "write_file expects 2 arguments",
-                            )]);
-                        };
-                        let path = lower_string_expression(path, context)?;
-                        let contents = lower_string_expression(contents, context)?;
-                        context.push_statement(mir::Statement::WriteFile { path, contents });
-                    } else if name == "append_file" {
-                        let [path, contents] = argument_values(args)[..] else {
-                            return Err(vec![unsupported(
-                                *call_span,
-                                "append_file expects 2 arguments",
-                            )]);
-                        };
-                        let path = lower_string_expression(path, context)?;
-                        let contents = lower_string_expression(contents, context)?;
-                        context.push_statement(mir::Statement::AppendFile { path, contents });
-                    } else if matches!(name.as_str(), "write_stdout_bytes" | "write_stderr_bytes") {
-                        let [contents] = argument_values(args)[..] else {
-                            return Err(vec![unsupported(
-                                *call_span,
-                                format!("{name} expects 1 argument"),
-                            )]);
-                        };
-                        let contents = lower_bytes_local(contents, context)?.0;
-                        context.push_statement(mir::Statement::WriteStreamBytes {
-                            contents,
-                            stderr: name == "write_stderr_bytes",
-                        });
-                    } else if name == "write_stderr" {
-                        let [value] = argument_values(args)[..] else {
-                            return Err(vec![unsupported(
-                                *call_span,
-                                "write_stderr expects 1 argument",
-                            )]);
-                        };
-                        let value = lower_string_expression(value, context)?;
-                        context.push_statement(mir::Statement::WriteStderr(value));
-                    } else {
-                        let call = lower_statement_call(name, args, *call_span, context)?;
-                        context.push_statement(call);
-                    }
-                } else {
-                    return Err(vec![unsupported(
-                        *span,
-                        "only calls to void free functions can be used as expression statements in native compilation",
-                    )]);
-                }
+                lower_with_statement_temporaries(context, |context| {
+                    lower_expression_statement(expr, *span, context)
+                })?;
             }
         }
     }
 
+    Ok(())
+}
+
+fn lower_with_statement_temporaries(
+    context: &mut LoweringContext,
+    lower: impl FnOnce(&mut LoweringContext) -> DiagnosticResult<()>,
+) -> DiagnosticResult<()> {
+    context.begin_statement_temporaries();
+    let result = lower(context);
+    context.finish_statement_temporaries(result.is_ok());
+    result
+}
+
+fn lower_expression_statement(
+    expr: &hir::Expr,
+    span: Span,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<()> {
+    if let hir::Expr::FunctionCall {
+        name,
+        args,
+        span: call_span,
+    } = expr
+    {
+        if lower_byte_file_write_statement(name, args, *call_span, context)? {
+            return Ok(());
+        }
+    }
+    materialize_nested_collection_places(expr, false, context)?;
+    if let hir::Expr::MethodCall {
+        object,
+        method,
+        args,
+        span: call_span,
+        null_safe,
+    } = expr
+    {
+        if !*null_safe && lower_collection_method_statement(object, method, args, context)? {
+            return Ok(());
+        }
+        let statement = if *null_safe {
+            let (object, signature, args) =
+                lower_null_safe_method_call(object, method, args, *call_span, context)?;
+            discarded_null_safe_call_statement(object, signature, args, span)?
+        } else {
+            let (signature, args) =
+                lower_instance_method_call(object, method, args, *call_span, context)?;
+            discarded_call_statement("method", signature, args, span)?
+        };
+        context.push_statement(statement);
+        return Ok(());
+    }
+    if let hir::Expr::StaticCall {
+        class_name,
+        method,
+        args,
+        span: call_span,
+    } = expr
+    {
+        let (signature, args) =
+            lower_static_method_call(class_name, method, args, *call_span, context)?;
+        let statement = discarded_call_statement("static method", signature, args, span)?;
+        context.push_statement(statement);
+        return Ok(());
+    }
+    let hir::Expr::FunctionCall {
+        name,
+        args,
+        span: call_span,
+    } = expr
+    else {
+        return Err(vec![unsupported(
+            span,
+            "only calls to void free functions can be used as expression statements in native compilation",
+        )]);
+    };
+    if name == "panic" {
+        let message = lower_panic_message(args, *call_span, context)?;
+        context.terminate_current(mir::Terminator::Panic(message));
+    } else if name == "printf" {
+        let format = lower_format_expression(args, *call_span, context)?;
+        context.push_statement(mir::Statement::Printf(format));
+    } else if name == "write_file" {
+        let [path, contents] = argument_values(args)[..] else {
+            return Err(vec![unsupported(
+                *call_span,
+                "write_file expects 2 arguments",
+            )]);
+        };
+        let path = lower_string_expression(path, context)?;
+        let contents = lower_string_expression(contents, context)?;
+        context.push_statement(mir::Statement::WriteFile { path, contents });
+    } else if name == "append_file" {
+        let [path, contents] = argument_values(args)[..] else {
+            return Err(vec![unsupported(
+                *call_span,
+                "append_file expects 2 arguments",
+            )]);
+        };
+        let path = lower_string_expression(path, context)?;
+        let contents = lower_string_expression(contents, context)?;
+        context.push_statement(mir::Statement::AppendFile { path, contents });
+    } else if matches!(name.as_str(), "write_stdout_bytes" | "write_stderr_bytes") {
+        let [contents] = argument_values(args)[..] else {
+            return Err(vec![unsupported(
+                *call_span,
+                format!("{name} expects 1 argument"),
+            )]);
+        };
+        let contents = lower_bytes_local(contents, context)?.0;
+        context.push_statement(mir::Statement::WriteStreamBytes {
+            contents,
+            stderr: name == "write_stderr_bytes",
+        });
+    } else if name == "write_stderr" {
+        let [value] = argument_values(args)[..] else {
+            return Err(vec![unsupported(
+                *call_span,
+                "write_stderr expects 1 argument",
+            )]);
+        };
+        let value = lower_string_expression(value, context)?;
+        context.push_statement(mir::Statement::WriteStderr(value));
+    } else {
+        let call = lower_statement_call(name, args, *call_span, context)?;
+        context.push_statement(call);
+    }
     Ok(())
 }
 
@@ -1802,12 +1835,10 @@ fn lower_for_statement_in_scope(
     context: &mut LoweringContext,
 ) -> DiagnosticResult<()> {
     if let Some(initializer) = &for_stmt.initializer {
-        match initializer {
-            hir::ForInitializer::VarDecl(decl) => lower_var_decl(decl, context)?,
-            hir::ForInitializer::Assignment(assignment) => {
-                lower_assignment(assignment, context)?;
-            }
-        }
+        lower_with_statement_temporaries(context, |context| match initializer {
+            hir::ForInitializer::VarDecl(decl) => lower_var_decl(decl, context),
+            hir::ForInitializer::Assignment(assignment) => lower_assignment(assignment, context),
+        })?;
     }
 
     let header_block = context.create_block();
@@ -1844,12 +1875,10 @@ fn lower_for_statement_in_scope(
 
     context.current_block = Some(increment_block);
     if let Some(increment) = &for_stmt.increment {
-        match increment {
-            hir::ForIncrement::Increment(increment) => lower_increment(increment, context)?,
-            hir::ForIncrement::Assignment(assignment) => {
-                lower_assignment(assignment, context)?;
-            }
-        }
+        lower_with_statement_temporaries(context, |context| match increment {
+            hir::ForIncrement::Increment(increment) => lower_increment(increment, context),
+            hir::ForIncrement::Assignment(assignment) => lower_assignment(assignment, context),
+        })?;
     }
     context.terminate_current(mir::Terminator::Jump(header_block));
     context.current_block = context.is_reachable(exit_block).then_some(exit_block);
@@ -2540,6 +2569,7 @@ struct LoweringContext<'semantic> {
     local_scopes: Vec<HashMap<String, mir::LocalId>>,
     materialized_collection_places: HashMap<(usize, usize), mir::LocalId>,
     scope_owned_locals: Vec<Vec<DropObligation>>,
+    statement_owned_locals: Vec<Vec<DropObligation>>,
     temp_counter: usize,
     blocks: Vec<BlockBuilder>,
     reachable_blocks: Vec<bool>,
@@ -2604,6 +2634,7 @@ impl<'semantic> LoweringContext<'semantic> {
             local_scopes: vec![HashMap::new()],
             materialized_collection_places: HashMap::new(),
             scope_owned_locals: vec![Vec::new()],
+            statement_owned_locals: Vec::new(),
             temp_counter: 0,
             blocks: vec![BlockBuilder {
                 id: mir::BlockId(0),
@@ -2715,12 +2746,56 @@ impl<'semantic> LoweringContext<'semantic> {
     }
 
     fn cleanup_scopes_from(&mut self, depth: usize) {
+        self.cleanup_active_statement_temporaries();
         let cleanup = self.scope_owned_locals[depth..]
             .iter()
-            .rev()
-            .flat_map(|scope| scope.iter().rev().copied())
+            .flat_map(|scope| scope.iter().copied())
             .collect::<Vec<_>>();
-        for obligation in cleanup {
+        self.emit_drop_obligations(&cleanup);
+    }
+
+    fn has_cleanup_obligations(&self) -> bool {
+        self.scope_owned_locals
+            .iter()
+            .any(|scope| !scope.is_empty())
+            || self
+                .statement_owned_locals
+                .iter()
+                .any(|statement| !statement.is_empty())
+    }
+
+    fn begin_statement_temporaries(&mut self) {
+        self.statement_owned_locals.push(Vec::new());
+    }
+
+    fn finish_statement_temporaries(&mut self, emit_cleanup: bool) {
+        let cleanup = self
+            .statement_owned_locals
+            .pop()
+            .expect("MIR lowering must have an active statement-temporary scope");
+        if emit_cleanup && self.current_block.is_some() {
+            self.emit_drop_obligations(&cleanup);
+        }
+        self.materialized_collection_places.clear();
+    }
+
+    fn take_statement_temporaries(&mut self) -> Vec<DropObligation> {
+        self.statement_owned_locals
+            .pop()
+            .expect("MIR lowering must have an active statement-temporary scope")
+    }
+
+    fn cleanup_active_statement_temporaries(&mut self) {
+        let cleanup = self
+            .statement_owned_locals
+            .iter_mut()
+            .flat_map(|statement| statement.drain(..))
+            .collect::<Vec<_>>();
+        self.emit_drop_obligations(&cleanup);
+    }
+
+    fn emit_drop_obligations(&mut self, cleanup: &[DropObligation]) {
+        for obligation in cleanup.iter().rev().copied() {
             self.push_statement(match obligation {
                 DropObligation::Class(local, class) => mir::Statement::DropClass { local, class },
                 DropObligation::Shared(local, class) => {
@@ -2748,12 +2823,6 @@ impl<'semantic> LoweringContext<'semantic> {
                 }
             });
         }
-    }
-
-    fn has_cleanup_obligations(&self) -> bool {
-        self.scope_owned_locals
-            .iter()
-            .any(|scope| !scope.is_empty())
     }
 
     fn push_loop_targets(&mut self, targets: LoopTargets) {
@@ -2897,10 +2966,14 @@ impl<'semantic> LoweringContext<'semantic> {
             synthetic: true,
         });
         let obligation = drop_obligation_for_owned_local(id, ty);
-        self.scope_owned_locals
-            .last_mut()
-            .expect("MIR lowering must have an ownership scope")
-            .push(obligation);
+        if let Some(statement) = self.statement_owned_locals.last_mut() {
+            statement.push(obligation);
+        } else {
+            self.scope_owned_locals
+                .last_mut()
+                .expect("MIR lowering must have an ownership scope")
+                .push(obligation);
+        }
         id
     }
 
@@ -6228,12 +6301,88 @@ fn lower_condition_to_blocks(
     else_block: mir::BlockId,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<()> {
+    context.begin_statement_temporaries();
+    let condition_entry = context.current_block();
+    let first_generated_block = context.blocks.len();
+    let result = lower_condition_to_blocks_inner(expr, then_block, else_block, context);
+    if let Err(diagnostics) = result {
+        context.finish_statement_temporaries(false);
+        return Err(diagnostics);
+    }
+    let cleanup = context.take_statement_temporaries();
+    context.materialized_collection_places.clear();
+    if cleanup.is_empty() {
+        return Ok(());
+    }
+
+    let last_condition_block = context.blocks.len();
+    let then_cleanup = context.create_block();
+    let else_cleanup = context.create_block();
+    let condition_blocks = std::iter::once(condition_entry).chain(
+        (first_generated_block..last_condition_block)
+            .map(mir::BlockId)
+            .filter(|block| *block != then_block && *block != else_block),
+    );
+    for block in condition_blocks {
+        let Some(terminator) = context.blocks[block.0].terminator.as_mut() else {
+            continue;
+        };
+        reroute_condition_target(terminator, then_block, then_cleanup);
+        reroute_condition_target(terminator, else_block, else_cleanup);
+    }
+
+    context.current_block = Some(then_cleanup);
+    context.emit_drop_obligations(&cleanup);
+    context.terminate_current(mir::Terminator::Jump(then_block));
+
+    context.current_block = Some(else_cleanup);
+    context.emit_drop_obligations(&cleanup);
+    context.terminate_current(mir::Terminator::Jump(else_block));
+    Ok(())
+}
+
+fn reroute_condition_target(
+    terminator: &mut mir::Terminator,
+    from: mir::BlockId,
+    to: mir::BlockId,
+) {
+    match terminator {
+        mir::Terminator::Jump(target) => {
+            if *target == from {
+                *target = to;
+            }
+        }
+        mir::Terminator::Branch {
+            then_block,
+            else_block,
+            ..
+        } => {
+            if *then_block == from {
+                *then_block = to;
+            }
+            if *else_block == from {
+                *else_block = to;
+            }
+        }
+        mir::Terminator::Return(_)
+        | mir::Terminator::ReturnVoid
+        | mir::Terminator::Panic(_)
+        | mir::Terminator::Unreachable => {}
+    }
+}
+
+fn lower_condition_to_blocks_inner(
+    expr: &hir::Expr,
+    then_block: mir::BlockId,
+    else_block: mir::BlockId,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<()> {
     match unparenthesized_place(expr) {
         hir::Expr::Unary {
             op: hir::UnaryOp::Not,
             expr,
             ..
-        } => lower_condition_to_blocks(expr, else_block, then_block, context),
+        } => lower_condition_to_blocks_inner(expr, else_block, then_block, context),
         hir::Expr::Binary {
             left,
             op: hir::BinaryOp::And,
@@ -6241,9 +6390,9 @@ fn lower_condition_to_blocks(
             ..
         } => {
             let right_block = context.create_block();
-            lower_condition_to_blocks(left, right_block, else_block, context)?;
+            lower_condition_to_blocks_inner(left, right_block, else_block, context)?;
             context.current_block = Some(right_block);
-            lower_condition_to_blocks(right, then_block, else_block, context)
+            lower_condition_to_blocks_inner(right, then_block, else_block, context)
         }
         hir::Expr::Binary {
             left,
@@ -6252,9 +6401,9 @@ fn lower_condition_to_blocks(
             ..
         } => {
             let right_block = context.create_block();
-            lower_condition_to_blocks(left, then_block, right_block, context)?;
+            lower_condition_to_blocks_inner(left, then_block, right_block, context)?;
             context.current_block = Some(right_block);
-            lower_condition_to_blocks(right, then_block, else_block, context)
+            lower_condition_to_blocks_inner(right, then_block, else_block, context)
         }
         _ => {
             materialize_nested_collection_places(expr, false, context)?;
@@ -11597,14 +11746,16 @@ fn lower_property_place(
                 let value = lower_shared_reference_access_expression(
                     object, payload, writable, false, context,
                 )?;
-                let owner = context.declare_borrowed_temp(
-                    if writable {
-                        mir::Type::WritableSharedReferenceAccess(payload)
-                    } else {
-                        mir::Type::ReadonlySharedReferenceAccess(payload)
-                    },
-                    writable,
-                );
+                let owner_type = if writable {
+                    mir::Type::WritableSharedReferenceAccess(payload)
+                } else {
+                    mir::Type::ReadonlySharedReferenceAccess(payload)
+                };
+                let owner = if value.owned_temporary() {
+                    context.declare_owned_temp(owner_type)
+                } else {
+                    context.declare_borrowed_temp(owner_type, writable)
+                };
                 context.push_statement(mir::Statement::AssignLocal {
                     target: owner,
                     value: mir::Rvalue::SharedReferenceAccess(value),

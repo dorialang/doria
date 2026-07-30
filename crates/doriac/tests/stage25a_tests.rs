@@ -798,7 +798,7 @@ function main(): void
         .expect("borrowed shared composition should execute");
     assert_eq!(
         output.stdout,
-        b"make fallback\nfallback\nfallback\nmake tested\ndrop tested\nmake call\ncall\nmake root\nroot\ndrop root\ndrop call\ndrop fallback\n"
+        b"make fallback\nfallback\nfallback\nmake tested\ndrop tested\nmake call\ncall\ndrop call\nmake root\nroot\ndrop root\ndrop fallback\n"
     );
     doriac::codegen_cranelift::lower_mir_to_object(&program)
         .expect("borrowed shared composition should lower through Cranelift");
@@ -1887,6 +1887,57 @@ fn nullable_collection_access_forwards_lazily() {
     #[cfg(feature = "llvm-backend")]
     doriac::codegen_llvm::lower_mir_to_object(&program)
         .expect("nullable collection accesses should lower through LLVM");
+}
+
+#[test]
+fn forwarded_access_temporaries_end_with_their_statement() {
+    let source =
+        include_str!("../../../examples/native/main_stage25a_temporary_access_cleanup.doria");
+    let program = doriac::lower_source_to_mir("stage25a-temporary-access-cleanup.doria", source)
+        .expect("forwarded access temporaries should lower with statement cleanup");
+    let output = doriac::mir_interpreter::interpret(&program)
+        .expect("the next statement should be able to acquire incompatible access");
+    assert_eq!(
+        output.stdout,
+        include_bytes!("fixtures/native_io/main_stage25a_temporary_access_cleanup/expected_stdout")
+    );
+    doriac::codegen_cranelift::lower_mir_to_object(&program)
+        .expect("statement access cleanup should lower through Cranelift");
+    #[cfg(feature = "llvm-backend")]
+    doriac::codegen_llvm::lower_mir_to_object(&program)
+        .expect("statement access cleanup should lower through LLVM");
+}
+
+#[test]
+fn forwarded_access_temporaries_live_through_the_complete_statement() {
+    let source = r#"
+function acquireWritable(WritableSharedReference<List<int>> $owner): bool
+{
+    let writable $access = $owner->acquireWritableAccess();
+    return true;
+}
+
+function main(): void
+{
+    let $owner = new WritableSharedReference<List<int>>([1]);
+    if (
+        $owner->acquireReadonlyAccess()->contains(1)
+        && acquireWritable($owner)
+    ) {
+        echo "unreachable\n";
+    }
+}
+"#;
+    let program = doriac::lower_source_to_mir("stage25a-statement-access-lifetime.doria", source)
+        .expect("forwarded access lifetime fixture should lower");
+    let output = doriac::mir_interpreter::interpret(&program)
+        .expect("incompatible access should use Doria's abort-only panic path");
+    assert_eq!(output.exit_status, 101);
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("Cannot Acquire Writable Access While Readonly Access Is Active"),
+        "the readonly expression temporary must remain active through the entire condition"
+    );
 }
 
 #[test]

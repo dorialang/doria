@@ -142,6 +142,7 @@ examples/native/main_stage25a_nullable_collection_access.doria
 examples/native/main_stage25a_nullable_ownership_paths.doria
 examples/native/main_stage25a_shared_playground.doria
 examples/native/main_stage25a_stored_access.doria
+examples/native/main_stage25a_temporary_access_cleanup.doria
 examples/native/main_string_concat_hello.doria
 examples/native/main_string_comparison_42.doria
 examples/native/main_string_local_hello.doria
