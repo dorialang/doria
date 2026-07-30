@@ -85,8 +85,9 @@ so the surface is closed-with-a-roadmap rather than half-specified:
   bound/classification constants; a broader math surface.
 - `Bool::toInt(bool): int` (`false`→0, `true`→1) — deferred because bool↔int is a
   coercion Doria should introduce deliberately, not by default.
-- `String`: the fuller transform set (`replace`/`split`/`pad`/`substring`) and the
-  Unicode-vs-ASCII contract, per 0103's own TBD.
+- `String`: decision 0103 now owns the complete canonical string-specific
+  vocabulary and Unicode contracts; implementation still lands incrementally,
+  beginning with the Minimum String Runtime Surface.
 
 ## Alternatives considered
 

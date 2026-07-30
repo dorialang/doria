@@ -476,7 +476,7 @@ See `docs/api-design-guidelines.md` for the detailed design notes.
 
 Doria chooses casing by API category, not by whether an implementation is built into the language:
 
-- Built-in free functions use `snake_case`, such as `get_time()` and `str_starts_with()`.
+- Built-in free functions use `snake_case`, such as `read_line()` and `get_time()`.
 - Userland free functions, instance methods, static methods, companion/type APIs, properties, parameters, and named arguments use `camelCase`.
 - Classes, interfaces, traits, enums, and enum cases use `PascalCase`.
 - Constants use `SCREAMING_SNAKE_CASE`.
@@ -487,13 +487,30 @@ Free-function casing and member/companion casing are intentionally different:
 
 ```doria
 let $now = get_time();
-let $matches = str_starts_with($name, "Dor");
+let $matches = String::startsWith($name, "Dor");
 let $wrapped = Int::wrappingAdd(1, 2);
 let $empty = $s->isEmpty();
 let $tenant = $message->tenantId;
 $message->retryAfter(seconds: 30);
 let $person = $repository->findById($id);
 ```
+
+Type-coupled vocabulary belongs to the type companion. For `string`,
+`$text->length`, `$text->byteLength`, `$text->isEmpty`, `$text->bytes`,
+`$text->graphemes`, and `$text->codePoints` are intrinsic properties or views;
+all string-specific operations use the `String::` companion. Doria has no
+public `str_*` family and no instance-method aliases such as `$text->trim()`.
+
+A Doria `string` always contains valid UTF-8. `$text->length` counts Unicode
+extended grapheme clusters, while `$text->byteLength` reports exact UTF-8
+bytes. Search indices, slicing, and padding lengths use grapheme units.
+`$text->graphemes` traverses extended grapheme clusters and
+`$text->codePoints` traverses Unicode scalar values. Integer indexing on a
+`string` is not permitted. The canonical string-operation families are
+`String::trim`/`trimStart`/`trimEnd`, `lower`/`upper`, predicates and search,
+replacement, `split`/`join`, `slice`, `repeat`, padding, `fromBytes`, and
+comparison. Decision 0103 defines their complete planned contracts; the
+Minimum String Runtime Surface remains the next implementation beat.
 
 ## 7. Basic type system
 

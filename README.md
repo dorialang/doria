@@ -58,7 +58,7 @@ or access guard should be cleaned up before the surrounding function continues.
 
 - **Contracts are written down.** Every parameter is explicitly typed — always. Nothing silently defaults to a dynamic type, and nullability is spelled `?T` and enforced.
 - **One word, one meaning.** `use` imports. `uses` composes traits. `with` captures in closures. No keyword in Doria ever has two jobs.
-- **A standard library with one voice.** Built-in functions follow one uniform naming law — full words, predictable pairs, no cryptic contractions (`str_case_compare`, never `strcasecmp`), the same argument order everywhere.
+- **A standard library with one voice.** Type-specific operations live on companions such as `String::startsWith`, while cross-domain capabilities use fully worded free functions such as `read_line`. Each operation has one canonical spelling.
 - **Honest defaults.** Booleans print as `true` and `false`. Integer overflow is an error, not a wraparound. Format strings are checked at compile time. Errors are declared with `throws` and handled with `try`/`catch` — the compiler makes sure of it.
 - **Small language, sharp edges filed off.** Where a familiar construct is a known footgun, Doria deliberately does the safer thing instead.
 

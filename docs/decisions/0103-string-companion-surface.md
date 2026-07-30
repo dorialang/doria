@@ -1,110 +1,293 @@
-# Decision 0103: String companion surface
+# Decision 0103: Canonical String API And Companion Boundary
 
-**Status:** Accepted (establishes the `String` companion as the home for pure
-string transforms, and draws the boundary between the three ways string operations
-are spelled). Seeds the minimal transform set; the fuller surface grows with the
-strings work.
+**Status:** Accepted (amended after Stage 25a Slice 3)
 
 ## Context
 
-The website guides teach `String::trim(...)` and `String::lower(...)` as built-in
-companions — five guides use them, and the statics-and-constants guide states it
-outright: "Built-in companions use the same call syntax. For example,
-`Int::parse($value)` … and `String::trim($value)` trims text." But no `String`
-companion method was ever scheduled: the plan's string surface is `$s->` intrinsic
-members (`length`/`isEmpty`/`bytes`/`chars`, §4.6, 0045) plus the PHP-familiar
-`str_*` free-function family (`str_starts_with`, `str_case_compare`, §9.1/0074).
-So the guides promise a surface the plan does not own — and, left unresolved, they
-also risk a *third* spelling for the same operations, which Doria's one-spelling
-rule (the `print`/`echo` ban) forbids.
+The original record divided string operations among three public spellings:
+intrinsic `$string->` members, a small `String::` transform seed, and a
+PHP-familiar `str_*` predicate/search family. That division gave one primitive
+type three API homes and made PHP's historical function catalogue, rather than
+Doria's companion model, determine where operations lived.
 
-The `Int`/`Float`/`Bool`/`String` companions already exist as a concept
-(§Core primitive companions; `Int::parse`, `Int::toFloat`, `Float::parse` are
-scheduled). This record puts string transforms on the `String` companion to match,
-and fixes which of the three spellings owns what so there is exactly one home per
-operation.
+Doria's primitive companions already provide the natural owner for
+type-specific operations. Free functions remain useful where no single type is
+the natural owner, but string-specific vocabulary does have one natural owner.
+
+This amendment supersedes the earlier three-spelling boundary. Doria has not
+been publicly released, so the old `str_*` spelling receives no alias,
+compatibility shim, or deprecation period.
 
 ## Decision
 
-### `String` is the companion home for pure string transforms
+The canonical boundary is:
 
-A **string transform** — a pure operation that takes a `string` and returns a new
-`string` (or a parsed `?T`) — lives on the **`String` companion**, spelled
-`String::method(...)`, PascalCase companion + camelCase method, exactly like the
-`Int`/`Float` companions. Because `string` is immutable UTF-8 (0045), a transform
-never mutates; it returns a new value.
+```text
+$string->   intrinsic data, measurements, and views
+String::    every string-specific operation
+free function
+             capabilities that do not naturally belong to one type
+```
 
-The seed set, ratifying what the guides already use plus the obvious sibling:
+There is one public spelling for each string operation.
 
-- `String::trim(string): string` — strip leading/trailing ASCII whitespace.
-- `String::lower(string): string` — ASCII/Unicode-lowercased copy.
-- `String::upper(string): string` — the uppercase sibling.
+### Intrinsic data and views
 
-This is the **minimal** set. The fuller transform surface (`replace`, `split`,
-`padStart`/`padEnd`, `substring`/slicing, `repeat`, case-fold specifics, and the
-Unicode-vs-ASCII contract for `lower`/`upper`) is settled with the strings work,
-marked *(surface TBD)* in the stdlib reference until then. `String::parse`-shaped
-companions are not introduced here (parsing to numbers is `Int::parse`/`Float::parse`).
+The instance surface contains facts and compiler-known views intrinsic to one
+string value:
 
-### The three-spelling boundary — one home per operation
+```doria
+$text->length
+$text->byteLength
+$text->isEmpty
+$text->bytes
+$text->graphemes
+$text->codePoints
+```
 
-To keep exactly one spelling per operation:
+These are properties or views, not action methods. The canonical instance
+surface does not include `$text->trim()`, `$text->contains(...)`,
+`$text->startsWith(...)`, or `$text->split(...)`.
 
-- **`$s->` intrinsic members** own *data about the string* — `length`, `isEmpty`,
-  `bytes`, `chars` (deferred). These are properties of the value, not transforms.
-- **`String::` companion** owns *pure transforms* — `trim`, `lower`, `upper`, and
-  the fuller transform set above.
-- **The `str_*` free-function family** owns the *PHP-familiar predicate/search
-  layer* — `str_starts_with`, `str_case_compare`, and the rest of that family. It
-  **does not** duplicate the companion transforms: there is deliberately **no**
-  `str_trim` / `str_lower` / `str_upper`. A given operation is spelled exactly one
-  way.
+A Doria `string` always contains valid UTF-8. Invalid UTF-8 remains in `Bytes`
+until explicitly validated and converted.
 
-This mirrors the numeric companions (`Int::parse` is `Int::`, not `int_parse`) and
-keeps the §9.1 naming charter intact (companion/member APIs camelCase; the
-remaining free functions snake_case).
+- `length` is the number of Unicode extended grapheme clusters.
+- `byteLength` is the exact number of bytes in the UTF-8 representation.
+- `isEmpty` is equivalent to `byteLength == 0` and does not require traversal.
+- `bytes` exposes the UTF-8 bytes under the accepted `Bytes` contract, which is
+  a copy in v1.0 unless a later decision explicitly changes it.
+- `graphemes` traverses Unicode extended grapheme clusters.
+- `codePoints` traverses Unicode scalar values.
 
-### Scheduling
+`chars` is not a canonical Doria member. The exact nameable types behind the two
+text views remain scheduled with the traversal surface. Integer indexing on
+`string` is not permitted.
 
-The `String` companion transforms are primitive-companion surface, the same tier
-as the `Int`/`Float` companions, and land with the strings/companion work (they do
-not depend on collections or later stages). The seed set is small and pure; the
-fuller surface follows the strings work.
+### The `String` companion
+
+Every operation whose meaning is specifically about strings belongs to the
+`String` companion. This includes transforms, trimming, casing, predicates,
+search, comparison, replacement, splitting, joining, slicing, padding,
+repetition, and explicit construction or validation.
+
+#### Trimming and casing
+
+```doria
+String::trim($text)
+String::trimStart($text)
+String::trimEnd($text)
+String::lower($text)
+String::upper($text)
+```
+
+Trimming uses Unicode whitespace. Casing is Unicode-aware,
+locale-independent, and returns a new string without changing the original.
+Runtime sharing optimizations may occur only when unobservable.
+
+#### Predicates
+
+```doria
+String::contains($text, $needle)
+String::startsWith($text, $prefix)
+String::endsWith($text, $suffix)
+String::equalsIgnoreCase($left, $right)
+```
+
+`contains`, `startsWith`, and `endsWith` are case-sensitive.
+`equalsIgnoreCase` uses Unicode case folding rather than ASCII-only lowercasing.
+Case-insensitive behavior is explicit rather than selected by a boolean flag.
+The runtime implementation must document empty-needle behavior consistently
+with the search contract.
+
+#### Search
+
+```doria
+String::indexOf($text, $needle)
+String::lastIndexOf($text, $needle)
+```
+
+Both return `?int`; absence is `null`. Indices use grapheme units, not UTF-8
+byte offsets. Byte-level searching belongs to `Bytes`.
+
+#### Replacement
+
+```doria
+String::replace($text, $search, $replacement)
+```
+
+Replacement is literal, not regular-expression based. It replaces all
+non-overlapping occurrences from left to right. Regular expressions require a
+separately designed API.
+
+#### Splitting and joining
+
+```doria
+String::split(string $text, string $separator): List<string>
+String::join(string $separator, List<string> $values): string
+```
+
+Splitting is literal, not regular-expression based. `join` may generalize to
+`Iterable<string>` after the public iteration protocol lands without breaking
+existing `List<string>` callers.
+
+#### Slicing
+
+The single canonical name is `String::slice`; `substring` is not an alias.
+Slicing operates in grapheme units. The planned callable shape is:
+
+```doria
+String::slice(
+    string $text,
+    int $start,
+    ?int $length = null,
+): string
+```
+
+The implementation beat must settle and test the exact accepted argument
+behavior before activation. This record does not invent a nameable `Range`
+parameter.
+
+#### Repetition and padding
+
+```doria
+String::repeat($text, $count)
+String::padStart($text, $length, $padding)
+String::padEnd($text, $length, $padding)
+```
+
+Padding targets use grapheme units. The implementation must define or reject an
+empty padding string and must not silently wrap negative repetition counts or
+padding targets.
+
+#### Explicit construction from bytes
+
+```doria
+String::fromBytes(Bytes $bytes): ?string
+```
+
+This returns a Doria string for valid UTF-8 and `null` for invalid UTF-8. It is
+not lossy and never substitutes replacement characters. Any future lossy
+conversion needs a distinct name and decision.
+
+#### Ordering comparison
+
+```doria
+String::compare($left, $right)
+String::compareIgnoreCase($left, $right)
+```
+
+These are reserved with planned return type `Ordering` and activate only when
+that accepted surface is executable. Doria does not introduce an
+integer-returning `str_case_compare` replacement.
+
+### Free functions
+
+Built-in free functions remain valid for capabilities without one natural
+owning type, including I/O, formatting, environment, process, time,
+cross-domain capabilities, and compiler meta operations:
+
+```doria
+read_line()
+read_file($path)
+write_file($path, $contents)
+get_time()
+function_exists("name")
+```
+
+This decision removes string-specific free functions. It does not remove free
+functions as a language or standard-library category.
+
+### Removed public spellings
+
+The public Doria API has no `str_*` or `string_*` family and no instance-method
+aliases:
+
+```doria
+str_starts_with($text, $prefix)    // not Doria
+string_starts_with($text, $prefix) // not Doria
+$text->startsWith($prefix)         // not Doria
+$text->trim()                      // not Doria
+```
+
+The canonical forms are:
+
+```doria
+String::startsWith($text, $prefix)
+String::trim($text)
+String::split($text, ",")
+String::join(",", $values)
+String::slice($text, 1, 4)
+```
+
+The one-spelling rule applies to compiler diagnostics, documentation, examples,
+generated code, migration guidance, language-server hovers, playground
+examples, books, and website copy.
+
+### PHP migration mapping
+
+PHP source maps to Doria's companion surface:
+
+| PHP input | Doria |
+| --- | --- |
+| `trim($text)` | `String::trim($text)` |
+| `ltrim($text)` | `String::trimStart($text)` |
+| `rtrim($text)` | `String::trimEnd($text)` |
+| `strtolower($text)` | `String::lower($text)` |
+| `strtoupper($text)` | `String::upper($text)` |
+| `str_contains($text, $needle)` | `String::contains($text, $needle)` |
+| `str_starts_with($text, $prefix)` | `String::startsWith($text, $prefix)` |
+| `str_ends_with($text, $suffix)` | `String::endsWith($text, $suffix)` |
+| `strpos($text, $needle)` | `String::indexOf($text, $needle)` |
+| `strrpos($text, $needle)` | `String::lastIndexOf($text, $needle)` |
+| `str_replace($a, $b, $text)` | `String::replace($text, $a, $b)` |
+| `explode($separator, $text)` | `String::split($text, $separator)` |
+| `implode($separator, $values)` | `String::join($separator, $values)` |
+| `substr($text, $start, $length)` | `String::slice($text, $start, $length)` |
+| `str_repeat($text, $count)` | `String::repeat($text, $count)` |
+| `str_pad(..., STR_PAD_LEFT)` | `String::padStart(...)` |
+| `str_pad(..., STR_PAD_RIGHT)` | `String::padEnd(...)` |
+| `strcasecmp($left, $right)` | `String::compareIgnoreCase($left, $right)` |
+
+This is migration guidance, not semantic inheritance. Tooling must identify
+differences where Doria uses Unicode grapheme units and PHP uses byte-oriented
+behavior.
 
 ## Alternatives considered
 
-- **Fix the guides to `str_trim`/`str_lower` instead (make transforms free
-  functions).** Rejected — it would grow the `str_*` family into transforms and
-  split string operations across two rationales (some `str_*`, some `$s->`), and it
-  diverges from the `Int`/`Float` companion precedent. Companions are the
-  established home for typed operations on a primitive.
-- **Put transforms on `$s->` members (`$s->trim()`).** Reasonable and PHP-fluent,
-  but it collides with the guides' shipped `String::` spelling and would still need
-  a ruling to retire one of the two. Kept as a possible future ergonomic addition,
-  not the v1.0 canonical spelling. `$s->` stays reserved for intrinsic properties.
-- **Allow both `String::trim` and `str_trim`.** Rejected — that is the exact
-  `print`/`echo` redundancy Doria bans.
+### Keep predicates and search as `str_*` free functions
+
+Rejected. It preserves a PHP-derived split for one type and makes one-spelling
+discipline harder to teach and enforce.
+
+### Put all operations on string instances
+
+Rejected. Doria's companion model already owns primitive-specific operations,
+while the instance surface remains a compact set of intrinsic facts and views.
+
+### Keep aliases during migration
+
+Rejected. Doria has no released compatibility obligation, and aliases would
+make the rejected split permanent.
 
 ## Consequences
 
-- The guides' `String::trim`/`String::lower` are correct as written and now have a
-  scheduled home; no guide edits are required for these.
-- String operations have one home each: properties on `$s->`, transforms on
-  `String::`, PHP-familiar predicates/search on `str_*`.
-- The `str_*` family will never carry a transform that duplicates a `String::`
-  method.
-
-## Affected components
-
-The stdlib reference (String entry — add the `String::` companion transforms),
-plan §4.6 / §Core primitive companions and §9.1 (the boundary note), semantic
-analysis and the runtime `String` companion intrinsics when implemented, and SPEC
-when the methods land. No compiler behavior changes with this record; it schedules
-and bounds a surface.
+- The prior three-spelling division in this record is superseded.
+- `$string->` owns only intrinsic measurements and views.
+- `String::` owns the complete string-specific vocabulary.
+- String-specific free functions and instance-method aliases are not Doria.
+- PHP migration tooling rewrites PHP spellings to companion calls while warning
+  when grapheme-based Doria semantics differ from byte-based PHP behavior.
+- The Minimum String Runtime Surface selects and implements the first executable
+  subset. This decision does not implement any member or companion operation.
 
 ## Invalidated elsewhere
 
-- The stdlib reference's `String` entry — now also lists the `String::` companion
-  transforms, not only `$s->` members and the `str_*` family.
-- Any assumption that string casing/trimming is a `str_*` free function — it is a
-  `String::` companion transform; `str_trim`/`str_lower`/`str_upper` do not exist.
+- D19 examples that use string-specific free functions to illustrate built-in
+  `snake_case`.
+- The stdlib catalogue's `str_*` family.
+- `$string->chars` and byte-length descriptions of `$string->length`.
+- API guidance that assigns string predicates or search to free functions.
+- Compiler, language-server, website, book, example, or migration guidance that
+  publishes the old canonical spellings.
+- Future runtime or tooling work planned around the former three-way split.

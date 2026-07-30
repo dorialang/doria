@@ -36,7 +36,7 @@ A bare noun method such as `body()` can be misread as an action, preparation ste
 
 The naming charter is category-based:
 
-- Built-in free functions use `snake_case`, such as `get_time()` and `str_starts_with()`.
+- Built-in free functions use `snake_case`, such as `read_line()` and `get_time()`.
 - Userland free functions use `camelCase`.
 - Instance methods, static methods, and companion/type APIs use `camelCase`, whether they are built in or user-authored.
 - Properties, parameters, and named arguments use `camelCase`.
@@ -49,7 +49,7 @@ Free-function casing and member casing are intentionally different:
 
 ```doria
 let $now = get_time();
-let $startsWithDor = str_starts_with($name, "Dor");
+let $startsWithDor = String::startsWith($name, "Dor");
 let $wrapped = Int::wrappingAdd(1, 2);
 let $empty = $s->isEmpty();
 let $tenant = $message->tenantId;
@@ -58,6 +58,21 @@ let $person = $repository->findById($id);
 ```
 
 Avoid snake_case methods, static methods, properties, parameters, and named arguments unless a later accepted decision introduces a specific exception.
+
+Type-coupled vocabulary belongs to the type companion. Cross-domain and
+environment capabilities may remain free functions. In particular,
+`$string->` is reserved for intrinsic data, measurements, and views, while
+every string-specific operation is a `String::` companion call:
+
+```doria
+let $length = $text->length;
+let $bytes = $text->byteLength;
+let $trimmed = String::trim($text);
+let $matches = String::startsWith($text, "Dor");
+```
+
+Doria has no public `str_*` family and does not duplicate companion operations
+as instance methods such as `$text->trim()`.
 
 ## Properties are for data
 

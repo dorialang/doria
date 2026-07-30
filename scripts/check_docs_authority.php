@@ -132,6 +132,37 @@ function add_failure(array &$failures, string $path, int $lineNumber, string $me
 }
 
 /**
+ * Return source lines inside Markdown fences for one language.
+ *
+ * @return list<array{line: int, text: string}>
+ */
+function find_fenced_source_lines(string $contents, string $language): array
+{
+    $found = [];
+    $active = false;
+    $lines = preg_split('/\R/', $contents) ?: [];
+
+    foreach ($lines as $index => $line) {
+        $trimmed = trim($line);
+        if (str_starts_with($trimmed, '```')) {
+            if ($active) {
+                $active = false;
+                continue;
+            }
+
+            $active = preg_match('/^```' . preg_quote($language, '/') . '\b/i', $trimmed) === 1;
+            continue;
+        }
+
+        if ($active) {
+            $found[] = ['line' => $index + 1, 'text' => $line];
+        }
+    }
+
+    return $found;
+}
+
+/**
  * Return decision-shaped tokens outside Markdown code fences.
  *
  * @return list<array{line: int, number: string, text: string}>
@@ -497,6 +528,7 @@ $forbiddenCodeSpellings = [
     ['/\binstanceof\b/', 'instanceof is rejected permanently; the namespace-model decision uses the type-test and narrowing operator `is`'],
     ['/\breadline\s*\(/', 'readline is rejected as a fused name; the stdin built-in is read_line'],
     ['/__toString/', 'Doria has no __toString magic method; display conversion is Displayable::toString'],
+    ['/\bstr_[a-z_]+\s*\(/', 'string-specific operations use the String companion; Doria has no public str_* family'],
     [$forbiddenPrintStatementPattern, 'print is rejected; echo is the spelling'],
     ['/::\s*\$/', 'Doria static access is sigil-free; use Foo::prop rather than Foo::$prop'],
     ['/\bstatic\s*::/', 'Doria has no late static binding; use the reserved self:: qualifier'],
@@ -520,6 +552,38 @@ foreach ($doriaCodeFiles as $path) {
             if (preg_match($pattern, $line) === 1) {
                 add_failure($failures, $path, $index + 1, $message, $line);
             }
+        }
+    }
+}
+
+// Canonical authored Doria snippets follow the same String spelling law as
+// source files. PHP fences and prose remain available for migration mappings,
+// rejected spellings, and historical context.
+$canonicalStringDocPaths = [
+    'AGENTS.md',
+    'README.md',
+    'SPEC.md',
+    'docs/doria-end-to-end-plan.md',
+    'docs/stdlib-reference.md',
+    'docs/api-design-guidelines.md',
+    'docs/website-content-guidelines.md',
+];
+foreach ($canonicalStringDocPaths as $path) {
+    $contents = file_get_contents($root . '/' . $path);
+    if ($contents === false) {
+        $failures[] = "{$path}: unable to read file for canonical String snippet checks";
+        continue;
+    }
+
+    foreach (find_fenced_source_lines($contents, 'doria') as $sourceLine) {
+        if (preg_match('/\bstr_[a-z_]+\s*\(/', $sourceLine['text']) === 1) {
+            add_failure(
+                $failures,
+                $path,
+                $sourceLine['line'],
+                'canonical Doria snippets must use String:: for string-specific operations',
+                $sourceLine['text']
+            );
         }
     }
 }
@@ -566,6 +630,95 @@ if ($namingAuthority !== false) {
     foreach (['Formatted I/O — the v1.0 minimal set (record 0071)', '`read_file(): string`', '`read_file_bytes(): Bytes`', '`read_file_bytes(string $path, ...): Bytes`'] as $staleGuidance) {
         if (str_contains($namingAuthority, $staleGuidance)) {
             $failures[] = "{$namingAuthorityPath}: contains stale I/O authority guidance {$staleGuidance}";
+        }
+    }
+
+    $stringDecisionPath = 'docs/decisions/0103-string-companion-surface.md';
+    $stringDecision = file_get_contents($root . '/' . $stringDecisionPath);
+    $stdlibPath = 'docs/stdlib-reference.md';
+    $stdlib = file_get_contents($root . '/' . $stdlibPath);
+    $pipelinePath = 'docs/notes/current-pipeline.md';
+    $pipeline = file_get_contents($root . '/' . $pipelinePath);
+
+    $requiredStringDecisionGuidance = [
+        '# Decision 0103: Canonical String API And Companion Boundary',
+        '$text->length',
+        '$text->byteLength',
+        '$text->graphemes',
+        '$text->codePoints',
+        'String::startsWith',
+        'String::indexOf',
+        'String::replace',
+        'String::split',
+        'String::join',
+        'String::slice',
+        'String::repeat',
+        'String::padStart',
+        'String::fromBytes',
+        'String::compareIgnoreCase',
+        'The public Doria API has no `str_*`',
+    ];
+    if ($stringDecision === false) {
+        $failures[] = "{$stringDecisionPath}: unable to read canonical String decision";
+    } else {
+        foreach ($requiredStringDecisionGuidance as $guidance) {
+            if (!str_contains($stringDecision, $guidance)) {
+                $failures[] = "{$stringDecisionPath}: missing canonical String guidance {$guidance}";
+            }
+        }
+    }
+
+    foreach ([
+        'String API Decision Amendment — Implemented',
+        'Minimum String Runtime Surface — Next',
+        'Interactive Line-Input Amendment — Pending',
+    ] as $guidance) {
+        if (!str_contains($namingAuthority, $guidance)) {
+            $failures[] = "{$namingAuthorityPath}: missing String checkpoint status {$guidance}";
+        }
+    }
+
+    if (
+        $pipeline === false
+        || !str_contains($pipeline, 'The String API Decision Amendment is implemented')
+        || !str_contains($pipeline, 'Stage 25a remains incomplete until Slice 4')
+    ) {
+        $failures[] = "{$pipelinePath}: must keep the String amendment implemented, the runtime surface next, and Stage 25a incomplete";
+    }
+
+    if (
+        $stdlib === false
+        || !str_contains($stdlib, '$s->byteLength')
+        || !str_contains($stdlib, 'There is no public `str_*` family')
+        || !str_contains($stdlib, 'Minimum String Runtime Surface')
+    ) {
+        $failures[] = "{$stdlibPath}: missing canonical planned String inventory or implementation-status boundary";
+    }
+
+    $staleStringAssertions = [
+        'Plus the `str_*` free-function family',
+        '`$s->length` is byte length',
+        'iteration yields grapheme clusters via `$s->chars`',
+        '`$s->chars` (grapheme iteration) is deferred',
+        'intrinsic properties (`length`/`isEmpty`/`bytes`/`chars`)',
+        'String/utility:** `get_time`, `str_starts_with`',
+        'predicate/search layer* — `str_starts_with`',
+    ];
+    foreach ([
+        $namingAuthorityPath => $namingAuthority,
+        $stdlibPath => $stdlib,
+        'SPEC.md' => file_get_contents($root . '/SPEC.md'),
+        'docs/api-design-guidelines.md' => file_get_contents($root . '/docs/api-design-guidelines.md'),
+        'docs/website-content-guidelines.md' => file_get_contents($root . '/docs/website-content-guidelines.md'),
+    ] as $path => $contents) {
+        if ($contents === false) {
+            $failures[] = "{$path}: unable to read file for stale String assertion checks";
+            continue;
+        }
+        foreach ($staleStringAssertions as $stale) {
+            if (str_contains($contents, $stale)) {
+                $failures[] = "{$path}: contains stale canonical String assertion {$stale}";
+            }
         }
     }
 
