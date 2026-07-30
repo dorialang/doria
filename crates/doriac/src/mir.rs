@@ -204,6 +204,17 @@ pub struct SharedAccessType {
     pub nullable: bool,
 }
 
+impl SharedAccessType {
+    pub const fn into_type(self) -> Type {
+        match (self.nullable, self.writable) {
+            (false, false) => Type::ReadonlySharedReferenceAccess(self.payload),
+            (false, true) => Type::WritableSharedReferenceAccess(self.payload),
+            (true, false) => Type::NullableReadonlySharedReferenceAccess(self.payload),
+            (true, true) => Type::NullableWritableSharedReferenceAccess(self.payload),
+        }
+    }
+}
+
 impl Type {
     pub const fn has_move_ownership(self) -> bool {
         matches!(
@@ -1386,6 +1397,12 @@ pub enum NullableSharedReferenceAccessExpression {
         writable: bool,
         remove: bool,
     },
+    CollectionGet {
+        collection: LocalId,
+        key: Box<Rvalue>,
+        access: NullableCollectionAccess,
+        stored: SharedAccessType,
+    },
     Call {
         payload: WritableSharedPayload,
         function: FunctionId,
@@ -1409,6 +1426,7 @@ impl NullableSharedReferenceAccessExpression {
             | Self::CollectionIndex { payload, .. }
             | Self::Call { payload, .. }
             | Self::NullSafeAcquire { payload, .. } => *payload,
+            Self::CollectionGet { stored, .. } => stored.payload,
             Self::Access(value) => value.payload(),
         }
     }
@@ -1421,6 +1439,7 @@ impl NullableSharedReferenceAccessExpression {
             | Self::CollectionIndex { writable, .. }
             | Self::Call { writable, .. }
             | Self::NullSafeAcquire { writable, .. } => *writable,
+            Self::CollectionGet { stored, .. } => stored.writable,
             Self::Access(value) => value.writable(),
         }
     }
@@ -1440,6 +1459,10 @@ impl NullableSharedReferenceAccessExpression {
             Self::Call { return_borrow, .. } => return_borrow.is_none(),
             Self::NullSafeAcquire { .. } => true,
             Self::CollectionIndex { remove, .. } => *remove,
+            Self::CollectionGet { access, .. } => matches!(
+                access,
+                NullableCollectionAccess::Remove | NullableCollectionAccess::Pop
+            ),
             Self::Null { .. } | Self::Property { .. } => false,
         }
     }
@@ -2756,6 +2779,9 @@ fn nullable_shared_access_class_temporary_capacity(
         }
         NullableSharedReferenceAccessExpression::CollectionIndex { index, .. } => {
             rvalue_class_temporary_capacity(index)
+        }
+        NullableSharedReferenceAccessExpression::CollectionGet { key, .. } => {
+            rvalue_class_temporary_capacity(key)
         }
         NullableSharedReferenceAccessExpression::Null { .. }
         | NullableSharedReferenceAccessExpression::Local { .. }

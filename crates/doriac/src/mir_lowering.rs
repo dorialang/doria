@@ -8597,16 +8597,28 @@ fn nullable_collection_access_rvalue(
                 },
             ))
         }
+        ty @ (mir::Type::ReadonlySharedReferenceAccess(_)
+        | mir::Type::WritableSharedReferenceAccess(_)
+        | mir::Type::NullableReadonlySharedReferenceAccess(_)
+        | mir::Type::NullableWritableSharedReferenceAccess(_)) => {
+            let shared_access = ty
+                .shared_access()
+                .expect("matched shared access collection element");
+            Ok(mir::Rvalue::NullableSharedReferenceAccess(
+                mir::NullableSharedReferenceAccessExpression::CollectionGet {
+                    collection,
+                    key,
+                    access,
+                    stored: shared_access,
+                },
+            ))
+        }
         mir::Type::Mixed => Err(vec![Diagnostic::unsupported_stage(
             "M1101",
             "nullable accessors returning `?mixed` from collections land with the next mixed collection slice",
             object.span(),
         )]),
         mir::Type::Collection(_)
-        | mir::Type::ReadonlySharedReferenceAccess(_)
-        | mir::Type::WritableSharedReferenceAccess(_)
-                | mir::Type::NullableReadonlySharedReferenceAccess(_)
-                | mir::Type::NullableWritableSharedReferenceAccess(_)
         | mir::Type::NullableScalar(_)
         | mir::Type::NullableString
         | mir::Type::NullableMixed
@@ -8652,6 +8664,16 @@ fn lower_discarded_rvalue(value: mir::Rvalue, context: &mut LoweringContext) {
         target: local,
         value,
     });
+    if owned {
+        if let Some(access) = ty.shared_access() {
+            context.push_statement(mir::Statement::DropSharedReferenceAccess {
+                local,
+                payload: access.payload,
+                writable: access.writable,
+            });
+            return;
+        }
+    }
     match ty {
         mir::Type::Class(class) | mir::Type::NullableClass(class) => {
             context.push_statement(mir::Statement::DropClass { local, class });
@@ -8673,20 +8695,6 @@ fn lower_discarded_rvalue(value: mir::Rvalue, context: &mut LoweringContext) {
             if owned =>
         {
             context.push_statement(mir::Statement::DropWritableWeakReference { local, payload });
-        }
-        mir::Type::ReadonlySharedReferenceAccess(payload) if owned => {
-            context.push_statement(mir::Statement::DropSharedReferenceAccess {
-                local,
-                payload,
-                writable: false,
-            });
-        }
-        mir::Type::WritableSharedReferenceAccess(payload) if owned => {
-            context.push_statement(mir::Statement::DropSharedReferenceAccess {
-                local,
-                payload,
-                writable: true,
-            });
         }
         mir::Type::Collection(collection) => {
             context.push_statement(mir::Statement::DropCollection { local, collection });
@@ -10303,6 +10311,50 @@ fn lower_nullable_shared_reference_access_expression(
             span,
             ..
         } => {
+            if let Some((collection, key, value_type, access)) =
+                lower_dictionary_get(object, method, args, context)?
+            {
+                let stored_nullable = match value_type {
+                    mir::Type::ReadonlySharedReferenceAccess(payload)
+                        if payload == expected && !writable =>
+                    {
+                        false
+                    }
+                    mir::Type::WritableSharedReferenceAccess(payload)
+                        if payload == expected && writable =>
+                    {
+                        false
+                    }
+                    mir::Type::NullableReadonlySharedReferenceAccess(payload)
+                        if payload == expected && !writable =>
+                    {
+                        true
+                    }
+                    mir::Type::NullableWritableSharedReferenceAccess(payload)
+                        if payload == expected && writable =>
+                    {
+                        true
+                    }
+                    _ => {
+                        return Err(vec![unsupported(
+                            *span,
+                            "collection accessor has another shared access type",
+                        )])
+                    }
+                };
+                return Ok(
+                    mir::NullableSharedReferenceAccessExpression::CollectionGet {
+                        collection,
+                        key: Box::new(key),
+                        access,
+                        stored: mir::SharedAccessType {
+                            payload: expected,
+                            writable,
+                            nullable: stored_nullable,
+                        },
+                    },
+                );
+            }
             if context.expression_type(expr)? != nullable_ty {
                 return Ok(mir::NullableSharedReferenceAccessExpression::Access(
                     Box::new(lower_shared_reference_access_expression(

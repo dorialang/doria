@@ -3176,9 +3176,18 @@ fn display_borrow_root(root: &str) -> String {
 }
 
 fn statements_use_variable(statements: &[Stmt], name: &str) -> bool {
-    statements
-        .iter()
-        .any(|statement| statement_uses_variable(statement, name))
+    for statement in statements {
+        if statement_uses_variable(statement, name) {
+            return true;
+        }
+        if matches!(
+            statement,
+            Stmt::VarDecl(declaration) if declaration.name == name
+        ) {
+            return false;
+        }
+    }
+    false
 }
 
 fn statement_uses_variable(statement: &Stmt, name: &str) -> bool {
@@ -3213,24 +3222,32 @@ fn statement_uses_variable(statement: &Stmt, name: &str) -> bool {
                 || statements_use_variable(&statement.body.statements, name)
         }
         Stmt::For(statement) => {
-            statement
+            let initializer_uses = statement
                 .initializer
                 .as_ref()
-                .is_some_and(|initializer| for_initializer_uses_variable(initializer, name))
-                || statement
-                    .condition
-                    .as_ref()
-                    .is_some_and(|expr| expr_uses_variable(expr, name))
-                || statement
-                    .increment
-                    .as_ref()
-                    .is_some_and(|increment| for_increment_uses_variable(increment, name))
-                || statements_use_variable(&statement.body.statements, name)
+                .is_some_and(|initializer| for_initializer_uses_variable(initializer, name));
+            let initializer_shadows = matches!(
+                statement.initializer.as_ref(),
+                Some(ast::ForInitializer::VarDecl(declaration)) if declaration.name == name
+            );
+            initializer_uses
+                || (!initializer_shadows
+                    && (statement
+                        .condition
+                        .as_ref()
+                        .is_some_and(|expr| expr_uses_variable(expr, name))
+                        || statement
+                            .increment
+                            .as_ref()
+                            .is_some_and(|increment| for_increment_uses_variable(increment, name))
+                        || statements_use_variable(&statement.body.statements, name)))
         }
         Stmt::Break { .. } | Stmt::Continue { .. } => false,
         Stmt::Foreach(statement) => {
             expr_uses_variable(&statement.iterable, name)
-                || statements_use_variable(&statement.body.statements, name)
+                || (statement.key.as_ref().is_none_or(|key| key.name != name)
+                    && statement.value.name != name
+                    && statements_use_variable(&statement.body.statements, name))
         }
         Stmt::Increment(statement) => expr_uses_variable(&statement.target, name),
     }

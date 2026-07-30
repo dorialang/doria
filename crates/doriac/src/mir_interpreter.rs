@@ -2594,6 +2594,46 @@ impl Interpreter<'_> {
                             control: None,
                             class,
                         }),
+                    (expected, value) if expected.shared_access().is_some() => {
+                        let access = expected
+                            .shared_access()
+                            .expect("guarded shared access collection result");
+                        let control = match (access.nullable, value) {
+                            (
+                                false,
+                                Some(LocalValue::SharedReferenceAccess {
+                                    control,
+                                    payload,
+                                    writable,
+                                }),
+                            ) if payload == access.payload && writable == access.writable => {
+                                Some(control)
+                            }
+                            (
+                                true,
+                                Some(LocalValue::NullableSharedReferenceAccess {
+                                    control,
+                                    payload,
+                                    writable,
+                                }),
+                            ) if payload == access.payload && writable == access.writable => {
+                                control
+                            }
+                            (_, None) => None,
+                            _ => {
+                                return Err(InterpreterError::new(
+                                    "Dictionary::get produced another shared access type",
+                                ))
+                            }
+                        };
+                        self.current_frame_mut()?.values.push(
+                            EvaluationValue::NullableSharedReferenceAccess {
+                                control,
+                                payload: access.payload,
+                                writable: access.writable,
+                            },
+                        );
+                    }
                     _ => {
                         return Err(InterpreterError::new(
                             "Dictionary::get produced another value type",
@@ -6715,6 +6755,20 @@ impl Interpreter<'_> {
                         remove,
                     });
                 frame.tasks.push(EvaluationTask::Rvalue(*index));
+            }
+            mir::NullableSharedReferenceAccessExpression::CollectionGet {
+                collection,
+                key,
+                access,
+                stored,
+            } => {
+                let frame = self.current_frame_mut()?;
+                frame.tasks.push(EvaluationTask::DictionaryGet {
+                    collection,
+                    expected: stored.into_type(),
+                    access,
+                });
+                frame.tasks.push(EvaluationTask::Rvalue(*key));
             }
             mir::NullableSharedReferenceAccessExpression::Call {
                 payload,

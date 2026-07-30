@@ -4545,6 +4545,22 @@ fn lower_nullable_shared_reference_access_expression(
             remove,
             ..
         } => lower_collection_index(builder, *collection, index, *remove, resources),
+        mir::NullableSharedReferenceAccessExpression::CollectionGet {
+            collection,
+            key,
+            access,
+            stored,
+        } => {
+            let (_, value) = lower_dictionary_get(
+                builder,
+                *collection,
+                key,
+                stored.into_type(),
+                *access,
+                resources,
+            )?;
+            Ok(value)
+        }
         mir::NullableSharedReferenceAccessExpression::Call { function, args, .. } => {
             lower_function_call(builder, *function, args, resources)?
                 .ok_or_else(|| malformed_mir("nullable shared access call produced no result"))?

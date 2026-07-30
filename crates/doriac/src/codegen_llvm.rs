@@ -4153,6 +4153,15 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             } => Ok(self
                 .lower_collection_index(*collection, index, *remove)?
                 .into_pointer_value()),
+            mir::NullableSharedReferenceAccessExpression::CollectionGet {
+                collection,
+                key,
+                access,
+                stored,
+            } => Ok(self
+                .lower_dictionary_get(*collection, key, stored.into_type(), *access)?
+                .1
+                .into_pointer_value()),
             mir::NullableSharedReferenceAccessExpression::Call { function, args, .. } => Ok(self
                 .lower_call(*function, args, true)?
                 .ok_or_else(|| malformed_mir("nullable shared access call produced no result"))?

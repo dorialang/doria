@@ -1867,3 +1867,30 @@ fn nullable_ownership_paths_preserve_transfer_and_cleanup() {
     doriac::codegen_llvm::lower_mir_to_object(&program)
         .expect("nullable ownership paths should lower through LLVM");
 }
+
+#[test]
+fn nested_shadows_do_not_extend_outer_borrow_lifetimes() {
+    doriac::check_source(
+        "stage25a-shadowed-borrow-liveness.doria",
+        r#"
+class Guard
+{
+    writable int $value = 0;
+    writable function mutate(): void { $this->value++; }
+}
+
+function identity(Guard $guard): Guard { return $guard; }
+
+function route(writable Guard $guard): void
+{
+    let $alias = identity($guard);
+    {
+        let $alias = new Guard();
+        echo "{$alias->value}";
+        $guard->mutate();
+    }
+}
+"#,
+    )
+    .expect("a nested shadow must end liveness of an inaccessible outer borrow");
+}

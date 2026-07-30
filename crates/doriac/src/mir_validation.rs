@@ -2581,6 +2581,19 @@ fn validate_nullable_shared_reference_access_expression(
             nullable_ty,
             *remove,
         ),
+        mir::NullableSharedReferenceAccessExpression::CollectionGet {
+            collection,
+            key,
+            access,
+            stored,
+        } => validate_dictionary_get(
+            program,
+            function,
+            *collection,
+            key,
+            stored.into_type(),
+            *access,
+        ),
         mir::NullableSharedReferenceAccessExpression::Call {
             function: callee,
             args,
@@ -4511,6 +4524,9 @@ fn collect_nullable_shared_access_class_local_accesses<'a>(
         }
         mir::NullableSharedReferenceAccessExpression::CollectionIndex { index, .. } => {
             collect_rvalue_class_local_accesses(index, accesses)
+        }
+        mir::NullableSharedReferenceAccessExpression::CollectionGet { key, .. } => {
+            collect_rvalue_class_local_accesses(key, accesses)
         }
         mir::NullableSharedReferenceAccessExpression::Null { .. }
         | mir::NullableSharedReferenceAccessExpression::Local { .. }
@@ -6777,6 +6793,9 @@ fn nullable_shared_access_observes_property(
         }
         mir::NullableSharedReferenceAccessExpression::CollectionIndex { index, .. } => {
             rvalue_observes_property(index, receiver, property)
+        }
+        mir::NullableSharedReferenceAccessExpression::CollectionGet { key, .. } => {
+            rvalue_observes_property(key, receiver, property)
         }
         mir::NullableSharedReferenceAccessExpression::Null { .. }
         | mir::NullableSharedReferenceAccessExpression::Local { .. } => false,

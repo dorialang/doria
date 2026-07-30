@@ -88,6 +88,21 @@ function main(): void
     let $calledWrite = maybeWrite($calledWriteOwner);
     echo "called write\n";
 
+    let $discardedReadOwner = new WritableSharedReference(new Item());
+    let writable $discardedReads = [maybeRead($discardedReadOwner)];
+    $discardedReads->pop();
+    let writable $afterDiscardedRead = $discardedReadOwner->acquireWritableAccess();
+    $afterDiscardedRead->value = 2;
+    echo "discarded read released {$afterDiscardedRead->value}\n";
+
+    let $discardedWriteOwner = new WritableSharedReference(new Item());
+    let writable $discardedWrites = [
+        "write" => maybeWrite($discardedWriteOwner),
+    ];
+    $discardedWrites->remove("write");
+    let $afterDiscardedWrite = $discardedWriteOwner->acquireReadonlyAccess();
+    echo "discarded write released {$afterDiscardedWrite->value}\n";
+
     let $weakOwner = new WritableSharedReference(new Item());
     let $weak = $weakOwner->createWeakReference();
     let $calledStrong = reacquire($weak);
@@ -109,5 +124,22 @@ function main(): void
     let $removedNullableRead = $nullableReads->removeAt(0);
     if ($removedNullableRead != null) {
         echo "removed nullable {$removedNullableRead->value}\n";
+    }
+
+    let $popOwner = new WritableSharedReference(new Item());
+    let writable $popReads = [$popOwner->acquireReadonlyAccess()];
+    let $poppedRead = $popReads->pop();
+    if ($poppedRead != null) {
+        echo "popped read {$poppedRead->value}\n";
+    }
+
+    let $dictionaryOwner = new WritableSharedReference(new Item());
+    let writable $dictionaryWrites = [
+        "write" => $dictionaryOwner->acquireWritableAccess(),
+    ];
+    let writable $removedDictionaryWrite = $dictionaryWrites->remove("write");
+    if ($removedDictionaryWrite != null) {
+        $removedDictionaryWrite->value = 6;
+        echo "removed dictionary write {$removedDictionaryWrite->value}\n";
     }
 }
