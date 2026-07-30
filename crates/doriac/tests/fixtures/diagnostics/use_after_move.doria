@@ -1,0 +1,10 @@
+class Guard {}
+
+function consume(take Guard $guard): void {}
+
+function main(): void
+{
+    let $guard = new Guard();
+    consume($guard);
+    consume($guard);
+}

@@ -1851,10 +1851,17 @@ impl Checker<'_> {
                                 format!("`${name}` is still being used after its value was given away"),
                                 *span,
                             )
-                            .with_help(format!(
-                                "the value was given away at bytes {}..{} and cannot be used afterward",
-                                at.start, at.end
-                            )),
+                            .with_title(format!(
+                                "`${name}` Cannot Be Used After Its Value Was Given Away"
+                            ))
+                            .with_primary_label("Value Used Again Here")
+                            .with_explanation(
+                                "Giving away a move value ends this binding's ownership, so later reads are invalid.",
+                            )
+                            .with_related(at, "Value Given Here")
+                            .with_help(
+                                "Restructure the code so the final use happens before ownership is transferred.",
+                            ),
                         );
                     }
                 }
@@ -2672,11 +2679,13 @@ impl Checker<'_> {
                 ),
                 span,
             )
-            .with_help(format!(
-                "finish the earlier use at bytes {}..{} before taking the conflicting writable access",
-                existing_span.start,
-                existing_span.end
-            )),
+            .with_title("Conflicting Access")
+            .with_primary_label("This Access Conflicts With an Earlier Access")
+            .with_explanation(
+                "Writable access must be exclusive for the complete duration of the earlier access.",
+            )
+            .with_related(existing_span, "Earlier Access Starts Here")
+            .with_help("Finish the earlier access before taking the conflicting writable access."),
         );
     }
 

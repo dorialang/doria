@@ -107,6 +107,45 @@ pub fn bind_arguments(
     }
 }
 
+/// Returns a spelling correction only when one candidate is both close enough
+/// and strictly better than every alternative. This keeps automatic named
+/// argument fixes semantic and deterministic rather than guess-based.
+pub fn unambiguous_name_suggestion<'a>(written: &str, candidates: &'a [&str]) -> Option<&'a str> {
+    let mut ranked = candidates
+        .iter()
+        .copied()
+        .map(|candidate| (edit_distance(written, candidate), candidate))
+        .collect::<Vec<_>>();
+    ranked.sort_by_key(|(distance, candidate)| (*distance, *candidate));
+    let &(best_distance, best) = ranked.first()?;
+    let threshold = if written.chars().count() >= 4 { 2 } else { 1 };
+    if best_distance > threshold
+        || ranked
+            .get(1)
+            .is_some_and(|(distance, _)| *distance == best_distance)
+    {
+        return None;
+    }
+    Some(best)
+}
+
+fn edit_distance(left: &str, right: &str) -> usize {
+    let right = right.chars().collect::<Vec<_>>();
+    let mut previous = (0..=right.len()).collect::<Vec<_>>();
+    for (left_index, left_character) in left.chars().enumerate() {
+        let mut current = vec![left_index + 1];
+        for (right_index, right_character) in right.iter().enumerate() {
+            current.push(
+                (previous[right_index + 1] + 1)
+                    .min(current[right_index] + 1)
+                    .min(previous[right_index] + usize::from(left_character != *right_character)),
+            );
+        }
+        previous = current;
+    }
+    previous[right.len()]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -171,5 +210,19 @@ mod tests {
     fn positional_overflow_counts() {
         let bound = bind_arguments(&["a"], &[false], &[None, None, None]);
         assert_eq!(bound.overflow, 2);
+    }
+
+    #[test]
+    fn spelling_suggestions_require_one_clear_candidate() {
+        assert_eq!(
+            unambiguous_name_suggestion("nmae", &["name", "size"]),
+            Some("name")
+        );
+        assert_eq!(
+            unambiguous_name_suggestion("cot", &["cat", "cut"]),
+            None,
+            "equally close candidates require human review"
+        );
+        assert_eq!(unambiguous_name_suggestion("payload", &["name"]), None);
     }
 }

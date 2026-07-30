@@ -692,10 +692,11 @@ fn render_label(
                 marker_offset,
             )
         };
-        rendered.push_str(&format!(
-            "\n{:>gutter_width$} | {}",
-            context_line, visible_line
-        ));
+        rendered.push_str(&format!("\n{:>gutter_width$} |", context_line));
+        if !visible_line.is_empty() {
+            rendered.push(' ');
+            rendered.push_str(&visible_line);
+        }
         if is_labelled {
             let marker = if label.role == LabelRole::Primary {
                 '^'

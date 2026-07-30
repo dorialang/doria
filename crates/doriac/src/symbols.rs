@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use crate::ast::MemberAccess;
 use crate::numeric::IntegerValue;
+use crate::source::Span;
 use crate::types::{TypeId, TypeRef};
 
 #[derive(Debug, Clone)]
@@ -65,6 +66,7 @@ pub struct PropertyInfo {
     pub writable: bool,
     pub ty: TypeId,
     pub init_state: PropertyInitState,
+    pub declaration_span: Span,
 }
 
 #[derive(Debug, Clone)]

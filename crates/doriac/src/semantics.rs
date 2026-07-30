@@ -2653,6 +2653,7 @@ impl<'program> Checker<'program> {
                 } else {
                     PropertyInitState::Uninitialized
                 },
+                declaration_span: property.span,
             },
         );
     }
@@ -2755,6 +2756,7 @@ impl<'program> Checker<'program> {
                 writable: param.writable,
                 ty,
                 init_state: PropertyInitState::PromotedParameter,
+                declaration_span: param.span,
             },
         );
     }
@@ -5524,8 +5526,13 @@ impl<'program> Checker<'program> {
                                 format!("cannot assign to readonly variable `${name}`"),
                                 *span,
                             )
+                            .with_title("Cannot Write to Readonly Binding")
+                            .with_primary_label("This Assignment Needs Writable Access")
+                            .with_explanation(
+                                "Readonly bindings may be initialized once but cannot be assigned another value.",
+                            )
                             .with_help(format!(
-                                "declare it as `let writable ${name} = ...` if mutation is intended"
+                                "Declare it as `let writable ${name} = ...` if mutation is intended."
                             )),
                         );
                     }
@@ -5625,8 +5632,19 @@ impl<'program> Checker<'program> {
                                     ),
                                     *span,
                                 )
+                                .with_title(format!(
+                                    "Cannot Write to Readonly Property `{property}`"
+                                ))
+                                .with_primary_label("This Operation Needs Writable Access")
+                                .with_explanation(
+                                    "This assignment changes a property whose declaration does not grant writable access.",
+                                )
+                                .with_related(
+                                    property_info.declaration_span,
+                                    format!("`{property}` Is Readonly Here"),
+                                )
                                 .with_help(format!(
-                                    "mark the property writable: `writable {} ${property};`",
+                                    "Mark the property writable: `writable {} ${property};`",
                                     self.types.display(property_info.ty)
                                 )),
                             );
@@ -6896,11 +6914,37 @@ impl<'program> Checker<'program> {
                 .name
                 .as_ref()
                 .expect("an unknown-named argument always carries a name");
-            self.diagnostics.push(Diagnostic::new(
+            let mut diagnostic = Diagnostic::new(
                 "E0516",
                 format!("{callee} has no parameter named `{}`", name.text),
                 name.span,
+            )
+            .with_title("Unknown Named Argument")
+            .with_primary_label("No Parameter Has This Name")
+            .with_explanation(
+                "Named arguments must match a parameter name in the called declaration.",
+            )
+            .with_help(format!(
+                "Available parameter names: {}.",
+                param_names
+                    .iter()
+                    .map(|name| format!("`{name}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ));
+            if let Some(suggestion) =
+                crate::arg_binding::unambiguous_name_suggestion(&name.text, &param_names)
+            {
+                diagnostic = diagnostic.with_help(format!("Did you mean `{suggestion}`?"));
+                let suggestion_is_unbound = param_names
+                    .iter()
+                    .position(|candidate| *candidate == suggestion)
+                    .is_some_and(|index| bound.param_to_arg[index].is_none());
+                if suggestion_is_unbound {
+                    diagnostic = diagnostic.with_fix(name.span, suggestion);
+                }
+            }
+            self.diagnostics.push(diagnostic);
             fatal = true;
         }
         for &arg_index in &bound.duplicate {
@@ -8568,8 +8612,15 @@ impl<'program> Checker<'program> {
             ),
         };
 
-        self.diagnostics
-            .push(Diagnostic::new("E0403", message, span));
+        self.diagnostics.push(
+            Diagnostic::new("E0403", message, span)
+                .with_title("Type Mismatch")
+                .with_primary_label("This Value Has the Wrong Type")
+                .with_explanation(format!(
+                    "This position requires `{target_name}`, but the expression produces `{value_name}`."
+                ))
+                .with_help("Change the expression or the declared destination type."),
+        );
     }
 
     fn check_expr_assignable(
