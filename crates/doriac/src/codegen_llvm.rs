@@ -39,10 +39,17 @@ use crate::native_abi::{
     MIXED_TAG_STRING, MIXED_TAG_UINT16, MIXED_TAG_UINT32, MIXED_TAG_UINT64, MIXED_TAG_UINT8,
     MIXED_TYPE_ID, NULLABLE_STRING_EQUAL, PROCESS_EXIT, READ_FILE, READ_FILE_BYTES,
     READ_STDIN_BYTES, READ_STDIN_LINE, SHARED_ACQUIRE, SHARED_CREATE, SHARED_CREATE_WEAK,
-    SHARED_PAYLOAD, SHARED_RELEASE, SHARED_RELEASE_WEAK, SHARED_RETAIN, STRING_COMPARE,
-    STRING_CONCAT, STRING_DATA, STRING_FROM_BOOL, STRING_FROM_F32, STRING_FROM_F64,
-    STRING_FROM_I64, STRING_FROM_U64, STRING_FROM_UTF8, STRING_LENGTH, STRING_RELEASE,
-    STRING_RETAIN, STRING_WRITE_STDERR, STRING_WRITE_STDOUT, WRITABLE_SHARED_ACQUIRE,
+    SHARED_PAYLOAD, SHARED_RELEASE, SHARED_RELEASE_WEAK, SHARED_RETAIN, STRING_BYTE_LENGTH,
+    STRING_COMPARE, STRING_CONCAT, STRING_CONTAINS, STRING_CONTAINS_IGNORE_CASE,
+    STRING_COUNT_OCCURRENCES, STRING_DATA, STRING_ENDS_WITH, STRING_ENDS_WITH_IGNORE_CASE,
+    STRING_EQUALS_IGNORE_CASE, STRING_FROM_BOOL, STRING_FROM_BYTES, STRING_FROM_F32,
+    STRING_FROM_F64, STRING_FROM_I64, STRING_FROM_U64, STRING_FROM_UTF8, STRING_GRAPHEME_LENGTH,
+    STRING_INDEX_OF, STRING_INDEX_OF_IGNORE_CASE, STRING_IS_EMPTY, STRING_JOIN,
+    STRING_LAST_INDEX_OF, STRING_LAST_INDEX_OF_IGNORE_CASE, STRING_LOWER, STRING_LOWER_FIRST,
+    STRING_PAD_END, STRING_PAD_START, STRING_RELEASE, STRING_REPEAT, STRING_REPLACE, STRING_RETAIN,
+    STRING_SLICE, STRING_SPLIT, STRING_STARTS_WITH, STRING_STARTS_WITH_IGNORE_CASE,
+    STRING_TO_BYTES, STRING_TRIM, STRING_TRIM_END, STRING_TRIM_START, STRING_UPPER,
+    STRING_UPPER_FIRST, STRING_WRITE_STDERR, STRING_WRITE_STDOUT, WRITABLE_SHARED_ACQUIRE,
     WRITABLE_SHARED_ACQUIRE_READONLY_ACCESS, WRITABLE_SHARED_ACQUIRE_WRITABLE_ACCESS,
     WRITABLE_SHARED_CREATE, WRITABLE_SHARED_CREATE_WEAK, WRITABLE_SHARED_READONLY_PAYLOAD,
     WRITABLE_SHARED_RELEASE, WRITABLE_SHARED_RELEASE_READONLY_ACCESS, WRITABLE_SHARED_RELEASE_WEAK,
@@ -1164,7 +1171,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 let usize_type = self.context.ptr_sized_int_type(self.target_data, None);
                 let length = self
                     .call_runtime(
-                        STRING_LENGTH,
+                        STRING_BYTE_LENGTH,
                         &[pointer.into()],
                         Some(usize_type.into()),
                         &[string.into()],
@@ -1596,6 +1603,9 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         let pointer = self.context.ptr_type(AddressSpace::default());
         let usize_type = self.context.ptr_sized_int_type(self.target_data, None);
         match expression {
+            mir::CollectionExpression::StringIntrinsic(call) => {
+                Ok(self.lower_string_intrinsic_call(call)?.into_pointer_value())
+            }
             mir::CollectionExpression::Local {
                 local, transfer, ..
             } => {
@@ -4568,6 +4578,9 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
     ) -> Result<StructValue<'ctx>, BackendError> {
         let pointer = self.context.ptr_type(AddressSpace::default());
         match expression {
+            mir::NullableStringExpression::Intrinsic(call) => {
+                Ok(self.lower_string_intrinsic_call(call)?.into_struct_value())
+            }
             mir::NullableStringExpression::Null => {
                 self.nullable_value(self.present_word(false), pointer.const_null().into())
             }
@@ -4710,6 +4723,9 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         let ty = expression.ty();
         let payload_type = scalar_type(self.context, ty);
         match expression {
+            mir::NullableScalarExpression::StringIntrinsic(call) => {
+                Ok(self.lower_string_intrinsic_call(call)?.into_struct_value())
+            }
             mir::NullableScalarExpression::Null(_) => {
                 self.nullable_value(self.present_word(false), payload_type.const_zero())
             }
@@ -4978,6 +4994,345 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             )?
             .ok_or_else(|| backend_failure("string retain produced no result"))?
             .into_pointer_value())
+    }
+
+    fn lower_string_intrinsic_call(
+        &mut self,
+        call: &mir::StringIntrinsicCall,
+    ) -> Result<BasicValueEnum<'ctx>, BackendError> {
+        use mir::StringIntrinsicKind as Kind;
+
+        let pointer = self.context.ptr_type(AddressSpace::default());
+        let usize_type = self.context.ptr_sized_int_type(self.target_data, None);
+        let i8_type = self.context.i8_type();
+        let i64_type = self.context.i64_type();
+        let mut arguments = Vec::with_capacity(call.args.len());
+        let mut owned_strings = Vec::new();
+        for argument in &call.args {
+            let value = self.lower_rvalue(argument)?;
+            match argument.ty() {
+                mir::Type::String => owned_strings.push(value.into_pointer_value()),
+                mir::Type::NullableString => owned_strings.push(
+                    self.nullable_parts(value.into_struct_value())?
+                        .1
+                        .into_pointer_value(),
+                ),
+                _ => {}
+            }
+            arguments.push(value);
+        }
+        let argument = |index: usize| -> Result<BasicValueEnum<'ctx>, BackendError> {
+            arguments
+                .get(index)
+                .copied()
+                .ok_or_else(|| malformed_mir("String intrinsic argument is missing"))
+        };
+
+        let result: BasicValueEnum<'ctx> = match call.kind {
+            Kind::GraphemeLength | Kind::ByteLength => {
+                let name = if call.kind == Kind::GraphemeLength {
+                    STRING_GRAPHEME_LENGTH
+                } else {
+                    STRING_BYTE_LENGTH
+                };
+                let value = self
+                    .call_runtime(
+                        name,
+                        &[pointer.into()],
+                        Some(usize_type.into()),
+                        &[argument(0)?.into()],
+                    )?
+                    .ok_or_else(|| {
+                        backend_failure("String length runtime call produced no result")
+                    })?
+                    .into_int_value();
+                if usize_type.get_bit_width() == 64 {
+                    value.into()
+                } else {
+                    build(
+                        self.builder
+                            .build_int_z_extend(value, i64_type, "string.length.i64"),
+                    )?
+                    .into()
+                }
+            }
+            Kind::IsEmpty => self
+                .call_runtime(
+                    STRING_IS_EMPTY,
+                    &[pointer.into()],
+                    Some(i8_type.into()),
+                    &[argument(0)?.into()],
+                )?
+                .ok_or_else(|| backend_failure("String empty test produced no result"))?,
+            Kind::ToBytes => self
+                .call_runtime(
+                    STRING_TO_BYTES,
+                    &[pointer.into()],
+                    Some(pointer.into()),
+                    &[argument(0)?.into()],
+                )?
+                .ok_or_else(|| backend_failure("String bytes conversion produced no result"))?,
+            Kind::Trim
+            | Kind::TrimStart
+            | Kind::TrimEnd
+            | Kind::Lower
+            | Kind::Upper
+            | Kind::LowerFirst
+            | Kind::UpperFirst => {
+                let name = match call.kind {
+                    Kind::Trim => STRING_TRIM,
+                    Kind::TrimStart => STRING_TRIM_START,
+                    Kind::TrimEnd => STRING_TRIM_END,
+                    Kind::Lower => STRING_LOWER,
+                    Kind::Upper => STRING_UPPER,
+                    Kind::LowerFirst => STRING_LOWER_FIRST,
+                    Kind::UpperFirst => STRING_UPPER_FIRST,
+                    _ => unreachable!(),
+                };
+                self.call_runtime(
+                    name,
+                    &[pointer.into(), pointer.into()],
+                    Some(pointer.into()),
+                    &[self.current_frame.into(), argument(0)?.into()],
+                )?
+                .ok_or_else(|| backend_failure("String transform produced no result"))?
+            }
+            Kind::ContainsIgnoreCase | Kind::StartsWithIgnoreCase | Kind::EndsWithIgnoreCase => {
+                let name = match call.kind {
+                    Kind::ContainsIgnoreCase => STRING_CONTAINS_IGNORE_CASE,
+                    Kind::StartsWithIgnoreCase => STRING_STARTS_WITH_IGNORE_CASE,
+                    Kind::EndsWithIgnoreCase => STRING_ENDS_WITH_IGNORE_CASE,
+                    _ => unreachable!(),
+                };
+                self.call_runtime(
+                    name,
+                    &[pointer.into(), pointer.into(), pointer.into()],
+                    Some(i8_type.into()),
+                    &[
+                        self.current_frame.into(),
+                        argument(0)?.into(),
+                        argument(1)?.into(),
+                    ],
+                )?
+                .ok_or_else(|| {
+                    backend_failure("String case-insensitive predicate produced no result")
+                })?
+            }
+            Kind::Contains | Kind::StartsWith | Kind::EndsWith => {
+                let name = match call.kind {
+                    Kind::Contains => STRING_CONTAINS,
+                    Kind::StartsWith => STRING_STARTS_WITH,
+                    Kind::EndsWith => STRING_ENDS_WITH,
+                    _ => unreachable!(),
+                };
+                self.call_runtime(
+                    name,
+                    &[pointer.into(), pointer.into()],
+                    Some(i8_type.into()),
+                    &[argument(0)?.into(), argument(1)?.into()],
+                )?
+                .ok_or_else(|| backend_failure("String predicate produced no result"))?
+            }
+            Kind::EqualsIgnoreCase => self
+                .call_runtime(
+                    STRING_EQUALS_IGNORE_CASE,
+                    &[pointer.into(), pointer.into(), pointer.into()],
+                    Some(i8_type.into()),
+                    &[
+                        self.current_frame.into(),
+                        argument(0)?.into(),
+                        argument(1)?.into(),
+                    ],
+                )?
+                .ok_or_else(|| backend_failure("String case-fold comparison produced no result"))?,
+            Kind::IndexOf
+            | Kind::LastIndexOf
+            | Kind::IndexOfIgnoreCase
+            | Kind::LastIndexOfIgnoreCase => {
+                let found_slot = build(self.builder.build_alloca(i8_type, "string.search.found"))?;
+                let (name, with_frame) = match call.kind {
+                    Kind::IndexOf => (STRING_INDEX_OF, false),
+                    Kind::LastIndexOf => (STRING_LAST_INDEX_OF, false),
+                    Kind::IndexOfIgnoreCase => (STRING_INDEX_OF_IGNORE_CASE, true),
+                    Kind::LastIndexOfIgnoreCase => (STRING_LAST_INDEX_OF_IGNORE_CASE, true),
+                    _ => unreachable!(),
+                };
+                let mut params = Vec::with_capacity(4);
+                let mut values = Vec::with_capacity(4);
+                if with_frame {
+                    params.push(pointer.into());
+                    values.push(self.current_frame.into());
+                }
+                params.extend([pointer.into(), pointer.into(), pointer.into()]);
+                values.extend([argument(0)?.into(), argument(1)?.into(), found_slot.into()]);
+                let payload = self
+                    .call_runtime(name, &params, Some(i64_type.into()), &values)?
+                    .ok_or_else(|| backend_failure("String search produced no result"))?;
+                let found = build(self.builder.build_load(
+                    i8_type,
+                    found_slot,
+                    "string.search.found.value",
+                ))?
+                .into_int_value();
+                let present = build(self.builder.build_int_z_extend(
+                    found,
+                    usize_type,
+                    "string.search.present",
+                ))?;
+                self.nullable_value(present, payload)?.into()
+            }
+            Kind::CountOccurrences => self
+                .call_runtime(
+                    STRING_COUNT_OCCURRENCES,
+                    &[pointer.into(), pointer.into(), pointer.into()],
+                    Some(i64_type.into()),
+                    &[
+                        self.current_frame.into(),
+                        argument(0)?.into(),
+                        argument(1)?.into(),
+                    ],
+                )?
+                .ok_or_else(|| backend_failure("String occurrence count produced no result"))?,
+            Kind::Replace => self
+                .call_runtime(
+                    STRING_REPLACE,
+                    &[
+                        pointer.into(),
+                        pointer.into(),
+                        pointer.into(),
+                        pointer.into(),
+                    ],
+                    Some(pointer.into()),
+                    &[
+                        self.current_frame.into(),
+                        argument(0)?.into(),
+                        argument(1)?.into(),
+                        argument(2)?.into(),
+                    ],
+                )?
+                .ok_or_else(|| backend_failure("String replacement produced no result"))?,
+            Kind::Split => self
+                .call_runtime(
+                    STRING_SPLIT,
+                    &[pointer.into(), pointer.into(), pointer.into()],
+                    Some(pointer.into()),
+                    &[
+                        self.current_frame.into(),
+                        argument(0)?.into(),
+                        argument(1)?.into(),
+                    ],
+                )?
+                .ok_or_else(|| backend_failure("String split produced no result"))?,
+            Kind::Join => self
+                .call_runtime(
+                    STRING_JOIN,
+                    &[pointer.into(), pointer.into(), pointer.into()],
+                    Some(pointer.into()),
+                    &[
+                        self.current_frame.into(),
+                        argument(0)?.into(),
+                        argument(1)?.into(),
+                    ],
+                )?
+                .ok_or_else(|| backend_failure("String join produced no result"))?,
+            Kind::Slice => {
+                let (has_length, length) = self.nullable_parts(argument(2)?.into_struct_value())?;
+                let has_length = build(self.builder.build_int_truncate(
+                    has_length,
+                    i8_type,
+                    "string.slice.has-length",
+                ))?;
+                self.call_runtime(
+                    STRING_SLICE,
+                    &[
+                        pointer.into(),
+                        pointer.into(),
+                        i64_type.into(),
+                        i64_type.into(),
+                        i8_type.into(),
+                    ],
+                    Some(pointer.into()),
+                    &[
+                        self.current_frame.into(),
+                        argument(0)?.into(),
+                        argument(1)?.into(),
+                        length.into(),
+                        has_length.into(),
+                    ],
+                )?
+                .ok_or_else(|| backend_failure("String slice produced no result"))?
+            }
+            Kind::Repeat => self
+                .call_runtime(
+                    STRING_REPEAT,
+                    &[pointer.into(), pointer.into(), i64_type.into()],
+                    Some(pointer.into()),
+                    &[
+                        self.current_frame.into(),
+                        argument(0)?.into(),
+                        argument(1)?.into(),
+                    ],
+                )?
+                .ok_or_else(|| backend_failure("String repetition produced no result"))?,
+            Kind::PadStart | Kind::PadEnd => {
+                let name = if call.kind == Kind::PadStart {
+                    STRING_PAD_START
+                } else {
+                    STRING_PAD_END
+                };
+                self.call_runtime(
+                    name,
+                    &[
+                        pointer.into(),
+                        pointer.into(),
+                        i64_type.into(),
+                        pointer.into(),
+                    ],
+                    Some(pointer.into()),
+                    &[
+                        self.current_frame.into(),
+                        argument(0)?.into(),
+                        argument(1)?.into(),
+                        argument(2)?.into(),
+                    ],
+                )?
+                .ok_or_else(|| backend_failure("String padding produced no result"))?
+            }
+            Kind::FromBytes => {
+                let payload = self
+                    .call_runtime(
+                        STRING_FROM_BYTES,
+                        &[pointer.into()],
+                        Some(pointer.into()),
+                        &[argument(0)?.into()],
+                    )?
+                    .ok_or_else(|| backend_failure("String UTF-8 validation produced no result"))?
+                    .into_pointer_value();
+                let present = build(
+                    self.builder
+                        .build_is_not_null(payload, "string.from-bytes.present"),
+                )?;
+                let present = build(self.builder.build_int_z_extend(
+                    present,
+                    usize_type,
+                    "string.from-bytes.present.word",
+                ))?;
+                self.nullable_value(present, payload.into())?.into()
+            }
+        };
+
+        for string in owned_strings {
+            self.release_string(string)?;
+        }
+        for index in ordered_owned_argument_indices(&call.args) {
+            if let Some(collection) = call.args[index].owned_temporary_collection() {
+                self.defer_or_drop_collection_temporary(
+                    arguments[index].into_pointer_value(),
+                    collection,
+                )?;
+            }
+        }
+        Ok(result)
     }
 
     fn drop_shared_value(
@@ -6095,6 +6450,9 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         let pointer = self.context.ptr_type(AddressSpace::default());
         let usize_type = self.context.ptr_sized_int_type(self.target_data, None);
         match expression {
+            mir::StringExpression::Intrinsic(call) => {
+                Ok(self.lower_string_intrinsic_call(call)?.into_pointer_value())
+            }
             mir::StringExpression::Literal(value) => {
                 let data = define_bytes(
                     self.context,
@@ -6998,6 +7356,9 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         operand: &mir::Operand,
     ) -> Result<IntValue<'ctx>, BackendError> {
         match operand {
+            mir::Operand::StringIntrinsic(call) => {
+                Ok(self.lower_string_intrinsic_call(call)?.into_int_value())
+            }
             mir::Operand::Scalar(mir::ScalarValue::Integer(value)) if value.ty == ty => {
                 Ok(integer_constant(self.context, *value))
             }
@@ -8001,6 +8362,9 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         operand: &mir::Operand,
     ) -> Result<IntValue<'ctx>, BackendError> {
         match operand {
+            mir::Operand::StringIntrinsic(call) => {
+                Ok(self.lower_string_intrinsic_call(call)?.into_int_value())
+            }
             mir::Operand::Scalar(mir::ScalarValue::Bool(value)) => {
                 Ok(self.context.i8_type().const_int(u64::from(*value), false))
             }
@@ -8556,7 +8920,8 @@ fn resolve_string_expression_from_definitions(
             }
             Ok(value)
         }
-        mir::StringExpression::Display(_)
+        mir::StringExpression::Intrinsic(_)
+        | mir::StringExpression::Display(_)
         | mir::StringExpression::Call { .. }
         | mir::StringExpression::Property { .. }
         | mir::StringExpression::Static(_)
@@ -8592,7 +8957,8 @@ fn resolve_string_expression(
             }
             Ok(value)
         }
-        mir::StringExpression::Display(_)
+        mir::StringExpression::Intrinsic(_)
+        | mir::StringExpression::Display(_)
         | mir::StringExpression::Call { .. }
         | mir::StringExpression::Property { .. }
         | mir::StringExpression::Static(_)

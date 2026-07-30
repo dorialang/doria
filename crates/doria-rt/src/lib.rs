@@ -13,6 +13,7 @@ mod entry_args;
 mod file_io;
 mod line_io;
 mod mixed;
+mod string_ops;
 
 use device_io::{StandardStream, WriteOutcome};
 
@@ -21,6 +22,59 @@ const PANIC_STATUS: i32 = 101;
 const SIGPIPE: i32 = 13;
 #[cfg(unix)]
 const SIG_IGN: usize = 1;
+
+#[cfg(all(not(test), panic = "abort"))]
+struct RuntimeAllocator;
+
+#[cfg(all(not(test), panic = "abort"))]
+unsafe impl core::alloc::GlobalAlloc for RuntimeAllocator {
+    unsafe fn alloc(&self, layout: core::alloc::Layout) -> *mut u8 {
+        let header = mem::size_of::<usize>();
+        let Some(byte_length) = layout
+            .size()
+            .checked_add(layout.align() - 1)
+            .and_then(|length| length.checked_add(header))
+        else {
+            return ptr::null_mut();
+        };
+        let allocation = allocate(byte_length);
+        if allocation.is_null() {
+            return allocation;
+        }
+        let start = allocation.add(header);
+        let aligned = start
+            .add(layout.align() - 1)
+            .map_addr(|address| address & !(layout.align() - 1));
+        aligned.sub(header).cast::<usize>().write(allocation.addr());
+        aligned
+    }
+
+    unsafe fn dealloc(&self, memory: *mut u8, _layout: core::alloc::Layout) {
+        let allocation = memory.sub(mem::size_of::<usize>()).cast::<usize>().read() as *mut u8;
+        deallocate(allocation);
+    }
+
+    unsafe fn realloc(
+        &self,
+        memory: *mut u8,
+        layout: core::alloc::Layout,
+        new_size: usize,
+    ) -> *mut u8 {
+        let Ok(new_layout) = core::alloc::Layout::from_size_align(new_size, layout.align()) else {
+            return ptr::null_mut();
+        };
+        let replacement = self.alloc(new_layout);
+        if !replacement.is_null() {
+            ptr::copy_nonoverlapping(memory, replacement, layout.size().min(new_size));
+            self.dealloc(memory, layout);
+        }
+        replacement
+    }
+}
+
+#[cfg(all(not(test), panic = "abort"))]
+#[global_allocator]
+static RUNTIME_ALLOCATOR: RuntimeAllocator = RuntimeAllocator;
 
 #[repr(C)]
 pub struct DrStackFrameV1 {
@@ -1511,12 +1565,29 @@ pub unsafe extern "C" fn dr_v1_string_from_utf8(
 }
 
 pub(crate) unsafe fn allocate_string(byte_length: usize) -> *mut DrStringV1 {
+    allocate_string_with_frame(ptr::null(), byte_length)
+}
+
+pub(crate) unsafe fn allocate_string_with_frame(
+    frame: *const DrStackFrameV1,
+    byte_length: usize,
+) -> *mut DrStringV1 {
     let total = STRING_HEADER_SIZE
         .checked_add(byte_length)
-        .unwrap_or_else(|| string_runtime_panic(b"string length overflow"));
+        .unwrap_or_else(|| {
+            dr_v1_panic(
+                frame,
+                b"String Result Is Too Large".as_ptr(),
+                b"String Result Is Too Large".len(),
+            )
+        });
     let string = allocate(total).cast::<DrStringV1>();
     if string.is_null() {
-        string_runtime_panic(b"string allocation failed");
+        dr_v1_panic(
+            frame,
+            b"String Result Is Too Large".as_ptr(),
+            b"String Result Is Too Large".len(),
+        );
     }
     ptr::write(
         string,
@@ -1661,6 +1732,15 @@ pub unsafe extern "C" fn dr_v1_string_data(string: *const DrStringV1) -> *const 
 /// # Safety
 /// `string` must identify a live doria-rt string.
 pub unsafe extern "C" fn dr_v1_string_length(string: *const DrStringV1) -> usize {
+    dr_v1_string_byte_length(string)
+}
+
+#[no_mangle]
+/// Returns the exact UTF-8 byte length for a live string.
+///
+/// # Safety
+/// `string` must identify a live doria-rt string.
+pub unsafe extern "C" fn dr_v1_string_byte_length(string: *const DrStringV1) -> usize {
     (*string).byte_length
 }
 

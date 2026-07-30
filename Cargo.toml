@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/doria-rt", "crates/doriac"]
+members = ["crates/doria-rt", "crates/doria-unicode", "crates/doriac"]
 resolver = "2"
 
 [workspace.package]
@@ -9,10 +9,21 @@ repository = "https://github.com/dorialang/doria"
 version = "2026.3.1-canary"
 
 [workspace.dependencies]
+icu_casemap = { version = "=2.2.0", default-features = false, features = ["compiled_data"] }
+icu_locale_core = { version = "=2.2.0", default-features = false }
+icu_properties = { version = "=2.2.0", default-features = false, features = ["compiled_data"] }
+icu_segmenter = { version = "=2.2.0", default-features = false, features = ["compiled_data"] }
 ryu = { version = "=1.0.23", default-features = false }
+writeable = { version = "=0.6.3", default-features = false }
 
 [profile.dev]
 panic = "abort"
+
+[profile.dev.package.icu_provider]
+# ICU4X's debug logging shim links `std` when `alloc` and debug assertions are
+# both enabled. The embedded Doria runtime is freestanding, so keep its provider
+# dependency on the no_std path in development builds as well as release builds.
+debug-assertions = false
 
 [profile.test]
 debug = "line-tables-only"

@@ -1,0 +1,13 @@
+[package]
+name = "doria-unicode"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+icu_casemap.workspace = true
+icu_locale_core.workspace = true
+icu_properties.workspace = true
+icu_segmenter.workspace = true
+writeable.workspace = true

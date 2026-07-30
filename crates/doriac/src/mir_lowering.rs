@@ -4275,6 +4275,17 @@ fn lower_string_expression(
     expr: &hir::Expr,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::StringExpression> {
+    if let Some(call) = lower_string_intrinsic_call(expr, context) {
+        let call = call?;
+        if call.result != mir::Type::String {
+            return Err(vec![Diagnostic::new(
+                "I1301",
+                "checked String intrinsic does not return string",
+                expr.span(),
+            )]);
+        }
+        return Ok(mir::StringExpression::Intrinsic(Box::new(call)));
+    }
     if let Some((collection, index, value_type)) = lower_list_remove_at(expr, context)? {
         if value_type != mir::Type::String {
             return Err(vec![unsupported(
@@ -4459,6 +4470,17 @@ fn lower_nullable_string_expression(
     expr: &hir::Expr,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::NullableStringExpression> {
+    if let Some(call) = lower_string_intrinsic_call(expr, context) {
+        let call = call?;
+        if call.result != mir::Type::NullableString {
+            return Err(vec![Diagnostic::new(
+                "I1301",
+                "checked String intrinsic does not return nullable string",
+                expr.span(),
+            )]);
+        }
+        return Ok(mir::NullableStringExpression::Intrinsic(Box::new(call)));
+    }
     if let Some((collection, key, value_type, access)) =
         lower_collection_nullable_property(expr, context)?
     {
@@ -4709,6 +4731,19 @@ fn lower_nullable_scalar_expression(
     expected: mir::ScalarType,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::NullableScalarExpression> {
+    if let Some(call) = lower_string_intrinsic_call(expr, context) {
+        let call = call?;
+        if call.result != mir::Type::NullableScalar(expected) {
+            return Err(vec![Diagnostic::new(
+                "I1301",
+                "checked String intrinsic has a different nullable scalar result",
+                expr.span(),
+            )]);
+        }
+        return Ok(mir::NullableScalarExpression::StringIntrinsic(Box::new(
+            call,
+        )));
+    }
     if let Some(value) = lower_null_safe_collection_scalar(expr, expected, context)? {
         return Ok(value);
     }
@@ -6012,6 +6047,21 @@ fn lower_const_parameter_default(
             value.clone(),
         )));
     }
+    if matches!(value, crate::const_eval::ConstValue::Null) {
+        return match expected {
+            mir::Type::NullableScalar(ty) => Ok(mir::Rvalue::NullableScalar(
+                mir::NullableScalarExpression::Null(ty),
+            )),
+            mir::Type::NullableString => Ok(mir::Rvalue::NullableString(
+                mir::NullableStringExpression::Null,
+            )),
+            _ => Err(vec![Diagnostic::new(
+                "I2003",
+                "checked null parameter default does not match its MIR parameter type",
+                span,
+            )]),
+        };
+    }
 
     let value = match (value, expected) {
         (
@@ -6040,6 +6090,313 @@ fn lower_const_parameter_default(
         }
     };
     Ok(mir::Rvalue::Value(value))
+}
+
+fn lower_string_intrinsic_call(
+    expr: &hir::Expr,
+    context: &mut LoweringContext,
+) -> Option<DiagnosticResult<mir::StringIntrinsicCall>> {
+    let (kind, args, span, property_receiver) = match expr {
+        hir::Expr::PropertyAccess {
+            object,
+            property,
+            span,
+            ..
+        } => {
+            if context.expression_type(object).ok() != Some(mir::Type::String) {
+                return None;
+            }
+            let kind = match property.as_str() {
+                "length" => mir::StringIntrinsicKind::GraphemeLength,
+                "byteLength" => mir::StringIntrinsicKind::ByteLength,
+                "isEmpty" => mir::StringIntrinsicKind::IsEmpty,
+                "bytes" => mir::StringIntrinsicKind::ToBytes,
+                _ => return None,
+            };
+            (kind, &[][..], *span, Some(object.as_ref()))
+        }
+        hir::Expr::StaticCall {
+            class_name,
+            method,
+            args,
+            span,
+        } if class_name == "String" => {
+            let kind = match method.as_str() {
+                "trim" => mir::StringIntrinsicKind::Trim,
+                "trimStart" => mir::StringIntrinsicKind::TrimStart,
+                "trimEnd" => mir::StringIntrinsicKind::TrimEnd,
+                "lower" => mir::StringIntrinsicKind::Lower,
+                "upper" => mir::StringIntrinsicKind::Upper,
+                "lowerFirst" => mir::StringIntrinsicKind::LowerFirst,
+                "upperFirst" => mir::StringIntrinsicKind::UpperFirst,
+                "contains" => mir::StringIntrinsicKind::Contains,
+                "startsWith" => mir::StringIntrinsicKind::StartsWith,
+                "endsWith" => mir::StringIntrinsicKind::EndsWith,
+                "containsIgnoreCase" => mir::StringIntrinsicKind::ContainsIgnoreCase,
+                "startsWithIgnoreCase" => mir::StringIntrinsicKind::StartsWithIgnoreCase,
+                "endsWithIgnoreCase" => mir::StringIntrinsicKind::EndsWithIgnoreCase,
+                "equalsIgnoreCase" => mir::StringIntrinsicKind::EqualsIgnoreCase,
+                "indexOf" => mir::StringIntrinsicKind::IndexOf,
+                "lastIndexOf" => mir::StringIntrinsicKind::LastIndexOf,
+                "indexOfIgnoreCase" => mir::StringIntrinsicKind::IndexOfIgnoreCase,
+                "lastIndexOfIgnoreCase" => mir::StringIntrinsicKind::LastIndexOfIgnoreCase,
+                "countOccurrences" => mir::StringIntrinsicKind::CountOccurrences,
+                "replace" => mir::StringIntrinsicKind::Replace,
+                "split" => mir::StringIntrinsicKind::Split,
+                "join" => mir::StringIntrinsicKind::Join,
+                "slice" => mir::StringIntrinsicKind::Slice,
+                "repeat" => mir::StringIntrinsicKind::Repeat,
+                "padStart" => mir::StringIntrinsicKind::PadStart,
+                "padEnd" => mir::StringIntrinsicKind::PadEnd,
+                "fromBytes" => mir::StringIntrinsicKind::FromBytes,
+                _ => return None,
+            };
+            (kind, args.as_slice(), *span, None)
+        }
+        _ => return None,
+    };
+
+    Some((|| {
+        let signature = string_intrinsic_signature(kind, context, span)?;
+        let result = match property_receiver {
+            Some(receiver) => vec![lower_rvalue_as_expected(
+                receiver,
+                mir::Type::String,
+                context,
+            )?],
+            None => lower_call_args_with_ownership(
+                &format!("String::{}", string_intrinsic_name(kind)),
+                args,
+                signature.clone(),
+                span,
+                context,
+            )?,
+        };
+        Ok(mir::StringIntrinsicCall {
+            kind,
+            args: result,
+            result: match signature.return_type {
+                mir::ReturnType::Value(result) => result,
+                mir::ReturnType::Void => {
+                    return Err(vec![Diagnostic::new(
+                        "I1301",
+                        "String intrinsic unexpectedly has a void MIR result",
+                        span,
+                    )]);
+                }
+            },
+            span,
+        })
+    })())
+}
+
+fn string_intrinsic_signature(
+    kind: mir::StringIntrinsicKind,
+    context: &LoweringContext,
+    span: Span,
+) -> DiagnosticResult<FunctionSignature> {
+    use mir::StringIntrinsicKind as Kind;
+
+    let int = mir::Type::Scalar(mir::ScalarType::Integer(IntegerType::Int64));
+    let nullable_int = mir::Type::NullableScalar(mir::ScalarType::Integer(IntegerType::Int64));
+    let bool_ty = mir::Type::Scalar(mir::ScalarType::Bool);
+    let string = mir::Type::String;
+    let bytes = || {
+        context
+            .collection_registry
+            .ids
+            .get(&(
+                mir::CollectionKind::Bytes,
+                None,
+                mir::Type::Scalar(mir::ScalarType::Integer(IntegerType::UInt8)),
+            ))
+            .copied()
+            .map(mir::Type::Collection)
+    };
+    let strings = || {
+        context
+            .collection_registry
+            .ids
+            .get(&(mir::CollectionKind::List, None, mir::Type::String))
+            .copied()
+            .map(mir::Type::Collection)
+    };
+
+    let (parameters, names, defaults, result) = match kind {
+        Kind::GraphemeLength | Kind::ByteLength => (vec![string], vec!["text"], vec![None], int),
+        Kind::IsEmpty => (vec![string], vec!["text"], vec![None], bool_ty),
+        Kind::ToBytes => (
+            vec![string],
+            vec!["text"],
+            vec![None],
+            bytes().ok_or_else(|| {
+                vec![Diagnostic::new(
+                    "I1301",
+                    "checked String bytes property has no interned Bytes MIR type",
+                    span,
+                )]
+            })?,
+        ),
+        Kind::Trim
+        | Kind::TrimStart
+        | Kind::TrimEnd
+        | Kind::Lower
+        | Kind::Upper
+        | Kind::LowerFirst
+        | Kind::UpperFirst => (vec![string], vec!["text"], vec![None], string),
+        Kind::Contains | Kind::ContainsIgnoreCase => (
+            vec![string, string],
+            vec!["text", "needle"],
+            vec![None, None],
+            bool_ty,
+        ),
+        Kind::StartsWith | Kind::StartsWithIgnoreCase => (
+            vec![string, string],
+            vec!["text", "prefix"],
+            vec![None, None],
+            bool_ty,
+        ),
+        Kind::EndsWith | Kind::EndsWithIgnoreCase => (
+            vec![string, string],
+            vec!["text", "suffix"],
+            vec![None, None],
+            bool_ty,
+        ),
+        Kind::EqualsIgnoreCase => (
+            vec![string, string],
+            vec!["left", "right"],
+            vec![None, None],
+            bool_ty,
+        ),
+        Kind::IndexOf
+        | Kind::LastIndexOf
+        | Kind::IndexOfIgnoreCase
+        | Kind::LastIndexOfIgnoreCase => (
+            vec![string, string],
+            vec!["text", "needle"],
+            vec![None, None],
+            nullable_int,
+        ),
+        Kind::CountOccurrences => (
+            vec![string, string],
+            vec!["text", "needle"],
+            vec![None, None],
+            int,
+        ),
+        Kind::Replace => (
+            vec![string, string, string],
+            vec!["text", "search", "replacement"],
+            vec![None, None, None],
+            string,
+        ),
+        Kind::Split => (
+            vec![string, string],
+            vec!["text", "separator"],
+            vec![None, None],
+            strings().ok_or_else(|| {
+                vec![Diagnostic::new(
+                    "I1301",
+                    "checked String::split call has no interned List<string> MIR type",
+                    span,
+                )]
+            })?,
+        ),
+        Kind::Join => (
+            vec![
+                string,
+                strings().ok_or_else(|| {
+                    vec![Diagnostic::new(
+                        "I1301",
+                        "checked String::join call has no interned List<string> MIR type",
+                        span,
+                    )]
+                })?,
+            ],
+            vec!["separator", "values"],
+            vec![None, None],
+            string,
+        ),
+        Kind::Slice => (
+            vec![string, int, nullable_int],
+            vec!["text", "start", "length"],
+            vec![None, None, Some(crate::const_eval::ConstValue::Null)],
+            string,
+        ),
+        Kind::Repeat => (
+            vec![string, int],
+            vec!["text", "count"],
+            vec![None, None],
+            string,
+        ),
+        Kind::PadStart | Kind::PadEnd => (
+            vec![string, int, string],
+            vec!["text", "length", "padding"],
+            vec![None, None, None],
+            string,
+        ),
+        Kind::FromBytes => (
+            vec![bytes().ok_or_else(|| {
+                vec![Diagnostic::new(
+                    "I1301",
+                    "checked String::fromBytes call has no interned Bytes MIR type",
+                    span,
+                )]
+            })?],
+            vec!["bytes"],
+            vec![None],
+            mir::Type::NullableString,
+        ),
+    };
+    let count = parameters.len();
+    Ok(FunctionSignature {
+        id: mir::FunctionId(usize::MAX),
+        return_type: mir::ReturnType::Value(result),
+        return_borrow: None,
+        parameter_types: parameters,
+        parameter_names: names.into_iter().map(str::to_string).collect(),
+        parameter_defaults: defaults,
+        parameter_transfers: vec![false; count],
+        parameter_owns: vec![false; count],
+        method_class: None,
+        receiver_mode: None,
+    })
+}
+
+const fn string_intrinsic_name(kind: mir::StringIntrinsicKind) -> &'static str {
+    use mir::StringIntrinsicKind as Kind;
+    match kind {
+        Kind::GraphemeLength => "length",
+        Kind::ByteLength => "byteLength",
+        Kind::IsEmpty => "isEmpty",
+        Kind::ToBytes => "bytes",
+        Kind::Trim => "trim",
+        Kind::TrimStart => "trimStart",
+        Kind::TrimEnd => "trimEnd",
+        Kind::Lower => "lower",
+        Kind::Upper => "upper",
+        Kind::LowerFirst => "lowerFirst",
+        Kind::UpperFirst => "upperFirst",
+        Kind::Contains => "contains",
+        Kind::StartsWith => "startsWith",
+        Kind::EndsWith => "endsWith",
+        Kind::ContainsIgnoreCase => "containsIgnoreCase",
+        Kind::StartsWithIgnoreCase => "startsWithIgnoreCase",
+        Kind::EndsWithIgnoreCase => "endsWithIgnoreCase",
+        Kind::EqualsIgnoreCase => "equalsIgnoreCase",
+        Kind::IndexOf => "indexOf",
+        Kind::LastIndexOf => "lastIndexOf",
+        Kind::IndexOfIgnoreCase => "indexOfIgnoreCase",
+        Kind::LastIndexOfIgnoreCase => "lastIndexOfIgnoreCase",
+        Kind::CountOccurrences => "countOccurrences",
+        Kind::Replace => "replace",
+        Kind::Split => "split",
+        Kind::Join => "join",
+        Kind::Slice => "slice",
+        Kind::Repeat => "repeat",
+        Kind::PadStart => "padStart",
+        Kind::PadEnd => "padEnd",
+        Kind::FromBytes => "fromBytes",
+    }
 }
 
 fn lower_instance_method_call(
@@ -6418,6 +6775,19 @@ fn lower_condition(
     expr: &hir::Expr,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::BoolExpression> {
+    if let Some(call) = lower_string_intrinsic_call(expr, context) {
+        let call = call?;
+        if call.result != mir::Type::Scalar(mir::ScalarType::Bool) {
+            return Err(vec![Diagnostic::new(
+                "I1301",
+                "checked String intrinsic does not return bool",
+                expr.span(),
+            )]);
+        }
+        return Ok(mir::BoolExpression::Use {
+            operand: mir::Operand::StringIntrinsic(Box::new(call)),
+        });
+    }
     if let Some(crate::const_eval::ConstValue::Bool(value)) = context.constant_value(expr) {
         return Ok(mir::BoolExpression::Use {
             operand: mir::Operand::Scalar(mir::ScalarValue::Bool(*value)),
@@ -7704,6 +8074,17 @@ fn lower_collection_expression(
     transfer: bool,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::CollectionExpression> {
+    if let Some(call) = lower_string_intrinsic_call(expr, context) {
+        let call = call?;
+        if call.result != mir::Type::Collection(expected) {
+            return Err(vec![Diagnostic::new(
+                "I1301",
+                "checked String intrinsic has a different collection result",
+                expr.span(),
+            )]);
+        }
+        return Ok(mir::CollectionExpression::StringIntrinsic(Box::new(call)));
+    }
     if let Some((access, writable)) = lower_shared_access_payload_local(
         expr,
         mir::WritableSharedPayload::Collection(expected),
@@ -12213,6 +12594,20 @@ fn lower_integer_expression(
     expr: &hir::Expr,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::IntegerExpression> {
+    if let Some(call) = lower_string_intrinsic_call(expr, context) {
+        let call = call?;
+        let mir::Type::Scalar(mir::ScalarType::Integer(ty)) = call.result else {
+            return Err(vec![Diagnostic::new(
+                "I1301",
+                "checked String intrinsic does not return an integer",
+                expr.span(),
+            )]);
+        };
+        return Ok(mir::IntegerExpression::Use {
+            ty,
+            operand: mir::Operand::StringIntrinsic(Box::new(call)),
+        });
+    }
     if let Some(crate::const_eval::ConstValue::Integer(value)) = context.constant_value(expr) {
         return Ok(mir::IntegerExpression::constant(*value));
     }

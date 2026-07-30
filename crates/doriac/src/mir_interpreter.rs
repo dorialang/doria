@@ -3,6 +3,8 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::rc::Rc;
 
+use doria_unicode::{CaseMapping, PadSide, StringError, TrimMode};
+
 use crate::mir;
 use crate::numeric::{FloatType, FloatValue, IntegerPanic, IntegerType, IntegerValue};
 
@@ -573,6 +575,11 @@ enum EvaluationTask {
     },
     WriteStderr,
     StringConcat(usize),
+    StringIntrinsic {
+        kind: mir::StringIntrinsicKind,
+        result: mir::Type,
+        argument_count: usize,
+    },
     StringDisplay,
     StringCompare(mir::CompareOp),
     Echo,
@@ -3793,6 +3800,20 @@ impl Interpreter<'_> {
                 parts.reverse();
                 self.push_string(parts.concat())?;
             }
+            EvaluationTask::StringIntrinsic {
+                kind,
+                result,
+                argument_count,
+            } => {
+                let mut arguments = Vec::with_capacity(argument_count);
+                for _ in 0..argument_count {
+                    arguments.push(self.pop_local_value()?);
+                }
+                arguments.reverse();
+                if let Some(message) = self.execute_string_intrinsic(kind, result, arguments)? {
+                    return Ok(StepOutcome::Panic(message));
+                }
+            }
             EvaluationTask::StringDisplay => {
                 let value = self.pop_scalar()?;
                 self.push_string(display_scalar(value))?;
@@ -4625,6 +4646,9 @@ impl Interpreter<'_> {
                     .push(EvaluationTask::CollectionKeyString(collection));
                 frame.tasks.push(EvaluationTask::Rvalue(*offset));
             }
+            mir::StringExpression::Intrinsic(call) => {
+                self.queue_string_intrinsic(*call)?;
+            }
         }
         Ok(())
     }
@@ -4681,6 +4705,9 @@ impl Interpreter<'_> {
                     args,
                     ReturnExpectation::Value(mir::Type::NullableScalar(ty)),
                 )?;
+            }
+            mir::NullableScalarExpression::StringIntrinsic(call) => {
+                self.queue_string_intrinsic(*call)?;
             }
             mir::NullableScalarExpression::NullSafeProperty {
                 object, property, ..
@@ -4958,6 +4985,9 @@ impl Interpreter<'_> {
                     args,
                     ReturnExpectation::Value(mir::Type::NullableString),
                 )?;
+            }
+            mir::NullableStringExpression::Intrinsic(call) => {
+                self.queue_string_intrinsic(*call)?;
             }
             mir::NullableStringExpression::NullSafeProperty { object, property } => {
                 let owned_receiver = object.owned_temporary_class();
@@ -7033,6 +7063,9 @@ impl Interpreter<'_> {
                 self.stdin_cursor = self.stdin.len();
                 self.push_byte_collection(collection, &remaining)?;
             }
+            mir::CollectionExpression::StringIntrinsic(call) => {
+                self.queue_string_intrinsic(*call)?;
+            }
             mir::CollectionExpression::Call {
                 collection,
                 function,
@@ -8132,8 +8165,319 @@ impl Interpreter<'_> {
                 frame.tasks.push(EvaluationTask::Rvalue((**offset).clone()));
                 Ok(true)
             }
+            mir::Operand::StringIntrinsic(call) => {
+                self.queue_string_intrinsic((**call).clone())?;
+                Ok(true)
+            }
             _ => Ok(false),
         }
+    }
+
+    fn queue_string_intrinsic(
+        &mut self,
+        mut call: mir::StringIntrinsicCall,
+    ) -> Result<(), InterpreterError> {
+        let arguments = std::mem::take(&mut call.args);
+        let frame = self.current_frame_mut()?;
+        frame.tasks.push(EvaluationTask::StringIntrinsic {
+            kind: call.kind,
+            result: call.result,
+            argument_count: arguments.len(),
+        });
+        for argument in arguments.into_iter().rev() {
+            frame.tasks.push(EvaluationTask::Rvalue(argument));
+        }
+        Ok(())
+    }
+
+    fn execute_string_intrinsic(
+        &mut self,
+        kind: mir::StringIntrinsicKind,
+        result: mir::Type,
+        arguments: Vec<LocalValue>,
+    ) -> Result<Option<String>, InterpreterError> {
+        use mir::StringIntrinsicKind as Kind;
+
+        let panic = |error: StringError| Ok(Some(error.panic_message().to_string()));
+        match kind {
+            Kind::GraphemeLength | Kind::ByteLength => {
+                let text = local_string(&arguments, 0)?;
+                let length = if kind == Kind::GraphemeLength {
+                    doria_unicode::grapheme_count(text)
+                } else {
+                    doria_unicode::byte_length(text)
+                };
+                let Some(value) = i64::try_from(length).ok().and_then(|value| {
+                    IntegerValue::from_i128(IntegerType::Int64, i128::from(value))
+                }) else {
+                    return panic(StringError::ResultTooLarge);
+                };
+                self.push_scalar(mir::ScalarValue::Integer(value))?;
+            }
+            Kind::IsEmpty => {
+                self.push_scalar(mir::ScalarValue::Bool(doria_unicode::is_empty(
+                    local_string(&arguments, 0)?,
+                )))?;
+            }
+            Kind::ToBytes => {
+                let collection = collection_result_id(result)?;
+                self.push_byte_collection(collection, local_string(&arguments, 0)?.as_bytes())?;
+            }
+            Kind::Trim | Kind::TrimStart | Kind::TrimEnd => {
+                let text = local_string(&arguments, 0)?;
+                let mode = match kind {
+                    Kind::Trim => TrimMode::Both,
+                    Kind::TrimStart => TrimMode::Start,
+                    Kind::TrimEnd => TrimMode::End,
+                    _ => unreachable!(),
+                };
+                self.push_string(text[doria_unicode::trim_range(text, mode)].to_string())?;
+            }
+            Kind::Lower | Kind::Upper | Kind::LowerFirst | Kind::UpperFirst => {
+                let text = local_string(&arguments, 0)?;
+                let mapping = match kind {
+                    Kind::Lower | Kind::LowerFirst => CaseMapping::Lower,
+                    Kind::Upper | Kind::UpperFirst => CaseMapping::Upper,
+                    _ => unreachable!(),
+                };
+                let first_only = matches!(kind, Kind::LowerFirst | Kind::UpperFirst);
+                let length = match if first_only {
+                    doria_unicode::first_case_output_length(text, mapping)
+                } else {
+                    doria_unicode::case_output_length(text, mapping)
+                } {
+                    Ok(length) => length,
+                    Err(error) => return panic(error),
+                };
+                let mut output = vec![0; length];
+                let written = if first_only {
+                    doria_unicode::write_first_case(text, mapping, &mut output)
+                } else {
+                    doria_unicode::write_case(text, mapping, &mut output)
+                };
+                if let Err(error) = written {
+                    return panic(error);
+                }
+                self.push_string(unsafe { String::from_utf8_unchecked(output) })?;
+            }
+            Kind::Contains | Kind::StartsWith | Kind::EndsWith => {
+                let text = local_string(&arguments, 0)?;
+                let needle = local_string(&arguments, 1)?;
+                let value = match kind {
+                    Kind::Contains => doria_unicode::contains(text, needle),
+                    Kind::StartsWith => doria_unicode::starts_with(text, needle),
+                    Kind::EndsWith => doria_unicode::ends_with(text, needle),
+                    _ => unreachable!(),
+                };
+                self.push_scalar(mir::ScalarValue::Bool(value))?;
+            }
+            Kind::ContainsIgnoreCase | Kind::StartsWithIgnoreCase | Kind::EndsWithIgnoreCase => {
+                let text = local_string(&arguments, 0)?;
+                let needle = local_string(&arguments, 1)?;
+                let value = match kind {
+                    Kind::ContainsIgnoreCase => doria_unicode::contains_ignore_case(text, needle),
+                    Kind::StartsWithIgnoreCase => {
+                        doria_unicode::starts_with_ignore_case(text, needle)
+                    }
+                    Kind::EndsWithIgnoreCase => doria_unicode::ends_with_ignore_case(text, needle),
+                    _ => unreachable!(),
+                };
+                match value {
+                    Ok(value) => self.push_scalar(mir::ScalarValue::Bool(value))?,
+                    Err(error) => return panic(error),
+                }
+            }
+            Kind::EqualsIgnoreCase => {
+                let left = local_string(&arguments, 0)?;
+                let right = local_string(&arguments, 1)?;
+                let length = match doria_unicode::case_output_length(left, CaseMapping::Fold) {
+                    Ok(length) => length,
+                    Err(error) => return panic(error),
+                };
+                let mut scratch = vec![0; length];
+                let value = match doria_unicode::equals_ignore_case(left, right, &mut scratch) {
+                    Ok(value) => value,
+                    Err(error) => return panic(error),
+                };
+                self.push_scalar(mir::ScalarValue::Bool(value))?;
+            }
+            Kind::IndexOf
+            | Kind::LastIndexOf
+            | Kind::IndexOfIgnoreCase
+            | Kind::LastIndexOfIgnoreCase => {
+                let text = local_string(&arguments, 0)?;
+                let needle = local_string(&arguments, 1)?;
+                let index = match kind {
+                    Kind::IndexOf => Ok(doria_unicode::first_index_of(text, needle)),
+                    Kind::LastIndexOf => Ok(doria_unicode::last_index_of(text, needle)),
+                    Kind::IndexOfIgnoreCase => {
+                        doria_unicode::first_index_of_ignore_case(text, needle)
+                    }
+                    Kind::LastIndexOfIgnoreCase => {
+                        doria_unicode::last_index_of_ignore_case(text, needle)
+                    }
+                    _ => unreachable!(),
+                };
+                let index = match index {
+                    Ok(index) => index,
+                    Err(error) => return panic(error),
+                };
+                let value = match index {
+                    Some(index) => {
+                        let Ok(index) = i64::try_from(index) else {
+                            return panic(StringError::ResultTooLarge);
+                        };
+                        Some(
+                            IntegerValue::from_i128(IntegerType::Int64, i128::from(index))
+                                .expect("i64 fits Doria int"),
+                        )
+                    }
+                    None => None,
+                };
+                self.push_nullable_scalar(
+                    mir::ScalarType::Integer(IntegerType::Int64),
+                    value.map(mir::ScalarValue::Integer),
+                )?;
+            }
+            Kind::CountOccurrences => {
+                let count = match doria_unicode::count_occurrences(
+                    local_string(&arguments, 0)?,
+                    local_string(&arguments, 1)?,
+                ) {
+                    Ok(count) => count,
+                    Err(error) => return panic(error),
+                };
+                let Ok(count) = i64::try_from(count) else {
+                    return panic(StringError::ResultTooLarge);
+                };
+                self.push_scalar(mir::ScalarValue::Integer(
+                    IntegerValue::from_i128(IntegerType::Int64, i128::from(count))
+                        .expect("i64 fits Doria int"),
+                ))?;
+            }
+            Kind::Replace => {
+                let text = local_string(&arguments, 0)?;
+                let search = local_string(&arguments, 1)?;
+                let replacement = local_string(&arguments, 2)?;
+                let length =
+                    match doria_unicode::replacement_output_length(text, search, replacement) {
+                        Ok(length) => length,
+                        Err(error) => return panic(error),
+                    };
+                let mut output = vec![0; length];
+                if let Err(error) =
+                    doria_unicode::write_replacement(text, search, replacement, &mut output)
+                {
+                    return panic(error);
+                }
+                self.push_string(unsafe { String::from_utf8_unchecked(output) })?;
+            }
+            Kind::Split => {
+                let text = local_string(&arguments, 0)?;
+                let separator = local_string(&arguments, 1)?;
+                if let Err(error) = doria_unicode::split_field_count(text, separator) {
+                    return panic(error);
+                }
+                let mut entries = Vec::new();
+                doria_unicode::split_fields(text, separator, |field| {
+                    entries.push((None, LocalValue::String(SharedString::from(field))));
+                });
+                self.current_frame_mut()?
+                    .values
+                    .push(EvaluationValue::Collection(CollectionValue::new(
+                        collection_result_id(result)?,
+                        entries,
+                    )));
+            }
+            Kind::Join => {
+                let separator = local_string(&arguments, 0)?;
+                let values = local_collection(&arguments, 1)?;
+                let entries = values.entries();
+                let mut length = 0usize;
+                for (index, (_, value)) in entries.iter().enumerate() {
+                    let LocalValue::String(value) = value else {
+                        return Err(InterpreterError::new(
+                            "String join observed a non-string list element",
+                        ));
+                    };
+                    length = match doria_unicode::checked_add(length, value.len()) {
+                        Ok(length) => length,
+                        Err(error) => return panic(error),
+                    };
+                    if index != 0 {
+                        length = match doria_unicode::checked_add(length, separator.len()) {
+                            Ok(length) => length,
+                            Err(error) => return panic(error),
+                        };
+                    }
+                }
+                let mut output = String::with_capacity(length);
+                for (index, (_, value)) in entries.iter().enumerate() {
+                    if index != 0 {
+                        output.push_str(separator);
+                    }
+                    let LocalValue::String(value) = value else {
+                        unreachable!("validated List<string>");
+                    };
+                    output.push_str(value);
+                }
+                drop(entries);
+                self.push_string(output)?;
+            }
+            Kind::Slice => {
+                let text = local_string(&arguments, 0)?;
+                let start = local_int(&arguments, 1)?;
+                let length = local_nullable_int(&arguments, 2)?;
+                let range = match doria_unicode::slice_range(text, start, length) {
+                    Ok(range) => range,
+                    Err(error) => return panic(error),
+                };
+                self.push_string(text[range].to_string())?;
+            }
+            Kind::Repeat => {
+                let text = local_string(&arguments, 0)?;
+                let count = local_int(&arguments, 1)?;
+                let length = match doria_unicode::repetition_output_length(text, count) {
+                    Ok(length) => length,
+                    Err(error) => return panic(error),
+                };
+                let mut output = vec![0; length];
+                if let Err(error) = doria_unicode::write_repetition(text, count, &mut output) {
+                    return panic(error);
+                }
+                self.push_string(unsafe { String::from_utf8_unchecked(output) })?;
+            }
+            Kind::PadStart | Kind::PadEnd => {
+                let text = local_string(&arguments, 0)?;
+                let length = local_int(&arguments, 1)?;
+                let padding = local_string(&arguments, 2)?;
+                let output_length =
+                    match doria_unicode::padding_output_length(text, length, padding) {
+                        Ok(length) => length,
+                        Err(error) => return panic(error),
+                    };
+                let mut output = vec![0; output_length];
+                let side = if kind == Kind::PadStart {
+                    PadSide::Start
+                } else {
+                    PadSide::End
+                };
+                if let Err(error) =
+                    doria_unicode::write_padding(text, length, padding, side, &mut output)
+                {
+                    return panic(error);
+                }
+                self.push_string(unsafe { String::from_utf8_unchecked(output) })?;
+            }
+            Kind::FromBytes => {
+                let bytes = collection_bytes(local_collection(&arguments, 0)?)?;
+                match String::from_utf8(bytes) {
+                    Ok(value) => self.push_nullable_string(Some(value.into()))?,
+                    Err(_) => self.push_nullable_string(None)?,
+                }
+            }
+        }
+        Ok(None)
     }
 
     fn pop_integer(&mut self) -> Result<IntegerValue, InterpreterError> {
@@ -8242,6 +8586,9 @@ impl Interpreter<'_> {
             | mir::Operand::CollectionIndex { .. }
             | mir::Operand::CollectionKeyAt { .. } => Err(InterpreterError::new(
                 "MIR collection operand requires queued evaluation",
+            )),
+            mir::Operand::StringIntrinsic(_) => Err(InterpreterError::new(
+                "String intrinsic scalar operand was not queued",
             )),
             mir::Operand::MixedPayload { mixed, tag } => {
                 let value =
@@ -9047,6 +9394,94 @@ fn eval_binary(
         mir::IntegerBinaryOp::BitwiseXor => Ok(left.bitwise_xor(right)),
         mir::IntegerBinaryOp::BitwiseOr => Ok(left.bitwise_or(right)),
     }
+}
+
+fn local_string(arguments: &[LocalValue], index: usize) -> Result<&str, InterpreterError> {
+    match arguments.get(index) {
+        Some(LocalValue::String(value)) => Ok(value.as_ref()),
+        _ => Err(InterpreterError::new(format!(
+            "String intrinsic argument {index} is not a string"
+        ))),
+    }
+}
+
+fn local_collection(
+    arguments: &[LocalValue],
+    index: usize,
+) -> Result<&CollectionValue, InterpreterError> {
+    match arguments.get(index) {
+        Some(LocalValue::Collection(value)) => Ok(value),
+        _ => Err(InterpreterError::new(format!(
+            "String intrinsic argument {index} is not a collection"
+        ))),
+    }
+}
+
+fn local_int(arguments: &[LocalValue], index: usize) -> Result<i64, InterpreterError> {
+    match arguments.get(index) {
+        Some(LocalValue::Scalar(mir::ScalarValue::Integer(value)))
+            if value.ty == IntegerType::Int64 =>
+        {
+            i64::try_from(value.signed_value()).map_err(|_| {
+                InterpreterError::new(format!(
+                    "String intrinsic argument {index} is outside Doria int range"
+                ))
+            })
+        }
+        _ => Err(InterpreterError::new(format!(
+            "String intrinsic argument {index} is not an int"
+        ))),
+    }
+}
+
+fn local_nullable_int(
+    arguments: &[LocalValue],
+    index: usize,
+) -> Result<Option<i64>, InterpreterError> {
+    match arguments.get(index) {
+        Some(LocalValue::NullableScalar {
+            ty: mir::ScalarType::Integer(IntegerType::Int64),
+            value: None,
+        }) => Ok(None),
+        Some(LocalValue::NullableScalar {
+            ty: mir::ScalarType::Integer(IntegerType::Int64),
+            value: Some(mir::ScalarValue::Integer(value)),
+        }) => i64::try_from(value.signed_value()).map(Some).map_err(|_| {
+            InterpreterError::new(format!(
+                "String intrinsic argument {index} is outside Doria int range"
+            ))
+        }),
+        _ => Err(InterpreterError::new(format!(
+            "String intrinsic argument {index} is not a nullable int"
+        ))),
+    }
+}
+
+fn collection_result_id(ty: mir::Type) -> Result<mir::CollectionTypeId, InterpreterError> {
+    match ty {
+        mir::Type::Collection(collection) => Ok(collection),
+        _ => Err(InterpreterError::new(
+            "String intrinsic result is not a collection",
+        )),
+    }
+}
+
+fn collection_bytes(collection: &CollectionValue) -> Result<Vec<u8>, InterpreterError> {
+    collection
+        .entries()
+        .iter()
+        .map(|(_, value)| match value {
+            LocalValue::Scalar(mir::ScalarValue::Integer(value))
+                if value.ty == IntegerType::UInt8 =>
+            {
+                u8::try_from(value.unsigned_value())
+                    .map_err(|_| InterpreterError::new("MIR Bytes value is outside uint8 range"))
+            }
+            _ => Err(InterpreterError::new(
+                "String intrinsic Bytes argument contains a non-uint8 value",
+            )),
+        })
+        .collect()
 }
 
 fn local_value_type(value: &LocalValue) -> mir::Type {

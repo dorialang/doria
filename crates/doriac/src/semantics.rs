@@ -1360,6 +1360,10 @@ impl<'program> Checker<'program> {
                 "`Bytes` is the compiler-known byte-buffer type and cannot be redeclared"
                     .to_string(),
             ),
+            "String" => Some(
+                "`String` is the compiler-known string companion and cannot be redeclared"
+                    .to_string(),
+            ),
             "List" | "Dictionary" | "Set" => Some(format!(
                 "`{name}` is a compiler-known collection alias and cannot be redeclared"
             )),
@@ -4076,10 +4080,22 @@ impl<'program> Checker<'program> {
                         self.lookup_property(object, property, *span, scopes, method_context);
                     }
                 } else if self
-                    .collection_property_type(object, property, *null_safe, scopes, method_context)
+                    .compiler_known_property_type(
+                        object,
+                        property,
+                        *null_safe,
+                        scopes,
+                        method_context,
+                    )
                     .is_some()
                 {
-                    self.check_collection_property(object, property, *span, scopes, method_context);
+                    self.check_compiler_known_property(
+                        object,
+                        property,
+                        *span,
+                        scopes,
+                        method_context,
+                    );
                 } else {
                     self.lookup_property(object, property, *span, scopes, method_context);
                 }
@@ -4103,7 +4119,13 @@ impl<'program> Checker<'program> {
                     scopes,
                     method_context,
                 );
-                if !self.check_collection_method_call(
+                if !self.check_string_instance_method_call(
+                    object,
+                    method,
+                    *span,
+                    scopes,
+                    method_context,
+                ) && !self.check_collection_method_call(
                     object,
                     method,
                     args,
@@ -5798,6 +5820,62 @@ impl<'program> Checker<'program> {
         }
 
         let Some(function_info) = self.functions.get(name).cloned() else {
+            if let Some((replacement, executable, direct_replacement)) = match name {
+                "str_starts_with" => Some((
+                    "String::startsWith($text, $prefix)",
+                    true,
+                    Some("String::startsWith"),
+                )),
+                "str_ends_with" => Some((
+                    "String::endsWith($text, $suffix)",
+                    true,
+                    Some("String::endsWith"),
+                )),
+                "str_contains" => Some((
+                    "String::contains($text, $needle)",
+                    true,
+                    Some("String::contains"),
+                )),
+                "str_case_compare" => {
+                    Some(("String::compareIgnoreCase($left, $right)", false, None))
+                }
+                "explode" => Some(("String::split($text, $separator)", true, None)),
+                "implode" => Some((
+                    "String::join($separator, $values)",
+                    true,
+                    Some("String::join"),
+                )),
+                "substr" => Some((
+                    "String::slice($text, $start, $length)",
+                    true,
+                    Some("String::slice"),
+                )),
+                _ => None,
+            } {
+                let mut diagnostic = Diagnostic::new(
+                    "E0461",
+                    format!("`{name}` is not a Doria string operation"),
+                    span,
+                )
+                .with_title("Use The String Companion")
+                .with_primary_label("Removed Or Foreign String Spelling")
+                .with_explanation(
+                    "Doria keeps string-specific operations on the `String` companion and has no public `str_*` family.",
+                )
+                .with_help(format!("write `{replacement}`"));
+                if !executable {
+                    diagnostic = diagnostic.with_help(
+                        "`String::compareIgnoreCase` is accepted but remains pending until `Ordering` is executable; use `String::equalsIgnoreCase` for equality",
+                    );
+                } else if let Some(direct_replacement) = direct_replacement {
+                    diagnostic = diagnostic.with_fix(
+                        Span::new(span.start, span.start + name.len()),
+                        direct_replacement,
+                    );
+                }
+                self.diagnostics.push(diagnostic);
+                return;
+            }
             if let Some(suggestion) = php_function_suggestion(name) {
                 self.diagnostics.push(
                     Diagnostic::new(
@@ -6219,6 +6297,203 @@ impl<'program> Checker<'program> {
         );
     }
 
+    fn string_companion_signature(&mut self, method: &str) -> Option<(Vec<ParamInfo>, TypeId)> {
+        let string = self.types.intern(TypeKind::String);
+        let int = self.types.intern(TypeKind::Integer(IntegerType::Int64));
+        let bool_ty = self.types.intern(TypeKind::Bool);
+        let bytes = self.types.intern(TypeKind::Bytes);
+        let nullable_int = self.types.intern(TypeKind::Nullable(int));
+        let nullable_string = self.types.intern(TypeKind::Nullable(string));
+        let string_list = self.types.intern(TypeKind::List(string));
+        let required = |name: &str, ty| ParamInfo {
+            name: name.to_string(),
+            ty,
+            take: false,
+            writable: false,
+            has_default: false,
+        };
+        let optional = |name: &str, ty| ParamInfo {
+            name: name.to_string(),
+            ty,
+            take: false,
+            writable: false,
+            has_default: true,
+        };
+        let signature = match method {
+            "trim" | "trimStart" | "trimEnd" | "lower" | "upper" | "lowerFirst" | "upperFirst" => {
+                (vec![required("text", string)], string)
+            }
+            "contains" | "containsIgnoreCase" => (
+                vec![required("text", string), required("needle", string)],
+                bool_ty,
+            ),
+            "startsWith" | "startsWithIgnoreCase" => (
+                vec![required("text", string), required("prefix", string)],
+                bool_ty,
+            ),
+            "endsWith" | "endsWithIgnoreCase" => (
+                vec![required("text", string), required("suffix", string)],
+                bool_ty,
+            ),
+            "equalsIgnoreCase" => (
+                vec![required("left", string), required("right", string)],
+                bool_ty,
+            ),
+            "indexOf" | "lastIndexOf" | "indexOfIgnoreCase" | "lastIndexOfIgnoreCase" => (
+                vec![required("text", string), required("needle", string)],
+                nullable_int,
+            ),
+            "countOccurrences" => (
+                vec![required("text", string), required("needle", string)],
+                int,
+            ),
+            "replace" => (
+                vec![
+                    required("text", string),
+                    required("search", string),
+                    required("replacement", string),
+                ],
+                string,
+            ),
+            "split" => (
+                vec![required("text", string), required("separator", string)],
+                string_list,
+            ),
+            "join" => (
+                vec![
+                    required("separator", string),
+                    required("values", string_list),
+                ],
+                string,
+            ),
+            "slice" => (
+                vec![
+                    required("text", string),
+                    required("start", int),
+                    optional("length", nullable_int),
+                ],
+                string,
+            ),
+            "repeat" => (
+                vec![required("text", string), required("count", int)],
+                string,
+            ),
+            "padStart" | "padEnd" => (
+                vec![
+                    required("text", string),
+                    required("length", int),
+                    required("padding", string),
+                ],
+                string,
+            ),
+            "fromBytes" => (vec![required("bytes", bytes)], nullable_string),
+            _ => return None,
+        };
+        Some(signature)
+    }
+
+    fn check_string_companion_call(
+        &mut self,
+        method: &str,
+        args: &[Argument],
+        span: Span,
+        scopes: &ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) {
+        if matches!(method, "compare" | "compareIgnoreCase") {
+            self.diagnostics.push(
+                Diagnostic::unsupported_stage(
+                    "E0304",
+                    format!("String::{method} requires the executable `Ordering` type"),
+                    span,
+                )
+                .with_help(
+                    "use typed equality or `String::equalsIgnoreCase` when only equality is needed",
+                ),
+            );
+            return;
+        }
+        let Some((params, _)) = self.string_companion_signature(method) else {
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "E0304",
+                    format!("unknown String companion operation `String::{method}`"),
+                    span,
+                )
+                .with_help(
+                    "use the canonical `String::` surface documented in the standard-library reference",
+                ),
+            );
+            return;
+        };
+        self.check_call_arguments(
+            &format!("String::{method}"),
+            &params,
+            args,
+            span,
+            scopes,
+            method_context,
+        );
+    }
+
+    fn check_string_instance_method_call(
+        &mut self,
+        object: &Expr,
+        method: &str,
+        span: Span,
+        scopes: &ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) -> bool {
+        let ty = self.infer_expr_type(object, scopes, method_context);
+        if !matches!(self.types.kind(ty), TypeKind::String) {
+            return false;
+        }
+        let canonical = match method {
+            "trim"
+            | "trimStart"
+            | "trimEnd"
+            | "lower"
+            | "upper"
+            | "lowerFirst"
+            | "upperFirst"
+            | "contains"
+            | "startsWith"
+            | "endsWith"
+            | "containsIgnoreCase"
+            | "startsWithIgnoreCase"
+            | "endsWithIgnoreCase"
+            | "indexOf"
+            | "lastIndexOf"
+            | "indexOfIgnoreCase"
+            | "lastIndexOfIgnoreCase"
+            | "countOccurrences"
+            | "replace"
+            | "split"
+            | "slice"
+            | "repeat"
+            | "padStart"
+            | "padEnd" => Some(method),
+            _ => None,
+        };
+        let mut diagnostic = Diagnostic::new(
+            "E0304",
+            format!("String operation `{method}` belongs on the `String` companion"),
+            span,
+        )
+        .with_title("Use The String Companion")
+        .with_primary_label("String Action Method Alias")
+        .with_explanation(
+            "String values expose intrinsic measurements and views as properties; string operations use `String::`.",
+        );
+        if let Some(canonical) = canonical {
+            diagnostic = diagnostic.with_help(format!(
+                "write `String::{canonical}($text, ...)` and pass the string as the first argument"
+            ));
+        }
+        self.diagnostics.push(diagnostic);
+        true
+    }
+
     fn check_static_call(
         &mut self,
         access: StaticAccess<'_>,
@@ -6232,6 +6507,16 @@ impl<'program> Checker<'program> {
         let class_name = class_name.as_str();
         if class_name.contains('\\') {
             self.report_deferred_qualified_name(class_name, access.span);
+            return;
+        }
+        if class_name == "String" {
+            self.check_string_companion_call(
+                access.member,
+                args,
+                access.span,
+                scopes,
+                method_context,
+            );
             return;
         }
         if class_name == "Int" && access.member == "toFloat" {
@@ -9223,7 +9508,7 @@ impl<'program> Checker<'program> {
                         return self.types.unknown();
                     }
                 }
-                if let Some(result) = self.collection_property_type(
+                if let Some(result) = self.compiler_known_property_type(
                     object,
                     property,
                     *null_safe,
@@ -9396,6 +9681,12 @@ impl<'program> Checker<'program> {
                         return self.types.intern(TypeKind::Integer(integer));
                     }
                 }
+                if class_name == "String" {
+                    return self
+                        .string_companion_signature(method)
+                        .map(|(_, return_ty)| return_ty)
+                        .unwrap_or_else(|| self.types.unknown());
+                }
                 if class_name == "Bytes" && method == "fromArray" {
                     return self.types.intern(TypeKind::Bytes);
                 }
@@ -9513,7 +9804,7 @@ impl<'program> Checker<'program> {
         );
     }
 
-    fn collection_property_type(
+    fn compiler_known_property_type(
         &mut self,
         object: &Expr,
         property: &str,
@@ -9529,6 +9820,10 @@ impl<'program> Checker<'program> {
         let int = self.types.intern(TypeKind::Integer(IntegerType::Int64));
         let bool_ty = self.types.intern(TypeKind::Bool);
         let result = match (self.types.kind(ty), property) {
+            (TypeKind::String, "length" | "byteLength") => Some(int),
+            (TypeKind::String, "isEmpty") => Some(bool_ty),
+            (TypeKind::String, "bytes") => Some(self.types.intern(TypeKind::Bytes)),
+            (TypeKind::String, "graphemes" | "codePoints") => Some(self.types.unknown()),
             (TypeKind::TypedArray(_), "length") => Some(int),
             (TypeKind::Bytes, "length") => Some(int),
             (TypeKind::List(_) | TypeKind::Dictionary(_, _) | TypeKind::Set(_), "count") => {
@@ -9542,7 +9837,8 @@ impl<'program> Checker<'program> {
             }
             (TypeKind::Dictionary(_, _), "keys" | "values") => Some(self.types.unknown()),
             (
-                TypeKind::Bytes
+                TypeKind::String
+                | TypeKind::Bytes
                 | TypeKind::TypedArray(_)
                 | TypeKind::List(_)
                 | TypeKind::Dictionary(_, _)
@@ -9985,7 +10281,7 @@ impl<'program> Checker<'program> {
         Some(self.null_safe_result_type(result, null_safe && nullable_access))
     }
 
-    fn check_collection_property(
+    fn check_compiler_known_property(
         &mut self,
         object: &Expr,
         property: &str,
@@ -9995,6 +10291,34 @@ impl<'program> Checker<'program> {
     ) {
         let ty = self.infer_expr_type(object, scopes, method_context);
         let ty = self.forwarded_access_payload_type(ty);
+        if matches!(self.types.kind(ty), TypeKind::String) {
+            match property {
+                "length" | "byteLength" | "isEmpty" | "bytes" => {}
+                "graphemes" | "codePoints" => self.diagnostics.push(
+                    Diagnostic::unsupported_stage(
+                        "E0304",
+                        format!(
+                            "String property `{property}` requires the future public iteration protocol"
+                        ),
+                        span,
+                    )
+                    .with_help(
+                        "use the executable `length`, `byteLength`, `isEmpty`, or `bytes` property",
+                    ),
+                ),
+                _ => self.diagnostics.push(
+                    Diagnostic::new(
+                        "E0306",
+                        format!("unknown String property `{property}`"),
+                        span,
+                    )
+                    .with_help(
+                        "String intrinsic properties are `length`, `byteLength`, `isEmpty`, and `bytes`",
+                    ),
+                ),
+            }
+            return;
+        }
         let supported = matches!(
             (self.types.kind(ty), property),
             (TypeKind::TypedArray(_), "length")
