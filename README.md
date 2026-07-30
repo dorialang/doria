@@ -34,9 +34,14 @@ Doria's memory model is built on ownership: every value has exactly one owner, a
 - **`writable`** grants exclusive access: mutation with a compile-time guarantee that nobody else is watching.
 - **`take`** hands ownership over entirely — the signature says so, and the compiler holds everyone to it.
 
-There are no annotations to sprinkle, no sigils to memorize, and no jargon in the diagnostics. When something's wrong, the compiler says so in plain language:
+There are no annotations to sprinkle, no sigils to memorize, and no jargon in
+the diagnostics. When something is wrong, the compiler names the problem,
+labels every relevant source location, explains the Doria rule, and offers only
+fixes whose safety is explicit:
 
-> `$user was given to store() on line 12, so it can no longer be used here — clone it first if you need a copy.`
+> `Error[E0470]: Value Used After Ownership Transfer`
+>
+> `$user` was given away here and cannot be used afterward.
 
 Use-after-free, data races, double-frees, null surprises: these are compile errors in Doria, not production incidents.
 
@@ -71,6 +76,18 @@ Doria was created by a PHP developer who wanted compile-time safety and native p
 ## Tooling
 
 Official language-server and editor integrations are developed separately in [`dorialang/doria-language-server`](https://github.com/dorialang/doria-language-server), which consumes reusable `doriac` frontend services without duplicating compiler semantics.
+
+The CLI supports human, concise, and versioned JSON diagnostics. Human and
+concise output go to stderr; JSON goes to stdout for tools:
+
+```console
+doriac check main.doria --diagnostic-format human
+doriac check main.doria --diagnostic-format concise
+doriac check main.doria --diagnostic-format json
+```
+
+Color is controlled independently with
+`--diagnostic-color auto|always|never`; automatic color honors `NO_COLOR`.
 
 ---
 

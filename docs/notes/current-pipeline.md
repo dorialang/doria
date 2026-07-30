@@ -29,6 +29,13 @@ Documentation role: working note. This file prevents duplicated in-flight work. 
 - Stage 23c sequence fills are complete on the current branch. `[value; count]` constructs runtime-sized `T[]` or one-shot-filled `List<T>` values, defaulting to `List<T>` without context. The value and count each evaluate once in source order; Copy scalars are bit-copied and string handles are retained once per slot. Constant-negative counts are rejected, dynamic-negative counts panic with `fill count is negative`, and zero produces an empty sequence. Move-type fills remain gated on Stage 35 `Cloneable`; `Set` and `Dictionary` fills remain intentionally unsupported.
 - Stage 24 generic free functions, instance methods, and static methods are complete. Type arguments are inferred through the existing positional/named argument binding, with a typed declaration supplying expected-result context when arguments alone cannot resolve a parameter. MIR monomorphization emits one reachable specialization per distinct concrete argument set and deduplicates repeated uses; its kinded specialization key leaves compile-time value parameters as an additive future extension. Compiler-known constraints are checked at instantiation; user-defined interface constraints remain deferred to Stage 35.
 - Stage 25 generic classes are complete on the current branch under decision 0105. `Name<T>` is structurally typed and monomorphized into a distinct concrete class layout and method set per argument list, including nested instantiations. Every class instantiation remains an owned move type; substituted field types specialize its field handling and drop glue. Type parameters are invariant, while default type arguments, compile-time value arguments, and runtime generic reflection remain fenced.
+- The Diagnostic Experience Foundation is implemented under decision 0108.
+  Compiler diagnostics now carry stable severity/kind metadata, Title Case
+  titles, multi-source labels, explanations, repeated notes/help,
+  applicability-classified multi-edit fixes, cause identity, documentation, and
+  protected developer details. Human/concise stderr and versioned JSON stdout
+  are rendered centrally with exact-duplicate suppression. Coordinated
+  language-server and website consumers use the structured model.
 - The durable manifest supports raw stdin, isolated seeded files, declared program arguments, and exact interpreter/Cranelift/LLVM stdout, stderr, status, generated-file, and class-lifetime comparison.
 
 ## Next

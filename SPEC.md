@@ -56,6 +56,18 @@ If an implementation task reaches a design fork not answered by this specificati
 
 Temporary backend limitations may produce unsupported-feature diagnostics. They must not redefine Doria.
 
+Compiler diagnostics use the shared human-first model defined by the compiler
+diagnostic authority. Every diagnostic has a stable code, severity, kind, Title
+Case title, one or more source-identified labels, and optional explanation,
+notes, help, applicability-classified multi-edit fixes, causal identity, and
+documentation metadata. Human and concise CLI presentations write to stderr;
+schema-version-1 structured JSON writes to stdout and contains no ANSI.
+Language-server and website consumers use that structure rather than parsing
+terminal prose. Backend/external/internal failures preserve full developer
+details but do not expose raw tool or Rust panic output by default. Runtime
+panic remains a separate status-101 contract whose `Panic` and `Stack Trace`
+headings are Title Case and byte-identical across enabled backends.
+
 ## 2. What Doria is not
 
 Doria is not PHP++ and is not required to parse every valid PHP program.

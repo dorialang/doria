@@ -51,6 +51,18 @@ The accepted project-tool name is Baton. Baton is the planned user-facing projec
 - When stopping for a design decision, report the question, viable options, tradeoffs, affected files, and a recommendation clearly marked as a recommendation.
 - Do not implement a workaround that makes the current backend pass while leaving Doria semantics ambiguous.
 - Prefer clear unsupported-feature diagnostics over permissive behavior that may become wrong.
+- Treat diagnostics as a public language interface. Follow
+  `docs/diagnostic-style.md`: user-facing headings, prefixes, and titles are
+  Title Case; explanations use plain Doria vocabulary; every source location
+  and suggested edit stays structured. Do not make a consumer parse rendered
+  terminal prose.
+- Add every new diagnostic code to the compiler catalogue and run
+  `php scripts/check_diagnostic_style.php`. Automatic editor actions are limited
+  to machine-applicable fixes; requires-review and informational fixes remain
+  guidance.
+- Backend, external-tool, and internal failures must cross public boundaries as
+  structured diagnostics. Preserve complete developer details without exposing
+  raw tool output, Rust panic text, or backtraces by default.
 - Preserve the ability to lower Doria to native code safely, even if the immediate task only touches frontend code or a compatibility backend.
 - Do not silently rename or replace Baton.
 - Do not claim Baton is implemented until it exists.
