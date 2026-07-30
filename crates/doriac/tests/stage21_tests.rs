@@ -187,8 +187,9 @@ function main(): void
 }
 
 #[test]
-fn borrow_return_cannot_initialize_an_owning_let() {
-    assert_diagnostic(
+fn borrow_return_can_initialize_a_borrowed_let() {
+    doriac::check_source(
+        "stage21-borrowed-let.doria",
         r#"
 class Guard
 {
@@ -200,8 +201,30 @@ function route(Guard $guard): void
     let $alias = $guard->inspect();
 }
 "#,
-        "E0478",
-    );
+    )
+    .expect("returned borrows may initialize readonly borrowed locals");
+}
+
+#[test]
+fn borrowed_local_ends_at_its_final_use() {
+    doriac::check_source(
+        "stage21-borrowed-let-final-use.doria",
+        r#"
+class Guard
+{
+    function inspect(): self { return $this; }
+    writable function touch(): void {}
+}
+
+function route(writable Guard $guard): void
+{
+    let $alias = $guard->inspect();
+    $alias->inspect();
+    $guard->touch();
+}
+"#,
+    )
+    .expect("a borrowed local should stop blocking its owner after its final use");
 }
 
 #[test]
@@ -281,11 +304,43 @@ function identity(Child $child): Child { return $child; }
     )
     .expect("one unambiguous borrowed source should determine the returned borrow");
 
-    assert_diagnostic(
+    doriac::check_source(
+        "stage21-borrowed-local.doria",
         r#"
 class Guard {}
 function identity(Guard $guard): Guard { return $guard; }
 function route(Guard $guard): void { let $alias = identity($guard); }
+"#,
+    )
+    .expect("a local may retain a returned borrow while its owner remains live");
+}
+
+#[test]
+fn borrowed_local_results_retain_their_owner_provenance() {
+    assert_diagnostic(
+        r#"
+class Guard
+{
+    writable int $value = 0;
+    writable function mutate(): void { $this->value++; }
+}
+function identity(Guard $guard): Guard { return $guard; }
+function route(writable Guard $guard): void
+{
+    let $alias = identity($guard);
+    $guard->mutate();
+    echo "{$alias->value}";
+}
+"#,
+        "E0477",
+    );
+
+    assert_diagnostic(
+        r#"
+class Guard {}
+function make(): Guard { return new Guard(); }
+function identity(Guard $guard): Guard { return $guard; }
+function route(): void { let $alias = identity(make()); }
 "#,
         "E0478",
     );
@@ -1652,8 +1707,9 @@ function main(): int
 }
 
 #[test]
-fn nested_property_returns_stop_before_unlowerable_mir_places() {
-    assert_diagnostic(
+fn nested_property_returns_preserve_receiver_provenance() {
+    doriac::check_source(
+        "stage21-nested-property-return.doria",
         r#"
 class Leaf {}
 class Child { Leaf $leaf = new Leaf(); }
@@ -1663,6 +1719,6 @@ class Parent
     function leaf(): Leaf { return $this->child->leaf; }
 }
 "#,
-        "E0472",
-    );
+    )
+    .expect("nested readonly property projections borrow transitively from the receiver");
 }

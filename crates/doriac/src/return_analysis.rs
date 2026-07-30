@@ -47,6 +47,7 @@ pub fn else_branch_falls_through(branch: &ElseBranch) -> bool {
 
 fn statement_span(statement: &Stmt) -> crate::source::Span {
     match statement {
+        Stmt::Block(block) => block.span,
         Stmt::VarDecl(decl) => decl.span,
         Stmt::Assignment(assignment) => assignment.span,
         Stmt::Echo { span, .. } | Stmt::Return { span, .. } | Stmt::Expr { span, .. } => *span,

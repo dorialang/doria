@@ -214,6 +214,7 @@ fn lower_block(block: &ast::Block, class_name: Option<ClassContext<'_>>) -> hir:
 
 fn lower_stmt(statement: &ast::Stmt, class_name: Option<ClassContext<'_>>) -> hir::Stmt {
     match statement {
+        ast::Stmt::Block(block) => hir::Stmt::Block(lower_block(block, class_name)),
         ast::Stmt::VarDecl(decl) => hir::Stmt::VarDecl(hir::VarDecl {
             writable: decl.writable,
             ty: decl.ty.as_ref().map(|ty| lower_type_ref(ty, class_name)),

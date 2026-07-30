@@ -66,6 +66,149 @@ fn shared_validator_rejects_noncanonical_bool_operands() {
 }
 
 #[test]
+fn shared_validator_rejects_writable_access_projection_from_a_strong_handle() {
+    let source = r#"
+class Value
+{
+    writable int $number = 0;
+}
+
+function main(): void
+{
+    let $shared = new WritableSharedReference(new Value());
+    let writable $access = $shared->acquireWritableAccess();
+    $access->number = 1;
+}
+"#;
+    let mut program = doriac::lower_source_to_mir("malformed-writable-access.doria", source)
+        .expect("valid writable access should lower");
+    let main = program
+        .functions
+        .iter_mut()
+        .find(|function| function.name == "main")
+        .expect("main should exist");
+    let access = main
+        .locals
+        .iter()
+        .find(|local| local.name == "access")
+        .expect("access local should exist")
+        .id;
+    let payload = match main
+        .locals
+        .iter()
+        .find(|local| local.id == access)
+        .expect("access local should exist")
+        .ty
+    {
+        Type::WritableSharedReferenceAccess(payload) => payload,
+        other => panic!("expected writable access, got {other}"),
+    };
+    main.locals[access.0].ty = Type::WritableSharedReference(payload);
+
+    let error = doriac::mir_validation::validate_program(&program)
+        .expect_err("a strong handle cannot stand in for an access object");
+    assert!(error.message.contains("mismatched shared-handle rvalue"));
+}
+
+#[test]
+fn shared_validator_rejects_writable_operations_over_the_readonly_family() {
+    let source = r#"
+class Value {}
+
+function main(): void
+{
+    let $shared = new WritableSharedReference(new Value());
+    let $second = $shared->share();
+}
+"#;
+    let mut program = doriac::lower_source_to_mir("malformed-writable-family.doria", source)
+        .expect("valid writable sharing should lower");
+    let main = program
+        .functions
+        .iter_mut()
+        .find(|function| function.name == "main")
+        .expect("main should exist");
+    let strong = main
+        .locals
+        .iter()
+        .find(|local| local.name == "shared")
+        .expect("strong local should exist")
+        .id;
+    let class = match main.locals[strong.0].ty {
+        Type::WritableSharedReference(doriac::mir::WritableSharedPayload::Class(class)) => class,
+        other => panic!("expected writable class handle, got {other}"),
+    };
+    main.locals[strong.0].ty = Type::SharedReference(class);
+
+    let error = doriac::mir_validation::validate_program(&program)
+        .expect_err("writable retain must reject a readonly-family local");
+    assert!(error.message.contains("mismatched shared-handle rvalue"));
+}
+
+#[test]
+fn shared_validator_rejects_nullable_access_family_mismatches() {
+    let mut program =
+        doriac::lower_source_to_mir("nullable-access-family.doria", nullable_access_source())
+            .expect("valid nullable access should lower");
+    let main = program
+        .functions
+        .iter_mut()
+        .find(|function| function.name == "main")
+        .expect("main should exist");
+    let access = main
+        .locals
+        .iter_mut()
+        .find(|local| local.name == "access")
+        .expect("access local should exist");
+    let Type::NullableReadonlySharedReferenceAccess(payload) = access.ty else {
+        panic!("expected nullable readonly access, got {}", access.ty);
+    };
+    access.ty = Type::NullableWritableSharedReferenceAccess(payload);
+
+    let error = doriac::mir_validation::validate_program(&program)
+        .expect_err("nullable access families must match exactly");
+    assert!(error.message.contains("mismatched shared-handle rvalue"));
+}
+
+#[test]
+fn shared_validator_requires_presence_proof_for_nullable_access_unwraps() {
+    let mut program =
+        doriac::lower_source_to_mir("nullable-access-proof.doria", nullable_access_source())
+            .expect("valid nullable access should lower");
+    let main = program
+        .functions
+        .iter_mut()
+        .find(|function| function.name == "main")
+        .expect("main should exist");
+    let branch =
+        main.blocks
+            .iter_mut()
+            .find(|block| {
+                matches!(
+                    block.terminator,
+                    Terminator::Branch {
+                        condition:
+                            doriac::mir::BoolExpression::NullableSharedReferenceAccessIsPresent(_),
+                        ..
+                    }
+                )
+            })
+            .expect("nullable access presence branch should exist");
+    let Terminator::Branch { condition, .. } = &mut branch.terminator else {
+        unreachable!("branch was selected above");
+    };
+    *condition = doriac::mir::BoolExpression::Use {
+        operand: Operand::Scalar(ScalarValue::Bool(true)),
+    };
+
+    let error = doriac::mir_validation::validate_program(&program)
+        .expect_err("nullable access unwraps require a dominating presence proof");
+    assert!(error
+        .message
+        .contains("without a dominating presence proof"));
+}
+
+#[test]
 fn shared_validator_rejects_noncanonical_bytes_storage() {
     let mut program = valid_void_program();
     program.collection_types.push(CollectionType {
@@ -79,6 +222,25 @@ fn shared_validator_rejects_noncanonical_bytes_storage() {
         .expect_err("Bytes must always use the packed uint8 element contract");
     assert!(error.message.contains("Bytes collection"));
     assert!(error.message.contains("packed uint8"));
+}
+
+fn nullable_access_source() -> &'static str {
+    r#"
+class Value
+{
+    int $number = 1;
+}
+
+function main(): void
+{
+    ?WritableSharedReference<Value> $source = null;
+    ?ReadonlySharedReferenceAccess<Value> $access =
+        $source?->acquireReadonlyAccess();
+    if ($access != null) {
+        echo "{$access->number}";
+    }
+}
+"#
 }
 
 #[test]
@@ -2858,7 +3020,7 @@ fn shared_validator_rejects_cleanup_and_assignment_of_borrowed_class_locals() {
         .expect_err("borrowed class slots cannot become owners through assignment");
     assert!(error
         .message
-        .contains("assignment targets borrowed local local0"));
+        .contains("borrowed class local0 receives an owning value"));
 }
 
 #[test]

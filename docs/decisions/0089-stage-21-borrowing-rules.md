@@ -63,6 +63,14 @@ so `$store->add($a)->add($b);` is accepted without creating two simultaneous
 writers. A borrow-returning result cannot be bound as an owned `let` when the
 receiver is an owned temporary that drops at the end of the statement.
 
+Returned-borrow provenance is transitive. A result derived from `$this` or one
+borrowed parameter remains tied to that root when it passes through readonly
+property projection, nested property projection, collection indexing,
+`Dictionary::get`, `List::first`, `List::last`, nullable wrapping, null-safe
+access, or generic substitution. These operations do not turn an element borrow
+into an owned value and do not acquire a cleanup obligation. Ambiguous roots and
+borrows from temporaries that die before the result remain errors.
+
 ### Owned temporaries
 
 An owned rvalue, including `new X()` and a call returning an owned `T`, is an
@@ -115,3 +123,5 @@ convention.
 - `docs/notes/current-pipeline.md` status text that lists non-lexical borrowing
   as future Stage 21 work.
 - The Stage 19 temporary native-eligibility gate, now removed by decision 0090.
+- Any checker or MIR path that treats a `$this`-derived collection/property
+  projection as an owned return or loses its original borrow root.

@@ -1,0 +1,59 @@
+class Repository<T>
+{
+    internal writable Dictionary<string, T> $items = [];
+
+    writable function save(
+        string $id,
+        take T $item,
+    ): void
+    {
+        $this->items[$id] = $item;
+    }
+
+    function find(string $id): ?T
+    {
+        return $this->items->get($id);
+    }
+}
+
+class Customer
+{
+    function __construct(string $name)
+    {
+    }
+}
+
+class Invoice
+{
+    function __construct(string $number)
+    {
+    }
+}
+
+function main(): void
+{
+    let writable $customers =
+        new Repository<Customer>();
+
+    let writable $invoices =
+        new Repository<Invoice>();
+
+    $customers->save(
+        "42",
+        new Customer("Maya"),
+    );
+
+    $invoices->save(
+        "42",
+        new Invoice("INV-42"),
+    );
+
+    let $customer =
+        $customers->find("42");
+
+    let $invoice =
+        $invoices->find("42");
+
+    echo ($customer?->name ?? "missing") . "\n";
+    echo ($invoice?->number ?? "missing") . "\n";
+}

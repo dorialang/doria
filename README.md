@@ -46,6 +46,9 @@ properties are initialized exactly once, writable properties may be changed
 after their first initialization, and a branch that ends in a fatal panic does
 not produce a partially initialized object.
 
+Bare `{ ... }` blocks provide an explicit shorter lifetime boundary when a value
+or access guard should be cleaned up before the surrounding function continues.
+
 ## Design principles
 
 - **Contracts are written down.** Every parameter is explicitly typed — always. Nothing silently defaults to a dynamic type, and nullability is spelled `?T` and enforced.

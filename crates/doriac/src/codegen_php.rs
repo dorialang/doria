@@ -398,6 +398,7 @@ fn validate_block(block: &Block, semantic_info: &SemanticInfo) -> Result<(), Bac
 
 fn validate_statement(statement: &Stmt, semantic_info: &SemanticInfo) -> Result<(), BackendError> {
     match statement {
+        Stmt::Block(block) => validate_block(block, semantic_info),
         Stmt::VarDecl(decl) => {
             if let Some(ty) = &decl.ty {
                 validate_type(ty, decl.span)?;
@@ -1375,6 +1376,7 @@ fn emit_statement(
     scopes: &mut PhpNameScopes,
 ) {
     match statement {
+        Stmt::Block(block) => emit_block(block, output, indent, scopes),
         Stmt::VarDecl(decl) => {
             let initializer = emit_expr(&decl.initializer, scopes);
             let php_name = scopes.declare(&decl.name);
