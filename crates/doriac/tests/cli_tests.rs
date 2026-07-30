@@ -73,16 +73,25 @@ fn check_json_exposes_static_identity_fix_ranges() {
         .output()
         .expect("doriac binary should run");
     assert!(!output.status.success());
-    let diagnostics: serde_json::Value =
-        serde_json::from_slice(&output.stderr).expect("check --json stderr should be valid JSON");
-    let diagnostic = diagnostics
+    assert!(
+        output.stderr.is_empty(),
+        "structured diagnostics must not be mixed with stderr"
+    );
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("check --json stdout should be valid JSON");
+    assert_eq!(envelope["schemaVersion"], 1);
+    let diagnostic = envelope["diagnostics"]
         .as_array()
         .and_then(|diagnostics| diagnostics.iter().find(|item| item["code"] == "E0494"))
         .expect("E0494 JSON diagnostic");
     let dollar = source.rfind("$prop").expect("access sigil");
-    assert_eq!(diagnostic["fix"]["span"]["start"], dollar);
-    assert_eq!(diagnostic["fix"]["span"]["end"], dollar + 1);
-    assert_eq!(diagnostic["fix"]["replacement"], "");
+    assert_eq!(diagnostic["fixes"][0]["applicability"], "machineApplicable");
+    assert_eq!(diagnostic["fixes"][0]["edits"][0]["span"]["start"], dollar);
+    assert_eq!(
+        diagnostic["fixes"][0]["edits"][0]["span"]["end"],
+        dollar + 1
+    );
+    assert_eq!(diagnostic["fixes"][0]["edits"][0]["replacement"], "");
 
     let late_static_source = "class Foo { static function create(): int { return 1; } function read(): int { return static::create(); } }";
     fs::write(temp_dir.join("main.doria"), late_static_source)
@@ -95,18 +104,70 @@ fn check_json_exposes_static_identity_fix_ranges() {
         .output()
         .expect("doriac binary should run");
     assert!(!late_static_output.status.success());
-    let diagnostics: serde_json::Value = serde_json::from_slice(&late_static_output.stderr)
-        .expect("late-static check --json stderr should be valid JSON");
-    let diagnostic = diagnostics
+    let envelope: serde_json::Value = serde_json::from_slice(&late_static_output.stdout)
+        .expect("late-static check --json stdout should be valid JSON");
+    let diagnostic = envelope["diagnostics"]
         .as_array()
         .and_then(|diagnostics| diagnostics.iter().find(|item| item["code"] == "E0495"))
         .expect("E0495 JSON diagnostic");
     let qualifier = late_static_source
         .rfind("static::")
         .expect("late-static qualifier");
-    assert_eq!(diagnostic["fix"]["span"]["start"], qualifier);
-    assert_eq!(diagnostic["fix"]["span"]["end"], qualifier + 6);
-    assert_eq!(diagnostic["fix"]["replacement"], "self");
+    assert_eq!(
+        diagnostic["fixes"][0]["edits"][0]["span"]["start"],
+        qualifier
+    );
+    assert_eq!(
+        diagnostic["fixes"][0]["edits"][0]["span"]["end"],
+        qualifier + 6
+    );
+    assert_eq!(diagnostic["fixes"][0]["edits"][0]["replacement"], "self");
+
+    let _ = fs::remove_dir_all(temp_dir);
+}
+
+#[test]
+fn diagnostic_formats_have_stable_channels_and_color_rules() {
+    let temp_dir = temp_dir_path("diagnostic-formats");
+    fs::create_dir_all(&temp_dir).expect("temp directory should be created");
+    fs::write(temp_dir.join("main.doria"), "function main(): void { § }")
+        .expect("source should be writable");
+
+    let human = Command::new(doriac_bin())
+        .current_dir(&temp_dir)
+        .args([
+            "check",
+            "main.doria",
+            "--diagnostic-format",
+            "human",
+            "--diagnostic-color",
+            "never",
+        ])
+        .output()
+        .expect("doriac binary should run");
+    assert!(!human.status.success());
+    let human = String::from_utf8(human.stderr).expect("human diagnostics should be UTF-8");
+    assert!(human.starts_with("Error[L0001]: Unexpected Character"));
+    assert!(human.contains("Why:"));
+    assert!(human.contains("Compilation Failed:"));
+    assert!(!human.contains("\u{1b}["));
+
+    let concise = Command::new(doriac_bin())
+        .current_dir(&temp_dir)
+        .args(["check", "main.doria", "--diagnostic-format", "concise"])
+        .output()
+        .expect("doriac binary should run");
+    assert!(!concise.status.success());
+    let concise = String::from_utf8(concise.stderr).expect("concise diagnostics should be UTF-8");
+    assert!(concise.starts_with("main.doria:1:"));
+    assert!(!concise.contains("\n   |"));
+
+    let colored = Command::new(doriac_bin())
+        .current_dir(&temp_dir)
+        .args(["check", "main.doria", "--diagnostic-color", "always"])
+        .output()
+        .expect("doriac binary should run");
+    assert!(String::from_utf8_lossy(&colored.stderr).contains("\u{1b}[31;1mError[L0001]"));
 
     let _ = fs::remove_dir_all(temp_dir);
 }
