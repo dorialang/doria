@@ -1721,3 +1721,130 @@ function main(): void
         .expect("readonly access should succeed after block cleanup");
     assert_eq!(output.stdout, b"dark");
 }
+
+#[test]
+fn nullable_access_parameters_borrow_unless_declared_take() {
+    let source = r#"
+class Counter
+{
+    function __construct(string $name, writable int $value = 0) {}
+}
+
+function inspect(
+    ?ReadonlySharedReferenceAccess<Counter> $access,
+): void
+{
+    if ($access != null) {
+        echo "inspect {$access->name}\n";
+    }
+}
+
+function increment(
+    ?WritableSharedReferenceAccess<Counter> $access,
+): void
+{
+    if ($access != null) {
+        $access->value++;
+    }
+}
+
+function main(): void
+{
+    let $readShared = new WritableSharedReference(new Counter("read"));
+    ?ReadonlySharedReferenceAccess<Counter> $read =
+        $readShared->acquireReadonlyAccess();
+    inspect($read);
+    if ($read != null) {
+        echo "after {$read->name}\n";
+    }
+
+    let $writeShared = new WritableSharedReference(new Counter("write"));
+    ?WritableSharedReferenceAccess<Counter> $write =
+        $writeShared->acquireWritableAccess();
+    increment($write);
+    if ($write != null) {
+        $write->value++;
+        echo "value {$write->value}\n";
+    }
+}
+"#;
+    let program = doriac::lower_source_to_mir("stage25a-nullable-access-borrow.doria", source)
+        .expect("nullable access parameters should preserve default borrowing");
+    let output = doriac::mir_interpreter::interpret(&program)
+        .expect("borrowed nullable access parameters should remain live after calls");
+    assert_eq!(output.stdout, b"inspect read\nafter read\nvalue 2\n");
+    doriac::codegen_cranelift::lower_mir_to_object(&program)
+        .expect("borrowed nullable access parameters should lower through Cranelift");
+    #[cfg(feature = "llvm-backend")]
+    doriac::codegen_llvm::lower_mir_to_object(&program)
+        .expect("borrowed nullable access parameters should lower through LLVM");
+}
+
+#[test]
+fn reordered_nullable_access_temporaries_transfer_with_balanced_cleanup() {
+    let source = r#"
+class Counter
+{
+    function __construct(string $name, writable int $value = 0) {}
+}
+
+function marker(string $name): int
+{
+    echo "marker {$name}\n";
+    return 7;
+}
+
+function consumeReadonly(
+    int $marker,
+    take ?ReadonlySharedReferenceAccess<Counter> $access,
+): void
+{
+    if ($access != null) {
+        echo "{$marker}:{$access->name}\n";
+    }
+}
+
+function consumeWritable(
+    int $marker,
+    take ?WritableSharedReferenceAccess<Counter> $access,
+): void
+{
+    if ($access != null) {
+        echo "{$marker}:{$access->name}:{$access->value}\n";
+    }
+}
+
+function exerciseReordering(
+    ?WritableSharedReference<Counter> $source,
+): void
+{
+    consumeReadonly(
+        access: $source?->acquireReadonlyAccess(),
+        marker: marker("read"),
+    );
+    consumeWritable(
+        access: $source?->acquireWritableAccess(),
+        marker: marker("write"),
+    );
+}
+
+function main(): void
+{
+    let $owner = new WritableSharedReference(new Counter("owned"));
+    exerciseReordering($owner);
+}
+"#;
+    let program = doriac::lower_source_to_mir("stage25a-nullable-access-reorder.doria", source)
+        .expect("reordered nullable access temporaries should lower without panicking");
+    let output = doriac::mir_interpreter::interpret(&program)
+        .expect("reordered nullable access temporaries should transfer exactly once");
+    assert_eq!(
+        output.stdout,
+        b"marker read\n7:owned\nmarker write\n7:owned:0\n"
+    );
+    doriac::codegen_cranelift::lower_mir_to_object(&program)
+        .expect("reordered nullable access temporaries should lower through Cranelift");
+    #[cfg(feature = "llvm-backend")]
+    doriac::codegen_llvm::lower_mir_to_object(&program)
+        .expect("reordered nullable access temporaries should lower through LLVM");
+}

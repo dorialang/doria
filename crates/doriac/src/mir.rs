@@ -197,6 +197,13 @@ pub enum WritableSharedPayload {
     Collection(CollectionTypeId),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SharedAccessType {
+    pub payload: WritableSharedPayload,
+    pub writable: bool,
+    pub nullable: bool,
+}
+
 impl Type {
     pub const fn has_move_ownership(self) -> bool {
         matches!(
@@ -219,6 +226,32 @@ impl Type {
                 | Self::NullableWritableSharedReferenceAccess(_)
                 | Self::Collection(_)
         )
+    }
+
+    pub const fn shared_access(self) -> Option<SharedAccessType> {
+        match self {
+            Self::ReadonlySharedReferenceAccess(payload) => Some(SharedAccessType {
+                payload,
+                writable: false,
+                nullable: false,
+            }),
+            Self::WritableSharedReferenceAccess(payload) => Some(SharedAccessType {
+                payload,
+                writable: true,
+                nullable: false,
+            }),
+            Self::NullableReadonlySharedReferenceAccess(payload) => Some(SharedAccessType {
+                payload,
+                writable: false,
+                nullable: true,
+            }),
+            Self::NullableWritableSharedReferenceAccess(payload) => Some(SharedAccessType {
+                payload,
+                writable: true,
+                nullable: true,
+            }),
+            _ => None,
+        }
     }
 }
 

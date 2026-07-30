@@ -2560,6 +2560,34 @@ enum DropObligation {
     Collection(mir::LocalId, mir::CollectionTypeId),
 }
 
+fn drop_obligation_for_owned_local(local: mir::LocalId, ty: mir::Type) -> DropObligation {
+    if let Some(access) = ty.shared_access() {
+        return DropObligation::SharedAccess(local, access.payload, access.writable);
+    }
+    match ty {
+        mir::Type::Class(class) | mir::Type::NullableClass(class) => {
+            DropObligation::Class(local, class)
+        }
+        mir::Type::SharedReference(class) | mir::Type::NullableSharedReference(class) => {
+            DropObligation::Shared(local, class)
+        }
+        mir::Type::WeakReference(class) | mir::Type::NullableWeakReference(class) => {
+            DropObligation::Weak(local, class)
+        }
+        mir::Type::WritableSharedReference(payload)
+        | mir::Type::NullableWritableSharedReference(payload) => {
+            DropObligation::WritableShared(local, payload)
+        }
+        mir::Type::WritableWeakReference(payload)
+        | mir::Type::NullableWritableWeakReference(payload) => {
+            DropObligation::WritableWeak(local, payload)
+        }
+        mir::Type::Mixed | mir::Type::NullableMixed => DropObligation::Mixed(local),
+        mir::Type::Collection(collection) => DropObligation::Collection(local, collection),
+        _ => unreachable!("only move locals may own native drop obligations"),
+    }
+}
+
 impl<'semantic> LoweringContext<'semantic> {
     fn new(inputs: &FunctionLoweringInputs<'semantic>) -> Self {
         Self {
@@ -2787,35 +2815,7 @@ impl<'semantic> LoweringContext<'semantic> {
             .expect("MIR lowering must have a local scope")
             .insert(name.to_string(), id);
         if owned {
-            let obligation = match ty {
-                mir::Type::Class(class) | mir::Type::NullableClass(class) => {
-                    DropObligation::Class(id, class)
-                }
-                mir::Type::SharedReference(class) | mir::Type::NullableSharedReference(class) => {
-                    DropObligation::Shared(id, class)
-                }
-                mir::Type::WeakReference(class) => DropObligation::Weak(id, class),
-                mir::Type::NullableWeakReference(class) => DropObligation::Weak(id, class),
-                mir::Type::WritableSharedReference(payload)
-                | mir::Type::NullableWritableSharedReference(payload) => {
-                    DropObligation::WritableShared(id, payload)
-                }
-                mir::Type::WritableWeakReference(payload)
-                | mir::Type::NullableWritableWeakReference(payload) => {
-                    DropObligation::WritableWeak(id, payload)
-                }
-                mir::Type::ReadonlySharedReferenceAccess(payload)
-                | mir::Type::NullableReadonlySharedReferenceAccess(payload) => {
-                    DropObligation::SharedAccess(id, payload, false)
-                }
-                mir::Type::WritableSharedReferenceAccess(payload)
-                | mir::Type::NullableWritableSharedReferenceAccess(payload) => {
-                    DropObligation::SharedAccess(id, payload, true)
-                }
-                mir::Type::Mixed | mir::Type::NullableMixed => DropObligation::Mixed(id),
-                mir::Type::Collection(collection) => DropObligation::Collection(id, collection),
-                _ => unreachable!("only move locals may own native drop obligations"),
-            };
+            let obligation = drop_obligation_for_owned_local(id, ty);
             self.scope_owned_locals
                 .last_mut()
                 .expect("MIR lowering must have an ownership scope")
@@ -2896,33 +2896,7 @@ impl<'semantic> LoweringContext<'semantic> {
             owned: true,
             synthetic: true,
         });
-        let obligation = match ty {
-            mir::Type::Class(class) | mir::Type::NullableClass(class) => {
-                DropObligation::Class(id, class)
-            }
-            mir::Type::SharedReference(class) | mir::Type::NullableSharedReference(class) => {
-                DropObligation::Shared(id, class)
-            }
-            mir::Type::WeakReference(class) => DropObligation::Weak(id, class),
-            mir::Type::NullableWeakReference(class) => DropObligation::Weak(id, class),
-            mir::Type::WritableSharedReference(payload)
-            | mir::Type::NullableWritableSharedReference(payload) => {
-                DropObligation::WritableShared(id, payload)
-            }
-            mir::Type::WritableWeakReference(payload)
-            | mir::Type::NullableWritableWeakReference(payload) => {
-                DropObligation::WritableWeak(id, payload)
-            }
-            mir::Type::ReadonlySharedReferenceAccess(payload) => {
-                DropObligation::SharedAccess(id, payload, false)
-            }
-            mir::Type::WritableSharedReferenceAccess(payload) => {
-                DropObligation::SharedAccess(id, payload, true)
-            }
-            mir::Type::Mixed | mir::Type::NullableMixed => DropObligation::Mixed(id),
-            mir::Type::Collection(collection) => DropObligation::Collection(id, collection),
-            _ => unreachable!("only move locals may own native drop obligations"),
-        };
+        let obligation = drop_obligation_for_owned_local(id, ty);
         self.scope_owned_locals
             .last_mut()
             .expect("MIR lowering must have an ownership scope")
@@ -5745,12 +5719,11 @@ fn lower_call_args_with_ownership(
                     )?,
                 )
             }
-            mir::Type::ReadonlySharedReferenceAccess(payload)
-            | mir::Type::WritableSharedReferenceAccess(payload) => {
-                let writable = matches!(expected, mir::Type::WritableSharedReferenceAccess(_));
-                mir::Rvalue::SharedReferenceAccess(lower_shared_reference_access_expression(
-                    value, payload, writable, transfers, context,
-                )?)
+            ty @ (mir::Type::ReadonlySharedReferenceAccess(_)
+            | mir::Type::WritableSharedReferenceAccess(_)
+            | mir::Type::NullableReadonlySharedReferenceAccess(_)
+            | mir::Type::NullableWritableSharedReferenceAccess(_)) => {
+                lower_shared_access_rvalue(value, ty, transfers, context)?
             }
             _ => lower_rvalue_as_expected(value, expected, context)?,
         };
@@ -7128,6 +7101,36 @@ fn value_expression_from_operand(
     }
 }
 
+fn lower_shared_access_rvalue(
+    expr: &hir::Expr,
+    expected: mir::Type,
+    transfer: bool,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<mir::Rvalue> {
+    let Some(access) = expected.shared_access() else {
+        unreachable!("shared access lowering requires a shared access MIR type");
+    };
+    if access.nullable {
+        lower_nullable_shared_reference_access_expression(
+            expr,
+            access.payload,
+            access.writable,
+            transfer,
+            context,
+        )
+        .map(mir::Rvalue::NullableSharedReferenceAccess)
+    } else {
+        lower_shared_reference_access_expression(
+            expr,
+            access.payload,
+            access.writable,
+            transfer,
+            context,
+        )
+        .map(mir::Rvalue::SharedReferenceAccess)
+    }
+}
+
 fn lower_rvalue_as_expected(
     expr: &hir::Expr,
     expected: mir::Type,
@@ -7194,21 +7197,11 @@ fn lower_rvalue_as_expected(
             lower_nullable_writable_weak_reference_expression(expr, payload, true, context)
                 .map(mir::Rvalue::NullableWritableWeakReference)
         }
-        mir::Type::ReadonlySharedReferenceAccess(payload) => {
-            lower_shared_reference_access_expression(expr, payload, false, true, context)
-                .map(mir::Rvalue::SharedReferenceAccess)
-        }
-        mir::Type::WritableSharedReferenceAccess(payload) => {
-            lower_shared_reference_access_expression(expr, payload, true, true, context)
-                .map(mir::Rvalue::SharedReferenceAccess)
-        }
-        mir::Type::NullableReadonlySharedReferenceAccess(payload) => {
-            lower_nullable_shared_reference_access_expression(expr, payload, false, true, context)
-                .map(mir::Rvalue::NullableSharedReferenceAccess)
-        }
-        mir::Type::NullableWritableSharedReferenceAccess(payload) => {
-            lower_nullable_shared_reference_access_expression(expr, payload, true, true, context)
-                .map(mir::Rvalue::NullableSharedReferenceAccess)
+        ty @ (mir::Type::ReadonlySharedReferenceAccess(_)
+        | mir::Type::WritableSharedReferenceAccess(_)
+        | mir::Type::NullableReadonlySharedReferenceAccess(_)
+        | mir::Type::NullableWritableSharedReferenceAccess(_)) => {
+            lower_shared_access_rvalue(expr, ty, true, context)
         }
         mir::Type::Collection(collection) => {
             lower_collection_expression(expr, collection, true, context)
@@ -7262,13 +7255,11 @@ fn lower_rvalue_as_borrowed(
             lower_nullable_writable_weak_reference_expression(expr, payload, false, context)
                 .map(mir::Rvalue::NullableWritableWeakReference)
         }
-        mir::Type::ReadonlySharedReferenceAccess(payload) => {
-            lower_shared_reference_access_expression(expr, payload, false, false, context)
-                .map(mir::Rvalue::SharedReferenceAccess)
-        }
-        mir::Type::WritableSharedReferenceAccess(payload) => {
-            lower_shared_reference_access_expression(expr, payload, true, false, context)
-                .map(mir::Rvalue::SharedReferenceAccess)
+        ty @ (mir::Type::ReadonlySharedReferenceAccess(_)
+        | mir::Type::WritableSharedReferenceAccess(_)
+        | mir::Type::NullableReadonlySharedReferenceAccess(_)
+        | mir::Type::NullableWritableSharedReferenceAccess(_)) => {
+            lower_shared_access_rvalue(expr, ty, false, context)
         }
         mir::Type::Collection(collection) => {
             lower_collection_expression(expr, collection, false, context)
