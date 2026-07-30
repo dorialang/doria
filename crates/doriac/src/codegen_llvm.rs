@@ -4092,9 +4092,12 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 object, property, ..
             } => self.lower_pointer_property(*object, *property, "shared.access.property"),
             mir::SharedReferenceAccessExpression::CollectionIndex {
-                collection, index, ..
+                collection,
+                index,
+                remove,
+                ..
             } => Ok(self
-                .lower_collection_index(*collection, index, false)?
+                .lower_collection_index(*collection, index, *remove)?
                 .into_pointer_value()),
             mir::SharedReferenceAccessExpression::Call { function, args, .. } => Ok(self
                 .lower_call(*function, args, true)?
@@ -4145,9 +4148,10 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             mir::NullableSharedReferenceAccessExpression::CollectionIndex {
                 collection,
                 index,
+                remove,
                 ..
             } => Ok(self
-                .lower_collection_index(*collection, index, false)?
+                .lower_collection_index(*collection, index, *remove)?
                 .into_pointer_value()),
             mir::NullableSharedReferenceAccessExpression::Call { function, args, .. } => Ok(self
                 .lower_call(*function, args, true)?

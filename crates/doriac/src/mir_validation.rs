@@ -2495,22 +2495,18 @@ fn validate_shared_reference_access_expression(
             object, property, ..
         } => validate_writable_shared_property(program, function, *object, *property, access_type),
         mir::SharedReferenceAccessExpression::CollectionIndex {
-            collection, index, ..
-        } => {
-            let local = local_in(function, *collection)?;
-            let mir::Type::Collection(collection) = local.ty else {
-                return Err(malformed_mir(
-                    "shared access collection index uses a non-collection local",
-                ));
-            };
-            let definition = collection_in(program, collection)?;
-            if definition.value != access_type {
-                return Err(malformed_mir(
-                    "shared access collection index has another value type",
-                ));
-            }
-            validate_collection_index(program, function, definition, index)
-        }
+            collection,
+            index,
+            remove,
+            ..
+        } => validate_writable_collection_index(
+            program,
+            function,
+            *collection,
+            index,
+            access_type,
+            *remove,
+        ),
         mir::SharedReferenceAccessExpression::Call {
             function: callee,
             args,
@@ -2573,22 +2569,18 @@ fn validate_nullable_shared_reference_access_expression(
             object, property, ..
         } => validate_writable_shared_property(program, function, *object, *property, nullable_ty),
         mir::NullableSharedReferenceAccessExpression::CollectionIndex {
-            collection, index, ..
-        } => {
-            let local = local_in(function, *collection)?;
-            let mir::Type::Collection(collection) = local.ty else {
-                return Err(malformed_mir(
-                    "nullable shared access index uses a non-collection local",
-                ));
-            };
-            let definition = collection_in(program, collection)?;
-            if definition.value != nullable_ty {
-                return Err(malformed_mir(
-                    "nullable shared access index has another value type",
-                ));
-            }
-            validate_collection_index(program, function, definition, index)
-        }
+            collection,
+            index,
+            remove,
+            ..
+        } => validate_writable_collection_index(
+            program,
+            function,
+            *collection,
+            index,
+            nullable_ty,
+            *remove,
+        ),
         mir::NullableSharedReferenceAccessExpression::Call {
             function: callee,
             args,

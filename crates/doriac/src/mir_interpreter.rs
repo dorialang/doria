@@ -431,6 +431,7 @@ enum EvaluationTask {
         payload: mir::WritableSharedPayload,
         writable: bool,
         nullable: bool,
+        remove: bool,
     },
     BuildClassNew {
         class: crate::class_layout::ClassId,
@@ -2751,9 +2752,10 @@ impl Interpreter<'_> {
                 payload,
                 writable,
                 nullable,
+                remove,
             } => {
                 let index = self.pop_local_value()?;
-                let value = match self.collection_value_at(collection, &index, false) {
+                let value = match self.collection_value_at(collection, &index, remove) {
                     Ok(value) => value,
                     Err(message) => return Ok(StepOutcome::Panic(message)),
                 };
@@ -6561,6 +6563,7 @@ impl Interpreter<'_> {
                 collection,
                 index,
                 writable,
+                remove,
             } => {
                 let frame = self.current_frame_mut()?;
                 frame
@@ -6570,6 +6573,7 @@ impl Interpreter<'_> {
                         payload,
                         writable,
                         nullable: false,
+                        remove,
                     });
                 frame.tasks.push(EvaluationTask::Rvalue(*index));
             }
@@ -6698,6 +6702,7 @@ impl Interpreter<'_> {
                 collection,
                 index,
                 writable,
+                remove,
             } => {
                 let frame = self.current_frame_mut()?;
                 frame
@@ -6707,6 +6712,7 @@ impl Interpreter<'_> {
                         payload,
                         writable,
                         nullable: true,
+                        remove,
                     });
                 frame.tasks.push(EvaluationTask::Rvalue(*index));
             }

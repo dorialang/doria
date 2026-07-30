@@ -8008,6 +8008,35 @@ fn collection_remove_at_rvalue(
                 remove: true,
             },
         )),
+        mir::Type::ReadonlySharedReferenceAccess(payload)
+        | mir::Type::WritableSharedReferenceAccess(payload) => {
+            let writable = matches!(ty, mir::Type::WritableSharedReferenceAccess(_));
+            Ok(mir::Rvalue::SharedReferenceAccess(
+                mir::SharedReferenceAccessExpression::CollectionIndex {
+                    payload,
+                    collection,
+                    index: Box::new(index),
+                    writable,
+                    remove: true,
+                },
+            ))
+        }
+        mir::Type::NullableReadonlySharedReferenceAccess(payload)
+        | mir::Type::NullableWritableSharedReferenceAccess(payload) => {
+            let writable = matches!(
+                ty,
+                mir::Type::NullableWritableSharedReferenceAccess(_)
+            );
+            Ok(mir::Rvalue::NullableSharedReferenceAccess(
+                mir::NullableSharedReferenceAccessExpression::CollectionIndex {
+                    payload,
+                    collection,
+                    index: Box::new(index),
+                    writable,
+                    remove: true,
+                },
+            ))
+        }
         mir::Type::Mixed => Ok(mir::Rvalue::Mixed(mir::MixedExpression::CollectionIndex {
             collection,
             index: Box::new(index),
@@ -8027,11 +8056,7 @@ fn collection_remove_at_rvalue(
         | mir::Type::NullableMixed
         | mir::Type::NullableClass(_)
         | mir::Type::NullableWritableSharedReference(_)
-        | mir::Type::NullableWritableWeakReference(_)
-        | mir::Type::ReadonlySharedReferenceAccess(_)
-        | mir::Type::WritableSharedReferenceAccess(_)
-        | mir::Type::NullableReadonlySharedReferenceAccess(_)
-        | mir::Type::NullableWritableSharedReferenceAccess(_) => Err(vec![unsupported(
+        | mir::Type::NullableWritableWeakReference(_) => Err(vec![unsupported(
             Span::new(0, 0),
             "removing nullable collection elements is deferred beyond Stage 23 Slice 3",
         )]),
@@ -9629,6 +9654,60 @@ fn lower_nullable_writable_shared_reference_expression(
                 transfer,
             })
         }
+        hir::Expr::PropertyAccess { span, .. } => {
+            if transfer {
+                return Err(vec![unsupported(
+                    *span,
+                    "moving directly out of an owned nullable writable shared-reference property is not supported",
+                )]);
+            }
+            let (object, property, ty) = lower_property_place(expr, context)?;
+            if ty == mir::Type::NullableWritableSharedReference(expected) {
+                Ok(mir::NullableWritableSharedReferenceExpression::Property {
+                    payload: expected,
+                    object,
+                    property,
+                })
+            } else {
+                Ok(mir::NullableWritableSharedReferenceExpression::Strong(
+                    lower_writable_shared_reference_expression(
+                        expr, expected, transfer, context,
+                    )?,
+                ))
+            }
+        }
+        hir::Expr::FunctionCall { name, args, span } => {
+            let signature = context.lookup_function(name, *span)?;
+            match signature.return_type {
+                mir::ReturnType::Value(mir::Type::NullableWritableSharedReference(payload))
+                    if payload == expected =>
+                {
+                    Ok(mir::NullableWritableSharedReferenceExpression::Call {
+                        payload: expected,
+                        function: signature.id,
+                        return_borrow: signature.return_borrow,
+                        args: lower_call_args_with_ownership(
+                            name, args, signature, *span, context,
+                        )?,
+                    })
+                }
+                mir::ReturnType::Value(mir::Type::WritableSharedReference(payload))
+                    if payload == expected =>
+                {
+                    Ok(mir::NullableWritableSharedReferenceExpression::Strong(
+                        lower_writable_shared_reference_expression(
+                            expr, expected, transfer, context,
+                        )?,
+                    ))
+                }
+                _ => Err(vec![unsupported(
+                    *span,
+                    format!(
+                        "function `{name}` does not return the expected nullable writable shared reference"
+                    ),
+                )]),
+            }
+        }
         hir::Expr::MethodCall {
             object,
             method,
@@ -9676,6 +9755,110 @@ fn lower_nullable_writable_shared_reference_expression(
                 },
             )
         }
+        hir::Expr::MethodCall {
+            object,
+            method,
+            args,
+            span,
+            ..
+        } => {
+            let (signature, args) =
+                lower_instance_method_call(object, method, args, *span, context)?;
+            match signature.return_type {
+                mir::ReturnType::Value(mir::Type::NullableWritableSharedReference(payload))
+                    if payload == expected =>
+                {
+                    Ok(mir::NullableWritableSharedReferenceExpression::Call {
+                        payload: expected,
+                        function: signature.id,
+                        return_borrow: signature.return_borrow,
+                        args,
+                    })
+                }
+                mir::ReturnType::Value(mir::Type::WritableSharedReference(payload))
+                    if payload == expected =>
+                {
+                    Ok(mir::NullableWritableSharedReferenceExpression::Strong(
+                        mir::WritableSharedReferenceExpression::Call {
+                            payload: expected,
+                            function: signature.id,
+                            return_borrow: signature.return_borrow,
+                            args,
+                        },
+                    ))
+                }
+                _ => Err(vec![unsupported(
+                    *span,
+                    "method does not return the expected nullable writable shared reference",
+                )]),
+            }
+        }
+        hir::Expr::StaticCall {
+            class_name,
+            method,
+            args,
+            span,
+        } => {
+            let (signature, args) =
+                lower_static_method_call(class_name, method, args, *span, context)?;
+            match signature.return_type {
+                mir::ReturnType::Value(mir::Type::NullableWritableSharedReference(payload))
+                    if payload == expected =>
+                {
+                    Ok(mir::NullableWritableSharedReferenceExpression::Call {
+                        payload: expected,
+                        function: signature.id,
+                        return_borrow: signature.return_borrow,
+                        args,
+                    })
+                }
+                mir::ReturnType::Value(mir::Type::WritableSharedReference(payload))
+                    if payload == expected =>
+                {
+                    Ok(mir::NullableWritableSharedReferenceExpression::Strong(
+                        mir::WritableSharedReferenceExpression::Call {
+                            payload: expected,
+                            function: signature.id,
+                            return_borrow: signature.return_borrow,
+                            args,
+                        },
+                    ))
+                }
+                _ => Err(vec![unsupported(
+                    *span,
+                    "static method does not return the expected nullable writable shared reference",
+                )]),
+            }
+        }
+        hir::Expr::Binary {
+            left,
+            op: hir::BinaryOp::Coalesce,
+            right,
+            ..
+        } => match context.coalesce_selection(left) {
+            CoalesceSelection::Left => {
+                lower_nullable_writable_shared_reference_expression(
+                    left, expected, transfer, context,
+                )
+            }
+            CoalesceSelection::Right => {
+                lower_nullable_writable_shared_reference_expression(
+                    right, expected, transfer, context,
+                )
+            }
+            CoalesceSelection::Dynamic => {
+                Ok(mir::NullableWritableSharedReferenceExpression::Coalesce {
+                    payload: expected,
+                    left: Box::new(lower_nullable_writable_shared_reference_expression(
+                        left, expected, transfer, context,
+                    )?),
+                    right: Box::new(lower_nullable_writable_shared_reference_expression(
+                        right, expected, transfer, context,
+                    )?),
+                    transfer,
+                })
+            }
+        },
         _ => Ok(mir::NullableWritableSharedReferenceExpression::Strong(
             lower_writable_shared_reference_expression(expr, expected, transfer, context)?,
         )),
@@ -9857,6 +10040,7 @@ fn lower_shared_reference_access_expression(
                 collection,
                 index: Box::new(index),
                 writable,
+                remove: false,
             })
         }
         hir::Expr::MethodCall {
@@ -9897,6 +10081,61 @@ fn lower_shared_reference_access_expression(
                 writable,
             })
         }
+        hir::Expr::MethodCall {
+            object,
+            method,
+            args,
+            span,
+            ..
+        } => {
+            let (signature, args) =
+                lower_instance_method_call(object, method, args, *span, context)?;
+            let expected_ty = if writable {
+                mir::Type::WritableSharedReferenceAccess(expected)
+            } else {
+                mir::Type::ReadonlySharedReferenceAccess(expected)
+            };
+            if signature.return_type != mir::ReturnType::Value(expected_ty) {
+                return Err(vec![unsupported(
+                    *span,
+                    "method does not return the expected shared access type",
+                )]);
+            }
+            Ok(mir::SharedReferenceAccessExpression::Call {
+                payload: expected,
+                function: signature.id,
+                return_borrow: signature.return_borrow,
+                args,
+                writable,
+            })
+        }
+        hir::Expr::StaticCall {
+            class_name,
+            method,
+            args,
+            span,
+        } => {
+            let (signature, args) =
+                lower_static_method_call(class_name, method, args, *span, context)?;
+            let expected_ty = if writable {
+                mir::Type::WritableSharedReferenceAccess(expected)
+            } else {
+                mir::Type::ReadonlySharedReferenceAccess(expected)
+            };
+            if signature.return_type != mir::ReturnType::Value(expected_ty) {
+                return Err(vec![unsupported(
+                    *span,
+                    "static method does not return the expected shared access type",
+                )]);
+            }
+            Ok(mir::SharedReferenceAccessExpression::Call {
+                payload: expected,
+                function: signature.id,
+                return_borrow: signature.return_borrow,
+                args,
+                writable,
+            })
+        }
         _ => Err(vec![unsupported(
             expr.span(),
             "this shared-access expression is not supported by native compilation",
@@ -9932,6 +10171,68 @@ fn lower_nullable_shared_reference_access_expression(
                 transfer,
             })
         }
+        hir::Expr::PropertyAccess { span, .. } => {
+            if transfer {
+                return Err(vec![unsupported(
+                    *span,
+                    "moving directly out of an owned nullable shared-access property is not supported",
+                )]);
+            }
+            let (object, property, ty) = lower_property_place(expr, context)?;
+            if ty != nullable_ty {
+                return Ok(mir::NullableSharedReferenceAccessExpression::Access(
+                    Box::new(lower_shared_reference_access_expression(
+                        expr, expected, writable, transfer, context,
+                    )?),
+                ));
+            }
+            Ok(mir::NullableSharedReferenceAccessExpression::Property {
+                payload: expected,
+                object,
+                property,
+                writable,
+            })
+        }
+        hir::Expr::Index {
+            collection,
+            index,
+            span,
+        } => {
+            if transfer {
+                return Err(vec![unsupported(
+                    *span,
+                    "indexed nullable shared access objects are borrowed and cannot be moved out",
+                )]);
+            }
+            let (collection, index) =
+                lower_collection_index_operand(collection, index, nullable_ty, context)?;
+            Ok(
+                mir::NullableSharedReferenceAccessExpression::CollectionIndex {
+                    payload: expected,
+                    collection,
+                    index: Box::new(index),
+                    writable,
+                    remove: false,
+                },
+            )
+        }
+        hir::Expr::FunctionCall { name, args, span } => {
+            let signature = context.lookup_function(name, *span)?;
+            if signature.return_type != mir::ReturnType::Value(nullable_ty) {
+                return Ok(mir::NullableSharedReferenceAccessExpression::Access(
+                    Box::new(lower_shared_reference_access_expression(
+                        expr, expected, writable, transfer, context,
+                    )?),
+                ));
+            }
+            Ok(mir::NullableSharedReferenceAccessExpression::Call {
+                payload: expected,
+                function: signature.id,
+                return_borrow: signature.return_borrow,
+                args: lower_call_args_with_ownership(name, args, signature, *span, context)?,
+                writable,
+            })
+        }
         hir::Expr::MethodCall {
             object,
             method,
@@ -9952,6 +10253,65 @@ fn lower_nullable_shared_reference_access_expression(
                     writable,
                 },
             )
+        }
+        hir::Expr::MethodCall {
+            object,
+            method,
+            args,
+            span,
+            ..
+        } => {
+            if context.expression_type(expr)? != nullable_ty {
+                return Ok(mir::NullableSharedReferenceAccessExpression::Access(
+                    Box::new(lower_shared_reference_access_expression(
+                        expr, expected, writable, transfer, context,
+                    )?),
+                ));
+            }
+            let (signature, args) =
+                lower_instance_method_call(object, method, args, *span, context)?;
+            if signature.return_type != mir::ReturnType::Value(nullable_ty) {
+                return Err(vec![unsupported(
+                    *span,
+                    "method does not return the expected nullable shared access type",
+                )]);
+            }
+            Ok(mir::NullableSharedReferenceAccessExpression::Call {
+                payload: expected,
+                function: signature.id,
+                return_borrow: signature.return_borrow,
+                args,
+                writable,
+            })
+        }
+        hir::Expr::StaticCall {
+            class_name,
+            method,
+            args,
+            span,
+        } => {
+            if context.expression_type(expr)? != nullable_ty {
+                return Ok(mir::NullableSharedReferenceAccessExpression::Access(
+                    Box::new(lower_shared_reference_access_expression(
+                        expr, expected, writable, transfer, context,
+                    )?),
+                ));
+            }
+            let (signature, args) =
+                lower_static_method_call(class_name, method, args, *span, context)?;
+            if signature.return_type != mir::ReturnType::Value(nullable_ty) {
+                return Err(vec![unsupported(
+                    *span,
+                    "static method does not return the expected nullable shared access type",
+                )]);
+            }
+            Ok(mir::NullableSharedReferenceAccessExpression::Call {
+                payload: expected,
+                function: signature.id,
+                return_borrow: signature.return_borrow,
+                args,
+                writable,
+            })
         }
         _ => Ok(mir::NullableSharedReferenceAccessExpression::Access(
             Box::new(lower_shared_reference_access_expression(

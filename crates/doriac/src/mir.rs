@@ -1344,6 +1344,7 @@ pub enum SharedReferenceAccessExpression {
         collection: LocalId,
         index: Box<Rvalue>,
         writable: bool,
+        remove: bool,
     },
     Call {
         payload: WritableSharedPayload,
@@ -1383,6 +1384,7 @@ pub enum NullableSharedReferenceAccessExpression {
         collection: LocalId,
         index: Box<Rvalue>,
         writable: bool,
+        remove: bool,
     },
     Call {
         payload: WritableSharedPayload,
@@ -1437,7 +1439,8 @@ impl NullableSharedReferenceAccessExpression {
             Self::Local { transfer, .. } => *transfer,
             Self::Call { return_borrow, .. } => return_borrow.is_none(),
             Self::NullSafeAcquire { .. } => true,
-            Self::Null { .. } | Self::Property { .. } | Self::CollectionIndex { .. } => false,
+            Self::CollectionIndex { remove, .. } => *remove,
+            Self::Null { .. } | Self::Property { .. } => false,
         }
     }
 }
@@ -1480,7 +1483,8 @@ impl SharedReferenceAccessExpression {
                 *transfer
             }
             Self::Call { return_borrow, .. } => return_borrow.is_none(),
-            Self::Property { .. } | Self::CollectionIndex { .. } => false,
+            Self::CollectionIndex { remove, .. } => *remove,
+            Self::Property { .. } => false,
         }
     }
 }

@@ -1576,39 +1576,11 @@ fn lower_statement(
                     mir::Type::WeakReference(_) | mir::Type::NullableWeakReference(_),
                     Some(old_value),
                 ) => lower_drop_shared_value(builder, old_value, true, resources)?,
-                (
-                    mir::Type::WritableSharedReference(_)
-                    | mir::Type::NullableWritableSharedReference(_),
-                    Some(old_value),
-                ) => lower_drop_writable_shared_value(
-                    builder,
-                    old_value,
-                    WRITABLE_SHARED_RELEASE,
-                    resources,
-                )?,
-                (
-                    mir::Type::WritableWeakReference(_)
-                    | mir::Type::NullableWritableWeakReference(_),
-                    Some(old_value),
-                ) => lower_drop_writable_shared_value(
-                    builder,
-                    old_value,
-                    WRITABLE_SHARED_RELEASE_WEAK,
-                    resources,
-                )?,
-                (mir::Type::ReadonlySharedReferenceAccess(_), Some(old_value)) => {
+                (ty, Some(old_value)) if writable_shared_release_symbol(ty).is_some() => {
                     lower_drop_writable_shared_value(
                         builder,
                         old_value,
-                        WRITABLE_SHARED_RELEASE_READONLY_ACCESS,
-                        resources,
-                    )?
-                }
-                (mir::Type::WritableSharedReferenceAccess(_), Some(old_value)) => {
-                    lower_drop_writable_shared_value(
-                        builder,
-                        old_value,
-                        WRITABLE_SHARED_RELEASE_WRITABLE_ACCESS,
+                        writable_shared_release_symbol(ty).expect("matched above"),
                         resources,
                     )?
                 }
@@ -4506,8 +4478,11 @@ fn lower_shared_reference_access_expression(
             object, property, ..
         } => lower_pointer_property(builder, *object, *property, resources),
         mir::SharedReferenceAccessExpression::CollectionIndex {
-            collection, index, ..
-        } => lower_collection_index(builder, *collection, index, false, resources),
+            collection,
+            index,
+            remove,
+            ..
+        } => lower_collection_index(builder, *collection, index, *remove, resources),
         mir::SharedReferenceAccessExpression::Call { function, args, .. } => {
             lower_function_call(builder, *function, args, resources)?
                 .ok_or_else(|| malformed_mir("shared access call produced no result"))?
@@ -4565,8 +4540,11 @@ fn lower_nullable_shared_reference_access_expression(
             object, property, ..
         } => lower_pointer_property(builder, *object, *property, resources),
         mir::NullableSharedReferenceAccessExpression::CollectionIndex {
-            collection, index, ..
-        } => lower_collection_index(builder, *collection, index, false, resources),
+            collection,
+            index,
+            remove,
+            ..
+        } => lower_collection_index(builder, *collection, index, *remove, resources),
         mir::NullableSharedReferenceAccessExpression::Call { function, args, .. } => {
             lower_function_call(builder, *function, args, resources)?
                 .ok_or_else(|| malformed_mir("nullable shared access call produced no result"))?
