@@ -379,7 +379,7 @@ impl<'source> Lexer<'source> {
                     continue;
                 }
                 byte => {
-                    self.error(
+                    self.unexpected_character(
                         format!("unexpected character `{}`", byte as char),
                         start,
                         self.index,
@@ -646,6 +646,11 @@ impl<'source> Lexer<'source> {
     }
 
     fn error(&mut self, message: impl Into<String>, start: usize, end: usize) {
+        self.diagnostics
+            .push(Diagnostic::new("L0001", message, Span::new(start, end)));
+    }
+
+    fn unexpected_character(&mut self, message: impl Into<String>, start: usize, end: usize) {
         self.diagnostics.push(
             Diagnostic::new("L0001", message, Span::new(start, end))
                 .with_title("Unexpected Character")
