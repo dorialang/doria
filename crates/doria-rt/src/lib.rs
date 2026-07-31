@@ -1322,9 +1322,14 @@ pub unsafe extern "C" fn dr_v2_read_stdin_bytes(
 /// `current_frame` must be null or a valid frame chain for panic reporting.
 #[no_mangle]
 pub unsafe extern "C" fn dr_v2_flush_stdout(current_frame: *const DrStackFrameV2) {
-    if !device_io::flush(StandardStream::Stdout) {
-        panic_catalogued(current_frame, b"P1407");
+    match device_io::flush(StandardStream::Stdout) {
+        WriteOutcome::Success => return,
+        // A closed downstream pipe is the permanent clean status-0 exit, exactly as
+        // for an ordinary write. It must never become a status-101 panic.
+        WriteOutcome::BrokenPipe => exit_process(0),
+        WriteOutcome::OtherFailure => {}
     }
+    panic_catalogued(current_frame, b"P1407")
 }
 
 /// Flushes stderr through the implementation-private standard-device abstraction.
@@ -1333,9 +1338,14 @@ pub unsafe extern "C" fn dr_v2_flush_stdout(current_frame: *const DrStackFrameV2
 /// `current_frame` must be null or a valid frame chain for panic reporting.
 #[no_mangle]
 pub unsafe extern "C" fn dr_v2_flush_stderr(current_frame: *const DrStackFrameV2) {
-    if !device_io::flush(StandardStream::Stderr) {
-        panic_catalogued(current_frame, b"P1407");
+    match device_io::flush(StandardStream::Stderr) {
+        WriteOutcome::Success => return,
+        // A closed downstream pipe is the permanent clean status-0 exit, exactly as
+        // for an ordinary write. It must never become a status-101 panic.
+        WriteOutcome::BrokenPipe => exit_process(0),
+        WriteOutcome::OtherFailure => {}
     }
+    panic_catalogued(current_frame, b"P1407")
 }
 
 /// Returns whether one standard stream is attached to an interactive terminal.
