@@ -29,7 +29,7 @@ struct RuntimeAllocator;
 #[cfg(all(not(test), panic = "abort"))]
 unsafe impl core::alloc::GlobalAlloc for RuntimeAllocator {
     unsafe fn alloc(&self, layout: core::alloc::Layout) -> *mut u8 {
-        let header = mem::size_of::<usize>();
+        let header = mem::size_of::<*mut u8>();
         let Some(byte_length) = layout
             .size()
             .checked_add(layout.align() - 1)
@@ -45,12 +45,15 @@ unsafe impl core::alloc::GlobalAlloc for RuntimeAllocator {
         let aligned = start
             .add(layout.align() - 1)
             .map_addr(|address| address & !(layout.align() - 1));
-        aligned.sub(header).cast::<usize>().write(allocation.addr());
+        aligned.sub(header).cast::<*mut u8>().write(allocation);
         aligned
     }
 
     unsafe fn dealloc(&self, memory: *mut u8, _layout: core::alloc::Layout) {
-        let allocation = memory.sub(mem::size_of::<usize>()).cast::<usize>().read() as *mut u8;
+        let allocation = memory
+            .sub(mem::size_of::<*mut u8>())
+            .cast::<*mut u8>()
+            .read();
         deallocate(allocation);
     }
 
@@ -2444,6 +2447,21 @@ pub unsafe extern "C" fn memcmp(left: *const c_void, right: *const c_void, count
     0
 }
 
+/// Returns the byte length of a null-terminated string.
+///
+/// # Safety
+///
+/// `value` must point to a readable null-terminated byte string.
+#[cfg(all(windows, feature = "standalone-windows-support"))]
+#[no_mangle]
+pub unsafe extern "C" fn strlen(value: *const u8) -> usize {
+    let mut length = 0;
+    while ptr::read_volatile(value.add(length)) != 0 {
+        length += 1;
+    }
+    length
+}
+
 /// Lets Windows continue searching when precompiled `core` unwind metadata is inspected.
 ///
 /// Doria's runtime is abort-only and never initiates SEH/C++ unwinding. The Rust-distributed
@@ -2799,6 +2817,8 @@ mod tests {
             assert_eq!(memcmp(b"abc".as_ptr().cast(), b"abc".as_ptr().cast(), 3), 0);
             assert!(memcmp(b"abc".as_ptr().cast(), b"abd".as_ptr().cast(), 3) < 0);
             assert!(memcmp(b"abe".as_ptr().cast(), b"abd".as_ptr().cast(), 3) > 0);
+            assert_eq!(strlen(b"\0".as_ptr()), 0);
+            assert_eq!(strlen(b"doria\0".as_ptr()), 5);
 
             #[cfg(target_env = "msvc")]
             assert_eq!(

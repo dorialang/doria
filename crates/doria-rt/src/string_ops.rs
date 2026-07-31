@@ -253,7 +253,12 @@ pub unsafe extern "C" fn dr_v1_string_equals_ignore_case(
         }
         scratch
     };
-    let scratch_slice = core::slice::from_raw_parts_mut(scratch, scratch_length);
+    let mut empty_scratch = [];
+    let scratch_slice = if scratch_length == 0 {
+        empty_scratch.as_mut_slice()
+    } else {
+        core::slice::from_raw_parts_mut(scratch, scratch_length)
+    };
     let equal = doria_unicode::equals_ignore_case(left, right, scratch_slice)
         .unwrap_or_else(|error| panic_error(frame, error));
     if !scratch.is_null() {
@@ -537,6 +542,12 @@ mod tests {
                 dr_v1_string_equals_ignore_case(ptr::null(), trimmed, folded),
                 1
             );
+            let empty_left = string("");
+            let empty_right = string("");
+            assert_eq!(
+                dr_v1_string_equals_ignore_case(ptr::null(), empty_left, empty_right),
+                1
+            );
             let first = string("ßTRASSE");
             let upper_first = dr_v1_string_upper_first(ptr::null(), first);
             assert_eq!(read(upper_first), "SSTRASSE");
@@ -560,6 +571,8 @@ mod tests {
             crate::dr_v1_string_release(trimmed);
             crate::dr_v1_string_release(upper);
             crate::dr_v1_string_release(folded);
+            crate::dr_v1_string_release(empty_left);
+            crate::dr_v1_string_release(empty_right);
             crate::dr_v1_string_release(first);
             crate::dr_v1_string_release(upper_first);
             crate::dr_v1_string_release(case_needle);
