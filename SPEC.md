@@ -509,8 +509,14 @@ bytes. Search indices, slicing, and padding lengths use grapheme units.
 `string` is not permitted. The canonical string-operation families are
 `String::trim`/`trimStart`/`trimEnd`, `lower`/`upper`, predicates and search,
 replacement, `split`/`join`, `slice`, `repeat`, padding, `fromBytes`, and
-comparison. Decision 0103 defines their complete planned contracts; the
-Minimum String Runtime Surface remains the next implementation beat.
+comparison. Decision 0103 defines the reviewed v1 inventory. The executable
+surface includes `length`, `byteLength`, `isEmpty`, `bytes`, trimming, default
+Unicode casing and case folding, predicates, grapheme-indexed search,
+replacement, `split`/`join`, `slice`, `repeat`, padding, and UTF-8-validating
+`fromBytes`. It also includes the reviewed ignore-case search family,
+first-grapheme casing, and occurrence counting. The `graphemes`/`codePoints`
+views await the public traversal protocol, and ordering comparisons await the
+executable `Ordering` type.
 
 ## 7. Basic type system
 

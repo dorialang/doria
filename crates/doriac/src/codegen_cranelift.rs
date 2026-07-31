@@ -32,12 +32,20 @@ use crate::native_abi::{
     MIXED_TAG_UINT64, MIXED_TAG_UINT8, MIXED_TYPE_ID, NULLABLE_STRING_EQUAL, PROCESS_EXIT,
     READ_FILE, READ_FILE_BYTES, READ_STDIN_BYTES, READ_STDIN_LINE, SHARED_ACQUIRE, SHARED_CREATE,
     SHARED_CREATE_WEAK, SHARED_PAYLOAD, SHARED_RELEASE, SHARED_RELEASE_WEAK, SHARED_RETAIN,
-    STRING_COMPARE, STRING_CONCAT, STRING_DATA, STRING_FROM_BOOL, STRING_FROM_F32, STRING_FROM_F64,
-    STRING_FROM_I64, STRING_FROM_U64, STRING_FROM_UTF8, STRING_LENGTH, STRING_RELEASE,
-    STRING_RETAIN, STRING_WRITE_STDERR, STRING_WRITE_STDOUT, WRITABLE_SHARED_ACQUIRE,
-    WRITABLE_SHARED_ACQUIRE_READONLY_ACCESS, WRITABLE_SHARED_ACQUIRE_WRITABLE_ACCESS,
-    WRITABLE_SHARED_CREATE, WRITABLE_SHARED_CREATE_WEAK, WRITABLE_SHARED_READONLY_PAYLOAD,
-    WRITABLE_SHARED_RELEASE, WRITABLE_SHARED_RELEASE_READONLY_ACCESS, WRITABLE_SHARED_RELEASE_WEAK,
+    STRING_BYTE_LENGTH, STRING_COMPARE, STRING_CONCAT, STRING_CONTAINS,
+    STRING_CONTAINS_IGNORE_CASE, STRING_COUNT_OCCURRENCES, STRING_DATA, STRING_ENDS_WITH,
+    STRING_ENDS_WITH_IGNORE_CASE, STRING_EQUALS_IGNORE_CASE, STRING_FROM_BOOL, STRING_FROM_BYTES,
+    STRING_FROM_F32, STRING_FROM_F64, STRING_FROM_I64, STRING_FROM_U64, STRING_FROM_UTF8,
+    STRING_GRAPHEME_LENGTH, STRING_INDEX_OF, STRING_INDEX_OF_IGNORE_CASE, STRING_IS_EMPTY,
+    STRING_JOIN, STRING_LAST_INDEX_OF, STRING_LAST_INDEX_OF_IGNORE_CASE, STRING_LOWER,
+    STRING_LOWER_FIRST, STRING_PAD_END, STRING_PAD_START, STRING_RELEASE, STRING_REPEAT,
+    STRING_REPLACE, STRING_RETAIN, STRING_SLICE, STRING_SPLIT, STRING_STARTS_WITH,
+    STRING_STARTS_WITH_IGNORE_CASE, STRING_TO_BYTES, STRING_TRIM, STRING_TRIM_END,
+    STRING_TRIM_START, STRING_UPPER, STRING_UPPER_FIRST, STRING_WRITE_STDERR, STRING_WRITE_STDOUT,
+    WRITABLE_SHARED_ACQUIRE, WRITABLE_SHARED_ACQUIRE_READONLY_ACCESS,
+    WRITABLE_SHARED_ACQUIRE_WRITABLE_ACCESS, WRITABLE_SHARED_CREATE, WRITABLE_SHARED_CREATE_WEAK,
+    WRITABLE_SHARED_READONLY_PAYLOAD, WRITABLE_SHARED_RELEASE,
+    WRITABLE_SHARED_RELEASE_READONLY_ACCESS, WRITABLE_SHARED_RELEASE_WEAK,
     WRITABLE_SHARED_RELEASE_WRITABLE_ACCESS, WRITABLE_SHARED_RETAIN,
     WRITABLE_SHARED_WRITABLE_PAYLOAD, WRITE_FILE, WRITE_FILE_BYTES, WRITE_STDERR_BYTES,
     WRITE_STDOUT_BYTES,
@@ -1920,8 +1928,11 @@ fn lower_terminator(
             let pointer_type = resources.module.target_config().pointer_type();
             let data_id =
                 resources.declare_runtime(STRING_DATA, &[pointer_type], Some(pointer_type))?;
-            let len_id =
-                resources.declare_runtime(STRING_LENGTH, &[pointer_type], Some(pointer_type))?;
+            let len_id = resources.declare_runtime(
+                STRING_BYTE_LENGTH,
+                &[pointer_type],
+                Some(pointer_type),
+            )?;
             let data_ref = resources.module.declare_func_in_func(data_id, builder.func);
             let len_ref = resources.module.declare_func_in_func(len_id, builder.func);
             let data_call = builder.ins().call(data_ref, &[string]);
@@ -2234,6 +2245,9 @@ fn lower_collection_expression(
 ) -> Result<Value, BackendError> {
     let pointer = resources.module.target_config().pointer_type();
     match expression {
+        mir::CollectionExpression::StringIntrinsic(call) => {
+            lower_string_intrinsic_call(builder, call, resources)?.single()
+        }
         mir::CollectionExpression::Local {
             local, transfer, ..
         } => {
@@ -5866,6 +5880,9 @@ fn lower_string_expression(
 ) -> Result<Value, BackendError> {
     let pointer = resources.module.target_config().pointer_type();
     match expression {
+        mir::StringExpression::Intrinsic(call) => {
+            lower_string_intrinsic_call(builder, call, resources)?.single()
+        }
         mir::StringExpression::Literal(value) => {
             let data = define_data(builder, value.as_bytes(), resources)?;
             let length = builder.ins().iconst(pointer, value.len() as i64);
@@ -6049,6 +6066,9 @@ fn lower_nullable_string_expression(
 ) -> Result<LoweredValue, BackendError> {
     let pointer = resources.module.target_config().pointer_type();
     match expression {
+        mir::NullableStringExpression::Intrinsic(call) => {
+            lower_string_intrinsic_call(builder, call, resources)
+        }
         mir::NullableStringExpression::Null => {
             let zero = builder.ins().iconst(pointer, 0);
             Ok(LoweredValue::Nullable {
@@ -6190,6 +6210,9 @@ fn lower_nullable_scalar_expression(
     let pointer = resources.module.target_config().pointer_type();
     let ty = expression.ty();
     match expression {
+        mir::NullableScalarExpression::StringIntrinsic(call) => {
+            lower_string_intrinsic_call(builder, call, resources)
+        }
         mir::NullableScalarExpression::Null(_) => {
             let present = builder.ins().iconst(pointer, 0);
             let payload = scalar_zero(builder, ty);
@@ -7014,6 +7037,9 @@ fn lower_integer_operand(
     resources: &mut LoweringResources<'_, '_>,
 ) -> Result<Value, BackendError> {
     match operand {
+        mir::Operand::StringIntrinsic(call) => {
+            lower_string_intrinsic_call(builder, call, resources)?.single()
+        }
         mir::Operand::Scalar(mir::ScalarValue::Integer(value)) => {
             if value.ty != ty {
                 return Err(malformed_mir(format!(
@@ -7356,6 +7382,285 @@ fn lower_call_args(
         owned_strings,
         temporary_mixed,
     })
+}
+
+fn lower_string_intrinsic_call(
+    builder: &mut FunctionBuilder,
+    call: &mir::StringIntrinsicCall,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<LoweredValue, BackendError> {
+    use mir::StringIntrinsicKind as Kind;
+
+    let pointer = resources.module.target_config().pointer_type();
+    let lowered = lower_call_args(builder, &call.args, resources)?;
+    let argument = |index: usize| -> Result<Value, BackendError> {
+        lowered
+            .arguments
+            .get(index)
+            .ok_or_else(|| malformed_mir("String intrinsic argument is missing"))?
+            .single()
+    };
+    let call_runtime = |builder: &mut FunctionBuilder,
+                        name: &'static str,
+                        params: &[ClifType],
+                        result: ClifType,
+                        values: &[Value],
+                        resources: &mut LoweringResources<'_, '_>| {
+        runtime_call(builder, name, params, Some(result), values, resources)?
+            .ok_or_else(|| backend_failure("String intrinsic runtime call produced no result"))
+    };
+
+    let result = match call.kind {
+        Kind::GraphemeLength | Kind::ByteLength => {
+            let name = if call.kind == Kind::GraphemeLength {
+                STRING_GRAPHEME_LENGTH
+            } else {
+                STRING_BYTE_LENGTH
+            };
+            let value = call_runtime(
+                builder,
+                name,
+                &[pointer],
+                pointer,
+                &[argument(0)?],
+                resources,
+            )?;
+            let value = if pointer == types::I64 {
+                value
+            } else {
+                builder.ins().uextend(types::I64, value)
+            };
+            LoweredValue::Single(value)
+        }
+        Kind::IsEmpty => LoweredValue::Single(call_runtime(
+            builder,
+            STRING_IS_EMPTY,
+            &[pointer],
+            types::I8,
+            &[argument(0)?],
+            resources,
+        )?),
+        Kind::ToBytes => LoweredValue::Single(call_runtime(
+            builder,
+            STRING_TO_BYTES,
+            &[pointer],
+            pointer,
+            &[argument(0)?],
+            resources,
+        )?),
+        Kind::Trim
+        | Kind::TrimStart
+        | Kind::TrimEnd
+        | Kind::Lower
+        | Kind::Upper
+        | Kind::LowerFirst
+        | Kind::UpperFirst => {
+            let name = match call.kind {
+                Kind::Trim => STRING_TRIM,
+                Kind::TrimStart => STRING_TRIM_START,
+                Kind::TrimEnd => STRING_TRIM_END,
+                Kind::Lower => STRING_LOWER,
+                Kind::Upper => STRING_UPPER,
+                Kind::LowerFirst => STRING_LOWER_FIRST,
+                Kind::UpperFirst => STRING_UPPER_FIRST,
+                _ => unreachable!(),
+            };
+            LoweredValue::Single(call_runtime(
+                builder,
+                name,
+                &[pointer, pointer],
+                pointer,
+                &[resources.current_frame, argument(0)?],
+                resources,
+            )?)
+        }
+        Kind::ContainsIgnoreCase | Kind::StartsWithIgnoreCase | Kind::EndsWithIgnoreCase => {
+            let name = match call.kind {
+                Kind::ContainsIgnoreCase => STRING_CONTAINS_IGNORE_CASE,
+                Kind::StartsWithIgnoreCase => STRING_STARTS_WITH_IGNORE_CASE,
+                Kind::EndsWithIgnoreCase => STRING_ENDS_WITH_IGNORE_CASE,
+                _ => unreachable!(),
+            };
+            LoweredValue::Single(call_runtime(
+                builder,
+                name,
+                &[pointer, pointer, pointer],
+                types::I8,
+                &[resources.current_frame, argument(0)?, argument(1)?],
+                resources,
+            )?)
+        }
+        Kind::Contains | Kind::StartsWith | Kind::EndsWith => {
+            let name = match call.kind {
+                Kind::Contains => STRING_CONTAINS,
+                Kind::StartsWith => STRING_STARTS_WITH,
+                Kind::EndsWith => STRING_ENDS_WITH,
+                _ => unreachable!(),
+            };
+            LoweredValue::Single(call_runtime(
+                builder,
+                name,
+                &[pointer, pointer],
+                types::I8,
+                &[argument(0)?, argument(1)?],
+                resources,
+            )?)
+        }
+        Kind::EqualsIgnoreCase => LoweredValue::Single(call_runtime(
+            builder,
+            STRING_EQUALS_IGNORE_CASE,
+            &[pointer, pointer, pointer],
+            types::I8,
+            &[resources.current_frame, argument(0)?, argument(1)?],
+            resources,
+        )?),
+        Kind::IndexOf
+        | Kind::LastIndexOf
+        | Kind::IndexOfIgnoreCase
+        | Kind::LastIndexOfIgnoreCase => {
+            let found_slot = builder.create_sized_stack_slot(StackSlotData::new(
+                StackSlotKind::ExplicitSlot,
+                1,
+                0,
+            ));
+            let found_pointer = builder.ins().stack_addr(pointer, found_slot, 0);
+            let (name, with_frame) = match call.kind {
+                Kind::IndexOf => (STRING_INDEX_OF, false),
+                Kind::LastIndexOf => (STRING_LAST_INDEX_OF, false),
+                Kind::IndexOfIgnoreCase => (STRING_INDEX_OF_IGNORE_CASE, true),
+                Kind::LastIndexOfIgnoreCase => (STRING_LAST_INDEX_OF_IGNORE_CASE, true),
+                _ => unreachable!(),
+            };
+            let mut values = Vec::with_capacity(4);
+            if with_frame {
+                values.push(resources.current_frame);
+            }
+            values.extend([argument(0)?, argument(1)?, found_pointer]);
+            let mut params = Vec::with_capacity(4);
+            if with_frame {
+                params.push(pointer);
+            }
+            params.extend([pointer, pointer, pointer]);
+            let payload = call_runtime(builder, name, &params, types::I64, &values, resources)?;
+            let found = builder.ins().stack_load(pointer, types::I8, found_slot, 0);
+            let present = builder.ins().uextend(pointer, found);
+            LoweredValue::Nullable { present, payload }
+        }
+        Kind::CountOccurrences => LoweredValue::Single(call_runtime(
+            builder,
+            STRING_COUNT_OCCURRENCES,
+            &[pointer, pointer, pointer],
+            types::I64,
+            &[resources.current_frame, argument(0)?, argument(1)?],
+            resources,
+        )?),
+        Kind::Replace => LoweredValue::Single(call_runtime(
+            builder,
+            STRING_REPLACE,
+            &[pointer, pointer, pointer, pointer],
+            pointer,
+            &[
+                resources.current_frame,
+                argument(0)?,
+                argument(1)?,
+                argument(2)?,
+            ],
+            resources,
+        )?),
+        Kind::Split => LoweredValue::Single(call_runtime(
+            builder,
+            STRING_SPLIT,
+            &[pointer, pointer, pointer],
+            pointer,
+            &[resources.current_frame, argument(0)?, argument(1)?],
+            resources,
+        )?),
+        Kind::Join => LoweredValue::Single(call_runtime(
+            builder,
+            STRING_JOIN,
+            &[pointer, pointer, pointer],
+            pointer,
+            &[resources.current_frame, argument(0)?, argument(1)?],
+            resources,
+        )?),
+        Kind::Slice => {
+            let (has_length, length) = lowered
+                .arguments
+                .get(2)
+                .ok_or_else(|| malformed_mir("String::slice length argument is missing"))?
+                .nullable()?;
+            let has_length = builder.ins().ireduce(types::I8, has_length);
+            LoweredValue::Single(call_runtime(
+                builder,
+                STRING_SLICE,
+                &[pointer, pointer, types::I64, types::I64, types::I8],
+                pointer,
+                &[
+                    resources.current_frame,
+                    argument(0)?,
+                    argument(1)?,
+                    length,
+                    has_length,
+                ],
+                resources,
+            )?)
+        }
+        Kind::Repeat => LoweredValue::Single(call_runtime(
+            builder,
+            STRING_REPEAT,
+            &[pointer, pointer, types::I64],
+            pointer,
+            &[resources.current_frame, argument(0)?, argument(1)?],
+            resources,
+        )?),
+        Kind::PadStart | Kind::PadEnd => {
+            let name = if call.kind == Kind::PadStart {
+                STRING_PAD_START
+            } else {
+                STRING_PAD_END
+            };
+            LoweredValue::Single(call_runtime(
+                builder,
+                name,
+                &[pointer, pointer, types::I64, pointer],
+                pointer,
+                &[
+                    resources.current_frame,
+                    argument(0)?,
+                    argument(1)?,
+                    argument(2)?,
+                ],
+                resources,
+            )?)
+        }
+        Kind::FromBytes => {
+            let payload = call_runtime(
+                builder,
+                STRING_FROM_BYTES,
+                &[pointer],
+                pointer,
+                &[argument(0)?],
+                resources,
+            )?;
+            let present = presence_word(builder, payload, pointer);
+            LoweredValue::Nullable { present, payload }
+        }
+    };
+
+    for (_, string) in lowered.owned_strings {
+        release_string(builder, string, resources)?;
+    }
+    for index in ordered_owned_argument_indices(&call.args) {
+        if let Some(collection) = call.args[index].owned_temporary_collection() {
+            defer_or_drop_collection_temporary(
+                builder,
+                lowered.arguments[index].single()?,
+                collection,
+                resources,
+            )?;
+        }
+    }
+    Ok(result)
 }
 
 fn lower_function_call(
@@ -8063,6 +8368,9 @@ fn lower_bool_operand(
     resources: &mut LoweringResources<'_, '_>,
 ) -> Result<Value, BackendError> {
     match operand {
+        mir::Operand::StringIntrinsic(call) => {
+            lower_string_intrinsic_call(builder, call, resources)?.single()
+        }
         mir::Operand::Scalar(mir::ScalarValue::Bool(value)) => {
             Ok(builder.ins().iconst(types::I8, i64::from(*value)))
         }
@@ -8233,7 +8541,8 @@ fn resolve_string_expression_from_definitions(
             }
             Ok(value)
         }
-        mir::StringExpression::Display(_)
+        mir::StringExpression::Intrinsic(_)
+        | mir::StringExpression::Display(_)
         | mir::StringExpression::Call { .. }
         | mir::StringExpression::ReadFile(_)
         | mir::StringExpression::Format(_)
@@ -8277,7 +8586,8 @@ fn resolve_string_expression(
             }
             Ok(value)
         }
-        mir::StringExpression::Display(_)
+        mir::StringExpression::Intrinsic(_)
+        | mir::StringExpression::Display(_)
         | mir::StringExpression::Call { .. }
         | mir::StringExpression::ReadFile(_)
         | mir::StringExpression::Format(_)

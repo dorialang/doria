@@ -2967,6 +2967,12 @@ fn validate_collection_expression(
             }
             Ok(())
         }
+        mir::CollectionExpression::StringIntrinsic(call) => validate_string_intrinsic(
+            program,
+            function,
+            call,
+            mir::Type::Collection(definition.id),
+        ),
         mir::CollectionExpression::Call {
             function: callee,
             args,
@@ -2988,6 +2994,213 @@ fn validate_collection_expression(
             validate_call_args(program, function, callee, args)
         }
     }
+}
+
+fn validate_string_intrinsic(
+    program: &mir::Program,
+    function: &mir::Function,
+    call: &mir::StringIntrinsicCall,
+    expected_result: mir::Type,
+) -> Result<(), BackendError> {
+    use mir::StringIntrinsicKind as Kind;
+
+    if call.result != expected_result {
+        return Err(malformed_mir(format!(
+            "String {} result is {}, expected {expected_result}",
+            call.kind, call.result
+        )));
+    }
+    for argument in &call.args {
+        validate_rvalue(program, function, argument)?;
+    }
+
+    let int = mir::Type::Scalar(mir::ScalarType::Integer(IntegerType::Int64));
+    let nullable_int = mir::Type::NullableScalar(mir::ScalarType::Integer(IntegerType::Int64));
+    let bool_ty = mir::Type::Scalar(mir::ScalarType::Bool);
+    let string = mir::Type::String;
+
+    let exact = |expected: &[mir::Type]| {
+        if call.args.len() != expected.len() {
+            return Err(malformed_mir(format!(
+                "String {} expects {} arguments, got {}",
+                call.kind,
+                expected.len(),
+                call.args.len()
+            )));
+        }
+        for (index, (argument, expected)) in call.args.iter().zip(expected).enumerate() {
+            if argument.ty() != *expected {
+                return Err(malformed_mir(format!(
+                    "String {} argument {} has type {}, expected {expected}",
+                    call.kind,
+                    index + 1,
+                    argument.ty()
+                )));
+            }
+        }
+        Ok(())
+    };
+
+    match call.kind {
+        Kind::GraphemeLength | Kind::ByteLength => {
+            exact(&[string])?;
+            require_string_intrinsic_result(call, int)
+        }
+        Kind::IsEmpty => {
+            exact(&[string])?;
+            require_string_intrinsic_result(call, bool_ty)
+        }
+        Kind::ToBytes => {
+            exact(&[string])?;
+            require_collection_shape(program, call.result, mir::CollectionKind::Bytes, None, {
+                mir::Type::Scalar(mir::ScalarType::Integer(IntegerType::UInt8))
+            })
+        }
+        Kind::Trim
+        | Kind::TrimStart
+        | Kind::TrimEnd
+        | Kind::Lower
+        | Kind::Upper
+        | Kind::LowerFirst
+        | Kind::UpperFirst => {
+            exact(&[string])?;
+            require_string_intrinsic_result(call, string)
+        }
+        Kind::Contains
+        | Kind::StartsWith
+        | Kind::EndsWith
+        | Kind::ContainsIgnoreCase
+        | Kind::StartsWithIgnoreCase
+        | Kind::EndsWithIgnoreCase
+        | Kind::EqualsIgnoreCase => {
+            exact(&[string, string])?;
+            require_string_intrinsic_result(call, bool_ty)
+        }
+        Kind::IndexOf
+        | Kind::LastIndexOf
+        | Kind::IndexOfIgnoreCase
+        | Kind::LastIndexOfIgnoreCase => {
+            exact(&[string, string])?;
+            require_string_intrinsic_result(call, nullable_int)
+        }
+        Kind::CountOccurrences => {
+            exact(&[string, string])?;
+            require_string_intrinsic_result(call, int)
+        }
+        Kind::Replace => {
+            exact(&[string, string, string])?;
+            require_string_intrinsic_result(call, string)
+        }
+        Kind::Split => {
+            exact(&[string, string])?;
+            require_collection_shape(
+                program,
+                call.result,
+                mir::CollectionKind::List,
+                None,
+                string,
+            )
+        }
+        Kind::Join => {
+            if call.args.len() != 2 || call.args[0].ty() != string {
+                return Err(malformed_mir(
+                    "String join expects separator string and List<string>",
+                ));
+            }
+            require_collection_shape(
+                program,
+                call.args[1].ty(),
+                mir::CollectionKind::List,
+                None,
+                string,
+            )?;
+            require_borrowed_collection_argument(&call.args[1], "String join")?;
+            require_string_intrinsic_result(call, string)
+        }
+        Kind::Slice => {
+            exact(&[string, int, nullable_int])?;
+            require_string_intrinsic_result(call, string)
+        }
+        Kind::Repeat => {
+            exact(&[string, int])?;
+            require_string_intrinsic_result(call, string)
+        }
+        Kind::PadStart | Kind::PadEnd => {
+            exact(&[string, int, string])?;
+            require_string_intrinsic_result(call, string)
+        }
+        Kind::FromBytes => {
+            if call.args.len() != 1 {
+                return Err(malformed_mir(format!(
+                    "String fromBytes expects 1 argument, got {}",
+                    call.args.len()
+                )));
+            }
+            require_collection_shape(
+                program,
+                call.args[0].ty(),
+                mir::CollectionKind::Bytes,
+                None,
+                mir::Type::Scalar(mir::ScalarType::Integer(IntegerType::UInt8)),
+            )?;
+            require_borrowed_collection_argument(&call.args[0], "String fromBytes")?;
+            require_string_intrinsic_result(call, mir::Type::NullableString)
+        }
+    }
+}
+
+fn require_string_intrinsic_result(
+    call: &mir::StringIntrinsicCall,
+    expected: mir::Type,
+) -> Result<(), BackendError> {
+    (call.result == expected).then_some(()).ok_or_else(|| {
+        malformed_mir(format!(
+            "String {} has result {}, expected {expected}",
+            call.kind, call.result
+        ))
+    })
+}
+
+fn require_collection_shape(
+    program: &mir::Program,
+    ty: mir::Type,
+    kind: mir::CollectionKind,
+    key: Option<mir::Type>,
+    value: mir::Type,
+) -> Result<(), BackendError> {
+    let mir::Type::Collection(id) = ty else {
+        return Err(malformed_mir(
+            "String intrinsic collection type is not a collection",
+        ));
+    };
+    let collection = collection_in(program, id)?;
+    if collection.kind != kind || collection.key != key || collection.value != value {
+        return Err(malformed_mir(
+            "String intrinsic collection argument or result has the wrong shape",
+        ));
+    }
+    Ok(())
+}
+
+fn require_borrowed_collection_argument(
+    value: &mir::Rvalue,
+    operation: &str,
+) -> Result<(), BackendError> {
+    let mir::Rvalue::Collection(collection) = value else {
+        return Err(malformed_mir(format!(
+            "{operation} collection argument has another representation"
+        )));
+    };
+    if matches!(
+        collection,
+        mir::CollectionExpression::Local { transfer: true, .. }
+            | mir::CollectionExpression::Index { transfer: true, .. }
+    ) {
+        return Err(malformed_mir(format!(
+            "{operation} consumes a readonly borrowed collection argument"
+        )));
+    }
+    Ok(())
 }
 
 fn validate_collection_borrow_writability(
@@ -3576,6 +3789,7 @@ fn infer_collection_expression_return_borrow(
         | mir::CollectionExpression::BytesFromArray { .. }
         | mir::CollectionExpression::ReadFileBytes { .. }
         | mir::CollectionExpression::ReadStdinBytes { .. }
+        | mir::CollectionExpression::StringIntrinsic(_)
         | mir::CollectionExpression::Call {
             return_borrow: None,
             ..
@@ -4574,6 +4788,9 @@ fn collect_collection_class_local_accesses<'a>(
             collect_rvalue_args_class_local_accesses(args, accesses);
             accesses.call(*function, args);
         }
+        mir::CollectionExpression::StringIntrinsic(call) => {
+            collect_rvalue_args_class_local_accesses(&call.args, accesses);
+        }
         mir::CollectionExpression::Local { .. }
         | mir::CollectionExpression::SharedAccessPayload { .. }
         | mir::CollectionExpression::SetFrom { .. }
@@ -4661,6 +4878,9 @@ fn collect_operand_class_local_accesses<'a>(
             collect_rvalue_class_local_accesses(offset, accesses)
         }
         mir::Operand::MixedPayload { mixed, tag } => accesses.assume_mixed_tag(*mixed, *tag),
+        mir::Operand::StringIntrinsic(call) => {
+            collect_rvalue_args_class_local_accesses(&call.args, accesses);
+        }
         mir::Operand::Scalar(_)
         | mir::Operand::Local(_)
         | mir::Operand::Static(_)
@@ -4763,6 +4983,9 @@ fn collect_string_class_local_accesses<'a>(
         mir::StringExpression::CollectionKeyAt { offset, .. } => {
             collect_rvalue_class_local_accesses(offset, accesses)
         }
+        mir::StringExpression::Intrinsic(call) => {
+            collect_rvalue_args_class_local_accesses(&call.args, accesses)
+        }
         mir::StringExpression::NullableLocalAssumeNonNull(local) => {
             accesses.assume_nullable_present(*local)
         }
@@ -4819,6 +5042,9 @@ fn collect_nullable_string_class_local_accesses<'a>(
         }
         mir::NullableStringExpression::DictionaryGet { key, .. } => {
             collect_rvalue_class_local_accesses(key, accesses)
+        }
+        mir::NullableStringExpression::Intrinsic(call) => {
+            collect_rvalue_args_class_local_accesses(&call.args, accesses)
         }
     }
 }
@@ -5039,6 +5265,9 @@ fn collect_nullable_scalar_class_local_accesses<'a>(
         }
         mir::NullableScalarExpression::DictionaryGet { key, .. } => {
             collect_rvalue_class_local_accesses(key, accesses)
+        }
+        mir::NullableScalarExpression::StringIntrinsic(call) => {
+            collect_rvalue_args_class_local_accesses(&call.args, accesses)
         }
         mir::NullableScalarExpression::Parse { .. }
         | mir::NullableScalarExpression::Null(_)
@@ -5686,7 +5915,8 @@ fn nullable_scalar_expression_is_present(
         | mir::NullableScalarExpression::NullSafeProperty { .. }
         | mir::NullableScalarExpression::NullSafeCall { .. }
         | mir::NullableScalarExpression::DictionaryGet { .. }
-        | mir::NullableScalarExpression::Parse { .. } => false,
+        | mir::NullableScalarExpression::Parse { .. }
+        | mir::NullableScalarExpression::StringIntrinsic(_) => false,
     }
 }
 
@@ -5708,7 +5938,8 @@ fn nullable_string_expression_is_present(
         | mir::NullableStringExpression::Call { .. }
         | mir::NullableStringExpression::NullSafeProperty { .. }
         | mir::NullableStringExpression::NullSafeCall { .. }
-        | mir::NullableStringExpression::DictionaryGet { .. } => false,
+        | mir::NullableStringExpression::DictionaryGet { .. }
+        | mir::NullableStringExpression::Intrinsic(_) => false,
     }
 }
 
@@ -6984,6 +7215,10 @@ fn collection_observes_property(
         mir::CollectionExpression::Call { args, .. } => args
             .iter()
             .any(|argument| rvalue_observes_property(argument, receiver, property)),
+        mir::CollectionExpression::StringIntrinsic(call) => call
+            .args
+            .iter()
+            .any(|argument| rvalue_observes_property(argument, receiver, property)),
         mir::CollectionExpression::Local { .. }
         | mir::CollectionExpression::SharedAccessPayload { .. }
         | mir::CollectionExpression::SetFrom { .. }
@@ -7142,6 +7377,10 @@ fn string_observes_property(
         mir::StringExpression::CollectionKeyAt { offset, .. } => {
             rvalue_observes_property(offset, receiver, property)
         }
+        mir::StringExpression::Intrinsic(call) => call
+            .args
+            .iter()
+            .any(|argument| rvalue_observes_property(argument, receiver, property)),
         mir::StringExpression::Literal(_)
         | mir::StringExpression::Local(_)
         | mir::StringExpression::Static(_)
@@ -7182,6 +7421,10 @@ fn nullable_string_observes_property(
         mir::NullableStringExpression::DictionaryGet { key, .. } => {
             rvalue_observes_property(key, receiver, property)
         }
+        mir::NullableStringExpression::Intrinsic(call) => call
+            .args
+            .iter()
+            .any(|argument| rvalue_observes_property(argument, receiver, property)),
         mir::NullableStringExpression::Null
         | mir::NullableStringExpression::Local(_)
         | mir::NullableStringExpression::Static(_)
@@ -7337,6 +7580,10 @@ fn nullable_scalar_observes_property(
         mir::NullableScalarExpression::Parse { value, .. } => {
             string_observes_property(value, receiver, property)
         }
+        mir::NullableScalarExpression::StringIntrinsic(call) => call
+            .args
+            .iter()
+            .any(|argument| rvalue_observes_property(argument, receiver, property)),
         mir::NullableScalarExpression::Null(_)
         | mir::NullableScalarExpression::Local { .. }
         | mir::NullableScalarExpression::Static { .. } => false,
@@ -8052,6 +8299,12 @@ fn validate_condition(
                 *tag,
                 mir::Type::Scalar(mir::ScalarType::Bool),
             ),
+            mir::Operand::StringIntrinsic(call) => validate_string_intrinsic(
+                program,
+                function,
+                call,
+                mir::Type::Scalar(mir::ScalarType::Bool),
+            ),
             mir::Operand::CollectionIndex {
                 collection,
                 index,
@@ -8299,6 +8552,12 @@ fn validate_integer_operand(
             *tag,
             mir::Type::Scalar(mir::ScalarType::Integer(ty)),
         ),
+        mir::Operand::StringIntrinsic(call) => validate_string_intrinsic(
+            program,
+            function,
+            call,
+            mir::Type::Scalar(mir::ScalarType::Integer(ty)),
+        ),
     }
 }
 
@@ -8414,6 +8673,9 @@ fn validate_string_expression(
             validate_nullable_string_expression(program, function, left)?;
             validate_string_expression(program, function, right)
         }
+        mir::StringExpression::Intrinsic(call) => {
+            validate_string_intrinsic(program, function, call, mir::Type::String)
+        }
     }
 }
 
@@ -8488,6 +8750,9 @@ fn validate_nullable_string_expression(
             mir::Type::String,
             *access,
         ),
+        mir::NullableStringExpression::Intrinsic(call) => {
+            validate_string_intrinsic(program, function, call, mir::Type::NullableString)
+        }
     }
 }
 
@@ -8595,6 +8860,9 @@ fn validate_nullable_scalar_expression(
                 return Err(malformed_mir("parse produces only `?int` or `?float`"));
             }
             validate_string_expression(program, function, value)
+        }
+        mir::NullableScalarExpression::StringIntrinsic(call) => {
+            validate_string_intrinsic(program, function, call, mir::Type::NullableScalar(ty))
         }
         mir::NullableScalarExpression::Value(_) => {
             Err(malformed_mir("nullable scalar wraps another scalar type"))

@@ -9,6 +9,7 @@ use std::fmt;
 use crate::class_layout::{ClassId, ClassLayout, PropertyId};
 use crate::format_string::FormatPiece;
 use crate::numeric::{FloatType, FloatValue, IntegerType, IntegerValue};
+use crate::source::Span;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct FunctionId(pub usize);
@@ -303,6 +304,50 @@ pub enum Operand {
         mixed: LocalId,
         tag: MixedTag,
     },
+    StringIntrinsic(Box<StringIntrinsicCall>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum StringIntrinsicKind {
+    GraphemeLength,
+    ByteLength,
+    IsEmpty,
+    ToBytes,
+    Trim,
+    TrimStart,
+    TrimEnd,
+    Lower,
+    Upper,
+    LowerFirst,
+    UpperFirst,
+    Contains,
+    StartsWith,
+    EndsWith,
+    ContainsIgnoreCase,
+    StartsWithIgnoreCase,
+    EndsWithIgnoreCase,
+    EqualsIgnoreCase,
+    IndexOf,
+    LastIndexOf,
+    IndexOfIgnoreCase,
+    LastIndexOfIgnoreCase,
+    CountOccurrences,
+    Replace,
+    Split,
+    Join,
+    Slice,
+    Repeat,
+    PadStart,
+    PadEnd,
+    FromBytes,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StringIntrinsicCall {
+    pub kind: StringIntrinsicKind,
+    pub args: Vec<Rvalue>,
+    pub result: Type,
+    pub span: Span,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1565,6 +1610,7 @@ pub enum CollectionExpression {
     ReadStdinBytes {
         collection: CollectionTypeId,
     },
+    StringIntrinsic(Box<StringIntrinsicCall>),
     Call {
         collection: CollectionTypeId,
         function: FunctionId,
@@ -1604,6 +1650,10 @@ impl CollectionExpression {
             | Self::ReadFileBytes { collection, .. }
             | Self::ReadStdinBytes { collection }
             | Self::Call { collection, .. } => *collection,
+            Self::StringIntrinsic(call) => match call.result {
+                Type::Collection(collection) => collection,
+                _ => panic!("validated String intrinsic collection result"),
+            },
         }
     }
 
@@ -1631,6 +1681,10 @@ impl CollectionExpression {
                 return_borrow: None,
                 ..
             } => Some(*collection),
+            Self::StringIntrinsic(call) => match call.result {
+                Type::Collection(collection) => Some(collection),
+                _ => None,
+            },
             Self::Local {
                 transfer: false, ..
             }
@@ -1848,6 +1902,7 @@ pub enum NullableScalarExpression {
         ty: ScalarType,
         value: Box<StringExpression>,
     },
+    StringIntrinsic(Box<StringIntrinsicCall>),
 }
 
 impl NullableScalarExpression {
@@ -1863,6 +1918,10 @@ impl NullableScalarExpression {
             | Self::Coalesce { ty, .. }
             | Self::DictionaryGet { ty, .. }
             | Self::Parse { ty, .. } => *ty,
+            Self::StringIntrinsic(call) => match call.result {
+                Type::NullableScalar(ty) => ty,
+                _ => panic!("validated String intrinsic nullable scalar result"),
+            },
             Self::Value(value) => value.ty(),
         }
     }
@@ -2196,6 +2255,7 @@ pub enum StringExpression {
         offset: Box<Rvalue>,
     },
     MixedPayload(LocalId),
+    Intrinsic(Box<StringIntrinsicCall>),
 }
 
 impl StringExpression {
@@ -2244,6 +2304,7 @@ pub enum NullableStringExpression {
         key: Box<Rvalue>,
         access: NullableCollectionAccess,
     },
+    Intrinsic(Box<StringIntrinsicCall>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3023,6 +3084,9 @@ fn collection_class_temporary_capacity(value: &CollectionExpression) -> usize {
             CollectionExpression::Call { args, .. } => {
                 args.iter().map(rvalue_class_temporary_capacity).sum()
             }
+            CollectionExpression::StringIntrinsic(call) => {
+                call.args.iter().map(rvalue_class_temporary_capacity).sum()
+            }
             CollectionExpression::Literal { entries, .. } => entries
                 .iter()
                 .map(|entry| {
@@ -3104,6 +3168,9 @@ fn string_class_temporary_capacity(value: &StringExpression) -> usize {
         }
         StringExpression::CollectionIndex { index, .. } => rvalue_class_temporary_capacity(index),
         StringExpression::CollectionKeyAt { offset, .. } => rvalue_class_temporary_capacity(offset),
+        StringExpression::Intrinsic(call) => {
+            call.args.iter().map(rvalue_class_temporary_capacity).sum()
+        }
         StringExpression::Literal(_)
         | StringExpression::Local(_)
         | StringExpression::NullableLocalAssumeNonNull(_)
@@ -3118,6 +3185,9 @@ fn nullable_string_class_temporary_capacity(value: &NullableStringExpression) ->
         NullableStringExpression::String(value) => string_class_temporary_capacity(value),
         NullableStringExpression::Call { args, .. } => {
             args.iter().map(rvalue_class_temporary_capacity).sum()
+        }
+        NullableStringExpression::Intrinsic(call) => {
+            call.args.iter().map(rvalue_class_temporary_capacity).sum()
         }
         NullableStringExpression::NullSafeProperty { object, .. } => {
             nullable_class_temporary_capacity(object)
@@ -3205,6 +3275,9 @@ fn nullable_scalar_class_temporary_capacity(value: &NullableScalarExpression) ->
                 + nullable_scalar_class_temporary_capacity(right)
         }
         NullableScalarExpression::DictionaryGet { key, .. } => rvalue_class_temporary_capacity(key),
+        NullableScalarExpression::StringIntrinsic(call) => {
+            call.args.iter().map(rvalue_class_temporary_capacity).sum()
+        }
         NullableScalarExpression::Parse { .. }
         | NullableScalarExpression::Null(_)
         | NullableScalarExpression::Local { .. }
@@ -3477,6 +3550,7 @@ impl fmt::Display for Operand {
             Operand::MixedPayload { mixed, tag } => {
                 write!(formatter, "mixed_payload<{tag}>(local{})", mixed.0)
             }
+            Operand::StringIntrinsic(call) => write!(formatter, "{call}"),
         }
     }
 }
@@ -3598,6 +3672,7 @@ impl fmt::Display for CollectionExpression {
             }
             Self::ReadFileBytes { path, .. } => write!(formatter, "read_file_bytes({path})"),
             Self::ReadStdinBytes { .. } => formatter.write_str("read_stdin_bytes()"),
+            Self::StringIntrinsic(call) => write!(formatter, "{call}"),
             Self::Call { function, args, .. } => write_call(formatter, *function, args),
         }
     }
@@ -3971,6 +4046,7 @@ impl fmt::Display for IntegerExpression {
                 Operand::MixedPayload { mixed, tag } => {
                     write!(formatter, "mixed_payload<{tag}>(local{}): {ty}", mixed.0)
                 }
+                Operand::StringIntrinsic(call) => write!(formatter, "{call}: {ty}"),
             },
             IntegerExpression::Unary { ty, op, operand } => {
                 write!(formatter, "({op}{operand}): {ty}")
@@ -4039,6 +4115,7 @@ impl fmt::Display for FloatExpression {
                 Operand::MixedPayload { mixed, tag } => {
                     write!(formatter, "mixed_payload<{tag}>(local{}): {ty}", mixed.0)
                 }
+                Operand::StringIntrinsic(call) => write!(formatter, "{call}: {ty}"),
             },
             Self::Negate { ty, operand } => write!(formatter, "(-{operand}): {ty}"),
             Self::Binary {
@@ -4101,6 +4178,7 @@ impl fmt::Display for StringExpression {
             StringExpression::CollectionKeyAt { collection, offset } => {
                 write!(formatter, "key_at(local{}, {offset})", collection.0)
             }
+            StringExpression::Intrinsic(call) => write!(formatter, "{call}"),
         }
     }
 }
@@ -4134,6 +4212,7 @@ impl fmt::Display for NullableStringExpression {
             } => {
                 write!(formatter, "local{}.get({key})", collection.0)
             }
+            Self::Intrinsic(call) => write!(formatter, "{call}"),
         }
     }
 }
@@ -4194,6 +4273,7 @@ impl fmt::Display for BoolExpression {
                 Operand::MixedPayload { mixed, tag } => {
                     write!(formatter, "mixed_payload<{tag}>(local{}): bool", mixed.0)
                 }
+                Operand::StringIntrinsic(call) => write!(formatter, "{call}: bool"),
             },
             Self::Compare { op, left, right } => write!(formatter, "{left} {op} {right}"),
             Self::StringCompare { op, left, right } => write!(formatter, "{left} {op} {right}"),
@@ -4274,7 +4354,59 @@ impl fmt::Display for NullableScalarExpression {
                 write!(formatter, "local{}.get({key})", collection.0)
             }
             Self::Parse { ty, value } => write!(formatter, "parse::<{ty}>({value})"),
+            Self::StringIntrinsic(call) => write!(formatter, "{call}"),
         }
+    }
+}
+
+impl fmt::Display for StringIntrinsicCall {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "String::{}(", self.kind)?;
+        for (index, argument) in self.args.iter().enumerate() {
+            if index > 0 {
+                formatter.write_str(", ")?;
+            }
+            write!(formatter, "{argument}")?;
+        }
+        write!(formatter, "): {}", self.result)
+    }
+}
+
+impl fmt::Display for StringIntrinsicKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::GraphemeLength => "graphemeLength",
+            Self::ByteLength => "byteLength",
+            Self::IsEmpty => "isEmpty",
+            Self::ToBytes => "toBytes",
+            Self::Trim => "trim",
+            Self::TrimStart => "trimStart",
+            Self::TrimEnd => "trimEnd",
+            Self::Lower => "lower",
+            Self::Upper => "upper",
+            Self::LowerFirst => "lowerFirst",
+            Self::UpperFirst => "upperFirst",
+            Self::Contains => "contains",
+            Self::StartsWith => "startsWith",
+            Self::EndsWith => "endsWith",
+            Self::ContainsIgnoreCase => "containsIgnoreCase",
+            Self::StartsWithIgnoreCase => "startsWithIgnoreCase",
+            Self::EndsWithIgnoreCase => "endsWithIgnoreCase",
+            Self::EqualsIgnoreCase => "equalsIgnoreCase",
+            Self::IndexOf => "indexOf",
+            Self::LastIndexOf => "lastIndexOf",
+            Self::IndexOfIgnoreCase => "indexOfIgnoreCase",
+            Self::LastIndexOfIgnoreCase => "lastIndexOfIgnoreCase",
+            Self::CountOccurrences => "countOccurrences",
+            Self::Replace => "replace",
+            Self::Split => "split",
+            Self::Join => "join",
+            Self::Slice => "slice",
+            Self::Repeat => "repeat",
+            Self::PadStart => "padStart",
+            Self::PadEnd => "padEnd",
+            Self::FromBytes => "fromBytes",
+        })
     }
 }
 

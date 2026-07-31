@@ -1,0 +1,4 @@
+function main(): void
+{
+    echo String::padEnd("Doria", 8, "");
+}

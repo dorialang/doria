@@ -272,6 +272,17 @@ jobs:
         with:
           arch: x64
 
+      - name: Select the MSVC linker
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $linker = (Get-Command link.exe -ErrorAction Stop).Source
+          if ($linker -notmatch '\\VC\\Tools\\MSVC\\') {
+            throw "expected the MSVC linker after developer environment setup, found: $linker"
+          }
+          "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=$linker" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
       - name: Install LLVM 18 on Linux
         if: runner.os == 'Linux'
         shell: bash

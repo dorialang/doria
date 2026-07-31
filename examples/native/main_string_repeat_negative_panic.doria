@@ -1,0 +1,4 @@
+function main(): void
+{
+    echo String::repeat("Doria", -1);
+}

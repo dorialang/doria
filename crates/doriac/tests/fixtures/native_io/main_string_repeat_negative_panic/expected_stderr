@@ -1,0 +1,3 @@
+Panic: String Repetition Count Cannot Be Negative
+Stack Trace:
+  at main

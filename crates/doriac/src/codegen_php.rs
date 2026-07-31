@@ -16,6 +16,7 @@ const PHP_OWNERSHIP_UNSUPPORTED_CODE: &str = "B1901";
 const PHP_CONSTANT_UNSUPPORTED_CODE: &str = "B2001";
 const PHP_COLLECTION_UNSUPPORTED_CODE: &str = "B2301";
 const PHP_GENERICS_UNSUPPORTED_CODE: &str = "B2401";
+const PHP_STRING_RUNTIME_UNSUPPORTED_CODE: &str = "B2501";
 
 pub fn generate(program: &Program) -> Result<String, BackendError> {
     validate_program(program)?;
@@ -607,6 +608,19 @@ fn validate_expr(expr: &Expr, semantic_info: &SemanticInfo) -> Result<(), Backen
                     format!("collection property `{property}`"),
                 ));
             }
+            if semantic_info
+                .expression_type(object.span())
+                .is_some_and(|ty| matches!(ty, ResolvedType::String))
+                && matches!(
+                    property.as_str(),
+                    "length" | "byteLength" | "isEmpty" | "bytes"
+                )
+            {
+                return Err(unsupported_string_runtime_shape(
+                    *span,
+                    format!("String intrinsic property `{property}`"),
+                ));
+            }
             Ok(())
         }
         Expr::MethodCall {
@@ -666,6 +680,13 @@ fn validate_expr(expr: &Expr, semantic_info: &SemanticInfo) -> Result<(), Backen
             args,
             span,
         } => {
+            if class_name == "String" {
+                validate_arguments(args, semantic_info)?;
+                return Err(unsupported_string_runtime_shape(
+                    *span,
+                    format!("Unicode String operation `String::{method}`"),
+                ));
+            }
             if matches!(class_name.as_str(), "Bytes" | "Set") {
                 validate_arguments(args, semantic_info)?;
                 return Err(unsupported_collection_shape(
@@ -990,6 +1011,17 @@ fn unsupported_collection_shape(span: Span, feature: impl Into<String>) -> Backe
         PHP_COLLECTION_UNSUPPORTED_CODE,
         format!(
             "PHP compatibility backend cannot preserve {} exactly; use the `native` or `debug` target for this valid Doria program",
+            feature.into()
+        ),
+        span,
+    )])
+}
+
+fn unsupported_string_runtime_shape(span: Span, feature: impl Into<String>) -> BackendError {
+    BackendError::from_diagnostics(vec![Diagnostic::new(
+        PHP_STRING_RUNTIME_UNSUPPORTED_CODE,
+        format!(
+            "PHP compatibility backend cannot preserve {} exactly without optional extensions; use the `native` or `debug` target for this valid Doria program",
             feature.into()
         ),
         span,

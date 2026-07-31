@@ -1,0 +1,3 @@
+Panic: String Padding Text Cannot Be Empty
+Stack Trace:
+  at main

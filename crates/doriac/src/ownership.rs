@@ -1868,7 +1868,7 @@ impl Checker<'_> {
             }
             Expr::Grouped { expr, .. } => self.use_expr(expr, scopes, mode),
             Expr::PropertyAccess { object, span, .. } => {
-                if mode == UseMode::Give && self.expr_is_move_value(expr, scopes) {
+                if mode == UseMode::Give && self.expr_is_non_transferable_property(expr, scopes) {
                     self.diagnostics.push(
                         Diagnostic::new(
                             "E0472",
@@ -2834,6 +2834,34 @@ impl Checker<'_> {
         }
     }
 
+    fn expr_is_non_transferable_property(&self, expr: &Expr, scopes: &Scopes) -> bool {
+        let Expr::PropertyAccess {
+            object, property, ..
+        } = expr
+        else {
+            return false;
+        };
+        if property == "referencedValue"
+            && self.resolved_type(object).is_some_and(|ty| {
+                resolved_shared_handle_kind(ty)
+                    == Some(crate::types::SharedHandleKind::SharedReference)
+            })
+        {
+            return true;
+        }
+        if let Some(collection) = self.expr_collection_info(object, scopes) {
+            return collection.family == CollectionFamily::List
+                && matches!(property.as_str(), "first" | "last")
+                && collection.value_move;
+        }
+        let Some(class) = self.expr_class(object, scopes) else {
+            return false;
+        };
+        self.properties
+            .get(&(class, property.clone()))
+            .is_some_and(|property| property.move_type)
+    }
+
     fn expr_returns_borrow(&self, expr: &Expr, scopes: &Scopes) -> bool {
         match expr {
             Expr::Grouped { expr, .. } => self.expr_returns_borrow(expr, scopes),
@@ -3407,6 +3435,16 @@ fn resolved_type_is_move_type(ty: &crate::types::ResolvedType) -> bool {
         | crate::types::ResolvedType::Set(_) => true,
         crate::types::ResolvedType::Nullable(inner) => resolved_type_is_move_type(inner),
         _ => false,
+    }
+}
+
+fn resolved_shared_handle_kind(
+    ty: &crate::types::ResolvedType,
+) -> Option<crate::types::SharedHandleKind> {
+    match ty {
+        crate::types::ResolvedType::SharedHandle(kind, _) => Some(*kind),
+        crate::types::ResolvedType::Nullable(inner) => resolved_shared_handle_kind(inner),
+        _ => None,
     }
 }
 

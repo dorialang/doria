@@ -45,16 +45,8 @@ fn main() {
         .and_then(|path| path.parent())
         .expect("Cargo build directory")
         .join("deps");
-    let ryu = std::fs::read_dir(&dependency_dir)
-        .expect("Cargo dependency directory")
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .find(|path| {
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with("libryu-") && name.ends_with(".rlib"))
-        })
-        .expect("compiled ryu dependency");
+    let ryu = find_rlib(&dependency_dir, "ryu");
+    let doria_unicode = find_rlib(&dependency_dir, "doria_unicode");
     let rustc = env::var_os("RUSTC").unwrap_or_else(|| OsString::from("rustc"));
     let mut command = Command::new(rustc);
     command
@@ -70,6 +62,8 @@ fn main() {
         .arg(format!("dependency={}", dependency_dir.display()))
         .arg("--extern")
         .arg(format!("ryu={}", ryu.display()))
+        .arg("--extern")
+        .arg(format!("doria_unicode={}", doria_unicode.display()))
         .arg("-C")
         .arg(format!(
             "opt-level={}",
@@ -93,6 +87,25 @@ fn main() {
     assert!(status.success(), "failed to build doria-rt static library");
 
     println!("cargo:rustc-env=DORIA_RT_BUILT_PATH={}", output.display());
+}
+
+fn find_rlib(dependency_dir: &Path, crate_name: &str) -> PathBuf {
+    let prefix = format!("lib{crate_name}-");
+    std::fs::read_dir(dependency_dir)
+        .expect("Cargo dependency directory")
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let modified = entry.metadata().ok()?.modified().ok()?;
+            Some((modified, entry.path()))
+        })
+        .filter(|(_, path)| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(&prefix) && name.ends_with(".rlib"))
+        })
+        .max_by_key(|(modified, _)| *modified)
+        .map(|(_, path)| path)
+        .unwrap_or_else(|| panic!("compiled {crate_name} dependency"))
 }
 
 fn watch_git_identity(repository_dir: &Path) {
