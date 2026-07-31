@@ -1427,7 +1427,16 @@ function main(): void
     )
     .expect("Stage 17 PHP compatibility lowering should succeed");
 
-    assert!(php.contains("function __doria_read_line(int $start, int $end): ?string"));
+    assert!(
+        php.contains("function __doria_read_line(string $prompt, int $start, int $end): ?string")
+    );
+    // The prompt is written exactly and stdout is flushed before stdin is read,
+    // without depending on PHP's optional readline extension.
+    assert!(
+        php.contains("if ($prompt !== \"\") { __doria_write_all(STDOUT, $prompt, $start, $end); }")
+    );
+    assert!(php.contains("@fflush(STDOUT);"));
+    assert!(!php.contains("readline("));
     assert!(php.contains(
         "function __doria_panic(string $code, int $start, int $end, ?string $message = null)"
     ));

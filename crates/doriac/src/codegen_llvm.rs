@@ -38,7 +38,7 @@ use crate::native_abi::{
     MIXED_TAG_FLOAT64, MIXED_TAG_INT16, MIXED_TAG_INT32, MIXED_TAG_INT64, MIXED_TAG_INT8,
     MIXED_TAG_STRING, MIXED_TAG_UINT16, MIXED_TAG_UINT32, MIXED_TAG_UINT64, MIXED_TAG_UINT8,
     MIXED_TYPE_ID, NULLABLE_STRING_EQUAL, PROCESS_EXIT, READ_FILE, READ_FILE_BYTES,
-    READ_STDIN_BYTES, READ_STDIN_LINE, SHARED_ACQUIRE, SHARED_CREATE, SHARED_CREATE_WEAK,
+    READ_STDIN_BYTES, READ_STDIN_LINE_PROMPTED, SHARED_ACQUIRE, SHARED_CREATE, SHARED_CREATE_WEAK,
     SHARED_PAYLOAD, SHARED_RELEASE, SHARED_RELEASE_WEAK, SHARED_RETAIN, STRING_BYTE_LENGTH,
     STRING_COMPARE, STRING_CONCAT, STRING_CONTAINS, STRING_CONTAINS_IGNORE_CASE,
     STRING_COUNT_OCCURRENCES, STRING_DATA, STRING_ENDS_WITH, STRING_ENDS_WITH_IGNORE_CASE,
@@ -4776,16 +4776,24 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     self.retain_string(payload.into_pointer_value())?.into(),
                 )
             }
-            mir::NullableStringExpression::ReadLine => {
+            mir::NullableStringExpression::ReadLine {
+                prompt,
+                prompt_span,
+            } => {
+                // Same validated MIR and same runtime ABI as Cranelift: the prompt is
+                // evaluated once, borrowed across the call, and released afterwards.
+                let prompt = self.lower_string_expression(prompt)?;
+                self.set_active_panic_site(*prompt_span)?;
                 let payload = self
                     .call_runtime(
-                        READ_STDIN_LINE,
-                        &[pointer.into()],
+                        READ_STDIN_LINE_PROMPTED,
+                        &[pointer.into(), pointer.into()],
                         Some(pointer.into()),
-                        &[self.current_frame.into()],
+                        &[self.current_frame.into(), prompt.into()],
                     )?
                     .ok_or_else(|| backend_failure("read_line produced no result"))?
                     .into_pointer_value();
+                self.release_string(prompt)?;
                 let present = build(self.builder.build_is_not_null(payload, "read-line.present"))?;
                 let present = build(self.builder.build_int_z_extend(
                     present,

@@ -568,6 +568,7 @@ enum EvaluationTask {
     Format(mir::FormatExpression),
     BuildFormat(mir::FormatExpression),
     ReadFile(Span),
+    ReadLine(Span),
     WriteFile,
     AppendFile,
     ReadFileBytes(mir::CollectionTypeId, Span),
@@ -3769,6 +3770,33 @@ impl Interpreter<'_> {
                 let values = self.take_evaluation_values(format.arguments.len())?;
                 self.push_string(render_format(&format, &values)?)?;
             }
+            EvaluationTask::ReadLine(_prompt_span) => {
+                let prompt = self.pop_string()?;
+                // Write the prompt exactly, adding no characters. A zero-length write
+                // is skipped; the flush that follows is not. Against the interpreter's
+                // in-memory stdout a flush is a successful no-op, so appending before
+                // consuming stdin reproduces the observable order the native runtime
+                // produces.
+                if !prompt.is_empty() {
+                    self.stdout.extend_from_slice(prompt.as_bytes());
+                }
+                if self.stdin_cursor == self.stdin.len() {
+                    self.push_nullable_string(None)?;
+                } else {
+                    let remaining = &self.stdin[self.stdin_cursor..];
+                    let newline = remaining.iter().position(|byte| *byte == b'\n');
+                    let consumed = newline.map_or(remaining.len(), |index| index + 1);
+                    let mut line_length = newline.unwrap_or(remaining.len());
+                    if line_length != 0 && remaining[line_length - 1] == b'\r' {
+                        line_length -= 1;
+                    }
+                    let line = core::str::from_utf8(&remaining[..line_length])
+                        .map_err(|_| InterpreterError::new("stdin contained invalid UTF-8"))?
+                        .to_string();
+                    self.stdin_cursor += consumed;
+                    self.push_nullable_string(Some(line.into()))?;
+                }
+            }
             EvaluationTask::ReadFile(path_span) => {
                 let path = self.pop_string()?;
                 if path.as_bytes().contains(&0) {
@@ -5086,23 +5114,15 @@ impl Interpreter<'_> {
                     }
                 }
             }
-            mir::NullableStringExpression::ReadLine => {
-                if self.stdin_cursor == self.stdin.len() {
-                    self.push_nullable_string(None)?;
-                } else {
-                    let remaining = &self.stdin[self.stdin_cursor..];
-                    let newline = remaining.iter().position(|byte| *byte == b'\n');
-                    let consumed = newline.map_or(remaining.len(), |index| index + 1);
-                    let mut line_length = newline.unwrap_or(remaining.len());
-                    if line_length != 0 && remaining[line_length - 1] == b'\r' {
-                        line_length -= 1;
-                    }
-                    let line = core::str::from_utf8(&remaining[..line_length])
-                        .map_err(|_| InterpreterError::new("stdin contained invalid UTF-8"))?
-                        .to_string();
-                    self.stdin_cursor += consumed;
-                    self.push_nullable_string(Some(line.into()))?;
-                }
+            mir::NullableStringExpression::ReadLine {
+                prompt,
+                prompt_span,
+            } => {
+                // The prompt evaluates first and exactly once; the continuation then
+                // writes it, flushes, and reads one line.
+                let frame = self.current_frame_mut()?;
+                frame.tasks.push(EvaluationTask::ReadLine(prompt_span));
+                frame.tasks.push(EvaluationTask::String(*prompt));
             }
             mir::NullableStringExpression::Call { function, args } => {
                 self.queue_call(

@@ -2421,7 +2421,17 @@ pub enum NullableStringExpression {
         property: PropertyId,
     },
     Static(StaticId),
-    ReadLine,
+    /// `read_line(string $prompt = ""): ?string`.
+    ///
+    /// One canonical operation owns the complete ordering contract: the prompt is
+    /// evaluated exactly once, written to stdout with no added characters, stdout
+    /// is flushed, and only then is one line read. The zero-argument source form
+    /// lowers to the canonical empty-string prompt, so there is no second
+    /// operation and no overload pair.
+    ReadLine {
+        prompt: Box<StringExpression>,
+        prompt_span: Span,
+    },
     Call {
         function: FunctionId,
         args: Vec<Rvalue>,
@@ -3350,11 +3360,13 @@ fn nullable_string_class_temporary_capacity(value: &NullableStringExpression) ->
                 + nullable_string_class_temporary_capacity(right)
         }
         NullableStringExpression::DictionaryGet { key, .. } => rvalue_class_temporary_capacity(key),
+        NullableStringExpression::ReadLine { prompt, .. } => {
+            string_class_temporary_capacity(prompt)
+        }
         NullableStringExpression::Null
         | NullableStringExpression::Local(_)
         | NullableStringExpression::Static(_)
-        | NullableStringExpression::Property { .. }
-        | NullableStringExpression::ReadLine => 0,
+        | NullableStringExpression::Property { .. } => 0,
     }
 }
 
@@ -4343,7 +4355,7 @@ impl fmt::Display for NullableStringExpression {
                 write!(formatter, "local{}->property{}", object.0, property.index)
             }
             Self::Static(id) => write!(formatter, "static{}", id.0),
-            Self::ReadLine => formatter.write_str("read_line()"),
+            Self::ReadLine { prompt, .. } => write!(formatter, "read_line({prompt})"),
             Self::Call { function, args } => write_call(formatter, *function, args),
             Self::NullSafeProperty { object, property } => {
                 write!(formatter, "{object}?->property{}", property.index)

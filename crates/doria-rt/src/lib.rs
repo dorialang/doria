@@ -1384,6 +1384,55 @@ pub unsafe extern "C" fn dr_v2_read_stdin_line(
     }
 }
 
+/// Writes a prompt to stdout, flushes stdout, and then reads one line from stdin.
+///
+/// This is the single runtime operation behind `read_line(string $prompt = "")`.
+/// The ordering is observable and mandatory: the prompt is written exactly as
+/// supplied with no added newline, stdout is flushed, and only then is stdin read.
+/// The flush happens even when the prompt is empty, so output written earlier with
+/// `echo` is visible before the program blocks for input.
+///
+/// A closed stdout pipe during the prompt write or flush is the permanent clean
+/// status-0 exit and never reaches stdin. Other output failures raise P1407; input
+/// failures keep their existing identities.
+///
+/// The prompt is borrowed for the duration of the write and is never retained.
+///
+/// # Safety
+/// `prompt` must be null (treated as empty) or a valid `DrStringV1`. `current_frame`
+/// must be null or a valid `DrStackFrameV2` chain for panic reporting.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v2_read_stdin_line_prompted(
+    current_frame: *const DrStackFrameV2,
+    prompt: *const DrStringV1,
+) -> *mut DrStringV1 {
+    // 1. Write the prompt exactly. A zero-length write is skipped, but the flush
+    //    below is never skipped.
+    let prompt_length = if prompt.is_null() {
+        0
+    } else {
+        (*prompt).byte_length
+    };
+    if prompt_length > 0 {
+        match write_standard_stream(StandardStream::Stdout, string_bytes(prompt), prompt_length) {
+            WriteOutcome::Success => {}
+            WriteOutcome::BrokenPipe => exit_process(0),
+            WriteOutcome::OtherFailure => panic_catalogued(current_frame, b"P1407"),
+        }
+    }
+
+    // 2. Flush stdout before reading, so the prompt is observable while the program
+    //    waits for input.
+    match device_io::flush(StandardStream::Stdout) {
+        WriteOutcome::Success => {}
+        WriteOutcome::BrokenPipe => exit_process(0),
+        WriteOutcome::OtherFailure => panic_catalogued(current_frame, b"P1407"),
+    }
+
+    // 3. Read one line under the existing line discipline.
+    dr_v2_read_stdin_line(current_frame)
+}
+
 /// Reads a complete UTF-8 text file into an owned runtime string.
 ///
 /// # Safety

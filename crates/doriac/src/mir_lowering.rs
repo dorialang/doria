@@ -4616,10 +4616,24 @@ fn lower_nullable_string_expression(
             }
         }
         hir::Expr::FunctionCall { name, args, span } if name == "read_line" => {
-            if !args.is_empty() {
-                return Err(vec![unsupported(*span, "read_line expects no arguments")]);
-            }
-            Ok(mir::NullableStringExpression::ReadLine)
+            // The omitted argument lowers to the canonical empty-string default, so
+            // both source forms reach one operation rather than selecting between
+            // two. The default still carries the call span, because a failure while
+            // writing or flushing an empty prompt is attributed to the call.
+            let (prompt, prompt_span) = match argument_values(args)[..] {
+                [] => (mir::StringExpression::Literal(String::new()), *span),
+                [prompt] => (lower_string_expression(prompt, context)?, prompt.span()),
+                _ => {
+                    return Err(vec![unsupported(
+                        *span,
+                        "read_line expects at most 1 argument",
+                    )])
+                }
+            };
+            Ok(mir::NullableStringExpression::ReadLine {
+                prompt: Box::new(prompt),
+                prompt_span,
+            })
         }
         hir::Expr::FunctionCall { name, args, span } => {
             let signature = context.lookup_function(name, *span)?;

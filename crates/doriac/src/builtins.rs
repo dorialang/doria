@@ -92,6 +92,29 @@ impl Builtin {
         }
     }
 
+    /// The accepted argument count as an inclusive `(minimum, maximum)` range, or
+    /// `None` when the builtin is variadic.
+    ///
+    /// This is the one compiler-owned arity definition. A builtin with an optional
+    /// parameter — `read_line(string $prompt = ""): ?string` — is one function with
+    /// a range, never an overload pair, so the omitted argument is filled with the
+    /// canonical default rather than selecting a second operation.
+    pub const fn arity(self) -> Option<(usize, usize)> {
+        match self {
+            Self::ReadLine => Some((0, 1)),
+            Self::ReadStdinBytes => Some((0, 0)),
+            Self::ReadFile
+            | Self::ReadFileBytes
+            | Self::WriteStderr
+            | Self::WriteStdoutBytes
+            | Self::WriteStderrBytes => Some((1, 1)),
+            Self::WriteFile | Self::AppendFile | Self::WriteFileBytes | Self::AppendFileBytes => {
+                Some((2, 2))
+            }
+            Self::Sprintf | Self::Printf | Self::Panic => None,
+        }
+    }
+
     pub const fn return_is_non_null(self) -> Option<bool> {
         match self {
             Self::Sprintf | Self::ReadFile | Self::ReadFileBytes | Self::ReadStdinBytes => {

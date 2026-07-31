@@ -5933,26 +5933,30 @@ impl<'program> Checker<'program> {
         if self.reject_named_arguments(builtin.name(), args) {
             return;
         }
-        let expected = match builtin {
-            Builtin::ReadLine | Builtin::ReadStdinBytes => Some(0),
-            Builtin::ReadFile
-            | Builtin::ReadFileBytes
-            | Builtin::WriteStderr
-            | Builtin::WriteStdoutBytes
-            | Builtin::WriteStderrBytes => Some(1),
-            Builtin::WriteFile
-            | Builtin::AppendFile
-            | Builtin::WriteFileBytes
-            | Builtin::AppendFileBytes => Some(2),
-            Builtin::Sprintf | Builtin::Printf => None,
-            Builtin::Panic => return self.check_panic_call(args, span, scopes, method_context),
-        };
-        if let Some(expected) = expected {
-            if args.len() != expected {
+        if matches!(builtin, Builtin::Panic) {
+            return self.check_panic_call(args, span, scopes, method_context);
+        }
+        // One compiler-owned arity definition drives every builtin, including the
+        // optional prompt on `read_line`.
+        let expected = builtin.arity();
+        if let Some((minimum, maximum)) = expected {
+            if args.len() < minimum || args.len() > maximum {
+                let requirement = if minimum == maximum {
+                    format!("exactly {minimum}")
+                } else if minimum == 0 {
+                    format!("at most {maximum}")
+                } else {
+                    format!("between {minimum} and {maximum}")
+                };
+                let plural = if maximum == 1 {
+                    "argument"
+                } else {
+                    "arguments"
+                };
                 self.diagnostics.push(Diagnostic::new(
                     "E0450",
                     format!(
-                        "{} expects exactly {expected} arguments, got {}",
+                        "{} expects {requirement} {plural}, got {}",
                         builtin.name(),
                         args.len()
                     ),
@@ -6067,7 +6071,13 @@ impl<'program> Checker<'program> {
                     }
                 }
             }
-            Builtin::ReadLine | Builtin::ReadStdinBytes | Builtin::Panic => {}
+            Builtin::ReadLine => {
+                // The prompt is exactly `string`; callers convert before calling.
+                if let Some(prompt) = args.first() {
+                    self.require_builtin_string_arg(builtin, &prompt.value, scopes, method_context);
+                }
+            }
+            Builtin::ReadStdinBytes | Builtin::Panic => {}
         }
     }
 

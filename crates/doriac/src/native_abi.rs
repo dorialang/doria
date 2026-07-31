@@ -44,6 +44,9 @@ pub const STRING_FROM_BYTES: &str = "dr_v1_string_from_bytes";
 pub const STRING_WRITE_STDOUT: &str = "dr_v2_write_string_stdout";
 pub const STRING_WRITE_STDERR: &str = "dr_v2_write_string_stderr";
 pub const READ_STDIN_LINE: &str = "dr_v2_read_stdin_line";
+/// Writes a prompt, flushes stdout, then reads one line. The single runtime
+/// operation behind `read_line(string $prompt = ""): ?string`.
+pub const READ_STDIN_LINE_PROMPTED: &str = "dr_v2_read_stdin_line_prompted";
 pub const INT_PARSE: &str = "dr_v1_int_parse";
 pub const FLOAT_PARSE: &str = "dr_v1_float_parse";
 pub const NULLABLE_STRING_EQUAL: &str = "dr_v1_nullable_string_equal";

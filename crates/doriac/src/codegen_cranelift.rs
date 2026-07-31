@@ -30,9 +30,9 @@ use crate::native_abi::{
     MIXED_TAG_CLASS, MIXED_TAG_FLOAT32, MIXED_TAG_FLOAT64, MIXED_TAG_INT16, MIXED_TAG_INT32,
     MIXED_TAG_INT64, MIXED_TAG_INT8, MIXED_TAG_STRING, MIXED_TAG_UINT16, MIXED_TAG_UINT32,
     MIXED_TAG_UINT64, MIXED_TAG_UINT8, MIXED_TYPE_ID, NULLABLE_STRING_EQUAL, PROCESS_EXIT,
-    READ_FILE, READ_FILE_BYTES, READ_STDIN_BYTES, READ_STDIN_LINE, SHARED_ACQUIRE, SHARED_CREATE,
-    SHARED_CREATE_WEAK, SHARED_PAYLOAD, SHARED_RELEASE, SHARED_RELEASE_WEAK, SHARED_RETAIN,
-    STRING_BYTE_LENGTH, STRING_COMPARE, STRING_CONCAT, STRING_CONTAINS,
+    READ_FILE, READ_FILE_BYTES, READ_STDIN_BYTES, READ_STDIN_LINE_PROMPTED, SHARED_ACQUIRE,
+    SHARED_CREATE, SHARED_CREATE_WEAK, SHARED_PAYLOAD, SHARED_RELEASE, SHARED_RELEASE_WEAK,
+    SHARED_RETAIN, STRING_BYTE_LENGTH, STRING_COMPARE, STRING_CONCAT, STRING_CONTAINS,
     STRING_CONTAINS_IGNORE_CASE, STRING_COUNT_OCCURRENCES, STRING_DATA, STRING_ENDS_WITH,
     STRING_ENDS_WITH_IGNORE_CASE, STRING_EQUALS_IGNORE_CASE, STRING_FROM_BOOL, STRING_FROM_BYTES,
     STRING_FROM_F32, STRING_FROM_F64, STRING_FROM_I64, STRING_FROM_U64, STRING_FROM_UTF8,
@@ -6247,16 +6247,24 @@ fn lower_nullable_string_expression(
             let payload = retain_string(builder, payload, resources)?;
             Ok(LoweredValue::Nullable { present, payload })
         }
-        mir::NullableStringExpression::ReadLine => {
+        mir::NullableStringExpression::ReadLine {
+            prompt,
+            prompt_span,
+        } => {
+            // The prompt is evaluated once here, then borrowed for the duration of
+            // the runtime call, which owns the write/flush/read ordering.
+            let prompt = lower_string_expression(builder, prompt, resources)?;
+            set_active_panic_site(builder, *prompt_span, resources);
             let payload = runtime_call(
                 builder,
-                READ_STDIN_LINE,
-                &[pointer],
+                READ_STDIN_LINE_PROMPTED,
+                &[pointer, pointer],
                 Some(pointer),
-                &[resources.current_frame],
+                &[resources.current_frame, prompt],
                 resources,
             )?
             .ok_or_else(|| backend_failure("read_line produced no result"))?;
+            release_string(builder, prompt, resources)?;
             let present = presence_word(builder, payload, pointer);
             Ok(LoweredValue::Nullable { present, payload })
         }

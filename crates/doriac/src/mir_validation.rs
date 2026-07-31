@@ -5021,10 +5021,12 @@ fn collect_nullable_string_class_local_accesses<'a>(
             collect_rvalue_args_class_local_accesses(args, accesses);
             accesses.call(*function, args);
         }
+        mir::NullableStringExpression::ReadLine { prompt, .. } => {
+            collect_string_class_local_accesses(prompt, accesses);
+        }
         mir::NullableStringExpression::Null
         | mir::NullableStringExpression::Local(_)
-        | mir::NullableStringExpression::Static(_)
-        | mir::NullableStringExpression::ReadLine => {}
+        | mir::NullableStringExpression::Static(_) => {}
         mir::NullableStringExpression::Property { object, property } => {
             accesses.borrow_property(*object, *property);
         }
@@ -5942,7 +5944,7 @@ fn nullable_string_expression_is_present(
         mir::NullableStringExpression::Null
         | mir::NullableStringExpression::Property { .. }
         | mir::NullableStringExpression::Static(_)
-        | mir::NullableStringExpression::ReadLine
+        | mir::NullableStringExpression::ReadLine { .. }
         | mir::NullableStringExpression::Call { .. }
         | mir::NullableStringExpression::NullSafeProperty { .. }
         | mir::NullableStringExpression::NullSafeCall { .. }
@@ -7437,10 +7439,12 @@ fn nullable_string_observes_property(
             .args
             .iter()
             .any(|argument| rvalue_observes_property(argument, receiver, property)),
+        mir::NullableStringExpression::ReadLine { prompt, .. } => {
+            string_observes_property(prompt, receiver, property)
+        }
         mir::NullableStringExpression::Null
         | mir::NullableStringExpression::Local(_)
-        | mir::NullableStringExpression::Static(_)
-        | mir::NullableStringExpression::ReadLine => false,
+        | mir::NullableStringExpression::Static(_) => false,
     }
 }
 
@@ -8697,7 +8701,10 @@ fn validate_nullable_string_expression(
     expression: &mir::NullableStringExpression,
 ) -> Result<(), BackendError> {
     match expression {
-        mir::NullableStringExpression::Null | mir::NullableStringExpression::ReadLine => Ok(()),
+        mir::NullableStringExpression::Null => Ok(()),
+        mir::NullableStringExpression::ReadLine { prompt, .. } => {
+            validate_string_expression(program, function, prompt)
+        }
         mir::NullableStringExpression::String(value) => {
             validate_string_expression(program, function, value)
         }

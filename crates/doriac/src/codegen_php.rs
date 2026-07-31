@@ -154,8 +154,10 @@ function __doria_panic(string $code, int $start, int $end, ?string $message = nu
     exit(101);
 }
 
-function __doria_read_line(int $start, int $end): ?string
+function __doria_read_line(string $prompt, int $start, int $end): ?string
 {
+    if ($prompt !== "") { __doria_write_all(STDOUT, $prompt, $start, $end); }
+    @fflush(STDOUT);
     $line = @fgets(STDIN);
     if ($line === false) {
         if (feof(STDIN)) { return null; }
@@ -2202,6 +2204,9 @@ fn emit_function_call(name: &str, args: &[Argument], span: Span, scopes: &PhpNam
         name,
         "read_line" | "read_file" | "write_file" | "append_file" | "write_stderr"
     ) {
+        if name == "read_line" && emitted.is_empty() {
+            emitted.push("\"\"".to_string());
+        }
         emitted.push(format!("start: {}", span.start));
         emitted.push(format!("end: {}", span.end));
     }
