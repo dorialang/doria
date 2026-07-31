@@ -80,6 +80,7 @@ function main(): int
                 op: IntegerBinaryOp::Divide,
                 left,
                 right,
+                ..
             })),
             ..
         } if left.ty() == IntegerType::UInt16 && right.ty() == IntegerType::UInt16
@@ -187,75 +188,93 @@ fn stage_13_runtime_failures_preserve_exact_messages_and_helper_frames() {
         (
             "uint8 $one = 1; writable uint8 $value = 255; return $value + $one;",
             "uint8",
-            "integer overflow during addition",
+            "P1101",
+            "Integer Addition Overflowed",
         ),
         (
             "uint8 $one = 1; writable uint8 $value = 0; return $value - $one;",
             "uint8",
-            "integer overflow during subtraction",
+            "P1102",
+            "Integer Subtraction Overflowed",
         ),
         (
             "uint8 $two = 2; writable uint8 $value = 128; return $value * $two;",
             "uint8",
-            "integer overflow during multiplication",
+            "P1103",
+            "Integer Multiplication Overflowed",
         ),
         (
             "writable int8 $value = -128; return -$value;",
             "int8",
-            "integer overflow during negation",
+            "P1104",
+            "Integer Negation Overflowed",
         ),
         (
             "return -(-128);",
             "int8",
-            "integer overflow during negation",
+            "P1104",
+            "Integer Negation Overflowed",
         ),
         (
             "int8 $zero = 0; writable int8 $value = 42; return $value / $zero;",
             "int8",
-            "integer division by zero",
+            "P1105",
+            "Integer Division By Zero",
         ),
         (
             "int8 $minusOne = -1; writable int8 $value = -128; return $value / $minusOne;",
             "int8",
-            "integer division overflow",
+            "P1106",
+            "Integer Division Overflowed",
         ),
         (
             "uint8 $zero = 0; writable uint8 $value = 42; return $value % $zero;",
             "uint8",
-            "integer remainder by zero",
+            "P1107",
+            "Integer Remainder By Zero",
         ),
         (
             "int8 $count = -1; writable int8 $value = 1; return $value << $count;",
             "int8",
-            "integer shift count out of range",
+            "P1108",
+            "Integer Shift Count Is Out Of Range",
         ),
         (
             "uint8 $count = 8; writable uint8 $value = 1; return $value << $count;",
             "uint8",
-            "integer shift count out of range",
+            "P1108",
+            "Integer Shift Count Is Out Of Range",
         ),
         (
             "uint8 $count = 9; writable uint8 $value = 1; return $value >> $count;",
             "uint8",
-            "integer shift count out of range",
+            "P1108",
+            "Integer Shift Count Is Out Of Range",
         ),
         (
             "int $value = 256; return UInt8::from($value);",
             "uint8",
-            "integer conversion out of range",
+            "P1109",
+            "Integer Conversion Is Out Of Range",
         ),
     ];
 
-    for (body, return_type, message) in cases {
+    for (body, return_type, code, title) in cases {
         let source = format!(
             "function fail(): {return_type}\n{{\n    {body}\n}}\n\nfunction main(): int\n{{\n    return Int::from(fail());\n}}\n"
         );
         let output = run(&source);
-        assert_eq!(output.exit_status, 101, "case: {message}");
-        assert_eq!(
-            String::from_utf8(output.stderr).expect("panic stderr should be UTF-8"),
-            format!("Panic: {message}\nStack Trace:\n  at fail\n  at main\n"),
-            "case: {message}"
-        );
+        assert_eq!(output.exit_status, 101, "case: {code}");
+        let diagnostic = output
+            .runtime_diagnostic
+            .as_ref()
+            .expect("runtime panic should retain its structured diagnostic");
+        assert_eq!(diagnostic.code, code);
+        assert_eq!(diagnostic.title, title);
+        let stderr = String::from_utf8(output.stderr).expect("panic stderr should be UTF-8");
+        assert!(stderr.starts_with(&format!("Panic[{code}]: {title}\n\nWhere\n")));
+        assert!(stderr.contains("\n\nCall Path\nfail · stage13_mir_test.doria:"));
+        assert!(stderr.contains("\nmain · stage13_mir_test.doria:"));
+        assert!(stderr.ends_with("\n\nProcess Exited With Status 101\n"));
     }
 }

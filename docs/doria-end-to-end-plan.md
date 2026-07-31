@@ -196,7 +196,7 @@ function fastCopy(writable Bytes $dst, Bytes $src): void
 
 ### 3.6 Panics
 
-A panic is a fatal runtime error, distinct from checked `throw`/`throws` per decision 0035: arithmetic overflow, division by zero, out-of-bounds indexing, `WritableSharedReference` access violation, failed `Float::toInt`, explicit `panic("message")`. Default behavior: print message + Doria stack trace to stderr and exit with status 101. **v1.0 panic policy is abort-only (no unwinding, no catching panics).** This keeps codegen simple and honest; checked errors are the recoverable path.
+A panic is a fatal runtime error, distinct from checked `throw`/`throws` per decision 0035: arithmetic overflow, division by zero, out-of-bounds indexing, `WritableSharedReference` access violation, failed `Float::toInt`, explicit `panic("message")`. Decision 0109 represents it through the compiler-owned diagnostic model with a stable code, precise source label, explanation, Doria `Call Path`, and status 101. **v1.0 panic policy is abort-only (no unwinding, no catching panics).** This keeps codegen simple and honest; checked errors are the recoverable path.
 
 ---
 
@@ -405,7 +405,7 @@ Rules:
 - Because `throws` lowers to a hidden discriminated result (no unwinding), an error propagating out of `main` travels through ordinary returns, and drop elaboration runs `__destruct` at every scope boundary on the way out exactly as on the success path — files flush, sockets close, locks release. An escaping checked error is an *orderly, declared* failure; contrast panics, which abort with no cleanup and exit 101.
 - `dr_main` then prints `error: <ClassName>: <message>` to stderr — the class name via a minimal type-name intrinsic (drop glue already carries per-type metadata; this is not reflection and must not grow into one) and the message via the `Error` interface's guaranteed readonly `string $message` — destroys the error value, and exits with status **70** (BSD `EX_SOFTWARE`). Never 101.
 - The 70/101 split is machine-readable triage: a supervisor, orchestrator, or PHP frontend distinguishes "declared failure" (70) from "Doria bug" (101) without parsing stderr.
-- Checked errors carry **no stack traces by default**: they are values and ordinary control flow, and trace capture at every `throw` would tax exactly the hot paths the result ABI keeps cheap. Panics keep traces; errors keep messages. A dev-profile opt-in (trace capture at throw sites under an environment flag) may be added later within the checked-errors decision's scope.
+- Checked errors carry **no captured propagation path by default**: they are values and ordinary control flow, and path capture at every `throw` would tax exactly the hot paths the result ABI keeps cheap. Panics keep their source-aware `Call Path`; errors keep structured identities and messages. A dev-profile opt-in (path capture at throw sites under an environment flag) may be added later within the checked-errors decision's scope.
 - `async function main` is permitted: the entry glue bootstraps the executor with `main` as the root task, and structured concurrency guarantees no orphan tasks remain when the root task completes with an error — child scopes have already awaited or cancelled their tasks before propagation continues. A synchronous `main` never starts the executor, so non-async programs pay zero async cost. Bootstrap details land with the async decision / Stage 38.
 - `main`'s handler is the *process* boundary. The php-lib bridge is the *FFI* boundary with its own contract (§10.3): escaping checked errors become generated PHP exceptions and never terminate the host.
 
@@ -560,7 +560,7 @@ A Rust `crates/doria-rt` static library, introduced as a minimal runtime/panic f
 - Allocator (system malloc initially; pluggable arena hooks reserved for the engine later).
 - Drop-glue dispatch, `SharedReference<T>`/`WeakReference<T>` refcount and weak-resolution machinery, and the writable family's per-allocation access state (readonly-family allocations carry none — §3.3).
 - String/Bytes/List/Dictionary/Set intrinsic implementations (refcounted immutable string buffers, owned growable collection buffers, hashing).
-- Panic machinery, stack trace capture, process entry glue (`dr_main` wrapping user `main`).
+- Runtime-outcome transport, source-aware Doria call-path capture, and process entry glue (`dr_main` wrapping user `main`).
 - stdout/stderr/stdin, basic clock, environment access — the syscall surface the stdlib wraps.
 
 Record 0044's ABI review must evaluate, as named design cases before the native object representation freezes: externally owned memory (buffers doria-rt did not allocate), custom deallocation callbacks, alignment requirements, and pinned/non-moving memory for interop. The ownership model already guarantees the hard part — stable addresses, deterministic release, no movable-GC assumption — so these are representation questions, not model changes.
@@ -576,8 +576,10 @@ cause identity, documentation metadata, and developer details. Human and concise
 CLI output goes to stderr; schema-version-1 JSON goes to stdout without ANSI.
 The LSP and website consume the structure rather than parsing terminal prose.
 Backend, external-tool, and internal failures retain full developer detail
-without exposing raw output by default. Runtime panic remains a separate
-status-101 contract with exact Title Case `Panic` and `Stack Trace` headings.
+without exposing raw output by default. Decision 0109 extends the same
+compiler-owned model to runtime outcomes: built-in panics have stable `P`
+codes, source-aware labels, `Where`, `Why`, a Doria-only `Call Path`, and
+status-101 abort-without-cleanup semantics.
 
 Architectural goal, standing from now: **CLI commands wrap reusable compiler
 services** (in-memory parse/check, diagnostics, module compilation, interpreter
@@ -940,15 +942,28 @@ AC: legal/illegal borrow and ctor fixture matrix; borrow-conflict diagnostic sna
   casing, and occurrence counting are included. Grapheme and code-point views
   remain traversal work, and ordering comparisons remain blocked on executable
   `Ordering`.
+- **Unified Doria Diagnostic Presentation And Runtime Outcome Foundation —
+  Implemented.** Decision 0109 extends the compiler-owned `Diagnostic` as the
+  sole public representation for compile-time findings and runtime outcomes.
+  All implemented built-in panics have stable central-catalogue `P` codes,
+  source-aware labels, Doria call paths, and status-101
+  abort-without-cleanup semantics across the interpreter, Cranelift, LLVM, PHP
+  compatibility, standalone executables, and `doriac run`. Human output uses
+  the global Doria `Where`/preview/`Why` grammar and `Call Path`; concise, JSON,
+  LSP, and Playground projections consume the same structured facts. The
+  source model and runtime-outcome extension are also mandatory for future
+  unhandled checked errors, but checked errors remain unimplemented and their
+  final human presentation remains a designer-review item.
 - **Interactive Line-Input Amendment — Next.** This follows the completed
-  String Runtime Surface and precedes Stage 25a Slice 4.
+  Unified Diagnostic Presentation And Runtime Outcome Foundation and precedes
+  Stage 25a Slice 4.
 - **Stage 26 — Remaining collection family.** Stage 23 ships Decision 0100's default `List`/`Dictionary`/`Set`/`T[]` surface. Stage 26 adds the authored non-closure surface with `SortedDictionary`, `SortedSet`, `PriorityQueue`, and `Deque`; `map`/`filter`/`reduce` remain Stage 30 because they require closures. Before Stage 31 include/multi-file support, required stdlib fragments are compiler-bundled or prelude-style rather than source-included. AC: the remaining non-closure collection family compiles and runs from the compiler-provided stdlib surface.
 
 ### Phase E — Enums, match, errors (Stages 27–29)
 - **Stage 27 — Enums + payload cases.** D6, inline tagged layout, Copy/move classification per payloads. AC: `Shape` example native.
 - **Stage 28 — match.** D7, exhaustiveness, payload destructuring, narrowing integration; guards fast-follow within the stage. AC: exhaustiveness diagnostics snapshots; `match (true)` chains.
 - **Stage 28a — Control-flow completion.** The accepted-but-unimplemented control-flow family (records 0009/0020/0097): `when` (decision 0097 — the value-returning form of `if`), `given` predicate blocks on `if`/`when`/`while`, control-flow `finally` on `if`/`when`/`do`-loops, and `do … while … finally`. Built on the shared dataflow and drop/cleanup framework from Stages 21–22; the `finally`-block machinery is reused by Stage 29's `try`/`catch`/`finally`. `when` is basic control flow, so it lands here right after `match` (which `match (true)` already partly covers), not with the Stage 36 OOP work. AC: value-returning `when` chain (declared result type, mandatory `else`, `return`-to-yield); `given … when … else … finally` example; `do … while … finally` example; a compiler-side accepted-syntax fixture with zero parser errors and stage-named unsupported diagnostics before this stage.
-- **Stage 29 — Checked errors end-to-end.** D8: `throws` ABI, `try/catch/finally`, `Error` interface with property requirement, `main throws`. This stage also executes the record-0075 I/O failure migration: the §9 file/input free functions move from panic-on-failure to declared `throws` signatures, and `File`/stream object design is unblocked. Record 0091's ordinary-output closed-standard-stream exit remains status 0 and is never a throw; panic reporting remains fatal when stderr is unavailable. AC: SPEC-style `loadUser` example; uncovered-error diagnostics; finally-ordering fixture; error-escaping-`main` fixture asserting stderr `error: <Class>: <message>`, exit status 70, and destructor execution on the propagation path.
+- **Stage 29 — Checked errors end-to-end.** D8: `throws` ABI, `try/catch/finally`, `Error` interface with property requirement, `main throws`. This stage also executes the record-0075 I/O failure migration: the §9 file/input free functions move from panic-on-failure to declared `throws` signatures, and `File`/stream object design is unblocked. Record 0091's ordinary-output closed-standard-stream exit remains status 0 and is never a throw; panic reporting remains fatal when stderr is unavailable. Compile-time checked-error violations are ordinary compiler diagnostics; caught errors are ordinary control flow; and an error escaping `main` must reuse decision 0109's runtime-outcome extension, source model, renderers, JSON envelope, and tooling component without inheriting panic's abort semantics. Its error identity and message remain structured, propagation runs required cleanup and destructors, and process status remains 70. The exact future human header, origin/path presentation, cause-chain policy, help policy, and treatment of sensitive messages require designer review rather than preserving the earlier lowercase one-line output as a separate contract. AC: SPEC-style `loadUser` example; uncovered-error diagnostics; finally-ordering fixture; error-escaping-`main` fixture asserting the shared structured runtime outcome, status 70, and destructor execution on the propagation path.
 
 ### Phase F — Multi-file, namespaces, Baton (Stages 30–33)
 - **Stage 30 — Closures.** D10 + D20: explicitly typed closure and arrow-function parameters (omitted parameter types are compile errors with context-derived suggestions), borrow and `take` captures, function types in type position; collection closure APIs unlock. AC: sort-with-comparator example with typed callback parameters; borrow-bound closure escape rejected with a `take` suggestion fixture.

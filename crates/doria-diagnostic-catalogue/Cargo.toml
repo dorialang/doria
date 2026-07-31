@@ -1,0 +1,10 @@
+[package]
+name = "doria-diagnostic-catalogue"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "doria_diagnostic_catalogue"
+path = "src/lib.rs"

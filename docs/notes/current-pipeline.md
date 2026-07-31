@@ -58,12 +58,21 @@ Documentation role: working note. This file prevents duplicated in-flight work. 
   traversal protocol, and ordering comparisons remain pending on `Ordering`.
   The approved ignore-case search family, first-grapheme casing, and
   occurrence counting are included in this executable surface.
+- The Unified Doria Diagnostic Presentation And Runtime Outcome Foundation is
+  implemented under decision 0109. The compiler-owned `Diagnostic` is the sole
+  public representation for compilation findings and runtime outcomes.
+  Interpreter, Cranelift, LLVM, PHP compatibility, standalone executables, and
+  `doriac run` preserve catalogued `P` codes, source labels, Doria call paths,
+  and status-101 abort-without-cleanup semantics. Human output uses the global
+  `Where`/preview/`Why` grammar and `Call Path`; concise and JSON remain
+  projections of the same facts. Future unhandled checked errors are bound to
+  this foundation but remain unimplemented.
 - The durable manifest supports raw stdin, isolated seeded files, declared program arguments, and exact interpreter/Cranelift/LLVM stdout, stderr, status, generated-file, and class-lifetime comparison.
 
 ## Next
 
 - Implement the Interactive Line-Input Amendment.
-- Do not proceed directly to Stage 25a Slice 4.
+- Stage 25a Slice 4 remains blocked until that amendment is complete.
 
 ## Do not duplicate
 

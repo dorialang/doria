@@ -1934,8 +1934,7 @@ function main(): void
         .expect("incompatible access should use Doria's abort-only panic path");
     assert_eq!(output.exit_status, 101);
     assert!(
-        String::from_utf8_lossy(&output.stderr)
-            .contains("Cannot Acquire Writable Access While Readonly Access Is Active"),
+        String::from_utf8_lossy(&output.stderr).contains("Panic[P1501]"),
         "the readonly expression temporary must remain active through the entire condition"
     );
 }

@@ -201,7 +201,13 @@ unsafe fn wide_string_length(units: *const u16) -> usize {
 }
 
 unsafe fn argument_panic(message: &[u8]) -> ! {
-    crate::dr_v1_panic(ptr::null(), message.as_ptr(), message.len())
+    crate::dr_v2_panic_code(
+        ptr::null(),
+        b"P1410".as_ptr(),
+        5,
+        message.as_ptr(),
+        message.len(),
+    )
 }
 
 #[cfg(windows)]

@@ -5,6 +5,7 @@
 use core::ffi::c_void;
 use core::mem;
 use core::ptr;
+use unicode_width::UnicodeWidthChar;
 
 mod bytes;
 mod collection;
@@ -80,10 +81,28 @@ unsafe impl core::alloc::GlobalAlloc for RuntimeAllocator {
 static RUNTIME_ALLOCATOR: RuntimeAllocator = RuntimeAllocator;
 
 #[repr(C)]
-pub struct DrStackFrameV1 {
-    pub parent: *const DrStackFrameV1,
+pub struct DrStackFrameV2 {
+    pub parent: *const DrStackFrameV2,
     pub function_name: *const u8,
     pub function_name_length: usize,
+    pub source_path: *const u8,
+    pub source_path_length: usize,
+    pub source_text: *const u8,
+    pub source_text_length: usize,
+    pub function_span_start: usize,
+    pub function_span_end: usize,
+    pub active_span_start: usize,
+    pub active_span_end: usize,
+}
+
+#[repr(C)]
+pub struct DrRuntimeFactV2 {
+    pub name: *const u8,
+    pub name_length: usize,
+    /// 1 = signed, 2 = unsigned, 3 = boolean, 4 = static string.
+    pub kind: usize,
+    pub value: u64,
+    pub value_length: usize,
 }
 
 /// Opaque shared-ownership control block.
@@ -95,7 +114,7 @@ pub struct DrSharedControlV1 {
     strong_references: usize,
     weak_references: usize,
     payload: *mut u8,
-    drop_payload: unsafe extern "C" fn(*const DrStackFrameV1, *mut u8),
+    drop_payload: unsafe extern "C" fn(*const DrStackFrameV2, *mut u8),
 }
 
 /// Opaque writable shared-ownership control block.
@@ -109,7 +128,7 @@ pub struct DrWritableSharedControlV1 {
     readonly_accesses: usize,
     writable_access_active: bool,
     payload: *mut u8,
-    drop_payload: unsafe extern "C" fn(*const DrStackFrameV1, *mut u8),
+    drop_payload: unsafe extern "C" fn(*const DrStackFrameV2, *mut u8),
 }
 
 /// Opaque outside doria-rt. Bytes immediately follow this header.
@@ -155,8 +174,8 @@ pub unsafe extern "C" fn dr_v1_bytes_length(value: *const DrBytesV1) -> usize {
 ///
 /// `value` must point to a live byte buffer and `current_frame` must be null or valid.
 #[no_mangle]
-pub unsafe extern "C" fn dr_v1_bytes_get(
-    current_frame: *const DrStackFrameV1,
+pub unsafe extern "C" fn dr_v2_bytes_get(
+    current_frame: *const DrStackFrameV2,
     value: *const DrBytesV1,
     index: usize,
 ) -> u8 {
@@ -167,8 +186,8 @@ pub unsafe extern "C" fn dr_v1_bytes_get(
 ///
 /// `value` must be a uniquely borrowed live byte buffer and `current_frame` must be null or valid.
 #[no_mangle]
-pub unsafe extern "C" fn dr_v1_bytes_set(
-    current_frame: *const DrStackFrameV1,
+pub unsafe extern "C" fn dr_v2_bytes_set(
+    current_frame: *const DrStackFrameV2,
     value: *mut DrBytesV1,
     index: usize,
     byte: u8,
@@ -194,7 +213,7 @@ pub unsafe extern "C" fn dr_v1_bytes_from_collection(
     let length = collection::length(collection);
     let data = allocate(length);
     if length != 0 && data.is_null() {
-        panic_static(ptr::null(), b"byte-buffer allocation failed");
+        panic_catalogued(ptr::null(), b"P1302");
     }
     for index in 0..length {
         *data.add(index) = collection::value_at(ptr::null(), collection, index) as u8;
@@ -245,16 +264,15 @@ pub unsafe extern "C" fn dr_v1_collection_new(
 /// must be a canonical boolean byte. The returned pointer must be released
 /// exactly once with `dr_v1_collection_free`.
 #[no_mangle]
-pub unsafe extern "C" fn dr_v1_collection_fill_word(
-    current_frame: *const DrStackFrameV1,
+pub unsafe extern "C" fn dr_v2_collection_fill_word(
+    current_frame: *const DrStackFrameV2,
     value: u64,
     count: i64,
     fixed: u8,
     value_width: u8,
 ) -> *mut DrCollectionV1 {
     if count < 0 {
-        static MESSAGE: &[u8] = b"fill count is negative";
-        dr_v1_panic(current_frame, MESSAGE.as_ptr(), MESSAGE.len());
+        panic_catalogued(current_frame, b"P1311");
     }
     collection::fill_word(
         current_frame,
@@ -273,15 +291,14 @@ pub unsafe extern "C" fn dr_v1_collection_fill_word(
 /// be null or a live Doria string, and `fixed` must be a canonical boolean
 /// byte. Every retained slot is released when the collection is dropped.
 #[no_mangle]
-pub unsafe extern "C" fn dr_v1_collection_fill_string(
-    current_frame: *const DrStackFrameV1,
+pub unsafe extern "C" fn dr_v2_collection_fill_string(
+    current_frame: *const DrStackFrameV2,
     value: *mut DrStringV1,
     count: i64,
     fixed: u8,
 ) -> *mut DrCollectionV1 {
     if count < 0 {
-        static MESSAGE: &[u8] = b"fill count is negative";
-        dr_v1_panic(current_frame, MESSAGE.as_ptr(), MESSAGE.len());
+        panic_catalogued(current_frame, b"P1311");
     }
     collection::fill_string(current_frame, value, count as usize, fixed != 0)
 }
@@ -318,8 +335,8 @@ pub unsafe extern "C" fn dr_v1_collection_push(collection: *mut DrCollectionV1, 
 /// `collection` must be a uniquely borrowed live growable collection, and
 /// `value` must use its element representation.
 #[no_mangle]
-pub unsafe extern "C" fn dr_v1_collection_insert_at(
-    current_frame: *const DrStackFrameV1,
+pub unsafe extern "C" fn dr_v2_collection_insert_at(
+    current_frame: *const DrStackFrameV2,
     collection: *mut DrCollectionV1,
     index: usize,
     value: u64,
@@ -332,8 +349,8 @@ pub unsafe extern "C" fn dr_v1_collection_insert_at(
 /// `current_frame` must be null or a valid generated frame chain, and
 /// `collection` must be a uniquely borrowed live growable collection.
 #[no_mangle]
-pub unsafe extern "C" fn dr_v1_collection_remove_at(
-    current_frame: *const DrStackFrameV1,
+pub unsafe extern "C" fn dr_v2_collection_remove_at(
+    current_frame: *const DrStackFrameV2,
     collection: *mut DrCollectionV1,
     index: usize,
 ) -> u64 {
@@ -357,8 +374,8 @@ pub unsafe extern "C" fn dr_v1_collection_pop(
 /// `current_frame` must be null or a valid generated frame chain, and
 /// `collection` must point to a live collection allocation.
 #[no_mangle]
-pub unsafe extern "C" fn dr_v1_collection_value_at(
-    current_frame: *const DrStackFrameV1,
+pub unsafe extern "C" fn dr_v2_collection_value_at(
+    current_frame: *const DrStackFrameV2,
     collection: *const DrCollectionV1,
     index: usize,
 ) -> u64 {
@@ -370,8 +387,8 @@ pub unsafe extern "C" fn dr_v1_collection_value_at(
 /// `current_frame` must be null or a valid generated frame chain, and
 /// `collection` must point to a live keyed collection allocation.
 #[no_mangle]
-pub unsafe extern "C" fn dr_v1_collection_key_at(
-    current_frame: *const DrStackFrameV1,
+pub unsafe extern "C" fn dr_v2_collection_key_at(
+    current_frame: *const DrStackFrameV2,
     collection: *const DrCollectionV1,
     index: usize,
 ) -> u64 {
@@ -384,8 +401,8 @@ pub unsafe extern "C" fn dr_v1_collection_key_at(
 /// `collection` must be a uniquely borrowed live collection, and `value` must
 /// use its element representation.
 #[no_mangle]
-pub unsafe extern "C" fn dr_v1_collection_set_at(
-    current_frame: *const DrStackFrameV1,
+pub unsafe extern "C" fn dr_v2_collection_set_at(
+    current_frame: *const DrStackFrameV2,
     collection: *mut DrCollectionV1,
     index: usize,
     value: u64,
@@ -489,8 +506,7 @@ pub unsafe extern "C" fn dr_v1_collection_contains(
 pub unsafe extern "C" fn dr_v1_mixed_new(tag: u8, type_id: u32, payload: u64) -> *mut DrMixedV1 {
     let value = mixed::new_owned(tag, type_id, payload);
     if value.is_null() {
-        static MESSAGE: &[u8] = b"mixed allocation failed";
-        dr_v1_panic(ptr::null(), MESSAGE.as_ptr(), MESSAGE.len());
+        panic_catalogued(ptr::null(), b"P1320");
     }
     value
 }
@@ -506,8 +522,7 @@ pub unsafe extern "C" fn dr_v1_mixed_new_borrowed(
 ) -> *mut DrMixedV1 {
     let value = mixed::new_borrowed(tag, type_id, payload);
     if value.is_null() {
-        static MESSAGE: &[u8] = b"mixed allocation failed";
-        dr_v1_panic(ptr::null(), MESSAGE.as_ptr(), MESSAGE.len());
+        panic_catalogued(ptr::null(), b"P1320");
     }
     value
 }
@@ -519,8 +534,7 @@ pub unsafe extern "C" fn dr_v1_mixed_new_borrowed(
 pub unsafe extern "C" fn dr_v1_mixed_clone_owned(value: *const DrMixedV1) -> *mut DrMixedV1 {
     let clone = mixed::clone_owned(value);
     if clone.is_null() {
-        static MESSAGE: &[u8] = b"mixed ownership clone failed";
-        dr_v1_panic(ptr::null(), MESSAGE.as_ptr(), MESSAGE.len());
+        panic_catalogued(ptr::null(), b"P1322");
     }
     clone
 }
@@ -614,13 +628,13 @@ pub unsafe extern "C" fn dr_v1_collection_set_algebra(
 const STRING_HEADER_SIZE: usize = mem::size_of::<DrStringV1>();
 const IMMORTAL_STRING_REFERENCES: usize = usize::MAX;
 
-pub type DrMainIntV1 = unsafe extern "C" fn(*const DrStackFrameV1) -> i64;
-pub type DrMainVoidV1 = unsafe extern "C" fn(*const DrStackFrameV1);
+pub type DrMainIntV2 = unsafe extern "C" fn(*const DrStackFrameV2) -> i64;
+pub type DrMainVoidV2 = unsafe extern "C" fn(*const DrStackFrameV2);
 
 /// Entry forms that take the program arguments (decision 0099). The list is
 /// owned by the glue and borrowed by `main`, so the callee never releases it.
-pub type DrMainIntArgsV1 = unsafe extern "C" fn(*const DrStackFrameV1, *mut DrCollectionV1) -> i64;
-pub type DrMainVoidArgsV1 = unsafe extern "C" fn(*const DrStackFrameV1, *mut DrCollectionV1);
+pub type DrMainIntArgsV2 = unsafe extern "C" fn(*const DrStackFrameV2, *mut DrCollectionV1) -> i64;
+pub type DrMainVoidArgsV2 = unsafe extern "C" fn(*const DrStackFrameV2, *mut DrCollectionV1);
 
 /// Validates process arguments for an entrypoint that does not request the list.
 ///
@@ -645,8 +659,8 @@ pub unsafe extern "C" fn dr_v1_validate_entry_args(argc: i32, argv: *const *cons
 /// `current_frame` must be null or a valid generated frame chain. The returned
 /// pointer must be released exactly once with `dr_v1_class_free`.
 #[no_mangle]
-pub unsafe extern "C" fn dr_v1_class_allocate(
-    current_frame: *const DrStackFrameV1,
+pub unsafe extern "C" fn dr_v2_class_allocate(
+    current_frame: *const DrStackFrameV2,
     byte_length: usize,
     byte_alignment: usize,
 ) -> *mut u8 {
@@ -655,13 +669,11 @@ pub unsafe extern "C" fn dr_v1_class_allocate(
         || !byte_alignment.is_power_of_two()
         || byte_alignment > supported_alignment
     {
-        static MESSAGE: &[u8] = b"class allocation failed";
-        dr_v1_panic(current_frame, MESSAGE.as_ptr(), MESSAGE.len());
+        panic_catalogued(current_frame, b"P1601");
     }
     let payload = allocate(byte_length.max(1));
     if payload.is_null() {
-        static MESSAGE: &[u8] = b"class allocation failed";
-        dr_v1_panic(current_frame, MESSAGE.as_ptr(), MESSAGE.len());
+        panic_catalogued(current_frame, b"P1601");
     }
     // Stage 19 constructors may initialize a proven subset of fields in their
     // body. Zeroing the private payload keeps replacement-style stores safe
@@ -671,7 +683,7 @@ pub unsafe extern "C" fn dr_v1_class_allocate(
     payload
 }
 
-/// Frees a payload returned by `dr_v1_class_allocate`.
+/// Frees a payload returned by `dr_v2_class_allocate`.
 ///
 /// # Safety
 ///
@@ -692,14 +704,14 @@ pub unsafe extern "C" fn dr_v1_class_free(payload: *mut u8) {
 /// be its matching generated drop glue. Ownership transfers to the returned
 /// control block.
 #[no_mangle]
-pub unsafe extern "C" fn dr_v1_shared_create(
-    current_frame: *const DrStackFrameV1,
+pub unsafe extern "C" fn dr_v2_shared_create(
+    current_frame: *const DrStackFrameV2,
     payload: *mut u8,
-    drop_payload: unsafe extern "C" fn(*const DrStackFrameV1, *mut u8),
+    drop_payload: unsafe extern "C" fn(*const DrStackFrameV2, *mut u8),
 ) -> *mut DrSharedControlV1 {
     let control = allocate(mem::size_of::<DrSharedControlV1>()).cast::<DrSharedControlV1>();
     if control.is_null() {
-        panic_static(current_frame, b"Shared-Reference Allocation Failed");
+        panic_catalogued(current_frame, b"P1502");
     }
     control.write(DrSharedControlV1 {
         strong_references: 1,
@@ -716,12 +728,12 @@ pub unsafe extern "C" fn dr_v1_shared_create(
 ///
 /// `control` must point to a live control block with a live payload.
 #[no_mangle]
-pub unsafe extern "C" fn dr_v1_shared_retain(
-    current_frame: *const DrStackFrameV1,
+pub unsafe extern "C" fn dr_v2_shared_retain(
+    current_frame: *const DrStackFrameV2,
     control: *mut DrSharedControlV1,
 ) -> *mut DrSharedControlV1 {
     let Some(next) = (*control).strong_references.checked_add(1) else {
-        panic_static(current_frame, b"Shared-Reference Count Overflowed");
+        panic_catalogued(current_frame, b"P1503");
     };
     (*control).strong_references = next;
     control
@@ -734,8 +746,8 @@ pub unsafe extern "C" fn dr_v1_shared_retain(
 /// `control` must be null or hold a live strong reference. The released handle
 /// must not be used afterward.
 #[no_mangle]
-pub unsafe extern "C" fn dr_v1_shared_release(
-    current_frame: *const DrStackFrameV1,
+pub unsafe extern "C" fn dr_v2_shared_release(
+    current_frame: *const DrStackFrameV2,
     control: *mut DrSharedControlV1,
 ) {
     if control.is_null() {
@@ -760,12 +772,12 @@ pub unsafe extern "C" fn dr_v1_shared_release(
 ///
 /// `control` must point to a live control block with a strong reference.
 #[no_mangle]
-pub unsafe extern "C" fn dr_v1_shared_create_weak(
-    current_frame: *const DrStackFrameV1,
+pub unsafe extern "C" fn dr_v2_shared_create_weak(
+    current_frame: *const DrStackFrameV2,
     control: *mut DrSharedControlV1,
 ) -> *mut DrSharedControlV1 {
     let Some(next) = (*control).weak_references.checked_add(1) else {
-        panic_static(current_frame, b"Weak-Reference Count Overflowed");
+        panic_catalogued(current_frame, b"P1504");
     };
     (*control).weak_references = next;
     control
@@ -793,14 +805,14 @@ pub unsafe extern "C" fn dr_v1_shared_release_weak(control: *mut DrSharedControl
 ///
 /// `control` must hold a live weak reference.
 #[no_mangle]
-pub unsafe extern "C" fn dr_v1_shared_acquire(
-    current_frame: *const DrStackFrameV1,
+pub unsafe extern "C" fn dr_v2_shared_acquire(
+    current_frame: *const DrStackFrameV2,
     control: *mut DrSharedControlV1,
 ) -> *mut DrSharedControlV1 {
     if (*control).strong_references == 0 {
         return ptr::null_mut();
     }
-    dr_v1_shared_retain(current_frame, control)
+    dr_v2_shared_retain(current_frame, control)
 }
 
 /// Returns the live class payload behind a strong reference.
@@ -822,18 +834,15 @@ pub unsafe extern "C" fn dr_v1_shared_payload(control: *const DrSharedControlV1)
 ///
 /// `payload` must be uniquely owned and live, and `drop_payload` must match it.
 #[no_mangle]
-pub unsafe extern "C" fn dr_v1_writable_shared_create(
-    current_frame: *const DrStackFrameV1,
+pub unsafe extern "C" fn dr_v2_writable_shared_create(
+    current_frame: *const DrStackFrameV2,
     payload: *mut u8,
-    drop_payload: unsafe extern "C" fn(*const DrStackFrameV1, *mut u8),
+    drop_payload: unsafe extern "C" fn(*const DrStackFrameV2, *mut u8),
 ) -> *mut DrWritableSharedControlV1 {
     let control =
         allocate(mem::size_of::<DrWritableSharedControlV1>()).cast::<DrWritableSharedControlV1>();
     if control.is_null() {
-        panic_static(
-            current_frame,
-            b"Writable Shared-Reference Allocation Failed",
-        );
+        panic_catalogued(current_frame, b"P1502");
     }
     control.write(DrWritableSharedControlV1 {
         strong_references: 1,
@@ -852,12 +861,12 @@ pub unsafe extern "C" fn dr_v1_writable_shared_create(
 ///
 /// `control` must point to a live writable control block with a live payload.
 #[no_mangle]
-pub unsafe extern "C" fn dr_v1_writable_shared_retain(
-    current_frame: *const DrStackFrameV1,
+pub unsafe extern "C" fn dr_v2_writable_shared_retain(
+    current_frame: *const DrStackFrameV2,
     control: *mut DrWritableSharedControlV1,
 ) -> *mut DrWritableSharedControlV1 {
     let Some(next) = (*control).strong_references.checked_add(1) else {
-        panic_static(current_frame, b"Writable Shared-Reference Count Overflowed");
+        panic_catalogued(current_frame, b"P1503");
     };
     (*control).strong_references = next;
     control
@@ -869,8 +878,8 @@ pub unsafe extern "C" fn dr_v1_writable_shared_retain(
 ///
 /// `control` must be null or hold a live strong reference.
 #[no_mangle]
-pub unsafe extern "C" fn dr_v1_writable_shared_release(
-    current_frame: *const DrStackFrameV1,
+pub unsafe extern "C" fn dr_v2_writable_shared_release(
+    current_frame: *const DrStackFrameV2,
     control: *mut DrWritableSharedControlV1,
 ) {
     if control.is_null() {
@@ -897,12 +906,12 @@ pub unsafe extern "C" fn dr_v1_writable_shared_release(
 ///
 /// `control` must point to a live writable control block with a strong owner.
 #[no_mangle]
-pub unsafe extern "C" fn dr_v1_writable_shared_create_weak(
-    current_frame: *const DrStackFrameV1,
+pub unsafe extern "C" fn dr_v2_writable_shared_create_weak(
+    current_frame: *const DrStackFrameV2,
     control: *mut DrWritableSharedControlV1,
 ) -> *mut DrWritableSharedControlV1 {
     let Some(next) = (*control).weak_references.checked_add(1) else {
-        panic_static(current_frame, b"Writable Weak-Reference Count Overflowed");
+        panic_catalogued(current_frame, b"P1504");
     };
     (*control).weak_references = next;
     control
@@ -931,14 +940,14 @@ pub unsafe extern "C" fn dr_v1_writable_shared_release_weak(
 ///
 /// `control` must hold a live writable-family weak reference.
 #[no_mangle]
-pub unsafe extern "C" fn dr_v1_writable_shared_acquire(
-    current_frame: *const DrStackFrameV1,
+pub unsafe extern "C" fn dr_v2_writable_shared_acquire(
+    current_frame: *const DrStackFrameV2,
     control: *mut DrWritableSharedControlV1,
 ) -> *mut DrWritableSharedControlV1 {
     if (*control).strong_references == 0 {
         return ptr::null_mut();
     }
-    dr_v1_writable_shared_retain(current_frame, control)
+    dr_v2_writable_shared_retain(current_frame, control)
 }
 
 /// Acquires one readonly access object and its strong ownership claim.
@@ -947,21 +956,18 @@ pub unsafe extern "C" fn dr_v1_writable_shared_acquire(
 ///
 /// `control` must point to a live writable control block.
 #[no_mangle]
-pub unsafe extern "C" fn dr_v1_writable_shared_acquire_readonly_access(
-    current_frame: *const DrStackFrameV1,
+pub unsafe extern "C" fn dr_v2_writable_shared_acquire_readonly_access(
+    current_frame: *const DrStackFrameV2,
     control: *mut DrWritableSharedControlV1,
 ) -> *mut DrWritableSharedControlV1 {
     if (*control).writable_access_active {
-        panic_static(
-            current_frame,
-            b"Cannot Acquire Readonly Access While Writable Access Is Active",
-        );
+        panic_catalogued(current_frame, b"P1501");
     }
     let Some(next_accesses) = (*control).readonly_accesses.checked_add(1) else {
-        panic_static(current_frame, b"Readonly Access Count Overflowed");
+        panic_catalogued(current_frame, b"P1505");
     };
     let Some(next_strong) = (*control).strong_references.checked_add(1) else {
-        panic_static(current_frame, b"Writable Shared-Reference Count Overflowed");
+        panic_catalogued(current_frame, b"P1503");
     };
     (*control).readonly_accesses = next_accesses;
     (*control).strong_references = next_strong;
@@ -974,24 +980,18 @@ pub unsafe extern "C" fn dr_v1_writable_shared_acquire_readonly_access(
 ///
 /// `control` must point to a live writable control block.
 #[no_mangle]
-pub unsafe extern "C" fn dr_v1_writable_shared_acquire_writable_access(
-    current_frame: *const DrStackFrameV1,
+pub unsafe extern "C" fn dr_v2_writable_shared_acquire_writable_access(
+    current_frame: *const DrStackFrameV2,
     control: *mut DrWritableSharedControlV1,
 ) -> *mut DrWritableSharedControlV1 {
     if (*control).readonly_accesses != 0 {
-        panic_static(
-            current_frame,
-            b"Cannot Acquire Writable Access While Readonly Access Is Active",
-        );
+        panic_catalogued(current_frame, b"P1501");
     }
     if (*control).writable_access_active {
-        panic_static(
-            current_frame,
-            b"Cannot Acquire Writable Access While Writable Access Is Active",
-        );
+        panic_catalogued(current_frame, b"P1501");
     }
     let Some(next_strong) = (*control).strong_references.checked_add(1) else {
-        panic_static(current_frame, b"Writable Shared-Reference Count Overflowed");
+        panic_catalogued(current_frame, b"P1503");
     };
     (*control).strong_references = next_strong;
     (*control).writable_access_active = true;
@@ -1004,14 +1004,14 @@ pub unsafe extern "C" fn dr_v1_writable_shared_acquire_writable_access(
 ///
 /// `control` must hold a live readonly access registration.
 #[no_mangle]
-pub unsafe extern "C" fn dr_v1_writable_shared_release_readonly_access(
-    current_frame: *const DrStackFrameV1,
+pub unsafe extern "C" fn dr_v2_writable_shared_release_readonly_access(
+    current_frame: *const DrStackFrameV2,
     control: *mut DrWritableSharedControlV1,
 ) {
     debug_assert!(!control.is_null());
     debug_assert!((*control).readonly_accesses != 0);
     (*control).readonly_accesses -= 1;
-    dr_v1_writable_shared_release(current_frame, control);
+    dr_v2_writable_shared_release(current_frame, control);
 }
 
 /// Releases a writable access registration, then its strong ownership claim.
@@ -1020,14 +1020,14 @@ pub unsafe extern "C" fn dr_v1_writable_shared_release_readonly_access(
 ///
 /// `control` must hold the active writable access registration.
 #[no_mangle]
-pub unsafe extern "C" fn dr_v1_writable_shared_release_writable_access(
-    current_frame: *const DrStackFrameV1,
+pub unsafe extern "C" fn dr_v2_writable_shared_release_writable_access(
+    current_frame: *const DrStackFrameV2,
     control: *mut DrWritableSharedControlV1,
 ) {
     debug_assert!(!control.is_null());
     debug_assert!((*control).writable_access_active);
     (*control).writable_access_active = false;
-    dr_v1_writable_shared_release(current_frame, control);
+    dr_v2_writable_shared_release(current_frame, control);
 }
 
 /// Returns the payload behind a live readonly access object.
@@ -1064,28 +1064,59 @@ pub unsafe extern "C" fn dr_v1_writable_shared_writable_payload(
 ///
 /// # Safety
 ///
-/// `entry` must point to a generated function that implements `DrMainIntV1` and remains valid
+/// `entry` must point to a generated function that implements `DrMainIntV2` and remains valid
 /// for the duration of the call.
 #[no_mangle]
-pub unsafe extern "C" fn dr_v1_main_int(entry: DrMainIntV1) -> i32 {
-    process_status(entry(ptr::null()))
+pub unsafe extern "C" fn dr_v2_main_int(
+    entry: DrMainIntV2,
+    source_path: *const u8,
+    source_path_length: usize,
+    source_text: *const u8,
+    source_text_length: usize,
+    source_span_start: usize,
+    source_span_end: usize,
+) -> i32 {
+    process_status(
+        entry(ptr::null()),
+        source_path,
+        source_path_length,
+        source_text,
+        source_text_length,
+        source_span_start,
+        source_span_end,
+    )
 }
 
 /// Maps a Doria `main(): int` result to a process status, panicking outside the
 /// representable `0..=125` range.
-unsafe fn process_status(status: i64) -> i32 {
+unsafe fn process_status(
+    status: i64,
+    source_path: *const u8,
+    source_path_length: usize,
+    source_text: *const u8,
+    source_text_length: usize,
+    source_span_start: usize,
+    source_span_end: usize,
+) -> i32 {
     if (0..=125).contains(&status) {
         return status as i32;
     }
 
     static MAIN: &[u8] = b"main";
-    static MESSAGE: &[u8] = b"main returned process status outside 0..125";
-    let frame = DrStackFrameV1 {
+    let frame = DrStackFrameV2 {
         parent: ptr::null(),
         function_name: MAIN.as_ptr(),
         function_name_length: MAIN.len(),
+        source_path,
+        source_path_length,
+        source_text,
+        source_text_length,
+        function_span_start: source_span_start,
+        function_span_end: source_span_end,
+        active_span_start: source_span_start,
+        active_span_end: source_span_end,
     };
-    dr_v1_panic(&frame, MESSAGE.as_ptr(), MESSAGE.len())
+    panic_catalogued(&frame, b"P1111")
 }
 
 /// Invokes a Doria `main(List<string> $args): int`, building the argument list
@@ -1093,17 +1124,31 @@ unsafe fn process_status(status: i64) -> i32 {
 ///
 /// # Safety
 ///
-/// `entry` must implement `DrMainIntArgsV1`. `argv` must be the argument vector
+/// `entry` must implement `DrMainIntArgsV2`. `argv` must be the argument vector
 /// the process was started with, valid for `argc` entries.
 #[no_mangle]
-pub unsafe extern "C" fn dr_v1_main_int_args(
-    entry: DrMainIntArgsV1,
+pub unsafe extern "C" fn dr_v2_main_int_args(
+    entry: DrMainIntArgsV2,
     argc: i32,
     argv: *const *const u8,
+    source_path: *const u8,
+    source_path_length: usize,
+    source_text: *const u8,
+    source_text_length: usize,
+    source_span_start: usize,
+    source_span_end: usize,
 ) -> i32 {
     let args = entry_args::build(argc, argv);
     // Validate before cleanup: an invalid status is an abort-only panic path.
-    let status = process_status(entry(ptr::null(), args));
+    let status = process_status(
+        entry(ptr::null(), args),
+        source_path,
+        source_path_length,
+        source_text,
+        source_text_length,
+        source_span_start,
+        source_span_end,
+    );
     entry_args::release(args);
     status
 }
@@ -1112,11 +1157,11 @@ pub unsafe extern "C" fn dr_v1_main_int_args(
 ///
 /// # Safety
 ///
-/// `entry` must implement `DrMainVoidArgsV1`. `argv` must be the argument vector
+/// `entry` must implement `DrMainVoidArgsV2`. `argv` must be the argument vector
 /// the process was started with, valid for `argc` entries.
 #[no_mangle]
-pub unsafe extern "C" fn dr_v1_main_void_args(
-    entry: DrMainVoidArgsV1,
+pub unsafe extern "C" fn dr_v2_main_void_args(
+    entry: DrMainVoidArgsV2,
     argc: i32,
     argv: *const *const u8,
 ) -> i32 {
@@ -1130,10 +1175,10 @@ pub unsafe extern "C" fn dr_v1_main_void_args(
 ///
 /// # Safety
 ///
-/// `entry` must point to a generated function that implements `DrMainVoidV1` and remains valid
+/// `entry` must point to a generated function that implements `DrMainVoidV2` and remains valid
 /// for the duration of the call.
 #[no_mangle]
-pub unsafe extern "C" fn dr_v1_main_void(entry: DrMainVoidV1) -> i32 {
+pub unsafe extern "C" fn dr_v2_main_void(entry: DrMainVoidV2) -> i32 {
     entry(ptr::null());
     0
 }
@@ -1154,10 +1199,10 @@ pub extern "C" fn dr_v1_exit_process(status: i32) -> ! {
 /// # Safety
 ///
 /// `bytes` must be readable for `byte_length` bytes. `current_frame` must be null or point to a
-/// valid `DrStackFrameV1` chain whose frame and function-name storage remains live for the call.
+/// valid `DrStackFrameV2` chain whose frame and function-name storage remains live for the call.
 #[no_mangle]
-pub unsafe extern "C" fn dr_v1_write_stdout(
-    current_frame: *const DrStackFrameV1,
+pub unsafe extern "C" fn dr_v2_write_stdout(
+    current_frame: *const DrStackFrameV2,
     bytes: *const u8,
     byte_length: usize,
 ) {
@@ -1166,8 +1211,7 @@ pub unsafe extern "C" fn dr_v1_write_stdout(
         WriteOutcome::BrokenPipe => exit_process(0),
         WriteOutcome::OtherFailure => {}
     }
-    static MESSAGE: &[u8] = b"failed to write stdout";
-    dr_v1_panic(current_frame, MESSAGE.as_ptr(), MESSAGE.len())
+    panic_catalogued(current_frame, b"P1407")
 }
 
 /// Writes an exact byte sequence to stderr.
@@ -1190,8 +1234,8 @@ pub unsafe extern "C" fn dr_v1_write_stderr(bytes: *const u8, byte_length: usize
 ///
 /// `value` must point to a live byte buffer and `current_frame` must be null or valid.
 #[no_mangle]
-pub unsafe extern "C" fn dr_v1_write_stdout_bytes(
-    current_frame: *const DrStackFrameV1,
+pub unsafe extern "C" fn dr_v2_write_stdout_bytes(
+    current_frame: *const DrStackFrameV2,
     value: *const DrBytesV1,
 ) {
     write_byte_stream(
@@ -1207,8 +1251,8 @@ pub unsafe extern "C" fn dr_v1_write_stdout_bytes(
 ///
 /// `value` must point to a live byte buffer and `current_frame` must be null or valid.
 #[no_mangle]
-pub unsafe extern "C" fn dr_v1_write_stderr_bytes(
-    current_frame: *const DrStackFrameV1,
+pub unsafe extern "C" fn dr_v2_write_stderr_bytes(
+    current_frame: *const DrStackFrameV2,
     value: *const DrBytesV1,
 ) {
     write_byte_stream(
@@ -1224,22 +1268,20 @@ pub unsafe extern "C" fn dr_v1_write_stderr_bytes(
 ///
 /// `current_frame` must be null or a valid generated frame chain.
 #[no_mangle]
-pub unsafe extern "C" fn dr_v1_read_stdin_bytes(
-    current_frame: *const DrStackFrameV1,
+pub unsafe extern "C" fn dr_v2_read_stdin_bytes(
+    current_frame: *const DrStackFrameV2,
 ) -> *mut DrBytesV1 {
     let buffered = line_io::take_buffered_input();
     let mut capacity = 4096_usize;
     while capacity < buffered.length {
         let Some(next) = capacity.checked_mul(2) else {
-            static MESSAGE: &[u8] = b"byte-buffer allocation failed";
-            dr_v1_panic(current_frame, MESSAGE.as_ptr(), MESSAGE.len());
+            panic_catalogued(current_frame, b"P1302");
         };
         capacity = next;
     }
     let mut data = allocate(capacity);
     if data.is_null() {
-        static MESSAGE: &[u8] = b"byte-buffer allocation failed";
-        dr_v1_panic(current_frame, MESSAGE.as_ptr(), MESSAGE.len());
+        panic_catalogued(current_frame, b"P1302");
     }
     if buffered.length != 0 {
         ptr::copy_nonoverlapping(buffered.bytes, data, buffered.length);
@@ -1251,14 +1293,12 @@ pub unsafe extern "C" fn dr_v1_read_stdin_bytes(
     loop {
         if length == capacity {
             let Some(next) = capacity.checked_mul(2) else {
-                static MESSAGE: &[u8] = b"byte-buffer allocation failed";
-                dr_v1_panic(current_frame, MESSAGE.as_ptr(), MESSAGE.len());
+                panic_catalogued(current_frame, b"P1302");
             };
             let replacement = allocate(next);
             if replacement.is_null() {
                 deallocate(data);
-                static MESSAGE: &[u8] = b"byte-buffer allocation failed";
-                dr_v1_panic(current_frame, MESSAGE.as_ptr(), MESSAGE.len());
+                panic_catalogued(current_frame, b"P1302");
             }
             ptr::copy_nonoverlapping(data, replacement, length);
             deallocate(data);
@@ -1270,8 +1310,7 @@ pub unsafe extern "C" fn dr_v1_read_stdin_bytes(
             Ok(read) => length += read,
             Err(()) => {
                 deallocate(data);
-                static MESSAGE: &[u8] = b"failed to read stdin";
-                dr_v1_panic(current_frame, MESSAGE.as_ptr(), MESSAGE.len());
+                panic_catalogued(current_frame, b"P1403");
             }
         }
     }
@@ -1282,10 +1321,9 @@ pub unsafe extern "C" fn dr_v1_read_stdin_bytes(
 /// # Safety
 /// `current_frame` must be null or a valid frame chain for panic reporting.
 #[no_mangle]
-pub unsafe extern "C" fn dr_v1_flush_stdout(current_frame: *const DrStackFrameV1) {
+pub unsafe extern "C" fn dr_v2_flush_stdout(current_frame: *const DrStackFrameV2) {
     if !device_io::flush(StandardStream::Stdout) {
-        static MESSAGE: &[u8] = b"failed to flush stdout";
-        dr_v1_panic(current_frame, MESSAGE.as_ptr(), MESSAGE.len());
+        panic_catalogued(current_frame, b"P1407");
     }
 }
 
@@ -1294,10 +1332,9 @@ pub unsafe extern "C" fn dr_v1_flush_stdout(current_frame: *const DrStackFrameV1
 /// # Safety
 /// `current_frame` must be null or a valid frame chain for panic reporting.
 #[no_mangle]
-pub unsafe extern "C" fn dr_v1_flush_stderr(current_frame: *const DrStackFrameV1) {
+pub unsafe extern "C" fn dr_v2_flush_stderr(current_frame: *const DrStackFrameV2) {
     if !device_io::flush(StandardStream::Stderr) {
-        static MESSAGE: &[u8] = b"failed to flush stderr";
-        dr_v1_panic(current_frame, MESSAGE.as_ptr(), MESSAGE.len());
+        panic_catalogued(current_frame, b"P1407");
     }
 }
 
@@ -1325,24 +1362,15 @@ pub unsafe extern "C" fn dr_v1_stream_is_interactive(stream: u8) -> u8 {
 /// # Safety
 /// `current_frame` must be null or a valid frame chain for panic reporting.
 #[no_mangle]
-pub unsafe extern "C" fn dr_v1_read_stdin_line(
-    current_frame: *const DrStackFrameV1,
+pub unsafe extern "C" fn dr_v2_read_stdin_line(
+    current_frame: *const DrStackFrameV2,
 ) -> *mut DrStringV1 {
     match line_io::read_line() {
         Ok(Some((bytes, length))) => dr_v1_string_from_utf8(bytes, length),
         Ok(None) => ptr::null_mut(),
-        Err(line_io::ReadLineError::InvalidUtf8) => {
-            static MESSAGE: &[u8] = b"stdin contained invalid UTF-8";
-            dr_v1_panic(current_frame, MESSAGE.as_ptr(), MESSAGE.len())
-        }
-        Err(line_io::ReadLineError::Read) => {
-            static MESSAGE: &[u8] = b"failed to read stdin";
-            dr_v1_panic(current_frame, MESSAGE.as_ptr(), MESSAGE.len())
-        }
-        Err(line_io::ReadLineError::Allocation) => {
-            static MESSAGE: &[u8] = b"string allocation failed";
-            dr_v1_panic(current_frame, MESSAGE.as_ptr(), MESSAGE.len())
-        }
+        Err(line_io::ReadLineError::InvalidUtf8) => panic_catalogued(current_frame, b"P1404"),
+        Err(line_io::ReadLineError::Read) => panic_catalogued(current_frame, b"P1403"),
+        Err(line_io::ReadLineError::Allocation) => panic_catalogued(current_frame, b"P1206"),
     }
 }
 
@@ -1351,8 +1379,8 @@ pub unsafe extern "C" fn dr_v1_read_stdin_line(
 /// # Safety
 /// `path` must identify a live runtime string and `current_frame` must be null or valid.
 #[no_mangle]
-pub unsafe extern "C" fn dr_v1_read_file(
-    current_frame: *const DrStackFrameV1,
+pub unsafe extern "C" fn dr_v2_read_file(
+    current_frame: *const DrStackFrameV2,
     path: *const DrStringV1,
 ) -> *mut DrStringV1 {
     let path = core::slice::from_raw_parts(string_bytes(path), (*path).byte_length);
@@ -1360,23 +1388,13 @@ pub unsafe extern "C" fn dr_v1_read_file(
         Ok(contents) => {
             let bytes = core::slice::from_raw_parts(contents.bytes, contents.length);
             if core::str::from_utf8(bytes).is_err() {
-                static MESSAGE: &[u8] = b"file contained invalid UTF-8";
-                dr_v1_panic(current_frame, MESSAGE.as_ptr(), MESSAGE.len());
+                panic_catalogued(current_frame, b"P1406");
             }
             dr_v1_string_from_utf8(bytes.as_ptr(), bytes.len())
         }
-        Err(file_io::FileError::PathNul) => {
-            static MESSAGE: &[u8] = b"file path contained an embedded NUL";
-            dr_v1_panic(current_frame, MESSAGE.as_ptr(), MESSAGE.len())
-        }
-        Err(file_io::FileError::Allocation) => {
-            static MESSAGE: &[u8] = b"string allocation failed";
-            dr_v1_panic(current_frame, MESSAGE.as_ptr(), MESSAGE.len())
-        }
-        Err(_) => {
-            static MESSAGE: &[u8] = b"failed to read file";
-            dr_v1_panic(current_frame, MESSAGE.as_ptr(), MESSAGE.len())
-        }
+        Err(file_io::FileError::PathNul) => panic_catalogued(current_frame, b"P1405"),
+        Err(file_io::FileError::Allocation) => panic_catalogued(current_frame, b"P1206"),
+        Err(_) => panic_catalogued(current_frame, b"P1401"),
     }
 }
 
@@ -1385,8 +1403,8 @@ pub unsafe extern "C" fn dr_v1_read_file(
 /// # Safety
 /// Both strings must be live and `current_frame` must be null or valid.
 #[no_mangle]
-pub unsafe extern "C" fn dr_v1_write_file(
-    current_frame: *const DrStackFrameV1,
+pub unsafe extern "C" fn dr_v2_write_file(
+    current_frame: *const DrStackFrameV2,
     path: *const DrStringV1,
     contents: *const DrStringV1,
 ) {
@@ -1394,18 +1412,9 @@ pub unsafe extern "C" fn dr_v1_write_file(
     let contents = core::slice::from_raw_parts(string_bytes(contents), (*contents).byte_length);
     match file_io::write_file(path, contents) {
         Ok(()) => {}
-        Err(file_io::FileError::PathNul) => {
-            static MESSAGE: &[u8] = b"file path contained an embedded NUL";
-            dr_v1_panic(current_frame, MESSAGE.as_ptr(), MESSAGE.len())
-        }
-        Err(file_io::FileError::Allocation) => {
-            static MESSAGE: &[u8] = b"string allocation failed";
-            dr_v1_panic(current_frame, MESSAGE.as_ptr(), MESSAGE.len())
-        }
-        Err(_) => {
-            static MESSAGE: &[u8] = b"failed to write file";
-            dr_v1_panic(current_frame, MESSAGE.as_ptr(), MESSAGE.len())
-        }
+        Err(file_io::FileError::PathNul) => panic_catalogued(current_frame, b"P1405"),
+        Err(file_io::FileError::Allocation) => panic_catalogued(current_frame, b"P1206"),
+        Err(_) => panic_catalogued(current_frame, b"P1402"),
     }
 }
 
@@ -1413,8 +1422,8 @@ pub unsafe extern "C" fn dr_v1_write_file(
 ///
 /// `path` and `contents` must point to live runtime strings and `current_frame` must be null or valid.
 #[no_mangle]
-pub unsafe extern "C" fn dr_v1_append_file(
-    current_frame: *const DrStackFrameV1,
+pub unsafe extern "C" fn dr_v2_append_file(
+    current_frame: *const DrStackFrameV2,
     path: *const DrStringV1,
     contents: *const DrStringV1,
 ) {
@@ -1424,7 +1433,7 @@ pub unsafe extern "C" fn dr_v1_append_file(
         string_bytes(contents),
         (*contents).byte_length,
         true,
-        b"string allocation failed",
+        b"P1206",
     )
 }
 
@@ -1432,8 +1441,8 @@ pub unsafe extern "C" fn dr_v1_append_file(
 ///
 /// `path` must point to a live runtime string and `current_frame` must be null or valid.
 #[no_mangle]
-pub unsafe extern "C" fn dr_v1_read_file_bytes(
-    current_frame: *const DrStackFrameV1,
+pub unsafe extern "C" fn dr_v2_read_file_bytes(
+    current_frame: *const DrStackFrameV2,
     path: *const DrStringV1,
 ) -> *mut DrBytesV1 {
     let path = core::slice::from_raw_parts(string_bytes(path), (*path).byte_length);
@@ -1442,13 +1451,9 @@ pub unsafe extern "C" fn dr_v1_read_file_bytes(
             let (data, length) = contents.into_raw_parts();
             bytes::from_owned(data, length)
         }
-        Err(file_io::FileError::PathNul) => {
-            panic_static(current_frame, b"file path contained an embedded NUL")
-        }
-        Err(file_io::FileError::Allocation) => {
-            panic_static(current_frame, b"byte-buffer allocation failed")
-        }
-        Err(_) => panic_static(current_frame, b"failed to read file"),
+        Err(file_io::FileError::PathNul) => panic_catalogued(current_frame, b"P1405"),
+        Err(file_io::FileError::Allocation) => panic_catalogued(current_frame, b"P1302"),
+        Err(_) => panic_catalogued(current_frame, b"P1401"),
     }
 }
 
@@ -1456,8 +1461,8 @@ pub unsafe extern "C" fn dr_v1_read_file_bytes(
 ///
 /// `path` and `contents` must point to live values and `current_frame` must be null or valid.
 #[no_mangle]
-pub unsafe extern "C" fn dr_v1_write_file_bytes(
-    current_frame: *const DrStackFrameV1,
+pub unsafe extern "C" fn dr_v2_write_file_bytes(
+    current_frame: *const DrStackFrameV2,
     path: *const DrStringV1,
     contents: *const DrBytesV1,
 ) {
@@ -1467,7 +1472,7 @@ pub unsafe extern "C" fn dr_v1_write_file_bytes(
         bytes::data(contents),
         bytes::length(contents),
         false,
-        b"byte-buffer allocation failed",
+        b"P1302",
     )
 }
 
@@ -1475,8 +1480,8 @@ pub unsafe extern "C" fn dr_v1_write_file_bytes(
 ///
 /// `path` and `contents` must point to live values and `current_frame` must be null or valid.
 #[no_mangle]
-pub unsafe extern "C" fn dr_v1_append_file_bytes(
-    current_frame: *const DrStackFrameV1,
+pub unsafe extern "C" fn dr_v2_append_file_bytes(
+    current_frame: *const DrStackFrameV2,
     path: *const DrStringV1,
     contents: *const DrBytesV1,
 ) {
@@ -1486,17 +1491,17 @@ pub unsafe extern "C" fn dr_v1_append_file_bytes(
         bytes::data(contents),
         bytes::length(contents),
         true,
-        b"byte-buffer allocation failed",
+        b"P1302",
     )
 }
 
 unsafe fn write_file_contents(
-    current_frame: *const DrStackFrameV1,
+    current_frame: *const DrStackFrameV2,
     path: *const DrStringV1,
     contents: *const u8,
     length: usize,
     append: bool,
-    allocation_failure: &'static [u8],
+    allocation_failure_code: &'static [u8],
 ) {
     let path = core::slice::from_raw_parts(string_bytes(path), (*path).byte_length);
     let contents = if length == 0 {
@@ -1511,17 +1516,16 @@ unsafe fn write_file_contents(
     };
     match result {
         Ok(()) => {}
-        Err(file_io::FileError::PathNul) => {
-            panic_static(current_frame, b"file path contained an embedded NUL")
+        Err(file_io::FileError::PathNul) => panic_catalogued(current_frame, b"P1405"),
+        Err(file_io::FileError::Allocation) => {
+            panic_catalogued(current_frame, allocation_failure_code)
         }
-        Err(file_io::FileError::Allocation) => panic_static(current_frame, allocation_failure),
-        Err(_) if append => panic_static(current_frame, b"failed to append file"),
-        Err(_) => panic_static(current_frame, b"failed to write file"),
+        Err(_) => panic_catalogued(current_frame, b"P1402"),
     }
 }
 
-unsafe fn panic_static(current_frame: *const DrStackFrameV1, message: &'static [u8]) -> ! {
-    dr_v1_panic(current_frame, message.as_ptr(), message.len())
+unsafe fn panic_catalogued(current_frame: *const DrStackFrameV2, code: &'static [u8]) -> ! {
+    dr_v2_panic_code(current_frame, code.as_ptr(), code.len(), ptr::null(), 0)
 }
 
 /// Reports a fatal Doria panic and exits the process with status 101.
@@ -1529,26 +1533,569 @@ unsafe fn panic_static(current_frame: *const DrStackFrameV1, message: &'static [
 /// # Safety
 ///
 /// `message` must be readable for `message_length` bytes. `current_frame` must be null or point to
-/// a finite, valid `DrStackFrameV1` chain whose frames and function-name byte ranges remain live
+/// a finite, valid `DrStackFrameV2` chain whose frames and function-name byte ranges remain live
 /// until process termination.
 #[no_mangle]
-pub unsafe extern "C" fn dr_v1_panic(
-    current_frame: *const DrStackFrameV1,
+pub unsafe extern "C" fn dr_v2_panic(
+    current_frame: *const DrStackFrameV2,
     message: *const u8,
     message_length: usize,
 ) -> ! {
-    write_panic_fragment(b"Panic: ");
-    write_panic_bytes(message, message_length);
-    write_panic_fragment(b"\nStack Trace:\n");
+    dr_v2_panic_code(current_frame, b"P1000".as_ptr(), 5, message, message_length)
+}
 
+/// Reports a catalogued fatal Doria panic and exits with status 101.
+///
+/// This is the source-aware V2 panic ABI. `code` must identify an entry in the
+/// shared diagnostic catalogue. The optional message is used only for
+/// user-authored `panic(...)`; built-in outcomes derive their public prose from
+/// the catalogue.
+///
+/// # Safety
+///
+/// All byte ranges and every frame in `current_frame` must remain readable
+/// until process termination.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v2_panic_code(
+    current_frame: *const DrStackFrameV2,
+    code: *const u8,
+    code_length: usize,
+    message: *const u8,
+    message_length: usize,
+) -> ! {
+    dr_v2_panic_code_with_facts(
+        current_frame,
+        code,
+        code_length,
+        message,
+        message_length,
+        ptr::null(),
+        0,
+    )
+}
+
+#[no_mangle]
+/// Reports the catalogued empty-padding panic with the facts required by
+/// `P1203`.
+///
+/// # Safety
+///
+/// `current_frame` must be null or identify a valid bounded V2 frame chain,
+/// and `value` must identify a live runtime string until process termination.
+pub unsafe extern "C" fn dr_v2_panic_string_padding_empty(
+    current_frame: *const DrStackFrameV2,
+    value: *const DrStringV1,
+    current_grapheme_length: usize,
+    requested_grapheme_length: i64,
+    padding_grapheme_length: usize,
+) -> ! {
+    let facts = [
+        DrRuntimeFactV2 {
+            name: b"value".as_ptr(),
+            name_length: 5,
+            kind: 4,
+            value: dr_v1_string_data(value) as u64,
+            value_length: dr_v1_string_byte_length(value),
+        },
+        DrRuntimeFactV2 {
+            name: b"currentGraphemeLength".as_ptr(),
+            name_length: 21,
+            kind: 2,
+            value: current_grapheme_length as u64,
+            value_length: 0,
+        },
+        DrRuntimeFactV2 {
+            name: b"requestedGraphemeLength".as_ptr(),
+            name_length: 23,
+            kind: 1,
+            value: requested_grapheme_length as u64,
+            value_length: 0,
+        },
+        DrRuntimeFactV2 {
+            name: b"paddingGraphemeLength".as_ptr(),
+            name_length: 21,
+            kind: 2,
+            value: padding_grapheme_length as u64,
+            value_length: 0,
+        },
+    ];
+    dr_v2_panic_code_with_facts(
+        current_frame,
+        b"P1203".as_ptr(),
+        5,
+        ptr::null(),
+        0,
+        facts.as_ptr(),
+        facts.len(),
+    )
+}
+
+/// Source-aware V2 panic entry with typed dynamic facts.
+///
+/// # Safety
+///
+/// `facts` must contain `fact_count` valid records whose names remain live.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v2_panic_code_with_facts(
+    current_frame: *const DrStackFrameV2,
+    code: *const u8,
+    code_length: usize,
+    message: *const u8,
+    message_length: usize,
+    facts: *const DrRuntimeFactV2,
+    fact_count: usize,
+) -> ! {
+    if code.is_null()
+        || (message_length != 0 && message.is_null())
+        || (fact_count != 0 && facts.is_null())
+    {
+        emergency_runtime_panic();
+    }
+    let code_bytes = core::slice::from_raw_parts(code, code_length);
+    let code_text = core::str::from_utf8(code_bytes).unwrap_or("P1001");
+    let Some(entry) = doria_diagnostic_catalogue::runtime_entry(code_text) else {
+        emergency_runtime_panic();
+    };
+    if !runtime_facts_match(entry.fact_names, facts, fact_count) {
+        emergency_runtime_panic();
+    }
+
+    if write_runtime_outcome_record(
+        current_frame,
+        entry.code.as_bytes(),
+        message,
+        message_length,
+        facts,
+        fact_count,
+    ) {
+        exit_process(PANIC_STATUS)
+    }
+
+    write_panic_fragment(b"Panic[");
+    write_panic_fragment(entry.code.as_bytes());
+    write_panic_fragment(b"]: ");
+    write_panic_fragment(entry.title.as_bytes());
+
+    if !current_frame.is_null() {
+        render_runtime_where(current_frame, entry.primary_label.as_bytes());
+    }
+    write_panic_fragment(b"\n\nWhy\n");
+    if entry.code == "P1203" && fact_count == 4 {
+        write_panic_fragment(b"`padEnd` was asked to extend `\"");
+        write_panic_bytes((*facts).value as *const u8, (*facts).value_length);
+        write_panic_fragment(b"\"` from ");
+        write_usize((*facts.add(1)).value as usize);
+        write_panic_fragment(b" to ");
+        write_usize((*facts.add(2)).value as usize);
+        write_panic_fragment(b" graphemes,\nbut an empty padding string cannot add any graphemes.");
+    } else {
+        write_panic_fragment(entry.explanation.as_bytes());
+    }
+    if entry.code == "P1000" && message_length != 0 {
+        write_panic_fragment(b"\n\nNote\n");
+        write_panic_bytes(message, message_length);
+    }
+    if !current_frame.is_null() {
+        write_panic_fragment(b"\n\nCall Path");
+        let mut frame = current_frame;
+        while !frame.is_null() {
+            write_panic_fragment(b"\n");
+            write_panic_bytes((*frame).function_name, (*frame).function_name_length);
+            if (*frame).source_path_length != 0 {
+                write_panic_fragment(b" \xc2\xb7 ");
+                write_panic_bytes((*frame).source_path, (*frame).source_path_length);
+                write_panic_fragment(b":");
+                write_usize(source_line(
+                    (*frame).source_text,
+                    (*frame).source_text_length,
+                    (*frame).active_span_start,
+                ));
+            }
+            frame = (*frame).parent;
+        }
+    }
+    write_panic_fragment(b"\n\nProcess Exited With Status 101\n");
+    exit_process(PANIC_STATUS)
+}
+
+unsafe fn runtime_facts_match(
+    expected: &[&str],
+    facts: *const DrRuntimeFactV2,
+    fact_count: usize,
+) -> bool {
+    if fact_count == 0 {
+        return true;
+    }
+    if fact_count != expected.len() {
+        return false;
+    }
+    for (index, expected_name) in expected.iter().enumerate() {
+        let fact = &*facts.add(index);
+        if fact.name.is_null()
+            || fact.name_length != expected_name.len()
+            || !(1..=4).contains(&fact.kind)
+            || core::slice::from_raw_parts(fact.name, fact.name_length) != expected_name.as_bytes()
+            || (fact.kind == 4 && fact.value_length != 0 && fact.value == 0)
+        {
+            return false;
+        }
+    }
+    true
+}
+
+unsafe fn emergency_runtime_panic() -> ! {
+    write_panic_fragment(
+        b"Panic[P1001]: Runtime Diagnostic Failed\n\nProcess Exited With Status 101\n",
+    );
+    exit_process(PANIC_STATUS)
+}
+
+unsafe fn write_runtime_outcome_record(
+    current_frame: *const DrStackFrameV2,
+    code: &[u8],
+    message: *const u8,
+    message_length: usize,
+    facts: *const DrRuntimeFactV2,
+    fact_count: usize,
+) -> bool {
+    const MAX_CODE: usize = 16;
+    const MAX_MESSAGE: usize = 64 * 1024;
+    const MAX_PATH: usize = 4096;
+    const MAX_SOURCE: usize = 4 * 1024 * 1024;
+    const MAX_FUNCTION: usize = 1024;
+    const MAX_FRAMES: usize = 128;
+    const MAX_FACTS: usize = 32;
+
+    let mut path_buffer = [0_u8; MAX_PATH];
+    let Some(channel_path) = runtime_outcome_channel_path(&mut path_buffer) else {
+        return false;
+    };
+    if current_frame.is_null()
+        || code.len() > MAX_CODE
+        || message_length > MAX_MESSAGE
+        || (*current_frame).source_path_length > MAX_PATH
+        || (*current_frame).source_text_length > MAX_SOURCE
+        || (*current_frame).function_name_length > MAX_FUNCTION
+        || fact_count > MAX_FACTS
+    {
+        return false;
+    }
+    let mut frame_count = 0_usize;
     let mut frame = current_frame;
     while !frame.is_null() {
-        write_panic_fragment(b"  at ");
-        write_panic_bytes((*frame).function_name, (*frame).function_name_length);
-        write_panic_fragment(b"\n");
+        if frame_count == MAX_FRAMES
+            || (*frame).function_name_length > MAX_FUNCTION
+            || (*frame).source_path_length > MAX_PATH
+        {
+            return false;
+        }
+        frame_count += 1;
         frame = (*frame).parent;
     }
-    exit_process(PANIC_STATUS)
+
+    for index in 0..fact_count {
+        if (*facts.add(index)).name_length > 1024
+            || !(1..=4).contains(&(*facts.add(index)).kind)
+            || (*facts.add(index)).value_length > MAX_MESSAGE
+        {
+            return false;
+        }
+    }
+
+    let mut header = [0_u8; 46];
+    header[..8].copy_from_slice(b"DORIAO2\0");
+    put_u16(&mut header[8..10], 2);
+    put_u16(&mut header[10..12], code.len() as u16);
+    put_u32(&mut header[12..16], message_length as u32);
+    put_u32(
+        &mut header[16..20],
+        (*current_frame).source_path_length as u32,
+    );
+    put_u32(
+        &mut header[20..24],
+        (*current_frame).source_text_length as u32,
+    );
+    put_u16(
+        &mut header[24..26],
+        (*current_frame).function_name_length as u16,
+    );
+    put_u16(&mut header[26..28], frame_count as u16);
+    put_u16(&mut header[28..30], fact_count as u16);
+    put_u64(
+        &mut header[30..38],
+        (*current_frame).active_span_start as u64,
+    );
+    put_u64(&mut header[38..46], (*current_frame).active_span_end as u64);
+
+    if file_io::write_file(channel_path, &header).is_err()
+        || file_io::append_file(channel_path, code).is_err()
+        || (message_length != 0
+            && file_io::append_file(
+                channel_path,
+                core::slice::from_raw_parts(message, message_length),
+            )
+            .is_err())
+        || file_io::append_file(
+            channel_path,
+            core::slice::from_raw_parts(
+                (*current_frame).source_path,
+                (*current_frame).source_path_length,
+            ),
+        )
+        .is_err()
+        || file_io::append_file(
+            channel_path,
+            core::slice::from_raw_parts(
+                (*current_frame).source_text,
+                (*current_frame).source_text_length,
+            ),
+        )
+        .is_err()
+        || file_io::append_file(
+            channel_path,
+            core::slice::from_raw_parts(
+                (*current_frame).function_name,
+                (*current_frame).function_name_length,
+            ),
+        )
+        .is_err()
+    {
+        return false;
+    }
+
+    for index in 0..fact_count {
+        let fact = &*facts.add(index);
+        let mut fact_header = [0_u8; 15];
+        put_u16(&mut fact_header[..2], fact.name_length as u16);
+        fact_header[2] = fact.kind as u8;
+        put_u64(&mut fact_header[3..11], fact.value);
+        put_u32(&mut fact_header[11..15], fact.value_length as u32);
+        if file_io::append_file(channel_path, &fact_header).is_err()
+            || file_io::append_file(
+                channel_path,
+                core::slice::from_raw_parts(fact.name, fact.name_length),
+            )
+            .is_err()
+            || (fact.kind == 4
+                && fact.value_length != 0
+                && file_io::append_file(
+                    channel_path,
+                    core::slice::from_raw_parts(fact.value as *const u8, fact.value_length),
+                )
+                .is_err())
+        {
+            return false;
+        }
+    }
+
+    frame = current_frame;
+    while !frame.is_null() {
+        let mut frame_header = [0_u8; 22];
+        put_u16(&mut frame_header[..2], (*frame).function_name_length as u16);
+        put_u32(&mut frame_header[2..6], (*frame).source_path_length as u32);
+        put_u64(&mut frame_header[6..14], (*frame).active_span_start as u64);
+        put_u64(&mut frame_header[14..22], (*frame).active_span_end as u64);
+        if file_io::append_file(channel_path, &frame_header).is_err()
+            || file_io::append_file(
+                channel_path,
+                core::slice::from_raw_parts((*frame).function_name, (*frame).function_name_length),
+            )
+            .is_err()
+            || file_io::append_file(
+                channel_path,
+                core::slice::from_raw_parts((*frame).source_path, (*frame).source_path_length),
+            )
+            .is_err()
+        {
+            return false;
+        }
+        frame = (*frame).parent;
+    }
+    true
+}
+
+fn put_u16(target: &mut [u8], value: u16) {
+    target.copy_from_slice(&value.to_le_bytes());
+}
+
+fn put_u32(target: &mut [u8], value: u32) {
+    target.copy_from_slice(&value.to_le_bytes());
+}
+
+fn put_u64(target: &mut [u8], value: u64) {
+    target.copy_from_slice(&value.to_le_bytes());
+}
+
+#[cfg(unix)]
+unsafe fn runtime_outcome_channel_path(buffer: &mut [u8]) -> Option<&[u8]> {
+    let name = b"DORIA_RUNTIME_OUTCOME_V2\0";
+    let value = getenv(name.as_ptr());
+    if value.is_null() {
+        return None;
+    }
+    for index in 0..buffer.len() {
+        let byte = *value.add(index);
+        if byte == 0 {
+            return Some(&buffer[..index]);
+        }
+        buffer[index] = byte;
+    }
+    None
+}
+
+#[cfg(windows)]
+unsafe fn runtime_outcome_channel_path(buffer: &mut [u8]) -> Option<&[u8]> {
+    let name = b"DORIA_RUNTIME_OUTCOME_V2\0";
+    let length = GetEnvironmentVariableA(
+        name.as_ptr(),
+        buffer.as_mut_ptr(),
+        buffer.len().try_into().ok()?,
+    ) as usize;
+    (length != 0 && length < buffer.len()).then_some(&buffer[..length])
+}
+
+unsafe fn render_runtime_where(frame: *const DrStackFrameV2, primary_label: &[u8]) {
+    let line = source_line(
+        (*frame).source_text,
+        (*frame).source_text_length,
+        (*frame).active_span_start,
+    );
+    write_panic_fragment(b"\n\nWhere\n");
+    write_panic_bytes((*frame).source_path, (*frame).source_path_length);
+    write_panic_fragment(b" \xc2\xb7 line ");
+    write_usize(line);
+    write_panic_fragment(b" \xc2\xb7 ");
+    write_panic_bytes((*frame).function_name, (*frame).function_name_length);
+
+    if (*frame).source_text_length == 0 {
+        return;
+    }
+    let source = core::slice::from_raw_parts((*frame).source_text, (*frame).source_text_length);
+    if core::str::from_utf8(source).is_err() {
+        return;
+    }
+    let start = (*frame).active_span_start.min(source.len());
+    let end = (*frame)
+        .active_span_end
+        .max(start.saturating_add(1))
+        .min(source.len());
+    let mut line_number = line;
+    let mut line_start = source[..start]
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |index| index + 1);
+    let final_line = source_line(source.as_ptr(), source.len(), end);
+    let gutter = decimal_digits(final_line).max(3);
+    while line_number <= final_line && line_start <= source.len() {
+        let mut line_end = source[line_start..]
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(source.len(), |index| line_start + index);
+        if line_end > line_start && source[line_end - 1] == b'\r' {
+            line_end -= 1;
+        }
+        let marker_start = start.max(line_start).min(line_end);
+        let marker_end = end.min(line_end).max(marker_start);
+        let digits = decimal_digits(line_number);
+        if line_number == line {
+            write_panic_fragment(b"\n\n");
+        } else {
+            write_panic_fragment(b"\n");
+        }
+        for _ in digits..gutter {
+            write_panic_fragment(b" ");
+        }
+        write_usize(line_number);
+        write_panic_fragment(b"      ");
+        write_source_line(&source[line_start..line_end]);
+        write_panic_fragment(b"\n");
+        let marker_offset = display_width_with_tabs(&source[line_start..marker_start], 4);
+        let marker_width = display_width_with_tabs(&source[marker_start..marker_end], 4).max(1);
+        for _ in 0..(gutter + 6 + marker_offset) {
+            write_panic_fragment(b" ");
+        }
+        for _ in 0..marker_width {
+            write_panic_fragment(b"^");
+        }
+        if line_number == line {
+            write_panic_fragment(b"\n");
+            for _ in 0..(gutter + 6 + marker_offset) {
+                write_panic_fragment(b" ");
+            }
+            write_panic_fragment(primary_label);
+        }
+        let next_line_start = source[line_start..]
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map(|index| line_start + index + 1);
+        let Some(next_line_start) = next_line_start else {
+            break;
+        };
+        line_start = next_line_start;
+        line_number += 1;
+    }
+}
+
+fn display_width_with_tabs(bytes: &[u8], tab_width: usize) -> usize {
+    let Ok(text) = core::str::from_utf8(bytes) else {
+        return 0;
+    };
+    let mut width = 0;
+    for character in text.chars() {
+        if character == '\t' {
+            width += tab_width - (width % tab_width);
+        } else {
+            width += character.width().unwrap_or(0);
+        }
+    }
+    width
+}
+
+unsafe fn write_source_line(bytes: &[u8]) {
+    let Ok(text) = core::str::from_utf8(bytes) else {
+        return;
+    };
+    let mut width = 0;
+    for character in text.chars() {
+        if character == '\t' {
+            let spaces = 4 - (width % 4);
+            for _ in 0..spaces {
+                write_panic_fragment(b" ");
+            }
+            width += spaces;
+        } else {
+            let mut encoded = [0_u8; 4];
+            let value = character.encode_utf8(&mut encoded);
+            write_panic_fragment(value.as_bytes());
+            width += character.width().unwrap_or(0);
+        }
+    }
+}
+
+unsafe fn source_line(source: *const u8, source_length: usize, offset: usize) -> usize {
+    if source.is_null() || source_length == 0 {
+        return 1;
+    }
+    let source = core::slice::from_raw_parts(source, source_length);
+    1 + source[..offset.min(source.len())]
+        .iter()
+        .filter(|byte| **byte == b'\n')
+        .count()
+}
+
+fn decimal_digits(mut value: usize) -> usize {
+    let mut digits = 1;
+    while value >= 10 {
+        value /= 10;
+        digits += 1;
+    }
+    digits
+}
+
+unsafe fn write_usize(value: usize) {
+    let mut buffer = [0_u8; 20];
+    let (start, length) = unsigned_decimal(value as u64, &mut buffer);
+    write_panic_fragment(&buffer[start..start + length]);
 }
 
 /// Allocates an immutable runtime string from an explicit byte range.
@@ -1572,25 +2119,15 @@ pub(crate) unsafe fn allocate_string(byte_length: usize) -> *mut DrStringV1 {
 }
 
 pub(crate) unsafe fn allocate_string_with_frame(
-    frame: *const DrStackFrameV1,
+    frame: *const DrStackFrameV2,
     byte_length: usize,
 ) -> *mut DrStringV1 {
     let total = STRING_HEADER_SIZE
         .checked_add(byte_length)
-        .unwrap_or_else(|| {
-            dr_v1_panic(
-                frame,
-                b"String Result Is Too Large".as_ptr(),
-                b"String Result Is Too Large".len(),
-            )
-        });
+        .unwrap_or_else(|| panic_catalogued(frame, b"P1205"));
     let string = allocate(total).cast::<DrStringV1>();
     if string.is_null() {
-        dr_v1_panic(
-            frame,
-            b"String Result Is Too Large".as_ptr(),
-            b"String Result Is Too Large".len(),
-        );
+        panic_catalogued(frame, b"P1205");
     }
     ptr::write(
         string,
@@ -1623,7 +2160,7 @@ pub unsafe extern "C" fn dr_v1_string_retain(string: *mut DrStringV1) -> *mut Dr
         (*string).references = (*string)
             .references
             .checked_add(1)
-            .unwrap_or_else(|| string_runtime_panic(b"string reference count overflow"));
+            .unwrap_or_else(|| runtime_invariant_panic());
     }
     string
 }
@@ -1642,7 +2179,7 @@ pub unsafe extern "C" fn dr_v1_string_release(string: *mut DrStringV1) {
         return;
     }
     if references == 0 {
-        string_runtime_panic(b"string reference count underflow");
+        runtime_invariant_panic();
     }
     if references == 1 {
         deallocate(string.cast::<u8>());
@@ -1663,7 +2200,7 @@ pub unsafe extern "C" fn dr_v1_string_concat(
     let length = (*left)
         .byte_length
         .checked_add((*right).byte_length)
-        .unwrap_or_else(|| string_runtime_panic(b"string length overflow"));
+        .unwrap_or_else(|| string_result_too_large());
     let result = allocate_string(length);
     ptr::copy_nonoverlapping(
         string_bytes(left),
@@ -1752,11 +2289,11 @@ pub unsafe extern "C" fn dr_v1_string_byte_length(string: *const DrStringV1) -> 
 ///
 /// # Safety
 /// `string` must identify a live doria-rt string and `current_frame` must be null or a valid frame chain.
-pub unsafe extern "C" fn dr_v1_write_string_stdout(
-    current_frame: *const DrStackFrameV1,
+pub unsafe extern "C" fn dr_v2_write_string_stdout(
+    current_frame: *const DrStackFrameV2,
     string: *const DrStringV1,
 ) {
-    dr_v1_write_stdout(current_frame, string_bytes(string), (*string).byte_length)
+    dr_v2_write_stdout(current_frame, string_bytes(string), (*string).byte_length)
 }
 
 /// Writes a borrowed string to stderr without adding a newline.
@@ -1764,8 +2301,8 @@ pub unsafe extern "C" fn dr_v1_write_string_stdout(
 /// # Safety
 /// `string` must identify a live runtime string and `current_frame` must be null or valid.
 #[no_mangle]
-pub unsafe extern "C" fn dr_v1_write_string_stderr(
-    current_frame: *const DrStackFrameV1,
+pub unsafe extern "C" fn dr_v2_write_string_stderr(
+    current_frame: *const DrStackFrameV2,
     string: *const DrStringV1,
 ) {
     match write_standard_stream(
@@ -1777,8 +2314,7 @@ pub unsafe extern "C" fn dr_v1_write_string_stderr(
         WriteOutcome::BrokenPipe => exit_process(0),
         WriteOutcome::OtherFailure => {}
     }
-    static MESSAGE: &[u8] = b"failed to write stderr";
-    dr_v1_panic(current_frame, MESSAGE.as_ptr(), MESSAGE.len());
+    panic_catalogued(current_frame, b"P1407");
 }
 
 #[no_mangle]
@@ -1972,18 +2508,18 @@ unsafe fn format_fixed_float(
     for _ in 0..precision {
         factor = factor
             .checked_mul(10)
-            .unwrap_or_else(|| string_runtime_panic(b"formatted float precision is too large"));
+            .unwrap_or_else(|| string_result_too_large());
     }
     let scaled = value.abs() * factor as f64;
     if !scaled.is_finite() || scaled > u128::MAX as f64 {
-        string_runtime_panic(b"formatted float magnitude is too large");
+        string_result_too_large();
     }
     let truncated = scaled as u128;
     let fraction = scaled - truncated as f64;
     let rounded = if fraction > 0.5 || (fraction == 0.5 && truncated & 1 == 1) {
         truncated
             .checked_add(1)
-            .unwrap_or_else(|| string_runtime_panic(b"formatted float magnitude is too large"))
+            .unwrap_or_else(|| string_result_too_large())
     } else {
         truncated
     };
@@ -1997,7 +2533,7 @@ unsafe fn format_fixed_float(
         .checked_add(integer_length)
         .and_then(|length| length.checked_add(decimal_length))
         .and_then(|length| length.checked_add(precision))
-        .unwrap_or_else(|| string_runtime_panic(b"string length overflow"));
+        .unwrap_or_else(|| string_result_too_large());
     let raw = allocate_string(length);
     let mut cursor = 0;
     if negative {
@@ -2232,8 +2768,12 @@ pub unsafe extern "C" fn dr_v1_float_parse(text: *const DrStringV1, found: *mut 
     }
 }
 
-unsafe fn string_runtime_panic(message: &[u8]) -> ! {
-    dr_v1_panic(ptr::null(), message.as_ptr(), message.len())
+unsafe fn string_result_too_large() -> ! {
+    panic_catalogued(ptr::null(), b"P1205")
+}
+
+unsafe fn runtime_invariant_panic() -> ! {
+    panic_catalogued(ptr::null(), b"P1001")
 }
 
 #[cfg(unix)]
@@ -2288,7 +2828,7 @@ unsafe fn write_standard_stream(
 }
 
 unsafe fn write_byte_stream(
-    current_frame: *const DrStackFrameV1,
+    current_frame: *const DrStackFrameV2,
     stream: StandardStream,
     data: *const u8,
     length: usize,
@@ -2300,7 +2840,10 @@ unsafe fn write_byte_stream(
     match device_io::write_bytes(stream, data, length) {
         WriteOutcome::Success => {}
         WriteOutcome::BrokenPipe => exit_process(0),
-        WriteOutcome::OtherFailure => dr_v1_panic(current_frame, failure.as_ptr(), failure.len()),
+        WriteOutcome::OtherFailure => {
+            let _ = failure;
+            panic_catalogued(current_frame, b"P1407")
+        }
     }
 }
 
@@ -2324,9 +2867,16 @@ unsafe fn exit_process(_status: i32) -> ! {
 #[cfg(unix)]
 extern "C" {
     fn signal(signal: i32, handler: usize) -> usize;
+    fn getenv(name: *const u8) -> *const u8;
     fn _exit(status: i32) -> !;
     fn malloc(byte_length: usize) -> *mut c_void;
     fn free(memory: *mut c_void);
+}
+
+#[cfg(windows)]
+#[link(name = "kernel32")]
+extern "system" {
+    fn GetEnvironmentVariableA(name: *const u8, buffer: *mut u8, size: u32) -> u32;
 }
 
 // Doria's Windows executables deliberately do not link the C runtime. Rust and ryu still lower
@@ -2536,7 +3086,7 @@ mod tests {
     }
 
     unsafe extern "C" fn drop_test_shared_payload(
-        _current_frame: *const DrStackFrameV1,
+        _current_frame: *const DrStackFrameV2,
         payload: *mut u8,
     ) {
         SHARED_PAYLOAD_DROPS.set(SHARED_PAYLOAD_DROPS.get() + 1);
@@ -2548,13 +3098,13 @@ mod tests {
     }
 
     #[test]
-    fn stack_frame_layout_is_three_pointer_words() {
+    fn stack_frame_v2_layout_is_source_aware() {
         assert_eq!(
-            core::mem::size_of::<DrStackFrameV1>(),
-            3 * core::mem::size_of::<usize>()
+            core::mem::size_of::<DrStackFrameV2>(),
+            11 * core::mem::size_of::<usize>()
         );
         assert_eq!(
-            core::mem::align_of::<DrStackFrameV1>(),
+            core::mem::align_of::<DrStackFrameV2>(),
             core::mem::align_of::<usize>()
         );
     }
@@ -2563,7 +3113,7 @@ mod tests {
     fn headerless_class_allocation_handles_empty_and_nonempty_payloads() {
         unsafe {
             for size in [0, 1, 24] {
-                let payload = dr_v1_class_allocate(ptr::null(), size, 8);
+                let payload = dr_v2_class_allocate(ptr::null(), size, 8);
                 assert!(!payload.is_null());
                 if size > 0 {
                     assert!(core::slice::from_raw_parts(payload, size)
@@ -2580,29 +3130,29 @@ mod tests {
     fn shared_control_drops_payload_once_and_outlives_it_for_weak_references() {
         unsafe {
             reset_shared_payload_drops();
-            let payload = dr_v1_class_allocate(ptr::null(), 8, 8);
-            let control = dr_v1_shared_create(ptr::null(), payload, drop_test_shared_payload);
+            let payload = dr_v2_class_allocate(ptr::null(), 8, 8);
+            let control = dr_v2_shared_create(ptr::null(), payload, drop_test_shared_payload);
 
             assert_eq!((*control).strong_references, 1);
             assert_eq!((*control).weak_references, 0);
             assert_eq!(dr_v1_shared_payload(control), payload);
 
-            assert_eq!(dr_v1_shared_retain(ptr::null(), control), control);
-            assert_eq!(dr_v1_shared_create_weak(ptr::null(), control), control);
+            assert_eq!(dr_v2_shared_retain(ptr::null(), control), control);
+            assert_eq!(dr_v2_shared_create_weak(ptr::null(), control), control);
             assert_eq!((*control).strong_references, 2);
             assert_eq!((*control).weak_references, 1);
 
-            dr_v1_shared_release(ptr::null(), control);
-            let acquired = dr_v1_shared_acquire(ptr::null(), control);
+            dr_v2_shared_release(ptr::null(), control);
+            let acquired = dr_v2_shared_acquire(ptr::null(), control);
             assert_eq!(acquired, control);
             assert_eq!((*control).strong_references, 2);
 
-            dr_v1_shared_release(ptr::null(), acquired);
-            dr_v1_shared_release(ptr::null(), control);
+            dr_v2_shared_release(ptr::null(), acquired);
+            dr_v2_shared_release(ptr::null(), control);
             assert_eq!(shared_payload_drops(), 1);
             assert_eq!((*control).strong_references, 0);
             assert!((*control).payload.is_null());
-            assert!(dr_v1_shared_acquire(ptr::null(), control).is_null());
+            assert!(dr_v2_shared_acquire(ptr::null(), control).is_null());
 
             dr_v1_shared_release_weak(control);
         }
@@ -2612,54 +3162,54 @@ mod tests {
     fn writable_shared_control_tracks_ownership_access_and_payload_lifetime() {
         unsafe {
             reset_shared_payload_drops();
-            let payload = dr_v1_class_allocate(ptr::null(), 8, 8);
+            let payload = dr_v2_class_allocate(ptr::null(), 8, 8);
             let control =
-                dr_v1_writable_shared_create(ptr::null(), payload, drop_test_shared_payload);
+                dr_v2_writable_shared_create(ptr::null(), payload, drop_test_shared_payload);
 
             assert_eq!((*control).strong_references, 1);
             assert_eq!((*control).weak_references, 0);
             assert_eq!((*control).readonly_accesses, 0);
             assert!(!(*control).writable_access_active);
 
-            assert_eq!(dr_v1_writable_shared_retain(ptr::null(), control), control);
+            assert_eq!(dr_v2_writable_shared_retain(ptr::null(), control), control);
             assert_eq!(
-                dr_v1_writable_shared_create_weak(ptr::null(), control),
+                dr_v2_writable_shared_create_weak(ptr::null(), control),
                 control
             );
             assert_eq!((*control).strong_references, 2);
             assert_eq!((*control).weak_references, 1);
 
-            let first = dr_v1_writable_shared_acquire_readonly_access(ptr::null(), control);
-            let second = dr_v1_writable_shared_acquire_readonly_access(ptr::null(), control);
+            let first = dr_v2_writable_shared_acquire_readonly_access(ptr::null(), control);
+            let second = dr_v2_writable_shared_acquire_readonly_access(ptr::null(), control);
             assert_eq!(first, control);
             assert_eq!(second, control);
             assert_eq!((*control).strong_references, 4);
             assert_eq!((*control).readonly_accesses, 2);
             assert_eq!(dr_v1_writable_shared_readonly_payload(first), payload);
 
-            dr_v1_writable_shared_release_readonly_access(ptr::null(), first);
-            dr_v1_writable_shared_release_readonly_access(ptr::null(), second);
+            dr_v2_writable_shared_release_readonly_access(ptr::null(), first);
+            dr_v2_writable_shared_release_readonly_access(ptr::null(), second);
             assert_eq!((*control).strong_references, 2);
             assert_eq!((*control).readonly_accesses, 0);
 
-            let writable = dr_v1_writable_shared_acquire_writable_access(ptr::null(), control);
+            let writable = dr_v2_writable_shared_acquire_writable_access(ptr::null(), control);
             assert_eq!((*control).strong_references, 3);
             assert!((*control).writable_access_active);
             assert_eq!(dr_v1_writable_shared_writable_payload(writable), payload);
-            dr_v1_writable_shared_release_writable_access(ptr::null(), writable);
+            dr_v2_writable_shared_release_writable_access(ptr::null(), writable);
             assert_eq!((*control).strong_references, 2);
             assert!(!(*control).writable_access_active);
 
-            dr_v1_writable_shared_release(ptr::null(), control);
-            let acquired = dr_v1_writable_shared_acquire(ptr::null(), control);
+            dr_v2_writable_shared_release(ptr::null(), control);
+            let acquired = dr_v2_writable_shared_acquire(ptr::null(), control);
             assert_eq!(acquired, control);
-            dr_v1_writable_shared_release(ptr::null(), acquired);
-            dr_v1_writable_shared_release(ptr::null(), control);
+            dr_v2_writable_shared_release(ptr::null(), acquired);
+            dr_v2_writable_shared_release(ptr::null(), control);
 
             assert_eq!(shared_payload_drops(), 1);
             assert_eq!((*control).strong_references, 0);
             assert!((*control).payload.is_null());
-            assert!(dr_v1_writable_shared_acquire(ptr::null(), control).is_null());
+            assert!(dr_v2_writable_shared_acquire(ptr::null(), control).is_null());
 
             dr_v1_writable_shared_release_weak(control);
         }
@@ -2669,21 +3219,21 @@ mod tests {
     fn writable_access_object_can_be_the_final_strong_owner() {
         unsafe {
             reset_shared_payload_drops();
-            let payload = dr_v1_class_allocate(ptr::null(), 8, 8);
+            let payload = dr_v2_class_allocate(ptr::null(), 8, 8);
             let control =
-                dr_v1_writable_shared_create(ptr::null(), payload, drop_test_shared_payload);
-            let weak = dr_v1_writable_shared_create_weak(ptr::null(), control);
-            let access = dr_v1_writable_shared_acquire_readonly_access(ptr::null(), control);
+                dr_v2_writable_shared_create(ptr::null(), payload, drop_test_shared_payload);
+            let weak = dr_v2_writable_shared_create_weak(ptr::null(), control);
+            let access = dr_v2_writable_shared_acquire_readonly_access(ptr::null(), control);
 
-            dr_v1_writable_shared_release(ptr::null(), control);
-            let acquired = dr_v1_writable_shared_acquire(ptr::null(), weak);
+            dr_v2_writable_shared_release(ptr::null(), control);
+            let acquired = dr_v2_writable_shared_acquire(ptr::null(), weak);
             assert_eq!(acquired, control);
-            dr_v1_writable_shared_release(ptr::null(), acquired);
+            dr_v2_writable_shared_release(ptr::null(), acquired);
             assert_eq!(shared_payload_drops(), 0);
 
-            dr_v1_writable_shared_release_readonly_access(ptr::null(), access);
+            dr_v2_writable_shared_release_readonly_access(ptr::null(), access);
             assert_eq!(shared_payload_drops(), 1);
-            assert!(dr_v1_writable_shared_acquire(ptr::null(), weak).is_null());
+            assert!(dr_v2_writable_shared_acquire(ptr::null(), weak).is_null());
             dr_v1_writable_shared_release_weak(weak);
         }
     }
@@ -2697,6 +3247,15 @@ mod tests {
                 dr_v1_string_release(string);
             }
         }
+    }
+
+    #[test]
+    fn runtime_source_markers_use_terminal_display_width() {
+        assert_eq!(display_width_with_tabs(b"\t", 4), 4);
+        assert_eq!(display_width_with_tabs("e\u{301}".as_bytes(), 4), 1);
+        assert_eq!(display_width_with_tabs("🙂".as_bytes(), 4), 2);
+        assert_eq!(display_width_with_tabs("界".as_bytes(), 4), 2);
+        assert_eq!(display_width_with_tabs(b"a\tb", 4), 5);
     }
 
     #[test]
@@ -2724,20 +3283,20 @@ mod tests {
                 (4, 0xabcdef01u64),
                 (8, 0xabcdef0123456789u64),
             ] {
-                let words = dr_v1_collection_fill_word(ptr::null(), value, 3, 1, width);
+                let words = dr_v2_collection_fill_word(ptr::null(), value, 3, 1, width);
                 assert_eq!(dr_v1_collection_length(words), 3);
                 for index in 0..3 {
-                    assert_eq!(dr_v1_collection_value_at(ptr::null(), words, index), value);
+                    assert_eq!(dr_v2_collection_value_at(ptr::null(), words, index), value);
                 }
                 dr_v1_collection_free(words);
             }
 
             let string = dr_v1_string_from_utf8(b"shared".as_ptr(), 6);
-            let strings = dr_v1_collection_fill_string(ptr::null(), string, 3, 0);
+            let strings = dr_v2_collection_fill_string(ptr::null(), string, 3, 0);
             assert_eq!((*string).references, 4);
             for index in 0..3 {
                 let slot =
-                    dr_v1_collection_value_at(ptr::null(), strings, index) as *mut DrStringV1;
+                    dr_v2_collection_value_at(ptr::null(), strings, index) as *mut DrStringV1;
                 assert_eq!(slot, string);
                 dr_v1_string_release(slot);
             }

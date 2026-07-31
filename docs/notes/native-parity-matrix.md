@@ -62,7 +62,7 @@ Source of truth for sequencing remains `docs/doria-end-to-end-plan.md`. The dura
 | Transitive returned collection borrows | Covered | Covered | Covered | Covered | Generic repository results preserve `$this` provenance through property projection and `Dictionary::get` without acquiring ownership. |
 | Readonly shared ownership | Covered | Covered | Covered | Covered | `SharedReference<T>`, `WeakReference<T>`, nullable acquisition, forwarding, generic/property/collection storage, and exact final-strong destruction use a separate non-atomic control block without changing class payload layout. |
 | Writable shared ownership and access | Covered | Covered | Covered | Covered | Class/collection/`Bytes` payloads, disjoint strong/weak families, owned access objects, conflict panics, forwarding, and deterministic access-before-strong release share one validated MIR/runtime contract. |
-| Runtime panic diagnostic envelope | Covered | Covered | Covered | Covered | Canonical panic messages, Title Case `Panic` / `Stack Trace` headings, Doria frames, stderr bytes, and status 101 remain exact across the durable manifest. |
+| Runtime panic diagnostic outcome | Covered | Covered | Covered | Covered | Catalogued `P` code, Title Case title, precise Doria source label, `Why`, `Call Path`, stderr bytes, and status 101 remain exact across the durable manifest. |
 | `take` ownership transfer | Covered | Covered | Covered | Covered | Transfer invalidates the caller slot and cleanup becomes the callee's obligation. |
 | Property loads and Stage 19 assignments | Covered | Covered | Covered | Covered | Shared class metadata supplies checked types and compiler-known offsets. |
 | Property-rooted indexed move-in | Covered | Covered | Covered | Covered | Writable paths mutate a contained collection slot, move the element once, and drop a replaced value without replacing the collection property. |
@@ -93,11 +93,11 @@ Source of truth for sequencing remains `docs/doria-end-to-end-plan.md`. The dura
 | Process exit boundary | Covered | Covered | Covered | Covered | Only `main(): int` is restricted to `0..125`. |
 | Recursion and mutual recursion | Covered | Covered | Covered | Covered | Explicit interpreter frames remove the former 256-frame semantic cap. |
 | Return from nested control flow | Covered | Covered | Covered | Covered | Source CFG reachability permits return anywhere and rejects reachable fallthrough. |
-| Explicit panic | Covered | Covered | Covered | Covered | Exact stderr stack trace and status 101 agree. |
+| Explicit panic | Covered | Covered | Covered | Covered | Exact structured runtime diagnostic, Doria call path, and status 101 agree. |
 | Checked overflow panic | Covered | Covered | Covered | Covered | Addition, subtraction, and multiplication messages agree exactly. |
-| Signed negation overflow panic | Covered | Covered | Covered | Covered | Exact message, Doria stack frames, and status 101 agree. |
+| Signed negation overflow panic | Covered | Covered | Covered | Covered | Exact catalogue identity, Doria call-path frames, and status 101 agree. |
 | Divide-by-zero and signed-division-overflow panic | Covered | Covered | Covered | Covered | Both failure classes keep their distinct deterministic messages. |
-| Remainder-by-zero panic | Covered | Covered | Covered | Covered | Exact message, Doria stack frames, and status 101 agree. |
+| Remainder-by-zero panic | Covered | Covered | Covered | Covered | Exact catalogue identity, Doria call-path frames, and status 101 agree. |
 | Shift-count panic | Covered | Covered | Covered | Covered | Negative and width-or-greater counts use one deterministic panic message. |
 | Conversion-out-of-range panic | Covered | Covered | Covered | Covered | Checked companion conversion failure agrees on stderr and status 101. |
 | Fixed-width function ABI | Covered | Covered | Covered | Covered | Narrow signed/unsigned parameters and returns preserve canonical type and bit pattern. |
@@ -116,7 +116,7 @@ Source of truth for sequencing remains `docs/doria-end-to-end-plan.md`. The dura
 | Bool eager xor | Covered | Covered | Covered | Covered | Both operands execute left-to-right and produce a canonical bool. |
 | `Int::toFloat` | Covered | Covered | Covered | Covered | Canonical signed int64 converts to binary64 with IEEE rounding and no panic. |
 | `Float::toInt` | Covered | Covered | Covered | Covered | Binary64 truncates toward zero after explicit finite/range checks. |
-| Float-to-int panic | Covered | Covered | Covered | Covered | NaN, infinity, and positive `2^63` produce identical message, stack trace, and status 101. |
+| Float-to-int panic | Covered | Covered | Covered | Covered | NaN, infinity, and positive `2^63` produce identical structured diagnostics, call paths, and status 101. |
 | Mixed int/float and float-width rejection | Frontend | Frontend | Frontend | Covered | Semantic diagnostics prevent implicit cross-kind or cross-width values before MIR. |
 | PHP float32 boundary | Diagnostic | Diagnostic | Diagnostic | Covered | PHP never emits unknown float width names; exact float64 division uses `fdiv`. |
 | Invalid process status panic | Covered | Covered | Covered | Covered | Runtime entry validates `main(): int` and exits 101 on failure. |
@@ -132,7 +132,7 @@ Source of truth for sequencing remains `docs/doria-end-to-end-plan.md`. The dura
 | Checked `sprintf` | Covered | Covered | Covered | Covered | One validated MIR plan covers every accepted conversion, width, alignment, padding, and precision form. |
 | Checked `printf` | Covered | Covered | Covered | Covered | Same plan as `sprintf`; exact stdout, void result, and no implicit newline. |
 | Format failures | Frontend | Frontend | Frontend | Covered | Dynamic, malformed, unsupported, wrong-arity, and wrong-type formats are rejected before MIR. |
-| I/O panic failures | Covered | Covered | Covered | Covered | Missing-file panic preserves exact message, Doria stack trace, and status 101. |
+| I/O panic failures | Covered | Covered | Covered | Covered | Missing-file panic preserves its exact catalogue entry, path-argument label, Doria call path, and status 101. |
 | Windows Unicode output | Unit + CI | Unit + CI | Unit + CI | Covered | Interactive console uses wide writes; redirected handles preserve exact UTF-8 bytes. |
 | Per-stream interactivity foundation | Runtime | Runtime | Runtime | Covered | Internal stdin/stdout/stderr detection is independent and is not exposed as a public Doria API. |
 | Native compile without execution preflight | Covered | Covered | Covered | Covered | Infinite-loop source compiles but is excluded from executable parity. |

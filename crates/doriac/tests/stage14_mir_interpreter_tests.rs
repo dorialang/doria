@@ -175,9 +175,20 @@ fn invalid_float_to_int_conversions_use_doria_panic_contract() {
         );
         let output = run(&source);
         assert_eq!(output.exit_status, 101);
+        let diagnostic = output
+            .runtime_diagnostic
+            .as_ref()
+            .expect("conversion panic should retain a structured diagnostic");
+        assert_eq!(diagnostic.code, "P1110");
         assert_eq!(
-            String::from_utf8(output.stderr).unwrap(),
-            "Panic: float-to-integer conversion out of range\nStack Trace:\n  at convert\n  at main\n"
+            diagnostic.title,
+            "Float To Integer Conversion Is Out Of Range"
         );
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(stderr
+            .starts_with("Panic[P1110]: Float To Integer Conversion Is Out Of Range\n\nWhere\n"));
+        assert!(stderr.contains("\n\nCall Path\nconvert · stage14_mir.doria:"));
+        assert!(stderr.contains("\nmain · stage14_mir.doria:"));
+        assert!(stderr.ends_with("\n\nProcess Exited With Status 101\n"));
     }
 }

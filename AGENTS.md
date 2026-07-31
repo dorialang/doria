@@ -56,6 +56,14 @@ The accepted project-tool name is Baton. Baton is the planned user-facing projec
   Title Case; explanations use plain Doria vocabulary; every source location
   and suggested edit stays structured. Do not make a consumer parse rendered
   terminal prose.
+- The compiler-owned `Diagnostic` is the sole public model for compile-time
+  findings and runtime outcomes. Built-in panics use catalogued `P` codes,
+  source-identified byte spans, and the same human, concise, and JSON
+  presentations as compilation diagnostics. Human panic output uses `Where`
+  and `Call Path`, never `Stack Trace`; native runtime records are private ABI
+  transport, not another diagnostic model. Future unhandled checked errors
+  must extend this same runtime-outcome foundation while preserving their
+  cleanup and status-70 semantics.
 - Add every new diagnostic code to the compiler catalogue and run
   `php scripts/check_diagnostic_style.php`. Automatic editor actions are limited
   to machine-applicable fixes; requires-review and informational fixes remain

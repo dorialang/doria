@@ -1,3 +1,16 @@
-Panic: Cannot Acquire Writable Access While Writable Access Is Active
-Stack Trace:
-  at main
+Panic[P1501]: Writable Shared Access Conflicted
+
+Where
+examples/native/main_stage25a_conflict_writable_then_writable.doria · line 7 · main
+
+  7          let writable $second = $shared->acquireWritableAccess();
+                                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+                                    Conflicting Access Requested Here
+
+Why
+The requested shared access overlaps an incompatible active access to the same allocation.
+
+Call Path
+main · examples/native/main_stage25a_conflict_writable_then_writable.doria:7
+
+Process Exited With Status 101

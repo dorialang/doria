@@ -7,8 +7,14 @@ use std::process::{Command, ExitCode, ExitStatus};
 use std::str::FromStr;
 
 use doriac::backend::{BackendOutput, BackendTarget, CompileOptions, NativeProfile};
-use doriac::diagnostics::{ColorChoice, Diagnostic, DiagnosticFormat, RenderOptions};
+use doriac::diagnostics::{
+    ColorChoice, Diagnostic, DiagnosticFormat, DiagnosticSource, RenderOptions, RuntimeFact,
+    RuntimeFactValue, RuntimeOutcomeDetails, RuntimeOutcomeFrame, RuntimeOutcomeOrigin,
+    TerminationBehavior,
+};
+use doriac::source::Span;
 
+#[derive(Debug)]
 enum CliError {
     Message(String),
     Diagnostics {
@@ -427,13 +433,17 @@ fn run_command(args: &[OsString]) -> Result<ExitCode, CliError> {
         text.clone(),
         CompileOptions::native(profile),
     )
-    .map_err(|diagnostics| CliError::diagnostics(path, text, diagnostics, diagnostic_options))?;
+    .map_err(|diagnostics| {
+        CliError::diagnostics(path.clone(), text.clone(), diagnostics, diagnostic_options)
+    })?;
 
     let temp_path = temp_run_executable_path(input);
+    let outcome_path = temp_path.with_extension("doria-outcome-v2");
     write_backend_output(&temp_path, output)
         .map_err(|error| format!("failed to write temp native executable: {error}"))?;
 
     let status = Command::new(&temp_path)
+        .env("DORIA_RUNTIME_OUTCOME_V2", &outcome_path)
         .args(program_args)
         .status()
         .map_err(|error| {
@@ -443,8 +453,214 @@ fn run_command(args: &[OsString]) -> Result<ExitCode, CliError> {
             )
         })?;
 
+    let runtime_payload = fs::read(&outcome_path).ok();
+    let _ = fs::remove_file(&outcome_path);
     let _ = fs::remove_file(&temp_path);
+    let runtime_diagnostic = runtime_payload
+        .map(|payload| decode_runtime_outcome(&payload, &path))
+        .transpose()?;
+    if let Some(diagnostic) = runtime_diagnostic {
+        let diagnostic_options = RenderOptions {
+            context_lines: 0,
+            ..diagnostic_options
+        };
+        let rendered =
+            doriac::render_diagnostics_with_options(path, text, &[diagnostic], diagnostic_options);
+        eprintln!("{rendered}");
+    }
     Ok(exit_code_from_status(status)?)
+}
+
+fn decode_runtime_outcome(payload: &[u8], source_path: &str) -> Result<Diagnostic, CliError> {
+    let mut decoder = RuntimeOutcomeDecoder::new(payload);
+    if decoder.take(8)? != b"DORIAO2\0" || decoder.u16()? != 2 {
+        return Err("native program returned an unsupported runtime outcome record".into());
+    }
+    let code_length = usize::from(decoder.u16()?);
+    let message_length = decoder.u32()? as usize;
+    let path_length = decoder.u32()? as usize;
+    let source_length = decoder.u32()? as usize;
+    let function_length = usize::from(decoder.u16()?);
+    let frame_count = usize::from(decoder.u16()?);
+    let fact_count = usize::from(decoder.u16()?);
+    if code_length > 16
+        || message_length > 64 * 1024
+        || path_length > 4096
+        || source_length > 4 * 1024 * 1024
+        || function_length > 1024
+        || frame_count > 128
+        || fact_count > 32
+    {
+        return Err("native program returned an oversized runtime outcome record".into());
+    }
+    let primary_span = Span::new(decoder.u64()? as usize, decoder.u64()? as usize);
+    let code = decoder.text(code_length)?;
+    let message = decoder.text(message_length)?;
+    let record_path = decoder.text(path_length)?;
+    let _embedded_source = decoder.text(source_length)?;
+    let function = decoder.text(function_length)?;
+    let catalogue_entry = doriac::diagnostics::runtime_catalogue_entry(&code)
+        .ok_or_else(|| "native program returned an unknown runtime diagnostic code".to_string())?;
+    let mut facts = Vec::with_capacity(fact_count);
+    for _ in 0..fact_count {
+        let name_length = usize::from(decoder.u16()?);
+        let kind = decoder.byte()?;
+        let value = decoder.u64()?;
+        let value_length = decoder.u32()? as usize;
+        if name_length > 1024 || value_length > 64 * 1024 {
+            return Err("native program returned an oversized runtime fact".into());
+        }
+        let name = decoder.text(name_length)?;
+        let value = match kind {
+            1 if value_length == 0 => RuntimeFactValue::Signed(value as i64),
+            2 if value_length == 0 => RuntimeFactValue::Unsigned(value),
+            3 if value_length == 0 && value <= 1 => RuntimeFactValue::Boolean(value != 0),
+            4 => RuntimeFactValue::StaticString(decoder.text(value_length)?),
+            1..=3 => return Err("native program returned a malformed runtime fact".into()),
+            _ => return Err("native program returned an unknown runtime fact type".into()),
+        };
+        facts.push(RuntimeFact { name, value });
+    }
+    if !facts.is_empty()
+        && (facts.len() != catalogue_entry.fact_names.len()
+            || facts
+                .iter()
+                .zip(catalogue_entry.fact_names)
+                .any(|(actual, expected)| actual.name != *expected))
+    {
+        return Err(
+            "native program returned facts that do not match the diagnostic catalogue".into(),
+        );
+    }
+    let mut frames = Vec::with_capacity(frame_count);
+    for _ in 0..frame_count {
+        let frame_function_length = usize::from(decoder.u16()?);
+        let frame_path_length = decoder.u32()? as usize;
+        let span = Span::new(decoder.u64()? as usize, decoder.u64()? as usize);
+        if frame_function_length > 1024 || frame_path_length > 4096 {
+            return Err("native program returned an oversized runtime frame".into());
+        }
+        let frame_function = decoder.text(frame_function_length)?;
+        let frame_path = decoder.text(frame_path_length)?;
+        frames.push(RuntimeOutcomeFrame {
+            function: frame_function,
+            source: diagnostic_source(&frame_path, source_path),
+            span,
+        });
+    }
+    if !decoder.is_empty() {
+        return Err("native program returned trailing runtime outcome bytes".into());
+    }
+
+    let code = catalogue_entry.code;
+    if code == "P1000" && !message.is_empty() {
+        facts.push(RuntimeFact {
+            name: "message".to_string(),
+            value: RuntimeFactValue::StaticString(message.clone()),
+        });
+    }
+    let outcome = RuntimeOutcomeDetails {
+        process_status: 101,
+        termination_behavior: TerminationBehavior::AbortWithoutCleanup,
+        origin: RuntimeOutcomeOrigin {
+            source: diagnostic_source(&record_path, source_path),
+            span: primary_span,
+            function: Some(function),
+        },
+        path: frames,
+        facts,
+    };
+    let mut diagnostic = Diagnostic::runtime_panic(code, primary_span, outcome);
+    if code == "P1203" {
+        let text = diagnostic
+            .runtime_outcome
+            .as_ref()
+            .and_then(|outcome| outcome.facts.iter().find(|fact| fact.name == "value"))
+            .and_then(|fact| match &fact.value {
+                RuntimeFactValue::StaticString(value) => Some(value.as_str()),
+                _ => None,
+            });
+        let unsigned = |name: &str| {
+            diagnostic
+                .runtime_outcome
+                .as_ref()
+                .and_then(|outcome| outcome.facts.iter().find(|fact| fact.name == name))
+                .and_then(|fact| match fact.value {
+                    RuntimeFactValue::Unsigned(value) => Some(value),
+                    RuntimeFactValue::Signed(value) => u64::try_from(value).ok(),
+                    _ => None,
+                })
+        };
+        if let (Some(value), Some(current), Some(requested), Some(_padding)) = (
+            text,
+            unsigned("currentGraphemeLength"),
+            unsigned("requestedGraphemeLength"),
+            unsigned("paddingGraphemeLength"),
+        ) {
+            diagnostic.explanation = Some(format!(
+                "`padEnd` was asked to extend `\"{value}\"` from {current} to {requested} graphemes,\nbut an empty padding string cannot add any graphemes."
+            ));
+        }
+    }
+    if code == "P1000" && !message.is_empty() {
+        diagnostic.notes.push(message);
+    }
+    Ok(diagnostic)
+}
+
+fn diagnostic_source(path: &str, current: &str) -> DiagnosticSource {
+    if path == current {
+        DiagnosticSource::Current
+    } else {
+        DiagnosticSource::Path(path.to_string())
+    }
+}
+
+struct RuntimeOutcomeDecoder<'a> {
+    remaining: &'a [u8],
+}
+
+impl<'a> RuntimeOutcomeDecoder<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { remaining: bytes }
+    }
+
+    fn take(&mut self, length: usize) -> Result<&'a [u8], CliError> {
+        if length > self.remaining.len() {
+            return Err("native program returned a truncated runtime outcome record".into());
+        }
+        let (value, remaining) = self.remaining.split_at(length);
+        self.remaining = remaining;
+        Ok(value)
+    }
+
+    fn u16(&mut self) -> Result<u16, CliError> {
+        let bytes: [u8; 2] = self.take(2)?.try_into().expect("fixed length");
+        Ok(u16::from_le_bytes(bytes))
+    }
+
+    fn byte(&mut self) -> Result<u8, CliError> {
+        Ok(self.take(1)?[0])
+    }
+
+    fn u32(&mut self) -> Result<u32, CliError> {
+        let bytes: [u8; 4] = self.take(4)?.try_into().expect("fixed length");
+        Ok(u32::from_le_bytes(bytes))
+    }
+
+    fn u64(&mut self) -> Result<u64, CliError> {
+        let bytes: [u8; 8] = self.take(8)?.try_into().expect("fixed length");
+        Ok(u64::from_le_bytes(bytes))
+    }
+
+    fn text(&mut self, length: usize) -> Result<String, CliError> {
+        String::from_utf8(self.take(length)?.to_vec())
+            .map_err(|_| "native program returned invalid UTF-8 in a runtime outcome".into())
+    }
+
+    fn is_empty(&self) -> bool {
+        self.remaining.is_empty()
+    }
 }
 
 fn temp_run_executable_path(input: &str) -> PathBuf {
@@ -569,4 +785,100 @@ fn make_executable(path: &Path) -> Result<(), String> {
 #[cfg(not(unix))]
 fn make_executable(_path: &Path) -> Result<(), String> {
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn runtime_record(code: &str, facts: &[(&str, u8, u64, &str)]) -> Vec<u8> {
+        let path = "main.doria";
+        let source = "function main(): void {}\n";
+        let function = "main";
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"DORIAO2\0");
+        bytes.extend_from_slice(&2_u16.to_le_bytes());
+        bytes.extend_from_slice(&(code.len() as u16).to_le_bytes());
+        bytes.extend_from_slice(&0_u32.to_le_bytes());
+        bytes.extend_from_slice(&(path.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&(source.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&(function.len() as u16).to_le_bytes());
+        bytes.extend_from_slice(&0_u16.to_le_bytes());
+        bytes.extend_from_slice(&(facts.len() as u16).to_le_bytes());
+        bytes.extend_from_slice(&0_u64.to_le_bytes());
+        bytes.extend_from_slice(&8_u64.to_le_bytes());
+        bytes.extend_from_slice(code.as_bytes());
+        bytes.extend_from_slice(path.as_bytes());
+        bytes.extend_from_slice(source.as_bytes());
+        bytes.extend_from_slice(function.as_bytes());
+        for (name, kind, scalar, text) in facts {
+            bytes.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            bytes.push(*kind);
+            bytes.extend_from_slice(&scalar.to_le_bytes());
+            bytes.extend_from_slice(&(text.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(name.as_bytes());
+            bytes.extend_from_slice(text.as_bytes());
+        }
+        bytes
+    }
+
+    fn decode_error(payload: &[u8]) -> String {
+        match decode_runtime_outcome(payload, "main.doria") {
+            Err(CliError::Message(message)) => message,
+            Err(CliError::Diagnostics { .. }) => {
+                panic!("transport decoding must not create a compilation diagnostic")
+            }
+            Ok(_) => panic!("malformed transport unexpectedly decoded"),
+        }
+    }
+
+    #[test]
+    fn runtime_transport_decodes_catalogued_facts() {
+        let payload = runtime_record(
+            "P1203",
+            &[
+                ("value", 4, 0, "Doria"),
+                ("currentGraphemeLength", 2, 5, ""),
+                ("requestedGraphemeLength", 2, 8, ""),
+                ("paddingGraphemeLength", 2, 0, ""),
+            ],
+        );
+        let diagnostic = decode_runtime_outcome(&payload, "main.doria").expect("valid record");
+
+        assert_eq!(diagnostic.code, "P1203");
+        assert_eq!(diagnostic.title, "String Padding Text Cannot Be Empty");
+        assert_eq!(
+            diagnostic
+                .runtime_outcome
+                .as_ref()
+                .expect("runtime outcome")
+                .facts
+                .len(),
+            4
+        );
+    }
+
+    #[test]
+    fn runtime_transport_rejects_truncated_unknown_and_trailing_records() {
+        assert!(decode_error(b"DORIA").contains("truncated"));
+
+        let unknown = runtime_record("PX999", &[]);
+        assert!(decode_error(&unknown).contains("unknown runtime diagnostic code"));
+
+        let mut trailing = runtime_record("P1101", &[]);
+        trailing.push(0);
+        assert!(decode_error(&trailing).contains("trailing"));
+    }
+
+    #[test]
+    fn runtime_transport_rejects_malformed_fact_schemas() {
+        let wrong_name = runtime_record("P1204", &[("length", 1, 1, "")]);
+        assert!(decode_error(&wrong_name).contains("do not match"));
+
+        let invalid_boolean = runtime_record("P1204", &[("count", 3, 2, "")]);
+        assert!(decode_error(&invalid_boolean).contains("malformed runtime fact"));
+
+        let unknown_kind = runtime_record("P1204", &[("count", 9, 0, "")]);
+        assert!(decode_error(&unknown_kind).contains("unknown runtime fact type"));
+    }
 }

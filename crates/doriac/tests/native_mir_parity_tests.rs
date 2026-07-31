@@ -18,18 +18,14 @@ const BROKEN_PIPE_STDERR_BYTES: &str =
 
 #[test]
 fn release_panic_projection_preserves_output_and_omits_only_frames() {
-    let expected = b"prefix\nPanic: boom\nStack Trace:\n  at fail\n  at main\n";
+    let expected = b"prefix\nPanic[P1000]: Program Panicked\n\nCall Path\nfail \xc2\xb7 source.doria:2\nmain \xc2\xb7 source.doria:5\n\nProcess Exited With Status 101\n";
     assert!(release_stderr_is_projection(
         expected,
-        b"prefix\nPanic: boom\nStack Trace:\n"
-    ));
-    assert!(release_stderr_is_projection(
-        expected,
-        b"prefix\nPanic: boom\nStack Trace:\n  at main\n"
+        b"prefix\nPanic[P1000]: Program Panicked\n\nCall Path\nmain \xc2\xb7 source.doria:5\n\nProcess Exited With Status 101\n"
     ));
     assert!(!release_stderr_is_projection(
         expected,
-        b"prefix\nPanic: boom\nStack Trace:\n  at other\n"
+        b"prefix\nPanic[P1000]: Program Panicked\n\nCall Path\nother \xc2\xb7 source.doria:5\n\nProcess Exited With Status 101\n"
     ));
 }
 
@@ -58,6 +54,37 @@ fn manifest_covers_every_native_example() {
         .collect::<BTreeSet<_>>();
 
     assert_eq!(manifest, examples);
+}
+
+#[test]
+fn interpreter_matches_every_durable_io_fixture() {
+    let workspace = workspace_root();
+    for relative_path in manifest_paths() {
+        let path = workspace.join(&relative_path);
+        let source = fs::read_to_string(&path).unwrap_or_else(|error| {
+            panic!("failed to read parity source {relative_path}: {error}")
+        });
+        let hir =
+            doriac::lower_source(relative_path.clone(), source).unwrap_or_else(|diagnostics| {
+                panic!("frontend rejected parity source {relative_path}: {diagnostics:#?}")
+            });
+        let mir = doriac::mir_lowering::lower_program(&hir).unwrap_or_else(|diagnostics| {
+            panic!("MIR rejected parity source {relative_path}: {diagnostics:#?}")
+        });
+        let fixture = IoFixture::load(&workspace, &relative_path);
+        let interpreted = doriac::mir_interpreter::interpret_with_io(
+            &mir,
+            doriac::mir_interpreter::MirIo {
+                stdin: fixture.stdin.clone(),
+                files: fixture.files.clone(),
+                args: fixture.args.clone(),
+            },
+        )
+        .unwrap_or_else(|error| {
+            panic!("interpreter rejected parity source {relative_path}: {error}")
+        });
+        fixture.assert_expected(&relative_path, &interpreted);
+    }
 }
 
 #[test]
@@ -337,35 +364,56 @@ fn assert_matches_interpreter(
 }
 
 fn release_stderr_is_projection(expected: &[u8], actual: &[u8]) -> bool {
-    const STACK_TRACE_HEADER: &[u8] = b"Stack Trace:\n";
+    const CALL_PATH_HEADER: &[u8] = b"Call Path\n";
+    const STATUS_HEADER: &[u8] = b"\n\nProcess Exited With Status ";
     let Some(expected_header) = expected
-        .windows(STACK_TRACE_HEADER.len())
-        .rposition(|window| window == STACK_TRACE_HEADER)
+        .windows(CALL_PATH_HEADER.len())
+        .rposition(|window| window == CALL_PATH_HEADER)
     else {
         return actual == expected;
     };
     let Some(actual_header) = actual
-        .windows(STACK_TRACE_HEADER.len())
-        .rposition(|window| window == STACK_TRACE_HEADER)
+        .windows(CALL_PATH_HEADER.len())
+        .rposition(|window| window == CALL_PATH_HEADER)
     else {
         return false;
     };
-    let expected_frames = expected_header + STACK_TRACE_HEADER.len();
-    let actual_frames = actual_header + STACK_TRACE_HEADER.len();
-    if expected[..expected_frames] != actual[..actual_frames] || !actual.ends_with(b"\n") {
+    let expected_frames = expected_header + CALL_PATH_HEADER.len();
+    let actual_frames = actual_header + CALL_PATH_HEADER.len();
+    let Some(expected_status) = expected[expected_frames..]
+        .windows(STATUS_HEADER.len())
+        .position(|window| window == STATUS_HEADER)
+        .map(|index| expected_frames + index)
+    else {
+        return false;
+    };
+    let Some(actual_status) = actual[actual_frames..]
+        .windows(STATUS_HEADER.len())
+        .position(|window| window == STATUS_HEADER)
+        .map(|index| actual_frames + index)
+    else {
+        return false;
+    };
+    if expected[..expected_frames] != actual[..actual_frames]
+        || expected[expected_status..] != actual[actual_status..]
+    {
         return false;
     }
 
-    let expected_frames = expected[expected_frames..]
+    let expected_frames = expected[expected_frames..expected_status]
         .split(|byte| *byte == b'\n')
         .filter(|line| !line.is_empty())
         .collect::<Vec<_>>();
     let mut next_expected = 0;
-    for frame in actual[actual_frames..]
+    let actual_frames = actual[actual_frames..actual_status]
         .split(|byte| *byte == b'\n')
         .filter(|line| !line.is_empty())
-    {
-        if !frame.starts_with(b"  at ") {
+        .collect::<Vec<_>>();
+    if actual_frames.is_empty() {
+        return false;
+    }
+    for frame in actual_frames {
+        if !frame.windows(3).any(|window| window == b" \xc2\xb7") {
             return false;
         }
         let Some(offset) = expected_frames[next_expected..]

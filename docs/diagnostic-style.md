@@ -29,7 +29,7 @@ All user-facing headings, prefixes, and titles use Title Case:
 - `Error`, `Warning`, `Note`, `Help`, `Related`, and `Why`
 - `Suggested Fix` and `Caused By`
 - `Internal Compiler Error`
-- runtime `Panic` and `Stack Trace`
+- runtime `Panic` and `Call Path`
 - `Compilation Failed` and `Compilation Completed With Warnings`
 
 Short source labels use Title Case (`Value Given Here`, `This Operation Needs
@@ -75,8 +75,9 @@ guidance.
 ## Output contracts
 
 `--diagnostic-format human` and `concise` write to stderr. Human output provides
-labels and explanations; concise output is one line per diagnostic. Both end
-with a Title Case compilation summary.
+labels and explanations; concise output is one line per diagnostic. Compilation
+findings end with a Title Case compilation summary. A runtime outcome instead
+ends with `Process Exited With Status <status>`.
 
 `--diagnostic-format json` writes one schema-version-1 envelope to stdout. It is
 deterministic, structured, and contains no ANSI. Consumers must use fields, not
@@ -96,9 +97,10 @@ An internal compiler error uses the dedicated `Internal Compiler Error`
 envelope, includes toolchain version and build commit, and asks for a report.
 Raw Rust panic messages and backtraces are not the default interface.
 
-Runtime panic is separate from compilation. Preserve each canonical panic
-message and the exact Title Case `Panic` / `Stack Trace` envelope across all
-backends.
+Runtime panic is separate from compilation but uses the same `Diagnostic`
+model. Preserve its catalogue identity, precise source label, explanation
+facts, `Call Path`, abort-without-cleanup behavior, and status 101 across all
+backends. No consumer may parse human panic prose.
 
 ## Review checklist
 

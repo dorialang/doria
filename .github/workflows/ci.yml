@@ -207,8 +207,8 @@ jobs:
           test "${float64_status}" -eq 42
           test "${bool_status}" -eq 42
           test "${panic_status}" -eq 101
-          grep -Fx "Panic: float-to-integer conversion out of range" build/native/main_float_to_int_nan_panic.stderr
-          grep -Fx "Stack Trace:" build/native/main_float_to_int_nan_panic.stderr
+          grep -Fx "Panic[P1110]: Float To Integer Conversion Is Out Of Range" build/native/main_float_to_int_nan_panic.stderr
+          grep -Fx "Call Path" build/native/main_float_to_int_nan_panic.stderr
 
       - name: Check repository script guardrails
         run: |
@@ -220,6 +220,12 @@ jobs:
 
       - name: Check documentation authority
         run: php scripts/check_docs_authority.php
+
+      - name: Check diagnostic and runtime-outcome architecture
+        run: |
+          php scripts/check_diagnostic_style.php
+          php scripts/check_panic_catalogue.php
+          php scripts/check_runtime_diagnostic_architecture.php
 
       - name: Smoke check native Doria example
         run: cargo run -p doriac -- check examples/native/main_if_42.doria
@@ -454,10 +460,10 @@ jobs:
           test "${release_status}" -eq 42
           test "${integer_panic_status}" -eq 101
           test "${float_panic_status}" -eq 101
-          grep -Fx "Panic: integer overflow during addition" build/native/main_add_overflow_panic.stderr
-          grep -Fx "Stack Trace:" build/native/main_add_overflow_panic.stderr
-          grep -Fx "Panic: float-to-integer conversion out of range" build/native/main_float_to_int_nan_panic.stderr
-          grep -Fx "Stack Trace:" build/native/main_float_to_int_nan_panic.stderr
+          grep -Fx "Panic[P1101]: Integer Addition Overflowed" build/native/main_add_overflow_panic.stderr
+          grep -Fx "Call Path" build/native/main_add_overflow_panic.stderr
+          grep -Fx "Panic[P1110]: Float To Integer Conversion Is Out Of Range" build/native/main_float_to_int_nan_panic.stderr
+          grep -Fx "Call Path" build/native/main_float_to_int_nan_panic.stderr
 
       - name: Smoke LLVM release profile and panic parity on Windows
         if: runner.os == 'Windows'
@@ -490,7 +496,7 @@ jobs:
           Invoke-DoriaFixture build/native/main_release_profile_42.exe 42
           Invoke-DoriaFixture build/native/main_add_overflow_panic.exe 101 build/native/main_add_overflow_panic.stderr
           Invoke-DoriaFixture build/native/main_float_to_int_nan_panic.exe 101 build/native/main_float_to_int_nan_panic.stderr
-          if (-not (Select-String -Path build/native/main_add_overflow_panic.stderr -SimpleMatch "Panic: integer overflow during addition")) { throw "missing integer panic" }
-          if (-not (Select-String -Path build/native/main_add_overflow_panic.stderr -SimpleMatch "Stack Trace:")) { throw "missing integer stack trace" }
-          if (-not (Select-String -Path build/native/main_float_to_int_nan_panic.stderr -SimpleMatch "Panic: float-to-integer conversion out of range")) { throw "missing float panic" }
-          if (-not (Select-String -Path build/native/main_float_to_int_nan_panic.stderr -SimpleMatch "Stack Trace:")) { throw "missing float stack trace" }
+          if (-not (Select-String -Path build/native/main_add_overflow_panic.stderr -SimpleMatch "Panic[P1101]: Integer Addition Overflowed")) { throw "missing integer panic" }
+          if (-not (Select-String -Path build/native/main_add_overflow_panic.stderr -SimpleMatch "Call Path")) { throw "missing integer call path" }
+          if (-not (Select-String -Path build/native/main_float_to_int_nan_panic.stderr -SimpleMatch "Panic[P1110]: Float To Integer Conversion Is Out Of Range")) { throw "missing float panic" }
+          if (-not (Select-String -Path build/native/main_float_to_int_nan_panic.stderr -SimpleMatch "Call Path")) { throw "missing float call path" }

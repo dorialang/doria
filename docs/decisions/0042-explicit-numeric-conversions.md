@@ -41,7 +41,9 @@ Conversion failure panics with this exact message:
 integer conversion out of range
 ```
 
-The panic follows decision 0040: it writes the deterministic panic message and Doria function-name stack trace to stderr, then exits with status 101.
+The panic follows decisions 0040 and 0109: it produces the catalogued,
+source-aware runtime diagnostic and Doria `Call Path`, then exits with status
+101.
 
 These conversion APIs are compiler-known companion intrinsics in Stage 13. This does not generally implement static methods or classes.
 
@@ -90,8 +92,8 @@ wrapping, saturating, and unchecked conversions. Existing integer companion
 - `Int::from(...)` and `Int64::from(...)` are aliases at the type level, not separate runtime conversions.
 - `Int::toFloat(...)` and `Float::toInt(...)` are the only accepted Stage 14
   cross-kind companion intrinsics.
-- Float-to-int failure uses decision 0040's deterministic panic, stack trace,
-  and status 101 contract.
+- Float-to-int failure uses decisions 0040 and 0109's deterministic structured
+  panic, Doria `Call Path`, and status 101 contract.
 
 ## Affected components
 

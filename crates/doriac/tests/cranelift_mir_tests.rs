@@ -290,6 +290,7 @@ fn rejects_malformed_function_id() {
         .push(Statement::CallVoid {
             function: FunctionId(99),
             args: Vec::new(),
+            span: Default::default(),
         });
 
     let error = doriac::codegen_cranelift::lower_mir_to_object(&program)
@@ -336,6 +337,7 @@ fn rejects_mixed_width_float_binary_operands() {
     program.functions.push(Function {
         id: FunctionId(1),
         name: "mixedWidth".to_string(),
+        source_span: Default::default(),
         method: None,
         receiver_mode: None,
         params: Vec::new(),
@@ -377,12 +379,14 @@ fn rejects_malformed_block_id() {
 
 fn void_program() -> Program {
     Program {
+        source: doriac::source::SourceFile::new("<test>", ""),
         classes: vec![],
         collection_types: vec![],
         statics: vec![],
         functions: vec![Function {
             id: FunctionId(0),
             name: "main".to_string(),
+            source_span: Default::default(),
             method: None,
             receiver_mode: None,
             params: Vec::new(),

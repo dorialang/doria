@@ -1,3 +1,16 @@
-Panic: collection capacity overflow
-Stack Trace:
-  at main
+Panic[P1313]: Collection Allocation Failed
+
+Where
+examples/native/main_stage23c_oversized_fill_panic.doria · line 8 · main
+
+  8          let $flags = [false; runtimeCount()];
+                                  ^^^^^^^^^^^^^^
+                                  Collection Created Here
+
+Why
+The runtime could not allocate or grow storage for the requested collection.
+
+Call Path
+main · examples/native/main_stage23c_oversized_fill_panic.doria:8
+
+Process Exited With Status 101

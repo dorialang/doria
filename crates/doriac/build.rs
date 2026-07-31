@@ -46,7 +46,9 @@ fn main() {
         .expect("Cargo build directory")
         .join("deps");
     let ryu = find_rlib(&dependency_dir, "ryu");
+    let doria_diagnostic_catalogue = find_rlib(&dependency_dir, "doria_diagnostic_catalogue");
     let doria_unicode = find_rlib(&dependency_dir, "doria_unicode");
+    let unicode_width = find_rlib(&dependency_dir, "unicode_width");
     let rustc = env::var_os("RUSTC").unwrap_or_else(|| OsString::from("rustc"));
     let mut command = Command::new(rustc);
     command
@@ -63,7 +65,14 @@ fn main() {
         .arg("--extern")
         .arg(format!("ryu={}", ryu.display()))
         .arg("--extern")
+        .arg(format!(
+            "doria_diagnostic_catalogue={}",
+            doria_diagnostic_catalogue.display()
+        ))
+        .arg("--extern")
         .arg(format!("doria_unicode={}", doria_unicode.display()))
+        .arg("--extern")
+        .arg(format!("unicode_width={}", unicode_width.display()))
         .arg("-C")
         .arg(format!(
             "opt-level={}",

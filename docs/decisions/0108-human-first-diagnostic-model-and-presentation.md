@@ -38,7 +38,7 @@ classification.
 
 User-facing headings, prefixes, and titles use Title Case: `Error`, `Warning`,
 `Note`, `Help`, `Related`, `Why`, `Suggested Fix`, `Caused By`,
-`Internal Compiler Error`, `Panic`, and `Stack Trace`. Explanatory prose remains
+`Internal Compiler Error`, `Panic`, and `Call Path`. Explanatory prose remains
 ordinary sentence case. Diagnostic titles use plain Doria vocabulary; ownership
 diagnostics say owns, gives away, readonly, writable, and still using rather
 than exposing compiler implementation terminology.
@@ -64,10 +64,13 @@ a dedicated envelope with the toolchain version, build commit, source context,
 and reporting guidance. Raw Rust panic text and backtraces are not ordinary
 user-facing output.
 
-Runtime panic remains a distinct abort-only status-101 outcome. Its canonical
-message text is part of the runtime contract; its `Panic` and `Stack Trace`
-headings follow the same presentation law and must remain byte-identical across
-the interpreter, Cranelift, LLVM, and PHP compatibility paths.
+Decision 0109 extends this same model with runtime-outcome details. Runtime
+panic remains a distinct abort-only status-101 outcome, represented as
+`DiagnosticKind::RuntimePanic`, with a precise source label, typed facts, and a
+Doria `Call Path`. It is not a parallel report, catalogue, renderer, or JSON
+schema. Interpreter, Cranelift, LLVM, PHP compatibility, standalone, CLI, LSP,
+and Playground paths consume the same structured facts; no consumer parses
+rendered prose.
 
 ## Alternatives considered
 

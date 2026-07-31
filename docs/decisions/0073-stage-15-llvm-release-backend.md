@@ -31,7 +31,9 @@ The release profile changes compilation time, optimization strategy, and artifac
 - Float lowering uses binary32/binary64 operations without fast-math flags, reassociation, NaN elision, or signed-zero elision.
 - Bool values remain canonical false/true scalars and `and`/`or` retain short-circuit control flow in condition and value positions.
 - Compile-time-known strings remain exact byte constants passed with explicit lengths; LLVM does not introduce runtime strings, `strlen`, null-terminated discovery, or implicit newlines.
-- Panic, output, Doria stack frames, and process entry continue through `doria-rt` with the existing exact status and formatting contracts.
+- Panic transport, output, source-aware Doria call paths, and process entry
+  continue through `doria-rt` with decisions 0040 and 0109's exact status and
+  presentation contracts.
 
 LLVM may not use undefined behavior as an implementation shortcut for a Doria operation with checked or otherwise defined semantics. Function and argument evaluation remains left-to-right where behavior is visible.
 

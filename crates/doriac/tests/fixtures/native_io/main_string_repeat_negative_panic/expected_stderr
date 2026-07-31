@@ -1,3 +1,16 @@
-Panic: String Repetition Count Cannot Be Negative
-Stack Trace:
-  at main
+Panic[P1204]: String Repetition Count Cannot Be Negative
+
+Where
+examples/native/main_string_repeat_negative_panic.doria · line 3 · main
+
+  3          echo String::repeat("Doria", -1);
+                                          ^^
+                                          Negative Repetition Count
+
+Why
+A string repetition count describes how many copies to produce and therefore cannot be negative.
+
+Call Path
+main · examples/native/main_string_repeat_negative_panic.doria:3
+
+Process Exited With Status 101

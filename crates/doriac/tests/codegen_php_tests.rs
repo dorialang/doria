@@ -18,7 +18,7 @@ echo $count;
     assert!(php.starts_with("<?php"));
     assert!(php.contains("$count = 0;"));
     assert!(php.contains("$count = 1;"));
-    assert!(php.contains("__doria_write_stdout(__doria_display($count));"));
+    assert!(php.contains("__doria_write_stdout(__doria_display($count), "));
 }
 
 #[test]
@@ -54,10 +54,10 @@ echo true xor false;
     )
     .expect("compilation should succeed");
 
-    assert!(php.contains("__doria_write_stdout(__doria_display(((true) && (false))));"));
-    assert!(php.contains("__doria_write_stdout(__doria_display(((false) || (true))));"));
-    assert!(php.contains("__doria_write_stdout(__doria_display(!(false)));"));
-    assert!(php.contains("__doria_write_stdout(__doria_display(((true) !== (false))));"));
+    assert!(php.contains("__doria_write_stdout(__doria_display(((true) && (false))), "));
+    assert!(php.contains("__doria_write_stdout(__doria_display(((false) || (true))), "));
+    assert!(php.contains("__doria_write_stdout(__doria_display(!(false)), "));
+    assert!(php.contains("__doria_write_stdout(__doria_display(((true) !== (false))), "));
 }
 
 #[test]
@@ -71,8 +71,8 @@ echo false or null ?? true;
     )
     .expect("compilation should succeed");
 
-    assert!(php.contains("__doria_write_stdout(__doria_display(((true) && (null ?? true))));"));
-    assert!(php.contains("__doria_write_stdout(__doria_display(((false) || (null ?? true))));"));
+    assert!(php.contains("__doria_write_stdout(__doria_display(((true) && (null ?? true))), "));
+    assert!(php.contains("__doria_write_stdout(__doria_display(((false) || (null ?? true))), "));
     assert!(!php.contains("true && null ?? true"));
     assert!(!php.contains("false || null ?? true"));
 }
@@ -88,8 +88,8 @@ echo false xor true != false;
     )
     .expect("compilation should succeed");
 
-    assert!(php.contains("__doria_write_stdout(__doria_display(((true === true) !== (false))));"));
-    assert!(php.contains("__doria_write_stdout(__doria_display(((false) !== (true !== false))));"));
+    assert!(php.contains("__doria_write_stdout(__doria_display(((true === true) !== (false))), "));
+    assert!(php.contains("__doria_write_stdout(__doria_display(((false) !== (true !== false))), "));
     assert!(!php.contains("true === true !== false"));
     assert!(!php.contains("false !== true !== false"));
 }
@@ -105,8 +105,8 @@ echo "01" != "1";
     )
     .expect("compilation should succeed");
 
-    assert!(php.contains("__doria_write_stdout(__doria_display(\"01\" === \"1\"));"));
-    assert!(php.contains("__doria_write_stdout(__doria_display(\"01\" !== \"1\"));"));
+    assert!(php.contains("__doria_write_stdout(__doria_display(\"01\" === \"1\"), "));
+    assert!(php.contains("__doria_write_stdout(__doria_display(\"01\" !== \"1\"), "));
     assert!(!php.contains("echo \"01\" == \"1\";"));
     assert!(!php.contains("echo \"01\" != \"1\";"));
 }
@@ -476,7 +476,7 @@ echo not (1 < 2);
     )
     .expect("compilation should succeed");
 
-    assert!(php.contains("__doria_write_stdout(__doria_display(!((__doria_less(1, 2)))));"));
+    assert!(php.contains("__doria_write_stdout(__doria_display(!((__doria_less(1, 2)))), "));
     assert!(!php.contains("echo !1 < 2;"));
 }
 
@@ -495,7 +495,7 @@ function main(): void
     .expect("compilation should succeed");
 
     assert!(php.contains("$message = \"Hello Doria!\";"));
-    assert!(php.contains("__doria_write_stdout(__doria_display($message));"));
+    assert!(php.contains("__doria_write_stdout(__doria_display($message), "));
 }
 
 #[test]
@@ -533,7 +533,7 @@ function main(): void
 
     assert!(php.contains("$message = __doria_display("));
     assert!(php.contains("__doria_display($name)"));
-    assert!(php.contains("__doria_write_stdout(__doria_display($message));"));
+    assert!(php.contains("__doria_write_stdout(__doria_display($message), "));
 }
 
 #[test]
@@ -628,7 +628,7 @@ function main(): void
     .expect("compilation should succeed");
 
     assert!(php.contains("function hello(): void"));
-    assert!(php.contains("__doria_write_stdout(__doria_display(\"Hello Doria!\"));"));
+    assert!(php.contains("__doria_write_stdout(__doria_display(\"Hello Doria!\"), "));
     assert!(php.contains("function main(): void"));
     assert!(php.contains("hello();"));
 }
@@ -734,16 +734,14 @@ while ($count < 10) {
     )
     .expect("compilation should succeed");
 
-    assert!(
-        php.contains("if (__doria_less($count, 10))\n{\n    __doria_write_stdout(__doria_display(\"small\"));\n}")
-    );
-    assert!(php.contains(
-        "else if (__doria_less($count, 20))\n{\n    __doria_write_stdout(__doria_display(\"medium\"));\n}"
-    ));
-    assert!(php.contains("else\n{\n    __doria_write_stdout(__doria_display(\"large\"));\n}"));
-    assert!(php.contains(
-        "while (__doria_less($count, 10))\n{\n    __doria_write_stdout(__doria_display($count));\n    $count = 10;\n}"
-    ));
+    assert!(php.contains("if (__doria_less($count, 10))"));
+    assert!(php.contains("__doria_write_stdout(__doria_display(\"small\"), "));
+    assert!(php.contains("else if (__doria_less($count, 20))"));
+    assert!(php.contains("__doria_write_stdout(__doria_display(\"medium\"), "));
+    assert!(php.contains("__doria_write_stdout(__doria_display(\"large\"), "));
+    assert!(php.contains("while (__doria_less($count, 10))"));
+    assert!(php.contains("__doria_write_stdout(__doria_display($count), "));
+    assert!(php.contains("$count = 10;"));
 }
 
 #[test]
@@ -867,7 +865,7 @@ main();
     .expect("compilation should succeed");
 
     assert!(php.contains("function main(): void"));
-    assert!(php.contains("__doria_write_stdout(__doria_display(\"Hello Doria!\"));"));
+    assert!(php.contains("__doria_write_stdout(__doria_display(\"Hello Doria!\"), "));
     assert!(php.contains("return;"));
     assert!(php.contains("main();"));
     assert!(!php.contains("exit(main())"));
@@ -901,7 +899,7 @@ function greet(string $name): string
     assert!(php.contains("$name = \"outer\";"));
     assert!(php.contains("$name__doria1 = __doria_display($name) . __doria_display(\" inner\");"));
     assert!(php.contains("__doria_display($name__doria1)"));
-    assert!(php.contains("__doria_write_stdout(__doria_display($name));"));
+    assert!(php.contains("__doria_write_stdout(__doria_display($name), "));
     assert!(php.contains("function greet(string $name): string"));
     assert!(php.contains("$name__doria1 = \"inner\";"));
     assert!(php.contains("return $name__doria1;"));
@@ -958,9 +956,11 @@ fn php_backend_lowers_panic_to_stderr_and_status_101() {
     )
     .expect("panic should lower through the compatibility backend");
 
-    assert!(php.contains("@fwrite(STDERR, \"Panic: \" . \"boom\" . \"\\nStack Trace:\\n\");"));
+    assert!(php.contains("__doria_panic(\"P1000\""));
+    assert!(php.contains("\"P1000\" => [\"Program Panicked\""));
     assert!(php.contains("debug_backtrace(DEBUG_BACKTRACE_IGNORE_ARGS)"));
-    assert!(php.contains("@fwrite(STDERR, \"  at \""));
+    assert!(php.contains("\"\\n\\nCall Path\""));
+    assert!(php.contains("\"\\n\\nProcess Exited With Status 101\\n\""));
     assert!(php.contains("exit(101);"));
     assert!(!php.contains("throw new"));
 }
@@ -989,7 +989,7 @@ function main(): void
 
     assert!(php.contains("foreach (debug_backtrace(DEBUG_BACKTRACE_IGNORE_ARGS)"));
     assert!(php.contains("[\"function\"]"));
-    assert!(php.contains("\"  at \""));
+    assert!(php.contains("\"\\n\" . $name . \" · \""));
 
     let Ok(version) = Command::new("php").arg("--version").output() else {
         return;
@@ -1010,10 +1010,15 @@ function main(): void
 
     assert_eq!(run.status.code(), Some(101));
     assert!(run.stdout.is_empty());
-    assert_eq!(
-        run.stderr,
-        b"Panic: boom\nStack Trace:\n  at panicNow\n  at middle\n  at main\n"
-    );
+    let stderr = String::from_utf8(run.stderr).expect("diagnostic must be UTF-8");
+    assert!(stderr.starts_with("Panic[P1000]: Program Panicked\n\nWhere\n"));
+    assert!(stderr.contains("\n\nWhy\nThe program explicitly raised a fatal panic."));
+    assert!(stderr.contains("\n\nNote\nboom"));
+    assert!(stderr.contains("\n\nCall Path\npanicNow · test.doria:"));
+    assert!(stderr.contains("\nmiddle · test.doria:"));
+    assert!(stderr.contains("\nmain · test.doria:"));
+    assert!(stderr.ends_with("\n\nProcess Exited With Status 101\n"));
+    assert!(!stderr.contains("Stack Trace"));
 }
 
 #[test]
@@ -1060,10 +1065,13 @@ function main(): void
 
     assert_eq!(run.status.code(), Some(101));
     assert!(run.stdout.is_empty());
-    assert_eq!(
-        run.stderr,
-        b"Panic: failed to read file\nStack Trace:\n  at __doria_read_file\n  at main\n"
-    );
+    let stderr = String::from_utf8(run.stderr).expect("diagnostic must be UTF-8");
+    assert!(stderr.starts_with("Panic[P1401]: File Read Failed\n\nWhere\n"));
+    assert!(stderr.contains("\n\nCall Path\nReader::__doria_read_file · test.doria:"));
+    assert!(stderr.contains("\nmain · test.doria:"));
+    assert!(stderr.ends_with("\n\nProcess Exited With Status 101\n"));
+    assert!(!stderr.contains("PHP"));
+    assert!(!stderr.contains("Stack Trace"));
 }
 
 #[test]
@@ -1380,8 +1388,8 @@ echo "Total: {$amount} ($currency)";
     )
     .expect("compilation should succeed");
 
-    assert!(php.contains("__doria_write_stdout(__doria_display(\"Hello, \\$name\"));"));
-    assert!(php.contains("__doria_write_stdout(__doria_display(\"Literal \\$name\"));"));
+    assert!(php.contains("__doria_write_stdout(__doria_display(\"Hello, \\$name\"), "));
+    assert!(php.contains("__doria_write_stdout(__doria_display(\"Literal \\$name\"), "));
     assert!(php.contains("\"Total: \" . __doria_display($amount) . \" (\\$currency)\""));
 }
 
@@ -1419,26 +1427,29 @@ function main(): void
     )
     .expect("Stage 17 PHP compatibility lowering should succeed");
 
-    assert!(php.contains("function __doria_read_line(): ?string"));
-    assert!(php.contains("function __doria_io_panic(string $message)"));
-    assert!(!php.contains("function __doria_io_panic(string $message): never"));
+    assert!(php.contains("function __doria_read_line(int $start, int $end): ?string"));
+    assert!(php.contains(
+        "function __doria_panic(string $code, int $start, int $end, ?string $message = null)"
+    ));
+    assert!(!php.contains("): never"));
     assert!(php.contains("if ($line === false)"));
     assert!(php.contains("if (feof(STDIN)) { return null; }"));
-    assert!(php.contains("__doria_io_panic(\"failed to read stdin\")"));
+    assert!(php.contains("__doria_panic(\"P1403\", $start, $end)"));
     assert!(php.contains(
-        "if (preg_match('//u', $line) !== 1) { __doria_io_panic(\"stdin contained invalid UTF-8\"); }"
+        "if (preg_match('//u', $line) !== 1) { __doria_panic(\"P1404\", $start, $end); }"
     ));
     assert!(php.contains("str_ends_with($line, \"\\n\")"));
     assert!(php.contains("str_ends_with($line, \"\\r\")"));
-    assert!(php.contains("__doria_read_file(\"input.txt\")"));
+    assert!(php.contains("__doria_read_file(\"input.txt\", start:"));
     assert!(php.contains("$contents === false"));
-    assert!(php.contains("__doria_write_file(\"copy.txt\", $contents)"));
-    assert!(php.contains("__doria_append_file(\"copy.txt\", $contents)"));
+    assert!(php.contains("__doria_write_file(\"copy.txt\", $contents, start:"));
+    assert!(php.contains("__doria_append_file(\"copy.txt\", $contents, start:"));
     assert!(php.contains("file_put_contents($path, $contents, FILE_APPEND)"));
-    assert!(php.contains("__doria_io_panic(\"failed to append file\")"));
+    assert!(php.contains("__doria_panic(\"P1402\", $start, $end)"));
     assert!(php.contains("$written === false || $written !== strlen($contents)"));
-    assert!(php.contains("__doria_write_stderr($line)"));
-    assert!(php.contains("__doria_printf(\"enabled=%s\", __doria_display(false))"));
+    assert!(php.contains("__doria_write_stderr($line, start:"));
+    assert!(php.contains("__doria_printf("));
+    assert!(php.contains("\"enabled=%s\", __doria_display(false))"));
     assert!(php.contains("__doria_sprintf(\"%05d\", 42)"));
 }
 
@@ -1794,7 +1805,7 @@ echo NAN;
         assert!(php.contains(&format!("const __DORIA_CONST_{name} =")));
         assert!(!php.contains(&format!("const {name} =")));
         assert!(php.contains(&format!(
-            "__doria_write_stdout(__doria_display(__DORIA_CONST_{name}));"
+            "__doria_write_stdout(__doria_display(__DORIA_CONST_{name}), "
         )));
     }
 }

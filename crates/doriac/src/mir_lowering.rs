@@ -827,6 +827,10 @@ pub fn lower_program(program: &hir::Program) -> DiagnosticResult<mir::Program> {
         .collect::<DiagnosticResult<Vec<_>>>()?;
 
     Ok(mir::Program {
+        source: crate::source::SourceFile::new(
+            program.source_path.clone(),
+            program.source_text.clone(),
+        ),
         classes,
         collection_types: collection_registry.types,
         statics,
@@ -1481,6 +1485,7 @@ fn lower_function(
     Ok(mir::Function {
         id: signature.id,
         name: inputs_method_name(function, class, inputs.semantic_info),
+        source_span: function.span,
         method: class.map(|class| mir::MethodIdentity {
             class,
             name: function.name.clone(),
@@ -1689,7 +1694,10 @@ fn lower_expression_statement(
     };
     if name == "panic" {
         let message = lower_panic_message(args, *call_span, context)?;
-        context.terminate_current(mir::Terminator::Panic(message));
+        context.terminate_current(mir::Terminator::Panic {
+            message,
+            span: *call_span,
+        });
     } else if name == "printf" {
         let format = lower_format_expression(args, *call_span, context)?;
         context.push_statement(mir::Statement::Printf(format));
@@ -2157,6 +2165,8 @@ fn lower_collection_foreach_in_scope(
                 right: Box::new(mir::IntegerExpression::constant(IntegerValue::one(
                     index_type,
                 ))),
+                span: foreach.span,
+                right_span: foreach.span,
             },
         )),
     });
@@ -2284,6 +2294,7 @@ fn collection_value_rvalue(
                 collection: nested,
                 source: collection,
                 index: Box::new(index),
+                index_span: Span::default(),
                 transfer: false,
             }))
         }
@@ -2469,6 +2480,8 @@ fn lower_range_foreach_in_scope(
                 right: Box::new(mir::IntegerExpression::constant(IntegerValue::one(
                     integer_type,
                 ))),
+                span: foreach.span,
+                right_span: foreach.span,
             },
         )),
     });
@@ -3473,7 +3486,7 @@ fn terminator_targets(terminator: &mir::Terminator) -> Vec<mir::BlockId> {
         } => vec![*then_block, *else_block],
         mir::Terminator::Return(_)
         | mir::Terminator::ReturnVoid
-        | mir::Terminator::Panic(_)
+        | mir::Terminator::Panic { .. }
         | mir::Terminator::Unreachable => Vec::new(),
     }
 }
@@ -3954,6 +3967,7 @@ fn lower_assignment(
             scalar_type,
             &assignment.op,
             &assignment.value,
+            assignment.span,
             context,
         )?;
         context.push_statement(place.assignment(value));
@@ -4210,6 +4224,8 @@ fn lower_increment_value(
                     right: Box::new(mir::IntegerExpression::constant(IntegerValue::one(
                         integer_type,
                     ))),
+                    span,
+                    right_span: span,
                 },
             ))
         }
@@ -4392,9 +4408,10 @@ fn lower_string_expression(
                 let [path] = argument_values(args)[..] else {
                     return Err(vec![unsupported(*span, "read_file expects 1 argument")]);
                 };
-                return Ok(mir::StringExpression::ReadFile(Box::new(
-                    lower_string_expression(path, context)?,
-                )));
+                return Ok(mir::StringExpression::ReadFile {
+                    path: Box::new(lower_string_expression(path, context)?),
+                    path_span: path.span(),
+                });
             }
             if name == "sprintf" {
                 return Ok(mir::StringExpression::Format(Box::new(
@@ -5635,6 +5652,7 @@ fn discarded_call_statement(
         mir::ReturnType::Void => mir::Statement::CallVoid {
             function: signature.id,
             args,
+            span,
         },
         mir::ReturnType::Value(
             mir::Type::Class(_)
@@ -5645,6 +5663,7 @@ fn discarded_call_statement(
         ) if signature.return_borrow.is_some() => mir::Statement::CallBorrowed {
             function: signature.id,
             args,
+            span,
         },
         mir::ReturnType::Value(_) => {
             return Err(vec![unsupported(
@@ -5683,6 +5702,7 @@ fn discarded_null_safe_call_statement(
         object,
         function: signature.id,
         args,
+        span,
     })
 }
 
@@ -6186,6 +6206,10 @@ fn lower_string_intrinsic_call(
                 }
             },
             span,
+            argument_spans: match property_receiver {
+                Some(receiver) => vec![receiver.span()],
+                None => args.iter().map(|argument| argument.value.span()).collect(),
+            },
         })
     })())
 }
@@ -6723,7 +6747,7 @@ fn reroute_condition_target(
         }
         mir::Terminator::Return(_)
         | mir::Terminator::ReturnVoid
-        | mir::Terminator::Panic(_)
+        | mir::Terminator::Panic { .. }
         | mir::Terminator::Unreachable => {}
     }
 }
@@ -8113,6 +8137,7 @@ fn lower_collection_expression(
             collection: expected,
             source: collection,
             index: Box::new(index),
+            index_span: expr.span(),
             transfer: true,
         });
     }
@@ -8197,6 +8222,7 @@ fn lower_collection_expression(
             Ok(mir::CollectionExpression::ReadFileBytes {
                 collection: expected,
                 path: Box::new(lower_string_expression(&args[0].value, context)?),
+                path_span: args[0].value.span(),
             })
         }
         hir::Expr::FunctionCall { name, args, .. }
@@ -8346,6 +8372,7 @@ fn lower_collection_expression(
                 collection: expected,
                 value: Box::new(lower_rvalue_as_expected(value, collection.value, context)?),
                 count: Box::new(lower_integer_expression(count, context)?),
+                count_span: count.span(),
             })
         }
         hir::Expr::Index {
@@ -8377,6 +8404,7 @@ fn lower_collection_expression(
                 collection: expected,
                 source,
                 index: Box::new(lower_rvalue_as_expected(index, index_type, context)?),
+                index_span: index.span(),
                 transfer: false,
             })
         }
@@ -8578,6 +8606,7 @@ fn collection_remove_at_rvalue(
                 collection: nested,
                 source: collection,
                 index: Box::new(index),
+                index_span: Span::default(),
                 transfer: true,
             }))
         }
@@ -10287,6 +10316,7 @@ fn lower_writable_shared_reference_expression(
             object,
             method,
             args,
+            span,
             ..
         } if method == "share" && args.is_empty() => {
             let value =
@@ -10918,6 +10948,7 @@ fn lower_shared_reference_access_expression(
             object,
             method,
             args,
+            span,
             ..
         } if args.is_empty()
             && ((!writable && method == "acquireReadonlyAccess")
@@ -10929,6 +10960,7 @@ fn lower_shared_reference_access_expression(
                 payload: expected,
                 value: Box::new(value),
                 writable,
+                span: *span,
             })
         }
         hir::Expr::FunctionCall { name, args, span } => {
@@ -11126,6 +11158,7 @@ fn lower_nullable_shared_reference_access_expression(
             method,
             args,
             null_safe: true,
+            span,
             ..
         } if args.is_empty()
             && ((!writable && method == "acquireReadonlyAccess")
@@ -11139,6 +11172,7 @@ fn lower_nullable_shared_reference_access_expression(
                     payload: expected,
                     value: Box::new(value),
                     writable,
+                    span: *span,
                 },
             )
         }
@@ -12809,7 +12843,7 @@ fn lower_integer_expression(
             ensure_expression_type(&lowered, ty, expr.span())?;
             Ok(lowered)
         }
-        hir::Expr::Unary { op, expr, .. } => {
+        hir::Expr::Unary { op, expr, span } => {
             let operand = lower_integer_expression(expr, context)?;
             ensure_expression_type(&operand, ty, expr.span())?;
             let op = match op {
@@ -12821,12 +12855,14 @@ fn lower_integer_expression(
                 ty,
                 op,
                 operand: Box::new(operand),
+                span: *span,
             })
         }
         hir::Expr::Binary {
             left, op, right, ..
         } => {
             let op = lower_integer_binary_op(op, expr.span())?;
+            let right_span = right.span();
             let left = lower_integer_expression(left, context)?;
             let right = lower_integer_expression(right, context)?;
             ensure_expression_type(&left, ty, expr.span())?;
@@ -12836,6 +12872,8 @@ fn lower_integer_expression(
                 op,
                 left: Box::new(left),
                 right: Box::new(right),
+                span: expr.span(),
+                right_span,
             })
         }
         hir::Expr::FunctionCall { .. } => unreachable!("function calls return before type lookup"),
@@ -12854,6 +12892,8 @@ fn lower_integer_expression(
             };
             Ok(mir::IntegerExpression::FloatToInt {
                 value: Box::new(lower_float_expression(value, context)?),
+                span: *span,
+                value_span: value.span(),
             })
         }
         hir::Expr::StaticCall {
@@ -12883,6 +12923,8 @@ fn lower_integer_expression(
             Ok(mir::IntegerExpression::Convert {
                 ty,
                 value: Box::new(lower_integer_expression(value, context)?),
+                span: *span,
+                value_span: value.span(),
             })
         }
         hir::Expr::StaticCall {
@@ -12972,6 +13014,7 @@ fn lower_compound_value(
     ty: mir::ScalarType,
     op: &hir::AssignOp,
     right: &hir::Expr,
+    span: Span,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::ValueExpression> {
     match ty {
@@ -12985,6 +13028,8 @@ fn lower_compound_value(
                     op: lower_compound_assignment_op(op),
                     left: Box::new(mir::IntegerExpression::use_operand(integer, target)),
                     right: Box::new(right),
+                    span,
+                    right_span,
                 },
             ))
         }

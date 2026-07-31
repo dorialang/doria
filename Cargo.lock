@@ -236,11 +236,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "doria-diagnostic-catalogue"
+version = "2026.3.1-canary"
+
+[[package]]
 name = "doria-rt"
 version = "2026.3.1-canary"
 dependencies = [
+ "doria-diagnostic-catalogue",
  "doria-unicode",
  "ryu",
+ "unicode-width",
 ]
 
 [[package]]
@@ -263,6 +269,7 @@ dependencies = [
  "cranelift-module",
  "cranelift-native",
  "cranelift-object",
+ "doria-diagnostic-catalogue",
  "doria-rt",
  "doria-unicode",
  "inkwell",

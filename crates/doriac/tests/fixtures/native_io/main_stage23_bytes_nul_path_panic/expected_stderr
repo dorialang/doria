@@ -1,3 +1,16 @@
-Panic: file path contained an embedded NUL
-Stack Trace:
-  at main
+Panic[P1405]: File Path Contains A NUL Byte
+
+Where
+examples/native/main_stage23_bytes_nul_path_panic.doria · line 5 · main
+
+  5              Bytes $contents = read_file_bytes($path);
+                                                   ^^^^^
+                                                   Invalid File Path Used Here
+
+Why
+A file path cannot contain an embedded NUL byte.
+
+Call Path
+main · examples/native/main_stage23_bytes_nul_path_panic.doria:5
+
+Process Exited With Status 101

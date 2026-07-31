@@ -9,7 +9,7 @@ use std::fmt;
 use crate::class_layout::{ClassId, ClassLayout, PropertyId};
 use crate::format_string::FormatPiece;
 use crate::numeric::{FloatType, FloatValue, IntegerType, IntegerValue};
-use crate::source::Span;
+use crate::source::{SourceFile, Span};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct FunctionId(pub usize);
@@ -26,14 +26,27 @@ pub struct StaticId(pub usize);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct CollectionTypeId(pub usize);
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct Program {
+    pub source: SourceFile,
     pub classes: Vec<Class>,
     pub collection_types: Vec<CollectionType>,
     pub statics: Vec<StaticProperty>,
     pub functions: Vec<Function>,
     pub entry: FunctionId,
 }
+
+impl PartialEq for Program {
+    fn eq(&self, other: &Self) -> bool {
+        self.classes == other.classes
+            && self.collection_types == other.collection_types
+            && self.statics == other.statics
+            && self.functions == other.functions
+            && self.entry == other.entry
+    }
+}
+
+impl Eq for Program {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CollectionKind {
@@ -88,10 +101,11 @@ pub struct Property {
     pub promoted: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct Function {
     pub id: FunctionId,
     pub name: String,
+    pub source_span: Span,
     pub method: Option<MethodIdentity>,
     pub receiver_mode: Option<ReceiverMode>,
     pub params: Vec<LocalId>,
@@ -100,6 +114,22 @@ pub struct Function {
     pub blocks: Vec<BasicBlock>,
     pub entry_block: BlockId,
 }
+
+impl PartialEq for Function {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+            && self.name == other.name
+            && self.method == other.method
+            && self.receiver_mode == other.receiver_mode
+            && self.params == other.params
+            && self.return_type == other.return_type
+            && self.locals == other.locals
+            && self.blocks == other.blocks
+            && self.entry_block == other.entry_block
+    }
+}
+
+impl Eq for Function {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MethodIdentity {
@@ -348,6 +378,7 @@ pub struct StringIntrinsicCall {
     pub args: Vec<Rvalue>,
     pub result: Type,
     pub span: Span,
+    pub argument_spans: Vec<Span>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1413,6 +1444,7 @@ pub enum SharedReferenceAccessExpression {
         payload: WritableSharedPayload,
         value: Box<WritableSharedReferenceExpression>,
         writable: bool,
+        span: Span,
     },
 }
 
@@ -1459,6 +1491,7 @@ pub enum NullableSharedReferenceAccessExpression {
         payload: WritableSharedPayload,
         value: Box<NullableWritableSharedReferenceExpression>,
         writable: bool,
+        span: Span,
     },
 }
 
@@ -1572,11 +1605,13 @@ pub enum CollectionExpression {
         collection: CollectionTypeId,
         value: Box<Rvalue>,
         count: Box<IntegerExpression>,
+        count_span: Span,
     },
     Index {
         collection: CollectionTypeId,
         source: LocalId,
         index: Box<Rvalue>,
+        index_span: Span,
         transfer: bool,
     },
     Property {
@@ -1606,6 +1641,7 @@ pub enum CollectionExpression {
     ReadFileBytes {
         collection: CollectionTypeId,
         path: Box<StringExpression>,
+        path_span: Span,
     },
     ReadStdinBytes {
         collection: CollectionTypeId,
@@ -2103,7 +2139,7 @@ pub enum IntegerBinaryOp {
     BitwiseOr,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub enum IntegerExpression {
     Use {
         ty: IntegerType,
@@ -2113,19 +2149,26 @@ pub enum IntegerExpression {
         ty: IntegerType,
         op: IntegerUnaryOp,
         operand: Box<IntegerExpression>,
+        span: Span,
     },
     Binary {
         ty: IntegerType,
         op: IntegerBinaryOp,
         left: Box<IntegerExpression>,
         right: Box<IntegerExpression>,
+        span: Span,
+        right_span: Span,
     },
     Convert {
         ty: IntegerType,
         value: Box<IntegerExpression>,
+        span: Span,
+        value_span: Span,
     },
     FloatToInt {
         value: Box<FloatExpression>,
+        span: Span,
+        value_span: Span,
     },
     Call {
         ty: IntegerType,
@@ -2138,6 +2181,100 @@ pub enum IntegerExpression {
         right: Box<IntegerExpression>,
     },
 }
+
+impl PartialEq for IntegerExpression {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (
+                Self::Use {
+                    ty: left_ty,
+                    operand: left,
+                },
+                Self::Use {
+                    ty: right_ty,
+                    operand: right,
+                },
+            ) => left_ty == right_ty && left == right,
+            (
+                Self::Unary {
+                    ty: left_ty,
+                    op: left_op,
+                    operand: left,
+                    ..
+                },
+                Self::Unary {
+                    ty: right_ty,
+                    op: right_op,
+                    operand: right,
+                    ..
+                },
+            ) => left_ty == right_ty && left_op == right_op && left == right,
+            (
+                Self::Binary {
+                    ty: left_ty,
+                    op: left_op,
+                    left: left_left,
+                    right: left_right,
+                    ..
+                },
+                Self::Binary {
+                    ty: right_ty,
+                    op: right_op,
+                    left: right_left,
+                    right: right_right,
+                    ..
+                },
+            ) => {
+                left_ty == right_ty
+                    && left_op == right_op
+                    && left_left == right_left
+                    && left_right == right_right
+            }
+            (
+                Self::Convert {
+                    ty: left_ty,
+                    value: left,
+                    ..
+                },
+                Self::Convert {
+                    ty: right_ty,
+                    value: right,
+                    ..
+                },
+            ) => left_ty == right_ty && left == right,
+            (Self::FloatToInt { value: left, .. }, Self::FloatToInt { value: right, .. }) => {
+                left == right
+            }
+            (
+                Self::Call {
+                    ty: left_ty,
+                    function: left_function,
+                    args: left_args,
+                },
+                Self::Call {
+                    ty: right_ty,
+                    function: right_function,
+                    args: right_args,
+                },
+            ) => left_ty == right_ty && left_function == right_function && left_args == right_args,
+            (
+                Self::Coalesce {
+                    ty: left_ty,
+                    left: left_left,
+                    right: left_right,
+                },
+                Self::Coalesce {
+                    ty: right_ty,
+                    left: right_left,
+                    right: right_right,
+                },
+            ) => left_ty == right_ty && left_left == right_left && left_right == right_right,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for IntegerExpression {}
 
 impl IntegerExpression {
     pub const fn ty(&self) -> IntegerType {
@@ -2239,7 +2376,10 @@ pub enum StringExpression {
         function: FunctionId,
         args: Vec<Rvalue>,
     },
-    ReadFile(Box<StringExpression>),
+    ReadFile {
+        path: Box<StringExpression>,
+        path_span: Span,
+    },
     Format(Box<FormatExpression>),
     Coalesce {
         left: Box<NullableStringExpression>,
@@ -2551,15 +2691,18 @@ pub enum Statement {
     CallVoid {
         function: FunctionId,
         args: Vec<Rvalue>,
+        span: Span,
     },
     CallBorrowed {
         function: FunctionId,
         args: Vec<Rvalue>,
+        span: Span,
     },
     CallNullSafe {
         object: NullableClassExpression,
         function: FunctionId,
         args: Vec<Rvalue>,
+        span: Span,
     },
     Printf(FormatExpression),
     WriteFile {
@@ -2653,7 +2796,10 @@ pub enum CollectionMutationOp {
 pub enum Terminator {
     Return(Rvalue),
     ReturnVoid,
-    Panic(StringExpression),
+    Panic {
+        message: StringExpression,
+        span: Span,
+    },
     Unreachable,
     Jump(BlockId),
     Branch {
@@ -2725,7 +2871,7 @@ fn statement_class_temporary_capacity(statement: &Statement) -> usize {
 fn terminator_class_temporary_capacity(terminator: &Terminator) -> usize {
     match terminator {
         Terminator::Return(value) => rvalue_class_temporary_capacity(value),
-        Terminator::Panic(value) => string_class_temporary_capacity(value),
+        Terminator::Panic { message, .. } => string_class_temporary_capacity(message),
         Terminator::Branch { condition, .. } => bool_class_temporary_capacity(condition),
         Terminator::ReturnVoid | Terminator::Unreachable | Terminator::Jump(_) => 0,
     }
@@ -3127,7 +3273,7 @@ fn integer_class_temporary_capacity(value: &IntegerExpression) -> usize {
         IntegerExpression::Binary { left, right, .. } => {
             integer_class_temporary_capacity(left) + integer_class_temporary_capacity(right)
         }
-        IntegerExpression::FloatToInt { value } => float_class_temporary_capacity(value),
+        IntegerExpression::FloatToInt { value, .. } => float_class_temporary_capacity(value),
         IntegerExpression::Call { args, .. } => {
             args.iter().map(rvalue_class_temporary_capacity).sum()
         }
@@ -3161,7 +3307,7 @@ fn string_class_temporary_capacity(value: &StringExpression) -> usize {
         StringExpression::Call { args, .. } => {
             args.iter().map(rvalue_class_temporary_capacity).sum()
         }
-        StringExpression::ReadFile(path) => string_class_temporary_capacity(path),
+        StringExpression::ReadFile { path, .. } => string_class_temporary_capacity(path),
         StringExpression::Format(format) => format_class_temporary_capacity(format),
         StringExpression::Coalesce { left, right } => {
             nullable_string_class_temporary_capacity(left) + string_class_temporary_capacity(right)
@@ -3626,6 +3772,7 @@ impl fmt::Display for CollectionExpression {
                 collection,
                 value,
                 count,
+                ..
             } => write!(formatter, "collection#{}[{value}; {count}]", collection.0),
             Self::Index {
                 source,
@@ -4048,7 +4195,9 @@ impl fmt::Display for IntegerExpression {
                 }
                 Operand::StringIntrinsic(call) => write!(formatter, "{call}: {ty}"),
             },
-            IntegerExpression::Unary { ty, op, operand } => {
+            IntegerExpression::Unary {
+                ty, op, operand, ..
+            } => {
                 write!(formatter, "({op}{operand}): {ty}")
             }
             IntegerExpression::Binary {
@@ -4056,11 +4205,12 @@ impl fmt::Display for IntegerExpression {
                 op,
                 left,
                 right,
+                ..
             } => write!(formatter, "({left} {op} {right}): {ty}"),
-            IntegerExpression::Convert { ty, value } => {
+            IntegerExpression::Convert { ty, value, .. } => {
                 write!(formatter, "convert<{ty}>({value}): {ty}")
             }
-            IntegerExpression::FloatToInt { value } => {
+            IntegerExpression::FloatToInt { value, .. } => {
                 write!(formatter, "Float::toInt({value}): int")
             }
             IntegerExpression::Call { ty, function, args } => {
@@ -4165,7 +4315,7 @@ impl fmt::Display for StringExpression {
             }
             StringExpression::Display(value) => write!(formatter, "display({value})"),
             StringExpression::Call { function, args } => write_call(formatter, *function, args),
-            StringExpression::ReadFile(path) => write!(formatter, "read_file({path})"),
+            StringExpression::ReadFile { path, .. } => write!(formatter, "read_file({path})"),
             StringExpression::Format(format) => write!(formatter, "format({format})"),
             StringExpression::Coalesce { left, right } => {
                 write!(formatter, "({left} ?? {right})")
@@ -4482,13 +4632,15 @@ impl fmt::Display for Statement {
                 write!(formatter, "echo \"{}\"", escape_debug_string(value))
             }
             Statement::EchoString(value) => write!(formatter, "echo {value}"),
-            Statement::CallVoid { function, args } | Statement::CallBorrowed { function, args } => {
+            Statement::CallVoid { function, args, .. }
+            | Statement::CallBorrowed { function, args, .. } => {
                 write_call(formatter, *function, args)
             }
             Statement::CallNullSafe {
                 object,
                 function,
                 args,
+                ..
             } => {
                 write!(formatter, "null_safe {object} -> ")?;
                 write_call(formatter, *function, args)
@@ -4599,7 +4751,7 @@ impl fmt::Display for Terminator {
         match self {
             Terminator::Return(operand) => write!(formatter, "return {operand}"),
             Terminator::ReturnVoid => write!(formatter, "return"),
-            Terminator::Panic(message) => write!(formatter, "panic {message}"),
+            Terminator::Panic { message, .. } => write!(formatter, "panic {message}"),
             Terminator::Unreachable => write!(formatter, "unreachable"),
             Terminator::Jump(target) => write!(formatter, "jump block{}", target.0),
             Terminator::Branch {

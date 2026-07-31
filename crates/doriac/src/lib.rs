@@ -97,7 +97,10 @@ pub fn lower_source(
     let source = SourceFile::new(path, text);
     let program = parse_source_file(&source)?;
     let semantic_info = semantics::analyze_program(&program)?;
-    lowering::lower_program_with_semantics(&program, semantic_info)
+    let mut hir = lowering::lower_program_with_semantics(&program, semantic_info)?;
+    hir.source_path = source.path;
+    hir.source_text = source.text;
+    Ok(hir)
 }
 
 pub fn lower_source_to_mir(

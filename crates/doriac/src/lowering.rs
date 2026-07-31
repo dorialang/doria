@@ -40,6 +40,8 @@ pub fn lower_program_with_semantics(
     }
 
     Ok(hir::Program {
+        source_path: String::new(),
+        source_text: String::new(),
         namespace: program
             .namespace
             .as_ref()

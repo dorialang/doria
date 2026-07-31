@@ -124,10 +124,10 @@ fn runtime_negative_fill_count_preserves_canonical_panic() {
     let output = doriac::mir_interpreter::interpret(&mir)
         .expect("runtime negative fill should produce a Doria panic outcome");
     assert_eq!(output.exit_status, 101);
-    assert_eq!(
-        output.stderr,
-        b"Panic: fill count is negative\nStack Trace:\n  at main\n"
-    );
+    let diagnostic = output
+        .runtime_diagnostic
+        .expect("fill panic should retain a structured diagnostic");
+    assert_eq!(diagnostic.code, "P1311");
 }
 
 #[test]
@@ -139,8 +139,8 @@ fn oversized_runtime_fill_count_produces_a_doria_panic() {
         .expect("oversized fill should produce a Doria panic rather than aborting the host");
 
     assert_eq!(output.exit_status, 101);
-    assert_eq!(
-        output.stderr,
-        b"Panic: collection capacity overflow\nStack Trace:\n  at main\n"
-    );
+    let diagnostic = output
+        .runtime_diagnostic
+        .expect("allocation panic should retain a structured diagnostic");
+    assert_eq!(diagnostic.code, "P1313");
 }

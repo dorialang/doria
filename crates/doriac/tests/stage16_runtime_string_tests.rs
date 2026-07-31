@@ -87,11 +87,16 @@ function fail(string $subject): void
 function main(): void { fail("string"); }
 "#);
     assert_eq!(output.stdout, b"");
-    assert_eq!(
-        output.stderr,
-        b"Panic: runtime string 16\nStack Trace:\n  at fail\n  at main\n"
-    );
     assert_eq!(output.exit_status, 101);
+    let diagnostic = output
+        .runtime_diagnostic
+        .expect("user panic should retain a structured diagnostic");
+    assert_eq!(diagnostic.code, "P1000");
+    assert_eq!(diagnostic.title, "Program Panicked");
+    let stderr = String::from_utf8(output.stderr).expect("panic output should be UTF-8");
+    assert!(stderr.contains("\n\nNote\nruntime string 16\n"));
+    assert!(stderr.contains("\n\nCall Path\nfail · stage16.doria:"));
+    assert!(stderr.contains("\nmain · stage16.doria:"));
 }
 
 #[test]

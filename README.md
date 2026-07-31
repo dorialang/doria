@@ -90,6 +90,12 @@ doriac check main.doria --diagnostic-format json
 Color is controlled independently with
 `--diagnostic-color auto|always|never`; automatic color honors `NO_COLOR`.
 
+Runtime panics use the same structured diagnostic model and format selection.
+Built-in panics have stable `P` codes, a precise Doria source label, an
+explanation, a Doria-only `Call Path`, and status 101. `doriac run` receives
+native runtime facts over a private structured channel; neither it, the
+language server, nor the Playground parses rendered terminal prose.
+
 ---
 
 <div align="center">

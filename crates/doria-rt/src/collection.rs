@@ -1,7 +1,7 @@
 use core::mem;
 use core::ptr;
 
-use crate::{allocate, deallocate, dr_v1_panic, DrStackFrameV1, DrStringV1};
+use crate::{allocate, deallocate, dr_v2_panic_code, DrStackFrameV2, DrStringV1};
 
 const COMPARE_STRING: u8 = 1;
 const COMPARE_FLOAT32: u8 = 2;
@@ -43,7 +43,7 @@ unsafe fn read_value(collection: *const DrCollectionV1, index: usize) -> u64 {
         2 => u64::from(*address.cast::<u16>()),
         4 => u64::from(*address.cast::<u32>()),
         8 => *address.cast::<u64>(),
-        _ => collection_panic(b"invalid collection value width"),
+        _ => collection_panic(b"P1001"),
     }
 }
 
@@ -54,20 +54,20 @@ unsafe fn write_value(collection: *mut DrCollectionV1, index: usize, value: u64)
         2 => *address.cast::<u16>() = value as u16,
         4 => *address.cast::<u32>() = value as u32,
         8 => *address.cast::<u64>() = value,
-        _ => collection_panic(b"invalid collection value width"),
+        _ => collection_panic(b"P1001"),
     }
 }
 
-unsafe fn allocate_words_with_frame(frame: *const DrStackFrameV1, capacity: usize) -> *mut u64 {
+unsafe fn allocate_words_with_frame(frame: *const DrStackFrameV2, capacity: usize) -> *mut u64 {
     if capacity == 0 {
         return ptr::null_mut();
     }
     let bytes = capacity
         .checked_mul(mem::size_of::<u64>())
-        .unwrap_or_else(|| collection_panic_with_frame(frame, b"collection capacity overflow"));
+        .unwrap_or_else(|| collection_panic_with_frame(frame, b"P1313"));
     let words = allocate(bytes).cast::<u64>();
     if words.is_null() {
-        collection_panic_with_frame(frame, b"collection allocation failed");
+        collection_panic_with_frame(frame, b"P1313");
     }
     ptr::write_bytes(words, 0, capacity);
     words
@@ -78,7 +78,7 @@ unsafe fn allocate_words(capacity: usize) -> *mut u64 {
 }
 
 unsafe fn allocate_values_with_frame(
-    frame: *const DrStackFrameV1,
+    frame: *const DrStackFrameV2,
     capacity: usize,
     value_width: u8,
 ) -> *mut u8 {
@@ -89,13 +89,13 @@ unsafe fn allocate_values_with_frame(
     // compact scalar representation needs fewer physical bytes.
     capacity
         .checked_mul(mem::size_of::<u64>())
-        .unwrap_or_else(|| collection_panic_with_frame(frame, b"collection capacity overflow"));
+        .unwrap_or_else(|| collection_panic_with_frame(frame, b"P1313"));
     let bytes = capacity
         .checked_mul(usize::from(value_width))
-        .unwrap_or_else(|| collection_panic_with_frame(frame, b"collection capacity overflow"));
+        .unwrap_or_else(|| collection_panic_with_frame(frame, b"P1313"));
     let values = allocate(bytes);
     if values.is_null() {
-        collection_panic_with_frame(frame, b"collection allocation failed");
+        collection_panic_with_frame(frame, b"P1313");
     }
     ptr::write_bytes(values, 0, bytes);
     values
@@ -103,12 +103,12 @@ unsafe fn allocate_values_with_frame(
 
 unsafe fn grow(collection: *mut DrCollectionV1) {
     if (*collection).fixed != 0 {
-        collection_panic(b"cannot grow a fixed-length typed array");
+        collection_panic(b"P1001");
     }
     let next = (*collection)
         .capacity
         .checked_mul(2)
-        .unwrap_or_else(|| collection_panic(b"collection capacity overflow"))
+        .unwrap_or_else(|| collection_panic(b"P1313"))
         .max(4);
     let values = allocate_values_with_frame(ptr::null(), next, (*collection).value_width);
     if (*collection).length != 0 {
@@ -141,19 +141,19 @@ pub unsafe fn new(length: usize, keyed: bool, fixed: bool, value_width: u8) -> *
 }
 
 unsafe fn new_with_frame(
-    frame: *const DrStackFrameV1,
+    frame: *const DrStackFrameV2,
     length: usize,
     keyed: bool,
     fixed: bool,
     value_width: u8,
 ) -> *mut DrCollectionV1 {
     if !valid_value_width(value_width) {
-        collection_panic_with_frame(frame, b"invalid collection value width");
+        collection_panic_with_frame(frame, b"P1001");
     }
     let capacity = if fixed { length } else { length.max(4) };
     let collection = allocate(mem::size_of::<DrCollectionV1>()).cast::<DrCollectionV1>();
     if collection.is_null() {
-        collection_panic_with_frame(frame, b"collection allocation failed");
+        collection_panic_with_frame(frame, b"P1313");
     }
     ptr::write(
         collection,
@@ -175,7 +175,7 @@ unsafe fn new_with_frame(
 }
 
 pub unsafe fn fill_word(
-    frame: *const DrStackFrameV1,
+    frame: *const DrStackFrameV2,
     value: u64,
     count: usize,
     fixed: bool,
@@ -190,7 +190,7 @@ pub unsafe fn fill_word(
 }
 
 pub unsafe fn fill_string(
-    frame: *const DrStackFrameV1,
+    frame: *const DrStackFrameV2,
     value: *mut DrStringV1,
     count: usize,
     fixed: bool,
@@ -236,14 +236,13 @@ pub unsafe fn push(collection: *mut DrCollectionV1, value: u64) {
 }
 
 pub unsafe fn insert_at(
-    frame: *const DrStackFrameV1,
+    frame: *const DrStackFrameV2,
     collection: *mut DrCollectionV1,
     index: usize,
     value: u64,
 ) {
     if index > (*collection).length {
-        static MESSAGE: &[u8] = b"collection index out of bounds";
-        dr_v1_panic(frame, MESSAGE.as_ptr(), MESSAGE.len());
+        collection_panic_with_frame(frame, b"P1310");
     }
     if (*collection).length == (*collection).capacity {
         grow(collection);
@@ -261,13 +260,12 @@ pub unsafe fn insert_at(
 }
 
 pub unsafe fn remove_at(
-    frame: *const DrStackFrameV1,
+    frame: *const DrStackFrameV2,
     collection: *mut DrCollectionV1,
     index: usize,
 ) -> u64 {
     if index >= (*collection).length {
-        static MESSAGE: &[u8] = b"collection index out of bounds";
-        dr_v1_panic(frame, MESSAGE.as_ptr(), MESSAGE.len());
+        collection_panic_with_frame(frame, b"P1310");
     }
     let removed = read_value(collection, index);
     let tail = (*collection).length - index - 1;
@@ -293,44 +291,38 @@ pub unsafe fn pop(collection: *mut DrCollectionV1, found: *mut u8) -> u64 {
 }
 
 pub unsafe fn value_at(
-    frame: *const DrStackFrameV1,
+    frame: *const DrStackFrameV2,
     collection: *const DrCollectionV1,
     index: usize,
 ) -> u64 {
     if index >= (*collection).length {
-        static MESSAGE: &[u8] = b"collection index out of bounds";
-        dr_v1_panic(frame, MESSAGE.as_ptr(), MESSAGE.len());
+        collection_panic_with_frame(frame, b"P1310");
     }
     read_value(collection, index)
 }
 
 pub unsafe fn key_at(
-    frame: *const DrStackFrameV1,
+    frame: *const DrStackFrameV2,
     collection: *const DrCollectionV1,
     index: usize,
 ) -> u64 {
     if (*collection).keyed == 0 {
-        collection_panic(b"collection does not have keys");
+        collection_panic(b"P1001");
     }
     if index >= (*collection).length {
-        dr_v1_panic(
-            frame,
-            b"collection index out of bounds".as_ptr(),
-            b"collection index out of bounds".len(),
-        );
+        collection_panic_with_frame(frame, b"P1310");
     }
     *(*collection).keys.add(index)
 }
 
 pub unsafe fn set_at(
-    frame: *const DrStackFrameV1,
+    frame: *const DrStackFrameV2,
     collection: *mut DrCollectionV1,
     index: usize,
     value: u64,
 ) -> u64 {
     if index >= (*collection).length {
-        static MESSAGE: &[u8] = b"collection index out of bounds";
-        dr_v1_panic(frame, MESSAGE.as_ptr(), MESSAGE.len());
+        collection_panic_with_frame(frame, b"P1310");
     }
     let previous = read_value(collection, index);
     write_value(collection, index, value);
@@ -461,7 +453,7 @@ pub unsafe fn nullable_access(
             }
         }
         4 => pop(collection, found),
-        _ => collection_panic(b"invalid nullable collection access"),
+        _ => collection_panic(b"P1001"),
     }
 }
 
@@ -517,7 +509,7 @@ pub unsafe fn set_algebra(
             0 => true,
             1 => contains(right, value, value_kind),
             2 => !contains(right, value, value_kind),
-            _ => collection_panic(b"invalid set operation"),
+            _ => collection_panic(b"P1001"),
         };
         if include {
             push_retained(result, value, value_kind);
@@ -541,10 +533,10 @@ unsafe fn push_retained(collection: *mut DrCollectionV1, value: u64, value_kind:
     push(collection, value);
 }
 
-fn collection_panic(message: &'static [u8]) -> ! {
-    collection_panic_with_frame(ptr::null(), message)
+fn collection_panic(code: &'static [u8]) -> ! {
+    collection_panic_with_frame(ptr::null(), code)
 }
 
-fn collection_panic_with_frame(frame: *const DrStackFrameV1, message: &'static [u8]) -> ! {
-    unsafe { dr_v1_panic(frame, message.as_ptr(), message.len()) }
+fn collection_panic_with_frame(frame: *const DrStackFrameV2, code: &'static [u8]) -> ! {
+    unsafe { dr_v2_panic_code(frame, code.as_ptr(), code.len(), ptr::null(), 0) }
 }

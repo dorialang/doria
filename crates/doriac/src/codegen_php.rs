@@ -24,12 +24,76 @@ pub fn generate(program: &Program) -> Result<String, BackendError> {
     let mut output = String::from(
         "<?php\n\ninterface __DoriaDisplayable\n{\n    public function toString(): string;\n}\n\nfunction __doria_display(string|int|float|bool|__DoriaDisplayable $value): string\n{\n    if ($value instanceof __DoriaDisplayable) { return $value->toString(); }\n    if (is_bool($value)) { return $value ? 'true' : 'false'; }\n    return (string) $value;\n}\n\nfunction __doria_less(string|int|float|bool $left, string|int|float|bool $right): bool\n{\n    if (is_string($left) && is_string($right)) { return strcmp($left, $right) < 0; }\n    return $left < $right;\n}\n\nfunction __doria_less_equal(string|int|float|bool $left, string|int|float|bool $right): bool\n{\n    if (is_string($left) && is_string($right)) { return strcmp($left, $right) <= 0; }\n    return $left <= $right;\n}\n\nfunction __doria_greater(string|int|float|bool $left, string|int|float|bool $right): bool\n{\n    if (is_string($left) && is_string($right)) { return strcmp($left, $right) > 0; }\n    return $left > $right;\n}\n\nfunction __doria_greater_equal(string|int|float|bool $left, string|int|float|bool $right): bool\n{\n    if (is_string($left) && is_string($right)) { return strcmp($left, $right) >= 0; }\n    return $left >= $right;\n}\n\n",
     );
+    output.push_str(&format!(
+        "$__doria_source_path = {};\n$__doria_source_text = hex2bin({});\n",
+        emit_php_string_literal(&program.source_path),
+        emit_php_string_literal(&hex_bytes(program.source_text.as_bytes())),
+    ));
+    output.push_str("$__doria_catalogue = [\n");
+    for entry in doria_diagnostic_catalogue::RUNTIME_CATALOGUE
+        .iter()
+        .filter(|entry| {
+            matches!(
+                entry.code,
+                "P1000"
+                    | "P1001"
+                    | "P1401"
+                    | "P1402"
+                    | "P1403"
+                    | "P1404"
+                    | "P1405"
+                    | "P1406"
+                    | "P1407"
+            )
+        })
+    {
+        output.push_str(&format!(
+            "    {} => [{}, {}, {}],\n",
+            emit_php_string_literal(entry.code),
+            emit_php_string_literal(entry.title),
+            emit_php_string_literal(entry.primary_label),
+            emit_php_string_literal(entry.explanation),
+        ));
+    }
+    output.push_str("];\n$__doria_function_spans = [\n");
+    for item in &program.items {
+        match item {
+            Item::Function(function) => output.push_str(&format!(
+                "    {} => {},\n",
+                emit_php_string_literal(&function.name),
+                function.span.start,
+            )),
+            Item::Class(class) => {
+                for member in &class.members {
+                    if let ClassMember::Method(function) = member {
+                        output.push_str(&format!(
+                            "    {} => {},\n",
+                            emit_php_string_literal(&format!("{}::{}", class.name, function.name)),
+                            function.span.start,
+                        ));
+                    }
+                }
+            }
+            Item::Constant(_) | Item::Statement(_) => {}
+        }
+    }
+    output.push_str("];\n\n");
     output.push_str(
-        r#"function __doria_io_panic(string $message)
+        r#"function __doria_source_line(int $offset): int
 {
-    @fwrite(STDERR, "Panic: " . $message . "\nStack Trace:\n");
+    global $__doria_source_text;
+    return substr_count(substr($__doria_source_text, 0, max(0, $offset)), "\n") + 1;
+}
+
+function __doria_panic(string $code, int $start, int $end, ?string $message = null)
+{
+    global $__doria_catalogue, $__doria_source_path, $__doria_source_text, $__doria_function_spans;
+    if (!isset($__doria_catalogue[$code])) { $code = "P1001"; }
+    [$title, $label, $why] = $__doria_catalogue[$code];
+    $line = __doria_source_line($start);
     $helperFunctions = [
-        "__doria_io_panic",
+        "__doria_panic",
+        "__doria_source_line",
         "__doria_read_line",
         "__doria_read_file",
         "__doria_write_file",
@@ -41,23 +105,63 @@ pub fn generate(program: &Program) -> Result<String, BackendError> {
         "__doria_sprintf",
         "__doria_printf",
     ];
+    $frames = [];
     foreach (debug_backtrace(DEBUG_BACKTRACE_IGNORE_ARGS) as $frame) {
         if (isset($frame["function"]) &&
             (isset($frame["class"]) || !in_array($frame["function"], $helperFunctions, true))) {
-            @fwrite(STDERR, "  at " . $frame["function"] . "\n");
+            $frames[] = $frame;
         }
     }
+    $function = "main";
+    if (isset($frames[0])) {
+        $function = isset($frames[0]["class"])
+            ? $frames[0]["class"] . "::" . $frames[0]["function"]
+            : $frames[0]["function"];
+    }
+    @fwrite(STDERR, "Panic[" . $code . "]: " . $title . "\n\nWhere\n");
+    @fwrite(STDERR, $__doria_source_path . " · line " . $line . " · " . $function . "\n\n");
+    $before = substr($__doria_source_text, 0, max(0, $start));
+    $lineStart = strrpos($before, "\n");
+    $lineStart = $lineStart === false ? 0 : $lineStart + 1;
+    $lineEnd = strpos($__doria_source_text, "\n", max(0, $start));
+    $lineEnd = $lineEnd === false ? strlen($__doria_source_text) : $lineEnd;
+    $lineText = rtrim(substr($__doria_source_text, $lineStart, $lineEnd - $lineStart), "\r");
+    $prefix = substr($__doria_source_text, $lineStart, max(0, $start - $lineStart));
+    $selected = substr($__doria_source_text, max(0, $start), max(1, $end - $start));
+    $prefixWidth = preg_match_all('/\X/u', $prefix, $unused);
+    $markerWidth = preg_match_all('/\X/u', $selected, $unused);
+    if ($prefixWidth === false) { $prefixWidth = strlen($prefix); }
+    if ($markerWidth === false || $markerWidth === 0) { $markerWidth = 1; }
+    @fwrite(STDERR, "  " . $line . "  " . $lineText . "\n");
+    $gutter = str_repeat(" ", 4 + strlen((string) $line) + $prefixWidth);
+    @fwrite(STDERR, $gutter . str_repeat("^", $markerWidth) . "\n");
+    @fwrite(STDERR, $gutter . $label . "\n\nWhy\n" . $why);
+    if ($code === "P1000" && $message !== null) {
+        @fwrite(STDERR, "\n\nNote\n" . $message);
+    }
+    @fwrite(STDERR, "\n\nCall Path");
+    foreach ($frames as $index => $frame) {
+        $name = isset($frame["class"])
+            ? $frame["class"] . "::" . $frame["function"]
+            : $frame["function"];
+        $frameOffset = $index === 0 ? $start : ($__doria_function_spans[$name] ?? $start);
+        @fwrite(
+            STDERR,
+            "\n" . $name . " · " . $__doria_source_path . ":" . __doria_source_line($frameOffset)
+        );
+    }
+    @fwrite(STDERR, "\n\nProcess Exited With Status 101\n");
     exit(101);
 }
 
-function __doria_read_line(): ?string
+function __doria_read_line(int $start, int $end): ?string
 {
     $line = @fgets(STDIN);
     if ($line === false) {
         if (feof(STDIN)) { return null; }
-        __doria_io_panic("failed to read stdin");
+        __doria_panic("P1403", $start, $end);
     }
-    if (preg_match('//u', $line) !== 1) { __doria_io_panic("stdin contained invalid UTF-8"); }
+    if (preg_match('//u', $line) !== 1) { __doria_panic("P1404", $start, $end); }
     if (str_ends_with($line, "\n")) {
         $line = substr($line, 0, -1);
         if (str_ends_with($line, "\r")) { $line = substr($line, 0, -1); }
@@ -65,27 +169,27 @@ function __doria_read_line(): ?string
     return $line;
 }
 
-function __doria_read_file(string $path): string
+function __doria_read_file(string $path, int $start, int $end): string
 {
-    if (str_contains($path, "\0")) { __doria_io_panic("file path contained an embedded NUL"); }
+    if (str_contains($path, "\0")) { __doria_panic("P1405", $start, $end); }
     $contents = @file_get_contents($path);
-    if ($contents === false) { __doria_io_panic("failed to read file"); }
-    if (preg_match('//u', $contents) !== 1) { __doria_io_panic("file contained invalid UTF-8"); }
+    if ($contents === false) { __doria_panic("P1401", $start, $end); }
+    if (preg_match('//u', $contents) !== 1) { __doria_panic("P1406", $start, $end); }
     return $contents;
 }
 
-function __doria_write_file(string $path, string $contents): void
+function __doria_write_file(string $path, string $contents, int $start, int $end): void
 {
-    if (str_contains($path, "\0")) { __doria_io_panic("file path contained an embedded NUL"); }
+    if (str_contains($path, "\0")) { __doria_panic("P1405", $start, $end); }
     $written = @file_put_contents($path, $contents);
-    if ($written === false || $written !== strlen($contents)) { __doria_io_panic("failed to write file"); }
+    if ($written === false || $written !== strlen($contents)) { __doria_panic("P1402", $start, $end); }
 }
 
-function __doria_append_file(string $path, string $contents): void
+function __doria_append_file(string $path, string $contents, int $start, int $end): void
 {
-    if (str_contains($path, "\0")) { __doria_io_panic("file path contained an embedded NUL"); }
+    if (str_contains($path, "\0")) { __doria_panic("P1405", $start, $end); }
     $written = @file_put_contents($path, $contents, FILE_APPEND);
-    if ($written === false || $written !== strlen($contents)) { __doria_io_panic("failed to append file"); }
+    if ($written === false || $written !== strlen($contents)) { __doria_panic("P1402", $start, $end); }
 }
 
 function __doria_is_broken_pipe(?array $error): bool
@@ -99,7 +203,7 @@ function __doria_is_broken_pipe(?array $error): bool
     return stripos($message, "broken pipe") !== false;
 }
 
-function __doria_write_all(mixed $stream, string $value, string $failure): void
+function __doria_write_all(mixed $stream, string $value, int $start, int $end): void
 {
     $offset = 0;
     $length = strlen($value);
@@ -108,20 +212,20 @@ function __doria_write_all(mixed $stream, string $value, string $failure): void
         $written = @fwrite($stream, substr($value, $offset));
         if ($written === false || $written === 0) {
             if (__doria_is_broken_pipe(error_get_last())) { exit(0); }
-            __doria_io_panic($failure);
+            __doria_panic("P1407", $start, $end);
         }
         $offset += $written;
     }
 }
 
-function __doria_write_stdout(string $value): void
+function __doria_write_stdout(string $value, int $start, int $end): void
 {
-    __doria_write_all(STDOUT, $value, "failed to write stdout");
+    __doria_write_all(STDOUT, $value, $start, $end);
 }
 
-function __doria_write_stderr(string $value): void
+function __doria_write_stderr(string $value, int $start, int $end): void
 {
-    __doria_write_all(STDERR, $value, "failed to write stderr");
+    __doria_write_all(STDERR, $value, $start, $end);
 }
 
 function __doria_sprintf(string $format, mixed ...$values): string
@@ -129,10 +233,10 @@ function __doria_sprintf(string $format, mixed ...$values): string
     return sprintf($format, ...$values);
 }
 
-function __doria_printf(string $format, mixed ...$values): void
+function __doria_printf(int $start, int $end, string $format, mixed ...$values): void
 {
     $value = sprintf($format, ...$values);
-    __doria_write_all(STDOUT, $value, "failed to write stdout");
+    __doria_write_all(STDOUT, $value, $start, $end);
 }
 
 "#,
@@ -1451,13 +1555,15 @@ fn emit_statement(
                 ),
             );
         }
-        Stmt::Echo { expr, .. } => {
+        Stmt::Echo { expr, span } => {
             writeln(
                 output,
                 indent,
                 &format!(
-                    "__doria_write_stdout(__doria_display({}));",
-                    emit_expr(expr, scopes)
+                    "__doria_write_stdout(__doria_display({}), {}, {});",
+                    emit_expr(expr, scopes),
+                    span.start,
+                    span.end,
                 ),
             );
         }
@@ -1496,9 +1602,9 @@ fn emit_statement(
             );
         }
         Stmt::Expr { expr, .. } => {
-            if let Expr::FunctionCall { name, args, .. } = expr {
+            if let Expr::FunctionCall { name, args, span } = expr {
                 if name == "panic" && args.len() == 1 {
-                    emit_panic(&args[0].value, output, indent, scopes);
+                    emit_panic(&args[0].value, *span, output, indent, scopes);
                     return;
                 }
             }
@@ -1507,36 +1613,23 @@ fn emit_statement(
     }
 }
 
-fn emit_panic(message: &Expr, output: &mut String, indent: usize, scopes: &mut PhpNameScopes) {
-    let frame_name = scopes.fresh_temp("frame");
+fn emit_panic(
+    message: &Expr,
+    span: Span,
+    output: &mut String,
+    indent: usize,
+    scopes: &mut PhpNameScopes,
+) {
     writeln(
         output,
         indent,
         &format!(
-            "@fwrite(STDERR, \"Panic: \" . {} . \"\\nStack Trace:\\n\");",
-            emit_expr(message, scopes)
+            "__doria_panic(\"P1000\", {}, {}, {});",
+            span.start,
+            span.end,
+            emit_expr(message, scopes),
         ),
     );
-    writeln(
-        output,
-        indent,
-        &format!("foreach (debug_backtrace(DEBUG_BACKTRACE_IGNORE_ARGS) as ${frame_name})"),
-    );
-    writeln(output, indent, "{");
-    writeln(
-        output,
-        indent + 1,
-        &format!("if (isset(${frame_name}[\"function\"]))"),
-    );
-    writeln(output, indent + 1, "{");
-    writeln(
-        output,
-        indent + 2,
-        &format!("@fwrite(STDERR, \"  at \" . ${frame_name}[\"function\"] . \"\\n\");"),
-    );
-    writeln(output, indent + 1, "}");
-    writeln(output, indent, "}");
-    writeln(output, indent, "exit(101);");
 }
 
 fn emit_for(for_stmt: &ForStmt, output: &mut String, indent: usize, scopes: &mut PhpNameScopes) {
@@ -1891,7 +1984,7 @@ fn emit_expr(expr: &Expr, scopes: &PhpNameScopes) -> String {
             if *null_safe { "?->" } else { "->" },
             emit_arguments(args, scopes)
         ),
-        Expr::FunctionCall { name, args, .. } => emit_function_call(name, args, scopes),
+        Expr::FunctionCall { name, args, span } => emit_function_call(name, args, *span, scopes),
         Expr::StaticCall {
             class_name,
             method,
@@ -2068,7 +2161,7 @@ fn emit_binary_op(op: &BinaryOp) -> &'static str {
     }
 }
 
-fn emit_function_call(name: &str, args: &[Argument], scopes: &PhpNameScopes) -> String {
+fn emit_function_call(name: &str, args: &[Argument], span: Span, scopes: &PhpNameScopes) -> String {
     let helper = match name {
         "read_line" => "__doria_read_line",
         "read_file" => "__doria_read_file",
@@ -2102,7 +2195,27 @@ fn emit_function_call(name: &str, args: &[Argument], scopes: &PhpNameScopes) -> 
             }
         }
     }
+    if name == "printf" {
+        emitted.insert(0, span.end.to_string());
+        emitted.insert(0, span.start.to_string());
+    } else if matches!(
+        name,
+        "read_line" | "read_file" | "write_file" | "append_file" | "write_stderr"
+    ) {
+        emitted.push(format!("start: {}", span.start));
+        emitted.push(format!("end: {}", span.end));
+    }
     format!("{helper}({})", emitted.join(", "))
+}
+
+fn hex_bytes(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push(DIGITS[(byte >> 4) as usize] as char);
+        output.push(DIGITS[(byte & 0x0f) as usize] as char);
+    }
+    output
 }
 
 fn php_format_from_plan(pieces: &[FormatPiece]) -> String {

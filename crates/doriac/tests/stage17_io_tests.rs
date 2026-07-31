@@ -136,10 +136,12 @@ function main(): void
 
     assert!(output.output.stdout.is_empty());
     assert_eq!(output.output.exit_status, 101);
-    assert_eq!(
-        output.output.stderr,
-        b"Panic: file contained invalid UTF-8\nStack Trace:\n  at main\n"
-    );
+    let diagnostic = output
+        .output
+        .runtime_diagnostic
+        .expect("invalid UTF-8 should retain a structured diagnostic");
+    assert_eq!(diagnostic.code, "P1406");
+    assert_eq!(diagnostic.title, "File Text Is Not Valid UTF-8");
 }
 
 #[test]

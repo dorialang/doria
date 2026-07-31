@@ -60,7 +60,7 @@ fn representative_fixtures_exercise_the_human_first_contract() {
             },
         );
         assert!(human.contains(&format!("Error[{code}]: {title}")));
-        assert!(human.contains("Why:"));
+        assert!(human.contains("\nWhy\n"));
         assert!(human.ends_with(&format!(
             "Compilation Failed: {} Error{}",
             diagnostics.len(),

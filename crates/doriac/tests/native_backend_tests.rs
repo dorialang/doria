@@ -889,7 +889,8 @@ fn stage_13_native_integer_failures_use_runtime_panic_and_doria_frames() {
     let cases = [
         (
             "addition",
-            "integer overflow during addition",
+            "P1101",
+            "Integer Addition Overflowed",
             r#"function fail(int8 $value): int8
 {
     return $value + 1;
@@ -903,7 +904,8 @@ function main(): int
         ),
         (
             "subtraction",
-            "integer overflow during subtraction",
+            "P1102",
+            "Integer Subtraction Overflowed",
             r#"function fail(uint8 $value): uint8
 {
     return $value - 1;
@@ -917,7 +919,8 @@ function main(): int
         ),
         (
             "multiplication",
-            "integer overflow during multiplication",
+            "P1103",
+            "Integer Multiplication Overflowed",
             r#"function fail(uint8 $value): uint8
 {
     return $value * 2;
@@ -931,7 +934,8 @@ function main(): int
         ),
         (
             "negation",
-            "integer overflow during negation",
+            "P1104",
+            "Integer Negation Overflowed",
             r#"function fail(int8 $value): int8
 {
     return -$value;
@@ -945,7 +949,8 @@ function main(): int
         ),
         (
             "division_zero",
-            "integer division by zero",
+            "P1105",
+            "Integer Division By Zero",
             r#"function fail(int8 $value, int8 $divisor): int8
 {
     return $value / $divisor;
@@ -959,7 +964,8 @@ function main(): int
         ),
         (
             "division_overflow",
-            "integer division overflow",
+            "P1106",
+            "Integer Division Overflowed",
             r#"function fail(int8 $value, int8 $divisor): int8
 {
     return $value / $divisor;
@@ -973,7 +979,8 @@ function main(): int
         ),
         (
             "remainder_zero",
-            "integer remainder by zero",
+            "P1107",
+            "Integer Remainder By Zero",
             r#"function fail(int8 $value, int8 $divisor): int8
 {
     return $value % $divisor;
@@ -987,7 +994,8 @@ function main(): int
         ),
         (
             "shift",
-            "integer shift count out of range",
+            "P1108",
+            "Integer Shift Count Is Out Of Range",
             r#"function fail(uint8 $value, uint8 $count): uint8
 {
     return $value << $count;
@@ -1001,7 +1009,8 @@ function main(): int
         ),
         (
             "negative_shift",
-            "integer shift count out of range",
+            "P1108",
+            "Integer Shift Count Is Out Of Range",
             r#"function fail(int8 $value, int8 $count): int8
 {
     return $value >> $count;
@@ -1015,7 +1024,8 @@ function main(): int
         ),
         (
             "conversion",
-            "integer conversion out of range",
+            "P1109",
+            "Integer Conversion Is Out Of Range",
             r#"function fail(int $value): uint8
 {
     return UInt8::from($value);
@@ -1029,7 +1039,8 @@ function main(): int
         ),
         (
             "negative_conversion",
-            "integer conversion out of range",
+            "P1109",
+            "Integer Conversion Is Out Of Range",
             r#"function fail(int8 $value): uint16
 {
     return UInt16::from($value);
@@ -1043,7 +1054,8 @@ function main(): int
         ),
         (
             "unsigned_to_signed_conversion",
-            "integer conversion out of range",
+            "P1109",
+            "Integer Conversion Is Out Of Range",
             r#"function fail(uint64 $value): int64
 {
     return Int64::from($value);
@@ -1057,17 +1069,13 @@ function main(): int
         ),
     ];
 
-    for (stem, message, source) in cases {
+    for (stem, code, title, source) in cases {
         let output = temp_executable_path(&format!("stage13_{stem}_panic"));
         compile_native_source(source, &output);
         let run = run_native_executable(&output).expect("native executable should run");
         assert_eq!(run.status.code(), Some(101), "{stem}");
         assert!(run.stdout.is_empty(), "{stem}");
-        assert_eq!(
-            String::from_utf8(run.stderr).expect("panic stderr should be UTF-8"),
-            format!("Panic: {message}\nStack Trace:\n  at fail\n  at main\n"),
-            "{stem}"
-        );
+        assert_native_runtime_panic(&run.stderr, code, title, &["fail", "main"], stem);
         let _ = fs::remove_file(output);
     }
 }
@@ -1209,9 +1217,12 @@ function main(): void
         .expect("native executable should run");
     assert_eq!(run.status.code(), Some(101));
     assert!(run.stdout.is_empty());
-    assert_eq!(
-        run.stderr,
-        b"Panic: file contained invalid UTF-8\nStack Trace:\n  at main\n"
+    assert_native_runtime_panic(
+        &run.stderr,
+        "P1406",
+        "File Text Is Not Valid UTF-8",
+        &["main"],
+        "invalid UTF-8 file",
     );
 
     let _ = fs::remove_dir_all(directory);
@@ -1386,9 +1397,12 @@ fn native_file_write_failure_still_panics() {
         .expect("native executable should run");
     assert_eq!(run.status.code(), Some(101));
     assert!(run.stdout.is_empty());
-    assert_eq!(
-        run.stderr,
-        b"Panic: failed to write file\nStack Trace:\n  at main\n"
+    assert_native_runtime_panic(
+        &run.stderr,
+        "P1402",
+        "File Write Failed",
+        &["main"],
+        "file write failure",
     );
 
     let _ = fs::remove_file(output);
@@ -1431,9 +1445,12 @@ function main(): void
 
     assert_eq!(run.status.code(), Some(101));
     assert!(run.stdout.is_empty());
-    assert_eq!(
-        run.stderr,
-        b"Panic: failed to read stdin\nStack Trace:\n  at main\n"
+    assert_native_runtime_panic(
+        &run.stderr,
+        "P1403",
+        "Standard Input Read Failed",
+        &["main"],
+        "stdin read failure",
     );
 
     let _ = fs::remove_file(output);
@@ -1456,6 +1473,43 @@ fn os_pipe() -> io::Result<(OwnedFd, OwnedFd)> {
             OwnedFd::from_raw_fd(descriptors[1]),
         )
     })
+}
+
+fn assert_native_runtime_panic(
+    stderr: &[u8],
+    code: &str,
+    title: &str,
+    frames: &[&str],
+    context: &str,
+) {
+    let stderr = String::from_utf8(stderr.to_vec()).expect("panic stderr should be UTF-8");
+    assert!(
+        stderr.starts_with(&format!("Panic[{code}]: {title}\n\nWhere\n")),
+        "{context}: unexpected panic header or Where section:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("\n\nWhy\n"),
+        "{context}: missing Why section:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("\n\nCall Path\n"),
+        "{context}: missing Call Path section:\n{stderr}"
+    );
+    let mut previous = 0;
+    for frame in frames {
+        let marker = format!("\n{frame} · ");
+        let index = stderr[previous..]
+            .find(&marker)
+            .map(|index| previous + index)
+            .unwrap_or_else(|| panic!("{context}: missing `{frame}` call-path frame:\n{stderr}"));
+        previous = index + marker.len();
+    }
+    assert!(
+        stderr.ends_with("\n\nProcess Exited With Status 101\n"),
+        "{context}: missing final process status:\n{stderr}"
+    );
+    assert!(!stderr.contains("Stack Trace"), "{context}: {stderr}");
+    assert!(!stderr.contains("-->"), "{context}: {stderr}");
 }
 
 fn inline_native_source(stem: &str) -> &'static str {

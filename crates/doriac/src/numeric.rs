@@ -700,6 +700,20 @@ pub enum IntegerPanic {
 }
 
 impl IntegerPanic {
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::OverflowAddition => "P1101",
+            Self::OverflowSubtraction => "P1102",
+            Self::OverflowMultiplication => "P1103",
+            Self::OverflowNegation => "P1104",
+            Self::DivisionByZero => "P1105",
+            Self::DivisionOverflow => "P1106",
+            Self::RemainderByZero => "P1107",
+            Self::ShiftCountOutOfRange => "P1108",
+            Self::ConversionOutOfRange => "P1109",
+        }
+    }
+
     pub const fn message(self) -> &'static str {
         match self {
             Self::OverflowAddition => "integer overflow during addition",

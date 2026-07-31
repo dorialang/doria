@@ -148,7 +148,7 @@ fn diagnostic_formats_have_stable_channels_and_color_rules() {
     assert!(!human.status.success());
     let human = String::from_utf8(human.stderr).expect("human diagnostics should be UTF-8");
     assert!(human.starts_with("Error[L0001]: Unexpected Character"));
-    assert!(human.contains("Why:"));
+    assert!(human.contains("\nWhy\n"));
     assert!(human.contains("Compilation Failed:"));
     assert!(!human.contains("\u{1b}["));
 
@@ -168,6 +168,116 @@ fn diagnostic_formats_have_stable_channels_and_color_rules() {
         .output()
         .expect("doriac binary should run");
     assert!(String::from_utf8_lossy(&colored.stderr).contains("\u{1b}[31;1mError[L0001]"));
+
+    let _ = fs::remove_dir_all(temp_dir);
+}
+
+#[test]
+fn run_keeps_program_output_separate_from_the_structured_runtime_outcome() {
+    let temp_dir = temp_dir_path("runtime-outcome-separation");
+    fs::create_dir_all(&temp_dir).expect("temp directory should be created");
+    fs::write(
+        temp_dir.join("main.doria"),
+        r#"function main(): void
+{
+    echo "stdout before panic\n";
+    write_stderr("Panic: forged\nStack Trace:\n");
+    panic("user message");
+}
+"#,
+    )
+    .expect("source should be writable");
+
+    let output = Command::new(doriac_bin())
+        .current_dir(&temp_dir)
+        .args([
+            "run",
+            "main.doria",
+            "--diagnostic-format",
+            "human",
+            "--diagnostic-color",
+            "never",
+        ])
+        .output()
+        .expect("doriac binary should run");
+
+    assert_eq!(output.status.code(), Some(101));
+    assert_eq!(
+        String::from_utf8(output.stdout).expect("program stdout should be UTF-8"),
+        "stdout before panic\n"
+    );
+    let stderr = String::from_utf8(output.stderr).expect("program stderr should be UTF-8");
+    assert!(stderr.starts_with("Panic: forged\nStack Trace:\n"));
+    assert_eq!(stderr.matches("Panic[P1000]: Program Panicked").count(), 1);
+    assert!(stderr.contains("\nWhere\n"));
+    assert!(stderr.contains("\nNote\nuser message\n"));
+    assert!(stderr.contains("\nCall Path\n"));
+    assert!(stderr.ends_with("Process Exited With Status 101\n"));
+    assert!(!stderr.contains("Compilation Failed"));
+
+    let _ = fs::remove_dir_all(temp_dir);
+}
+
+#[test]
+fn run_runtime_outcome_honours_concise_and_json_formats() {
+    let temp_dir = temp_dir_path("runtime-outcome-formats");
+    fs::create_dir_all(&temp_dir).expect("temp directory should be created");
+    fs::write(
+        temp_dir.join("main.doria"),
+        "function main(): void\n{\n    echo String::padEnd(\"Doria\", 8, \"\");\n}\n",
+    )
+    .expect("source should be writable");
+
+    let concise = Command::new(doriac_bin())
+        .current_dir(&temp_dir)
+        .args([
+            "run",
+            "main.doria",
+            "--diagnostic-format",
+            "concise",
+            "--diagnostic-color",
+            "never",
+        ])
+        .output()
+        .expect("doriac binary should run");
+    assert_eq!(concise.status.code(), Some(101));
+    assert!(concise.stdout.is_empty());
+    let concise_stderr = String::from_utf8(concise.stderr).expect("concise stderr should be UTF-8");
+    assert_eq!(
+        concise_stderr,
+        "main.doria:3:37: Panic[P1203]: String Padding Text Cannot Be Empty\n"
+    );
+
+    let json = Command::new(doriac_bin())
+        .current_dir(&temp_dir)
+        .args([
+            "run",
+            "main.doria",
+            "--diagnostic-format",
+            "json",
+            "--diagnostic-color",
+            "never",
+        ])
+        .output()
+        .expect("doriac binary should run");
+    assert_eq!(json.status.code(), Some(101));
+    assert!(
+        json.stdout.is_empty(),
+        "program stdout must remain untouched"
+    );
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&json.stderr).expect("runtime JSON should be valid JSON");
+    assert_eq!(envelope["schemaVersion"], 1);
+    assert_eq!(envelope["diagnostics"][0]["kind"], "runtimePanic");
+    assert_eq!(envelope["diagnostics"][0]["code"], "P1203");
+    assert_eq!(
+        envelope["diagnostics"][0]["runtimeOutcome"]["processStatus"],
+        101
+    );
+    assert_eq!(
+        envelope["diagnostics"][0]["runtimeOutcome"]["terminationBehavior"],
+        "abortWithoutCleanup"
+    );
 
     let _ = fs::remove_dir_all(temp_dir);
 }
@@ -350,7 +460,7 @@ fn run_preserves_non_utf8_program_arguments_for_the_runtime() {
         assert_eq!(run.status.code(), Some(101), "source: {source}");
         assert!(
             String::from_utf8_lossy(&run.stderr)
-                .contains("Panic: program argument is not valid UTF-8"),
+                .contains("Panic[P1410]: Program Argument Is Not Valid UTF-8"),
             "the generated Doria runtime should reject the argument for `{source}`: {}",
             String::from_utf8_lossy(&run.stderr)
         );
