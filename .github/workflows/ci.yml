@@ -334,8 +334,12 @@ jobs:
           Invoke-WebRequest -Uri "https://github.com/llvm/llvm-project/releases/download/llvmorg-18.1.8/clang%2Bllvm-18.1.8-x86_64-pc-windows-msvc.tar.xz" -OutFile $archive
           tar -xf $archive -C $env:RUNNER_TEMP
           $vcpkg = (Get-Command vcpkg -ErrorAction Stop).Source
-          & $vcpkg install "libxml2[core]:x64-windows-static"
-          if ($LASTEXITCODE -ne 0) { throw "failed to install LLVM's static libxml2 dependency" }
+          for ($attempt = 1; $attempt -le 3; $attempt++) {
+            & $vcpkg install "libxml2[core]:x64-windows-static"
+            if ($LASTEXITCODE -eq 0) { break }
+            if ($attempt -eq 3) { throw "failed to install LLVM's static libxml2 dependency after $attempt attempts" }
+            Start-Sleep -Seconds (5 * $attempt)
+          }
           $libxmlDirectory = Join-Path (Split-Path $vcpkg) "installed\x64-windows-static\lib"
           $libxml = Join-Path $libxmlDirectory "libxml2s.lib"
           if (-not (Test-Path $libxml)) { $libxml = Join-Path $libxmlDirectory "libxml2.lib" }
