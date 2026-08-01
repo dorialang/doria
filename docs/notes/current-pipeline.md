@@ -69,10 +69,24 @@ Documentation role: working note. This file prevents duplicated in-flight work. 
   this foundation but remain unimplemented.
 - The durable manifest supports raw stdin, isolated seeded files, declared program arguments, and exact interpreter/Cranelift/LLVM stdout, stderr, status, generated-file, and class-lifetime comparison.
 
+- The Interactive Line-Input Amendment is implemented. `read_line(string $prompt
+  = ""): ?string` is one compiler-known function with an optional parameter and
+  an inclusive arity range, not an overload pair. One canonical MIR operation
+  owns the ordering contract — evaluate the prompt exactly once, write it
+  exactly with no added newline, flush stdout, then read one line — and the
+  interpreter, Cranelift, LLVM, and PHP compatibility backend all consume it.
+  `read_line()` remains valid and lowers with the canonical empty-string default,
+  which still performs the pre-read flush. Line discipline, EOF, and buffered
+  remainders are unchanged. A closed stdout pipe during the prompt write or
+  flush exits with status 0 without reading stdin; other output failures use
+  P1407, read failures P1403, invalid UTF-8 P1404, and allocation failure P1206,
+  all through the decision 0109 foundation. The flush substrate now reports the
+  same success/broken-pipe/other-failure vocabulary as writes.
+
 ## Next
 
-- Implement the Interactive Line-Input Amendment.
-- Stage 25a Slice 4 remains blocked until that amendment is complete.
+- Stage 25a Slice 4.
+- Stage 25a remains incomplete until Slice 4 lands.
 
 ## Do not duplicate
 

@@ -27,6 +27,16 @@ Native Unix recognizes `EPIPE`; native Windows recognizes
 `ERROR_BROKEN_PIPE` and `ERROR_NO_DATA`. Unix continues to ignore `SIGPIPE` so
 the write operation can report `EPIPE` instead of terminating by signal.
 
+The prompt written by `read_line(string $prompt = "")` is ordinary program output,
+so a closed stdout pipe during that write — or during the mandatory flush that
+precedes the stdin read — takes this clean status-0 exit and does not go on to read
+stdin. A non-broken-pipe prompt-write or flush failure keeps the status-101 panic
+path. Because the flush now participates, the device layer reports flush results
+with the same success / broken pipe / other-failure vocabulary as writes. When
+checked errors land, the `read_line` migration carries prompt output and its flush
+alongside the stdin read and input decoding; the closed-pipe exit above stays a
+permanent carve-out and never becomes a throw.
+
 This rule is limited to ordinary program output on standard streams. Panic
 diagnostic writes are best effort and never replace the fatal panic status: if
 stderr is closed while a panic is being reported, diagnostic bytes may be absent

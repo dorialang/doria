@@ -831,7 +831,7 @@ Simple collection literals infer collection element/key/value types when all cle
 Stage 17 provides these compiler-known built-ins:
 
 ```doria
-read_line(): ?string
+read_line(string $prompt = ""): ?string
 read_file(string $path): string
 write_file(string $path, string $contents): void
 write_stderr(string $value): void

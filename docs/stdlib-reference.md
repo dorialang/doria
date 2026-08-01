@@ -57,7 +57,7 @@ object's lifetime before the surrounding function continues.
 Regularized `snake_case` functions for capabilities without one natural owning type. Type-coupled vocabulary belongs to the corresponding companion. Details: decision 0074 (formatted I/O), §9.1 charter, and decision 0103 (String boundary).
 
 - **Formatting:** compiler-known `sprintf` returns `string` and `printf` returns `void`. Each takes a literal `string $format` first, followed by the typed operands required by that format; this intrinsic-only tail is not an untyped userland parameter declaration. Specifiers: `%s %d %f %.Nf %x %X %o %b %%`, width / `-` / `0` flags.
-- **Text I/O:** `read_line(): ?string`, `read_file(string): string`, `write_file(string, string): void` (truncate), `append_file(string, string): void`, `write_stderr(string): void`.
+- **Text I/O:** `read_line(string $prompt = ""): ?string` — writes the prompt exactly (no newline added), flushes stdout, then reads one line; the flush happens even for the default empty prompt, `null` is EOF and `""` is a blank line — `read_file(string): string`, `write_file(string, string): void` (truncate), `append_file(string, string): void`, `write_stderr(string): void`.
 - **Output statement:** `echo` (the single output spelling — `print` is rejected).
 - **Time:** `get_time`.
 - **Meta:** `function_exists("name")` — const-evaluated compile-time predicate for guarded/polyfill declarations.

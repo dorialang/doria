@@ -19,7 +19,7 @@ when it is authored.
 
 Stage 17 adds compiler-known free functions that cannot be redeclared:
 
-- `read_line(): ?string`
+- `read_line(string $prompt = ""): ?string`
 - `read_file(string $path): string`
 - `write_file(string $path, string $contents): void`
 - `write_stderr(string $value): void`
@@ -54,6 +54,59 @@ the same model. Ordered nullable comparison remains outside the accepted nullabl
 
 ### Line input
 
+> Amended post-acceptance by the Interactive Line-Input Amendment. The canonical
+> declaration was `read_line(): ?string`, and this record previously required a
+> prompt to be printed separately with `echo`. That rule is **superseded**: the
+> prompt is now a parameter of `read_line` itself. The line-discipline and EOF
+> contract below is unchanged.
+
+The canonical declaration is:
+
+```doria
+read_line(string $prompt = ""): ?string
+```
+
+It is one compiler-known function with an optional parameter, not an overload pair,
+and it remains positional-only under the intrinsic rule. The zero-argument form
+`read_line()` stays valid and is exactly equivalent to `read_line("")`.
+
+Every call performs this observable, mandatory sequence:
+
+1. Evaluate the prompt expression exactly once.
+2. Write it to stdout exactly as supplied.
+3. Add no newline and no other characters.
+4. Flush stdout.
+5. Read one line from stdin.
+6. Apply the line-discipline rules below.
+7. Return `string` or `null`.
+
+The prompt is exactly `string`; callers convert before calling. It is written
+whenever the function is called — under redirection, into a pipe, or to a file —
+and is never conditional on whether stdin or stdout is a terminal. It is not
+trimmed, normalized, stored as history, treated as a format string, or interpreted
+as terminal markup, and it is not line editing, history, completion, or formatting.
+
+**An empty prompt still flushes stdout.** The zero-length write may be skipped; the
+flush may not. This is a deliberate behavioral addition to the zero-argument form,
+so the established pattern
+
+```doria
+echo "Name: ";
+let $name = read_line();
+```
+
+reliably exposes prior output before the program blocks for input.
+
+Repeated calls emit their own prompts even when the next line is already buffered
+from an earlier device read, and calls after EOF still write and flush their prompt
+before returning `null`.
+
+A closed stdout pipe during the prompt write or flush is the permanent
+decision-0091 carve-out: the process exits immediately with status 0, emits no
+panic and no runtime diagnostic, and does not go on to read stdin. Other
+prompt-output and flush failures remain status-101 runtime panics until checked
+errors land, reported through the Decision 0109 runtime-outcome foundation.
+
 `read_line` reads stdin synchronously. It removes one LF or one CRLF line ending and no other
 whitespace. Empty lines return a non-null empty string. EOF after bytes returns the final line;
 EOF before bytes returns null. Embedded NUL is preserved. Invalid UTF-8 panics with `stdin
@@ -74,7 +127,9 @@ panics until checked errors land at Stage 29. At that stage these free functions
 declared `throws` signatures,
 except that a closed standard-stream pipe during ordinary program output remains a clean exit and
 is never thrown; `null` from
-`read_line` remains EOF only. The additive text spelling is
+`read_line` remains EOF only. The future checked-error form of `read_line` covers failures from
+prompt output, the stdout flush, the stdin read, and input decoding — the prompt half is part of
+the same migration, not an unplanned gap. The additive text spelling is
 `append_file(string $path, string $contents): void`; `write_file` remains truncate-only, and
 implementation of append is scheduled with its `append_file_bytes` sibling for Stage 23. The
 text/binary/stream tiers and migration are recorded separately in Decisions 0075 and 0091.
@@ -150,6 +205,29 @@ and the stateless-versus-ScreenBuffer choice remain deferred.
   deferred. Decision 0093 now implements general nullable types without changing
   this record's EOF contract.
 - The internal runtime ABI grows but remains private and versioned with `dr_v1_*` symbols.
+
+## Invalidated elsewhere
+
+Recorded by the Interactive Line-Input Amendment:
+
+- This record's own canonical declaration `read_line(): ?string` and its rule that a
+  prompt is printed separately with `echo` are **superseded**. Every active authority
+  quoting the no-prompt form is stale; historical excerpts must be labelled as such.
+- The zero-argument form gains an observable behavior it did not have: a mandatory
+  stdout flush before the stdin read. Programs relying on output staying unflushed
+  until process exit see it earlier. No existing source becomes invalid.
+- Decision 0091's closed-pipe carve-out now also governs prompt writes and the
+  pre-read flush, so the device layer reports flush outcomes with the write
+  vocabulary rather than a boolean.
+- Decision 0075's Stage 29 migration for `read_line` must carry prompt-output,
+  flush, read, and decoding failures together.
+- The PHP compatibility shim's signature changes; it must write and flush the prompt
+  without depending on the optional `readline` extension.
+- The `readline` → `read_line` PHP spelling guidance now maps a prompted call
+  structurally, but must not claim ext/readline parity: editing, history,
+  completion, configuration, and callbacks are not provided.
+- Language-server hover/signature presentation, website documentation, and the
+  Playground stdin model restate this signature and must follow.
 
 ## Affected components
 

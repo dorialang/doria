@@ -125,7 +125,7 @@ Source of truth for sequencing remains `docs/doria-end-to-end-plan.md`. The dura
 | Nullable concrete classes | Covered | Covered | Covered | Covered | Null-pointer absence preserves class move ownership and drops only present payloads. |
 | `??`, `?->`, null guards, and exact `is` | Covered | Covered | Covered | Covered | `main_stage22_nullable.doria` covers lazy defaults, null-safe calls, path narrowing, matching and incompatible exact tests, and byte-identical output. |
 | `mixed` runtime box | Covered | Covered | Covered | Covered | Bare operations are rejected until exact `is` narrowing; bool, numeric, string, concrete-class, nullable, and mixed collection-value paths round trip through the boxed runtime representation. |
-| `read_line` and repeated buffering | Covered | Covered | Covered | Covered | Raw sidecar stdin covers LF, CRLF, empty lines, buffered subsequent lines, and final unterminated input. |
+| `read_line` and repeated buffering | Covered | Covered | Covered | Covered | Raw sidecar stdin covers LF, CRLF, empty lines, buffered subsequent lines, and final unterminated input. The prompted form writes the prompt exactly, flushes stdout, then reads; the flush also occurs for the default empty prompt, and each call emits its own prompt even when the next line is already buffered. |
 | `read_file` | Covered | Covered | Covered | Covered | Complete UTF-8 text and Unicode content agree through isolated fixture directories. |
 | `write_file` and file side effects | Covered | Covered | Covered | Covered | Create/truncate output is compared byte-for-byte against expected files. |
 | `write_stderr` | Covered | Covered | Covered | Covered | Exact stderr bytes with no implicit newline. |
