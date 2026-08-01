@@ -532,6 +532,18 @@ fn decode_runtime_outcome(payload: &[u8], source_path: &str) -> Result<Diagnosti
             "native program returned facts that do not match the diagnostic catalogue".into(),
         );
     }
+    if code == "P1501"
+        && !facts.iter().any(|fact| {
+            fact.name == doria_diagnostic_catalogue::SHARED_ACCESS_CONFLICT_REASON_FACT
+                && matches!(
+                    &fact.value,
+                    RuntimeFactValue::StaticString(value)
+                        if doria_diagnostic_catalogue::is_shared_access_conflict_reason(value)
+                )
+        })
+    {
+        return Err("native program returned an invalid shared-access conflict reason".into());
+    }
     let mut frames = Vec::with_capacity(frame_count);
     for _ in 0..frame_count {
         let frame_function_length = usize::from(decoder.u16()?);
@@ -880,5 +892,14 @@ mod tests {
 
         let unknown_kind = runtime_record("P1204", &[("count", 9, 0, "")]);
         assert!(decode_error(&unknown_kind).contains("unknown runtime fact type"));
+
+        let missing_conflict_reason = runtime_record("P1501", &[]);
+        assert!(decode_error(&missing_conflict_reason)
+            .contains("invalid shared-access conflict reason"));
+
+        let unknown_conflict_reason =
+            runtime_record("P1501", &[("conflictReason", 4, 0, "Unknown Conflict")]);
+        assert!(decode_error(&unknown_conflict_reason)
+            .contains("invalid shared-access conflict reason"));
     }
 }

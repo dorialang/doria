@@ -166,10 +166,12 @@ jobs:
           valgrind --leak-check=full --show-leak-kinds=all --errors-for-leak-kinds=definite,indirect --track-origins=yes --error-exitcode=1 build/native/main_stage25a_readonly_shared_ownership
           cargo run -p doriac -- compile examples/native/main_stage25a_shared_coalesce_ownership.doria --out build/native/main_stage25a_shared_coalesce_ownership
           valgrind --leak-check=full --show-leak-kinds=all --errors-for-leak-kinds=definite,indirect --track-origins=yes --error-exitcode=1 build/native/main_stage25a_shared_coalesce_ownership
+          cargo run -p doriac -- compile examples/native/main_stage25a_referenced_value_collision.doria --out build/native/main_stage25a_referenced_value_collision
+          valgrind --leak-check=full --show-leak-kinds=all --errors-for-leak-kinds=definite,indirect --track-origins=yes --error-exitcode=1 build/native/main_stage25a_referenced_value_collision
 
       - name: Leak-check Stage 25a writable shared ownership with Cranelift
         run: |
-          for name in main_stage25a_writable_shared_class main_stage25a_writable_shared_collection main_stage25a_writable_shared_domains main_stage25a_writable_weak_reference main_stage25a_access_lifetime main_stage25a_stored_access; do
+          for name in main_stage25a_writable_shared_class main_stage25a_writable_shared_collection main_stage25a_writable_shared_domains main_stage25a_writable_weak_reference main_stage25a_weak_cycle main_stage25a_shared_stress main_stage25a_access_lifetime main_stage25a_stored_access; do
             cargo run -p doriac -- compile "examples/native/${name}.doria" --out "build/native/${name}"
             valgrind --leak-check=full --show-leak-kinds=all --errors-for-leak-kinds=definite,indirect --track-origins=yes --error-exitcode=1 "build/native/${name}"
           done
@@ -432,12 +434,14 @@ jobs:
           valgrind --leak-check=full --show-leak-kinds=all --errors-for-leak-kinds=definite,indirect --track-origins=yes --error-exitcode=1 build/native/main_stage25a_readonly_shared_ownership_release
           cargo run -p doriac --features llvm-backend -- compile examples/native/main_stage25a_shared_coalesce_ownership.doria --release --out build/native/main_stage25a_shared_coalesce_ownership_release
           valgrind --leak-check=full --show-leak-kinds=all --errors-for-leak-kinds=definite,indirect --track-origins=yes --error-exitcode=1 build/native/main_stage25a_shared_coalesce_ownership_release
+          cargo run -p doriac --features llvm-backend -- compile examples/native/main_stage25a_referenced_value_collision.doria --release --out build/native/main_stage25a_referenced_value_collision_release
+          valgrind --leak-check=full --show-leak-kinds=all --errors-for-leak-kinds=definite,indirect --track-origins=yes --error-exitcode=1 build/native/main_stage25a_referenced_value_collision_release
 
       - name: Leak-check Stage 25a writable shared ownership with LLVM
         if: runner.os == 'Linux'
         shell: bash
         run: |
-          for name in main_stage25a_writable_shared_class main_stage25a_writable_shared_collection main_stage25a_writable_shared_domains main_stage25a_writable_weak_reference main_stage25a_access_lifetime main_stage25a_stored_access; do
+          for name in main_stage25a_writable_shared_class main_stage25a_writable_shared_collection main_stage25a_writable_shared_domains main_stage25a_writable_weak_reference main_stage25a_weak_cycle main_stage25a_shared_stress main_stage25a_access_lifetime main_stage25a_stored_access; do
             cargo run -p doriac --features llvm-backend -- compile "examples/native/${name}.doria" --release --out "build/native/${name}_release"
             valgrind --leak-check=full --show-leak-kinds=all --errors-for-leak-kinds=definite,indirect --track-origins=yes --error-exitcode=1 "build/native/${name}_release"
           done

@@ -5,6 +5,22 @@ class Box<T>
     }
 }
 
+class Counter
+{
+    writable int $value = 0;
+}
+
+function verifyLifetime<T>(
+    string $name,
+    WritableSharedReference<T> $owner,
+): void {
+    let $additionalOwner = $owner->share();
+    let $weak = $additionalOwner->createWeakReference();
+    if ($weak->acquire() != null) {
+        echo "{$name} live\n";
+    }
+}
+
 function inspectBox(WritableSharedReference<Box<int>> $box): void
 {
     let $boxAccess = $box->acquireReadonlyAccess();
@@ -39,17 +55,54 @@ function inspectMaybeWritable(
 
 function main(): void
 {
+    let $counter = new WritableSharedReference(new Counter());
+    verifyLifetime("class", $counter);
+    {
+        let writable $counterAccess = $counter->acquireWritableAccess();
+        $counterAccess->value = 2;
+    }
+
     let $box = new WritableSharedReference(new Box<int>(1));
+    verifyLifetime("generic class", $box);
     inspectBox($box);
 
     let $boxes = new WritableSharedReference<List<Box<int>>>([
         new Box<int>(3),
     ]);
+    verifyLifetime("list", $boxes);
     inspectBoxes($boxes);
+
+    let $array = new WritableSharedReference<int[]>([4, 5]);
+    verifyLifetime("array", $array);
+    {
+        let writable $arrayAccess = $array->acquireWritableAccess();
+        $arrayAccess[1] += 2;
+        echo "array {$arrayAccess[1]}:{$arrayAccess->length}\n";
+    }
+
+    let $dictionary = new WritableSharedReference<Dictionary<string, int>>([
+        "one" => 1,
+    ]);
+    verifyLifetime("dictionary", $dictionary);
+    {
+        let writable $dictionaryAccess =
+            $dictionary->acquireWritableAccess();
+        $dictionaryAccess->set("two", 2);
+        echo "dictionary {$dictionaryAccess["two"]}:{$dictionaryAccess->count}\n";
+    }
+
+    let $set = new WritableSharedReference<Set<int>>(Set::from([1]));
+    verifyLifetime("set", $set);
+    {
+        let writable $setAccess = $set->acquireWritableAccess();
+        $setAccess->add(2);
+        echo "set {$setAccess->count}\n";
+    }
 
     let $bytes = new WritableSharedReference(
         Bytes::fromArray([1, 2, 3]),
     );
+    verifyLifetime("bytes", $bytes);
     mutateBytes($bytes);
 
     ?WritableSharedReference<Box<int>> $present = $box->share();

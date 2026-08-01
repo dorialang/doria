@@ -18,6 +18,29 @@ type SharedString = Rc<str>;
 type SharedControl = Rc<RefCell<SharedControlValue>>;
 type WritableSharedControl = Rc<RefCell<WritableSharedControlValue>>;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SharedAccessConflict {
+    ReadonlyThenWritable,
+    WritableThenReadonly,
+    WritableThenWritable,
+}
+
+impl SharedAccessConflict {
+    const fn reason(self) -> &'static str {
+        match self {
+            Self::ReadonlyThenWritable => {
+                doria_diagnostic_catalogue::READONLY_THEN_WRITABLE_CONFLICT
+            }
+            Self::WritableThenReadonly => {
+                doria_diagnostic_catalogue::WRITABLE_THEN_READONLY_CONFLICT
+            }
+            Self::WritableThenWritable => {
+                doria_diagnostic_catalogue::WRITABLE_THEN_WRITABLE_CONFLICT
+            }
+        }
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct SharedControlValue {
     strong: usize,
@@ -64,14 +87,14 @@ impl InterpreterError {
 fn register_shared_access(
     control: &WritableSharedControl,
     writable: bool,
-) -> Result<bool, InterpreterError> {
+) -> Result<Option<SharedAccessConflict>, InterpreterError> {
     let mut state = control.borrow_mut();
     if writable {
         if state.readonly_accesses != 0 {
-            return Ok(true);
+            return Ok(Some(SharedAccessConflict::ReadonlyThenWritable));
         }
         if state.writable_access_active {
-            return Ok(true);
+            return Ok(Some(SharedAccessConflict::WritableThenWritable));
         }
         state.strong = state
             .strong
@@ -80,7 +103,7 @@ fn register_shared_access(
         state.writable_access_active = true;
     } else {
         if state.writable_access_active {
-            return Ok(true);
+            return Ok(Some(SharedAccessConflict::WritableThenReadonly));
         }
         let next_readonly = state
             .readonly_accesses
@@ -93,7 +116,7 @@ fn register_shared_access(
         state.readonly_accesses = next_readonly;
         state.strong = next_strong;
     }
-    Ok(false)
+    Ok(None)
 }
 
 impl fmt::Display for InterpreterError {
@@ -2182,8 +2205,8 @@ impl Interpreter<'_> {
                         "shared access acquisition changed payload type",
                     ));
                 }
-                if register_shared_access(&control, writable)? {
-                    return self.runtime_panic_step_at("P1501", span);
+                if let Some(conflict) = register_shared_access(&control, writable)? {
+                    return self.shared_access_conflict_panic_step_at(conflict, span);
                 }
                 if drop_receiver {
                     self.current_frame_mut()?
@@ -2220,8 +2243,8 @@ impl Interpreter<'_> {
                     );
                     return Ok(StepOutcome::Continue);
                 };
-                if register_shared_access(&control, writable)? {
-                    return self.runtime_panic_step_at("P1501", span);
+                if let Some(conflict) = register_shared_access(&control, writable)? {
+                    return self.shared_access_conflict_panic_step_at(conflict, span);
                 }
                 if drop_receiver {
                     self.current_frame_mut()?
@@ -2702,6 +2725,77 @@ impl Interpreter<'_> {
                         .push(EvaluationValue::NullableWeakReference {
                             control: None,
                             class,
+                        }),
+                    (
+                        mir::Type::WritableSharedReference(payload),
+                        Some(LocalValue::WritableSharedReference {
+                            control,
+                            payload: actual,
+                        }),
+                    ) if payload == actual => self.current_frame_mut()?.values.push(
+                        EvaluationValue::NullableWritableSharedReference {
+                            control: Some(control),
+                            payload,
+                        },
+                    ),
+                    (mir::Type::WritableSharedReference(payload), None) => self
+                        .current_frame_mut()?
+                        .values
+                        .push(EvaluationValue::NullableWritableSharedReference {
+                            control: None,
+                            payload,
+                        }),
+                    (
+                        mir::Type::NullableWritableSharedReference(payload),
+                        Some(LocalValue::NullableWritableSharedReference {
+                            control,
+                            payload: actual,
+                        }),
+                    ) if payload == actual => self.current_frame_mut()?.values.push(
+                        EvaluationValue::NullableWritableSharedReference { control, payload },
+                    ),
+                    (mir::Type::NullableWritableSharedReference(payload), None) => self
+                        .current_frame_mut()?
+                        .values
+                        .push(EvaluationValue::NullableWritableSharedReference {
+                            control: None,
+                            payload,
+                        }),
+                    (
+                        mir::Type::WritableWeakReference(payload),
+                        Some(LocalValue::WritableWeakReference {
+                            control,
+                            payload: actual,
+                        }),
+                    ) if payload == actual => self.current_frame_mut()?.values.push(
+                        EvaluationValue::NullableWritableWeakReference {
+                            control: Some(control),
+                            payload,
+                        },
+                    ),
+                    (mir::Type::WritableWeakReference(payload), None) => self
+                        .current_frame_mut()?
+                        .values
+                        .push(EvaluationValue::NullableWritableWeakReference {
+                            control: None,
+                            payload,
+                        }),
+                    (
+                        mir::Type::NullableWritableWeakReference(payload),
+                        Some(LocalValue::NullableWritableWeakReference {
+                            control,
+                            payload: actual,
+                        }),
+                    ) if payload == actual => self
+                        .current_frame_mut()?
+                        .values
+                        .push(EvaluationValue::NullableWritableWeakReference { control, payload }),
+                    (mir::Type::NullableWritableWeakReference(payload), None) => self
+                        .current_frame_mut()?
+                        .values
+                        .push(EvaluationValue::NullableWritableWeakReference {
+                            control: None,
+                            payload,
                         }),
                     (expected, value) if expected.shared_access().is_some() => {
                         let access = expected
@@ -9593,6 +9687,21 @@ impl Interpreter<'_> {
         span: Span,
     ) -> Result<StepOutcome, InterpreterError> {
         self.runtime_panic_step_with_facts_at(code, span, Vec::new())
+    }
+
+    fn shared_access_conflict_panic_step_at(
+        &self,
+        conflict: SharedAccessConflict,
+        span: Span,
+    ) -> Result<StepOutcome, InterpreterError> {
+        self.runtime_panic_step_with_facts_at(
+            "P1501",
+            span,
+            vec![RuntimeFact {
+                name: doria_diagnostic_catalogue::SHARED_ACCESS_CONFLICT_REASON_FACT.to_string(),
+                value: RuntimeFactValue::StaticString(conflict.reason().to_string()),
+            }],
+        )
     }
 
     fn runtime_panic_step_with_facts(

@@ -8,7 +8,7 @@ examples/native/main_stage25a_conflict_writable_then_writable.doria · line 7 ·
                                     Conflicting Access Requested Here
 
 Why
-The requested shared access overlaps an incompatible active access to the same allocation.
+Cannot Acquire Writable Access While Writable Access Is Active
 
 Call Path
 main · examples/native/main_stage25a_conflict_writable_then_writable.doria:7

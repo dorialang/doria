@@ -46,6 +46,23 @@ pub struct RuntimeCatalogueEntry {
     pub fact_names: &'static [&'static str],
 }
 
+pub const SHARED_ACCESS_CONFLICT_REASON_FACT: &str = "conflictReason";
+pub const READONLY_THEN_WRITABLE_CONFLICT: &str =
+    "Cannot Acquire Writable Access While Readonly Access Is Active";
+pub const WRITABLE_THEN_READONLY_CONFLICT: &str =
+    "Cannot Acquire Readonly Access While Writable Access Is Active";
+pub const WRITABLE_THEN_WRITABLE_CONFLICT: &str =
+    "Cannot Acquire Writable Access While Writable Access Is Active";
+
+pub fn is_shared_access_conflict_reason(value: &str) -> bool {
+    matches!(
+        value,
+        READONLY_THEN_WRITABLE_CONFLICT
+            | WRITABLE_THEN_READONLY_CONFLICT
+            | WRITABLE_THEN_WRITABLE_CONFLICT
+    )
+}
+
 pub fn runtime_entry(code: &str) -> Option<&'static RuntimeCatalogueEntry> {
     RUNTIME_CATALOGUE.iter().find(|entry| entry.code == code)
 }
@@ -387,7 +404,7 @@ pub const RUNTIME_CATALOGUE: &[RuntimeCatalogueEntry] = &[
         primary_label: "Conflicting Access Requested Here",
         explanation: "The requested shared access overlaps an incompatible active access to the same allocation.",
         process_status: 101,
-        fact_names: &[],
+        fact_names: &[SHARED_ACCESS_CONFLICT_REASON_FACT],
     },
     RuntimeCatalogueEntry {
         code: "P1502",

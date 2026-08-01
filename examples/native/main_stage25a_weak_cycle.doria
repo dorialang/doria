@@ -1,0 +1,55 @@
+class Parent
+{
+    writable List<WritableSharedReference<Child>> $children = [];
+
+    function __destruct()
+    {
+        echo "drop parent\n";
+    }
+}
+
+class Child
+{
+    function __construct(take WritableWeakReference<Parent> $parentReference)
+    {
+    }
+
+    function inspectParent(): void
+    {
+        let $parent = $this->parentReference->acquire();
+        if ($parent != null) {
+            echo "parent alive\n";
+        }
+    }
+
+    function __destruct()
+    {
+        echo "drop child\n";
+    }
+}
+
+function makeExpiredParent(): WritableWeakReference<Parent>
+{
+    let $parent = new WritableSharedReference(new Parent());
+    let $externalWeak = $parent->createWeakReference();
+    let $child = new WritableSharedReference(
+        new Child($parent->createWeakReference()),
+    );
+
+    {
+        let writable $parentAccess = $parent->acquireWritableAccess();
+        $parentAccess->children->add($child->share());
+    }
+
+    let $childAccess = $child->acquireReadonlyAccess();
+    $childAccess->inspectParent();
+    return $externalWeak;
+}
+
+function main(): void
+{
+    let $parent = makeExpiredParent();
+    if ($parent->acquire() == null) {
+        echo "parent expired\n";
+    }
+}

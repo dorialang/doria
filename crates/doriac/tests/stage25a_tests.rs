@@ -1,7 +1,9 @@
 //! Stage 25a — shared-ownership grammar, type model, and readonly runtime family
 //! (record 0106).
 
-use doriac::diagnostics::Diagnostic;
+use doriac::diagnostics::{
+    ColorChoice, Diagnostic, DiagnosticFormat, RenderOptions, RuntimeFactValue,
+};
 
 const NODE: &str = r#"
 class Node
@@ -51,6 +53,71 @@ fn assert_code(body: &str, code: &str) {
             .map(|entry| format!("{}: {}", entry.code, entry.message))
             .collect::<Vec<_>>()
     );
+}
+
+#[test]
+fn shared_access_conflicts_preserve_their_exact_structured_reason() {
+    for (path, source, expected_reason) in [
+        (
+            "examples/native/main_stage25a_conflict_readonly_then_writable.doria",
+            include_str!(
+                "../../../examples/native/main_stage25a_conflict_readonly_then_writable.doria"
+            ),
+            doria_diagnostic_catalogue::READONLY_THEN_WRITABLE_CONFLICT,
+        ),
+        (
+            "examples/native/main_stage25a_conflict_writable_then_readonly.doria",
+            include_str!(
+                "../../../examples/native/main_stage25a_conflict_writable_then_readonly.doria"
+            ),
+            doria_diagnostic_catalogue::WRITABLE_THEN_READONLY_CONFLICT,
+        ),
+        (
+            "examples/native/main_stage25a_conflict_writable_then_writable.doria",
+            include_str!(
+                "../../../examples/native/main_stage25a_conflict_writable_then_writable.doria"
+            ),
+            doria_diagnostic_catalogue::WRITABLE_THEN_WRITABLE_CONFLICT,
+        ),
+    ] {
+        let program = doriac::lower_source_to_mir(path, source)
+            .expect("conflict fixture should lower before its runtime panic");
+        let output = doriac::mir_interpreter::interpret(&program)
+            .expect("conflict fixture should produce a structured runtime panic");
+        let diagnostic = output
+            .runtime_diagnostic
+            .as_ref()
+            .expect("conflict fixture should retain its runtime diagnostic");
+        assert_eq!(diagnostic.code, "P1501");
+        assert_eq!(diagnostic.explanation.as_deref(), Some(expected_reason));
+        assert!(diagnostic
+            .runtime_outcome
+            .as_ref()
+            .expect("runtime outcome")
+            .facts
+            .iter()
+            .any(|fact| {
+                fact.name == doria_diagnostic_catalogue::SHARED_ACCESS_CONFLICT_REASON_FACT
+                    && matches!(
+                        &fact.value,
+                        RuntimeFactValue::StaticString(value) if value == expected_reason
+                    )
+            }));
+        assert!(String::from_utf8_lossy(&output.stderr).contains(expected_reason));
+
+        let rendered_source = doriac::source::SourceFile::new(path, source);
+        let json = doriac::diagnostics::render_diagnostics(
+            &rendered_source,
+            std::slice::from_ref(diagnostic),
+            RenderOptions {
+                format: DiagnosticFormat::Json,
+                color: ColorChoice::Never,
+                ..RenderOptions::default()
+            },
+        );
+        assert!(json.contains("conflictReason"));
+        assert!(json.contains(expected_reason));
+    }
 }
 
 // --- Grammar -------------------------------------------------------------

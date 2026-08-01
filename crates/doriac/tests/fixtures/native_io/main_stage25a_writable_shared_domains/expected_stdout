@@ -1,5 +1,15 @@
+class live
+generic class live
 generic class 1
+list live
 generic collection 3
+array live
+array 7:2
+dictionary live
+dictionary 2:2
+set live
+set 2
+bytes live
 bytes 7:3
 nullable live
 nullable absent

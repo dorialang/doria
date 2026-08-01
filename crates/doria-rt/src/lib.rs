@@ -961,7 +961,10 @@ pub unsafe extern "C" fn dr_v2_writable_shared_acquire_readonly_access(
     control: *mut DrWritableSharedControlV1,
 ) -> *mut DrWritableSharedControlV1 {
     if (*control).writable_access_active {
-        panic_catalogued(current_frame, b"P1501");
+        panic_shared_access_conflict(
+            current_frame,
+            doria_diagnostic_catalogue::WRITABLE_THEN_READONLY_CONFLICT,
+        );
     }
     let Some(next_accesses) = (*control).readonly_accesses.checked_add(1) else {
         panic_catalogued(current_frame, b"P1505");
@@ -985,10 +988,16 @@ pub unsafe extern "C" fn dr_v2_writable_shared_acquire_writable_access(
     control: *mut DrWritableSharedControlV1,
 ) -> *mut DrWritableSharedControlV1 {
     if (*control).readonly_accesses != 0 {
-        panic_catalogued(current_frame, b"P1501");
+        panic_shared_access_conflict(
+            current_frame,
+            doria_diagnostic_catalogue::READONLY_THEN_WRITABLE_CONFLICT,
+        );
     }
     if (*control).writable_access_active {
-        panic_catalogued(current_frame, b"P1501");
+        panic_shared_access_conflict(
+            current_frame,
+            doria_diagnostic_catalogue::WRITABLE_THEN_WRITABLE_CONFLICT,
+        );
     }
     let Some(next_strong) = (*control).strong_references.checked_add(1) else {
         panic_catalogued(current_frame, b"P1503");
@@ -1587,6 +1596,28 @@ unsafe fn panic_catalogued(current_frame: *const DrStackFrameV2, code: &'static 
     dr_v2_panic_code(current_frame, code.as_ptr(), code.len(), ptr::null(), 0)
 }
 
+unsafe fn panic_shared_access_conflict(
+    current_frame: *const DrStackFrameV2,
+    reason: &'static str,
+) -> ! {
+    let fact = DrRuntimeFactV2 {
+        name: doria_diagnostic_catalogue::SHARED_ACCESS_CONFLICT_REASON_FACT.as_ptr(),
+        name_length: doria_diagnostic_catalogue::SHARED_ACCESS_CONFLICT_REASON_FACT.len(),
+        kind: 4,
+        value: reason.as_ptr() as u64,
+        value_length: reason.len(),
+    };
+    dr_v2_panic_code_with_facts(
+        current_frame,
+        b"P1501".as_ptr(),
+        5,
+        ptr::null(),
+        0,
+        &fact,
+        1,
+    )
+}
+
 /// Reports a fatal Doria panic and exits the process with status 101.
 ///
 /// # Safety
@@ -1718,6 +1749,9 @@ pub unsafe extern "C" fn dr_v2_panic_code_with_facts(
     if !runtime_facts_match(entry.fact_names, facts, fact_count) {
         emergency_runtime_panic();
     }
+    if entry.code == "P1501" && !shared_access_conflict_fact_matches(facts, fact_count) {
+        emergency_runtime_panic();
+    }
 
     if write_runtime_outcome_record(
         current_frame,
@@ -1747,6 +1781,8 @@ pub unsafe extern "C" fn dr_v2_panic_code_with_facts(
         write_panic_fragment(b" to ");
         write_usize((*facts.add(2)).value as usize);
         write_panic_fragment(b" graphemes,\nbut an empty padding string cannot add any graphemes.");
+    } else if entry.code == "P1501" && fact_count == 1 {
+        write_panic_bytes((*facts).value as *const u8, (*facts).value_length);
     } else {
         write_panic_fragment(entry.explanation.as_bytes());
     }
@@ -1775,6 +1811,18 @@ pub unsafe extern "C" fn dr_v2_panic_code_with_facts(
     }
     write_panic_fragment(b"\n\nProcess Exited With Status 101\n");
     exit_process(PANIC_STATUS)
+}
+
+unsafe fn shared_access_conflict_fact_matches(
+    facts: *const DrRuntimeFactV2,
+    fact_count: usize,
+) -> bool {
+    if fact_count != 1 || facts.is_null() || (*facts).kind != 4 {
+        return false;
+    }
+    let value = core::slice::from_raw_parts((*facts).value as *const u8, (*facts).value_length);
+    core::str::from_utf8(value)
+        .is_ok_and(doria_diagnostic_catalogue::is_shared_access_conflict_reason)
 }
 
 unsafe fn runtime_facts_match(
@@ -3201,6 +3249,12 @@ mod tests {
             assert_eq!((*control).strong_references, 2);
             assert_eq!((*control).weak_references, 1);
 
+            // Payload projection is a readonly pointer lookup. It must not
+            // retain either ownership count or allocate an access claim.
+            assert_eq!(dr_v1_shared_payload(control), payload);
+            assert_eq!((*control).strong_references, 2);
+            assert_eq!((*control).weak_references, 1);
+
             dr_v2_shared_release(ptr::null(), control);
             let acquired = dr_v2_shared_acquire(ptr::null(), control);
             assert_eq!(acquired, control);
@@ -3215,6 +3269,18 @@ mod tests {
 
             dr_v1_shared_release_weak(control);
         }
+    }
+
+    #[test]
+    fn shared_control_layouts_keep_writable_access_state_out_of_readonly_allocations() {
+        let word = core::mem::size_of::<usize>();
+        assert_eq!(core::mem::size_of::<DrSharedControlV1>(), 4 * word);
+        assert_eq!(core::mem::size_of::<DrWritableSharedControlV1>(), 6 * word);
+        assert!(
+            core::mem::size_of::<DrSharedControlV1>()
+                < core::mem::size_of::<DrWritableSharedControlV1>()
+        );
+        assert_eq!(core::mem::size_of::<*mut DrWritableSharedControlV1>(), word);
     }
 
     #[test]
@@ -3294,6 +3360,55 @@ mod tests {
             assert_eq!(shared_payload_drops(), 1);
             assert!(dr_v2_writable_shared_acquire(ptr::null(), weak).is_null());
             dr_v1_writable_shared_release_weak(weak);
+        }
+    }
+
+    #[test]
+    fn writable_shared_bookkeeping_stays_balanced_under_bounded_stress() {
+        unsafe {
+            reset_shared_payload_drops();
+            let payload = dr_v2_class_allocate(ptr::null(), 8, 8);
+            let control =
+                dr_v2_writable_shared_create(ptr::null(), payload, drop_test_shared_payload);
+
+            for _ in 0..64 {
+                dr_v2_writable_shared_retain(ptr::null(), control);
+                dr_v2_writable_shared_create_weak(ptr::null(), control);
+            }
+            for _ in 0..128 {
+                dr_v2_writable_shared_acquire_readonly_access(ptr::null(), control);
+            }
+            assert_eq!((*control).strong_references, 193);
+            assert_eq!((*control).weak_references, 64);
+            assert_eq!((*control).readonly_accesses, 128);
+
+            for _ in 0..128 {
+                dr_v2_writable_shared_release_readonly_access(ptr::null(), control);
+            }
+            assert_eq!((*control).strong_references, 65);
+            assert_eq!((*control).readonly_accesses, 0);
+
+            for _ in 0..128 {
+                let access = dr_v2_writable_shared_acquire_writable_access(ptr::null(), control);
+                dr_v2_writable_shared_release_writable_access(ptr::null(), access);
+            }
+            assert_eq!((*control).strong_references, 65);
+            assert!(!(*control).writable_access_active);
+
+            for _ in 0..64 {
+                let acquired = dr_v2_writable_shared_acquire(ptr::null(), control);
+                assert_eq!(acquired, control);
+                dr_v2_writable_shared_release(ptr::null(), acquired);
+            }
+
+            for _ in 0..65 {
+                dr_v2_writable_shared_release(ptr::null(), control);
+            }
+            assert_eq!(shared_payload_drops(), 1);
+            assert_eq!((*control).strong_references, 0);
+            for _ in 0..64 {
+                dr_v1_writable_shared_release_weak(control);
+            }
         }
     }
 

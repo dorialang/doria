@@ -1,0 +1,55 @@
+class Counter
+{
+    writable int $value = 0;
+
+    function __destruct()
+    {
+        echo "drop counter\n";
+    }
+}
+
+function main(): void
+{
+    let $owner = new WritableSharedReference(new Counter());
+    writable List<WritableSharedReference<Counter>> $owners = [];
+    writable List<WritableWeakReference<Counter>> $weaks = [];
+    writable List<ReadonlySharedReferenceAccess<Counter>> $reads = [];
+
+    let writable $index = 0;
+    while ($index < 64) {
+        $owners->add($owner->share());
+        $weaks->add($owner->createWeakReference());
+        $reads->add($owner->acquireReadonlyAccess());
+        $index++;
+    }
+
+    echo "stored {$owners->count}:{$weaks->count}:{$reads->count}\n";
+
+    let writable $live = 0;
+    foreach ($weaks as WritableWeakReference<Counter> $weak) {
+        if ($weak->acquire() != null) {
+            $live++;
+        }
+    }
+
+    while (!$reads->isEmpty) {
+        $reads->pop();
+    }
+
+    $index = 0;
+    while ($index < 32) {
+        {
+            let writable $access = $owner->acquireWritableAccess();
+            $access->value++;
+        }
+        $index++;
+    }
+
+    while (!$owners->isEmpty) {
+        $owners->pop();
+    }
+
+    let $finalAccess = $owner->acquireReadonlyAccess();
+    echo "live {$live}\n";
+    echo "value {$finalAccess->value}\n";
+}

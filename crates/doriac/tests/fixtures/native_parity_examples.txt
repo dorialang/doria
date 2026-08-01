@@ -1,5 +1,5 @@
 # Durable executable source of truth for accepted native behavior.
-# Highest completed stage: Stage 25a Slice 2
+# Highest covered stage: Stage 25a Slice 4 closure
 examples/native/main_add_overflow_panic.doria
 examples/native/main_arithmetic_42.doria
 examples/native/main_bitwise_42.doria
@@ -132,6 +132,8 @@ examples/native/main_stage23c_sequence_fill.doria
 examples/native/main_stage24_generic_first.doria
 examples/native/main_stage25_generic_classes.doria
 examples/native/main_stage25a_readonly_shared_ownership.doria
+examples/native/main_stage25a_referenced_value_collision.doria
+examples/native/main_stage25a_shared_stress.doria
 examples/native/main_stage25a_shared_coalesce_ownership.doria
 examples/native/main_stage25a_conflict_readonly_then_writable.doria
 examples/native/main_stage25a_conflict_writable_then_readonly.doria
@@ -140,6 +142,7 @@ examples/native/main_stage25a_writable_shared_class.doria
 examples/native/main_stage25a_writable_shared_collection.doria
 examples/native/main_stage25a_writable_shared_domains.doria
 examples/native/main_stage25a_writable_weak_reference.doria
+examples/native/main_stage25a_weak_cycle.doria
 examples/native/main_stage25a_access_lifetime.doria
 examples/native/main_stage25a_generic_repository.doria
 examples/native/main_stage25a_lexical_block_cleanup.doria

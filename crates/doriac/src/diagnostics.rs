@@ -273,6 +273,25 @@ impl Diagnostic {
     pub fn runtime_panic(code: &'static str, span: Span, outcome: RuntimeOutcomeDetails) -> Self {
         let entry = runtime_catalogue_entry(code)
             .unwrap_or_else(|| panic!("runtime diagnostic code `{code}` is not catalogued"));
+        let explanation = if code == "P1501" {
+            outcome
+                .facts
+                .iter()
+                .find(|fact| {
+                    fact.name == doria_diagnostic_catalogue::SHARED_ACCESS_CONFLICT_REASON_FACT
+                })
+                .and_then(|fact| match &fact.value {
+                    RuntimeFactValue::StaticString(value)
+                        if doria_diagnostic_catalogue::is_shared_access_conflict_reason(value) =>
+                    {
+                        Some(value.as_str())
+                    }
+                    _ => None,
+                })
+                .unwrap_or(entry.explanation)
+        } else {
+            entry.explanation
+        };
         let mut diagnostic = Self::build(
             code,
             entry.title.to_string(),
@@ -281,7 +300,7 @@ impl Diagnostic {
         )
         .with_title(entry.title)
         .with_primary_label(entry.primary_label)
-        .with_explanation(entry.explanation);
+        .with_explanation(explanation);
         diagnostic.runtime_outcome = Some(outcome);
         diagnostic
     }
