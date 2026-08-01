@@ -226,11 +226,7 @@ jobs:
           php scripts/check_stage25a_completion.php
 
       - name: Checkout website API reference
-        uses: actions/checkout@v7
-        with:
-          repository: dorialang/doria-website
-          path: doria-website
-          persist-credentials: false
+        run: git clone --depth 1 https://github.com/dorialang/doria-website.git doria-website
 
       - name: Check built-in API reference synchronization
         env:
