@@ -784,6 +784,15 @@ struct RuntimePanicEvent {
     explanation: Option<String>,
 }
 
+enum CollectionAccessError {
+    Catalogued(&'static str),
+    Bounds {
+        code: &'static str,
+        index: i64,
+        length: usize,
+    },
+}
+
 pub fn interpret(program: &mir::Program) -> Result<InterpreterOutput, InterpreterError> {
     Ok(interpret_with_io(program, MirIo::default())?.output)
 }
@@ -2339,7 +2348,8 @@ impl Interpreter<'_> {
                         "P1311",
                         count_span,
                         vec![RuntimeFact {
-                            name: "count".to_string(),
+                            name: doria_diagnostic_catalogue::COLLECTION_FILL_COUNT_FACT
+                                .to_string(),
                             value: RuntimeFactValue::Signed(count as i64),
                         }],
                     );
@@ -2371,7 +2381,7 @@ impl Interpreter<'_> {
                 let index = self.pop_local_value()?;
                 let value = match self.collection_value_at(collection, &index, transfer) {
                     Ok(value) => value,
-                    Err(code) => return self.runtime_panic_step_at(code, index_span),
+                    Err(error) => return self.collection_access_panic_step_at(error, index_span),
                 };
                 self.push_local_value(value)?;
             }
@@ -2405,8 +2415,15 @@ impl Interpreter<'_> {
                     mir::CollectionMutationOp::InsertAt => {
                         let index = index.expect("insertAt task carries an index");
                         let collection = self.collection_local(collection)?;
-                        if index > collection.entries().len() {
-                            return self.runtime_panic_step("P1310");
+                        let length = collection.entries().len();
+                        if index > length {
+                            return self.collection_access_panic_step(
+                                CollectionAccessError::Bounds {
+                                    code: "P1310",
+                                    index: index as i64,
+                                    length,
+                                },
+                            );
                         }
                         collection.entries_mut().insert(index, (None, value));
                     }
@@ -2464,7 +2481,7 @@ impl Interpreter<'_> {
                             .entries_mut()
                             .push((Some(index), value));
                     }
-                    Err(code) => return self.runtime_panic_step(code),
+                    Err(error) => return self.collection_access_panic_step(error),
                 }
             }
             EvaluationTask::CollectionHas {
@@ -2550,7 +2567,7 @@ impl Interpreter<'_> {
                 let index = self.pop_local_value()?;
                 let value = match self.collection_value_at(collection, &index, false) {
                     Ok(value) => value,
-                    Err(code) => return self.runtime_panic_step(code),
+                    Err(error) => return self.collection_access_panic_step(error),
                 };
                 let LocalValue::Scalar(value) = value else {
                     return Err(InterpreterError::new(
@@ -2852,7 +2869,7 @@ impl Interpreter<'_> {
                 let index = self.pop_local_value()?;
                 let value = match self.collection_value_at(collection, &index, transfer) {
                     Ok(value) => value,
-                    Err(code) => return self.runtime_panic_step(code),
+                    Err(error) => return self.collection_access_panic_step(error),
                 };
                 let LocalValue::Class {
                     object,
@@ -2882,7 +2899,7 @@ impl Interpreter<'_> {
                 let index = self.pop_local_value()?;
                 let value = match self.collection_value_at(collection, &index, transfer) {
                     Ok(value) => value,
-                    Err(code) => return self.runtime_panic_step(code),
+                    Err(error) => return self.collection_access_panic_step(error),
                 };
                 let value = match (weak, nullable, value) {
                     (
@@ -2939,7 +2956,7 @@ impl Interpreter<'_> {
                 let index = self.pop_local_value()?;
                 let value = match self.collection_value_at(collection, &index, transfer) {
                     Ok(value) => value,
-                    Err(code) => return self.runtime_panic_step(code),
+                    Err(error) => return self.collection_access_panic_step(error),
                 };
                 let value = match (weak, nullable, value) {
                     (
@@ -3000,7 +3017,7 @@ impl Interpreter<'_> {
                 let index = self.pop_local_value()?;
                 let value = match self.collection_value_at(collection, &index, remove) {
                     Ok(value) => value,
-                    Err(code) => return self.runtime_panic_step(code),
+                    Err(error) => return self.collection_access_panic_step(error),
                 };
                 let result = match (nullable, value) {
                     (
@@ -8539,12 +8556,39 @@ impl Interpreter<'_> {
         use mir::StringIntrinsicKind as Kind;
 
         let panic = |error: StringError| {
+            let facts = match error {
+                StringError::SliceLengthNegative => vec![RuntimeFact {
+                    name: doria_diagnostic_catalogue::STRING_SLICE_LENGTH_FACT.to_string(),
+                    value: RuntimeFactValue::Signed(
+                        local_nullable_int(&arguments, 2)?.ok_or_else(|| {
+                            InterpreterError::new(
+                                "negative string slice length is unexpectedly absent",
+                            )
+                        })?,
+                    ),
+                }],
+                StringError::PaddingLengthNegative => vec![RuntimeFact {
+                    name: doria_diagnostic_catalogue::STRING_PADDING_REQUESTED_LENGTH_FACT
+                        .to_string(),
+                    value: RuntimeFactValue::Signed(local_int(&arguments, 1)?),
+                }],
+                StringError::RepetitionCountNegative => vec![RuntimeFact {
+                    name: doria_diagnostic_catalogue::STRING_REPETITION_COUNT_FACT.to_string(),
+                    value: RuntimeFactValue::Signed(local_int(&arguments, 1)?),
+                }],
+                StringError::PaddingTextEmpty => {
+                    return Err(InterpreterError::new(
+                        "empty string padding must use the operation-aware panic path",
+                    ))
+                }
+                StringError::ResultTooLarge => Vec::new(),
+            };
             Ok(Some(string_panic_event(
                 error,
                 kind,
                 span,
                 argument_spans,
-                Vec::new(),
+                facts,
                 None,
             )))
         };
@@ -8807,29 +8851,39 @@ impl Interpreter<'_> {
                     Err(StringError::PaddingTextEmpty) => {
                         let current = doria_unicode::grapheme_count(text) as u64;
                         let padding_length = doria_unicode::grapheme_count(padding) as u64;
-                        let facts = vec![
-                            RuntimeFact {
-                                name: "value".to_string(),
-                                value: RuntimeFactValue::StaticString(text.to_string()),
-                            },
-                            RuntimeFact {
-                                name: "currentGraphemeLength".to_string(),
-                                value: RuntimeFactValue::Unsigned(current),
-                            },
-                            RuntimeFact {
-                                name: "requestedGraphemeLength".to_string(),
-                                value: RuntimeFactValue::Signed(length),
-                            },
-                            RuntimeFact {
-                                name: "paddingGraphemeLength".to_string(),
-                                value: RuntimeFactValue::Unsigned(padding_length),
-                            },
-                        ];
                         let operation = if kind == Kind::PadStart {
                             "padStart"
                         } else {
                             "padEnd"
                         };
+                        let facts = vec![
+                            RuntimeFact {
+                                name: doria_diagnostic_catalogue::STRING_PADDING_OPERATION_FACT
+                                    .to_string(),
+                                value: RuntimeFactValue::StaticString(operation.to_string()),
+                            },
+                            RuntimeFact {
+                                name: doria_diagnostic_catalogue::STRING_PADDING_VALUE_FACT
+                                    .to_string(),
+                                value: RuntimeFactValue::StaticString(text.to_string()),
+                            },
+                            RuntimeFact {
+                                name:
+                                    doria_diagnostic_catalogue::STRING_PADDING_CURRENT_LENGTH_FACT
+                                        .to_string(),
+                                value: RuntimeFactValue::Unsigned(current),
+                            },
+                            RuntimeFact {
+                                name: doria_diagnostic_catalogue::STRING_PADDING_REQUESTED_GRAPHEME_LENGTH_FACT
+                                    .to_string(),
+                                value: RuntimeFactValue::Signed(length),
+                            },
+                            RuntimeFact {
+                                name: doria_diagnostic_catalogue::STRING_PADDING_PADDING_LENGTH_FACT
+                                    .to_string(),
+                                value: RuntimeFactValue::Unsigned(padding_length),
+                            },
+                        ];
                         return Ok(Some(string_panic_event(
                                 StringError::PaddingTextEmpty,
                                 kind,
@@ -9495,38 +9549,48 @@ impl Interpreter<'_> {
         &self,
         local: mir::LocalId,
         index: &LocalValue,
-    ) -> Result<usize, &'static str> {
-        let collection = self.collection_local(local).map_err(|_| "P1001")?;
+    ) -> Result<usize, CollectionAccessError> {
+        let collection = self
+            .collection_local(local)
+            .map_err(|_| CollectionAccessError::Catalogued("P1001"))?;
         let definition = self
             .program
             .collection_types
             .get(collection.ty.0)
-            .ok_or("P1001")?;
+            .ok_or(CollectionAccessError::Catalogued("P1001"))?;
         if definition.key.is_some() {
             collection
                 .entries()
                 .iter()
                 .position(|(key, _)| key.as_ref() == Some(index))
-                .ok_or("P1312")
+                .ok_or(CollectionAccessError::Catalogued("P1312"))
         } else {
             let LocalValue::Scalar(mir::ScalarValue::Integer(index)) = index else {
-                return Err("P1001");
+                return Err(CollectionAccessError::Catalogued("P1001"));
             };
+            let signed_index = index.signed_value() as i64;
+            let length = collection.entries().len();
             let Some(index) = usize::try_from(index.signed_value()).ok() else {
-                return Err(if definition.kind == mir::CollectionKind::Bytes {
-                    "P1301"
-                } else {
-                    "P1310"
-                });
-            };
-            (index < collection.entries().len())
-                .then_some(index)
-                .ok_or_else(|| {
-                    if definition.kind == mir::CollectionKind::Bytes {
+                return Err(CollectionAccessError::Bounds {
+                    code: if definition.kind == mir::CollectionKind::Bytes {
                         "P1301"
                     } else {
                         "P1310"
-                    }
+                    },
+                    index: signed_index,
+                    length,
+                });
+            };
+            (index < length)
+                .then_some(index)
+                .ok_or_else(|| CollectionAccessError::Bounds {
+                    code: if definition.kind == mir::CollectionKind::Bytes {
+                        "P1301"
+                    } else {
+                        "P1310"
+                    },
+                    index: signed_index,
+                    length,
                 })
         }
     }
@@ -9536,16 +9600,16 @@ impl Interpreter<'_> {
         local: mir::LocalId,
         index: &LocalValue,
         transfer: bool,
-    ) -> Result<LocalValue, &'static str> {
+    ) -> Result<LocalValue, CollectionAccessError> {
         let position = self.collection_position(local, index)?;
         if transfer {
             self.collection_local(local)
                 .map(|collection| collection.entries_mut().remove(position).1)
-                .map_err(|_| "P1001")
+                .map_err(|_| CollectionAccessError::Catalogued("P1001"))
         } else {
             self.collection_local(local)
                 .map(|collection| collection.entries()[position].1.clone())
-                .map_err(|_| "P1001")
+                .map_err(|_| CollectionAccessError::Catalogued("P1001"))
         }
     }
 
@@ -9647,7 +9711,7 @@ impl Interpreter<'_> {
                             operation_span: entry.source_span,
                             primary_span: entry.source_span,
                             facts: vec![RuntimeFact {
-                                name: "status".to_string(),
+                                name: doria_diagnostic_catalogue::PROCESS_STATUS_FACT.to_string(),
                                 value: RuntimeFactValue::Signed(value as i64),
                             }],
                             explanation: None,
@@ -9687,6 +9751,46 @@ impl Interpreter<'_> {
         span: Span,
     ) -> Result<StepOutcome, InterpreterError> {
         self.runtime_panic_step_with_facts_at(code, span, Vec::new())
+    }
+
+    fn collection_access_panic_step(
+        &self,
+        error: CollectionAccessError,
+    ) -> Result<StepOutcome, InterpreterError> {
+        let span = self
+            .frames
+            .last()
+            .and_then(|frame| self.program.functions.get(frame.function.0))
+            .map_or(Span::default(), |function| function.source_span);
+        self.collection_access_panic_step_at(error, span)
+    }
+
+    fn collection_access_panic_step_at(
+        &self,
+        error: CollectionAccessError,
+        span: Span,
+    ) -> Result<StepOutcome, InterpreterError> {
+        match error {
+            CollectionAccessError::Catalogued(code) => self.runtime_panic_step_at(code, span),
+            CollectionAccessError::Bounds {
+                code,
+                index,
+                length,
+            } => self.runtime_panic_step_with_facts_at(
+                code,
+                span,
+                vec![
+                    RuntimeFact {
+                        name: doria_diagnostic_catalogue::INDEX_FACT.to_string(),
+                        value: RuntimeFactValue::Signed(index),
+                    },
+                    RuntimeFact {
+                        name: doria_diagnostic_catalogue::INDEXED_LENGTH_FACT.to_string(),
+                        value: RuntimeFactValue::Unsigned(length as u64),
+                    },
+                ],
+            ),
+        }
     }
 
     fn shared_access_conflict_panic_step_at(

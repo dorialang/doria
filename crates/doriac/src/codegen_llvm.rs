@@ -1688,7 +1688,13 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             comparable_length,
             "collection.index.out-of-bounds",
         ))?;
-        self.lower_panic_if_code(out_of_bounds, "P1310", self.function.source_span)?;
+        self.lower_index_bounds_panic_if(
+            out_of_bounds,
+            "P1310",
+            index,
+            length,
+            self.function.source_span,
+        )?;
 
         let element_index = match index
             .get_type()
@@ -5421,9 +5427,11 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     negative,
                     "string.slice.invalid-length",
                 ))?;
-                self.lower_panic_if_code(
+                self.lower_panic_if_signed_fact(
                     invalid_length,
                     "P1201",
+                    doria_diagnostic_catalogue::STRING_SLICE_LENGTH_FACT,
+                    length,
                     call.argument_spans.get(2).copied().unwrap_or(call.span),
                 )?;
                 self.set_active_panic_site(call.span)?;
@@ -5455,9 +5463,11 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     i64_type.const_zero(),
                     "string.repeat.negative",
                 ))?;
-                self.lower_panic_if_code(
+                self.lower_panic_if_signed_fact(
                     negative,
                     "P1204",
+                    doria_diagnostic_catalogue::STRING_REPETITION_COUNT_FACT,
+                    count,
                     call.argument_spans.get(1).copied().unwrap_or(call.span),
                 )?;
                 self.set_active_panic_site(call.span)?;
@@ -5482,9 +5492,11 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     i64_type.const_zero(),
                     "string.padding.negative",
                 ))?;
-                self.lower_panic_if_code(
+                self.lower_panic_if_signed_fact(
                     negative,
                     "P1202",
+                    doria_diagnostic_catalogue::STRING_PADDING_REQUESTED_LENGTH_FACT,
+                    target_length,
                     call.argument_spans.get(1).copied().unwrap_or(call.span),
                 )?;
                 let current_length_word = self
@@ -5529,10 +5541,13 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 ))?;
                 self.lower_padding_empty_panic_if(
                     invalid_padding,
-                    argument(0)?.into_pointer_value(),
-                    current_length_word,
-                    target_length,
-                    padding_length,
+                    call.kind == Kind::PadStart,
+                    (
+                        argument(0)?.into_pointer_value(),
+                        current_length_word,
+                        target_length,
+                        padding_length,
+                    ),
                     call.argument_spans.get(2).copied().unwrap_or(call.span),
                 )?;
                 self.set_active_panic_site(call.span)?;
@@ -8729,15 +8744,138 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         Ok(())
     }
 
+    fn lower_panic_if_signed_fact(
+        &mut self,
+        condition: IntValue<'ctx>,
+        code: &'static str,
+        fact_name: &'static str,
+        value: IntValue<'ctx>,
+        span: crate::source::Span,
+    ) -> Result<(), BackendError> {
+        let function = current_function(&self.builder)?;
+        let panic_block = self
+            .context
+            .append_basic_block(function, "panic.catalogued.fact");
+        let continue_block = self
+            .context
+            .append_basic_block(function, "panic.catalogued.fact.continue");
+        build(
+            self.builder
+                .build_conditional_branch(condition, panic_block, continue_block),
+        )?;
+        self.builder.position_at_end(panic_block);
+        self.set_active_panic_site(span)?;
+        let pointer = self.context.ptr_type(AddressSpace::default());
+        let usize_type = self.context.ptr_sized_int_type(self.target_data, None);
+        let runtime = self.runtime_function(
+            "dr_v2_panic_signed_fact",
+            &[
+                pointer.into(),
+                pointer.into(),
+                usize_type.into(),
+                pointer.into(),
+                usize_type.into(),
+                self.context.i64_type().into(),
+            ],
+            None,
+        );
+        let code_pointer = self.define_data(code.as_bytes(), "panic.code");
+        let fact_name_pointer = self.define_data(fact_name.as_bytes(), "panic.fact-name");
+        build(self.builder.build_call(
+            runtime,
+            &[
+                self.current_frame.into(),
+                code_pointer.into(),
+                usize_type.const_int(code.len() as u64, false).into(),
+                fact_name_pointer.into(),
+                usize_type.const_int(fact_name.len() as u64, false).into(),
+                value.into(),
+            ],
+            "panic.catalogued.fact",
+        ))?;
+        build(self.builder.build_unreachable())?;
+        self.builder.position_at_end(continue_block);
+        Ok(())
+    }
+
+    fn lower_index_bounds_panic_if(
+        &mut self,
+        condition: IntValue<'ctx>,
+        code: &'static str,
+        index: IntValue<'ctx>,
+        length: IntValue<'ctx>,
+        span: crate::source::Span,
+    ) -> Result<(), BackendError> {
+        let function = current_function(&self.builder)?;
+        let panic_block = self
+            .context
+            .append_basic_block(function, "panic.index-bounds");
+        let continue_block = self
+            .context
+            .append_basic_block(function, "panic.index-bounds.continue");
+        build(
+            self.builder
+                .build_conditional_branch(condition, panic_block, continue_block),
+        )?;
+        self.builder.position_at_end(panic_block);
+        self.set_active_panic_site(span)?;
+        let pointer = self.context.ptr_type(AddressSpace::default());
+        let usize_type = self.context.ptr_sized_int_type(self.target_data, None);
+        let i64_type = self.context.i64_type();
+        let index = match index.get_type().get_bit_width().cmp(&64) {
+            std::cmp::Ordering::Less => build(self.builder.build_int_s_extend(
+                index,
+                i64_type,
+                "panic.index.i64",
+            ))?,
+            std::cmp::Ordering::Equal => index,
+            std::cmp::Ordering::Greater => build(self.builder.build_int_truncate(
+                index,
+                i64_type,
+                "panic.index.i64",
+            ))?,
+        };
+        let runtime = self.runtime_function(
+            "dr_v2_panic_index_out_of_bounds",
+            &[
+                pointer.into(),
+                pointer.into(),
+                usize_type.into(),
+                i64_type.into(),
+                usize_type.into(),
+            ],
+            None,
+        );
+        let code_pointer = self.define_data(code.as_bytes(), "panic.code");
+        build(self.builder.build_call(
+            runtime,
+            &[
+                self.current_frame.into(),
+                code_pointer.into(),
+                usize_type.const_int(code.len() as u64, false).into(),
+                index.into(),
+                length.into(),
+            ],
+            "panic.index-bounds",
+        ))?;
+        build(self.builder.build_unreachable())?;
+        self.builder.position_at_end(continue_block);
+        Ok(())
+    }
+
     fn lower_padding_empty_panic_if(
         &mut self,
         condition: IntValue<'ctx>,
-        value: PointerValue<'ctx>,
-        current_length: IntValue<'ctx>,
-        requested_length: IntValue<'ctx>,
-        padding_length: IntValue<'ctx>,
+        pad_start: bool,
+        facts: (
+            PointerValue<'ctx>,
+            IntValue<'ctx>,
+            IntValue<'ctx>,
+            IntValue<'ctx>,
+        ),
         span: crate::source::Span,
     ) -> Result<(), BackendError> {
+        let (value, current_length, requested_length, padding_length) = facts;
         let function = current_function(&self.builder)?;
         let panic_block = self
             .context
@@ -8753,10 +8891,12 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         self.set_active_panic_site(span)?;
         let pointer = self.context.ptr_type(AddressSpace::default());
         let usize_type = self.context.ptr_sized_int_type(self.target_data, None);
+        let i8_type = self.context.i8_type();
         let runtime = self.runtime_function(
             "dr_v2_panic_string_padding_empty",
             &[
                 pointer.into(),
+                i8_type.into(),
                 pointer.into(),
                 usize_type.into(),
                 self.context.i64_type().into(),
@@ -8768,6 +8908,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             runtime,
             &[
                 self.current_frame.into(),
+                i8_type.const_int(u64::from(pad_start), false).into(),
                 value.into(),
                 current_length.into(),
                 requested_length.into(),

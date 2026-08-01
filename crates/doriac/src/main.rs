@@ -466,7 +466,11 @@ fn run_command(args: &[OsString]) -> Result<ExitCode, CliError> {
         };
         let rendered =
             doriac::render_diagnostics_with_options(path, text, &[diagnostic], diagnostic_options);
-        eprintln!("{rendered}");
+        if diagnostic_options.format == DiagnosticFormat::Json {
+            println!("{rendered}");
+        } else {
+            eprintln!("{rendered}");
+        }
     }
     Ok(exit_code_from_status(status)?)
 }
@@ -521,17 +525,6 @@ fn decode_runtime_outcome(payload: &[u8], source_path: &str) -> Result<Diagnosti
         };
         facts.push(RuntimeFact { name, value });
     }
-    if !facts.is_empty()
-        && (facts.len() != catalogue_entry.fact_names.len()
-            || facts
-                .iter()
-                .zip(catalogue_entry.fact_names)
-                .any(|(actual, expected)| actual.name != *expected))
-    {
-        return Err(
-            "native program returned facts that do not match the diagnostic catalogue".into(),
-        );
-    }
     if code == "P1501"
         && !facts.iter().any(|fact| {
             fact.name == doria_diagnostic_catalogue::SHARED_ACCESS_CONFLICT_REASON_FACT
@@ -543,6 +536,36 @@ fn decode_runtime_outcome(payload: &[u8], source_path: &str) -> Result<Diagnosti
         })
     {
         return Err("native program returned an invalid shared-access conflict reason".into());
+    }
+    if code == "P1203"
+        && !facts.iter().any(|fact| {
+            fact.name == doria_diagnostic_catalogue::STRING_PADDING_OPERATION_FACT
+                && matches!(
+                    &fact.value,
+                    RuntimeFactValue::StaticString(value)
+                        if doria_diagnostic_catalogue::is_string_padding_operation(value)
+                )
+        })
+    {
+        return Err("native program returned an invalid string-padding operation".into());
+    }
+    let transport_fact_names = if code == "P1000" {
+        catalogue_entry
+            .fact_names
+            .strip_prefix(&["message"])
+            .expect("P1000 message fact schema")
+    } else {
+        catalogue_entry.fact_names
+    };
+    if facts.len() != transport_fact_names.len()
+        || facts
+            .iter()
+            .zip(transport_fact_names)
+            .any(|(actual, expected)| actual.name != *expected)
+    {
+        return Err(
+            "native program returned facts that do not match the diagnostic catalogue".into(),
+        );
     }
     let mut frames = Vec::with_capacity(frame_count);
     for _ in 0..frame_count {
@@ -584,10 +607,27 @@ fn decode_runtime_outcome(payload: &[u8], source_path: &str) -> Result<Diagnosti
     };
     let mut diagnostic = Diagnostic::runtime_panic(code, primary_span, outcome);
     if code == "P1203" {
+        let operation = diagnostic
+            .runtime_outcome
+            .as_ref()
+            .and_then(|outcome| {
+                outcome.facts.iter().find(|fact| {
+                    fact.name == doria_diagnostic_catalogue::STRING_PADDING_OPERATION_FACT
+                })
+            })
+            .and_then(|fact| match &fact.value {
+                RuntimeFactValue::StaticString(value) => Some(value.as_str()),
+                _ => None,
+            });
         let text = diagnostic
             .runtime_outcome
             .as_ref()
-            .and_then(|outcome| outcome.facts.iter().find(|fact| fact.name == "value"))
+            .and_then(|outcome| {
+                outcome
+                    .facts
+                    .iter()
+                    .find(|fact| fact.name == doria_diagnostic_catalogue::STRING_PADDING_VALUE_FACT)
+            })
             .and_then(|fact| match &fact.value {
                 RuntimeFactValue::StaticString(value) => Some(value.as_str()),
                 _ => None,
@@ -603,14 +643,15 @@ fn decode_runtime_outcome(payload: &[u8], source_path: &str) -> Result<Diagnosti
                     _ => None,
                 })
         };
-        if let (Some(value), Some(current), Some(requested), Some(_padding)) = (
+        if let (Some(operation), Some(value), Some(current), Some(requested), Some(_padding)) = (
+            operation,
             text,
-            unsigned("currentGraphemeLength"),
-            unsigned("requestedGraphemeLength"),
-            unsigned("paddingGraphemeLength"),
+            unsigned(doria_diagnostic_catalogue::STRING_PADDING_CURRENT_LENGTH_FACT),
+            unsigned(doria_diagnostic_catalogue::STRING_PADDING_REQUESTED_GRAPHEME_LENGTH_FACT),
+            unsigned(doria_diagnostic_catalogue::STRING_PADDING_PADDING_LENGTH_FACT),
         ) {
             diagnostic.explanation = Some(format!(
-                "`padEnd` was asked to extend `\"{value}\"` from {current} to {requested} graphemes,\nbut an empty padding string cannot add any graphemes."
+                "`{operation}` was asked to extend `\"{value}\"` from {current} to {requested} graphemes,\nbut an empty padding string cannot add any graphemes."
             ));
         }
     }
@@ -849,6 +890,7 @@ mod tests {
         let payload = runtime_record(
             "P1203",
             &[
+                ("operation", 4, 0, "padStart"),
                 ("value", 4, 0, "Doria"),
                 ("currentGraphemeLength", 2, 5, ""),
                 ("requestedGraphemeLength", 2, 8, ""),
@@ -866,8 +908,12 @@ mod tests {
                 .expect("runtime outcome")
                 .facts
                 .len(),
-            4
+            5
         );
+        assert!(diagnostic
+            .explanation
+            .as_deref()
+            .is_some_and(|explanation| explanation.starts_with("`padStart` was asked")));
     }
 
     #[test]
@@ -884,6 +930,9 @@ mod tests {
 
     #[test]
     fn runtime_transport_rejects_malformed_fact_schemas() {
+        let missing_status = runtime_record("P1111", &[]);
+        assert!(decode_error(&missing_status).contains("do not match"));
+
         let wrong_name = runtime_record("P1204", &[("length", 1, 1, "")]);
         assert!(decode_error(&wrong_name).contains("do not match"));
 

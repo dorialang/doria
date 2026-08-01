@@ -63,6 +63,24 @@ pub fn is_shared_access_conflict_reason(value: &str) -> bool {
     )
 }
 
+pub const STRING_PADDING_OPERATION_FACT: &str = "operation";
+pub const PROCESS_STATUS_FACT: &str = "status";
+pub const STRING_SLICE_LENGTH_FACT: &str = "length";
+pub const STRING_PADDING_REQUESTED_LENGTH_FACT: &str = "requestedLength";
+pub const STRING_REPETITION_COUNT_FACT: &str = "count";
+pub const STRING_PADDING_VALUE_FACT: &str = "value";
+pub const STRING_PADDING_CURRENT_LENGTH_FACT: &str = "currentGraphemeLength";
+pub const STRING_PADDING_REQUESTED_GRAPHEME_LENGTH_FACT: &str = "requestedGraphemeLength";
+pub const STRING_PADDING_PADDING_LENGTH_FACT: &str = "paddingGraphemeLength";
+pub const INDEX_FACT: &str = "index";
+pub const INDEXED_LENGTH_FACT: &str = "length";
+pub const COLLECTION_FILL_COUNT_FACT: &str = "count";
+pub const STRING_PADDING_OPERATIONS: &[&str] = &["padStart", "padEnd"];
+
+pub fn is_string_padding_operation(value: &str) -> bool {
+    STRING_PADDING_OPERATIONS.contains(&value)
+}
+
 pub fn runtime_entry(code: &str) -> Option<&'static RuntimeCatalogueEntry> {
     RUNTIME_CATALOGUE.iter().find(|entry| entry.code == code)
 }
@@ -183,7 +201,7 @@ pub const RUNTIME_CATALOGUE: &[RuntimeCatalogueEntry] = &[
         primary_label: "Invalid Process Status Returned Here",
         explanation: "A Doria entry point may return only a process status from 0 through 125.",
         process_status: 101,
-        fact_names: &["status"],
+        fact_names: &[PROCESS_STATUS_FACT],
     },
     RuntimeCatalogueEntry {
         code: "P1201",
@@ -192,7 +210,7 @@ pub const RUNTIME_CATALOGUE: &[RuntimeCatalogueEntry] = &[
         primary_label: "Negative Slice Length",
         explanation: "A string slice length describes a count of graphemes and therefore cannot be negative.",
         process_status: 101,
-        fact_names: &["length"],
+        fact_names: &[STRING_SLICE_LENGTH_FACT],
     },
     RuntimeCatalogueEntry {
         code: "P1202",
@@ -201,7 +219,7 @@ pub const RUNTIME_CATALOGUE: &[RuntimeCatalogueEntry] = &[
         primary_label: "Negative Padding Length",
         explanation: "A string padding target is a grapheme length and therefore cannot be negative.",
         process_status: 101,
-        fact_names: &["requestedLength"],
+        fact_names: &[STRING_PADDING_REQUESTED_LENGTH_FACT],
     },
     RuntimeCatalogueEntry {
         code: "P1203",
@@ -211,10 +229,11 @@ pub const RUNTIME_CATALOGUE: &[RuntimeCatalogueEntry] = &[
         explanation: "The padding operation must add graphemes, but empty padding text cannot add any graphemes.",
         process_status: 101,
         fact_names: &[
-            "value",
-            "currentGraphemeLength",
-            "requestedGraphemeLength",
-            "paddingGraphemeLength",
+            STRING_PADDING_OPERATION_FACT,
+            STRING_PADDING_VALUE_FACT,
+            STRING_PADDING_CURRENT_LENGTH_FACT,
+            STRING_PADDING_REQUESTED_GRAPHEME_LENGTH_FACT,
+            STRING_PADDING_PADDING_LENGTH_FACT,
         ],
     },
     RuntimeCatalogueEntry {
@@ -224,7 +243,7 @@ pub const RUNTIME_CATALOGUE: &[RuntimeCatalogueEntry] = &[
         primary_label: "Negative Repetition Count",
         explanation: "A string repetition count describes how many copies to produce and therefore cannot be negative.",
         process_status: 101,
-        fact_names: &["count"],
+        fact_names: &[STRING_REPETITION_COUNT_FACT],
     },
     RuntimeCatalogueEntry {
         code: "P1205",
@@ -251,7 +270,7 @@ pub const RUNTIME_CATALOGUE: &[RuntimeCatalogueEntry] = &[
         primary_label: "Invalid Byte Index",
         explanation: "The byte index is outside the valid range of this Bytes value.",
         process_status: 101,
-        fact_names: &["index", "length"],
+        fact_names: &[INDEX_FACT, INDEXED_LENGTH_FACT],
     },
     RuntimeCatalogueEntry {
         code: "P1302",
@@ -269,7 +288,7 @@ pub const RUNTIME_CATALOGUE: &[RuntimeCatalogueEntry] = &[
         primary_label: "Invalid Collection Index",
         explanation: "The collection index is outside the valid range of this collection.",
         process_status: 101,
-        fact_names: &["index", "length"],
+        fact_names: &[INDEX_FACT, INDEXED_LENGTH_FACT],
     },
     RuntimeCatalogueEntry {
         code: "P1311",
@@ -278,7 +297,7 @@ pub const RUNTIME_CATALOGUE: &[RuntimeCatalogueEntry] = &[
         primary_label: "Negative Fill Count",
         explanation: "A collection fill count describes how many elements to create and therefore cannot be negative.",
         process_status: 101,
-        fact_names: &["count"],
+        fact_names: &[COLLECTION_FILL_COUNT_FACT],
     },
     RuntimeCatalogueEntry {
         code: "P1312",

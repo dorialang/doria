@@ -7218,9 +7218,59 @@ fn lower_panic_if_code(
     Ok(())
 }
 
+fn lower_panic_if_signed_fact(
+    builder: &mut FunctionBuilder,
+    condition: Value,
+    code: &'static str,
+    fact_name: &'static str,
+    value: Value,
+    span: crate::source::Span,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<(), BackendError> {
+    let panic_block = builder.create_block();
+    let continue_block = builder.create_block();
+    builder
+        .ins()
+        .brif(condition, panic_block, &[], continue_block, &[]);
+
+    builder.switch_to_block(panic_block);
+    set_active_panic_site(builder, span, resources);
+    let pointer = resources.module.target_config().pointer_type();
+    let code_pointer = define_data(builder, code.as_bytes(), resources)?;
+    let code_length = builder.ins().iconst(pointer, code.len() as i64);
+    let fact_name_pointer = define_data(builder, fact_name.as_bytes(), resources)?;
+    let fact_name_length = builder.ins().iconst(pointer, fact_name.len() as i64);
+    let panic_id = resources.declare_runtime(
+        "dr_v2_panic_signed_fact",
+        &[pointer, pointer, pointer, pointer, pointer, types::I64],
+        None,
+    )?;
+    let panic = resources
+        .module
+        .declare_func_in_func(panic_id, builder.func);
+    builder.ins().call(
+        panic,
+        &[
+            resources.current_frame,
+            code_pointer,
+            code_length,
+            fact_name_pointer,
+            fact_name_length,
+            value,
+        ],
+    );
+    builder
+        .ins()
+        .trap(TrapCode::unwrap_user(RUNTIME_RETURNED_TRAP));
+
+    builder.switch_to_block(continue_block);
+    Ok(())
+}
+
 fn lower_padding_empty_panic_if(
     builder: &mut FunctionBuilder,
     condition: Value,
+    pad_start: bool,
     facts: [Value; 4],
     span: crate::source::Span,
     resources: &mut LoweringResources<'_, '_>,
@@ -7237,16 +7287,18 @@ fn lower_padding_empty_panic_if(
     let pointer = resources.module.target_config().pointer_type();
     let panic_id = resources.declare_runtime(
         "dr_v2_panic_string_padding_empty",
-        &[pointer, pointer, pointer, types::I64, pointer],
+        &[pointer, types::I8, pointer, pointer, types::I64, pointer],
         None,
     )?;
     let panic = resources
         .module
         .declare_func_in_func(panic_id, builder.func);
+    let pad_start = builder.ins().iconst(types::I8, i64::from(pad_start));
     builder.ins().call(
         panic,
         &[
             resources.current_frame,
+            pad_start,
             value,
             current_length,
             requested_length,
@@ -7827,10 +7879,12 @@ fn lower_string_intrinsic_call(
             let has_length_flag = builder.ins().icmp_imm_u(IntCC::NotEqual, has_length, 0);
             let negative = builder.ins().icmp_imm_s(IntCC::SignedLessThan, length, 0);
             let invalid_length = builder.ins().band(has_length_flag, negative);
-            lower_panic_if_code(
+            lower_panic_if_signed_fact(
                 builder,
                 invalid_length,
                 "P1201",
+                doria_diagnostic_catalogue::STRING_SLICE_LENGTH_FACT,
+                length,
                 call.argument_spans.get(2).copied().unwrap_or(call.span),
                 resources,
             )?;
@@ -7853,10 +7907,12 @@ fn lower_string_intrinsic_call(
         Kind::Repeat => {
             let count = argument(1)?;
             let negative = builder.ins().icmp_imm_s(IntCC::SignedLessThan, count, 0);
-            lower_panic_if_code(
+            lower_panic_if_signed_fact(
                 builder,
                 negative,
                 "P1204",
+                doria_diagnostic_catalogue::STRING_REPETITION_COUNT_FACT,
+                count,
                 call.argument_spans.get(1).copied().unwrap_or(call.span),
                 resources,
             )?;
@@ -7880,10 +7936,12 @@ fn lower_string_intrinsic_call(
             let negative = builder
                 .ins()
                 .icmp_imm_s(IntCC::SignedLessThan, target_length, 0);
-            lower_panic_if_code(
+            lower_panic_if_signed_fact(
                 builder,
                 negative,
                 "P1202",
+                doria_diagnostic_catalogue::STRING_PADDING_REQUESTED_LENGTH_FACT,
+                target_length,
                 call.argument_spans.get(1).copied().unwrap_or(call.span),
                 resources,
             )?;
@@ -7917,6 +7975,7 @@ fn lower_string_intrinsic_call(
             lower_padding_empty_panic_if(
                 builder,
                 invalid_padding,
+                call.kind == Kind::PadStart,
                 [
                     argument(0)?,
                     current_length_word,

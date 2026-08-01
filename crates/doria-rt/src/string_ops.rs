@@ -5,7 +5,8 @@ use doria_unicode::{CaseMapping, PadSide, StringError, TrimMode};
 
 use crate::{
     allocate, allocate_string_with_frame, bytes, collection, deallocate, dr_v1_string_retain,
-    dr_v2_panic_code, string_bytes_mut, DrBytesV1, DrCollectionV1, DrStackFrameV2, DrStringV1,
+    dr_v2_panic_code, dr_v2_panic_signed_fact, dr_v2_panic_string_padding_empty, string_bytes_mut,
+    DrBytesV1, DrCollectionV1, DrStackFrameV2, DrStringV1,
 };
 
 unsafe fn text<'a>(value: *const DrStringV1) -> &'a str {
@@ -456,7 +457,17 @@ pub unsafe extern "C" fn dr_v2_string_slice(
 ) -> *mut DrStringV1 {
     let source = text(value);
     let range = doria_unicode::slice_range(source, start, (has_length != 0).then_some(length))
-        .unwrap_or_else(|error| panic_error(frame, error));
+        .unwrap_or_else(|error| match error {
+            StringError::SliceLengthNegative => dr_v2_panic_signed_fact(
+                frame,
+                b"P1201".as_ptr(),
+                5,
+                doria_diagnostic_catalogue::STRING_SLICE_LENGTH_FACT.as_ptr(),
+                doria_diagnostic_catalogue::STRING_SLICE_LENGTH_FACT.len(),
+                length,
+            ),
+            error => panic_error(frame, error),
+        });
     copy_range(frame, source, range)
 }
 
@@ -467,8 +478,20 @@ pub unsafe extern "C" fn dr_v2_string_repeat(
     count: i64,
 ) -> *mut DrStringV1 {
     let source = text(value);
-    let length = doria_unicode::repetition_output_length(source, count)
-        .unwrap_or_else(|error| panic_error(frame, error));
+    let length =
+        doria_unicode::repetition_output_length(source, count).unwrap_or_else(
+            |error| match error {
+                StringError::RepetitionCountNegative => dr_v2_panic_signed_fact(
+                    frame,
+                    b"P1204".as_ptr(),
+                    5,
+                    doria_diagnostic_catalogue::STRING_REPETITION_COUNT_FACT.as_ptr(),
+                    doria_diagnostic_catalogue::STRING_REPETITION_COUNT_FACT.len(),
+                    count,
+                ),
+                error => panic_error(frame, error),
+            },
+        );
     let result = new_result(frame, length);
     let output = core::slice::from_raw_parts_mut(string_bytes_mut(result), length);
     doria_unicode::write_repetition(source, count, output)
@@ -485,12 +508,31 @@ unsafe fn pad(
 ) -> *mut DrStringV1 {
     let source = text(value);
     let padding = text(padding);
-    let length = doria_unicode::padding_output_length(source, target_length, padding)
-        .unwrap_or_else(|error| panic_error(frame, error));
+    let panic = |error| match error {
+        StringError::PaddingTextEmpty => dr_v2_panic_string_padding_empty(
+            frame,
+            u8::from(side == PadSide::Start),
+            value,
+            doria_unicode::grapheme_count(source),
+            target_length,
+            doria_unicode::grapheme_count(padding),
+        ),
+        StringError::PaddingLengthNegative => dr_v2_panic_signed_fact(
+            frame,
+            b"P1202".as_ptr(),
+            5,
+            doria_diagnostic_catalogue::STRING_PADDING_REQUESTED_LENGTH_FACT.as_ptr(),
+            doria_diagnostic_catalogue::STRING_PADDING_REQUESTED_LENGTH_FACT.len(),
+            target_length,
+        ),
+        error => panic_error(frame, error),
+    };
+    let length =
+        doria_unicode::padding_output_length(source, target_length, padding).unwrap_or_else(panic);
     let result = new_result(frame, length);
     let output = core::slice::from_raw_parts_mut(string_bytes_mut(result), length);
     doria_unicode::write_padding(source, target_length, padding, side, output)
-        .unwrap_or_else(|error| panic_error(frame, error));
+        .unwrap_or_else(panic);
     result
 }
 

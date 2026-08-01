@@ -1,7 +1,10 @@
 use core::mem;
 use core::ptr;
 
-use crate::{allocate, deallocate, dr_v2_panic_code, DrStackFrameV2, DrStringV1};
+use crate::{
+    allocate, deallocate, dr_v2_panic_code, dr_v2_panic_index_out_of_bounds, DrStackFrameV2,
+    DrStringV1,
+};
 
 const COMPARE_STRING: u8 = 1;
 const COMPARE_FLOAT32: u8 = 2;
@@ -242,7 +245,7 @@ pub unsafe fn insert_at(
     value: u64,
 ) {
     if index > (*collection).length {
-        collection_panic_with_frame(frame, b"P1310");
+        collection_bounds_panic(frame, index, (*collection).length);
     }
     if (*collection).length == (*collection).capacity {
         grow(collection);
@@ -265,7 +268,7 @@ pub unsafe fn remove_at(
     index: usize,
 ) -> u64 {
     if index >= (*collection).length {
-        collection_panic_with_frame(frame, b"P1310");
+        collection_bounds_panic(frame, index, (*collection).length);
     }
     let removed = read_value(collection, index);
     let tail = (*collection).length - index - 1;
@@ -296,7 +299,7 @@ pub unsafe fn value_at(
     index: usize,
 ) -> u64 {
     if index >= (*collection).length {
-        collection_panic_with_frame(frame, b"P1310");
+        collection_bounds_panic(frame, index, (*collection).length);
     }
     read_value(collection, index)
 }
@@ -310,7 +313,7 @@ pub unsafe fn key_at(
         collection_panic(b"P1001");
     }
     if index >= (*collection).length {
-        collection_panic_with_frame(frame, b"P1310");
+        collection_bounds_panic(frame, index, (*collection).length);
     }
     *(*collection).keys.add(index)
 }
@@ -322,7 +325,7 @@ pub unsafe fn set_at(
     value: u64,
 ) -> u64 {
     if index >= (*collection).length {
-        collection_panic_with_frame(frame, b"P1310");
+        collection_bounds_panic(frame, index, (*collection).length);
     }
     let previous = read_value(collection, index);
     write_value(collection, index, value);
@@ -539,4 +542,8 @@ fn collection_panic(code: &'static [u8]) -> ! {
 
 fn collection_panic_with_frame(frame: *const DrStackFrameV2, code: &'static [u8]) -> ! {
     unsafe { dr_v2_panic_code(frame, code.as_ptr(), code.len(), ptr::null(), 0) }
+}
+
+fn collection_bounds_panic(frame: *const DrStackFrameV2, index: usize, length: usize) -> ! {
+    unsafe { dr_v2_panic_index_out_of_bounds(frame, b"P1310".as_ptr(), 5, index as i64, length) }
 }

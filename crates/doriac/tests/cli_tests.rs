@@ -224,7 +224,7 @@ fn run_runtime_outcome_honours_concise_and_json_formats() {
     fs::create_dir_all(&temp_dir).expect("temp directory should be created");
     fs::write(
         temp_dir.join("main.doria"),
-        "function main(): void\n{\n    echo String::padEnd(\"Doria\", 8, \"\");\n}\n",
+        "function main(): void\n{\n    echo String::padStart(\"Doria\", 8, \"\");\n}\n",
     )
     .expect("source should be writable");
 
@@ -245,7 +245,7 @@ fn run_runtime_outcome_honours_concise_and_json_formats() {
     let concise_stderr = String::from_utf8(concise.stderr).expect("concise stderr should be UTF-8");
     assert_eq!(
         concise_stderr,
-        "main.doria:3:37: Panic[P1203]: String Padding Text Cannot Be Empty\n"
+        "main.doria:3:39: Panic[P1203]: String Padding Text Cannot Be Empty\n"
     );
 
     let json = Command::new(doriac_bin())
@@ -261,12 +261,9 @@ fn run_runtime_outcome_honours_concise_and_json_formats() {
         .output()
         .expect("doriac binary should run");
     assert_eq!(json.status.code(), Some(101));
-    assert!(
-        json.stdout.is_empty(),
-        "program stdout must remain untouched"
-    );
+    assert!(json.stderr.is_empty(), "JSON diagnostics belong on stdout");
     let envelope: serde_json::Value =
-        serde_json::from_slice(&json.stderr).expect("runtime JSON should be valid JSON");
+        serde_json::from_slice(&json.stdout).expect("runtime JSON should be valid JSON");
     assert_eq!(envelope["schemaVersion"], 1);
     assert_eq!(envelope["diagnostics"][0]["kind"], "runtimePanic");
     assert_eq!(envelope["diagnostics"][0]["code"], "P1203");
@@ -277,6 +274,38 @@ fn run_runtime_outcome_honours_concise_and_json_formats() {
     assert_eq!(
         envelope["diagnostics"][0]["runtimeOutcome"]["terminationBehavior"],
         "abortWithoutCleanup"
+    );
+    assert_eq!(
+        envelope["diagnostics"][0]["runtimeOutcome"]["facts"][0]["name"],
+        "operation"
+    );
+    assert_eq!(
+        envelope["diagnostics"][0]["runtimeOutcome"]["facts"][0]["value"],
+        "padStart"
+    );
+
+    fs::write(
+        temp_dir.join("main.doria"),
+        "function main(): int\n{\n    return 126;\n}\n",
+    )
+    .expect("source should be writable");
+    let invalid_status = Command::new(doriac_bin())
+        .current_dir(&temp_dir)
+        .args(["run", "main.doria", "--diagnostic-format", "json"])
+        .output()
+        .expect("doriac binary should run");
+    assert_eq!(invalid_status.status.code(), Some(101));
+    assert!(invalid_status.stderr.is_empty());
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&invalid_status.stdout).expect("runtime JSON should be valid JSON");
+    assert_eq!(envelope["diagnostics"][0]["code"], "P1111");
+    assert_eq!(
+        envelope["diagnostics"][0]["runtimeOutcome"]["facts"][0]["name"],
+        "status"
+    );
+    assert_eq!(
+        envelope["diagnostics"][0]["runtimeOutcome"]["facts"][0]["value"],
+        126
     );
 
     let _ = fs::remove_dir_all(temp_dir);

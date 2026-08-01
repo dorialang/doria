@@ -1,7 +1,9 @@
 use core::mem;
 use core::ptr;
 
-use crate::{allocate, deallocate, dr_v2_panic_code, DrStackFrameV2};
+use crate::{
+    allocate, deallocate, dr_v2_panic_code, dr_v2_panic_index_out_of_bounds, DrStackFrameV2,
+};
 
 #[repr(C)]
 pub struct DrBytesV1 {
@@ -64,14 +66,14 @@ pub unsafe fn data(bytes: *const DrBytesV1) -> *const u8 {
 
 pub unsafe fn get(frame: *const DrStackFrameV2, bytes: *const DrBytesV1, index: usize) -> u8 {
     if index >= (*bytes).length {
-        dr_v2_panic_code(frame, b"P1301".as_ptr(), 5, ptr::null(), 0);
+        dr_v2_panic_index_out_of_bounds(frame, b"P1301".as_ptr(), 5, index as i64, (*bytes).length);
     }
     *(*bytes).data.add(index)
 }
 
 pub unsafe fn set(frame: *const DrStackFrameV2, bytes: *mut DrBytesV1, index: usize, value: u8) {
     if index >= (*bytes).length {
-        dr_v2_panic_code(frame, b"P1301".as_ptr(), 5, ptr::null(), 0);
+        dr_v2_panic_index_out_of_bounds(frame, b"P1301".as_ptr(), 5, index as i64, (*bytes).length);
     }
     *(*bytes).data.add(index) = value;
 }

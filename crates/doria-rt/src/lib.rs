@@ -105,6 +105,10 @@ pub struct DrRuntimeFactV2 {
     pub value_length: usize,
 }
 
+const RUNTIME_FACT_SIGNED: usize = 1;
+const RUNTIME_FACT_UNSIGNED: usize = 2;
+const RUNTIME_FACT_STATIC_STRING: usize = 4;
+
 /// Opaque shared-ownership control block.
 ///
 /// The class payload remains a separately allocated, headerless native class
@@ -272,7 +276,12 @@ pub unsafe extern "C" fn dr_v2_collection_fill_word(
     value_width: u8,
 ) -> *mut DrCollectionV1 {
     if count < 0 {
-        panic_catalogued(current_frame, b"P1311");
+        panic_signed_fact(
+            current_frame,
+            b"P1311",
+            doria_diagnostic_catalogue::COLLECTION_FILL_COUNT_FACT.as_bytes(),
+            count,
+        );
     }
     collection::fill_word(
         current_frame,
@@ -298,7 +307,12 @@ pub unsafe extern "C" fn dr_v2_collection_fill_string(
     fixed: u8,
 ) -> *mut DrCollectionV1 {
     if count < 0 {
-        panic_catalogued(current_frame, b"P1311");
+        panic_signed_fact(
+            current_frame,
+            b"P1311",
+            doria_diagnostic_catalogue::COLLECTION_FILL_COUNT_FACT.as_bytes(),
+            count,
+        );
     }
     collection::fill_string(current_frame, value, count as usize, fixed != 0)
 }
@@ -1125,7 +1139,12 @@ unsafe fn process_status(
         active_span_start: source_span_start,
         active_span_end: source_span_end,
     };
-    panic_catalogued(&frame, b"P1111")
+    panic_signed_fact(
+        &frame,
+        b"P1111",
+        doria_diagnostic_catalogue::PROCESS_STATUS_FACT.as_bytes(),
+        status,
+    )
 }
 
 /// Invokes a Doria `main(List<string> $args): int`, building the argument list
@@ -1596,6 +1615,22 @@ unsafe fn panic_catalogued(current_frame: *const DrStackFrameV2, code: &'static 
     dr_v2_panic_code(current_frame, code.as_ptr(), code.len(), ptr::null(), 0)
 }
 
+unsafe fn panic_signed_fact(
+    current_frame: *const DrStackFrameV2,
+    code: &'static [u8],
+    name: &'static [u8],
+    value: i64,
+) -> ! {
+    dr_v2_panic_signed_fact(
+        current_frame,
+        code.as_ptr(),
+        code.len(),
+        name.as_ptr(),
+        name.len(),
+        value,
+    )
+}
+
 unsafe fn panic_shared_access_conflict(
     current_frame: *const DrStackFrameV2,
     reason: &'static str,
@@ -1603,7 +1638,7 @@ unsafe fn panic_shared_access_conflict(
     let fact = DrRuntimeFactV2 {
         name: doria_diagnostic_catalogue::SHARED_ACCESS_CONFLICT_REASON_FACT.as_ptr(),
         name_length: doria_diagnostic_catalogue::SHARED_ACCESS_CONFLICT_REASON_FACT.len(),
-        kind: 4,
+        kind: RUNTIME_FACT_STATIC_STRING,
         value: reason.as_ptr() as u64,
         value_length: reason.len(),
     };
@@ -1664,6 +1699,73 @@ pub unsafe extern "C" fn dr_v2_panic_code(
     )
 }
 
+/// Reports a catalogued panic carrying one signed-integer fact.
+///
+/// # Safety
+///
+/// The code and fact-name byte ranges and every frame in `current_frame` must
+/// remain readable until process termination.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v2_panic_signed_fact(
+    current_frame: *const DrStackFrameV2,
+    code: *const u8,
+    code_length: usize,
+    fact_name: *const u8,
+    fact_name_length: usize,
+    value: i64,
+) -> ! {
+    let fact = DrRuntimeFactV2 {
+        name: fact_name,
+        name_length: fact_name_length,
+        kind: RUNTIME_FACT_SIGNED,
+        value: value as u64,
+        value_length: 0,
+    };
+    dr_v2_panic_code_with_facts(current_frame, code, code_length, ptr::null(), 0, &fact, 1)
+}
+
+/// Reports a byte/collection bounds panic with the canonical index and length
+/// facts.
+///
+/// # Safety
+///
+/// The code byte range and every frame in `current_frame` must remain readable
+/// until process termination.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v2_panic_index_out_of_bounds(
+    current_frame: *const DrStackFrameV2,
+    code: *const u8,
+    code_length: usize,
+    index: i64,
+    length: usize,
+) -> ! {
+    let facts = [
+        DrRuntimeFactV2 {
+            name: doria_diagnostic_catalogue::INDEX_FACT.as_ptr(),
+            name_length: doria_diagnostic_catalogue::INDEX_FACT.len(),
+            kind: RUNTIME_FACT_SIGNED,
+            value: index as u64,
+            value_length: 0,
+        },
+        DrRuntimeFactV2 {
+            name: doria_diagnostic_catalogue::INDEXED_LENGTH_FACT.as_ptr(),
+            name_length: doria_diagnostic_catalogue::INDEXED_LENGTH_FACT.len(),
+            kind: RUNTIME_FACT_UNSIGNED,
+            value: length as u64,
+            value_length: 0,
+        },
+    ];
+    dr_v2_panic_code_with_facts(
+        current_frame,
+        code,
+        code_length,
+        ptr::null(),
+        0,
+        facts.as_ptr(),
+        facts.len(),
+    )
+}
+
 #[no_mangle]
 /// Reports the catalogued empty-padding panic with the facts required by
 /// `P1203`.
@@ -1674,37 +1776,52 @@ pub unsafe extern "C" fn dr_v2_panic_code(
 /// and `value` must identify a live runtime string until process termination.
 pub unsafe extern "C" fn dr_v2_panic_string_padding_empty(
     current_frame: *const DrStackFrameV2,
+    pad_start: u8,
     value: *const DrStringV1,
     current_grapheme_length: usize,
     requested_grapheme_length: i64,
     padding_grapheme_length: usize,
 ) -> ! {
+    let operation = match pad_start {
+        0 => b"padEnd".as_slice(),
+        1 => b"padStart".as_slice(),
+        _ => emergency_runtime_panic(),
+    };
     let facts = [
         DrRuntimeFactV2 {
-            name: b"value".as_ptr(),
-            name_length: 5,
-            kind: 4,
+            name: doria_diagnostic_catalogue::STRING_PADDING_OPERATION_FACT.as_ptr(),
+            name_length: doria_diagnostic_catalogue::STRING_PADDING_OPERATION_FACT.len(),
+            kind: RUNTIME_FACT_STATIC_STRING,
+            value: operation.as_ptr() as u64,
+            value_length: operation.len(),
+        },
+        DrRuntimeFactV2 {
+            name: doria_diagnostic_catalogue::STRING_PADDING_VALUE_FACT.as_ptr(),
+            name_length: doria_diagnostic_catalogue::STRING_PADDING_VALUE_FACT.len(),
+            kind: RUNTIME_FACT_STATIC_STRING,
             value: dr_v1_string_data(value) as u64,
             value_length: dr_v1_string_byte_length(value),
         },
         DrRuntimeFactV2 {
-            name: b"currentGraphemeLength".as_ptr(),
-            name_length: 21,
-            kind: 2,
+            name: doria_diagnostic_catalogue::STRING_PADDING_CURRENT_LENGTH_FACT.as_ptr(),
+            name_length: doria_diagnostic_catalogue::STRING_PADDING_CURRENT_LENGTH_FACT.len(),
+            kind: RUNTIME_FACT_UNSIGNED,
             value: current_grapheme_length as u64,
             value_length: 0,
         },
         DrRuntimeFactV2 {
-            name: b"requestedGraphemeLength".as_ptr(),
-            name_length: 23,
-            kind: 1,
+            name: doria_diagnostic_catalogue::STRING_PADDING_REQUESTED_GRAPHEME_LENGTH_FACT
+                .as_ptr(),
+            name_length: doria_diagnostic_catalogue::STRING_PADDING_REQUESTED_GRAPHEME_LENGTH_FACT
+                .len(),
+            kind: RUNTIME_FACT_SIGNED,
             value: requested_grapheme_length as u64,
             value_length: 0,
         },
         DrRuntimeFactV2 {
-            name: b"paddingGraphemeLength".as_ptr(),
-            name_length: 21,
-            kind: 2,
+            name: doria_diagnostic_catalogue::STRING_PADDING_PADDING_LENGTH_FACT.as_ptr(),
+            name_length: doria_diagnostic_catalogue::STRING_PADDING_PADDING_LENGTH_FACT.len(),
+            kind: RUNTIME_FACT_UNSIGNED,
             value: padding_grapheme_length as u64,
             value_length: 0,
         },
@@ -1746,10 +1863,21 @@ pub unsafe extern "C" fn dr_v2_panic_code_with_facts(
     let Some(entry) = doria_diagnostic_catalogue::runtime_entry(code_text) else {
         emergency_runtime_panic();
     };
-    if !runtime_facts_match(entry.fact_names, facts, fact_count) {
+    let transport_fact_names = if entry.code == "P1000" {
+        entry
+            .fact_names
+            .strip_prefix(&["message"])
+            .unwrap_or(entry.fact_names)
+    } else {
+        entry.fact_names
+    };
+    if !runtime_facts_match(transport_fact_names, facts, fact_count) {
         emergency_runtime_panic();
     }
     if entry.code == "P1501" && !shared_access_conflict_fact_matches(facts, fact_count) {
+        emergency_runtime_panic();
+    }
+    if entry.code == "P1203" && !string_padding_operation_fact_matches(facts, fact_count) {
         emergency_runtime_panic();
     }
 
@@ -1773,13 +1901,18 @@ pub unsafe extern "C" fn dr_v2_panic_code_with_facts(
         render_runtime_where(current_frame, entry.primary_label.as_bytes());
     }
     write_panic_fragment(b"\n\nWhy\n");
-    if entry.code == "P1203" && fact_count == 4 {
-        write_panic_fragment(b"`padEnd` was asked to extend `\"");
+    if entry.code == "P1203" && fact_count == 5 {
+        write_panic_fragment(b"`");
         write_panic_bytes((*facts).value as *const u8, (*facts).value_length);
+        write_panic_fragment(b"` was asked to extend `\"");
+        write_panic_bytes(
+            (*facts.add(1)).value as *const u8,
+            (*facts.add(1)).value_length,
+        );
         write_panic_fragment(b"\"` from ");
-        write_usize((*facts.add(1)).value as usize);
-        write_panic_fragment(b" to ");
         write_usize((*facts.add(2)).value as usize);
+        write_panic_fragment(b" to ");
+        write_usize((*facts.add(3)).value as usize);
         write_panic_fragment(b" graphemes,\nbut an empty padding string cannot add any graphemes.");
     } else if entry.code == "P1501" && fact_count == 1 {
         write_panic_bytes((*facts).value as *const u8, (*facts).value_length);
@@ -1817,7 +1950,7 @@ unsafe fn shared_access_conflict_fact_matches(
     facts: *const DrRuntimeFactV2,
     fact_count: usize,
 ) -> bool {
-    if fact_count != 1 || facts.is_null() || (*facts).kind != 4 {
+    if fact_count != 1 || facts.is_null() || (*facts).kind != RUNTIME_FACT_STATIC_STRING {
         return false;
     }
     let value = core::slice::from_raw_parts((*facts).value as *const u8, (*facts).value_length);
@@ -1825,14 +1958,22 @@ unsafe fn shared_access_conflict_fact_matches(
         .is_ok_and(doria_diagnostic_catalogue::is_shared_access_conflict_reason)
 }
 
+unsafe fn string_padding_operation_fact_matches(
+    facts: *const DrRuntimeFactV2,
+    fact_count: usize,
+) -> bool {
+    if fact_count != 5 || facts.is_null() || (*facts).kind != RUNTIME_FACT_STATIC_STRING {
+        return false;
+    }
+    let value = core::slice::from_raw_parts((*facts).value as *const u8, (*facts).value_length);
+    core::str::from_utf8(value).is_ok_and(doria_diagnostic_catalogue::is_string_padding_operation)
+}
+
 unsafe fn runtime_facts_match(
     expected: &[&str],
     facts: *const DrRuntimeFactV2,
     fact_count: usize,
 ) -> bool {
-    if fact_count == 0 {
-        return true;
-    }
     if fact_count != expected.len() {
         return false;
     }
@@ -3214,6 +3355,30 @@ mod tests {
             core::mem::align_of::<DrStackFrameV2>(),
             core::mem::align_of::<usize>()
         );
+    }
+
+    #[test]
+    fn runtime_fact_validation_requires_the_complete_catalogue_schema() {
+        let status = DrRuntimeFactV2 {
+            name: doria_diagnostic_catalogue::PROCESS_STATUS_FACT.as_ptr(),
+            name_length: doria_diagnostic_catalogue::PROCESS_STATUS_FACT.len(),
+            kind: RUNTIME_FACT_SIGNED,
+            value: 126,
+            value_length: 0,
+        };
+        unsafe {
+            assert!(!runtime_facts_match(
+                &[doria_diagnostic_catalogue::PROCESS_STATUS_FACT],
+                ptr::null(),
+                0
+            ));
+            assert!(runtime_facts_match(
+                &[doria_diagnostic_catalogue::PROCESS_STATUS_FACT],
+                &status,
+                1
+            ));
+            assert!(!runtime_facts_match(&[], &status, 1));
+        }
     }
 
     #[test]
