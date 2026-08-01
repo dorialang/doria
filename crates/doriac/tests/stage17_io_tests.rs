@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 
-use doriac::mir_interpreter::{interpret_with_io, MirIo};
+use doriac::diagnostics::{ColorChoice, DiagnosticFormat, RenderOptions};
+use doriac::mir_interpreter::{interpret_with_io, MirIo, MirIoFaults, MirIoWriteFailure};
 
 fn interpret(
     source: &str,
@@ -14,9 +15,151 @@ fn interpret(
             stdin: stdin.to_vec(),
             files,
             args: Vec::new(),
+            ..MirIo::default()
         },
     )
     .expect("MIR should interpret")
+}
+
+fn interpret_with_host(source: &str, io: MirIo) -> doriac::mir_interpreter::InterpreterIoOutput {
+    let program = doriac::lower_source_to_mir("test.doria", source).expect("source should lower");
+    interpret_with_io(&program, io).expect("MIR should interpret")
+}
+
+const PROMPTED_READ: &str = r#"
+function main(): void
+{
+    let $line = read_line("Name: ");
+    if ($line != null) { echo $line; }
+}
+"#;
+
+#[test]
+fn prompted_read_line_observes_write_flush_and_read_in_order() {
+    let output = interpret_with_host(
+        PROMPTED_READ,
+        MirIo {
+            stdin: b"Doria\n".to_vec(),
+            ..MirIo::default()
+        },
+    );
+
+    assert_eq!(output.output.stdout, b"Name: Doria");
+    assert_eq!(output.trace.prompt_writes, 1);
+    assert_eq!(output.trace.stdout_flushes, 1);
+    assert_eq!(output.trace.stdin_line_reads, 1);
+
+    let empty = interpret_with_host(
+        "function main(): void { let $line = read_line(); }",
+        MirIo::default(),
+    );
+    assert_eq!(empty.trace.prompt_writes, 0);
+    assert_eq!(empty.trace.stdout_flushes, 1);
+    assert_eq!(empty.trace.stdin_line_reads, 1);
+}
+
+#[test]
+fn prompted_read_line_broken_pipes_exit_cleanly_before_stdin() {
+    for faults in [
+        MirIoFaults {
+            prompt_write: Some(MirIoWriteFailure::BrokenPipe),
+            ..MirIoFaults::default()
+        },
+        MirIoFaults {
+            stdout_flush: Some(MirIoWriteFailure::BrokenPipe),
+            ..MirIoFaults::default()
+        },
+    ] {
+        let output = interpret_with_host(
+            PROMPTED_READ,
+            MirIo {
+                stdin: b"must not be read\n".to_vec(),
+                faults,
+                ..MirIo::default()
+            },
+        );
+        assert_eq!(output.output.exit_status, 0);
+        assert!(output.output.stderr.is_empty());
+        assert!(output.output.runtime_diagnostic.is_none());
+        assert_eq!(output.trace.stdin_line_reads, 0);
+    }
+}
+
+#[test]
+fn prompted_read_line_host_failures_keep_their_runtime_codes() {
+    let cases = [
+        (
+            MirIoFaults {
+                prompt_write: Some(MirIoWriteFailure::Other),
+                ..MirIoFaults::default()
+            },
+            b"".as_slice(),
+            "P1407",
+        ),
+        (
+            MirIoFaults {
+                stdout_flush: Some(MirIoWriteFailure::Other),
+                ..MirIoFaults::default()
+            },
+            b"Name: ".as_slice(),
+            "P1407",
+        ),
+        (
+            MirIoFaults {
+                stdin_line_read: true,
+                ..MirIoFaults::default()
+            },
+            b"Name: ".as_slice(),
+            "P1403",
+        ),
+        (
+            MirIoFaults {
+                line_allocation: true,
+                ..MirIoFaults::default()
+            },
+            b"Name: ".as_slice(),
+            "P1206",
+        ),
+    ];
+
+    for (faults, stdout, code) in cases {
+        let output = interpret_with_host(
+            PROMPTED_READ,
+            MirIo {
+                stdin: b"Doria\n".to_vec(),
+                faults,
+                ..MirIo::default()
+            },
+        );
+        assert_eq!(output.output.stdout, stdout, "{code}");
+        assert_eq!(output.output.exit_status, 101, "{code}");
+        assert_eq!(
+            output
+                .output
+                .runtime_diagnostic
+                .as_ref()
+                .map(|diagnostic| diagnostic.code),
+            Some(code),
+        );
+    }
+
+    let invalid_utf8 = interpret_with_host(
+        PROMPTED_READ,
+        MirIo {
+            stdin: vec![0xff, b'\n'],
+            ..MirIo::default()
+        },
+    );
+    assert_eq!(invalid_utf8.output.stdout, b"Name: ");
+    assert_eq!(invalid_utf8.output.exit_status, 101);
+    assert_eq!(
+        invalid_utf8
+            .output
+            .runtime_diagnostic
+            .as_ref()
+            .map(|diagnostic| diagnostic.code),
+        Some("P1404"),
+    );
 }
 
 #[test]
@@ -62,6 +205,51 @@ fn php_readline_spelling_is_rejected_with_doria_guidance() {
     assert!(diagnostics.iter().any(|diagnostic| {
         diagnostic.code == "E0310" && diagnostic.message.contains("`read_line`")
     }));
+}
+
+#[test]
+fn prompted_read_line_diagnostics_survive_every_presentation() {
+    let cases = [
+        ("function main(): void { read_line(42); }", "E0453"),
+        ("function main(): void { read_line(null); }", "E0453"),
+        (
+            "function main(): void { read_line(\"a\", \"b\"); }",
+            "E0450",
+        ),
+    ];
+
+    for (source, code) in cases {
+        let diagnostics = doriac::check_source("prompt-error.doria", source)
+            .expect_err("invalid prompted input must be rejected");
+        let diagnostic = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == code)
+            .unwrap_or_else(|| panic!("expected {code}, got {diagnostics:?}"));
+        assert!(diagnostic.span.end > diagnostic.span.start);
+
+        for format in [
+            DiagnosticFormat::Human,
+            DiagnosticFormat::Concise,
+            DiagnosticFormat::Json,
+        ] {
+            let rendered = doriac::render_diagnostics_with_options(
+                "prompt-error.doria",
+                source,
+                &diagnostics,
+                RenderOptions {
+                    format,
+                    color: ColorChoice::Never,
+                    ..RenderOptions::default()
+                },
+            );
+            assert!(rendered.contains(code), "{format:?}: {rendered}");
+            if format == DiagnosticFormat::Json {
+                let value: serde_json::Value =
+                    serde_json::from_str(&rendered).expect("JSON diagnostics should parse");
+                assert_eq!(value["schemaVersion"], 1);
+            }
+        }
+    }
 }
 
 #[test]

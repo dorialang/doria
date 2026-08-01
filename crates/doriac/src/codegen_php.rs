@@ -100,6 +100,7 @@ function __doria_panic(string $code, int $start, int $end, ?string $message = nu
         "__doria_append_file",
         "__doria_is_broken_pipe",
         "__doria_write_all",
+        "__doria_flush_stdout",
         "__doria_write_stdout",
         "__doria_write_stderr",
         "__doria_sprintf",
@@ -157,7 +158,7 @@ function __doria_panic(string $code, int $start, int $end, ?string $message = nu
 function __doria_read_line(string $prompt, int $start, int $end): ?string
 {
     if ($prompt !== "") { __doria_write_all(STDOUT, $prompt, $start, $end); }
-    @fflush(STDOUT);
+    __doria_flush_stdout($start, $end);
     $line = @fgets(STDIN);
     if ($line === false) {
         if (feof(STDIN)) { return null; }
@@ -218,6 +219,14 @@ function __doria_write_all(mixed $stream, string $value, int $start, int $end): 
         }
         $offset += $written;
     }
+}
+
+function __doria_flush_stdout(int $start, int $end): void
+{
+    error_clear_last();
+    if (@fflush(STDOUT)) { return; }
+    if (__doria_is_broken_pipe(error_get_last())) { exit(0); }
+    __doria_panic("P1407", $start, $end);
 }
 
 function __doria_write_stdout(string $value, int $start, int $end): void

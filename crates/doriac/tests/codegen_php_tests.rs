@@ -1435,7 +1435,9 @@ function main(): void
     assert!(
         php.contains("if ($prompt !== \"\") { __doria_write_all(STDOUT, $prompt, $start, $end); }")
     );
-    assert!(php.contains("@fflush(STDOUT);"));
+    assert!(php.contains("__doria_flush_stdout($start, $end);"));
+    assert!(php.contains("if (@fflush(STDOUT)) { return; }"));
+    assert!(php.contains("if (__doria_is_broken_pipe(error_get_last())) { exit(0); }"));
     assert!(!php.contains("readline("));
     assert!(php.contains(
         "function __doria_panic(string $code, int $start, int $end, ?string $message = null)"
@@ -1460,6 +1462,57 @@ function main(): void
     assert!(php.contains("__doria_printf("));
     assert!(php.contains("\"enabled=%s\", __doria_display(false))"));
     assert!(php.contains("__doria_sprintf(\"%05d\", 42)"));
+}
+
+#[test]
+fn php_prompted_read_line_preserves_prompt_and_line_discipline() {
+    let Ok(version) = Command::new("php").arg("--version").output() else {
+        return;
+    };
+    if !version.status.success() {
+        return;
+    }
+
+    let php = doriac::compile_source_to_php(
+        "prompted-input.doria",
+        r#"
+function main(): void
+{
+    let $first = read_line("P: ");
+    if ($first != null) { echo "<{$first}>\n"; }
+
+    let $blank = read_line();
+    if ($blank != null) { echo "[{$blank}]\n"; }
+
+    let $eof = read_line("E: ");
+    if ($eof == null) { echo "EOF"; }
+}
+"#,
+    )
+    .expect("prompted input should lower to PHP");
+    let script = format!(
+        "{}\nmain();",
+        php.strip_prefix("<?php").expect("generated PHP header")
+    );
+    let mut child = Command::new("php")
+        .arg("-r")
+        .arg(script)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("PHP should execute prompted input");
+    child
+        .stdin
+        .take()
+        .expect("PHP stdin should be piped")
+        .write_all(b"alpha\r\n\n")
+        .expect("PHP fixture input should be writable");
+    let output = child.wait_with_output().expect("PHP fixture should exit");
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(output.stdout, b"P: <alpha>\n[]\nE: EOF");
+    assert!(output.stderr.is_empty());
 }
 
 #[test]
@@ -1520,6 +1573,29 @@ function main(): void
         assert!(output.stdout.is_empty(), "{name} fixture wrote stdout");
         assert!(output.stderr.is_empty(), "{name} fixture wrote stderr");
     }
+
+    let php = doriac::compile_source_to_php(
+        "closed-prompt.doria",
+        "function main(): void { let $line = read_line(\"Prompt: \" ); }",
+    )
+    .expect("closed prompt fixture should lower to PHP");
+    let script = format!(
+        "{}\nmain();",
+        php.strip_prefix("<?php").expect("generated PHP header")
+    );
+    let mut child = Command::new("php")
+        .arg("-r")
+        .arg(script)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("PHP should execute the closed-prompt fixture");
+    drop(child.stdout.take());
+    drop(child.stdin.take());
+    let output = child.wait_with_output().expect("PHP fixture should exit");
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stderr.is_empty());
 }
 
 #[test]

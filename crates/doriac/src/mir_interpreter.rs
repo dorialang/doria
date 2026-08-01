@@ -692,6 +692,8 @@ struct Interpreter<'program> {
     stderr: Vec<u8>,
     stdin: Vec<u8>,
     stdin_cursor: usize,
+    io_faults: MirIoFaults,
+    io_trace: MirIoTrace,
     files: BTreeMap<String, Vec<u8>>,
     heap: BTreeMap<usize, ObjectValue>,
     statics: Vec<LocalValue>,
@@ -702,6 +704,27 @@ struct Interpreter<'program> {
     pending_panic: Option<&'static str>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MirIoWriteFailure {
+    BrokenPipe,
+    Other,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MirIoFaults {
+    pub prompt_write: Option<MirIoWriteFailure>,
+    pub stdout_flush: Option<MirIoWriteFailure>,
+    pub stdin_line_read: bool,
+    pub line_allocation: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MirIoTrace {
+    pub prompt_writes: usize,
+    pub stdout_flushes: usize,
+    pub stdin_line_reads: usize,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MirIo {
     pub stdin: Vec<u8>,
@@ -710,16 +733,21 @@ pub struct MirIo {
     /// 0099). These are the arguments only — the executable path is stripped by
     /// the entry glue, so element 0 is the first real argument.
     pub args: Vec<String>,
+    /// Deterministic host failures used to verify the shared standard-I/O
+    /// contract without depending on platform-specific devices.
+    pub faults: MirIoFaults,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InterpreterIoOutput {
     pub output: InterpreterOutput,
     pub files: BTreeMap<String, Vec<u8>>,
+    pub trace: MirIoTrace,
 }
 
 enum StepOutcome {
     Continue,
+    CleanExit,
     EntryReturned(FunctionOutcome),
     RuntimePanic(RuntimePanicEvent),
 }
@@ -798,6 +826,8 @@ fn interpret_internal(
         stderr: Vec::new(),
         stdin: io.stdin,
         stdin_cursor: 0,
+        io_faults: io.faults,
+        io_trace: MirIoTrace::default(),
         files: io.files,
         heap: BTreeMap::new(),
         statics: program
@@ -852,11 +882,24 @@ fn interpret_internal(
     loop {
         match interpreter.step()? {
             StepOutcome::Continue => {}
+            StepOutcome::CleanExit => {
+                return Ok(InterpreterIoOutput {
+                    output: InterpreterOutput {
+                        stdout: interpreter.stdout,
+                        stderr: interpreter.stderr,
+                        exit_status: 0,
+                        runtime_diagnostic: None,
+                    },
+                    files: interpreter.files,
+                    trace: interpreter.io_trace,
+                });
+            }
             StepOutcome::RuntimePanic(event) => {
                 let output = interpreter.runtime_panic_output(event);
                 return Ok(InterpreterIoOutput {
                     output,
                     files: interpreter.files,
+                    trace: interpreter.io_trace,
                 });
             }
             StepOutcome::EntryReturned(outcome) => {
@@ -864,6 +907,7 @@ fn interpret_internal(
                 return Ok(InterpreterIoOutput {
                     output,
                     files: interpreter.files,
+                    trace: interpreter.io_trace,
                 });
             }
         }
@@ -3770,15 +3814,34 @@ impl Interpreter<'_> {
                 let values = self.take_evaluation_values(format.arguments.len())?;
                 self.push_string(render_format(&format, &values)?)?;
             }
-            EvaluationTask::ReadLine(_prompt_span) => {
+            EvaluationTask::ReadLine(prompt_span) => {
                 let prompt = self.pop_string()?;
-                // Write the prompt exactly, adding no characters. A zero-length write
-                // is skipped; the flush that follows is not. Against the interpreter's
-                // in-memory stdout a flush is a successful no-op, so appending before
-                // consuming stdin reproduces the observable order the native runtime
-                // produces.
                 if !prompt.is_empty() {
+                    self.io_trace.prompt_writes += 1;
+                    match self.io_faults.prompt_write {
+                        Some(MirIoWriteFailure::BrokenPipe) => {
+                            return Ok(StepOutcome::CleanExit);
+                        }
+                        Some(MirIoWriteFailure::Other) => {
+                            return self.runtime_panic_step_at("P1407", prompt_span);
+                        }
+                        None => {}
+                    }
                     self.stdout.extend_from_slice(prompt.as_bytes());
+                }
+                self.io_trace.stdout_flushes += 1;
+                match self.io_faults.stdout_flush {
+                    Some(MirIoWriteFailure::BrokenPipe) => {
+                        return Ok(StepOutcome::CleanExit);
+                    }
+                    Some(MirIoWriteFailure::Other) => {
+                        return self.runtime_panic_step_at("P1407", prompt_span);
+                    }
+                    None => {}
+                }
+                self.io_trace.stdin_line_reads += 1;
+                if self.io_faults.stdin_line_read {
+                    return self.runtime_panic_step_at("P1403", prompt_span);
                 }
                 if self.stdin_cursor == self.stdin.len() {
                     self.push_nullable_string(None)?;
@@ -3790,9 +3853,13 @@ impl Interpreter<'_> {
                     if line_length != 0 && remaining[line_length - 1] == b'\r' {
                         line_length -= 1;
                     }
-                    let line = core::str::from_utf8(&remaining[..line_length])
-                        .map_err(|_| InterpreterError::new("stdin contained invalid UTF-8"))?
-                        .to_string();
+                    let Ok(line) = core::str::from_utf8(&remaining[..line_length]) else {
+                        return self.runtime_panic_step_at("P1404", prompt_span);
+                    };
+                    if self.io_faults.line_allocation {
+                        return self.runtime_panic_step_at("P1206", prompt_span);
+                    }
+                    let line = line.to_string();
                     self.stdin_cursor += consumed;
                     self.push_nullable_string(Some(line.into()))?;
                 }

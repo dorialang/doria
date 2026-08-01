@@ -15,6 +15,12 @@ const BROKEN_PIPE_STDOUT_BYTES: &str =
     include_str!("fixtures/native_io/broken_pipe_stdout_bytes.doria");
 const BROKEN_PIPE_STDERR_BYTES: &str =
     include_str!("fixtures/native_io/broken_pipe_stderr_bytes.doria");
+const BROKEN_PIPE_READ_LINE_PROMPT: &str = r#"
+function main(): void
+{
+    let $line = read_line("Name: ");
+}
+"#;
 
 #[test]
 fn release_panic_projection_preserves_output_and_omits_only_frames() {
@@ -78,6 +84,7 @@ fn interpreter_matches_every_durable_io_fixture() {
                 stdin: fixture.stdin.clone(),
                 files: fixture.files.clone(),
                 args: fixture.args.clone(),
+                ..doriac::mir_interpreter::MirIo::default()
             },
         )
         .unwrap_or_else(|error| {
@@ -119,6 +126,7 @@ fn interpreter_cranelift_and_enabled_llvm_match_for_the_durable_native_manifest(
                 stdin: fixture.stdin.clone(),
                 files: fixture.files.clone(),
                 args: fixture.args.clone(),
+                ..doriac::mir_interpreter::MirIo::default()
             },
         )
         .unwrap_or_else(|error| {
@@ -202,6 +210,7 @@ fn enabled_native_backends_exit_cleanly_when_an_output_pipe_closes() {
                 stdin: stdin.to_vec(),
                 files: BTreeMap::new(),
                 args: Vec::new(),
+                ..doriac::mir_interpreter::MirIo::default()
             },
         )
         .unwrap_or_else(|error| panic!("interpreter rejected broken-pipe {name} fixture: {error}"))
@@ -220,6 +229,39 @@ fn enabled_native_backends_exit_cleanly_when_an_output_pipe_closes() {
         #[cfg(feature = "llvm-backend")]
         assert_closed_output_pipe(&mir, NativeProfile::Release, name, closed_stream, stdin);
     }
+}
+
+#[test]
+fn prompted_read_line_exits_cleanly_when_stdout_closes_before_stdin() {
+    if !host_linker_is_available() {
+        let message = format!("native parity requires host linker {}", host_linker());
+        if std::env::var_os("CI").is_some() {
+            panic!("{message}; CI must not skip the prompted-input broken-pipe check");
+        }
+        eprintln!("{message}; skipping local prompted-input broken-pipe check");
+        return;
+    }
+
+    let mir = doriac::lower_source_to_mir(
+        "broken_pipe_read_line_prompt.doria",
+        BROKEN_PIPE_READ_LINE_PROMPT,
+    )
+    .expect("prompted read_line broken-pipe fixture should lower");
+    assert_closed_output_pipe(
+        &mir,
+        NativeProfile::Fast,
+        "read-line-prompt",
+        ClosedStream::Stdout,
+        b"must not be read\n",
+    );
+    #[cfg(feature = "llvm-backend")]
+    assert_closed_output_pipe(
+        &mir,
+        NativeProfile::Release,
+        "read-line-prompt",
+        ClosedStream::Stdout,
+        b"must not be read\n",
+    );
 }
 
 #[derive(Clone, Copy)]

@@ -65,6 +65,9 @@ examples/native/main_recursive_fibonacci_55.doria
 examples/native/main_release_profile_42.doria
 examples/native/main_printf_42.doria
 examples/native/main_prompted_read_line.doria
+examples/native/main_prompted_read_line_bytes.doria
+examples/native/main_prompted_read_line_invalid_utf8.doria
+examples/native/main_prompted_read_line_matrix.doria
 examples/native/main_recursive_panic_stack.doria
 examples/native/main_remainder_by_zero_panic.doria
 examples/native/main_runtime_interpolation.doria
