@@ -700,9 +700,11 @@ if ($namingAuthority !== false) {
         || !str_contains($pipeline, 'Andrew approved the audit')
         || !str_contains($pipeline, 'The Minimum String Runtime Surface is implemented')
         || !str_contains($pipeline, 'Interactive Line-Input Amendment')
-        || !str_contains($pipeline, 'Stage 25a remains incomplete until Slice 4')
+        || !str_contains($pipeline, 'Stage 25a Slices 1 through 4 are implemented')
+        || !str_contains($pipeline, 'Stage 25a is complete')
+        || !str_contains($pipeline, 'Stage 26 is next')
     ) {
-        $failures[] = "{$pipelinePath}: must keep the String audit review and runtime surface implemented, line input sequenced, and Stage 25a incomplete";
+        $failures[] = "{$pipelinePath}: must keep the String audit review and runtime surface implemented, line input sequenced, Stage 25a complete, and Stage 26 next";
     }
 
     if (

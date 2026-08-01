@@ -221,7 +221,9 @@ jobs:
           fi
 
       - name: Check documentation authority
-        run: php scripts/check_docs_authority.php
+        run: |
+          php scripts/check_docs_authority.php
+          php scripts/check_stage25a_completion.php
 
       - name: Check diagnostic and runtime-outcome architecture
         run: |

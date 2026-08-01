@@ -54,6 +54,15 @@ not produce a partially initialized object.
 Bare `{ ... }` blocks provide an explicit shorter lifetime boundary when a value
 or access guard should be cleaned up before the surrounding function continues.
 
+When a graph genuinely needs several owners, Doria provides an explicit escape
+hatch rather than changing the default model. `shared new Node()` creates a
+readonly `SharedReference<Node>`; writable shared graphs use
+`WritableSharedReference<T>` and scoped readonly/writable access objects. The two
+families are deliberately disjoint, additional ownership is always requested
+with `share()`, and weak references break back-reference cycles without keeping
+the payload alive. Ordinary owned values still pay no reference-counting or
+runtime access-check cost.
+
 ## Design principles
 
 - **Contracts are written down.** Every parameter is explicitly typed — always. Nothing silently defaults to a dynamic type, and nullability is spelled `?T` and enforced.

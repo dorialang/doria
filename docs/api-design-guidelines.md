@@ -74,6 +74,14 @@ let $matches = String::startsWith($text, "Dor");
 Doria has no public `str_*` family and does not duplicate companion operations
 as instance methods such as `$text->trim()`.
 
+Shared ownership follows the same explicit-vocabulary rule. `share()` means
+"create another owner" and `createWeakReference()` means "observe without
+keeping alive"; neither is shortened to ecosystem-specific terms. The readonly
+and writable families remain visible in signatures as `SharedReference<T>` and
+`WritableSharedReference<T>` rather than being hidden behind one ambiguous
+wrapper. `referencedValue` is the one compiler-known collision projection on
+`SharedReference<T>`, not a general `.value` proxy convention.
+
 ## Properties are for data
 
 Use properties for stored values, state, identifiers, configuration values, computed values that are conceptually data, cheap derived values, and values exposed through validation or access control.
