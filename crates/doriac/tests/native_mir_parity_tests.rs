@@ -747,3 +747,140 @@ fn make_executable(path: &Path) {
 
 #[cfg(not(unix))]
 fn make_executable(_path: &Path) {}
+
+/// Proves the prompt is observable *before* input is supplied, not merely ordered
+/// correctly in the final output after the process has exited.
+///
+/// The test reads the exact prompt bytes from the child's stdout first, and only
+/// then writes the input line. If the runtime deferred the prompt until input
+/// arrived, or skipped the pre-read flush, this would deadlock rather than pass —
+/// so the bounded read is the assertion. The reader thread bounds the wait and the
+/// child is killed and reaped on every exit path.
+#[test]
+fn prompted_read_line_writes_its_prompt_before_input_is_supplied() {
+    const PROMPT: &[u8] = b"Name: ";
+    let source = r#"
+function main(): void
+{
+    let $name = read_line("Name: ");
+
+    if ($name != null) {
+        echo "Hello, {$name}!";
+    }
+}
+"#;
+
+    let mir = doriac::lower_source_to_mir("prompt-timing.doria", source)
+        .expect("prompted read_line should lower");
+
+    #[cfg(feature = "llvm-backend")]
+    let profiles = vec![NativeProfile::Fast, NativeProfile::Release];
+    #[cfg(not(feature = "llvm-backend"))]
+    let profiles = vec![NativeProfile::Fast];
+
+    for profile in profiles {
+        let backend = match profile {
+            NativeProfile::Fast => "Cranelift",
+            NativeProfile::Release => "LLVM",
+        };
+        let bytes =
+            doriac::codegen_native::generate_executable(&mir, profile).unwrap_or_else(|error| {
+                panic!("{backend} rejected the prompt-timing fixture: {error:?}")
+            });
+        let directory = temp_working_directory(&format!("prompt-timing-{backend}"));
+        fs::create_dir_all(&directory).expect("prompt-timing working directory should be created");
+        let executable = directory.join(if cfg!(windows) {
+            "program.exe"
+        } else {
+            "program"
+        });
+        fs::write(&executable, bytes).expect("prompt-timing executable should be writable");
+        make_executable(&executable);
+
+        let mut child = retry_transient_executable_busy(|| {
+            Command::new(&executable)
+                .current_dir(&directory)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+        })
+        .unwrap_or_else(|error| {
+            panic!("failed to start the {backend} prompt-timing fixture: {error}")
+        });
+
+        // Read exactly the prompt on a worker thread so the wait is bounded.
+        let mut stdout = child.stdout.take().expect("child stdout should be piped");
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let reader = thread::spawn(move || {
+            use std::io::Read;
+            let mut seen = vec![0_u8; PROMPT.len()];
+            let result = stdout.read_exact(&mut seen).map(|()| seen);
+            let _ = sender.send(result.map_err(|error| error.to_string()));
+            stdout
+        });
+
+        let observed = receiver.recv_timeout(Duration::from_secs(30));
+        let observed = match observed {
+            Ok(observed) => observed,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = reader.join();
+                panic!(
+                    "the {backend} prompt-timing fixture never produced its prompt before input: {error}"
+                );
+            }
+        };
+        let observed = match observed {
+            Ok(observed) => observed,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = reader.join();
+                panic!("failed to read the {backend} prompt before supplying input: {error}");
+            }
+        };
+        assert_eq!(
+            observed, PROMPT,
+            "{backend} must write the exact prompt bytes before reading stdin"
+        );
+
+        // Only now supply the input.
+        let mut child_stdin = child.stdin.take().expect("child stdin should be piped");
+        write_stdin_tolerating_early_close(&mut child_stdin, b"Dorothy\n").unwrap_or_else(
+            |error| panic!("failed to feed the {backend} prompt-timing fixture: {error}"),
+        );
+        drop(child_stdin);
+
+        let mut stdout = reader
+            .join()
+            .expect("prompt reader thread should not panic");
+        let mut rest = Vec::new();
+        {
+            use std::io::Read;
+            stdout
+                .read_to_end(&mut rest)
+                .expect("remaining stdout should be readable");
+        }
+        let status = child.wait().unwrap_or_else(|error| {
+            panic!("failed to wait for the {backend} prompt-timing fixture: {error}")
+        });
+        let mut stderr = Vec::new();
+        if let Some(mut handle) = child.stderr.take() {
+            use std::io::Read;
+            let _ = handle.read_to_end(&mut stderr);
+        }
+
+        assert_eq!(
+            rest, b"Hello, Dorothy!",
+            "{backend} produced unexpected output"
+        );
+        assert!(stderr.is_empty(), "{backend} produced unexpected stderr");
+        assert_eq!(
+            status.code(),
+            Some(0),
+            "{backend} produced unexpected status"
+        );
+    }
+}
