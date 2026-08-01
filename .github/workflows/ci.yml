@@ -1,8 +1,10 @@
 name: ci
 
 on:
+  push:
+    branches: [develop]
   pull_request:
-    branches: [main, develop]
+    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -224,6 +226,18 @@ jobs:
         run: |
           php scripts/check_docs_authority.php
           php scripts/check_stage25a_completion.php
+
+      - name: Checkout website API reference
+        uses: actions/checkout@v7
+        with:
+          repository: dorialang/doria-website
+          path: doria-website
+          persist-credentials: false
+
+      - name: Check built-in API reference synchronization
+        env:
+          DORIA_REPOSITORY_PATH: ${{ github.workspace }}
+        run: php doria-website/scripts/check_api_reference_sync.php
 
       - name: Check diagnostic and runtime-outcome architecture
         run: |
