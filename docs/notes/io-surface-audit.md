@@ -1,5 +1,485 @@
-# I/O surface completeness audit
+# PHP Stream And I/O Completeness Audit
 
+> Documentation role: working design artifact for Andrew's review. This is a
+> capability-completeness and scheduling audit, not a decision record and not an
+> implementation. Candidate spellings are illustrative only. The eventual
+> **Stream, Readiness, Standard I/O, And Blocking-Mode Model** decision must
+> settle the public surface before Stage 36a begins.
+
+This expanded audit **supersedes the previous partial completeness scope** while
+preserving its accepted results, historical snapshots, Q1–Q6 reasoning, derived
+findings, and decision references below. It does not silently ratify any open
+recommendation. The machine-checkable companion ledger is
+`php-stream-capability-inventory.json`; `scripts/check_stream_io_completeness.php`
+proves the stored official inventory remains complete without network access.
+
+## Audit authority and snapshot
+
+- **Audit date:** 2026-08-02.
+- **PHP manual banner:** `PHP 8.4.24 Released!` — an identifier for the audited
+  manual snapshot, **not** a Doria compatibility target.
+- **PHP manual copyright:** © 2001–2026 The PHP Documentation Group.
+- **Normative inventory sources:** the current official PHP manual pages titled
+  *Streams*, *Stream Functions*, *The php_user_filter class*, *The streamWrapper
+  class*, *The StreamBucket class*, *Stream Filters*, *Stream Contexts*, *Stream
+  Errors*, *Supported Protocols and Wrappers*, *Filesystem Functions*, *Program
+  execution Functions*, and *Readline Functions*.
+- **Stored counts:** 47 Stream Functions; 25 `streamWrapper` methods; 3
+  `php_user_filter` methods; 30 relevant filesystem stream entries; 4 process-pipe
+  entries; 13 Readline entries; 12 wrapper/protocol families; 153 total rows.
+
+PHP is the capability and migration inventory, not Doria's semantic authority.
+PHP generalizes files, network connections, compression, and other linear I/O
+through resources, URL wrappers, filters, contexts, warnings, and sentinel
+returns. Doria preserves useful capabilities while replacing those shapes with
+owned typed values, checked errors, explicit outcomes, capability contracts, and
+domain modules.
+
+## Existing Doria I/O substrate (verified, not newly implemented)
+
+| Layer | Current fact |
+|---|---|
+| Text intrinsics | `read_line(string $prompt = ""): ?string`, `read_file`, `write_file`, `append_file`, `write_stderr`, `echo`, `printf`, and `sprintf` are executable. |
+| Binary intrinsics | `read_file_bytes`, `write_file_bytes`, `append_file_bytes`, `read_stdin_bytes`, `write_stdout_bytes`, and `write_stderr_bytes` are executable. |
+| Standard devices | One internal `doria-rt` abstraction owns stdin/stdout/stderr on Unix and Windows; first-class public stream values do not yet exist. |
+| Read discipline | Raw bytes sit below UTF-8 line validation; one LF or CRLF is stripped; EOF before bytes is distinct from a blank line. |
+| Write discipline | Unix and Windows loop short writes; Unix retries `EINTR`; raw standard writes are unbuffered. |
+| Flush | The standard-output flush is presently an intentional successful no-op over unbuffered writes, not durable filesystem synchronization. |
+| TTY | Runtime interactivity detection uses `isatty` on Unix and console-handle detection on Windows. |
+| Broken pipe | Unix ignores `SIGPIPE`; Unix `EPIPE` and Windows broken-pipe conditions cleanly exit status 0 for ordinary standard output. |
+| Failures | Runtime panics use decision 0109's unified structured outcomes; Stage 29 migrates ordinary I/O failures to checked errors. |
+
+## Architectural constraints carried into review
+
+1. Preserve capabilities, not PHP spellings. Rejecting a resource, global
+   registry, string filter name, context bag, boolean flag, or sentinel does not
+   reject the behavior it represents.
+2. Generic streams move `Bytes`; UTF-8 text, lines, delimiters, and other
+   encodings are explicit typed adapters above that byte foundation.
+3. Interfaces expose only the capability required by the caller. Readability
+   does not imply writing, seeking, truncating, locking, mode mutation, or socket
+   metadata.
+4. Non-blocking reads distinguish data, would-block, and EOF. Non-blocking writes
+   report partial progress. Exact enum/result names remain unresolved.
+5. Readiness precedes async. Stage 37 consumes one Stage 36a readiness,
+   ownership, timeout/deadline, backpressure, and process-pipe model.
+6. First-class standard streams are a v1 design requirement unless review finds
+   a compelling objection; they share the current intrinsic/runtime substrate.
+7. Dynamic wrappers, filters, and process-global contexts are replaced by typed
+   constructors, adapters, and explicit configuration.
+8. `Console` remains the owner of raw mode, key/resize decoding, cursor, screen,
+   color, and styling. It reuses generic readiness and standard devices.
+
+## Capability-family review
+
+### 1. Stream ownership and lifetime
+
+Stream handles are owned move values by default; readonly/writable borrows grant
+only their declared access, and `take` transfers the close obligation. Normal
+scope exit and checked-error propagation close through deterministic destruction.
+Close semantics, idempotence, explicit early close, duplication, half-shutdown,
+use-after-close diagnostics, destructor failure, and whether buffered destruction
+may surface errors require the stream decision. Abort-only panic runs no cleanup;
+buffered data may therefore be lost, and the design must not promise otherwise.
+
+### 2. Read semantics
+
+Stage 36a needs byte-oriented read-up-to, read-exact, read-to-end, read-available,
+one-byte, EOF, would-block, timeout, interruption, and partial-read semantics.
+Text/line/delimiter/peek behavior belongs to adapters with explicit maximum
+allocation. A read result must separate data, would-block, and EOF; the candidate
+`ReadOutcome<T>` illustration is not accepted syntax. Read-exact and read-to-end
+are compositions that retain checked source failures and allocation limits.
+
+### 3. Write semantics
+
+The foundation distinguishes write-some from write-all. Write-some reports the
+accepted byte count or would-block; write-all resumes after writable readiness,
+observes cancellation/backpressure, and never pretends partial progress did not
+occur. Broken standard-stream pipes keep the existing status-0 carve-out. Flush
+of user/runtime buffers is distinct from `fdatasync`/durable synchronization, and
+half-close is a duplex/network/process capability rather than ordinary close.
+
+### 4. Seeking and position
+
+Seek from start/current/end, tell, rewind, truncate, length, sparse-file behavior,
+and unsupported seek are preserved. Review should prefer a seekable capability
+contract so a forward-only pipe cannot advertise seeking; platform/filesystem
+failures still use checked errors. Open-handle operations belong to `Io`; path
+namespace metadata belongs to `Fs`.
+
+### 5. Blocking mode
+
+Blocking control is a real, platform-dependent capability, not a cosmetic flag.
+It belongs to a capable stream value/interface, never a global
+`stream_set_blocking` clone. A typed mode enum is recommended over a boolean;
+alternatives are separate blocking/non-blocking types or construction-only mode.
+Runtime mutation is useful for pipes, sockets, standard streams, and terminal
+handles but is not uniformly meaningful for local files. The illustrative
+`setBlockingMode(BlockingMode::NonBlocking)` spelling remains unapproved.
+
+### 6. Readiness and polling
+
+One portable readiness substrate covers readable/writable readiness, exceptional
+closure, immediate poll, finite/indefinite wait, multiple handles, fairness,
+spurious readiness, cancellation, and deadlines. `select`, `poll`, `epoll`,
+`kqueue`, and IOCP remain backend vocabulary. Review must choose whether one-
+stream conveniences derive from a multi-stream waiter or both are public, while
+preserving level/edge-trigger implementation freedom.
+
+### 7. Timeouts and deadlines
+
+Connection, accept, read, write, idle, overall-operation, and readiness-wait
+timing are separate facts. A single ambiguous stream timeout is rejected. Review
+must decide `Duration`, `Deadline`, or both with `Doria\Std\Time`; finite waits
+must compose with cancellation without inventing an async-only timing model.
+
+### 8. Buffering
+
+Typed buffered reader/writer adapters own capacity, read-ahead, unread bytes,
+line buffering, and flush. Mixing adapter reads with raw reads or seeking requires
+an explicit state rule. Buffering is per value, not process-global. Blocking-mode
+changes and seek must account for buffered data; panic may discard unflushed
+buffers, while structured exits follow the accepted close/flush error contract.
+
+### 9. Text adapters
+
+Doria `string` remains valid UTF-8. A UTF-8 text reader/writer, bounded line and
+delimiter readers, CRLF/LF policy, invalid-encoding checked errors, and explicit
+other-encoding conversion sit above byte streams. Generic network/process bytes
+never pass through `string` implicitly. Maximum line length and allocation policy
+are mandatory designer decisions.
+
+### 10. Stream copying
+
+The PHP copy capability becomes bounded streaming copy between readable and
+writable contracts, not a whole-input allocation. It handles partial writes,
+backpressure, cancellation, progress, maximum bytes, buffer reuse, EOF, and
+independent source/destination failures. Copy-to-end and bounded-copy are required
+v1 compositions; progress callback shape remains a review item.
+
+### 11. Files
+
+The v1 file surface needs typed open modes (read/write/append/create/create-new/
+truncate), byte reads/writes, seek/tell, flush, durable data/full sync, close,
+length/open-handle metadata, advisory locks, and temporary files. Permissions and
+platform differences are explicit. Namespace/path operations stay in `Fs`; the
+`Path` value-type question remains open and is not silently settled here.
+
+### 12. Standard streams
+
+Stdin/stdout/stderr become first-class borrowed or otherwise non-owning views over
+the same runtime devices used by existing intrinsics. Review must settle accessor
+names, borrowing, close permission, blocking control, buffering, injection for
+tests, and redirection. User code should not accidentally invalidate process-wide
+intrinsics by closing a shared standard device. Per-stream write order remains
+exact; independent stdout/stderr handles do not create a reconstructable global
+order unless explicitly merged.
+
+### 13. Process pipes
+
+`Doria\Std\Process` owns a child and typed stdin/stdout/stderr pipe values. The
+model needs half-close, wait, termination, exit status, output limits, timeouts,
+non-blocking mode, and readiness. Stdout and stderr must be drained concurrently
+to avoid the classic full-pipe deadlock. Ownership determines whether dropping a
+child waits, detaches, terminates, or only releases handles; review must settle it.
+
+### 14. Networking boundary
+
+PHP socket-stream functions map to `Doria\Std\Net`: TCP clients/listeners,
+accept, UDP, Unix-domain sockets, socket pairs, local/peer addresses, half-close,
+connect/accept timeouts, and later TLS upgrade. Stage 36a supplies duplex byte
+streams, readiness, partial writes, timing, and ownership; Stage 44 owns product
+network/HTTP APIs and TLS implementation.
+
+### 15. Terminal boundary
+
+TTY detection, standard-input readiness, blocking mode, and platform device
+abstraction are Stage 36a substrate. Portable key events additionally require raw
+mode, canonical-mode changes, escape/console-event decoding, resize events, and
+restoration, all exclusively Stage 46 `Console` work. Non-blocking stdin alone is
+not a portable `pollKey` implementation.
+
+### 16. Filters, wrappers, contexts, and adapters
+
+Compression, TLS, encoding, hashing, limits, buffering, rate limiting, progress,
+proxy/HTTP/certificate options are preserved through typed adapters or typed
+domain configuration. Global wrapper registries, string-selected filters,
+`mixed` bags, global default contexts, and scheme-dispatch as the core API are
+rejected. Each family and protocol has a manifest row naming its owner/deferral.
+
+### 17. Metadata and capability discovery
+
+PHP's metadata array becomes typed properties, capability interfaces, operation
+results, or domain metadata values: EOF, blocking, timeout, unread bytes,
+seekability, readability, writability, locality, TTY status, peer/local addresses,
+and stream kind. Doria does not expose `Dictionary<string, mixed>` metadata.
+
+### 18. Locking
+
+Files preserve shared/exclusive advisory lock, non-blocking try-lock, unlock, and
+unsupported-lock behavior. A typed RAII lock guard is recommended over integer
+flag combinations so release is deterministic. Exact guard ownership and whether
+lock support is static or checked dynamically remain review items.
+
+### 19. Async integration
+
+Stages 37–39 consume the synchronous ownership/results/readiness model for async
+read/write/accept/connect, cancellation, deadlines, backpressure, bounded buffers,
+closure, and failure propagation. Async lowering does not create a parallel
+stream hierarchy or a second event loop/cancellation model. Structured task-group
+cancellation releases operations deterministically under the accepted ownership
+contract.
+
+## Required v1.0 recommendation matrix
+
+| Capability | Recommendation | Candidate API status | Landing |
+|---|---|---|---|
+| Readable, writable, duplex, seekable contracts | Required For v1.0 | Names unresolved | Stage 36a |
+| First-class standard streams | Required For v1.0 | Access/ownership names unresolved | Stage 36a |
+| File handles and typed open modes | Required For v1.0 | Exact types/modes unresolved | Stage 36a |
+| Read some/exact/to-end and explicit EOF | Required For v1.0 | Result spelling unresolved | Stage 36a |
+| Write some/all and partial progress | Required For v1.0 | Result spelling unresolved | Stage 36a |
+| Would-block and blocking-mode control | Required For v1.0 | Typed mode spelling unresolved | Stage 36a |
+| Readiness: one/many, immediate/finite/indefinite | Required For v1.0 | Waiter/poller shape unresolved | Stage 36a |
+| Timeouts and deadlines | Required For v1.0 | Depends on `Doria\Std\Time` design | Stage 36a |
+| Buffered byte adapters | Required For v1.0 | Type names unresolved | Stage 36a |
+| UTF-8 text writer/reader and bounded line reader | Required For v1.0 | Type names unresolved | Stage 36a |
+| Streaming copy | Required For v1.0 | Operation owner unresolved | Stage 36a |
+| Temporary files and advisory locking | Recommended For v1.0 | RAII lock shape unresolved | Stage 36a |
+| Process pipes and concurrent child-output drainage | Required For v1.0 | Child ownership unresolved | Stage 36a |
+| Socket readiness substrate | Required For v1.0 | Generic substrate only | Stage 36a |
+| Network/TLS adapter boundary | Recommended For v1.0 | Product surface unresolved | Stage 44 |
+| Compression and encoding adapters | Recommended For v1.0 | Typed adapter names unresolved | Review after Stage 36a |
+| Terminal readiness integration | Required For v1.0 | Generic substrate only | Stages 36a/46 |
+| Async stream integration | Required For v1.0 | Reuses sync contracts | Stages 37–39 |
+
+Functionality, candidate spelling, and implementation stage are deliberately
+separate columns. No candidate name becomes authority merely by appearing here.
+
+## PHP migration ledger
+
+Every current official PHP Streams entry and each relevant external stream/
+process/Readline entry appears exactly once below. Detailed EOF, would-block,
+partial-progress, platform, dependency, alias, and semantic-difference facts live
+in the JSON row with the same PHP name.
+
+| PHP entry | Area/kind | Capability category | Doria classification / owner | v1 / stage | Migration |
+|---|---|---|---|---|---|| `stream_bucket_append` | streams / function | filter-bucket | Rejected Resource-Oriented Shape / Doria\Std\Io | Rejected / — | Rewrite Through Adapter |
+| `stream_bucket_make_writeable` | streams / function | filter-bucket | Rejected Resource-Oriented Shape / Doria\Std\Io | Rejected / — | Rewrite Through Adapter |
+| `stream_bucket_new` | streams / function | filter-bucket | Rejected Resource-Oriented Shape / Doria\Std\Io | Rejected / — | Rewrite Through Adapter |
+| `stream_bucket_prepend` | streams / function | filter-bucket | Rejected Resource-Oriented Shape / Doria\Std\Io | Rejected / — | Rewrite Through Adapter |
+| `stream_context_create` | streams / function | typed-configuration | Unresolved Design Fork / Domain Configuration Types | Unresolved / 36a | Requires Human Review |
+| `stream_context_get_default` | streams / function | global-context | Rejected Global Configuration / — | Rejected / — | No Doria Equivalent By Design |
+| `stream_context_get_options` | streams / function | typed-configuration | Unresolved Design Fork / Domain Configuration Types | Unresolved / 36a | Requires Human Review |
+| `stream_context_get_params` | streams / function | typed-configuration | Unresolved Design Fork / Domain Configuration Types | Unresolved / 36a | Requires Human Review |
+| `stream_context_set_default` | streams / function | global-context | Rejected Global Configuration / — | Rejected / — | No Doria Equivalent By Design |
+| `stream_context_set_option` | streams / function | typed-configuration | Unresolved Design Fork / Domain Configuration Types | Unresolved / 36a | Requires Human Review |
+| `stream_context_set_options` | streams / function | typed-configuration | Unresolved Design Fork / Domain Configuration Types | Unresolved / 36a | Requires Human Review |
+| `stream_context_set_params` | streams / function | typed-configuration | Unresolved Design Fork / Domain Configuration Types | Unresolved / 36a | Requires Human Review |
+| `stream_copy_to_stream` | streams / function | stream-copy | Proposed Doria Std Io / Doria\Std\Io | Required For v1.0 / 36a | Direct Typed Rewrite |
+| `stream_filter_append` | streams / function | filter-composition | Proposed Doria Std Io / Typed Stream Adapters | Recommended For v1.0 / 36a | Rewrite Through Adapter |
+| `stream_filter_prepend` | streams / function | filter-composition | Proposed Doria Std Io / Typed Stream Adapters | Recommended For v1.0 / 36a | Rewrite Through Adapter |
+| `stream_filter_register` | streams / function | filter-registry | Rejected Dynamic Wrapper Mechanism / — | Rejected / — | No Doria Equivalent By Design |
+| `stream_filter_remove` | streams / function | filter-composition | Proposed Doria Std Io / Typed Stream Adapters | Recommended For v1.0 / 36a | Rewrite Through Adapter |
+| `stream_get_contents` | streams / function | read-to-end | Proposed Doria Std Io / Doria\Std\Io | Required For v1.0 / 36a | Rewrite With Semantic Warning |
+| `stream_get_filters` | streams / function | filter-registry | Rejected Dynamic Wrapper Mechanism / — | Rejected / — | No Doria Equivalent By Design |
+| `stream_get_line` | streams / function | delimiter-read | Proposed Text Adapter / Doria\Std\Io | Required For v1.0 / 36a | Rewrite Through Adapter |
+| `stream_get_meta_data` | streams / function | capability-metadata | Proposed Doria Std Io / Doria\Std\Io | Required For v1.0 / 36a | Rewrite With Semantic Warning |
+| `stream_get_transports` | streams / function | network-stream | Proposed Doria Std Net / Doria\Std\Net | Recommended For v1.0 / 44 | Rewrite Through Domain Module |
+| `stream_get_wrappers` | streams / function | wrapper-registry-introspection | Rejected Dynamic Wrapper Mechanism / — | Rejected / — | No Doria Equivalent By Design |
+| `stream_is_local` | streams / function | capability-metadata | Proposed Doria Std Io / Doria\Std\Io | Required For v1.0 / 36a | Rewrite With Semantic Warning |
+| `stream_isatty` | streams / function | tty-detection | Existing Doria Runtime Substrate / Doria\Std\Term | Required For v1.0 / 46 | Rewrite Through Domain Module |
+| `stream_notification_callback` | streams / function | progress-notification | Unresolved Design Fork / Operation-Specific Progress API | Unresolved / 44 | Requires Human Review |
+| `stream_register_wrapper` | streams / function | wrapper-registry-alias | Rejected PHP Alias / — | Rejected / — | No Doria Equivalent By Design |
+| `stream_resolve_include_path` | streams / function | path-resolution | Proposed Doria Std Fs / Doria\Std\Fs | Acceptable Post-v1 / Fs design | Rewrite Through Domain Module |
+| `stream_select` | streams / function | readiness | Proposed Async Integration / Doria\Std\Io | Required For v1.0 / 36a | Direct Typed Rewrite |
+| `stream_set_blocking` | streams / function | blocking-control | Proposed Doria Std Io / Doria\Std\Io | Required For v1.0 / 36a | Rewrite With Semantic Warning |
+| `stream_set_chunk_size` | streams / function | buffering | Proposed Doria Std Io / Doria\Std\Io | Required For v1.0 / 36a | Rewrite Through Adapter |
+| `stream_set_read_buffer` | streams / function | buffering | Proposed Doria Std Io / Doria\Std\Io | Required For v1.0 / 36a | Rewrite Through Adapter |
+| `stream_set_timeout` | streams / function | timeouts | Proposed Doria Std Io / Doria\Std\Io | Required For v1.0 / 36a | Requires Human Review |
+| `stream_set_write_buffer` | streams / function | buffering | Proposed Doria Std Io / Doria\Std\Io | Required For v1.0 / 36a | Rewrite Through Adapter |
+| `stream_socket_accept` | streams / function | network-stream | Proposed Doria Std Net / Doria\Std\Net | Recommended For v1.0 / 44 | Rewrite Through Domain Module |
+| `stream_socket_client` | streams / function | network-stream | Proposed Doria Std Net / Doria\Std\Net | Recommended For v1.0 / 44 | Rewrite Through Domain Module |
+| `stream_socket_enable_crypto` | streams / function | network-stream | Proposed Doria Std Net / Doria\Std\Net | Recommended For v1.0 / 44 | Rewrite Through Domain Module |
+| `stream_socket_get_name` | streams / function | network-stream | Proposed Doria Std Net / Doria\Std\Net | Recommended For v1.0 / 44 | Rewrite Through Domain Module |
+| `stream_socket_pair` | streams / function | network-stream | Proposed Doria Std Net / Doria\Std\Net | Recommended For v1.0 / 44 | Rewrite Through Domain Module |
+| `stream_socket_recvfrom` | streams / function | network-stream | Proposed Doria Std Net / Doria\Std\Net | Recommended For v1.0 / 44 | Rewrite Through Domain Module |
+| `stream_socket_sendto` | streams / function | network-stream | Proposed Doria Std Net / Doria\Std\Net | Recommended For v1.0 / 44 | Rewrite Through Domain Module |
+| `stream_socket_server` | streams / function | network-stream | Proposed Doria Std Net / Doria\Std\Net | Recommended For v1.0 / 44 | Rewrite Through Domain Module |
+| `stream_socket_shutdown` | streams / function | network-stream | Proposed Doria Std Net / Doria\Std\Net | Recommended For v1.0 / 44 | Rewrite Through Domain Module |
+| `stream_supports_lock` | streams / function | capability-metadata | Proposed Doria Std Io / Doria\Std\Io | Required For v1.0 / 36a | Rewrite With Semantic Warning |
+| `stream_wrapper_register` | streams / function | wrapper-registry | Rejected Dynamic Wrapper Mechanism / — | Rejected / — | No Doria Equivalent By Design |
+| `stream_wrapper_restore` | streams / function | wrapper-registry | Rejected Dynamic Wrapper Mechanism / — | Rejected / — | No Doria Equivalent By Design |
+| `stream_wrapper_unregister` | streams / function | wrapper-registry | Rejected Dynamic Wrapper Mechanism / — | Rejected / — | No Doria Equivalent By Design |
+| `php_user_filter` | streams / class | dynamic-stream-prototype | Rejected Dynamic Wrapper Mechanism / Typed Stream Adapters | Rejected / — | Rewrite Through Adapter |
+| `streamWrapper` | streams / class | dynamic-stream-prototype | Rejected Dynamic Wrapper Mechanism / Typed Stream Adapters | Rejected / — | Rewrite Through Adapter |
+| `StreamBucket` | filter / class | dynamic-stream-prototype | Rejected Resource-Oriented Shape / Typed Stream Adapters | Rejected / — | Rewrite Through Adapter |
+| `php_user_filter::filter` | filter / method | filter-lifecycle | Proposed Doria Std Io / Typed Stream Adapters | Recommended For v1.0 / 36a | Rewrite Through Adapter |
+| `php_user_filter::onClose` | filter / method | filter-lifecycle | Proposed Doria Std Io / Typed Stream Adapters | Recommended For v1.0 / 36a | Rewrite Through Adapter |
+| `php_user_filter::onCreate` | filter / method | filter-lifecycle | Proposed Doria Std Io / Typed Stream Adapters | Recommended For v1.0 / 36a | Rewrite Through Adapter |
+| `streamWrapper::__construct` | wrapper / method | wrapper-lifecycle | Rejected Dynamic Wrapper Mechanism / Typed Constructors | Rejected / — | No Doria Equivalent By Design |
+| `streamWrapper::__destruct` | wrapper / method | wrapper-lifecycle | Rejected Dynamic Wrapper Mechanism / Typed Constructors | Rejected / — | No Doria Equivalent By Design |
+| `streamWrapper::dir_closedir` | wrapper / method | filesystem-namespace | Proposed Doria Std Fs / Doria\Std\Fs | Recommended For v1.0 / Fs design | Rewrite Through Domain Module |
+| `streamWrapper::dir_opendir` | wrapper / method | filesystem-namespace | Proposed Doria Std Fs / Doria\Std\Fs | Recommended For v1.0 / Fs design | Rewrite Through Domain Module |
+| `streamWrapper::dir_readdir` | wrapper / method | filesystem-namespace | Proposed Doria Std Fs / Doria\Std\Fs | Recommended For v1.0 / Fs design | Rewrite Through Domain Module |
+| `streamWrapper::dir_rewinddir` | wrapper / method | filesystem-namespace | Proposed Doria Std Fs / Doria\Std\Fs | Recommended For v1.0 / Fs design | Rewrite Through Domain Module |
+| `streamWrapper::mkdir` | wrapper / method | filesystem-namespace | Proposed Doria Std Fs / Doria\Std\Fs | Recommended For v1.0 / Fs design | Rewrite Through Domain Module |
+| `streamWrapper::rename` | wrapper / method | filesystem-namespace | Proposed Doria Std Fs / Doria\Std\Fs | Recommended For v1.0 / Fs design | Rewrite Through Domain Module |
+| `streamWrapper::rmdir` | wrapper / method | filesystem-namespace | Proposed Doria Std Fs / Doria\Std\Fs | Recommended For v1.0 / Fs design | Rewrite Through Domain Module |
+| `streamWrapper::stream_cast` | wrapper / method | wrapper-lifecycle | Rejected Dynamic Wrapper Mechanism / Typed Constructors | Rejected / — | No Doria Equivalent By Design |
+| `streamWrapper::stream_close` | wrapper / method | stream-capability | Proposed Doria Std Io / Doria\Std\Io | Recommended For v1.0 / 36a | Rewrite Through Domain Module |
+| `streamWrapper::stream_eof` | wrapper / method | stream-capability | Proposed Doria Std Io / Doria\Std\Io | Recommended For v1.0 / 36a | Rewrite Through Domain Module |
+| `streamWrapper::stream_flush` | wrapper / method | stream-capability | Proposed Doria Std Io / Doria\Std\Io | Recommended For v1.0 / 36a | Rewrite Through Domain Module |
+| `streamWrapper::stream_lock` | wrapper / method | stream-capability | Proposed Doria Std Io / Doria\Std\Io | Recommended For v1.0 / 36a | Rewrite Through Domain Module |
+| `streamWrapper::stream_metadata` | wrapper / method | filesystem-namespace | Proposed Doria Std Fs / Doria\Std\Fs | Recommended For v1.0 / Fs design | Rewrite Through Domain Module |
+| `streamWrapper::stream_open` | wrapper / method | stream-capability | Proposed Doria Std Io / Doria\Std\Io | Recommended For v1.0 / 36a | Rewrite Through Domain Module |
+| `streamWrapper::stream_read` | wrapper / method | stream-capability | Proposed Doria Std Io / Doria\Std\Io | Recommended For v1.0 / 36a | Rewrite Through Domain Module |
+| `streamWrapper::stream_seek` | wrapper / method | stream-capability | Proposed Doria Std Io / Doria\Std\Io | Recommended For v1.0 / 36a | Rewrite Through Domain Module |
+| `streamWrapper::stream_set_option` | wrapper / method | stream-capability | Proposed Doria Std Io / Doria\Std\Io | Recommended For v1.0 / 36a | Rewrite Through Domain Module |
+| `streamWrapper::stream_stat` | wrapper / method | stream-capability | Proposed Doria Std Io / Doria\Std\Io | Recommended For v1.0 / 36a | Rewrite Through Domain Module |
+| `streamWrapper::stream_tell` | wrapper / method | stream-capability | Proposed Doria Std Io / Doria\Std\Io | Recommended For v1.0 / 36a | Rewrite Through Domain Module |
+| `streamWrapper::stream_truncate` | wrapper / method | stream-capability | Proposed Doria Std Io / Doria\Std\Io | Recommended For v1.0 / 36a | Rewrite Through Domain Module |
+| `streamWrapper::stream_write` | wrapper / method | stream-capability | Proposed Doria Std Io / Doria\Std\Io | Recommended For v1.0 / 36a | Rewrite Through Domain Module |
+| `streamWrapper::unlink` | wrapper / method | filesystem-namespace | Proposed Doria Std Fs / Doria\Std\Fs | Recommended For v1.0 / Fs design | Rewrite Through Domain Module |
+| `streamWrapper::url_stat` | wrapper / method | filesystem-namespace | Proposed Doria Std Fs / Doria\Std\Fs | Recommended For v1.0 / Fs design | Rewrite Through Domain Module |
+| `Stream abstraction` | streams / concept | stream-concept | Rejected Resource-Oriented Shape / Doria\Std\Io | Rejected / — | Rewrite With Semantic Warning |
+| `Stream Context Concepts` | streams / concept | stream-concept | Proposed Doria Std Io / Doria\Std\Io | Required For v1.0 / 36a | Direct Typed Rewrite |
+| `Stream Filter Concepts` | streams / concept | stream-concept | Proposed Doria Std Io / Doria\Std\Io | Required For v1.0 / 36a | Direct Typed Rewrite |
+| `Stream Error Concepts` | streams / concept | stream-concept | Proposed Doria Std Io / Doria\Std\Io | Required For v1.0 / 36a | Direct Typed Rewrite |
+| `file://` | wrapper / wrapper | protocol-wrapper | Proposed Doria Std Fs / Doria\Std\Fs | Required For v1.0 / 36a | Rewrite Through Domain Module |
+| `http://` | wrapper / wrapper | protocol-wrapper | Proposed Doria Std Net / Doria\Std\Http | Recommended For v1.0 / 44 | Rewrite Through Domain Module |
+| `ftp://` | wrapper / wrapper | protocol-wrapper | Deferred Post-v1 / Doria\Std\Net | Acceptable Post-v1 / post-v1 network review | Deferred Until Named Stage |
+| `php://` | wrapper / wrapper | protocol-wrapper | Proposed Doria Std Io / Doria\Std\Io | Required For v1.0 / 36a | Direct Typed Rewrite |
+| `zlib://` | wrapper / wrapper | protocol-wrapper | Proposed Compression Adapter / Compression Adapter | Recommended For v1.0 / adapter review after 36a | Rewrite Through Adapter |
+| `data://` | wrapper / wrapper | protocol-wrapper | Derivable From Existing Surface / Bytes/String Constructors | Recommended For v1.0 / 36a | Derivable Composition |
+| `glob://` | wrapper / wrapper | protocol-wrapper | Proposed Doria Std Fs / Doria\Std\Fs | Acceptable Post-v1 / Fs design | Rewrite Through Domain Module |
+| `phar://` | wrapper / wrapper | protocol-wrapper | Deferred Post-v1 / Domain Package | Acceptable Post-v1 / post-v1 package review | Deferred Until Named Stage |
+| `ssh2://` | wrapper / wrapper | protocol-wrapper | Deferred Post-v1 / Doria\Std\Net | Acceptable Post-v1 / post-v1 network review | Deferred Until Named Stage |
+| `rar://` | wrapper / wrapper | protocol-wrapper | Deferred Post-v1 / Domain Package | Acceptable Post-v1 / post-v1 package review | Deferred Until Named Stage |
+| `ogg://` | wrapper / wrapper | protocol-wrapper | Deferred Post-v1 / Domain Package | Acceptable Post-v1 / post-v1 package review | Deferred Until Named Stage |
+| `expect://` | wrapper / wrapper | protocol-wrapper | Proposed Doria Std Process / Doria\Std\Process | Acceptable Post-v1 / post-v1 process interaction review | Rewrite Through Domain Module |
+| `String Filters` | filter / concept | filter-family | Proposed Text Adapter / Doria\Std\Io | Required For v1.0 / 36a | Rewrite Through Adapter |
+| `Conversion Filters` | filter / concept | filter-family | Proposed Encoding Adapter / Encoding Adapter | Recommended For v1.0 / adapter review after 36a | Rewrite Through Adapter |
+| `Compression Filters` | filter / concept | filter-family | Proposed Compression Adapter / Compression Adapter | Recommended For v1.0 / adapter review after 36a | Rewrite Through Adapter |
+| `Encryption Filters` | filter / concept | filter-family | Proposed Doria Std Net / Doria\Std\Net | Recommended For v1.0 / 44 | Rewrite Through Adapter |
+| `Socket context options` | context / concept | context-family | Proposed Doria Std Net / Doria\Std\Net | Recommended For v1.0 / 44 | Rewrite Through Domain Module |
+| `HTTP context options` | context / concept | context-family | Proposed Doria Std Net / Doria\Std\Net | Recommended For v1.0 / 44 | Rewrite Through Domain Module |
+| `FTP context options` | context / concept | context-family | Proposed Doria Std Net / Doria\Std\Net | Recommended For v1.0 / 44 | Rewrite Through Domain Module |
+| `SSL context options` | context / concept | context-family | Proposed Doria Std Net / Doria\Std\Net | Recommended For v1.0 / 44 | Rewrite Through Domain Module |
+| `Phar context options` | context / concept | context-family | Rejected Resource-Oriented Shape / Explicit Domain Configuration | Rejected / — | No Doria Equivalent By Design |
+| `Context parameters` | context / concept | context-family | Rejected Resource-Oriented Shape / Explicit Domain Configuration | Rejected / — | No Doria Equivalent By Design |
+| `Zip context options` | context / concept | context-family | Proposed Compression Adapter / Compression Adapter | Recommended For v1.0 / adapter review after 36a | Rewrite Through Domain Module |
+| `Zlib context options` | context / concept | context-family | Proposed Compression Adapter / Compression Adapter | Recommended For v1.0 / adapter review after 36a | Rewrite Through Domain Module |
+| `fclose` | filesystem / function | stream-lifetime-position | Proposed Doria Std Io / Doria\Std\Io | Required For v1.0 / 36a | Direct Typed Rewrite |
+| `fdatasync` | filesystem / function | stream-write | Proposed Doria Std Io / Doria\Std\Io | Required For v1.0 / 36a | Direct Typed Rewrite |
+| `feof` | filesystem / function | stream-read | Proposed Doria Std Io / Doria\Std\Io | Required For v1.0 / 36a | Direct Typed Rewrite |
+| `fflush` | filesystem / function | stream-write | Proposed Doria Std Io / Doria\Std\Io | Required For v1.0 / 36a | Direct Typed Rewrite |
+| `fgetc` | filesystem / function | stream-read | Proposed Doria Std Io / Doria\Std\Io | Required For v1.0 / 36a | Direct Typed Rewrite |
+| `fgetcsv` | filesystem / function | stream-read | Proposed Doria Std Io / Doria\Std\Io | Required For v1.0 / 36a | Direct Typed Rewrite |
+| `fgets` | filesystem / function | stream-read | Proposed Doria Std Io / Doria\Std\Io | Required For v1.0 / 36a | Direct Typed Rewrite |
+| `fgetss` | filesystem / function | stream-read | Proposed Doria Std Io / Doria\Std\Io | Required For v1.0 / 36a | Direct Typed Rewrite |
+| `file` | filesystem / function | stream-read | Derivable From Existing Surface / Doria\Std\Io | Required For v1.0 / 36a | Direct Typed Rewrite |
+| `file_get_contents` | filesystem / function | stream-read | Derivable From Existing Surface / Doria\Std\Io | Required For v1.0 / 36a | Direct Typed Rewrite |
+| `file_put_contents` | filesystem / function | stream-write | Derivable From Existing Surface / Doria\Std\Io | Required For v1.0 / 36a | Direct Typed Rewrite |
+| `flock` | filesystem / function | stream-lifetime-position | Proposed Doria Std Io / Doria\Std\Io | Required For v1.0 / 36a | Direct Typed Rewrite |
+| `fopen` | filesystem / function | stream-lifetime-position | Proposed Doria Std Io / Doria\Std\Io | Required For v1.0 / 36a | Direct Typed Rewrite |
+| `fpassthru` | filesystem / function | stream-read | Proposed Doria Std Io / Doria\Std\Io | Required For v1.0 / 36a | Direct Typed Rewrite |
+| `fputcsv` | filesystem / function | stream-write | Proposed Doria Std Io / Doria\Std\Io | Required For v1.0 / 36a | Direct Typed Rewrite |
+| `fputs` | filesystem / function | stream-write | Rejected PHP Alias / — | Rejected / — | No Doria Equivalent By Design |
+| `fread` | filesystem / function | stream-read | Proposed Doria Std Io / Doria\Std\Io | Required For v1.0 / 36a | Direct Typed Rewrite |
+| `fscanf` | filesystem / function | stream-read | Proposed Doria Std Io / Doria\Std\Io | Required For v1.0 / 36a | Direct Typed Rewrite |
+| `fseek` | filesystem / function | stream-lifetime-position | Proposed Doria Std Io / Doria\Std\Io | Required For v1.0 / 36a | Direct Typed Rewrite |
+| `fstat` | filesystem / function | stream-lifetime-position | Proposed Doria Std Io / Doria\Std\Io | Required For v1.0 / 36a | Direct Typed Rewrite |
+| `fsync` | filesystem / function | stream-write | Proposed Doria Std Io / Doria\Std\Io | Required For v1.0 / 36a | Direct Typed Rewrite |
+| `ftell` | filesystem / function | stream-lifetime-position | Proposed Doria Std Io / Doria\Std\Io | Required For v1.0 / 36a | Direct Typed Rewrite |
+| `ftruncate` | filesystem / function | stream-write | Proposed Doria Std Io / Doria\Std\Io | Required For v1.0 / 36a | Direct Typed Rewrite |
+| `fwrite` | filesystem / function | stream-write | Proposed Doria Std Io / Doria\Std\Io | Required For v1.0 / 36a | Direct Typed Rewrite |
+| `pclose` | filesystem / function | process-pipe | Proposed Doria Std Process / Doria\Std\Process | Required For v1.0 / 36a | Rewrite Through Domain Module |
+| `popen` | filesystem / function | process-pipe | Proposed Doria Std Process / Doria\Std\Process | Required For v1.0 / 36a | Rewrite Through Domain Module |
+| `readfile` | filesystem / function | stream-read | Derivable From Existing Surface / Doria\Std\Io | Required For v1.0 / 36a | Direct Typed Rewrite |
+| `rewind` | filesystem / function | stream-lifetime-position | Proposed Doria Std Io / Doria\Std\Io | Required For v1.0 / 36a | Direct Typed Rewrite |
+| `set_file_buffer` | filesystem / function | stream-write | Rejected PHP Alias / — | Rejected / — | No Doria Equivalent By Design |
+| `tmpfile` | filesystem / function | stream-lifetime-position | Proposed Doria Std Io / Doria\Std\Io | Required For v1.0 / 36a | Direct Typed Rewrite |
+| `proc_close` | process / function | child-process-pipes | Proposed Doria Std Process / Doria\Std\Process | Required For v1.0 / 36a | Rewrite Through Domain Module |
+| `proc_get_status` | process / function | child-process-pipes | Proposed Doria Std Process / Doria\Std\Process | Required For v1.0 / 36a | Rewrite Through Domain Module |
+| `proc_open` | process / function | child-process-pipes | Proposed Doria Std Process / Doria\Std\Process | Required For v1.0 / 36a | Rewrite Through Domain Module |
+| `proc_terminate` | process / function | child-process-pipes | Proposed Doria Std Process / Doria\Std\Process | Required For v1.0 / 36a | Rewrite Through Domain Module |
+| `readline` | readline / function | line-input | Existing Doria Intrinsic / read_line | Required For v1.0 / implemented | Rewrite With Semantic Warning |
+| `readline_add_history` | readline / function | interactive-line-editor | Proposed Doria Std Term / Doria\Std\Term | Recommended For v1.0 / 46 | Rewrite Through Domain Module |
+| `readline_callback_handler_install` | readline / function | interactive-line-editor | Proposed Doria Std Term / Doria\Std\Term | Recommended For v1.0 / 46 | Rewrite Through Domain Module |
+| `readline_callback_handler_remove` | readline / function | interactive-line-editor | Proposed Doria Std Term / Doria\Std\Term | Recommended For v1.0 / 46 | Rewrite Through Domain Module |
+| `readline_callback_read_char` | readline / function | interactive-line-editor | Proposed Doria Std Term / Doria\Std\Term | Recommended For v1.0 / 46 | Rewrite Through Domain Module |
+| `readline_clear_history` | readline / function | interactive-line-editor | Proposed Doria Std Term / Doria\Std\Term | Recommended For v1.0 / 46 | Rewrite Through Domain Module |
+| `readline_completion_function` | readline / function | interactive-line-editor | Proposed Doria Std Term / Doria\Std\Term | Recommended For v1.0 / 46 | Rewrite Through Domain Module |
+| `readline_info` | readline / function | interactive-line-editor | Proposed Doria Std Term / Doria\Std\Term | Recommended For v1.0 / 46 | Rewrite Through Domain Module |
+| `readline_list_history` | readline / function | interactive-line-editor | Proposed Doria Std Term / Doria\Std\Term | Recommended For v1.0 / 46 | Rewrite Through Domain Module |
+| `readline_on_new_line` | readline / function | interactive-line-editor | Proposed Doria Std Term / Doria\Std\Term | Recommended For v1.0 / 46 | Rewrite Through Domain Module |
+| `readline_read_history` | readline / function | interactive-line-editor | Proposed Doria Std Term / Doria\Std\Term | Recommended For v1.0 / 46 | Rewrite Through Domain Module |
+| `readline_redisplay` | readline / function | interactive-line-editor | Proposed Doria Std Term / Doria\Std\Term | Recommended For v1.0 / 46 | Rewrite Through Domain Module |
+| `readline_write_history` | readline / function | interactive-line-editor | Proposed Doria Std Term / Doria\Std\Term | Recommended For v1.0 / 46 | Rewrite Through Domain Module |
+
+## Designer review table
+
+These are the unresolved decisions Andrew reviews next. Recommendations are
+direction, not accepted public API.
+
+| Decision | Recommendation | Alternatives | Why it matters | PHP capability preserved | Doria owner | v1 status | Landing | Dependencies | Runtime impact | Migration impact |
+|---|---|---|---|---|---|---|---|---|---|---|
+| Stream interface decomposition | Small readable/writable/duplex/seekable/etc. capabilities | One stream class; dynamic checks | Prevents accidental authority | Resource polymorphism | `Io` | Required | 36a | 29, 35 | Vtables/adapters | Typed resource rewrite |
+| First-class standard streams | Yes, on existing substrate | Intrinsic-only forever | Enables generic CLI composition | `php://std*` | `Io` | Required | 36a | 29, 35 | Borrowed device views | Direct typed rewrite |
+| Standard-stream ownership | Non-owning views; no accidental close | Owned closable handles | Protects process-global devices | STDIN/OUT/ERR resources | `Io` | Required | 36a | ownership | Device lifetime | Human review |
+| Close semantics | Deterministic close plus reviewed explicit early close | Idempotent close; consuming close only | Prevents leaks/double close | `fclose` | `Io` | Required | 36a | 29 | Drop/close errors | Semantic warning |
+| Blocking-mode naming | Typed mode on capable value | Boolean; separate types; construction-only | Mode is capability, not flag | `stream_set_blocking` | `Io` | Required | 36a | 35 | Platform mode calls | Semantic warning |
+| Runtime mode mutation | Permit only where supported | Immutable mode types | Pipes/sockets/terminals need transitions | Blocking mutation | `Io` | Required | 36a | readiness | Capability checks | Human review |
+| Capability discovery | Interfaces plus typed facts | Metadata bag; try-and-fail only | Avoids `mixed` metadata | `stream_get_meta_data` | `Io` | Required | 36a | 35 | Typed metadata | Domain rewrite |
+| Non-blocking read outcome | Data / would-block / EOF distinction | Result nesting; separate calls | Prevents sentinel ambiguity | `fread`/`feof` | `Io` | Required | 36a | 29 | Result tags | Semantic warning |
+| Partial-write outcome | Count / would-block / closed/error | Boolean success | Prevents data loss | `fwrite` count | `Io` | Required | 36a | readiness | Resume state | Semantic warning |
+| Readiness API shape | Portable typed readiness results | Callback reactor; platform handles | Foundation for sync and async | `stream_select` | `Io` | Required | 36a | Time | OS pollers | Direct typed rewrite |
+| One-stream versus waiter API | Derive convenience from multi-stream core | Public one-stream only; both primitives | Avoids duplicate readiness models | Single/multi select | `Io` | Required | 36a | readiness | Wait registration | Human review |
+| Timeout versus deadline | Support explicit operation timing, likely both | Duration only; deadline only | Different timeout meanings | Stream/socket timeouts | `Io`/`Time` | Required | 36a | Time | Timer integration | Semantic warning |
+| Buffering types | Per-value typed adapters | Flags on streams; globals | Makes read-ahead/flush ownership visible | Buffer controls | `Io` | Required | 36a | 29, 35 | Adapter buffers | Adapter rewrite |
+| Text adapter names | Explicit UTF-8 reader/writer | Text on every stream | Preserves string invariant | Text filters/line reads | `Io` | Required | 36a | Bytes | Adapter rewrite |
+| Line-read limits | Required explicit/default safe maximum | Unbounded allocation | Prevents hostile-input growth | `fgets`/delimiter read | Text adapter | Required | 36a | errors | Bounded buffers | Semantic warning |
+| File open modes | Typed non-boolean modes | Mode strings; builder | Makes create/truncate/append explicit | `fopen` modes | `Io` | Required | 36a | 29 | OS open flags | Semantic warning |
+| Path type | Defer, leaning value type | Keep `string`; dual acceptance | Cross-platform path correctness | File wrapper targets | `Fs` | Unresolved | Fs review | 31 | Path conversion | Human review |
+| Flush versus durable sync | Separate buffer flush, data sync, full sync | One `flush` | Prevents false durability claims | `fflush`/`fdatasync`/`fsync` | `Io` | Required | 36a | errors | OS sync calls | Semantic warning |
+| Advisory locking | Typed RAII guard | Integer flags; manual unlock | Deterministic release | `flock` | `Io` | Recommended | 36a | 29, 35 | Lock backend | Semantic warning |
+| Process pipe model | Owned child plus typed three pipes | Shell-only helpers | Enables safe composition | `proc_open`/`popen` | `Process` | Required | 36a | 29, 35 | Spawn/pipe backend | Domain rewrite |
+| Child output drainage | Readiness-driven concurrent drain | Sequential reads; threads only | Prevents deadlock | Child stdout/stderr pipes | `Process`/`Io` | Required | 36a | readiness | Multi-handle wait | Semantic warning |
+| Typed metadata | Properties/interfaces/results | Dictionary of `mixed` | Static safety and portability | Metadata arrays | Domain owners | Required | 36a/44/46 | 35 | Typed facts | Domain rewrite |
+| Wrapper/filter replacement | Typed constructors/adapters | Dynamic registry | Keeps capability without global strings | Wrappers/filters | Domain owners | Required | 36a+ | 31, 35 | Composition | Adapter/domain rewrite |
+| Compression adapters | Typed reader/writer adapters | URL/filter strings | Streaming compression | zlib wrapper/filter | Adapter | Recommended | after 36a | 35 | Codec state | Adapter rewrite |
+| Encoding adapters | Explicit byte/text converters | Implicit locale conversion | Preserves UTF-8 invariant | conversion filters | Adapter | Recommended | after 36a | Bytes | Codec state | Adapter rewrite |
+| TLS adapter boundary | Network-owned typed upgrade/config | SSL context bag | Secure duplex streams | crypto/socket contexts | `Net` | Recommended | 44 | 36a, 37/38 | TLS state | Domain rewrite |
+| Sync/async stream unification | One ownership/result/readiness model | Async-specific streams | Avoids two incompatible stacks | Non-blocking streams | `Io` | Required | 36a–39 | 37 design | Await integration | Direct typed rewrite |
+| Terminal integration | Reuse readiness/devices; keep decoding in `Console` | Terminal-specific polling core | Portable key/resize input | Readline/TTY | `Term` | Required | 46 | 36a | Raw/event backends | Domain rewrite |
+| Network integration | Reuse duplex/readiness/timeouts/partial writes | Socket-specific contracts | Avoids parallel I/O semantics | Socket streams | `Net` | Required boundary | 44 | 36a–38 | Socket backend | Domain rewrite |
+
+## Scheduling and authority consequence
+
+- Stage 25a is complete.
+- This PHP Stream And I/O Completeness Audit is implemented.
+- Andrew's Stream API Completeness Review is next.
+- Stage 26 is blocked only until that review completes.
+- Stage 36a is scheduled, not implemented; its public surface remains pending
+  review and the unauthored stream decision.
+- No `BlockingMode`, read-outcome type, poller/waiter, stream interface, file
+  object, process API, or first-class standard-stream spelling is executable yet.
+
+## Invalidated elsewhere
+
+- The end-to-end plan now places Stage 36a between Stages 36 and 37 and amends
+  Stages 29, 35, 37–39, 44, 46, the phase range, and the 1.0 gate.
+- The standard-library inventory now distinguishes current intrinsics from the
+  scheduled reviewed `Io`/`Fs`/`Process`/`Net`/`Term` capability boundaries.
+- The current-pipeline note now records the audit/review gate and refuses false
+  implementation claims.
+- The language-server and website audits found no stale final-stream claim, so
+  their behavior, compiler pins, and repositories remain unchanged.
+
+---
+# Historical partial I/O audit (preserved)\n
 > Documentation role: working note / findings for Andrew's decision. This is a
 > design-completeness audit, not a decision record and not an implementation.
 > Every open question below is a stop-and-ask: options and a marked recommendation

@@ -109,7 +109,6 @@ foreach ([
     [$plan, 'Stage 25a is complete'],
     [$pipeline, 'Stage 25a Slices 1 through 4 are implemented'],
     [$pipeline, 'Stage 25a is complete'],
-    [$pipeline, 'Stage 26 is next'],
     [$decision, 'Stage 25a Slice 4 completes'],
 ] as [$contents, $needle]) {
     if (!str_contains($contents, $needle)) {

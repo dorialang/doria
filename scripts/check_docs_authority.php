@@ -6,8 +6,10 @@ declare(strict_types=1);
     require __DIR__ . '/check_string_api_completeness.php';
 })();
 
+require_once __DIR__ . '/check_stream_io_completeness.php';
+
 $root = dirname(__DIR__);
-$failures = [];
+$failures = check_stream_io_completeness($root);
 
 // Keys are "path:line:number". Keep this empty unless the repository contains
 // a verified decision-shaped token that is not a citation. Every entry requires
@@ -702,9 +704,11 @@ if ($namingAuthority !== false) {
         || !str_contains($pipeline, 'Interactive Line-Input Amendment')
         || !str_contains($pipeline, 'Stage 25a Slices 1 through 4 are implemented')
         || !str_contains($pipeline, 'Stage 25a is complete')
-        || !str_contains($pipeline, 'Stage 26 is next')
+        || !str_contains($pipeline, 'PHP Stream And I/O Completeness Audit — Implemented')
+        || !str_contains($pipeline, 'Andrew’s Stream API Completeness Review — Next')
+        || !str_contains($pipeline, 'Stage 26 — Blocked Pending Review')
     ) {
-        $failures[] = "{$pipelinePath}: must keep the String audit review and runtime surface implemented, line input sequenced, Stage 25a complete, and Stage 26 next";
+        $failures[] = "{$pipelinePath}: must keep the String audit review and runtime surface implemented, line input sequenced, Stage 25a complete, the stream audit implemented, Andrew's review next, and Stage 26 blocked pending review";
     }
 
     if (
