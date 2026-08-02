@@ -3,6 +3,32 @@
 > Documentation role: supporting design note.
 > Source-of-truth hierarchy: `docs/doria-end-to-end-plan.md` owns future sequencing; accepted `docs/decisions/*.md` files own topic-level decisions. This note is subordinate to both.
 
+## Target-State Authority
+
+The public website represents the completed language and toolchain target, not a
+status page for the incremental compiler implementation. It is Andrew's BDD/UAT
+surface: examples may intentionally describe accepted target behavior before the
+compiler can execute it, so implementation gaps remain visible during delivery.
+
+Guardrails:
+
+- Never downgrade target-state documentation or playground examples to match the
+  current compiler stage.
+- Change website semantics only when a later accepted decision changes the
+  completed target.
+- Do not expose stage numbers, current backend coverage, temporary deferral
+  diagnostics, or implementation-status caveats as product documentation.
+- Do not invent exact API spellings that an accepted decision explicitly defers.
+  Describe the accepted capability contract until the owning decision settles
+  its public names.
+- A current compiler failure against a valid target-state example is UAT evidence,
+  not permission to remove or weaken the example.
+- Performance copy must reflect an accepted target-state contract and remain
+  workload-specific. Describe bounded allocation/copy behavior or benchmarked
+  cases when authority supports them; never turn a design goal or one benchmark
+  into an unqualified claim that Doria is faster, instant, zero-cost, or has no
+  hidden costs.
+
 ## Homepage Toolchain Positioning
 
 The homepage teaches Doria's public workflow as:
@@ -13,7 +39,9 @@ write -> build -> run
 
 Baton is the intended public project tool. `doriac` is the underlying compiler. Baton coordinates projects, packages, builds, tests, and application runs by invoking compiler functionality; it does not define Doria semantics.
 
-Baton is planned, not currently implemented. Until Baton exists, public docs must describe it as planned product direction rather than current user functionality.
+The website presents Baton as the completed public project tool. Compiler-side
+working notes may track its implementation status, but public product copy must
+remain written from the completed-release perspective.
 
 Guardrails:
 
@@ -21,7 +49,6 @@ Guardrails:
 - Do not imply users must manually validate a program before building it.
 - `doriac check` remains valid optional tooling for editors, compiler tooling, CI, and local validation without output.
 - Backend implementation details such as Cranelift, LLVM, object files, linkers, and backend profile names are not homepage onboarding content.
-- The homepage must not claim full native-language support while the native backend remains intentionally incremental.
 - Compiler-oriented documentation may still document direct `doriac` commands.
 
 Acceptable:
@@ -46,10 +73,6 @@ Doria source -> doriac check -> doriac compile -> Executable
 
 ```text
 Check your source, compile it, then run it.
-```
-
-```text
-Baton currently builds Doria projects.
 ```
 
 ## API Naming

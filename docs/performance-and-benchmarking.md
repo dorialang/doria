@@ -248,6 +248,8 @@ Settled:
 - Doria should avoid unsupported performance marketing.
 - Native desktop/game/FFI use cases should influence future benchmark design.
 - The native backend direction is a staged Cranelift/LLVM route: Cranelift first for native smoke/backend iteration, LLVM later as the longer-term optimizing backend path.
+- Decision 0110 makes the stream semantic and performance/memory contract
+  binding. Stage 36a, not Stage 43, owns its initial regression gate.
 ```
 
 Open:
@@ -258,3 +260,62 @@ Open:
 - Exact benchmark runner implementation.
 - Whether benchmark results are published per release.
 ```
+
+---
+
+## 10. Stage 36a stream performance gate
+
+Decision 0110 requires stream implementation choices to preserve efficient
+steady-state operation, not merely semantic correctness. Stage 36a therefore
+ships the first cross-platform stream benchmark and memory-regression gate.
+Stage 43 continues and broadens this suite for engine workloads.
+
+The gate records these metrics where the host platform can measure them
+reliably:
+
+```text
+- compile time
+- cold startup
+- throughput and latency distribution
+- wall, user, and system time
+- peak RSS
+- allocation count and allocated bytes
+- syscall count
+- bytes copied by the stream/adapter path
+- generic specialization count
+- runtime library growth
+- development binary size
+- release binary size
+- stripped binary size
+- output correctness hash
+```
+
+The initial fixture set is binding:
+
+```text
+- large streaming file copy
+- repeated small writes
+- non-blocking pipe transfer
+- child stdout and stderr drainage
+- incremental UTF-8 line processing across multibyte boundaries and long lines
+- first-class versus intrinsic standard-output writes
+- many stable readiness registrations
+- synchronous startup proving zero executor/task/scheduler initialization
+- concrete adapter chain
+- erased interface stream
+```
+
+Each case has an equivalent direct OS, C, or Rust baseline where meaningful.
+Those programs establish comparative evidence; they do not authorize broad
+claims that Doria is faster than another language. Correctness hashes and
+observable output must agree before timing data is considered.
+
+Ordinary CI enforces deterministic structural invariants: common outcomes and
+standard-stream views are allocation-free; reusable-buffer loops do not require
+a steady-state allocation; the implementation does not copy whole chunks or
+unread suffixes as hidden adapter work; readiness registration and event storage
+are reused; synchronous startup initializes no async infrastructure; and bounded
+operations remain bounded. Timing thresholds run on curated, controlled runners
+because shared CI noise is not a reliable regression signal. Thresholds, runner
+identity, compiler revision, build flags, sample count, and raw results are
+versioned with the harness before the Stage 36a gate can pass.

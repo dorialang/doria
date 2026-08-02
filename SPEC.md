@@ -867,6 +867,56 @@ unshadowable.
 
 The runtime separates raw standard-device reads/writes and explicit flush from buffered line discipline. It detects stdin, stdout, and stderr interactivity independently for internal use. On Windows, interactive console text uses validated UTF-8 converted to wide console operations; redirected handles preserve exact UTF-8 bytes. Binary standard-stream operations bypass text-console conversion and preserve exact bytes. This is infrastructure for the future Stage 46 `Console` API, not a public terminal API.
 
+### Hosted stream architecture (accepted future target)
+
+Decision 0110 defines the hosted I/O architecture that Stage 36a will implement.
+Generic streams are byte-oriented owned move values exposed through small
+capability interfaces rather than one universal stream class. A handle may be
+readable, writable, duplex, seekable, flushable, blocking-configurable, or
+readiness-aware only when it actually provides that authority. Explicit
+close/finish consumes an owned handle and reports checked failure; destructor
+cleanup is best-effort and nonthrowing. Structured checked-error exits clean up,
+while abort-only panic does not.
+
+Primitive reads distinguish data, would-block, EOF, and timeout; empty data is
+not EOF. Primitive writes preserve partial progress and distinguish would-block.
+One multi-stream readiness substrate, durations and absolute deadlines, and one
+cancellation/backpressure model serve synchronous I/O, future async lowering,
+networking, child-process pipes, and terminal input. Platform polling and handle
+types never enter the Doria surface.
+
+Standard input, output, and error become first-class non-owning, nonclosable
+views over the same devices used by the intrinsics above. Typed per-value
+buffering and UTF-8 text adapters layer over byte streams, own their underlying
+handle by default, and use explicit borrowing when they do not. Line and
+delimiter operations are bounded. Typed file requests replace mode strings;
+buffer flush, durable data synchronization, and full synchronization are
+distinct. Owned child processes expose typed pipes and require concurrent,
+bounded stdout/stderr drainage.
+
+The steady-state stream data plane does not require an allocation per read,
+write, readiness event, adapter hop, or loop iteration. Chunk operations expose
+reusable caller- or adapter-owned storage and safe readable/writable byte
+regions; successful progress reports the initialized or consumed extent without
+copying a whole chunk or unread suffix. Text decoding is incremental, buffering
+is bounded, and backpressure prevents an unbounded producer queue. Static
+generic adapters remain eligible for specialization and inlining; deliberate
+interface erasure may use dynamic dispatch but does not require a heap object per
+call or layer.
+
+Readiness implementations reuse registration and platform event storage rather
+than rebuilding them on every wait, and ordinary operation does not busy-poll or
+allocate one thread per stream. Timing support is opt-in per operation or wait.
+Synchronous programs do not initialize async executors, task objects, or async
+scheduler infrastructure. Stage 36a owns the initial cross-platform stream
+performance and memory regression gate defined by decision 0110; Stage 43
+continues and broadens the benchmark suite rather than postponing that gate.
+
+Stage 36a is scheduled and not implemented. The semantic and performance
+contracts are accepted. Exact public interface, member,
+outcome-case, readiness, standard-stream, file, adapter, and process spellings
+remain deferred under decision 0110; the accepted semantics above do not.
+
 ### Equality and boolean operators
 
 Doria equality is typed:
@@ -1343,7 +1393,7 @@ Future work includes:
 - Advanced control-flow design for `do ... while ... finally`, `given ... when`, `given ... while`, `if` chains with possible `finally`, value-returning `when`, `match`, and labeled or numeric loop control.
 - Careful evaluation of `goto`, labeled loop control, and structured conditional compilation without adopting C/C++ textual macros.
 - Async/await and structured concurrency.
-- Public stream/file objects, binary I/O, and terminal APIs beyond the Stage 17 text helpers.
+- The decision-0110 hosted stream/file foundation and the later terminal APIs beyond the existing text and binary intrinsics.
 - Self-hosting path for writing more of `doriac` in Doria.
 - PHP-to-Doria migration tooling.
 - Package management.

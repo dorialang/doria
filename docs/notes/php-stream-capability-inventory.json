@@ -46,6 +46,79 @@
             "totalRows": 153
         }
     },
+    "review": {
+        "status": "approved",
+        "reviewDate": "2026-08-02",
+        "decisionRecord": "0110",
+        "semanticDirection": "accepted",
+        "performanceContract": "accepted",
+        "publicSpellingStatus": "deferred",
+        "stage26Blocked": false,
+        "stage26Status": "next",
+        "stage36aStatus": "scheduled",
+        "stage36aImplemented": false
+    },
+    "performance": {
+        "status": "accepted",
+        "decisionRecord": "0110",
+        "initialGateOwner": "Stage 36a",
+        "continuationOwner": "Stage 43",
+        "profiles": [
+            {
+                "name": "stream-data-plane",
+                "capabilities": [
+                    "bounded-streaming-copy",
+                    "file-stream-operation",
+                    "network-stream-operation",
+                    "read-bytes-to-end",
+                    "stream-operation",
+                    "typed-operation-progress"
+                ],
+                "allocationSensitivity": "no mandatory allocation per steady-state operation or loop iteration; common outcomes and standard-stream views are allocation-free",
+                "copySensitivity": "chunk-oriented progress does not hide a whole-chunk or unread-suffix copy",
+                "partialProgress": "accepted and preserved",
+                "reusableBufferRequirement": "caller- or adapter-owned reusable storage with safe readable/writable byte regions",
+                "readinessReuse": "operations resume through reusable readiness state when waiting is required",
+                "backpressureRequirement": "bounded by construction",
+                "asyncCostIsolation": "synchronous use initializes no executor, task, or scheduler infrastructure"
+            },
+            {
+                "name": "adapter-pipeline",
+                "capabilities": [
+                    "bounded-delimiter-read",
+                    "buffered-adapter-configuration",
+                    "typed-adapter-buffer-flow",
+                    "typed-adapter-composition",
+                    "typed-adapter-lifecycle",
+                    "typed-adapters",
+                    "typed-transform-adapter"
+                ],
+                "allocationSensitivity": "no mandatory heap object per call or adapter layer",
+                "copySensitivity": "incremental transforms retain unread state without copying the whole suffix",
+                "partialProgress": "adapter outcomes preserve underlying progress",
+                "reusableBufferRequirement": "adapter-owned buffers are reusable and bounded",
+                "readinessReuse": "adapter layers preserve the underlying reusable readiness registration",
+                "backpressureRequirement": "propagated through every adapter layer",
+                "asyncCostIsolation": "the same adapter contracts serve sync and async without async cost in sync programs"
+            },
+            {
+                "name": "readiness-and-process",
+                "capabilities": [
+                    "operation-timeout-or-deadline",
+                    "owned-child-process-and-pipes",
+                    "portable-readiness-wait",
+                    "process-pipe-lifecycle"
+                ],
+                "allocationSensitivity": "registration and event storage are reused across waits",
+                "copySensitivity": "readiness reporting does not copy stream payloads",
+                "partialProgress": "readiness resumes the existing operation state",
+                "reusableBufferRequirement": "wait and process-drain loops reuse their storage",
+                "readinessReuse": "stable watched sets reuse registrations, event storage, platform handles, and watcher identity",
+                "backpressureRequirement": "child stdout and stderr are drained concurrently within explicit bounds",
+                "asyncCostIsolation": "ordinary readiness does not busy-poll or allocate one thread per stream"
+            }
+        ]
+    },
     "officialInventory": {
         "streamFunctions": [
             "stream_bucket_append",
@@ -350,23 +423,26 @@
             "eofRelevant": false,
             "wouldBlockRelevant": false,
             "platformConstraints": [],
-            "doriaClassification": "Unresolved Design Fork",
+            "doriaClassification": "Rejected Global Configuration",
             "doriaOwner": "Domain Configuration Types",
             "doriaCapability": "explicit-typed-configuration",
             "doriaCandidateSpelling": null,
-            "doriaStatus": "unresolved",
-            "v1Recommendation": "Unresolved",
+            "semanticStatus": "accepted",
+            "publicSpellingStatus": "deferred",
+            "decisionRecord": "0110",
+            "doriaStatus": "rejected",
+            "v1Recommendation": "Rejected PHP Shape",
             "landingStage": "36a",
             "dependencies": [
                 "Stage 29",
                 "Stage 35"
             ],
-            "migrationAction": "Requires Human Review",
+            "migrationAction": "Rewrite Through Domain Module",
             "byteTextSemantics": "configuration",
             "semanticDifferences": [
                 "String-keyed context bags become explicit typed configuration"
             ],
-            "designerDecisionRequired": true,
+            "designerDecisionRequired": false,
             "aliasOf": null,
             "replacementCapabilities": [
                 "Typed File Options",
@@ -423,23 +499,26 @@
             "eofRelevant": false,
             "wouldBlockRelevant": false,
             "platformConstraints": [],
-            "doriaClassification": "Unresolved Design Fork",
+            "doriaClassification": "Rejected Global Configuration",
             "doriaOwner": "Domain Configuration Types",
             "doriaCapability": "explicit-typed-configuration",
             "doriaCandidateSpelling": null,
-            "doriaStatus": "unresolved",
-            "v1Recommendation": "Unresolved",
+            "semanticStatus": "accepted",
+            "publicSpellingStatus": "deferred",
+            "decisionRecord": "0110",
+            "doriaStatus": "rejected",
+            "v1Recommendation": "Rejected PHP Shape",
             "landingStage": "36a",
             "dependencies": [
                 "Stage 29",
                 "Stage 35"
             ],
-            "migrationAction": "Requires Human Review",
+            "migrationAction": "Rewrite Through Domain Module",
             "byteTextSemantics": "configuration",
             "semanticDifferences": [
                 "String-keyed context bags become explicit typed configuration"
             ],
-            "designerDecisionRequired": true,
+            "designerDecisionRequired": false,
             "aliasOf": null,
             "replacementCapabilities": [
                 "Typed File Options",
@@ -461,23 +540,26 @@
             "eofRelevant": false,
             "wouldBlockRelevant": false,
             "platformConstraints": [],
-            "doriaClassification": "Unresolved Design Fork",
+            "doriaClassification": "Rejected Global Configuration",
             "doriaOwner": "Domain Configuration Types",
             "doriaCapability": "explicit-typed-configuration",
             "doriaCandidateSpelling": null,
-            "doriaStatus": "unresolved",
-            "v1Recommendation": "Unresolved",
+            "semanticStatus": "accepted",
+            "publicSpellingStatus": "deferred",
+            "decisionRecord": "0110",
+            "doriaStatus": "rejected",
+            "v1Recommendation": "Rejected PHP Shape",
             "landingStage": "36a",
             "dependencies": [
                 "Stage 29",
                 "Stage 35"
             ],
-            "migrationAction": "Requires Human Review",
+            "migrationAction": "Rewrite Through Domain Module",
             "byteTextSemantics": "configuration",
             "semanticDifferences": [
                 "String-keyed context bags become explicit typed configuration"
             ],
-            "designerDecisionRequired": true,
+            "designerDecisionRequired": false,
             "aliasOf": null,
             "replacementCapabilities": [
                 "Typed File Options",
@@ -534,23 +616,26 @@
             "eofRelevant": false,
             "wouldBlockRelevant": false,
             "platformConstraints": [],
-            "doriaClassification": "Unresolved Design Fork",
+            "doriaClassification": "Rejected Global Configuration",
             "doriaOwner": "Domain Configuration Types",
             "doriaCapability": "explicit-typed-configuration",
             "doriaCandidateSpelling": null,
-            "doriaStatus": "unresolved",
-            "v1Recommendation": "Unresolved",
+            "semanticStatus": "accepted",
+            "publicSpellingStatus": "deferred",
+            "decisionRecord": "0110",
+            "doriaStatus": "rejected",
+            "v1Recommendation": "Rejected PHP Shape",
             "landingStage": "36a",
             "dependencies": [
                 "Stage 29",
                 "Stage 35"
             ],
-            "migrationAction": "Requires Human Review",
+            "migrationAction": "Rewrite Through Domain Module",
             "byteTextSemantics": "configuration",
             "semanticDifferences": [
                 "String-keyed context bags become explicit typed configuration"
             ],
-            "designerDecisionRequired": true,
+            "designerDecisionRequired": false,
             "aliasOf": null,
             "replacementCapabilities": [
                 "Typed File Options",
@@ -572,23 +657,26 @@
             "eofRelevant": false,
             "wouldBlockRelevant": false,
             "platformConstraints": [],
-            "doriaClassification": "Unresolved Design Fork",
+            "doriaClassification": "Rejected Global Configuration",
             "doriaOwner": "Domain Configuration Types",
             "doriaCapability": "explicit-typed-configuration",
             "doriaCandidateSpelling": null,
-            "doriaStatus": "unresolved",
-            "v1Recommendation": "Unresolved",
+            "semanticStatus": "accepted",
+            "publicSpellingStatus": "deferred",
+            "decisionRecord": "0110",
+            "doriaStatus": "rejected",
+            "v1Recommendation": "Rejected PHP Shape",
             "landingStage": "36a",
             "dependencies": [
                 "Stage 29",
                 "Stage 35"
             ],
-            "migrationAction": "Requires Human Review",
+            "migrationAction": "Rewrite Through Domain Module",
             "byteTextSemantics": "configuration",
             "semanticDifferences": [
                 "String-keyed context bags become explicit typed configuration"
             ],
-            "designerDecisionRequired": true,
+            "designerDecisionRequired": false,
             "aliasOf": null,
             "replacementCapabilities": [
                 "Typed File Options",
@@ -610,23 +698,26 @@
             "eofRelevant": false,
             "wouldBlockRelevant": false,
             "platformConstraints": [],
-            "doriaClassification": "Unresolved Design Fork",
+            "doriaClassification": "Rejected Global Configuration",
             "doriaOwner": "Domain Configuration Types",
             "doriaCapability": "explicit-typed-configuration",
             "doriaCandidateSpelling": null,
-            "doriaStatus": "unresolved",
-            "v1Recommendation": "Unresolved",
+            "semanticStatus": "accepted",
+            "publicSpellingStatus": "deferred",
+            "decisionRecord": "0110",
+            "doriaStatus": "rejected",
+            "v1Recommendation": "Rejected PHP Shape",
             "landingStage": "36a",
             "dependencies": [
                 "Stage 29",
                 "Stage 35"
             ],
-            "migrationAction": "Requires Human Review",
+            "migrationAction": "Rewrite Through Domain Module",
             "byteTextSemantics": "configuration",
             "semanticDifferences": [
                 "String-keyed context bags become explicit typed configuration"
             ],
-            "designerDecisionRequired": true,
+            "designerDecisionRequired": false,
             "aliasOf": null,
             "replacementCapabilities": [
                 "Typed File Options",
@@ -1113,23 +1204,26 @@
             "eofRelevant": false,
             "wouldBlockRelevant": false,
             "platformConstraints": [],
-            "doriaClassification": "Unresolved Design Fork",
+            "doriaClassification": "Deferred Post-v1",
             "doriaOwner": "Operation-Specific Progress API",
             "doriaCapability": "typed-operation-progress",
             "doriaCandidateSpelling": null,
-            "doriaStatus": "unresolved",
-            "v1Recommendation": "Unresolved",
-            "landingStage": "44",
+            "semanticStatus": "accepted",
+            "publicSpellingStatus": "deferred",
+            "decisionRecord": "0110",
+            "doriaStatus": "deferred",
+            "v1Recommendation": "Deferred",
+            "landingStage": "Operation-specific review",
             "dependencies": [
                 "Stage 30",
                 "Stage 36a"
             ],
-            "migrationAction": "Requires Human Review",
+            "migrationAction": "Deferred Until Named Stage",
             "byteTextSemantics": "metadata",
             "semanticDifferences": [
                 "Callback event codes become typed domain progress events"
             ],
-            "designerDecisionRequired": true,
+            "designerDecisionRequired": false,
             "aliasOf": null,
             "replacementCapabilities": [],
             "notes": ""
@@ -5596,4 +5690,3 @@
         }
     ]
 }
-

@@ -705,10 +705,15 @@ if ($namingAuthority !== false) {
         || !str_contains($pipeline, 'Stage 25a Slices 1 through 4 are implemented')
         || !str_contains($pipeline, 'Stage 25a is complete')
         || !str_contains($pipeline, 'PHP Stream And I/O Completeness Audit — Implemented')
-        || !str_contains($pipeline, 'Andrew’s Stream API Completeness Review — Next')
-        || !str_contains($pipeline, 'Stage 26 — Blocked Pending Review')
+        || !str_contains($pipeline, 'Andrew’s Stream API Completeness Review — Complete')
+        || !str_contains($pipeline, 'Stream, Readiness, Standard I/O, Blocking Mode, And Performance Model — Accepted (decision 0110)')
+        || !str_contains($pipeline, 'Stage 36a owns the initial')
+        || !str_contains($pipeline, 'Stage 43 later')
+        || !str_contains($pipeline, 'Stage 26 — Next')
+        || !str_contains($pipeline, 'Stage 36a Public Spellings — Deferred')
+        || !str_contains($pipeline, 'Stage 36a — Not Implemented')
     ) {
-        $failures[] = "{$pipelinePath}: must keep the String audit review and runtime surface implemented, line input sequenced, Stage 25a complete, the stream audit implemented, Andrew's review next, and Stage 26 blocked pending review";
+        $failures[] = "{$pipelinePath}: must keep the String audit review and runtime surface implemented, line input sequenced, Stage 25a complete, the stream audit and review complete, decision 0110's semantic/performance contract accepted, Stage 26 next, and Stage 36a scheduled but not implemented with public spellings deferred";
     }
 
     if (

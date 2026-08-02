@@ -82,6 +82,60 @@ and writable families remain visible in signatures as `SharedReference<T>` and
 wrapper. `referencedValue` is the one compiler-known collision projection on
 `SharedReference<T>`, not a general `.value` proxy convention.
 
+## Capability and resource APIs
+
+Decision 0110 supplies reusable rules for hosted resource APIs:
+
+- Prefer small capability interfaces over universal god objects. A value should
+  advertise only the operations it can actually perform.
+- Make ownership visible. Resource handles are move values; ownership transfer
+  uses `take`; explicit close/finish consumes the owner; borrowed adapters are
+  explicitly distinguished from the default owning form.
+- Use typed outcomes for ordinary state such as EOF, would-block, timeout,
+  partial progress, lock contention, readiness, and closure. Do not encode those
+  states as booleans, negative numbers, empty values, or other sentinels.
+- Prefer named modes over boolean control flags, and expose the current mode when
+  it is meaningful.
+- Expose partial progress whenever the operating system or domain can make it;
+  then provide readable high-level conveniences, such as complete writes, over
+  that honest primitive.
+- Use typed request/configuration values instead of string modes, boolean flag
+  clusters, string-keyed option bags, global contexts, or dictionaries of
+  `mixed`.
+- Keep timing operation-local. Durations, deadlines, and cancellation compose
+  across synchronous, asynchronous, network, process, and terminal work; they
+  are not mutable process-global settings.
+- Keep resource use bounded by default. Line/delimiter reads, capture, buffering,
+  copying, and progress reporting must expose the relevant limit or policy.
+- Make steady-state reuse possible. Chunk APIs accept reusable storage and expose
+  safe readable/writable byte regions so progress does not require allocating or
+  copying an entire chunk or unread suffix on every operation.
+- Keep abstraction costs proportional to the chosen abstraction. Concrete
+  generic adapters remain statically specializable; deliberate interface
+  erasure may dispatch dynamically but does not allocate a heap object per call
+  or per adapter layer.
+- Reuse readiness registrations and event storage. Ordinary waiting neither
+  busy-polls nor creates one thread per stream, and timeout bookkeeping is
+  incurred only when timing is requested.
+- Keep asynchronous machinery isolated. A synchronous program must not start an
+  executor or allocate task/scheduler state merely because the standard library
+  also supports asynchronous I/O.
+- Separate buffer flushing from durable synchronization, and explicit
+  failure-reporting cleanup from best-effort nonthrowing destruction.
+- Keep platform mechanisms behind portable contracts. File descriptors, OS
+  handles, polling APIs, shell parsing, and terminal encodings are backend facts.
+- Prefer typed adapters and domain ownership over registries and wrappers named
+  by strings. Each domain extends the common ownership/read/write/readiness/time/
+  cancellation/backpressure foundation instead of creating a parallel one.
+- Expose typed metadata through properties, capability interfaces, outcomes, or
+  domain values rather than `Dictionary<string, mixed>`.
+- Prefer clear, fully worded Doria vocabulary over abbreviated systems jargon
+  unless an accepted naming rule establishes the abbreviation.
+
+The semantic and performance patterns are settled. Exact Stage 36a public names
+remain deferred under decision 0110 and must not be inferred from illustrative
+audit vocabulary.
+
 ## Properties are for data
 
 Use properties for stored values, state, identifiers, configuration values, computed values that are conceptually data, cheap derived values, and values exposed through validation or access control.
