@@ -23,6 +23,11 @@ Guardrails:
   its public names.
 - A current compiler failure against a valid target-state example is UAT evidence,
   not permission to remove or weaken the example.
+- Performance copy must reflect an accepted target-state contract and remain
+  workload-specific. Describe bounded allocation/copy behavior or benchmarked
+  cases when authority supports them; never turn a design goal or one benchmark
+  into an unqualified claim that Doria is faster, instant, zero-cost, or has no
+  hidden costs.
 
 ## Homepage Toolchain Positioning
 

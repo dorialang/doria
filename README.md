@@ -11,7 +11,7 @@
 
 ## What is Doria?
 
-Doria is a general-purpose systems language built around three commitments: **code that reads plainly, safety that is checked at compile time, and performance that is deterministic.** It compiles to fast, standalone native executables with no garbage collector, no runtime pauses, and no hidden costs — while its syntax stays approachable enough to be someone's first language.
+Doria is a general-purpose systems language built around three commitments: **code that reads plainly, safety that is checked at compile time, and performance that is deterministic.** It compiles to standalone native executables with deterministic ownership and no tracing garbage collector. Runtime and allocation costs are specified explicitly and verified with workload-specific measurements, while the syntax stays approachable enough to be someone's first language.
 
 ```doria
 function greet(string $name, int $year): string
@@ -74,9 +74,9 @@ runtime access-check cost.
 
 ## What people build with it
 
-- **Native services and CLI tools** — single-binary deployment, instant startup, predictable memory.
+- **Native services and CLI tools** — single-binary deployment, measured cold startup, predictable memory.
 - **Portable terminal applications** — first-class, cross-platform TUI support (Windows, macOS, Linux) with no hand-written escape sequences: terminal games and tools that just run everywhere.
-- **Game engines and performance-critical systems** — deterministic destruction, fixed-width numerics, zero-cost abstractions, and a safe interop story with native libraries.
+- **Game engines and performance-critical systems** — deterministic destruction, fixed-width numerics, statically specialized abstractions, and a safe interop story with native libraries.
 - **Native power for PHP applications** — Doria libraries compile to packages that PHP code calls like ordinary classes, with generated, type-checked bindings.
 
 ## Lineage

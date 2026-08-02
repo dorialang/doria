@@ -3,13 +3,14 @@
 > Documentation role: completed capability-completeness audit and supporting
 > context for accepted decision 0110. This is not an implementation. Candidate
 > spellings remain illustrative only; decision 0110 accepts the architecture and
-> defers exact public spellings through its bounded appendix process.
+> binding performance/memory contract, and defers exact public spellings through
+> its bounded appendix process.
 
 This expanded audit **supersedes the previous partial completeness scope** while
 preserving its accepted results, historical snapshots, Q1–Q6 reasoning, derived
 findings, and decision references below. Andrew approved all thirteen
 architecture recommendations on 2026-08-02; decision 0110 is authoritative for
-their semantics. The machine-checkable companion ledger is
+their semantics and performance constraints. The machine-checkable companion ledger is
 `php-stream-capability-inventory.json`; `scripts/check_stream_io_completeness.php`
 proves the stored official inventory remains complete without network access.
 
@@ -38,9 +39,10 @@ domain modules.
 ## Approval resolution — 2026-08-02
 
 Andrew approved all 13 consolidated recommendations. Every load-bearing semantic
-stream decision raised by the review is settled in decision 0110. The remaining
-deferrals concern public spelling and the named dependent domains. Stage 26 is
-unblocked. Stage 36a remains scheduled rather than implemented.
+and performance stream decision raised by the review is settled in decision
+0110. The remaining deferrals concern public spelling and the named dependent
+domains. Stage 26 is unblocked. Stage 36a remains scheduled rather than
+implemented and owns the initial performance/memory gate.
 
 This resolution does not rewrite the audit as though the recommendations had
 always been accepted. The alternatives, reasoning, and historical partial audit
@@ -443,61 +445,68 @@ in the JSON row with the same PHP name.
 ## Designer review table
 
 Andrew approved these recommendations on 2026-08-02. Decision 0110 owns their
-semantics. “Public spelling deferred” means only the exact source vocabulary is
-open; it does not reopen the architecture.
+semantics and performance constraints. “Public spelling deferred” means only
+the exact source vocabulary is open; it does not reopen the architecture,
+allocation/copy model, reusable-buffer requirement, readiness reuse, or async
+cost isolation. The performance column is Accepted for every reviewed decision;
+the capability-specific detail is normalized in the machine-readable manifest.
 
-| Decision | Recommendation | Alternatives | Why it matters | PHP capability preserved | Doria owner | v1 status | Landing | Dependencies | Runtime impact | Migration impact | Semantic status | Public spelling status | Authority |
-|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| Stream interface decomposition | Small readable/writable/duplex/seekable/etc. capabilities | One stream class; dynamic checks | Prevents accidental authority | Resource polymorphism | `Io` | Required | 36a | 29, 35 | Vtables/adapters | Typed resource rewrite | Accepted | Deferred where applicable | decision 0110 |
-| First-class standard streams | Yes, on existing substrate | Intrinsic-only forever | Enables generic CLI composition | `php://std*` | `Io` | Required | 36a | 29, 35 | Borrowed device views | Direct typed rewrite | Accepted | Deferred where applicable | decision 0110 |
-| Standard-stream ownership | Non-owning views; no accidental close | Owned closable handles | Protects process-global devices | STDIN/OUT/ERR resources | `Io` | Required | 36a | ownership | Device lifetime | Human review | Accepted | Deferred where applicable | decision 0110 |
-| Close semantics | Consuming explicit close/finish reports checked failure; destruction is best-effort and nonthrowing | Idempotent nonconsuming close | Prevents leaks, double close, and hidden failures | `fclose` | `Io` | Required | 36a | 29 | Drop/close errors | Semantic warning | Accepted | Deferred where applicable | decision 0110 |
-| Blocking-mode naming | Typed mode on capable value | Boolean; separate types; construction-only | Mode is capability, not flag | `stream_set_blocking` | `Io` | Required | 36a | 35 | Platform mode calls | Semantic warning | Accepted | Deferred where applicable | decision 0110 |
-| Runtime mode mutation | Permit only where supported | Immutable mode types | Pipes/sockets/terminals need transitions | Blocking mutation | `Io` | Required | 36a | readiness | Capability checks | Human review | Accepted | Deferred where applicable | decision 0110 |
-| Capability discovery | Interfaces plus typed facts | Metadata bag; try-and-fail only | Avoids `mixed` metadata | `stream_get_meta_data` | `Io` | Required | 36a | 35 | Typed metadata | Domain rewrite | Accepted | Deferred where applicable | decision 0110 |
-| Non-blocking read outcome | Data / would-block / EOF distinction | Result nesting; separate calls | Prevents sentinel ambiguity | `fread`/`feof` | `Io` | Required | 36a | 29 | Result tags | Semantic warning | Accepted | Deferred where applicable | decision 0110 |
-| Partial-write outcome | Count / would-block / closed/error | Boolean success | Prevents data loss | `fwrite` count | `Io` | Required | 36a | readiness | Resume state | Semantic warning | Accepted | Deferred where applicable | decision 0110 |
-| Readiness API shape | Portable typed readiness results | Callback reactor; platform handles | Foundation for sync and async | `stream_select` | `Io` | Required | 36a | Time | OS pollers | Direct typed rewrite | Accepted | Deferred where applicable | decision 0110 |
-| One-stream versus waiter API | Derive convenience from multi-stream core | Public one-stream only; both primitives | Avoids duplicate readiness models | Single/multi select | `Io` | Required | 36a | readiness | Wait registration | Human review | Accepted | Deferred where applicable | decision 0110 |
-| Timeout versus deadline | Support durations and absolute deadlines per operation/wait | Duration only; deadline only | Different timeout meanings | Stream/socket timeouts | `Io`/`Time` | Required | 36a | Time | Timer integration | Semantic warning | Accepted | Deferred where applicable | decision 0110 |
-| Buffering types | Per-value typed adapters | Flags on streams; globals | Makes read-ahead/flush ownership visible | Buffer controls | `Io` | Required | 36a | 29, 35 | Adapter buffers | Adapter rewrite | Accepted | Deferred where applicable | decision 0110 |
-| Text adapter names | Explicit UTF-8 reader/writer | Text on every stream | Preserves string invariant | Text filters/line reads | `Io` | Required | 36a | Bytes | Adapter rewrite | Accepted | Deferred where applicable | decision 0110 |
-| Line-read limits | Required explicit/default safe maximum | Unbounded allocation | Prevents hostile-input growth | `fgets`/delimiter read | Text adapter | Required | 36a | errors | Bounded buffers | Semantic warning | Accepted | Deferred where applicable | decision 0110 |
-| File open modes | Typed non-boolean modes | Mode strings; builder | Makes create/truncate/append explicit | `fopen` modes | `Io` | Required | 36a | 29 | OS open flags | Semantic warning | Accepted | Deferred where applicable | decision 0110 |
-| Path type | Defer exact representation while preserving typed evolution | Keep `string`; dual acceptance | Cross-platform path correctness | File wrapper targets | `Fs` | Deferred | Fs review | 31 | Path conversion | Human review | Accepted | Deferred | decision 0110 |
-| Flush versus durable sync | Separate buffer flush, data sync, full sync | One `flush` | Prevents false durability claims | `fflush`/`fdatasync`/`fsync` | `Io` | Required | 36a | errors | OS sync calls | Semantic warning | Accepted | Deferred where applicable | decision 0110 |
-| Advisory locking | Typed RAII guard | Integer flags; manual unlock | Deterministic release | `flock` | `Io` | Recommended | 36a | 29, 35 | Lock backend | Semantic warning | Accepted | Deferred where applicable | decision 0110 |
-| Process pipe model | Owned child plus typed three pipes and explicit wait/detach/terminate resolution | Shell-only helpers | Enables safe composition | `proc_open`/`popen` | `Process` | Required | 36a | 29, 35 | Spawn/pipe backend | Domain rewrite | Accepted | Deferred where applicable | decision 0110 |
-| Child output drainage | Readiness-driven concurrent drain | Sequential reads; threads only | Prevents deadlock | Child stdout/stderr pipes | `Process`/`Io` | Required | 36a | readiness | Multi-handle wait | Semantic warning | Accepted | Deferred where applicable | decision 0110 |
-| Typed metadata | Properties/interfaces/results | Dictionary of `mixed` | Static safety and portability | Metadata arrays | Domain owners | Required | 36a/44/46 | 35 | Typed facts | Domain rewrite | Accepted | Deferred where applicable | decision 0110 |
-| Wrapper/filter replacement | Typed constructors/adapters | Dynamic registry | Keeps capability without global strings | Wrappers/filters | Domain owners | Required | 36a+ | 31, 35 | Composition | Adapter/domain rewrite | Accepted | Deferred where applicable | decision 0110 |
-| Compression adapters | Typed reader/writer adapters | URL/filter strings | Streaming compression | zlib wrapper/filter | Adapter | Recommended | after 36a | 35 | Codec state | Adapter rewrite | Accepted | Deferred where applicable | decision 0110 |
-| Encoding adapters | Explicit byte/text converters | Implicit locale conversion | Preserves UTF-8 invariant | conversion filters | Adapter | Recommended | after 36a | Bytes | Codec state | Adapter rewrite | Accepted | Deferred where applicable | decision 0110 |
-| TLS adapter boundary | Network-owned typed upgrade/config | SSL context bag | Secure duplex streams | crypto/socket contexts | `Net` | Recommended | 44 | 36a, 37/38 | TLS state | Domain rewrite | Accepted | Deferred where applicable | decision 0110 |
-| Sync/async stream unification | One ownership/result/readiness model | Async-specific streams | Avoids two incompatible stacks | Non-blocking streams | `Io` | Required | 36a–39 | 37 design | Await integration | Direct typed rewrite | Accepted | Deferred where applicable | decision 0110 |
-| Terminal integration | Reuse readiness/devices; keep decoding in `Console` | Terminal-specific polling core | Portable key/resize input | Readline/TTY | `Term` | Required | 46 | 36a | Raw/event backends | Domain rewrite | Accepted | Deferred where applicable | decision 0110 |
-| Network integration | Reuse duplex/readiness/timeouts/partial writes | Socket-specific contracts | Avoids parallel I/O semantics | Socket streams | `Net` | Required boundary | 44 | 36a–38 | Socket backend | Domain rewrite | Accepted | Deferred where applicable | decision 0110 |
+| Decision                       | Recommendation                                                                                      | Alternatives                               | Why it matters                                    | PHP capability preserved     | Doria owner    | v1 status         | Landing   | Dependencies | Runtime impact        | Migration impact       | Performance constraints | Semantic status           | Public spelling status    | Authority     |
+| ------------------------------ | --------------------------------------------------------------------------------------------------- | ------------------------------------------ | ------------------------------------------------- | ---------------------------- | -------------- | ----------------- | --------- | ------------ | --------------------- | ---------------------- | ----------------------- | ------------------------- | ------------------------- | ------------- |
+| Stream interface decomposition | Small readable/writable/duplex/seekable/etc. capabilities                                           | One stream class; dynamic checks           | Prevents accidental authority                     | Resource polymorphism        | `Io`           | Required          | 36a       | 29, 35       | Vtables/adapters      | Typed resource rewrite | Accepted                | Accepted                  | Deferred where applicable | decision 0110 |
+| First-class standard streams   | Yes, on existing substrate                                                                          | Intrinsic-only forever                     | Enables generic CLI composition                   | `php://std*`                 | `Io`           | Required          | 36a       | 29, 35       | Borrowed device views | Direct typed rewrite   | Accepted                | Accepted                  | Deferred where applicable | decision 0110 |
+| Standard-stream ownership      | Non-owning views; no accidental close                                                               | Owned closable handles                     | Protects process-global devices                   | STDIN/OUT/ERR resources      | `Io`           | Required          | 36a       | ownership    | Device lifetime       | Human review           | Accepted                | Accepted                  | Deferred where applicable | decision 0110 |
+| Close semantics                | Consuming explicit close/finish reports checked failure; destruction is best-effort and nonthrowing | Idempotent nonconsuming close              | Prevents leaks, double close, and hidden failures | `fclose`                     | `Io`           | Required          | 36a       | 29           | Drop/close errors     | Semantic warning       | Accepted                | Accepted                  | Deferred where applicable | decision 0110 |
+| Blocking-mode naming           | Typed mode on capable value                                                                         | Boolean; separate types; construction-only | Mode is capability, not flag                      | `stream_set_blocking`        | `Io`           | Required          | 36a       | 35           | Platform mode calls   | Semantic warning       | Accepted                | Accepted                  | Deferred where applicable | decision 0110 |
+| Runtime mode mutation          | Permit only where supported                                                                         | Immutable mode types                       | Pipes/sockets/terminals need transitions          | Blocking mutation            | `Io`           | Required          | 36a       | readiness    | Capability checks     | Human review           | Accepted                | Accepted                  | Deferred where applicable | decision 0110 |
+| Capability discovery           | Interfaces plus typed facts                                                                         | Metadata bag; try-and-fail only            | Avoids `mixed` metadata                           | `stream_get_meta_data`       | `Io`           | Required          | 36a       | 35           | Typed metadata        | Domain rewrite         | Accepted                | Accepted                  | Deferred where applicable | decision 0110 |
+| Non-blocking read outcome      | Data / would-block / EOF distinction                                                                | Result nesting; separate calls             | Prevents sentinel ambiguity                       | `fread`/`feof`               | `Io`           | Required          | 36a       | 29           | Result tags           | Semantic warning       | Accepted                | Accepted                  | Deferred where applicable | decision 0110 |
+| Partial-write outcome          | Count / would-block / closed/error                                                                  | Boolean success                            | Prevents data loss                                | `fwrite` count               | `Io`           | Required          | 36a       | readiness    | Resume state          | Semantic warning       | Accepted                | Accepted                  | Deferred where applicable | decision 0110 |
+| Readiness API shape            | Portable typed readiness results                                                                    | Callback reactor; platform handles         | Foundation for sync and async                     | `stream_select`              | `Io`           | Required          | 36a       | Time         | OS pollers            | Direct typed rewrite   | Accepted                | Accepted                  | Deferred where applicable | decision 0110 |
+| One-stream versus waiter API   | Derive convenience from multi-stream core                                                           | Public one-stream only; both primitives    | Avoids duplicate readiness models                 | Single/multi select          | `Io`           | Required          | 36a       | readiness    | Wait registration     | Human review           | Accepted                | Accepted                  | Deferred where applicable | decision 0110 |
+| Timeout versus deadline        | Support durations and absolute deadlines per operation/wait                                         | Duration only; deadline only               | Different timeout meanings                        | Stream/socket timeouts       | `Io`/`Time`    | Required          | 36a       | Time         | Timer integration     | Semantic warning       | Accepted                | Accepted                  | Deferred where applicable | decision 0110 |
+| Buffering types                | Per-value typed adapters                                                                            | Flags on streams; globals                  | Makes read-ahead/flush ownership visible          | Buffer controls              | `Io`           | Required          | 36a       | 29, 35       | Adapter buffers       | Adapter rewrite        | Accepted                | Accepted                  | Deferred where applicable | decision 0110 |
+| Text adapter names             | Explicit UTF-8 reader/writer                                                                        | Text on every stream                       | Preserves string invariant                        | Text filters/line reads      | `Io`           | Required          | 36a       | Bytes        | Adapter rewrite       | Accepted               | Accepted                | Deferred where applicable | decision 0110             |
+| Line-read limits               | Required explicit/default safe maximum                                                              | Unbounded allocation                       | Prevents hostile-input growth                     | `fgets`/delimiter read       | Text adapter   | Required          | 36a       | errors       | Bounded buffers       | Semantic warning       | Accepted                | Accepted                  | Deferred where applicable | decision 0110 |
+| File open modes                | Typed non-boolean modes                                                                             | Mode strings; builder                      | Makes create/truncate/append explicit             | `fopen` modes                | `Io`           | Required          | 36a       | 29           | OS open flags         | Semantic warning       | Accepted                | Accepted                  | Deferred where applicable | decision 0110 |
+| Path type                      | Defer exact representation while preserving typed evolution                                         | Keep `string`; dual acceptance             | Cross-platform path correctness                   | File wrapper targets         | `Fs`           | Deferred          | Fs review | 31           | Path conversion       | Human review           | Accepted                | Accepted                  | Deferred                  | decision 0110 |
+| Flush versus durable sync      | Separate buffer flush, data sync, full sync                                                         | One `flush`                                | Prevents false durability claims                  | `fflush`/`fdatasync`/`fsync` | `Io`           | Required          | 36a       | errors       | OS sync calls         | Semantic warning       | Accepted                | Accepted                  | Deferred where applicable | decision 0110 |
+| Advisory locking               | Typed RAII guard                                                                                    | Integer flags; manual unlock               | Deterministic release                             | `flock`                      | `Io`           | Recommended       | 36a       | 29, 35       | Lock backend          | Semantic warning       | Accepted                | Accepted                  | Deferred where applicable | decision 0110 |
+| Process pipe model             | Owned child plus typed three pipes and explicit wait/detach/terminate resolution                    | Shell-only helpers                         | Enables safe composition                          | `proc_open`/`popen`          | `Process`      | Required          | 36a       | 29, 35       | Spawn/pipe backend    | Domain rewrite         | Accepted                | Accepted                  | Deferred where applicable | decision 0110 |
+| Child output drainage          | Readiness-driven concurrent drain                                                                   | Sequential reads; threads only             | Prevents deadlock                                 | Child stdout/stderr pipes    | `Process`/`Io` | Required          | 36a       | readiness    | Multi-handle wait     | Semantic warning       | Accepted                | Accepted                  | Deferred where applicable | decision 0110 |
+| Typed metadata                 | Properties/interfaces/results                                                                       | Dictionary of `mixed`                      | Static safety and portability                     | Metadata arrays              | Domain owners  | Required          | 36a/44/46 | 35           | Typed facts           | Domain rewrite         | Accepted                | Accepted                  | Deferred where applicable | decision 0110 |
+| Wrapper/filter replacement     | Typed constructors/adapters                                                                         | Dynamic registry                           | Keeps capability without global strings           | Wrappers/filters             | Domain owners  | Required          | 36a+      | 31, 35       | Composition           | Adapter/domain rewrite | Accepted                | Accepted                  | Deferred where applicable | decision 0110 |
+| Compression adapters           | Typed reader/writer adapters                                                                        | URL/filter strings                         | Streaming compression                             | zlib wrapper/filter          | Adapter        | Recommended       | after 36a | 35           | Codec state           | Adapter rewrite        | Accepted                | Accepted                  | Deferred where applicable | decision 0110 |
+| Encoding adapters              | Explicit byte/text converters                                                                       | Implicit locale conversion                 | Preserves UTF-8 invariant                         | conversion filters           | Adapter        | Recommended       | after 36a | Bytes        | Codec state           | Adapter rewrite        | Accepted                | Accepted                  | Deferred where applicable | decision 0110 |
+| TLS adapter boundary           | Network-owned typed upgrade/config                                                                  | SSL context bag                            | Secure duplex streams                             | crypto/socket contexts       | `Net`          | Recommended       | 44        | 36a, 37/38   | TLS state             | Domain rewrite         | Accepted                | Accepted                  | Deferred where applicable | decision 0110 |
+| Sync/async stream unification  | One ownership/result/readiness model                                                                | Async-specific streams                     | Avoids two incompatible stacks                    | Non-blocking streams         | `Io`           | Required          | 36a–39  | 37 design    | Await integration     | Direct typed rewrite   | Accepted                | Accepted                  | Deferred where applicable | decision 0110 |
+| Terminal integration           | Reuse readiness/devices; keep decoding in `Console`                                                 | Terminal-specific polling core             | Portable key/resize input                         | Readline/TTY                 | `Term`         | Required          | 46        | 36a          | Raw/event backends    | Domain rewrite         | Accepted                | Accepted                  | Deferred where applicable | decision 0110 |
+| Network integration            | Reuse duplex/readiness/timeouts/partial writes                                                      | Socket-specific contracts                  | Avoids parallel I/O semantics                     | Socket streams               | `Net`          | Required boundary | 44        | 36a–38     | Socket backend        | Domain rewrite         | Accepted                | Accepted                  | Deferred where applicable | decision 0110 |
 
 ## Scheduling and authority consequence
 
 - Stage 25a is complete.
 - This PHP Stream And I/O Completeness Audit is implemented.
 - Andrew's Stream API Completeness Review is complete.
-- Decision 0110 is accepted.
+- Decision 0110's semantic and performance contract is accepted.
 - Stage 26 is unblocked and next.
-- Stage 36a is scheduled, not implemented; its semantics are accepted and its
-  exact public spellings remain deferred to the decision-0110 appendix.
+- Stage 36a is scheduled, not implemented; its semantics, allocation/copy
+  constraints, reusable-buffer/byte-region model, readiness reuse, and async
+  isolation are accepted, while exact public spellings remain deferred to the
+  decision-0110 appendix. Stage 36a owns their initial benchmark and
+  memory-regression gate; Stage 43 later continues and broadens it.
 - No `BlockingMode`, read-outcome type, poller/waiter, stream interface, file
   object, process API, or first-class standard-stream spelling is executable yet.
 
 ## Invalidated elsewhere
 
 - The end-to-end plan now places Stage 36a between Stages 36 and 37 and amends
-  Stages 29, 35, 37–39, 44, 46, the phase range, and the 1.0 gate.
+  Stages 29, 35, 37–39, 43, 44, 46, the phase range, and the 1.0 gate.
 - The standard-library inventory now distinguishes current intrinsics from the
   scheduled reviewed `Io`/`Fs`/`Process`/`Net`/`Term` capability boundaries.
 - Decision 0110 supersedes this audit wherever recommendation language could be
-  mistaken for an unresolved semantic fork; candidate names remain noncanonical.
+  mistaken for an unresolved semantic or performance fork; candidate names
+  remain noncanonical.
 - The current-pipeline note now records the audit/review gate and refuses false
   implementation claims.
 - The language-server and website audits found no stale final-stream claim, so

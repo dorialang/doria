@@ -107,6 +107,19 @@ Decision 0110 supplies reusable rules for hosted resource APIs:
   are not mutable process-global settings.
 - Keep resource use bounded by default. Line/delimiter reads, capture, buffering,
   copying, and progress reporting must expose the relevant limit or policy.
+- Make steady-state reuse possible. Chunk APIs accept reusable storage and expose
+  safe readable/writable byte regions so progress does not require allocating or
+  copying an entire chunk or unread suffix on every operation.
+- Keep abstraction costs proportional to the chosen abstraction. Concrete
+  generic adapters remain statically specializable; deliberate interface
+  erasure may dispatch dynamically but does not allocate a heap object per call
+  or per adapter layer.
+- Reuse readiness registrations and event storage. Ordinary waiting neither
+  busy-polls nor creates one thread per stream, and timeout bookkeeping is
+  incurred only when timing is requested.
+- Keep asynchronous machinery isolated. A synchronous program must not start an
+  executor or allocate task/scheduler state merely because the standard library
+  also supports asynchronous I/O.
 - Separate buffer flushing from durable synchronization, and explicit
   failure-reporting cleanup from best-effort nonthrowing destruction.
 - Keep platform mechanisms behind portable contracts. File descriptors, OS
@@ -119,8 +132,9 @@ Decision 0110 supplies reusable rules for hosted resource APIs:
 - Prefer clear, fully worded Doria vocabulary over abbreviated systems jargon
   unless an accepted naming rule establishes the abbreviation.
 
-The semantic patterns are settled. Exact Stage 36a public names remain deferred
-under decision 0110 and must not be inferred from illustrative audit vocabulary.
+The semantic and performance patterns are settled. Exact Stage 36a public names
+remain deferred under decision 0110 and must not be inferred from illustrative
+audit vocabulary.
 
 ## Properties are for data
 

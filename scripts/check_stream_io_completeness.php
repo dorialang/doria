@@ -10,11 +10,12 @@ function check_stream_io_completeness(string $root): array
     $auditPath = $root . '/docs/notes/io-surface-audit.md';
     $planPath = $root . '/docs/doria-end-to-end-plan.md';
     $pipelinePath = $root . '/docs/notes/current-pipeline.md';
-    $decisionPath = $root . '/docs/decisions/0110-stream-readiness-standard-io-and-blocking-mode-model.md';
+    $decisionPath = $root . '/docs/decisions/0110-stream-readiness-standard-io-blocking-and-performance-model.md';
     $specPath = $root . '/SPEC.md';
     $stdlibPath = $root . '/docs/stdlib-reference.md';
     $apiGuidelinesPath = $root . '/docs/api-design-guidelines.md';
     $websiteGuidelinesPath = $root . '/docs/website-content-guidelines.md';
+    $performancePath = $root . '/docs/performance-and-benchmarking.md';
 
     try {
         $manifest = json_decode(
@@ -192,6 +193,7 @@ function check_stream_io_completeness(string $root): array
         'reviewDate' => '2026-08-02',
         'decisionRecord' => '0110',
         'semanticDirection' => 'accepted',
+        'performanceContract' => 'accepted',
         'publicSpellingStatus' => 'deferred',
         'stage26Blocked' => false,
         'stage26Status' => 'next',
@@ -201,6 +203,42 @@ function check_stream_io_completeness(string $root): array
     foreach ($expectedReview as $field => $expected) {
         if (($review[$field] ?? null) !== $expected) {
             $failures[] = "manifest review metadata {$field} must be " . json_encode($expected);
+        }
+    }
+
+    $performance = $manifest['performance'] ?? [];
+    if (($performance['status'] ?? null) !== 'accepted'
+        || ($performance['decisionRecord'] ?? null) !== '0110'
+        || ($performance['initialGateOwner'] ?? null) !== 'Stage 36a'
+        || ($performance['continuationOwner'] ?? null) !== 'Stage 43') {
+        $failures[] = 'manifest performance metadata must bind decision 0110, Stage 36a, and Stage 43';
+    }
+    $profileCapabilities = [];
+    foreach (($performance['profiles'] ?? []) as $profileIndex => $profile) {
+        if (!is_array($profile) || empty($profile['name']) || empty($profile['capabilities'])) {
+            $failures[] = "manifest performance profile {$profileIndex} lacks a name or capabilities";
+            continue;
+        }
+        foreach (['allocationSensitivity', 'copySensitivity', 'partialProgress', 'reusableBufferRequirement', 'readinessReuse', 'backpressureRequirement', 'asyncCostIsolation'] as $field) {
+            if (empty($profile[$field])) {
+                $failures[] = "manifest performance profile {$profile['name']} lacks {$field}";
+            }
+        }
+        foreach ($profile['capabilities'] as $capability) {
+            $profileCapabilities[$capability] = true;
+        }
+    }
+    $requiredPerformanceCapabilities = [
+        'stream-operation', 'typed-operation-progress', 'bounded-streaming-copy',
+        'typed-adapter-buffer-flow', 'portable-readiness-wait',
+        'owned-child-process-and-pipes',
+    ];
+    foreach ($requiredPerformanceCapabilities as $capability) {
+        if (!isset($profileCapabilities[$capability])) {
+            $failures[] = "manifest performance profiles do not cover {$capability}";
+        }
+        if (!array_filter($rows, static fn(mixed $row): bool => is_array($row) && ($row['doriaCapability'] ?? null) === $capability)) {
+            $failures[] = "manifest performance profile names unknown capability {$capability}";
         }
     }
 
@@ -238,6 +276,7 @@ function check_stream_io_completeness(string $root): array
     $stdlib = (string) file_get_contents($stdlibPath);
     $apiGuidelines = (string) file_get_contents($apiGuidelinesPath);
     $websiteGuidelines = (string) file_get_contents($websiteGuidelinesPath);
+    $performanceAuthority = (string) file_get_contents($performancePath);
     foreach ([
         '# PHP Stream And I/O Completeness Audit',
         'supersedes the previous partial completeness scope',
@@ -245,7 +284,9 @@ function check_stream_io_completeness(string $root): array
         '## PHP migration ledger',
         '## Designer review table',
         'Andrew approved these recommendations on 2026-08-02',
-        'Semantic status | Public spelling status | Authority |',
+        'Performance constraints',
+        'Semantic status',
+        'Public spelling status',
         'Stage 26 is unblocked and next',
         'Stage 36a is scheduled, not implemented',
     ] as $required) {
@@ -262,9 +303,9 @@ function check_stream_io_completeness(string $root): array
     }
     foreach ([
         'Stage 37 must consume Stage 36a readiness',
-        'Stage 44 builds on Stage 36a duplex streams, readiness, timeouts, partial writes, cancellation, backpressure, and async integration',
+        'Stage 44 builds on Stage 36a duplex streams, readiness, timeouts, partial writes, cancellation, backpressure, reusable buffers/byte regions, readiness reuse, and async-cost isolation',
         'Stage 46 reuses Stage 36a standard-stream views, readiness, blocking substrate, timeout/deadline integration, cancellation, and platform-device abstraction',
-        'Decision 0110: stream, readiness, standard I/O, and blocking-mode model',
+        'Decision 0110: stream, readiness, standard I/O, blocking-mode, and performance model',
         'Stage 26 — Remaining collection family.',
         'Stage 26 — Next',
         'Stage 36a Public Spellings — Deferred',
@@ -277,7 +318,7 @@ function check_stream_io_completeness(string $root): array
     foreach ([
         'PHP Stream And I/O Completeness Audit — Implemented',
         'Andrew’s Stream API Completeness Review — Complete',
-        'Stream, Readiness, Standard I/O, And Blocking-Mode Model — Accepted (decision 0110)',
+        'Stream, Readiness, Standard I/O, Blocking Mode, And Performance Model — Accepted (decision 0110)',
         'Stage 26 — Next',
         'Stage 36a — Scheduled',
         'Stage 36a Public Spellings — Deferred',
@@ -294,7 +335,7 @@ function check_stream_io_completeness(string $root): array
     }
 
     $decisionHeadings = [
-        '# Decision 0110: Stream, Readiness, Standard I/O, And Blocking-Mode Model',
+        '# Decision 0110: Stream, Readiness, Standard I/O, Blocking Mode, And Performance Model',
         '- **Status:** Accepted',
         '## Context', '## Decision', '## Core Stream Architecture',
         '## Ownership And Lifetime', '## First-Class Standard Streams',
@@ -302,6 +343,10 @@ function check_stream_io_completeness(string $root): array
         '## Readiness', '## Timeouts, Deadlines, And Cancellation',
         '## Buffering And Text', '## Files', '## Child Processes And Pipes',
         '## Typed Adapters And Domain Ownership', '## Cross-Domain I/O Unification',
+        '## Performance And Memory Contract',
+        '## Reusable Buffer And Byte-Region Requirement',
+        '## Dispatch And Specialization', '## Readiness Efficiency',
+        '## Async Cost Isolation', '## Benchmark And Regression Requirements',
         '## Stage Boundaries', '## Deferred Public Spellings',
         '## Reopening Rules', '## Consequences', '## Invalidated Elsewhere',
     ];
@@ -335,6 +380,28 @@ function check_stream_io_completeness(string $root): array
             $failures[] = "decision 0110: missing accepted semantic rule {$semantic}";
         }
     }
+    $decisionPerformance = [
+        'without allocating on every iteration',
+        'must not require allocation by design',
+        'Common data, would-block, EOF, timeout, partial-progress, readable, writable, and closure outcomes use compact inline representations',
+        'must support reusable caller-owned or adapter-owned byte storage',
+        'must not construct a second buffer merely to return progress',
+        'rather than allocating and copying an unwritten suffix',
+        'retain monomorphization, inlining, devirtualization, and static-dispatch opportunities',
+        'Dynamic dispatch remains valid for genuine runtime heterogeneity or deliberate type erasure',
+        'Stable watched sets reuse registration storage, event storage, platform handles, and watcher identity',
+        'one thread per watched stream are rejected as the ordinary model',
+        'Backpressure is bounded',
+        'does not initialize an executor, worker pool, timer wheel, async task allocator, readiness thread, or async cancellation registry',
+        'UTF-8 adapters validate incrementally',
+        'Stage 36a owns its first performance acceptance gate',
+        'Stage 43 incorporates and extends this suite',
+    ];
+    foreach ($decisionPerformance as $constraint) {
+        if (!str_contains($decision, $constraint)) {
+            $failures[] = "decision 0110: missing accepted performance constraint {$constraint}";
+        }
+    }
     $deferralRules = [
         'before Stage 36a implementation begins',
         'Reopen in `Doria\\Std\\Fs` design',
@@ -359,7 +426,7 @@ function check_stream_io_completeness(string $root): array
     }
     foreach ([
         'small readable/writable/duplex/seekable/flushable/blocking/readiness capabilities',
-        'Stage 36a scheduled and not implemented; semantics accepted, public spellings deferred',
+        'Stage 36a scheduled and not implemented; semantics and performance contract accepted, public spellings deferred',
     ] as $required) {
         if (!str_contains($stdlib, $required)) {
             $failures[] = "docs/stdlib-reference.md: missing {$required}";
@@ -369,6 +436,8 @@ function check_stream_io_completeness(string $root): array
         'Prefer small capability interfaces over universal god objects',
         'Use typed outcomes for ordinary state',
         'Keep resource use bounded by default',
+        'Make steady-state reuse possible',
+        'Keep asynchronous machinery isolated',
     ] as $required) {
         if (!str_contains($apiGuidelines, $required)) {
             $failures[] = "docs/api-design-guidelines.md: missing {$required}";
@@ -379,9 +448,24 @@ function check_stream_io_completeness(string $root): array
         'Never downgrade target-state documentation or playground examples',
         'Do not invent exact API spellings',
         'A current compiler failure against a valid target-state example is UAT evidence',
+        'Performance copy must reflect an accepted target-state contract',
     ] as $required) {
         if (!str_contains($websiteGuidelines, $required)) {
             $failures[] = "docs/website-content-guidelines.md: missing {$required}";
+        }
+    }
+
+    foreach ([
+        '## 10. Stage 36a stream performance gate',
+        'large streaming file copy',
+        'non-blocking pipe transfer',
+        'synchronous startup proving zero executor/task/scheduler initialization',
+        'equivalent direct OS, C, or Rust baseline',
+        'Ordinary CI enforces deterministic structural invariants',
+        'Timing thresholds run on curated, controlled runners',
+    ] as $required) {
+        if (!str_contains($performanceAuthority, $required)) {
+            $failures[] = "docs/performance-and-benchmarking.md: missing {$required}";
         }
     }
 

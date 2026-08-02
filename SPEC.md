@@ -894,7 +894,26 @@ buffer flush, durable data synchronization, and full synchronization are
 distinct. Owned child processes expose typed pipes and require concurrent,
 bounded stdout/stderr drainage.
 
-Stage 36a is scheduled and not implemented. Exact public interface, member,
+The steady-state stream data plane does not require an allocation per read,
+write, readiness event, adapter hop, or loop iteration. Chunk operations expose
+reusable caller- or adapter-owned storage and safe readable/writable byte
+regions; successful progress reports the initialized or consumed extent without
+copying a whole chunk or unread suffix. Text decoding is incremental, buffering
+is bounded, and backpressure prevents an unbounded producer queue. Static
+generic adapters remain eligible for specialization and inlining; deliberate
+interface erasure may use dynamic dispatch but does not require a heap object per
+call or layer.
+
+Readiness implementations reuse registration and platform event storage rather
+than rebuilding them on every wait, and ordinary operation does not busy-poll or
+allocate one thread per stream. Timing support is opt-in per operation or wait.
+Synchronous programs do not initialize async executors, task objects, or async
+scheduler infrastructure. Stage 36a owns the initial cross-platform stream
+performance and memory regression gate defined by decision 0110; Stage 43
+continues and broadens the benchmark suite rather than postponing that gate.
+
+Stage 36a is scheduled and not implemented. The semantic and performance
+contracts are accepted. Exact public interface, member,
 outcome-case, readiness, standard-stream, file, adapter, and process spellings
 remain deferred under decision 0110; the accepted semantics above do not.
 
