@@ -75,7 +75,11 @@ The accepted project-tool name is Baton. Baton is the planned user-facing projec
   raw tool output, Rust panic text, or backtraces by default.
 - Preserve the ability to lower Doria to native code safely, even if the immediate task only touches frontend code or a compatibility backend.
 - Do not silently rename or replace Baton.
-- Do not claim Baton is implemented until it exists.
+- Do not claim Baton is implemented in compiler status, pipeline, or direct
+  compiler documentation until it exists. This is not a website-content rule:
+  `doria-website` is the completed-language BDD/UAT authority and must present
+  Baton as the finished public project tool. Never downgrade that target-state
+  website or its examples to match current implementation lag.
 - Do not turn Baton into a separate compiler or semantic authority.
 - Do not present `doriac check` as a mandatory public workflow stage.
 - Public onboarding uses write/build/run.

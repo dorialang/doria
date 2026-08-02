@@ -7,6 +7,8 @@ function check_stream_io_completeness(string $root): array
 {
     $failures = [];
     $manifestPath = $root . '/docs/notes/php-stream-capability-inventory.json';
+    $agentsPath = $root . '/AGENTS.md';
+    $readmePath = $root . '/README.md';
     $auditPath = $root . '/docs/notes/io-surface-audit.md';
     $planPath = $root . '/docs/doria-end-to-end-plan.md';
     $pipelinePath = $root . '/docs/notes/current-pipeline.md';
@@ -269,6 +271,8 @@ function check_stream_io_completeness(string $root): array
     }
 
     $auditText = (string) file_get_contents($auditPath);
+    $agents = (string) file_get_contents($agentsPath);
+    $readme = (string) file_get_contents($readmePath);
     $plan = (string) file_get_contents($planPath);
     $pipeline = (string) file_get_contents($pipelinePath);
     $decision = (string) file_get_contents($decisionPath);
@@ -454,12 +458,27 @@ function check_stream_io_completeness(string $root): array
             $failures[] = "docs/website-content-guidelines.md: missing {$required}";
         }
     }
+    foreach ([
+        '`doria-website` is the completed-language BDD/UAT authority',
+        'Never downgrade that target-state',
+        'website or its examples to match current implementation lag',
+    ] as $required) {
+        if (!str_contains($agents, $required)) {
+            $failures[] = "AGENTS.md: missing website target-state boundary {$required}";
+        }
+    }
 
     foreach ([
         '## 10. Stage 36a stream performance gate',
+        '- compile time',
         'large streaming file copy',
         'non-blocking pipe transfer',
         'synchronous startup proving zero executor/task/scheduler initialization',
+        '- generic specialization count',
+        '- runtime library growth',
+        '- development binary size',
+        '- release binary size',
+        '- stripped binary size',
         'equivalent direct OS, C, or Rust baseline',
         'Ordinary CI enforces deterministic structural invariants',
         'Timing thresholds run on curated, controlled runners',
@@ -469,14 +488,29 @@ function check_stream_io_completeness(string $root): array
         }
     }
 
-    foreach ([
+    $activeAuthorities = [
+        'AGENTS.md' => $agents,
+        'README.md' => $readme,
+        'SPEC.md' => $spec,
+        'docs/doria-end-to-end-plan.md' => $plan,
+        'docs/notes/current-pipeline.md' => $pipeline,
+        'docs/decisions/0110-stream-readiness-standard-io-blocking-and-performance-model.md' => $decision,
+        'docs/stdlib-reference.md' => $stdlib,
+        'docs/api-design-guidelines.md' => $apiGuidelines,
+        'docs/website-content-guidelines.md' => $websiteGuidelines,
+        'docs/performance-and-benchmarking.md' => $performanceAuthority,
+    ];
+    $staleReviewStates = [
         "Andrew’s Stream API Completeness Review — Next",
         'Stage 26 — Blocked Pending Review',
         'Stage 36a Public Surface — Pending Review',
         'unauthored **Stream, Readiness, Standard I/O, And Blocking-Mode Model**',
-    ] as $stale) {
-        if (str_contains($plan, $stale) || str_contains($pipeline, $stale) || str_contains($stdlib, $stale)) {
-            $failures[] = "active authority retains stale stream-review state {$stale}";
+    ];
+    foreach ($activeAuthorities as $path => $authority) {
+        foreach ($staleReviewStates as $stale) {
+            if (str_contains($authority, $stale)) {
+                $failures[] = "{$path}: active authority retains stale stream-review state {$stale}";
+            }
         }
     }
 

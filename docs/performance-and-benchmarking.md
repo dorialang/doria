@@ -274,6 +274,7 @@ The gate records these metrics where the host platform can measure them
 reliably:
 
 ```text
+- compile time
 - cold startup
 - throughput and latency distribution
 - wall, user, and system time
@@ -281,7 +282,11 @@ reliably:
 - allocation count and allocated bytes
 - syscall count
 - bytes copied by the stream/adapter path
-- binary and stripped-binary size
+- generic specialization count
+- runtime library growth
+- development binary size
+- release binary size
+- stripped binary size
 - output correctness hash
 ```
 
