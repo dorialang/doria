@@ -27,9 +27,15 @@ Documentation role: working note. This file prevents duplicated in-flight work. 
   Capabilities are preserved through typed owners or explicit deferrals without
   accepting PHP resources, dynamic wrapper/filter registries, global contexts,
   mixed metadata bags, or sentinel outcomes.
-- Stage 36a — Scheduled. Stage 36a Public Surface — Pending Review. **Stage 36a is scheduled, not implemented**: no stream interface, blocking-mode type,
+- Andrew’s Stream API Completeness Review — Complete. Stream, Readiness, Standard I/O, And Blocking-Mode Model — Accepted (decision 0110). The semantic model is fixed: small byte
+  capabilities, owned handles, typed outcomes, first-class non-owning standard
+  streams, one readiness/time/cancellation/backpressure substrate, and typed
+  domain adapters.
+- Stage 36a — Scheduled. Stage 36a Public Spellings — Deferred. **Stage 36a — Not Implemented**: no stream interface, blocking-mode type,
   non-blocking result, readiness waiter, file handle, process API, or first-class
-  standard-stream accessor is currently executable.
+  standard-stream accessor is currently executable. Exact names reopen through
+  decision 0110's bounded appendix before implementation, without reopening the
+  accepted architecture.
 - The parser accepts generalized `parent::member()` and trait-local `self::member` under the two-clocks rule; semantic checking names Stage 34 and Stage 35 respectively and stops those forms before MIR. `Foo::$prop` and `static::` are permanent errors with precise fixes.
 - Native remains one target: direct compile/run uses the Cranelift fast profile, while `--release` selects LLVM 18 over the same validated typed MIR.
 - Ordinary expression interpolation of primitive/string values lowers through the existing ordered MIR string and display operations consumed by all three execution paths.
@@ -96,9 +102,8 @@ Documentation role: working note. This file prevents duplicated in-flight work. 
 
 ## Next
 
-- Andrew’s Stream API Completeness Review — Next.
-- Stage 26 — Blocked Pending Review. The block lasts only until Andrew completes
-  the audit review; Stage 26 remains the next implementation stage afterward.
+- Stage 26 — Next. The stream review is complete and no longer blocks the
+  remaining collection-family implementation.
 
 ## Do not duplicate
 

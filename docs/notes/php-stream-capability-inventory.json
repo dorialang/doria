@@ -46,6 +46,17 @@
             "totalRows": 153
         }
     },
+    "review": {
+        "status": "approved",
+        "reviewDate": "2026-08-02",
+        "decisionRecord": "0110",
+        "semanticDirection": "accepted",
+        "publicSpellingStatus": "deferred",
+        "stage26Blocked": false,
+        "stage26Status": "next",
+        "stage36aStatus": "scheduled",
+        "stage36aImplemented": false
+    },
     "officialInventory": {
         "streamFunctions": [
             "stream_bucket_append",
@@ -350,23 +361,26 @@
             "eofRelevant": false,
             "wouldBlockRelevant": false,
             "platformConstraints": [],
-            "doriaClassification": "Unresolved Design Fork",
+            "doriaClassification": "Rejected Global Configuration",
             "doriaOwner": "Domain Configuration Types",
             "doriaCapability": "explicit-typed-configuration",
             "doriaCandidateSpelling": null,
-            "doriaStatus": "unresolved",
-            "v1Recommendation": "Unresolved",
+            "semanticStatus": "accepted",
+            "publicSpellingStatus": "deferred",
+            "decisionRecord": "0110",
+            "doriaStatus": "rejected",
+            "v1Recommendation": "Rejected PHP Shape",
             "landingStage": "36a",
             "dependencies": [
                 "Stage 29",
                 "Stage 35"
             ],
-            "migrationAction": "Requires Human Review",
+            "migrationAction": "Rewrite Through Domain Module",
             "byteTextSemantics": "configuration",
             "semanticDifferences": [
                 "String-keyed context bags become explicit typed configuration"
             ],
-            "designerDecisionRequired": true,
+            "designerDecisionRequired": false,
             "aliasOf": null,
             "replacementCapabilities": [
                 "Typed File Options",
@@ -423,23 +437,26 @@
             "eofRelevant": false,
             "wouldBlockRelevant": false,
             "platformConstraints": [],
-            "doriaClassification": "Unresolved Design Fork",
+            "doriaClassification": "Rejected Global Configuration",
             "doriaOwner": "Domain Configuration Types",
             "doriaCapability": "explicit-typed-configuration",
             "doriaCandidateSpelling": null,
-            "doriaStatus": "unresolved",
-            "v1Recommendation": "Unresolved",
+            "semanticStatus": "accepted",
+            "publicSpellingStatus": "deferred",
+            "decisionRecord": "0110",
+            "doriaStatus": "rejected",
+            "v1Recommendation": "Rejected PHP Shape",
             "landingStage": "36a",
             "dependencies": [
                 "Stage 29",
                 "Stage 35"
             ],
-            "migrationAction": "Requires Human Review",
+            "migrationAction": "Rewrite Through Domain Module",
             "byteTextSemantics": "configuration",
             "semanticDifferences": [
                 "String-keyed context bags become explicit typed configuration"
             ],
-            "designerDecisionRequired": true,
+            "designerDecisionRequired": false,
             "aliasOf": null,
             "replacementCapabilities": [
                 "Typed File Options",
@@ -461,23 +478,26 @@
             "eofRelevant": false,
             "wouldBlockRelevant": false,
             "platformConstraints": [],
-            "doriaClassification": "Unresolved Design Fork",
+            "doriaClassification": "Rejected Global Configuration",
             "doriaOwner": "Domain Configuration Types",
             "doriaCapability": "explicit-typed-configuration",
             "doriaCandidateSpelling": null,
-            "doriaStatus": "unresolved",
-            "v1Recommendation": "Unresolved",
+            "semanticStatus": "accepted",
+            "publicSpellingStatus": "deferred",
+            "decisionRecord": "0110",
+            "doriaStatus": "rejected",
+            "v1Recommendation": "Rejected PHP Shape",
             "landingStage": "36a",
             "dependencies": [
                 "Stage 29",
                 "Stage 35"
             ],
-            "migrationAction": "Requires Human Review",
+            "migrationAction": "Rewrite Through Domain Module",
             "byteTextSemantics": "configuration",
             "semanticDifferences": [
                 "String-keyed context bags become explicit typed configuration"
             ],
-            "designerDecisionRequired": true,
+            "designerDecisionRequired": false,
             "aliasOf": null,
             "replacementCapabilities": [
                 "Typed File Options",
@@ -534,23 +554,26 @@
             "eofRelevant": false,
             "wouldBlockRelevant": false,
             "platformConstraints": [],
-            "doriaClassification": "Unresolved Design Fork",
+            "doriaClassification": "Rejected Global Configuration",
             "doriaOwner": "Domain Configuration Types",
             "doriaCapability": "explicit-typed-configuration",
             "doriaCandidateSpelling": null,
-            "doriaStatus": "unresolved",
-            "v1Recommendation": "Unresolved",
+            "semanticStatus": "accepted",
+            "publicSpellingStatus": "deferred",
+            "decisionRecord": "0110",
+            "doriaStatus": "rejected",
+            "v1Recommendation": "Rejected PHP Shape",
             "landingStage": "36a",
             "dependencies": [
                 "Stage 29",
                 "Stage 35"
             ],
-            "migrationAction": "Requires Human Review",
+            "migrationAction": "Rewrite Through Domain Module",
             "byteTextSemantics": "configuration",
             "semanticDifferences": [
                 "String-keyed context bags become explicit typed configuration"
             ],
-            "designerDecisionRequired": true,
+            "designerDecisionRequired": false,
             "aliasOf": null,
             "replacementCapabilities": [
                 "Typed File Options",
@@ -572,23 +595,26 @@
             "eofRelevant": false,
             "wouldBlockRelevant": false,
             "platformConstraints": [],
-            "doriaClassification": "Unresolved Design Fork",
+            "doriaClassification": "Rejected Global Configuration",
             "doriaOwner": "Domain Configuration Types",
             "doriaCapability": "explicit-typed-configuration",
             "doriaCandidateSpelling": null,
-            "doriaStatus": "unresolved",
-            "v1Recommendation": "Unresolved",
+            "semanticStatus": "accepted",
+            "publicSpellingStatus": "deferred",
+            "decisionRecord": "0110",
+            "doriaStatus": "rejected",
+            "v1Recommendation": "Rejected PHP Shape",
             "landingStage": "36a",
             "dependencies": [
                 "Stage 29",
                 "Stage 35"
             ],
-            "migrationAction": "Requires Human Review",
+            "migrationAction": "Rewrite Through Domain Module",
             "byteTextSemantics": "configuration",
             "semanticDifferences": [
                 "String-keyed context bags become explicit typed configuration"
             ],
-            "designerDecisionRequired": true,
+            "designerDecisionRequired": false,
             "aliasOf": null,
             "replacementCapabilities": [
                 "Typed File Options",
@@ -610,23 +636,26 @@
             "eofRelevant": false,
             "wouldBlockRelevant": false,
             "platformConstraints": [],
-            "doriaClassification": "Unresolved Design Fork",
+            "doriaClassification": "Rejected Global Configuration",
             "doriaOwner": "Domain Configuration Types",
             "doriaCapability": "explicit-typed-configuration",
             "doriaCandidateSpelling": null,
-            "doriaStatus": "unresolved",
-            "v1Recommendation": "Unresolved",
+            "semanticStatus": "accepted",
+            "publicSpellingStatus": "deferred",
+            "decisionRecord": "0110",
+            "doriaStatus": "rejected",
+            "v1Recommendation": "Rejected PHP Shape",
             "landingStage": "36a",
             "dependencies": [
                 "Stage 29",
                 "Stage 35"
             ],
-            "migrationAction": "Requires Human Review",
+            "migrationAction": "Rewrite Through Domain Module",
             "byteTextSemantics": "configuration",
             "semanticDifferences": [
                 "String-keyed context bags become explicit typed configuration"
             ],
-            "designerDecisionRequired": true,
+            "designerDecisionRequired": false,
             "aliasOf": null,
             "replacementCapabilities": [
                 "Typed File Options",
@@ -1113,23 +1142,26 @@
             "eofRelevant": false,
             "wouldBlockRelevant": false,
             "platformConstraints": [],
-            "doriaClassification": "Unresolved Design Fork",
+            "doriaClassification": "Deferred Post-v1",
             "doriaOwner": "Operation-Specific Progress API",
             "doriaCapability": "typed-operation-progress",
             "doriaCandidateSpelling": null,
-            "doriaStatus": "unresolved",
-            "v1Recommendation": "Unresolved",
-            "landingStage": "44",
+            "semanticStatus": "accepted",
+            "publicSpellingStatus": "deferred",
+            "decisionRecord": "0110",
+            "doriaStatus": "deferred",
+            "v1Recommendation": "Deferred",
+            "landingStage": "Operation-specific review",
             "dependencies": [
                 "Stage 30",
                 "Stage 36a"
             ],
-            "migrationAction": "Requires Human Review",
+            "migrationAction": "Deferred Until Named Stage",
             "byteTextSemantics": "metadata",
             "semanticDifferences": [
                 "Callback event codes become typed domain progress events"
             ],
-            "designerDecisionRequired": true,
+            "designerDecisionRequired": false,
             "aliasOf": null,
             "replacementCapabilities": [],
             "notes": ""
@@ -5596,4 +5628,3 @@
         }
     ]
 }
-

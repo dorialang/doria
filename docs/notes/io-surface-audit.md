@@ -1,15 +1,15 @@
 # PHP Stream And I/O Completeness Audit
 
-> Documentation role: working design artifact for Andrew's review. This is a
-> capability-completeness and scheduling audit, not a decision record and not an
-> implementation. Candidate spellings are illustrative only. The eventual
-> **Stream, Readiness, Standard I/O, And Blocking-Mode Model** decision must
-> settle the public surface before Stage 36a begins.
+> Documentation role: completed capability-completeness audit and supporting
+> context for accepted decision 0110. This is not an implementation. Candidate
+> spellings remain illustrative only; decision 0110 accepts the architecture and
+> defers exact public spellings through its bounded appendix process.
 
 This expanded audit **supersedes the previous partial completeness scope** while
 preserving its accepted results, historical snapshots, Q1–Q6 reasoning, derived
-findings, and decision references below. It does not silently ratify any open
-recommendation. The machine-checkable companion ledger is
+findings, and decision references below. Andrew approved all thirteen
+architecture recommendations on 2026-08-02; decision 0110 is authoritative for
+their semantics. The machine-checkable companion ledger is
 `php-stream-capability-inventory.json`; `scripts/check_stream_io_completeness.php`
 proves the stored official inventory remains complete without network access.
 
@@ -35,6 +35,18 @@ returns. Doria preserves useful capabilities while replacing those shapes with
 owned typed values, checked errors, explicit outcomes, capability contracts, and
 domain modules.
 
+## Approval resolution — 2026-08-02
+
+Andrew approved all 13 consolidated recommendations. Every load-bearing semantic
+stream decision raised by the review is settled in decision 0110. The remaining
+deferrals concern public spelling and the named dependent domains. Stage 26 is
+unblocked. Stage 36a remains scheduled rather than implemented.
+
+This resolution does not rewrite the audit as though the recommendations had
+always been accepted. The alternatives, reasoning, and historical partial audit
+remain below; decision 0110 is authoritative where their earlier review language
+is now stale.
+
 ## Existing Doria I/O substrate (verified, not newly implemented)
 
 | Layer | Current fact |
@@ -59,8 +71,9 @@ domain modules.
 3. Interfaces expose only the capability required by the caller. Readability
    does not imply writing, seeking, truncating, locking, mode mutation, or socket
    metadata.
-4. Non-blocking reads distinguish data, would-block, and EOF. Non-blocking writes
-   report partial progress. Exact enum/result names remain unresolved.
+4. Non-blocking reads distinguish data, would-block, EOF, and timeout.
+   Non-blocking writes report partial progress. Exact enum/result names remain
+   deferred under decision 0110.
 5. Readiness precedes async. Stage 37 consumes one Stage 36a readiness,
    ownership, timeout/deadline, backpressure, and process-pipe model.
 6. First-class standard streams are a v1 design requirement unless review finds
@@ -77,10 +90,12 @@ domain modules.
 Stream handles are owned move values by default; readonly/writable borrows grant
 only their declared access, and `take` transfers the close obligation. Normal
 scope exit and checked-error propagation close through deterministic destruction.
-Close semantics, idempotence, explicit early close, duplication, half-shutdown,
-use-after-close diagnostics, destructor failure, and whether buffered destruction
-may surface errors require the stream decision. Abort-only panic runs no cleanup;
-buffered data may therefore be lost, and the design must not promise otherwise.
+Explicit close/finish consumes the handle and reports checked failure; repeat use
+is a compile-time error. Destructor cleanup is best-effort and nonthrowing.
+Adapters own their underlying handle unless explicitly constructed as borrowing.
+Half-shutdown remains a duplex/process/network capability. Abort-only panic runs
+no cleanup; buffered data may therefore be lost, and the design must not promise
+otherwise.
 
 ### 2. Read semantics
 
@@ -103,8 +118,8 @@ half-close is a duplex/network/process capability rather than ordinary close.
 ### 4. Seeking and position
 
 Seek from start/current/end, tell, rewind, truncate, length, sparse-file behavior,
-and unsupported seek are preserved. Review should prefer a seekable capability
-contract so a forward-only pipe cannot advertise seeking; platform/filesystem
+and unsupported seek are preserved through a seekable capability contract, so a
+forward-only pipe cannot advertise seeking; platform/filesystem
 failures still use checked errors. Open-handle operations belong to `Io`; path
 namespace metadata belongs to `Fs`.
 
@@ -112,27 +127,28 @@ namespace metadata belongs to `Fs`.
 
 Blocking control is a real, platform-dependent capability, not a cosmetic flag.
 It belongs to a capable stream value/interface, never a global
-`stream_set_blocking` clone. A typed mode enum is recommended over a boolean;
-alternatives are separate blocking/non-blocking types or construction-only mode.
-Runtime mutation is useful for pipes, sockets, standard streams, and terminal
-handles but is not uniformly meaningful for local files. The illustrative
-`setBlockingMode(BlockingMode::NonBlocking)` spelling remains unapproved.
+`stream_set_blocking` clone. The current mode is readable and runtime mutation
+uses a named typed state only where the capability and platform support it;
+unsupported transitions are checked failures. Buffers coordinate mode changes.
+The illustrative `setBlockingMode(BlockingMode::NonBlocking)` spelling remains
+noncanonical because exact names are deferred.
 
 ### 6. Readiness and polling
 
 One portable readiness substrate covers readable/writable readiness, exceptional
 closure, immediate poll, finite/indefinite wait, multiple handles, fairness,
 spurious readiness, cancellation, and deadlines. `select`, `poll`, `epoll`,
-`kqueue`, and IOCP remain backend vocabulary. Review must choose whether one-
-stream conveniences derive from a multi-stream waiter or both are public, while
-preserving level/edge-trigger implementation freedom.
+`kqueue`, and IOCP remain backend vocabulary. A multi-stream core is
+authoritative; public one-stream conveniences may derive from it. Readiness is
+advisory, preserving level/edge-trigger implementation freedom.
 
 ### 7. Timeouts and deadlines
 
 Connection, accept, read, write, idle, overall-operation, and readiness-wait
-timing are separate facts. A single ambiguous stream timeout is rejected. Review
-must decide `Duration`, `Deadline`, or both with `Doria\Std\Time`; finite waits
-must compose with cancellation without inventing an async-only timing model.
+timing are separate facts. A single ambiguous stream timeout is rejected.
+Durations and absolute deadlines are both accepted, apply per operation or wait,
+and compose with one cancellation model. Exact `Doria\Std\Time` spellings remain
+deferred to their owner.
 
 ### 8. Buffering
 
@@ -147,8 +163,8 @@ buffers, while structured exits follow the accepted close/flush error contract.
 Doria `string` remains valid UTF-8. A UTF-8 text reader/writer, bounded line and
 delimiter readers, CRLF/LF policy, invalid-encoding checked errors, and explicit
 other-encoding conversion sit above byte streams. Generic network/process bytes
-never pass through `string` implicitly. Maximum line length and allocation policy
-are mandatory designer decisions.
+never pass through `string` implicitly. Line and delimiter reads are bounded;
+the exact limit/configuration spelling remains deferred.
 
 ### 10. Stream copying
 
@@ -156,7 +172,8 @@ The PHP copy capability becomes bounded streaming copy between readable and
 writable contracts, not a whole-input allocation. It handles partial writes,
 backpressure, cancellation, progress, maximum bytes, buffer reuse, EOF, and
 independent source/destination failures. Copy-to-end and bounded-copy are required
-v1 compositions; progress callback shape remains a review item.
+v1 compositions. Progress reporting is deferred until the first operation or
+adapter that needs it and must then be typed and operation-local.
 
 ### 11. Files
 
@@ -164,15 +181,16 @@ The v1 file surface needs typed open modes (read/write/append/create/create-new/
 truncate), byte reads/writes, seek/tell, flush, durable data/full sync, close,
 length/open-handle metadata, advisory locks, and temporary files. Permissions and
 platform differences are explicit. Namespace/path operations stay in `Fs`; the
-`Path` value-type question remains open and is not silently settled here.
+exact `Path` representation is safely deferred to the filesystem design, and
+Stage 36a must preserve typed-path evolution.
 
 ### 12. Standard streams
 
-Stdin/stdout/stderr become first-class borrowed or otherwise non-owning views over
-the same runtime devices used by existing intrinsics. Review must settle accessor
-names, borrowing, close permission, blocking control, buffering, injection for
-tests, and redirection. User code should not accidentally invalidate process-wide
-intrinsics by closing a shared standard device. Per-stream write order remains
+Stdin/stdout/stderr become first-class non-owning, nonclosable views over the same
+runtime devices used by existing intrinsics. They may be stored, passed, wrapped,
+redirected, and injected for tests through that same model. Mode mutation needs
+exclusive control and a restoring guard. Exact accessor names remain deferred.
+Per-stream write order remains
 exact; independent stdout/stderr handles do not create a reconstructable global
 order unless explicitly merged.
 
@@ -181,8 +199,9 @@ order unless explicitly merged.
 `Doria\Std\Process` owns a child and typed stdin/stdout/stderr pipe values. The
 model needs half-close, wait, termination, exit status, output limits, timeouts,
 non-blocking mode, and readiness. Stdout and stderr must be drained concurrently
-to avoid the classic full-pipe deadlock. Ownership determines whether dropping a
-child waits, detaches, terminates, or only releases handles; review must settle it.
+and capture must be bounded to avoid deadlock or unbounded memory. An active child
+must be resolved explicitly by wait, detach, or terminate; destruction does not
+silently choose. Direct and shell invocation remain separate typed operations.
 
 ### 14. Networking boundary
 
@@ -219,8 +238,9 @@ and stream kind. Doria does not expose `Dictionary<string, mixed>` metadata.
 
 Files preserve shared/exclusive advisory lock, non-blocking try-lock, unlock, and
 unsupported-lock behavior. A typed RAII lock guard is recommended over integer
-flag combinations so release is deterministic. Exact guard ownership and whether
-lock support is static or checked dynamically remain review items.
+flag combinations so release is deterministic. Non-blocking acquisition uses a
+typed outcome, and unsupported locking is a capability/checked-failure fact rather
+than a flag or sentinel.
 
 ### 19. Async integration
 
@@ -235,22 +255,22 @@ contract.
 
 | Capability | Recommendation | Candidate API status | Landing |
 |---|---|---|---|
-| Readable, writable, duplex, seekable contracts | Required For v1.0 | Names unresolved | Stage 36a |
-| First-class standard streams | Required For v1.0 | Access/ownership names unresolved | Stage 36a |
-| File handles and typed open modes | Required For v1.0 | Exact types/modes unresolved | Stage 36a |
-| Read some/exact/to-end and explicit EOF | Required For v1.0 | Result spelling unresolved | Stage 36a |
-| Write some/all and partial progress | Required For v1.0 | Result spelling unresolved | Stage 36a |
-| Would-block and blocking-mode control | Required For v1.0 | Typed mode spelling unresolved | Stage 36a |
-| Readiness: one/many, immediate/finite/indefinite | Required For v1.0 | Waiter/poller shape unresolved | Stage 36a |
+| Readable, writable, duplex, seekable contracts | Required For v1.0 | Names deferred | Stage 36a |
+| First-class standard streams | Required For v1.0 | Access/ownership names deferred | Stage 36a |
+| File handles and typed open modes | Required For v1.0 | Exact types/modes deferred | Stage 36a |
+| Read some/exact/to-end and explicit EOF | Required For v1.0 | Result spelling deferred | Stage 36a |
+| Write some/all and partial progress | Required For v1.0 | Result spelling deferred | Stage 36a |
+| Would-block and blocking-mode control | Required For v1.0 | Typed mode spelling deferred | Stage 36a |
+| Readiness: one/many, immediate/finite/indefinite | Required For v1.0 | Waiter/poller shape deferred | Stage 36a |
 | Timeouts and deadlines | Required For v1.0 | Depends on `Doria\Std\Time` design | Stage 36a |
-| Buffered byte adapters | Required For v1.0 | Type names unresolved | Stage 36a |
-| UTF-8 text writer/reader and bounded line reader | Required For v1.0 | Type names unresolved | Stage 36a |
-| Streaming copy | Required For v1.0 | Operation owner unresolved | Stage 36a |
-| Temporary files and advisory locking | Recommended For v1.0 | RAII lock shape unresolved | Stage 36a |
-| Process pipes and concurrent child-output drainage | Required For v1.0 | Child ownership unresolved | Stage 36a |
+| Buffered byte adapters | Required For v1.0 | Type names deferred | Stage 36a |
+| UTF-8 text writer/reader and bounded line reader | Required For v1.0 | Type names deferred | Stage 36a |
+| Streaming copy | Required For v1.0 | Operation name deferred | Stage 36a |
+| Temporary files and advisory locking | Recommended For v1.0 | RAII lock spelling deferred | Stage 36a |
+| Process pipes and concurrent child-output drainage | Required For v1.0 | Child type/member names deferred | Stage 36a |
 | Socket readiness substrate | Required For v1.0 | Generic substrate only | Stage 36a |
-| Network/TLS adapter boundary | Recommended For v1.0 | Product surface unresolved | Stage 44 |
-| Compression and encoding adapters | Recommended For v1.0 | Typed adapter names unresolved | Review after Stage 36a |
+| Network/TLS adapter boundary | Recommended For v1.0 | Product spelling deferred | Stage 44 |
+| Compression and encoding adapters | Recommended For v1.0 | Typed adapter names deferred | Review after Stage 36a |
 | Terminal readiness integration | Required For v1.0 | Generic substrate only | Stages 36a/46 |
 | Async stream integration | Required For v1.0 | Reuses sync contracts | Stages 37–39 |
 
@@ -265,18 +285,19 @@ partial-progress, platform, dependency, alias, and semantic-difference facts liv
 in the JSON row with the same PHP name.
 
 | PHP entry | Area/kind | Capability category | Doria classification / owner | v1 / stage | Migration |
-|---|---|---|---|---|---|| `stream_bucket_append` | streams / function | filter-bucket | Rejected Resource-Oriented Shape / Doria\Std\Io | Rejected / — | Rewrite Through Adapter |
+|---|---|---|---|---|---|
+| `stream_bucket_append` | streams / function | filter-bucket | Rejected Resource-Oriented Shape / Doria\Std\Io | Rejected / — | Rewrite Through Adapter |
 | `stream_bucket_make_writeable` | streams / function | filter-bucket | Rejected Resource-Oriented Shape / Doria\Std\Io | Rejected / — | Rewrite Through Adapter |
 | `stream_bucket_new` | streams / function | filter-bucket | Rejected Resource-Oriented Shape / Doria\Std\Io | Rejected / — | Rewrite Through Adapter |
 | `stream_bucket_prepend` | streams / function | filter-bucket | Rejected Resource-Oriented Shape / Doria\Std\Io | Rejected / — | Rewrite Through Adapter |
-| `stream_context_create` | streams / function | typed-configuration | Unresolved Design Fork / Domain Configuration Types | Unresolved / 36a | Requires Human Review |
+| `stream_context_create` | streams / function | typed-configuration | Rejected Global Configuration / Domain Configuration Types | Rejected PHP Shape / 36a | Rewrite Through Domain Module |
 | `stream_context_get_default` | streams / function | global-context | Rejected Global Configuration / — | Rejected / — | No Doria Equivalent By Design |
-| `stream_context_get_options` | streams / function | typed-configuration | Unresolved Design Fork / Domain Configuration Types | Unresolved / 36a | Requires Human Review |
-| `stream_context_get_params` | streams / function | typed-configuration | Unresolved Design Fork / Domain Configuration Types | Unresolved / 36a | Requires Human Review |
+| `stream_context_get_options` | streams / function | typed-configuration | Rejected Global Configuration / Domain Configuration Types | Rejected PHP Shape / 36a | Rewrite Through Domain Module |
+| `stream_context_get_params` | streams / function | typed-configuration | Rejected Global Configuration / Domain Configuration Types | Rejected PHP Shape / 36a | Rewrite Through Domain Module |
 | `stream_context_set_default` | streams / function | global-context | Rejected Global Configuration / — | Rejected / — | No Doria Equivalent By Design |
-| `stream_context_set_option` | streams / function | typed-configuration | Unresolved Design Fork / Domain Configuration Types | Unresolved / 36a | Requires Human Review |
-| `stream_context_set_options` | streams / function | typed-configuration | Unresolved Design Fork / Domain Configuration Types | Unresolved / 36a | Requires Human Review |
-| `stream_context_set_params` | streams / function | typed-configuration | Unresolved Design Fork / Domain Configuration Types | Unresolved / 36a | Requires Human Review |
+| `stream_context_set_option` | streams / function | typed-configuration | Rejected Global Configuration / Domain Configuration Types | Rejected PHP Shape / 36a | Rewrite Through Domain Module |
+| `stream_context_set_options` | streams / function | typed-configuration | Rejected Global Configuration / Domain Configuration Types | Rejected PHP Shape / 36a | Rewrite Through Domain Module |
+| `stream_context_set_params` | streams / function | typed-configuration | Rejected Global Configuration / Domain Configuration Types | Rejected PHP Shape / 36a | Rewrite Through Domain Module |
 | `stream_copy_to_stream` | streams / function | stream-copy | Proposed Doria Std Io / Doria\Std\Io | Required For v1.0 / 36a | Direct Typed Rewrite |
 | `stream_filter_append` | streams / function | filter-composition | Proposed Doria Std Io / Typed Stream Adapters | Recommended For v1.0 / 36a | Rewrite Through Adapter |
 | `stream_filter_prepend` | streams / function | filter-composition | Proposed Doria Std Io / Typed Stream Adapters | Recommended For v1.0 / 36a | Rewrite Through Adapter |
@@ -290,7 +311,7 @@ in the JSON row with the same PHP name.
 | `stream_get_wrappers` | streams / function | wrapper-registry-introspection | Rejected Dynamic Wrapper Mechanism / — | Rejected / — | No Doria Equivalent By Design |
 | `stream_is_local` | streams / function | capability-metadata | Proposed Doria Std Io / Doria\Std\Io | Required For v1.0 / 36a | Rewrite With Semantic Warning |
 | `stream_isatty` | streams / function | tty-detection | Existing Doria Runtime Substrate / Doria\Std\Term | Required For v1.0 / 46 | Rewrite Through Domain Module |
-| `stream_notification_callback` | streams / function | progress-notification | Unresolved Design Fork / Operation-Specific Progress API | Unresolved / 44 | Requires Human Review |
+| `stream_notification_callback` | streams / function | progress-notification | Deferred Post-v1 / Operation-Specific Progress API | Deferred / operation-specific review | Deferred Until Named Stage |
 | `stream_register_wrapper` | streams / function | wrapper-registry-alias | Rejected PHP Alias / — | Rejected / — | No Doria Equivalent By Design |
 | `stream_resolve_include_path` | streams / function | path-resolution | Proposed Doria Std Fs / Doria\Std\Fs | Acceptable Post-v1 / Fs design | Rewrite Through Domain Module |
 | `stream_select` | streams / function | readiness | Proposed Async Integration / Doria\Std\Io | Required For v1.0 / 36a | Direct Typed Rewrite |
@@ -421,49 +442,51 @@ in the JSON row with the same PHP name.
 
 ## Designer review table
 
-These are the unresolved decisions Andrew reviews next. Recommendations are
-direction, not accepted public API.
+Andrew approved these recommendations on 2026-08-02. Decision 0110 owns their
+semantics. “Public spelling deferred” means only the exact source vocabulary is
+open; it does not reopen the architecture.
 
-| Decision | Recommendation | Alternatives | Why it matters | PHP capability preserved | Doria owner | v1 status | Landing | Dependencies | Runtime impact | Migration impact |
-|---|---|---|---|---|---|---|---|---|---|---|
-| Stream interface decomposition | Small readable/writable/duplex/seekable/etc. capabilities | One stream class; dynamic checks | Prevents accidental authority | Resource polymorphism | `Io` | Required | 36a | 29, 35 | Vtables/adapters | Typed resource rewrite |
-| First-class standard streams | Yes, on existing substrate | Intrinsic-only forever | Enables generic CLI composition | `php://std*` | `Io` | Required | 36a | 29, 35 | Borrowed device views | Direct typed rewrite |
-| Standard-stream ownership | Non-owning views; no accidental close | Owned closable handles | Protects process-global devices | STDIN/OUT/ERR resources | `Io` | Required | 36a | ownership | Device lifetime | Human review |
-| Close semantics | Deterministic close plus reviewed explicit early close | Idempotent close; consuming close only | Prevents leaks/double close | `fclose` | `Io` | Required | 36a | 29 | Drop/close errors | Semantic warning |
-| Blocking-mode naming | Typed mode on capable value | Boolean; separate types; construction-only | Mode is capability, not flag | `stream_set_blocking` | `Io` | Required | 36a | 35 | Platform mode calls | Semantic warning |
-| Runtime mode mutation | Permit only where supported | Immutable mode types | Pipes/sockets/terminals need transitions | Blocking mutation | `Io` | Required | 36a | readiness | Capability checks | Human review |
-| Capability discovery | Interfaces plus typed facts | Metadata bag; try-and-fail only | Avoids `mixed` metadata | `stream_get_meta_data` | `Io` | Required | 36a | 35 | Typed metadata | Domain rewrite |
-| Non-blocking read outcome | Data / would-block / EOF distinction | Result nesting; separate calls | Prevents sentinel ambiguity | `fread`/`feof` | `Io` | Required | 36a | 29 | Result tags | Semantic warning |
-| Partial-write outcome | Count / would-block / closed/error | Boolean success | Prevents data loss | `fwrite` count | `Io` | Required | 36a | readiness | Resume state | Semantic warning |
-| Readiness API shape | Portable typed readiness results | Callback reactor; platform handles | Foundation for sync and async | `stream_select` | `Io` | Required | 36a | Time | OS pollers | Direct typed rewrite |
-| One-stream versus waiter API | Derive convenience from multi-stream core | Public one-stream only; both primitives | Avoids duplicate readiness models | Single/multi select | `Io` | Required | 36a | readiness | Wait registration | Human review |
-| Timeout versus deadline | Support explicit operation timing, likely both | Duration only; deadline only | Different timeout meanings | Stream/socket timeouts | `Io`/`Time` | Required | 36a | Time | Timer integration | Semantic warning |
-| Buffering types | Per-value typed adapters | Flags on streams; globals | Makes read-ahead/flush ownership visible | Buffer controls | `Io` | Required | 36a | 29, 35 | Adapter buffers | Adapter rewrite |
-| Text adapter names | Explicit UTF-8 reader/writer | Text on every stream | Preserves string invariant | Text filters/line reads | `Io` | Required | 36a | Bytes | Adapter rewrite |
-| Line-read limits | Required explicit/default safe maximum | Unbounded allocation | Prevents hostile-input growth | `fgets`/delimiter read | Text adapter | Required | 36a | errors | Bounded buffers | Semantic warning |
-| File open modes | Typed non-boolean modes | Mode strings; builder | Makes create/truncate/append explicit | `fopen` modes | `Io` | Required | 36a | 29 | OS open flags | Semantic warning |
-| Path type | Defer, leaning value type | Keep `string`; dual acceptance | Cross-platform path correctness | File wrapper targets | `Fs` | Unresolved | Fs review | 31 | Path conversion | Human review |
-| Flush versus durable sync | Separate buffer flush, data sync, full sync | One `flush` | Prevents false durability claims | `fflush`/`fdatasync`/`fsync` | `Io` | Required | 36a | errors | OS sync calls | Semantic warning |
-| Advisory locking | Typed RAII guard | Integer flags; manual unlock | Deterministic release | `flock` | `Io` | Recommended | 36a | 29, 35 | Lock backend | Semantic warning |
-| Process pipe model | Owned child plus typed three pipes | Shell-only helpers | Enables safe composition | `proc_open`/`popen` | `Process` | Required | 36a | 29, 35 | Spawn/pipe backend | Domain rewrite |
-| Child output drainage | Readiness-driven concurrent drain | Sequential reads; threads only | Prevents deadlock | Child stdout/stderr pipes | `Process`/`Io` | Required | 36a | readiness | Multi-handle wait | Semantic warning |
-| Typed metadata | Properties/interfaces/results | Dictionary of `mixed` | Static safety and portability | Metadata arrays | Domain owners | Required | 36a/44/46 | 35 | Typed facts | Domain rewrite |
-| Wrapper/filter replacement | Typed constructors/adapters | Dynamic registry | Keeps capability without global strings | Wrappers/filters | Domain owners | Required | 36a+ | 31, 35 | Composition | Adapter/domain rewrite |
-| Compression adapters | Typed reader/writer adapters | URL/filter strings | Streaming compression | zlib wrapper/filter | Adapter | Recommended | after 36a | 35 | Codec state | Adapter rewrite |
-| Encoding adapters | Explicit byte/text converters | Implicit locale conversion | Preserves UTF-8 invariant | conversion filters | Adapter | Recommended | after 36a | Bytes | Codec state | Adapter rewrite |
-| TLS adapter boundary | Network-owned typed upgrade/config | SSL context bag | Secure duplex streams | crypto/socket contexts | `Net` | Recommended | 44 | 36a, 37/38 | TLS state | Domain rewrite |
-| Sync/async stream unification | One ownership/result/readiness model | Async-specific streams | Avoids two incompatible stacks | Non-blocking streams | `Io` | Required | 36a–39 | 37 design | Await integration | Direct typed rewrite |
-| Terminal integration | Reuse readiness/devices; keep decoding in `Console` | Terminal-specific polling core | Portable key/resize input | Readline/TTY | `Term` | Required | 46 | 36a | Raw/event backends | Domain rewrite |
-| Network integration | Reuse duplex/readiness/timeouts/partial writes | Socket-specific contracts | Avoids parallel I/O semantics | Socket streams | `Net` | Required boundary | 44 | 36a–38 | Socket backend | Domain rewrite |
+| Decision | Recommendation | Alternatives | Why it matters | PHP capability preserved | Doria owner | v1 status | Landing | Dependencies | Runtime impact | Migration impact | Semantic status | Public spelling status | Authority |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| Stream interface decomposition | Small readable/writable/duplex/seekable/etc. capabilities | One stream class; dynamic checks | Prevents accidental authority | Resource polymorphism | `Io` | Required | 36a | 29, 35 | Vtables/adapters | Typed resource rewrite | Accepted | Deferred where applicable | decision 0110 |
+| First-class standard streams | Yes, on existing substrate | Intrinsic-only forever | Enables generic CLI composition | `php://std*` | `Io` | Required | 36a | 29, 35 | Borrowed device views | Direct typed rewrite | Accepted | Deferred where applicable | decision 0110 |
+| Standard-stream ownership | Non-owning views; no accidental close | Owned closable handles | Protects process-global devices | STDIN/OUT/ERR resources | `Io` | Required | 36a | ownership | Device lifetime | Human review | Accepted | Deferred where applicable | decision 0110 |
+| Close semantics | Consuming explicit close/finish reports checked failure; destruction is best-effort and nonthrowing | Idempotent nonconsuming close | Prevents leaks, double close, and hidden failures | `fclose` | `Io` | Required | 36a | 29 | Drop/close errors | Semantic warning | Accepted | Deferred where applicable | decision 0110 |
+| Blocking-mode naming | Typed mode on capable value | Boolean; separate types; construction-only | Mode is capability, not flag | `stream_set_blocking` | `Io` | Required | 36a | 35 | Platform mode calls | Semantic warning | Accepted | Deferred where applicable | decision 0110 |
+| Runtime mode mutation | Permit only where supported | Immutable mode types | Pipes/sockets/terminals need transitions | Blocking mutation | `Io` | Required | 36a | readiness | Capability checks | Human review | Accepted | Deferred where applicable | decision 0110 |
+| Capability discovery | Interfaces plus typed facts | Metadata bag; try-and-fail only | Avoids `mixed` metadata | `stream_get_meta_data` | `Io` | Required | 36a | 35 | Typed metadata | Domain rewrite | Accepted | Deferred where applicable | decision 0110 |
+| Non-blocking read outcome | Data / would-block / EOF distinction | Result nesting; separate calls | Prevents sentinel ambiguity | `fread`/`feof` | `Io` | Required | 36a | 29 | Result tags | Semantic warning | Accepted | Deferred where applicable | decision 0110 |
+| Partial-write outcome | Count / would-block / closed/error | Boolean success | Prevents data loss | `fwrite` count | `Io` | Required | 36a | readiness | Resume state | Semantic warning | Accepted | Deferred where applicable | decision 0110 |
+| Readiness API shape | Portable typed readiness results | Callback reactor; platform handles | Foundation for sync and async | `stream_select` | `Io` | Required | 36a | Time | OS pollers | Direct typed rewrite | Accepted | Deferred where applicable | decision 0110 |
+| One-stream versus waiter API | Derive convenience from multi-stream core | Public one-stream only; both primitives | Avoids duplicate readiness models | Single/multi select | `Io` | Required | 36a | readiness | Wait registration | Human review | Accepted | Deferred where applicable | decision 0110 |
+| Timeout versus deadline | Support durations and absolute deadlines per operation/wait | Duration only; deadline only | Different timeout meanings | Stream/socket timeouts | `Io`/`Time` | Required | 36a | Time | Timer integration | Semantic warning | Accepted | Deferred where applicable | decision 0110 |
+| Buffering types | Per-value typed adapters | Flags on streams; globals | Makes read-ahead/flush ownership visible | Buffer controls | `Io` | Required | 36a | 29, 35 | Adapter buffers | Adapter rewrite | Accepted | Deferred where applicable | decision 0110 |
+| Text adapter names | Explicit UTF-8 reader/writer | Text on every stream | Preserves string invariant | Text filters/line reads | `Io` | Required | 36a | Bytes | Adapter rewrite | Accepted | Deferred where applicable | decision 0110 |
+| Line-read limits | Required explicit/default safe maximum | Unbounded allocation | Prevents hostile-input growth | `fgets`/delimiter read | Text adapter | Required | 36a | errors | Bounded buffers | Semantic warning | Accepted | Deferred where applicable | decision 0110 |
+| File open modes | Typed non-boolean modes | Mode strings; builder | Makes create/truncate/append explicit | `fopen` modes | `Io` | Required | 36a | 29 | OS open flags | Semantic warning | Accepted | Deferred where applicable | decision 0110 |
+| Path type | Defer exact representation while preserving typed evolution | Keep `string`; dual acceptance | Cross-platform path correctness | File wrapper targets | `Fs` | Deferred | Fs review | 31 | Path conversion | Human review | Accepted | Deferred | decision 0110 |
+| Flush versus durable sync | Separate buffer flush, data sync, full sync | One `flush` | Prevents false durability claims | `fflush`/`fdatasync`/`fsync` | `Io` | Required | 36a | errors | OS sync calls | Semantic warning | Accepted | Deferred where applicable | decision 0110 |
+| Advisory locking | Typed RAII guard | Integer flags; manual unlock | Deterministic release | `flock` | `Io` | Recommended | 36a | 29, 35 | Lock backend | Semantic warning | Accepted | Deferred where applicable | decision 0110 |
+| Process pipe model | Owned child plus typed three pipes and explicit wait/detach/terminate resolution | Shell-only helpers | Enables safe composition | `proc_open`/`popen` | `Process` | Required | 36a | 29, 35 | Spawn/pipe backend | Domain rewrite | Accepted | Deferred where applicable | decision 0110 |
+| Child output drainage | Readiness-driven concurrent drain | Sequential reads; threads only | Prevents deadlock | Child stdout/stderr pipes | `Process`/`Io` | Required | 36a | readiness | Multi-handle wait | Semantic warning | Accepted | Deferred where applicable | decision 0110 |
+| Typed metadata | Properties/interfaces/results | Dictionary of `mixed` | Static safety and portability | Metadata arrays | Domain owners | Required | 36a/44/46 | 35 | Typed facts | Domain rewrite | Accepted | Deferred where applicable | decision 0110 |
+| Wrapper/filter replacement | Typed constructors/adapters | Dynamic registry | Keeps capability without global strings | Wrappers/filters | Domain owners | Required | 36a+ | 31, 35 | Composition | Adapter/domain rewrite | Accepted | Deferred where applicable | decision 0110 |
+| Compression adapters | Typed reader/writer adapters | URL/filter strings | Streaming compression | zlib wrapper/filter | Adapter | Recommended | after 36a | 35 | Codec state | Adapter rewrite | Accepted | Deferred where applicable | decision 0110 |
+| Encoding adapters | Explicit byte/text converters | Implicit locale conversion | Preserves UTF-8 invariant | conversion filters | Adapter | Recommended | after 36a | Bytes | Codec state | Adapter rewrite | Accepted | Deferred where applicable | decision 0110 |
+| TLS adapter boundary | Network-owned typed upgrade/config | SSL context bag | Secure duplex streams | crypto/socket contexts | `Net` | Recommended | 44 | 36a, 37/38 | TLS state | Domain rewrite | Accepted | Deferred where applicable | decision 0110 |
+| Sync/async stream unification | One ownership/result/readiness model | Async-specific streams | Avoids two incompatible stacks | Non-blocking streams | `Io` | Required | 36a–39 | 37 design | Await integration | Direct typed rewrite | Accepted | Deferred where applicable | decision 0110 |
+| Terminal integration | Reuse readiness/devices; keep decoding in `Console` | Terminal-specific polling core | Portable key/resize input | Readline/TTY | `Term` | Required | 46 | 36a | Raw/event backends | Domain rewrite | Accepted | Deferred where applicable | decision 0110 |
+| Network integration | Reuse duplex/readiness/timeouts/partial writes | Socket-specific contracts | Avoids parallel I/O semantics | Socket streams | `Net` | Required boundary | 44 | 36a–38 | Socket backend | Domain rewrite | Accepted | Deferred where applicable | decision 0110 |
 
 ## Scheduling and authority consequence
 
 - Stage 25a is complete.
 - This PHP Stream And I/O Completeness Audit is implemented.
-- Andrew's Stream API Completeness Review is next.
-- Stage 26 is blocked only until that review completes.
-- Stage 36a is scheduled, not implemented; its public surface remains pending
-  review and the unauthored stream decision.
+- Andrew's Stream API Completeness Review is complete.
+- Decision 0110 is accepted.
+- Stage 26 is unblocked and next.
+- Stage 36a is scheduled, not implemented; its semantics are accepted and its
+  exact public spellings remain deferred to the decision-0110 appendix.
 - No `BlockingMode`, read-outcome type, poller/waiter, stream interface, file
   object, process API, or first-class standard-stream spelling is executable yet.
 
@@ -473,6 +496,8 @@ direction, not accepted public API.
   Stages 29, 35, 37–39, 44, 46, the phase range, and the 1.0 gate.
 - The standard-library inventory now distinguishes current intrinsics from the
   scheduled reviewed `Io`/`Fs`/`Process`/`Net`/`Term` capability boundaries.
+- Decision 0110 supersedes this audit wherever recommendation language could be
+  mistaken for an unresolved semantic fork; candidate names remain noncanonical.
 - The current-pipeline note now records the audit/review gate and refuses false
   implementation claims.
 - The language-server and website audits found no stale final-stream claim, so

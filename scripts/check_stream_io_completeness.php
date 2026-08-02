@@ -10,6 +10,11 @@ function check_stream_io_completeness(string $root): array
     $auditPath = $root . '/docs/notes/io-surface-audit.md';
     $planPath = $root . '/docs/doria-end-to-end-plan.md';
     $pipelinePath = $root . '/docs/notes/current-pipeline.md';
+    $decisionPath = $root . '/docs/decisions/0110-stream-readiness-standard-io-and-blocking-mode-model.md';
+    $specPath = $root . '/SPEC.md';
+    $stdlibPath = $root . '/docs/stdlib-reference.md';
+    $apiGuidelinesPath = $root . '/docs/api-design-guidelines.md';
+    $websiteGuidelinesPath = $root . '/docs/website-content-guidelines.md';
 
     try {
         $manifest = json_decode(
@@ -177,16 +182,72 @@ function check_stream_io_completeness(string $root): array
     if (($audit['counts']['totalRows'] ?? null) !== count($rows)) {
         $failures[] = 'manifest totalRows does not match the stored rows';
     }
+    if (count($rows) !== 153) {
+        $failures[] = 'manifest must preserve the audited 153-row inventory';
+    }
+
+    $review = $manifest['review'] ?? [];
+    $expectedReview = [
+        'status' => 'approved',
+        'reviewDate' => '2026-08-02',
+        'decisionRecord' => '0110',
+        'semanticDirection' => 'accepted',
+        'publicSpellingStatus' => 'deferred',
+        'stage26Blocked' => false,
+        'stage26Status' => 'next',
+        'stage36aStatus' => 'scheduled',
+        'stage36aImplemented' => false,
+    ];
+    foreach ($expectedReview as $field => $expected) {
+        if (($review[$field] ?? null) !== $expected) {
+            $failures[] = "manifest review metadata {$field} must be " . json_encode($expected);
+        }
+    }
+
+    $resolvedReviewNames = [
+        'stream_context_create',
+        'stream_context_get_options',
+        'stream_context_get_params',
+        'stream_context_set_option',
+        'stream_context_set_options',
+        'stream_context_set_params',
+        'stream_notification_callback',
+    ];
+    foreach ($rows as $index => $row) {
+        if (($row['doriaStatus'] ?? null) === 'unresolved'
+            || ($row['doriaClassification'] ?? null) === 'Unresolved Design Fork') {
+            $failures[] = "manifest row {$index}: semantic review must not remain unresolved";
+        }
+        if (in_array($row['phpName'] ?? null, $resolvedReviewNames, true)) {
+            if (($row['semanticStatus'] ?? null) !== 'accepted'
+                || ($row['publicSpellingStatus'] ?? null) !== 'deferred'
+                || ($row['decisionRecord'] ?? null) !== '0110'
+                || !array_key_exists('doriaCandidateSpelling', $row)
+                || $row['doriaCandidateSpelling'] !== null
+                || ($row['designerDecisionRequired'] ?? true) !== false) {
+                $failures[] = "manifest row {$index}: approved semantics and deferred spelling metadata are incomplete";
+            }
+        }
+    }
 
     $auditText = (string) file_get_contents($auditPath);
     $plan = (string) file_get_contents($planPath);
     $pipeline = (string) file_get_contents($pipelinePath);
+    $decision = (string) file_get_contents($decisionPath);
+    $spec = (string) file_get_contents($specPath);
+    $stdlib = (string) file_get_contents($stdlibPath);
+    $apiGuidelines = (string) file_get_contents($apiGuidelinesPath);
+    $websiteGuidelines = (string) file_get_contents($websiteGuidelinesPath);
     foreach ([
         '# PHP Stream And I/O Completeness Audit',
         'supersedes the previous partial completeness scope',
         '## Required v1.0 recommendation matrix',
         '## PHP migration ledger',
         '## Designer review table',
+        'Andrew approved these recommendations on 2026-08-02',
+        'Semantic status | Public spelling status | Authority |',
+        'Stage 26 is unblocked and next',
+        'Stage 36a is scheduled, not implemented',
     ] as $required) {
         if (!str_contains($auditText, $required)) {
             $failures[] = "docs/notes/io-surface-audit.md: missing {$required}";
@@ -201,8 +262,13 @@ function check_stream_io_completeness(string $root): array
     }
     foreach ([
         'Stage 37 must consume Stage 36a readiness',
-        'Stage 44 builds on Stage 36a duplex streams, readiness, timeouts, partial writes, and async integration',
-        'Stage 46 reuses Stage 36a standard-stream access, readiness, blocking substrate, timeout integration, and platform-device abstraction',
+        'Stage 44 builds on Stage 36a duplex streams, readiness, timeouts, partial writes, cancellation, backpressure, and async integration',
+        'Stage 46 reuses Stage 36a standard-stream views, readiness, blocking substrate, timeout/deadline integration, cancellation, and platform-device abstraction',
+        'Decision 0110: stream, readiness, standard I/O, and blocking-mode model',
+        'Stage 26 — Remaining collection family.',
+        'Stage 26 — Next',
+        'Stage 36a Public Spellings — Deferred',
+        'Stage 36a — Not Implemented',
     ] as $required) {
         if (!str_contains($plan, $required)) {
             $failures[] = "docs/doria-end-to-end-plan.md: missing {$required}";
@@ -210,11 +276,12 @@ function check_stream_io_completeness(string $root): array
     }
     foreach ([
         'PHP Stream And I/O Completeness Audit — Implemented',
-        'Andrew’s Stream API Completeness Review — Next',
-        'Stage 26 — Blocked Pending Review',
+        'Andrew’s Stream API Completeness Review — Complete',
+        'Stream, Readiness, Standard I/O, And Blocking-Mode Model — Accepted (decision 0110)',
+        'Stage 26 — Next',
         'Stage 36a — Scheduled',
-        'Stage 36a Public Surface — Pending Review',
-        'Stage 36a is scheduled, not implemented',
+        'Stage 36a Public Spellings — Deferred',
+        'Stage 36a — Not Implemented',
     ] as $required) {
         if (!str_contains($pipeline, $required)) {
             $failures[] = "docs/notes/current-pipeline.md: missing {$required}";
@@ -223,6 +290,109 @@ function check_stream_io_completeness(string $root): array
     foreach (['BlockingMode', 'ReadOutcome', 'Poller'] as $candidate) {
         if (str_contains($pipeline, "{$candidate} is implemented")) {
             $failures[] = "docs/notes/current-pipeline.md: falsely claims {$candidate} is implemented";
+        }
+    }
+
+    $decisionHeadings = [
+        '# Decision 0110: Stream, Readiness, Standard I/O, And Blocking-Mode Model',
+        '- **Status:** Accepted',
+        '## Context', '## Decision', '## Core Stream Architecture',
+        '## Ownership And Lifetime', '## First-Class Standard Streams',
+        '## Blocking Modes', '## Read Results', '## Write Results',
+        '## Readiness', '## Timeouts, Deadlines, And Cancellation',
+        '## Buffering And Text', '## Files', '## Child Processes And Pipes',
+        '## Typed Adapters And Domain Ownership', '## Cross-Domain I/O Unification',
+        '## Stage Boundaries', '## Deferred Public Spellings',
+        '## Reopening Rules', '## Consequences', '## Invalidated Elsewhere',
+    ];
+    foreach ($decisionHeadings as $heading) {
+        if (!str_contains($decision, $heading)) {
+            $failures[] = "decision 0110: missing {$heading}";
+        }
+    }
+    $decisionSemantics = [
+        'There is no universal stream god object',
+        'Ordinary stream handles are owned move values',
+        'Explicit close or finish consumes the owned handle',
+        'first-class, non-owning, nonclosable views',
+        'Blocking mode is a named typed state',
+        'data, would-block, end-of-stream, and timed-out outcomes',
+        'partial progress is observable',
+        'One multi-stream readiness core',
+        'Durations and absolute deadlines are both semantic concepts',
+        'Buffering is typed and per value',
+        'File opening uses typed request/options values',
+        'Advisory locking is v1 functionality represented by an ownership guard',
+        'Active ownership must be resolved explicitly by waiting, detaching, or terminating',
+        'Typed composition replaces PHP wrappers, filters, contexts, registries, string options, and mixed bags',
+        'Sync and async I/O, networking, processes, and terminals share one ownership, read, write, readiness, time, cancellation, and backpressure model',
+        'Stage 37 consumes it in the async design',
+        'Stage 44 owns network-specific',
+        'Stage 46 owns terminal raw mode',
+    ];
+    foreach ($decisionSemantics as $semantic) {
+        if (!str_contains($decision, $semantic)) {
+            $failures[] = "decision 0110: missing accepted semantic rule {$semantic}";
+        }
+    }
+    $deferralRules = [
+        'before Stage 36a implementation begins',
+        'Reopen in `Doria\\Std\\Fs` design',
+        'no later than Stage 36a surface finalization',
+        'after the Stage 36a foundation and before their v1 implementation',
+        'Reopen in the Stage 44 `Doria\\Std\\Net` design',
+        'first operation or adapter that requires it',
+    ];
+    foreach ($deferralRules as $rule) {
+        if (!str_contains($decision, $rule)) {
+            $failures[] = "decision 0110: safe deferral lacks owner or reopen trigger {$rule}";
+        }
+    }
+    foreach ([
+        'Stage 36a is scheduled and not implemented',
+        'Exact public interface, member',
+        'remain deferred under decision 0110',
+    ] as $required) {
+        if (!str_contains($spec, $required)) {
+            $failures[] = "SPEC.md: missing accepted stream authority {$required}";
+        }
+    }
+    foreach ([
+        'small readable/writable/duplex/seekable/flushable/blocking/readiness capabilities',
+        'Stage 36a scheduled and not implemented; semantics accepted, public spellings deferred',
+    ] as $required) {
+        if (!str_contains($stdlib, $required)) {
+            $failures[] = "docs/stdlib-reference.md: missing {$required}";
+        }
+    }
+    foreach ([
+        'Prefer small capability interfaces over universal god objects',
+        'Use typed outcomes for ordinary state',
+        'Keep resource use bounded by default',
+    ] as $required) {
+        if (!str_contains($apiGuidelines, $required)) {
+            $failures[] = "docs/api-design-guidelines.md: missing {$required}";
+        }
+    }
+    foreach ([
+        'The public website represents the completed language and toolchain target',
+        'Never downgrade target-state documentation or playground examples',
+        'Do not invent exact API spellings',
+        'A current compiler failure against a valid target-state example is UAT evidence',
+    ] as $required) {
+        if (!str_contains($websiteGuidelines, $required)) {
+            $failures[] = "docs/website-content-guidelines.md: missing {$required}";
+        }
+    }
+
+    foreach ([
+        "Andrew’s Stream API Completeness Review — Next",
+        'Stage 26 — Blocked Pending Review',
+        'Stage 36a Public Surface — Pending Review',
+        'unauthored **Stream, Readiness, Standard I/O, And Blocking-Mode Model**',
+    ] as $stale) {
+        if (str_contains($plan, $stale) || str_contains($pipeline, $stale) || str_contains($stdlib, $stale)) {
+            $failures[] = "active authority retains stale stream-review state {$stale}";
         }
     }
 
