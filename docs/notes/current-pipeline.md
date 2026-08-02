@@ -19,6 +19,17 @@ Documentation role: working note. This file prevents duplicated in-flight work. 
 - Stage 23 Slice 2 is complete on the current branch. The owned `Bytes` move type provides explicit copying conversion to and from `uint8[]`, length, byte indexing and indexed read-modify-write, and byte-wise equality. `read_file_bytes`/`write_file_bytes`/`append_file_bytes`, `read_stdin_bytes`/`write_stdout_bytes`/`write_stderr_bytes`, and text `append_file` use shared validated MIR and `doria-rt`, with exact non-UTF-8 bytes and interpreter/Cranelift/LLVM parity.
 - Stage 23 Slice 3 is complete on the current branch. The boxed `dr_mixed` runtime representation stores a tag, class type id when needed, and owned payload; bool, fixed-width integers, floats, string, and concrete classes box into `mixed`, narrow back out through exact `is`, and execute through the interpreter, Cranelift, and LLVM. `?mixed`, `List<mixed>`, `Dictionary<K, mixed>`, and `Set<mixed>` value paths use the same shared MIR/runtime box. Collection/interface/subtype `is` and boxing collections, typed arrays, or `Bytes` into `mixed` remain deferred with stage-named diagnostics.
 - Stage 25a Slices 1 through 4 are implemented and Stage 25a is complete. The readonly `SharedReference<T>` / `WeakReference<T>` family and the permanently disjoint writable family lower through validated MIR to the interpreter, Cranelift, LLVM, and separate `doria-rt` control structures. `WritableSharedReference<T>` executes class, generic-class, typed-array, `List<T>`, `Dictionary<K, V>`, `Set<T>`, and `Bytes` payloads through owned readonly/writable access objects. One access state is shared by every writable-family handle to an allocation; access objects move through returns, parameters, properties, and collection slots; nullable strong, weak, and readonly/writable access forms remain in-family and lazy; and destruction releases access before strong ownership. P1501 carries one of the three exact Decision 0106 conflict conditions as a typed runtime fact. The allocation-free `referencedValue` projection resolves wrapper/payload collisions without changing either ownership count, and durable weak-cycle and bounded-stress fixtures agree across all native paths. Scalar/string payload access and all shared handles through `mixed` remain runtime-pending rather than being given an invented value projection or misrepresented as class pointers. The PHP backend still refuses shared ownership.
+- PHP Stream And I/O Completeness Audit — Implemented. The canonical human
+  artifact expands `docs/notes/io-surface-audit.md`; the stored 153-row PHP
+  inventory and offline guard classify every official Stream Function,
+  `streamWrapper`/`php_user_filter` method, `StreamBucket`, wrapper/context/filter
+  family, relevant open-stream filesystem/process entry, and Readline boundary.
+  Capabilities are preserved through typed owners or explicit deferrals without
+  accepting PHP resources, dynamic wrapper/filter registries, global contexts,
+  mixed metadata bags, or sentinel outcomes.
+- Stage 36a — Scheduled. Stage 36a Public Surface — Pending Review. **Stage 36a is scheduled, not implemented**: no stream interface, blocking-mode type,
+  non-blocking result, readiness waiter, file handle, process API, or first-class
+  standard-stream accessor is currently executable.
 - The parser accepts generalized `parent::member()` and trait-local `self::member` under the two-clocks rule; semantic checking names Stage 34 and Stage 35 respectively and stops those forms before MIR. `Foo::$prop` and `static::` are permanent errors with precise fixes.
 - Native remains one target: direct compile/run uses the Cranelift fast profile, while `--release` selects LLVM 18 over the same validated typed MIR.
 - Ordinary expression interpolation of primitive/string values lowers through the existing ordered MIR string and display operations consumed by all three execution paths.
@@ -85,7 +96,9 @@ Documentation role: working note. This file prevents duplicated in-flight work. 
 
 ## Next
 
-- Stage 26 is next: the remaining collection family.
+- Andrew’s Stream API Completeness Review — Next.
+- Stage 26 — Blocked Pending Review. The block lasts only until Andrew completes
+  the audit review; Stage 26 remains the next implementation stage afterward.
 
 ## Do not duplicate
 
