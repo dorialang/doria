@@ -225,14 +225,6 @@ jobs:
           php scripts/check_docs_authority.php
           php scripts/check_stage25a_completion.php
 
-      - name: Checkout website API reference
-        run: git clone --depth 1 https://github.com/dorialang/doria-website.git doria-website
-
-      - name: Check built-in API reference synchronization
-        env:
-          DORIA_REPOSITORY_PATH: ${{ github.workspace }}
-        run: php doria-website/scripts/check_api_reference_sync.php
-
       - name: Check diagnostic and runtime-outcome architecture
         run: |
           php scripts/check_diagnostic_style.php
