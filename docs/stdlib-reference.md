@@ -29,13 +29,18 @@ Details: decision 0096 (primitive conformance), the interfaces/traits decision (
 Primitives conform to `Equatable`/`Comparable`/`Hashable` by compiler-known conformance and satisfy generic constraints with no boxing (0096).
 
 ### Shared ownership
-The escape hatch when single ownership does not fit (caches, graphs, back-references). Details: §3.3, decision 0106. Stage 25a Slices 1 through 3 implement the grammar/type model, readonly family, writable family, and runtime-checked access guards. Final integration remains in Slice 4.
+The escape hatch when single ownership does not fit (caches, graphs, back-references). Details: §3.3, decision 0106. Stage 25a Slices 1 through 4 implement the grammar/type model, both disjoint families, runtime-checked access guards, collision projection, complete payload matrix, backend parity, and tooling integration.
 
 - **`SharedReference<T>`** — an owning reference that may share responsibility for keeping one value alive with other `SharedReference<T>` values. Constructed with `shared new T(...)`. `share()` creates another owning reference (distinct from `Cloneable`'s `clone()`, which duplicates the value); `createWeakReference()` derives a `WeakReference<T>`; gives direct readonly access to `T`. Reference counting is the implementation mechanism; the source-level model is ownership and lifetime responsibility.
 - **`WeakReference<T>`** — a non-owning reference to a shared value; it does not keep the value alive. `acquire()` returns `?SharedReference<T>` — a live owner, or `null` once the last owner is released (breaks cycles).
 - **`WritableSharedReference<T>`** — a shared owning reference permitting runtime-checked writable access, built with an ordinary ownership-taking constructor (`new WritableSharedReference(new T())`). `share()` returns another `WritableSharedReference<T>`; `createWeakReference()` returns a `WritableWeakReference<T>`. It never forwards direct access to `T`: `acquireReadonlyAccess()` / `acquireWritableAccess()` return the access objects below, and overlapping incompatible access causes a clear panic (the one place runtime borrow checks appear).
 - **`WritableWeakReference<T>`** — the non-owning form of `WritableSharedReference<T>`; `acquire()` returns `?WritableSharedReference<T>`, so breaking a cycle in a writable shared graph retains the writable capability.
 `SharedReference<T>` also carries a compiler-known readonly `referencedValue` projection: compiler-known members win on the direct receiver, everything else forwards transparently to `T`, and `referencedValue` keeps a colliding payload member reachable (`$document->referencedValue->share()`). It never copies, moves, or consumes the value.
+
+Writable access conflicts retain the stable P1501 identity and identify the exact
+failed transition through a structured `conflictReason`: readonly-to-writable,
+writable-to-readonly, or writable-to-writable. Access objects release that access
+registration before releasing their owning claim.
 
 In v1.0 the readonly family accepts **class payloads only** — `SharedReference<int>` and `shared new List<int>()` are rejected, since it forwards readonly access directly with no access object for indexed operations. The writable family accepts supported owned collection move types, because its access objects forward member and indexed operations (`$access[0] = 10`). This is a v1.0 domain rule that a later readonly-sharing design may widen.
 
@@ -57,7 +62,7 @@ object's lifetime before the surrounding function continues.
 Regularized `snake_case` functions for capabilities without one natural owning type. Type-coupled vocabulary belongs to the corresponding companion. Details: decision 0074 (formatted I/O), §9.1 charter, and decision 0103 (String boundary).
 
 - **Formatting:** compiler-known `sprintf` returns `string` and `printf` returns `void`. Each takes a literal `string $format` first, followed by the typed operands required by that format; this intrinsic-only tail is not an untyped userland parameter declaration. Specifiers: `%s %d %f %.Nf %x %X %o %b %%`, width / `-` / `0` flags.
-- **Text I/O:** `read_line(): ?string`, `read_file(string): string`, `write_file(string, string): void` (truncate), `append_file(string, string): void`, `write_stderr(string): void`.
+- **Text I/O:** `read_line(string $prompt = ""): ?string` — writes the prompt exactly (no newline added), flushes stdout, then reads one line; the flush happens even for the default empty prompt, `null` is EOF and `""` is a blank line — `read_file(string): string`, `write_file(string, string): void` (truncate), `append_file(string, string): void`, `write_stderr(string): void`.
 - **Output statement:** `echo` (the single output spelling — `print` is rejected).
 - **Time:** `get_time`.
 - **Meta:** `function_exists("name")` — const-evaluated compile-time predicate for guarded/polyfill declarations.

@@ -685,7 +685,8 @@ if ($namingAuthority !== false) {
         'String API Completeness Audit Against PHP — Implemented',
         'Decision 0103 Completeness Review — Implemented',
         'Minimum String Runtime Surface — Implemented',
-        'Interactive Line-Input Amendment — Next',
+        'Interactive Line-Input Amendment — Implemented',
+        'Stage 25a Slice 4',
     ] as $guidance) {
         if (!str_contains($namingAuthority, $guidance)) {
             $failures[] = "{$namingAuthorityPath}: missing String checkpoint status {$guidance}";
@@ -699,9 +700,11 @@ if ($namingAuthority !== false) {
         || !str_contains($pipeline, 'Andrew approved the audit')
         || !str_contains($pipeline, 'The Minimum String Runtime Surface is implemented')
         || !str_contains($pipeline, 'Interactive Line-Input Amendment')
-        || !str_contains($pipeline, 'Stage 25a remains incomplete until Slice 4')
+        || !str_contains($pipeline, 'Stage 25a Slices 1 through 4 are implemented')
+        || !str_contains($pipeline, 'Stage 25a is complete')
+        || !str_contains($pipeline, 'Stage 26 is next')
     ) {
-        $failures[] = "{$pipelinePath}: must keep the String audit review and runtime surface implemented, line input sequenced, and Stage 25a incomplete";
+        $failures[] = "{$pipelinePath}: must keep the String audit review and runtime surface implemented, line input sequenced, Stage 25a complete, and Stage 26 next";
     }
 
     if (
@@ -714,6 +717,73 @@ if ($namingAuthority !== false) {
         || !str_contains($stdlib, 'There is no public `str_*` family')
     ) {
         $failures[] = "{$stdlibPath}: missing canonical executable and deferred String inventory";
+    }
+
+    // Interactive Line-Input Amendment: the canonical prompted signature and its
+    // ordering, failure, and non-goal rules must stay stated in active authority,
+    // and the superseded no-prompt declaration must not return as canonical.
+    $lineInputAuthorities = [
+        'docs/decisions/0074-stage-17-stdio-and-formatted-io.md',
+        'SPEC.md',
+        'docs/doria-end-to-end-plan.md',
+        'docs/stdlib-reference.md',
+    ];
+    foreach ($lineInputAuthorities as $lineInputPath) {
+        $lineInput = file_get_contents($root . '/' . $lineInputPath);
+        if ($lineInput === false) {
+            $failures[] = "{$lineInputPath}: could not read line-input authority";
+            continue;
+        }
+        if (!str_contains($lineInput, 'read_line(string $prompt = ""): ?string')) {
+            $failures[] = "{$lineInputPath}: missing canonical read_line(string \$prompt = \"\"): ?string";
+        }
+    }
+
+    $lineInputDecision = file_get_contents($root . '/docs/decisions/0074-stage-17-stdio-and-formatted-io.md');
+    foreach ([
+        'read_line()',
+        'Evaluate the prompt expression exactly once',
+        'Add no newline and no other characters',
+        'Flush stdout',
+        'An empty prompt still flushes stdout',
+        'under redirection',
+        'already buffered',
+        'EOF before bytes returns null',
+        'Empty lines return a non-null empty string',
+        'removes one LF or one CRLF line ending and no other',
+        'exits immediately with status 0',
+        'Decision 0109',
+        'not line editing, history, completion',
+    ] as $guidance) {
+        if ($lineInputDecision === false || !str_contains($lineInputDecision, $guidance)) {
+            $failures[] = "docs/decisions/0074-stage-17-stdio-and-formatted-io.md: missing line-input guidance {$guidance}";
+        }
+    }
+
+    foreach (['docs/decisions/0075-io-family-tiers-and-failure-migration.md', 'docs/decisions/0091-io-surface-corrections.md'] as $migrationPath) {
+        $migration = file_get_contents($root . '/' . $migrationPath);
+        if ($migration === false || !str_contains($migration, 'prompt output')) {
+            $failures[] = "{$migrationPath}: must record prompt-output failure migration";
+        }
+    }
+
+    // The superseded declaration may survive only where it is labelled historical.
+    foreach (['SPEC.md', 'docs/stdlib-reference.md', 'docs/api-design-guidelines.md'] as $supersededPath) {
+        $superseded = file_get_contents($root . '/' . $supersededPath);
+        if ($superseded !== false && str_contains($superseded, 'read_line(): ?string')) {
+            $failures[] = "{$supersededPath}: reintroduces the superseded no-prompt read_line declaration";
+        }
+    }
+
+    // `readline` and `input` are not Doria built-ins, and Console stays deferred.
+    $builtins = file_get_contents($root . '/crates/doriac/src/builtins.rs');
+    if ($builtins !== false) {
+        if (str_contains($builtins, '"readline" => Some(') || str_contains($builtins, '"input" => Some(')) {
+            $failures[] = 'crates/doriac/src/builtins.rs: readline/input must not become Doria built-ins';
+        }
+        if (!str_contains($builtins, '("readline", "read_line")')) {
+            $failures[] = 'crates/doriac/src/builtins.rs: missing readline -> read_line migration guidance';
+        }
     }
 
     $unicodeNotePath = 'docs/notes/unicode-string-runtime.md';

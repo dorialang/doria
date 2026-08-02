@@ -15,21 +15,23 @@ const BROKEN_PIPE_STDOUT_BYTES: &str =
     include_str!("fixtures/native_io/broken_pipe_stdout_bytes.doria");
 const BROKEN_PIPE_STDERR_BYTES: &str =
     include_str!("fixtures/native_io/broken_pipe_stderr_bytes.doria");
+const BROKEN_PIPE_READ_LINE_PROMPT: &str = r#"
+function main(): void
+{
+    let $line = read_line("Name: ");
+}
+"#;
 
 #[test]
 fn release_panic_projection_preserves_output_and_omits_only_frames() {
-    let expected = b"prefix\nPanic: boom\nStack Trace:\n  at fail\n  at main\n";
+    let expected = b"prefix\nPanic[P1000]: Program Panicked\n\nCall Path\nfail \xc2\xb7 source.doria:2\nmain \xc2\xb7 source.doria:5\n\nProcess Exited With Status 101\n";
     assert!(release_stderr_is_projection(
         expected,
-        b"prefix\nPanic: boom\nStack Trace:\n"
-    ));
-    assert!(release_stderr_is_projection(
-        expected,
-        b"prefix\nPanic: boom\nStack Trace:\n  at main\n"
+        b"prefix\nPanic[P1000]: Program Panicked\n\nCall Path\nmain \xc2\xb7 source.doria:5\n\nProcess Exited With Status 101\n"
     ));
     assert!(!release_stderr_is_projection(
         expected,
-        b"prefix\nPanic: boom\nStack Trace:\n  at other\n"
+        b"prefix\nPanic[P1000]: Program Panicked\n\nCall Path\nother \xc2\xb7 source.doria:5\n\nProcess Exited With Status 101\n"
     ));
 }
 
@@ -58,6 +60,38 @@ fn manifest_covers_every_native_example() {
         .collect::<BTreeSet<_>>();
 
     assert_eq!(manifest, examples);
+}
+
+#[test]
+fn interpreter_matches_every_durable_io_fixture() {
+    let workspace = workspace_root();
+    for relative_path in manifest_paths() {
+        let path = workspace.join(&relative_path);
+        let source = fs::read_to_string(&path).unwrap_or_else(|error| {
+            panic!("failed to read parity source {relative_path}: {error}")
+        });
+        let hir =
+            doriac::lower_source(relative_path.clone(), source).unwrap_or_else(|diagnostics| {
+                panic!("frontend rejected parity source {relative_path}: {diagnostics:#?}")
+            });
+        let mir = doriac::mir_lowering::lower_program(&hir).unwrap_or_else(|diagnostics| {
+            panic!("MIR rejected parity source {relative_path}: {diagnostics:#?}")
+        });
+        let fixture = IoFixture::load(&workspace, &relative_path);
+        let interpreted = doriac::mir_interpreter::interpret_with_io(
+            &mir,
+            doriac::mir_interpreter::MirIo {
+                stdin: fixture.stdin.clone(),
+                files: fixture.files.clone(),
+                args: fixture.args.clone(),
+                ..doriac::mir_interpreter::MirIo::default()
+            },
+        )
+        .unwrap_or_else(|error| {
+            panic!("interpreter rejected parity source {relative_path}: {error}")
+        });
+        fixture.assert_expected(&relative_path, &interpreted);
+    }
 }
 
 #[test]
@@ -92,6 +126,7 @@ fn interpreter_cranelift_and_enabled_llvm_match_for_the_durable_native_manifest(
                 stdin: fixture.stdin.clone(),
                 files: fixture.files.clone(),
                 args: fixture.args.clone(),
+                ..doriac::mir_interpreter::MirIo::default()
             },
         )
         .unwrap_or_else(|error| {
@@ -175,6 +210,7 @@ fn enabled_native_backends_exit_cleanly_when_an_output_pipe_closes() {
                 stdin: stdin.to_vec(),
                 files: BTreeMap::new(),
                 args: Vec::new(),
+                ..doriac::mir_interpreter::MirIo::default()
             },
         )
         .unwrap_or_else(|error| panic!("interpreter rejected broken-pipe {name} fixture: {error}"))
@@ -193,6 +229,39 @@ fn enabled_native_backends_exit_cleanly_when_an_output_pipe_closes() {
         #[cfg(feature = "llvm-backend")]
         assert_closed_output_pipe(&mir, NativeProfile::Release, name, closed_stream, stdin);
     }
+}
+
+#[test]
+fn prompted_read_line_exits_cleanly_when_stdout_closes_before_stdin() {
+    if !host_linker_is_available() {
+        let message = format!("native parity requires host linker {}", host_linker());
+        if std::env::var_os("CI").is_some() {
+            panic!("{message}; CI must not skip the prompted-input broken-pipe check");
+        }
+        eprintln!("{message}; skipping local prompted-input broken-pipe check");
+        return;
+    }
+
+    let mir = doriac::lower_source_to_mir(
+        "broken_pipe_read_line_prompt.doria",
+        BROKEN_PIPE_READ_LINE_PROMPT,
+    )
+    .expect("prompted read_line broken-pipe fixture should lower");
+    assert_closed_output_pipe(
+        &mir,
+        NativeProfile::Fast,
+        "read-line-prompt",
+        ClosedStream::Stdout,
+        b"must not be read\n",
+    );
+    #[cfg(feature = "llvm-backend")]
+    assert_closed_output_pipe(
+        &mir,
+        NativeProfile::Release,
+        "read-line-prompt",
+        ClosedStream::Stdout,
+        b"must not be read\n",
+    );
 }
 
 #[derive(Clone, Copy)]
@@ -337,35 +406,56 @@ fn assert_matches_interpreter(
 }
 
 fn release_stderr_is_projection(expected: &[u8], actual: &[u8]) -> bool {
-    const STACK_TRACE_HEADER: &[u8] = b"Stack Trace:\n";
+    const CALL_PATH_HEADER: &[u8] = b"Call Path\n";
+    const STATUS_HEADER: &[u8] = b"\n\nProcess Exited With Status ";
     let Some(expected_header) = expected
-        .windows(STACK_TRACE_HEADER.len())
-        .rposition(|window| window == STACK_TRACE_HEADER)
+        .windows(CALL_PATH_HEADER.len())
+        .rposition(|window| window == CALL_PATH_HEADER)
     else {
         return actual == expected;
     };
     let Some(actual_header) = actual
-        .windows(STACK_TRACE_HEADER.len())
-        .rposition(|window| window == STACK_TRACE_HEADER)
+        .windows(CALL_PATH_HEADER.len())
+        .rposition(|window| window == CALL_PATH_HEADER)
     else {
         return false;
     };
-    let expected_frames = expected_header + STACK_TRACE_HEADER.len();
-    let actual_frames = actual_header + STACK_TRACE_HEADER.len();
-    if expected[..expected_frames] != actual[..actual_frames] || !actual.ends_with(b"\n") {
+    let expected_frames = expected_header + CALL_PATH_HEADER.len();
+    let actual_frames = actual_header + CALL_PATH_HEADER.len();
+    let Some(expected_status) = expected[expected_frames..]
+        .windows(STATUS_HEADER.len())
+        .position(|window| window == STATUS_HEADER)
+        .map(|index| expected_frames + index)
+    else {
+        return false;
+    };
+    let Some(actual_status) = actual[actual_frames..]
+        .windows(STATUS_HEADER.len())
+        .position(|window| window == STATUS_HEADER)
+        .map(|index| actual_frames + index)
+    else {
+        return false;
+    };
+    if expected[..expected_frames] != actual[..actual_frames]
+        || expected[expected_status..] != actual[actual_status..]
+    {
         return false;
     }
 
-    let expected_frames = expected[expected_frames..]
+    let expected_frames = expected[expected_frames..expected_status]
         .split(|byte| *byte == b'\n')
         .filter(|line| !line.is_empty())
         .collect::<Vec<_>>();
     let mut next_expected = 0;
-    for frame in actual[actual_frames..]
+    let actual_frames = actual[actual_frames..actual_status]
         .split(|byte| *byte == b'\n')
         .filter(|line| !line.is_empty())
-    {
-        if !frame.starts_with(b"  at ") {
+        .collect::<Vec<_>>();
+    if actual_frames.is_empty() {
+        return false;
+    }
+    for frame in actual_frames {
+        if !frame.windows(3).any(|window| window == b" \xc2\xb7") {
             return false;
         }
         let Some(offset) = expected_frames[next_expected..]
@@ -699,3 +789,140 @@ fn make_executable(path: &Path) {
 
 #[cfg(not(unix))]
 fn make_executable(_path: &Path) {}
+
+/// Proves the prompt is observable *before* input is supplied, not merely ordered
+/// correctly in the final output after the process has exited.
+///
+/// The test reads the exact prompt bytes from the child's stdout first, and only
+/// then writes the input line. If the runtime deferred the prompt until input
+/// arrived, or skipped the pre-read flush, this would deadlock rather than pass —
+/// so the bounded read is the assertion. The reader thread bounds the wait and the
+/// child is killed and reaped on every exit path.
+#[test]
+fn prompted_read_line_writes_its_prompt_before_input_is_supplied() {
+    const PROMPT: &[u8] = b"Name: ";
+    let source = r#"
+function main(): void
+{
+    let $name = read_line("Name: ");
+
+    if ($name != null) {
+        echo "Hello, {$name}!";
+    }
+}
+"#;
+
+    let mir = doriac::lower_source_to_mir("prompt-timing.doria", source)
+        .expect("prompted read_line should lower");
+
+    #[cfg(feature = "llvm-backend")]
+    let profiles = vec![NativeProfile::Fast, NativeProfile::Release];
+    #[cfg(not(feature = "llvm-backend"))]
+    let profiles = vec![NativeProfile::Fast];
+
+    for profile in profiles {
+        let backend = match profile {
+            NativeProfile::Fast => "Cranelift",
+            NativeProfile::Release => "LLVM",
+        };
+        let bytes =
+            doriac::codegen_native::generate_executable(&mir, profile).unwrap_or_else(|error| {
+                panic!("{backend} rejected the prompt-timing fixture: {error:?}")
+            });
+        let directory = temp_working_directory(&format!("prompt-timing-{backend}"));
+        fs::create_dir_all(&directory).expect("prompt-timing working directory should be created");
+        let executable = directory.join(if cfg!(windows) {
+            "program.exe"
+        } else {
+            "program"
+        });
+        fs::write(&executable, bytes).expect("prompt-timing executable should be writable");
+        make_executable(&executable);
+
+        let mut child = retry_transient_executable_busy(|| {
+            Command::new(&executable)
+                .current_dir(&directory)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+        })
+        .unwrap_or_else(|error| {
+            panic!("failed to start the {backend} prompt-timing fixture: {error}")
+        });
+
+        // Read exactly the prompt on a worker thread so the wait is bounded.
+        let mut stdout = child.stdout.take().expect("child stdout should be piped");
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let reader = thread::spawn(move || {
+            use std::io::Read;
+            let mut seen = vec![0_u8; PROMPT.len()];
+            let result = stdout.read_exact(&mut seen).map(|()| seen);
+            let _ = sender.send(result.map_err(|error| error.to_string()));
+            stdout
+        });
+
+        let observed = receiver.recv_timeout(Duration::from_secs(30));
+        let observed = match observed {
+            Ok(observed) => observed,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = reader.join();
+                panic!(
+                    "the {backend} prompt-timing fixture never produced its prompt before input: {error}"
+                );
+            }
+        };
+        let observed = match observed {
+            Ok(observed) => observed,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = reader.join();
+                panic!("failed to read the {backend} prompt before supplying input: {error}");
+            }
+        };
+        assert_eq!(
+            observed, PROMPT,
+            "{backend} must write the exact prompt bytes before reading stdin"
+        );
+
+        // Only now supply the input.
+        let mut child_stdin = child.stdin.take().expect("child stdin should be piped");
+        write_stdin_tolerating_early_close(&mut child_stdin, b"Dorothy\n").unwrap_or_else(
+            |error| panic!("failed to feed the {backend} prompt-timing fixture: {error}"),
+        );
+        drop(child_stdin);
+
+        let mut stdout = reader
+            .join()
+            .expect("prompt reader thread should not panic");
+        let mut rest = Vec::new();
+        {
+            use std::io::Read;
+            stdout
+                .read_to_end(&mut rest)
+                .expect("remaining stdout should be readable");
+        }
+        let status = child.wait().unwrap_or_else(|error| {
+            panic!("failed to wait for the {backend} prompt-timing fixture: {error}")
+        });
+        let mut stderr = Vec::new();
+        if let Some(mut handle) = child.stderr.take() {
+            use std::io::Read;
+            let _ = handle.read_to_end(&mut stderr);
+        }
+
+        assert_eq!(
+            rest, b"Hello, Dorothy!",
+            "{backend} produced unexpected output"
+        );
+        assert!(stderr.is_empty(), "{backend} produced unexpected stderr");
+        assert_eq!(
+            status.code(),
+            Some(0),
+            "{backend} produced unexpected status"
+        );
+    }
+}

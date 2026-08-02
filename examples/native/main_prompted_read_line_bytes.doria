@@ -1,0 +1,11 @@
+function main(): void
+{
+    let $line = read_line("line: ");
+    if ($line != null) { echo "{$line}\n"; }
+
+    Bytes $remaining = read_stdin_bytes();
+    write_stdout_bytes($remaining);
+
+    let $after = read_line("after: ");
+    if ($after == null) { echo "EOF"; }
+}

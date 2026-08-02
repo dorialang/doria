@@ -1,0 +1,23 @@
+function observedPrompt(): string
+{
+    echo "[eval]";
+    return "Side: ";
+}
+
+function main(): void
+{
+    let $name = read_line("Name: ");
+    if ($name != null) { echo "<{$name}>\n"; }
+
+    let $blank = read_line();
+    if ($blank != null) { echo "blank=[{$blank}]\n"; }
+
+    let $unicode = read_line("Unicode -> ");
+    if ($unicode != null) { echo "<{$unicode}>\n"; }
+
+    let $final = read_line(read_file("prompt.txt"));
+    if ($final != null) { echo "<{$final}>\n"; }
+
+    let $eof = read_line(observedPrompt());
+    if ($eof == null) { echo "EOF\n"; }
+}

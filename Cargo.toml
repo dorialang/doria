@@ -1,5 +1,10 @@
 [workspace]
-members = ["crates/doria-rt", "crates/doria-unicode", "crates/doriac"]
+members = [
+    "crates/doria-diagnostic-catalogue",
+    "crates/doria-rt",
+    "crates/doria-unicode",
+    "crates/doriac",
+]
 resolver = "2"
 
 [workspace.package]

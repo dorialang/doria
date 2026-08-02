@@ -18,6 +18,7 @@ fn shared_validator_rejects_mixed_width_float_binary_operands() {
     program.functions.push(Function {
         id: FunctionId(1),
         name: "mixedWidth".to_string(),
+        source_span: Default::default(),
         method: None,
         receiver_mode: None,
         params: Vec::new(),
@@ -74,6 +75,7 @@ fn shared_validator_rejects_malformed_string_intrinsic_signatures() {
             args: vec![],
             result: Type::String,
             span: Default::default(),
+            argument_spans: Vec::new(),
         },
         StringIntrinsicCall {
             kind: StringIntrinsicKind::Repeat,
@@ -83,24 +85,28 @@ fn shared_validator_rejects_malformed_string_intrinsic_signatures() {
             ],
             result: Type::String,
             span: Default::default(),
+            argument_spans: Vec::new(),
         },
         StringIntrinsicCall {
             kind: StringIntrinsicKind::Upper,
             args: vec![Rvalue::String(StringExpression::Literal("x".to_string()))],
             result: Type::Scalar(ScalarType::Bool),
             span: Default::default(),
+            argument_spans: Vec::new(),
         },
         StringIntrinsicCall {
             kind: StringIntrinsicKind::LowerFirst,
             args: vec![Rvalue::String(StringExpression::Literal("x".to_string()))],
             result: Type::Scalar(ScalarType::Bool),
             span: Default::default(),
+            argument_spans: Vec::new(),
         },
         StringIntrinsicCall {
             kind: StringIntrinsicKind::ContainsIgnoreCase,
             args: vec![Rvalue::String(StringExpression::Literal("x".to_string()))],
             result: Type::Scalar(ScalarType::Bool),
             span: Default::default(),
+            argument_spans: Vec::new(),
         },
         StringIntrinsicCall {
             kind: StringIntrinsicKind::IndexOfIgnoreCase,
@@ -110,6 +116,7 @@ fn shared_validator_rejects_malformed_string_intrinsic_signatures() {
             ],
             result: Type::String,
             span: Default::default(),
+            argument_spans: Vec::new(),
         },
         StringIntrinsicCall {
             kind: StringIntrinsicKind::CountOccurrences,
@@ -119,6 +126,7 @@ fn shared_validator_rejects_malformed_string_intrinsic_signatures() {
             ],
             result: Type::Scalar(ScalarType::Bool),
             span: Default::default(),
+            argument_spans: Vec::new(),
         },
     ];
 
@@ -161,6 +169,7 @@ fn shared_validator_rejects_confused_string_intrinsic_collection_shapes() {
                     args: vec![Rvalue::String(StringExpression::Literal("x".to_string()))],
                     result: Type::Collection(CollectionTypeId(0)),
                     span: Default::default(),
+                    argument_spans: Vec::new(),
                 },
             ))),
         },
@@ -199,6 +208,7 @@ fn shared_validator_rejects_wrong_nullable_string_intrinsic_representation() {
                     ],
                     result: Type::NullableString,
                     span: Default::default(),
+                    argument_spans: Vec::new(),
                 },
             ))),
         });
@@ -245,6 +255,7 @@ fn shared_validator_rejects_consuming_string_intrinsic_collection_inputs() {
             ],
             result: Type::String,
             span: Default::default(),
+            argument_spans: Vec::new(),
         }))),
     ];
 
@@ -461,6 +472,7 @@ fn shared_validator_enforces_sequence_fill_shape() {
                 count: Box::new(IntegerExpression::constant(
                     IntegerValue::from_i128(IntegerType::Int64, 3).expect("valid int"),
                 )),
+                count_span: doriac::source::Span::default(),
             }),
         },
         Statement::DropCollection {
@@ -831,6 +843,7 @@ fn shared_validator_preserves_implicit_display_borrows_across_format_arguments()
         program.functions.push(Function {
             id,
             name: name.to_string(),
+            source_span: Default::default(),
             method: None,
             receiver_mode: None,
             params: vec![LocalId(0)],
@@ -926,6 +939,7 @@ fn shared_validator_requires_class_calls_to_return_the_declared_class() {
     program.functions.push(Function {
         id: FunctionId(1),
         name: "makeOther".to_string(),
+        source_span: Default::default(),
         method: None,
         receiver_mode: None,
         params: vec![],
@@ -971,6 +985,7 @@ fn shared_validator_skips_the_implicit_constructor_receiver() {
     program.functions.push(Function {
         id: FunctionId(1),
         name: "Message::__construct".to_string(),
+        source_span: Default::default(),
         method: None,
         receiver_mode: None,
         params: vec![LocalId(0), LocalId(1)],
@@ -1042,6 +1057,7 @@ fn shared_validator_requires_promoted_class_arguments_to_transfer_ownership() {
     program.functions.push(Function {
         id: FunctionId(1),
         name: "Parent::__construct".to_string(),
+        source_span: Default::default(),
         method: None,
         receiver_mode: None,
         params: vec![LocalId(0), LocalId(1)],
@@ -1069,6 +1085,7 @@ fn shared_validator_rejects_borrowing_and_transferring_one_class_local_in_a_call
     program.functions[0].blocks[0]
         .statements
         .push(Statement::CallVoid {
+            span: Default::default(),
             function: FunctionId(1),
             args: vec![
                 Rvalue::Class(ClassExpression::Local {
@@ -1088,6 +1105,7 @@ fn shared_validator_rejects_borrowing_and_transferring_one_class_local_in_a_call
     program.functions.push(Function {
         id: FunctionId(1),
         name: "borrowAndTake".to_string(),
+        source_span: Default::default(),
         method: None,
         receiver_mode: None,
         params: vec![LocalId(0), LocalId(1)],
@@ -1115,6 +1133,7 @@ fn shared_validator_enforces_writable_class_argument_rules() {
     program.functions[0].blocks[0]
         .statements
         .push(Statement::CallVoid {
+            span: Default::default(),
             function: FunctionId(1),
             args: vec![Rvalue::Class(ClassExpression::Local {
                 class: ClassId(0),
@@ -1127,6 +1146,7 @@ fn shared_validator_enforces_writable_class_argument_rules() {
     program.functions.push(Function {
         id: FunctionId(1),
         name: "mutate".to_string(),
+        source_span: Default::default(),
         method: None,
         receiver_mode: None,
         params: vec![LocalId(0)],
@@ -1183,6 +1203,7 @@ fn shared_validator_does_not_keep_nested_argument_borrows_alive() {
     program.functions[0].blocks[0]
         .statements
         .push(Statement::CallVoid {
+            span: Default::default(),
             function: FunctionId(2),
             args: vec![
                 Rvalue::String(StringExpression::Call {
@@ -1203,6 +1224,7 @@ fn shared_validator_does_not_keep_nested_argument_borrows_alive() {
     program.functions.push(Function {
         id: FunctionId(1),
         name: "label".to_string(),
+        source_span: Default::default(),
         method: None,
         receiver_mode: None,
         params: vec![LocalId(0)],
@@ -1220,6 +1242,7 @@ fn shared_validator_does_not_keep_nested_argument_borrows_alive() {
     program.functions.push(Function {
         id: FunctionId(2),
         name: "sink".to_string(),
+        source_span: Default::default(),
         method: None,
         receiver_mode: None,
         params: vec![LocalId(0), LocalId(1)],
@@ -1277,6 +1300,7 @@ fn shared_validator_preserves_constant_boolean_move_reachability() {
         BasicBlock {
             id: BlockId(1),
             statements: vec![Statement::CallVoid {
+                span: Default::default(),
                 function: FunctionId(2),
                 args: vec![Rvalue::Class(ClassExpression::Local {
                     class: ClassId(0),
@@ -1294,6 +1318,7 @@ fn shared_validator_preserves_constant_boolean_move_reachability() {
         BasicBlock {
             id: BlockId(3),
             statements: vec![Statement::CallVoid {
+                span: Default::default(),
                 function: FunctionId(3),
                 args: vec![Rvalue::Class(ClassExpression::Local {
                     class: ClassId(0),
@@ -1307,6 +1332,7 @@ fn shared_validator_preserves_constant_boolean_move_reachability() {
     program.functions.push(Function {
         id: FunctionId(1),
         name: "probe".to_string(),
+        source_span: Default::default(),
         method: None,
         receiver_mode: None,
         params: vec![LocalId(0)],
@@ -1326,6 +1352,7 @@ fn shared_validator_preserves_constant_boolean_move_reachability() {
     program.functions.push(Function {
         id: FunctionId(2),
         name: "consume".to_string(),
+        source_span: Default::default(),
         method: None,
         receiver_mode: None,
         params: vec![LocalId(0)],
@@ -1341,6 +1368,7 @@ fn shared_validator_preserves_constant_boolean_move_reachability() {
     program.functions.push(Function {
         id: FunctionId(3),
         name: "inspect".to_string(),
+        source_span: Default::default(),
         method: None,
         receiver_mode: None,
         params: vec![LocalId(0)],
@@ -1365,6 +1393,7 @@ fn shared_validator_tracks_nested_transfers_across_outer_call_arguments() {
     program.functions[0].blocks[0]
         .statements
         .push(Statement::CallVoid {
+            span: Default::default(),
             function: FunctionId(1),
             args: vec![
                 Rvalue::Class(ClassExpression::Local {
@@ -1388,6 +1417,7 @@ fn shared_validator_tracks_nested_transfers_across_outer_call_arguments() {
     program.functions.push(Function {
         id: FunctionId(1),
         name: "inspectWithLabel".to_string(),
+        source_span: Default::default(),
         method: None,
         receiver_mode: None,
         params: vec![LocalId(0), LocalId(1)],
@@ -1413,6 +1443,7 @@ fn shared_validator_tracks_nested_transfers_across_outer_call_arguments() {
     program.functions.push(Function {
         id: FunctionId(2),
         name: "consumeAndLabel".to_string(),
+        source_span: Default::default(),
         method: None,
         receiver_mode: None,
         params: vec![LocalId(0)],
@@ -1456,6 +1487,7 @@ fn shared_validator_tracks_property_borrows_across_outer_call_arguments() {
     program.functions[0].blocks[0]
         .statements
         .push(Statement::CallVoid {
+            span: Default::default(),
             function: FunctionId(1),
             args: vec![
                 Rvalue::Class(ClassExpression::Local {
@@ -1477,6 +1509,7 @@ fn shared_validator_tracks_property_borrows_across_outer_call_arguments() {
     program.functions.push(Function {
         id: FunctionId(1),
         name: "takeWithLabel".to_string(),
+        source_span: Default::default(),
         method: None,
         receiver_mode: None,
         params: vec![LocalId(0), LocalId(1)],
@@ -1555,9 +1588,12 @@ fn shared_validator_tracks_property_borrows_across_outer_call_arguments() {
         })],
     };
     program.functions[0].blocks[0].statements[0] = Statement::CallVoid {
+        span: Default::default(),
         function: FunctionId(1),
         args: vec![Rvalue::Value(ValueExpression::Integer(
             doriac::mir::IntegerExpression::Binary {
+                span: Default::default(),
+                right_span: Default::default(),
                 ty: IntegerType::Int64,
                 op: doriac::mir::IntegerBinaryOp::Add,
                 left: Box::new(property_read),
@@ -1572,6 +1608,7 @@ fn shared_validator_tracks_property_borrows_across_outer_call_arguments() {
     program.functions.push(Function {
         id: FunctionId(2),
         name: "update".to_string(),
+        source_span: Default::default(),
         method: None,
         receiver_mode: None,
         params: vec![LocalId(0)],
@@ -1718,6 +1755,7 @@ fn shared_validator_rejects_reusing_a_moved_constructor_argument() {
     program.functions.push(Function {
         id: FunctionId(1),
         name: "Pair::__construct".to_string(),
+        source_span: Default::default(),
         method: None,
         receiver_mode: None,
         params: vec![LocalId(0), LocalId(1)],
@@ -1884,6 +1922,7 @@ fn shared_validator_tracks_nested_transfers_across_property_initializers() {
     program.functions.push(Function {
         id: FunctionId(1),
         name: "relay".to_string(),
+        source_span: Default::default(),
         method: None,
         receiver_mode: None,
         params: vec![LocalId(0)],
@@ -1950,6 +1989,7 @@ fn shared_validator_rejects_a_promoted_class_owner_also_owned_by_the_constructor
     program.functions.push(Function {
         id: FunctionId(1),
         name: "Parent::__construct".to_string(),
+        source_span: Default::default(),
         method: None,
         receiver_mode: None,
         params: vec![LocalId(0), LocalId(1)],
@@ -1988,6 +2028,7 @@ fn shared_validator_invalidates_promoted_class_aliases_after_property_replacemen
             }),
         },
         Statement::CallVoid {
+            span: Default::default(),
             function: FunctionId(2),
             args: vec![Rvalue::Class(ClassExpression::Local {
                 class: ClassId(1),
@@ -2227,6 +2268,7 @@ fn shared_validator_requires_constructor_body_initializers_on_every_return_path(
     program.functions.push(Function {
         id: FunctionId(1),
         name: "Message::__construct".to_string(),
+        source_span: Default::default(),
         method: None,
         receiver_mode: None,
         params: vec![LocalId(0), LocalId(1)],
@@ -2308,8 +2350,10 @@ fn shared_validator_requires_constructor_body_initializers_on_every_return_path(
 
     let mut unreachable_write = program;
     unreachable_write.functions[1].blocks[2].statements.clear();
-    unreachable_write.functions[1].blocks[2].terminator =
-        Terminator::Panic(StringExpression::Literal("stop".to_string()));
+    unreachable_write.functions[1].blocks[2].terminator = Terminator::Panic {
+        message: StringExpression::Literal("stop".to_string()),
+        span: Default::default(),
+    };
     unreachable_write.functions[1].blocks.push(BasicBlock {
         id: BlockId(4),
         statements: vec![Statement::AssignProperty {
@@ -2428,6 +2472,7 @@ fn shared_validator_rejects_property_assignment_receiver_borrows_except_the_targ
     program.functions.push(Function {
         id: FunctionId(1),
         name: "update".to_string(),
+        source_span: Default::default(),
         method: None,
         receiver_mode: None,
         params: vec![LocalId(0)],
@@ -2616,6 +2661,7 @@ fn shared_validator_rejects_unknown_classes_in_function_types() {
     parameter.functions.push(Function {
         id: FunctionId(1),
         name: "missingClassParameter".to_string(),
+        source_span: Default::default(),
         method: None,
         receiver_mode: None,
         params: vec![LocalId(0)],
@@ -2636,6 +2682,7 @@ fn shared_validator_rejects_unknown_classes_in_function_types() {
     returned.functions.push(Function {
         id: FunctionId(1),
         name: "missingClass".to_string(),
+        source_span: Default::default(),
         method: None,
         receiver_mode: None,
         params: vec![],
@@ -2662,6 +2709,7 @@ fn shared_validator_checks_lifecycle_metadata_even_when_unused() {
     valid.functions.push(Function {
         id: FunctionId(1),
         name: "Class0::__destruct".to_string(),
+        source_span: Default::default(),
         method: None,
         receiver_mode: None,
         params: vec![LocalId(0)],
@@ -2708,6 +2756,7 @@ fn shared_validator_rejects_transfers_into_borrowed_class_parameters() {
     program.functions[0].blocks[0]
         .statements
         .push(Statement::CallVoid {
+            span: Default::default(),
             function: FunctionId(1),
             args: vec![Rvalue::Class(ClassExpression::Local {
                 class: ClassId(0),
@@ -2720,6 +2769,7 @@ fn shared_validator_rejects_transfers_into_borrowed_class_parameters() {
     program.functions.push(Function {
         id: FunctionId(1),
         name: "inspect".to_string(),
+        source_span: Default::default(),
         method: None,
         receiver_mode: None,
         params: vec![LocalId(0)],
@@ -2747,6 +2797,7 @@ fn shared_validator_rejects_borrows_into_owned_class_parameters() {
     program.functions[0].blocks[0]
         .statements
         .push(Statement::CallVoid {
+            span: Default::default(),
             function: FunctionId(1),
             args: vec![Rvalue::Class(ClassExpression::Local {
                 class: ClassId(0),
@@ -2757,6 +2808,7 @@ fn shared_validator_rejects_borrows_into_owned_class_parameters() {
     program.functions.push(Function {
         id: FunctionId(1),
         name: "consume".to_string(),
+        source_span: Default::default(),
         method: None,
         receiver_mode: None,
         params: vec![LocalId(0)],
@@ -2783,6 +2835,7 @@ fn shared_validator_rejects_owned_parameters_as_return_borrow_sources() {
     program.functions.push(Function {
         id: FunctionId(1),
         name: "invalidBorrowReturn".to_string(),
+        source_span: Default::default(),
         method: None,
         receiver_mode: None,
         params: vec![LocalId(0)],
@@ -2814,6 +2867,7 @@ fn shared_validator_tracks_borrow_returning_outer_call_arguments() {
     program.functions[0].blocks[0]
         .statements
         .push(Statement::CallVoid {
+            span: Default::default(),
             function: FunctionId(2),
             args: vec![
                 Rvalue::Class(ClassExpression::Call {
@@ -2839,6 +2893,7 @@ fn shared_validator_tracks_borrow_returning_outer_call_arguments() {
     program.functions.push(Function {
         id: FunctionId(1),
         name: "identity".to_string(),
+        source_span: Default::default(),
         method: None,
         receiver_mode: None,
         params: vec![LocalId(0)],
@@ -2858,6 +2913,7 @@ fn shared_validator_tracks_borrow_returning_outer_call_arguments() {
     program.functions.push(Function {
         id: FunctionId(2),
         name: "observeThenConsume".to_string(),
+        source_span: Default::default(),
         method: None,
         receiver_mode: None,
         params: vec![LocalId(0), LocalId(1)],
@@ -2888,6 +2944,7 @@ fn shared_validator_rejects_duplicate_class_local_transfers_in_one_call() {
     program.functions[0].blocks[0]
         .statements
         .push(Statement::CallVoid {
+            span: Default::default(),
             function: FunctionId(1),
             args: vec![
                 Rvalue::Class(ClassExpression::Local {
@@ -2905,6 +2962,7 @@ fn shared_validator_rejects_duplicate_class_local_transfers_in_one_call() {
     program.functions.push(Function {
         id: FunctionId(1),
         name: "consumeBoth".to_string(),
+        source_span: Default::default(),
         method: None,
         receiver_mode: None,
         params: vec![LocalId(0), LocalId(1)],
@@ -3012,6 +3070,7 @@ fn shared_validator_rejects_borrowed_class_rvalues_in_owning_slots() {
     returned.functions.push(Function {
         id: FunctionId(1),
         name: "borrowedReturn".to_string(),
+        source_span: Default::default(),
         method: None,
         receiver_mode: None,
         params: vec![],
@@ -3120,6 +3179,7 @@ fn shared_validator_treats_promoted_nullable_class_arguments_as_transfers() {
     program.functions.push(Function {
         id: FunctionId(1),
         name: "Holder::__construct".to_string(),
+        source_span: Default::default(),
         method: None,
         receiver_mode: None,
         params: vec![LocalId(0), LocalId(1)],
@@ -3217,6 +3277,7 @@ fn shared_validator_rejects_mismatched_shared_reference_operations() {
     program.functions.push(Function {
         id: FunctionId(1),
         name: "wrongShare".to_string(),
+        source_span: Default::default(),
         method: None,
         receiver_mode: None,
         params: vec![LocalId(0)],
@@ -3294,6 +3355,7 @@ fn shared_validator_rejects_mismatched_weak_acquisition_and_drop() {
     acquire.functions.push(Function {
         id: FunctionId(1),
         name: "wrongAcquire".to_string(),
+        source_span: Default::default(),
         method: None,
         receiver_mode: None,
         params: vec![LocalId(0)],
@@ -3351,12 +3413,14 @@ fn display_spec() -> FormatSpec {
 
 fn valid_void_program() -> Program {
     Program {
+        source: doriac::source::SourceFile::new("<test>", ""),
         classes: vec![],
         collection_types: vec![],
         statics: vec![],
         functions: vec![Function {
             id: FunctionId(0),
             name: "main".to_string(),
+            source_span: Default::default(),
             method: None,
             receiver_mode: None,
             params: Vec::new(),
@@ -3445,6 +3509,7 @@ fn class_new_program() -> Program {
     program.functions.push(Function {
         id: FunctionId(1),
         name: "Message::__construct".to_string(),
+        source_span: Default::default(),
         method: None,
         receiver_mode: None,
         params: vec![LocalId(0), LocalId(1)],
@@ -3508,6 +3573,7 @@ fn promoted_class_alias_program() -> (Program, PropertyId) {
     program.functions.push(Function {
         id: FunctionId(1),
         name: "Parent::__construct".to_string(),
+        source_span: Default::default(),
         method: None,
         receiver_mode: None,
         params: vec![LocalId(0), LocalId(1)],
@@ -3526,6 +3592,7 @@ fn promoted_class_alias_program() -> (Program, PropertyId) {
     program.functions.push(Function {
         id: FunctionId(2),
         name: "inspect".to_string(),
+        source_span: Default::default(),
         method: None,
         receiver_mode: None,
         params: vec![LocalId(0)],

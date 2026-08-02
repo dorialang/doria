@@ -1,3 +1,16 @@
-Panic: String Slice Length Cannot Be Negative
-Stack Trace:
-  at main
+Panic[P1201]: String Slice Length Cannot Be Negative
+
+Where
+examples/native/main_string_slice_negative_panic.doria · line 3 · main
+
+  3          echo String::slice("Doria", 0, -1);
+                                            ^^
+                                            Negative Slice Length
+
+Why
+A string slice length describes a count of graphemes and therefore cannot be negative.
+
+Call Path
+main · examples/native/main_string_slice_negative_panic.doria:3
+
+Process Exited With Status 101

@@ -8,6 +8,7 @@ $failures = [];
 $required = [
     'docs/diagnostic-style.md',
     'docs/decisions/0108-human-first-diagnostic-model-and-presentation.md',
+    'docs/decisions/0109-unified-diagnostic-presentation-and-runtime-outcomes.md',
     'docs/notes/diagnostic-catalogue-audit.md',
 ];
 
@@ -27,8 +28,11 @@ if ($renderer === false) {
         '"Note"',
         '"Help"',
         '"Why"',
+        'Where\\n',
+        'Related',
+        'Call Path',
         'Suggested Fix',
-        'Caused By: ',
+        'Process Exited With Status',
         '"Internal Compiler Error"',
         '"Compilation Failed"',
         'DIAGNOSTIC_SCHEMA_VERSION: u32 = 1',
@@ -41,8 +45,9 @@ if ($renderer === false) {
 }
 
 $cataloguedCodes = [];
-if (is_string($renderer)
-    && preg_match('/CATALOGUED_CODES[^=]*=\s*&\[(.*?)\];/s', $renderer, $catalogueMatch) === 1
+$catalogue = file_get_contents($root . '/crates/doria-diagnostic-catalogue/src/lib.rs');
+if (is_string($catalogue)
+    && preg_match('/DIAGNOSTIC_CODES[^=]*=\s*&\[(.*?)\];/s', $catalogue, $catalogueMatch) === 1
     && preg_match_all('/"([A-Z][0-9]{4})"/', $catalogueMatch[1], $codeMatches) !== false
 ) {
     $cataloguedCodes = array_fill_keys($codeMatches[1], true);

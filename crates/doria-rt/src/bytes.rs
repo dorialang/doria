@@ -1,7 +1,9 @@
 use core::mem;
 use core::ptr;
 
-use crate::{allocate, deallocate, dr_v1_panic, DrStackFrameV1};
+use crate::{
+    allocate, deallocate, dr_v2_panic_code, dr_v2_panic_index_out_of_bounds, DrStackFrameV2,
+};
 
 #[repr(C)]
 pub struct DrBytesV1 {
@@ -27,7 +29,7 @@ unsafe fn allocate_header(data: *mut u8, length: usize) -> *mut DrBytesV1 {
         if !data.is_null() {
             deallocate(data);
         }
-        bytes_panic(b"byte-buffer allocation failed");
+        bytes_panic(b"P1302");
     }
     ptr::write(bytes, DrBytesV1 { length, data });
     bytes
@@ -39,7 +41,7 @@ unsafe fn allocate_data(length: usize) -> *mut u8 {
     }
     let data = allocate(length);
     if data.is_null() {
-        bytes_panic(b"byte-buffer allocation failed");
+        bytes_panic(b"P1302");
     }
     data
 }
@@ -62,24 +64,16 @@ pub unsafe fn data(bytes: *const DrBytesV1) -> *const u8 {
     (*bytes).data
 }
 
-pub unsafe fn get(frame: *const DrStackFrameV1, bytes: *const DrBytesV1, index: usize) -> u8 {
+pub unsafe fn get(frame: *const DrStackFrameV2, bytes: *const DrBytesV1, index: usize) -> u8 {
     if index >= (*bytes).length {
-        dr_v1_panic(
-            frame,
-            b"byte index out of bounds".as_ptr(),
-            b"byte index out of bounds".len(),
-        );
+        dr_v2_panic_index_out_of_bounds(frame, b"P1301".as_ptr(), 5, index as i64, (*bytes).length);
     }
     *(*bytes).data.add(index)
 }
 
-pub unsafe fn set(frame: *const DrStackFrameV1, bytes: *mut DrBytesV1, index: usize, value: u8) {
+pub unsafe fn set(frame: *const DrStackFrameV2, bytes: *mut DrBytesV1, index: usize, value: u8) {
     if index >= (*bytes).length {
-        dr_v1_panic(
-            frame,
-            b"byte index out of bounds".as_ptr(),
-            b"byte index out of bounds".len(),
-        );
+        dr_v2_panic_index_out_of_bounds(frame, b"P1301".as_ptr(), 5, index as i64, (*bytes).length);
     }
     *(*bytes).data.add(index) = value;
 }
@@ -96,8 +90,8 @@ pub unsafe fn equal(left: *const DrBytesV1, right: *const DrBytesV1) -> bool {
         == core::slice::from_raw_parts((*right).data, length)
 }
 
-fn bytes_panic(message: &'static [u8]) -> ! {
-    unsafe { dr_v1_panic(ptr::null(), message.as_ptr(), message.len()) }
+fn bytes_panic(code: &'static [u8]) -> ! {
+    unsafe { dr_v2_panic_code(ptr::null(), code.as_ptr(), code.len(), ptr::null(), 0) }
 }
 
 #[cfg(test)]

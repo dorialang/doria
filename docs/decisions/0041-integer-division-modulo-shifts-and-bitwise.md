@@ -120,7 +120,8 @@ integer shift count out of range
 integer conversion out of range
 ```
 
-Each panic follows decision 0040: it writes the deterministic panic message and Doria function-name stack trace to stderr, then exits with status 101.
+Each panic follows decisions 0040 and 0109: it produces a catalogued
+source-aware diagnostic and Doria `Call Path`, then exits with status 101.
 
 ## Alternatives considered
 
@@ -134,7 +135,9 @@ Each panic follows decision 0040: it writes the deterministic panic message and 
 - Operator checking must know the canonical integer type before lowering.
 - Contextual literals can make a mixed literal/value expression well typed, but nonliteral values never convert implicitly.
 - MIR and every execution backend must preserve signedness and bit width for integer operations.
-- The interpreter, native backend, and PHP compatibility backend must agree on results, panic text, stack trace, and exit status.
+- The interpreter, native backends, and PHP compatibility backend must agree on
+  results, structured panic facts, Doria `Call Path`, human output, and exit
+  status.
 
 ## Affected components
 

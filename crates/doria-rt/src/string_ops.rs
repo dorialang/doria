@@ -4,8 +4,9 @@ use core::ptr;
 use doria_unicode::{CaseMapping, PadSide, StringError, TrimMode};
 
 use crate::{
-    allocate, allocate_string_with_frame, bytes, collection, deallocate, dr_v1_panic,
-    dr_v1_string_retain, string_bytes_mut, DrBytesV1, DrCollectionV1, DrStackFrameV1, DrStringV1,
+    allocate, allocate_string_with_frame, bytes, collection, deallocate, dr_v1_string_retain,
+    dr_v2_panic_code, dr_v2_panic_signed_fact, dr_v2_panic_string_padding_empty, string_bytes_mut,
+    DrBytesV1, DrCollectionV1, DrStackFrameV2, DrStringV1,
 };
 
 unsafe fn text<'a>(value: *const DrStringV1) -> &'a str {
@@ -16,17 +17,30 @@ unsafe fn text<'a>(value: *const DrStringV1) -> &'a str {
     core::str::from_utf8_unchecked(bytes)
 }
 
-unsafe fn panic_error(frame: *const DrStackFrameV1, error: StringError) -> ! {
+unsafe fn panic_error(frame: *const DrStackFrameV2, error: StringError) -> ! {
+    let code = match error {
+        StringError::SliceLengthNegative => b"P1201",
+        StringError::PaddingLengthNegative => b"P1202",
+        StringError::PaddingTextEmpty => b"P1203",
+        StringError::RepetitionCountNegative => b"P1204",
+        StringError::ResultTooLarge => b"P1205",
+    };
     let message = error.panic_message().as_bytes();
-    dr_v1_panic(frame, message.as_ptr(), message.len())
+    dr_v2_panic_code(
+        frame,
+        code.as_ptr(),
+        code.len(),
+        message.as_ptr(),
+        message.len(),
+    )
 }
 
-unsafe fn new_result(frame: *const DrStackFrameV1, byte_length: usize) -> *mut DrStringV1 {
+unsafe fn new_result(frame: *const DrStackFrameV2, byte_length: usize) -> *mut DrStringV1 {
     allocate_string_with_frame(frame, byte_length)
 }
 
 unsafe fn copy_range(
-    frame: *const DrStackFrameV1,
+    frame: *const DrStackFrameV2,
     source: &str,
     range: core::ops::Range<usize>,
 ) -> *mut DrStringV1 {
@@ -39,7 +53,7 @@ unsafe fn copy_range(
 }
 
 unsafe fn transform(
-    frame: *const DrStackFrameV1,
+    frame: *const DrStackFrameV2,
     value: *const DrStringV1,
     mapping: CaseMapping,
 ) -> *mut DrStringV1 {
@@ -55,7 +69,7 @@ unsafe fn transform(
 }
 
 unsafe fn transform_first(
-    frame: *const DrStackFrameV1,
+    frame: *const DrStackFrameV2,
     value: *const DrStringV1,
     mapping: CaseMapping,
 ) -> *mut DrStringV1 {
@@ -89,7 +103,7 @@ pub unsafe extern "C" fn dr_v1_string_to_bytes(value: *const DrStringV1) -> *mut
 }
 
 unsafe fn trim(
-    frame: *const DrStackFrameV1,
+    frame: *const DrStackFrameV2,
     value: *const DrStringV1,
     mode: TrimMode,
 ) -> *mut DrStringV1 {
@@ -102,56 +116,56 @@ unsafe fn trim(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn dr_v1_string_trim(
-    frame: *const DrStackFrameV1,
+pub unsafe extern "C" fn dr_v2_string_trim(
+    frame: *const DrStackFrameV2,
     value: *const DrStringV1,
 ) -> *mut DrStringV1 {
     trim(frame, value, TrimMode::Both)
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn dr_v1_string_trim_start(
-    frame: *const DrStackFrameV1,
+pub unsafe extern "C" fn dr_v2_string_trim_start(
+    frame: *const DrStackFrameV2,
     value: *const DrStringV1,
 ) -> *mut DrStringV1 {
     trim(frame, value, TrimMode::Start)
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn dr_v1_string_trim_end(
-    frame: *const DrStackFrameV1,
+pub unsafe extern "C" fn dr_v2_string_trim_end(
+    frame: *const DrStackFrameV2,
     value: *const DrStringV1,
 ) -> *mut DrStringV1 {
     trim(frame, value, TrimMode::End)
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn dr_v1_string_lower(
-    frame: *const DrStackFrameV1,
+pub unsafe extern "C" fn dr_v2_string_lower(
+    frame: *const DrStackFrameV2,
     value: *const DrStringV1,
 ) -> *mut DrStringV1 {
     transform(frame, value, CaseMapping::Lower)
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn dr_v1_string_upper(
-    frame: *const DrStackFrameV1,
+pub unsafe extern "C" fn dr_v2_string_upper(
+    frame: *const DrStackFrameV2,
     value: *const DrStringV1,
 ) -> *mut DrStringV1 {
     transform(frame, value, CaseMapping::Upper)
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn dr_v1_string_lower_first(
-    frame: *const DrStackFrameV1,
+pub unsafe extern "C" fn dr_v2_string_lower_first(
+    frame: *const DrStackFrameV2,
     value: *const DrStringV1,
 ) -> *mut DrStringV1 {
     transform_first(frame, value, CaseMapping::Lower)
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn dr_v1_string_upper_first(
-    frame: *const DrStackFrameV1,
+pub unsafe extern "C" fn dr_v2_string_upper_first(
+    frame: *const DrStackFrameV2,
     value: *const DrStringV1,
 ) -> *mut DrStringV1 {
     transform_first(frame, value, CaseMapping::Upper)
@@ -182,7 +196,7 @@ pub unsafe extern "C" fn dr_v1_string_ends_with(
 }
 
 unsafe fn ignore_case_predicate(
-    frame: *const DrStackFrameV1,
+    frame: *const DrStackFrameV2,
     text_value: *const DrStringV1,
     needle: *const DrStringV1,
     predicate: impl FnOnce(&str, &str) -> Result<bool, StringError>,
@@ -193,8 +207,8 @@ unsafe fn ignore_case_predicate(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn dr_v1_string_contains_ignore_case(
-    frame: *const DrStackFrameV1,
+pub unsafe extern "C" fn dr_v2_string_contains_ignore_case(
+    frame: *const DrStackFrameV2,
     text_value: *const DrStringV1,
     needle: *const DrStringV1,
 ) -> u8 {
@@ -207,8 +221,8 @@ pub unsafe extern "C" fn dr_v1_string_contains_ignore_case(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn dr_v1_string_starts_with_ignore_case(
-    frame: *const DrStackFrameV1,
+pub unsafe extern "C" fn dr_v2_string_starts_with_ignore_case(
+    frame: *const DrStackFrameV2,
     text_value: *const DrStringV1,
     prefix: *const DrStringV1,
 ) -> u8 {
@@ -221,8 +235,8 @@ pub unsafe extern "C" fn dr_v1_string_starts_with_ignore_case(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn dr_v1_string_ends_with_ignore_case(
-    frame: *const DrStackFrameV1,
+pub unsafe extern "C" fn dr_v2_string_ends_with_ignore_case(
+    frame: *const DrStackFrameV2,
     text_value: *const DrStringV1,
     suffix: *const DrStringV1,
 ) -> u8 {
@@ -235,8 +249,8 @@ pub unsafe extern "C" fn dr_v1_string_ends_with_ignore_case(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn dr_v1_string_equals_ignore_case(
-    frame: *const DrStackFrameV1,
+pub unsafe extern "C" fn dr_v2_string_equals_ignore_case(
+    frame: *const DrStackFrameV2,
     left: *const DrStringV1,
     right: *const DrStringV1,
 ) -> u8 {
@@ -288,7 +302,7 @@ unsafe fn index_of(
 }
 
 unsafe fn index_of_ignore_case(
-    frame: *const DrStackFrameV1,
+    frame: *const DrStackFrameV2,
     text_value: *const DrStringV1,
     needle: *const DrStringV1,
     found: *mut u8,
@@ -328,8 +342,8 @@ pub unsafe extern "C" fn dr_v1_string_last_index_of(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn dr_v1_string_index_of_ignore_case(
-    frame: *const DrStackFrameV1,
+pub unsafe extern "C" fn dr_v2_string_index_of_ignore_case(
+    frame: *const DrStackFrameV2,
     text_value: *const DrStringV1,
     needle: *const DrStringV1,
     found: *mut u8,
@@ -338,8 +352,8 @@ pub unsafe extern "C" fn dr_v1_string_index_of_ignore_case(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn dr_v1_string_last_index_of_ignore_case(
-    frame: *const DrStackFrameV1,
+pub unsafe extern "C" fn dr_v2_string_last_index_of_ignore_case(
+    frame: *const DrStackFrameV2,
     text_value: *const DrStringV1,
     needle: *const DrStringV1,
     found: *mut u8,
@@ -348,8 +362,8 @@ pub unsafe extern "C" fn dr_v1_string_last_index_of_ignore_case(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn dr_v1_string_count_occurrences(
-    frame: *const DrStackFrameV1,
+pub unsafe extern "C" fn dr_v2_string_count_occurrences(
+    frame: *const DrStackFrameV2,
     text_value: *const DrStringV1,
     needle: *const DrStringV1,
 ) -> i64 {
@@ -359,8 +373,8 @@ pub unsafe extern "C" fn dr_v1_string_count_occurrences(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn dr_v1_string_replace(
-    frame: *const DrStackFrameV1,
+pub unsafe extern "C" fn dr_v2_string_replace(
+    frame: *const DrStackFrameV2,
     text_value: *const DrStringV1,
     search: *const DrStringV1,
     replacement: *const DrStringV1,
@@ -378,8 +392,8 @@ pub unsafe extern "C" fn dr_v1_string_replace(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn dr_v1_string_split(
-    frame: *const DrStackFrameV1,
+pub unsafe extern "C" fn dr_v2_string_split(
+    frame: *const DrStackFrameV2,
     text_value: *const DrStringV1,
     separator: *const DrStringV1,
 ) -> *mut DrCollectionV1 {
@@ -396,8 +410,8 @@ pub unsafe extern "C" fn dr_v1_string_split(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn dr_v1_string_join(
-    frame: *const DrStackFrameV1,
+pub unsafe extern "C" fn dr_v2_string_join(
+    frame: *const DrStackFrameV2,
     separator: *const DrStringV1,
     values: *const DrCollectionV1,
 ) -> *mut DrStringV1 {
@@ -434,8 +448,8 @@ pub unsafe extern "C" fn dr_v1_string_join(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn dr_v1_string_slice(
-    frame: *const DrStackFrameV1,
+pub unsafe extern "C" fn dr_v2_string_slice(
+    frame: *const DrStackFrameV2,
     value: *const DrStringV1,
     start: i64,
     length: i64,
@@ -443,19 +457,41 @@ pub unsafe extern "C" fn dr_v1_string_slice(
 ) -> *mut DrStringV1 {
     let source = text(value);
     let range = doria_unicode::slice_range(source, start, (has_length != 0).then_some(length))
-        .unwrap_or_else(|error| panic_error(frame, error));
+        .unwrap_or_else(|error| match error {
+            StringError::SliceLengthNegative => dr_v2_panic_signed_fact(
+                frame,
+                b"P1201".as_ptr(),
+                5,
+                doria_diagnostic_catalogue::STRING_SLICE_LENGTH_FACT.as_ptr(),
+                doria_diagnostic_catalogue::STRING_SLICE_LENGTH_FACT.len(),
+                length,
+            ),
+            error => panic_error(frame, error),
+        });
     copy_range(frame, source, range)
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn dr_v1_string_repeat(
-    frame: *const DrStackFrameV1,
+pub unsafe extern "C" fn dr_v2_string_repeat(
+    frame: *const DrStackFrameV2,
     value: *const DrStringV1,
     count: i64,
 ) -> *mut DrStringV1 {
     let source = text(value);
-    let length = doria_unicode::repetition_output_length(source, count)
-        .unwrap_or_else(|error| panic_error(frame, error));
+    let length =
+        doria_unicode::repetition_output_length(source, count).unwrap_or_else(
+            |error| match error {
+                StringError::RepetitionCountNegative => dr_v2_panic_signed_fact(
+                    frame,
+                    b"P1204".as_ptr(),
+                    5,
+                    doria_diagnostic_catalogue::STRING_REPETITION_COUNT_FACT.as_ptr(),
+                    doria_diagnostic_catalogue::STRING_REPETITION_COUNT_FACT.len(),
+                    count,
+                ),
+                error => panic_error(frame, error),
+            },
+        );
     let result = new_result(frame, length);
     let output = core::slice::from_raw_parts_mut(string_bytes_mut(result), length);
     doria_unicode::write_repetition(source, count, output)
@@ -464,7 +500,7 @@ pub unsafe extern "C" fn dr_v1_string_repeat(
 }
 
 unsafe fn pad(
-    frame: *const DrStackFrameV1,
+    frame: *const DrStackFrameV2,
     value: *const DrStringV1,
     target_length: i64,
     padding: *const DrStringV1,
@@ -472,18 +508,37 @@ unsafe fn pad(
 ) -> *mut DrStringV1 {
     let source = text(value);
     let padding = text(padding);
-    let length = doria_unicode::padding_output_length(source, target_length, padding)
-        .unwrap_or_else(|error| panic_error(frame, error));
+    let panic = |error| match error {
+        StringError::PaddingTextEmpty => dr_v2_panic_string_padding_empty(
+            frame,
+            u8::from(side == PadSide::Start),
+            value,
+            doria_unicode::grapheme_count(source),
+            target_length,
+            doria_unicode::grapheme_count(padding),
+        ),
+        StringError::PaddingLengthNegative => dr_v2_panic_signed_fact(
+            frame,
+            b"P1202".as_ptr(),
+            5,
+            doria_diagnostic_catalogue::STRING_PADDING_REQUESTED_LENGTH_FACT.as_ptr(),
+            doria_diagnostic_catalogue::STRING_PADDING_REQUESTED_LENGTH_FACT.len(),
+            target_length,
+        ),
+        error => panic_error(frame, error),
+    };
+    let length =
+        doria_unicode::padding_output_length(source, target_length, padding).unwrap_or_else(panic);
     let result = new_result(frame, length);
     let output = core::slice::from_raw_parts_mut(string_bytes_mut(result), length);
     doria_unicode::write_padding(source, target_length, padding, side, output)
-        .unwrap_or_else(|error| panic_error(frame, error));
+        .unwrap_or_else(panic);
     result
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn dr_v1_string_pad_start(
-    frame: *const DrStackFrameV1,
+pub unsafe extern "C" fn dr_v2_string_pad_start(
+    frame: *const DrStackFrameV2,
     value: *const DrStringV1,
     target_length: i64,
     padding: *const DrStringV1,
@@ -492,8 +547,8 @@ pub unsafe extern "C" fn dr_v1_string_pad_start(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn dr_v1_string_pad_end(
-    frame: *const DrStackFrameV1,
+pub unsafe extern "C" fn dr_v2_string_pad_end(
+    frame: *const DrStackFrameV2,
     value: *const DrStringV1,
     target_length: i64,
     padding: *const DrStringV1,
@@ -532,37 +587,37 @@ mod tests {
             assert_eq!(dr_v1_string_is_empty(family), 0);
 
             let source = string("\u{2003}Straße 👍🏾\u{00a0}");
-            let trimmed = dr_v1_string_trim(ptr::null(), source);
-            let upper = dr_v1_string_upper(ptr::null(), trimmed);
+            let trimmed = dr_v2_string_trim(ptr::null(), source);
+            let upper = dr_v2_string_upper(ptr::null(), trimmed);
             assert_eq!(read(trimmed), "Straße 👍🏾");
             assert_eq!(read(upper), "STRASSE 👍🏾");
 
             let folded = string("STRASSE 👍🏾");
             assert_eq!(
-                dr_v1_string_equals_ignore_case(ptr::null(), trimmed, folded),
+                dr_v2_string_equals_ignore_case(ptr::null(), trimmed, folded),
                 1
             );
             let empty_left = string("");
             let empty_right = string("");
             assert_eq!(
-                dr_v1_string_equals_ignore_case(ptr::null(), empty_left, empty_right),
+                dr_v2_string_equals_ignore_case(ptr::null(), empty_left, empty_right),
                 1
             );
             let first = string("ßTRASSE");
-            let upper_first = dr_v1_string_upper_first(ptr::null(), first);
+            let upper_first = dr_v2_string_upper_first(ptr::null(), first);
             assert_eq!(read(upper_first), "SSTRASSE");
 
             let case_needle = string("strasse");
             let mut found = 0;
             assert_eq!(
-                dr_v1_string_index_of_ignore_case(ptr::null(), trimmed, case_needle, &mut found,),
+                dr_v2_string_index_of_ignore_case(ptr::null(), trimmed, case_needle, &mut found,),
                 0
             );
             assert_eq!(found, 1);
             let repeated = string("aaaa");
             let occurrence = string("aa");
             assert_eq!(
-                dr_v1_string_count_occurrences(ptr::null(), repeated, occurrence),
+                dr_v2_string_count_occurrences(ptr::null(), repeated, occurrence),
                 2
             );
 
@@ -586,9 +641,9 @@ mod tests {
         unsafe {
             let source = string("one,👍🏾,three");
             let separator = string(",");
-            let fields = dr_v1_string_split(ptr::null(), source, separator);
+            let fields = dr_v2_string_split(ptr::null(), source, separator);
             assert_eq!(collection::length(fields), 3);
-            let joined = dr_v1_string_join(ptr::null(), separator, fields);
+            let joined = dr_v2_string_join(ptr::null(), separator, fields);
             assert_eq!(read(joined), "one,👍🏾,three");
 
             let bytes = dr_v1_string_to_bytes(source);

@@ -1,3 +1,16 @@
-Panic: failed to read file
-Stack Trace:
-  at main
+Panic[P1401]: File Read Failed
+
+Where
+examples/native/main_missing_file_panic.doria · line 3 · main
+
+  3          echo read_file("does-not-exist.txt");
+                            ^^^^^^^^^^^^^^^^^^^^
+                            File Read Requested Here
+
+Why
+The runtime could not read the requested file.
+
+Call Path
+main · examples/native/main_missing_file_panic.doria:3
+
+Process Exited With Status 101

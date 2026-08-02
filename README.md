@@ -54,6 +54,15 @@ not produce a partially initialized object.
 Bare `{ ... }` blocks provide an explicit shorter lifetime boundary when a value
 or access guard should be cleaned up before the surrounding function continues.
 
+When a graph genuinely needs several owners, Doria provides an explicit escape
+hatch rather than changing the default model. `shared new Node()` creates a
+readonly `SharedReference<Node>`; writable shared graphs use
+`WritableSharedReference<T>` and scoped readonly/writable access objects. The two
+families are deliberately disjoint, additional ownership is always requested
+with `share()`, and weak references break back-reference cycles without keeping
+the payload alive. Ordinary owned values still pay no reference-counting or
+runtime access-check cost.
+
 ## Design principles
 
 - **Contracts are written down.** Every parameter is explicitly typed — always. Nothing silently defaults to a dynamic type, and nullability is spelled `?T` and enforced.
@@ -89,6 +98,12 @@ doriac check main.doria --diagnostic-format json
 
 Color is controlled independently with
 `--diagnostic-color auto|always|never`; automatic color honors `NO_COLOR`.
+
+Runtime panics use the same structured diagnostic model and format selection.
+Built-in panics have stable `P` codes, a precise Doria source label, an
+explanation, a Doria-only `Call Path`, and status 101. `doriac run` receives
+native runtime facts over a private structured channel; neither it, the
+language server, nor the Playground parses rendered terminal prose.
 
 ---
 

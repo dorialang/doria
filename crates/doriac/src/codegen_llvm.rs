@@ -38,7 +38,7 @@ use crate::native_abi::{
     MIXED_TAG_FLOAT64, MIXED_TAG_INT16, MIXED_TAG_INT32, MIXED_TAG_INT64, MIXED_TAG_INT8,
     MIXED_TAG_STRING, MIXED_TAG_UINT16, MIXED_TAG_UINT32, MIXED_TAG_UINT64, MIXED_TAG_UINT8,
     MIXED_TYPE_ID, NULLABLE_STRING_EQUAL, PROCESS_EXIT, READ_FILE, READ_FILE_BYTES,
-    READ_STDIN_BYTES, READ_STDIN_LINE, SHARED_ACQUIRE, SHARED_CREATE, SHARED_CREATE_WEAK,
+    READ_STDIN_BYTES, READ_STDIN_LINE_PROMPTED, SHARED_ACQUIRE, SHARED_CREATE, SHARED_CREATE_WEAK,
     SHARED_PAYLOAD, SHARED_RELEASE, SHARED_RELEASE_WEAK, SHARED_RETAIN, STRING_BYTE_LENGTH,
     STRING_COMPARE, STRING_CONCAT, STRING_CONTAINS, STRING_CONTAINS_IGNORE_CASE,
     STRING_COUNT_OCCURRENCES, STRING_DATA, STRING_ENDS_WITH, STRING_ENDS_WITH_IGNORE_CASE,
@@ -105,7 +105,13 @@ pub fn lower_mir_to_object(program: &mir::Program) -> Result<Vec<u8>, BackendErr
     }
     define_class_drop_functions(&context, &module, &target_data, program, &declarations)?;
     define_collection_drop_functions(&context, &module, &target_data, program, &declarations)?;
-    define_process_main(&context, &module, program, &declarations.functions)?;
+    define_process_main(
+        &context,
+        &module,
+        &target_data,
+        program,
+        &declarations.functions,
+    )?;
 
     module
         .verify()
@@ -384,10 +390,80 @@ fn define_function<'ctx>(
         build(builder.build_store(local_slot(&local_slots, *parameter)?, value))?;
     }
 
-    // Release objects deliberately omit the shadow-frame chain. Every runtime
-    // call receives null, allowing LLVM to remove the now-unused hidden frame
-    // parameter from internal calls and recover normal tail-call optimization.
-    let current_frame = context.ptr_type(AddressSpace::default()).const_null();
+    let pointer = context.ptr_type(AddressSpace::default());
+    let usize_type = context.ptr_sized_int_type(target_data, None);
+    let frame_type = context.struct_type(
+        &[
+            pointer.into(),
+            pointer.into(),
+            usize_type.into(),
+            pointer.into(),
+            usize_type.into(),
+            pointer.into(),
+            usize_type.into(),
+            usize_type.into(),
+            usize_type.into(),
+            usize_type.into(),
+            usize_type.into(),
+        ],
+        false,
+    );
+    let frame = build(builder.build_alloca(frame_type, "doria.frame.v2"))?;
+    let parent = llvm_function
+        .get_nth_param(0)
+        .ok_or_else(|| malformed_mir("LLVM function is missing its parent frame"))?
+        .into_pointer_value();
+    let function_name = define_bytes(
+        context,
+        module,
+        function.name.as_bytes(),
+        &format!("__doria_function_name_{}", function.id.0),
+    );
+    let source_path = define_bytes(
+        context,
+        module,
+        program.source.path.as_bytes(),
+        &format!("__doria_source_path_{}", function.id.0),
+    );
+    let source_text = define_bytes(
+        context,
+        module,
+        program.source.text.as_bytes(),
+        &format!("__doria_source_text_{}", function.id.0),
+    );
+    let frame_values: [BasicValueEnum<'ctx>; 11] = [
+        parent.into(),
+        function_name.into(),
+        usize_type
+            .const_int(function.name.len() as u64, false)
+            .into(),
+        source_path.into(),
+        usize_type
+            .const_int(program.source.path.len() as u64, false)
+            .into(),
+        source_text.into(),
+        usize_type
+            .const_int(program.source.text.len() as u64, false)
+            .into(),
+        usize_type
+            .const_int(function.source_span.start as u64, false)
+            .into(),
+        usize_type
+            .const_int(function.source_span.end as u64, false)
+            .into(),
+        usize_type
+            .const_int(function.source_span.start as u64, false)
+            .into(),
+        usize_type
+            .const_int(function.source_span.end as u64, false)
+            .into(),
+    ];
+    for (index, value) in frame_values.into_iter().enumerate() {
+        let field =
+            build(builder.build_struct_gep(frame_type, frame, index as u32, "doria.frame.field"))?;
+        build(builder.build_store(field, value))?;
+    }
+    let current_frame = frame;
     let mut lowerer = FunctionLowerer {
         context,
         module,
@@ -524,6 +600,7 @@ fn define_collection_drop_functions<'ctx>(
 fn define_process_main<'ctx>(
     context: &'ctx Context,
     module: &Module<'ctx>,
+    target_data: &TargetData,
     program: &mir::Program,
     functions: &[FunctionValue<'ctx>],
 ) -> Result<(), BackendError> {
@@ -577,44 +654,86 @@ fn define_process_main<'ctx>(
         (
             mir::ReturnType::Value(mir::Type::Scalar(mir::ScalarType::Integer(IntegerType::Int64))),
             false,
-        ) => "dr_v1_main_int",
+        ) => "dr_v2_main_int",
         (
             mir::ReturnType::Value(mir::Type::Scalar(mir::ScalarType::Integer(IntegerType::Int64))),
             true,
-        ) => "dr_v1_main_int_args",
-        (mir::ReturnType::Void, false) => "dr_v1_main_void",
-        (mir::ReturnType::Void, true) => "dr_v1_main_void_args",
+        ) => "dr_v2_main_int_args",
+        (mir::ReturnType::Void, false) => "dr_v2_main_void",
+        (mir::ReturnType::Void, true) => "dr_v2_main_void_args",
         (mir::ReturnType::Value(other), _) => {
             return Err(malformed_mir(format!(
                 "entry function has unsupported process return type {other}"
             )))
         }
     };
+    let integer_entry = matches!(
+        entry.return_type,
+        mir::ReturnType::Value(mir::Type::Scalar(mir::ScalarType::Integer(
+            IntegerType::Int64
+        )))
+    );
+    let usize_type = context.ptr_sized_int_type(target_data, None);
     let runtime = module.get_function(runtime_name).unwrap_or_else(|| {
-        let signature = if takes_arguments {
-            context.i32_type().fn_type(
-                &[
-                    pointer_type.into(),
-                    context.i32_type().into(),
-                    pointer_type.into(),
-                ],
-                false,
-            )
-        } else {
-            context.i32_type().fn_type(&[pointer_type.into()], false)
-        };
+        let mut parameters: Vec<BasicMetadataTypeEnum<'ctx>> = vec![pointer_type.into()];
+        if takes_arguments {
+            parameters.push(context.i32_type().into());
+            parameters.push(pointer_type.into());
+        }
+        if integer_entry {
+            parameters.push(pointer_type.into());
+            parameters.push(usize_type.into());
+            parameters.push(pointer_type.into());
+            parameters.push(usize_type.into());
+            parameters.push(usize_type.into());
+            parameters.push(usize_type.into());
+        }
+        let signature = context.i32_type().fn_type(&parameters, false);
         module.add_function(runtime_name, signature, Some(Linkage::External))
     });
     let entry_pointer = entry_function.as_global_value().as_pointer_value();
-    let call = if takes_arguments {
-        build(builder.build_call(
-            runtime,
-            &[entry_pointer.into(), argc.into(), argv.into()],
-            "process.status",
-        ))?
-    } else {
-        build(builder.build_call(runtime, &[entry_pointer.into()], "process.status"))?
-    };
+    let mut runtime_args: Vec<BasicMetadataValueEnum<'ctx>> = vec![entry_pointer.into()];
+    if takes_arguments {
+        runtime_args.push(argc.into());
+        runtime_args.push(argv.into());
+    }
+    if integer_entry {
+        let source_path = define_bytes(
+            context,
+            module,
+            program.source.path.as_bytes(),
+            "__doria_process_source_path",
+        );
+        let source_text = define_bytes(
+            context,
+            module,
+            program.source.text.as_bytes(),
+            "__doria_process_source_text",
+        );
+        runtime_args.push(source_path.into());
+        runtime_args.push(
+            usize_type
+                .const_int(program.source.path.len() as u64, false)
+                .into(),
+        );
+        runtime_args.push(source_text.into());
+        runtime_args.push(
+            usize_type
+                .const_int(program.source.text.len() as u64, false)
+                .into(),
+        );
+        runtime_args.push(
+            usize_type
+                .const_int(entry.source_span.start as u64, false)
+                .into(),
+        );
+        runtime_args.push(
+            usize_type
+                .const_int(entry.source_span.end as u64, false)
+                .into(),
+        );
+    }
+    let call = build(builder.build_call(runtime, &runtime_args, "process.status"))?;
     let status = call
         .try_as_basic_value()
         .basic()
@@ -845,15 +964,28 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 )?;
                 self.release_string(value)?;
             }
-            mir::Statement::CallVoid { function, args }
-            | mir::Statement::CallBorrowed { function, args } => {
+            mir::Statement::CallVoid {
+                function,
+                args,
+                span,
+            }
+            | mir::Statement::CallBorrowed {
+                function,
+                args,
+                span,
+            } => {
+                self.set_active_panic_site(*span)?;
                 let _ = self.lower_call(*function, args, false)?;
             }
             mir::Statement::CallNullSafe {
                 object,
                 function,
                 args,
-            } => self.lower_null_safe_statement_call(object, *function, args)?,
+                span,
+            } => {
+                self.set_active_panic_site(*span)?;
+                self.lower_null_safe_statement_call(object, *function, args)?
+            }
             mir::Statement::WriteStderr(value) => {
                 let value = self.lower_string_expression(value)?;
                 let pointer = self.context.ptr_type(AddressSpace::default());
@@ -1152,7 +1284,8 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 self.cleanup_string_locals()?;
                 build(self.builder.build_return(None))?;
             }
-            mir::Terminator::Panic(message) => {
+            mir::Terminator::Panic { message, span } => {
+                self.set_active_panic_site(*span)?;
                 debug_assert!(self.deferred_class_temporary_drops.is_empty());
                 self.defer_class_temporary_drops = true;
                 let string = self.lower_string_expression(message)?;
@@ -1178,7 +1311,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     )?
                     .ok_or_else(|| backend_failure("string length produced no result"))?;
                 let panic = self.runtime_function(
-                    "dr_v1_panic",
+                    "dr_v2_panic",
                     &[pointer.into(), pointer.into(), usize_type.into()],
                     None,
                 );
@@ -1555,7 +1688,13 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             comparable_length,
             "collection.index.out-of-bounds",
         ))?;
-        self.lower_panic_if(out_of_bounds, b"collection index out of bounds")?;
+        self.lower_index_bounds_panic_if(
+            out_of_bounds,
+            "P1310",
+            index,
+            length,
+            self.function.source_span,
+        )?;
 
         let element_index = match index
             .get_type()
@@ -1729,11 +1868,13 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 collection,
                 value,
                 count,
+                count_span,
             } => {
                 let definition = self.collection_definition(*collection)?.clone();
                 let fixed = definition.kind == mir::CollectionKind::TypedArray;
                 let value = self.lower_rvalue(value)?;
                 let count = self.lower_integer_expression(count)?;
+                self.set_active_panic_site(*count_span)?;
                 let fixed = self.context.i8_type().const_int(u64::from(fixed), false);
                 let value_width = self.context.i8_type().const_int(
                     u64::from(
@@ -1787,11 +1928,15 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             mir::CollectionExpression::Index {
                 source,
                 index,
+                index_span,
                 transfer,
                 ..
-            } => Ok(self
-                .lower_collection_index(*source, index, *transfer)?
-                .into_pointer_value()),
+            } => {
+                self.set_active_panic_site(*index_span)?;
+                Ok(self
+                    .lower_collection_index(*source, index, *transfer)?
+                    .into_pointer_value())
+            }
             mir::CollectionExpression::Property {
                 object, property, ..
             } => Ok(build(self.builder.build_load(
@@ -1833,8 +1978,11 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     .ok_or_else(|| backend_failure("Bytes::fromArray produced no result"))?
                     .into_pointer_value())
             }
-            mir::CollectionExpression::ReadFileBytes { path, .. } => {
+            mir::CollectionExpression::ReadFileBytes {
+                path, path_span, ..
+            } => {
                 let path = self.lower_string_expression(path)?;
+                self.set_active_panic_site(*path_span)?;
                 let result = self
                     .call_runtime(
                         READ_FILE_BYTES,
@@ -1943,7 +2091,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 self.context.i8_type().const_zero(),
                 "dictionary.missing",
             ))?;
-            self.lower_panic_if(missing, b"dictionary key not found")?;
+            self.lower_panic_if_code(missing, "P1312", self.function.source_span)?;
             if index_type == mir::Type::String {
                 self.release_string(index_value.into_pointer_value())?;
             }
@@ -4114,10 +4262,14 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 .ok_or_else(|| malformed_mir("shared access call produced no result"))?
                 .into_pointer_value()),
             mir::SharedReferenceAccessExpression::Acquire {
-                value, writable, ..
+                value,
+                writable,
+                span,
+                ..
             } => {
                 let owned = value.owned_temporary();
                 let control = self.lower_writable_shared_reference_expression(value)?;
+                self.set_active_panic_site(*span)?;
                 let result = self
                     .call_runtime(
                         if *writable {
@@ -4179,10 +4331,12 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             mir::NullableSharedReferenceAccessExpression::NullSafeAcquire {
                 value,
                 writable,
+                span,
                 ..
             } => {
                 let owned = value.owned_temporary();
                 let control = self.lower_nullable_writable_shared_reference_expression(value)?;
+                self.set_active_panic_site(*span)?;
                 let result = self.lower_null_safe_shared_call(
                     control,
                     if *writable {
@@ -4628,16 +4782,24 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     self.retain_string(payload.into_pointer_value())?.into(),
                 )
             }
-            mir::NullableStringExpression::ReadLine => {
+            mir::NullableStringExpression::ReadLine {
+                prompt,
+                prompt_span,
+            } => {
+                // Same validated MIR and same runtime ABI as Cranelift: the prompt is
+                // evaluated once, borrowed across the call, and released afterwards.
+                let prompt = self.lower_string_expression(prompt)?;
+                self.set_active_panic_site(*prompt_span)?;
                 let payload = self
                     .call_runtime(
-                        READ_STDIN_LINE,
-                        &[pointer.into()],
+                        READ_STDIN_LINE_PROMPTED,
+                        &[pointer.into(), pointer.into()],
                         Some(pointer.into()),
-                        &[self.current_frame.into()],
+                        &[self.current_frame.into(), prompt.into()],
                     )?
                     .ok_or_else(|| backend_failure("read_line produced no result"))?
                     .into_pointer_value();
+                self.release_string(prompt)?;
                 let present = build(self.builder.build_is_not_null(payload, "read-line.present"))?;
                 let present = build(self.builder.build_int_z_extend(
                     present,
@@ -4953,7 +5115,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             };
             self.module.add_function(name, ty, Some(Linkage::External))
         });
-        if name == "dr_v1_panic" {
+        if name == "dr_v2_panic" {
             for name in ["cold", "noreturn"] {
                 let kind = inkwell::attributes::Attribute::get_named_enum_kind_id(name);
                 function.add_attribute(
@@ -5002,6 +5164,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
     ) -> Result<BasicValueEnum<'ctx>, BackendError> {
         use mir::StringIntrinsicKind as Kind;
 
+        self.set_active_panic_site(call.span)?;
         let pointer = self.context.ptr_type(AddressSpace::default());
         let usize_type = self.context.ptr_sized_int_type(self.target_data, None);
         let i8_type = self.context.i8_type();
@@ -5241,11 +5404,37 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 .ok_or_else(|| backend_failure("String join produced no result"))?,
             Kind::Slice => {
                 let (has_length, length) = self.nullable_parts(argument(2)?.into_struct_value())?;
+                let length = length.into_int_value();
                 let has_length = build(self.builder.build_int_truncate(
                     has_length,
                     i8_type,
                     "string.slice.has-length",
                 ))?;
+                let has_length_flag = build(self.builder.build_int_compare(
+                    IntPredicate::NE,
+                    has_length,
+                    i8_type.const_zero(),
+                    "string.slice.has-length.flag",
+                ))?;
+                let negative = build(self.builder.build_int_compare(
+                    IntPredicate::SLT,
+                    length,
+                    i64_type.const_zero(),
+                    "string.slice.negative",
+                ))?;
+                let invalid_length = build(self.builder.build_and(
+                    has_length_flag,
+                    negative,
+                    "string.slice.invalid-length",
+                ))?;
+                self.lower_panic_if_signed_fact(
+                    invalid_length,
+                    "P1201",
+                    doria_diagnostic_catalogue::STRING_SLICE_LENGTH_FACT,
+                    length,
+                    call.argument_spans.get(2).copied().unwrap_or(call.span),
+                )?;
+                self.set_active_panic_site(call.span)?;
                 self.call_runtime(
                     STRING_SLICE,
                     &[
@@ -5266,24 +5455,102 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 )?
                 .ok_or_else(|| backend_failure("String slice produced no result"))?
             }
-            Kind::Repeat => self
-                .call_runtime(
+            Kind::Repeat => {
+                let count = argument(1)?.into_int_value();
+                let negative = build(self.builder.build_int_compare(
+                    IntPredicate::SLT,
+                    count,
+                    i64_type.const_zero(),
+                    "string.repeat.negative",
+                ))?;
+                self.lower_panic_if_signed_fact(
+                    negative,
+                    "P1204",
+                    doria_diagnostic_catalogue::STRING_REPETITION_COUNT_FACT,
+                    count,
+                    call.argument_spans.get(1).copied().unwrap_or(call.span),
+                )?;
+                self.set_active_panic_site(call.span)?;
+                self.call_runtime(
                     STRING_REPEAT,
                     &[pointer.into(), pointer.into(), i64_type.into()],
                     Some(pointer.into()),
-                    &[
-                        self.current_frame.into(),
-                        argument(0)?.into(),
-                        argument(1)?.into(),
-                    ],
+                    &[self.current_frame.into(), argument(0)?.into(), count.into()],
                 )?
-                .ok_or_else(|| backend_failure("String repetition produced no result"))?,
+                .ok_or_else(|| backend_failure("String repetition produced no result"))?
+            }
             Kind::PadStart | Kind::PadEnd => {
                 let name = if call.kind == Kind::PadStart {
                     STRING_PAD_START
                 } else {
                     STRING_PAD_END
                 };
+                let target_length = argument(1)?.into_int_value();
+                let negative = build(self.builder.build_int_compare(
+                    IntPredicate::SLT,
+                    target_length,
+                    i64_type.const_zero(),
+                    "string.padding.negative",
+                ))?;
+                self.lower_panic_if_signed_fact(
+                    negative,
+                    "P1202",
+                    doria_diagnostic_catalogue::STRING_PADDING_REQUESTED_LENGTH_FACT,
+                    target_length,
+                    call.argument_spans.get(1).copied().unwrap_or(call.span),
+                )?;
+                let current_length_word = self
+                    .call_runtime(
+                        STRING_GRAPHEME_LENGTH,
+                        &[pointer.into()],
+                        Some(usize_type.into()),
+                        &[argument(0)?.into()],
+                    )?
+                    .ok_or_else(|| backend_failure("String length produced no result"))?
+                    .into_int_value();
+                let current_length = build(self.builder.build_int_z_extend_or_bit_cast(
+                    current_length_word,
+                    i64_type,
+                    "string.padding.current-length",
+                ))?;
+                let needs_padding = build(self.builder.build_int_compare(
+                    IntPredicate::SGT,
+                    target_length,
+                    current_length,
+                    "string.padding.required",
+                ))?;
+                let padding_length = self
+                    .call_runtime(
+                        STRING_GRAPHEME_LENGTH,
+                        &[pointer.into()],
+                        Some(usize_type.into()),
+                        &[argument(2)?.into()],
+                    )?
+                    .ok_or_else(|| backend_failure("String length produced no result"))?
+                    .into_int_value();
+                let padding_empty = build(self.builder.build_int_compare(
+                    IntPredicate::EQ,
+                    padding_length,
+                    usize_type.const_zero(),
+                    "string.padding.empty",
+                ))?;
+                let invalid_padding = build(self.builder.build_and(
+                    needs_padding,
+                    padding_empty,
+                    "string.padding.invalid",
+                ))?;
+                self.lower_padding_empty_panic_if(
+                    invalid_padding,
+                    call.kind == Kind::PadStart,
+                    (
+                        argument(0)?.into_pointer_value(),
+                        current_length_word,
+                        target_length,
+                        padding_length,
+                    ),
+                    call.argument_spans.get(2).copied().unwrap_or(call.span),
+                )?;
+                self.set_active_panic_site(call.span)?;
                 self.call_runtime(
                     name,
                     &[
@@ -5732,10 +5999,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 self.context.i8_type().const_zero(),
                 "mixed.take.shared",
             ))?;
-            self.lower_panic_if(
-                not_final,
-                b"cannot take ownership of a shared `mixed` value",
-            )?;
+            self.lower_panic_if_code(not_final, "P1321", self.function.source_span)?;
         }
         let _ = self.call_runtime(MIXED_FREE, &[pointer.into()], None, &[mixed.into()])?;
         Ok(payload)
@@ -6611,8 +6875,9 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 .lower_call(*function, args, true)?
                 .ok_or_else(|| malformed_mir("string call produced no result"))?
                 .into_pointer_value()),
-            mir::StringExpression::ReadFile(path) => {
+            mir::StringExpression::ReadFile { path, path_span } => {
                 let path = self.lower_string_expression(path)?;
+                self.set_active_panic_site(*path_span)?;
                 let result = self
                     .call_runtime(
                         READ_FILE,
@@ -6905,28 +7170,42 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
     ) -> Result<IntValue<'ctx>, BackendError> {
         match expression {
             mir::IntegerExpression::Use { ty, operand } => self.lower_integer_operand(*ty, operand),
-            mir::IntegerExpression::Unary { ty, op, operand } => {
+            mir::IntegerExpression::Unary {
+                ty,
+                op,
+                operand,
+                span,
+            } => {
                 let operand = self.lower_integer_expression(operand)?;
-                self.lower_integer_unary(*ty, *op, operand)
+                self.lower_integer_unary(*ty, *op, operand, *span)
             }
             mir::IntegerExpression::Binary {
                 ty,
                 op,
                 left,
                 right,
+                span,
+                right_span,
             } => {
                 let left = self.lower_integer_expression(left)?;
                 let right = self.lower_integer_expression(right)?;
-                self.lower_integer_binary(*ty, *op, left, right)
+                self.lower_integer_binary(*ty, *op, left, right, *span, *right_span)
             }
-            mir::IntegerExpression::Convert { ty, value } => {
+            mir::IntegerExpression::Convert {
+                ty,
+                value,
+                value_span,
+                ..
+            } => {
                 let source = value.ty();
                 let value = self.lower_integer_expression(value)?;
-                self.lower_integer_conversion(source, *ty, value)
+                self.lower_integer_conversion(source, *ty, value, *value_span)
             }
-            mir::IntegerExpression::FloatToInt { value } => {
+            mir::IntegerExpression::FloatToInt {
+                value, value_span, ..
+            } => {
                 let value = self.lower_float_expression(value)?;
-                self.lower_float_to_int(value)
+                self.lower_float_to_int(value, *value_span)
             }
             mir::IntegerExpression::Call { function, args, .. } => {
                 let result = self
@@ -6950,6 +7229,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         ty: IntegerType,
         op: mir::IntegerUnaryOp,
         operand: IntValue<'ctx>,
+        span: crate::source::Span,
     ) -> Result<IntValue<'ctx>, BackendError> {
         match op {
             mir::IntegerUnaryOp::Negate => {
@@ -6964,10 +7244,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     minimum,
                     "neg.overflow",
                 ))?;
-                self.lower_panic_if(
-                    overflow,
-                    IntegerPanic::OverflowNegation.message().as_bytes(),
-                )?;
+                self.lower_panic_if_code(overflow, IntegerPanic::OverflowNegation.code(), span)?;
                 build(self.builder.build_int_sub(zero, operand, "negated"))
             }
             mir::IntegerUnaryOp::BitwiseNot => build(self.builder.build_not(operand, "not")),
@@ -6980,15 +7257,23 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         op: mir::IntegerBinaryOp,
         left: IntValue<'ctx>,
         right: IntValue<'ctx>,
+        span: crate::source::Span,
+        right_span: crate::source::Span,
     ) -> Result<IntValue<'ctx>, BackendError> {
         match op {
             mir::IntegerBinaryOp::Add
             | mir::IntegerBinaryOp::Subtract
-            | mir::IntegerBinaryOp::Multiply => self.lower_checked_arithmetic(ty, op, left, right),
-            mir::IntegerBinaryOp::Divide => self.lower_integer_division(ty, left, right),
-            mir::IntegerBinaryOp::Remainder => self.lower_integer_remainder(ty, left, right),
+            | mir::IntegerBinaryOp::Multiply => {
+                self.lower_checked_arithmetic(ty, op, left, right, span)
+            }
+            mir::IntegerBinaryOp::Divide => {
+                self.lower_integer_division(ty, left, right, span, right_span)
+            }
+            mir::IntegerBinaryOp::Remainder => {
+                self.lower_integer_remainder(ty, left, right, right_span)
+            }
             mir::IntegerBinaryOp::ShiftLeft | mir::IntegerBinaryOp::ShiftRight => {
-                self.lower_integer_shift(ty, op, left, right)
+                self.lower_integer_shift(ty, op, left, right, right_span)
             }
             mir::IntegerBinaryOp::BitwiseAnd => build(self.builder.build_and(left, right, "and")),
             mir::IntegerBinaryOp::BitwiseXor => build(self.builder.build_xor(left, right, "xor")),
@@ -7004,6 +7289,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         op: mir::IntegerBinaryOp,
         left: IntValue<'ctx>,
         right: IntValue<'ctx>,
+        span: crate::source::Span,
     ) -> Result<IntValue<'ctx>, BackendError> {
         let operation = match op {
             mir::IntegerBinaryOp::Add => "add",
@@ -7055,7 +7341,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             mir::IntegerBinaryOp::Multiply => IntegerPanic::OverflowMultiplication,
             _ => unreachable!("non-arithmetic operator reached checked arithmetic lowering"),
         };
-        self.lower_panic_if(overflow, panic.message().as_bytes())?;
+        self.lower_panic_if_code(overflow, panic.code(), span)?;
         Ok(value)
     }
 
@@ -7064,6 +7350,8 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         ty: IntegerType,
         left: IntValue<'ctx>,
         right: IntValue<'ctx>,
+        span: crate::source::Span,
+        right_span: crate::source::Span,
     ) -> Result<IntValue<'ctx>, BackendError> {
         let zero = integer_type(self.context, ty).const_zero();
         let divides_by_zero = build(self.builder.build_int_compare(
@@ -7072,9 +7360,10 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             zero,
             "division.by_zero",
         ))?;
-        self.lower_panic_if(
+        self.lower_panic_if_code(
             divides_by_zero,
-            IntegerPanic::DivisionByZero.message().as_bytes(),
+            IntegerPanic::DivisionByZero.code(),
+            right_span,
         )?;
         if ty.is_signed() {
             let minimum = integer_constant(
@@ -7100,10 +7389,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 is_negative_one,
                 "division.overflow",
             ))?;
-            self.lower_panic_if(
-                overflow,
-                IntegerPanic::DivisionOverflow.message().as_bytes(),
-            )?;
+            self.lower_panic_if_code(overflow, IntegerPanic::DivisionOverflow.code(), span)?;
             build(self.builder.build_int_signed_div(left, right, "quotient"))
         } else {
             build(self.builder.build_int_unsigned_div(left, right, "quotient"))
@@ -7115,6 +7401,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         ty: IntegerType,
         left: IntValue<'ctx>,
         right: IntValue<'ctx>,
+        right_span: crate::source::Span,
     ) -> Result<IntValue<'ctx>, BackendError> {
         let integer_type = integer_type(self.context, ty);
         let zero = integer_type.const_zero();
@@ -7124,9 +7411,10 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             zero,
             "remainder.by_zero",
         ))?;
-        self.lower_panic_if(
+        self.lower_panic_if_code(
             divides_by_zero,
-            IntegerPanic::RemainderByZero.message().as_bytes(),
+            IntegerPanic::RemainderByZero.code(),
+            right_span,
         )?;
         if !ty.is_signed() {
             return build(
@@ -7187,6 +7475,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         op: mir::IntegerBinaryOp,
         left: IntValue<'ctx>,
         right: IntValue<'ctx>,
+        right_span: crate::source::Span,
     ) -> Result<IntValue<'ctx>, BackendError> {
         let integer_type = integer_type(self.context, ty);
         let width = integer_type.const_int(ty.bit_width() as u64, false);
@@ -7207,9 +7496,10 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         } else {
             too_large
         };
-        self.lower_panic_if(
+        self.lower_panic_if_code(
             invalid,
-            IntegerPanic::ShiftCountOutOfRange.message().as_bytes(),
+            IntegerPanic::ShiftCountOutOfRange.code(),
+            right_span,
         )?;
         match op {
             mir::IntegerBinaryOp::ShiftLeft => {
@@ -7230,11 +7520,13 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         source: IntegerType,
         target: IntegerType,
         value: IntValue<'ctx>,
+        span: crate::source::Span,
     ) -> Result<IntValue<'ctx>, BackendError> {
         if let Some(out_of_range) = self.conversion_out_of_range(source, target, value)? {
-            self.lower_panic_if(
+            self.lower_panic_if_code(
                 out_of_range,
-                IntegerPanic::ConversionOutOfRange.message().as_bytes(),
+                IntegerPanic::ConversionOutOfRange.code(),
+                span,
             )?;
         }
         let source_width = source.bit_width();
@@ -7579,6 +7871,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
     fn lower_float_to_int(
         &mut self,
         value: LlvmFloatValue<'ctx>,
+        span: crate::source::Span,
     ) -> Result<IntValue<'ctx>, BackendError> {
         let float_type = self.context.f64_type();
         let minimum = float_type.const_float(-9_223_372_036_854_775_808.0);
@@ -7607,7 +7900,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             invalid_range,
             "float_to_int.invalid",
         ))?;
-        self.lower_panic_if(invalid, b"float-to-integer conversion out of range")?;
+        self.lower_panic_if_code(invalid, "P1110", span)?;
         build(self.builder.build_float_to_signed_int(
             value,
             self.context.i64_type(),
@@ -8427,20 +8720,203 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         }
     }
 
-    fn lower_panic_if(
+    fn lower_panic_if_code(
         &mut self,
         condition: IntValue<'ctx>,
-        message: &[u8],
+        code: &'static str,
+        span: crate::source::Span,
     ) -> Result<(), BackendError> {
         let function = current_function(&self.builder)?;
-        let panic_block = self.context.append_basic_block(function, "panic");
-        let continue_block = self.context.append_basic_block(function, "panic.continue");
+        let panic_block = self
+            .context
+            .append_basic_block(function, "panic.catalogued");
+        let continue_block = self
+            .context
+            .append_basic_block(function, "panic.catalogued.continue");
         build(
             self.builder
                 .build_conditional_branch(condition, panic_block, continue_block),
         )?;
         self.builder.position_at_end(panic_block);
-        self.lower_runtime_panic(message)?;
+        self.set_active_panic_site(span)?;
+        self.lower_runtime_panic_code(code.as_bytes(), &[])?;
+        self.builder.position_at_end(continue_block);
+        Ok(())
+    }
+
+    fn lower_panic_if_signed_fact(
+        &mut self,
+        condition: IntValue<'ctx>,
+        code: &'static str,
+        fact_name: &'static str,
+        value: IntValue<'ctx>,
+        span: crate::source::Span,
+    ) -> Result<(), BackendError> {
+        let function = current_function(&self.builder)?;
+        let panic_block = self
+            .context
+            .append_basic_block(function, "panic.catalogued.fact");
+        let continue_block = self
+            .context
+            .append_basic_block(function, "panic.catalogued.fact.continue");
+        build(
+            self.builder
+                .build_conditional_branch(condition, panic_block, continue_block),
+        )?;
+        self.builder.position_at_end(panic_block);
+        self.set_active_panic_site(span)?;
+        let pointer = self.context.ptr_type(AddressSpace::default());
+        let usize_type = self.context.ptr_sized_int_type(self.target_data, None);
+        let runtime = self.runtime_function(
+            "dr_v2_panic_signed_fact",
+            &[
+                pointer.into(),
+                pointer.into(),
+                usize_type.into(),
+                pointer.into(),
+                usize_type.into(),
+                self.context.i64_type().into(),
+            ],
+            None,
+        );
+        let code_pointer = self.define_data(code.as_bytes(), "panic.code");
+        let fact_name_pointer = self.define_data(fact_name.as_bytes(), "panic.fact-name");
+        build(self.builder.build_call(
+            runtime,
+            &[
+                self.current_frame.into(),
+                code_pointer.into(),
+                usize_type.const_int(code.len() as u64, false).into(),
+                fact_name_pointer.into(),
+                usize_type.const_int(fact_name.len() as u64, false).into(),
+                value.into(),
+            ],
+            "panic.catalogued.fact",
+        ))?;
+        build(self.builder.build_unreachable())?;
+        self.builder.position_at_end(continue_block);
+        Ok(())
+    }
+
+    fn lower_index_bounds_panic_if(
+        &mut self,
+        condition: IntValue<'ctx>,
+        code: &'static str,
+        index: IntValue<'ctx>,
+        length: IntValue<'ctx>,
+        span: crate::source::Span,
+    ) -> Result<(), BackendError> {
+        let function = current_function(&self.builder)?;
+        let panic_block = self
+            .context
+            .append_basic_block(function, "panic.index-bounds");
+        let continue_block = self
+            .context
+            .append_basic_block(function, "panic.index-bounds.continue");
+        build(
+            self.builder
+                .build_conditional_branch(condition, panic_block, continue_block),
+        )?;
+        self.builder.position_at_end(panic_block);
+        self.set_active_panic_site(span)?;
+        let pointer = self.context.ptr_type(AddressSpace::default());
+        let usize_type = self.context.ptr_sized_int_type(self.target_data, None);
+        let i64_type = self.context.i64_type();
+        let index = match index.get_type().get_bit_width().cmp(&64) {
+            std::cmp::Ordering::Less => build(self.builder.build_int_s_extend(
+                index,
+                i64_type,
+                "panic.index.i64",
+            ))?,
+            std::cmp::Ordering::Equal => index,
+            std::cmp::Ordering::Greater => build(self.builder.build_int_truncate(
+                index,
+                i64_type,
+                "panic.index.i64",
+            ))?,
+        };
+        let runtime = self.runtime_function(
+            "dr_v2_panic_index_out_of_bounds",
+            &[
+                pointer.into(),
+                pointer.into(),
+                usize_type.into(),
+                i64_type.into(),
+                usize_type.into(),
+            ],
+            None,
+        );
+        let code_pointer = self.define_data(code.as_bytes(), "panic.code");
+        build(self.builder.build_call(
+            runtime,
+            &[
+                self.current_frame.into(),
+                code_pointer.into(),
+                usize_type.const_int(code.len() as u64, false).into(),
+                index.into(),
+                length.into(),
+            ],
+            "panic.index-bounds",
+        ))?;
+        build(self.builder.build_unreachable())?;
+        self.builder.position_at_end(continue_block);
+        Ok(())
+    }
+
+    fn lower_padding_empty_panic_if(
+        &mut self,
+        condition: IntValue<'ctx>,
+        pad_start: bool,
+        facts: (
+            PointerValue<'ctx>,
+            IntValue<'ctx>,
+            IntValue<'ctx>,
+            IntValue<'ctx>,
+        ),
+        span: crate::source::Span,
+    ) -> Result<(), BackendError> {
+        let (value, current_length, requested_length, padding_length) = facts;
+        let function = current_function(&self.builder)?;
+        let panic_block = self
+            .context
+            .append_basic_block(function, "panic.padding-empty");
+        let continue_block = self
+            .context
+            .append_basic_block(function, "panic.padding-empty.continue");
+        build(
+            self.builder
+                .build_conditional_branch(condition, panic_block, continue_block),
+        )?;
+        self.builder.position_at_end(panic_block);
+        self.set_active_panic_site(span)?;
+        let pointer = self.context.ptr_type(AddressSpace::default());
+        let usize_type = self.context.ptr_sized_int_type(self.target_data, None);
+        let i8_type = self.context.i8_type();
+        let runtime = self.runtime_function(
+            "dr_v2_panic_string_padding_empty",
+            &[
+                pointer.into(),
+                i8_type.into(),
+                pointer.into(),
+                usize_type.into(),
+                self.context.i64_type().into(),
+                usize_type.into(),
+            ],
+            None,
+        );
+        build(self.builder.build_call(
+            runtime,
+            &[
+                self.current_frame.into(),
+                i8_type.const_int(u64::from(pad_start), false).into(),
+                value.into(),
+                current_length.into(),
+                requested_length.into(),
+                padding_length.into(),
+            ],
+            "panic.padding-empty",
+        ))?;
+        build(self.builder.build_unreachable())?;
         self.builder.position_at_end(continue_block);
         Ok(())
     }
@@ -8453,10 +8929,10 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         let usize_type = self.context.ptr_sized_int_type(self.target_data, None);
         let runtime = self
             .module
-            .get_function("dr_v1_write_stdout")
+            .get_function("dr_v2_write_stdout")
             .unwrap_or_else(|| {
                 self.module.add_function(
-                    "dr_v1_write_stdout",
+                    "dr_v2_write_stdout",
                     self.context.void_type().fn_type(
                         &[
                             self.context.ptr_type(AddressSpace::default()).into(),
@@ -8480,14 +8956,22 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         Ok(())
     }
 
-    fn lower_runtime_panic(&mut self, message: &[u8]) -> Result<(), BackendError> {
-        let pointer = self.define_data(message, "panic.message");
+    fn lower_runtime_panic_code(
+        &mut self,
+        code: &[u8],
+        message: &[u8],
+    ) -> Result<(), BackendError> {
+        let code_pointer = self.define_data(code, "panic.code");
+        let message_pointer = self.define_data(message, "panic.message");
+        let pointer = self.context.ptr_type(AddressSpace::default());
         let usize_type = self.context.ptr_sized_int_type(self.target_data, None);
         let runtime = self.runtime_function(
-            "dr_v1_panic",
+            "dr_v2_panic_code",
             &[
-                self.context.ptr_type(AddressSpace::default()).into(),
-                self.context.ptr_type(AddressSpace::default()).into(),
+                pointer.into(),
+                pointer.into(),
+                usize_type.into(),
+                pointer.into(),
                 usize_type.into(),
             ],
             None,
@@ -8496,10 +8980,12 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             runtime,
             &[
                 self.current_frame.into(),
-                pointer.into(),
+                code_pointer.into(),
+                usize_type.const_int(code.len() as u64, false).into(),
+                message_pointer.into(),
                 usize_type.const_int(message.len() as u64, false).into(),
             ],
-            "panic",
+            "panic.catalogued",
         ))?;
         build(self.builder.build_unreachable())?;
         Ok(())
@@ -8512,6 +8998,40 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         );
         self.next_data_id += 1;
         define_bytes(self.context, self.module, bytes, &name)
+    }
+
+    fn set_active_panic_site(&self, span: crate::source::Span) -> Result<(), BackendError> {
+        let pointer = self.context.ptr_type(AddressSpace::default());
+        let usize_type = self.context.ptr_sized_int_type(self.target_data, None);
+        let frame_type = self.context.struct_type(
+            &[
+                pointer.into(),
+                pointer.into(),
+                usize_type.into(),
+                pointer.into(),
+                usize_type.into(),
+                pointer.into(),
+                usize_type.into(),
+                usize_type.into(),
+                usize_type.into(),
+                usize_type.into(),
+                usize_type.into(),
+            ],
+            false,
+        );
+        for (index, offset) in [(9, span.start), (10, span.end)] {
+            let field = build(self.builder.build_struct_gep(
+                frame_type,
+                self.current_frame,
+                index,
+                "doria.frame.active",
+            ))?;
+            build(
+                self.builder
+                    .build_store(field, usize_type.const_int(offset as u64, false)),
+            )?;
+        }
+        Ok(())
     }
 }
 
@@ -8931,7 +9451,7 @@ fn resolve_string_expression_from_definitions(
         | mir::StringExpression::Static(_)
         | mir::StringExpression::MixedPayload(_)
         | mir::StringExpression::NullableLocalAssumeNonNull(_)
-        | mir::StringExpression::ReadFile(_)
+        | mir::StringExpression::ReadFile { .. }
         | mir::StringExpression::Format(_)
         | mir::StringExpression::Coalesce { .. }
         | mir::StringExpression::CollectionIndex { .. }
@@ -8968,7 +9488,7 @@ fn resolve_string_expression(
         | mir::StringExpression::Static(_)
         | mir::StringExpression::MixedPayload(_)
         | mir::StringExpression::NullableLocalAssumeNonNull(_)
-        | mir::StringExpression::ReadFile(_)
+        | mir::StringExpression::ReadFile { .. }
         | mir::StringExpression::Format(_)
         | mir::StringExpression::Coalesce { .. }
         | mir::StringExpression::CollectionIndex { .. }

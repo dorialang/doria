@@ -18,7 +18,7 @@ Documentation role: working note. This file prevents duplicated in-flight work. 
 - Stage 23 Slice 1 runtime collections and typed arrays are complete on the current branch. `T[]`, `List<T>`, `Dictionary<K, V>`, and `Set<T>` are owned move types backed by shared collection MIR and `doria-rt`; contextual literals, fixed-length typed arrays, indexing and indexed read-modify-write, insertion-ordered `foreach`, move-in/removal ownership, and Decision 0100's default member surface run through the interpreter, Cranelift, and LLVM. Dictionary `keys`/`values` are readonly, insertion-ordered, `foreach`-only projections and are not storable values.
 - Stage 23 Slice 2 is complete on the current branch. The owned `Bytes` move type provides explicit copying conversion to and from `uint8[]`, length, byte indexing and indexed read-modify-write, and byte-wise equality. `read_file_bytes`/`write_file_bytes`/`append_file_bytes`, `read_stdin_bytes`/`write_stdout_bytes`/`write_stderr_bytes`, and text `append_file` use shared validated MIR and `doria-rt`, with exact non-UTF-8 bytes and interpreter/Cranelift/LLVM parity.
 - Stage 23 Slice 3 is complete on the current branch. The boxed `dr_mixed` runtime representation stores a tag, class type id when needed, and owned payload; bool, fixed-width integers, floats, string, and concrete classes box into `mixed`, narrow back out through exact `is`, and execute through the interpreter, Cranelift, and LLVM. `?mixed`, `List<mixed>`, `Dictionary<K, mixed>`, and `Set<mixed>` value paths use the same shared MIR/runtime box. Collection/interface/subtype `is` and boxing collections, typed arrays, or `Bytes` into `mixed` remain deferred with stage-named diagnostics.
-- Stage 25a Slices 1 through 3 are implemented. The readonly `SharedReference<T>` / `WeakReference<T>` family and the disjoint writable family lower through validated MIR to the interpreter, Cranelift, LLVM, and separate `doria-rt` control structures. `WritableSharedReference<T>` supports class, generic-class, typed-array, `List<T>`, `Dictionary<K, V>`, `Set<T>`, and `Bytes` payloads through owned readonly/writable access objects. One access state is shared by every writable-family handle to an allocation; access objects move through returns, parameters, properties, and collection slots; nullable strong, weak, and readonly/writable access forms remain in-family and lazy; and destruction releases access before strong ownership. Exact conflict panics use the abort-only status-101 path. The Slice 3 prerequisite corrections also support property-rooted indexed move-in, transitive returned collection borrows, and standalone lexical block statements with structured-exit cleanup. Scalar/string payload access and all shared handles through `mixed` remain runtime-pending rather than being given an invented value projection or misrepresented as class pointers. The PHP backend still refuses shared ownership. Stage 25a remains incomplete until Slice 4.
+- Stage 25a Slices 1 through 4 are implemented and Stage 25a is complete. The readonly `SharedReference<T>` / `WeakReference<T>` family and the permanently disjoint writable family lower through validated MIR to the interpreter, Cranelift, LLVM, and separate `doria-rt` control structures. `WritableSharedReference<T>` executes class, generic-class, typed-array, `List<T>`, `Dictionary<K, V>`, `Set<T>`, and `Bytes` payloads through owned readonly/writable access objects. One access state is shared by every writable-family handle to an allocation; access objects move through returns, parameters, properties, and collection slots; nullable strong, weak, and readonly/writable access forms remain in-family and lazy; and destruction releases access before strong ownership. P1501 carries one of the three exact Decision 0106 conflict conditions as a typed runtime fact. The allocation-free `referencedValue` projection resolves wrapper/payload collisions without changing either ownership count, and durable weak-cycle and bounded-stress fixtures agree across all native paths. Scalar/string payload access and all shared handles through `mixed` remain runtime-pending rather than being given an invented value projection or misrepresented as class pointers. The PHP backend still refuses shared ownership.
 - The parser accepts generalized `parent::member()` and trait-local `self::member` under the two-clocks rule; semantic checking names Stage 34 and Stage 35 respectively and stops those forms before MIR. `Foo::$prop` and `static::` are permanent errors with precise fixes.
 - Native remains one target: direct compile/run uses the Cranelift fast profile, while `--release` selects LLVM 18 over the same validated typed MIR.
 - Ordinary expression interpolation of primitive/string values lowers through the existing ordered MIR string and display operations consumed by all three execution paths.
@@ -58,12 +58,34 @@ Documentation role: working note. This file prevents duplicated in-flight work. 
   traversal protocol, and ordering comparisons remain pending on `Ordering`.
   The approved ignore-case search family, first-grapheme casing, and
   occurrence counting are included in this executable surface.
+- The Unified Doria Diagnostic Presentation And Runtime Outcome Foundation is
+  implemented under decision 0109. The compiler-owned `Diagnostic` is the sole
+  public representation for compilation findings and runtime outcomes.
+  Interpreter, Cranelift, LLVM, PHP compatibility, standalone executables, and
+  `doriac run` preserve catalogued `P` codes, source labels, Doria call paths,
+  and status-101 abort-without-cleanup semantics. Human output uses the global
+  `Where`/preview/`Why` grammar and `Call Path`; concise and JSON remain
+  projections of the same facts. Future unhandled checked errors are bound to
+  this foundation but remain unimplemented.
 - The durable manifest supports raw stdin, isolated seeded files, declared program arguments, and exact interpreter/Cranelift/LLVM stdout, stderr, status, generated-file, and class-lifetime comparison.
+
+- The Interactive Line-Input Amendment is implemented. `read_line(string $prompt
+  = ""): ?string` is one compiler-known function with an optional parameter and
+  an inclusive arity range, not an overload pair. One canonical MIR operation
+  owns the ordering contract — evaluate the prompt exactly once, write it
+  exactly with no added newline, flush stdout, then read one line — and the
+  interpreter, Cranelift, LLVM, and PHP compatibility backend all consume it.
+  `read_line()` remains valid and lowers with the canonical empty-string default,
+  which still performs the pre-read flush. Line discipline, EOF, and buffered
+  remainders are unchanged. A closed stdout pipe during the prompt write or
+  flush exits with status 0 without reading stdin; other output failures use
+  P1407, read failures P1403, invalid UTF-8 P1404, and allocation failure P1206,
+  all through the decision 0109 foundation. The flush substrate now reports the
+  same success/broken-pipe/other-failure vocabulary as writes.
 
 ## Next
 
-- Implement the Interactive Line-Input Amendment.
-- Do not proceed directly to Stage 25a Slice 4.
+- Stage 26 is next: the remaining collection family.
 
 ## Do not duplicate
 

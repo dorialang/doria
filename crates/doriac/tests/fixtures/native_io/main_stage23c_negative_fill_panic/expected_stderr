@@ -1,3 +1,16 @@
-Panic: fill count is negative
-Stack Trace:
-  at main
+Panic[P1311]: Collection Fill Count Cannot Be Negative
+
+Where
+examples/native/main_stage23c_negative_fill_panic.doria · line 8 · main
+
+  8          bool[] $flags = [true; negativeCount()];
+                                    ^^^^^^^^^^^^^^^
+                                    Negative Fill Count
+
+Why
+A collection fill count describes how many elements to create and therefore cannot be negative.
+
+Call Path
+main · examples/native/main_stage23c_negative_fill_panic.doria:8
+
+Process Exited With Status 101

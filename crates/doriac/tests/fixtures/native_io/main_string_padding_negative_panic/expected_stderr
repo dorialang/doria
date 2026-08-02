@@ -1,3 +1,16 @@
-Panic: String Padding Length Cannot Be Negative
-Stack Trace:
-  at main
+Panic[P1202]: String Padding Length Cannot Be Negative
+
+Where
+examples/native/main_string_padding_negative_panic.doria · line 3 · main
+
+  3          echo String::padStart("Doria", -1, ".");
+                                            ^^
+                                            Negative Padding Length
+
+Why
+A string padding target is a grapheme length and therefore cannot be negative.
+
+Call Path
+main · examples/native/main_string_padding_negative_panic.doria:3
+
+Process Exited With Status 101

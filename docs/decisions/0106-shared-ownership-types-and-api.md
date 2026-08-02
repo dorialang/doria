@@ -148,7 +148,11 @@ Whether the control block and payload occupy one physical allocation or separate
 internal allocations is an implementation choice, provided ordinary object payload
 layout is unchanged, `shared new` exposes no source-visible intermediate owner,
 final destruction and weak retention are correct, and no FFI-visible Doria object
-layout is exposed. All runtime ABI symbols stay internal and `dr_v1_`-versioned.
+layout is exposed. All runtime ABI symbols stay internal and versioned. Ownership
+operations that can fail receive the current Doria stack frame and report through
+Decision 0109's private source-aware V2 runtime-outcome transport; older V1-named
+infallible lifecycle helpers remain private implementation details rather than a
+public ABI promise.
 
 ## Weak-reference lifetime
 
@@ -309,6 +313,12 @@ Cannot Acquire Readonly Access While Writable Access Is Active
 Cannot Acquire Writable Access While Writable Access Is Active
 ```
 
+All three conditions retain P1501 as the stable shared-access-conflict family.
+The exact condition is carried as the typed static-string runtime fact
+`conflictReason`, and the human renderer uses that same value for `Why`. The
+interpreter and native runtime validate the fact against this closed three-value
+set; no backend owns a parallel message table.
+
 ## Member-name collision between wrapper and payload
 
 `SharedReference<T>` owns `share()` and `createWeakReference()` while also
@@ -405,8 +415,8 @@ for a later readonly-sharing design rather than declared impossible.
 
 ## Implementation clarification
 
-Stage 25a Slice 3 implements the writable control structure and access guards
-without changing this decision's surface. Class, generic-class, typed-array,
+Stage 25a Slice 4 completes the four-slice implementation without changing this
+decision's surface. Class, generic-class, typed-array,
 `List<T>`, `Dictionary<K, V>`, `Set<T>`, and `Bytes` payloads execute through the
 interpreter, Cranelift, and LLVM. Access objects retain their registration while
 stored in parameters, returns, properties, and collection value slots. Every
@@ -426,6 +436,13 @@ identity, but runtime construction remains behind a Stage 25a diagnostic until a
 complete-value access surface is accepted. Shared handles through `mixed` remain
 pending because preserving family identity and drop obligations requires explicit
 mixed runtime tags.
+
+The final integration matrix adds exact collision parity for `referencedValue`,
+a leak-free weak back-reference cycle, all seven writable payload domains,
+bounded strong/weak/access stress, P1501 reason parity, LSP/editor coverage, and
+Playground coordination. Linux leak jobs cover both Cranelift fast and LLVM
+release profiles. PHP compatibility continues to refuse these forms rather than
+emulate them.
 
 ## Consequences
 

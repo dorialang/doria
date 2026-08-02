@@ -1,0 +1,41 @@
+class Document
+{
+    function __construct(
+        string $title,
+        string $referencedValue,
+    ) {
+    }
+
+    function share(): string
+    {
+        return "payload share {$this->title}";
+    }
+
+    function __destruct()
+    {
+        echo "drop {$this->title}\n";
+    }
+}
+
+function inspect(SharedReference<Document> $document): void
+{
+    let $additionalOwner = $document->share();
+    echo $document->referencedValue->share() . "\n";
+    echo $document->referencedValue->referencedValue . "\n";
+}
+
+function makeExpiredWeak(): WeakReference<Document>
+{
+    let $document = shared new Document("report", "payload property");
+    let $weak = $document->createWeakReference();
+    inspect($document);
+    return $weak;
+}
+
+function main(): void
+{
+    let $weak = makeExpiredWeak();
+    if ($weak->acquire() == null) {
+        echo "expired\n";
+    }
+}

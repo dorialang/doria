@@ -65,8 +65,10 @@ schema-version-1 structured JSON writes to stdout and contains no ANSI.
 Language-server and website consumers use that structure rather than parsing
 terminal prose. Backend/external/internal failures preserve full developer
 details but do not expose raw tool or Rust panic output by default. Runtime
-panic remains a separate status-101 contract whose `Panic` and `Stack Trace`
-headings are Title Case and byte-identical across enabled backends.
+panic is a `RuntimePanic` outcome in the same compiler-owned model. Built-in
+panics use stable `P` codes, source-identified labels, `Where`, `Why`, and a
+Doria-only `Call Path`; panic remains abort-only, performs no cleanup or
+destruction, and exits with status 101.
 
 ## 2. What Doria is not
 
@@ -78,7 +80,7 @@ Valid PHP should be easy to migrate to Doria, but Doria-specific syntax does not
 
 Doria does not use `public`, `protected`, or `private` as member visibility modifiers. Class members are externally accessible by default, and `internal` marks implementation details.
 
-The current compiler implementation lowers the accepted native subset through validated typed MIR. The debug interpreter, default Cranelift fast profile, and `--release` LLVM profile consume that same MIR, and the durable executable parity manifest compares exact stdin-driven stdout bytes, stderr bytes, process status, declared file side effects, and class lifetime behavior across all three paths. The supported subset includes top-level free functions; int/void `main` with either no parameters or one readonly borrowed `List<string>` argument; structured control flow and recursion; fixed-width numerics and bool; const-evaluable defaults for Copy scalars and readonly strings; immutable UTF-8 strings; expression interpolation; general nullable scalar, string, concrete-class, and `mixed` values with flow narrowing, `??`, `?->`, and exact `is`; checked formatting; UTF-8 line/file I/O; exact stdout/stderr; fatal panic; native classes, methods, statics, constants, complete `internal` checking, deterministic ownership, and compile-time borrowing; Stage 23 collections, typed arrays, `Bytes`, binary I/O, and boxed `mixed`; Stage 24 generic functions and methods; Stage 25 generic classes; and both Stage 25a shared-ownership families. The readonly `SharedReference<T>` / `WeakReference<T>` family supports class payloads. The writable family supports class, typed-array, `List<T>`, `Dictionary<K, V>`, `Set<T>`, and `Bytes` payloads through `WritableSharedReference<T>` / `WritableWeakReference<T>` and owned readonly/writable access objects. It includes nullable weak acquisition, lazy nullable operations, generic/property/collection storage, deterministic strong/weak/access release, and one per-allocation many-readonly-XOR-one-writable access state. Native strings are private non-atomic refcounted buffers and are Copy at the source level. Native classes, collections, `Bytes`, `mixed` boxes, and shared-reference handles are pointer-sized move values whose payload layout is compiler-known. Shared-reference control blocks are separate from unchanged payload layouts; the final strong release destroys the payload once, while weak references may keep only the control block alive. `main(): int` crosses the accepted `0..125` process boundary and `main(): void` maps normal completion to status `0`. Release optimization does not change observable semantics. `doria-rt` owns process entry, class/collection/byte-buffer/mixed-box/shared-control allocation and free, runtime strings, raw standard-device I/O, line discipline, text/binary file I/O, exact output, panic formatting, and Doria stack traces. Scalar/string writable-shared payload access, shared handles through `mixed`, and interface-typed values remain unsupported. The former Stage 7-10 native smoke module remains retired.
+The current compiler implementation lowers the accepted native subset through validated typed MIR. The debug interpreter, default Cranelift fast profile, and `--release` LLVM profile consume that same MIR, and the durable executable parity manifest compares exact stdin-driven stdout bytes, stderr bytes, process status, declared file side effects, and class lifetime behavior across all three paths. The supported subset includes top-level free functions; int/void `main` with either no parameters or one readonly borrowed `List<string>` argument; structured control flow and recursion; fixed-width numerics and bool; const-evaluable defaults for Copy scalars and readonly strings; immutable UTF-8 strings; expression interpolation; general nullable scalar, string, concrete-class, and `mixed` values with flow narrowing, `??`, `?->`, and exact `is`; checked formatting; UTF-8 line/file I/O; exact stdout/stderr; fatal panic; native classes, methods, statics, constants, complete `internal` checking, deterministic ownership, and compile-time borrowing; Stage 23 collections, typed arrays, `Bytes`, binary I/O, and boxed `mixed`; Stage 24 generic functions and methods; Stage 25 generic classes; and both Stage 25a shared-ownership families. The readonly `SharedReference<T>` / `WeakReference<T>` family supports class payloads. The writable family supports class, generic-class, typed-array, `List<T>`, `Dictionary<K, V>`, `Set<T>`, and `Bytes` payloads through `WritableSharedReference<T>` / `WritableWeakReference<T>` and owned readonly/writable access objects. It includes nullable weak acquisition, lazy nullable operations, generic/property/collection storage, deterministic strong/weak/access release, and one per-allocation many-readonly-XOR-one-writable access state. `SharedReference<T>::referencedValue` is a readonly, allocation-free, refcount-neutral collision projection available only on that wrapper. Native strings are private non-atomic refcounted buffers and are Copy at the source level. Native classes, collections, `Bytes`, `mixed` boxes, and shared-reference handles are pointer-sized move values whose payload layout is compiler-known. Shared-reference control blocks are separate from unchanged payload layouts; the final strong release destroys the payload once, while weak references may keep only the control block alive. Shared-access conflicts use P1501 with a typed `conflictReason` that distinguishes all three incompatible access states. `main(): int` crosses the accepted `0..125` process boundary and `main(): void` maps normal completion to status `0`. Release optimization does not change observable semantics. `doria-rt` owns process entry, class/collection/byte-buffer/mixed-box/shared-control allocation and free, runtime strings, raw standard-device I/O, line discipline, text/binary file I/O, exact output, and the private source-aware runtime-outcome transport and standalone `Call Path` projection. Scalar/string writable-shared payload access, shared handles through `mixed`, and interface-typed values remain unsupported. The former Stage 7-10 native smoke module remains retired.
 
 Doria is not a Rust language. Rust is the current bootstrap implementation language for `doriac`, not the permanent identity of the compiler.
 
@@ -829,7 +831,7 @@ Simple collection literals infer collection element/key/value types when all cle
 Stage 17 provides these compiler-known built-ins:
 
 ```doria
-read_line(): ?string
+read_line(string $prompt = ""): ?string
 read_file(string $path): string
 write_file(string $path, string $contents): void
 write_stderr(string $value): void
@@ -846,7 +848,7 @@ the binary file tier; `write_file` remains truncate-only.
 
 `read_line` reads UTF-8 text, removes one LF ending and a preceding CR when present, preserves empty lines and final unterminated lines, and returns `null` only when EOF occurs before any bytes. Its return type was the first supported position for the nullable `?T` model now generalized by Decision 0093. A `!= null` guard narrows `?string` to `string`; assigning `null` or another nullable result invalidates that fact, while assigning a known `string` establishes a new non-null fact.
 
-`read_file` and `write_file` are text-file functions. `read_file` reads an entire file and validates UTF-8 before constructing a `string`; invalid bytes never enter a Doria string. `write_file` creates or truncates a text file and writes the string's exact bytes. `write_stderr` writes exact bytes without adding a newline. An ordinary program write to stdout or stderr that reports a closed pipe exits immediately with status 0 and emits no panic or stack trace. This exception does not apply to panic diagnostics: a panic remains fatal with status 101 when stderr is unavailable, although its best-effort diagnostic output may be absent. Other Stage 17 I/O failures, including invalid UTF-8, file failures, and non-broken-pipe operating-system failures, use the fatal panic path with a clear message; `null` from `read_line` means EOF and never signals an error. At Stage 29 these free functions migrate to declared `throws` signatures when checked errors are implemented, but the ordinary standard-stream broken-pipe clean exit is permanent and is never thrown.
+`read_file` and `write_file` are text-file functions. `read_file` reads an entire file and validates UTF-8 before constructing a `string`; invalid bytes never enter a Doria string. `write_file` creates or truncates a text file and writes the string's exact bytes. `write_stderr` writes exact bytes without adding a newline. An ordinary program write to stdout or stderr that reports a closed pipe exits immediately with status 0 and emits no panic diagnostic or `Call Path`. This exception does not apply to panic diagnostics: a panic remains fatal with status 101 when stderr is unavailable, although its best-effort diagnostic output may be absent. Other Stage 17 I/O failures, including invalid UTF-8, file failures, and non-broken-pipe operating-system failures, use the fatal catalogued runtime-outcome path; `null` from `read_line` means EOF and never signals an error. At Stage 29 these free functions migrate to declared `throws` signatures when checked errors are implemented, but the ordinary standard-stream broken-pipe clean exit is permanent and is never thrown.
 
 Stage 23 Slice 2 binary file I/O is whole-file: `read_file_bytes(string $path): Bytes`,
 `write_file_bytes(string $path, Bytes $contents): void`, and
@@ -932,17 +934,28 @@ The accepted checked error direction is recorded in `docs/decisions/0035-checked
 
 `panic("message");` invokes a compiler-known built-in free function that terminates execution. Panic is fatal, is not catchable, does not unwind, and does not run cleanup or destructors while aborting in v1.0. User code cannot redeclare `panic`.
 
-The current compiler accepts a string literal, readonly compile-time-known string local, or concatenation of those expressions as the panic message. Panic writes a deterministic first line and a Doria function-name stack trace to stderr, then exits with status 101:
+The current compiler accepts a string literal, readonly compile-time-known string local, or concatenation of those expressions as the panic message. Panic produces a source-aware runtime diagnostic through the compiler-owned diagnostic model and exits with status 101:
 
 ```text
-Panic: <message>
-Stack Trace:
-  at <currentFunction>
-  at <callerFunction>
-  at main
+Panic[P1000]: User Panic
+
+Where
+<path> · line <line> · <function>
+
+<source preview and marker>
+
+Note
+<message>
+
+Call Path
+<currentFunction> · <path>:<line>
+<callerFunction>  · <path>:<line>
+main              · <path>:<line>
+
+Process Exited With Status 101
 ```
 
-Checked integer addition, subtraction, multiplication, and signed negation overflow use this panic path for every integer width. Division by zero, signed division overflow, remainder by zero, an out-of-range shift count, and an out-of-range explicit conversion use the same path with the deterministic messages in decisions 0041 and 0042. Returning a process status outside `0..125` from `main(): int` also panics. Panic is a runtime outcome, not a compiler diagnostic or malformed-MIR error.
+Checked integer addition, subtraction, multiplication, and signed negation overflow use this runtime-outcome path for every integer width. Division by zero, signed division overflow, remainder by zero, an out-of-range shift count, and an out-of-range explicit conversion use the same catalogue infrastructure with distinct codes and titles. Returning a process status outside `0..125` from `main(): int` also panics. A panic is not a compilation failure: it is a runtime outcome represented by the compiler-owned `Diagnostic`, with abort-without-cleanup termination semantics.
 
 Compiler implementation for `throw`, `throws`, `try`, and `catch` is future work.
 

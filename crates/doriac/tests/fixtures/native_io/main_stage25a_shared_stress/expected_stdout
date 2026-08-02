@@ -1,0 +1,4 @@
+stored 64:64:64
+live 64
+value 32
+drop counter

@@ -1,0 +1,5 @@
+function main(): void
+{
+    int[] $values = [1];
+    echo "{$values[1]}";
+}

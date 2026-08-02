@@ -613,7 +613,8 @@ function main(): void
     assert!(output.stdout.is_empty());
     assert_eq!(output.exit_status, 101);
     let stderr = String::from_utf8(output.stderr).expect("panic output is UTF-8");
-    assert!(stderr.contains("Panic: method failed"));
+    assert!(stderr.starts_with("Panic[P1000]: Program Panicked"));
+    assert!(stderr.contains("\n\nNote\nmethod failed\n"));
     assert!(stderr.contains("Runner::fail"));
 }
 

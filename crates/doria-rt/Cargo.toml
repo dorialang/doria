@@ -15,5 +15,7 @@ default = ["standalone-windows-support"]
 standalone-windows-support = []
 
 [dependencies]
+doria-diagnostic-catalogue = { path = "../doria-diagnostic-catalogue" }
 doria-unicode = { path = "../doria-unicode" }
 ryu.workspace = true
+unicode-width = { version = "=0.2.2", default-features = false, features = ["cjk", "no_std"] }

@@ -1,0 +1,11 @@
+function main(): void
+{
+    let $name = read_line("What is your name? ");
+
+    if ($name == null) {
+        echo "No name was provided.";
+        return;
+    }
+
+    echo "Hello, {$name}!";
+}

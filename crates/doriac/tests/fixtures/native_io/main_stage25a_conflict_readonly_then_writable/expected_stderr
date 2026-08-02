@@ -1,3 +1,16 @@
-Panic: Cannot Acquire Writable Access While Readonly Access Is Active
-Stack Trace:
-  at main
+Panic[P1501]: Writable Shared Access Conflicted
+
+Where
+examples/native/main_stage25a_conflict_readonly_then_writable.doria · line 7 · main
+
+  7          let writable $writable = $shared->acquireWritableAccess();
+                                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+                                      Conflicting Access Requested Here
+
+Why
+Cannot Acquire Writable Access While Readonly Access Is Active
+
+Call Path
+main · examples/native/main_stage25a_conflict_readonly_then_writable.doria:7
+
+Process Exited With Status 101

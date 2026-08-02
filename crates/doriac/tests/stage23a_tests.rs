@@ -109,10 +109,11 @@ function main(): void
         output.stdout.is_empty(),
         "the later marker must not run before the source-earlier fill panic"
     );
-    assert_eq!(
-        output.stderr,
-        b"Panic: fill count is negative\nStack Trace:\n  at route\n  at main\n"
-    );
+    let diagnostic = output
+        .runtime_diagnostic
+        .expect("fill panic should retain a structured diagnostic");
+    assert_eq!(diagnostic.code, "P1311");
+    assert_eq!(diagnostic.title, "Collection Fill Count Cannot Be Negative");
 }
 
 #[test]

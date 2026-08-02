@@ -1,0 +1,4 @@
+parent alive
+drop parent
+drop child
+parent expired

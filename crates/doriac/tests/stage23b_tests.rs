@@ -28,6 +28,7 @@ fn run_with_args(source: &str, args: &[&str]) -> String {
             stdin: Vec::new(),
             files: BTreeMap::new(),
             args: args.iter().map(|argument| argument.to_string()).collect(),
+            ..MirIo::default()
         },
     )
     .expect("MIR should interpret");

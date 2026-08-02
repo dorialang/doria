@@ -5,12 +5,41 @@ use std::rc::Rc;
 
 use doria_unicode::{CaseMapping, PadSide, StringError, TrimMode};
 
+use crate::diagnostics::{
+    ColorChoice, Diagnostic, DiagnosticFormat, DiagnosticSource, RenderOptions, RuntimeFact,
+    RuntimeFactValue, RuntimeOutcomeDetails, RuntimeOutcomeFrame, RuntimeOutcomeOrigin,
+    TerminationBehavior,
+};
 use crate::mir;
 use crate::numeric::{FloatType, FloatValue, IntegerPanic, IntegerType, IntegerValue};
+use crate::source::Span;
 
 type SharedString = Rc<str>;
 type SharedControl = Rc<RefCell<SharedControlValue>>;
 type WritableSharedControl = Rc<RefCell<WritableSharedControlValue>>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SharedAccessConflict {
+    ReadonlyThenWritable,
+    WritableThenReadonly,
+    WritableThenWritable,
+}
+
+impl SharedAccessConflict {
+    const fn reason(self) -> &'static str {
+        match self {
+            Self::ReadonlyThenWritable => {
+                doria_diagnostic_catalogue::READONLY_THEN_WRITABLE_CONFLICT
+            }
+            Self::WritableThenReadonly => {
+                doria_diagnostic_catalogue::WRITABLE_THEN_READONLY_CONFLICT
+            }
+            Self::WritableThenWritable => {
+                doria_diagnostic_catalogue::WRITABLE_THEN_WRITABLE_CONFLICT
+            }
+        }
+    }
+}
 
 #[derive(Debug, PartialEq, Eq)]
 struct SharedControlValue {
@@ -33,6 +62,7 @@ pub struct InterpreterOutput {
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
     pub exit_status: i32,
+    pub runtime_diagnostic: Option<Diagnostic>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -57,18 +87,14 @@ impl InterpreterError {
 fn register_shared_access(
     control: &WritableSharedControl,
     writable: bool,
-) -> Result<Option<&'static str>, InterpreterError> {
+) -> Result<Option<SharedAccessConflict>, InterpreterError> {
     let mut state = control.borrow_mut();
     if writable {
         if state.readonly_accesses != 0 {
-            return Ok(Some(
-                "Cannot Acquire Writable Access While Readonly Access Is Active",
-            ));
+            return Ok(Some(SharedAccessConflict::ReadonlyThenWritable));
         }
         if state.writable_access_active {
-            return Ok(Some(
-                "Cannot Acquire Writable Access While Writable Access Is Active",
-            ));
+            return Ok(Some(SharedAccessConflict::WritableThenWritable));
         }
         state.strong = state
             .strong
@@ -77,9 +103,7 @@ fn register_shared_access(
         state.writable_access_active = true;
     } else {
         if state.writable_access_active {
-            return Ok(Some(
-                "Cannot Acquire Readonly Access While Writable Access Is Active",
-            ));
+            return Ok(Some(SharedAccessConflict::WritableThenReadonly));
         }
         let next_readonly = state
             .readonly_accesses
@@ -369,11 +393,13 @@ enum EvaluationTask {
         payload: mir::WritableSharedPayload,
         writable: bool,
         drop_receiver: bool,
+        span: Span,
     },
     FinishNullableSharedAccessAcquire {
         payload: mir::WritableSharedPayload,
         writable: bool,
         drop_receiver: bool,
+        span: Span,
     },
     Collection(mir::CollectionExpression),
     BuildCollection {
@@ -382,9 +408,11 @@ enum EvaluationTask {
     },
     BuildCollectionFill {
         collection: mir::CollectionTypeId,
+        count_span: Span,
     },
     LoadCollectionValue {
         collection: mir::LocalId,
+        index_span: Span,
         transfer: bool,
     },
     CollectionAdd {
@@ -557,14 +585,16 @@ enum EvaluationTask {
         function: mir::FunctionId,
         args: Vec<mir::Rvalue>,
         owned_receiver: Option<crate::class_layout::ClassId>,
+        call_site: Option<Span>,
     },
     NullableStringCompare(mir::CompareOp),
     Format(mir::FormatExpression),
     BuildFormat(mir::FormatExpression),
-    ReadFile,
+    ReadFile(Span),
+    ReadLine(Span),
     WriteFile,
     AppendFile,
-    ReadFileBytes(mir::CollectionTypeId),
+    ReadFileBytes(mir::CollectionTypeId, Span),
     WriteFileBytes {
         contents: mir::LocalId,
         append: bool,
@@ -579,16 +609,32 @@ enum EvaluationTask {
         kind: mir::StringIntrinsicKind,
         result: mir::Type,
         argument_count: usize,
+        span: Span,
+        argument_spans: Vec<Span>,
     },
     StringDisplay,
     StringCompare(mir::CompareOp),
     Echo,
-    PanicString,
+    PanicString(Span),
     Integer(mir::IntegerExpression),
-    IntegerUnary(mir::IntegerUnaryOp),
-    IntegerBinary(mir::IntegerBinaryOp),
-    IntegerConvert(IntegerType),
-    FloatToInt,
+    IntegerUnary {
+        op: mir::IntegerUnaryOp,
+        span: Span,
+    },
+    IntegerBinary {
+        op: mir::IntegerBinaryOp,
+        span: Span,
+        right_span: Span,
+    },
+    IntegerConvert {
+        target: IntegerType,
+        operation_span: Span,
+        primary_span: Span,
+    },
+    FloatToInt {
+        operation_span: Span,
+        primary_span: Span,
+    },
     Float(mir::FloatExpression),
     FloatNegate,
     FloatBinary(mir::FloatBinaryOp),
@@ -604,6 +650,7 @@ enum EvaluationTask {
         argument_count: usize,
         expectation: ReturnExpectation,
         temporary_arg_drops: Vec<usize>,
+        call_site: Option<Span>,
     },
     FinishStatement,
     DropTemporaryValues(Vec<OwnedDrop>),
@@ -659,6 +706,7 @@ struct CallFrame {
     values: Vec<EvaluationValue>,
     statement_temporary_drops: Vec<OwnedDrop>,
     caller_expectation: Option<ReturnExpectation>,
+    entered_from: Option<Span>,
 }
 
 struct Interpreter<'program> {
@@ -667,6 +715,8 @@ struct Interpreter<'program> {
     stderr: Vec<u8>,
     stdin: Vec<u8>,
     stdin_cursor: usize,
+    io_faults: MirIoFaults,
+    io_trace: MirIoTrace,
     files: BTreeMap<String, Vec<u8>>,
     heap: BTreeMap<usize, ObjectValue>,
     statics: Vec<LocalValue>,
@@ -674,7 +724,28 @@ struct Interpreter<'program> {
     frames: Vec<CallFrame>,
     limits: InterpreterLimits,
     executed_blocks: usize,
-    pending_panic: Option<String>,
+    pending_panic: Option<&'static str>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MirIoWriteFailure {
+    BrokenPipe,
+    Other,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MirIoFaults {
+    pub prompt_write: Option<MirIoWriteFailure>,
+    pub stdout_flush: Option<MirIoWriteFailure>,
+    pub stdin_line_read: bool,
+    pub line_allocation: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MirIoTrace {
+    pub prompt_writes: usize,
+    pub stdout_flushes: usize,
+    pub stdin_line_reads: usize,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -685,18 +756,41 @@ pub struct MirIo {
     /// 0099). These are the arguments only — the executable path is stripped by
     /// the entry glue, so element 0 is the first real argument.
     pub args: Vec<String>,
+    /// Deterministic host failures used to verify the shared standard-I/O
+    /// contract without depending on platform-specific devices.
+    pub faults: MirIoFaults,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InterpreterIoOutput {
     pub output: InterpreterOutput,
     pub files: BTreeMap<String, Vec<u8>>,
+    pub trace: MirIoTrace,
 }
 
 enum StepOutcome {
     Continue,
+    CleanExit,
     EntryReturned(FunctionOutcome),
-    Panic(String),
+    RuntimePanic(RuntimePanicEvent),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RuntimePanicEvent {
+    code: &'static str,
+    operation_span: Span,
+    primary_span: Span,
+    facts: Vec<RuntimeFact>,
+    explanation: Option<String>,
+}
+
+enum CollectionAccessError {
+    Catalogued(&'static str),
+    Bounds {
+        code: &'static str,
+        index: i64,
+        length: usize,
+    },
 }
 
 pub fn interpret(program: &mir::Program) -> Result<InterpreterOutput, InterpreterError> {
@@ -764,6 +858,8 @@ fn interpret_internal(
         stderr: Vec::new(),
         stdin: io.stdin,
         stdin_cursor: 0,
+        io_faults: io.faults,
+        io_trace: MirIoTrace::default(),
         files: io.files,
         heap: BTreeMap::new(),
         statics: program
@@ -813,16 +909,29 @@ fn interpret_internal(
         pending_panic: None,
     };
     let entry_frame_arguments: Vec<LocalValue> = entry_arguments.into_iter().collect();
-    interpreter.push_frame(program.entry, &entry_frame_arguments, None)?;
+    interpreter.push_frame(program.entry, &entry_frame_arguments, None, None)?;
 
     loop {
         match interpreter.step()? {
             StepOutcome::Continue => {}
-            StepOutcome::Panic(message) => {
-                let output = interpreter.panic_output(&message);
+            StepOutcome::CleanExit => {
+                return Ok(InterpreterIoOutput {
+                    output: InterpreterOutput {
+                        stdout: interpreter.stdout,
+                        stderr: interpreter.stderr,
+                        exit_status: 0,
+                        runtime_diagnostic: None,
+                    },
+                    files: interpreter.files,
+                    trace: interpreter.io_trace,
+                });
+            }
+            StepOutcome::RuntimePanic(event) => {
+                let output = interpreter.runtime_panic_output(event);
                 return Ok(InterpreterIoOutput {
                     output,
                     files: interpreter.files,
+                    trace: interpreter.io_trace,
                 });
             }
             StepOutcome::EntryReturned(outcome) => {
@@ -830,6 +939,7 @@ fn interpret_internal(
                 return Ok(InterpreterIoOutput {
                     output,
                     files: interpreter.files,
+                    trace: interpreter.io_trace,
                 });
             }
         }
@@ -838,8 +948,8 @@ fn interpret_internal(
 
 impl Interpreter<'_> {
     fn step(&mut self) -> Result<StepOutcome, InterpreterError> {
-        if let Some(message) = self.pending_panic.take() {
-            return Ok(StepOutcome::Panic(message));
+        if let Some(code) = self.pending_panic.take() {
+            return self.runtime_panic_step(code);
         }
         let task = self.frames.last_mut().and_then(|frame| frame.tasks.pop());
         if let Some(task) = task {
@@ -1149,22 +1259,36 @@ impl Interpreter<'_> {
                 frame.tasks.push(EvaluationTask::Echo);
                 frame.tasks.push(EvaluationTask::String(expression));
             }
-            mir::Statement::CallVoid { function, args } => {
-                self.queue_call(function, args, ReturnExpectation::Void)?;
+            mir::Statement::CallVoid {
+                function,
+                args,
+                span,
+            } => {
+                self.queue_call_at(function, args, ReturnExpectation::Void, Some(span))?;
             }
-            mir::Statement::CallBorrowed { function, args } => {
+            mir::Statement::CallBorrowed {
+                function,
+                args,
+                span,
+            } => {
                 let callee = function_in(self.program, function)?;
                 let mir::ReturnType::Value(return_type) = callee.return_type else {
                     return Err(InterpreterError::new(
                         "MIR borrowed call targeted a void function",
                     ));
                 };
-                self.queue_call(function, args, ReturnExpectation::Discard(return_type))?;
+                self.queue_call_at(
+                    function,
+                    args,
+                    ReturnExpectation::Discard(return_type),
+                    Some(span),
+                )?;
             }
             mir::Statement::CallNullSafe {
                 object,
                 function,
                 args,
+                span,
             } => {
                 let owned_receiver = object.owned_temporary_class();
                 let frame = self.current_frame_mut()?;
@@ -1174,6 +1298,7 @@ impl Interpreter<'_> {
                         function,
                         args,
                         owned_receiver,
+                        call_site: Some(span),
                     });
                 frame.tasks.push(EvaluationTask::NullableClass(object));
             }
@@ -1366,9 +1491,9 @@ impl Interpreter<'_> {
                 frame.tasks.push(EvaluationTask::CleanupFrame);
                 Ok(StepOutcome::Continue)
             }
-            mir::Terminator::Panic(message) => {
+            mir::Terminator::Panic { message, span } => {
                 let frame = self.current_frame_mut()?;
-                frame.tasks.push(EvaluationTask::PanicString);
+                frame.tasks.push(EvaluationTask::PanicString(span));
                 frame.tasks.push(EvaluationTask::String(message));
                 Ok(StepOutcome::Continue)
             }
@@ -2081,6 +2206,7 @@ impl Interpreter<'_> {
                 payload,
                 writable,
                 drop_receiver,
+                span,
             } => {
                 let (control, actual) = self.pop_writable_shared_reference()?;
                 if actual != payload {
@@ -2088,9 +2214,8 @@ impl Interpreter<'_> {
                         "shared access acquisition changed payload type",
                     ));
                 }
-                let conflict = register_shared_access(&control, writable)?;
-                if let Some(message) = conflict {
-                    return Ok(StepOutcome::Panic(message.to_string()));
+                if let Some(conflict) = register_shared_access(&control, writable)? {
+                    return self.shared_access_conflict_panic_step_at(conflict, span);
                 }
                 if drop_receiver {
                     self.current_frame_mut()?
@@ -2109,6 +2234,7 @@ impl Interpreter<'_> {
                 payload,
                 writable,
                 drop_receiver,
+                span,
             } => {
                 let (control, actual) = self.pop_nullable_writable_shared_reference()?;
                 if actual != payload {
@@ -2126,9 +2252,8 @@ impl Interpreter<'_> {
                     );
                     return Ok(StepOutcome::Continue);
                 };
-                let conflict = register_shared_access(&control, writable)?;
-                if let Some(message) = conflict {
-                    return Ok(StepOutcome::Panic(message.to_string()));
+                if let Some(conflict) = register_shared_access(&control, writable)? {
+                    return self.shared_access_conflict_panic_step_at(conflict, span);
                 }
                 if drop_receiver {
                     self.current_frame_mut()?
@@ -2202,7 +2327,10 @@ impl Interpreter<'_> {
                         collection, entries,
                     )));
             }
-            EvaluationTask::BuildCollectionFill { collection } => {
+            EvaluationTask::BuildCollectionFill {
+                collection,
+                count_span,
+            } => {
                 let count = self.pop_local_value()?;
                 let LocalValue::Scalar(mir::ScalarValue::Integer(count)) = count else {
                     return Err(InterpreterError::new(
@@ -2216,7 +2344,15 @@ impl Interpreter<'_> {
                 }
                 let count = count.signed_value();
                 if count < 0 {
-                    return Ok(StepOutcome::Panic("fill count is negative".to_string()));
+                    return self.runtime_panic_step_with_facts_at(
+                        "P1311",
+                        count_span,
+                        vec![RuntimeFact {
+                            name: doria_diagnostic_catalogue::COLLECTION_FILL_COUNT_FACT
+                                .to_string(),
+                            value: RuntimeFactValue::Signed(count as i64),
+                        }],
+                    );
                 }
                 let count = usize::try_from(count).map_err(|_| {
                     InterpreterError::new("MIR collection fill count exceeds host capacity")
@@ -2229,7 +2365,7 @@ impl Interpreter<'_> {
                 }
                 let entries = match repeat_collection_entries(value, count) {
                     Ok(entries) => entries,
-                    Err(message) => return Ok(StepOutcome::Panic(message.to_string())),
+                    Err(code) => return self.runtime_panic_step_at(code, count_span),
                 };
                 self.current_frame_mut()?
                     .values
@@ -2239,12 +2375,13 @@ impl Interpreter<'_> {
             }
             EvaluationTask::LoadCollectionValue {
                 collection,
+                index_span,
                 transfer,
             } => {
                 let index = self.pop_local_value()?;
                 let value = match self.collection_value_at(collection, &index, transfer) {
                     Ok(value) => value,
-                    Err(message) => return Ok(StepOutcome::Panic(message)),
+                    Err(error) => return self.collection_access_panic_step_at(error, index_span),
                 };
                 self.push_local_value(value)?;
             }
@@ -2278,10 +2415,15 @@ impl Interpreter<'_> {
                     mir::CollectionMutationOp::InsertAt => {
                         let index = index.expect("insertAt task carries an index");
                         let collection = self.collection_local(collection)?;
-                        if index > collection.entries().len() {
-                            return Ok(StepOutcome::Panic(
-                                "collection index out of bounds".to_string(),
-                            ));
+                        let length = collection.entries().len();
+                        if index > length {
+                            return self.collection_access_panic_step(
+                                CollectionAccessError::Bounds {
+                                    code: "P1310",
+                                    index: index as i64,
+                                    length,
+                                },
+                            );
                         }
                         collection.entries_mut().insert(index, (None, value));
                     }
@@ -2339,7 +2481,7 @@ impl Interpreter<'_> {
                             .entries_mut()
                             .push((Some(index), value));
                     }
-                    Err(message) => return Ok(StepOutcome::Panic(message)),
+                    Err(error) => return self.collection_access_panic_step(error),
                 }
             }
             EvaluationTask::CollectionHas {
@@ -2425,7 +2567,7 @@ impl Interpreter<'_> {
                 let index = self.pop_local_value()?;
                 let value = match self.collection_value_at(collection, &index, false) {
                     Ok(value) => value,
-                    Err(message) => return Ok(StepOutcome::Panic(message)),
+                    Err(error) => return self.collection_access_panic_step(error),
                 };
                 let LocalValue::Scalar(value) = value else {
                     return Err(InterpreterError::new(
@@ -2601,6 +2743,77 @@ impl Interpreter<'_> {
                             control: None,
                             class,
                         }),
+                    (
+                        mir::Type::WritableSharedReference(payload),
+                        Some(LocalValue::WritableSharedReference {
+                            control,
+                            payload: actual,
+                        }),
+                    ) if payload == actual => self.current_frame_mut()?.values.push(
+                        EvaluationValue::NullableWritableSharedReference {
+                            control: Some(control),
+                            payload,
+                        },
+                    ),
+                    (mir::Type::WritableSharedReference(payload), None) => self
+                        .current_frame_mut()?
+                        .values
+                        .push(EvaluationValue::NullableWritableSharedReference {
+                            control: None,
+                            payload,
+                        }),
+                    (
+                        mir::Type::NullableWritableSharedReference(payload),
+                        Some(LocalValue::NullableWritableSharedReference {
+                            control,
+                            payload: actual,
+                        }),
+                    ) if payload == actual => self.current_frame_mut()?.values.push(
+                        EvaluationValue::NullableWritableSharedReference { control, payload },
+                    ),
+                    (mir::Type::NullableWritableSharedReference(payload), None) => self
+                        .current_frame_mut()?
+                        .values
+                        .push(EvaluationValue::NullableWritableSharedReference {
+                            control: None,
+                            payload,
+                        }),
+                    (
+                        mir::Type::WritableWeakReference(payload),
+                        Some(LocalValue::WritableWeakReference {
+                            control,
+                            payload: actual,
+                        }),
+                    ) if payload == actual => self.current_frame_mut()?.values.push(
+                        EvaluationValue::NullableWritableWeakReference {
+                            control: Some(control),
+                            payload,
+                        },
+                    ),
+                    (mir::Type::WritableWeakReference(payload), None) => self
+                        .current_frame_mut()?
+                        .values
+                        .push(EvaluationValue::NullableWritableWeakReference {
+                            control: None,
+                            payload,
+                        }),
+                    (
+                        mir::Type::NullableWritableWeakReference(payload),
+                        Some(LocalValue::NullableWritableWeakReference {
+                            control,
+                            payload: actual,
+                        }),
+                    ) if payload == actual => self
+                        .current_frame_mut()?
+                        .values
+                        .push(EvaluationValue::NullableWritableWeakReference { control, payload }),
+                    (mir::Type::NullableWritableWeakReference(payload), None) => self
+                        .current_frame_mut()?
+                        .values
+                        .push(EvaluationValue::NullableWritableWeakReference {
+                            control: None,
+                            payload,
+                        }),
                     (expected, value) if expected.shared_access().is_some() => {
                         let access = expected
                             .shared_access()
@@ -2656,7 +2869,7 @@ impl Interpreter<'_> {
                 let index = self.pop_local_value()?;
                 let value = match self.collection_value_at(collection, &index, transfer) {
                     Ok(value) => value,
-                    Err(message) => return Ok(StepOutcome::Panic(message)),
+                    Err(error) => return self.collection_access_panic_step(error),
                 };
                 let LocalValue::Class {
                     object,
@@ -2686,7 +2899,7 @@ impl Interpreter<'_> {
                 let index = self.pop_local_value()?;
                 let value = match self.collection_value_at(collection, &index, transfer) {
                     Ok(value) => value,
-                    Err(message) => return Ok(StepOutcome::Panic(message)),
+                    Err(error) => return self.collection_access_panic_step(error),
                 };
                 let value = match (weak, nullable, value) {
                     (
@@ -2743,7 +2956,7 @@ impl Interpreter<'_> {
                 let index = self.pop_local_value()?;
                 let value = match self.collection_value_at(collection, &index, transfer) {
                     Ok(value) => value,
-                    Err(message) => return Ok(StepOutcome::Panic(message)),
+                    Err(error) => return self.collection_access_panic_step(error),
                 };
                 let value = match (weak, nullable, value) {
                     (
@@ -2804,7 +3017,7 @@ impl Interpreter<'_> {
                 let index = self.pop_local_value()?;
                 let value = match self.collection_value_at(collection, &index, remove) {
                     Ok(value) => value,
-                    Err(message) => return Ok(StepOutcome::Panic(message)),
+                    Err(error) => return self.collection_access_panic_step(error),
                 };
                 let result = match (nullable, value) {
                     (
@@ -2922,6 +3135,7 @@ impl Interpreter<'_> {
                         constructor,
                         &constructor_arguments,
                         Some(ReturnExpectation::Void),
+                        None,
                     )?;
                 } else {
                     self.current_frame_mut()?
@@ -3664,6 +3878,7 @@ impl Interpreter<'_> {
                 function,
                 args,
                 owned_receiver,
+                call_site,
             } => {
                 let (class, object) = self.pop_nullable_class()?;
                 if let Some(object) = object {
@@ -3672,7 +3887,7 @@ impl Interpreter<'_> {
                             .statement_temporary_drops
                             .push(OwnedDrop::Class { object, class });
                     }
-                    self.queue_null_safe_statement_call(object, class, function, args)?;
+                    self.queue_null_safe_statement_call(object, class, function, args, call_site)?;
                 }
             }
             EvaluationTask::NullableStringCompare(op) => {
@@ -3710,20 +3925,66 @@ impl Interpreter<'_> {
                 let values = self.take_evaluation_values(format.arguments.len())?;
                 self.push_string(render_format(&format, &values)?)?;
             }
-            EvaluationTask::ReadFile => {
+            EvaluationTask::ReadLine(prompt_span) => {
+                let prompt = self.pop_string()?;
+                if !prompt.is_empty() {
+                    self.io_trace.prompt_writes += 1;
+                    match self.io_faults.prompt_write {
+                        Some(MirIoWriteFailure::BrokenPipe) => {
+                            return Ok(StepOutcome::CleanExit);
+                        }
+                        Some(MirIoWriteFailure::Other) => {
+                            return self.runtime_panic_step_at("P1407", prompt_span);
+                        }
+                        None => {}
+                    }
+                    self.stdout.extend_from_slice(prompt.as_bytes());
+                }
+                self.io_trace.stdout_flushes += 1;
+                match self.io_faults.stdout_flush {
+                    Some(MirIoWriteFailure::BrokenPipe) => {
+                        return Ok(StepOutcome::CleanExit);
+                    }
+                    Some(MirIoWriteFailure::Other) => {
+                        return self.runtime_panic_step_at("P1407", prompt_span);
+                    }
+                    None => {}
+                }
+                self.io_trace.stdin_line_reads += 1;
+                if self.io_faults.stdin_line_read {
+                    return self.runtime_panic_step_at("P1403", prompt_span);
+                }
+                if self.stdin_cursor == self.stdin.len() {
+                    self.push_nullable_string(None)?;
+                } else {
+                    let remaining = &self.stdin[self.stdin_cursor..];
+                    let newline = remaining.iter().position(|byte| *byte == b'\n');
+                    let consumed = newline.map_or(remaining.len(), |index| index + 1);
+                    let mut line_length = newline.unwrap_or(remaining.len());
+                    if line_length != 0 && remaining[line_length - 1] == b'\r' {
+                        line_length -= 1;
+                    }
+                    let Ok(line) = core::str::from_utf8(&remaining[..line_length]) else {
+                        return self.runtime_panic_step_at("P1404", prompt_span);
+                    };
+                    if self.io_faults.line_allocation {
+                        return self.runtime_panic_step_at("P1206", prompt_span);
+                    }
+                    let line = line.to_string();
+                    self.stdin_cursor += consumed;
+                    self.push_nullable_string(Some(line.into()))?;
+                }
+            }
+            EvaluationTask::ReadFile(path_span) => {
                 let path = self.pop_string()?;
                 if path.as_bytes().contains(&0) {
-                    return Ok(StepOutcome::Panic(
-                        "file path contained an embedded NUL".to_string(),
-                    ));
+                    return self.runtime_panic_step_at("P1405", path_span);
                 }
                 let Some(bytes) = self.files.get(path.as_ref()) else {
-                    return Ok(StepOutcome::Panic("failed to read file".to_string()));
+                    return self.runtime_panic_step_at("P1401", path_span);
                 };
                 let Ok(value) = String::from_utf8(bytes.clone()) else {
-                    return Ok(StepOutcome::Panic(
-                        "file contained invalid UTF-8".to_string(),
-                    ));
+                    return self.runtime_panic_step_at("P1406", path_span);
                 };
                 self.push_string(value)?;
             }
@@ -3731,9 +3992,7 @@ impl Interpreter<'_> {
                 let contents = self.pop_string()?;
                 let path = self.pop_string()?;
                 if path.as_bytes().contains(&0) {
-                    return Ok(StepOutcome::Panic(
-                        "file path contained an embedded NUL".to_string(),
-                    ));
+                    return self.runtime_panic_step("P1405");
                 }
                 self.files
                     .insert(path.to_string(), contents.as_bytes().to_vec());
@@ -3742,33 +4001,27 @@ impl Interpreter<'_> {
                 let contents = self.pop_string()?;
                 let path = self.pop_string()?;
                 if path.as_bytes().contains(&0) {
-                    return Ok(StepOutcome::Panic(
-                        "file path contained an embedded NUL".to_string(),
-                    ));
+                    return self.runtime_panic_step("P1405");
                 }
                 self.files
                     .entry(path.to_string())
                     .or_default()
                     .extend_from_slice(contents.as_bytes());
             }
-            EvaluationTask::ReadFileBytes(collection) => {
+            EvaluationTask::ReadFileBytes(collection, path_span) => {
                 let path = self.pop_string()?;
                 if path.as_bytes().contains(&0) {
-                    return Ok(StepOutcome::Panic(
-                        "file path contained an embedded NUL".to_string(),
-                    ));
+                    return self.runtime_panic_step_at("P1405", path_span);
                 }
                 let Some(contents) = self.files.get(path.as_ref()).cloned() else {
-                    return Ok(StepOutcome::Panic("failed to read file".to_string()));
+                    return self.runtime_panic_step_at("P1401", path_span);
                 };
                 self.push_byte_collection(collection, &contents)?;
             }
             EvaluationTask::WriteFileBytes { contents, append } => {
                 let path = self.pop_string()?;
                 if path.as_bytes().contains(&0) {
-                    return Ok(StepOutcome::Panic(
-                        "file path contained an embedded NUL".to_string(),
-                    ));
+                    return self.runtime_panic_step("P1405");
                 }
                 let bytes = self.byte_collection(contents)?;
                 if append {
@@ -3804,14 +4057,18 @@ impl Interpreter<'_> {
                 kind,
                 result,
                 argument_count,
+                span,
+                argument_spans,
             } => {
                 let mut arguments = Vec::with_capacity(argument_count);
                 for _ in 0..argument_count {
                     arguments.push(self.pop_local_value()?);
                 }
                 arguments.reverse();
-                if let Some(message) = self.execute_string_intrinsic(kind, result, arguments)? {
-                    return Ok(StepOutcome::Panic(message));
+                if let Some(event) =
+                    self.execute_string_intrinsic(kind, result, arguments, span, &argument_spans)?
+                {
+                    return Ok(StepOutcome::RuntimePanic(event));
                 }
             }
             EvaluationTask::StringDisplay => {
@@ -3836,46 +4093,90 @@ impl Interpreter<'_> {
                 let value = self.pop_string()?;
                 self.stdout.extend_from_slice(value.as_bytes());
             }
-            EvaluationTask::PanicString => {
-                return Ok(StepOutcome::Panic(self.pop_string()?.to_string()));
+            EvaluationTask::PanicString(span) => {
+                let message = self.pop_string()?.to_string();
+                return Ok(StepOutcome::RuntimePanic(RuntimePanicEvent {
+                    code: "P1000",
+                    operation_span: span,
+                    primary_span: span,
+                    facts: vec![RuntimeFact {
+                        name: "message".to_string(),
+                        value: RuntimeFactValue::StaticString(message.clone()),
+                    }],
+                    explanation: None,
+                }));
             }
             EvaluationTask::Integer(expression) => self.expand_integer_expression(expression)?,
-            EvaluationTask::IntegerUnary(op) => {
+            EvaluationTask::IntegerUnary { op, span } => {
                 let operand = self.pop_integer()?;
                 let value = match eval_unary(op, operand) {
                     Ok(value) => value,
-                    Err(panic) => return Ok(StepOutcome::Panic(panic.message().to_string())),
+                    Err(panic) => {
+                        return Ok(StepOutcome::RuntimePanic(Self::integer_panic_event(
+                            panic, span,
+                        )))
+                    }
                 };
                 self.current_frame_mut()?
                     .values
                     .push(EvaluationValue::Scalar(mir::ScalarValue::Integer(value)));
             }
-            EvaluationTask::IntegerBinary(op) => {
+            EvaluationTask::IntegerBinary {
+                op,
+                span,
+                right_span,
+            } => {
                 let right = self.pop_integer()?;
                 let left = self.pop_integer()?;
                 let value = match eval_binary(op, left, right) {
                     Ok(value) => value,
-                    Err(panic) => return Ok(StepOutcome::Panic(panic.message().to_string())),
+                    Err(panic) => {
+                        let primary_span = match panic {
+                            IntegerPanic::DivisionByZero
+                            | IntegerPanic::RemainderByZero
+                            | IntegerPanic::ShiftCountOutOfRange => right_span,
+                            _ => span,
+                        };
+                        return Ok(StepOutcome::RuntimePanic(Self::integer_panic_event(
+                            panic,
+                            primary_span,
+                        )));
+                    }
                 };
                 self.current_frame_mut()?
                     .values
                     .push(EvaluationValue::Scalar(mir::ScalarValue::Integer(value)));
             }
-            EvaluationTask::IntegerConvert(target) => {
+            EvaluationTask::IntegerConvert {
+                target,
+                operation_span,
+                primary_span,
+            } => {
                 let value = match self.pop_integer()?.convert(target) {
                     Ok(value) => value,
-                    Err(panic) => return Ok(StepOutcome::Panic(panic.message().to_string())),
+                    Err(panic) => {
+                        let mut event = Self::integer_panic_event(panic, operation_span);
+                        event.primary_span = primary_span;
+                        return Ok(StepOutcome::RuntimePanic(event));
+                    }
                 };
                 self.current_frame_mut()?
                     .values
                     .push(EvaluationValue::Scalar(mir::ScalarValue::Integer(value)));
             }
-            EvaluationTask::FloatToInt => {
+            EvaluationTask::FloatToInt {
+                operation_span,
+                primary_span,
+            } => {
                 let value = self.pop_float()?;
                 let Some(value) = value.to_i64_checked() else {
-                    return Ok(StepOutcome::Panic(
-                        "float-to-integer conversion out of range".to_string(),
-                    ));
+                    return Ok(StepOutcome::RuntimePanic(RuntimePanicEvent {
+                        code: "P1110",
+                        operation_span,
+                        primary_span,
+                        facts: Vec::new(),
+                        explanation: None,
+                    }));
                 };
                 self.push_scalar(mir::ScalarValue::Integer(
                     IntegerValue::from_i128(IntegerType::Int64, value as i128)
@@ -3948,6 +4249,7 @@ impl Interpreter<'_> {
                 argument_count,
                 expectation,
                 temporary_arg_drops,
+                call_site,
             } => {
                 let args = self.take_call_arguments(argument_count)?;
                 let mut drops = Vec::new();
@@ -3959,7 +4261,7 @@ impl Interpreter<'_> {
                         .statement_temporary_drops
                         .extend(drops);
                 }
-                self.push_frame(function, &args, Some(expectation))?;
+                self.push_frame(function, &args, Some(expectation), call_site)?;
             }
             EvaluationTask::FinishStatement => {
                 let drops =
@@ -4164,7 +4466,12 @@ impl Interpreter<'_> {
                     .values
                     .push(EvaluationValue::Scalar(mir::ScalarValue::Integer(value)));
             }
-            mir::IntegerExpression::Unary { ty, op, operand } => {
+            mir::IntegerExpression::Unary {
+                ty,
+                op,
+                operand,
+                span,
+            } => {
                 if operand.ty() != ty {
                     return Err(InterpreterError::new(format!(
                         "MIR {ty} unary expression has operand type {}",
@@ -4177,7 +4484,7 @@ impl Interpreter<'_> {
                     )));
                 }
                 let frame = self.current_frame_mut()?;
-                frame.tasks.push(EvaluationTask::IntegerUnary(op));
+                frame.tasks.push(EvaluationTask::IntegerUnary { op, span });
                 frame.tasks.push(EvaluationTask::Integer(*operand));
             }
             mir::IntegerExpression::Binary {
@@ -4185,6 +4492,8 @@ impl Interpreter<'_> {
                 op,
                 left,
                 right,
+                span,
+                right_span,
             } => {
                 if left.ty() != ty || right.ty() != ty {
                     return Err(InterpreterError::new(format!(
@@ -4194,18 +4503,38 @@ impl Interpreter<'_> {
                     )));
                 }
                 let frame = self.current_frame_mut()?;
-                frame.tasks.push(EvaluationTask::IntegerBinary(op));
+                frame.tasks.push(EvaluationTask::IntegerBinary {
+                    op,
+                    span,
+                    right_span,
+                });
                 frame.tasks.push(EvaluationTask::Integer(*right));
                 frame.tasks.push(EvaluationTask::Integer(*left));
             }
-            mir::IntegerExpression::Convert { ty, value } => {
+            mir::IntegerExpression::Convert {
+                ty,
+                value,
+                span,
+                value_span,
+            } => {
                 let frame = self.current_frame_mut()?;
-                frame.tasks.push(EvaluationTask::IntegerConvert(ty));
+                frame.tasks.push(EvaluationTask::IntegerConvert {
+                    target: ty,
+                    operation_span: span,
+                    primary_span: value_span,
+                });
                 frame.tasks.push(EvaluationTask::Integer(*value));
             }
-            mir::IntegerExpression::FloatToInt { value } => {
+            mir::IntegerExpression::FloatToInt {
+                value,
+                span,
+                value_span,
+            } => {
                 let frame = self.current_frame_mut()?;
-                frame.tasks.push(EvaluationTask::FloatToInt);
+                frame.tasks.push(EvaluationTask::FloatToInt {
+                    operation_span: span,
+                    primary_span: value_span,
+                });
                 frame.tasks.push(EvaluationTask::Float(*value));
             }
             mir::IntegerExpression::Call { ty, function, args } => {
@@ -4610,9 +4939,9 @@ impl Interpreter<'_> {
             mir::StringExpression::Call { function, args } => {
                 self.queue_call(function, args, ReturnExpectation::Value(mir::Type::String))?;
             }
-            mir::StringExpression::ReadFile(path) => {
+            mir::StringExpression::ReadFile { path, path_span } => {
                 let frame = self.current_frame_mut()?;
-                frame.tasks.push(EvaluationTask::ReadFile);
+                frame.tasks.push(EvaluationTask::ReadFile(path_span));
                 frame.tasks.push(EvaluationTask::String(*path));
             }
             mir::StringExpression::Format(format) => {
@@ -4635,6 +4964,7 @@ impl Interpreter<'_> {
                 let frame = self.current_frame_mut()?;
                 frame.tasks.push(EvaluationTask::LoadCollectionValue {
                     collection,
+                    index_span: Span::default(),
                     transfer: remove,
                 });
                 frame.tasks.push(EvaluationTask::Rvalue(*index));
@@ -4840,6 +5170,7 @@ impl Interpreter<'_> {
                 }
                 frame.tasks.push(EvaluationTask::LoadCollectionValue {
                     collection,
+                    index_span: Span::default(),
                     transfer: remove,
                 });
                 frame.tasks.push(EvaluationTask::Rvalue(*index));
@@ -4961,23 +5292,15 @@ impl Interpreter<'_> {
                     }
                 }
             }
-            mir::NullableStringExpression::ReadLine => {
-                if self.stdin_cursor == self.stdin.len() {
-                    self.push_nullable_string(None)?;
-                } else {
-                    let remaining = &self.stdin[self.stdin_cursor..];
-                    let newline = remaining.iter().position(|byte| *byte == b'\n');
-                    let consumed = newline.map_or(remaining.len(), |index| index + 1);
-                    let mut line_length = newline.unwrap_or(remaining.len());
-                    if line_length != 0 && remaining[line_length - 1] == b'\r' {
-                        line_length -= 1;
-                    }
-                    let line = core::str::from_utf8(&remaining[..line_length])
-                        .map_err(|_| InterpreterError::new("stdin contained invalid UTF-8"))?
-                        .to_string();
-                    self.stdin_cursor += consumed;
-                    self.push_nullable_string(Some(line.into()))?;
-                }
+            mir::NullableStringExpression::ReadLine {
+                prompt,
+                prompt_span,
+            } => {
+                // The prompt evaluates first and exactly once; the continuation then
+                // writes it, flushes, and reads one line.
+                let frame = self.current_frame_mut()?;
+                frame.tasks.push(EvaluationTask::ReadLine(prompt_span));
+                frame.tasks.push(EvaluationTask::String(*prompt));
             }
             mir::NullableStringExpression::Call { function, args } => {
                 self.queue_call(
@@ -5315,8 +5638,7 @@ impl Interpreter<'_> {
                         claims == 1 && payload_owned
                     };
                     if !owns_final {
-                        self.pending_panic =
-                            Some("cannot take ownership of a shared `mixed` value".to_string());
+                        self.pending_panic = Some("P1321");
                         return Ok(());
                     }
                 }
@@ -6665,6 +6987,7 @@ impl Interpreter<'_> {
                 payload,
                 value,
                 writable,
+                span,
             } => {
                 let drop_receiver = value.owned_temporary();
                 let frame = self.current_frame_mut()?;
@@ -6672,6 +6995,7 @@ impl Interpreter<'_> {
                     payload,
                     writable,
                     drop_receiver,
+                    span,
                 });
                 frame
                     .tasks
@@ -6818,6 +7142,7 @@ impl Interpreter<'_> {
                 payload,
                 value,
                 writable,
+                span,
             } => {
                 let drop_receiver = value.owned_temporary();
                 let frame = self.current_frame_mut()?;
@@ -6827,6 +7152,7 @@ impl Interpreter<'_> {
                         payload,
                         writable,
                         drop_receiver,
+                        span,
                     });
                 frame
                     .tasks
@@ -6897,11 +7223,13 @@ impl Interpreter<'_> {
                 collection,
                 value,
                 count,
+                count_span,
             } => {
                 let frame = self.current_frame_mut()?;
-                frame
-                    .tasks
-                    .push(EvaluationTask::BuildCollectionFill { collection });
+                frame.tasks.push(EvaluationTask::BuildCollectionFill {
+                    collection,
+                    count_span,
+                });
                 frame
                     .tasks
                     .push(EvaluationTask::Value(mir::ValueExpression::Integer(*count)));
@@ -6910,12 +7238,14 @@ impl Interpreter<'_> {
             mir::CollectionExpression::Index {
                 source,
                 index,
+                index_span,
                 transfer,
                 ..
             } => {
                 let frame = self.current_frame_mut()?;
                 frame.tasks.push(EvaluationTask::LoadCollectionValue {
                     collection: source,
+                    index_span,
                     transfer,
                 });
                 frame.tasks.push(EvaluationTask::Rvalue(*index));
@@ -7053,9 +7383,15 @@ impl Interpreter<'_> {
                         collection, entries,
                     )));
             }
-            mir::CollectionExpression::ReadFileBytes { collection, path } => {
+            mir::CollectionExpression::ReadFileBytes {
+                collection,
+                path,
+                path_span,
+            } => {
                 let frame = self.current_frame_mut()?;
-                frame.tasks.push(EvaluationTask::ReadFileBytes(collection));
+                frame
+                    .tasks
+                    .push(EvaluationTask::ReadFileBytes(collection, path_span));
                 frame.tasks.push(EvaluationTask::String(*path));
             }
             mir::CollectionExpression::ReadStdinBytes { collection } => {
@@ -7245,6 +7581,16 @@ impl Interpreter<'_> {
         args: Vec<mir::Rvalue>,
         expectation: ReturnExpectation,
     ) -> Result<(), InterpreterError> {
+        self.queue_call_at(function, args, expectation, None)
+    }
+
+    fn queue_call_at(
+        &mut self,
+        function: mir::FunctionId,
+        args: Vec<mir::Rvalue>,
+        expectation: ReturnExpectation,
+        call_site: Option<Span>,
+    ) -> Result<(), InterpreterError> {
         let callee = function_in(self.program, function)?;
         let temporary_arg_drops = temporary_argument_drop_order(&args, callee, 0, |_| false)?;
         let frame = self.current_frame_mut()?;
@@ -7253,6 +7599,7 @@ impl Interpreter<'_> {
             argument_count: args.len(),
             expectation,
             temporary_arg_drops,
+            call_site,
         });
         for argument in args.into_iter().rev() {
             frame.tasks.push(EvaluationTask::Rvalue(argument));
@@ -7297,6 +7644,7 @@ impl Interpreter<'_> {
             argument_count: args.len() + 1,
             expectation: ReturnExpectation::Value(result),
             temporary_arg_drops,
+            call_site: None,
         });
         for argument in args.into_iter().rev() {
             frame.tasks.push(EvaluationTask::Rvalue(argument));
@@ -7310,6 +7658,7 @@ impl Interpreter<'_> {
         class: crate::class_layout::ClassId,
         function: mir::FunctionId,
         args: Vec<mir::Rvalue>,
+        call_site: Option<Span>,
     ) -> Result<(), InterpreterError> {
         let callee = function_in(self.program, function)?;
         let expectation = match callee.return_type {
@@ -7327,6 +7676,7 @@ impl Interpreter<'_> {
             argument_count: args.len() + 1,
             expectation,
             temporary_arg_drops,
+            call_site,
         });
         for argument in args.into_iter().rev() {
             frame.tasks.push(EvaluationTask::Rvalue(argument));
@@ -7339,6 +7689,7 @@ impl Interpreter<'_> {
         function_id: mir::FunctionId,
         args: &[LocalValue],
         caller_expectation: Option<ReturnExpectation>,
+        entered_from: Option<Span>,
     ) -> Result<(), InterpreterError> {
         if let Some(limit) = self.limits.max_call_frames {
             if self.frames.len() >= limit {
@@ -7390,6 +7741,7 @@ impl Interpreter<'_> {
             values: Vec::new(),
             statement_temporary_drops: Vec::new(),
             caller_expectation,
+            entered_from,
         });
         Ok(())
     }
@@ -8147,6 +8499,7 @@ impl Interpreter<'_> {
                 if *remove {
                     frame.tasks.push(EvaluationTask::LoadCollectionValue {
                         collection: *collection,
+                        index_span: Span::default(),
                         transfer: true,
                     });
                 } else {
@@ -8183,6 +8536,8 @@ impl Interpreter<'_> {
             kind: call.kind,
             result: call.result,
             argument_count: arguments.len(),
+            span: call.span,
+            argument_spans: call.argument_spans,
         });
         for argument in arguments.into_iter().rev() {
             frame.tasks.push(EvaluationTask::Rvalue(argument));
@@ -8195,10 +8550,48 @@ impl Interpreter<'_> {
         kind: mir::StringIntrinsicKind,
         result: mir::Type,
         arguments: Vec<LocalValue>,
-    ) -> Result<Option<String>, InterpreterError> {
+        span: Span,
+        argument_spans: &[Span],
+    ) -> Result<Option<RuntimePanicEvent>, InterpreterError> {
         use mir::StringIntrinsicKind as Kind;
 
-        let panic = |error: StringError| Ok(Some(error.panic_message().to_string()));
+        let panic = |error: StringError| {
+            let facts = match error {
+                StringError::SliceLengthNegative => vec![RuntimeFact {
+                    name: doria_diagnostic_catalogue::STRING_SLICE_LENGTH_FACT.to_string(),
+                    value: RuntimeFactValue::Signed(
+                        local_nullable_int(&arguments, 2)?.ok_or_else(|| {
+                            InterpreterError::new(
+                                "negative string slice length is unexpectedly absent",
+                            )
+                        })?,
+                    ),
+                }],
+                StringError::PaddingLengthNegative => vec![RuntimeFact {
+                    name: doria_diagnostic_catalogue::STRING_PADDING_REQUESTED_LENGTH_FACT
+                        .to_string(),
+                    value: RuntimeFactValue::Signed(local_int(&arguments, 1)?),
+                }],
+                StringError::RepetitionCountNegative => vec![RuntimeFact {
+                    name: doria_diagnostic_catalogue::STRING_REPETITION_COUNT_FACT.to_string(),
+                    value: RuntimeFactValue::Signed(local_int(&arguments, 1)?),
+                }],
+                StringError::PaddingTextEmpty => {
+                    return Err(InterpreterError::new(
+                        "empty string padding must use the operation-aware panic path",
+                    ))
+                }
+                StringError::ResultTooLarge => Vec::new(),
+            };
+            Ok(Some(string_panic_event(
+                error,
+                kind,
+                span,
+                argument_spans,
+                facts,
+                None,
+            )))
+        };
         match kind {
             Kind::GraphemeLength | Kind::ByteLength => {
                 let text = local_string(&arguments, 0)?;
@@ -8451,11 +8844,59 @@ impl Interpreter<'_> {
                 let text = local_string(&arguments, 0)?;
                 let length = local_int(&arguments, 1)?;
                 let padding = local_string(&arguments, 2)?;
-                let output_length =
-                    match doria_unicode::padding_output_length(text, length, padding) {
-                        Ok(length) => length,
-                        Err(error) => return panic(error),
-                    };
+                let output_length = match doria_unicode::padding_output_length(
+                    text, length, padding,
+                ) {
+                    Ok(length) => length,
+                    Err(StringError::PaddingTextEmpty) => {
+                        let current = doria_unicode::grapheme_count(text) as u64;
+                        let padding_length = doria_unicode::grapheme_count(padding) as u64;
+                        let operation = if kind == Kind::PadStart {
+                            "padStart"
+                        } else {
+                            "padEnd"
+                        };
+                        let facts = vec![
+                            RuntimeFact {
+                                name: doria_diagnostic_catalogue::STRING_PADDING_OPERATION_FACT
+                                    .to_string(),
+                                value: RuntimeFactValue::StaticString(operation.to_string()),
+                            },
+                            RuntimeFact {
+                                name: doria_diagnostic_catalogue::STRING_PADDING_VALUE_FACT
+                                    .to_string(),
+                                value: RuntimeFactValue::StaticString(text.to_string()),
+                            },
+                            RuntimeFact {
+                                name:
+                                    doria_diagnostic_catalogue::STRING_PADDING_CURRENT_LENGTH_FACT
+                                        .to_string(),
+                                value: RuntimeFactValue::Unsigned(current),
+                            },
+                            RuntimeFact {
+                                name: doria_diagnostic_catalogue::STRING_PADDING_REQUESTED_GRAPHEME_LENGTH_FACT
+                                    .to_string(),
+                                value: RuntimeFactValue::Signed(length),
+                            },
+                            RuntimeFact {
+                                name: doria_diagnostic_catalogue::STRING_PADDING_PADDING_LENGTH_FACT
+                                    .to_string(),
+                                value: RuntimeFactValue::Unsigned(padding_length),
+                            },
+                        ];
+                        return Ok(Some(string_panic_event(
+                                StringError::PaddingTextEmpty,
+                                kind,
+                                span,
+                                argument_spans,
+                                facts,
+                                Some(format!(
+                                    "`{operation}` was asked to extend `\"{text}\"` from {current} to {length} graphemes,\nbut an empty padding string cannot add any graphemes."
+                                )),
+                            )));
+                    }
+                    Err(error) => return panic(error),
+                };
                 let mut output = vec![0; output_length];
                 let side = if kind == Kind::PadStart {
                     PadSide::Start
@@ -8904,6 +9345,7 @@ impl Interpreter<'_> {
                 function,
                 &[LocalValue::Class { object, class }],
                 Some(ReturnExpectation::Void),
+                None,
             )?;
         }
         Ok(())
@@ -9008,6 +9450,16 @@ impl Interpreter<'_> {
             .ok_or_else(|| InterpreterError::new("MIR interpreter has no active call frame"))
     }
 
+    fn integer_panic_event(panic: IntegerPanic, span: Span) -> RuntimePanicEvent {
+        RuntimePanicEvent {
+            code: panic.code(),
+            operation_span: span,
+            primary_span: span,
+            facts: Vec::new(),
+            explanation: None,
+        }
+    }
+
     fn current_frame_mut(&mut self) -> Result<&mut CallFrame, InterpreterError> {
         self.frames
             .last_mut()
@@ -9097,40 +9549,48 @@ impl Interpreter<'_> {
         &self,
         local: mir::LocalId,
         index: &LocalValue,
-    ) -> Result<usize, String> {
+    ) -> Result<usize, CollectionAccessError> {
         let collection = self
             .collection_local(local)
-            .map_err(|error| error.message)?;
+            .map_err(|_| CollectionAccessError::Catalogued("P1001"))?;
         let definition = self
             .program
             .collection_types
             .get(collection.ty.0)
-            .ok_or_else(|| "collection type does not exist".to_string())?;
+            .ok_or(CollectionAccessError::Catalogued("P1001"))?;
         if definition.key.is_some() {
             collection
                 .entries()
                 .iter()
                 .position(|(key, _)| key.as_ref() == Some(index))
-                .ok_or_else(|| "dictionary key not found".to_string())
+                .ok_or(CollectionAccessError::Catalogued("P1312"))
         } else {
             let LocalValue::Scalar(mir::ScalarValue::Integer(index)) = index else {
-                return Err("collection index is not an integer".to_string());
+                return Err(CollectionAccessError::Catalogued("P1001"));
             };
+            let signed_index = index.signed_value() as i64;
+            let length = collection.entries().len();
             let Some(index) = usize::try_from(index.signed_value()).ok() else {
-                return Err(if definition.kind == mir::CollectionKind::Bytes {
-                    "byte index out of bounds".to_string()
-                } else {
-                    "collection index out of bounds".to_string()
+                return Err(CollectionAccessError::Bounds {
+                    code: if definition.kind == mir::CollectionKind::Bytes {
+                        "P1301"
+                    } else {
+                        "P1310"
+                    },
+                    index: signed_index,
+                    length,
                 });
             };
-            (index < collection.entries().len())
+            (index < length)
                 .then_some(index)
-                .ok_or_else(|| {
-                    if definition.kind == mir::CollectionKind::Bytes {
-                        "byte index out of bounds".to_string()
+                .ok_or_else(|| CollectionAccessError::Bounds {
+                    code: if definition.kind == mir::CollectionKind::Bytes {
+                        "P1301"
                     } else {
-                        "collection index out of bounds".to_string()
-                    }
+                        "P1310"
+                    },
+                    index: signed_index,
+                    length,
                 })
         }
     }
@@ -9140,16 +9600,16 @@ impl Interpreter<'_> {
         local: mir::LocalId,
         index: &LocalValue,
         transfer: bool,
-    ) -> Result<LocalValue, String> {
+    ) -> Result<LocalValue, CollectionAccessError> {
         let position = self.collection_position(local, index)?;
         if transfer {
             self.collection_local(local)
                 .map(|collection| collection.entries_mut().remove(position).1)
-                .map_err(|error| error.message)
+                .map_err(|_| CollectionAccessError::Catalogued("P1001"))
         } else {
             self.collection_local(local)
                 .map(|collection| collection.entries()[position].1.clone())
-                .map_err(|error| error.message)
+                .map_err(|_| CollectionAccessError::Catalogued("P1001"))
         }
     }
 
@@ -9242,11 +9702,21 @@ impl Interpreter<'_> {
                         stdout: self.stdout.clone(),
                         stderr: self.stderr.clone(),
                         exit_status: value as i32,
+                        runtime_diagnostic: None,
                     })
                 } else {
-                    Ok(self.panic_output_with_trace(
-                        "main returned process status outside 0..125",
-                        &[entry.name.as_str()],
+                    Ok(self.runtime_panic_output_for_entry(
+                        RuntimePanicEvent {
+                            code: "P1111",
+                            operation_span: entry.source_span,
+                            primary_span: entry.source_span,
+                            facts: vec![RuntimeFact {
+                                name: doria_diagnostic_catalogue::PROCESS_STATUS_FACT.to_string(),
+                                value: RuntimeFactValue::Signed(value as i64),
+                            }],
+                            explanation: None,
+                        },
+                        entry,
                     ))
                 }
             }
@@ -9254,6 +9724,7 @@ impl Interpreter<'_> {
                 stdout: self.stdout.clone(),
                 stderr: self.stderr.clone(),
                 exit_status: 0,
+                runtime_diagnostic: None,
             }),
             (mir::ReturnType::Value(_), FunctionOutcome::Void) => Err(InterpreterError::new(
                 "MIR scalar entry function returned void",
@@ -9270,37 +9741,240 @@ impl Interpreter<'_> {
         }
     }
 
-    fn panic_output(&self, message: &str) -> InterpreterOutput {
-        let trace = self
-            .frames
-            .iter()
-            .rev()
-            .filter_map(|frame| {
-                self.program
-                    .functions
-                    .get(frame.function.0)
-                    .map(|function| function.name.as_str())
-            })
-            .collect::<Vec<_>>();
-        self.panic_output_with_trace(message, &trace)
+    fn runtime_panic_step(&self, code: &'static str) -> Result<StepOutcome, InterpreterError> {
+        self.runtime_panic_step_with_facts(code, Vec::new())
     }
 
-    fn panic_output_with_trace(&self, message: &str, trace: &[&str]) -> InterpreterOutput {
+    fn runtime_panic_step_at(
+        &self,
+        code: &'static str,
+        span: Span,
+    ) -> Result<StepOutcome, InterpreterError> {
+        self.runtime_panic_step_with_facts_at(code, span, Vec::new())
+    }
+
+    fn collection_access_panic_step(
+        &self,
+        error: CollectionAccessError,
+    ) -> Result<StepOutcome, InterpreterError> {
+        let span = self
+            .frames
+            .last()
+            .and_then(|frame| self.program.functions.get(frame.function.0))
+            .map_or(Span::default(), |function| function.source_span);
+        self.collection_access_panic_step_at(error, span)
+    }
+
+    fn collection_access_panic_step_at(
+        &self,
+        error: CollectionAccessError,
+        span: Span,
+    ) -> Result<StepOutcome, InterpreterError> {
+        match error {
+            CollectionAccessError::Catalogued(code) => self.runtime_panic_step_at(code, span),
+            CollectionAccessError::Bounds {
+                code,
+                index,
+                length,
+            } => self.runtime_panic_step_with_facts_at(
+                code,
+                span,
+                vec![
+                    RuntimeFact {
+                        name: doria_diagnostic_catalogue::INDEX_FACT.to_string(),
+                        value: RuntimeFactValue::Signed(index),
+                    },
+                    RuntimeFact {
+                        name: doria_diagnostic_catalogue::INDEXED_LENGTH_FACT.to_string(),
+                        value: RuntimeFactValue::Unsigned(length as u64),
+                    },
+                ],
+            ),
+        }
+    }
+
+    fn shared_access_conflict_panic_step_at(
+        &self,
+        conflict: SharedAccessConflict,
+        span: Span,
+    ) -> Result<StepOutcome, InterpreterError> {
+        self.runtime_panic_step_with_facts_at(
+            "P1501",
+            span,
+            vec![RuntimeFact {
+                name: doria_diagnostic_catalogue::SHARED_ACCESS_CONFLICT_REASON_FACT.to_string(),
+                value: RuntimeFactValue::StaticString(conflict.reason().to_string()),
+            }],
+        )
+    }
+
+    fn runtime_panic_step_with_facts(
+        &self,
+        code: &'static str,
+        facts: Vec<RuntimeFact>,
+    ) -> Result<StepOutcome, InterpreterError> {
+        let span = self
+            .frames
+            .last()
+            .and_then(|frame| self.program.functions.get(frame.function.0))
+            .map_or(Span::default(), |function| function.source_span);
+        self.runtime_panic_step_with_facts_at(code, span, facts)
+    }
+
+    fn runtime_panic_step_with_facts_at(
+        &self,
+        code: &'static str,
+        span: Span,
+        facts: Vec<RuntimeFact>,
+    ) -> Result<StepOutcome, InterpreterError> {
+        Ok(StepOutcome::RuntimePanic(RuntimePanicEvent {
+            code,
+            operation_span: span,
+            primary_span: span,
+            facts,
+            explanation: None,
+        }))
+    }
+
+    fn runtime_panic_output(&self, event: RuntimePanicEvent) -> InterpreterOutput {
+        let code = event.code;
+        let primary_span = event.primary_span;
+        let explanation = event.explanation;
+        let origin_function = self
+            .frames
+            .last()
+            .and_then(|frame| self.program.functions.get(frame.function.0))
+            .map(|function| function.name.clone());
+        let mut path = Vec::with_capacity(self.frames.len());
+        for reverse_index in 0..self.frames.len() {
+            let frame_index = self.frames.len() - 1 - reverse_index;
+            let frame = &self.frames[frame_index];
+            let Some(function) = self.program.functions.get(frame.function.0) else {
+                continue;
+            };
+            let span = if reverse_index == 0 {
+                event.operation_span
+            } else {
+                self.frames[frame_index + 1]
+                    .entered_from
+                    .unwrap_or(function.source_span)
+            };
+            path.push(RuntimeOutcomeFrame {
+                function: function.name.clone(),
+                source: DiagnosticSource::Current,
+                span,
+            });
+        }
+        let outcome = RuntimeOutcomeDetails {
+            process_status: 101,
+            termination_behavior: TerminationBehavior::AbortWithoutCleanup,
+            origin: RuntimeOutcomeOrigin {
+                source: DiagnosticSource::Current,
+                span: event.primary_span,
+                function: origin_function,
+            },
+            path,
+            facts: event.facts,
+        };
+        self.render_runtime_panic(code, primary_span, explanation, outcome)
+    }
+
+    fn runtime_panic_output_for_entry(
+        &self,
+        event: RuntimePanicEvent,
+        entry: &mir::Function,
+    ) -> InterpreterOutput {
+        let code = event.code;
+        let primary_span = event.primary_span;
+        let explanation = event.explanation;
+        let outcome = RuntimeOutcomeDetails {
+            process_status: 101,
+            termination_behavior: TerminationBehavior::AbortWithoutCleanup,
+            origin: RuntimeOutcomeOrigin {
+                source: DiagnosticSource::Current,
+                span: event.primary_span,
+                function: Some(entry.name.clone()),
+            },
+            path: vec![RuntimeOutcomeFrame {
+                function: entry.name.clone(),
+                source: DiagnosticSource::Current,
+                span: event.operation_span,
+            }],
+            facts: event.facts,
+        };
+        self.render_runtime_panic(code, primary_span, explanation, outcome)
+    }
+
+    fn render_runtime_panic(
+        &self,
+        code: &'static str,
+        primary_span: Span,
+        explanation: Option<String>,
+        outcome: RuntimeOutcomeDetails,
+    ) -> InterpreterOutput {
+        let mut diagnostic = Diagnostic::runtime_panic(code, primary_span, outcome);
+        if let Some(explanation) = explanation {
+            diagnostic.explanation = Some(explanation);
+        }
+        if code == "P1000" {
+            let message = diagnostic
+                .runtime_outcome
+                .as_ref()
+                .and_then(|outcome| outcome.facts.iter().find(|fact| fact.name == "message"))
+                .and_then(|fact| match &fact.value {
+                    RuntimeFactValue::StaticString(message) => Some(message.clone()),
+                    _ => None,
+                });
+            if let Some(message) = message {
+                diagnostic.notes.push(message);
+            }
+        }
+        let rendered = crate::diagnostics::render_diagnostics(
+            &self.program.source,
+            std::slice::from_ref(&diagnostic),
+            RenderOptions {
+                format: DiagnosticFormat::Human,
+                color: ColorChoice::Never,
+                context_lines: 0,
+                ..RenderOptions::default()
+            },
+        );
         let mut stderr = Vec::new();
         stderr.extend_from_slice(&self.stderr);
-        stderr.extend_from_slice(b"Panic: ");
-        stderr.extend_from_slice(message.as_bytes());
-        stderr.extend_from_slice(b"\nStack Trace:\n");
-        for function in trace {
-            stderr.extend_from_slice(b"  at ");
-            stderr.extend_from_slice(function.as_bytes());
-            stderr.push(b'\n');
-        }
+        stderr.extend_from_slice(rendered.as_bytes());
+        stderr.push(b'\n');
         InterpreterOutput {
             stdout: self.stdout.clone(),
             stderr,
             exit_status: 101,
+            runtime_diagnostic: Some(diagnostic),
         }
+    }
+}
+
+fn string_panic_event(
+    error: StringError,
+    _kind: mir::StringIntrinsicKind,
+    operation_span: Span,
+    argument_spans: &[Span],
+    facts: Vec<RuntimeFact>,
+    explanation: Option<String>,
+) -> RuntimePanicEvent {
+    let (code, argument) = match error {
+        StringError::ResultTooLarge => ("P1205", None),
+        StringError::SliceLengthNegative => ("P1201", Some(2)),
+        StringError::RepetitionCountNegative => ("P1204", Some(1)),
+        StringError::PaddingLengthNegative => ("P1202", Some(1)),
+        StringError::PaddingTextEmpty => ("P1203", Some(2)),
+    };
+    RuntimePanicEvent {
+        code,
+        operation_span,
+        primary_span: argument
+            .and_then(|index| argument_spans.get(index).copied())
+            .unwrap_or(operation_span),
+        facts,
+        explanation,
     }
 }
 
@@ -9675,12 +10349,10 @@ fn repeat_collection_entries(
     count: usize,
 ) -> Result<CollectionEntries, &'static str> {
     if count.checked_mul(core::mem::size_of::<u64>()).is_none() {
-        return Err("collection capacity overflow");
+        return Err("P1313");
     }
     let mut entries = Vec::new();
-    entries
-        .try_reserve_exact(count)
-        .map_err(|_| "collection allocation failed")?;
+    entries.try_reserve_exact(count).map_err(|_| "P1313")?;
     entries.extend(core::iter::repeat_n((None, value), count));
     Ok(entries)
 }
@@ -10090,12 +10762,12 @@ mod tests {
     }
 
     #[test]
-    fn oversized_repeat_capacity_is_a_doria_panic_message() {
+    fn oversized_repeat_capacity_uses_the_catalogued_panic_identity() {
         let count = usize::MAX / core::mem::size_of::<u64>() + 1;
         let error =
             repeat_collection_entries(LocalValue::Scalar(mir::ScalarValue::Bool(false)), count)
                 .expect_err("native-word capacity overflow should be rejected");
 
-        assert_eq!(error, "collection capacity overflow");
+        assert_eq!(error, "P1313");
     }
 }

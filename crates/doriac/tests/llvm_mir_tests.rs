@@ -49,6 +49,7 @@ fn lowers_complete_stage_14_mir_shapes_to_verified_objects() {
 #[test]
 fn rejects_malformed_mixed_width_float_mir_before_llvm_emission() {
     let program = Program {
+        source: doriac::source::SourceFile::new("llvm-test.doria", ""),
         classes: vec![],
         collection_types: vec![],
         statics: vec![],
@@ -56,6 +57,7 @@ fn rejects_malformed_mixed_width_float_mir_before_llvm_emission() {
             Function {
                 id: FunctionId(0),
                 name: "main".to_string(),
+                source_span: Default::default(),
                 method: None,
                 receiver_mode: None,
                 params: Vec::new(),
@@ -71,6 +73,7 @@ fn rejects_malformed_mixed_width_float_mir_before_llvm_emission() {
             Function {
                 id: FunctionId(1),
                 name: "mixedWidth".to_string(),
+                source_span: Default::default(),
                 method: None,
                 receiver_mode: None,
                 params: Vec::new(),

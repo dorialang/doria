@@ -30,9 +30,9 @@ use crate::native_abi::{
     MIXED_TAG_CLASS, MIXED_TAG_FLOAT32, MIXED_TAG_FLOAT64, MIXED_TAG_INT16, MIXED_TAG_INT32,
     MIXED_TAG_INT64, MIXED_TAG_INT8, MIXED_TAG_STRING, MIXED_TAG_UINT16, MIXED_TAG_UINT32,
     MIXED_TAG_UINT64, MIXED_TAG_UINT8, MIXED_TYPE_ID, NULLABLE_STRING_EQUAL, PROCESS_EXIT,
-    READ_FILE, READ_FILE_BYTES, READ_STDIN_BYTES, READ_STDIN_LINE, SHARED_ACQUIRE, SHARED_CREATE,
-    SHARED_CREATE_WEAK, SHARED_PAYLOAD, SHARED_RELEASE, SHARED_RELEASE_WEAK, SHARED_RETAIN,
-    STRING_BYTE_LENGTH, STRING_COMPARE, STRING_CONCAT, STRING_CONTAINS,
+    READ_FILE, READ_FILE_BYTES, READ_STDIN_BYTES, READ_STDIN_LINE_PROMPTED, SHARED_ACQUIRE,
+    SHARED_CREATE, SHARED_CREATE_WEAK, SHARED_PAYLOAD, SHARED_RELEASE, SHARED_RELEASE_WEAK,
+    SHARED_RETAIN, STRING_BYTE_LENGTH, STRING_COMPARE, STRING_CONCAT, STRING_CONTAINS,
     STRING_CONTAINS_IGNORE_CASE, STRING_COUNT_OCCURRENCES, STRING_DATA, STRING_ENDS_WITH,
     STRING_ENDS_WITH_IGNORE_CASE, STRING_EQUALS_IGNORE_CASE, STRING_FROM_BOOL, STRING_FROM_BYTES,
     STRING_FROM_F32, STRING_FROM_F64, STRING_FROM_I64, STRING_FROM_U64, STRING_FROM_UTF8,
@@ -587,7 +587,7 @@ fn define_function(
             .collect::<Vec<_>>();
         let frame_slot = builder.create_sized_stack_slot(StackSlotData::new(
             StackSlotKind::ExplicitSlot,
-            pointer_bytes * 3,
+            pointer_bytes * 11,
             pointer_bytes.trailing_zeros() as u8,
         ));
 
@@ -623,6 +623,65 @@ fn define_function(
             frame_slot,
             (pointer_bytes * 2) as i32,
         );
+        let source_path = define_named_data(
+            &mut builder,
+            program.source.path.as_bytes(),
+            module,
+            &format!("__doria_source_path_{}", function.id.0),
+        )?;
+        let source_text = define_named_data(
+            &mut builder,
+            program.source.text.as_bytes(),
+            module,
+            &format!("__doria_source_text_{}", function.id.0),
+        )?;
+        for (word, value) in [
+            (3, source_path),
+            (
+                4,
+                builder
+                    .ins()
+                    .iconst(pointer_type, program.source.path.len() as i64),
+            ),
+            (5, source_text),
+            (
+                6,
+                builder
+                    .ins()
+                    .iconst(pointer_type, program.source.text.len() as i64),
+            ),
+            (
+                7,
+                builder
+                    .ins()
+                    .iconst(pointer_type, function.source_span.start as i64),
+            ),
+            (
+                8,
+                builder
+                    .ins()
+                    .iconst(pointer_type, function.source_span.end as i64),
+            ),
+            (
+                9,
+                builder
+                    .ins()
+                    .iconst(pointer_type, function.source_span.start as i64),
+            ),
+            (
+                10,
+                builder
+                    .ins()
+                    .iconst(pointer_type, function.source_span.end as i64),
+            ),
+        ] {
+            builder.ins().stack_store(
+                pointer_type,
+                value,
+                frame_slot,
+                (pointer_bytes * word) as i32,
+            );
+        }
         let current_frame = builder.ins().stack_addr(pointer_type, frame_slot, 0);
 
         let mut resources = LoweringResources {
@@ -1157,6 +1216,17 @@ fn define_process_main(
             runtime_signature.params.push(AbiParam::new(types::I32));
             runtime_signature.params.push(AbiParam::new(pointer_type));
         }
+        let integer_entry = matches!(
+            entry.return_type,
+            mir::ReturnType::Value(mir::Type::Scalar(mir::ScalarType::Integer(
+                IntegerType::Int64
+            )))
+        );
+        if integer_entry {
+            for _ in 0..6 {
+                runtime_signature.params.push(AbiParam::new(pointer_type));
+            }
+        }
         runtime_signature.returns.push(AbiParam::new(types::I32));
         let runtime_symbol = match (entry.return_type, takes_arguments) {
             (
@@ -1164,15 +1234,15 @@ fn define_process_main(
                     IntegerType::Int64,
                 ))),
                 false,
-            ) => "dr_v1_main_int",
+            ) => "dr_v2_main_int",
             (
                 mir::ReturnType::Value(mir::Type::Scalar(mir::ScalarType::Integer(
                     IntegerType::Int64,
                 ))),
                 true,
-            ) => "dr_v1_main_int_args",
-            (mir::ReturnType::Void, false) => "dr_v1_main_void",
-            (mir::ReturnType::Void, true) => "dr_v1_main_void_args",
+            ) => "dr_v2_main_int_args",
+            (mir::ReturnType::Void, false) => "dr_v2_main_void",
+            (mir::ReturnType::Void, true) => "dr_v2_main_void_args",
             (mir::ReturnType::Value(other), _) => {
                 return Err(malformed_mir(format!(
                     "entry function has unsupported process return type {other}"
@@ -1183,11 +1253,41 @@ fn define_process_main(
             .declare_function(runtime_symbol, Linkage::Import, &runtime_signature)
             .map_err(|error| backend_failure(error.to_string()))?;
         let runtime = module.declare_func_in_func(runtime_id, builder.func);
-        let call = if takes_arguments {
-            builder.ins().call(runtime, &[entry_pointer, argc, argv])
-        } else {
-            builder.ins().call(runtime, &[entry_pointer])
-        };
+        let mut runtime_args = vec![entry_pointer];
+        if takes_arguments {
+            runtime_args.extend([argc, argv]);
+        }
+        if integer_entry {
+            let source_path = define_named_data(
+                &mut builder,
+                program.source.path.as_bytes(),
+                module,
+                "__doria_process_source_path",
+            )?;
+            let source_text = define_named_data(
+                &mut builder,
+                program.source.text.as_bytes(),
+                module,
+                "__doria_process_source_text",
+            )?;
+            runtime_args.extend([
+                source_path,
+                builder
+                    .ins()
+                    .iconst(pointer_type, program.source.path.len() as i64),
+                source_text,
+                builder
+                    .ins()
+                    .iconst(pointer_type, program.source.text.len() as i64),
+                builder
+                    .ins()
+                    .iconst(pointer_type, entry.source_span.start as i64),
+                builder
+                    .ins()
+                    .iconst(pointer_type, entry.source_span.end as i64),
+            ]);
+        }
+        let call = builder.ins().call(runtime, &runtime_args);
         let status = builder.inst_results(call)[0];
         if cfg!(windows) {
             let mut exit_signature = module.make_signature();
@@ -1254,7 +1354,7 @@ impl<'module, 'program> LoweringResources<'module, 'program> {
         signature.params.push(AbiParam::new(pointer_type));
         let id = self
             .module
-            .declare_function("dr_v1_write_stdout", Linkage::Import, &signature)
+            .declare_function("dr_v2_write_stdout", Linkage::Import, &signature)
             .map_err(|error| backend_failure(error.to_string()))?;
         self.write_stdout_func_id = Some(id);
         Ok(id)
@@ -1271,7 +1371,7 @@ impl<'module, 'program> LoweringResources<'module, 'program> {
         signature.params.push(AbiParam::new(pointer_type));
         let id = self
             .module
-            .declare_function("dr_v1_panic", Linkage::Import, &signature)
+            .declare_function("dr_v2_panic", Linkage::Import, &signature)
             .map_err(|error| backend_failure(error.to_string()))?;
         self.panic_func_id = Some(id);
         Ok(id)
@@ -1417,15 +1517,28 @@ fn lower_statement(
                 .call(write, &[resources.current_frame, string]);
             release_string(builder, string, resources)?;
         }
-        mir::Statement::CallVoid { function, args }
-        | mir::Statement::CallBorrowed { function, args } => {
+        mir::Statement::CallVoid {
+            function,
+            args,
+            span,
+        }
+        | mir::Statement::CallBorrowed {
+            function,
+            args,
+            span,
+        } => {
+            set_active_panic_site(builder, *span, resources);
             let _ = lower_function_call(builder, *function, args, resources)?;
         }
         mir::Statement::CallNullSafe {
             object,
             function,
             args,
-        } => lower_null_safe_statement_call(builder, object, *function, args, resources)?,
+            span,
+        } => {
+            set_active_panic_site(builder, *span, resources);
+            lower_null_safe_statement_call(builder, object, *function, args, resources)?
+        }
         mir::Statement::WriteStderr(value) => {
             let string = lower_string_expression(builder, value, resources)?;
             let pointer = resources.module.target_config().pointer_type();
@@ -1918,7 +2031,8 @@ fn lower_terminator(
             cleanup_string_locals(builder, resources)?;
             builder.ins().return_(&[]);
         }
-        mir::Terminator::Panic(message) => {
+        mir::Terminator::Panic { message, span } => {
+            set_active_panic_site(builder, *span, resources);
             debug_assert!(resources.deferred_class_temporary_drops.is_empty());
             resources.defer_class_temporary_drops = true;
             let string = lower_string_expression(builder, message, resources)?;
@@ -2362,11 +2476,13 @@ fn lower_collection_expression(
             collection,
             value,
             count,
+            count_span,
         } => {
             let definition = collection_definition(resources.program, *collection)?.clone();
             let fixed = definition.kind == mir::CollectionKind::TypedArray;
             let value = lower_rvalue(builder, value, resources)?.single()?;
             let count = lower_integer_expression(builder, count, resources)?;
+            set_active_panic_site(builder, *count_span, resources);
             let fixed = builder.ins().iconst(types::I8, i64::from(fixed));
             let value_width = builder.ins().iconst(
                 types::I8,
@@ -2410,9 +2526,13 @@ fn lower_collection_expression(
         mir::CollectionExpression::Index {
             source,
             index,
+            index_span,
             transfer,
             ..
-        } => lower_collection_index(builder, *source, index, *transfer, resources),
+        } => {
+            set_active_panic_site(builder, *index_span, resources);
+            lower_collection_index(builder, *source, index, *transfer, resources)
+        }
         mir::CollectionExpression::Property {
             object, property, ..
         } => {
@@ -2459,8 +2579,11 @@ fn lower_collection_expression(
             )?
             .ok_or_else(|| backend_failure("Bytes::fromArray produced no result"))
         }
-        mir::CollectionExpression::ReadFileBytes { path, .. } => {
+        mir::CollectionExpression::ReadFileBytes {
+            path, path_span, ..
+        } => {
             let path = lower_string_expression(builder, path, resources)?;
+            set_active_panic_site(builder, *path_span, resources);
             let result = runtime_call(
                 builder,
                 READ_FILE_BYTES,
@@ -2563,7 +2686,13 @@ fn lower_collection_index(
         let found = builder.ins().stack_load(pointer, types::I8, found_slot, 0);
         let zero = builder.ins().iconst(types::I8, 0);
         let missing = builder.ins().icmp(IntCC::Equal, found, zero);
-        lower_panic_if_message(builder, missing, b"dictionary key not found", resources)?;
+        lower_panic_if_code(
+            builder,
+            missing,
+            "P1312",
+            function_in(resources.program, resources.function_id)?.source_span,
+            resources,
+        )?;
         if index_type == mir::Type::String {
             release_string(builder, index_value, resources)?;
         }
@@ -4503,10 +4632,14 @@ fn lower_shared_reference_access_expression(
                 .single()
         }
         mir::SharedReferenceAccessExpression::Acquire {
-            value, writable, ..
+            value,
+            writable,
+            span,
+            ..
         } => {
             let owned = value.owned_temporary();
             let control = lower_writable_shared_reference_expression(builder, value, resources)?;
+            set_active_panic_site(builder, *span, resources);
             let symbol = if *writable {
                 WRITABLE_SHARED_ACQUIRE_WRITABLE_ACCESS
             } else {
@@ -4581,11 +4714,15 @@ fn lower_nullable_shared_reference_access_expression(
                 .single()
         }
         mir::NullableSharedReferenceAccessExpression::NullSafeAcquire {
-            value, writable, ..
+            value,
+            writable,
+            span,
+            ..
         } => {
             let owned = value.owned_temporary();
             let control =
                 lower_nullable_writable_shared_reference_expression(builder, value, resources)?;
+            set_active_panic_site(builder, *span, resources);
             let symbol = if *writable {
                 WRITABLE_SHARED_ACQUIRE_WRITABLE_ACCESS
             } else {
@@ -5810,10 +5947,11 @@ fn lower_take_mixed_payload(
     if matches!(tag, mir::MixedTag::String | mir::MixedTag::Class(_)) {
         let zero_flag = builder.ins().iconst(types::I8, 0);
         let not_final = builder.ins().icmp(IntCC::Equal, owns_final, zero_flag);
-        lower_panic_if_message(
+        lower_panic_if_code(
             builder,
             not_final,
-            b"cannot take ownership of a shared `mixed` value",
+            "P1321",
+            function_in(resources.program, resources.function_id)?.source_span,
             resources,
         )?;
     }
@@ -6004,8 +6142,9 @@ fn lower_string_expression(
                 .ok_or_else(|| malformed_mir("string call produced no result"))?
                 .single()
         }
-        mir::StringExpression::ReadFile(path) => {
+        mir::StringExpression::ReadFile { path, path_span } => {
             let path = lower_string_expression(builder, path, resources)?;
+            set_active_panic_site(builder, *path_span, resources);
             let pointer = resources.module.target_config().pointer_type();
             let result = runtime_call(
                 builder,
@@ -6108,16 +6247,24 @@ fn lower_nullable_string_expression(
             let payload = retain_string(builder, payload, resources)?;
             Ok(LoweredValue::Nullable { present, payload })
         }
-        mir::NullableStringExpression::ReadLine => {
+        mir::NullableStringExpression::ReadLine {
+            prompt,
+            prompt_span,
+        } => {
+            // The prompt is evaluated once here, then borrowed for the duration of
+            // the runtime call, which owns the write/flush/read ordering.
+            let prompt = lower_string_expression(builder, prompt, resources)?;
+            set_active_panic_site(builder, *prompt_span, resources);
             let payload = runtime_call(
                 builder,
-                READ_STDIN_LINE,
-                &[pointer],
+                READ_STDIN_LINE_PROMPTED,
+                &[pointer, pointer],
                 Some(pointer),
-                &[resources.current_frame],
+                &[resources.current_frame, prompt],
                 resources,
             )?
             .ok_or_else(|| backend_failure("read_line produced no result"))?;
+            release_string(builder, prompt, resources)?;
             let present = presence_word(builder, payload, pointer);
             Ok(LoweredValue::Nullable { present, payload })
         }
@@ -6664,28 +6811,50 @@ fn lower_integer_expression(
         mir::IntegerExpression::Use { ty, operand } => {
             lower_integer_operand(builder, *ty, operand, resources)
         }
-        mir::IntegerExpression::Unary { ty, op, operand } => {
+        mir::IntegerExpression::Unary {
+            ty,
+            op,
+            operand,
+            span,
+        } => {
             let operand = lower_integer_expression(builder, operand, resources)?;
-            lower_integer_unary(builder, *ty, *op, operand, resources)
+            lower_integer_unary(builder, *ty, *op, operand, *span, resources)
         }
         mir::IntegerExpression::Binary {
             ty,
             op,
             left,
             right,
+            span,
+            right_span,
         } => {
             let left = lower_integer_expression(builder, left, resources)?;
             let right = lower_integer_expression(builder, right, resources)?;
-            lower_integer_binary(builder, *ty, *op, left, right, resources)
+            lower_integer_binary(
+                builder,
+                *ty,
+                *op,
+                left,
+                right,
+                (*span, *right_span),
+                resources,
+            )
         }
-        mir::IntegerExpression::Convert { ty, value } => {
+        mir::IntegerExpression::Convert {
+            ty,
+            value,
+            value_span,
+            ..
+        } => {
             let source_type = value.ty();
             let value = lower_integer_expression(builder, value, resources)?;
-            lower_integer_conversion(builder, source_type, *ty, value, resources)
+            lower_integer_conversion(builder, source_type, *ty, value, *value_span, resources)
         }
-        mir::IntegerExpression::FloatToInt { value } => {
+        mir::IntegerExpression::FloatToInt {
+            value, value_span, ..
+        } => {
             let value = lower_float_expression(builder, value, resources)?;
-            lower_float_to_int(builder, value, resources)
+            lower_float_to_int(builder, value, *value_span, resources)
         }
         mir::IntegerExpression::Call { ty, function, args } => {
             lower_integer_call(builder, *ty, *function, args, resources)
@@ -6710,13 +6879,20 @@ fn lower_integer_unary(
     ty: IntegerType,
     op: mir::IntegerUnaryOp,
     operand: Value,
+    span: crate::source::Span,
     resources: &mut LoweringResources<'_, '_>,
 ) -> Result<Value, BackendError> {
     match op {
         mir::IntegerUnaryOp::Negate => {
             let zero = builder.ins().iconst(clif_integer_type(ty), 0);
             let (value, overflow) = builder.ins().ssub_overflow(zero, operand);
-            lower_panic_if(builder, overflow, IntegerPanic::OverflowNegation, resources)?;
+            lower_panic_if(
+                builder,
+                overflow,
+                IntegerPanic::OverflowNegation,
+                span,
+                resources,
+            )?;
             Ok(value)
         }
         mir::IntegerUnaryOp::BitwiseNot => Ok(builder.ins().bnot(operand)),
@@ -6729,20 +6905,24 @@ fn lower_integer_binary(
     op: mir::IntegerBinaryOp,
     left: Value,
     right: Value,
+    spans: (crate::source::Span, crate::source::Span),
     resources: &mut LoweringResources<'_, '_>,
 ) -> Result<Value, BackendError> {
+    let (span, right_span) = spans;
     match op {
         mir::IntegerBinaryOp::Add
         | mir::IntegerBinaryOp::Subtract
         | mir::IntegerBinaryOp::Multiply => {
-            lower_checked_arithmetic(builder, ty, op, left, right, resources)
+            lower_checked_arithmetic(builder, ty, op, left, right, span, resources)
         }
-        mir::IntegerBinaryOp::Divide => lower_integer_division(builder, ty, left, right, resources),
+        mir::IntegerBinaryOp::Divide => {
+            lower_integer_division(builder, ty, left, right, span, right_span, resources)
+        }
         mir::IntegerBinaryOp::Remainder => {
-            lower_integer_remainder(builder, ty, left, right, resources)
+            lower_integer_remainder(builder, ty, left, right, right_span, resources)
         }
         mir::IntegerBinaryOp::ShiftLeft | mir::IntegerBinaryOp::ShiftRight => {
-            lower_integer_shift(builder, ty, op, left, right, resources)
+            lower_integer_shift(builder, ty, op, left, right, right_span, resources)
         }
         mir::IntegerBinaryOp::BitwiseAnd => Ok(builder.ins().band(left, right)),
         mir::IntegerBinaryOp::BitwiseXor => Ok(builder.ins().bxor(left, right)),
@@ -6756,6 +6936,7 @@ fn lower_checked_arithmetic(
     op: mir::IntegerBinaryOp,
     left: Value,
     right: Value,
+    span: crate::source::Span,
     resources: &mut LoweringResources<'_, '_>,
 ) -> Result<Value, BackendError> {
     let (value, overflow) = match op {
@@ -6777,7 +6958,7 @@ fn lower_checked_arithmetic(
         mir::IntegerBinaryOp::Multiply => IntegerPanic::OverflowMultiplication,
         _ => unreachable!("non-arithmetic operator reached checked arithmetic lowering"),
     };
-    lower_panic_if(builder, overflow, panic, resources)?;
+    lower_panic_if(builder, overflow, panic, span, resources)?;
     Ok(value)
 }
 
@@ -6786,6 +6967,8 @@ fn lower_integer_division(
     ty: IntegerType,
     left: Value,
     right: Value,
+    span: crate::source::Span,
+    right_span: crate::source::Span,
     resources: &mut LoweringResources<'_, '_>,
 ) -> Result<Value, BackendError> {
     let zero = builder.ins().iconst(clif_integer_type(ty), 0);
@@ -6794,6 +6977,7 @@ fn lower_integer_division(
         builder,
         divides_by_zero,
         IntegerPanic::DivisionByZero,
+        right_span,
         resources,
     )?;
 
@@ -6810,6 +6994,7 @@ fn lower_integer_division(
             builder,
             overflows,
             IntegerPanic::DivisionOverflow,
+            span,
             resources,
         )?;
         Ok(builder.ins().sdiv(left, right))
@@ -6823,6 +7008,7 @@ fn lower_integer_remainder(
     ty: IntegerType,
     left: Value,
     right: Value,
+    right_span: crate::source::Span,
     resources: &mut LoweringResources<'_, '_>,
 ) -> Result<Value, BackendError> {
     let zero = builder.ins().iconst(clif_integer_type(ty), 0);
@@ -6831,6 +7017,7 @@ fn lower_integer_remainder(
         builder,
         divides_by_zero,
         IntegerPanic::RemainderByZero,
+        right_span,
         resources,
     )?;
 
@@ -6873,6 +7060,7 @@ fn lower_integer_shift(
     op: mir::IntegerBinaryOp,
     left: Value,
     right: Value,
+    right_span: crate::source::Span,
     resources: &mut LoweringResources<'_, '_>,
 ) -> Result<Value, BackendError> {
     let width = builder
@@ -6892,6 +7080,7 @@ fn lower_integer_shift(
         builder,
         invalid,
         IntegerPanic::ShiftCountOutOfRange,
+        right_span,
         resources,
     )?;
 
@@ -6908,6 +7097,7 @@ fn lower_integer_conversion(
     source: IntegerType,
     target: IntegerType,
     value: Value,
+    span: crate::source::Span,
     resources: &mut LoweringResources<'_, '_>,
 ) -> Result<Value, BackendError> {
     if let Some(out_of_range) = conversion_out_of_range(builder, source, target, value) {
@@ -6915,6 +7105,7 @@ fn lower_integer_conversion(
             builder,
             out_of_range,
             IntegerPanic::ConversionOutOfRange,
+            span,
             resources,
         )?;
     }
@@ -7000,15 +7191,17 @@ fn lower_panic_if(
     builder: &mut FunctionBuilder,
     condition: Value,
     panic: IntegerPanic,
+    span: crate::source::Span,
     resources: &mut LoweringResources<'_, '_>,
 ) -> Result<(), BackendError> {
-    lower_panic_if_message(builder, condition, panic.message().as_bytes(), resources)
+    lower_panic_if_code(builder, condition, panic.code(), span, resources)
 }
 
-fn lower_panic_if_message(
+fn lower_panic_if_code(
     builder: &mut FunctionBuilder,
     condition: Value,
-    message: &[u8],
+    code: &'static str,
+    span: crate::source::Span,
     resources: &mut LoweringResources<'_, '_>,
 ) -> Result<(), BackendError> {
     let panic_block = builder.create_block();
@@ -7018,7 +7211,103 @@ fn lower_panic_if_message(
         .brif(condition, panic_block, &[], continue_block, &[]);
 
     builder.switch_to_block(panic_block);
-    lower_runtime_panic(builder, message, resources)?;
+    set_active_panic_site(builder, span, resources);
+    lower_runtime_panic_code(builder, code.as_bytes(), &[], resources)?;
+
+    builder.switch_to_block(continue_block);
+    Ok(())
+}
+
+fn lower_panic_if_signed_fact(
+    builder: &mut FunctionBuilder,
+    condition: Value,
+    code: &'static str,
+    fact_name: &'static str,
+    value: Value,
+    span: crate::source::Span,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<(), BackendError> {
+    let panic_block = builder.create_block();
+    let continue_block = builder.create_block();
+    builder
+        .ins()
+        .brif(condition, panic_block, &[], continue_block, &[]);
+
+    builder.switch_to_block(panic_block);
+    set_active_panic_site(builder, span, resources);
+    let pointer = resources.module.target_config().pointer_type();
+    let code_pointer = define_data(builder, code.as_bytes(), resources)?;
+    let code_length = builder.ins().iconst(pointer, code.len() as i64);
+    let fact_name_pointer = define_data(builder, fact_name.as_bytes(), resources)?;
+    let fact_name_length = builder.ins().iconst(pointer, fact_name.len() as i64);
+    let panic_id = resources.declare_runtime(
+        "dr_v2_panic_signed_fact",
+        &[pointer, pointer, pointer, pointer, pointer, types::I64],
+        None,
+    )?;
+    let panic = resources
+        .module
+        .declare_func_in_func(panic_id, builder.func);
+    builder.ins().call(
+        panic,
+        &[
+            resources.current_frame,
+            code_pointer,
+            code_length,
+            fact_name_pointer,
+            fact_name_length,
+            value,
+        ],
+    );
+    builder
+        .ins()
+        .trap(TrapCode::unwrap_user(RUNTIME_RETURNED_TRAP));
+
+    builder.switch_to_block(continue_block);
+    Ok(())
+}
+
+fn lower_padding_empty_panic_if(
+    builder: &mut FunctionBuilder,
+    condition: Value,
+    pad_start: bool,
+    facts: [Value; 4],
+    span: crate::source::Span,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<(), BackendError> {
+    let [value, current_length, requested_length, padding_length] = facts;
+    let panic_block = builder.create_block();
+    let continue_block = builder.create_block();
+    builder
+        .ins()
+        .brif(condition, panic_block, &[], continue_block, &[]);
+
+    builder.switch_to_block(panic_block);
+    set_active_panic_site(builder, span, resources);
+    let pointer = resources.module.target_config().pointer_type();
+    let panic_id = resources.declare_runtime(
+        "dr_v2_panic_string_padding_empty",
+        &[pointer, types::I8, pointer, pointer, types::I64, pointer],
+        None,
+    )?;
+    let panic = resources
+        .module
+        .declare_func_in_func(panic_id, builder.func);
+    let pad_start = builder.ins().iconst(types::I8, i64::from(pad_start));
+    builder.ins().call(
+        panic,
+        &[
+            resources.current_frame,
+            pad_start,
+            value,
+            current_length,
+            requested_length,
+            padding_length,
+        ],
+    );
+    builder
+        .ins()
+        .trap(TrapCode::unwrap_user(RUNTIME_RETURNED_TRAP));
 
     builder.switch_to_block(continue_block);
     Ok(())
@@ -7276,6 +7565,7 @@ fn lower_float_expression(
 fn lower_float_to_int(
     builder: &mut FunctionBuilder,
     value: Value,
+    span: crate::source::Span,
     resources: &mut LoweringResources<'_, '_>,
 ) -> Result<Value, BackendError> {
     let minimum = builder.ins().f64const(Ieee64::with_bits(
@@ -7291,12 +7581,7 @@ fn lower_float_to_int(
         .fcmp(FloatCC::GreaterThanOrEqual, value, maximum);
     let invalid_range = builder.ins().bor(below, above);
     let invalid = builder.ins().bor(unordered, invalid_range);
-    lower_panic_if_message(
-        builder,
-        invalid,
-        b"float-to-integer conversion out of range",
-        resources,
-    )?;
+    lower_panic_if_code(builder, invalid, "P1110", span, resources)?;
     Ok(builder.ins().fcvt_to_sint(types::I64, value))
 }
 
@@ -7391,6 +7676,7 @@ fn lower_string_intrinsic_call(
 ) -> Result<LoweredValue, BackendError> {
     use mir::StringIntrinsicKind as Kind;
 
+    set_active_panic_site(builder, call.span, resources);
     let pointer = resources.module.target_config().pointer_type();
     let lowered = lower_call_args(builder, &call.args, resources)?;
     let argument = |index: usize| -> Result<Value, BackendError> {
@@ -7590,6 +7876,19 @@ fn lower_string_intrinsic_call(
                 .ok_or_else(|| malformed_mir("String::slice length argument is missing"))?
                 .nullable()?;
             let has_length = builder.ins().ireduce(types::I8, has_length);
+            let has_length_flag = builder.ins().icmp_imm_u(IntCC::NotEqual, has_length, 0);
+            let negative = builder.ins().icmp_imm_s(IntCC::SignedLessThan, length, 0);
+            let invalid_length = builder.ins().band(has_length_flag, negative);
+            lower_panic_if_signed_fact(
+                builder,
+                invalid_length,
+                "P1201",
+                doria_diagnostic_catalogue::STRING_SLICE_LENGTH_FACT,
+                length,
+                call.argument_spans.get(2).copied().unwrap_or(call.span),
+                resources,
+            )?;
+            set_active_panic_site(builder, call.span, resources);
             LoweredValue::Single(call_runtime(
                 builder,
                 STRING_SLICE,
@@ -7605,20 +7904,88 @@ fn lower_string_intrinsic_call(
                 resources,
             )?)
         }
-        Kind::Repeat => LoweredValue::Single(call_runtime(
-            builder,
-            STRING_REPEAT,
-            &[pointer, pointer, types::I64],
-            pointer,
-            &[resources.current_frame, argument(0)?, argument(1)?],
-            resources,
-        )?),
+        Kind::Repeat => {
+            let count = argument(1)?;
+            let negative = builder.ins().icmp_imm_s(IntCC::SignedLessThan, count, 0);
+            lower_panic_if_signed_fact(
+                builder,
+                negative,
+                "P1204",
+                doria_diagnostic_catalogue::STRING_REPETITION_COUNT_FACT,
+                count,
+                call.argument_spans.get(1).copied().unwrap_or(call.span),
+                resources,
+            )?;
+            set_active_panic_site(builder, call.span, resources);
+            LoweredValue::Single(call_runtime(
+                builder,
+                STRING_REPEAT,
+                &[pointer, pointer, types::I64],
+                pointer,
+                &[resources.current_frame, argument(0)?, count],
+                resources,
+            )?)
+        }
         Kind::PadStart | Kind::PadEnd => {
             let name = if call.kind == Kind::PadStart {
                 STRING_PAD_START
             } else {
                 STRING_PAD_END
             };
+            let target_length = argument(1)?;
+            let negative = builder
+                .ins()
+                .icmp_imm_s(IntCC::SignedLessThan, target_length, 0);
+            lower_panic_if_signed_fact(
+                builder,
+                negative,
+                "P1202",
+                doria_diagnostic_catalogue::STRING_PADDING_REQUESTED_LENGTH_FACT,
+                target_length,
+                call.argument_spans.get(1).copied().unwrap_or(call.span),
+                resources,
+            )?;
+            let current_length_word = call_runtime(
+                builder,
+                STRING_GRAPHEME_LENGTH,
+                &[pointer],
+                pointer,
+                &[argument(0)?],
+                resources,
+            )?;
+            let current_length = if pointer == types::I64 {
+                current_length_word
+            } else {
+                builder.ins().uextend(types::I64, current_length_word)
+            };
+            let needs_padding =
+                builder
+                    .ins()
+                    .icmp(IntCC::SignedGreaterThan, target_length, current_length);
+            let padding_length = call_runtime(
+                builder,
+                STRING_GRAPHEME_LENGTH,
+                &[pointer],
+                pointer,
+                &[argument(2)?],
+                resources,
+            )?;
+            let padding_empty = builder.ins().icmp_imm_u(IntCC::Equal, padding_length, 0);
+            let invalid_padding = builder.ins().band(needs_padding, padding_empty);
+            lower_padding_empty_panic_if(
+                builder,
+                invalid_padding,
+                call.kind == Kind::PadStart,
+                [
+                    argument(0)?,
+                    current_length_word,
+                    target_length,
+                    padding_length,
+                ],
+                call.argument_spans.get(2).copied().unwrap_or(call.span),
+                resources,
+            )?;
+            set_active_panic_site(builder, call.span, resources);
             LoweredValue::Single(call_runtime(
                 builder,
                 name,
@@ -7661,6 +8028,24 @@ fn lower_string_intrinsic_call(
         }
     }
     Ok(result)
+}
+
+fn set_active_panic_site(
+    builder: &mut FunctionBuilder,
+    span: crate::source::Span,
+    resources: &LoweringResources<'_, '_>,
+) {
+    let pointer = resources.module.target_config().pointer_type();
+    let pointer_bytes = pointer.bytes() as i32;
+    let flags = MemFlagsData::new();
+    let start = builder.ins().iconst(pointer, span.start as i64);
+    let end = builder.ins().iconst(pointer, span.end as i64);
+    builder
+        .ins()
+        .store(flags, start, resources.current_frame, pointer_bytes * 9);
+    builder
+        .ins()
+        .store(flags, end, resources.current_frame, pointer_bytes * 10);
 }
 
 fn lower_function_call(
@@ -8544,7 +8929,7 @@ fn resolve_string_expression_from_definitions(
         mir::StringExpression::Intrinsic(_)
         | mir::StringExpression::Display(_)
         | mir::StringExpression::Call { .. }
-        | mir::StringExpression::ReadFile(_)
+        | mir::StringExpression::ReadFile { .. }
         | mir::StringExpression::Format(_)
         | mir::StringExpression::Coalesce { .. }
         | mir::StringExpression::CollectionIndex { .. }
@@ -8589,7 +8974,7 @@ fn resolve_string_expression(
         mir::StringExpression::Intrinsic(_)
         | mir::StringExpression::Display(_)
         | mir::StringExpression::Call { .. }
-        | mir::StringExpression::ReadFile(_)
+        | mir::StringExpression::ReadFile { .. }
         | mir::StringExpression::Format(_)
         | mir::StringExpression::Coalesce { .. }
         | mir::StringExpression::CollectionIndex { .. }
@@ -8620,21 +9005,41 @@ fn lower_echo_bytes(
     Ok(())
 }
 
-fn lower_runtime_panic(
+fn lower_runtime_panic_code(
     builder: &mut FunctionBuilder,
+    code: &[u8],
     message: &[u8],
     resources: &mut LoweringResources<'_, '_>,
 ) -> Result<(), BackendError> {
-    let pointer = define_data(builder, message, resources)?;
     let pointer_type = resources.module.target_config().pointer_type();
-    let length = builder.ins().iconst(pointer_type, message.len() as i64);
-    let panic_id = resources.declare_panic()?;
+    let code_pointer = define_data(builder, code, resources)?;
+    let code_length = builder.ins().iconst(pointer_type, code.len() as i64);
+    let message_pointer = define_data(builder, message, resources)?;
+    let message_length = builder.ins().iconst(pointer_type, message.len() as i64);
+    let panic_id = resources.declare_runtime(
+        "dr_v2_panic_code",
+        &[
+            pointer_type,
+            pointer_type,
+            pointer_type,
+            pointer_type,
+            pointer_type,
+        ],
+        None,
+    )?;
     let panic = resources
         .module
         .declare_func_in_func(panic_id, builder.func);
-    builder
-        .ins()
-        .call(panic, &[resources.current_frame, pointer, length]);
+    builder.ins().call(
+        panic,
+        &[
+            resources.current_frame,
+            code_pointer,
+            code_length,
+            message_pointer,
+            message_length,
+        ],
+    );
     builder
         .ins()
         .trap(TrapCode::unwrap_user(RUNTIME_RETURNED_TRAP));

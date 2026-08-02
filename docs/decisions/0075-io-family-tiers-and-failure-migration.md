@@ -26,7 +26,11 @@ Doria's file I/O family has three deliberate tiers:
 3. Post-Stage 29 `File` and stream objects: owned RAII resources with buffered and seekable access.
 
 Until checked errors land, Stage 17 free-function I/O failures panic with a clear message and status
-101. `read_line(): ?string` returns `null` only for EOF; it does not encode failures as null. At
+101. `read_line(string $prompt = ""): ?string` returns `null` only for EOF; it does not encode
+failures as null. Its checked-error migration covers failures from prompt output, the stdout
+flush, the stdin read, and input decoding, so the prompt half is planned rather than a later gap;
+a closed stdout pipe during prompt output or its flush stays on the permanent status-0 carve-out
+below and never becomes a throw, and it does not go on to read stdin. At
 Stage 29 the I/O free functions migrate to declared `throws` signatures. That planned signature
 change does not alter successful text behavior or the meaning of EOF. A closed stdout or stderr
 pipe during ordinary program output is the permanent decision-0091 exception: it exits cleanly

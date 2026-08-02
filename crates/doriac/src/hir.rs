@@ -12,6 +12,8 @@ pub use crate::ast::{
 /// before backend output. A lower native-oriented IR may come later.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Program {
+    pub source_path: String,
+    pub source_text: String,
     pub namespace: Option<NamespaceDecl>,
     pub items: Vec<Item>,
     pub semantic_info: crate::semantics::SemanticInfo,

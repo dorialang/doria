@@ -56,6 +56,65 @@ impl DiagnosticKind {
             Self::RuntimePanic => "runtimePanic",
         }
     }
+
+    fn title(self, severity: DiagnosticSeverity) -> &'static str {
+        match self {
+            Self::RuntimePanic => "Panic",
+            _ => severity.title(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminationBehavior {
+    AbortWithoutCleanup,
+    PropagateWithCleanup,
+}
+
+impl TerminationBehavior {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::AbortWithoutCleanup => "abortWithoutCleanup",
+            Self::PropagateWithCleanup => "propagateWithCleanup",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeOutcomeOrigin {
+    pub source: DiagnosticSource,
+    pub span: Span,
+    pub function: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeOutcomeFrame {
+    pub function: String,
+    pub source: DiagnosticSource,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuntimeFactValue {
+    Signed(i64),
+    Unsigned(u64),
+    Boolean(bool),
+    StaticString(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeFact {
+    pub name: String,
+    pub value: RuntimeFactValue,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeOutcomeDetails {
+    pub process_status: i32,
+    pub termination_behavior: TerminationBehavior,
+    pub origin: RuntimeOutcomeOrigin,
+    pub path: Vec<RuntimeOutcomeFrame>,
+    pub facts: Vec<RuntimeFact>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -174,6 +233,7 @@ pub struct DiagnosticDetails {
     pub development_only: bool,
     pub documentation: Option<DiagnosticDocumentation>,
     pub developer_details: Option<String>,
+    pub runtime_outcome: Option<RuntimeOutcomeDetails>,
     // Compatibility views used by existing compiler passes and tests.
     pub help: Option<String>,
     pub fix: Option<Box<FixIt>>,
@@ -207,6 +267,41 @@ impl Diagnostic {
             DiagnosticKind::UnsupportedDevelopmentSurface,
         );
         diagnostic.development_only = true;
+        diagnostic
+    }
+
+    pub fn runtime_panic(code: &'static str, span: Span, outcome: RuntimeOutcomeDetails) -> Self {
+        let entry = runtime_catalogue_entry(code)
+            .unwrap_or_else(|| panic!("runtime diagnostic code `{code}` is not catalogued"));
+        let explanation = if code == "P1501" {
+            outcome
+                .facts
+                .iter()
+                .find(|fact| {
+                    fact.name == doria_diagnostic_catalogue::SHARED_ACCESS_CONFLICT_REASON_FACT
+                })
+                .and_then(|fact| match &fact.value {
+                    RuntimeFactValue::StaticString(value)
+                        if doria_diagnostic_catalogue::is_shared_access_conflict_reason(value) =>
+                    {
+                        Some(value.as_str())
+                    }
+                    _ => None,
+                })
+                .unwrap_or(entry.explanation)
+        } else {
+            entry.explanation
+        };
+        let mut diagnostic = Self::build(
+            code,
+            entry.title.to_string(),
+            span,
+            DiagnosticKind::RuntimePanic,
+        )
+        .with_title(entry.title)
+        .with_primary_label(entry.primary_label)
+        .with_explanation(explanation);
+        diagnostic.runtime_outcome = Some(outcome);
         diagnostic
     }
 
@@ -291,6 +386,7 @@ impl Diagnostic {
                         | DiagnosticKind::ExternalTool
                 )
                 .then(|| message.clone()),
+                runtime_outcome: None,
                 message,
                 help: None,
                 fix: None,
@@ -460,6 +556,12 @@ impl Diagnostic {
         self
     }
 
+    pub fn with_runtime_outcome(mut self, outcome: RuntimeOutcomeDetails) -> Self {
+        self.kind = DiagnosticKind::RuntimePanic;
+        self.runtime_outcome = Some(outcome);
+        self
+    }
+
     pub fn internal_compiler_error(
         context: impl Into<String>,
         details: impl Into<String>,
@@ -600,12 +702,17 @@ fn render_human(
     let color = options.color.enabled();
     let mut rendered = Vec::with_capacity(diagnostics.len() + 1);
     for diagnostic in diagnostics {
-        let prefix = format!("{}[{}]", diagnostic.severity.title(), diagnostic.code);
+        let prefix = format!(
+            "{}[{}]",
+            diagnostic.kind.title(diagnostic.severity),
+            diagnostic.code
+        );
         let prefix = if color {
-            let ansi = match diagnostic.severity {
-                DiagnosticSeverity::Error => "31;1",
-                DiagnosticSeverity::Warning => "33;1",
-                DiagnosticSeverity::Note => "36;1",
+            let ansi = match (diagnostic.kind, diagnostic.severity) {
+                (DiagnosticKind::RuntimePanic, _) => "31;1",
+                (_, DiagnosticSeverity::Error) => "31;1",
+                (_, DiagnosticSeverity::Warning) => "33;1",
+                (_, DiagnosticSeverity::Note) => "36;1",
             };
             format!("\x1b[{ansi}m{prefix}\x1b[0m")
         } else {
@@ -620,34 +727,55 @@ fn render_human(
                 label.role != LabelRole::Primary,
             )
         });
-        for label in &labels {
-            render_label(&mut block, source, label, options);
+        if let Some(primary) = labels.iter().find(|label| label.role == LabelRole::Primary) {
+            block.push_str("\n\nWhere\n");
+            render_label(
+                &mut block,
+                source,
+                primary,
+                options,
+                diagnostic
+                    .runtime_outcome
+                    .as_ref()
+                    .and_then(|outcome| outcome.origin.function.as_deref()),
+            );
+        }
+        let related = labels
+            .iter()
+            .filter(|label| label.role == LabelRole::Secondary)
+            .collect::<Vec<_>>();
+        if !related.is_empty() {
+            block.push_str("\n\nRelated");
+            for label in related {
+                block.push('\n');
+                render_label(&mut block, source, label, options, None);
+            }
         }
         if let Some(explanation) = &diagnostic.explanation {
             push_prose_section(&mut block, "Why", explanation, options.terminal_width, true);
         }
         for note in &diagnostic.notes {
-            push_prose_section(&mut block, "Note", note, options.terminal_width, false);
+            push_prose_section(&mut block, "Note", note, options.terminal_width, true);
         }
         for help in &diagnostic.helps {
-            push_prose_section(&mut block, "Help", help, options.terminal_width, false);
+            push_prose_section(&mut block, "Help", help, options.terminal_width, true);
         }
         for fix in &diagnostic.fixes {
             block.push_str(&format!(
-                "\nSuggested Fix ({}): {}",
+                "\n\nSuggested Fix\n{}\n{}",
                 fix.applicability.title(),
                 fix.title
             ));
             for edit in &fix.edits {
                 let location = display_location(source, &edit.source, edit.span.start);
                 block.push_str(&format!(
-                    "\n  {location} replace with `{}`",
+                    "\n{location} · Replace With `{}`",
                     edit.replacement
                 ));
             }
         }
         if let Some(cause) = &diagnostic.cause_id {
-            block.push_str("\nCaused By: ");
+            block.push_str("\n\nCaused By\n");
             block.push_str(cause);
         }
         if matches!(
@@ -657,17 +785,40 @@ fn render_human(
                 | DiagnosticKind::InternalCompiler
         ) {
             if let Some(details) = &diagnostic.developer_details {
-                block.push_str("\nNote: developer details are available in JSON diagnostics.");
+                block.push_str("\n\nNote\nDeveloper details are available in JSON diagnostics.");
                 if std::env::var_os("DORIA_DIAGNOSTIC_DEBUG").is_some() {
-                    block.push_str("\nDeveloper Details: ");
+                    block.push_str("\n\nDeveloper Details\n");
                     block.push_str(details);
                 }
             }
         }
+        if let Some(outcome) = &diagnostic.runtime_outcome {
+            if !outcome.path.is_empty() {
+                block.push_str("\n\nCall Path");
+                for frame in &outcome.path {
+                    let (line, _) = display_line_col(source, frame.span.start, 4);
+                    block.push_str(&format!(
+                        "\n{} · {}:{}",
+                        frame.function,
+                        source_name(&frame.source, source),
+                        line
+                    ));
+                }
+            }
+            block.push_str(&format!(
+                "\n\nProcess Exited With Status {}",
+                outcome.process_status
+            ));
+        }
         rendered.push(block);
     }
-    let summary = DiagnosticSummary::from_diagnostics(diagnostics);
-    rendered.push(format_summary(summary));
+    if diagnostics
+        .iter()
+        .all(|diagnostic| diagnostic.runtime_outcome.is_none())
+    {
+        let summary = DiagnosticSummary::from_diagnostics(diagnostics);
+        rendered.push(format_summary(summary));
+    }
     rendered.join("\n\n")
 }
 
@@ -676,14 +827,19 @@ fn render_label(
     source: &SourceFile,
     label: &DiagnosticLabel,
     options: RenderOptions,
+    context: Option<&str>,
 ) {
-    let (line, col) = display_line_col(source, label.span.start, 4);
+    let (line, _) = display_line_col(source, label.span.start, 4);
     let label_source = source_name(&label.source, source);
-    rendered.push_str(&format!("\n  --> {label_source}:{line}:{col}\n   |"));
+    rendered.push_str(&format!("{label_source} · line {line}"));
+    if let Some(context) = context {
+        rendered.push_str(" · ");
+        rendered.push_str(context);
+    }
+    rendered.push('\n');
 
     if matches!(label.source, DiagnosticSource::Path(ref path) if path != &source.path) {
         if !label.message.is_empty() {
-            rendered.push_str("\nRelated: ");
             rendered.push_str(&label.message);
         }
         return;
@@ -720,9 +876,10 @@ fn render_label(
                 marker_offset,
             )
         };
-        rendered.push_str(&format!("\n{:>gutter_width$} |", context_line));
-        if !visible_line.is_empty() {
-            rendered.push(' ');
+        if visible_line.is_empty() {
+            rendered.push_str(&format!("\n{:>gutter_width$}", context_line));
+        } else {
+            rendered.push_str(&format!("\n{:>gutter_width$}      ", context_line));
             rendered.push_str(&visible_line);
         }
         if is_labelled {
@@ -732,7 +889,7 @@ fn render_label(
                 '-'
             };
             rendered.push_str(&format!(
-                "\n{:>gutter_width$} | {}{}",
+                "\n{:>gutter_width$}      {}{}",
                 "",
                 " ".repeat(visible_marker_offset.min(maximum_width)),
                 marker.to_string().repeat(
@@ -742,7 +899,11 @@ fn render_label(
                 )
             ));
             if context_line == line && !label.message.is_empty() {
-                rendered.push(' ');
+                rendered.push_str(&format!(
+                    "\n{:>gutter_width$}      {}",
+                    "",
+                    " ".repeat(visible_marker_offset.min(maximum_width))
+                ));
                 rendered.push_str(&label.message);
             }
         }
@@ -761,11 +922,11 @@ fn push_prose_section(
     }
     rendered.push('\n');
     rendered.push_str(heading);
-    rendered.push_str(":\n");
-    let line_width = terminal_width.saturating_sub(2).max(20);
+    rendered.push('\n');
+    let line_width = terminal_width.max(20);
     for paragraph in prose.lines() {
         if paragraph.is_empty() {
-            rendered.push_str("  \n");
+            rendered.push('\n');
             continue;
         }
         let mut current = String::new();
@@ -776,7 +937,6 @@ fn push_prose_section(
                 current.width() + 1 + word.width()
             };
             if !current.is_empty() && next_width > line_width {
-                rendered.push_str("  ");
                 rendered.push_str(&current);
                 rendered.push('\n');
                 current.clear();
@@ -786,7 +946,6 @@ fn push_prose_section(
             }
             current.push_str(word);
         }
-        rendered.push_str("  ");
         rendered.push_str(&current);
         rendered.push('\n');
     }
@@ -808,14 +967,19 @@ fn render_concise(source: &SourceFile, diagnostics: &[&Diagnostic]) -> String {
             });
             format!(
                 "{path}:{line}:{col}: {}[{}]: {}",
-                diagnostic.severity.title(),
+                diagnostic.kind.title(diagnostic.severity),
                 diagnostic.code,
                 diagnostic.title
             )
         })
         .collect::<Vec<_>>();
-    let summary = DiagnosticSummary::from_diagnostics(diagnostics);
-    lines.push(format_summary(summary));
+    if diagnostics
+        .iter()
+        .all(|diagnostic| diagnostic.runtime_outcome.is_none())
+    {
+        let summary = DiagnosticSummary::from_diagnostics(diagnostics);
+        lines.push(format_summary(summary));
+    }
     lines.join("\n")
 }
 
@@ -866,6 +1030,28 @@ fn diagnostics_json(source: &SourceFile, diagnostics: &[&Diagnostic]) -> String 
                     "url": docs.url,
                 })),
                 "developerDetails": diagnostic.developer_details,
+                "runtimeOutcome": diagnostic.runtime_outcome.as_ref().map(|outcome| {
+                    serde_json::json!({
+                        "processStatus": outcome.process_status,
+                        "terminationBehavior": outcome.termination_behavior.as_str(),
+                        "origin": runtime_origin_json(source, &outcome.origin),
+                        "pathKind": "callPath",
+                        "frames": outcome.path.iter().map(|frame| {
+                            let (line, column) = display_line_col(source, frame.span.start, 4);
+                            serde_json::json!({
+                                "function": frame.function,
+                                "source": source_name(&frame.source, source),
+                                "span": {
+                                    "start": frame.span.start,
+                                    "end": frame.span.end,
+                                },
+                                "line": line,
+                                "column": column,
+                            })
+                        }).collect::<Vec<_>>(),
+                        "facts": outcome.facts.iter().map(runtime_fact_json).collect::<Vec<_>>(),
+                    })
+                }),
             })
         })
         .collect::<Vec<_>>();
@@ -873,7 +1059,11 @@ fn diagnostics_json(source: &SourceFile, diagnostics: &[&Diagnostic]) -> String 
         "schemaVersion": DIAGNOSTIC_SCHEMA_VERSION,
         "diagnostics": values,
         "summary": {
-            "status": summary.status(),
+            "status": diagnostics.iter().find_map(|diagnostic| {
+                diagnostic.runtime_outcome.as_ref().map(|outcome| {
+                    format!("Process Exited With Status {}", outcome.process_status)
+                })
+            }).unwrap_or_else(|| summary.status().to_string()),
             "errors": summary.errors,
             "warnings": summary.warnings,
             "notes": summary.notes,
@@ -881,6 +1071,37 @@ fn diagnostics_json(source: &SourceFile, diagnostics: &[&Diagnostic]) -> String 
     }))
     .unwrap_or_else(|_| {
         "{\"schemaVersion\":1,\"diagnostics\":[],\"summary\":{\"status\":\"Internal Compiler Error\",\"errors\":1,\"warnings\":0,\"notes\":0}}".to_string()
+    })
+}
+
+fn runtime_origin_json(source: &SourceFile, origin: &RuntimeOutcomeOrigin) -> serde_json::Value {
+    let (line, column) = display_line_col(source, origin.span.start, 4);
+    let (end_line, end_column) = display_line_col(source, origin.span.end, 4);
+    serde_json::json!({
+        "source": source_name(&origin.source, source),
+        "function": origin.function,
+        "span": {
+            "start": origin.span.start,
+            "end": origin.span.end,
+        },
+        "range": {
+            "start": { "line": line, "column": column },
+            "end": { "line": end_line, "column": end_column },
+        },
+    })
+}
+
+fn runtime_fact_json(fact: &RuntimeFact) -> serde_json::Value {
+    let (kind, value) = match &fact.value {
+        RuntimeFactValue::Signed(value) => ("signedInteger", serde_json::json!(value)),
+        RuntimeFactValue::Unsigned(value) => ("unsignedInteger", serde_json::json!(value)),
+        RuntimeFactValue::Boolean(value) => ("boolean", serde_json::json!(value)),
+        RuntimeFactValue::StaticString(value) => ("staticString", serde_json::json!(value)),
+    };
+    serde_json::json!({
+        "name": fact.name,
+        "kind": kind,
+        "value": value,
     })
 }
 
@@ -1196,10 +1417,16 @@ pub struct DiagnosticMetadata {
     pub development_only: bool,
 }
 
+pub use doria_diagnostic_catalogue::{
+    runtime_entry as runtime_catalogue_entry, RuntimeCatalogueEntry,
+    DIAGNOSTIC_CODES as CATALOGUED_CODES, RUNTIME_CATALOGUE,
+};
 pub fn catalogue_metadata(code: &str) -> DiagnosticMetadata {
+    let runtime = code.starts_with("P1");
     let kind = match code.as_bytes().first().copied() {
         Some(b'B') => DiagnosticKind::Backend,
         Some(b'I') => DiagnosticKind::InternalCompiler,
+        Some(b'P') if runtime => DiagnosticKind::RuntimePanic,
         _ => DiagnosticKind::Language,
     };
     DiagnosticMetadata {
@@ -1207,6 +1434,7 @@ pub fn catalogue_metadata(code: &str) -> DiagnosticMetadata {
         kind,
         title_family: match code.as_bytes().first().copied() {
             Some(b'L') => "Lexical Error",
+            Some(b'P') if runtime => "Runtime Panic",
             Some(b'P') => "Syntax Error",
             Some(b'E') => "Language Error",
             Some(b'M') => "MIR Error",
@@ -1221,27 +1449,6 @@ pub fn catalogue_metadata(code: &str) -> DiagnosticMetadata {
 fn is_catalogued_code(code: &str) -> bool {
     CATALOGUED_CODES.contains(&code)
 }
-
-pub const CATALOGUED_CODES: &[&str] = &[
-    "B0001", "B0002", "B1301", "B1901", "B2001", "B2301", "B2401", "B2501", "E0101", "E0102",
-    "E0103", "E0201", "E0202", "E0203", "E0204", "E0300", "E0303", "E0304", "E0305", "E0306",
-    "E0307", "E0308", "E0309", "E0310", "E0401", "E0402", "E0403", "E0404", "E0405", "E0406",
-    "E0407", "E0408", "E0409", "E0410", "E0411", "E0412", "E0413", "E0414", "E0415", "E0416",
-    "E0417", "E0419", "E0420", "E0421", "E0422", "E0423", "E0424", "E0425", "E0426", "E0430",
-    "E0431", "E0432", "E0433", "E0434", "E0435", "E0436", "E0440", "E0441", "E0442", "E0443",
-    "E0444", "E0445", "E0450", "E0451", "E0452", "E0453", "E0454", "E0455", "E0456", "E0457",
-    "E0461", "E0462", "E0463", "E0464", "E0465", "E0466", "E0467", "E0468", "E0470", "E0471",
-    "E0472", "E0473", "E0474", "E0475", "E0476", "E0477", "E0478", "E0479", "E0480", "E0481",
-    "E0482", "E0483", "E0484", "E0485", "E0486", "E0487", "E0488", "E0489", "E0490", "E0491",
-    "E0492", "E0493", "E0494", "E0495", "E0496", "E0497", "E0498", "E0500", "E0501", "E0502",
-    "E0503", "E0504", "E0505", "E0506", "E0507", "E0508", "E0509", "E0510", "E0511", "E0512",
-    "E0513", "E0515", "E0516", "E0517", "E0518", "E0519", "E0520", "E0521", "E0522", "E0523",
-    "E0524", "E0525", "E0526", "E0527", "E0528", "E0529", "E0530", "E0531", "E0532", "E0533",
-    "E0534", "E0535", "E0536", "E0537", "E0538", "E0539", "E0540", "E0541", "E0542", "E0543",
-    "E0544", "E0545", "E0546", "E0547", "E0548", "E0549", "E0550", "I0001", "I1101", "I1301",
-    "I1302", "I1401", "I2001", "I2002", "I2003", "I2201", "I2401", "L0001", "L0002", "M1101",
-    "M1102", "P0001", "P0002", "P0017",
-];
 
 fn contains_development_stage_reference(text: &str) -> bool {
     let mut words = text.split_whitespace();
@@ -1369,10 +1576,10 @@ mod tests {
                 ..RenderOptions::default()
             },
         );
-        assert!(rendered.contains("unicode.doria:1:8"));
+        assert!(rendered.contains("unicode.doria · line 1"));
         assert!(rendered.contains("…"));
         assert!(rendered.contains("second $value"));
-        assert_eq!(rendered.matches("Help:").count(), 2);
+        assert_eq!(rendered.lines().filter(|line| *line == "Help").count(), 2);
         assert!(rendered.lines().filter(|line| line.contains('^')).count() >= 2);
     }
 
@@ -1414,7 +1621,7 @@ mod tests {
                 ..RenderOptions::default()
             },
         );
-        assert!(rendered.contains("Note: developer details are available in JSON diagnostics."));
+        assert!(rendered.contains("\n\nNote\nDeveloper details are available in JSON diagnostics."));
         assert!(!rendered.contains("complete linker output"));
     }
 

@@ -41,9 +41,12 @@ unsupported-development-surface constructor when its implementation lands.
 - Unexpected characters, type mismatches, readonly binding/property writes, use after ownership
   transfer, unknown named arguments, and conflicting access now exercise the
   richer explanatory and secondary-label paths.
-- Runtime `Panic` and `Stack Trace` headings are already Title Case in the
-  interpreter, native runtime, and PHP compatibility emitter. Canonical panic
-  messages remain unchanged because they are runtime behavior, not titles.
+- Runtime panics now extend the compiler-owned diagnostic model and central
+  catalogue infrastructure. Every implemented built-in panic has a stable
+  `P` code and Title Case title; interpreter, native runtime, and PHP
+  compatibility output use `Where`, precise source labels, `Why`, and
+  `Call Path`. The runtime's compact generated table is an internal
+  representation of compiler authority, not an independent catalogue.
 
 ## Compatibility bridge
 

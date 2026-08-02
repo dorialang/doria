@@ -1,3 +1,26 @@
-Panic: byte index out of bounds
-Stack Trace:
-  at main
+Panic[P1301]: Byte Index Is Out Of Bounds
+
+Where
+examples/native/main_stage23_bytes_oob_panic.doria · line 1 · main
+
+  1      function main(): void
+         ^^^^^^^^^^^^^^^^^^^^^
+         Invalid Byte Index
+  2      {
+         ^
+  3          uint8[] $source = [1];
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  4          Bytes $bytes = Bytes::fromArray($source);
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  5          echo "{$bytes[1]}";
+         ^^^^^^^^^^^^^^^^^^^^^^^
+  6      }
+         ^
+
+Why
+The byte index is outside the valid range of this Bytes value.
+
+Call Path
+main · examples/native/main_stage23_bytes_oob_panic.doria:1
+
+Process Exited With Status 101

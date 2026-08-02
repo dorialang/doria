@@ -777,6 +777,7 @@ fn validate_statement(
         mir::Statement::CallVoid {
             function: callee,
             args,
+            ..
         } => {
             let callee = function_in(program, *callee)?;
             if callee.return_type != mir::ReturnType::Void {
@@ -790,6 +791,7 @@ fn validate_statement(
         mir::Statement::CallBorrowed {
             function: callee,
             args,
+            ..
         } => {
             let callee = function_in(program, *callee)?;
             if !matches!(
@@ -814,6 +816,7 @@ fn validate_statement(
             object,
             function: callee,
             args,
+            ..
         } => validate_null_safe_statement_call(program, function, object, *callee, args),
         mir::Statement::Printf(format) => validate_format_expression(program, function, format),
         mir::Statement::WriteFile { path, contents }
@@ -1279,7 +1282,9 @@ fn validate_terminator(
             }
             Ok(())
         }
-        mir::Terminator::Panic(message) => validate_string_expression(program, function, message),
+        mir::Terminator::Panic { message, .. } => {
+            validate_string_expression(program, function, message)
+        }
         mir::Terminator::Unreachable => Ok(()),
         mir::Terminator::Jump(target) => block_in(function, *target).map(|_| ()),
         mir::Terminator::Branch {
@@ -1303,7 +1308,9 @@ fn validate_integer_expression(
         mir::IntegerExpression::Use { ty, operand } => {
             validate_integer_operand(program, function, *ty, operand)
         }
-        mir::IntegerExpression::Unary { ty, op, operand } => {
+        mir::IntegerExpression::Unary {
+            ty, op, operand, ..
+        } => {
             if operand.ty() != *ty {
                 return Err(malformed_mir(format!(
                     "{ty} unary expression contains {} operand",
@@ -1333,7 +1340,7 @@ fn validate_integer_expression(
         mir::IntegerExpression::Convert { value, .. } => {
             validate_integer_expression(program, function, value)
         }
-        mir::IntegerExpression::FloatToInt { value } => {
+        mir::IntegerExpression::FloatToInt { value, .. } => {
             validate_float_expression(program, function, value)
         }
         mir::IntegerExpression::Call {
@@ -4904,7 +4911,7 @@ fn collect_integer_class_local_accesses<'a>(
             collect_integer_class_local_accesses(left, accesses);
             collect_integer_class_local_accesses(right, accesses);
         }
-        mir::IntegerExpression::FloatToInt { value } => {
+        mir::IntegerExpression::FloatToInt { value, .. } => {
             collect_float_class_local_accesses(value, accesses);
         }
         mir::IntegerExpression::Call { function, args, .. } => {
@@ -4967,7 +4974,7 @@ fn collect_string_class_local_accesses<'a>(
             collect_rvalue_args_class_local_accesses(args, accesses);
             accesses.call(*function, args);
         }
-        mir::StringExpression::ReadFile(path) => {
+        mir::StringExpression::ReadFile { path, .. } => {
             collect_string_class_local_accesses(path, accesses);
         }
         mir::StringExpression::Format(format) => {
@@ -5014,10 +5021,12 @@ fn collect_nullable_string_class_local_accesses<'a>(
             collect_rvalue_args_class_local_accesses(args, accesses);
             accesses.call(*function, args);
         }
+        mir::NullableStringExpression::ReadLine { prompt, .. } => {
+            collect_string_class_local_accesses(prompt, accesses);
+        }
         mir::NullableStringExpression::Null
         | mir::NullableStringExpression::Local(_)
-        | mir::NullableStringExpression::Static(_)
-        | mir::NullableStringExpression::ReadLine => {}
+        | mir::NullableStringExpression::Static(_) => {}
         mir::NullableStringExpression::Property { object, property } => {
             accesses.borrow_property(*object, *property);
         }
@@ -5362,8 +5371,8 @@ fn collect_statement_class_local_accesses(statement: &mir::Statement) -> ClassLo
         mir::Statement::EchoString(value) | mir::Statement::WriteStderr(value) => {
             collect_string_class_local_accesses(value, &mut accesses);
         }
-        mir::Statement::CallVoid { function, args }
-        | mir::Statement::CallBorrowed { function, args } => {
+        mir::Statement::CallVoid { function, args, .. }
+        | mir::Statement::CallBorrowed { function, args, .. } => {
             accesses.begin_call();
             collect_rvalue_args_class_local_accesses(args, &mut accesses);
             accesses.call(*function, args);
@@ -5372,6 +5381,7 @@ fn collect_statement_class_local_accesses(statement: &mir::Statement) -> ClassLo
             object,
             function,
             args,
+            ..
         } => {
             collect_nullable_class_local_accesses(object, &mut accesses);
             if !nullable_class_expression_is_definitely_null(object) {
@@ -5427,7 +5437,7 @@ fn collect_terminator_class_local_accesses(terminator: &mir::Terminator) -> Clas
         mir::Terminator::Return(value) => {
             collect_rvalue_class_local_accesses(value, &mut accesses);
         }
-        mir::Terminator::Panic(value) => {
+        mir::Terminator::Panic { message: value, .. } => {
             collect_string_class_local_accesses(value, &mut accesses);
         }
         mir::Terminator::Branch { condition, .. } => {
@@ -5591,7 +5601,7 @@ fn validate_nullable_presence(
             }
             mir::Terminator::Return(_)
             | mir::Terminator::ReturnVoid
-            | mir::Terminator::Panic(_)
+            | mir::Terminator::Panic { .. }
             | mir::Terminator::Unreachable => {}
         }
     }
@@ -5661,7 +5671,7 @@ fn validate_mixed_tag_proofs(
             }
             mir::Terminator::Return(_)
             | mir::Terminator::ReturnVoid
-            | mir::Terminator::Panic(_)
+            | mir::Terminator::Panic { .. }
             | mir::Terminator::Unreachable => {}
         }
     }
@@ -5934,7 +5944,7 @@ fn nullable_string_expression_is_present(
         mir::NullableStringExpression::Null
         | mir::NullableStringExpression::Property { .. }
         | mir::NullableStringExpression::Static(_)
-        | mir::NullableStringExpression::ReadLine
+        | mir::NullableStringExpression::ReadLine { .. }
         | mir::NullableStringExpression::Call { .. }
         | mir::NullableStringExpression::NullSafeProperty { .. }
         | mir::NullableStringExpression::NullSafeCall { .. }
@@ -6660,7 +6670,7 @@ fn terminator_targets(terminator: &mir::Terminator) -> Vec<mir::BlockId> {
         } => vec![*then_block, *else_block],
         mir::Terminator::Return(_)
         | mir::Terminator::ReturnVoid
-        | mir::Terminator::Panic(_)
+        | mir::Terminator::Panic { .. }
         | mir::Terminator::Unreachable => Vec::new(),
     }
 }
@@ -6780,7 +6790,9 @@ fn terminator_observes_property(
 ) -> bool {
     match terminator {
         mir::Terminator::Return(value) => rvalue_observes_property(value, receiver, property),
-        mir::Terminator::Panic(value) => string_observes_property(value, receiver, property),
+        mir::Terminator::Panic { message: value, .. } => {
+            string_observes_property(value, receiver, property)
+        }
         mir::Terminator::Branch { condition, .. } => {
             bool_observes_property(condition, receiver, property)
         }
@@ -7304,7 +7316,7 @@ fn integer_observes_property(
             integer_observes_property(left, receiver, property)
                 || integer_observes_property(right, receiver, property)
         }
-        mir::IntegerExpression::FloatToInt { value } => {
+        mir::IntegerExpression::FloatToInt { value, .. } => {
             float_observes_property(value, receiver, property)
         }
         mir::IntegerExpression::Call { args, .. } => args
@@ -7363,7 +7375,9 @@ fn string_observes_property(
         mir::StringExpression::Call { args, .. } => args
             .iter()
             .any(|value| rvalue_observes_property(value, receiver, property)),
-        mir::StringExpression::ReadFile(path) => string_observes_property(path, receiver, property),
+        mir::StringExpression::ReadFile { path, .. } => {
+            string_observes_property(path, receiver, property)
+        }
         mir::StringExpression::Format(format) => {
             format_observes_property(format, receiver, property)
         }
@@ -7425,10 +7439,12 @@ fn nullable_string_observes_property(
             .args
             .iter()
             .any(|argument| rvalue_observes_property(argument, receiver, property)),
+        mir::NullableStringExpression::ReadLine { prompt, .. } => {
+            string_observes_property(prompt, receiver, property)
+        }
         mir::NullableStringExpression::Null
         | mir::NullableStringExpression::Local(_)
-        | mir::NullableStringExpression::Static(_)
-        | mir::NullableStringExpression::ReadLine => false,
+        | mir::NullableStringExpression::Static(_) => false,
     }
 }
 
@@ -8663,7 +8679,7 @@ fn validate_string_expression(
             }
             validate_call_args(program, function, callee, args)
         }
-        mir::StringExpression::ReadFile(path) => {
+        mir::StringExpression::ReadFile { path, .. } => {
             validate_string_expression(program, function, path)
         }
         mir::StringExpression::Format(format) => {
@@ -8685,7 +8701,10 @@ fn validate_nullable_string_expression(
     expression: &mir::NullableStringExpression,
 ) -> Result<(), BackendError> {
     match expression {
-        mir::NullableStringExpression::Null | mir::NullableStringExpression::ReadLine => Ok(()),
+        mir::NullableStringExpression::Null => Ok(()),
+        mir::NullableStringExpression::ReadLine { prompt, .. } => {
+            validate_string_expression(program, function, prompt)
+        }
         mir::NullableStringExpression::String(value) => {
             validate_string_expression(program, function, value)
         }

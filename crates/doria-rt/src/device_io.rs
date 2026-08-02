@@ -113,9 +113,19 @@ pub(crate) unsafe fn read_bytes(
     read(stream, destination, capacity)
 }
 
-/// Raw writes are currently unbuffered, so flushing is intentionally a successful no-op.
-pub(crate) unsafe fn flush(stream: StandardStream) -> bool {
-    stream != StandardStream::Stdin
+/// Flushes a standard output device.
+///
+/// Raw writes are currently unbuffered, so this is intentionally a successful
+/// no-op for the output streams. It reports the same `WriteOutcome` vocabulary as
+/// [`write`] rather than a bare boolean, so a caller can distinguish a closed pipe
+/// — which is a clean status-0 exit under the permanent ordinary-output rule — from
+/// a genuine device failure, which panics. Flushing standard input is not a
+/// meaningful operation and is reported as a failure.
+pub(crate) unsafe fn flush(stream: StandardStream) -> WriteOutcome {
+    if stream == StandardStream::Stdin {
+        return WriteOutcome::OtherFailure;
+    }
+    WriteOutcome::Success
 }
 
 #[cfg(unix)]

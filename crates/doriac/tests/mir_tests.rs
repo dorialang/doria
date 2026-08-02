@@ -110,12 +110,14 @@ fn debug_contents(source: &str) -> String {
 
 fn conditional_program(condition: Condition, then_status: i64, else_status: i64) -> Program {
     Program {
+        source: doriac::source::SourceFile::new("<test>", ""),
         classes: vec![],
         collection_types: vec![],
         statics: vec![],
         functions: vec![Function {
             id: FunctionId(0),
             name: "main".to_string(),
+            source_span: Default::default(),
             method: None,
             receiver_mode: None,
             params: Vec::new(),
@@ -204,6 +206,8 @@ fn lowers_return_add_42_to_mir_arithmetic() {
         function.blocks[0].terminator,
         Terminator::Return(Rvalue::Value(ValueExpression::Integer(
             IntegerExpression::Binary {
+                span: Default::default(),
+                right_span: Default::default(),
                 ty: DEFAULT_INT,
                 op: IntegerBinaryOp::Add,
                 left: Box::new(int_constant(40)),
@@ -359,6 +363,8 @@ fn lowers_add_assign_to_read_add_write() {
         Statement::AssignLocal {
             target: LocalId(0),
             value: Rvalue::Value(ValueExpression::Integer(IntegerExpression::Binary {
+                span: Default::default(),
+                right_span: Default::default(),
                 ty: DEFAULT_INT,
                 op: IntegerBinaryOp::Add,
                 left: Box::new(integer_expression(Operand::Local(LocalId(0)))),
@@ -387,6 +393,8 @@ fn lowers_sub_assign_to_read_subtract_write() {
         Statement::AssignLocal {
             target: LocalId(0),
             value: Rvalue::Value(ValueExpression::Integer(IntegerExpression::Binary {
+                span: Default::default(),
+                right_span: Default::default(),
                 ty: DEFAULT_INT,
                 op: IntegerBinaryOp::Subtract,
                 left: Box::new(integer_expression(Operand::Local(LocalId(0)))),
@@ -427,6 +435,8 @@ fn lowers_post_and_pre_increment_equivalently() {
         Statement::AssignLocal {
             target: LocalId(0),
             value: Rvalue::Value(ValueExpression::Integer(IntegerExpression::Binary {
+                span: Default::default(),
+                right_span: Default::default(),
                 ty: DEFAULT_INT,
                 op: IntegerBinaryOp::Add,
                 left: Box::new(integer_expression(Operand::Local(LocalId(0)))),
@@ -467,6 +477,8 @@ fn lowers_post_and_pre_decrement_equivalently() {
         Statement::AssignLocal {
             target: LocalId(0),
             value: Rvalue::Value(ValueExpression::Integer(IntegerExpression::Binary {
+                span: Default::default(),
+                right_span: Default::default(),
                 ty: DEFAULT_INT,
                 op: IntegerBinaryOp::Subtract,
                 left: Box::new(integer_expression(Operand::Local(LocalId(0)))),
@@ -776,12 +788,14 @@ fn interprets_multiple_echoes_without_newline() {
 #[test]
 fn interpreter_reports_arithmetic_overflow_as_runtime_panic() {
     let program = Program {
+        source: doriac::source::SourceFile::new("<test>", ""),
         classes: vec![],
         collection_types: vec![],
         statics: vec![],
         functions: vec![Function {
             id: FunctionId(0),
             name: "main".to_string(),
+            source_span: Default::default(),
             method: None,
             receiver_mode: None,
             params: Vec::new(),
@@ -799,6 +813,8 @@ fn interpreter_reports_arithmetic_overflow_as_runtime_panic() {
                 statements: vec![Statement::AssignLocal {
                     target: LocalId(0),
                     value: Rvalue::Value(ValueExpression::Integer(IntegerExpression::Binary {
+                        span: Default::default(),
+                        right_span: Default::default(),
                         ty: DEFAULT_INT,
                         op: IntegerBinaryOp::Add,
                         left: Box::new(integer_expression(int_operand(i64::MAX))),
@@ -816,7 +832,14 @@ fn interpreter_reports_arithmetic_overflow_as_runtime_panic() {
     assert_eq!(output.exit_status, 101);
     assert!(output
         .stderr
-        .starts_with(b"Panic: integer overflow during addition\n"));
+        .starts_with(b"Panic[P1101]: Integer Addition Overflowed\n"));
+    assert_eq!(
+        output
+            .runtime_diagnostic
+            .as_ref()
+            .map(|diagnostic| diagnostic.code),
+        Some("P1101")
+    );
 }
 
 #[test]
@@ -834,7 +857,7 @@ fn interpreter_panics_for_main_int_exit_status_126() {
     assert_eq!(output.exit_status, 101);
     assert!(output
         .stderr
-        .starts_with(b"Panic: main returned process status outside 0..125\n"));
+        .starts_with(b"Panic[P1111]: Main Returned An Invalid Process Status\n"));
 }
 
 #[test]
@@ -852,8 +875,10 @@ fn debug_target_renders_interpreter_process_status_panic() {
     let BackendOutput::Text { contents, .. } = output else {
         panic!("debug backend should emit text");
     };
-    assert!(contents.starts_with("exit_status: 101\nstdout:\nstderr: Panic: "));
-    assert!(contents.contains("main returned process status outside 0..125"));
+    assert!(contents.starts_with(
+        "exit_status: 101\nstdout:\nstderr: Panic[P1111]: Main Returned An Invalid Process Status"
+    ));
+    assert!(contents.contains("Process Exited With Status 101"));
 }
 
 #[test]
@@ -1045,6 +1070,8 @@ fn lowers_if_condition_to_branch_terminator() {
             condition: Condition::Compare {
                 op: CompareOp::Equal,
                 left: Box::new(ValueExpression::Integer(IntegerExpression::Binary {
+                    span: Default::default(),
+                    right_span: Default::default(),
                     ty: DEFAULT_INT,
                     op: IntegerBinaryOp::Add,
                     left: Box::new(int_constant(40)),
@@ -1419,12 +1446,14 @@ fn interpreter_preserves_void_fallthrough_after_final_else_if() {
 #[test]
 fn explicitly_limited_interpreter_stops_repeated_mir_state_cycles() {
     let program = Program {
+        source: doriac::source::SourceFile::new("<test>", ""),
         classes: vec![],
         collection_types: vec![],
         statics: vec![],
         functions: vec![Function {
             id: FunctionId(0),
             name: "main".to_string(),
+            source_span: Default::default(),
             method: None,
             receiver_mode: None,
             params: Vec::new(),
@@ -1538,6 +1567,8 @@ fn lowers_assignment_and_echo_inside_while() {
         vec![Statement::AssignLocal {
             target: LocalId(0),
             value: Rvalue::Value(ValueExpression::Integer(IntegerExpression::Binary {
+                span: Default::default(),
+                right_span: Default::default(),
                 ty: DEFAULT_INT,
                 op: IntegerBinaryOp::Add,
                 left: Box::new(integer_expression(Operand::Local(LocalId(0)))),
@@ -1978,6 +2009,8 @@ fn lowers_for_to_initializer_header_body_increment_and_exit_blocks() {
         vec![Statement::AssignLocal {
             target: LocalId(0),
             value: Rvalue::Value(ValueExpression::Integer(IntegerExpression::Binary {
+                span: Default::default(),
+                right_span: Default::default(),
                 ty: DEFAULT_INT,
                 op: IntegerBinaryOp::Add,
                 left: Box::new(integer_expression(Operand::Local(LocalId(0)))),
@@ -1991,6 +2024,8 @@ fn lowers_for_to_initializer_header_body_increment_and_exit_blocks() {
         vec![Statement::AssignLocal {
             target: LocalId(1),
             value: Rvalue::Value(ValueExpression::Integer(IntegerExpression::Binary {
+                span: Default::default(),
+                right_span: Default::default(),
                 ty: DEFAULT_INT,
                 op: IntegerBinaryOp::Add,
                 left: Box::new(integer_expression(Operand::Local(LocalId(1)))),
@@ -2047,6 +2082,8 @@ fn lowers_exclusive_range_foreach_to_counter_binding_update_and_exit_blocks() {
         vec![Statement::AssignLocal {
             target: LocalId(1),
             value: Rvalue::Value(ValueExpression::Integer(IntegerExpression::Binary {
+                span: Default::default(),
+                right_span: Default::default(),
                 ty: DEFAULT_INT,
                 op: IntegerBinaryOp::Add,
                 left: Box::new(integer_expression(Operand::Local(LocalId(1)))),
@@ -2620,19 +2657,21 @@ fn stage_11f_lowers_void_calls_and_literal_echo_helpers() {
         program.functions[1].blocks[0].statements,
         vec![Statement::EchoStringLiteral("Doria!".to_string())]
     );
-    assert_eq!(
-        program.functions[2].blocks[0].statements,
-        vec![
+    assert!(matches!(
+        program.functions[2].blocks[0].statements.as_slice(),
+        [
             Statement::CallVoid {
                 function: FunctionId(0),
-                args: Vec::new(),
+                args,
+                ..
             },
             Statement::CallVoid {
                 function: FunctionId(1),
-                args: Vec::new(),
+                args: other_args,
+                ..
             },
-        ]
-    );
+        ] if args.is_empty() && other_args.is_empty()
+    ));
 }
 
 #[test]
@@ -2884,12 +2923,14 @@ fn stage_11f_debug_target_handles_all_examples() {
 #[test]
 fn explicitly_limited_interpreter_can_bound_call_frames() {
     let program = Program {
+        source: doriac::source::SourceFile::new("<test>", ""),
         classes: vec![],
         collection_types: vec![],
         statics: vec![],
         functions: vec![Function {
             id: FunctionId(0),
             name: "main".to_string(),
+            source_span: Default::default(),
             method: None,
             receiver_mode: None,
             params: Vec::new(),

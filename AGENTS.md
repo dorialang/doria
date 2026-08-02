@@ -36,6 +36,8 @@ The accepted project-tool name is Baton. Baton is the planned user-facing projec
 - `doria` is the compiler repository and the subject of these instructions.
 - `doria-website` is a separate repository. It hosts the documentation site and a playground that invokes `doriac` against user source, plus per-stage examples used for acceptance testing. Do not modify, clone, scaffold, or make assumptions about it from compiler work.
 - Playground acceptance testing has repeatedly found language-design gaps before implementation calcified them. When a compiler change alters an accepted surface, report it as an "Invalidated elsewhere" item so the website can follow. Do not schedule website work from a compiler prompt.
+- A compiler change to a public type, intrinsic, standard-library module/member, namespace, ownership rule, return value, or failure contract invalidates the website's versioned guide and API reference. Name both documentation surfaces in "Invalidated elsewhere" even when the website update is deliberately handled as separate work; do not report only the playground impact.
+- Any change to a built-in type, primitive companion, interface, trait, enum, function, constant, constructor, property, method, parameter name, return contract, ownership mode, or failure contract must update `docs/stdlib-reference.md` and the matching `doria-website/src/Docs/Api/Content/<release>/` entries in the same synchronization beat. The compiler and website CI workflows compare the website release lock with this inventory; refresh the lock only after reviewing and updating the reference pages.
 - `doria-language-server` is a separate repository that is **in scope for compiler work**, unlike `doria-website`, and pins `doriac` by git revision in its root `Cargo.toml`. Never infer where its checkout lives; developers and automation provide its path explicitly. Because it restates language facts in hover text, diagnostics, and highlighting, it goes stale the moment a stage lands — and a stale language server tells the user their valid code is wrong, which is worse than no language server. "Coordinate" in the rules below means **do the work in that repository in the same beat**, not mention it in a report. See "Language-server sweep".
 - Andrew is the language designer and sole developer. He reviews and approves before anything advances.
 
@@ -56,6 +58,14 @@ The accepted project-tool name is Baton. Baton is the planned user-facing projec
   Title Case; explanations use plain Doria vocabulary; every source location
   and suggested edit stays structured. Do not make a consumer parse rendered
   terminal prose.
+- The compiler-owned `Diagnostic` is the sole public model for compile-time
+  findings and runtime outcomes. Built-in panics use catalogued `P` codes,
+  source-identified byte spans, and the same human, concise, and JSON
+  presentations as compilation diagnostics. Human panic output uses `Where`
+  and `Call Path`, never `Stack Trace`; native runtime records are private ABI
+  transport, not another diagnostic model. Future unhandled checked errors
+  must extend this same runtime-outcome foundation while preserving their
+  cleanup and status-70 semantics.
 - Add every new diagnostic code to the compiler catalogue and run
   `php scripts/check_diagnostic_style.php`. Automatic editor actions are limited
   to machine-applicable fixes; requires-review and informational fixes remain
@@ -175,7 +185,7 @@ These are identity, not scope deferral. They do not become available later, and 
 - Treat supporting specification, notes, and decision files as subordinate where they conflict with the end-to-end plan.
 - Treat `docs/doria-end-to-end-plan.md`, `docs/decisions/`, `SPEC.md`, `README.md`, `AGENTS.md`, and `docs/information-architecture.md` according to the documentation authority model. Supporting design notes are subordinate to the end-to-end plan and accepted decisions.
 - Doria has a real ownership/borrow checker model in Doria spelling: readonly is shared borrow, writable is exclusive borrow, and `take` transfers ownership.
-- Stage 25a's readonly and writable shared-ownership families are permanently disjoint. Keep their control blocks and ABI release operations distinct; access-object destruction releases its access registration before its strong ownership claim, including values stored in properties and collections.
+- Stage 25a's readonly and writable shared-ownership families are permanently disjoint. Keep their control blocks and ABI release operations distinct; access-object destruction releases its access registration before its strong ownership claim, including values stored in properties and collections. Shared-access conflicts retain P1501 as one catalogue family while carrying one of Decision 0106's three exact conditions in the typed `conflictReason` runtime fact; backends must not collapse or restate those reasons independently.
 - `use` is namespace import/alias, `uses` is trait composition, and `with` is closure capture. These three keywords are not interchangeable.
 - Keep compiler work incremental and tested, but never use incremental delivery as an excuse to make unsound language decisions.
 - Do not make PHP the public identity of Doria. PHP is development context, migration context, and one optional compatibility backend; Doria should be described as its own native-first language.
