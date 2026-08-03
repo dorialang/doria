@@ -3641,12 +3641,21 @@ fn lower_var_decl(decl: &hir::VarDecl, context: &mut LoweringContext) -> Diagnos
         None => context.expression_type(&decl.initializer)?,
     };
 
+    if decl.bindings.len() > 1 {
+        return lower_grouped_var_decl(decl, ty, context);
+    }
+    let name = &decl
+        .bindings
+        .first()
+        .expect("semantic checking guarantees a local declaration binding")
+        .name;
+
     if ty == mir::Type::String {
         return lower_string_var_decl(decl, context);
     }
     if ty == mir::Type::NullableString {
         let value = lower_nullable_string_expression(&decl.initializer, context)?;
-        let local = context.declare_user_local(&decl.name, decl.writable, ty);
+        let local = context.declare_user_local(name, decl.writable, ty);
         context.push_statement(mir::Statement::AssignLocal {
             target: local,
             value: mir::Rvalue::NullableString(value),
@@ -3655,7 +3664,7 @@ fn lower_var_decl(decl: &hir::VarDecl, context: &mut LoweringContext) -> Diagnos
     }
     if let mir::Type::NullableScalar(scalar) = ty {
         let value = lower_nullable_scalar_expression(&decl.initializer, scalar, context)?;
-        let local = context.declare_user_local(&decl.name, decl.writable, ty);
+        let local = context.declare_user_local(name, decl.writable, ty);
         context.push_statement(mir::Statement::AssignLocal {
             target: local,
             value: mir::Rvalue::NullableScalar(value),
@@ -3665,7 +3674,7 @@ fn lower_var_decl(decl: &hir::VarDecl, context: &mut LoweringContext) -> Diagnos
     if let mir::Type::NullableClass(class) = ty {
         let value = lower_nullable_class_expression(&decl.initializer, class, true, context)?;
         let owned = !value.borrows_class_value();
-        let local = context.declare_user_local_owned(&decl.name, decl.writable, ty, owned);
+        let local = context.declare_user_local_owned(name, decl.writable, ty, owned);
         context.push_statement(mir::Statement::AssignLocal {
             target: local,
             value: mir::Rvalue::NullableClass(value),
@@ -3675,7 +3684,7 @@ fn lower_var_decl(decl: &hir::VarDecl, context: &mut LoweringContext) -> Diagnos
     if ty == mir::Type::Mixed {
         let value = lower_mixed_expression(&decl.initializer, true, context)?;
         let owned = value.ownership() != mir::MixedOwnership::None;
-        let local = context.declare_user_local_owned(&decl.name, decl.writable, ty, owned);
+        let local = context.declare_user_local_owned(name, decl.writable, ty, owned);
         context.push_statement(mir::Statement::AssignLocal {
             target: local,
             value: mir::Rvalue::Mixed(value),
@@ -3684,7 +3693,7 @@ fn lower_var_decl(decl: &hir::VarDecl, context: &mut LoweringContext) -> Diagnos
     }
     if ty == mir::Type::NullableMixed {
         let value = lower_nullable_mixed_expression(&decl.initializer, true, context)?;
-        let local = context.declare_user_local_owned(&decl.name, decl.writable, ty, true);
+        let local = context.declare_user_local_owned(name, decl.writable, ty, true);
         context.push_statement(mir::Statement::AssignLocal {
             target: local,
             value: mir::Rvalue::NullableMixed(value),
@@ -3694,7 +3703,7 @@ fn lower_var_decl(decl: &hir::VarDecl, context: &mut LoweringContext) -> Diagnos
     if let mir::Type::Class(class) = ty {
         let value = lower_class_expression(&decl.initializer, class, true, context)?;
         let owned = !value.borrows_class_value();
-        let local = context.declare_user_local_owned(&decl.name, decl.writable, ty, owned);
+        let local = context.declare_user_local_owned(name, decl.writable, ty, owned);
         context.push_statement(mir::Statement::AssignLocal {
             target: local,
             value: mir::Rvalue::Class(value),
@@ -3703,7 +3712,7 @@ fn lower_var_decl(decl: &hir::VarDecl, context: &mut LoweringContext) -> Diagnos
     }
     if let mir::Type::SharedReference(class) = ty {
         let value = lower_shared_reference_expression(&decl.initializer, class, true, context)?;
-        let local = context.declare_user_local(&decl.name, decl.writable, ty);
+        let local = context.declare_user_local(name, decl.writable, ty);
         context.push_statement(mir::Statement::AssignLocal {
             target: local,
             value: mir::Rvalue::SharedReference(value),
@@ -3712,7 +3721,7 @@ fn lower_var_decl(decl: &hir::VarDecl, context: &mut LoweringContext) -> Diagnos
     }
     if let mir::Type::WeakReference(class) = ty {
         let value = lower_weak_reference_expression(&decl.initializer, class, true, context)?;
-        let local = context.declare_user_local(&decl.name, decl.writable, ty);
+        let local = context.declare_user_local(name, decl.writable, ty);
         context.push_statement(mir::Statement::AssignLocal {
             target: local,
             value: mir::Rvalue::WeakReference(value),
@@ -3723,7 +3732,7 @@ fn lower_var_decl(decl: &hir::VarDecl, context: &mut LoweringContext) -> Diagnos
         let value =
             lower_nullable_shared_reference_expression(&decl.initializer, class, true, context)?;
         let owned = decl.writable || value.owned_temporary().is_some();
-        let local = context.declare_user_local_owned(&decl.name, decl.writable, ty, owned);
+        let local = context.declare_user_local_owned(name, decl.writable, ty, owned);
         context.push_statement(mir::Statement::AssignLocal {
             target: local,
             value: mir::Rvalue::NullableSharedReference(value),
@@ -3734,7 +3743,7 @@ fn lower_var_decl(decl: &hir::VarDecl, context: &mut LoweringContext) -> Diagnos
         let value =
             lower_nullable_weak_reference_expression(&decl.initializer, class, true, context)?;
         let owned = decl.writable || value.owned_temporary().is_some();
-        let local = context.declare_user_local_owned(&decl.name, decl.writable, ty, owned);
+        let local = context.declare_user_local_owned(name, decl.writable, ty, owned);
         context.push_statement(mir::Statement::AssignLocal {
             target: local,
             value: mir::Rvalue::NullableWeakReference(value),
@@ -3744,7 +3753,7 @@ fn lower_var_decl(decl: &hir::VarDecl, context: &mut LoweringContext) -> Diagnos
     if let mir::Type::WritableSharedReference(payload) = ty {
         let value =
             lower_writable_shared_reference_expression(&decl.initializer, payload, true, context)?;
-        let local = context.declare_user_local(&decl.name, decl.writable, ty);
+        let local = context.declare_user_local(name, decl.writable, ty);
         context.push_statement(mir::Statement::AssignLocal {
             target: local,
             value: mir::Rvalue::WritableSharedReference(value),
@@ -3754,7 +3763,7 @@ fn lower_var_decl(decl: &hir::VarDecl, context: &mut LoweringContext) -> Diagnos
     if let mir::Type::WritableWeakReference(payload) = ty {
         let value =
             lower_writable_weak_reference_expression(&decl.initializer, payload, true, context)?;
-        let local = context.declare_user_local(&decl.name, decl.writable, ty);
+        let local = context.declare_user_local(name, decl.writable, ty);
         context.push_statement(mir::Statement::AssignLocal {
             target: local,
             value: mir::Rvalue::WritableWeakReference(value),
@@ -3768,7 +3777,7 @@ fn lower_var_decl(decl: &hir::VarDecl, context: &mut LoweringContext) -> Diagnos
             true,
             context,
         )?;
-        let local = context.declare_user_local_owned(&decl.name, decl.writable, ty, true);
+        let local = context.declare_user_local_owned(name, decl.writable, ty, true);
         context.push_statement(mir::Statement::AssignLocal {
             target: local,
             value: mir::Rvalue::NullableWritableSharedReference(value),
@@ -3782,7 +3791,7 @@ fn lower_var_decl(decl: &hir::VarDecl, context: &mut LoweringContext) -> Diagnos
             true,
             context,
         )?;
-        let local = context.declare_user_local_owned(&decl.name, decl.writable, ty, true);
+        let local = context.declare_user_local_owned(name, decl.writable, ty, true);
         context.push_statement(mir::Statement::AssignLocal {
             target: local,
             value: mir::Rvalue::NullableWritableWeakReference(value),
@@ -3800,7 +3809,7 @@ fn lower_var_decl(decl: &hir::VarDecl, context: &mut LoweringContext) -> Diagnos
             true,
             context,
         )?;
-        let local = context.declare_user_local(&decl.name, decl.writable, ty);
+        let local = context.declare_user_local(name, decl.writable, ty);
         context.push_statement(mir::Statement::AssignLocal {
             target: local,
             value: mir::Rvalue::SharedReferenceAccess(value),
@@ -3818,7 +3827,7 @@ fn lower_var_decl(decl: &hir::VarDecl, context: &mut LoweringContext) -> Diagnos
             true,
             context,
         )?;
-        let local = context.declare_user_local_owned(&decl.name, decl.writable, ty, true);
+        let local = context.declare_user_local_owned(name, decl.writable, ty, true);
         context.push_statement(mir::Statement::AssignLocal {
             target: local,
             value: mir::Rvalue::NullableSharedReferenceAccess(value),
@@ -3827,7 +3836,7 @@ fn lower_var_decl(decl: &hir::VarDecl, context: &mut LoweringContext) -> Diagnos
     }
     if let mir::Type::Collection(collection) = ty {
         let value = lower_collection_expression(&decl.initializer, collection, true, context)?;
-        let local = context.declare_user_local(&decl.name, decl.writable, ty);
+        let local = context.declare_user_local(name, decl.writable, ty);
         context.push_statement(mir::Statement::AssignLocal {
             target: local,
             value: mir::Rvalue::Collection(value),
@@ -3837,7 +3846,7 @@ fn lower_var_decl(decl: &hir::VarDecl, context: &mut LoweringContext) -> Diagnos
     if let mir::Type::NullableCollection(collection) = ty {
         let value =
             lower_nullable_collection_expression(&decl.initializer, collection, true, context)?;
-        let local = context.declare_user_local_owned(&decl.name, decl.writable, ty, true);
+        let local = context.declare_user_local_owned(name, decl.writable, ty, true);
         context.push_statement(mir::Statement::AssignLocal {
             target: local,
             value: mir::Rvalue::NullableCollection(value),
@@ -3850,12 +3859,115 @@ fn lower_var_decl(decl: &hir::VarDecl, context: &mut LoweringContext) -> Diagnos
     };
     let value = lower_value_expression(&decl.initializer, context)?;
     ensure_value_type(&value, scalar_type, decl.initializer.span())?;
-    let local =
-        context.declare_user_local(&decl.name, decl.writable, mir::Type::Scalar(scalar_type));
+    let local = context.declare_user_local(name, decl.writable, mir::Type::Scalar(scalar_type));
     context.push_statement(mir::Statement::AssignLocal {
         target: local,
         value: mir::Rvalue::Value(value),
     });
+    Ok(())
+}
+
+fn lower_grouped_var_decl(
+    decl: &hir::VarDecl,
+    ty: mir::Type,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<()> {
+    let value = match ty {
+        mir::Type::Scalar(scalar) => {
+            let value = lower_value_expression(&decl.initializer, context)?;
+            ensure_value_type(&value, scalar, decl.initializer.span())?;
+            mir::Rvalue::Value(value)
+        }
+        mir::Type::String => {
+            mir::Rvalue::String(lower_string_expression(&decl.initializer, context)?)
+        }
+        mir::Type::NullableScalar(scalar) => mir::Rvalue::NullableScalar(
+            lower_nullable_scalar_expression(&decl.initializer, scalar, context)?,
+        ),
+        mir::Type::NullableString => mir::Rvalue::NullableString(lower_nullable_string_expression(
+            &decl.initializer,
+            context,
+        )?),
+        mir::Type::NullableMixed => mir::Rvalue::NullableMixed(lower_nullable_mixed_expression(
+            &decl.initializer,
+            true,
+            context,
+        )?),
+        mir::Type::NullableClass(class) => mir::Rvalue::NullableClass(
+            lower_nullable_class_expression(&decl.initializer, class, true, context)?,
+        ),
+        mir::Type::NullableSharedReference(class) => mir::Rvalue::NullableSharedReference(
+            lower_nullable_shared_reference_expression(&decl.initializer, class, true, context)?,
+        ),
+        mir::Type::NullableWeakReference(class) => mir::Rvalue::NullableWeakReference(
+            lower_nullable_weak_reference_expression(&decl.initializer, class, true, context)?,
+        ),
+        mir::Type::NullableWritableSharedReference(payload) => {
+            mir::Rvalue::NullableWritableSharedReference(
+                lower_nullable_writable_shared_reference_expression(
+                    &decl.initializer,
+                    payload,
+                    true,
+                    context,
+                )?,
+            )
+        }
+        mir::Type::NullableWritableWeakReference(payload) => {
+            mir::Rvalue::NullableWritableWeakReference(
+                lower_nullable_writable_weak_reference_expression(
+                    &decl.initializer,
+                    payload,
+                    true,
+                    context,
+                )?,
+            )
+        }
+        mir::Type::NullableReadonlySharedReferenceAccess(payload)
+        | mir::Type::NullableWritableSharedReferenceAccess(payload) => {
+            let writable = matches!(ty, mir::Type::NullableWritableSharedReferenceAccess(_));
+            mir::Rvalue::NullableSharedReferenceAccess(
+                lower_nullable_shared_reference_access_expression(
+                    &decl.initializer,
+                    payload,
+                    writable,
+                    true,
+                    context,
+                )?,
+            )
+        }
+        mir::Type::NullableCollection(collection) => mir::Rvalue::NullableCollection(
+            lower_nullable_collection_expression(&decl.initializer, collection, true, context)?,
+        ),
+        mir::Type::Mixed
+        | mir::Type::Class(_)
+        | mir::Type::SharedReference(_)
+        | mir::Type::WeakReference(_)
+        | mir::Type::WritableSharedReference(_)
+        | mir::Type::WritableWeakReference(_)
+        | mir::Type::ReadonlySharedReferenceAccess(_)
+        | mir::Type::WritableSharedReferenceAccess(_)
+        | mir::Type::Collection(_) => {
+            return Err(vec![Diagnostic::new(
+                "I2601",
+                "internal compiler consistency error: grouped move-value declaration reached MIR lowering",
+                decl.span,
+            )]);
+        }
+    };
+
+    let targets = decl
+        .bindings
+        .iter()
+        .map(|binding| {
+            context.declare_user_local_owned(
+                &binding.name,
+                decl.writable,
+                ty,
+                ty.has_move_ownership(),
+            )
+        })
+        .collect();
+    context.push_statement(mir::Statement::AssignLocalGroup { targets, value });
     Ok(())
 }
 
@@ -3949,7 +4061,12 @@ fn lower_string_var_decl(
     context: &mut LoweringContext,
 ) -> DiagnosticResult<()> {
     let value = lower_string_expression(&decl.initializer, context)?;
-    let local = context.declare_user_local(&decl.name, decl.writable, mir::Type::String);
+    let name = &decl
+        .bindings
+        .first()
+        .expect("string local declaration must contain one binding")
+        .name;
+    let local = context.declare_user_local(name, decl.writable, mir::Type::String);
     context.push_statement(mir::Statement::AssignLocal {
         target: local,
         value: mir::Rvalue::String(value),

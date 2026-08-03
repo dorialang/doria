@@ -75,6 +75,9 @@ runtime access-check cost.
   beside ascending sorted variants, a min-first priority queue, and one deque
   that handles both FIFO and LIFO workflows. Collection ordering and ownership
   remain identical across the debug, native, and compatibility backends.
+- **Concise initialization without hidden work.** Grouped locals such as
+  `let writable $red, $green, $blue = 0;` evaluate one Copy initializer once,
+  create independent bindings in source order, and never hide cloning, sharing, or a runtime tuple.
 
 ## What people build with it
 

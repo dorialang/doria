@@ -400,6 +400,7 @@ enum EvaluationTask {
     NullableWritableWeakReference(mir::NullableWritableWeakReferenceExpression),
     SharedReferenceAccess(mir::SharedReferenceAccessExpression),
     NullableSharedReferenceAccess(mir::NullableSharedReferenceAccessExpression),
+    AssignGroup(Vec<mir::LocalId>),
     BuildSharedReference(crate::class_layout::ClassId),
     BuildNullableSharedSome(crate::class_layout::ClassId),
     BuildNullableWeakSome(crate::class_layout::ClassId),
@@ -1035,6 +1036,11 @@ impl Interpreter<'_> {
         statement: mir::Statement,
     ) -> Result<StepOutcome, InterpreterError> {
         match statement {
+            mir::Statement::AssignLocalGroup { targets, value } => {
+                let frame = self.current_frame_mut()?;
+                frame.tasks.push(EvaluationTask::AssignGroup(targets));
+                frame.tasks.push(EvaluationTask::Rvalue(value));
+            }
             mir::Statement::AssignLocal { target, value } => {
                 let definition = local_in(function, target)?;
                 match (definition.ty, value) {
@@ -4500,6 +4506,23 @@ impl Interpreter<'_> {
                 if owned {
                     if let Some(value) = old {
                         self.queue_value_drops(value)?;
+                    }
+                }
+            }
+            EvaluationTask::AssignGroup(targets) => {
+                let value = self.pop_local_value()?;
+                let function = function_in(self.program, self.current_frame()?.function)?;
+                for target in targets {
+                    let old = assign_local(
+                        &function.locals,
+                        &mut self.current_frame_mut()?.locals,
+                        target,
+                        value.clone(),
+                    )?;
+                    if old.is_some() {
+                        return Err(InterpreterError::new(
+                            "grouped local initializer targets an initialized local",
+                        ));
                     }
                 }
             }

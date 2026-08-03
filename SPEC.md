@@ -246,6 +246,28 @@ string $city = "Lusaka";
 writable int $score = 0;
 ```
 
+Two or more local bindings may share one declaration initializer:
+
+```doria
+let $left, $right = 0;
+let writable $red, $green, $blue = 0;
+int $minimum, $maximum = 0;
+writable int $x, $y = 0;
+```
+
+The initializer is evaluated exactly once before any group name enters scope,
+then the independent bindings initialize from left to right. One inferred or
+explicit type and one mutability mode apply to the complete group. Copy scalars
+and immutable strings are eligible; string handles are retained without copying
+their contents. Move values are rejected rather than implicitly cloned or
+shared. An explicitly typed nullable move group may begin as literal `null`, for
+example `?Token $left, $right = null;`; an untyped grouped `null` is rejected.
+Still-live locals clean up in reverse order. A group has no runtime object and
+does not permit a trailing comma or per-binding types, mutability, or
+initializers. Grouping is local-only; it is not destructuring and does not apply
+to properties, parameters, promotions, statics, constants, `foreach` bindings,
+or closure captures. Decision 0111 records the complete contract.
+
 Bare assignment never declares a variable:
 
 ```doria

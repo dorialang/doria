@@ -163,8 +163,17 @@ pub enum Stmt {
 pub struct VarDecl {
     pub writable: bool,
     pub ty: Option<TypeRef>,
-    pub name: String,
+    /// Local bindings in source order. A declaration always has at least one
+    /// binding; grouped declarations keep one shared initializer here rather
+    /// than cloning the expression for each name.
+    pub bindings: Vec<VarBinding>,
     pub initializer: Expr,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct VarBinding {
+    pub name: String,
     pub span: Span,
 }
 

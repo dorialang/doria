@@ -130,8 +130,14 @@ pub enum Stmt {
 pub struct VarDecl {
     pub writable: bool,
     pub ty: Option<TypeRef>,
-    pub name: String,
+    pub bindings: Vec<VarBinding>,
     pub initializer: Expr,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct VarBinding {
+    pub name: String,
     pub span: Span,
 }
 

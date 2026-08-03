@@ -1844,8 +1844,18 @@ fn emit_statement(
         Stmt::Block(block) => emit_block(block, output, indent, scopes),
         Stmt::VarDecl(decl) => {
             let initializer = emit_expr(&decl.initializer, scopes);
-            let php_name = scopes.declare(&decl.name);
-            writeln(output, indent, &format!("${php_name} = {initializer};"));
+            if decl.bindings.len() == 1 {
+                let php_name = scopes.declare(&decl.bindings[0].name);
+                writeln(output, indent, &format!("${php_name} = {initializer};"));
+            } else {
+                let temporary = scopes.fresh_temp("__doria_grouped_value");
+                writeln(output, indent, &format!("${temporary} = {initializer};"));
+                for binding in &decl.bindings {
+                    let php_name = scopes.declare(&binding.name);
+                    writeln(output, indent, &format!("${php_name} = ${temporary};"));
+                }
+                writeln(output, indent, &format!("unset(${temporary});"));
+            }
         }
         Stmt::Assignment(assignment) => {
             if assignment.op == AssignOp::DivAssign {
@@ -1995,8 +2005,23 @@ fn emit_for_initializer(initializer: &ForInitializer, scopes: &mut PhpNameScopes
     match initializer {
         ForInitializer::VarDecl(decl) => {
             let initializer = emit_expr(&decl.initializer, scopes);
-            let php_name = scopes.declare(&decl.name);
-            format!("${php_name} = {initializer}")
+            if decl.bindings.len() == 1 {
+                let php_name = scopes.declare(&decl.bindings[0].name);
+                format!("${php_name} = {initializer}")
+            } else {
+                let temporary = scopes.fresh_temp("__doria_grouped_value");
+                let mut expressions = vec![format!("${temporary} = {initializer}")];
+                expressions.extend(decl.bindings.iter().map(|binding| {
+                    let php_name = scopes.declare(&binding.name);
+                    format!("${php_name} = ${temporary}")
+                }));
+                // PHP's for-initializer accepts a comma-separated expression
+                // list. Clearing the collision-safe temporary releases its
+                // string handle after the ordered copies, matching Doria's
+                // statement-end temporary lifetime without a chained assign.
+                expressions.push(format!("${temporary} = null"));
+                expressions.join(", ")
+            }
         }
         ForInitializer::Assignment(assignment) => emit_assignment(assignment, scopes),
     }

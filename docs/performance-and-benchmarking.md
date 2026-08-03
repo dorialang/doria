@@ -20,6 +20,93 @@ stored inline without per-element allocation. Deterministic bounded runtime test
 compare these structures with `BTreeMap`, `BTreeSet`, `BinaryHeap<Reverse<_>>`,
 and `VecDeque`; those Rust types are test oracles, not public semantics.
 
+## Stage 26a grouped-local contract
+
+Grouped local declarations are syntax sugar with no runtime grouping
+abstraction. The initializer evaluates once; scalar copies match separate locals
+initialized from that result; string bindings retain the same immutable runtime
+handle without duplicating contents. Grouping alone creates no tuple,
+collection, heap allocation, dynamic dispatch, or async-runtime interaction.
+The canonical MIR node records ordered initialization for validation and is
+eligible for ordinary optimization; no group value survives in generated code.
+
+## Stage 26b performance baseline foundation
+
+Stage 26b is next. It establishes one repository-owned measurement system and
+accepted baselines that later stages extend. It is not an unlimited optimization
+campaign and does not displace Stage 36a's stream gate.
+
+The runner has three separate tracks:
+
+```text
+Compiler Performance
+- parse time
+- semantic-analysis time
+- MIR-lowering time
+- Cranelift code-generation time
+- LLVM code-generation time
+- link time
+- total compile time
+- compiler peak RSS
+- generic specialization count
+
+Generated-Program Performance
+- cold startup
+- hot throughput and latency
+- wall, user, and system time
+- peak RSS
+- allocation count where available
+- binary and stripped-binary size
+- compressed artifact size where useful
+- correctness output or hash
+
+Runtime-Subsystem Performance
+- strings, objects, and methods
+- ownership and collections
+- generics and shared ownership
+- streams, async, and FFI when their owning stages land
+```
+
+The Cranelift development profile prioritizes fast compilation, fast linking,
+responsive iteration, and acceptable runtime performance. The LLVM release
+profile prioritizes runtime performance, low memory use, strong optimization,
+and reasonable artifact size. The interpreter remains the semantic oracle and
+regression target, not a native performance competitor.
+
+Initial executable cases are `hello_world`, `startup`, `fibonacci`, `primes`,
+`integer_arithmetic`, `string_interpolation`, `string_search`,
+`list_operations`, `dictionary_lookup`, `set_membership`,
+`sorted_dictionary`, `sorted_set`, `priority_queue`, `deque`,
+`object_construction`, `method_calls`, `generic_specialization`,
+`shared_reference`, and `writable_shared_access`. Cases requiring closures,
+JSON, routing, templating, raylib, async, networking, or streams join only when
+their owning stages land.
+
+The initial comparison set is C, Rust, and PHP: C and Rust are native baselines;
+PHP is the central adoption comparison. C++, Java, C#, JavaScript, and Python may
+join after the runner and fairness rules stabilize. The project-owned runner
+uses the existing sibling `benchmarks` repository's `bench.php` entry point and
+flat peer-source case layout; a future `baton bench` orchestrates the same
+benchmark engine instead of creating another one.
+
+Correctness passes before timing is accepted. Every report records versions,
+flags, machine, inputs, runner identity, and profile. Cold startup remains
+separate from hot throughput, compile time remains separate from runtime, and
+unfavorable results remain visible. Curated reports may be committed; raw
+generated results normally are not. Shared CI owns deterministic structural
+checks; controlled runners own timing thresholds. Public claims remain specific
+to the measured workload.
+
+## Continuous performance impact rule
+
+Every later stage that changes runtime representation, allocation, ownership,
+dispatch, code generation, control flow, I/O, concurrency, or FFI records a
+`Performance Impact` section covering expected cost; allocation, copying,
+dispatch, memory, and code-size changes; benchmark cases added or updated; and
+measured evidence where material. “No measurable impact expected” is permitted
+only as a checkable claim. Ordinary shared CI does not use brittle wall-clock
+thresholds.
+
 ---
 
 ## 1. Performance expectation

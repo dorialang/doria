@@ -38,6 +38,7 @@ Source of truth for sequencing remains `docs/doria-end-to-end-plan.md`. The dura
 | `break` / `continue` | Covered | Covered | Covered | Covered | Nested loop targets and loop-specific continue blocks are covered. |
 | Standalone lexical blocks | Covered | Covered | Covered | Covered | Nested scopes and shared-access boundaries clean up on fallthrough and every structured exit; panic remains abort-only. |
 | Traditional `for` | Covered | Covered | Covered | Covered | `continue` reaches the increment block. |
+| Grouped local declarations | Covered | Covered | Covered | Covered | One canonical MIR initializer evaluates once; ordered independent Copy bindings, string retains, and typed nullable-move `null` agree exactly. |
 | Integer range `foreach` | Covered | Covered | Covered | Covered | Inclusive/exclusive ranges and terminal overflow guards are covered. |
 | Top-level integer helpers | Covered | Covered | Covered | Covered | Parameters and returns preserve every declared width and signedness. |
 | Void helper calls | Covered | Covered | Covered | Covered | Shared stdout preserves source call order. |
@@ -143,7 +144,10 @@ Source of truth for sequencing remains `docs/doria-end-to-end-plan.md`. The dura
 
 The durable Stage 26 fixture covers unsorted map/set construction, ascending
 iteration, min-first priority removal, deque front/back mutation, and
-front-to-back iteration across the interpreter, Cranelift, and LLVM.
+front-to-back iteration across the interpreter, Cranelift, and LLVM. The Stage
+26a fixture covers all four grouped-local prefixes, one-time side effects,
+independent writable bindings, shared immutable strings, and nullable empty
+move bindings across the same three execution paths.
 
 Status: Passed through Stage 22 after this branch's full validation gates pass.
 

@@ -2844,6 +2844,12 @@ pub enum Statement {
         target: LocalId,
         value: Rvalue,
     },
+    /// Evaluates `value` once, then initializes every target from left to right.
+    /// Validation restricts this to Copy values and nullable move-type `null`.
+    AssignLocalGroup {
+        targets: Vec<LocalId>,
+        value: Rvalue,
+    },
     EchoStringLiteral(String),
     EchoString(StringExpression),
     CallVoid {
@@ -2988,6 +2994,7 @@ pub(crate) fn class_temporary_capacity(function: &Function) -> usize {
 fn statement_class_temporary_capacity(statement: &Statement) -> usize {
     match statement {
         Statement::AssignLocal { value, .. }
+        | Statement::AssignLocalGroup { value, .. }
         | Statement::AssignProperty { value, .. }
         | Statement::AssignStatic { value, .. } => rvalue_class_temporary_capacity(value),
         Statement::CollectionAdd { value, .. } => rvalue_class_temporary_capacity(value),
@@ -4823,6 +4830,16 @@ impl fmt::Display for Statement {
         match self {
             Statement::AssignLocal { target, value } => {
                 write!(formatter, "local{} = {value}", target.0)
+            }
+            Statement::AssignLocalGroup { targets, value } => {
+                write!(formatter, "group [")?;
+                for (index, target) in targets.iter().enumerate() {
+                    if index > 0 {
+                        write!(formatter, ", ")?;
+                    }
+                    write!(formatter, "local{}", target.0)?;
+                }
+                write!(formatter, "] = {value}")
             }
             Statement::EchoStringLiteral(value) => {
                 write!(formatter, "echo \"{}\"", escape_debug_string(value))

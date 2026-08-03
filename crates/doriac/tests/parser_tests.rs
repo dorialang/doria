@@ -107,11 +107,13 @@ int[] $numbers = [1, 2, 3];
     assert_eq!(program.items.len(), 5);
     assert!(matches!(
         &program.items[0],
-        Item::Statement(Stmt::VarDecl(decl)) if !decl.writable && decl.name == "x"
+        Item::Statement(Stmt::VarDecl(decl))
+            if !decl.writable && decl.bindings.len() == 1 && decl.bindings[0].name == "x"
     ));
     assert!(matches!(
         &program.items[1],
-        Item::Statement(Stmt::VarDecl(decl)) if decl.writable && decl.name == "name"
+        Item::Statement(Stmt::VarDecl(decl))
+            if decl.writable && decl.bindings.len() == 1 && decl.bindings[0].name == "name"
     ));
     assert!(matches!(
         &program.items[2],
@@ -121,14 +123,16 @@ int[] $numbers = [1, 2, 3];
         &program.items[3],
         Item::Statement(Stmt::VarDecl(decl))
             if !decl.writable
-                && decl.name == "empty"
+                && decl.bindings.len() == 1
+                && decl.bindings[0].name == "empty"
                 && matches!(decl.ty.as_ref(), Some(ty) if ty.name == "null")
     ));
     assert!(matches!(
         &program.items[4],
         Item::Statement(Stmt::VarDecl(decl))
             if !decl.writable
-                && decl.name == "numbers"
+                && decl.bindings.len() == 1
+                && decl.bindings[0].name == "numbers"
                 && matches!(decl.ty.as_ref(), Some(ty)
                     if ty.name == "[]"
                         && ty.type_argument_count() == 1
@@ -893,7 +897,8 @@ $i--;
     };
     assert!(matches!(
         &first_for.initializer,
-        Some(ForInitializer::VarDecl(decl)) if decl.writable && decl.name == "i"
+        Some(ForInitializer::VarDecl(decl))
+            if decl.writable && decl.bindings.len() == 1 && decl.bindings[0].name == "i"
     ));
     assert!(matches!(first_for.condition, Some(Expr::Binary { .. })));
     assert!(matches!(
