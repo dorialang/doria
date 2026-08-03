@@ -1,0 +1,36 @@
+function number(): int
+{
+    echo "number\n";
+    return 7;
+}
+
+function text(): string
+{
+    echo "text\n";
+    return "shared";
+}
+
+class Token
+{
+    function __construct()
+    {
+    }
+}
+
+function main(): void
+{
+    let $first, $second = number();
+    let writable $third, $fourth = number();
+    int $fifth, $sixth = number();
+    writable int $seventh, $eighth = number();
+    let $left, $right = text();
+    ?Token $emptyLeft, $emptyRight = null;
+
+    $third = 8;
+    $eighth = 9;
+    echo "{$first}{$second}{$third}{$fourth}{$fifth}{$sixth}{$seventh}{$eighth}\n";
+    echo "{$left}:{$right}\n";
+    if ($emptyLeft == null && $emptyRight == null) {
+        echo "empty\n";
+    }
+}

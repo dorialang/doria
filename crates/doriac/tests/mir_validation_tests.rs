@@ -68,6 +68,47 @@ fn shared_validator_rejects_noncanonical_bool_operands() {
 }
 
 #[test]
+fn shared_validator_enforces_grouped_local_invariants() {
+    let mut valid = valid_void_program();
+    valid.functions[0].locals = (0..2)
+        .map(|index| Local {
+            id: LocalId(index),
+            name: format!("value{index}"),
+            ty: Type::Scalar(ScalarType::Integer(IntegerType::Int64)),
+            writable: false,
+            owned: false,
+            synthetic: false,
+        })
+        .collect();
+    valid.functions[0].blocks[0].statements = vec![Statement::AssignLocalGroup {
+        targets: vec![LocalId(0), LocalId(1)],
+        value: Rvalue::Value(ValueExpression::Integer(IntegerExpression::constant(
+            IntegerValue::from_bits(IntegerType::Int64, 1),
+        ))),
+    }];
+    doriac::mir_validation::validate_program(&valid)
+        .expect("a canonical Copy-valued local group should validate");
+
+    for (targets, expected) in [
+        (vec![LocalId(0)], "at least two targets"),
+        (vec![LocalId(0), LocalId(0)], "repeats local0"),
+        (vec![LocalId(1), LocalId(0)], "follow declaration order"),
+    ] {
+        let mut malformed = valid.clone();
+        let Statement::AssignLocalGroup {
+            targets: actual, ..
+        } = &mut malformed.functions[0].blocks[0].statements[0]
+        else {
+            unreachable!()
+        };
+        *actual = targets;
+        let error = doriac::mir_validation::validate_program(&malformed)
+            .expect_err("malformed grouped assignment must be rejected");
+        assert!(error.message.contains(expected), "{}", error.message);
+    }
+}
+
+#[test]
 fn shared_validator_rejects_malformed_string_intrinsic_signatures() {
     let malformed = [
         StringIntrinsicCall {

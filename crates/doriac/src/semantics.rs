@@ -2121,16 +2121,18 @@ impl<'program> Checker<'program> {
                     scopes,
                     method_context,
                 );
-                let _ = scopes.declare(
-                    decl.name.clone(),
-                    Binding {
-                        writable: decl.writable,
-                        ty,
-                        declared_ty: ty,
-                        int_constant: None,
-                        string_constant: None,
-                    },
-                );
+                for binding in &decl.bindings {
+                    let _ = scopes.declare(
+                        binding.name.clone(),
+                        Binding {
+                            writable: decl.writable,
+                            ty,
+                            declared_ty: ty,
+                            int_constant: None,
+                            string_constant: None,
+                        },
+                    );
+                }
                 None
             }
             Stmt::Assignment(assignment) => {
@@ -2252,16 +2254,18 @@ impl<'program> Checker<'program> {
                     scopes,
                     method_context,
                 );
-                let _ = scopes.declare(
-                    decl.name.clone(),
-                    Binding {
-                        writable: decl.writable,
-                        ty,
-                        declared_ty: ty,
-                        int_constant: None,
-                        string_constant: None,
-                    },
-                );
+                for binding in &decl.bindings {
+                    let _ = scopes.declare(
+                        binding.name.clone(),
+                        Binding {
+                            writable: decl.writable,
+                            ty,
+                            declared_ty: ty,
+                            int_constant: None,
+                            string_constant: None,
+                        },
+                    );
+                }
             }
             ForInitializer::Assignment(assignment) => {
                 self.infer_move_return_from_assignment(assignment, scopes, method_context);
@@ -3187,65 +3191,7 @@ impl<'program> Checker<'program> {
                 );
             }
             Stmt::VarDecl(decl) => {
-                self.check_expr(&decl.initializer, scopes, method_context);
-                let value_ty = self.infer_expr_type(&decl.initializer, scopes, method_context);
-                let ty = match &decl.ty {
-                    Some(ty) => {
-                        let target_ty = self.resolve_type_ref(ty, decl.span);
-                        self.check_expr_assignable(
-                            target_ty,
-                            &decl.initializer,
-                            scopes,
-                            method_context,
-                            AssignmentDestination::Type,
-                        );
-                        target_ty
-                    }
-                    None => {
-                        if let TypeKind::Integer(integer) = *self.types.kind(value_ty) {
-                            self.contextualize_integer_literals(&decl.initializer, integer);
-                        }
-                        if self.stage26_collection_has_unknown_arguments(value_ty) {
-                            self.diagnostics.push(
-                                Diagnostic::new(
-                                    "E0539",
-                                    "an empty collection source does not reveal the destination element type",
-                                    decl.initializer.span(),
-                                )
-                                .with_title("Collection Type Cannot Be Inferred")
-                                .with_explanation(
-                                    "An empty source contains no element or key/value pair from which to infer the generic arguments.",
-                                )
-                                .with_help(
-                                    "add an explicit destination type, for example `Deque<int> $values = Deque::from([])`",
-                                ),
-                            );
-                        }
-                        value_ty
-                    }
-                };
-                self.declare_binding(
-                    scopes,
-                    decl.name.clone(),
-                    Binding {
-                        writable: decl.writable,
-                        ty,
-                        declared_ty: ty,
-                        int_constant: self.readonly_int_constant(
-                            decl.writable,
-                            ty,
-                            &decl.initializer,
-                            scopes,
-                        ),
-                        string_constant: self.readonly_string_constant(
-                            decl.writable,
-                            ty,
-                            &decl.initializer,
-                            scopes,
-                        ),
-                    },
-                    decl.span,
-                );
+                self.check_local_declaration(decl, scopes, method_context);
             }
             Stmt::Assignment(assignment) => {
                 self.check_expr(&assignment.value, scopes, method_context);
@@ -3609,6 +3555,142 @@ impl<'program> Checker<'program> {
         }
     }
 
+    fn check_local_declaration(
+        &mut self,
+        decl: &VarDecl,
+        scopes: &mut ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) {
+        let diagnostics_before = self.diagnostics.len();
+        self.check_expr(&decl.initializer, scopes, method_context);
+        let value_ty = self.infer_expr_type(&decl.initializer, scopes, method_context);
+        let ty = match &decl.ty {
+            Some(ty) => {
+                let target_ty = self.resolve_type_ref(ty, decl.span);
+                self.check_expr_assignable(
+                    target_ty,
+                    &decl.initializer,
+                    scopes,
+                    method_context,
+                    AssignmentDestination::Type,
+                );
+                target_ty
+            }
+            None => {
+                if let TypeKind::Integer(integer) = *self.types.kind(value_ty) {
+                    self.contextualize_integer_literals(&decl.initializer, integer);
+                }
+                if self.stage26_collection_has_unknown_arguments(value_ty) {
+                    self.diagnostics.push(
+                        Diagnostic::new(
+                            "E0539",
+                            "an empty collection source does not reveal the destination element type",
+                            decl.initializer.span(),
+                        )
+                        .with_title("Collection Type Cannot Be Inferred")
+                        .with_explanation(
+                            "An empty source contains no element or key/value pair from which to infer the generic arguments.",
+                        )
+                        .with_help(
+                            "add an explicit destination type, for example `Deque<int> $values = Deque::from([])`",
+                        ),
+                    );
+                }
+                value_ty
+            }
+        };
+
+        let grouped = decl.bindings.len() > 1;
+        if grouped && decl.ty.is_none() && Self::is_null_literal(&decl.initializer) {
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "E0552",
+                    "`null` does not reveal the nullable payload type shared by this local group",
+                    decl.initializer.span(),
+                )
+                .with_title("Grouped Null Declaration Needs An Explicit Type")
+                .with_explanation(
+                    "Each empty binding needs the same explicit nullable type; Doria does not widen an untyped null group to `mixed`.",
+                )
+                .with_help("write an explicit nullable type before the grouped bindings"),
+            );
+        } else if grouped && self.type_is_move_type(ty) {
+            let explicitly_empty_nullable = decl.ty.is_some()
+                && Self::is_null_literal(&decl.initializer)
+                && matches!(self.types.kind(ty), TypeKind::Nullable(_));
+            if !explicitly_empty_nullable {
+                self.diagnostics.push(
+                    Diagnostic::new(
+                        "E0551",
+                        "one owned initializer cannot initialize several independent local bindings",
+                        decl.initializer.span(),
+                    )
+                    .with_title("Initializer Cannot Create Multiple Owned Bindings")
+                    .with_explanation(format!(
+                        "The initializer has move type `{}`, so copying it would create more than one owner of the same value.",
+                        self.types.display(ty)
+                    ))
+                    .with_help(
+                        "create each owned value explicitly, or use explicit shared ownership when the bindings should refer to one allocation",
+                    ),
+                );
+            }
+        }
+
+        if grouped {
+            let mut names = HashMap::<&str, Span>::new();
+            for binding in &decl.bindings {
+                if let Some(original) = names.insert(&binding.name, binding.span) {
+                    self.diagnostics.push(
+                        Diagnostic::new(
+                            "E0103",
+                            format!(
+                                "variable `${}` is already declared in this local group",
+                                binding.name
+                            ),
+                            binding.span,
+                        )
+                        .with_related(original, "the first binding with this name is here"),
+                    );
+                } else if scopes.contains_in_current_scope(&binding.name) {
+                    self.diagnostics.push(Diagnostic::new(
+                        "E0103",
+                        format!(
+                            "variable `${}` is already declared in this scope",
+                            binding.name
+                        ),
+                        binding.span,
+                    ));
+                }
+            }
+
+            // A grouped declaration is atomic. Its initializer is checked in
+            // the previous scope, and no name from the group is introduced if
+            // any part of the declaration is invalid.
+            if self.diagnostics.len() != diagnostics_before {
+                return;
+            }
+        }
+
+        let int_constant = self.readonly_int_constant(decl.writable, ty, &decl.initializer, scopes);
+        let string_constant =
+            self.readonly_string_constant(decl.writable, ty, &decl.initializer, scopes);
+        for binding in &decl.bindings {
+            self.declare_binding(
+                scopes,
+                binding.name.clone(),
+                Binding {
+                    writable: decl.writable,
+                    ty,
+                    declared_ty: ty,
+                    int_constant,
+                    string_constant: string_constant.clone(),
+                },
+                binding.span,
+            );
+        }
+    }
+
     fn check_for_initializer(
         &mut self,
         initializer: &ForInitializer,
@@ -3618,49 +3700,7 @@ impl<'program> Checker<'program> {
     ) {
         match initializer {
             ForInitializer::VarDecl(decl) => {
-                self.check_expr(&decl.initializer, scopes, method_context);
-                let value_ty = self.infer_expr_type(&decl.initializer, scopes, method_context);
-                let ty = match &decl.ty {
-                    Some(ty) => {
-                        let target_ty = self.resolve_type_ref(ty, decl.span);
-                        self.check_expr_assignable(
-                            target_ty,
-                            &decl.initializer,
-                            scopes,
-                            method_context,
-                            AssignmentDestination::Type,
-                        );
-                        target_ty
-                    }
-                    None => {
-                        if let TypeKind::Integer(integer) = *self.types.kind(value_ty) {
-                            self.contextualize_integer_literals(&decl.initializer, integer);
-                        }
-                        value_ty
-                    }
-                };
-                self.declare_binding(
-                    scopes,
-                    decl.name.clone(),
-                    Binding {
-                        writable: decl.writable,
-                        ty,
-                        declared_ty: ty,
-                        int_constant: self.readonly_int_constant(
-                            decl.writable,
-                            ty,
-                            &decl.initializer,
-                            scopes,
-                        ),
-                        string_constant: self.readonly_string_constant(
-                            decl.writable,
-                            ty,
-                            &decl.initializer,
-                            scopes,
-                        ),
-                    },
-                    decl.span,
-                );
+                self.check_local_declaration(decl, scopes, method_context);
             }
             ForInitializer::Assignment(assignment) => {
                 self.check_expr(&assignment.value, scopes, method_context);

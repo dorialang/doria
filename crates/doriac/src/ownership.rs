@@ -565,7 +565,7 @@ fn statement_return_borrow(
         Stmt::For(statement) => {
             let mut loop_shadowed = shadowed.clone();
             if let Some(ast::ForInitializer::VarDecl(decl)) = &statement.initializer {
-                loop_shadowed.insert(decl.name.clone());
+                loop_shadowed.extend(decl.bindings.iter().map(|binding| binding.name.clone()));
             }
             if statement
                 .condition
@@ -602,7 +602,7 @@ fn statement_return_borrow(
             ))
         }
         Stmt::VarDecl(decl) => {
-            shadowed.insert(decl.name.clone());
+            shadowed.extend(decl.bindings.iter().map(|binding| binding.name.clone()));
             Some(true)
         }
         Stmt::Break { .. } | Stmt::Continue { .. } => Some(false),
@@ -1115,6 +1115,11 @@ impl Checker<'_> {
         match statement {
             Stmt::Block(block) => self.check_block(block, scopes, return_move_type, true),
             Stmt::VarDecl(decl) => {
+                let declaration_name = decl
+                    .bindings
+                    .first()
+                    .map(|binding| binding.name.as_str())
+                    .unwrap_or("local");
                 let declared_class = decl.ty.as_ref().and_then(|ty| {
                     type_ref_class_name(ty, &self.classes, self.receiver_class.as_deref())
                 });
@@ -1142,7 +1147,7 @@ impl Checker<'_> {
                             "E0478",
                             format!(
                                 "borrowed result cannot initialize owning `${}`",
-                                decl.name
+                                declaration_name
                             ),
                             decl.initializer.span(),
                         )
@@ -1156,7 +1161,7 @@ impl Checker<'_> {
                             "E0478",
                             format!(
                                 "borrowed result from a temporary cannot initialize `${}`",
-                                decl.name
+                                declaration_name
                             ),
                             decl.initializer.span(),
                         )
@@ -1169,7 +1174,7 @@ impl Checker<'_> {
                     self.diagnostics.push(
                         Diagnostic::new(
                             "E0478",
-                            format!("borrowed binding `${}` cannot be writable", decl.name),
+                            format!("borrowed binding `${declaration_name}` cannot be writable"),
                             decl.span,
                         )
                         .with_help(
@@ -1189,35 +1194,38 @@ impl Checker<'_> {
                     },
                 );
                 if class.is_some() || mixed || declared_move_type {
-                    scopes.declare(
-                        decl.name.clone(),
-                        Binding {
-                            id: self.next_binding_id(),
-                            class,
-                            collection: decl
-                                .ty
-                                .as_ref()
-                                .and_then(|ty| {
-                                    type_ref_collection_info(
-                                        ty,
-                                        &self.classes,
-                                        self.receiver_class.as_deref(),
-                                        &self.current_type_params,
-                                        &[],
-                                    )
-                                })
-                                .or_else(|| self.expr_collection_info(&decl.initializer, scopes)),
-                            mixed,
-                            borrowed_place: borrowed_owning_value,
-                            borrow_root,
-                            writable: decl.writable,
-                            state: if borrowed_owning_value {
-                                State::Borrowed
-                            } else {
-                                State::Owned
+                    let collection = decl
+                        .ty
+                        .as_ref()
+                        .and_then(|ty| {
+                            type_ref_collection_info(
+                                ty,
+                                &self.classes,
+                                self.receiver_class.as_deref(),
+                                &self.current_type_params,
+                                &[],
+                            )
+                        })
+                        .or_else(|| self.expr_collection_info(&decl.initializer, scopes));
+                    for declaration in &decl.bindings {
+                        scopes.declare(
+                            declaration.name.clone(),
+                            Binding {
+                                id: self.next_binding_id(),
+                                class: class.clone(),
+                                collection: collection.clone(),
+                                mixed,
+                                borrowed_place: borrowed_owning_value,
+                                borrow_root: borrow_root.clone(),
+                                writable: decl.writable,
+                                state: if borrowed_owning_value {
+                                    State::Borrowed
+                                } else {
+                                    State::Owned
+                                },
                             },
-                        },
-                    );
+                        );
+                    }
                 }
                 Flow::fallthrough()
             }
@@ -3250,7 +3258,11 @@ fn statements_use_variable(statements: &[Stmt], name: &str) -> bool {
         }
         if matches!(
             statement,
-            Stmt::VarDecl(declaration) if declaration.name == name
+            Stmt::VarDecl(declaration)
+                if declaration
+                    .bindings
+                    .iter()
+                    .any(|binding| binding.name == name)
         ) {
             return false;
         }
@@ -3296,7 +3308,11 @@ fn statement_uses_variable(statement: &Stmt, name: &str) -> bool {
                 .is_some_and(|initializer| for_initializer_uses_variable(initializer, name));
             let initializer_shadows = matches!(
                 statement.initializer.as_ref(),
-                Some(ast::ForInitializer::VarDecl(declaration)) if declaration.name == name
+                Some(ast::ForInitializer::VarDecl(declaration))
+                    if declaration
+                        .bindings
+                        .iter()
+                        .any(|binding| binding.name == name)
             );
             initializer_uses
                 || (!initializer_shadows

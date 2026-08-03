@@ -20,20 +20,112 @@ stored inline without per-element allocation. Deterministic bounded runtime test
 compare these structures with `BTreeMap`, `BTreeSet`, `BinaryHeap<Reverse<_>>`,
 and `VecDeque`; those Rust types are test oracles, not public semantics.
 
+## Stage 26a grouped-local contract
+
+Grouped local declarations are syntax sugar with no runtime grouping
+abstraction. The initializer evaluates once; scalar copies match separate locals
+initialized from that result; string bindings retain the same immutable runtime
+handle without duplicating contents. Grouping alone creates no tuple,
+collection, heap allocation, dynamic dispatch, or async-runtime interaction.
+The canonical MIR node records ordered initialization for validation and is
+eligible for ordinary optimization; no group value survives in generated code.
+
+## Stage 26b performance baseline foundation
+
+Stage 26b is next. It establishes one repository-owned measurement system and
+accepted baselines that later stages extend. It is not an unlimited optimization
+campaign and does not displace Stage 36a's stream gate.
+
+The runner has three separate tracks:
+
+```text
+Compiler Performance
+- parse time
+- semantic-analysis time
+- MIR-lowering time
+- Cranelift code-generation time
+- LLVM code-generation time
+- link time
+- total compile time
+- compiler peak RSS
+- generic specialization count
+
+Generated-Program Performance
+- cold startup
+- hot throughput and latency
+- wall, user, and system time
+- peak RSS
+- allocation count where available
+- binary and stripped-binary size
+- compressed artifact size where useful
+- correctness output or hash
+
+Runtime-Subsystem Performance
+- strings, objects, and methods
+- ownership and collections
+- generics and shared ownership
+- streams, async, and FFI when their owning stages land
+```
+
+The Cranelift development profile prioritizes fast compilation, fast linking,
+responsive iteration, and acceptable runtime performance. The LLVM release
+profile prioritizes runtime performance, low memory use, strong optimization,
+and reasonable artifact size. The interpreter remains the semantic oracle and
+regression target, not a native performance competitor.
+
+Initial executable cases are `hello_world`, `startup`, `fibonacci`, `primes`,
+`integer_arithmetic`, `string_interpolation`, `string_search`,
+`list_operations`, `dictionary_lookup`, `set_membership`,
+`sorted_dictionary`, `sorted_set`, `priority_queue`, `deque`,
+`object_construction`, `method_calls`, `generic_specialization`,
+`shared_reference`, and `writable_shared_access`. Cases requiring closures,
+JSON, routing, templating, raylib, async, networking, or streams join only when
+their owning stages land.
+
+The initial comparison set is C, Rust, and PHP: C and Rust are native baselines;
+PHP is the central adoption comparison. C++, Java, C#, JavaScript, and Python may
+join after the runner and fairness rules stabilize. The project-owned runner
+uses the existing sibling `benchmarks` repository's `bench.php` entry point and
+flat peer-source case layout; a future `baton bench` orchestrates the same
+benchmark engine instead of creating another one.
+
+Correctness passes before timing is accepted. Every report records versions,
+flags, machine, inputs, runner identity, and profile. Cold startup remains
+separate from hot throughput, compile time remains separate from runtime, and
+unfavorable results remain visible. Curated reports may be committed; raw
+generated results normally are not. Shared CI owns deterministic structural
+checks; controlled runners own timing thresholds. Public claims remain specific
+to the measured workload.
+
+## Continuous performance impact rule
+
+Every later stage that changes runtime representation, allocation, ownership,
+dispatch, code generation, control flow, I/O, concurrency, or FFI records a
+`Performance Impact` section covering expected cost; allocation, copying,
+dispatch, memory, and code-size changes; benchmark cases added or updated; and
+measured evidence where material. “No measurable impact expected” is permitted
+only as a checkable claim. Ordinary shared CI does not use brittle wall-clock
+thresholds.
+
 ---
 
 ## 1. Performance expectation
 
-A mature native Doria should aim to be much closer to native compiled languages than to interpreted/dynamic application runtimes.
+Performance is a design pillar, not an outcome to be discovered after the fact. Suboptimal performance is a defect to be diagnosed, not a characteristic to be documented.
 
-Honest expectation:
+Target:
 
 ```text
-- Doria will probably not consistently beat mature C, C++, or Rust on low-level optimized workloads.
-- Doria can plausibly be in the Rust/Go/C# NativeAOT neighborhood for many application workloads if the compiler/runtime are well designed.
-- Doria should be much faster than PHP and Python for CPU-bound userland code.
-- Doria may be competitive with Java/C#/JavaScript depending on startup, hot-code behavior, runtime design, and workload shape.
+- Doria aims to match C, C++, and Rust on comparable native workloads. Parity is the floor, not the ceiling.
+- Where Doria can safely go faster, it should. Safety and correctness guarantees are never traded for speed.
+- Doria should be consistently optimized across workload shapes. An unexplained outlier is a defect, not a data point.
+- Doria should be far faster than PHP and Python for CPU-bound userland code, and must never treat that comparison as evidence of good performance.
+- Performance work is continuous. As the language matures, keep looking for headroom rather than settling at a benchmark ranking.
 ```
+
+The shared-backend limit is real and should be reasoned about rather than wished away. Doria, Clang, and rustc all lower through LLVM, so on scalar code LLVM already optimizes well, parity is the realistic ceiling. Beating C therefore means emitting information a C compiler cannot derive: aliasing facts implied by ownership, whole-program monomorphization and devirtualization, guaranteed alignment and dereferenceability, escape analysis into stack or arena allocation, and profile-guided layout by default. Those are the sanctioned routes to a win, and each is a compiler capability rather than a benchmark trick.
+
+Ambition and claims are governed separately, and conflating them is an error in both directions. The target above is unbounded; published claims are bound by measured evidence.
 
 Avoid broad claims like:
 
@@ -155,35 +247,33 @@ That aligns performance measurement with the self-hosting goal.
 
 ## 5. Repository structure
 
-Possible future structure:
+The suite lives in the `benchmarks` repository, a sibling checkout of `doria`:
 
 ```text
 benchmarks/
-  README.md
-  runner/
-    bench.py
-    report.py
-  cases/
-    hello_world/
-      doria/
-      c/
-      cpp/
-      rust/
-      java/
-      csharp/
-      php/
-      javascript/
-      python/
-    fibonacci/
-    json_parse/
-    object_construction/
-    lexer/
-    parser/
-  results/
-    .gitkeep
+  bench.php
+  <case>/
+    README.md
+    Baton.toml
+    <case>.doria
+    <case>.c
+    <case>.cpp
+    <case>.rs
+    <case>.go
+    <case>.js
+    <case>.php
+    <case>.py
+    <Case>.java
+    csharp/
+      Program.cs
+      <case>.csproj
 ```
 
-Generated benchmark results should usually not be committed except for curated release reports.
+Peers sit beside the Doria source rather than in per-language subdirectories. Only C# needs its own directory, for the project file; Java's filename is PascalCase to match its public class. `bench.php` is the single harness: it builds every target available on the current platform, verifies each one's output against the first target, then times best-of-N.
+
+Repository tooling here is PHP, never Python or shell. AGENTS.md assigns small repository text/JSON helpers to PHP and compiler/project tooling to Rust, and CI fails the build when any `.py` appears under `scripts/`.
+
+Generated benchmark results should usually not be committed, except for curated release reports and any committed regression baselines a performance gate depends on.
 
 ---
 
@@ -225,9 +315,9 @@ hyperfine \
   './build/doria/fibonacci' \
   './build/c/fibonacci' \
   './build/rust/fibonacci' \
-  'php benchmarks/cases/fibonacci/php/fibonacci.php' \
-  'node benchmarks/cases/fibonacci/javascript/fibonacci.js' \
-  'python3 benchmarks/cases/fibonacci/python/fibonacci.py'
+  'php ../benchmarks/fibonacci/fibonacci.php' \
+  'node ../benchmarks/fibonacci/fibonacci.js' \
+  'python3 ../benchmarks/fibonacci/fibonacci.py'
 ```
 
 ---

@@ -7,9 +7,11 @@ declare(strict_types=1);
 })();
 
 require_once __DIR__ . '/check_stream_io_completeness.php';
+require_once __DIR__ . '/check_grouped_local_declarations.php';
 
 $root = dirname(__DIR__);
 $failures = check_stream_io_completeness($root);
+array_push($failures, ...check_grouped_local_declarations($root));
 
 // Keys are "path:line:number". Keep this empty unless the repository contains
 // a verified decision-shaped token that is not a citation. Every entry requires
@@ -710,11 +712,13 @@ if ($namingAuthority !== false) {
         || !str_contains($pipeline, 'Stage 36a owns the initial')
         || !str_contains($pipeline, 'Stage 43 later')
         || !str_contains($pipeline, 'Stage 26 — Complete')
-        || !str_contains($pipeline, 'Stage 27 — Next')
+        || !str_contains($pipeline, 'Stage 26a — Complete')
+        || !str_contains($pipeline, 'Stage 26b — Performance Baseline Foundation — Next')
+        || !str_contains($pipeline, 'Stage 27 — Blocked Until Stage 26b Completes')
         || !str_contains($pipeline, 'Stage 36a Public Spellings — Deferred')
         || !str_contains($pipeline, 'Stage 36a — Not Implemented')
     ) {
-        $failures[] = "{$pipelinePath}: must keep the String audit review and runtime surface implemented, line input sequenced, Stage 25a complete, the stream audit and review complete, decision 0110's semantic/performance contract accepted, Stage 26 complete, Stage 27 next, and Stage 36a scheduled but not implemented with public spellings deferred";
+        $failures[] = "{$pipelinePath}: must keep the String audit review and runtime surface implemented, line input sequenced, Stage 25a complete, the stream audit and review complete, decision 0110's semantic/performance contract accepted, Stages 26 and 26a complete, Stage 26b next, Stage 27 blocked until 26b, and Stage 36a scheduled but not implemented with public spellings deferred";
     }
 
     if (

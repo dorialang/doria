@@ -654,7 +654,7 @@ impl ForwardAnalysis for NarrowingAnalysis<'_> {
             ),
             NodeAction::ForInitializer(initializer) => match initializer {
                 ForInitializer::VarDecl(declaration) => transfer_declaration(
-                    declaration.span,
+                    &declaration.bindings,
                     &declaration.initializer,
                     &mut output,
                     self.resolution,
@@ -765,7 +765,7 @@ fn transfer_statement(
     match statement {
         Stmt::Block(_) => {}
         Stmt::VarDecl(declaration) => transfer_declaration(
-            declaration.span,
+            &declaration.bindings,
             &declaration.initializer,
             state,
             resolution,
@@ -803,7 +803,7 @@ fn transfer_statement(
 }
 
 fn transfer_declaration(
-    span: Span,
+    bindings: &[crate::ast::VarBinding],
     initializer: &Expr,
     state: &mut State,
     resolution: &Resolution,
@@ -811,8 +811,10 @@ fn transfer_declaration(
     nullability: &NullabilityCatalog,
 ) {
     kill_mutated_call_arguments(initializer, state, resolution, mutations);
-    if let Some(binding) = resolution.declarations.get(&span.start) {
-        set_from_value(*binding, initializer, state, resolution, nullability);
+    for declaration in bindings {
+        if let Some(binding) = resolution.declarations.get(&declaration.span.start) {
+            set_from_value(*binding, initializer, state, resolution, nullability);
+        }
     }
 }
 
@@ -1727,14 +1729,16 @@ impl Resolver {
             Stmt::VarDecl(declaration) => {
                 self.resolve_expr(&declaration.initializer);
                 let inferred_class = self.resolved_expr_class(&declaration.initializer);
-                let binding = self.declare(
-                    &declaration.name,
-                    declaration.span.start,
-                    declaration.ty.clone(),
-                );
-                if declaration.ty.is_none() {
-                    if let Some(class) = inferred_class {
-                        self.resolution.declaration_classes.insert(binding, class);
+                for declaration_binding in &declaration.bindings {
+                    let binding = self.declare(
+                        &declaration_binding.name,
+                        declaration_binding.span.start,
+                        declaration.ty.clone(),
+                    );
+                    if declaration.ty.is_none() {
+                        if let Some(class) = inferred_class.clone() {
+                            self.resolution.declaration_classes.insert(binding, class);
+                        }
                     }
                 }
             }
@@ -1771,14 +1775,16 @@ impl Resolver {
                         ForInitializer::VarDecl(declaration) => {
                             self.resolve_expr(&declaration.initializer);
                             let inferred_class = self.resolved_expr_class(&declaration.initializer);
-                            let binding = self.declare(
-                                &declaration.name,
-                                declaration.span.start,
-                                declaration.ty.clone(),
-                            );
-                            if declaration.ty.is_none() {
-                                if let Some(class) = inferred_class {
-                                    self.resolution.declaration_classes.insert(binding, class);
+                            for declaration_binding in &declaration.bindings {
+                                let binding = self.declare(
+                                    &declaration_binding.name,
+                                    declaration_binding.span.start,
+                                    declaration.ty.clone(),
+                                );
+                                if declaration.ty.is_none() {
+                                    if let Some(class) = inferred_class.clone() {
+                                        self.resolution.declaration_classes.insert(binding, class);
+                                    }
                                 }
                             }
                         }

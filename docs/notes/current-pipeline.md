@@ -105,7 +105,7 @@ Documentation role: working note. This file prevents duplicated in-flight work. 
   all through the decision 0109 foundation. The flush substrate now reports the
   same success/broken-pipe/other-failure vocabulary as writes.
 
-## Current collection milestone
+## Current collection and local-declaration milestone
 
 - Stage 26 — Complete. `SortedDictionary`, `SortedSet`, min-first
   `PriorityQueue`, and ring-buffer `Deque` consume explicit validated MIR and a
@@ -113,7 +113,16 @@ Documentation role: working note. This file prevents duplicated in-flight work. 
   compatibility uses generated semantic helpers rather than host collection
   ordering. Set iteration is readonly and non-consuming construction/algebra
   preserve their sources.
-- Stage 27 — Next.
+- Stage 26a — Complete. Grouped inferred/typed readonly/writable locals preserve
+  one initializer in AST/HIR and canonical validated MIR. The initializer runs
+  once, targets initialize left to right, scope insertion is atomic, Copy values
+  remain independent, strings retain their immutable handle per binding, and
+  move values are rejected except for explicitly typed nullable literal-null
+  initialization. Interpreter, Cranelift, LLVM, and PHP compatibility agree;
+  grouping creates no runtime object.
+- Stage 26b — Performance Baseline Foundation — Next.
+- Stage 27 — Blocked Until Stage 26b Completes.
+- Stage 35a — Optimizer Contracts, Dispatch, And Escape Audit — Scheduled.
 - Stage 36a — Scheduled, Not Implemented.
 
 ## Do not duplicate

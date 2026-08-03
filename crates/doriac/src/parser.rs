@@ -549,9 +549,13 @@ impl Parser {
             let start = self.peek().span.start;
             let writable = self.match_kind(&TokenKind::Writable);
             if let Some(ty) = self.parse_type_ref() {
-                if let Some((name, _name_span)) = self.consume_variable() {
+                if let Some((name, name_span)) = self.consume_variable() {
+                    let bindings = self.parse_local_bindings(name, name_span)?;
                     self.expect(TokenKind::Equals, "expected `=` in variable declaration")?;
                     let initializer = self.parse_expression()?;
+                    if self.reject_additional_group_initializer() {
+                        return None;
+                    }
                     let end = self
                         .expect(
                             TokenKind::Semicolon,
@@ -562,7 +566,7 @@ impl Parser {
                     return Some(Stmt::VarDecl(VarDecl {
                         writable,
                         ty: Some(ty),
-                        name,
+                        bindings,
                         initializer,
                         span: Span::new(start, end),
                     }));
@@ -618,9 +622,13 @@ impl Parser {
         semicolon_message: &str,
     ) -> Option<VarDecl> {
         let writable = self.match_kind(&TokenKind::Writable);
-        let (name, _span) = self.expect_variable("expected variable name after `let`")?;
+        let (name, name_span) = self.expect_variable("expected variable name after `let`")?;
+        let bindings = self.parse_local_bindings(name, name_span)?;
         self.expect(TokenKind::Equals, "expected `=` in let declaration")?;
         let initializer = self.parse_expression()?;
+        if self.reject_additional_group_initializer() {
+            return None;
+        }
         let end = self
             .expect(TokenKind::Semicolon, semicolon_message)?
             .span
@@ -629,10 +637,119 @@ impl Parser {
         Some(VarDecl {
             writable,
             ty: None,
-            name,
+            bindings,
             initializer,
             span: Span::new(start, end),
         })
+    }
+
+    fn parse_local_bindings(&mut self, name: String, span: Span) -> Option<Vec<VarBinding>> {
+        let mut bindings = vec![VarBinding { name, span }];
+        while self.match_kind(&TokenKind::Comma) {
+            let comma = self.previous().span;
+            if self.check(&TokenKind::Equals) {
+                self.diagnostics.push(
+                    Diagnostic::new(
+                        "E0556",
+                        "a grouped local declaration cannot end its binding list with a comma",
+                        comma,
+                    )
+                    .with_title("Grouped Declaration Cannot Have A Trailing Comma")
+                    .with_explanation(
+                        "The first grouped-declaration form requires a variable after every comma.",
+                    )
+                    .with_help("remove the trailing comma before `=`"),
+                );
+                return None;
+            }
+
+            if self.check(&TokenKind::Writable) || self.check(&TokenKind::Readonly) {
+                let modifier = self.advance().clone();
+                self.diagnostics.push(
+                    Diagnostic::new(
+                        "E0554",
+                        "mutability is declared once for the complete local group",
+                        modifier.span,
+                    )
+                    .with_title("Grouped Bindings Share One Mutability Mode")
+                    .with_explanation(
+                        "Every binding in a grouped declaration receives the mutability mode written before the first binding.",
+                    )
+                    .with_help("move the mutability modifier to the shared declaration prefix"),
+                );
+                return None;
+            }
+
+            if let Some(type_span) = self.probe_per_binding_type() {
+                self.diagnostics.push(
+                    Diagnostic::new(
+                        "E0555",
+                        "a declared type applies to the complete local group",
+                        type_span,
+                    )
+                    .with_title("Grouped Bindings Share One Declared Type")
+                    .with_explanation(
+                        "Doria grouped declarations do not use C-style per-binding declarators.",
+                    )
+                    .with_help("write separate declarations when bindings need different types"),
+                );
+                return None;
+            }
+
+            let (name, span) =
+                self.expect_variable("expected variable name after `,` in grouped declaration")?;
+            bindings.push(VarBinding { name, span });
+        }
+        Some(bindings)
+    }
+
+    /// Recognize the complete ordinary type grammar without committing parser
+    /// state. Grouped declarations reject a type after a comma, but the
+    /// diagnostic must understand every type shape accepted elsewhere rather
+    /// than maintaining a second, shallower lookahead grammar.
+    fn probe_per_binding_type(&mut self) -> Option<Span> {
+        if matches!(self.peek().kind, TokenKind::Variable(_)) {
+            return None;
+        }
+
+        let current = self.current;
+        let pending_type_argument_close = self.pending_type_argument_close;
+        let diagnostic_count = self.diagnostics.len();
+        let start = self.peek().span.start;
+        let parsed = self.parse_type_ref();
+        let end = self.previous().span.end;
+        let followed_by_binding = matches!(self.peek().kind, TokenKind::Variable(_));
+
+        self.current = current;
+        self.pending_type_argument_close = pending_type_argument_close;
+        self.diagnostics.truncate(diagnostic_count);
+
+        (parsed.is_some() && followed_by_binding).then(|| Span::new(start, end))
+    }
+
+    fn reject_additional_group_initializer(&mut self) -> bool {
+        if !self.check(&TokenKind::Comma) {
+            return false;
+        }
+
+        let span = self.advance().span;
+        self.diagnostics.push(
+            Diagnostic::new(
+                "E0553",
+                "a grouped local declaration has one initializer shared by every binding",
+                span,
+            )
+            .with_title("Grouped Declarations Use One Shared Initializer")
+            .with_explanation("Every binding in a grouped declaration begins with the same value.")
+            .with_help("write separate declarations when the initial values differ"),
+        );
+        while !self.check(&TokenKind::Semicolon) && !self.is_at_end() {
+            self.advance();
+        }
+        if self.check(&TokenKind::Semicolon) {
+            self.advance();
+        }
+        true
     }
 
     fn parse_loop_control_statement(

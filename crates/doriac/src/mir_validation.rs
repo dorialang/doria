@@ -832,6 +832,75 @@ fn validate_statement(
                 ))),
             }
         }
+        mir::Statement::AssignLocalGroup { targets, value } => {
+            if targets.len() < 2 {
+                return Err(malformed_mir(
+                    "grouped local assignment must contain at least two targets",
+                ));
+            }
+            let mut unique = HashSet::with_capacity(targets.len());
+            let first = local_in(function, targets[0])?;
+            if first.synthetic {
+                return Err(malformed_mir(
+                    "grouped local assignment cannot target a synthetic local",
+                ));
+            }
+            for (index, target) in targets.iter().enumerate() {
+                let local = local_in(function, *target)?;
+                if !unique.insert(*target) {
+                    return Err(malformed_mir(format!(
+                        "grouped local assignment repeats local{}",
+                        target.0
+                    )));
+                }
+                if local.synthetic {
+                    return Err(malformed_mir(format!(
+                        "grouped local assignment targets synthetic local{}",
+                        target.0
+                    )));
+                }
+                if local.ty != first.ty
+                    || local.writable != first.writable
+                    || local.owned != first.owned
+                {
+                    return Err(malformed_mir(
+                        "grouped local assignment targets must share one type, mutability mode, and ownership mode",
+                    ));
+                }
+                if index > 0 && targets[index - 1].0 >= target.0 {
+                    return Err(malformed_mir(
+                        "grouped local assignment targets must follow declaration order",
+                    ));
+                }
+            }
+            if first.ty.has_move_ownership() {
+                if !first.owned || !grouped_move_rvalue_is_null(first.ty, value) {
+                    return Err(malformed_mir(
+                        "grouped move-type locals may only be initialized from a matching nullable null",
+                    ));
+                }
+            } else if first.owned
+                || !matches!(
+                    first.ty,
+                    mir::Type::Scalar(_)
+                        | mir::Type::String
+                        | mir::Type::NullableScalar(_)
+                        | mir::Type::NullableString
+                )
+            {
+                return Err(malformed_mir(
+                    "grouped local assignment requires a Copy type",
+                ));
+            }
+            validate_statement(
+                program,
+                function,
+                &mir::Statement::AssignLocal {
+                    target: targets[0],
+                    value: value.clone(),
+                },
+            )
+        }
         mir::Statement::EchoStringLiteral(_) => Ok(()),
         mir::Statement::EchoString(expression) => {
             validate_string_expression(program, function, expression)
@@ -1253,6 +1322,54 @@ fn validate_statement(
             }
             collection_in(program, *collection).map(|_| ())
         }
+    }
+}
+
+fn grouped_move_rvalue_is_null(ty: mir::Type, value: &mir::Rvalue) -> bool {
+    match (ty, value) {
+        (mir::Type::NullableMixed, mir::Rvalue::NullableMixed(value)) => {
+            matches!(value, mir::NullableMixedExpression::Null)
+        }
+        (mir::Type::NullableClass(expected), mir::Rvalue::NullableClass(value)) => {
+            matches!(value, mir::NullableClassExpression::Null(actual) if *actual == expected)
+        }
+        (
+            mir::Type::NullableSharedReference(expected),
+            mir::Rvalue::NullableSharedReference(value),
+        ) => {
+            matches!(value, mir::NullableSharedReferenceExpression::Null(actual) if *actual == expected)
+        }
+        (mir::Type::NullableWeakReference(expected), mir::Rvalue::NullableWeakReference(value)) => {
+            matches!(value, mir::NullableWeakReferenceExpression::Null(actual) if *actual == expected)
+        }
+        (
+            mir::Type::NullableWritableSharedReference(expected),
+            mir::Rvalue::NullableWritableSharedReference(value),
+        ) => {
+            matches!(value, mir::NullableWritableSharedReferenceExpression::Null(actual) if *actual == expected)
+        }
+        (
+            mir::Type::NullableWritableWeakReference(expected),
+            mir::Rvalue::NullableWritableWeakReference(value),
+        ) => {
+            matches!(value, mir::NullableWritableWeakReferenceExpression::Null(actual) if *actual == expected)
+        }
+        (
+            mir::Type::NullableReadonlySharedReferenceAccess(expected),
+            mir::Rvalue::NullableSharedReferenceAccess(value),
+        ) => {
+            matches!(value, mir::NullableSharedReferenceAccessExpression::Null { payload, writable: false } if *payload == expected)
+        }
+        (
+            mir::Type::NullableWritableSharedReferenceAccess(expected),
+            mir::Rvalue::NullableSharedReferenceAccess(value),
+        ) => {
+            matches!(value, mir::NullableSharedReferenceAccessExpression::Null { payload, writable: true } if *payload == expected)
+        }
+        (mir::Type::NullableCollection(expected), mir::Rvalue::NullableCollection(value)) => {
+            matches!(value, mir::NullableCollectionExpression::Null(actual) if *actual == expected)
+        }
+        _ => false,
     }
 }
 
@@ -5632,7 +5749,9 @@ fn collect_format_class_local_accesses<'a>(
 fn collect_statement_class_local_accesses(statement: &mir::Statement) -> ClassLocalAccesses<'_> {
     let mut accesses = ClassLocalAccesses::default();
     match statement {
-        mir::Statement::AssignLocal { value, .. } | mir::Statement::AssignStatic { value, .. } => {
+        mir::Statement::AssignLocal { value, .. }
+        | mir::Statement::AssignLocalGroup { value, .. }
+        | mir::Statement::AssignStatic { value, .. } => {
             collect_rvalue_class_local_accesses(value, &mut accesses);
         }
         mir::Statement::EchoString(value) | mir::Statement::WriteStderr(value) => {
@@ -5782,6 +5901,16 @@ fn apply_class_local_state(
             ) =>
         {
             moved.remove(target);
+        }
+        mir::Statement::AssignLocalGroup { targets, .. } => {
+            for target in targets {
+                if matches!(
+                    local_in(function, *target)?.ty,
+                    mir::Type::Class(_) | mir::Type::NullableClass(_)
+                ) {
+                    moved.remove(target);
+                }
+            }
         }
         mir::Statement::DropClass { local, .. } => {
             moved.insert(*local);
@@ -6050,6 +6179,31 @@ fn apply_nullable_presence_statement(
                 present.remove(target);
             }
         }
+        mir::Statement::AssignLocalGroup { targets, value } => {
+            let first = local_in(function, targets[0])?;
+            let value_is_present = match (first.ty, value) {
+                (mir::Type::NullableScalar(_), mir::Rvalue::NullableScalar(value)) => {
+                    nullable_scalar_expression_is_present(value, present)
+                }
+                (mir::Type::NullableString, mir::Rvalue::NullableString(value)) => {
+                    nullable_string_expression_is_present(value, present)
+                }
+                (mir::Type::NullableClass(_), mir::Rvalue::NullableClass(value)) => {
+                    nullable_class_expression_is_present(value, present)
+                }
+                (mir::Type::NullableCollection(_), mir::Rvalue::NullableCollection(value)) => {
+                    nullable_collection_expression_is_present(value, present)
+                }
+                _ => return Ok(()),
+            };
+            for target in targets {
+                if value_is_present {
+                    present.insert(*target);
+                } else {
+                    present.remove(target);
+                }
+            }
+        }
         mir::Statement::DropClass { local, .. } | mir::Statement::DropCollection { local, .. } => {
             present.remove(local);
         }
@@ -6070,6 +6224,16 @@ fn apply_mixed_tag_statement(
                 mir::Type::Mixed | mir::Type::NullableMixed
             ) {
                 tags.remove(target);
+            }
+        }
+        mir::Statement::AssignLocalGroup { targets, .. } => {
+            for target in targets {
+                if matches!(
+                    local_in(function, *target)?.ty,
+                    mir::Type::Mixed | mir::Type::NullableMixed
+                ) {
+                    tags.remove(target);
+                }
             }
         }
         mir::Statement::DropMixed { local } => {
@@ -7021,7 +7185,8 @@ fn statement_observes_property(
     property: crate::class_layout::PropertyId,
 ) -> bool {
     match statement {
-        mir::Statement::AssignLocal { value, .. } => {
+        mir::Statement::AssignLocal { value, .. }
+        | mir::Statement::AssignLocalGroup { value, .. } => {
             rvalue_observes_property(value, receiver, property)
         }
         mir::Statement::EchoStringLiteral(_)

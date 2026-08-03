@@ -220,7 +220,14 @@ fn lower_stmt(statement: &ast::Stmt, class_name: Option<ClassContext<'_>>) -> hi
         ast::Stmt::VarDecl(decl) => hir::Stmt::VarDecl(hir::VarDecl {
             writable: decl.writable,
             ty: decl.ty.as_ref().map(|ty| lower_type_ref(ty, class_name)),
-            name: decl.name.clone(),
+            bindings: decl
+                .bindings
+                .iter()
+                .map(|binding| hir::VarBinding {
+                    name: binding.name.clone(),
+                    span: binding.span,
+                })
+                .collect(),
             initializer: lower_expr(&decl.initializer, class_name),
             span: decl.span,
         }),
@@ -293,7 +300,14 @@ fn lower_for_initializer(
         ast::ForInitializer::VarDecl(decl) => hir::ForInitializer::VarDecl(hir::VarDecl {
             writable: decl.writable,
             ty: decl.ty.as_ref().map(|ty| lower_type_ref(ty, class_name)),
-            name: decl.name.clone(),
+            bindings: decl
+                .bindings
+                .iter()
+                .map(|binding| hir::VarBinding {
+                    name: binding.name.clone(),
+                    span: binding.span,
+                })
+                .collect(),
             initializer: lower_expr(&decl.initializer, class_name),
             span: decl.span,
         }),

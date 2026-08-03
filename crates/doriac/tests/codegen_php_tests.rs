@@ -22,6 +22,50 @@ echo $count;
 }
 
 #[test]
+fn php_grouped_declarations_use_one_collision_safe_temporary_in_order() {
+    let php = doriac::compile_source_to_php(
+        "stage26a.doria",
+        r#"
+function value(): string { echo "once\n"; return "shared"; }
+function main(): void
+{
+    let $__doria_grouped_value0 = "user";
+    let $first, $second, $third = value();
+    echo "{$first}:{$second}:{$third}:{$__doria_grouped_value0}\n";
+}
+main();
+"#,
+    )
+    .expect("PHP should lower grouped Copy declarations");
+
+    assert!(php.contains("$__doria_grouped_value0 = \"user\";"));
+    let temporary = php
+        .lines()
+        .find(|line| line.trim().ends_with(" = value();"))
+        .and_then(|line| line.trim().split_once(" = ").map(|(name, _)| name))
+        .expect("grouped initializer temporary");
+    assert_ne!(temporary, "$__doria_grouped_value0");
+    let first = php.find(&format!("$first = {temporary};")).unwrap();
+    let second = php.find(&format!("$second = {temporary};")).unwrap();
+    let third = php.find(&format!("$third = {temporary};")).unwrap();
+    let cleanup = php.find(&format!("unset({temporary});")).unwrap();
+    assert!(first < second && second < third && third < cleanup);
+    assert!(!php.contains("$first = $second ="));
+
+    let run = Command::new("php")
+        .arg("-r")
+        .arg(php.strip_prefix("<?php").expect("generated PHP header"))
+        .output()
+        .expect("PHP should execute grouped declarations");
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(run.stdout, b"once\nshared:shared:shared:user\n");
+}
+
+#[test]
 fn php_backend_emits_folded_copy_scalar_parameter_defaults() {
     let php = doriac::compile_source_to_php(
         "folded-defaults.doria",
@@ -646,7 +690,8 @@ echo $name;
 
     assert!(matches!(
         &lowered.items[0],
-        hir::Item::Statement(hir::Stmt::VarDecl(decl)) if decl.name == "name"
+        hir::Item::Statement(hir::Stmt::VarDecl(decl))
+            if decl.bindings.len() == 1 && decl.bindings[0].name == "name"
     ));
 }
 

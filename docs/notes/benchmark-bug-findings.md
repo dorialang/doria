@@ -107,7 +107,8 @@ The separate `withCapacity` capacity hint remains deliberately deferred.
 
 ## Where the repros come from
 
-`languages/benchmarks/` (sibling of the `doria` repo): `fib/`, `sieve/`,
-`mandelbrot/`, each with a Doria source plus C/C++/Rust/C#/Java/JS/PHP/Python
-peers and a shared `bench.py`. The sieve's Doria source documents the Bug 1
-workaround (`List<int>` with `== 1`) inline.
+`benchmarks/` (sibling checkout of the `doria` repo): `fib/`, `sieve/`,
+`mandelbrot/`, each with a Doria source plus C/C++/Rust/Go/C#/Java/JS/PHP/Python
+peers and a shared `bench.php` harness. The sieve's Doria source no longer
+carries the Bug 1 workaround; it builds a `bool[]` directly through the
+Decision 0102 fill literal.

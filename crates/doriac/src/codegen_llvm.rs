@@ -853,6 +853,35 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         debug_assert!(self.deferred_class_temporary_drops.is_empty());
         self.defer_class_temporary_drops = true;
         match statement {
+            mir::Statement::AssignLocalGroup { targets, value } => {
+                let first = *targets
+                    .first()
+                    .ok_or_else(|| malformed_mir("grouped local assignment has no targets"))?;
+                let ty = local_in(self.function, first)?.ty;
+                let value = self.lower_rvalue(value)?;
+                for (index, target) in targets.iter().enumerate() {
+                    let value = if index == 0 {
+                        value
+                    } else {
+                        match ty {
+                            mir::Type::String => {
+                                self.retain_string(value.into_pointer_value())?.into()
+                            }
+                            mir::Type::NullableString => {
+                                let (present, payload) =
+                                    self.nullable_parts(value.into_struct_value())?;
+                                let retained = self.retain_string(payload.into_pointer_value())?;
+                                self.nullable_value(present, retained.into())?.into()
+                            }
+                            _ => value,
+                        }
+                    };
+                    build(
+                        self.builder
+                            .build_store(local_slot(&self.local_slots, *target)?, value),
+                    )?;
+                }
+            }
             mir::Statement::AssignLocal { target, value } => {
                 let local = local_in(self.function, *target)?;
                 let slot = local_slot(&self.local_slots, *target)?;
@@ -9959,23 +9988,32 @@ fn resolve_string_locals(
     let mut definitions = HashMap::new();
     for block in &function.blocks {
         for statement in &block.statements {
-            let mir::Statement::AssignLocal { target, value } = statement else {
-                continue;
+            let (targets, value): (&[mir::LocalId], _) = match statement {
+                mir::Statement::AssignLocal { target, value } => {
+                    (std::slice::from_ref(target), value)
+                }
+                mir::Statement::AssignLocalGroup { targets, value } => (targets, value),
+                _ => continue,
             };
-            if function.locals[target.0].ty != mir::Type::String {
-                continue;
-            }
             let mir::Rvalue::String(expression) = value else {
-                return Err(malformed_mir(format!(
-                    "string local local{} has a non-string initializer",
-                    target.0
-                )));
+                if targets
+                    .iter()
+                    .any(|target| function.locals[target.0].ty == mir::Type::String)
+                {
+                    return Err(malformed_mir("string local has a non-string initializer"));
+                }
+                continue;
             };
-            if definitions.insert(*target, expression.clone()).is_some() {
-                return Err(malformed_mir(format!(
-                    "readonly string local local{} is assigned more than once",
-                    target.0
-                )));
+            for target in targets {
+                if function.locals[target.0].ty != mir::Type::String {
+                    continue;
+                }
+                if definitions.insert(*target, expression.clone()).is_some() {
+                    return Err(malformed_mir(format!(
+                        "readonly string local local{} is assigned more than once",
+                        target.0
+                    )));
+                }
             }
         }
     }
