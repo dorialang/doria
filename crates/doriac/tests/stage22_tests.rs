@@ -97,25 +97,22 @@ function safe(?Label $label): string
 }
 
 #[test]
-fn nullable_collection_payloads_remain_a_stage23_boundary() {
+fn nullable_collection_payloads_cover_every_collection_family() {
     for ty in [
         "?List<int>",
         "?Dictionary<string, int>",
         "?Set<int>",
+        "?SortedDictionary<string, int>",
+        "?SortedSet<int>",
+        "?PriorityQueue<int>",
+        "?Deque<int>",
         "?int[]",
     ] {
-        let diagnostics = diagnostics(&format!("function inspect({ty} $items): void {{}}"));
-        assert!(
-            diagnostics.iter().any(|diagnostic| {
-                diagnostic.code == "E0454"
-                    && diagnostic.message.contains("nullable collection type")
-                    && diagnostic
-                        .help
-                        .as_deref()
-                        .is_some_and(|help| help.contains("non-null collection"))
-            }),
-            "{ty} should fail at semantic type resolution: {diagnostics:#?}"
-        );
+        doriac::check_source(
+            "nullable-collection-family.doria",
+            format!("function inspect({ty} $items): void {{}}"),
+        )
+        .unwrap_or_else(|diagnostics| panic!("{ty} should be accepted: {diagnostics:#?}"));
     }
 }
 

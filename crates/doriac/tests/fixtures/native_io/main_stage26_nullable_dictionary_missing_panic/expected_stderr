@@ -1,0 +1,24 @@
+Panic[P1312]: Dictionary Key Was Not Found
+
+Where
+examples/native/main_stage26_nullable_dictionary_missing_panic.doria · line 1 · main
+
+  1      function main(): void
+         ^^^^^^^^^^^^^^^^^^^^^
+         Missing Dictionary Key
+  2      {
+         ^
+  3          Dictionary<int, ?int> $values = [1 => null];
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  4          echo $values[2] ?? -1;
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  5      }
+         ^
+
+Why
+The requested key does not exist in this dictionary.
+
+Call Path
+main · examples/native/main_stage26_nullable_dictionary_missing_panic.doria:1
+
+Process Exited With Status 101

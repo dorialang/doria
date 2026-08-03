@@ -231,6 +231,10 @@ Settled:
 - Property hooks should preserve property-style access when values need validation, computation, lazy decoding, or guarded behavior.
 - Methods should clearly communicate action, mutation, I/O, or meaningful work.
 - Doria examples should avoid Rust-flavored API vocabulary unless that vocabulary has been intentionally adopted.
+- Set and SortedSet iteration is readonly; replace an element through remove plus add.
+- PriorityQueue is min-first and deliberately has no foreach surface.
+- Deque owns both FIFO and LIFO vocabulary; do not introduce Queue or Stack aliases.
+- Existing-source collection construction and set algebra preserve their inputs and therefore require Copy or Cloneable values.
 ```
 
 Open:

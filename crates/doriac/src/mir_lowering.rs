@@ -29,14 +29,35 @@ impl CollectionRegistry {
             return *id;
         }
         let id = mir::CollectionTypeId(self.types.len());
+        let ordered = match kind {
+            mir::CollectionKind::SortedDictionary => key,
+            mir::CollectionKind::SortedSet | mir::CollectionKind::PriorityQueue => Some(value),
+            _ => None,
+        };
+        let comparator = ordered.and_then(collection_comparator);
         self.types.push(mir::CollectionType {
             id,
             kind,
             key,
             value,
+            comparator,
         });
         self.ids.insert(signature, id);
         id
+    }
+}
+
+fn collection_comparator(ty: mir::Type) -> Option<mir::CollectionComparator> {
+    match ty {
+        mir::Type::Scalar(mir::ScalarType::Integer(integer)) if integer.is_signed() => Some(
+            mir::CollectionComparator::SignedInteger(integer.bit_width() as u8),
+        ),
+        mir::Type::Scalar(mir::ScalarType::Integer(integer)) => Some(
+            mir::CollectionComparator::UnsignedInteger(integer.bit_width() as u8),
+        ),
+        mir::Type::Scalar(mir::ScalarType::Bool) => Some(mir::CollectionComparator::Bool),
+        mir::Type::String => Some(mir::CollectionComparator::StringBytes),
+        _ => None,
     }
 }
 
@@ -910,9 +931,34 @@ fn intern_resolved_collection_types(
                 value,
             ))
         }
+        ResolvedType::SortedDictionary(key, value) => {
+            let key = intern_resolved_collection_types(key, class_ids, collections)?;
+            let value = intern_resolved_collection_types(value, class_ids, collections)?;
+            mir::Type::Collection(collections.intern(
+                mir::CollectionKind::SortedDictionary,
+                Some(key),
+                value,
+            ))
+        }
         ResolvedType::Set(value) => {
             let value = intern_resolved_collection_types(value, class_ids, collections)?;
             mir::Type::Collection(collections.intern(mir::CollectionKind::Set, None, value))
+        }
+        ResolvedType::SortedSet(value) => {
+            let value = intern_resolved_collection_types(value, class_ids, collections)?;
+            mir::Type::Collection(collections.intern(mir::CollectionKind::SortedSet, None, value))
+        }
+        ResolvedType::PriorityQueue(value) => {
+            let value = intern_resolved_collection_types(value, class_ids, collections)?;
+            mir::Type::Collection(collections.intern(
+                mir::CollectionKind::PriorityQueue,
+                None,
+                value,
+            ))
+        }
+        ResolvedType::Deque(value) => {
+            let value = intern_resolved_collection_types(value, class_ids, collections)?;
+            mir::Type::Collection(collections.intern(mir::CollectionKind::Deque, None, value))
         }
         ResolvedType::Nullable(inner) => {
             match intern_resolved_collection_types(inner, class_ids, collections)? {
@@ -934,8 +980,11 @@ fn intern_resolved_collection_types(
                 mir::Type::WritableSharedReferenceAccess(payload) => {
                     mir::Type::NullableWritableSharedReferenceAccess(payload)
                 }
-                mir::Type::Collection(_)
-                | mir::Type::NullableScalar(_)
+                mir::Type::Collection(collection) => mir::Type::NullableCollection(collection),
+                mir::Type::NullableCollection(collection) => {
+                    mir::Type::NullableCollection(collection)
+                }
+                mir::Type::NullableScalar(_)
                 | mir::Type::NullableString
                 | mir::Type::NullableMixed
                 | mir::Type::NullableClass(_)
@@ -1334,7 +1383,18 @@ fn resolved_type_ref_with_substitutions(
                 Box::new(arguments[0].clone()),
                 Box::new(arguments[1].clone()),
             ),
+            "SortedDictionary" if arguments.len() == 2 => ResolvedType::SortedDictionary(
+                Box::new(arguments[0].clone()),
+                Box::new(arguments[1].clone()),
+            ),
             "Set" if arguments.len() == 1 => ResolvedType::Set(Box::new(arguments[0].clone())),
+            "SortedSet" if arguments.len() == 1 => {
+                ResolvedType::SortedSet(Box::new(arguments[0].clone()))
+            }
+            "PriorityQueue" if arguments.len() == 1 => {
+                ResolvedType::PriorityQueue(Box::new(arguments[0].clone()))
+            }
+            "Deque" if arguments.len() == 1 => ResolvedType::Deque(Box::new(arguments[0].clone())),
             name if arguments.len() == 1 => {
                 if let Some(kind) = crate::types::SharedHandleKind::from_source_name(name) {
                     ResolvedType::SharedHandle(kind, Box::new(arguments[0].clone()))
@@ -1395,6 +1455,7 @@ fn field_type(ty: mir::Type) -> Option<FieldType> {
             Some(FieldType::SharedReferenceAccess)
         }
         mir::Type::Collection(_) => Some(FieldType::Collection),
+        mir::Type::NullableCollection(_) => Some(FieldType::Collection),
     }
 }
 
@@ -1999,12 +2060,10 @@ fn lower_collection_foreach_in_scope(
     context: &mut LoweringContext,
 ) -> DiagnosticResult<()> {
     let definition = context.collection_type(collection_type).clone();
-    if projection != CollectionForeachProjection::Main
-        && definition.kind != mir::CollectionKind::Dictionary
-    {
+    if projection != CollectionForeachProjection::Main && !definition.kind.is_dictionary() {
         return Err(vec![unsupported(
             foreach.span,
-            "dictionary projections require a Dictionary",
+            "dictionary projections require Dictionary or SortedDictionary",
         )]);
     }
     if projection != CollectionForeachProjection::Main && foreach.key.is_some() {
@@ -2037,7 +2096,7 @@ fn lower_collection_foreach_in_scope(
         (Some(_), None, CollectionForeachProjection::Main) => {
             return Err(vec![unsupported(
                 foreach.span,
-                "foreach key bindings require a Dictionary",
+                "foreach key bindings require a dictionary collection",
             )])
         }
         (None, _, _) => None,
@@ -2046,7 +2105,7 @@ fn lower_collection_foreach_in_scope(
     let binding_type = match projection {
         CollectionForeachProjection::Keys => definition
             .key
-            .expect("a Dictionary collection type must have a key type"),
+            .expect("a dictionary collection type must have a key type"),
         CollectionForeachProjection::Main | CollectionForeachProjection::Values => definition.value,
     };
     let value_local = context.declare_user_local_owned(
@@ -2090,11 +2149,12 @@ fn lower_collection_foreach_in_scope(
     let binding_value = match projection {
         CollectionForeachProjection::Keys => key
             .clone()
-            .expect("a Dictionary collection type must produce a key"),
+            .expect("a dictionary collection type must produce a key"),
         CollectionForeachProjection::Main | CollectionForeachProjection::Values => {
             collection_value_rvalue(
                 collection,
                 key.clone().unwrap_or_else(|| offset.clone()),
+                offset.clone(),
                 definition.value,
             )?
         }
@@ -2122,7 +2182,10 @@ fn lower_collection_foreach_in_scope(
     context.current_block = Some(update_block);
     if foreach.value.writable && projection == CollectionForeachProjection::Main {
         match definition.value {
-            mir::Type::Scalar(_) | mir::Type::String => {
+            mir::Type::Scalar(_)
+            | mir::Type::String
+            | mir::Type::NullableScalar(_)
+            | mir::Type::NullableString => {
                 context.push_statement(mir::Statement::AssignCollectionIndex {
                     collection,
                     index: key.unwrap_or_else(|| offset.clone()),
@@ -2139,10 +2202,9 @@ fn lower_collection_foreach_in_scope(
             | mir::Type::NullableReadonlySharedReferenceAccess(_)
             | mir::Type::NullableWritableSharedReferenceAccess(_)
             | mir::Type::Mixed
-            | mir::Type::Collection(_) => {}
-            mir::Type::NullableScalar(_)
-            | mir::Type::NullableString
-            | mir::Type::NullableMixed
+            | mir::Type::Collection(_)
+            | mir::Type::NullableCollection(_) => {}
+            mir::Type::NullableMixed
             | mir::Type::NullableClass(_)
             | mir::Type::NullableSharedReference(_)
             | mir::Type::NullableWeakReference(_)
@@ -2211,6 +2273,7 @@ fn collection_key_at_rvalue(
 fn collection_value_rvalue(
     collection: mir::LocalId,
     index: mir::Rvalue,
+    offset: mir::Rvalue,
     ty: mir::Type,
 ) -> DiagnosticResult<mir::Rvalue> {
     match ty {
@@ -2229,12 +2292,35 @@ fn collection_value_rvalue(
                 remove: false,
             },
         )),
+        mir::Type::NullableScalar(ty) => Ok(mir::Rvalue::NullableScalar(
+            mir::NullableScalarExpression::DictionaryGet {
+                ty,
+                collection,
+                key: Box::new(offset),
+                access: mir::NullableCollectionAccess::At,
+            },
+        )),
+        mir::Type::NullableString => Ok(mir::Rvalue::NullableString(
+            mir::NullableStringExpression::DictionaryGet {
+                collection,
+                key: Box::new(offset),
+                access: mir::NullableCollectionAccess::At,
+            },
+        )),
         mir::Type::Class(class) => Ok(mir::Rvalue::Class(mir::ClassExpression::CollectionIndex {
             class,
             collection,
             index: Box::new(index),
             transfer: false,
         })),
+        mir::Type::NullableClass(class) => Ok(mir::Rvalue::NullableClass(
+            mir::NullableClassExpression::DictionaryGet {
+                class,
+                collection,
+                key: Box::new(offset),
+                access: mir::NullableCollectionAccess::At,
+            },
+        )),
         mir::Type::SharedReference(class) => Ok(mir::Rvalue::SharedReference(
             mir::SharedReferenceExpression::CollectionIndex {
                 class,
@@ -2298,10 +2384,8 @@ fn collection_value_rvalue(
                 transfer: false,
             }))
         }
-        mir::Type::NullableScalar(_)
-        | mir::Type::NullableString
-        | mir::Type::NullableMixed
-        | mir::Type::NullableClass(_)
+        mir::Type::NullableMixed
+        | mir::Type::NullableCollection(_)
         | mir::Type::NullableWritableSharedReference(_)
         | mir::Type::NullableWritableWeakReference(_)
         | mir::Type::ReadonlySharedReferenceAccess(_)
@@ -2321,6 +2405,12 @@ fn foreach_local_rvalue(local: mir::LocalId, ty: mir::Type) -> DiagnosticResult<
             mir::Operand::Local(local),
         ))),
         mir::Type::String => Ok(mir::Rvalue::String(mir::StringExpression::Local(local))),
+        mir::Type::NullableScalar(ty) => Ok(mir::Rvalue::NullableScalar(
+            mir::NullableScalarExpression::Local { ty, local },
+        )),
+        mir::Type::NullableString => Ok(mir::Rvalue::NullableString(
+            mir::NullableStringExpression::Local(local),
+        )),
         mir::Type::Mixed => Ok(mir::Rvalue::Mixed(mir::MixedExpression::Local {
             local,
             transfer: false,
@@ -2626,7 +2716,9 @@ fn drop_obligation_for_owned_local(local: mir::LocalId, ty: mir::Type) -> DropOb
             DropObligation::WritableWeak(local, payload)
         }
         mir::Type::Mixed | mir::Type::NullableMixed => DropObligation::Mixed(local),
-        mir::Type::Collection(collection) => DropObligation::Collection(local, collection),
+        mir::Type::Collection(collection) | mir::Type::NullableCollection(collection) => {
+            DropObligation::Collection(local, collection)
+        }
         _ => unreachable!("only move locals may own native drop obligations"),
     }
 }
@@ -3381,12 +3473,50 @@ impl<'semantic> LoweringContext<'semantic> {
                     .copied()
                     .map(mir::Type::Collection)
             }
+            ResolvedType::SortedDictionary(key, value) => {
+                let key = self.mir_resolved_type(key)?;
+                let value = self.mir_resolved_type(value)?;
+                self.collection_registry
+                    .ids
+                    .get(&(mir::CollectionKind::SortedDictionary, Some(key), value))
+                    .copied()
+                    .map(mir::Type::Collection)
+            }
             ResolvedType::Set(value) => self
                 .mir_resolved_type(value)
                 .and_then(|value| {
                     self.collection_registry
                         .ids
                         .get(&(mir::CollectionKind::Set, None, value))
+                })
+                .copied()
+                .map(mir::Type::Collection),
+            ResolvedType::SortedSet(value) => self
+                .mir_resolved_type(value)
+                .and_then(|value| {
+                    self.collection_registry
+                        .ids
+                        .get(&(mir::CollectionKind::SortedSet, None, value))
+                })
+                .copied()
+                .map(mir::Type::Collection),
+            ResolvedType::PriorityQueue(value) => self
+                .mir_resolved_type(value)
+                .and_then(|value| {
+                    self.collection_registry.ids.get(&(
+                        mir::CollectionKind::PriorityQueue,
+                        None,
+                        value,
+                    ))
+                })
+                .copied()
+                .map(mir::Type::Collection),
+            ResolvedType::Deque(value) => self
+                .mir_resolved_type(value)
+                .and_then(|value| {
+                    self.collection_registry
+                        .ids
+                        .get(&(mir::CollectionKind::Deque, None, value))
                 })
                 .copied()
                 .map(mir::Type::Collection),
@@ -3411,19 +3541,22 @@ impl<'semantic> LoweringContext<'semantic> {
                 mir::Type::WritableSharedReferenceAccess(payload) => {
                     Some(mir::Type::NullableWritableSharedReferenceAccess(payload))
                 }
+                mir::Type::Collection(collection) => {
+                    Some(mir::Type::NullableCollection(collection))
+                }
                 // `?(?X)` collapses to `?X`: a `?T` field substituted with a
                 // nullable argument is already nullable, not doubly-nullable.
                 already @ (mir::Type::NullableScalar(_)
                 | mir::Type::NullableString
                 | mir::Type::NullableMixed
                 | mir::Type::NullableClass(_)
+                | mir::Type::NullableCollection(_)
                 | mir::Type::NullableSharedReference(_)
                 | mir::Type::NullableWeakReference(_)
                 | mir::Type::NullableWritableSharedReference(_)
                 | mir::Type::NullableWritableWeakReference(_)
                 | mir::Type::NullableReadonlySharedReferenceAccess(_)
                 | mir::Type::NullableWritableSharedReferenceAccess(_)) => Some(already),
-                mir::Type::Collection(_) => None,
             },
             ResolvedType::Void | ResolvedType::Null | ResolvedType::Unsupported => None,
         }
@@ -3464,7 +3597,8 @@ impl<'semantic> LoweringContext<'semantic> {
             | mir::Type::WritableSharedReferenceAccess(_)
             | mir::Type::NullableReadonlySharedReferenceAccess(_)
             | mir::Type::NullableWritableSharedReferenceAccess(_)
-            | mir::Type::Collection(_) => Err(vec![Diagnostic::new(
+            | mir::Type::Collection(_)
+            | mir::Type::NullableCollection(_) => Err(vec![Diagnostic::new(
                 "I1401",
                 format!(
                     "internal compiler consistency error: string local local{} used as a scalar",
@@ -3697,6 +3831,16 @@ fn lower_var_decl(decl: &hir::VarDecl, context: &mut LoweringContext) -> Diagnos
         context.push_statement(mir::Statement::AssignLocal {
             target: local,
             value: mir::Rvalue::Collection(value),
+        });
+        return Ok(());
+    }
+    if let mir::Type::NullableCollection(collection) = ty {
+        let value =
+            lower_nullable_collection_expression(&decl.initializer, collection, true, context)?;
+        let local = context.declare_user_local_owned(&decl.name, decl.writable, ty, true);
+        context.push_statement(mir::Statement::AssignLocal {
+            target: local,
+            value: mir::Rvalue::NullableCollection(value),
         });
         return Ok(());
     }
@@ -4501,7 +4645,7 @@ fn lower_nullable_string_expression(
     if let Some((collection, key, value_type, access)) =
         lower_collection_nullable_property(expr, context)?
     {
-        if value_type != mir::Type::String {
+        if !nullable_collection_value_matches(value_type, mir::Type::String) {
             return Err(vec![unsupported(
                 expr.span(),
                 "collection property has another value type",
@@ -4576,6 +4720,21 @@ fn lower_nullable_string_expression(
                     "property does not produce string or ?string",
                 )]),
             }
+        }
+        hir::Expr::Index {
+            collection, index, ..
+        } => {
+            let (collection, key) = lower_collection_index_operand(
+                collection,
+                index,
+                mir::Type::NullableString,
+                context,
+            )?;
+            Ok(mir::NullableStringExpression::DictionaryGet {
+                collection,
+                key: Box::new(key),
+                access: mir::NullableCollectionAccess::Index,
+            })
         }
         hir::Expr::StaticMember {
             class_name,
@@ -4687,7 +4846,7 @@ fn lower_nullable_string_expression(
             if let Some((collection, key, value_type, access)) =
                 lower_dictionary_get(object, method, args, context)?
             {
-                if value_type != mir::Type::String {
+                if !nullable_collection_value_matches(value_type, mir::Type::String) {
                     return Err(vec![unsupported(
                         *span,
                         "Dictionary::get has another value type",
@@ -4781,7 +4940,7 @@ fn lower_nullable_scalar_expression(
     if let Some((collection, key, value_type, access)) =
         lower_collection_nullable_property(expr, context)?
     {
-        if value_type != mir::Type::Scalar(expected) {
+        if !nullable_collection_value_matches(value_type, mir::Type::Scalar(expected)) {
             return Err(vec![unsupported(
                 expr.span(),
                 "collection property has another scalar value type",
@@ -4908,6 +5067,22 @@ fn lower_nullable_scalar_expression(
                 )]),
             }
         }
+        hir::Expr::Index {
+            collection, index, ..
+        } => {
+            let (collection, key) = lower_collection_index_operand(
+                collection,
+                index,
+                mir::Type::NullableScalar(expected),
+                context,
+            )?;
+            Ok(mir::NullableScalarExpression::DictionaryGet {
+                ty: expected,
+                collection,
+                key: Box::new(key),
+                access: mir::NullableCollectionAccess::Index,
+            })
+        }
         hir::Expr::StaticMember {
             class_name,
             member,
@@ -4987,7 +5162,7 @@ fn lower_nullable_scalar_expression(
             if let Some((collection, key, value_type, access)) =
                 lower_dictionary_get(object, method, args, context)?
             {
-                if value_type != mir::Type::Scalar(expected) {
+                if !nullable_collection_value_matches(value_type, mir::Type::Scalar(expected)) {
                     return Err(vec![unsupported(
                         *span,
                         "Dictionary::get has another scalar value type",
@@ -5069,7 +5244,7 @@ fn lower_nullable_class_expression(
     if let Some((collection, key, value_type, access)) =
         lower_collection_nullable_property(expr, context)?
     {
-        if value_type != mir::Type::Class(expected) {
+        if !nullable_collection_value_matches(value_type, mir::Type::Class(expected)) {
             return Err(vec![unsupported(
                 expr.span(),
                 "collection property has another class value type",
@@ -5213,6 +5388,28 @@ fn lower_nullable_class_expression(
                 _ => Err(vec![unsupported(*span, "property has another class type")]),
             }
         }
+        hir::Expr::Index {
+            collection, index, ..
+        } => {
+            if transfer {
+                return Err(vec![unsupported(
+                    expr.span(),
+                    "indexed nullable class values are borrowed and cannot be moved out",
+                )]);
+            }
+            let (collection, key) = lower_collection_index_operand(
+                collection,
+                index,
+                mir::Type::NullableClass(expected),
+                context,
+            )?;
+            Ok(mir::NullableClassExpression::DictionaryGet {
+                class: expected,
+                collection,
+                key: Box::new(key),
+                access: mir::NullableCollectionAccess::Index,
+            })
+        }
         hir::Expr::FunctionCall { name, args, span } => {
             let signature = context.lookup_function(name, *span)?;
             match signature.return_type {
@@ -5275,7 +5472,7 @@ fn lower_nullable_class_expression(
             if let Some((collection, key, value_type, access)) =
                 lower_dictionary_get(object, method, args, context)?
             {
-                if value_type != mir::Type::Class(expected) {
+                if !nullable_collection_value_matches(value_type, mir::Type::Class(expected)) {
                     return Err(vec![unsupported(
                         *span,
                         "Dictionary::get has another class value type",
@@ -5537,6 +5734,7 @@ fn lower_display_string_expression(
         | mir::Type::NullableString
         | mir::Type::NullableMixed
         | mir::Type::NullableClass(_)
+        | mir::Type::NullableCollection(_)
         | mir::Type::NullableSharedReference(_)
         | mir::Type::NullableWeakReference(_)
         | mir::Type::NullableWritableSharedReference(_)
@@ -6020,7 +6218,8 @@ fn hoist_argument_temporary(
         | mir::Type::WritableSharedReferenceAccess(_)
         | mir::Type::NullableReadonlySharedReferenceAccess(_)
         | mir::Type::NullableWritableSharedReferenceAccess(_)
-        | mir::Type::Collection(_) => context.declare_owned_temp(ty),
+        | mir::Type::Collection(_)
+        | mir::Type::NullableCollection(_) => context.declare_owned_temp(ty),
     };
     context.push_statement(mir::Statement::AssignLocal {
         target: local,
@@ -6687,6 +6886,13 @@ fn local_rvalue(local: mir::LocalId, ty: mir::Type, transfer: bool) -> mir::Rval
                 transfer,
             })
         }
+        mir::Type::NullableCollection(collection) => {
+            mir::Rvalue::NullableCollection(mir::NullableCollectionExpression::Local {
+                collection,
+                local,
+                transfer,
+            })
+        }
     }
 }
 
@@ -7037,12 +7243,17 @@ fn lower_condition(
                 let info = context.collection_type(collection_type).clone();
                 let op = match (info.kind, method.as_str()) {
                     (mir::CollectionKind::List, "contains")
-                    | (mir::CollectionKind::Dictionary, "has")
-                    | (mir::CollectionKind::Set, "contains") => {
+                    | (
+                        mir::CollectionKind::Dictionary | mir::CollectionKind::SortedDictionary,
+                        "has",
+                    )
+                    | (mir::CollectionKind::Set | mir::CollectionKind::SortedSet, "contains") => {
                         Some(mir::CollectionMembershipOp::Contains)
                     }
-                    (mir::CollectionKind::Set, "add") => Some(mir::CollectionMembershipOp::Add),
-                    (mir::CollectionKind::Set, "remove") => {
+                    (mir::CollectionKind::Set | mir::CollectionKind::SortedSet, "add") => {
+                        Some(mir::CollectionMembershipOp::Add)
+                    }
+                    (mir::CollectionKind::Set | mir::CollectionKind::SortedSet, "remove") => {
                         Some(mir::CollectionMembershipOp::Remove)
                     }
                     _ => None,
@@ -7145,6 +7356,11 @@ fn lower_null_comparison(
         mir::Type::NullableClass(class) => mir::BoolExpression::NullableClassIsPresent(Box::new(
             lower_nullable_class_presence_subject(value, class, context)?,
         )),
+        mir::Type::NullableCollection(collection) => {
+            mir::BoolExpression::NullableCollectionIsPresent(Box::new(
+                lower_nullable_collection_expression(value, collection, false, context)?,
+            ))
+        }
         mir::Type::NullableSharedReference(class) => {
             mir::BoolExpression::NullableSharedReferenceIsPresent(Box::new(
                 lower_nullable_shared_reference_expression(value, class, false, context)?,
@@ -7242,6 +7458,13 @@ fn lower_is_condition(
                 lower_nullable_class_presence_subject(expr, class, context)?,
             ))
         }
+        mir::Type::NullableCollection(collection)
+            if tested_type == mir::Type::Collection(collection) =>
+        {
+            mir::BoolExpression::NullableCollectionIsPresent(Box::new(
+                lower_nullable_collection_expression(expr, collection, false, context)?,
+            ))
+        }
         mir::Type::NullableSharedReference(class)
             if tested_type == mir::Type::SharedReference(class) =>
         {
@@ -7328,6 +7551,11 @@ fn lower_is_condition(
         mir::Type::NullableClass(class) => {
             evaluate_then_false(mir::BoolExpression::NullableClassIsPresent(Box::new(
                 lower_nullable_class_presence_subject(expr, class, context)?,
+            )))
+        }
+        mir::Type::NullableCollection(collection) => {
+            evaluate_then_false(mir::BoolExpression::NullableCollectionIsPresent(Box::new(
+                lower_nullable_collection_expression(expr, collection, false, context)?,
             )))
         }
         mir::Type::SharedReference(_)
@@ -7566,6 +7794,11 @@ fn lower_concrete_is_presence(
         mir::Type::Collection(_) => Ok(mir::BoolExpression::Use {
             operand: mir::Operand::Scalar(mir::ScalarValue::Bool(true)),
         }),
+        mir::Type::NullableCollection(collection) => {
+            Ok(mir::BoolExpression::NullableCollectionIsPresent(Box::new(
+                lower_nullable_collection_expression(expr, collection, false, context)?,
+            )))
+        }
     }
 }
 
@@ -7767,6 +8000,10 @@ fn lower_rvalue_as_expected(
             lower_collection_expression(expr, collection, true, context)
                 .map(mir::Rvalue::Collection)
         }
+        mir::Type::NullableCollection(collection) => {
+            lower_nullable_collection_expression(expr, collection, true, context)
+                .map(mir::Rvalue::NullableCollection)
+        }
     }
 }
 
@@ -7824,6 +8061,10 @@ fn lower_rvalue_as_borrowed(
         mir::Type::Collection(collection) => {
             lower_collection_expression(expr, collection, false, context)
                 .map(mir::Rvalue::Collection)
+        }
+        mir::Type::NullableCollection(collection) => {
+            lower_nullable_collection_expression(expr, collection, false, context)
+                .map(mir::Rvalue::NullableCollection)
         }
         mir::Type::Mixed => lower_mixed_expression(expr, false, context).map(mir::Rvalue::Mixed),
         mir::Type::NullableMixed => {
@@ -7961,11 +8202,13 @@ fn lower_mixed_expression(
             expr.span(),
             "mixed expression could not be lowered as a mixed value",
         )]),
-        mir::Type::Collection(_) => Err(vec![Diagnostic::unsupported_stage(
+        mir::Type::Collection(_) | mir::Type::NullableCollection(_) => {
+            Err(vec![Diagnostic::unsupported_stage(
             "M1101",
             "boxing collections, typed arrays, or Bytes into `mixed` lands after Stage 23 Slice 3",
             expr.span(),
-        )]),
+        )])
+        }
         mir::Type::SharedReference(_)
         | mir::Type::WeakReference(_)
         | mir::Type::NullableSharedReference(_)
@@ -8019,6 +8262,7 @@ fn mixed_tag_for_type(ty: mir::Type, span: Span) -> DiagnosticResult<mir::MixedT
         | mir::Type::NullableScalar(_)
         | mir::Type::NullableString
         | mir::Type::NullableClass(_)
+        | mir::Type::NullableCollection(_)
         | mir::Type::Collection(_) => Err(vec![Diagnostic::unsupported_stage(
             "M1101",
             "only exact bool, integer, float, string, and concrete-class `is` tests unbox `mixed` in Stage 23 Slice 3",
@@ -8161,7 +8405,10 @@ fn lower_collection_expression(
         }
         hir::Expr::Variable { name, span } => {
             let local = context.lookup_local(name, *span)?;
-            if context.local_type(local) != mir::Type::Collection(expected) {
+            let local_type = context.local_type(local);
+            let narrowed_nullable = local_type == mir::Type::NullableCollection(expected)
+                && context.expression_type(expr)? == mir::Type::Collection(expected);
+            if local_type != mir::Type::Collection(expected) && !narrowed_nullable {
                 return Err(vec![unsupported(
                     *span,
                     format!("collection `${name}` does not have the expected collection type"),
@@ -8288,7 +8535,11 @@ fn lower_collection_expression(
             method,
             args,
             span,
-        } if !(class_name == "Set" && method == "from") => {
+        } if !(matches!(
+            class_name.as_str(),
+            "Set" | "SortedDictionary" | "SortedSet" | "PriorityQueue" | "Deque"
+        ) && method == "from") =>
+        {
             let (signature, args) =
                 lower_static_method_call(class_name, method, args, *span, context)?;
             if signature.return_type != mir::ReturnType::Value(mir::Type::Collection(expected)) {
@@ -8313,7 +8564,10 @@ fn lower_collection_expression(
         } if matches!(method.as_str(), "union" | "intersect" | "difference") => {
             let (left, left_type) = lower_collection_local(object, context)?;
             if left_type != expected
-                || context.collection_type(expected).kind != mir::CollectionKind::Set
+                || !matches!(
+                    context.collection_type(expected).kind,
+                    mir::CollectionKind::Set | mir::CollectionKind::SortedSet
+                )
             {
                 return Err(vec![unsupported(
                     *span,
@@ -8339,7 +8593,7 @@ fn lower_collection_expression(
                 "difference" => mir::SetAlgebraOp::Difference,
                 _ => unreachable!(),
             };
-            Ok(mir::CollectionExpression::SetFrom {
+            Ok(mir::CollectionExpression::From {
                 collection: expected,
                 source: left,
                 transfer: false,
@@ -8427,23 +8681,42 @@ fn lower_collection_expression(
             method,
             args,
             span,
-        } if class_name == "Set" && method == "from" => {
+        } if matches!(
+            class_name.as_str(),
+            "Set" | "SortedDictionary" | "SortedSet" | "PriorityQueue" | "Deque"
+        ) && method == "from" =>
+        {
             let [source] = argument_values(args)[..] else {
-                return Err(vec![unsupported(*span, "Set::from expects one argument")]);
+                return Err(vec![unsupported(
+                    *span,
+                    format!("{class_name}::from expects one argument"),
+                )]);
             };
             if let hir::Expr::Array { elements, .. } = source {
                 let collection = context.collection_type(expected).clone();
                 let entries = elements
                     .iter()
                     .map(|element| {
-                        if element.key.is_some() {
+                        if collection.key.is_none() && element.key.is_some() {
                             return Err(vec![unsupported(
                                 element.value.span(),
-                                "Set::from accepts a sequence collection",
+                                format!("{class_name}::from accepts a sequence collection"),
                             )]);
                         }
+                        let key = match (collection.key, element.key.as_ref()) {
+                            (Some(key_type), Some(key)) => {
+                                Some(lower_rvalue_as_expected(key, key_type, context)?)
+                            }
+                            (Some(_), None) => {
+                                return Err(vec![unsupported(
+                                    element.value.span(),
+                                    "SortedDictionary::from requires keyed entries",
+                                )])
+                            }
+                            (None, _) => None,
+                        };
                         Ok(mir::CollectionEntry {
-                            key: None,
+                            key,
                             value: lower_rvalue_as_expected(
                                 &element.value,
                                 collection.value,
@@ -8458,7 +8731,7 @@ fn lower_collection_expression(
                 });
             }
             let (source, _) = lower_collection_local(source, context)?;
-            Ok(mir::CollectionExpression::SetFrom {
+            Ok(mir::CollectionExpression::From {
                 collection: expected,
                 source,
                 transfer: false,
@@ -8468,6 +8741,138 @@ fn lower_collection_expression(
         _ => Err(vec![unsupported(
             expr.span(),
             "this collection expression is not supported by Stage 23 Slice 1",
+        )]),
+    }
+}
+
+fn lower_nullable_collection_expression(
+    expr: &hir::Expr,
+    expected: mir::CollectionTypeId,
+    transfer: bool,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<mir::NullableCollectionExpression> {
+    match expr {
+        hir::Expr::Null { .. } => Ok(mir::NullableCollectionExpression::Null(expected)),
+        hir::Expr::Grouped { expr, .. } => {
+            lower_nullable_collection_expression(expr, expected, transfer, context)
+        }
+        hir::Expr::Binary {
+            left,
+            op: hir::BinaryOp::Coalesce,
+            right,
+            ..
+        } => match context.coalesce_selection(left) {
+            CoalesceSelection::Left => {
+                lower_nullable_collection_expression(left, expected, transfer, context)
+            }
+            CoalesceSelection::Right => {
+                lower_nullable_collection_expression(right, expected, transfer, context)
+            }
+            CoalesceSelection::Dynamic => Ok(mir::NullableCollectionExpression::Coalesce {
+                collection: expected,
+                left: Box::new(lower_nullable_collection_expression(
+                    left, expected, transfer, context,
+                )?),
+                right: Box::new(lower_nullable_collection_expression(
+                    right, expected, transfer, context,
+                )?),
+                transfer,
+            }),
+        },
+        hir::Expr::Variable { name, span } => {
+            let local = context.lookup_local(name, *span)?;
+            match context.local_type(local) {
+                mir::Type::NullableCollection(collection) if collection == expected => {
+                    if transfer && !context.local_owns(local) {
+                        return Err(vec![unsupported(
+                            *span,
+                            "borrowed nullable collection cannot be given away",
+                        )]);
+                    }
+                    Ok(mir::NullableCollectionExpression::Local {
+                        collection: expected,
+                        local,
+                        transfer,
+                    })
+                }
+                mir::Type::Collection(collection) if collection == expected => {
+                    Ok(mir::NullableCollectionExpression::Collection(
+                        lower_collection_expression(expr, expected, transfer, context)?,
+                    ))
+                }
+                _ => Err(vec![unsupported(
+                    *span,
+                    format!("collection `${name}` does not have the expected nullable type"),
+                )]),
+            }
+        }
+        hir::Expr::PropertyAccess { span, .. } => {
+            if transfer {
+                return Err(vec![unsupported(
+                    *span,
+                    "nullable collection properties are borrowed and cannot be given away directly",
+                )]);
+            }
+            let (object, property, property_type) = lower_property_place(expr, context)?;
+            match property_type {
+                mir::Type::NullableCollection(collection) if collection == expected => {
+                    Ok(mir::NullableCollectionExpression::Property {
+                        collection: expected,
+                        object,
+                        property,
+                    })
+                }
+                mir::Type::Collection(collection) if collection == expected => {
+                    Ok(mir::NullableCollectionExpression::Collection(
+                        mir::CollectionExpression::Property {
+                            collection: expected,
+                            object,
+                            property,
+                        },
+                    ))
+                }
+                _ => Err(vec![unsupported(
+                    *span,
+                    "collection property does not have the expected nullable type",
+                )]),
+            }
+        }
+        hir::Expr::FunctionCall { name, args, span } => {
+            let signature = context.lookup_function(name, *span)?;
+            match signature.return_type {
+                mir::ReturnType::Value(mir::Type::NullableCollection(collection))
+                    if collection == expected =>
+                {
+                    Ok(mir::NullableCollectionExpression::Call {
+                        collection: expected,
+                        function: signature.id,
+                        return_borrow: signature.return_borrow,
+                        args: lower_call_args_with_ownership(
+                            name, args, signature, *span, context,
+                        )?,
+                    })
+                }
+                mir::ReturnType::Value(mir::Type::Collection(collection))
+                    if collection == expected =>
+                {
+                    Ok(mir::NullableCollectionExpression::Collection(
+                        lower_collection_expression(expr, expected, transfer, context)?,
+                    ))
+                }
+                _ => Err(vec![unsupported(
+                    *span,
+                    format!("function `{name}` does not return the expected nullable collection"),
+                )]),
+            }
+        }
+        _ if context.expression_type(expr)? == mir::Type::Collection(expected) => {
+            Ok(mir::NullableCollectionExpression::Collection(
+                lower_collection_expression(expr, expected, transfer, context)?,
+            ))
+        }
+        _ => Err(vec![unsupported(
+            expr.span(),
+            "this nullable collection expression is not supported by native compilation",
         )]),
     }
 }
@@ -8628,6 +9033,7 @@ fn collection_remove_at_rvalue(
         | mir::Type::NullableString
         | mir::Type::NullableMixed
         | mir::Type::NullableClass(_)
+        | mir::Type::NullableCollection(_)
         | mir::Type::NullableWritableSharedReference(_)
         | mir::Type::NullableWritableWeakReference(_) => Err(vec![unsupported(
             Span::new(0, 0),
@@ -9049,28 +9455,60 @@ impl NullableCollectionScalarOperation<'_> {
                 definition.kind == mir::CollectionKind::List
                     && definition.value == mir::Type::Scalar(expected)
             }
+            Self::Property("peek") => {
+                definition.kind == mir::CollectionKind::PriorityQueue
+                    && definition.value == mir::Type::Scalar(expected)
+            }
+            Self::Property("peekFront" | "peekBack") => {
+                definition.kind == mir::CollectionKind::Deque
+                    && definition.value == mir::Type::Scalar(expected)
+            }
             Self::Method("contains", [_]) => {
                 expected == mir::ScalarType::Bool
                     && matches!(
                         definition.kind,
-                        mir::CollectionKind::List | mir::CollectionKind::Set
+                        mir::CollectionKind::List
+                            | mir::CollectionKind::Set
+                            | mir::CollectionKind::SortedSet
                     )
             }
             Self::Method("has", [_]) => {
                 expected == mir::ScalarType::Bool
-                    && definition.kind == mir::CollectionKind::Dictionary
+                    && matches!(
+                        definition.kind,
+                        mir::CollectionKind::Dictionary | mir::CollectionKind::SortedDictionary
+                    )
             }
             Self::Method("add" | "remove", [_]) => {
-                (expected == mir::ScalarType::Bool && definition.kind == mir::CollectionKind::Set)
+                (expected == mir::ScalarType::Bool
+                    && matches!(
+                        definition.kind,
+                        mir::CollectionKind::Set | mir::CollectionKind::SortedSet
+                    ))
                     || (definition.value == mir::Type::Scalar(expected)
-                        && definition.kind == mir::CollectionKind::Dictionary)
+                        && matches!(
+                            definition.kind,
+                            mir::CollectionKind::Dictionary | mir::CollectionKind::SortedDictionary
+                        ))
             }
             Self::Method("get", [_]) => {
-                definition.kind == mir::CollectionKind::Dictionary
+                matches!(
+                    definition.kind,
+                    mir::CollectionKind::Dictionary | mir::CollectionKind::SortedDictionary
+                ) && definition.value == mir::Type::Scalar(expected)
+            }
+            Self::Method("removeAt", [_]) => {
+                definition.kind == mir::CollectionKind::List
                     && definition.value == mir::Type::Scalar(expected)
             }
-            Self::Method("removeAt", [_]) | Self::Method("pop", []) => {
-                definition.kind == mir::CollectionKind::List
+            Self::Method("pop", []) => {
+                matches!(
+                    definition.kind,
+                    mir::CollectionKind::List | mir::CollectionKind::PriorityQueue
+                ) && definition.value == mir::Type::Scalar(expected)
+            }
+            Self::Method("popFront" | "popBack", []) => {
+                definition.kind == mir::CollectionKind::Deque
                     && definition.value == mir::Type::Scalar(expected)
             }
             _ => false,
@@ -9091,12 +9529,12 @@ impl NullableCollectionScalarOperation<'_> {
             Self::Property("isEmpty") => Ok(mir::NullableScalarExpression::Value(
                 mir::ValueExpression::Bool(mir::BoolExpression::CollectionIsEmpty { collection }),
             )),
-            Self::Property(property @ ("first" | "last")) => {
+            Self::Property(property @ ("first" | "last" | "peek" | "peekFront" | "peekBack")) => {
                 Ok(mir::NullableScalarExpression::DictionaryGet {
                     ty: expected,
                     collection,
                     key: Box::new(zero_int_rvalue()),
-                    access: if *property == "first" {
+                    access: if matches!(*property, "first" | "peek" | "peekFront") {
                         mir::NullableCollectionAccess::First
                     } else {
                         mir::NullableCollectionAccess::Last
@@ -9118,12 +9556,19 @@ impl NullableCollectionScalarOperation<'_> {
                     },
                 })
             }
-            Self::Method("pop", []) => Ok(mir::NullableScalarExpression::DictionaryGet {
-                ty: expected,
-                collection,
-                key: Box::new(zero_int_rvalue()),
-                access: mir::NullableCollectionAccess::Pop,
-            }),
+            Self::Method(method @ ("pop" | "popFront" | "popBack"), []) => {
+                Ok(mir::NullableScalarExpression::DictionaryGet {
+                    ty: expected,
+                    collection,
+                    key: Box::new(zero_int_rvalue()),
+                    access: match *method {
+                        "pop" => mir::NullableCollectionAccess::Pop,
+                        "popFront" => mir::NullableCollectionAccess::PopFront,
+                        "popBack" => mir::NullableCollectionAccess::PopBack,
+                        _ => unreachable!(),
+                    },
+                })
+            }
             Self::Method("removeAt", [index]) => {
                 let index = lower_rvalue_as_expected(
                     &index.value,
@@ -9229,7 +9674,17 @@ fn materialize_collection_place_as(
 fn collection_method_mutates(method: &str) -> bool {
     matches!(
         method,
-        "add" | "insertAt" | "removeAt" | "pop" | "set" | "remove"
+        "add"
+            | "insertAt"
+            | "removeAt"
+            | "pop"
+            | "set"
+            | "remove"
+            | "push"
+            | "pushFront"
+            | "pushBack"
+            | "popFront"
+            | "popBack"
     )
 }
 
@@ -9301,12 +9756,24 @@ fn lower_collection_method_statement(
     };
     let info = context.collection_type(collection_type).clone();
     match (info.kind, method, args) {
-        (mir::CollectionKind::List | mir::CollectionKind::Set, "add", [value]) => {
+        (
+            mir::CollectionKind::List | mir::CollectionKind::Set | mir::CollectionKind::SortedSet,
+            "add",
+            [value],
+        )
+        | (mir::CollectionKind::PriorityQueue, "push", [value])
+        | (mir::CollectionKind::Deque, "pushFront" | "pushBack", [value]) => {
+            let op = match method {
+                "pushFront" => mir::CollectionMutationOp::PushFront,
+                "pushBack" => mir::CollectionMutationOp::PushBack,
+                "push" => mir::CollectionMutationOp::Push,
+                _ => mir::CollectionMutationOp::Add,
+            };
             let statement = mir::Statement::CollectionAdd {
                 collection,
                 value: lower_rvalue_as_expected(&value.value, info.value, context)?,
                 index: None,
-                op: mir::CollectionMutationOp::Add,
+                op,
             };
             context.push_statement(statement);
         }
@@ -9323,7 +9790,7 @@ fn lower_collection_method_statement(
             };
             context.push_statement(statement);
         }
-        (mir::CollectionKind::Set, "remove", [value]) => {
+        (mir::CollectionKind::Set | mir::CollectionKind::SortedSet, "remove", [value]) => {
             let statement = mir::Statement::CollectionAdd {
                 collection,
                 value: lower_rvalue_as_borrowed(&value.value, info.value, context)?,
@@ -9332,7 +9799,11 @@ fn lower_collection_method_statement(
             };
             context.push_statement(statement);
         }
-        (mir::CollectionKind::Dictionary, "set", [key, value]) => {
+        (
+            mir::CollectionKind::Dictionary | mir::CollectionKind::SortedDictionary,
+            "set",
+            [key, value],
+        ) => {
             let key_type = info.key.expect("dictionary collection has a key type");
             let statement = mir::Statement::CollectionSet {
                 collection,
@@ -9350,8 +9821,13 @@ fn lower_collection_method_statement(
             let value = collection_remove_at_rvalue(collection, index, info.value)?;
             lower_discarded_rvalue(value, context);
         }
-        (mir::CollectionKind::List, "pop", [])
-        | (mir::CollectionKind::Dictionary, "remove", [_]) => {
+        (mir::CollectionKind::List | mir::CollectionKind::PriorityQueue, "pop", [])
+        | (mir::CollectionKind::Deque, "popFront" | "popBack", [])
+        | (
+            mir::CollectionKind::Dictionary | mir::CollectionKind::SortedDictionary,
+            "remove",
+            [_],
+        ) => {
             let Some((collection, key, value_type, access)) =
                 lower_dictionary_get(object, method, args, context)?
             else {
@@ -9375,7 +9851,7 @@ fn nullable_collection_access_rvalue(
 ) -> DiagnosticResult<mir::Rvalue> {
     let key = Box::new(key);
     match value_type {
-        mir::Type::Scalar(ty) => Ok(mir::Rvalue::NullableScalar(
+        mir::Type::Scalar(ty) | mir::Type::NullableScalar(ty) => Ok(mir::Rvalue::NullableScalar(
             mir::NullableScalarExpression::DictionaryGet {
                 ty,
                 collection,
@@ -9383,14 +9859,14 @@ fn nullable_collection_access_rvalue(
                 access,
             },
         )),
-        mir::Type::String => Ok(mir::Rvalue::NullableString(
+        mir::Type::String | mir::Type::NullableString => Ok(mir::Rvalue::NullableString(
             mir::NullableStringExpression::DictionaryGet {
                 collection,
                 key,
                 access,
             },
         )),
-        mir::Type::Class(class) => Ok(mir::Rvalue::NullableClass(
+        mir::Type::Class(class) | mir::Type::NullableClass(class) => Ok(mir::Rvalue::NullableClass(
             mir::NullableClassExpression::DictionaryGet {
                 class,
                 collection,
@@ -9500,10 +9976,9 @@ fn nullable_collection_access_rvalue(
             object.span(),
         )]),
         mir::Type::Collection(_)
-        | mir::Type::NullableScalar(_)
-        | mir::Type::NullableString
+        | mir::Type::NullableCollection(_)
         | mir::Type::NullableMixed
-        | mir::Type::NullableClass(_) => Err(vec![unsupported(
+        => Err(vec![unsupported(
             object.span(),
             "discarding this nullable collection element type is not yet supported",
         )]),
@@ -9537,7 +10012,8 @@ fn lower_discarded_rvalue(value: mir::Rvalue, context: &mut LoweringContext) {
         | mir::Type::NullableClass(_)
         | mir::Type::Mixed
         | mir::Type::NullableMixed
-        | mir::Type::Collection(_) => true,
+        | mir::Type::Collection(_)
+        | mir::Type::NullableCollection(_) => true,
         _ => false,
     };
     let local = context.declare_return_temp(ty, owned);
@@ -9577,7 +10053,7 @@ fn lower_discarded_rvalue(value: mir::Rvalue, context: &mut LoweringContext) {
         {
             context.push_statement(mir::Statement::DropWritableWeakReference { local, payload });
         }
-        mir::Type::Collection(collection) => {
+        mir::Type::Collection(collection) | mir::Type::NullableCollection(collection) => {
             context.push_statement(mir::Statement::DropCollection { local, collection });
         }
         mir::Type::Mixed | mir::Type::NullableMixed => {
@@ -9620,17 +10096,23 @@ fn lower_dictionary_get(
     };
     let definition = context.collection_type(collection_type).clone();
     let (key, access) = match (definition.kind, method, args) {
-        (mir::CollectionKind::Dictionary, "get", [key]) => (
-            lower_rvalue_as_borrowed(
-                &key.value,
-                definition
-                    .key
-                    .expect("dictionary collection has a key type"),
-                context,
-            )?,
-            mir::NullableCollectionAccess::Get,
-        ),
-        (mir::CollectionKind::Dictionary, "remove", [key]) => (
+        (mir::CollectionKind::Dictionary | mir::CollectionKind::SortedDictionary, "get", [key]) => {
+            (
+                lower_rvalue_as_borrowed(
+                    &key.value,
+                    definition
+                        .key
+                        .expect("dictionary collection has a key type"),
+                    context,
+                )?,
+                mir::NullableCollectionAccess::Get,
+            )
+        }
+        (
+            mir::CollectionKind::Dictionary | mir::CollectionKind::SortedDictionary,
+            "remove",
+            [key],
+        ) => (
             lower_rvalue_as_borrowed(
                 &key.value,
                 definition
@@ -9640,7 +10122,7 @@ fn lower_dictionary_get(
             )?,
             mir::NullableCollectionAccess::Remove,
         ),
-        (mir::CollectionKind::List, "pop", []) => (
+        (mir::CollectionKind::List | mir::CollectionKind::PriorityQueue, "pop", []) => (
             mir::Rvalue::Value(mir::ValueExpression::Integer(
                 mir::IntegerExpression::constant(
                     IntegerValue::from_i128(IntegerType::Int64, 0).expect("zero is a valid int"),
@@ -9648,9 +10130,19 @@ fn lower_dictionary_get(
             )),
             mir::NullableCollectionAccess::Pop,
         ),
+        (mir::CollectionKind::Deque, "popFront", []) => {
+            (zero_int_rvalue(), mir::NullableCollectionAccess::PopFront)
+        }
+        (mir::CollectionKind::Deque, "popBack", []) => {
+            (zero_int_rvalue(), mir::NullableCollectionAccess::PopBack)
+        }
         _ => return Ok(None),
     };
     Ok(Some((collection, key, definition.value, access)))
+}
+
+fn nullable_collection_value_matches(value: mir::Type, payload: mir::Type) -> bool {
+    value == payload || crate::native_abi::nullable_payload_type(value) == Some(payload)
 }
 
 fn lower_collection_nullable_property(
@@ -9674,13 +10166,18 @@ fn lower_collection_nullable_property(
         return Ok(None);
     };
     let access = match property.as_str() {
-        "first" => mir::NullableCollectionAccess::First,
-        "last" => mir::NullableCollectionAccess::Last,
+        "first" | "peek" | "peekFront" => mir::NullableCollectionAccess::First,
+        "last" | "peekBack" => mir::NullableCollectionAccess::Last,
         _ => return Ok(None),
     };
     let (collection, collection_type) = lower_collection_local(object, context)?;
     let definition = context.collection_type(collection_type).clone();
-    if definition.kind != mir::CollectionKind::List {
+    if !matches!(
+        (definition.kind, property.as_str()),
+        (mir::CollectionKind::List, "first" | "last")
+            | (mir::CollectionKind::PriorityQueue, "peek")
+            | (mir::CollectionKind::Deque, "peekFront" | "peekBack")
+    ) {
         return Ok(None);
     }
     let key = mir::Rvalue::Value(mir::ValueExpression::Integer(

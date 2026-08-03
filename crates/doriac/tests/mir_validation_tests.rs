@@ -1,9 +1,9 @@
 use doriac::class_layout::{compute_class_layout, ClassId, FieldType, PropertyId};
 use doriac::format_string::{FormatConversion, FormatPiece, FormatSpec};
 use doriac::mir::{
-    BasicBlock, BlockId, Class, ClassExpression, CollectionExpression, CollectionKind,
-    CollectionType, CollectionTypeId, FloatBinaryOp, FloatExpression, FormatArgument,
-    FormatExpression, Function, FunctionId, IntegerExpression, Local, LocalId,
+    BasicBlock, BlockId, Class, ClassExpression, CollectionComparator, CollectionExpression,
+    CollectionKind, CollectionType, CollectionTypeId, FloatBinaryOp, FloatExpression,
+    FormatArgument, FormatExpression, Function, FunctionId, IntegerExpression, Local, LocalId,
     NullableClassExpression, NullableSharedReferenceExpression, NullableStringExpression, Operand,
     Program, Property, PropertyValue, PropertyValueSource, ReturnType, Rvalue, ScalarType,
     ScalarValue, SharedReferenceExpression, Statement, StaticId, StaticProperty, StaticValue,
@@ -151,6 +151,7 @@ fn shared_validator_rejects_confused_string_intrinsic_collection_shapes() {
         kind: CollectionKind::List,
         key: None,
         value: Type::String,
+        comparator: None,
     });
     program.functions[0].locals.push(Local {
         id: LocalId(0),
@@ -226,6 +227,7 @@ fn shared_validator_rejects_consuming_string_intrinsic_collection_inputs() {
         kind: CollectionKind::List,
         key: None,
         value: Type::String,
+        comparator: None,
     });
     program.functions[0].locals.push(Local {
         id: LocalId(0),
@@ -415,12 +417,62 @@ fn shared_validator_rejects_noncanonical_bytes_storage() {
         kind: CollectionKind::Bytes,
         key: None,
         value: Type::Scalar(ScalarType::Integer(IntegerType::Int64)),
+        comparator: None,
     });
 
     let error = doriac::mir_validation::validate_program(&program)
         .expect_err("Bytes must always use the packed uint8 element contract");
     assert!(error.message.contains("Bytes collection"));
     assert!(error.message.contains("packed uint8"));
+}
+
+#[test]
+fn shared_validator_enforces_stage26_collection_capabilities() {
+    for (name, collection, expected) in [
+        (
+            "missing sorted comparator",
+            CollectionType {
+                id: CollectionTypeId(0),
+                kind: CollectionKind::SortedSet,
+                key: None,
+                value: Type::Scalar(ScalarType::Integer(IntegerType::Int64)),
+                comparator: None,
+            },
+            "comparator identity",
+        ),
+        (
+            "float sorted comparator",
+            CollectionType {
+                id: CollectionTypeId(0),
+                kind: CollectionKind::PriorityQueue,
+                key: None,
+                value: Type::Scalar(ScalarType::Float(FloatType::Float64)),
+                comparator: Some(CollectionComparator::SignedInteger(64)),
+            },
+            "comparator identity",
+        ),
+        (
+            "deque comparator",
+            CollectionType {
+                id: CollectionTypeId(0),
+                kind: CollectionKind::Deque,
+                key: None,
+                value: Type::Scalar(ScalarType::Integer(IntegerType::Int64)),
+                comparator: Some(CollectionComparator::SignedInteger(64)),
+            },
+            "must not carry a comparator",
+        ),
+    ] {
+        let mut program = valid_void_program();
+        program.collection_types.push(collection);
+        let error = doriac::mir_validation::validate_program(&program)
+            .expect_err(&format!("{name} must be rejected"));
+        assert!(
+            error.message.contains(expected),
+            "{name}: {}",
+            error.message
+        );
+    }
 }
 
 fn nullable_access_source() -> &'static str {
@@ -450,6 +502,7 @@ fn shared_validator_enforces_sequence_fill_shape() {
         kind: CollectionKind::List,
         key: None,
         value: Type::Scalar(ScalarType::Integer(IntegerType::Int64)),
+        comparator: None,
     });
     program.functions[0].locals.push(Local {
         id: LocalId(0),

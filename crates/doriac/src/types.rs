@@ -282,7 +282,11 @@ pub enum TypeKind {
     Class(ClassType<TypeId>),
     List(TypeId),
     Dictionary(TypeId, TypeId),
+    SortedDictionary(TypeId, TypeId),
     Set(TypeId),
+    SortedSet(TypeId),
+    PriorityQueue(TypeId),
+    Deque(TypeId),
     SharedHandle(SharedHandleKind, TypeId),
 }
 
@@ -302,7 +306,11 @@ pub enum ResolvedType {
     TypedArray(Box<ResolvedType>),
     List(Box<ResolvedType>),
     Dictionary(Box<ResolvedType>, Box<ResolvedType>),
+    SortedDictionary(Box<ResolvedType>, Box<ResolvedType>),
     Set(Box<ResolvedType>),
+    SortedSet(Box<ResolvedType>),
+    PriorityQueue(Box<ResolvedType>),
+    Deque(Box<ResolvedType>),
     SharedHandle(SharedHandleKind, Box<ResolvedType>),
     Unsupported,
 }
@@ -313,8 +321,11 @@ pub(crate) fn resolved_type_complexity(ty: &ResolvedType) -> usize {
         | ResolvedType::TypedArray(inner)
         | ResolvedType::List(inner)
         | ResolvedType::Set(inner)
+        | ResolvedType::SortedSet(inner)
+        | ResolvedType::PriorityQueue(inner)
+        | ResolvedType::Deque(inner)
         | ResolvedType::SharedHandle(_, inner) => 1 + resolved_type_complexity(inner),
-        ResolvedType::Dictionary(key, value) => {
+        ResolvedType::Dictionary(key, value) | ResolvedType::SortedDictionary(key, value) => {
             1 + resolved_type_complexity(key) + resolved_type_complexity(value)
         }
         ResolvedType::Class(class) => {
@@ -414,7 +425,19 @@ impl TypeRegistry {
                     self.display(*value)
                 )
             }
+            TypeKind::SortedDictionary(key, value) => {
+                format!(
+                    "SortedDictionary<{}, {}>",
+                    self.display(*key),
+                    self.display(*value)
+                )
+            }
             TypeKind::Set(element) => format!("Set<{}>", self.display(*element)),
+            TypeKind::SortedSet(element) => format!("SortedSet<{}>", self.display(*element)),
+            TypeKind::PriorityQueue(element) => {
+                format!("PriorityQueue<{}>", self.display(*element))
+            }
+            TypeKind::Deque(element) => format!("Deque<{}>", self.display(*element)),
             TypeKind::SharedHandle(kind, payload) => {
                 format!("{}<{}>", kind.source_name(), self.display(*payload))
             }
@@ -449,7 +472,18 @@ impl TypeRegistry {
                 Box::new(self.resolved(*key)),
                 Box::new(self.resolved(*value)),
             ),
+            TypeKind::SortedDictionary(key, value) => ResolvedType::SortedDictionary(
+                Box::new(self.resolved(*key)),
+                Box::new(self.resolved(*value)),
+            ),
             TypeKind::Set(element) => ResolvedType::Set(Box::new(self.resolved(*element))),
+            TypeKind::SortedSet(element) => {
+                ResolvedType::SortedSet(Box::new(self.resolved(*element)))
+            }
+            TypeKind::PriorityQueue(element) => {
+                ResolvedType::PriorityQueue(Box::new(self.resolved(*element)))
+            }
+            TypeKind::Deque(element) => ResolvedType::Deque(Box::new(self.resolved(*element))),
             TypeKind::SharedHandle(kind, payload) => {
                 ResolvedType::SharedHandle(*kind, Box::new(self.resolved(*payload)))
             }

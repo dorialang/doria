@@ -2132,5 +2132,78 @@ function main(): void
     )
     .expect("readonly dictionary projections have a faithful PHP foreach lowering");
 
-    assert!(php.contains("foreach ($items as $key => $"));
+    assert!(php.contains("foreach (__doria_collection_projection($items, true) as $key)"));
+}
+
+#[test]
+fn php_backend_executes_the_stage26_collection_family_with_doria_ordering() {
+    let php = doriac::compile_source_to_php(
+        "stage26.php.doria",
+        r#"
+function main(): void
+{
+    writable SortedDictionary<int, string> $map =
+        SortedDictionary::from([2 => "two", -1 => "minus", 1 => "one"]);
+    $map->set(3, "three");
+    foreach ($map->keys as int $key) { echo "{$key} "; }
+    echo "\n";
+
+    writable SortedSet<int> $set = SortedSet::from([3, -1, 1, 3]);
+    $set->add(0);
+    foreach ($set as int $value) { echo "{$value} "; }
+    echo "\n";
+
+    writable PriorityQueue<int> $queue = PriorityQueue::from([4, -2, 1]);
+    $queue->push(-3);
+    while (!$queue->isEmpty) {
+        let $value = $queue->pop() ?? 99;
+        echo "{$value} ";
+    }
+    echo "\n";
+
+    writable Deque<string> $deque = Deque::from(["middle"]);
+    $deque->pushFront("first");
+    $deque->pushBack("last");
+    foreach ($deque as string $value) { echo "{$value} "; }
+}
+"#,
+    )
+    .expect("Stage 26 collections should lower to PHP compatibility helpers");
+
+    assert!(php.contains("final class SortedDictionary"));
+    assert!(php.contains("final class SortedSet"));
+    assert!(php.contains("final class PriorityQueue"));
+    assert!(php.contains("final class Deque"));
+
+    let Ok(version) = Command::new("php").arg("--version").output() else {
+        return;
+    };
+    if !version.status.success() {
+        return;
+    }
+    let script = format!(
+        "{}\nmain();",
+        php.strip_prefix("<?php").expect("generated PHP header")
+    );
+    let run = Command::new("php")
+        .arg("-d")
+        .arg("display_errors=1")
+        .arg("-r")
+        .arg(script)
+        .output()
+        .expect("generated Stage 26 PHP should execute");
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(
+        run.stdout,
+        b"-1 1 2 3 \n-1 0 1 3 \n-3 -2 1 4 \nfirst middle last "
+    );
+    assert!(
+        run.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
 }

@@ -108,6 +108,11 @@ sorted family, `PriorityQueue`, and `Deque` join the collections family with the
 stage assigned by the collections-runtime decision (at or after Stage 23). Nothing
 here is implementation; this fixes the family and its names.
 
+Stage 26 has now discharged the implementation dependency for
+`SortedDictionary`, `SortedSet`, `PriorityQueue`, and `Deque`. Their accepted
+names, order, and single-parameter priority-queue shape are unchanged; decision
+0100 owns the implemented member and ownership surface.
+
 ## Affected components
 
 Plan §4.9 and the D22 row (the named-collection list); the §9.1 collection-method
@@ -124,3 +129,5 @@ record.
   `Deque<T>`, the now-reserved name.
 - Any assumption that `Dictionary`/`Set` iteration order is unspecified — it is
   insertion order.
+- Any pipeline note that still describes the sorted/priority/deque family as
+  unimplemented — Stage 26 completes that family without adding aliases.

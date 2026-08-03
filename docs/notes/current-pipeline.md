@@ -105,10 +105,16 @@ Documentation role: working note. This file prevents duplicated in-flight work. 
   all through the decision 0109 foundation. The flush substrate now reports the
   same success/broken-pipe/other-failure vocabulary as writes.
 
-## Next
+## Current collection milestone
 
-- Stage 26 — Next. The stream review is complete and no longer blocks the
-  remaining collection-family implementation.
+- Stage 26 — Complete. `SortedDictionary`, `SortedSet`, min-first
+  `PriorityQueue`, and ring-buffer `Deque` consume explicit validated MIR and a
+  shared private runtime ABI across the interpreter, Cranelift, and LLVM. PHP
+  compatibility uses generated semantic helpers rather than host collection
+  ordering. Set iteration is readonly and non-consuming construction/algebra
+  preserve their sources.
+- Stage 27 — Next.
+- Stage 36a — Scheduled, Not Implemented.
 
 ## Do not duplicate
 

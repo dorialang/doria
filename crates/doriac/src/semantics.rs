@@ -1364,7 +1364,13 @@ impl<'program> Checker<'program> {
                 "`String` is the compiler-known string companion and cannot be redeclared"
                     .to_string(),
             ),
-            "List" | "Dictionary" | "Set" => Some(format!(
+            "List"
+            | "Dictionary"
+            | "SortedDictionary"
+            | "Set"
+            | "SortedSet"
+            | "PriorityQueue"
+            | "Deque" => Some(format!(
                 "`{name}` is a compiler-known collection alias and cannot be redeclared"
             )),
             "array" => Some(
@@ -2440,7 +2446,9 @@ impl<'program> Checker<'program> {
             Self::dictionary_foreach_projection(&foreach.iterable)
         {
             let dictionary_ty = self.infer_expr_type(dictionary, scopes, method_context);
-            if let TypeKind::Dictionary(key, value) = self.types.kind(dictionary_ty).clone() {
+            if let TypeKind::Dictionary(key, value) | TypeKind::SortedDictionary(key, value) =
+                self.types.kind(dictionary_ty).clone()
+            {
                 return (
                     unknown,
                     match projection {
@@ -2453,7 +2461,10 @@ impl<'program> Checker<'program> {
 
         let iterable_ty = self.infer_expr_type(&foreach.iterable, scopes, method_context);
         match self.types.kind(iterable_ty).clone() {
-            TypeKind::List(value) | TypeKind::Set(value) => (
+            TypeKind::List(value)
+            | TypeKind::Set(value)
+            | TypeKind::SortedSet(value)
+            | TypeKind::Deque(value) => (
                 self.types.intern(TypeKind::Integer(IntegerType::Int64)),
                 value,
             ),
@@ -2461,7 +2472,9 @@ impl<'program> Checker<'program> {
                 self.types.intern(TypeKind::Integer(IntegerType::Int64)),
                 value,
             ),
-            TypeKind::Dictionary(key, value) => (key, value),
+            TypeKind::Dictionary(key, value) | TypeKind::SortedDictionary(key, value) => {
+                (key, value)
+            }
             TypeKind::Mixed => (unknown, self.types.intern(TypeKind::Mixed)),
             _ => (unknown, unknown),
         }
@@ -3192,6 +3205,22 @@ impl<'program> Checker<'program> {
                         if let TypeKind::Integer(integer) = *self.types.kind(value_ty) {
                             self.contextualize_integer_literals(&decl.initializer, integer);
                         }
+                        if self.stage26_collection_has_unknown_arguments(value_ty) {
+                            self.diagnostics.push(
+                                Diagnostic::new(
+                                    "E0539",
+                                    "an empty collection source does not reveal the destination element type",
+                                    decl.initializer.span(),
+                                )
+                                .with_title("Collection Type Cannot Be Inferred")
+                                .with_explanation(
+                                    "An empty source contains no element or key/value pair from which to infer the generic arguments.",
+                                )
+                                .with_help(
+                                    "add an explicit destination type, for example `Deque<int> $values = Deque::from([])`",
+                                ),
+                            );
+                        }
                         value_ty
                     }
                 };
@@ -3365,9 +3394,26 @@ impl<'program> Checker<'program> {
                 let dictionary_projection = Self::dictionary_foreach_projection(&foreach.iterable)
                     .and_then(|(dictionary, projection)| {
                         let ty = self.infer_expr_type(dictionary, scopes, method_context);
-                        matches!(self.types.kind(ty), TypeKind::Dictionary(_, _))
-                            .then_some((dictionary, projection))
+                        matches!(
+                            self.types.kind(ty),
+                            TypeKind::Dictionary(_, _) | TypeKind::SortedDictionary(_, _)
+                        )
+                        .then_some((dictionary, projection))
                     });
+                let iterable_ty = self.infer_expr_type(&foreach.iterable, scopes, method_context);
+                if matches!(self.types.kind(iterable_ty), TypeKind::PriorityQueue(_)) {
+                    self.diagnostics.push(
+                        Diagnostic::new(
+                            "E0529",
+                            "PriorityQueue does not support foreach because heap layout is not a public iteration order",
+                            foreach.span,
+                        )
+                        .with_title("PriorityQueue Has No Foreach Order")
+                        .with_help(
+                            "use repeated `pop()` only when destructive min-first traversal is appropriate",
+                        ),
+                    );
+                }
                 if range_iterable {
                     if let Some(integer) = foreach
                         .value
@@ -3500,13 +3546,37 @@ impl<'program> Checker<'program> {
                         foreach.span,
                     ));
                 }
+                if matches!(
+                    self.types.kind(iterable_ty),
+                    TypeKind::Set(_) | TypeKind::SortedSet(_)
+                ) && foreach.value.writable
+                {
+                    self.diagnostics.push(
+                        Diagnostic::new(
+                            "E0530",
+                            "set elements cannot be written in place",
+                            foreach.span,
+                        )
+                        .with_title("Set Elements Cannot Be Written In Place")
+                        .with_explanation(
+                            "Changing a set element in place could invalidate uniqueness, hashing, or sorted order.",
+                        )
+                        .with_help(
+                            "remove the old element and add the replacement through the collection",
+                        ),
+                    );
+                }
                 self.declare_binding(
                     &mut loop_scopes,
                     foreach.value.name.clone(),
                     Binding {
                         writable: foreach.value.writable
                             && dictionary_projection.is_none()
-                            && !range_iterable,
+                            && !range_iterable
+                            && !matches!(
+                                self.types.kind(iterable_ty),
+                                TypeKind::Set(_) | TypeKind::SortedSet(_)
+                            ),
                         ty: value_ty,
                         declared_ty: value_ty,
                         int_constant: None,
@@ -5047,7 +5117,11 @@ impl<'program> Checker<'program> {
                 | TypeKind::TypedArray(_)
                 | TypeKind::List(_)
                 | TypeKind::Dictionary(_, _)
+                | TypeKind::SortedDictionary(_, _)
                 | TypeKind::Set(_)
+                | TypeKind::SortedSet(_)
+                | TypeKind::PriorityQueue(_)
+                | TypeKind::Deque(_)
                 | TypeKind::EmptyCollection
         )
     }
@@ -5205,10 +5279,13 @@ impl<'program> Checker<'program> {
         match self.types.kind(ty) {
             TypeKind::Mixed => true,
             TypeKind::Nullable(inner) => self.type_contains_mixed(*inner),
-            TypeKind::TypedArray(element) | TypeKind::List(element) | TypeKind::Set(element) => {
-                self.type_contains_mixed(*element)
-            }
-            TypeKind::Dictionary(key, value) => {
+            TypeKind::TypedArray(element)
+            | TypeKind::List(element)
+            | TypeKind::Set(element)
+            | TypeKind::SortedSet(element)
+            | TypeKind::PriorityQueue(element)
+            | TypeKind::Deque(element) => self.type_contains_mixed(*element),
+            TypeKind::Dictionary(key, value) | TypeKind::SortedDictionary(key, value) => {
                 self.type_contains_mixed(*key) || self.type_contains_mixed(*value)
             }
             _ => false,
@@ -5226,7 +5303,11 @@ impl<'program> Checker<'program> {
             | TypeKind::TypedArray(_)
             | TypeKind::List(_)
             | TypeKind::Dictionary(_, _)
+            | TypeKind::SortedDictionary(_, _)
             | TypeKind::Set(_)
+            | TypeKind::SortedSet(_)
+            | TypeKind::PriorityQueue(_)
+            | TypeKind::Deque(_)
             | TypeKind::EmptyCollection
             | TypeKind::Heterogeneous => true,
             _ => false,
@@ -5240,8 +5321,11 @@ impl<'program> Checker<'program> {
             | TypeKind::TypedArray(inner)
             | TypeKind::List(inner)
             | TypeKind::Set(inner)
+            | TypeKind::SortedSet(inner)
+            | TypeKind::PriorityQueue(inner)
+            | TypeKind::Deque(inner)
             | TypeKind::SharedHandle(_, inner) => self.type_is_symbolic(*inner),
-            TypeKind::Dictionary(key, value) => {
+            TypeKind::Dictionary(key, value) | TypeKind::SortedDictionary(key, value) => {
                 self.type_is_symbolic(*key) || self.type_is_symbolic(*value)
             }
             TypeKind::Class(class) => class
@@ -5303,9 +5387,26 @@ impl<'program> Checker<'program> {
                 let value = self.substitute_type_id(value, substitutions);
                 self.types.intern(TypeKind::Dictionary(key, value))
             }
+            TypeKind::SortedDictionary(key, value) => {
+                let key = self.substitute_type_id(key, substitutions);
+                let value = self.substitute_type_id(value, substitutions);
+                self.types.intern(TypeKind::SortedDictionary(key, value))
+            }
             TypeKind::Set(element) => {
                 let element = self.substitute_type_id(element, substitutions);
                 self.types.intern(TypeKind::Set(element))
+            }
+            TypeKind::SortedSet(element) => {
+                let element = self.substitute_type_id(element, substitutions);
+                self.types.intern(TypeKind::SortedSet(element))
+            }
+            TypeKind::PriorityQueue(element) => {
+                let element = self.substitute_type_id(element, substitutions);
+                self.types.intern(TypeKind::PriorityQueue(element))
+            }
+            TypeKind::Deque(element) => {
+                let element = self.substitute_type_id(element, substitutions);
+                self.types.intern(TypeKind::Deque(element))
             }
             TypeKind::SharedHandle(kind, payload) => {
                 let payload = self.substitute_type_id(payload, substitutions);
@@ -6593,6 +6694,13 @@ impl<'program> Checker<'program> {
             match self.types.kind(source).clone() {
                 TypeKind::TypedArray(element) | TypeKind::List(element) => {
                     self.check_stage23_hashable_type(element, args[0].value.span(), "Set element");
+                    self.check_non_consuming_collection_duplication(
+                        "Set",
+                        "Set::from",
+                        element,
+                        None,
+                        args[0].value.span(),
+                    );
                 }
                 TypeKind::EmptyCollection => {
                     // The destination Set<T> supplies the element type. Lowering
@@ -6609,6 +6717,20 @@ impl<'program> Checker<'program> {
                     ));
                 }
             }
+            return;
+        }
+        if matches!(
+            class_name,
+            "SortedDictionary" | "SortedSet" | "PriorityQueue" | "Deque"
+        ) {
+            self.check_stage26_collection_from_call(
+                class_name,
+                access.member,
+                args,
+                access.span,
+                scopes,
+                method_context,
+            );
             return;
         }
         if class_name == "Bytes" {
@@ -7529,7 +7651,10 @@ impl<'program> Checker<'program> {
             }
             (TypeKind::TypedArray(pattern), TypeKind::TypedArray(actual))
             | (TypeKind::List(pattern), TypeKind::List(actual))
-            | (TypeKind::Set(pattern), TypeKind::Set(actual)) => {
+            | (TypeKind::Set(pattern), TypeKind::Set(actual))
+            | (TypeKind::SortedSet(pattern), TypeKind::SortedSet(actual))
+            | (TypeKind::PriorityQueue(pattern), TypeKind::PriorityQueue(actual))
+            | (TypeKind::Deque(pattern), TypeKind::Deque(actual)) => {
                 self.infer_type_parameter_bindings(callee, pattern, actual, span, bindings);
             }
             // A shared handle unifies with the same handle kind, through its payload:
@@ -7544,6 +7669,10 @@ impl<'program> Checker<'program> {
             (
                 TypeKind::Dictionary(pattern_key, pattern_value),
                 TypeKind::Dictionary(actual_key, actual_value),
+            )
+            | (
+                TypeKind::SortedDictionary(pattern_key, pattern_value),
+                TypeKind::SortedDictionary(actual_key, actual_value),
             ) => {
                 self.infer_type_parameter_bindings(callee, pattern_key, actual_key, span, bindings);
                 self.infer_type_parameter_bindings(
@@ -7600,9 +7729,26 @@ impl<'program> Checker<'program> {
                 let value = self.substitute_type(value, bindings);
                 self.types.intern(TypeKind::Dictionary(key, value))
             }
+            TypeKind::SortedDictionary(key, value) => {
+                let key = self.substitute_type(key, bindings);
+                let value = self.substitute_type(value, bindings);
+                self.types.intern(TypeKind::SortedDictionary(key, value))
+            }
             TypeKind::Set(element) => {
                 let element = self.substitute_type(element, bindings);
                 self.types.intern(TypeKind::Set(element))
+            }
+            TypeKind::SortedSet(element) => {
+                let element = self.substitute_type(element, bindings);
+                self.types.intern(TypeKind::SortedSet(element))
+            }
+            TypeKind::PriorityQueue(element) => {
+                let element = self.substitute_type(element, bindings);
+                self.types.intern(TypeKind::PriorityQueue(element))
+            }
+            TypeKind::Deque(element) => {
+                let element = self.substitute_type(element, bindings);
+                self.types.intern(TypeKind::Deque(element))
             }
             TypeKind::SharedHandle(kind, payload) => {
                 let payload = self.substitute_type(payload, bindings);
@@ -8352,18 +8498,16 @@ impl<'program> Checker<'program> {
                 | TypeKind::Mixed
                 | TypeKind::TypeParameter(_)
                 | TypeKind::Class(_)
-                | TypeKind::SharedHandle(_, _) => self.types.intern(TypeKind::Nullable(inner)),
-                TypeKind::Bytes
+                | TypeKind::SharedHandle(_, _)
+                | TypeKind::Bytes
                 | TypeKind::TypedArray(_)
                 | TypeKind::List(_)
                 | TypeKind::Dictionary(_, _)
-                | TypeKind::Set(_) => self.reject_type_ref_with_help(
-                    ty,
-                    span,
-                    "E0454",
-                    format!("nullable collection type `{ty}` is not yet supported"),
-                    "use a non-null collection type in this compiler version",
-                ),
+                | TypeKind::SortedDictionary(_, _)
+                | TypeKind::Set(_)
+                | TypeKind::SortedSet(_)
+                | TypeKind::PriorityQueue(_)
+                | TypeKind::Deque(_) => self.types.intern(TypeKind::Nullable(inner)),
                 TypeKind::Void
                 | TypeKind::Null
                 | TypeKind::Nullable(_)
@@ -8542,6 +8686,18 @@ impl<'program> Checker<'program> {
                 self.check_stage23_hashable_type(key, span, "Dictionary key");
                 self.types.intern(TypeKind::Dictionary(key, value))
             }
+            "SortedDictionary" => {
+                if !self.expect_type_arg_count(ty, 2, span) {
+                    for arg in ty.type_arguments() {
+                        self.resolve_type_ref_in_position(arg, span, TypePosition::Value, declaring_class);
+                    }
+                    return self.types.unknown();
+                }
+                let key = self.resolve_type_ref_in_position(ty.type_argument(0).unwrap(), span, TypePosition::Value, declaring_class);
+                let value = self.resolve_type_ref_in_position(ty.type_argument(1).unwrap(), span, TypePosition::Value, declaring_class);
+                self.check_stage26_comparable_type(key, span, "SortedDictionary key");
+                self.types.intern(TypeKind::SortedDictionary(key, value))
+            }
             "Set" => {
                 if !self.expect_type_arg_count(ty, 1, span) {
                     for arg in ty.type_arguments() {
@@ -8553,6 +8709,48 @@ impl<'program> Checker<'program> {
                     self.resolve_type_ref_in_position(ty.type_argument(0).unwrap(), span, TypePosition::Value, declaring_class);
                 self.check_stage23_hashable_type(element, span, "Set element");
                 self.types.intern(TypeKind::Set(element))
+            }
+            "SortedSet" | "PriorityQueue" | "Deque" => {
+                if !self.expect_type_arg_count(ty, 1, span) {
+                    for arg in ty.type_arguments() {
+                        self.resolve_type_ref_in_position(arg, span, TypePosition::Value, declaring_class);
+                    }
+                    return self.types.unknown();
+                }
+                let element = self.resolve_type_ref_in_position(
+                    ty.type_argument(0).unwrap(),
+                    span,
+                    TypePosition::Value,
+                    declaring_class,
+                );
+                match ty.name.as_str() {
+                    "SortedSet" => {
+                        self.check_stage26_comparable_type(element, span, "SortedSet element");
+                        self.types.intern(TypeKind::SortedSet(element))
+                    }
+                    "PriorityQueue" => {
+                        self.check_stage26_comparable_type(element, span, "PriorityQueue element");
+                        self.types.intern(TypeKind::PriorityQueue(element))
+                    }
+                    "Deque" => self.types.intern(TypeKind::Deque(element)),
+                    _ => unreachable!(),
+                }
+            }
+            "Queue" | "Stack" | "HashMap" | "HashSet" | "SortedMap" => {
+                let replacement = match ty.name.as_str() {
+                    "Queue" | "Stack" => "Deque<T>",
+                    "HashMap" => "Dictionary<K, V>",
+                    "HashSet" => "Set<T>",
+                    "SortedMap" => "SortedDictionary<K, V>",
+                    _ => unreachable!(),
+                };
+                self.reject_type_ref_with_help(
+                    ty,
+                    span,
+                    "E0401",
+                    format!("Unknown Type `{}`", ty.name),
+                    format!("use `{replacement}`"),
+                )
             }
             name if self.classes.contains_key(name) => {
                 let type_params = self
@@ -8673,6 +8871,222 @@ impl<'program> Checker<'program> {
                 span,
             )
             .with_help("use an integer, string, or bool key/element; float is not Hashable"),
+        };
+        if !self.diagnostics.iter().any(|existing| {
+            existing.code == diagnostic.code && existing.message == diagnostic.message
+        }) {
+            self.diagnostics.push(diagnostic);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn check_stage26_collection_from_call(
+        &mut self,
+        collection: &str,
+        method: &str,
+        args: &[Argument],
+        span: Span,
+        scopes: &ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) {
+        if method != "from" {
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "E0521",
+                    format!("Unknown {collection} Companion Operation `{collection}::{method}`"),
+                    span,
+                )
+                .with_title("Unknown Collection Operation")
+                .with_help(format!(
+                    "construct this collection with `{collection}::from(...)`"
+                )),
+            );
+            return;
+        }
+        if self.reject_named_arguments(&format!("{collection}::from"), args) {
+            return;
+        }
+        if args.len() != 1 {
+            self.report_argument_count_mismatch(
+                &format!("{collection}::from"),
+                1,
+                1,
+                args.len(),
+                span,
+            );
+            return;
+        }
+
+        let source_expr = &args[0].value;
+        let source = self.infer_expr_type(source_expr, scopes, method_context);
+        let elements = match (collection, self.types.kind(source).clone()) {
+            ("SortedDictionary", TypeKind::Dictionary(key, value)) => Some((key, Some(value))),
+            (
+                "SortedSet" | "PriorityQueue" | "Deque",
+                TypeKind::TypedArray(element) | TypeKind::List(element),
+            ) => Some((element, None)),
+            (_, TypeKind::EmptyCollection) => None,
+            ("SortedDictionary", _) => {
+                self.diagnostics.push(
+                    Diagnostic::new(
+                        "E0403",
+                        format!(
+                            "`SortedDictionary::from` requires a `Dictionary<K, V>` source, got `{}`",
+                            self.types.display(source)
+                        ),
+                        source_expr.span(),
+                    )
+                    .with_title("Dictionary Source Required"),
+                );
+                return;
+            }
+            (_, _) => {
+                self.diagnostics.push(
+                    Diagnostic::new(
+                        "E0403",
+                        format!(
+                            "`{collection}::from` requires a `T[]` or `List<T>` source, got `{}`",
+                            self.types.display(source)
+                        ),
+                        source_expr.span(),
+                    )
+                    .with_title("Sequence Source Required"),
+                );
+                return;
+            }
+        };
+
+        let Some((first, second)) = elements else {
+            return;
+        };
+        if collection == "SortedDictionary" {
+            self.check_stage26_comparable_type(first, source_expr.span(), "SortedDictionary key");
+        } else if matches!(collection, "SortedSet" | "PriorityQueue") {
+            self.check_stage26_comparable_type(
+                first,
+                source_expr.span(),
+                &format!("{collection} element"),
+            );
+        }
+
+        self.check_non_consuming_collection_duplication(
+            collection,
+            &format!("{collection}::from"),
+            first,
+            second,
+            source_expr.span(),
+        );
+    }
+
+    fn check_non_consuming_collection_duplication(
+        &mut self,
+        collection: &str,
+        operation: &str,
+        first: TypeId,
+        second: Option<TypeId>,
+        span: Span,
+    ) {
+        if self.type_is_move_type(first)
+            || second.is_some_and(|value| self.type_is_move_type(value))
+        {
+            let element = second
+                .map(|value| {
+                    format!(
+                        "{} and {}",
+                        self.types.display(first),
+                        self.types.display(value)
+                    )
+                })
+                .unwrap_or_else(|| self.types.display(first));
+            self.diagnostics.push(
+                Diagnostic::unsupported_stage(
+                    "E0528",
+                    format!(
+                        "`{operation}` preserves its source, so owned move value `{element}` cannot be duplicated before Stage 35 `Cloneable`"
+                    ),
+                    span,
+                )
+                .with_title("Collection Elements Cannot Be Duplicated")
+                .with_explanation(format!(
+                    "`{operation}` leaves every input collection unchanged, so every stored value must be copied."
+                ))
+                .with_help(match collection {
+                    "Deque" => format!(
+                        "create an empty `Deque<{}>` and move each value into it with `pushBack`",
+                        self.types.display(first)
+                    ),
+                    "PriorityQueue" => format!(
+                        "create an empty `PriorityQueue<{}>` and move each value into it with `push`",
+                        self.types.display(first)
+                    ),
+                    "Set" | "SortedSet" => {
+                        format!("move values individually into an empty {collection} with `add`")
+                    }
+                    "SortedDictionary" => {
+                        "insert entries individually into an empty SortedDictionary with `set`"
+                            .to_string()
+                    }
+                    _ => format!(
+                        "build the destination incrementally; Stage 35 widens `{collection}` duplication through `Cloneable`"
+                    ),
+                }),
+            );
+        }
+    }
+
+    fn check_stage26_comparable_type(&mut self, ty: TypeId, span: Span, role: &str) {
+        let diagnostic = match self.types.kind(ty) {
+            TypeKind::Integer(_)
+            | TypeKind::String
+            | TypeKind::Bool
+            | TypeKind::Unknown => return,
+            TypeKind::TypeParameter(parameter)
+                if self.type_parameter_has_constraint(parameter, "Comparable") =>
+            {
+                return;
+            }
+            TypeKind::TypeParameter(parameter) => Diagnostic::new(
+                "E0537",
+                format!(
+                    "{role} type parameter `{parameter}` is not guaranteed to implement `Comparable`"
+                ),
+                span,
+            )
+            .with_title("Comparable Constraint Required")
+            .with_help(format!(
+                "declare `{parameter} implements Comparable` before using it in an ordered collection"
+            )),
+            TypeKind::Float(_) => Diagnostic::new(
+                "E0523",
+                format!(
+                    "{role} type `{}` does not provide the total order required by ordered collections",
+                    self.types.display(ty)
+                ),
+                span,
+            )
+            .with_title("Float Has No Collection Order")
+            .with_explanation(
+                "NaN and signed zero prevent Doria floats from defining the total order required by sorted collections and PriorityQueue.",
+            )
+            .with_help("use an integer, bool, or string element, or wrap the value in a later user-defined Comparable type"),
+            TypeKind::Class(_) => Diagnostic::unsupported_stage(
+                "E0523",
+                format!(
+                    "{role} type `{}` requires Stage 35 user-defined `Comparable` conformance",
+                    self.types.display(ty)
+                ),
+                span,
+            ),
+            _ => Diagnostic::new(
+                "E0523",
+                format!(
+                    "{role} type `{}` does not conform to `Comparable`",
+                    self.types.display(ty)
+                ),
+                span,
+            )
+            .with_title("Comparable Type Required")
+            .with_help("use an integer, bool, or string element; float has no total collection order"),
         };
         if !self.diagnostics.iter().any(|existing| {
             existing.code == diagnostic.code && existing.message == diagnostic.message
@@ -8927,6 +9341,31 @@ impl<'program> Checker<'program> {
         destination: AssignmentDestination,
     ) -> bool {
         self.complete_generic_call_from_expected(value_expr, target);
+
+        if matches!(value_expr, Expr::Array { .. }) {
+            let constructor = match self.types.kind(target) {
+                TypeKind::SortedDictionary(_, _) => Some("SortedDictionary::from"),
+                TypeKind::SortedSet(_) => Some("SortedSet::from"),
+                TypeKind::PriorityQueue(_) => Some("PriorityQueue::from"),
+                TypeKind::Deque(_) => Some("Deque::from"),
+                _ => None,
+            };
+            if let Some(constructor) = constructor {
+                self.diagnostics.push(
+                    Diagnostic::new(
+                        "E0538",
+                        "this collection type has no direct bracket-literal construction form",
+                        value_expr.span(),
+                    )
+                    .with_title("Explicit Collection Construction Required")
+                    .with_explanation(
+                        "Bracket literals directly construct List, Dictionary, or typed-array values; this collection family is constructed explicitly.",
+                    )
+                    .with_help(format!("wrap the literal with `{constructor}(...)`")),
+                );
+                return false;
+            }
+        }
         if let Some(fits) = self.contextualize_scalar_literals(target, value_expr) {
             return fits;
         }
@@ -8950,6 +9389,19 @@ impl<'program> Checker<'program> {
 
         self.check_assignable(target, value, value_expr.span(), destination);
         false
+    }
+
+    fn stage26_collection_has_unknown_arguments(&self, ty: TypeId) -> bool {
+        match self.types.kind(ty) {
+            TypeKind::SortedDictionary(key, value) => matches!(
+                (self.types.kind(*key), self.types.kind(*value)),
+                (TypeKind::Unknown, _) | (_, TypeKind::Unknown)
+            ),
+            TypeKind::SortedSet(value)
+            | TypeKind::PriorityQueue(value)
+            | TypeKind::Deque(value) => matches!(self.types.kind(*value), TypeKind::Unknown),
+            _ => false,
+        }
     }
 
     fn narrow_empty_collection_assignment(
@@ -9317,7 +9769,11 @@ impl<'program> Checker<'program> {
                 TypeKind::TypedArray(_)
                 | TypeKind::List(_)
                 | TypeKind::Dictionary(_, _)
-                | TypeKind::Set(_),
+                | TypeKind::SortedDictionary(_, _)
+                | TypeKind::Set(_)
+                | TypeKind::SortedSet(_)
+                | TypeKind::PriorityQueue(_)
+                | TypeKind::Deque(_),
             ) => true,
             (TypeKind::Class(target), TypeKind::Class(value)) => target == value,
             (TypeKind::TypedArray(target), TypeKind::TypedArray(value)) => {
@@ -9331,7 +9787,19 @@ impl<'program> Checker<'program> {
                 self.is_assignable(target_key, value_key)
                     && self.is_assignable(target_value, value_value)
             }
+            (
+                TypeKind::SortedDictionary(target_key, target_value),
+                TypeKind::SortedDictionary(value_key, value_value),
+            ) => {
+                self.is_assignable(target_key, value_key)
+                    && self.is_assignable(target_value, value_value)
+            }
             (TypeKind::Set(target), TypeKind::Set(value)) => self.is_assignable(target, value),
+            (TypeKind::SortedSet(target), TypeKind::SortedSet(value))
+            | (TypeKind::PriorityQueue(target), TypeKind::PriorityQueue(value))
+            | (TypeKind::Deque(target), TypeKind::Deque(value)) => {
+                self.is_assignable(target, value)
+            }
             // Shared handles are assignable only within the same handle kind, so the
             // families stay disjoint (record 0106) while a symbolic payload still
             // matches its concrete specialization.
@@ -9687,6 +10155,52 @@ impl<'program> Checker<'program> {
                         };
                         return self.types.intern(TypeKind::Set(element));
                     }
+                    if matches!(
+                        class_name.as_str(),
+                        "SortedDictionary" | "SortedSet" | "PriorityQueue" | "Deque"
+                    ) {
+                        let source = args
+                            .first()
+                            .map(|arg| self.infer_expr_type(&arg.value, scopes, method_context));
+                        return match (
+                            class_name.as_str(),
+                            source.map(|source| self.types.kind(source).clone()),
+                        ) {
+                            ("SortedDictionary", Some(TypeKind::Dictionary(key, value))) => {
+                                self.types.intern(TypeKind::SortedDictionary(key, value))
+                            }
+                            ("SortedDictionary", _) => {
+                                let unknown = self.types.unknown();
+                                self.types
+                                    .intern(TypeKind::SortedDictionary(unknown, unknown))
+                            }
+                            (
+                                "SortedSet",
+                                Some(TypeKind::TypedArray(element) | TypeKind::List(element)),
+                            ) => self.types.intern(TypeKind::SortedSet(element)),
+                            ("SortedSet", _) => {
+                                let unknown = self.types.unknown();
+                                self.types.intern(TypeKind::SortedSet(unknown))
+                            }
+                            (
+                                "PriorityQueue",
+                                Some(TypeKind::TypedArray(element) | TypeKind::List(element)),
+                            ) => self.types.intern(TypeKind::PriorityQueue(element)),
+                            ("PriorityQueue", _) => {
+                                let unknown = self.types.unknown();
+                                self.types.intern(TypeKind::PriorityQueue(unknown))
+                            }
+                            (
+                                "Deque",
+                                Some(TypeKind::TypedArray(element) | TypeKind::List(element)),
+                            ) => self.types.intern(TypeKind::Deque(element)),
+                            ("Deque", _) => {
+                                let unknown = self.types.unknown();
+                                self.types.intern(TypeKind::Deque(unknown))
+                            }
+                            _ => unreachable!(),
+                        };
+                    }
                     if let Some(integer) = IntegerType::from_companion_name(&class_name) {
                         return self.types.intern(TypeKind::Integer(integer));
                     }
@@ -9769,8 +10283,13 @@ impl<'program> Checker<'program> {
                 let byte = self.types.intern(TypeKind::Integer(IntegerType::UInt8));
                 Some((int, byte))
             }
-            TypeKind::Dictionary(key, value) => Some((key, value)),
-            TypeKind::Set(_) => None,
+            TypeKind::Dictionary(key, value) | TypeKind::SortedDictionary(key, value) => {
+                Some((key, value))
+            }
+            TypeKind::Set(_)
+            | TypeKind::SortedSet(_)
+            | TypeKind::PriorityQueue(_)
+            | TypeKind::Deque(_) => None,
             _ => None,
         }
     }
@@ -9784,12 +10303,42 @@ impl<'program> Checker<'program> {
         method_context: Option<&MethodContext>,
     ) {
         let collection_ty = self.infer_expr_type(collection, scopes, method_context);
-        if matches!(self.types.kind(collection_ty), TypeKind::Set(_)) {
+        if matches!(
+            self.types.kind(collection_ty),
+            TypeKind::Set(_) | TypeKind::SortedSet(_)
+        ) {
             self.diagnostics.push(Diagnostic::new(
                 "E0520",
-                "`Set<T>` does not support indexed access; use `contains` or `foreach`",
+                format!(
+                    "`{}` does not support indexed access; use `contains` or `foreach`",
+                    self.types.display(collection_ty)
+                ),
                 span,
             ));
+            return;
+        }
+        if matches!(
+            self.types.kind(collection_ty),
+            TypeKind::PriorityQueue(_) | TypeKind::Deque(_)
+        ) {
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "E0520",
+                    format!(
+                        "`{}` does not support indexed access",
+                        self.types.display(collection_ty)
+                    ),
+                    span,
+                )
+                .with_title("Collection Is Not Indexable")
+                .with_help(match self.types.kind(collection_ty) {
+                    TypeKind::PriorityQueue(_) => "use `peek` or `pop()` for min-first access",
+                    TypeKind::Deque(_) => {
+                        "use `peekFront`, `peekBack`, `popFront()`, or `popBack()`"
+                    }
+                    _ => unreachable!(),
+                }),
+            );
             return;
         }
         let Some((key, _)) = self.collection_index_types(collection, scopes, method_context) else {
@@ -9836,23 +10385,47 @@ impl<'program> Checker<'program> {
             (TypeKind::String, "graphemes" | "codePoints") => Some(self.types.unknown()),
             (TypeKind::TypedArray(_), "length") => Some(int),
             (TypeKind::Bytes, "length") => Some(int),
-            (TypeKind::List(_) | TypeKind::Dictionary(_, _) | TypeKind::Set(_), "count") => {
-                Some(int)
-            }
-            (TypeKind::List(_) | TypeKind::Dictionary(_, _) | TypeKind::Set(_), "isEmpty") => {
-                Some(bool_ty)
-            }
+            (
+                TypeKind::List(_)
+                | TypeKind::Dictionary(_, _)
+                | TypeKind::SortedDictionary(_, _)
+                | TypeKind::Set(_)
+                | TypeKind::SortedSet(_)
+                | TypeKind::PriorityQueue(_)
+                | TypeKind::Deque(_),
+                "count",
+            ) => Some(int),
+            (
+                TypeKind::List(_)
+                | TypeKind::Dictionary(_, _)
+                | TypeKind::SortedDictionary(_, _)
+                | TypeKind::Set(_)
+                | TypeKind::SortedSet(_)
+                | TypeKind::PriorityQueue(_)
+                | TypeKind::Deque(_),
+                "isEmpty",
+            ) => Some(bool_ty),
             (TypeKind::List(value), "first" | "last") => {
                 Some(self.types.intern(TypeKind::Nullable(*value)))
             }
-            (TypeKind::Dictionary(_, _), "keys" | "values") => Some(self.types.unknown()),
+            (TypeKind::Dictionary(_, _) | TypeKind::SortedDictionary(_, _), "keys" | "values") => {
+                Some(self.types.unknown())
+            }
+            (TypeKind::PriorityQueue(value), "peek")
+            | (TypeKind::Deque(value), "peekFront" | "peekBack") => {
+                Some(self.types.intern(TypeKind::Nullable(*value)))
+            }
             (
                 TypeKind::String
                 | TypeKind::Bytes
                 | TypeKind::TypedArray(_)
                 | TypeKind::List(_)
                 | TypeKind::Dictionary(_, _)
-                | TypeKind::Set(_),
+                | TypeKind::SortedDictionary(_, _)
+                | TypeKind::Set(_)
+                | TypeKind::SortedSet(_)
+                | TypeKind::PriorityQueue(_)
+                | TypeKind::Deque(_),
                 _,
             ) => Some(self.types.unknown()),
             _ => None,
@@ -10163,8 +10736,11 @@ impl<'program> Checker<'program> {
             TypeKind::Nullable(inner)
             | TypeKind::TypedArray(inner)
             | TypeKind::List(inner)
-            | TypeKind::Set(inner) => self.check_specialized_shared_payloads(inner, span),
-            TypeKind::Dictionary(key, value) => {
+            | TypeKind::Set(inner)
+            | TypeKind::SortedSet(inner)
+            | TypeKind::PriorityQueue(inner)
+            | TypeKind::Deque(inner) => self.check_specialized_shared_payloads(inner, span),
+            TypeKind::Dictionary(key, value) | TypeKind::SortedDictionary(key, value) => {
                 self.check_specialized_shared_payloads(key, span);
                 self.check_specialized_shared_payloads(value, span);
             }
@@ -10257,22 +10833,32 @@ impl<'program> Checker<'program> {
         let void = self.types.intern(TypeKind::Void);
         let bool_ty = self.types.intern(TypeKind::Bool);
         let result = match (self.types.kind(ty).clone(), method) {
-            (TypeKind::List(_), "add" | "insertAt") | (TypeKind::Dictionary(_, _), "set") => {
-                Some(void)
-            }
+            (TypeKind::List(_), "add" | "insertAt")
+            | (TypeKind::Dictionary(_, _) | TypeKind::SortedDictionary(_, _), "set")
+            | (TypeKind::PriorityQueue(_), "push")
+            | (TypeKind::Deque(_), "pushFront" | "pushBack") => Some(void),
             (TypeKind::List(value), "removeAt") => Some(value),
             (TypeKind::List(value), "pop") => Some(self.types.intern(TypeKind::Nullable(value))),
             (TypeKind::List(_), "contains") => Some(bool_ty),
-            (TypeKind::Dictionary(_, value), "get") => {
+            (TypeKind::Dictionary(_, value) | TypeKind::SortedDictionary(_, value), "get") => {
                 Some(self.types.intern(TypeKind::Nullable(value)))
             }
-            (TypeKind::Dictionary(_, value), "remove") => {
+            (TypeKind::Dictionary(_, value) | TypeKind::SortedDictionary(_, value), "remove") => {
                 Some(self.types.intern(TypeKind::Nullable(value)))
             }
-            (TypeKind::Dictionary(_, _), "has")
-            | (TypeKind::Set(_), "add" | "remove" | "contains") => Some(bool_ty),
+            (TypeKind::Dictionary(_, _) | TypeKind::SortedDictionary(_, _), "has")
+            | (TypeKind::Set(_) | TypeKind::SortedSet(_), "add" | "remove" | "contains") => {
+                Some(bool_ty)
+            }
             (TypeKind::Set(value), "union" | "intersect" | "difference") => {
                 Some(self.types.intern(TypeKind::Set(value)))
+            }
+            (TypeKind::SortedSet(value), "union" | "intersect" | "difference") => {
+                Some(self.types.intern(TypeKind::SortedSet(value)))
+            }
+            (TypeKind::PriorityQueue(value), "pop")
+            | (TypeKind::Deque(value), "popFront" | "popBack") => {
+                Some(self.types.intern(TypeKind::Nullable(value)))
             }
             (TypeKind::Bytes, "toArray") => {
                 let byte = self.types.intern(TypeKind::Integer(IntegerType::UInt8));
@@ -10283,7 +10869,11 @@ impl<'program> Checker<'program> {
                 | TypeKind::TypedArray(_)
                 | TypeKind::List(_)
                 | TypeKind::Dictionary(_, _)
-                | TypeKind::Set(_),
+                | TypeKind::SortedDictionary(_, _)
+                | TypeKind::Set(_)
+                | TypeKind::SortedSet(_)
+                | TypeKind::PriorityQueue(_)
+                | TypeKind::Deque(_),
                 _,
             ) => Some(self.types.unknown()),
             _ => None,
@@ -10334,18 +10924,35 @@ impl<'program> Checker<'program> {
             (TypeKind::TypedArray(_), "length")
                 | (TypeKind::Bytes, "length")
                 | (
-                    TypeKind::List(_) | TypeKind::Dictionary(_, _) | TypeKind::Set(_),
+                    TypeKind::List(_)
+                        | TypeKind::Dictionary(_, _)
+                        | TypeKind::SortedDictionary(_, _)
+                        | TypeKind::Set(_)
+                        | TypeKind::SortedSet(_)
+                        | TypeKind::PriorityQueue(_)
+                        | TypeKind::Deque(_),
                     "count"
                 )
                 | (
-                    TypeKind::List(_) | TypeKind::Dictionary(_, _) | TypeKind::Set(_),
+                    TypeKind::List(_)
+                        | TypeKind::Dictionary(_, _)
+                        | TypeKind::SortedDictionary(_, _)
+                        | TypeKind::Set(_)
+                        | TypeKind::SortedSet(_)
+                        | TypeKind::PriorityQueue(_)
+                        | TypeKind::Deque(_),
                     "isEmpty"
                 )
                 | (TypeKind::List(_), "first" | "last")
+                | (TypeKind::PriorityQueue(_), "peek")
+                | (TypeKind::Deque(_), "peekFront" | "peekBack")
         );
         if matches!(
             (self.types.kind(ty), property),
-            (TypeKind::Dictionary(_, _), "keys" | "values")
+            (
+                TypeKind::Dictionary(_, _) | TypeKind::SortedDictionary(_, _),
+                "keys" | "values",
+            )
         ) {
             self.diagnostics.push(
                 Diagnostic::new(
@@ -10390,7 +10997,11 @@ impl<'program> Checker<'program> {
                 | TypeKind::TypedArray(_)
                 | TypeKind::List(_)
                 | TypeKind::Dictionary(_, _)
+                | TypeKind::SortedDictionary(_, _)
                 | TypeKind::Set(_)
+                | TypeKind::SortedSet(_)
+                | TypeKind::PriorityQueue(_)
+                | TypeKind::Deque(_)
         );
         if !is_collection {
             return false;
@@ -10412,19 +11023,50 @@ impl<'program> Checker<'program> {
             (TypeKind::Dictionary(key, value), "set") => (vec![key, value], true),
             (TypeKind::Dictionary(key, _), "get" | "has") => (vec![key], false),
             (TypeKind::Dictionary(key, _), "remove") => (vec![key], true),
+            (TypeKind::SortedDictionary(key, value), "set") => (vec![key, value], true),
+            (TypeKind::SortedDictionary(key, _), "get" | "has") => (vec![key], false),
+            (TypeKind::SortedDictionary(key, _), "remove") => (vec![key], true),
             (TypeKind::Set(value), "add" | "remove") => (vec![value], true),
             (TypeKind::Set(value), "contains") => (vec![value], false),
             (TypeKind::Set(value), "union" | "intersect" | "difference") => {
+                self.check_non_consuming_collection_duplication(
+                    "Set",
+                    &format!("Set::{method}"),
+                    value,
+                    None,
+                    span,
+                );
                 let set = self.types.intern(TypeKind::Set(value));
                 (vec![set], false)
             }
+            (TypeKind::SortedSet(value), "add" | "remove") => (vec![value], true),
+            (TypeKind::SortedSet(value), "contains") => (vec![value], false),
+            (TypeKind::SortedSet(value), "union" | "intersect" | "difference") => {
+                self.check_non_consuming_collection_duplication(
+                    "SortedSet",
+                    &format!("SortedSet::{method}"),
+                    value,
+                    None,
+                    span,
+                );
+                let set = self.types.intern(TypeKind::SortedSet(value));
+                (vec![set], false)
+            }
+            (TypeKind::PriorityQueue(value), "push") => (vec![value], true),
+            (TypeKind::PriorityQueue(_), "pop") => (vec![], true),
+            (TypeKind::Deque(value), "pushFront" | "pushBack") => (vec![value], true),
+            (TypeKind::Deque(_), "popFront" | "popBack") => (vec![], true),
             (TypeKind::Bytes, "toArray") => (vec![], false),
             (
                 TypeKind::Bytes
                 | TypeKind::TypedArray(_)
                 | TypeKind::List(_)
                 | TypeKind::Dictionary(_, _)
-                | TypeKind::Set(_),
+                | TypeKind::SortedDictionary(_, _)
+                | TypeKind::Set(_)
+                | TypeKind::SortedSet(_)
+                | TypeKind::PriorityQueue(_)
+                | TypeKind::Deque(_),
                 "map" | "filter" | "reduce",
             ) => {
                 self.diagnostics.push(Diagnostic::unsupported_stage(
@@ -10934,7 +11576,11 @@ impl<'program> Checker<'program> {
             TypeKind::TypedArray(_)
                 | TypeKind::List(_)
                 | TypeKind::Dictionary(_, _)
+                | TypeKind::SortedDictionary(_, _)
                 | TypeKind::Set(_)
+                | TypeKind::SortedSet(_)
+                | TypeKind::PriorityQueue(_)
+                | TypeKind::Deque(_)
                 | TypeKind::EmptyCollection
         )
     }
@@ -10945,7 +11591,11 @@ impl<'program> Checker<'program> {
             TypeKind::TypedArray(_)
                 | TypeKind::List(_)
                 | TypeKind::Dictionary(_, _)
+                | TypeKind::SortedDictionary(_, _)
                 | TypeKind::Set(_)
+                | TypeKind::SortedSet(_)
+                | TypeKind::PriorityQueue(_)
+                | TypeKind::Deque(_)
         )
     }
 

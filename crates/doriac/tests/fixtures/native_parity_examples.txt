@@ -143,6 +143,8 @@ examples/native/main_stage25a_writable_shared_class.doria
 examples/native/main_stage25a_writable_shared_collection.doria
 examples/native/main_stage25a_writable_shared_domains.doria
 examples/native/main_stage25a_writable_weak_reference.doria
+examples/native/main_stage26_collections.doria
+examples/native/main_stage26_nullable_dictionary_missing_panic.doria
 examples/native/main_stage25a_weak_cycle.doria
 examples/native/main_stage25a_access_lifetime.doria
 examples/native/main_stage25a_generic_repository.doria

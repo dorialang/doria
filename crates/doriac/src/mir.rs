@@ -54,7 +54,50 @@ pub enum CollectionKind {
     TypedArray,
     List,
     Dictionary,
+    SortedDictionary,
     Set,
+    SortedSet,
+    PriorityQueue,
+    Deque,
+}
+
+impl CollectionKind {
+    pub const fn is_dictionary(self) -> bool {
+        matches!(self, Self::Dictionary | Self::SortedDictionary)
+    }
+
+    pub const fn is_set(self) -> bool {
+        matches!(self, Self::Set | Self::SortedSet)
+    }
+
+    pub const fn is_ordered(self) -> bool {
+        matches!(
+            self,
+            Self::SortedDictionary | Self::SortedSet | Self::PriorityQueue
+        )
+    }
+
+    pub const fn supports_foreach(self) -> bool {
+        !matches!(self, Self::PriorityQueue)
+    }
+
+    pub const fn supports_writable_element_iteration(self) -> bool {
+        matches!(
+            self,
+            Self::TypedArray | Self::List | Self::Dictionary | Self::SortedDictionary | Self::Deque
+        )
+    }
+}
+
+/// Backend-neutral ordering identity for collection kinds whose public
+/// semantics depend on a total order. This prevents native backends from
+/// guessing signedness or delegating string order to their host platform.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CollectionComparator {
+    SignedInteger(u8),
+    UnsignedInteger(u8),
+    Bool,
+    StringBytes,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,6 +106,7 @@ pub struct CollectionType {
     pub kind: CollectionKind,
     pub key: Option<Type>,
     pub value: Type,
+    pub comparator: Option<CollectionComparator>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -220,6 +264,7 @@ pub enum Type {
     NullableReadonlySharedReferenceAccess(WritableSharedPayload),
     NullableWritableSharedReferenceAccess(WritableSharedPayload),
     Collection(CollectionTypeId),
+    NullableCollection(CollectionTypeId),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -267,6 +312,7 @@ impl Type {
                 | Self::NullableReadonlySharedReferenceAccess(_)
                 | Self::NullableWritableSharedReferenceAccess(_)
                 | Self::Collection(_)
+                | Self::NullableCollection(_)
         )
     }
 
@@ -402,6 +448,7 @@ pub enum Rvalue {
     SharedReferenceAccess(SharedReferenceAccessExpression),
     NullableSharedReferenceAccess(NullableSharedReferenceAccessExpression),
     Collection(CollectionExpression),
+    NullableCollection(NullableCollectionExpression),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -440,6 +487,7 @@ impl Rvalue {
             Self::SharedReferenceAccess(value) => value.ty(),
             Self::NullableSharedReferenceAccess(value) => value.ty(),
             Self::Collection(value) => Type::Collection(value.collection()),
+            Self::NullableCollection(value) => Type::NullableCollection(value.collection()),
         }
     }
 
@@ -447,7 +495,7 @@ impl Rvalue {
         match self {
             Self::Class(value) => value.owned_temporary_class(),
             Self::NullableClass(value) => value.owned_temporary_class(),
-            Self::Collection(_) => None,
+            Self::Collection(_) | Self::NullableCollection(_) => None,
             Self::Value(_)
             | Self::String(_)
             | Self::Mixed(_)
@@ -470,6 +518,7 @@ impl Rvalue {
     pub const fn owned_temporary_collection(&self) -> Option<CollectionTypeId> {
         match self {
             Self::Collection(value) => value.owned_temporary_collection(),
+            Self::NullableCollection(value) => value.owned_temporary_collection(),
             Self::Value(_)
             | Self::String(_)
             | Self::Mixed(_)
@@ -539,7 +588,8 @@ impl Rvalue {
             | Self::NullableMixed(_)
             | Self::Class(_)
             | Self::NullableClass(_)
-            | Self::Collection(_) => None,
+            | Self::Collection(_)
+            | Self::NullableCollection(_) => None,
         }
     }
 
@@ -554,6 +604,7 @@ impl Rvalue {
             | Self::NullableString(_)
             | Self::NullableMixed(_)
             | Self::Collection(_)
+            | Self::NullableCollection(_)
             | Self::SharedReference(_)
             | Self::WeakReference(_)
             | Self::NullableSharedReference(_)
@@ -588,6 +639,11 @@ impl Rvalue {
                 ..
             })
             | Self::Collection(CollectionExpression::Local {
+                local,
+                transfer: true,
+                ..
+            })
+            | Self::NullableCollection(NullableCollectionExpression::Local {
                 local,
                 transfer: true,
                 ..
@@ -669,6 +725,7 @@ impl Rvalue {
             | Self::Class(_)
             | Self::NullableClass(_)
             | Self::Collection(_)
+            | Self::NullableCollection(_)
             | Self::SharedReference(_)
             | Self::WeakReference(_)
             | Self::NullableSharedReference(_)
@@ -693,6 +750,7 @@ impl Rvalue {
             | Self::Class(_)
             | Self::NullableClass(_)
             | Self::Collection(_)
+            | Self::NullableCollection(_)
             | Self::SharedReference(_)
             | Self::WeakReference(_)
             | Self::NullableSharedReference(_)
@@ -993,7 +1051,10 @@ impl NullableSharedReferenceExpression {
             Self::DictionaryGet { access, .. } => {
                 if matches!(
                     access,
-                    NullableCollectionAccess::Remove | NullableCollectionAccess::Pop
+                    NullableCollectionAccess::Remove
+                        | NullableCollectionAccess::Pop
+                        | NullableCollectionAccess::PopFront
+                        | NullableCollectionAccess::PopBack
                 ) {
                     Some(OwnedSharedTemporary::Strong)
                 } else {
@@ -1100,7 +1161,10 @@ impl NullableWeakReferenceExpression {
             Self::DictionaryGet { access, .. } => {
                 if matches!(
                     access,
-                    NullableCollectionAccess::Remove | NullableCollectionAccess::Pop
+                    NullableCollectionAccess::Remove
+                        | NullableCollectionAccess::Pop
+                        | NullableCollectionAccess::PopFront
+                        | NullableCollectionAccess::PopBack
                 ) {
                     Some(OwnedSharedTemporary::Weak)
                 } else {
@@ -1331,7 +1395,10 @@ impl NullableWritableSharedReferenceExpression {
             }
             Self::DictionaryGet { access, .. } => matches!(
                 access,
-                NullableCollectionAccess::Remove | NullableCollectionAccess::Pop
+                NullableCollectionAccess::Remove
+                    | NullableCollectionAccess::Pop
+                    | NullableCollectionAccess::PopFront
+                    | NullableCollectionAccess::PopBack
             ),
             Self::Null(_) | Self::Property { .. } => false,
         }
@@ -1399,7 +1466,10 @@ impl NullableWritableWeakReferenceExpression {
             Self::NullSafeCreate { .. } => true,
             Self::DictionaryGet { access, .. } => matches!(
                 access,
-                NullableCollectionAccess::Remove | NullableCollectionAccess::Pop
+                NullableCollectionAccess::Remove
+                    | NullableCollectionAccess::Pop
+                    | NullableCollectionAccess::PopFront
+                    | NullableCollectionAccess::PopBack
             ),
             Self::Null(_) | Self::Property { .. } => false,
         }
@@ -1539,7 +1609,10 @@ impl NullableSharedReferenceAccessExpression {
             Self::CollectionIndex { remove, .. } => *remove,
             Self::CollectionGet { access, .. } => matches!(
                 access,
-                NullableCollectionAccess::Remove | NullableCollectionAccess::Pop
+                NullableCollectionAccess::Remove
+                    | NullableCollectionAccess::Pop
+                    | NullableCollectionAccess::PopFront
+                    | NullableCollectionAccess::PopBack
             ),
             Self::Null { .. } | Self::Property { .. } => false,
         }
@@ -1624,7 +1697,7 @@ pub enum CollectionExpression {
         access: LocalId,
         writable: bool,
     },
-    SetFrom {
+    From {
         collection: CollectionTypeId,
         source: LocalId,
         transfer: bool,
@@ -1655,6 +1728,73 @@ pub enum CollectionExpression {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NullableCollectionExpression {
+    Null(CollectionTypeId),
+    Collection(CollectionExpression),
+    Local {
+        collection: CollectionTypeId,
+        local: LocalId,
+        transfer: bool,
+    },
+    Property {
+        collection: CollectionTypeId,
+        object: LocalId,
+        property: PropertyId,
+    },
+    Call {
+        collection: CollectionTypeId,
+        function: FunctionId,
+        args: Vec<Rvalue>,
+        return_borrow: Option<ReturnBorrow>,
+    },
+    Coalesce {
+        collection: CollectionTypeId,
+        left: Box<NullableCollectionExpression>,
+        right: Box<NullableCollectionExpression>,
+        transfer: bool,
+    },
+}
+
+impl NullableCollectionExpression {
+    pub const fn collection(&self) -> CollectionTypeId {
+        match self {
+            Self::Null(collection)
+            | Self::Local { collection, .. }
+            | Self::Property { collection, .. }
+            | Self::Call { collection, .. }
+            | Self::Coalesce { collection, .. } => *collection,
+            Self::Collection(value) => value.collection(),
+        }
+    }
+
+    pub const fn owned_temporary_collection(&self) -> Option<CollectionTypeId> {
+        match self {
+            Self::Collection(value) => value.owned_temporary_collection(),
+            Self::Local {
+                collection,
+                transfer: true,
+                ..
+            }
+            | Self::Call {
+                collection,
+                return_borrow: None,
+                ..
+            }
+            | Self::Coalesce {
+                collection,
+                transfer: true,
+                ..
+            } => Some(*collection),
+            Self::Null(_)
+            | Self::Local { .. }
+            | Self::Property { .. }
+            | Self::Call { .. }
+            | Self::Coalesce { .. } => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SetAlgebraOp {
     Union,
@@ -1665,10 +1805,14 @@ pub enum SetAlgebraOp {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NullableCollectionAccess {
     Get,
+    Index,
     Remove,
     First,
     Last,
     Pop,
+    PopFront,
+    PopBack,
+    At,
 }
 
 impl CollectionExpression {
@@ -1680,7 +1824,7 @@ impl CollectionExpression {
             | Self::Index { collection, .. }
             | Self::Property { collection, .. }
             | Self::SharedAccessPayload { collection, .. }
-            | Self::SetFrom { collection, .. }
+            | Self::From { collection, .. }
             | Self::FromBytes { collection, .. }
             | Self::BytesFromArray { collection, .. }
             | Self::ReadFileBytes { collection, .. }
@@ -1707,7 +1851,7 @@ impl CollectionExpression {
                 transfer: true,
                 ..
             }
-            | Self::SetFrom { collection, .. }
+            | Self::From { collection, .. }
             | Self::FromBytes { collection, .. }
             | Self::BytesFromArray { collection, .. }
             | Self::ReadFileBytes { collection, .. }
@@ -2578,7 +2722,10 @@ impl NullableClassExpression {
             } => true,
             Self::DictionaryGet { access, .. } => !matches!(
                 access,
-                NullableCollectionAccess::Remove | NullableCollectionAccess::Pop
+                NullableCollectionAccess::Remove
+                    | NullableCollectionAccess::Pop
+                    | NullableCollectionAccess::PopFront
+                    | NullableCollectionAccess::PopBack
             ),
             Self::Null(_)
             | Self::Call {
@@ -2628,6 +2775,7 @@ pub enum BoolExpression {
     },
     NullableScalarIsPresent(Box<NullableScalarExpression>),
     NullableClassIsPresent(Box<NullableClassExpression>),
+    NullableCollectionIsPresent(Box<NullableCollectionExpression>),
     NullableSharedReferenceIsPresent(Box<NullableSharedReferenceExpression>),
     NullableWeakReferenceIsPresent(Box<NullableWeakReferenceExpression>),
     NullableWritableSharedReferenceIsPresent(Box<NullableWritableSharedReferenceExpression>),
@@ -2800,6 +2948,9 @@ pub enum CollectionMutationOp {
     Add,
     InsertAt,
     Remove,
+    Push,
+    PushFront,
+    PushBack,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2967,7 +3118,28 @@ fn rvalue_class_temporary_capacity(value: &Rvalue) -> usize {
                 nullable_shared_access_class_temporary_capacity(value)
             }
             Rvalue::Collection(value) => collection_class_temporary_capacity(value),
+            Rvalue::NullableCollection(value) => {
+                nullable_collection_class_temporary_capacity(value)
+            }
         }
+}
+
+fn nullable_collection_class_temporary_capacity(value: &NullableCollectionExpression) -> usize {
+    match value {
+        NullableCollectionExpression::Collection(value) => {
+            collection_class_temporary_capacity(value)
+        }
+        NullableCollectionExpression::Call { args, .. } => {
+            args.iter().map(rvalue_class_temporary_capacity).sum()
+        }
+        NullableCollectionExpression::Coalesce { left, right, .. } => {
+            nullable_collection_class_temporary_capacity(left)
+                + nullable_collection_class_temporary_capacity(right)
+        }
+        NullableCollectionExpression::Null(_)
+        | NullableCollectionExpression::Local { .. }
+        | NullableCollectionExpression::Property { .. } => 0,
+    }
 }
 
 fn nullable_shared_access_class_temporary_capacity(
@@ -3233,7 +3405,7 @@ fn collection_class_temporary_capacity(value: &CollectionExpression) -> usize {
     usize::from(value.owned_temporary_collection().is_some())
         + match value {
             CollectionExpression::Local { .. } => 0,
-            CollectionExpression::SetFrom { .. }
+            CollectionExpression::From { .. }
             | CollectionExpression::FromBytes { .. }
             | CollectionExpression::BytesFromArray { .. }
             | CollectionExpression::ReadStdinBytes { .. } => 0,
@@ -3493,6 +3665,9 @@ pub(crate) fn bool_class_temporary_capacity(value: &BoolExpression) -> usize {
             nullable_scalar_class_temporary_capacity(value)
         }
         BoolExpression::NullableClassIsPresent(value) => nullable_class_temporary_capacity(value),
+        BoolExpression::NullableCollectionIsPresent(value) => {
+            nullable_collection_class_temporary_capacity(value)
+        }
         BoolExpression::NullableSharedReferenceIsPresent(value) => {
             nullable_shared_class_temporary_capacity(value)
         }
@@ -3657,6 +3832,9 @@ impl fmt::Display for Type {
                 write!(formatter, "?writable-shared-access<{payload}>")
             }
             Type::Collection(collection) => write!(formatter, "collection#{}", collection.0),
+            Type::NullableCollection(collection) => {
+                write!(formatter, "?collection#{}", collection.0)
+            }
         }
     }
 }
@@ -3747,6 +3925,9 @@ impl fmt::Display for Rvalue {
                 write!(formatter, "?shared_access<{:?}>", value.payload())
             }
             Rvalue::Collection(value) => write!(formatter, "{value}"),
+            Rvalue::NullableCollection(value) => {
+                write!(formatter, "?collection#{}", value.collection().0)
+            }
         }
     }
 }
@@ -3815,7 +3996,7 @@ impl fmt::Display for CollectionExpression {
                 access.0,
                 collection.0
             ),
-            Self::SetFrom {
+            Self::From {
                 source, transfer, ..
             } => write!(
                 formatter,
@@ -4444,6 +4625,9 @@ impl fmt::Display for BoolExpression {
             }
             Self::NullableScalarIsPresent(value) => write!(formatter, "present({value})"),
             Self::NullableClassIsPresent(value) => write!(formatter, "present({value})"),
+            Self::NullableCollectionIsPresent(value) => {
+                write!(formatter, "present(?collection#{})", value.collection().0)
+            }
             Self::NullableSharedReferenceIsPresent(value) => {
                 write!(formatter, "present({value})")
             }
