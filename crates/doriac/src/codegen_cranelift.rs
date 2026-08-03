@@ -1396,7 +1396,7 @@ impl<'module, 'program> LoweringResources<'module, 'program> {
         let mut signature = self.module.make_signature();
         signature
             .params
-            .extend(params.iter().copied().map(AbiParam::new));
+            .extend(params.iter().copied().map(runtime_abi_param));
         if let Some(result) = result {
             signature.returns.push(AbiParam::new(result));
         }
@@ -1406,6 +1406,15 @@ impl<'module, 'program> LoweringResources<'module, 'program> {
             .map_err(|error| backend_failure(error.to_string()))?;
         self.runtime_functions.insert(name, id);
         Ok(id)
+    }
+}
+
+fn runtime_abi_param(ty: ClifType) -> AbiParam {
+    let parameter = AbiParam::new(ty);
+    if ty == types::I8 || ty == types::I16 {
+        parameter.uext()
+    } else {
+        parameter
     }
 }
 

@@ -1446,6 +1446,27 @@ mod tests {
             assert_eq!((replaced, previous_present), (1, 0));
             assert!(read_present(collection, 1));
             assert_eq!(read_value(collection, 1), 20);
+
+            assert_eq!(
+                keyed_set_nullable(
+                    collection,
+                    1,
+                    0,
+                    false,
+                    COMPARE_SIGNED_64,
+                    &mut replaced,
+                    &mut previous_present,
+                ),
+                7
+            );
+            assert_eq!((replaced, previous_present), (1, 1));
+            let mut found = 0;
+            let mut present = 1;
+            assert_eq!(
+                keyed_get_nullable(collection, 1, COMPARE_SIGNED_64, &mut found, &mut present),
+                0
+            );
+            assert_eq!((found, present), (1, 0));
             free(collection);
         }
     }
