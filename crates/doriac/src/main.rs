@@ -5,6 +5,7 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, ExitStatus};
 use std::str::FromStr;
+use std::time::Instant;
 
 use doriac::backend::{BackendOutput, BackendTarget, CompileOptions, NativeProfile};
 use doriac::diagnostics::{
@@ -84,7 +85,11 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<ExitCode, CliError> {
-    let args = env::args_os().skip(1).collect::<Vec<_>>();
+    let mut process_args = env::args_os();
+    let executable = process_args
+        .next()
+        .unwrap_or_else(|| OsString::from("doriac"));
+    let args = process_args.collect::<Vec<_>>();
     let Some(command) = args.first() else {
         print_help();
         return Ok(ExitCode::SUCCESS);
@@ -132,7 +137,7 @@ fn run() -> Result<ExitCode, CliError> {
         "ast" => ast_command(&args[1..]).map(|()| ExitCode::SUCCESS),
         "hir" => hir_command(&args[1..]).map(|()| ExitCode::SUCCESS),
         "mir" => mir_command(&args[1..]).map(|()| ExitCode::SUCCESS),
-        "compile" => compile_command(&args[1..]).map(|()| ExitCode::SUCCESS),
+        "compile" => compile_command(&executable, &args[1..]).map(|()| ExitCode::SUCCESS),
         command if command.ends_with(".doria") || Path::new(command).is_file() => Err(format!(
             "unknown command `{command}`\n\n\
              `{command}` looks like a source file, and the command comes first. Did you mean:\n    \
@@ -203,7 +208,11 @@ fn utf8_cli_arguments(args: &[OsString]) -> Result<Vec<String>, String> {
         .collect()
 }
 
-fn compile_command(args: &[String]) -> Result<(), CliError> {
+fn compile_command(executable: &OsStr, args: &[String]) -> Result<(), CliError> {
+    let invocation = std::iter::once(executable.to_os_string())
+        .chain(std::iter::once(OsString::from("compile")))
+        .chain(args.iter().map(OsString::from))
+        .collect::<Vec<_>>();
     let (args, diagnostic_options) = parse_diagnostic_options(args)?;
     let input = args
         .first()
@@ -211,6 +220,7 @@ fn compile_command(args: &[String]) -> Result<(), CliError> {
     let mut target = BackendTarget::Native;
     let mut release = false;
     let mut out = None::<String>;
+    let mut performance_report = None::<String>;
     let mut index = 1;
     while index < args.len() {
         match args[index].as_str() {
@@ -234,12 +244,25 @@ fn compile_command(args: &[String]) -> Result<(), CliError> {
                 release = true;
                 index += 1;
             }
+            "--performance-report" => {
+                performance_report = Some(
+                    args.get(index + 1)
+                        .ok_or_else(|| "missing value for --performance-report".to_string())?
+                        .clone(),
+                );
+                index += 2;
+            }
             flag => return Err(format!("unknown compile option `{flag}`").into()),
         }
     }
 
     if release && target != BackendTarget::Native {
         return Err("--release is only valid for the native target".into());
+    }
+    if performance_report.is_some() && target != BackendTarget::Native {
+        return Err(
+            "--performance-report is currently available only for the native target".into(),
+        );
     }
 
     if !target.is_available() {
@@ -251,11 +274,18 @@ fn compile_command(args: &[String]) -> Result<(), CliError> {
         .into());
     }
 
+    let source_load_started = Instant::now();
     let (path, text) = read_source(input)?;
+    let source_load = source_load_started.elapsed();
     let out_path = match out {
         Some(out) => PathBuf::from(out),
         None => default_output_path(input, target)?,
     };
+    validate_compile_destinations(
+        Path::new(input),
+        &out_path,
+        performance_report.as_deref().map(Path::new),
+    )?;
     let options = CompileOptions {
         target,
         native_profile: if release {
@@ -264,13 +294,124 @@ fn compile_command(args: &[String]) -> Result<(), CliError> {
             NativeProfile::Fast
         },
     };
-    let output = doriac::compile_source_with_options(path.clone(), text.clone(), options).map_err(
-        |diagnostics| CliError::diagnostics(path, text, diagnostics, diagnostic_options),
-    )?;
+    let (output, mut report) = if performance_report.is_some() {
+        let command = utf8_cli_arguments(&invocation)?;
+        let compilation = doriac::performance::compile_native(
+            path.clone(),
+            text.clone(),
+            options,
+            source_load,
+            command,
+        )
+        .map_err(|diagnostics| {
+            CliError::diagnostics(path.clone(), text.clone(), diagnostics, diagnostic_options)
+        })?;
+        (compilation.output, Some(compilation.report))
+    } else {
+        let output = doriac::compile_source_with_options(path.clone(), text.clone(), options)
+            .map_err(|diagnostics| {
+                CliError::diagnostics(path.clone(), text.clone(), diagnostics, diagnostic_options)
+            })?;
+        (output, None)
+    };
 
     write_backend_output(&out_path, output)?;
+    if let Some(report) = report.as_mut() {
+        report["totalDurationNs"] = serde_json::Value::from(
+            u64::try_from(source_load_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+        );
+    }
+    if let (Some(report_path), Some(report)) = (performance_report, report) {
+        write_performance_report(
+            Path::new(&report_path),
+            &report,
+            &path,
+            &text,
+            diagnostic_options,
+        )?;
+    }
     println!("{}", out_path.display());
     Ok(())
+}
+
+fn write_performance_report(
+    path: &Path,
+    report: &serde_json::Value,
+    source_path: &str,
+    source_text: &str,
+    diagnostic_options: RenderOptions,
+) -> Result<(), CliError> {
+    let encoded = serde_json::to_vec_pretty(report).map_err(|error| {
+        performance_report_error(
+            path,
+            error.to_string(),
+            source_path,
+            source_text,
+            diagnostic_options,
+        )
+    })?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent).map_err(|error| {
+        performance_report_error(
+            path,
+            error.to_string(),
+            source_path,
+            source_text,
+            diagnostic_options,
+        )
+    })?;
+    let temporary = parent.join(format!(
+        ".{}.{}.tmp",
+        path.file_name()
+            .and_then(OsStr::to_str)
+            .unwrap_or("performance-report"),
+        std::process::id()
+    ));
+    fs::write(&temporary, encoded)
+        .and_then(|()| replace_file_atomically(&temporary, path))
+        .map_err(|error| {
+            let _ = fs::remove_file(&temporary);
+            performance_report_error(
+                path,
+                error.to_string(),
+                source_path,
+                source_text,
+                diagnostic_options,
+            )
+        })
+}
+
+fn performance_report_error(
+    report_path: &Path,
+    details: String,
+    source_path: &str,
+    source_text: &str,
+    options: RenderOptions,
+) -> CliError {
+    let diagnostic = Diagnostic::new(
+        "B2601",
+        format!(
+            "performance report write failed for `{}`: {details}",
+            report_path.display()
+        ),
+        Span::default(),
+    )
+    .with_title("Performance Report Could Not Be Written")
+    .with_primary_label("Performance Report Write Failed")
+    .with_explanation(
+        "Compilation completed, but the requested performance evidence could not be written atomically.",
+    )
+    .with_help("choose a writable report path that is separate from the source and compiler output")
+    .with_developer_details(details);
+    CliError::diagnostics(
+        source_path.to_string(),
+        source_text.to_string(),
+        vec![diagnostic],
+        options,
+    )
 }
 
 fn ast_command(args: &[String]) -> Result<(), CliError> {
@@ -352,36 +493,236 @@ fn default_output_path(input: &str, target: BackendTarget) -> Result<PathBuf, St
         file_name.push_str(extension);
     }
 
-    let output_path = PathBuf::from(file_name);
-    if inferred_output_aliases_input(input, &output_path)? {
-        return Err(format!(
-            "inferred output path `{}` would overwrite input `{}`; pass --out <file> to choose a different output path",
-            output_path.display(),
-            input
-        ));
-    }
-
-    Ok(output_path)
+    Ok(PathBuf::from(file_name))
 }
 
-fn inferred_output_aliases_input(input: &str, output_path: &Path) -> Result<bool, String> {
-    let input_path = Path::new(input);
-    let input_canonical = fs::canonicalize(input_path)
-        .map_err(|error| format!("failed to resolve input path `{input}`: {error}"))?;
-
-    if let Ok(output_canonical) = fs::canonicalize(output_path) {
-        return Ok(output_canonical == input_canonical);
+fn validate_compile_destinations(
+    input_path: &Path,
+    output_path: &Path,
+    performance_report_path: Option<&Path>,
+) -> Result<(), String> {
+    if paths_alias(input_path, output_path)? {
+        return Err(format!(
+            "output path `{}` would overwrite input `{}`; pass --out <file> to choose a different output path",
+            output_path.display(),
+            input_path.display()
+        ));
     }
+    let Some(report_path) = performance_report_path else {
+        return Ok(());
+    };
+    if paths_alias(report_path, input_path)? {
+        return Err(format!(
+            "performance report path `{}` would overwrite input `{}`; choose a separate report path",
+            report_path.display(),
+            input_path.display()
+        ));
+    }
+    if paths_alias(report_path, output_path)? {
+        return Err(format!(
+            "performance report path `{}` would overwrite compiler output `{}`; choose a separate report path",
+            report_path.display(),
+            output_path.display()
+        ));
+    }
+    Ok(())
+}
 
-    let output_absolute = if output_path.is_absolute() {
-        output_path.to_path_buf()
+fn paths_alias(left: &Path, right: &Path) -> Result<bool, String> {
+    let left_resolved = resolve_path_identity(left)?;
+    let right_resolved = resolve_path_identity(right)?;
+    if resolved_paths_equal(&left_resolved, &right_resolved) {
+        return Ok(true);
+    }
+    Ok(existing_paths_alias(left, right))
+}
+
+fn resolve_path_identity(path: &Path) -> Result<PathBuf, String> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
     } else {
         env::current_dir()
             .map_err(|error| format!("failed to resolve current directory: {error}"))?
-            .join(output_path)
+            .join(path)
     };
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            _ => normalized.push(component.as_os_str()),
+        }
+    }
+    let mut existing = normalized.as_path();
+    let mut missing = Vec::new();
+    while !existing.exists() {
+        let name = existing
+            .file_name()
+            .ok_or_else(|| format!("failed to resolve path identity for `{}`", path.display()))?;
+        missing.push(name.to_os_string());
+        existing = existing
+            .parent()
+            .ok_or_else(|| format!("failed to resolve path identity for `{}`", path.display()))?;
+    }
+    let mut resolved = fs::canonicalize(existing)
+        .map_err(|error| format!("failed to resolve `{}`: {error}", path.display()))?;
+    for component in missing.iter().rev() {
+        resolved.push(component);
+    }
+    Ok(resolved)
+}
 
-    Ok(output_absolute == input_canonical)
+#[cfg(not(windows))]
+fn resolved_paths_equal(left: &Path, right: &Path) -> bool {
+    left == right
+}
+
+#[cfg(windows)]
+fn resolved_paths_equal(left: &Path, right: &Path) -> bool {
+    use std::os::windows::ffi::OsStrExt;
+
+    const CSTR_EQUAL: i32 = 2;
+    #[link(name = "Kernel32")]
+    extern "system" {
+        fn CompareStringOrdinal(
+            string1: *const u16,
+            count1: i32,
+            string2: *const u16,
+            count2: i32,
+            ignore_case: i32,
+        ) -> i32;
+    }
+
+    let left = left.as_os_str().encode_wide().collect::<Vec<_>>();
+    let right = right.as_os_str().encode_wide().collect::<Vec<_>>();
+    let (Ok(left_len), Ok(right_len)) = (i32::try_from(left.len()), i32::try_from(right.len()))
+    else {
+        return false;
+    };
+    // SAFETY: Both UTF-16 buffers remain alive for the call and their explicit
+    // lengths bound every read. A case-insensitive ordinal comparison matches
+    // the default Windows path identity rules for destinations that do not yet
+    // exist, while conservatively rejecting collisions in case-sensitive trees.
+    unsafe {
+        CompareStringOrdinal(left.as_ptr(), left_len, right.as_ptr(), right_len, 1) == CSTR_EQUAL
+    }
+}
+
+#[cfg(unix)]
+fn existing_paths_alias(left: &Path, right: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let (Ok(left), Ok(right)) = (fs::metadata(left), fs::metadata(right)) else {
+        return false;
+    };
+    left.dev() == right.dev() && left.ino() == right.ino()
+}
+
+#[cfg(windows)]
+fn existing_paths_alias(left: &Path, right: &Path) -> bool {
+    windows_file_identity(left)
+        .is_some_and(|identity| windows_file_identity(right) == Some(identity))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn existing_paths_alias(_left: &Path, _right: &Path) -> bool {
+    false
+}
+
+#[cfg(windows)]
+fn windows_file_identity(path: &Path) -> Option<(u32, u64)> {
+    use std::ffi::c_void;
+    use std::mem::MaybeUninit;
+    use std::os::windows::io::AsRawHandle;
+
+    #[repr(C)]
+    struct FileTime {
+        low: u32,
+        high: u32,
+    }
+
+    #[repr(C)]
+    struct ByHandleFileInformation {
+        attributes: u32,
+        creation_time: FileTime,
+        last_access_time: FileTime,
+        last_write_time: FileTime,
+        volume_serial_number: u32,
+        file_size_high: u32,
+        file_size_low: u32,
+        number_of_links: u32,
+        file_index_high: u32,
+        file_index_low: u32,
+    }
+
+    #[link(name = "Kernel32")]
+    extern "system" {
+        fn GetFileInformationByHandle(
+            file: *mut c_void,
+            information: *mut ByHandleFileInformation,
+        ) -> i32;
+    }
+
+    let file = fs::File::open(path).ok()?;
+    let mut information = MaybeUninit::<ByHandleFileInformation>::uninit();
+    // SAFETY: `file` owns a valid handle for the duration of the call, and the
+    // Windows API initializes the complete output structure when it succeeds.
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), information.as_mut_ptr()) } == 0 {
+        return None;
+    }
+    // SAFETY: A successful call initialized the full structure.
+    let information = unsafe { information.assume_init() };
+    let file_index =
+        (u64::from(information.file_index_high) << 32) | u64::from(information.file_index_low);
+    Some((information.volume_serial_number, file_index))
+}
+
+#[cfg(not(windows))]
+fn replace_file_atomically(source: &Path, destination: &Path) -> std::io::Result<()> {
+    fs::rename(source, destination)
+}
+
+#[cfg(windows)]
+fn replace_file_atomically(source: &Path, destination: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+
+    const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
+    const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
+    #[link(name = "Kernel32")]
+    extern "system" {
+        fn MoveFileExW(
+            existing_file_name: *const u16,
+            new_file_name: *const u16,
+            flags: u32,
+        ) -> i32;
+    }
+
+    let source = source
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let destination = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    // SAFETY: Both path buffers are NUL-terminated and remain alive for the
+    // duration of the call. The flags request same-volume atomic replacement
+    // and synchronous persistence of the rename operation.
+    let replaced = unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if replaced == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
 }
 
 fn default_output_extension(target: BackendTarget) -> &'static str {
@@ -771,7 +1112,7 @@ fn direct_executable_hint(path: &Path) -> String {
 
 fn print_help() {
     println!(
-        "doriac {}\n\nUSAGE:\n    doriac check <source.doria> [diagnostic options]\n    doriac ast <source.doria> [diagnostic options]\n    doriac hir <source.doria> [diagnostic options]\n    doriac mir <source.doria> [diagnostic options]\n    doriac compile <source.doria> [--release] [--out <file>] [diagnostic options]\n    doriac compile <source.doria> --target php [--out <file>] [diagnostic options]\n    doriac run <source.doria> [--release] [diagnostic options] [-- <program args>...]\n\nDIAGNOSTIC OPTIONS:\n    --diagnostic-format human|concise|json    default: human\n    --diagnostic-color auto|always|never      default: auto; NO_COLOR disables auto color\n\nHuman and concise diagnostics are written to stderr. Versioned JSON diagnostics are written to stdout.\n\nNATIVE PROFILES:\n    fast       default Cranelift profile for rapid local feedback\n    release    LLVM optimized profile selected with --release\n\nTARGETS:\n    native    default target for standalone executables\n    php       compatibility and inspection backend\n    debug     MIR interpreter debug artifact\n    wasm      planned WebAssembly backend",
+        "doriac {}\n\nUSAGE:\n    doriac check <source.doria> [diagnostic options]\n    doriac ast <source.doria> [diagnostic options]\n    doriac hir <source.doria> [diagnostic options]\n    doriac mir <source.doria> [diagnostic options]\n    doriac compile <source.doria> [--release] [--out <file>] [--performance-report <file>] [diagnostic options]\n    doriac compile <source.doria> --target php [--out <file>] [diagnostic options]\n    doriac run <source.doria> [--release] [diagnostic options] [-- <program args>...]\n\nDIAGNOSTIC OPTIONS:\n    --diagnostic-format human|concise|json    default: human\n    --diagnostic-color auto|always|never      default: auto; NO_COLOR disables auto color\n\nHuman and concise diagnostics are written to stderr. Versioned JSON diagnostics are written to stdout.\n\nNATIVE PROFILES:\n    fast       default Cranelift profile for rapid local feedback\n    release    LLVM optimized profile selected with --release\n\nTARGETS:\n    native    default target for standalone executables\n    php       compatibility and inspection backend\n    debug     MIR interpreter debug artifact\n    wasm      planned WebAssembly backend",
         doriac::TOOLCHAIN_VERSION
     );
 }

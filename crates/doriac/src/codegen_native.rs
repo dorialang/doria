@@ -4,10 +4,19 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::backend::{BackendError, NativeProfile};
 use crate::{codegen_cranelift, mir, runtime_artifact};
+
+#[derive(Debug, Clone, Copy)]
+pub struct NativePerformance {
+    pub mir_validation: Duration,
+    pub code_generation: Duration,
+    pub runtime_selection: Duration,
+    pub linking: Duration,
+}
 
 pub fn generate_executable(
     program: &mir::Program,
@@ -21,9 +30,54 @@ pub fn generate_executable(
     link_object(&object_bytes, &runtime_path)
 }
 
+pub(crate) fn generate_executable_with_performance(
+    program: &mir::Program,
+    profile: NativeProfile,
+) -> Result<(Vec<u8>, NativePerformance), BackendError> {
+    let started = Instant::now();
+    crate::mir_validation::validate_program(program)?;
+    let mir_validation = started.elapsed();
+
+    let started = Instant::now();
+    let object_bytes = match profile {
+        NativeProfile::Fast => codegen_cranelift::lower_validated_mir_to_object(program)?,
+        NativeProfile::Release => lower_validated_release_object(program)?,
+    };
+    let code_generation = started.elapsed();
+
+    let started = Instant::now();
+    let runtime_path = runtime_artifact::locate(profile)?;
+    let runtime_selection = started.elapsed();
+
+    let started = Instant::now();
+    let executable = link_object(&object_bytes, &runtime_path)?;
+    let linking = started.elapsed();
+    Ok((
+        executable,
+        NativePerformance {
+            mir_validation,
+            code_generation,
+            runtime_selection,
+            linking,
+        },
+    ))
+}
+
 #[cfg(feature = "llvm-backend")]
 fn lower_release_object(program: &mir::Program) -> Result<Vec<u8>, BackendError> {
     crate::codegen_llvm::lower_mir_to_object(program)
+}
+
+#[cfg(feature = "llvm-backend")]
+fn lower_validated_release_object(program: &mir::Program) -> Result<Vec<u8>, BackendError> {
+    crate::codegen_llvm::lower_validated_mir_to_object(program)
+}
+
+#[cfg(not(feature = "llvm-backend"))]
+fn lower_validated_release_object(_program: &mir::Program) -> Result<Vec<u8>, BackendError> {
+    Err(BackendError::new(
+        "LLVM release support is not available in this doriac build\nhelp: rebuild doriac with the llvm-backend feature",
+    ))
 }
 
 #[cfg(not(feature = "llvm-backend"))]

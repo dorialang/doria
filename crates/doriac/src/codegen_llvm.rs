@@ -65,6 +65,12 @@ use crate::numeric::{FloatType, FloatValue, IntegerPanic, IntegerType, IntegerVa
 
 pub fn lower_mir_to_object(program: &mir::Program) -> Result<Vec<u8>, BackendError> {
     mir_validation::validate_program(program)?;
+    lower_validated_mir_to_object(program)
+}
+
+pub(crate) fn lower_validated_mir_to_object(
+    program: &mir::Program,
+) -> Result<Vec<u8>, BackendError> {
     initialize_native_target()?;
 
     let triple = TargetMachine::get_default_triple();

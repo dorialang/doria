@@ -106,6 +106,14 @@ doriac check main.doria --diagnostic-format json
 Color is controlled independently with
 `--diagnostic-color auto|always|never`; automatic color honors `NO_COLOR`.
 
+Performance evidence lives in the separate
+[`dorialang/benchmarks`](https://github.com/dorialang/benchmarks) repository.
+Its manifest checks committed exact output before timing, keeps Cranelift and
+LLVM results distinct, retains the raw samples behind its statistics, and
+records the compiler, build driver, toolchain, commands, and host used for each
+report. Public comparisons are workload-specific and reproducible rather than
+broad language rankings.
+
 Runtime panics use the same structured diagnostic model and format selection.
 Built-in panics have stable `P` codes, a precise Doria source label, an
 explanation, a Doria-only `Call Path`, and status 101. `doriac run` receives

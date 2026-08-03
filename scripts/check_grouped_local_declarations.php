@@ -50,7 +50,7 @@ function check_grouped_local_declarations(string $root): array
         'docs/doria-end-to-end-plan.md' => [
             'Decision 0111: grouped local declarations',
             'Stage 26a — Grouped local declarations — Complete.',
-            'Stage 26b — Performance Baseline Foundation — Next.',
+            'Stage 26b — Performance Baseline Foundation — In Progress; Slice 1 Complete, Slice 2 Next.',
             'Stage 27 — Enums + payload cases — Blocked Until Stage 26b Completes.',
             'Stage 35a — Optimizer Contracts, Dispatch, And Escape Audit — Scheduled.',
             'Stage 43 — Engine Performance And Optimization Hardening.',
@@ -73,7 +73,7 @@ function check_grouped_local_declarations(string $root): array
         'docs/notes/current-pipeline.md' => [
             'Stage 26 — Complete.',
             'Stage 26a — Complete.',
-            'Stage 26b — Performance Baseline Foundation — Next.',
+            'Stage 26b — Performance Baseline Foundation — In Progress.',
             'Stage 27 — Blocked Until Stage 26b Completes.',
             'Stage 35a — Optimizer Contracts, Dispatch, And Escape Audit — Scheduled.',
             'Stage 36a — Scheduled, Not Implemented.',

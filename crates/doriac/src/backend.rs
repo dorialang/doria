@@ -226,7 +226,7 @@ impl From<String> for BackendError {
     }
 }
 
-fn native_executable_extension() -> &'static str {
+pub(crate) fn native_executable_extension() -> &'static str {
     if cfg!(windows) {
         "exe"
     } else {

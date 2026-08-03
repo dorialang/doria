@@ -120,7 +120,13 @@ Documentation role: working note. This file prevents duplicated in-flight work. 
   move values are rejected except for explicitly typed nullable literal-null
   initialization. Interpreter, Cranelift, LLVM, and PHP compatibility agree;
   grouping creates no runtime object.
-- Stage 26b — Performance Baseline Foundation — Next.
+- Stage 26b — Performance Baseline Foundation — In Progress. Decision 0112 is
+  accepted and Slice 1 is complete: the manifest/report/provenance foundation,
+  opt-in compiler phase report, and three matched Doria diagnostic pairs are in
+  place. Slice 2, the controlled baseline matrix, is next.
+- Stage 26b — In Progress.
+- Stage 26b Slice 1 — Complete.
+- Stage 26b Slice 2 — Next.
 - Stage 27 — Blocked Until Stage 26b Completes.
 - Stage 35a — Optimizer Contracts, Dispatch, And Escape Audit — Scheduled.
 - Stage 36a — Scheduled, Not Implemented.
