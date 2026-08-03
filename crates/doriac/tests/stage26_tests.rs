@@ -21,7 +21,7 @@ fn complete_family_example_executes_in_the_semantic_oracle() {
     let output = interpret(source);
     assert_eq!(
         output.stdout,
-        b"Alice:1\nBob:2\nCharlie:3\n135\n258\nfirst\nmiddle\nlast\nnullable deque: none\nnullable deque: 2\nnullable map: -1 20 0\nnullable deque values: -1 -1 0 2 3\nnullable deque updated: 9 9 0 2 3\n"
+        b"Alice:1\nBob:2\nCharlie:3\n135\n258\nfirst\nmiddle\nlast\nnullable deque: none\nnullable deque: 2\nnullable indexed: -1 20 0\nnullable map: -1 20 0\nnullable deque values: -1 -1 0 2 3\nnullable deque updated: 9 9 0 2 3\nzero deque: 0\n"
     );
     assert_eq!(output.exit_status, 0);
 }
@@ -280,6 +280,13 @@ function main(): void
 fn nullable_elements_use_the_shared_sequence_and_dictionary_paths() {
     let output = interpret(
         r#"
+class Marker
+{
+    function __construct(int $value)
+    {
+    }
+}
+
 function main(): void
 {
     writable Dictionary<int, ?int> $plain = [1 => null, 2 => 0];
@@ -293,6 +300,13 @@ function main(): void
     foreach ($map->values as ?int $value) { echo $value ?? -1; echo " "; }
     let $missing = $map->get(99) ?? -1;
     echo "{$missing}\n";
+
+    Dictionary<int, ?string> $words = [1 => null, 2 => "Doria"];
+    echo ($words[1] ?? "none") . " " . ($words[2] ?? "none") . "\n";
+
+    Dictionary<int, ?Marker> $markers = [1 => null, 2 => new Marker(42)];
+    if ($markers[1] == null) { echo "no marker "; }
+    echo ($markers[2]?->value ?? -1) . "\n";
 
     writable List<?int> $list = [null, 0, 2];
     $list->insertAt(1, null);
@@ -317,6 +331,27 @@ function main(): void
     );
     assert_eq!(
         output.stdout,
-        b"-1 0 -1 -1 20 0 -1\n-1 -1 -1 2 \n-1 -1 0 2 3 -1:3\nnone Doria "
+        b"-1 0 -1 -1 20 0 -1\nnone Doria\nno marker 42\n-1 -1 -1 2 \n-1 -1 0 2 3 -1:3\nnone Doria "
+    );
+}
+
+#[test]
+fn nullable_dictionary_index_keeps_missing_keys_distinct_from_stored_null() {
+    let output = interpret(
+        r#"
+function main(): void
+{
+    Dictionary<int, ?int> $values = [1 => null];
+    echo $values[2] ?? -1;
+}
+"#,
+    );
+    assert_eq!(output.exit_status, 101);
+    assert_eq!(
+        output
+            .runtime_diagnostic
+            .expect("missing indexed key should retain a structured diagnostic")
+            .code,
+        "P1312"
     );
 }

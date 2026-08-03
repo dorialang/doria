@@ -1805,6 +1805,7 @@ pub enum SetAlgebraOp {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NullableCollectionAccess {
     Get,
+    Index,
     Remove,
     First,
     Last,

@@ -40,6 +40,7 @@ pub struct DrCollectionV1 {
     kind: u8,
     comparator: u8,
     finalized: u8,
+    value_nullable: u8,
     head: usize,
 }
 
@@ -94,7 +95,9 @@ unsafe fn write_value(collection: *mut DrCollectionV1, index: usize, value: u64)
 }
 
 unsafe fn read_present(collection: *const DrCollectionV1, index: usize) -> bool {
-    if (*collection).value_width == 16 {
+    if (*collection).value_nullable == 0 {
+        true
+    } else if (*collection).value_width == 16 {
         *value_address(collection, index).cast::<u64>() != 0
     } else {
         read_value(collection, index) != 0
@@ -107,6 +110,7 @@ unsafe fn write_nullable_value(
     present: bool,
     value: u64,
 ) {
+    (*collection).value_nullable = 1;
     if (*collection).value_width == 16 {
         let address = value_address(collection, index);
         *address.cast::<u64>() = u64::from(present);
@@ -260,6 +264,7 @@ unsafe fn new_with_frame(
             kind: KIND_LEGACY,
             comparator: 0,
             finalized: 1,
+            value_nullable: 0,
             head: 0,
         },
     );
@@ -340,7 +345,12 @@ pub unsafe fn length(collection: *const DrCollectionV1) -> usize {
 }
 
 pub unsafe fn push(collection: *mut DrCollectionV1, value: u64) {
-    push_nullable(collection, true, value);
+    if (*collection).length == (*collection).capacity {
+        grow(collection);
+    }
+    write_value(collection, (*collection).length, value);
+    (*collection).length += 1;
+    restore_priority_queue_order(collection);
 }
 
 pub unsafe fn push_nullable(collection: *mut DrCollectionV1, present: bool, value: u64) {
@@ -349,6 +359,10 @@ pub unsafe fn push_nullable(collection: *mut DrCollectionV1, present: bool, valu
     }
     write_nullable_value(collection, (*collection).length, present, value);
     (*collection).length += 1;
+    restore_priority_queue_order(collection);
+}
+
+unsafe fn restore_priority_queue_order(collection: *mut DrCollectionV1) {
     if (*collection).kind == KIND_PRIORITY_QUEUE && (*collection).finalized != 0 {
         let mut child = (*collection).length - 1;
         while child != 0 {
@@ -373,7 +387,22 @@ pub unsafe fn insert_at(
     index: usize,
     value: u64,
 ) {
-    insert_at_nullable(frame, collection, index, true, value);
+    if index > (*collection).length {
+        collection_bounds_panic(frame, index, (*collection).length);
+    }
+    if (*collection).length == (*collection).capacity {
+        grow(collection);
+    }
+    let tail = (*collection).length - index;
+    if tail != 0 {
+        ptr::copy(
+            value_address(collection, index),
+            value_address(collection, index + 1),
+            tail * usize::from((*collection).value_width),
+        );
+    }
+    write_value(collection, index, value);
+    (*collection).length += 1;
 }
 
 pub unsafe fn insert_at_nullable(
@@ -432,7 +461,7 @@ pub unsafe fn pop(collection: *mut DrCollectionV1, found: *mut u8) -> u64 {
         let removed = read_value(collection, 0);
         (*collection).length -= 1;
         if (*collection).length != 0 {
-            write_value(collection, 0, read_value(collection, (*collection).length));
+            copy_value_slot(collection, (*collection).length, 0);
             sift_down_min(collection, 0);
         }
         removed
@@ -443,9 +472,19 @@ pub unsafe fn pop(collection: *mut DrCollectionV1, found: *mut u8) -> u64 {
 }
 
 unsafe fn swap_values(collection: *mut DrCollectionV1, left: usize, right: usize) {
-    let value = read_value(collection, left);
-    write_value(collection, left, read_value(collection, right));
-    write_value(collection, right, value);
+    ptr::swap_nonoverlapping(
+        value_address(collection, left),
+        value_address(collection, right),
+        usize::from((*collection).value_width),
+    );
+}
+
+unsafe fn copy_value_slot(collection: *mut DrCollectionV1, source: usize, target: usize) {
+    ptr::copy_nonoverlapping(
+        value_address(collection, source),
+        value_address(collection, target),
+        usize::from((*collection).value_width),
+    );
 }
 
 unsafe fn swap_entries(collection: *mut DrCollectionV1, left: usize, right: usize, keyed: bool) {
@@ -556,7 +595,7 @@ unsafe fn deduplicate_sorted_set(collection: *mut DrCollectionV1) {
             continue;
         }
         if write != read {
-            write_value(collection, write, value);
+            copy_value_slot(collection, read, write);
         }
         write += 1;
     }
@@ -593,6 +632,7 @@ pub unsafe fn from_copy(
     value_kind: u8,
 ) -> *mut DrCollectionV1 {
     let result = new_stage26((*source).length, keyed, value_width, kind, comparator);
+    (*result).value_nullable = (*source).value_nullable;
     for index in 0..(*source).length {
         let mut value = read_value(source, index);
         if value_kind == COMPARE_STRING && read_present(source, index) {
@@ -606,24 +646,41 @@ pub unsafe fn from_copy(
             // Dictionary sources already have unique keys. Append in O(1) and
             // let finalization perform one O(n log n) sort instead of repeatedly
             // inserting into a growing ordered vector.
-            push_nullable(result, read_present(source, index), value);
+            push_stored_value(result, read_present(source, index), value);
             *(*result).keys.add((*result).length - 1) = key;
         } else if kind == KIND_SORTED_SET {
             // Append all values, sort once, then deduplicate in one linear pass.
-            push_nullable(result, read_present(source, index), value);
+            push_stored_value(result, read_present(source, index), value);
         } else {
-            push_nullable(result, read_present(source, index), value);
+            push_stored_value(result, read_present(source, index), value);
         }
     }
     finalize_stage26(result);
     result
 }
 
+unsafe fn push_stored_value(collection: *mut DrCollectionV1, present: bool, value: u64) {
+    if (*collection).value_nullable != 0 {
+        push_nullable(collection, present, value);
+    } else {
+        push(collection, value);
+    }
+}
+
 pub unsafe fn push_front(collection: *mut DrCollectionV1, value: u64) {
-    push_front_nullable(collection, true, value);
+    push_front_value(collection, true, value, false);
 }
 
 pub unsafe fn push_front_nullable(collection: *mut DrCollectionV1, present: bool, value: u64) {
+    push_front_value(collection, present, value, true);
+}
+
+unsafe fn push_front_value(
+    collection: *mut DrCollectionV1,
+    present: bool,
+    value: u64,
+    nullable: bool,
+) {
     if (*collection).kind != KIND_DEQUE {
         collection_panic(b"P1001");
     }
@@ -636,7 +693,11 @@ pub unsafe fn push_front_nullable(collection: *mut DrCollectionV1, present: bool
         (*collection).head - 1
     };
     (*collection).length += 1;
-    write_nullable_value(collection, 0, present, value);
+    if nullable {
+        write_nullable_value(collection, 0, present, value);
+    } else {
+        write_value(collection, 0, value);
+    }
 }
 
 pub unsafe fn pop_front(collection: *mut DrCollectionV1, found: *mut u8) -> u64 {
@@ -685,8 +746,12 @@ pub unsafe fn set_at(
     index: usize,
     value: u64,
 ) -> u64 {
-    let mut previous_present = 0;
-    set_at_nullable(frame, collection, index, true, value, &mut previous_present)
+    if index >= (*collection).length {
+        collection_bounds_panic(frame, index, (*collection).length);
+    }
+    let previous = read_value(collection, index);
+    write_value(collection, index, value);
+    previous
 }
 
 pub unsafe fn set_at_nullable(
@@ -786,6 +851,24 @@ pub unsafe fn keyed_get(
     }
 }
 
+pub unsafe fn keyed_get_nullable(
+    collection: *const DrCollectionV1,
+    key: u64,
+    key_kind: u8,
+    found: *mut u8,
+    present: *mut u8,
+) -> u64 {
+    if let Some(index) = find(collection, key, key_kind) {
+        *found = 1;
+        *present = u8::from(read_present(collection, index));
+        read_value(collection, index)
+    } else {
+        *found = 0;
+        *present = 0;
+        0
+    }
+}
+
 pub unsafe fn keyed_set(
     collection: *mut DrCollectionV1,
     key: u64,
@@ -793,16 +876,14 @@ pub unsafe fn keyed_set(
     key_kind: u8,
     replaced: *mut u8,
 ) -> u64 {
-    let mut previous_present = 0;
-    keyed_set_nullable(
-        collection,
-        key,
-        value,
-        true,
-        key_kind,
-        replaced,
-        &mut previous_present,
-    )
+    if let Some(index) = find(collection, key, key_kind) {
+        *replaced = 1;
+        let previous = read_value(collection, index);
+        write_value(collection, index, value);
+        return previous;
+    }
+    *replaced = 0;
+    insert_keyed_value(collection, key, true, value, false)
 }
 
 pub unsafe fn keyed_set_nullable(
@@ -823,6 +904,16 @@ pub unsafe fn keyed_set_nullable(
     }
     *replaced = 0;
     *previous_present = 0;
+    insert_keyed_value(collection, key, present, value, true)
+}
+
+unsafe fn insert_keyed_value(
+    collection: *mut DrCollectionV1,
+    key: u64,
+    present: bool,
+    value: u64,
+    nullable: bool,
+) -> u64 {
     if (*collection).length == (*collection).capacity {
         grow(collection);
     }
@@ -844,7 +935,11 @@ pub unsafe fn keyed_set_nullable(
         );
     }
     *(*collection).keys.add(index) = key;
-    write_nullable_value(collection, index, present, value);
+    if nullable {
+        write_nullable_value(collection, index, present, value);
+    } else {
+        write_value(collection, index, value);
+    }
     (*collection).length += 1;
     0
 }
@@ -1290,6 +1385,26 @@ mod tests {
     }
 
     #[test]
+    fn nonnullable_scalar_presence_does_not_depend_on_payload_bits() {
+        unsafe {
+            for (width, comparator) in [(1, COMPARE_BOOL), (8, COMPARE_SIGNED_64)] {
+                let collection = new_stage26(0, false, width, KIND_DEQUE, comparator);
+                finalize_stage26(collection);
+                push(collection, 0);
+
+                let mut found = 0;
+                let mut removed_key = 0;
+                assert_eq!(
+                    nullable_access(collection, 0, 0, 5, &mut found, &mut removed_key),
+                    0
+                );
+                assert_eq!(found, 1);
+                free(collection);
+            }
+        }
+    }
+
+    #[test]
     fn nullable_sorted_dictionary_orders_keys_and_tracks_replacement_presence() {
         unsafe {
             let collection = new_stage26(0, true, 16, KIND_SORTED_DICTIONARY, COMPARE_SIGNED_64);
@@ -1332,6 +1447,49 @@ mod tests {
             assert!(read_present(collection, 1));
             assert_eq!(read_value(collection, 1), 20);
             free(collection);
+        }
+    }
+
+    #[test]
+    fn nullable_sorted_dictionary_bulk_sort_preserves_presence_tags() {
+        unsafe {
+            let source = new(0, true, false, 16);
+            for (key, present, value) in [(2, false, 0), (1, true, 7), (3, true, 0)] {
+                let mut replaced = 0;
+                let mut previous_present = 0;
+                keyed_set_nullable(
+                    source,
+                    key,
+                    value,
+                    present,
+                    COMPARE_SIGNED_64,
+                    &mut replaced,
+                    &mut previous_present,
+                );
+            }
+
+            let sorted = from_copy(
+                source,
+                KIND_SORTED_DICTIONARY,
+                COMPARE_SIGNED_64,
+                true,
+                16,
+                COMPARE_SIGNED_64,
+                COMPARE_SIGNED_64,
+            );
+            let actual = (0..length(sorted))
+                .map(|index| {
+                    (
+                        key_at(ptr::null(), sorted, index),
+                        read_present(sorted, index),
+                        read_value(sorted, index),
+                    )
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(actual, vec![(1, true, 7), (2, false, 0), (3, true, 0)]);
+
+            free(sorted);
+            free(source);
         }
     }
 }

@@ -4721,6 +4721,21 @@ fn lower_nullable_string_expression(
                 )]),
             }
         }
+        hir::Expr::Index {
+            collection, index, ..
+        } => {
+            let (collection, key) = lower_collection_index_operand(
+                collection,
+                index,
+                mir::Type::NullableString,
+                context,
+            )?;
+            Ok(mir::NullableStringExpression::DictionaryGet {
+                collection,
+                key: Box::new(key),
+                access: mir::NullableCollectionAccess::Index,
+            })
+        }
         hir::Expr::StaticMember {
             class_name,
             member,
@@ -5052,6 +5067,22 @@ fn lower_nullable_scalar_expression(
                 )]),
             }
         }
+        hir::Expr::Index {
+            collection, index, ..
+        } => {
+            let (collection, key) = lower_collection_index_operand(
+                collection,
+                index,
+                mir::Type::NullableScalar(expected),
+                context,
+            )?;
+            Ok(mir::NullableScalarExpression::DictionaryGet {
+                ty: expected,
+                collection,
+                key: Box::new(key),
+                access: mir::NullableCollectionAccess::Index,
+            })
+        }
         hir::Expr::StaticMember {
             class_name,
             member,
@@ -5356,6 +5387,28 @@ fn lower_nullable_class_expression(
                 ),
                 _ => Err(vec![unsupported(*span, "property has another class type")]),
             }
+        }
+        hir::Expr::Index {
+            collection, index, ..
+        } => {
+            if transfer {
+                return Err(vec![unsupported(
+                    expr.span(),
+                    "indexed nullable class values are borrowed and cannot be moved out",
+                )]);
+            }
+            let (collection, key) = lower_collection_index_operand(
+                collection,
+                index,
+                mir::Type::NullableClass(expected),
+                context,
+            )?;
+            Ok(mir::NullableClassExpression::DictionaryGet {
+                class: expected,
+                collection,
+                key: Box::new(key),
+                access: mir::NullableCollectionAccess::Index,
+            })
         }
         hir::Expr::FunctionCall { name, args, span } => {
             let signature = context.lookup_function(name, *span)?;

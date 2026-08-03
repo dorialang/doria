@@ -61,6 +61,8 @@ function main(): void
         SortedDictionary::from($nullableScoresSource);
     $nullableScores->set(2, 20);
     $nullableScores->set(1, null);
+    echo "nullable indexed: " . ($nullableScores[1] ?? -1) . " " .
+        ($nullableScores[2] ?? -1) . " " . ($nullableScores[3] ?? -1) . "\n";
     echo "nullable map:";
     foreach ($nullableScores->values as ?int $score) {
         echo " " . ($score ?? -1);
@@ -86,4 +88,7 @@ function main(): void
         echo " " . ($value ?? -1);
     }
     echo "\n";
+
+    writable Deque<int> $zeroDeque = Deque::from([0]);
+    echo "zero deque: " . ($zeroDeque->popFront() ?? -1) . "\n";
 }

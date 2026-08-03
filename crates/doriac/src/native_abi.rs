@@ -134,6 +134,7 @@ pub const COLLECTION_KEY_AT: &str = "dr_v2_collection_key_at";
 pub const COLLECTION_SET_AT: &str = "dr_v2_collection_set_at";
 pub const COLLECTION_SET_AT_NULLABLE: &str = "dr_v2_collection_set_at_nullable";
 pub const COLLECTION_KEYED_GET: &str = "dr_v1_collection_keyed_get";
+pub const COLLECTION_KEYED_GET_NULLABLE: &str = "dr_v2_collection_keyed_get_nullable";
 pub const COLLECTION_KEYED_SET: &str = "dr_v1_collection_keyed_set";
 pub const COLLECTION_KEYED_SET_NULLABLE: &str = "dr_v2_collection_keyed_set_nullable";
 pub const COLLECTION_KEYED_HAS: &str = "dr_v1_collection_keyed_has";

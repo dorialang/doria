@@ -573,6 +573,24 @@ pub unsafe extern "C" fn dr_v1_collection_keyed_get(
     collection::keyed_get(collection, key, key_kind, found)
 }
 
+/// Reads a keyed nullable value while reporting key existence separately from
+/// the stored value's presence bit.
+///
+/// # Safety
+///
+/// `collection` must point to a live keyed collection. `key` must match
+/// `key_kind`; `found` and `present` must each point to writable one-byte storage.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v2_collection_keyed_get_nullable(
+    collection: *const DrCollectionV1,
+    key: u64,
+    key_kind: u8,
+    found: *mut u8,
+    present: *mut u8,
+) -> u64 {
+    collection::keyed_get_nullable(collection, key, key_kind, found, present)
+}
+
 /// # Safety
 ///
 /// `collection` must be a uniquely borrowed live keyed collection. `key` and

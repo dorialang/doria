@@ -29,15 +29,15 @@ use crate::native_abi::{
     CLASS_FREE, COLLECTION_COMPARE_FLOAT32, COLLECTION_COMPARE_FLOAT64, COLLECTION_COMPARE_STRING,
     COLLECTION_COMPARE_WORD, COLLECTION_CONTAINS, COLLECTION_FILL_STRING, COLLECTION_FILL_WORD,
     COLLECTION_FREE, COLLECTION_INSERT_AT, COLLECTION_INSERT_AT_NULLABLE, COLLECTION_KEYED_GET,
-    COLLECTION_KEYED_HAS, COLLECTION_KEYED_SET, COLLECTION_KEYED_SET_NULLABLE, COLLECTION_KEY_AT,
-    COLLECTION_LENGTH, COLLECTION_LENGTH_FIELD, COLLECTION_NEW, COLLECTION_NULLABLE_ACCESS,
-    COLLECTION_PUSH, COLLECTION_PUSH_FRONT, COLLECTION_PUSH_FRONT_NULLABLE,
-    COLLECTION_PUSH_NULLABLE, COLLECTION_PUSH_UNIQUE, COLLECTION_REMOVE_AT,
-    COLLECTION_REMOVE_VALUE, COLLECTION_SET_ALGEBRA, COLLECTION_SET_AT, COLLECTION_SET_AT_NULLABLE,
-    COLLECTION_STAGE26_FINALIZE, COLLECTION_STAGE26_FROM_COPY, COLLECTION_STAGE26_NEW,
-    COLLECTION_VALUES_FIELD, COLLECTION_VALUE_AT, FLOAT_PARSE, FORMAT_F32, FORMAT_F64, FORMAT_I64,
-    FORMAT_STRING, FORMAT_U64, INT_PARSE, MIXED_CLONE_OWNED, MIXED_FREE, MIXED_NEW,
-    MIXED_NEW_BORROWED, MIXED_PAYLOAD, MIXED_RELEASE_OWNED, MIXED_TAG, MIXED_TAG_BOOL,
+    COLLECTION_KEYED_GET_NULLABLE, COLLECTION_KEYED_HAS, COLLECTION_KEYED_SET,
+    COLLECTION_KEYED_SET_NULLABLE, COLLECTION_KEY_AT, COLLECTION_LENGTH, COLLECTION_LENGTH_FIELD,
+    COLLECTION_NEW, COLLECTION_NULLABLE_ACCESS, COLLECTION_PUSH, COLLECTION_PUSH_FRONT,
+    COLLECTION_PUSH_FRONT_NULLABLE, COLLECTION_PUSH_NULLABLE, COLLECTION_PUSH_UNIQUE,
+    COLLECTION_REMOVE_AT, COLLECTION_REMOVE_VALUE, COLLECTION_SET_ALGEBRA, COLLECTION_SET_AT,
+    COLLECTION_SET_AT_NULLABLE, COLLECTION_STAGE26_FINALIZE, COLLECTION_STAGE26_FROM_COPY,
+    COLLECTION_STAGE26_NEW, COLLECTION_VALUES_FIELD, COLLECTION_VALUE_AT, FLOAT_PARSE, FORMAT_F32,
+    FORMAT_F64, FORMAT_I64, FORMAT_STRING, FORMAT_U64, INT_PARSE, MIXED_CLONE_OWNED, MIXED_FREE,
+    MIXED_NEW, MIXED_NEW_BORROWED, MIXED_PAYLOAD, MIXED_RELEASE_OWNED, MIXED_TAG, MIXED_TAG_BOOL,
     MIXED_TAG_CLASS, MIXED_TAG_FLOAT32, MIXED_TAG_FLOAT64, MIXED_TAG_INT16, MIXED_TAG_INT32,
     MIXED_TAG_INT64, MIXED_TAG_INT8, MIXED_TAG_STRING, MIXED_TAG_UINT16, MIXED_TAG_UINT32,
     MIXED_TAG_UINT64, MIXED_TAG_UINT8, MIXED_TYPE_ID, NULLABLE_STRING_EQUAL, PROCESS_EXIT,
@@ -2438,11 +2438,11 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             return Err(malformed_mir("nullable collection access type mismatch"));
         }
         let key_type = match access {
-            mir::NullableCollectionAccess::Get | mir::NullableCollectionAccess::Remove => {
-                definition
-                    .key
-                    .ok_or_else(|| malformed_mir("dictionary access has no key type"))?
-            }
+            mir::NullableCollectionAccess::Get
+            | mir::NullableCollectionAccess::Index
+            | mir::NullableCollectionAccess::Remove => definition
+                .key
+                .ok_or_else(|| malformed_mir("dictionary access has no key type"))?,
             mir::NullableCollectionAccess::First
             | mir::NullableCollectionAccess::Last
             | mir::NullableCollectionAccess::Pop
@@ -2463,9 +2463,65 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             self.builder
                 .build_alloca(self.context.i64_type(), "dictionary.removed.key"),
         )?;
+        if access == mir::NullableCollectionAccess::Index {
+            let present = build(
+                self.builder
+                    .build_alloca(self.context.i8_type(), "dictionary.index.present"),
+            )?;
+            let word = self
+                .call_runtime(
+                    COLLECTION_KEYED_GET_NULLABLE,
+                    &[
+                        pointer.into(),
+                        self.context.i64_type().into(),
+                        self.context.i8_type().into(),
+                        pointer.into(),
+                        pointer.into(),
+                    ],
+                    Some(self.context.i64_type().into()),
+                    &[
+                        collection.into(),
+                        key_word.into(),
+                        self.collection_compare_kind(key_type)?.into(),
+                        found.into(),
+                        present.into(),
+                    ],
+                )?
+                .ok_or_else(|| backend_failure("nullable dictionary lookup produced no result"))?
+                .into_int_value();
+            let found_value = build(self.builder.build_load(
+                self.context.i8_type(),
+                found,
+                "dictionary.index.found",
+            ))?
+            .into_int_value();
+            let missing = build(self.builder.build_int_compare(
+                IntPredicate::EQ,
+                found_value,
+                self.context.i8_type().const_zero(),
+                "dictionary.index.missing",
+            ))?;
+            self.lower_panic_if_code(missing, "P1312", self.function.source_span)?;
+            if key_type == mir::Type::String {
+                self.release_string(key_value.into_pointer_value())?;
+            }
+            let present = build(self.builder.build_load(
+                self.context.i8_type(),
+                present,
+                "dictionary.index.present.value",
+            ))?
+            .into_int_value();
+            let present = build(self.builder.build_int_z_extend(
+                present,
+                self.context.ptr_sized_int_type(self.target_data, None),
+                "dictionary.index.present.extended",
+            ))?;
+            return Ok((present, self.collection_word_to_value(word, expected)?));
+        }
         let access_value = self.context.i8_type().const_int(
             match access {
                 mir::NullableCollectionAccess::Get => 0,
+                mir::NullableCollectionAccess::Index => unreachable!("index handled above"),
                 mir::NullableCollectionAccess::Remove => 1,
                 mir::NullableCollectionAccess::First => 2,
                 mir::NullableCollectionAccess::Last => 3,

@@ -2746,6 +2746,20 @@ impl Interpreter<'_> {
                         .iter()
                         .find(|(current, _)| current.as_ref() == Some(&key))
                         .map(|(_, value)| value.clone()),
+                    mir::NullableCollectionAccess::Index => {
+                        let value = self
+                            .collection_local(collection)?
+                            .entries()
+                            .iter()
+                            .find(|(current, _)| current.as_ref() == Some(&key))
+                            .map(|(_, value)| value.clone());
+                        let Some(value) = value else {
+                            return self.collection_access_panic_step(
+                                CollectionAccessError::Catalogued("P1312"),
+                            );
+                        };
+                        Some(value)
+                    }
                     mir::NullableCollectionAccess::Remove => {
                         let position = self
                             .collection_local(collection)?

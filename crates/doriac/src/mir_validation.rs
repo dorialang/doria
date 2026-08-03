@@ -3558,9 +3558,9 @@ fn validate_dictionary_get(
     };
     let collection = collection_in(program, collection)?;
     let kind_matches = match access {
-        mir::NullableCollectionAccess::Get | mir::NullableCollectionAccess::Remove => {
-            collection.kind.is_dictionary()
-        }
+        mir::NullableCollectionAccess::Get
+        | mir::NullableCollectionAccess::Index
+        | mir::NullableCollectionAccess::Remove => collection.kind.is_dictionary(),
         mir::NullableCollectionAccess::First | mir::NullableCollectionAccess::Last => matches!(
             collection.kind,
             mir::CollectionKind::List
@@ -3583,9 +3583,9 @@ fn validate_dictionary_get(
         return Err(malformed_mir("nullable collection access type mismatch"));
     }
     let expected_key = match access {
-        mir::NullableCollectionAccess::Get | mir::NullableCollectionAccess::Remove => {
-            collection.key
-        }
+        mir::NullableCollectionAccess::Get
+        | mir::NullableCollectionAccess::Index
+        | mir::NullableCollectionAccess::Remove => collection.key,
         mir::NullableCollectionAccess::First
         | mir::NullableCollectionAccess::Last
         | mir::NullableCollectionAccess::Pop
