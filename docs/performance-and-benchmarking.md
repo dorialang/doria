@@ -160,35 +160,33 @@ That aligns performance measurement with the self-hosting goal.
 
 ## 5. Repository structure
 
-Possible future structure:
+The suite lives in the `benchmarks` repository, a sibling checkout of `doria`:
 
 ```text
 benchmarks/
-  README.md
-  runner/
-    bench.py
-    report.py
-  cases/
-    hello_world/
-      doria/
-      c/
-      cpp/
-      rust/
-      java/
-      csharp/
-      php/
-      javascript/
-      python/
-    fibonacci/
-    json_parse/
-    object_construction/
-    lexer/
-    parser/
-  results/
-    .gitkeep
+  bench.php
+  <case>/
+    README.md
+    Baton.toml
+    <case>.doria
+    <case>.c
+    <case>.cpp
+    <case>.rs
+    <case>.go
+    <case>.js
+    <case>.php
+    <case>.py
+    <Case>.java
+    csharp/
+      Program.cs
+      <case>.csproj
 ```
 
-Generated benchmark results should usually not be committed except for curated release reports.
+Peers sit beside the Doria source rather than in per-language subdirectories. Only C# needs its own directory, for the project file; Java's filename is PascalCase to match its public class. `bench.php` is the single harness: it builds every target available on the current platform, verifies each one's output against the first target, then times best-of-N.
+
+Repository tooling here is PHP, never Python or shell. AGENTS.md assigns small repository text/JSON helpers to PHP and compiler/project tooling to Rust, and CI fails the build when any `.py` appears under `scripts/`.
+
+Generated benchmark results should usually not be committed, except for curated release reports and any committed regression baselines a performance gate depends on.
 
 ---
 
