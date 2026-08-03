@@ -663,12 +663,7 @@ impl Parser {
                 return None;
             }
 
-            if self.check(&TokenKind::Writable)
-                || matches!(
-                    &self.peek().kind,
-                    TokenKind::Identifier(name) if name == "readonly"
-                )
-            {
+            if self.check(&TokenKind::Writable) || self.check(&TokenKind::Readonly) {
                 let modifier = self.advance().clone();
                 self.diagnostics.push(
                     Diagnostic::new(
@@ -685,13 +680,7 @@ impl Parser {
                 return None;
             }
 
-            let looks_like_per_binding_type = !matches!(self.peek().kind, TokenKind::Variable(_))
-                && self
-                    .tokens
-                    .get(self.current + 1)
-                    .is_some_and(|token| matches!(token.kind, TokenKind::Variable(_)));
-            if looks_like_per_binding_type {
-                let type_span = self.peek().span;
+            if let Some(type_span) = self.probe_per_binding_type() {
                 self.diagnostics.push(
                     Diagnostic::new(
                         "E0555",
@@ -712,6 +701,30 @@ impl Parser {
             bindings.push(VarBinding { name, span });
         }
         Some(bindings)
+    }
+
+    /// Recognize the complete ordinary type grammar without committing parser
+    /// state. Grouped declarations reject a type after a comma, but the
+    /// diagnostic must understand every type shape accepted elsewhere rather
+    /// than maintaining a second, shallower lookahead grammar.
+    fn probe_per_binding_type(&mut self) -> Option<Span> {
+        if matches!(self.peek().kind, TokenKind::Variable(_)) {
+            return None;
+        }
+
+        let current = self.current;
+        let pending_type_argument_close = self.pending_type_argument_close;
+        let diagnostic_count = self.diagnostics.len();
+        let start = self.peek().span.start;
+        let parsed = self.parse_type_ref();
+        let end = self.previous().span.end;
+        let followed_by_binding = matches!(self.peek().kind, TokenKind::Variable(_));
+
+        self.current = current;
+        self.pending_type_argument_close = pending_type_argument_close;
+        self.diagnostics.truncate(diagnostic_count);
+
+        (parsed.is_some() && followed_by_binding).then(|| Span::new(start, end))
     }
 
     fn reject_additional_group_initializer(&mut self) -> bool {

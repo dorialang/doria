@@ -174,6 +174,11 @@ fn rejected_per_binding_syntax_has_focused_diagnostics() {
             "Grouped Bindings Share One Mutability Mode",
         ),
         (
+            "function main(): void { let $a, readonly $b = 1; }",
+            "E0554",
+            "Grouped Bindings Share One Mutability Mode",
+        ),
+        (
             "function main(): void { int $a, string $b = 1; }",
             "E0555",
             "Grouped Bindings Share One Declared Type",
@@ -186,6 +191,26 @@ fn rejected_per_binding_syntax_has_focused_diagnostics() {
     ] {
         let error = diagnostic(source, code);
         assert_eq!(error.title, title);
+    }
+}
+
+#[test]
+fn every_complete_per_binding_type_shape_uses_the_focused_diagnostic() {
+    for per_binding_type in [
+        "?int",
+        "List<int>",
+        "Dictionary<string, List<int>>",
+        "int[]",
+        "App\\Token",
+    ] {
+        let source = format!("function main(): void {{ int $a, {per_binding_type} $b = 1; }}");
+        let error = diagnostic(&source, "E0555");
+        assert_eq!(error.title, "Grouped Bindings Share One Declared Type");
+        assert_eq!(
+            &source[error.span.start..error.span.end],
+            per_binding_type,
+            "the complete rejected type should be highlighted"
+        );
     }
 }
 

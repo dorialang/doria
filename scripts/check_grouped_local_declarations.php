@@ -66,6 +66,9 @@ function check_grouped_local_declarations(string $root): array
             'Runtime-Subsystem Performance',
             '## Continuous performance impact rule',
             'Stage 36a\'s stream gate',
+            'php ../benchmarks/fibonacci/fibonacci.php',
+            'node ../benchmarks/fibonacci/fibonacci.js',
+            'python3 ../benchmarks/fibonacci/fibonacci.py',
         ],
         'docs/notes/current-pipeline.md' => [
             'Stage 26 — Complete.',
@@ -96,6 +99,22 @@ function check_grouped_local_declarations(string $root): array
         foreach ($needles as $needle) {
             if (!str_contains($contents, $needle)) {
                 $failures[] = "{$path}: missing grouped-local authority {$needle}";
+            }
+        }
+    }
+
+    $performance = file_get_contents($root . '/docs/performance-and-benchmarking.md');
+    if ($performance !== false) {
+        foreach (
+            [
+                'benchmarks/cases/' => 'the obsolete in-repository cases directory',
+                'fibonacci/php/' => 'a per-language PHP directory',
+                'fibonacci/javascript/' => 'a per-language JavaScript directory',
+                'fibonacci/python/' => 'a per-language Python directory',
+            ] as $stalePath => $description
+        ) {
+            if (str_contains($performance, $stalePath)) {
+                $failures[] = "docs/performance-and-benchmarking.md: contains {$description} ({$stalePath})";
             }
         }
     }

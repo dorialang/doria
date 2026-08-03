@@ -315,9 +315,9 @@ hyperfine \
   './build/doria/fibonacci' \
   './build/c/fibonacci' \
   './build/rust/fibonacci' \
-  'php benchmarks/cases/fibonacci/php/fibonacci.php' \
-  'node benchmarks/cases/fibonacci/javascript/fibonacci.js' \
-  'python3 benchmarks/cases/fibonacci/python/fibonacci.py'
+  'php ../benchmarks/fibonacci/fibonacci.php' \
+  'node ../benchmarks/fibonacci/fibonacci.js' \
+  'python3 ../benchmarks/fibonacci/fibonacci.py'
 ```
 
 ---
