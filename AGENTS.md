@@ -308,6 +308,8 @@ These are identity, not scope deferral. They do not become available later, and 
 - Do not mark rejected Doria syntax as accepted language syntax in editor tooling.
 - Keep self-hosting in mind when designing compiler APIs, diagnostics, source management, Doria IR, and the standard library.
 - Keep native desktop, game engine, C-library binding, and raylib goals visible when designing Doria IR, future native-oriented IR, runtime, memory representation, FFI, and performance benchmarks.
+- Performance cases, manifests, raw samples, and report schemas live in the separate `dorialang/benchmarks` repository. `benchmarks-revision.json` pins the coordinated revision; do not add a second runner here or silently substitute a different compiler/build driver. A future `baton bench` orchestrates that same engine.
+- Performance evidence checks committed stdout, stderr, and status before timing, keeps Cranelift and LLVM distinct, and records exact compiler/repository/build provenance. Shared CI may enforce deterministic structure, but noisy wall-clock thresholds require a controlled runner.
 - Keep Baton architecturally outside the compiler pipeline. Baton may orchestrate projects and invoke `doriac`; it must not duplicate parsing, semantic analysis, type checking, Doria IR lowering, or code generation.
 - CLI commands wrap reusable compiler services rather than owning compiler behavior, so future REPL, notebook, and incremental tooling never needs a second frontend.
 - Keep executable initializers and attribute expressions represented as Doria concepts, not PHP workarounds.

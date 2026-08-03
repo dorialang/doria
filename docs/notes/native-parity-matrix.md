@@ -6,6 +6,11 @@ Source of truth for sequencing remains `docs/doria-end-to-end-plan.md`. The dura
 
 `Covered` means the interpreter, Cranelift, and LLVM consume the same validated MIR and the behavior has focused or manifest-driven triple differential coverage.
 
+This matrix is semantic and correctness authority, not a performance table. The
+separate `dorialang/benchmarks` manifest owns timed evidence, treats the
+interpreter as an oracle rather than a native competitor, and records Cranelift
+and LLVM as distinct targets built by one explicitly selected compiler commit.
+
 | Feature / example | MIR interpreter | Cranelift fast | LLVM release | Status | Notes |
 | --- | --- | --- | --- | --- | --- |
 | `main(): int` literal return | Covered | Covered | Covered | Covered | All three produce the same explicit status. |

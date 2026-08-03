@@ -43,6 +43,21 @@ function check_performance_foundation(string $root): array
             'Slice 2, the controlled baseline matrix, is next',
             'Stage 27 — Blocked Until Stage 26b Completes.',
         ],
+        'AGENTS.md' => [
+            '`dorialang/benchmarks` repository',
+            '`benchmarks-revision.json` pins the coordinated revision',
+            'A future `baton bench` orchestrates that same engine',
+        ],
+        'README.md' => [
+            '`dorialang/benchmarks`',
+            'keeps Cranelift and',
+            'LLVM results distinct',
+            'Public comparisons are workload-specific and reproducible',
+        ],
+        'docs/notes/native-parity-matrix.md' => [
+            'semantic and correctness authority, not a performance table',
+            'interpreter as an oracle rather than a native competitor',
+        ],
         'crates/doriac/src/performance.rs' => [
             'REPORT_SCHEMA_VERSION',
             'callableSpecializationCount',
@@ -57,7 +72,7 @@ function check_performance_foundation(string $root): array
         ],
         'benchmarks-revision.json' => [
             '"repository": "dorialang/benchmarks"',
-            '"revision": "ca41bf0587fca1fdf4c68bd51990d253dd2df634"',
+            '"revision": "6ae7a8a40cc048936cace3b9c73c62e4fdfb04ab"',
         ],
         'scripts/check_benchmark_revision.php' => [
             'check_benchmark_revision',
