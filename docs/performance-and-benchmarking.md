@@ -24,16 +24,21 @@ and `VecDeque`; those Rust types are test oracles, not public semantics.
 
 ## 1. Performance expectation
 
-A mature native Doria should aim to be much closer to native compiled languages than to interpreted/dynamic application runtimes.
+Performance is a design pillar, not an outcome to be discovered after the fact. Suboptimal performance is a defect to be diagnosed, not a characteristic to be documented.
 
-Honest expectation:
+Target:
 
 ```text
-- Doria will probably not consistently beat mature C, C++, or Rust on low-level optimized workloads.
-- Doria can plausibly be in the Rust/Go/C# NativeAOT neighborhood for many application workloads if the compiler/runtime are well designed.
-- Doria should be much faster than PHP and Python for CPU-bound userland code.
-- Doria may be competitive with Java/C#/JavaScript depending on startup, hot-code behavior, runtime design, and workload shape.
+- Doria aims to match C, C++, and Rust on comparable native workloads. Parity is the floor, not the ceiling.
+- Where Doria can safely go faster, it should. Safety and correctness guarantees are never traded for speed.
+- Doria should be consistently optimized across workload shapes. An unexplained outlier is a defect, not a data point.
+- Doria should be far faster than PHP and Python for CPU-bound userland code, and must never treat that comparison as evidence of good performance.
+- Performance work is continuous. As the language matures, keep looking for headroom rather than settling at a benchmark ranking.
 ```
+
+The shared-backend limit is real and should be reasoned about rather than wished away. Doria, Clang, and rustc all lower through LLVM, so on scalar code LLVM already optimizes well, parity is the realistic ceiling. Beating C therefore means emitting information a C compiler cannot derive: aliasing facts implied by ownership, whole-program monomorphization and devirtualization, guaranteed alignment and dereferenceability, escape analysis into stack or arena allocation, and profile-guided layout by default. Those are the sanctioned routes to a win, and each is a compiler capability rather than a benchmark trick.
+
+Ambition and claims are governed separately, and conflating them is an error in both directions. The target above is unbounded; published claims are bound by measured evidence.
 
 Avoid broad claims like:
 
