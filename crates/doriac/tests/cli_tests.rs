@@ -666,6 +666,30 @@ echo "Hello from Doria\n";
     let _ = fs::remove_dir_all(temp_dir);
 }
 
+#[test]
+fn compile_rejects_explicit_output_that_would_overwrite_input() {
+    let temp_dir = temp_dir_path("explicit-overwrite-guard");
+    fs::create_dir_all(&temp_dir).expect("temp directory should be created");
+    let source = "function main(): void {}\n";
+    fs::write(temp_dir.join("main.doria"), source).expect("source file should be writable");
+
+    let compile = Command::new(doriac_bin())
+        .current_dir(&temp_dir)
+        .args(["compile", "main.doria", "--out", "main.doria"])
+        .output()
+        .expect("doriac binary should run");
+    assert_failure_contains(
+        "explicit output overwrite guard",
+        compile,
+        "would overwrite input",
+    );
+    assert_eq!(
+        fs::read_to_string(temp_dir.join("main.doria")).expect("preserved source"),
+        source
+    );
+    let _ = fs::remove_dir_all(temp_dir);
+}
+
 fn doriac_bin() -> &'static str {
     env!("CARGO_BIN_EXE_doriac")
 }

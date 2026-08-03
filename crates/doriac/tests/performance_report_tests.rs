@@ -25,6 +25,10 @@ fn opt_in_native_compile_writes_a_versioned_phase_report() {
             executable_name(),
             "--performance-report",
             "performance.json",
+            "--diagnostic-format",
+            "json",
+            "--diagnostic-color",
+            "never",
         ])
         .output()
         .expect("doriac");
@@ -41,6 +45,22 @@ fn opt_in_native_compile_writes_a_versioned_phase_report() {
     assert_eq!(report["success"], true);
     assert_eq!(report["backend"], "cranelift");
     assert_eq!(report["source"]["bytes"], 36);
+    assert_eq!(
+        report["command"],
+        serde_json::json!([
+            doriac_bin(),
+            "compile",
+            "main.doria",
+            "--out",
+            executable_name(),
+            "--performance-report",
+            "performance.json",
+            "--diagnostic-format",
+            "json",
+            "--diagnostic-color",
+            "never",
+        ])
+    );
     assert!(report["totalDurationNs"]
         .as_u64()
         .is_some_and(|value| value > 0));
@@ -59,6 +79,150 @@ fn opt_in_native_compile_writes_a_versioned_phase_report() {
         .as_u64()
         .is_some_and(|value| value > 0));
     assert!(report["metrics"]["functionCount"].as_u64().is_some());
+    let _ = fs::remove_dir_all(directory);
+}
+
+#[test]
+fn report_path_cannot_alias_source_or_compiler_output() {
+    let directory = fixture_directory("path-aliases");
+    fs::create_dir_all(&directory).expect("fixture directory");
+    let source = "function main(): void {}\n";
+    fs::write(directory.join("main.doria"), source).expect("source");
+
+    let source_alias = Command::new(doriac_bin())
+        .current_dir(&directory)
+        .args([
+            "compile",
+            "main.doria",
+            "--out",
+            executable_name(),
+            "--performance-report",
+            "main.doria",
+        ])
+        .output()
+        .expect("doriac");
+    assert!(!source_alias.status.success());
+    assert!(String::from_utf8_lossy(&source_alias.stderr).contains("would overwrite input"));
+    assert_eq!(
+        fs::read_to_string(directory.join("main.doria")).unwrap(),
+        source
+    );
+    assert!(!directory.join(executable_name()).exists());
+
+    let output_alias = Command::new(doriac_bin())
+        .current_dir(&directory)
+        .args([
+            "compile",
+            "main.doria",
+            "--out",
+            executable_name(),
+            "--performance-report",
+            executable_name(),
+        ])
+        .output()
+        .expect("doriac");
+    assert!(!output_alias.status.success());
+    assert!(
+        String::from_utf8_lossy(&output_alias.stderr).contains("would overwrite compiler output")
+    );
+    assert_eq!(
+        fs::read_to_string(directory.join("main.doria")).unwrap(),
+        source
+    );
+    assert!(!directory.join(executable_name()).exists());
+
+    let hard_link = directory.join("source-alias.json");
+    if fs::hard_link(directory.join("main.doria"), &hard_link).is_ok() {
+        let hard_link_alias = Command::new(doriac_bin())
+            .current_dir(&directory)
+            .args([
+                "compile",
+                "main.doria",
+                "--out",
+                executable_name(),
+                "--performance-report",
+                "source-alias.json",
+            ])
+            .output()
+            .expect("doriac");
+        assert!(!hard_link_alias.status.success());
+        assert!(String::from_utf8_lossy(&hard_link_alias.stderr).contains("would overwrite input"));
+        assert_eq!(
+            fs::read_to_string(directory.join("main.doria")).unwrap(),
+            source
+        );
+        assert!(!directory.join(executable_name()).exists());
+    }
+    let _ = fs::remove_dir_all(directory);
+}
+
+#[cfg(windows)]
+#[test]
+fn report_and_output_paths_are_compared_using_windows_identity_rules() {
+    let directory = fixture_directory("case-insensitive-path-alias");
+    fs::create_dir_all(&directory).expect("fixture directory");
+    fs::write(directory.join("main.doria"), "function main(): void {}\n").expect("source");
+
+    let output = Command::new(doriac_bin())
+        .current_dir(&directory)
+        .args([
+            "compile",
+            "main.doria",
+            "--out",
+            "program.exe",
+            "--performance-report",
+            "PROGRAM.EXE",
+        ])
+        .output()
+        .expect("doriac");
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("would overwrite compiler output"));
+    assert!(!directory.join("program.exe").exists());
+    let _ = fs::remove_dir_all(directory);
+}
+
+#[test]
+fn an_existing_report_is_replaced_atomically() {
+    if !host_linker_is_available() {
+        return;
+    }
+    let directory = fixture_directory("atomic-replacement");
+    fs::create_dir_all(&directory).expect("fixture directory");
+    fs::write(
+        directory.join("main.doria"),
+        "function main(): int { return 42; }\n",
+    )
+    .expect("source");
+    fs::write(directory.join("performance.json"), "stale report\n").expect("stale report");
+    let output = Command::new(doriac_bin())
+        .current_dir(&directory)
+        .args([
+            "compile",
+            "main.doria",
+            "--out",
+            executable_name(),
+            "--performance-report",
+            "performance.json",
+        ])
+        .output()
+        .expect("doriac");
+    assert!(
+        output.status.success(),
+        "compile failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value =
+        serde_json::from_slice(&fs::read(directory.join("performance.json")).expect("report"))
+            .expect("replacement report JSON");
+    assert_eq!(report["schemaVersion"], 1);
+    assert_eq!(report["success"], true);
+    assert!(fs::read_dir(&directory)
+        .expect("directory")
+        .all(|entry| !entry
+            .expect("entry")
+            .file_name()
+            .to_string_lossy()
+            .ends_with(".tmp")));
     let _ = fs::remove_dir_all(directory);
 }
 
