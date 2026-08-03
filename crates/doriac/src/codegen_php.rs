@@ -18,12 +18,308 @@ const PHP_COLLECTION_UNSUPPORTED_CODE: &str = "B2301";
 const PHP_GENERICS_UNSUPPORTED_CODE: &str = "B2401";
 const PHP_STRING_RUNTIME_UNSUPPORTED_CODE: &str = "B2501";
 
+const PHP_STAGE26_COLLECTION_HELPERS: &str = r#"
+abstract class __DoriaOrderedCollection
+{
+    protected static function compare(mixed $left, mixed $right): int
+    {
+        if (is_string($left)) { return strcmp($left, $right); }
+        if (is_bool($left)) { return ((int) $left) <=> ((int) $right); }
+        return $left <=> $right;
+    }
+}
+
+final class SortedDictionary extends __DoriaOrderedCollection implements ArrayAccess, IteratorAggregate
+{
+    private array $entries = [];
+
+    public static function from(array $source): self
+    {
+        $pairs = [];
+        foreach ($source as $key => $value) { $pairs[] = [$key, $value]; }
+        return self::fromPairs($pairs);
+    }
+
+    public static function fromPairs(array $pairs): self
+    {
+        $result = new self();
+        foreach ($pairs as $pair) { $result->set($pair[0], $pair[1]); }
+        return $result;
+    }
+
+    private function locate(mixed $key): array
+    {
+        $low = 0;
+        $high = count($this->entries);
+        while ($low < $high) {
+            $middle = $low + intdiv($high - $low, 2);
+            $order = self::compare($this->entries[$middle][0], $key);
+            if ($order < 0) { $low = $middle + 1; }
+            elseif ($order > 0) { $high = $middle; }
+            else { return [true, $middle]; }
+        }
+        return [false, $low];
+    }
+
+    public function set(mixed $key, mixed $value): void
+    {
+        [$found, $index] = $this->locate($key);
+        if ($found) { $this->entries[$index][1] = $value; return; }
+        array_splice($this->entries, $index, 0, [[$key, $value]]);
+    }
+
+    public function get(mixed $key): mixed
+    {
+        [$found, $index] = $this->locate($key);
+        return $found ? $this->entries[$index][1] : null;
+    }
+
+    public function has(mixed $key): bool { return $this->locate($key)[0]; }
+
+    public function remove(mixed $key): mixed
+    {
+        [$found, $index] = $this->locate($key);
+        if (!$found) { return null; }
+        $value = $this->entries[$index][1];
+        array_splice($this->entries, $index, 1);
+        return $value;
+    }
+
+    public function __get(string $name): mixed
+    {
+        if ($name === 'count') { return count($this->entries); }
+        if ($name === 'isEmpty') { return count($this->entries) === 0; }
+        if ($name === 'keys') { return array_map(fn($entry) => $entry[0], $this->entries); }
+        if ($name === 'values') { return array_map(fn($entry) => $entry[1], $this->entries); }
+        return null;
+    }
+
+    public function offsetExists(mixed $offset): bool { return $this->has($offset); }
+    public function offsetGet(mixed $offset): mixed
+    {
+        [$found, $index] = $this->locate($offset);
+        if (!$found) { __doria_panic('P1311', 0, 0); }
+        return $this->entries[$index][1];
+    }
+    public function offsetSet(mixed $offset, mixed $value): void { $this->set($offset, $value); }
+    public function offsetUnset(mixed $offset): void { $this->remove($offset); }
+
+    public function &getIterator(): Traversable
+    {
+        foreach ($this->entries as $index => $entry) {
+            yield $entry[0] => $this->entries[$index][1];
+        }
+    }
+}
+
+final class SortedSet extends __DoriaOrderedCollection implements IteratorAggregate
+{
+    private array $values = [];
+
+    public static function from(array $source): self
+    {
+        $result = new self();
+        foreach ($source as $value) { $result->add($value); }
+        return $result;
+    }
+
+    private function locate(mixed $value): array
+    {
+        $low = 0;
+        $high = count($this->values);
+        while ($low < $high) {
+            $middle = $low + intdiv($high - $low, 2);
+            $order = self::compare($this->values[$middle], $value);
+            if ($order < 0) { $low = $middle + 1; }
+            elseif ($order > 0) { $high = $middle; }
+            else { return [true, $middle]; }
+        }
+        return [false, $low];
+    }
+
+    public function add(mixed $value): bool
+    {
+        [$found, $index] = $this->locate($value);
+        if ($found) { return false; }
+        array_splice($this->values, $index, 0, [$value]);
+        return true;
+    }
+
+    public function remove(mixed $value): bool
+    {
+        [$found, $index] = $this->locate($value);
+        if (!$found) { return false; }
+        array_splice($this->values, $index, 1);
+        return true;
+    }
+
+    public function contains(mixed $value): bool { return $this->locate($value)[0]; }
+
+    private function algebra(self $other, string $operation): self
+    {
+        $result = new self();
+        foreach ($this->values as $value) {
+            if ($operation === 'union' || ($operation === 'intersect') === $other->contains($value)) {
+                $result->add($value);
+            }
+        }
+        if ($operation === 'union') {
+            foreach ($other->values as $value) { $result->add($value); }
+        }
+        return $result;
+    }
+
+    public function union(self $other): self { return $this->algebra($other, 'union'); }
+    public function intersect(self $other): self { return $this->algebra($other, 'intersect'); }
+    public function difference(self $other): self { return $this->algebra($other, 'difference'); }
+    public function __get(string $name): mixed
+    {
+        if ($name === 'count') { return count($this->values); }
+        if ($name === 'isEmpty') { return count($this->values) === 0; }
+        return null;
+    }
+    public function getIterator(): Traversable { yield from $this->values; }
+}
+
+final class PriorityQueue extends __DoriaOrderedCollection
+{
+    private array $heap = [];
+    public static function from(array $source): self
+    {
+        $result = new self();
+        $result->heap = array_values($source);
+        for ($root = intdiv(count($result->heap), 2) - 1; $root >= 0; --$root) {
+            $result->siftDown($root);
+        }
+        return $result;
+    }
+    private function siftDown(int $parent): void
+    {
+        $length = count($this->heap);
+        while (($left = $parent * 2 + 1) < $length) {
+            $right = $left + 1;
+            $child = $right < $length && self::compare($this->heap[$right], $this->heap[$left]) < 0
+                ? $right : $left;
+            if (self::compare($this->heap[$parent], $this->heap[$child]) <= 0) { return; }
+            [$this->heap[$parent], $this->heap[$child]] = [$this->heap[$child], $this->heap[$parent]];
+            $parent = $child;
+        }
+    }
+    public function push(mixed $value): void
+    {
+        $this->heap[] = $value;
+        $child = count($this->heap) - 1;
+        while ($child > 0) {
+            $parent = intdiv($child - 1, 2);
+            if (self::compare($this->heap[$parent], $this->heap[$child]) <= 0) { break; }
+            [$this->heap[$parent], $this->heap[$child]] = [$this->heap[$child], $this->heap[$parent]];
+            $child = $parent;
+        }
+    }
+    public function pop(): mixed
+    {
+        if (!$this->heap) { return null; }
+        $value = $this->heap[0];
+        $last = array_pop($this->heap);
+        if ($this->heap) { $this->heap[0] = $last; $this->siftDown(0); }
+        return $value;
+    }
+    public function __get(string $name): mixed
+    {
+        if ($name === 'count') { return count($this->heap); }
+        if ($name === 'isEmpty') { return count($this->heap) === 0; }
+        if ($name === 'peek') { return $this->heap[0] ?? null; }
+        return null;
+    }
+}
+
+final class Deque implements IteratorAggregate
+{
+    private array $values = [];
+    private int $head = 0;
+    private int $count = 0;
+    private int $capacity = 4;
+    public static function from(array $source): self
+    {
+        $result = new self();
+        foreach ($source as $value) { $result->pushBack($value); }
+        return $result;
+    }
+    private function grow(): void
+    {
+        $next = [];
+        for ($index = 0; $index < $this->count; ++$index) {
+            $next[$index] = $this->values[($this->head + $index) % $this->capacity];
+        }
+        $this->values = $next;
+        $this->head = 0;
+        $this->capacity *= 2;
+    }
+    public function pushBack(mixed $value): void
+    {
+        if ($this->count === $this->capacity) { $this->grow(); }
+        $this->values[($this->head + $this->count) % $this->capacity] = $value;
+        ++$this->count;
+    }
+    public function pushFront(mixed $value): void
+    {
+        if ($this->count === $this->capacity) { $this->grow(); }
+        $this->head = ($this->head + $this->capacity - 1) % $this->capacity;
+        $this->values[$this->head] = $value;
+        ++$this->count;
+    }
+    public function popFront(): mixed
+    {
+        if ($this->count === 0) { return null; }
+        $value = $this->values[$this->head];
+        unset($this->values[$this->head]);
+        $this->head = ($this->head + 1) % $this->capacity;
+        --$this->count;
+        return $value;
+    }
+    public function popBack(): mixed
+    {
+        if ($this->count === 0) { return null; }
+        $index = ($this->head + $this->count - 1) % $this->capacity;
+        $value = $this->values[$index];
+        unset($this->values[$index]);
+        --$this->count;
+        return $value;
+    }
+    public function __get(string $name): mixed
+    {
+        if ($name === 'count') { return $this->count; }
+        if ($name === 'isEmpty') { return $this->count === 0; }
+        if ($name === 'peekFront') { return $this->count ? $this->values[$this->head] : null; }
+        if ($name === 'peekBack') {
+            return $this->count ? $this->values[($this->head + $this->count - 1) % $this->capacity] : null;
+        }
+        return null;
+    }
+    public function &getIterator(): Traversable
+    {
+        for ($offset = 0; $offset < $this->count; ++$offset) {
+            $index = ($this->head + $offset) % $this->capacity;
+            yield $offset => $this->values[$index];
+        }
+    }
+}
+
+function __doria_collection_projection(mixed $collection, bool $keys): array
+{
+    if (is_array($collection)) { return $keys ? array_keys($collection) : array_values($collection); }
+    return $keys ? $collection->keys : $collection->values;
+}
+
+"#;
+
 pub fn generate(program: &Program) -> Result<String, BackendError> {
     validate_program(program)?;
 
     let mut output = String::from(
         "<?php\n\ninterface __DoriaDisplayable\n{\n    public function toString(): string;\n}\n\nfunction __doria_display(string|int|float|bool|__DoriaDisplayable $value): string\n{\n    if ($value instanceof __DoriaDisplayable) { return $value->toString(); }\n    if (is_bool($value)) { return $value ? 'true' : 'false'; }\n    return (string) $value;\n}\n\nfunction __doria_less(string|int|float|bool $left, string|int|float|bool $right): bool\n{\n    if (is_string($left) && is_string($right)) { return strcmp($left, $right) < 0; }\n    return $left < $right;\n}\n\nfunction __doria_less_equal(string|int|float|bool $left, string|int|float|bool $right): bool\n{\n    if (is_string($left) && is_string($right)) { return strcmp($left, $right) <= 0; }\n    return $left <= $right;\n}\n\nfunction __doria_greater(string|int|float|bool $left, string|int|float|bool $right): bool\n{\n    if (is_string($left) && is_string($right)) { return strcmp($left, $right) > 0; }\n    return $left > $right;\n}\n\nfunction __doria_greater_equal(string|int|float|bool $left, string|int|float|bool $right): bool\n{\n    if (is_string($left) && is_string($right)) { return strcmp($left, $right) >= 0; }\n    return $left >= $right;\n}\n\n",
     );
+    output.push_str(PHP_STAGE26_COLLECTION_HELPERS);
     output.push_str(&format!(
         "$__doria_source_path = {};\n$__doria_source_text = hex2bin({});\n",
         emit_php_string_literal(&program.source_path),
@@ -37,6 +333,7 @@ pub fn generate(program: &Program) -> Result<String, BackendError> {
                 entry.code,
                 "P1000"
                     | "P1001"
+                    | "P1311"
                     | "P1401"
                     | "P1402"
                     | "P1403"
@@ -455,7 +752,16 @@ fn validate_function(
 
 fn is_move_type(ty: &TypeRef, semantic_info: &SemanticInfo) -> bool {
     ty.name == "mixed"
-        || matches!(ty.name.as_str(), "[]" | "List" | "Dictionary" | "Set")
+        || matches!(
+            ty.name.as_str(),
+            "[]" | "List"
+                | "Dictionary"
+                | "Set"
+                | "SortedDictionary"
+                | "SortedSet"
+                | "PriorityQueue"
+                | "Deque"
+        )
         || semantic_info
             .classes
             .iter()
@@ -566,10 +872,22 @@ fn validate_statement(statement: &Stmt, semantic_info: &SemanticInfo) -> Result<
         Stmt::Break { .. } | Stmt::Continue { .. } => Ok(()),
         Stmt::Foreach(foreach) => {
             if foreach.value.writable {
-                return Err(unsupported_collection_shape(
-                    foreach.span,
-                    "writable collection element iteration",
-                ));
+                let iterable = dictionary_foreach_projection(&foreach.iterable)
+                    .map_or(&foreach.iterable, |(dictionary, _)| dictionary);
+                let supported = semantic_info
+                    .expression_type(iterable.span())
+                    .is_some_and(|ty| {
+                        matches!(
+                            ty,
+                            ResolvedType::SortedDictionary(_, _) | ResolvedType::Deque(_)
+                        )
+                    });
+                if !supported {
+                    return Err(unsupported_collection_shape(
+                        foreach.span,
+                        "writable collection element iteration",
+                    ));
+                }
             }
             if let Some((dictionary, _)) = dictionary_foreach_projection(&foreach.iterable) {
                 validate_expr(dictionary, semantic_info)?;
@@ -1777,21 +2095,27 @@ fn emit_foreach(
     }
 
     if let Some((dictionary, projection)) = dictionary_foreach_projection(&foreach.iterable) {
-        let iterable = emit_expr(dictionary, scopes);
+        let iterable = format!(
+            "__doria_collection_projection({}, {})",
+            emit_expr(dictionary, scopes),
+            if projection == DictionaryForeachProjection::Keys {
+                "true"
+            } else {
+                "false"
+            }
+        );
         scopes.push();
         let value_name = scopes.declare(&foreach.value.name);
-        let ignored_value = (projection == DictionaryForeachProjection::Keys)
-            .then(|| scopes.fresh_temp("projection_value"));
 
         write_indent(output, indent);
         output.push_str("foreach (");
         output.push_str(&iterable);
-        output.push_str(" as $");
-        output.push_str(&value_name);
-        if let Some(ignored_value) = ignored_value {
-            output.push_str(" => $");
-            output.push_str(&ignored_value);
+        output.push_str(" as ");
+        if foreach.value.writable {
+            output.push('&');
         }
+        output.push('$');
+        output.push_str(&value_name);
         output.push_str(")\n");
         writeln(output, indent, "{");
         for statement in &foreach.body.statements {
@@ -1815,6 +2139,9 @@ fn emit_foreach(
         output.push('$');
         output.push_str(&key_name);
         output.push_str(" => ");
+    }
+    if foreach.value.writable {
+        output.push('&');
     }
     output.push('$');
     output.push_str(&value_name);
@@ -2001,7 +2328,30 @@ fn emit_expr(expr: &Expr, scopes: &PhpNameScopes) -> String {
             method,
             args,
             ..
-        } => format!("{class_name}::{method}({})", emit_arguments(args, scopes)),
+        } => {
+            if class_name == "SortedDictionary" && method == "from" && args.len() == 1 {
+                if let Expr::Array { elements, .. } = &args[0].value {
+                    if elements.iter().all(|element| element.key.is_some()) {
+                        let pairs = elements
+                            .iter()
+                            .map(|element| {
+                                format!(
+                                    "[{}, {}]",
+                                    emit_expr(
+                                        element.key.as_ref().expect("checked keyed entry"),
+                                        scopes
+                                    ),
+                                    emit_expr(&element.value, scopes)
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        return format!("SortedDictionary::fromPairs([{pairs}])");
+                    }
+                }
+            }
+            format!("{class_name}::{method}({})", emit_arguments(args, scopes))
+        }
         Expr::StaticMember {
             class_name, member, ..
         } if scopes.is_static_property(class_name, member) => {

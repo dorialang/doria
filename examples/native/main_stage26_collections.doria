@@ -1,0 +1,89 @@
+function maybeDeque(bool $present): ?Deque<int>
+{
+    if ($present) {
+        return Deque::from([10, 20]);
+    }
+    return null;
+}
+
+function main(): void
+{
+    SortedDictionary<string, int> $scores =
+        SortedDictionary::from([
+            "Charlie" => 3,
+            "Alice" => 1,
+            "Bob" => 2,
+        ]);
+
+    foreach ($scores as string $name => int $score) {
+        echo "{$name}:{$score}\n";
+    }
+
+    SortedSet<int> $numbers = SortedSet::from([5, 1, 3, 1]);
+
+    foreach ($numbers as int $number) {
+        echo "{$number}";
+    }
+
+    echo "\n";
+
+    writable PriorityQueue<int> $queue = PriorityQueue::from([8, 2, 5]);
+
+    while (!$queue->isEmpty) {
+        ?int $next = $queue->pop();
+
+        if ($next != null) {
+            echo "{$next}";
+        }
+    }
+
+    echo "\n";
+
+    writable Deque<string> $commands = Deque::from(["middle"]);
+    $commands->pushFront("first");
+    $commands->pushBack("last");
+
+    foreach ($commands as string $command) {
+        echo "{$command}\n";
+    }
+
+    let $missing = maybeDeque(false);
+    let $present = maybeDeque(true);
+    if ($missing == null) {
+        echo "nullable deque: none\n";
+    }
+    if ($present != null) {
+        echo "nullable deque: {$present->count}\n";
+    }
+
+    Dictionary<int, ?int> $nullableScoresSource = [2 => null, 1 => 7, 3 => 0];
+    writable SortedDictionary<int, ?int> $nullableScores =
+        SortedDictionary::from($nullableScoresSource);
+    $nullableScores->set(2, 20);
+    $nullableScores->set(1, null);
+    echo "nullable map:";
+    foreach ($nullableScores->values as ?int $score) {
+        echo " " . ($score ?? -1);
+    }
+    echo "\n";
+
+    List<?int> $nullableDequeSource = [null, 0, 2];
+    writable Deque<?int> $nullableDeque = Deque::from($nullableDequeSource);
+    $nullableDeque->pushFront(null);
+    $nullableDeque->pushBack(3);
+    echo "nullable deque values:";
+    foreach ($nullableDeque as ?int $value) {
+        echo " " . ($value ?? -1);
+    }
+    echo "\n";
+    foreach ($nullableDeque as writable ?int $value) {
+        if ($value == null) {
+            $value = 9;
+        }
+    }
+    echo "nullable deque updated:";
+    foreach ($nullableDeque as ?int $value) {
+        echo " " . ($value ?? -1);
+    }
+    echo "\n";
+}

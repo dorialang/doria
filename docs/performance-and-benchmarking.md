@@ -9,6 +9,19 @@ This document records the benchmark direction. It is not a performance claim.
 
 ---
 
+## Stage 26 collection representations
+
+`SortedDictionary` and `SortedSet` use compact contiguous storage, one bulk sort,
+and binary search (`O(log n)` lookup; `O(n)` insertion/removal; `O(n)` ordered
+iteration). `PriorityQueue` is a binary min-heap (`O(1)` peek, `O(log n)` push and
+pop, `O(n)` bulk heapify). `Deque` is a circular buffer with amortized `O(1)`
+pushes at both ends and `O(1)` pops/peeks. Ordinary scalar and handle slots are
+stored inline without per-element allocation. Deterministic bounded runtime tests
+compare these structures with `BTreeMap`, `BTreeSet`, `BinaryHeap<Reverse<_>>`,
+and `VecDeque`; those Rust types are test oracles, not public semantics.
+
+---
+
 ## 1. Performance expectation
 
 A mature native Doria should aim to be much closer to native compiled languages than to interpreted/dynamic application runtimes.

@@ -138,9 +138,17 @@ form; `values` is readonly.
 | `contains(T): bool` | readonly | membership |
 | `union` / `intersect` / `difference(Set<T>): Set<T>` | readonly | return a **new owned** set; receiver and argument unchanged |
 | `count` / `isEmpty` | readonly properties | |
-| `foreach ($s as $e)` | readonly / writable borrow | insertion order (0092) |
+| `foreach ($s as $e)` | readonly borrow only | insertion order (0092) |
 
 `isSubsetOf` / `isSupersetOf` predicates are deferred (not required for v1.0).
+
+Set elements cannot be yielded as writable borrows. Mutating an element in place
+could invalidate membership lookup or create a duplicate; for a `SortedSet` it
+could additionally invalidate ordering. Element replacement is therefore
+expressed as `remove($old)` followed by `add($new)`. Dictionary keys remain
+readonly, dictionary values may be writable where the receiver and main
+dictionary iteration binding permit it, and deque elements may be readonly or
+writable according to the iteration binding. `PriorityQueue` has no `foreach`.
 
 ### The rest of the family (designed complete; scheduled after the defaults)
 
@@ -177,7 +185,20 @@ construction path. It is also **available** as the equivalent explicit form for 
 literal-constructible types (`List`/`Dictionary`/`T[]`). Each `::from` accepts the
 element (or key/value pair, for the map types) sequence its own type expects — e.g.
 `Set::from([...])`, `PriorityQueue::from([...])`, `Deque::from([...])`, and
-`SortedDictionary::from(["k" => v, ...])`. The runtime-sized **fill** constructor — a `T[]`/`List<T>` of
+`SortedDictionary::from(["k" => v, ...])`. Existing-source `::from` preserves
+its source. During Stage 26 its elements must therefore be `Copy`; for a map,
+both keys and values must be `Copy`. A `Comparable` or `Hashable` constraint does
+not imply `Copy`, and an otherwise unconstrained generic type parameter is not
+assumed to be `Copy`. Stage 35 widens these non-consuming operations to
+`Cloneable`. Until then, move-only values are moved individually into an empty
+destination. A separately named consuming conversion remains deferred; a
+non-empty temporary is not an implicit consuming exception.
+
+The same non-consuming rule applies to `Set` and `SortedSet` `union`,
+`intersect`, and `difference`: both operands remain unchanged, Stage 26 supports
+`Copy` elements, and Stage 35 widens the operations to `Cloneable` elements.
+
+The runtime-sized **fill** constructor — a `T[]`/`List<T>` of
 `count` copies of a value — is spelled as the `[value; count]` repeat literal
 (decision 0102), which supersedes this record's original bundling of fill with
 capacity. Capacity hints (`withCapacity`, an empty pre-allocated sequence) and
@@ -250,3 +271,9 @@ fixtures. SPEC is updated when the members are implemented, not now.
   `void`; fluency lives in userland via 0088.
 - Any ownership rule that classifies a property-rooted indexed write as a
   complete-property move, or loses the borrow root of `get`/`first`/`last`.
+- Any claim that `Set` or `SortedSet` writable iteration is supported — their
+  elements are readonly borrows and replacement is remove plus add.
+- Any construction or set-algebra rule that consumes an existing source, treats
+  a non-empty temporary specially, or equates `Comparable`/`Hashable` with
+  duplicability — Stage 26 requires `Copy`, Stage 35 reopens this for
+  `Cloneable`, and a consuming conversion remains separately deferred.

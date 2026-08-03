@@ -82,6 +82,11 @@ Doria does not use `public`, `protected`, or `private` as member visibility modi
 
 The current compiler implementation lowers the accepted native subset through validated typed MIR. The debug interpreter, default Cranelift fast profile, and `--release` LLVM profile consume that same MIR, and the durable executable parity manifest compares exact stdin-driven stdout bytes, stderr bytes, process status, declared file side effects, and class lifetime behavior across all three paths. The supported subset includes top-level free functions; int/void `main` with either no parameters or one readonly borrowed `List<string>` argument; structured control flow and recursion; fixed-width numerics and bool; const-evaluable defaults for Copy scalars and readonly strings; immutable UTF-8 strings; expression interpolation; general nullable scalar, string, concrete-class, and `mixed` values with flow narrowing, `??`, `?->`, and exact `is`; checked formatting; UTF-8 line/file I/O; exact stdout/stderr; fatal panic; native classes, methods, statics, constants, complete `internal` checking, deterministic ownership, and compile-time borrowing; Stage 23 collections, typed arrays, `Bytes`, binary I/O, and boxed `mixed`; Stage 24 generic functions and methods; Stage 25 generic classes; and both Stage 25a shared-ownership families. The readonly `SharedReference<T>` / `WeakReference<T>` family supports class payloads. The writable family supports class, generic-class, typed-array, `List<T>`, `Dictionary<K, V>`, `Set<T>`, and `Bytes` payloads through `WritableSharedReference<T>` / `WritableWeakReference<T>` and owned readonly/writable access objects. It includes nullable weak acquisition, lazy nullable operations, generic/property/collection storage, deterministic strong/weak/access release, and one per-allocation many-readonly-XOR-one-writable access state. `SharedReference<T>::referencedValue` is a readonly, allocation-free, refcount-neutral collision projection available only on that wrapper. Native strings are private non-atomic refcounted buffers and are Copy at the source level. Native classes, collections, `Bytes`, `mixed` boxes, and shared-reference handles are pointer-sized move values whose payload layout is compiler-known. Shared-reference control blocks are separate from unchanged payload layouts; the final strong release destroys the payload once, while weak references may keep only the control block alive. Shared-access conflicts use P1501 with a typed `conflictReason` that distinguishes all three incompatible access states. `main(): int` crosses the accepted `0..125` process boundary and `main(): void` maps normal completion to status `0`. Release optimization does not change observable semantics. `doria-rt` owns process entry, class/collection/byte-buffer/mixed-box/shared-control allocation and free, runtime strings, raw standard-device I/O, line discipline, text/binary file I/O, exact output, and the private source-aware runtime-outcome transport and standalone `Call Path` projection. Scalar/string writable-shared payload access, shared handles through `mixed`, and interface-typed values remain unsupported. The former Stage 7-10 native smoke module remains retired.
 
+Stage 26 completes the compiler-known non-closure collection family with
+ascending `SortedDictionary`/`SortedSet`, a min-first `PriorityQueue`, and a
+front/back `Deque`. These types share the validated MIR and native runtime
+contract used by the existing collections.
+
 Doria is not a Rust language. Rust is the current bootstrap implementation language for `doriac`, not the permanent identity of the compiler.
 
 ## 3. MVP syntax
@@ -546,6 +551,10 @@ T[]
 List<T>
 Dictionary<K, V>
 Set<T>
+SortedDictionary<K, V>
+SortedSet<T>
+PriorityQueue<T>
+Deque<T>
 ClassType
 ```
 

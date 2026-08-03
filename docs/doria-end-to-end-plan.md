@@ -278,7 +278,7 @@ function first<T>(List<T> $items): ?T
     // ...
 }
 
-class History<T>   // deliberately not Deque<T>: that name is reserved for a future stdlib collection (§4.9)
+class History<T>   // a domain type, distinct from the general Deque<T> collection (§4.9)
 {
     internal writable List<T> $entries = [];
 
@@ -973,11 +973,10 @@ AC: legal/illegal borrow and ctor fixture matrix; borrow-conflict diagnostic sna
   Diagnostic Presentation And Runtime Outcome Foundation and precedes Stage 25a
   Slice 4, which is now implemented. Stage 25a is complete. The PHP Stream And
   I/O Completeness Audit is implemented, Andrew's Stream API Completeness Review
-  is complete, and decision 0110 accepts the stream architecture and performance contract. Stage 26 is
-  therefore unblocked and next.
+  is complete, and decision 0110 accepts the stream architecture and performance contract. Stage 26 is complete and Stage 27 is next.
 
-  **Current planning checkpoint:** Stage 25a — Complete; PHP Stream And I/O Completeness Audit — Implemented; Andrew’s Stream API Completeness Review — Complete; Stream Architecture And Performance Decision — Accepted (decision 0110); Stage 26 — Next; Stage 36a — Scheduled; Stage 36a Public Spellings — Deferred; Stage 36a — Not Implemented.
-- **Stage 26 — Remaining collection family.** Stage 23 ships Decision 0100's default `List`/`Dictionary`/`Set`/`T[]` surface. Stage 26 is the next implementation stage and adds the authored non-closure surface with `SortedDictionary`, `SortedSet`, `PriorityQueue`, and `Deque`; `map`/`filter`/`reduce` remain Stage 30 because they require closures. Before Stage 31 include/multi-file support, required stdlib fragments are compiler-bundled or prelude-style rather than source-included. The completed stream review does not add streams to Stage 26. AC: the remaining non-closure collection family compiles and runs from the compiler-provided stdlib surface.
+  **Current planning checkpoint:** Stage 25a — Complete; PHP Stream And I/O Completeness Audit — Implemented; Andrew’s Stream API Completeness Review — Complete; Stream Architecture And Performance Decision — Accepted (decision 0110); Stage 26 — Complete; Stage 27 — Next; Stage 36a — Scheduled; Stage 36a Public Spellings — Deferred; Stage 36a — Not Implemented.
+- **Stage 26 — Remaining collection family — Complete.** Stage 23 ships Decision 0100's default `List`/`Dictionary`/`Set`/`T[]` surface. Stage 26 adds the authored non-closure surface with ascending `SortedDictionary`, ascending `SortedSet`, min-first `PriorityQueue`, and ring-buffer `Deque`; `map`/`filter`/`reduce` remain Stage 30 because they require closures. Existing-source `::from` and set algebra preserve their inputs and support `Copy` values here, with `Cloneable` widening retained by Stage 35. Set iteration is readonly, dictionary keys remain readonly, sorted-dictionary values and deque elements may be writable where their receiver and binding permit it, and `PriorityQueue` has no iteration order. Before Stage 31 include/multi-file support, required stdlib fragments are compiler-bundled or prelude-style rather than source-included. The completed stream review does not add streams to Stage 26. AC: the remaining non-closure collection family compiles and runs from the compiler-provided stdlib surface.
 
 ### Phase E — Enums, match, errors (Stages 27–29)
 - **Stage 27 — Enums + payload cases.** D6, inline tagged layout, Copy/move classification per payloads. AC: `Shape` example native.

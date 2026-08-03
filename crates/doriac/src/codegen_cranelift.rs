@@ -16,30 +16,33 @@ use crate::format_string::{FormatConversion, FormatPiece};
 use crate::mir;
 use crate::mir_validation;
 use crate::native_abi::{
-    collection_value_width, function_symbol, APPEND_FILE, APPEND_FILE_BYTES, BYTES_EQUAL,
-    BYTES_FREE, BYTES_FROM_COLLECTION, BYTES_GET, BYTES_LENGTH, BYTES_SET, BYTES_TO_COLLECTION,
-    CLASS_ALLOCATE, CLASS_FREE, COLLECTION_COMPARE_FLOAT32, COLLECTION_COMPARE_FLOAT64,
-    COLLECTION_COMPARE_STRING, COLLECTION_COMPARE_WORD, COLLECTION_CONTAINS,
-    COLLECTION_FILL_STRING, COLLECTION_FILL_WORD, COLLECTION_FREE, COLLECTION_INSERT_AT,
-    COLLECTION_KEYED_GET, COLLECTION_KEYED_HAS, COLLECTION_KEYED_SET, COLLECTION_KEY_AT,
+    collection_comparator_code, collection_value_width, function_symbol, nullable_payload_type,
+    stage26_collection_kind, APPEND_FILE, APPEND_FILE_BYTES, BYTES_EQUAL, BYTES_FREE,
+    BYTES_FROM_COLLECTION, BYTES_GET, BYTES_LENGTH, BYTES_SET, BYTES_TO_COLLECTION, CLASS_ALLOCATE,
+    CLASS_FREE, COLLECTION_COMPARE_FLOAT32, COLLECTION_COMPARE_FLOAT64, COLLECTION_COMPARE_STRING,
+    COLLECTION_COMPARE_WORD, COLLECTION_CONTAINS, COLLECTION_FILL_STRING, COLLECTION_FILL_WORD,
+    COLLECTION_FREE, COLLECTION_INSERT_AT, COLLECTION_INSERT_AT_NULLABLE, COLLECTION_KEYED_GET,
+    COLLECTION_KEYED_HAS, COLLECTION_KEYED_SET, COLLECTION_KEYED_SET_NULLABLE, COLLECTION_KEY_AT,
     COLLECTION_LENGTH, COLLECTION_NEW, COLLECTION_NULLABLE_ACCESS, COLLECTION_PUSH,
+    COLLECTION_PUSH_FRONT, COLLECTION_PUSH_FRONT_NULLABLE, COLLECTION_PUSH_NULLABLE,
     COLLECTION_PUSH_UNIQUE, COLLECTION_REMOVE_AT, COLLECTION_REMOVE_VALUE, COLLECTION_SET_ALGEBRA,
-    COLLECTION_SET_AT, COLLECTION_VALUE_AT, FLOAT_PARSE, FORMAT_F32, FORMAT_F64, FORMAT_I64,
-    FORMAT_STRING, FORMAT_U64, INT_PARSE, MIXED_CLONE_OWNED, MIXED_FREE, MIXED_NEW,
-    MIXED_NEW_BORROWED, MIXED_PAYLOAD, MIXED_RELEASE_OWNED, MIXED_TAG, MIXED_TAG_BOOL,
-    MIXED_TAG_CLASS, MIXED_TAG_FLOAT32, MIXED_TAG_FLOAT64, MIXED_TAG_INT16, MIXED_TAG_INT32,
-    MIXED_TAG_INT64, MIXED_TAG_INT8, MIXED_TAG_STRING, MIXED_TAG_UINT16, MIXED_TAG_UINT32,
-    MIXED_TAG_UINT64, MIXED_TAG_UINT8, MIXED_TYPE_ID, NULLABLE_STRING_EQUAL, PROCESS_EXIT,
-    READ_FILE, READ_FILE_BYTES, READ_STDIN_BYTES, READ_STDIN_LINE_PROMPTED, SHARED_ACQUIRE,
-    SHARED_CREATE, SHARED_CREATE_WEAK, SHARED_PAYLOAD, SHARED_RELEASE, SHARED_RELEASE_WEAK,
-    SHARED_RETAIN, STRING_BYTE_LENGTH, STRING_COMPARE, STRING_CONCAT, STRING_CONTAINS,
-    STRING_CONTAINS_IGNORE_CASE, STRING_COUNT_OCCURRENCES, STRING_DATA, STRING_ENDS_WITH,
-    STRING_ENDS_WITH_IGNORE_CASE, STRING_EQUALS_IGNORE_CASE, STRING_FROM_BOOL, STRING_FROM_BYTES,
-    STRING_FROM_F32, STRING_FROM_F64, STRING_FROM_I64, STRING_FROM_U64, STRING_FROM_UTF8,
-    STRING_GRAPHEME_LENGTH, STRING_INDEX_OF, STRING_INDEX_OF_IGNORE_CASE, STRING_IS_EMPTY,
-    STRING_JOIN, STRING_LAST_INDEX_OF, STRING_LAST_INDEX_OF_IGNORE_CASE, STRING_LOWER,
-    STRING_LOWER_FIRST, STRING_PAD_END, STRING_PAD_START, STRING_RELEASE, STRING_REPEAT,
-    STRING_REPLACE, STRING_RETAIN, STRING_SLICE, STRING_SPLIT, STRING_STARTS_WITH,
+    COLLECTION_SET_AT, COLLECTION_SET_AT_NULLABLE, COLLECTION_STAGE26_FINALIZE,
+    COLLECTION_STAGE26_FROM_COPY, COLLECTION_STAGE26_NEW, COLLECTION_VALUE_AT, FLOAT_PARSE,
+    FORMAT_F32, FORMAT_F64, FORMAT_I64, FORMAT_STRING, FORMAT_U64, INT_PARSE, MIXED_CLONE_OWNED,
+    MIXED_FREE, MIXED_NEW, MIXED_NEW_BORROWED, MIXED_PAYLOAD, MIXED_RELEASE_OWNED, MIXED_TAG,
+    MIXED_TAG_BOOL, MIXED_TAG_CLASS, MIXED_TAG_FLOAT32, MIXED_TAG_FLOAT64, MIXED_TAG_INT16,
+    MIXED_TAG_INT32, MIXED_TAG_INT64, MIXED_TAG_INT8, MIXED_TAG_STRING, MIXED_TAG_UINT16,
+    MIXED_TAG_UINT32, MIXED_TAG_UINT64, MIXED_TAG_UINT8, MIXED_TYPE_ID, NULLABLE_STRING_EQUAL,
+    PROCESS_EXIT, READ_FILE, READ_FILE_BYTES, READ_STDIN_BYTES, READ_STDIN_LINE_PROMPTED,
+    SHARED_ACQUIRE, SHARED_CREATE, SHARED_CREATE_WEAK, SHARED_PAYLOAD, SHARED_RELEASE,
+    SHARED_RELEASE_WEAK, SHARED_RETAIN, STRING_BYTE_LENGTH, STRING_COMPARE, STRING_CONCAT,
+    STRING_CONTAINS, STRING_CONTAINS_IGNORE_CASE, STRING_COUNT_OCCURRENCES, STRING_DATA,
+    STRING_ENDS_WITH, STRING_ENDS_WITH_IGNORE_CASE, STRING_EQUALS_IGNORE_CASE, STRING_FROM_BOOL,
+    STRING_FROM_BYTES, STRING_FROM_F32, STRING_FROM_F64, STRING_FROM_I64, STRING_FROM_U64,
+    STRING_FROM_UTF8, STRING_GRAPHEME_LENGTH, STRING_INDEX_OF, STRING_INDEX_OF_IGNORE_CASE,
+    STRING_IS_EMPTY, STRING_JOIN, STRING_LAST_INDEX_OF, STRING_LAST_INDEX_OF_IGNORE_CASE,
+    STRING_LOWER, STRING_LOWER_FIRST, STRING_PAD_END, STRING_PAD_START, STRING_RELEASE,
+    STRING_REPEAT, STRING_REPLACE, STRING_RETAIN, STRING_SLICE, STRING_SPLIT, STRING_STARTS_WITH,
     STRING_STARTS_WITH_IGNORE_CASE, STRING_TO_BYTES, STRING_TRIM, STRING_TRIM_END,
     STRING_TRIM_START, STRING_UPPER, STRING_UPPER_FIRST, STRING_WRITE_STDERR, STRING_WRITE_STDOUT,
     WRITABLE_SHARED_ACQUIRE, WRITABLE_SHARED_ACQUIRE_READONLY_ACCESS,
@@ -276,7 +279,8 @@ fn append_type_abi_params(params: &mut Vec<AbiParam>, ty: mir::Type, pointer_typ
         | mir::Type::WritableSharedReferenceAccess(_)
         | mir::Type::NullableReadonlySharedReferenceAccess(_)
         | mir::Type::NullableWritableSharedReferenceAccess(_)
-        | mir::Type::Collection(_) => {
+        | mir::Type::Collection(_)
+        | mir::Type::NullableCollection(_) => {
             params.push(AbiParam::new(pointer_type));
         }
         mir::Type::NullableScalar(ty) => {
@@ -557,7 +561,8 @@ fn define_function(
                 | mir::Type::WritableSharedReferenceAccess(_)
                 | mir::Type::NullableReadonlySharedReferenceAccess(_)
                 | mir::Type::NullableWritableSharedReferenceAccess(_)
-                | mir::Type::Collection(_) => {
+                | mir::Type::Collection(_)
+                | mir::Type::NullableCollection(_) => {
                     Some(builder.create_sized_stack_slot(StackSlotData::new(
                         StackSlotKind::ExplicitSlot,
                         u32::from(module.target_config().pointer_bytes()),
@@ -876,7 +881,8 @@ fn initialize_locals(
             | mir::Type::WritableSharedReferenceAccess(_)
             | mir::Type::NullableReadonlySharedReferenceAccess(_)
             | mir::Type::NullableWritableSharedReferenceAccess(_)
-            | mir::Type::Collection(_) => builder.ins().iconst(pointer_type, 0),
+            | mir::Type::Collection(_)
+            | mir::Type::NullableCollection(_) => builder.ins().iconst(pointer_type, 0),
             mir::Type::NullableScalar(_) | mir::Type::NullableString => {
                 let zero = builder.ins().iconst(pointer_type, 0);
                 let slot = local_slot(slots, local.id)?;
@@ -1651,7 +1657,8 @@ fn lower_statement(
                 | mir::Type::WritableSharedReferenceAccess(_)
                 | mir::Type::NullableReadonlySharedReferenceAccess(_)
                 | mir::Type::NullableWritableSharedReferenceAccess(_)
-                | mir::Type::Collection(_) => Some(
+                | mir::Type::Collection(_)
+                | mir::Type::NullableCollection(_) => Some(
                     load_lowered_from_address(
                         builder,
                         property_definition.ty,
@@ -1904,7 +1911,8 @@ fn load_lowered_from_stack(
         | mir::Type::WritableSharedReferenceAccess(_)
         | mir::Type::NullableReadonlySharedReferenceAccess(_)
         | mir::Type::NullableWritableSharedReferenceAccess(_)
-        | mir::Type::Collection(_) => {
+        | mir::Type::Collection(_)
+        | mir::Type::NullableCollection(_) => {
             LoweredValue::Single(builder.ins().stack_load(pointer, pointer, slot, 0))
         }
     }
@@ -1978,7 +1986,8 @@ fn load_lowered_from_address(
         | mir::Type::WritableSharedReferenceAccess(_)
         | mir::Type::NullableReadonlySharedReferenceAccess(_)
         | mir::Type::NullableWritableSharedReferenceAccess(_)
-        | mir::Type::Collection(_) => {
+        | mir::Type::Collection(_)
+        | mir::Type::NullableCollection(_) => {
             LoweredValue::Single(builder.ins().load(pointer, flags, address, 0))
         }
     }
@@ -2189,6 +2198,34 @@ fn lower_rvalue(
         mir::Rvalue::Collection(value) => {
             lower_collection_expression(builder, value, resources).map(LoweredValue::Single)
         }
+        mir::Rvalue::NullableCollection(value) => {
+            lower_nullable_collection_expression(builder, value, resources)
+                .map(LoweredValue::Single)
+        }
+    }
+}
+
+fn lower_nullable_collection_parts(
+    builder: &mut FunctionBuilder,
+    value: &mir::Rvalue,
+    ty: mir::Type,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<(Value, Value, mir::Type), BackendError> {
+    let payload_ty = nullable_payload_type(ty)
+        .ok_or_else(|| malformed_mir("collection value is not nullable"))?;
+    let pointer = resources.module.target_config().pointer_type();
+    let lowered = lower_rvalue(builder, value, resources)?;
+    match lowered {
+        LoweredValue::Nullable { present, payload } => {
+            let zero = builder.ins().iconst(pointer, 0);
+            let present = builder.ins().icmp(IntCC::NotEqual, present, zero);
+            Ok((present, payload, payload_ty))
+        }
+        LoweredValue::Single(payload) => {
+            let zero = builder.ins().iconst(pointer, 0);
+            let present = builder.ins().icmp(IntCC::NotEqual, payload, zero);
+            Ok((present, payload, payload_ty))
+        }
     }
 }
 
@@ -2231,7 +2268,8 @@ fn collection_compare_kind(ty: mir::Type) -> Result<i64, BackendError> {
         mir::Type::NullableScalar(_)
         | mir::Type::NullableString
         | mir::Type::NullableMixed
-        | mir::Type::NullableClass(_) => Err(malformed_mir(
+        | mir::Type::NullableClass(_)
+        | mir::Type::NullableCollection(_) => Err(malformed_mir(
             "nullable collection elements are not supported by Stage 23 Slice 3",
         )),
     }
@@ -2288,7 +2326,8 @@ fn value_to_collection_word(
         mir::Type::NullableScalar(_)
         | mir::Type::NullableString
         | mir::Type::NullableMixed
-        | mir::Type::NullableClass(_) => {
+        | mir::Type::NullableClass(_)
+        | mir::Type::NullableCollection(_) => {
             return Err(malformed_mir(
                 "nullable collection elements are not supported by Stage 23 Slice 3",
             ))
@@ -2344,7 +2383,8 @@ fn collection_word_to_value(
         mir::Type::NullableScalar(_)
         | mir::Type::NullableString
         | mir::Type::NullableMixed
-        | mir::Type::NullableClass(_) => {
+        | mir::Type::NullableClass(_)
+        | mir::Type::NullableCollection(_) => {
             return Err(malformed_mir(
                 "nullable collection elements are not supported by Stage 23 Slice 3",
             ))
@@ -2383,7 +2423,6 @@ fn lower_collection_expression(
             let keyed = builder
                 .ins()
                 .iconst(types::I8, i64::from(definition.key.is_some()));
-            let fixed_value = builder.ins().iconst(types::I8, i64::from(fixed));
             let value_width = builder.ins().iconst(
                 types::I8,
                 i64::from(
@@ -2396,28 +2435,105 @@ fn lower_collection_expression(
                     )?,
                 ),
             );
-            let result = runtime_call(
-                builder,
-                COLLECTION_NEW,
-                &[pointer, types::I8, types::I8, types::I8],
-                Some(pointer),
-                &[length, keyed, fixed_value, value_width],
-                resources,
-            )?
+            let result = if let Some(kind) = stage26_collection_kind(definition.kind) {
+                let kind = builder.ins().iconst(types::I8, i64::from(kind));
+                let comparator = builder.ins().iconst(
+                    types::I8,
+                    i64::from(
+                        definition
+                            .comparator
+                            .map(collection_comparator_code)
+                            .unwrap_or(COLLECTION_COMPARE_WORD),
+                    ),
+                );
+                runtime_call(
+                    builder,
+                    COLLECTION_STAGE26_NEW,
+                    &[pointer, types::I8, types::I8, types::I8, types::I8],
+                    Some(pointer),
+                    &[length, keyed, value_width, kind, comparator],
+                    resources,
+                )?
+            } else {
+                let fixed_value = builder.ins().iconst(types::I8, i64::from(fixed));
+                runtime_call(
+                    builder,
+                    COLLECTION_NEW,
+                    &[pointer, types::I8, types::I8, types::I8],
+                    Some(pointer),
+                    &[length, keyed, fixed_value, value_width],
+                    resources,
+                )?
+            }
             .ok_or_else(|| backend_failure("collection allocation produced no result"))?;
             for (index, entry) in entries.iter().enumerate() {
                 if let (Some(key_ty), Some(key)) = (definition.key, &entry.key) {
                     let key_value = lower_rvalue(builder, key, resources)?.single()?;
-                    let value = lower_rvalue(builder, &entry.value, resources)?.single()?;
-                    lower_dictionary_set_value(
+                    if nullable_payload_type(definition.value).is_some() {
+                        let (present, value, payload_ty) = lower_nullable_collection_parts(
+                            builder,
+                            &entry.value,
+                            definition.value,
+                            resources,
+                        )?;
+                        lower_dictionary_set_nullable_value(
+                            builder, result, key_value, key_ty, present, value, payload_ty,
+                            resources,
+                        )?;
+                    } else {
+                        let value = lower_rvalue(builder, &entry.value, resources)?.single()?;
+                        lower_dictionary_set_value(
+                            builder,
+                            result,
+                            key_value,
+                            key_ty,
+                            value,
+                            definition.value,
+                            resources,
+                        )?;
+                    }
+                    continue;
+                }
+                if nullable_payload_type(definition.value).is_some() {
+                    let (present, value, payload_ty) = lower_nullable_collection_parts(
                         builder,
-                        result,
-                        key_value,
-                        key_ty,
-                        value,
+                        &entry.value,
                         definition.value,
                         resources,
                     )?;
+                    let word = value_to_collection_word(builder, value, payload_ty, pointer)?;
+                    if fixed {
+                        let index = builder.ins().iconst(pointer, index as i64);
+                        let previous_present_slot = builder.create_sized_stack_slot(
+                            StackSlotData::new(StackSlotKind::ExplicitSlot, 1, 0),
+                        );
+                        let previous_present_pointer =
+                            builder.ins().stack_addr(pointer, previous_present_slot, 0);
+                        let _ = runtime_call(
+                            builder,
+                            COLLECTION_SET_AT_NULLABLE,
+                            &[pointer, pointer, pointer, types::I8, types::I64, pointer],
+                            Some(types::I64),
+                            &[
+                                resources.current_frame,
+                                result,
+                                index,
+                                present,
+                                word,
+                                previous_present_pointer,
+                            ],
+                            resources,
+                        )?;
+                    } else {
+                        let _ = runtime_call(
+                            builder,
+                            COLLECTION_PUSH_NULLABLE,
+                            &[pointer, types::I8, types::I64],
+                            None,
+                            &[result, present, word],
+                            resources,
+                        )?;
+                    }
                     continue;
                 }
                 let value = lower_rvalue(builder, &entry.value, resources)?.single()?;
@@ -2433,7 +2549,10 @@ fn lower_collection_expression(
                         &[resources.current_frame, result, index, value],
                         resources,
                     )?;
-                } else if definition.kind == mir::CollectionKind::Set {
+                } else if matches!(
+                    definition.kind,
+                    mir::CollectionKind::Set | mir::CollectionKind::SortedSet
+                ) {
                     let value =
                         value_to_collection_word(builder, value, definition.value, pointer)?;
                     let value_kind = builder
@@ -2469,6 +2588,16 @@ fn lower_collection_expression(
                         resources,
                     )?;
                 }
+            }
+            if stage26_collection_kind(definition.kind).is_some() {
+                let _ = runtime_call(
+                    builder,
+                    COLLECTION_STAGE26_FINALIZE,
+                    &[pointer],
+                    None,
+                    &[result],
+                    resources,
+                )?;
             }
             Ok(result)
         }
@@ -2542,7 +2671,7 @@ fn lower_collection_expression(
         mir::CollectionExpression::SharedAccessPayload {
             access, writable, ..
         } => lower_shared_access_payload(builder, *access, *writable, resources),
-        mir::CollectionExpression::SetFrom {
+        mir::CollectionExpression::From {
             collection,
             source,
             transfer,
@@ -2609,6 +2738,89 @@ fn lower_collection_expression(
             lower_function_call(builder, *function, args, resources)?
                 .ok_or_else(|| malformed_mir("collection call produced no result"))?
                 .single()
+        }
+    }
+}
+
+fn lower_nullable_collection_expression(
+    builder: &mut FunctionBuilder,
+    expression: &mir::NullableCollectionExpression,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<Value, BackendError> {
+    let pointer = resources.module.target_config().pointer_type();
+    match expression {
+        mir::NullableCollectionExpression::Null(_) => Ok(builder.ins().iconst(pointer, 0)),
+        mir::NullableCollectionExpression::Collection(value) => {
+            lower_collection_expression(builder, value, resources)
+        }
+        mir::NullableCollectionExpression::Local {
+            local, transfer, ..
+        } => {
+            let slot = local_slot(resources.local_slots, *local)?;
+            let value = builder.ins().stack_load(pointer, pointer, slot, 0);
+            if *transfer {
+                let zero = builder.ins().iconst(pointer, 0);
+                builder.ins().stack_store(pointer, zero, slot, 0);
+            }
+            Ok(value)
+        }
+        mir::NullableCollectionExpression::Property {
+            object, property, ..
+        } => {
+            let address = lower_property_address(builder, *object, *property, resources)?;
+            Ok(builder.ins().load(pointer, MemFlagsData::new(), address, 0))
+        }
+        mir::NullableCollectionExpression::Call { function, args, .. } => {
+            lower_function_call(builder, *function, args, resources)?
+                .ok_or_else(|| malformed_mir("nullable collection call produced no result"))?
+                .single()
+        }
+        mir::NullableCollectionExpression::Coalesce {
+            left,
+            right,
+            transfer,
+            collection,
+        } => {
+            let left_owned = left.owned_temporary_collection().is_some();
+            let right_owned = right.owned_temporary_collection().is_some();
+            let left = lower_nullable_collection_expression(builder, left, resources)?;
+            let zero = builder.ins().iconst(pointer, 0);
+            let present = builder.ins().icmp(IntCC::NotEqual, left, zero);
+            let left_block = builder.create_block();
+            let right_block = builder.create_block();
+            let done = builder.create_block();
+            builder.append_block_param(done, pointer);
+            builder.append_block_param(done, pointer);
+            builder
+                .ins()
+                .brif(present, left_block, &[], right_block, &[]);
+            builder.switch_to_block(left_block);
+            let left_temporary = if left_owned && !transfer { left } else { zero };
+            builder.ins().jump(
+                done,
+                &[BlockArg::Value(left), BlockArg::Value(left_temporary)],
+            );
+            builder.switch_to_block(right_block);
+            let right = lower_nullable_collection_expression(builder, right, resources)?;
+            let right_temporary = if right_owned && !transfer {
+                right
+            } else {
+                zero
+            };
+            builder.ins().jump(
+                done,
+                &[BlockArg::Value(right), BlockArg::Value(right_temporary)],
+            );
+            builder.switch_to_block(done);
+            if !transfer && (left_owned || right_owned) {
+                defer_or_drop_collection_temporary(
+                    builder,
+                    builder.block_params(done)[1],
+                    *collection,
+                    resources,
+                )?;
+            }
+            Ok(builder.block_params(done)[0])
         }
     }
 }
@@ -2767,7 +2979,7 @@ fn lower_dictionary_get(
         return Err(malformed_mir("Dictionary::get uses a non-collection local"));
     };
     let definition = collection_definition(resources.program, collection_type)?.clone();
-    if definition.value != expected {
+    if definition.value != expected && nullable_payload_type(definition.value) != Some(expected) {
         return Err(malformed_mir("nullable collection access type mismatch"));
     }
     let key_type = match access {
@@ -2776,7 +2988,10 @@ fn lower_dictionary_get(
             .ok_or_else(|| malformed_mir("dictionary access has no key type"))?,
         mir::NullableCollectionAccess::First
         | mir::NullableCollectionAccess::Last
-        | mir::NullableCollectionAccess::Pop => {
+        | mir::NullableCollectionAccess::Pop
+        | mir::NullableCollectionAccess::PopFront
+        | mir::NullableCollectionAccess::PopBack
+        | mir::NullableCollectionAccess::At => {
             mir::Type::Scalar(mir::ScalarType::Integer(IntegerType::Int64))
         }
     };
@@ -2800,6 +3015,9 @@ fn lower_dictionary_get(
             mir::NullableCollectionAccess::First => 2,
             mir::NullableCollectionAccess::Last => 3,
             mir::NullableCollectionAccess::Pop => 4,
+            mir::NullableCollectionAccess::PopFront => 5,
+            mir::NullableCollectionAccess::PopBack => 6,
+            mir::NullableCollectionAccess::At => 7,
         },
     );
     let word = runtime_call(
@@ -2862,6 +3080,46 @@ fn lower_collection_add(
     } else {
         None
     };
+    if nullable_payload_type(definition.value).is_some()
+        && matches!(
+            op,
+            mir::CollectionMutationOp::Add
+                | mir::CollectionMutationOp::InsertAt
+                | mir::CollectionMutationOp::PushFront
+                | mir::CollectionMutationOp::PushBack
+        )
+    {
+        let (present, value, payload_ty) =
+            lower_nullable_collection_parts(builder, value, definition.value, resources)?;
+        let word = value_to_collection_word(builder, value, payload_ty, pointer)?;
+        let (name, parameter_types, arguments) = if op == mir::CollectionMutationOp::InsertAt {
+            (
+                COLLECTION_INSERT_AT_NULLABLE,
+                vec![pointer, pointer, pointer, types::I8, types::I64],
+                vec![
+                    resources.current_frame,
+                    collection_value,
+                    index.expect("insertAt index was lowered"),
+                    present,
+                    word,
+                ],
+            )
+        } else if op == mir::CollectionMutationOp::PushFront {
+            (
+                COLLECTION_PUSH_FRONT_NULLABLE,
+                vec![pointer, types::I8, types::I64],
+                vec![collection_value, present, word],
+            )
+        } else {
+            (
+                COLLECTION_PUSH_NULLABLE,
+                vec![pointer, types::I8, types::I64],
+                vec![collection_value, present, word],
+            )
+        };
+        let _ = runtime_call(builder, name, &parameter_types, None, &arguments, resources)?;
+        return Ok(());
+    }
     let value = lower_rvalue(builder, value, resources)?.single()?;
     let word = value_to_collection_word(builder, value, definition.value, pointer)?;
     if op == mir::CollectionMutationOp::InsertAt {
@@ -2901,7 +3159,10 @@ fn lower_collection_add(
             collection_word_to_value(builder, removed_word, definition.value, pointer)?;
         lower_drop_value_if(builder, removed, removed_value, definition.value, resources)?;
         lower_drop_stored_value(builder, value, definition.value, resources)?;
-    } else if definition.kind == mir::CollectionKind::Set {
+    } else if matches!(
+        definition.kind,
+        mir::CollectionKind::Set | mir::CollectionKind::SortedSet
+    ) {
         let kind = builder
             .ins()
             .iconst(types::I8, collection_compare_kind(definition.value)?);
@@ -2915,6 +3176,15 @@ fn lower_collection_add(
         )?
         .ok_or_else(|| backend_failure("set insertion produced no result"))?;
         lower_drop_value_unless(builder, inserted, value, definition.value, resources)?;
+    } else if op == mir::CollectionMutationOp::PushFront {
+        let _ = runtime_call(
+            builder,
+            COLLECTION_PUSH_FRONT,
+            &[pointer, types::I64],
+            None,
+            &[collection_value, word],
+            resources,
+        )?;
     } else {
         let _ = runtime_call(
             builder,
@@ -2943,6 +3213,55 @@ fn lower_collection_set(
     let definition = collection_definition(resources.program, collection_type)?.clone();
     let collection_value = lower_collection_pointer(builder, collection, resources)?;
     let index = lower_rvalue(builder, index, resources)?.single()?;
+    if let Some(payload_ty) = nullable_payload_type(definition.value) {
+        let (present, value, actual_payload_ty) =
+            lower_nullable_collection_parts(builder, value, definition.value, resources)?;
+        debug_assert_eq!(payload_ty, actual_payload_ty);
+        if let Some(key_type) = definition.key {
+            lower_dictionary_set_nullable_value(
+                builder,
+                collection_value,
+                index,
+                key_type,
+                present,
+                value,
+                payload_ty,
+                resources,
+            )?;
+        } else {
+            let value_word = value_to_collection_word(builder, value, payload_ty, pointer)?;
+            let previous_present_slot = builder.create_sized_stack_slot(StackSlotData::new(
+                StackSlotKind::ExplicitSlot,
+                1,
+                0,
+            ));
+            let previous_present_pointer =
+                builder.ins().stack_addr(pointer, previous_present_slot, 0);
+            let old_word = runtime_call(
+                builder,
+                COLLECTION_SET_AT_NULLABLE,
+                &[pointer, pointer, pointer, types::I8, types::I64, pointer],
+                Some(types::I64),
+                &[
+                    resources.current_frame,
+                    collection_value,
+                    index,
+                    present,
+                    value_word,
+                    previous_present_pointer,
+                ],
+                resources,
+            )?
+            .ok_or_else(|| backend_failure("nullable collection write produced no result"))?;
+            let previous_present =
+                builder
+                    .ins()
+                    .stack_load(pointer, types::I8, previous_present_slot, 0);
+            let old_value = collection_word_to_value(builder, old_word, payload_ty, pointer)?;
+            lower_drop_value_if(builder, previous_present, old_value, payload_ty, resources)?;
+        }
+        return Ok(());
+    }
     let value = lower_rvalue(builder, value, resources)?.single()?;
     if definition.kind == mir::CollectionKind::Bytes {
         let _ = runtime_call(
@@ -3017,6 +3336,66 @@ fn lower_dictionary_set_value(
     lower_drop_value_if(builder, replaced, key, key_type, resources)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn lower_dictionary_set_nullable_value(
+    builder: &mut FunctionBuilder,
+    collection: Value,
+    key: Value,
+    key_type: mir::Type,
+    present: Value,
+    value: Value,
+    payload_type: mir::Type,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<(), BackendError> {
+    let pointer = resources.module.target_config().pointer_type();
+    let key_word = value_to_collection_word(builder, key, key_type, pointer)?;
+    let value_word = value_to_collection_word(builder, value, payload_type, pointer)?;
+    let replaced_slot =
+        builder.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 1, 0));
+    let replaced_pointer = builder.ins().stack_addr(pointer, replaced_slot, 0);
+    let previous_present_slot =
+        builder.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 1, 0));
+    let previous_present_pointer = builder.ins().stack_addr(pointer, previous_present_slot, 0);
+    let key_kind = builder
+        .ins()
+        .iconst(types::I8, collection_compare_kind(key_type)?);
+    let old_word = runtime_call(
+        builder,
+        COLLECTION_KEYED_SET_NULLABLE,
+        &[
+            pointer,
+            types::I64,
+            types::I64,
+            types::I8,
+            types::I8,
+            pointer,
+            pointer,
+        ],
+        Some(types::I64),
+        &[
+            collection,
+            key_word,
+            value_word,
+            present,
+            key_kind,
+            replaced_pointer,
+            previous_present_pointer,
+        ],
+        resources,
+    )?
+    .ok_or_else(|| backend_failure("nullable dictionary write produced no result"))?;
+    let replaced = builder
+        .ins()
+        .stack_load(pointer, types::I8, replaced_slot, 0);
+    let previous_present = builder
+        .ins()
+        .stack_load(pointer, types::I8, previous_present_slot, 0);
+    let drop_previous = builder.ins().band(replaced, previous_present);
+    let old_value = collection_word_to_value(builder, old_word, payload_type, pointer)?;
+    lower_drop_value_if(builder, drop_previous, old_value, payload_type, resources)?;
+    lower_drop_value_if(builder, replaced, key, key_type, resources)
+}
+
 fn lower_set_from(
     builder: &mut FunctionBuilder,
     target: mir::CollectionTypeId,
@@ -3068,6 +3447,72 @@ fn lower_set_from(
             resources,
         )?
         .ok_or_else(|| backend_failure("set algebra produced no result"));
+    }
+    if let Some(kind) = stage26_collection_kind(target_definition.kind) {
+        if transfer {
+            return Err(malformed_mir(
+                "Stage 26 collection construction must preserve its source",
+            ));
+        }
+        let kind = builder.ins().iconst(types::I8, i64::from(kind));
+        let comparator = builder.ins().iconst(
+            types::I8,
+            i64::from(
+                target_definition
+                    .comparator
+                    .map(collection_comparator_code)
+                    .unwrap_or(COLLECTION_COMPARE_WORD),
+            ),
+        );
+        let keyed = builder
+            .ins()
+            .iconst(types::I8, i64::from(target_definition.key.is_some()));
+        let value_width = builder.ins().iconst(
+            types::I8,
+            i64::from(
+                collection_value_width(target_definition.value, pointer.bytes() as u8)
+                    .ok_or_else(|| malformed_mir("collection value has no runtime width"))?,
+            ),
+        );
+        let key_kind = builder.ins().iconst(
+            types::I8,
+            target_definition
+                .key
+                .map(collection_compare_kind)
+                .transpose()?
+                .unwrap_or(i64::from(COLLECTION_COMPARE_WORD)),
+        );
+        let value_kind = builder.ins().iconst(
+            types::I8,
+            collection_compare_kind(
+                nullable_payload_type(target_definition.value).unwrap_or(target_definition.value),
+            )?,
+        );
+        return runtime_call(
+            builder,
+            COLLECTION_STAGE26_FROM_COPY,
+            &[
+                pointer,
+                types::I8,
+                types::I8,
+                types::I8,
+                types::I8,
+                types::I8,
+                types::I8,
+            ],
+            Some(pointer),
+            &[
+                source_value,
+                kind,
+                comparator,
+                keyed,
+                value_width,
+                key_kind,
+                value_kind,
+            ],
+            resources,
+        )?
+        .ok_or_else(|| backend_failure("Stage 26 collection conversion produced no result"));
     }
     if transfer {
         let zero = builder.ins().iconst(pointer, 0);
@@ -3186,6 +3631,7 @@ fn lower_drop_value_if(
             | mir::Type::NullableReadonlySharedReferenceAccess(_)
             | mir::Type::NullableWritableSharedReferenceAccess(_)
             | mir::Type::Collection(_)
+            | mir::Type::NullableCollection(_)
             | mir::Type::Mixed
             | mir::Type::NullableMixed
     ) {
@@ -3220,11 +3666,13 @@ fn lower_drop_stored_value(
     resources: &mut LoweringResources<'_, '_>,
 ) -> Result<(), BackendError> {
     match ty {
-        mir::Type::String => release_string(builder, value, resources),
+        mir::Type::String | mir::Type::NullableString => release_string(builder, value, resources),
         mir::Type::Mixed | mir::Type::NullableMixed => {
             lower_drop_mixed_value(builder, value, resources)
         }
-        mir::Type::Class(class) => lower_drop_class_value_checked(builder, value, class, resources),
+        mir::Type::Class(class) | mir::Type::NullableClass(class) => {
+            lower_drop_class_value_checked(builder, value, class, resources)
+        }
         mir::Type::SharedReference(_) | mir::Type::NullableSharedReference(_) => {
             lower_drop_shared_value(builder, value, false, resources)
         }
@@ -3243,15 +3691,10 @@ fn lower_drop_stored_value(
                 .ok_or_else(|| malformed_mir("writable shared release symbol is missing"))?;
             lower_drop_writable_shared_value(builder, value, symbol, resources)
         }
-        mir::Type::Collection(collection) => {
+        mir::Type::Collection(collection) | mir::Type::NullableCollection(collection) => {
             lower_drop_collection_value(builder, value, collection, resources)
         }
-        mir::Type::Scalar(_) => Ok(()),
-        mir::Type::NullableScalar(_) | mir::Type::NullableString | mir::Type::NullableClass(_) => {
-            Err(malformed_mir(
-                "nullable collection elements are not supported by Stage 23 Slice 1",
-            ))
-        }
+        mir::Type::Scalar(_) | mir::Type::NullableScalar(_) => Ok(()),
     }
 }
 
@@ -3312,8 +3755,9 @@ fn lower_drop_collection_value(
         resources,
     )?
     .ok_or_else(|| backend_failure("collection value read produced no result"))?;
-    let value = collection_word_to_value(builder, value_word, definition.value, pointer)?;
-    lower_drop_stored_value(builder, value, definition.value, resources)?;
+    let stored_value_type = nullable_payload_type(definition.value).unwrap_or(definition.value);
+    let value = collection_word_to_value(builder, value_word, stored_value_type, pointer)?;
+    lower_drop_stored_value(builder, value, stored_value_type, resources)?;
     if let Some(key_type) = definition.key {
         let key_word = runtime_call(
             builder,
@@ -5258,7 +5702,7 @@ fn lower_drop_class_value(
                 );
                 lower_drop_class_value_checked(builder, value, class, resources)?;
             }
-            mir::Type::Collection(collection) => {
+            mir::Type::Collection(collection) | mir::Type::NullableCollection(collection) => {
                 let value = builder.ins().load(
                     pointer_type,
                     cranelift_codegen::ir::MachMemFlags::trusted(),
@@ -6338,7 +6782,10 @@ fn lower_nullable_string_expression(
             )?;
             let payload = if matches!(
                 access,
-                mir::NullableCollectionAccess::Remove | mir::NullableCollectionAccess::Pop
+                mir::NullableCollectionAccess::Remove
+                    | mir::NullableCollectionAccess::Pop
+                    | mir::NullableCollectionAccess::PopFront
+                    | mir::NullableCollectionAccess::PopBack
             ) {
                 payload
             } else {
@@ -8425,6 +8872,19 @@ fn lower_condition_to_branch(
             let value = lower_nullable_class_expression(builder, value, resources)?;
             if let Some(class) = owned {
                 defer_or_drop_class_temporary(builder, value, class, resources)?;
+            }
+            let pointer = resources.module.target_config().pointer_type();
+            let zero = builder.ins().iconst(pointer, 0);
+            let present = builder.ins().icmp(IntCC::NotEqual, value, zero);
+            builder
+                .ins()
+                .brif(present, then_block, &[], else_block, &[]);
+        }
+        mir::BoolExpression::NullableCollectionIsPresent(value) => {
+            let owned = value.owned_temporary_collection();
+            let value = lower_nullable_collection_expression(builder, value, resources)?;
+            if let Some(collection) = owned {
+                defer_or_drop_collection_temporary(builder, value, collection, resources)?;
             }
             let pointer = resources.module.target_config().pointer_type();
             let zero = builder.ins().iconst(pointer, 0);

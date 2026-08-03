@@ -71,6 +71,10 @@ runtime access-check cost.
 - **Unicode text with explicit units.** `$text->length` counts what a reader sees as graphemes, `$text->byteLength` reports UTF-8 storage, and String search, slicing, casing, splitting, and padding use deterministic Unicode rules on every native backend.
 - **Honest defaults.** Booleans print as `true` and `false`. Integer overflow is an error, not a wraparound. Format strings are checked at compile time. Errors are declared with `throws` and handled with `try`/`catch` — the compiler makes sure of it.
 - **Small language, sharp edges filed off.** Where a familiar construct is a known footgun, Doria deliberately does the safer thing instead.
+- **Purpose-shaped collections.** Insertion-ordered dictionaries and sets sit
+  beside ascending sorted variants, a min-first priority queue, and one deque
+  that handles both FIFO and LIFO workflows. Collection ordering and ownership
+  remain identical across the debug, native, and compatibility backends.
 
 ## What people build with it
 

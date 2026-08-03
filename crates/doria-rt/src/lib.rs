@@ -260,6 +260,61 @@ pub unsafe extern "C" fn dr_v1_collection_new(
     collection::new(length, keyed != 0, fixed != 0, value_width)
 }
 
+/// Allocates a Stage 26 collection using the compatible tail extension of the
+/// private collection header. `kind` and `comparator` are validated compiler
+/// identities; call `dr_v2_collection_finalize` after bulk population.
+///
+/// # Safety
+///
+/// Arguments must describe one of the four Stage 26 collection kinds.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v2_collection_new(
+    length: usize,
+    keyed: u8,
+    value_width: u8,
+    kind: u8,
+    comparator: u8,
+) -> *mut DrCollectionV1 {
+    collection::new_stage26(length, keyed != 0, value_width, kind, comparator)
+}
+
+/// Completes bulk sorting, heapification, or deque initialization.
+///
+/// # Safety
+///
+/// `collection` must be a uniquely borrowed Stage 26 collection.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v2_collection_finalize(collection: *mut DrCollectionV1) {
+    collection::finalize_stage26(collection)
+}
+
+/// Copies a compiler-validated Copy-only source into a Stage 26 collection.
+/// Strings are retained once per destination slot; the source is unchanged.
+///
+/// # Safety
+///
+/// The source shape, type tags, widths, and destination kind must agree.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v2_collection_from_copy(
+    source: *const DrCollectionV1,
+    kind: u8,
+    comparator: u8,
+    keyed: u8,
+    value_width: u8,
+    key_kind: u8,
+    value_kind: u8,
+) -> *mut DrCollectionV1 {
+    collection::from_copy(
+        source,
+        kind,
+        comparator,
+        keyed != 0,
+        value_width,
+        key_kind,
+        value_kind,
+    )
+}
+
 /// Allocates a sequence containing `count` bitwise copies of `value`.
 ///
 /// # Safety
@@ -343,6 +398,45 @@ pub unsafe extern "C" fn dr_v1_collection_push(collection: *mut DrCollectionV1, 
     collection::push(collection, value)
 }
 
+/// Pushes a nullable value without allocating a per-element box.
+///
+/// # Safety
+///
+/// `collection` must be a uniquely borrowed live growable collection whose
+/// element representation matches `value`.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v2_collection_push_nullable(
+    collection: *mut DrCollectionV1,
+    present: u8,
+    value: u64,
+) {
+    collection::push_nullable(collection, present != 0, value)
+}
+
+/// Pushes at the logical front of a Deque.
+///
+/// # Safety
+///
+/// `collection` must be a uniquely borrowed live Deque.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v2_collection_push_front(collection: *mut DrCollectionV1, value: u64) {
+    collection::push_front(collection, value)
+}
+
+/// Pushes a nullable value at the logical front of a Deque.
+///
+/// # Safety
+///
+/// `collection` must be a uniquely borrowed live Deque.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v2_collection_push_front_nullable(
+    collection: *mut DrCollectionV1,
+    present: u8,
+    value: u64,
+) {
+    collection::push_front_nullable(collection, present != 0, value)
+}
+
 /// # Safety
 ///
 /// `current_frame` must be null or a valid generated frame chain.
@@ -356,6 +450,23 @@ pub unsafe extern "C" fn dr_v2_collection_insert_at(
     value: u64,
 ) {
     collection::insert_at(current_frame, collection, index, value)
+}
+
+/// Inserts a nullable element while preserving its presence bit.
+///
+/// # Safety
+///
+/// `current_frame` must be null or a valid generated frame chain, and
+/// `collection` must be a uniquely borrowed live growable collection.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v2_collection_insert_at_nullable(
+    current_frame: *const DrStackFrameV2,
+    collection: *mut DrCollectionV1,
+    index: usize,
+    present: u8,
+    value: u64,
+) {
+    collection::insert_at_nullable(current_frame, collection, index, present != 0, value)
 }
 
 /// # Safety
@@ -424,6 +535,30 @@ pub unsafe extern "C" fn dr_v2_collection_set_at(
     collection::set_at(current_frame, collection, index, value)
 }
 
+/// Replaces a nullable element and reports whether the previous payload existed.
+///
+/// # Safety
+///
+/// All pointers must be valid for the documented operation.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v2_collection_set_at_nullable(
+    current_frame: *const DrStackFrameV2,
+    collection: *mut DrCollectionV1,
+    index: usize,
+    present: u8,
+    value: u64,
+    previous_present: *mut u8,
+) -> u64 {
+    collection::set_at_nullable(
+        current_frame,
+        collection,
+        index,
+        present != 0,
+        value,
+        previous_present,
+    )
+}
+
 /// # Safety
 ///
 /// `collection` must point to a live keyed collection. `key` must match
@@ -452,6 +587,33 @@ pub unsafe extern "C" fn dr_v1_collection_keyed_set(
     replaced: *mut u8,
 ) -> u64 {
     collection::keyed_set(collection, key, value, key_kind, replaced)
+}
+
+/// Sets a nullable mapped value and reports both key replacement and the
+/// replaced value's presence bit.
+///
+/// # Safety
+///
+/// All pointers must be valid for the documented operation.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v2_collection_keyed_set_nullable(
+    collection: *mut DrCollectionV1,
+    key: u64,
+    value: u64,
+    present: u8,
+    key_kind: u8,
+    replaced: *mut u8,
+    previous_present: *mut u8,
+) -> u64 {
+    collection::keyed_set_nullable(
+        collection,
+        key,
+        value,
+        present != 0,
+        key_kind,
+        replaced,
+        previous_present,
+    )
 }
 
 /// # Safety

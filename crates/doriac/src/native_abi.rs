@@ -111,12 +111,19 @@ pub const MIXED_TAG: &str = "dr_v1_mixed_tag";
 pub const MIXED_TYPE_ID: &str = "dr_v1_mixed_type_id";
 pub const MIXED_PAYLOAD: &str = "dr_v1_mixed_payload";
 pub const COLLECTION_NEW: &str = "dr_v1_collection_new";
+pub const COLLECTION_STAGE26_NEW: &str = "dr_v2_collection_new";
+pub const COLLECTION_STAGE26_FINALIZE: &str = "dr_v2_collection_finalize";
+pub const COLLECTION_STAGE26_FROM_COPY: &str = "dr_v2_collection_from_copy";
 pub const COLLECTION_FILL_WORD: &str = "dr_v2_collection_fill_word";
 pub const COLLECTION_FILL_STRING: &str = "dr_v2_collection_fill_string";
 pub const COLLECTION_FREE: &str = "dr_v1_collection_free";
 pub const COLLECTION_LENGTH: &str = "dr_v1_collection_length";
 pub const COLLECTION_PUSH: &str = "dr_v1_collection_push";
+pub const COLLECTION_PUSH_NULLABLE: &str = "dr_v2_collection_push_nullable";
+pub const COLLECTION_PUSH_FRONT: &str = "dr_v2_collection_push_front";
+pub const COLLECTION_PUSH_FRONT_NULLABLE: &str = "dr_v2_collection_push_front_nullable";
 pub const COLLECTION_INSERT_AT: &str = "dr_v2_collection_insert_at";
+pub const COLLECTION_INSERT_AT_NULLABLE: &str = "dr_v2_collection_insert_at_nullable";
 pub const COLLECTION_REMOVE_AT: &str = "dr_v2_collection_remove_at";
 pub const COLLECTION_POP: &str = "dr_v1_collection_pop";
 pub const COLLECTION_PUSH_UNIQUE: &str = "dr_v1_collection_push_unique";
@@ -125,8 +132,10 @@ pub const COLLECTION_SET_ALGEBRA: &str = "dr_v1_collection_set_algebra";
 pub const COLLECTION_VALUE_AT: &str = "dr_v2_collection_value_at";
 pub const COLLECTION_KEY_AT: &str = "dr_v2_collection_key_at";
 pub const COLLECTION_SET_AT: &str = "dr_v2_collection_set_at";
+pub const COLLECTION_SET_AT_NULLABLE: &str = "dr_v2_collection_set_at_nullable";
 pub const COLLECTION_KEYED_GET: &str = "dr_v1_collection_keyed_get";
 pub const COLLECTION_KEYED_SET: &str = "dr_v1_collection_keyed_set";
+pub const COLLECTION_KEYED_SET_NULLABLE: &str = "dr_v2_collection_keyed_set_nullable";
 pub const COLLECTION_KEYED_HAS: &str = "dr_v1_collection_keyed_has";
 pub const COLLECTION_KEYED_REMOVE: &str = "dr_v1_collection_keyed_remove";
 pub const COLLECTION_NULLABLE_ACCESS: &str = "dr_v1_collection_nullable_access";
@@ -136,6 +145,20 @@ pub const COLLECTION_COMPARE_WORD: u8 = 0;
 pub const COLLECTION_COMPARE_STRING: u8 = 1;
 pub const COLLECTION_COMPARE_FLOAT32: u8 = 2;
 pub const COLLECTION_COMPARE_FLOAT64: u8 = 3;
+pub const COLLECTION_COMPARE_SIGNED_8: u8 = 4;
+pub const COLLECTION_COMPARE_SIGNED_16: u8 = 5;
+pub const COLLECTION_COMPARE_SIGNED_32: u8 = 6;
+pub const COLLECTION_COMPARE_SIGNED_64: u8 = 7;
+pub const COLLECTION_COMPARE_UNSIGNED_8: u8 = 8;
+pub const COLLECTION_COMPARE_UNSIGNED_16: u8 = 9;
+pub const COLLECTION_COMPARE_UNSIGNED_32: u8 = 10;
+pub const COLLECTION_COMPARE_UNSIGNED_64: u8 = 11;
+pub const COLLECTION_COMPARE_BOOL: u8 = 12;
+
+pub const COLLECTION_KIND_SORTED_DICTIONARY: u8 = 1;
+pub const COLLECTION_KIND_SORTED_SET: u8 = 2;
+pub const COLLECTION_KIND_PRIORITY_QUEUE: u8 = 3;
+pub const COLLECTION_KIND_DEQUE: u8 = 4;
 
 pub const COLLECTION_LENGTH_FIELD: u32 = 0;
 pub const COLLECTION_CAPACITY_FIELD: u32 = 1;
@@ -144,6 +167,33 @@ pub const COLLECTION_VALUES_FIELD: u32 = 3;
 pub const COLLECTION_KEYED_FIELD: u32 = 4;
 pub const COLLECTION_FIXED_FIELD: u32 = 5;
 pub const COLLECTION_VALUE_WIDTH_FIELD: u32 = 6;
+
+pub const fn stage26_collection_kind(kind: mir::CollectionKind) -> Option<u8> {
+    match kind {
+        mir::CollectionKind::SortedDictionary => Some(COLLECTION_KIND_SORTED_DICTIONARY),
+        mir::CollectionKind::SortedSet => Some(COLLECTION_KIND_SORTED_SET),
+        mir::CollectionKind::PriorityQueue => Some(COLLECTION_KIND_PRIORITY_QUEUE),
+        mir::CollectionKind::Deque => Some(COLLECTION_KIND_DEQUE),
+        _ => None,
+    }
+}
+
+pub const fn collection_comparator_code(comparator: mir::CollectionComparator) -> u8 {
+    match comparator {
+        mir::CollectionComparator::SignedInteger(8) => COLLECTION_COMPARE_SIGNED_8,
+        mir::CollectionComparator::SignedInteger(16) => COLLECTION_COMPARE_SIGNED_16,
+        mir::CollectionComparator::SignedInteger(32) => COLLECTION_COMPARE_SIGNED_32,
+        mir::CollectionComparator::SignedInteger(64) => COLLECTION_COMPARE_SIGNED_64,
+        mir::CollectionComparator::UnsignedInteger(8) => COLLECTION_COMPARE_UNSIGNED_8,
+        mir::CollectionComparator::UnsignedInteger(16) => COLLECTION_COMPARE_UNSIGNED_16,
+        mir::CollectionComparator::UnsignedInteger(32) => COLLECTION_COMPARE_UNSIGNED_32,
+        mir::CollectionComparator::UnsignedInteger(64) => COLLECTION_COMPARE_UNSIGNED_64,
+        mir::CollectionComparator::Bool => COLLECTION_COMPARE_BOOL,
+        mir::CollectionComparator::StringBytes => COLLECTION_COMPARE_STRING,
+        mir::CollectionComparator::SignedInteger(_)
+        | mir::CollectionComparator::UnsignedInteger(_) => COLLECTION_COMPARE_WORD,
+    }
+}
 
 pub const MIXED_TAG_BOOL: u8 = 1;
 pub const MIXED_TAG_INT8: u8 = 2;
@@ -168,6 +218,9 @@ pub const fn collection_value_width(ty: mir::Type, pointer_width: u8) -> Option<
         mir::Type::String
         | mir::Type::Mixed
         | mir::Type::Class(_)
+        | mir::Type::NullableString
+        | mir::Type::NullableMixed
+        | mir::Type::NullableClass(_)
         | mir::Type::SharedReference(_)
         | mir::Type::WeakReference(_)
         | mir::Type::NullableSharedReference(_)
@@ -180,11 +233,34 @@ pub const fn collection_value_width(ty: mir::Type, pointer_width: u8) -> Option<
         | mir::Type::WritableSharedReferenceAccess(_)
         | mir::Type::NullableReadonlySharedReferenceAccess(_)
         | mir::Type::NullableWritableSharedReferenceAccess(_)
-        | mir::Type::Collection(_) => Some(pointer_width),
-        mir::Type::NullableScalar(_)
-        | mir::Type::NullableString
-        | mir::Type::NullableMixed
-        | mir::Type::NullableClass(_) => None,
+        | mir::Type::Collection(_)
+        | mir::Type::NullableCollection(_) => Some(pointer_width),
+        mir::Type::NullableScalar(_) => Some(16),
+    }
+}
+
+pub const fn nullable_payload_type(ty: mir::Type) -> Option<mir::Type> {
+    match ty {
+        mir::Type::NullableScalar(value) => Some(mir::Type::Scalar(value)),
+        mir::Type::NullableString => Some(mir::Type::String),
+        mir::Type::NullableMixed => Some(mir::Type::Mixed),
+        mir::Type::NullableClass(value) => Some(mir::Type::Class(value)),
+        mir::Type::NullableSharedReference(value) => Some(mir::Type::SharedReference(value)),
+        mir::Type::NullableWeakReference(value) => Some(mir::Type::WeakReference(value)),
+        mir::Type::NullableWritableSharedReference(value) => {
+            Some(mir::Type::WritableSharedReference(value))
+        }
+        mir::Type::NullableWritableWeakReference(value) => {
+            Some(mir::Type::WritableWeakReference(value))
+        }
+        mir::Type::NullableReadonlySharedReferenceAccess(value) => {
+            Some(mir::Type::ReadonlySharedReferenceAccess(value))
+        }
+        mir::Type::NullableWritableSharedReferenceAccess(value) => {
+            Some(mir::Type::WritableSharedReferenceAccess(value))
+        }
+        mir::Type::NullableCollection(value) => Some(mir::Type::Collection(value)),
+        _ => None,
     }
 }
 
