@@ -5,6 +5,7 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, ExitStatus};
 use std::str::FromStr;
+use std::time::Instant;
 
 use doriac::backend::{BackendOutput, BackendTarget, CompileOptions, NativeProfile};
 use doriac::diagnostics::{
@@ -211,6 +212,7 @@ fn compile_command(args: &[String]) -> Result<(), CliError> {
     let mut target = BackendTarget::Native;
     let mut release = false;
     let mut out = None::<String>;
+    let mut performance_report = None::<String>;
     let mut index = 1;
     while index < args.len() {
         match args[index].as_str() {
@@ -234,12 +236,25 @@ fn compile_command(args: &[String]) -> Result<(), CliError> {
                 release = true;
                 index += 1;
             }
+            "--performance-report" => {
+                performance_report = Some(
+                    args.get(index + 1)
+                        .ok_or_else(|| "missing value for --performance-report".to_string())?
+                        .clone(),
+                );
+                index += 2;
+            }
             flag => return Err(format!("unknown compile option `{flag}`").into()),
         }
     }
 
     if release && target != BackendTarget::Native {
         return Err("--release is only valid for the native target".into());
+    }
+    if performance_report.is_some() && target != BackendTarget::Native {
+        return Err(
+            "--performance-report is currently available only for the native target".into(),
+        );
     }
 
     if !target.is_available() {
@@ -251,7 +266,9 @@ fn compile_command(args: &[String]) -> Result<(), CliError> {
         .into());
     }
 
+    let source_load_started = Instant::now();
     let (path, text) = read_source(input)?;
+    let source_load = source_load_started.elapsed();
     let out_path = match out {
         Some(out) => PathBuf::from(out),
         None => default_output_path(input, target)?,
@@ -264,13 +281,127 @@ fn compile_command(args: &[String]) -> Result<(), CliError> {
             NativeProfile::Fast
         },
     };
-    let output = doriac::compile_source_with_options(path.clone(), text.clone(), options).map_err(
-        |diagnostics| CliError::diagnostics(path, text, diagnostics, diagnostic_options),
-    )?;
+    let (output, mut report) = if performance_report.is_some() {
+        let command = std::iter::once("doriac".to_string())
+            .chain(std::iter::once("compile".to_string()))
+            .chain(args.iter().cloned())
+            .collect();
+        let compilation = doriac::performance::compile_native(
+            path.clone(),
+            text.clone(),
+            options,
+            source_load,
+            command,
+        )
+        .map_err(|diagnostics| {
+            CliError::diagnostics(path.clone(), text.clone(), diagnostics, diagnostic_options)
+        })?;
+        (compilation.output, Some(compilation.report))
+    } else {
+        let output = doriac::compile_source_with_options(path.clone(), text.clone(), options)
+            .map_err(|diagnostics| {
+                CliError::diagnostics(path.clone(), text.clone(), diagnostics, diagnostic_options)
+            })?;
+        (output, None)
+    };
 
     write_backend_output(&out_path, output)?;
+    if let Some(report) = report.as_mut() {
+        report["totalDurationNs"] = serde_json::Value::from(
+            u64::try_from(source_load_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+        );
+    }
+    if let (Some(report_path), Some(report)) = (performance_report, report) {
+        write_performance_report(
+            Path::new(&report_path),
+            &report,
+            &path,
+            &text,
+            diagnostic_options,
+        )?;
+    }
     println!("{}", out_path.display());
     Ok(())
+}
+
+fn write_performance_report(
+    path: &Path,
+    report: &serde_json::Value,
+    source_path: &str,
+    source_text: &str,
+    diagnostic_options: RenderOptions,
+) -> Result<(), CliError> {
+    let encoded = serde_json::to_vec_pretty(report).map_err(|error| {
+        performance_report_error(
+            path,
+            error.to_string(),
+            source_path,
+            source_text,
+            diagnostic_options,
+        )
+    })?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent).map_err(|error| {
+        performance_report_error(
+            path,
+            error.to_string(),
+            source_path,
+            source_text,
+            diagnostic_options,
+        )
+    })?;
+    let temporary = parent.join(format!(
+        ".{}.{}.tmp",
+        path.file_name()
+            .and_then(OsStr::to_str)
+            .unwrap_or("performance-report"),
+        std::process::id()
+    ));
+    fs::write(&temporary, encoded)
+        .and_then(|()| fs::rename(&temporary, path))
+        .map_err(|error| {
+            let _ = fs::remove_file(&temporary);
+            performance_report_error(
+                path,
+                error.to_string(),
+                source_path,
+                source_text,
+                diagnostic_options,
+            )
+        })
+}
+
+fn performance_report_error(
+    report_path: &Path,
+    details: String,
+    source_path: &str,
+    source_text: &str,
+    options: RenderOptions,
+) -> CliError {
+    let diagnostic = Diagnostic::new(
+        "B2601",
+        format!(
+            "performance report write failed for `{}`: {details}",
+            report_path.display()
+        ),
+        Span::default(),
+    )
+    .with_title("Performance Report Could Not Be Written")
+    .with_primary_label("Performance Report Write Failed")
+    .with_explanation(
+        "Compilation completed, but the requested performance evidence could not be written atomically.",
+    )
+    .with_help("choose a writable report path whose destination does not already exist")
+    .with_developer_details(details);
+    CliError::diagnostics(
+        source_path.to_string(),
+        source_text.to_string(),
+        vec![diagnostic],
+        options,
+    )
 }
 
 fn ast_command(args: &[String]) -> Result<(), CliError> {
@@ -771,7 +902,7 @@ fn direct_executable_hint(path: &Path) -> String {
 
 fn print_help() {
     println!(
-        "doriac {}\n\nUSAGE:\n    doriac check <source.doria> [diagnostic options]\n    doriac ast <source.doria> [diagnostic options]\n    doriac hir <source.doria> [diagnostic options]\n    doriac mir <source.doria> [diagnostic options]\n    doriac compile <source.doria> [--release] [--out <file>] [diagnostic options]\n    doriac compile <source.doria> --target php [--out <file>] [diagnostic options]\n    doriac run <source.doria> [--release] [diagnostic options] [-- <program args>...]\n\nDIAGNOSTIC OPTIONS:\n    --diagnostic-format human|concise|json    default: human\n    --diagnostic-color auto|always|never      default: auto; NO_COLOR disables auto color\n\nHuman and concise diagnostics are written to stderr. Versioned JSON diagnostics are written to stdout.\n\nNATIVE PROFILES:\n    fast       default Cranelift profile for rapid local feedback\n    release    LLVM optimized profile selected with --release\n\nTARGETS:\n    native    default target for standalone executables\n    php       compatibility and inspection backend\n    debug     MIR interpreter debug artifact\n    wasm      planned WebAssembly backend",
+        "doriac {}\n\nUSAGE:\n    doriac check <source.doria> [diagnostic options]\n    doriac ast <source.doria> [diagnostic options]\n    doriac hir <source.doria> [diagnostic options]\n    doriac mir <source.doria> [diagnostic options]\n    doriac compile <source.doria> [--release] [--out <file>] [--performance-report <file>] [diagnostic options]\n    doriac compile <source.doria> --target php [--out <file>] [diagnostic options]\n    doriac run <source.doria> [--release] [diagnostic options] [-- <program args>...]\n\nDIAGNOSTIC OPTIONS:\n    --diagnostic-format human|concise|json    default: human\n    --diagnostic-color auto|always|never      default: auto; NO_COLOR disables auto color\n\nHuman and concise diagnostics are written to stderr. Versioned JSON diagnostics are written to stdout.\n\nNATIVE PROFILES:\n    fast       default Cranelift profile for rapid local feedback\n    release    LLVM optimized profile selected with --release\n\nTARGETS:\n    native    default target for standalone executables\n    php       compatibility and inspection backend\n    debug     MIR interpreter debug artifact\n    wasm      planned WebAssembly backend",
         doriac::TOOLCHAIN_VERSION
     );
 }

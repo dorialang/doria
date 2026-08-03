@@ -60,7 +60,12 @@ const RUNTIME_RETURNED_TRAP: u8 = 1;
 
 pub fn lower_mir_to_object(program: &mir::Program) -> Result<Vec<u8>, BackendError> {
     mir_validation::validate_program(program)?;
+    lower_validated_mir_to_object(program)
+}
 
+pub(crate) fn lower_validated_mir_to_object(
+    program: &mir::Program,
+) -> Result<Vec<u8>, BackendError> {
     let isa_builder =
         cranelift_native::builder().map_err(|error| backend_failure(error.to_string()))?;
     let mut flag_builder = settings::builder();

@@ -72,7 +72,7 @@ pub enum GenericArgument {
     Type(ResolvedType),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum CallableTarget {
     Function {
         name: String,

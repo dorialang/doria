@@ -32,9 +32,15 @@ eligible for ordinary optimization; no group value survives in generated code.
 
 ## Stage 26b performance baseline foundation
 
-Stage 26b is next. It establishes one repository-owned measurement system and
-accepted baselines that later stages extend. It is not an unlimited optimization
-campaign and does not displace Stage 36a's stream gate.
+Stage 26b is in progress. Decision 0112 accepts the repository-owned measurement,
+provenance, and regression contract. Slice 1 is complete: the sibling benchmark
+repository has a strict manifest, versioned JSON schema, committed correctness
+fixtures, round-robin sampling, explicit toolchain selection, complete available
+provenance, and the first three diagnostic pairs. `doriac compile
+--performance-report <file>` produces opt-in compiler phase evidence without
+changing the ordinary compile path. Slice 2 records the controlled baseline
+matrix; Slice 3 adds accepted deterministic regression baselines. This is not an
+unlimited optimization campaign and does not displace Stage 36a's stream gate.
 
 The runner has three separate tracks:
 
@@ -89,10 +95,13 @@ uses the existing sibling `benchmarks` repository's `bench.php` entry point and
 flat peer-source case layout; a future `baton bench` orchestrates the same
 benchmark engine instead of creating another one.
 
-Correctness passes before timing is accepted. Every report records versions,
+Correctness passes against committed exact stdout, stderr, and status fixtures
+before timing is accepted; no target supplies an implicit reference. Every report records versions,
 flags, machine, inputs, runner identity, and profile. Cold startup remains
 separate from hot throughput, compile time remains separate from runtime, and
-unfavorable results remain visible. Curated reports may be committed; raw
+unfavorable results remain visible. Controlled runs default to five warmups and
+at least ten measured rounds, interleaved across targets with rotating order.
+Quick reports are explicitly baseline-ineligible. Curated reports may be committed; raw
 generated results normally are not. Shared CI owns deterministic structural
 checks; controlled runners own timing thresholds. Public claims remain specific
 to the measured workload.

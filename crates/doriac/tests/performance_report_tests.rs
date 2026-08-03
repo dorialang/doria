@@ -1,0 +1,277 @@
+use std::fs;
+use std::path::PathBuf;
+use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+#[test]
+fn opt_in_native_compile_writes_a_versioned_phase_report() {
+    if !host_linker_is_available() {
+        eprintln!("performance report test unavailable: host linker was not found");
+        return;
+    }
+    let directory = fixture_directory("success");
+    fs::create_dir_all(&directory).expect("fixture directory");
+    fs::write(
+        directory.join("main.doria"),
+        "function main(): int { return 42; }\n",
+    )
+    .expect("source");
+    let output = Command::new(doriac_bin())
+        .current_dir(&directory)
+        .args([
+            "compile",
+            "main.doria",
+            "--out",
+            executable_name(),
+            "--performance-report",
+            "performance.json",
+        ])
+        .output()
+        .expect("doriac");
+    assert!(
+        output.status.success(),
+        "compile failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(
+        &fs::read(directory.join("performance.json")).expect("performance report"),
+    )
+    .expect("report JSON");
+    assert_eq!(report["schemaVersion"], 1);
+    assert_eq!(report["success"], true);
+    assert_eq!(report["backend"], "cranelift");
+    assert_eq!(report["source"]["bytes"], 36);
+    assert!(report["totalDurationNs"]
+        .as_u64()
+        .is_some_and(|value| value > 0));
+    assert_eq!(report["phases"]["parse"]["available"], true);
+    assert_eq!(report["phases"]["semanticAnalysis"]["available"], true);
+    assert_eq!(report["phases"]["borrowChecking"]["available"], false);
+    assert_eq!(report["phases"]["mirLowering"]["available"], true);
+    assert_eq!(report["phases"]["mirValidation"]["available"], true);
+    assert_eq!(
+        report["phases"]["craneliftCodeGeneration"]["available"],
+        true
+    );
+    assert_eq!(report["phases"]["llvmCodeGeneration"]["available"], false);
+    assert_eq!(report["phases"]["link"]["available"], true);
+    assert!(report["metrics"]["outputBytes"]
+        .as_u64()
+        .is_some_and(|value| value > 0));
+    assert!(report["metrics"]["functionCount"].as_u64().is_some());
+    let _ = fs::remove_dir_all(directory);
+}
+
+#[test]
+fn ordinary_compile_does_not_create_performance_evidence() {
+    if !host_linker_is_available() {
+        return;
+    }
+    let directory = fixture_directory("absent");
+    fs::create_dir_all(&directory).expect("fixture directory");
+    fs::write(directory.join("main.doria"), "function main(): void {}\n").expect("source");
+    let output = Command::new(doriac_bin())
+        .current_dir(&directory)
+        .args(["compile", "main.doria", "--out", executable_name()])
+        .output()
+        .expect("doriac");
+    assert!(output.status.success());
+    assert!(!directory.join("performance.json").exists());
+    assert!(fs::read_dir(&directory)
+        .expect("directory")
+        .all(|entry| !entry
+            .expect("entry")
+            .file_name()
+            .to_string_lossy()
+            .contains("performance-report")));
+    let _ = fs::remove_dir_all(directory);
+}
+
+#[test]
+fn report_write_failure_uses_a_structured_title_case_diagnostic() {
+    if !host_linker_is_available() {
+        return;
+    }
+    let directory = fixture_directory("write-failure");
+    fs::create_dir_all(directory.join("occupied")).expect("fixture directory");
+    fs::write(directory.join("main.doria"), "function main(): void {}\n").expect("source");
+    let output = Command::new(doriac_bin())
+        .current_dir(&directory)
+        .args([
+            "compile",
+            "main.doria",
+            "--out",
+            executable_name(),
+            "--performance-report",
+            "occupied",
+            "--diagnostic-format",
+            "json",
+        ])
+        .output()
+        .expect("doriac");
+    assert!(!output.status.success());
+    assert!(output.stderr.is_empty());
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("diagnostic JSON");
+    assert_eq!(envelope["diagnostics"][0]["code"], "B2601");
+    assert_eq!(
+        envelope["diagnostics"][0]["title"],
+        "Performance Report Could Not Be Written"
+    );
+    let _ = fs::remove_dir_all(directory);
+}
+
+#[test]
+fn generic_specialization_fixture_reports_one_callable_specialization() {
+    if !host_linker_is_available() {
+        return;
+    }
+    let directory = fixture_directory("generic-specialization");
+    fs::create_dir_all(&directory).expect("fixture directory");
+    fs::write(
+        directory.join("main.doria"),
+        "function identity<T>(T $value): T { return $value; }\nfunction main(): int { return identity(42); }\n",
+    )
+    .expect("source");
+    let output = Command::new(doriac_bin())
+        .current_dir(&directory)
+        .args([
+            "compile",
+            "main.doria",
+            "--out",
+            executable_name(),
+            "--performance-report",
+            "performance.json",
+        ])
+        .output()
+        .expect("doriac");
+    assert!(
+        output.status.success(),
+        "compile failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value =
+        serde_json::from_slice(&fs::read(directory.join("performance.json")).expect("report"))
+            .expect("JSON");
+    assert_eq!(report["metrics"]["callableSpecializationCount"], 1);
+    assert_eq!(report["metrics"]["classSpecializationCount"], 0);
+    assert_eq!(report["metrics"]["totalGenericSpecializationCount"], 1);
+    let _ = fs::remove_dir_all(directory);
+}
+
+#[test]
+fn specialization_count_distinguishes_callables_with_the_same_type_arguments() {
+    if !host_linker_is_available() {
+        return;
+    }
+    let directory = fixture_directory("distinct-generic-specializations");
+    fs::create_dir_all(&directory).expect("fixture directory");
+    fs::write(
+        directory.join("main.doria"),
+        concat!(
+            "function first<T>(T $value): T { return $value; }\n",
+            "function second<T>(T $value): T { return $value; }\n",
+            "function main(): int { return first(20) + second(22); }\n",
+        ),
+    )
+    .expect("source");
+    let output = Command::new(doriac_bin())
+        .current_dir(&directory)
+        .args([
+            "compile",
+            "main.doria",
+            "--out",
+            executable_name(),
+            "--performance-report",
+            "performance.json",
+        ])
+        .output()
+        .expect("doriac");
+    assert!(
+        output.status.success(),
+        "compile failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value =
+        serde_json::from_slice(&fs::read(directory.join("performance.json")).expect("report"))
+            .expect("JSON");
+    assert_eq!(report["metrics"]["callableSpecializationCount"], 2);
+    assert_eq!(report["metrics"]["classSpecializationCount"], 0);
+    assert_eq!(report["metrics"]["totalGenericSpecializationCount"], 2);
+    let _ = fs::remove_dir_all(directory);
+}
+
+#[cfg(feature = "llvm-backend")]
+#[test]
+fn release_report_identifies_llvm_without_cranelift_phase_data() {
+    if !host_linker_is_available() {
+        return;
+    }
+    let directory = fixture_directory("llvm");
+    fs::create_dir_all(&directory).expect("fixture directory");
+    fs::write(
+        directory.join("main.doria"),
+        "function main(): int { return 42; }\n",
+    )
+    .expect("source");
+    let output = Command::new(doriac_bin())
+        .current_dir(&directory)
+        .args([
+            "compile",
+            "main.doria",
+            "--release",
+            "--out",
+            executable_name(),
+            "--performance-report",
+            "performance.json",
+        ])
+        .output()
+        .expect("doriac");
+    assert!(
+        output.status.success(),
+        "compile failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value =
+        serde_json::from_slice(&fs::read(directory.join("performance.json")).expect("report"))
+            .expect("JSON");
+    assert_eq!(report["backend"], "llvm");
+    assert_eq!(report["phases"]["llvmCodeGeneration"]["available"], true);
+    assert_eq!(
+        report["phases"]["craneliftCodeGeneration"]["available"],
+        false
+    );
+    let _ = fs::remove_dir_all(directory);
+}
+
+fn doriac_bin() -> &'static str {
+    env!("CARGO_BIN_EXE_doriac")
+}
+
+fn executable_name() -> &'static str {
+    if cfg!(windows) {
+        "program.exe"
+    } else {
+        "program"
+    }
+}
+
+fn host_linker_is_available() -> bool {
+    let linker = if cfg!(all(windows, target_env = "msvc")) {
+        "cl.exe"
+    } else {
+        "cc"
+    };
+    Command::new(linker).arg("--version").output().is_ok()
+}
+
+fn fixture_directory(label: &str) -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos();
+    std::env::temp_dir().join(format!(
+        "doriac-performance-{label}-{}-{nanos}",
+        std::process::id()
+    ))
+}

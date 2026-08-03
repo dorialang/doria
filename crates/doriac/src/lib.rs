@@ -26,6 +26,7 @@ pub mod native_abi;
 pub mod numeric;
 pub mod ownership;
 pub mod parser;
+pub mod performance;
 pub mod return_analysis;
 pub mod runtime_artifact;
 pub mod semantics;
