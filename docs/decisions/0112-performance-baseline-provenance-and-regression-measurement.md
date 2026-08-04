@@ -207,6 +207,23 @@ a control -- affinity verification, CPU model, memory size, or power mode -- the
 session records the control as unachieved with a reason and is not timing
 baseline eligible. The harness never infers that a control was achieved.
 
+Recorded provenance covers every artifact that executes, not only the compiler
+that produced it. The linked runtime archive is part of the measured program, so
+its identity belongs in the report alongside the compiler revision, commands,
+and driver. Two builds of one compiler revision produced materially different
+runtime archives during Slice 3 and moved a case median by more than four times;
+because the archive was unrecorded, the substitution left no trace and a finding
+was published that later had to be withdrawn. Timing evidence is not comparable
+across compiler rebuilds unless the runtime archive is identified, and a result
+that cannot be attributed to a specific runtime artifact is an observation about
+an unknown program.
+
+Runtime artifact selection must not depend on whatever happens to sit in a
+developer's build directory. A profile that prefers a workspace archive over the
+runtime the compiler bundled can link a runtime from a different revision than
+the compiler performing code generation, which silently violates the
+single-selected-revision rule this decision already requires.
+
 ## Invalidated Elsewhere
 
 - A future `baton bench` must orchestrate the same manifest/report contracts and

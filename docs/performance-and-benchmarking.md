@@ -54,15 +54,27 @@ difference, and which side it favours. Peers use idiomatic constructs and are no
 handicapped to match stricter Doria defaults, so differences favouring the peer
 stay visible.
 
-Two controlled candidate sessions produced a timing threshold proposal that
-accepts nothing. Its finding is that sixty-three of sixty-four case and target
-pairs are dominated by process startup rather than by their workload, so those
-cases cannot carry a timing threshold until their workloads are scaled. The one
-pair with measurable work, `string_search` on the Cranelift target, is recorded
-as an observation about loop-invariant code motion rather than an established
-cause, because the C and Rust peers appear to eliminate the loop entirely.
-Neither session is timing baseline eligible: CPU affinity cannot be verified on
-macOS, and the LLVM backend was unavailable, so the release path is unmeasured.
+Two controlled candidate sessions across five targets, covering both the
+Cranelift and LLVM backends, produced a timing threshold proposal that accepts
+nothing. Its finding is that seventy-nine of eighty case and target pairs are
+dominated by process startup rather than by their workload, so those cases
+cannot carry a timing threshold until their workloads are scaled. The one pair
+above the floor threshold clears it by about 2.6 ms, which is too small a margin
+to build a threshold on. Neither session is timing baseline eligible because CPU
+affinity cannot be verified on macOS; both are structurally eligible.
+
+The slice also produced a provenance finding that outlives its numbers. An
+earlier write-up reported `string_search` on Cranelift at 6.6 times its startup
+floor; that result did not survive a compiler rebuild and is withdrawn. Two
+builds of the same compiler revision bundled materially different runtime
+archives, and the benchmark report records the compiler revision, commands, and
+driver but not the identity of the linked runtime archive, so the substitution
+was invisible in the evidence. Timing results are therefore not comparable
+across compiler rebuilds until the runtime archive is part of recorded
+provenance. Separately, the release profile prefers a workspace
+`target/release/libdoria_rt.a` over the runtime the compiler bundled itself, so
+a stale archive can shadow the correct runtime and fail the link with a generic
+backend error.
 
 The runner has three separate tracks:
 

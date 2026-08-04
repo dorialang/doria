@@ -131,12 +131,16 @@ Documentation role: working note. This file prevents duplicated in-flight work. 
   generated-program and runtime-subsystem cases, peer fairness and
   semantic-equivalence records enforced when the manifest loads, two controlled
   candidate sessions, and a timing threshold proposal. It accepts no threshold
-  and promotes no baseline. The proposal's finding is that sixty-three of
-  sixty-four case and target pairs are dominated by process startup rather than
-  by their workload, so those cases cannot carry a timing threshold until their
-  workloads are scaled. The single pair with measurable work, `string_search` on
-  the Cranelift target, is recorded as an observation about loop-invariant code
-  motion and not as an established cause.
+  and promotes no baseline. Both Doria backends are measured. The proposal's
+  finding is that seventy-nine of eighty case and target pairs are dominated by
+  process startup rather than by their workload, so those cases cannot carry a
+  timing threshold until their workloads are scaled. An earlier write-up
+  reported `string_search` on Cranelift at 6.6 times its floor; that result did
+  not survive a compiler rebuild and is withdrawn, because two builds of the
+  same compiler revision bundled materially different runtime archives and the
+  report does not record which archive was linked. Timing results are not
+  comparable across compiler rebuilds until runtime-archive identity is part of
+  recorded provenance.
 - Stage 26b — In Progress.
 - Stage 26b Slice 1 — Complete.
 - Stage 26b Slice 2 — Complete.
