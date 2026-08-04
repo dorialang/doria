@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use crate::backend::{BackendError, NativeProfile};
 use crate::diagnostics::Diagnostic;
+use crate::runtime_digest::sha256_hex;
 use crate::source::Span;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -101,6 +102,62 @@ pub struct RuntimeArtifact {
     pub path: PathBuf,
     pub origin: RuntimeOrigin,
     pub metadata: Option<RuntimeMetadata>,
+}
+
+/// Complete identity of the archive an executable was linked against.
+///
+/// Every field is either a recorded fact or an explicit absence. A consumer can
+/// tell "this archive is unidentified" from "this archive is identified as X",
+/// which is the distinction the benchmark report previously could not make.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeProvenance {
+    pub path: String,
+    pub origin: &'static str,
+    pub metadata_path: Option<String>,
+    pub bytes: Option<u64>,
+    /// Digest of the bytes actually on disk, not the digest the sidecar claims.
+    pub sha256: Option<String>,
+    pub abi_version: Option<String>,
+    pub runtime_revision: Option<String>,
+    pub target_triple: Option<String>,
+    pub profile: Option<String>,
+    /// Whether the recorded digest agrees with the sidecar's claim. `None` when
+    /// there was no claim to check.
+    pub digest_matches_metadata: Option<bool>,
+}
+
+impl RuntimeArtifact {
+    /// Read the archive and describe it completely.
+    ///
+    /// This hashes the archive, so it is called when a performance report is
+    /// requested rather than on every compilation. Ordinary builds pay nothing
+    /// for it. The digest is taken from the bytes on disk rather than copied
+    /// from the sidecar, so a sidecar that no longer describes its archive is
+    /// visible instead of believed.
+    pub fn provenance(&self) -> RuntimeProvenance {
+        let archive = std::fs::read(&self.path).ok();
+        let sha256 = archive.as_ref().map(|bytes| sha256_hex(bytes));
+        let bytes = archive.as_ref().map(|bytes| bytes.len() as u64);
+        let digest_matches_metadata = match (&self.metadata, &sha256) {
+            (Some(metadata), Some(sha256)) => Some(&metadata.sha256 == sha256),
+            _ => None,
+        };
+        RuntimeProvenance {
+            path: self.path.display().to_string(),
+            origin: self.origin.as_str(),
+            metadata_path: self
+                .metadata
+                .is_some()
+                .then(|| metadata_path(&self.path).display().to_string()),
+            bytes,
+            sha256,
+            abi_version: self.metadata.as_ref().map(|m| m.abi_version.clone()),
+            runtime_revision: self.metadata.as_ref().map(|m| m.runtime_revision.clone()),
+            target_triple: self.metadata.as_ref().map(|m| m.target_triple.clone()),
+            profile: self.metadata.as_ref().map(|m| m.profile.clone()),
+            digest_matches_metadata,
+        }
+    }
 }
 
 pub fn locate(profile: NativeProfile) -> Result<RuntimeArtifact, BackendError> {
@@ -757,6 +814,71 @@ mod tests {
         let resolved = resolve_in(&directory, None, None, "release")
             .expect("an installed toolchain runtime should resolve");
         assert_eq!(resolved.origin, RuntimeOrigin::InstalledToolchain);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn provenance_records_the_complete_identity() {
+        let directory = temp_directory("provenance");
+        let compiler_built = directory.join("build/libdoria_rt.a");
+        write_archive(&compiler_built, &[]);
+        let resolved = resolve_in(&directory, None, Some(&compiler_built), "release")
+            .expect("runtime should resolve");
+        let provenance = resolved.provenance();
+
+        assert_eq!(provenance.origin, "compiler-bundled");
+        assert_eq!(provenance.abi_version.as_deref(), Some("1"));
+        assert_eq!(provenance.profile.as_deref(), Some("release"));
+        assert_eq!(
+            provenance.target_triple.as_deref(),
+            Some("aarch64-apple-darwin")
+        );
+        assert_eq!(provenance.runtime_revision.as_deref(), Some("cafebabe"));
+        assert!(provenance.metadata_path.is_some());
+        assert_eq!(provenance.bytes, Some(7));
+        // The digest is of the bytes on disk, not the sidecar's claim, so a
+        // sidecar that no longer describes its archive is visible.
+        assert_eq!(
+            provenance.sha256.as_deref(),
+            Some(sha256_hex(b"archive").as_str())
+        );
+        assert_eq!(provenance.digest_matches_metadata, Some(false));
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn provenance_reports_an_unidentified_runtime_as_unidentified() {
+        // Absence must be reportable. A consumer has to be able to tell "no
+        // identity recorded" from "identity recorded as X" so it can mark the
+        // evidence rather than quietly compare it.
+        let directory = temp_directory("provenance-unidentified");
+        let compiler_built = directory.join("build/libdoria_rt.a");
+        write_unidentified_archive(&compiler_built);
+        let resolved = resolve_in(&directory, None, Some(&compiler_built), "release")
+            .expect("runtime should resolve");
+        let provenance = resolved.provenance();
+
+        assert!(provenance.abi_version.is_none());
+        assert!(provenance.runtime_revision.is_none());
+        assert!(provenance.metadata_path.is_none());
+        assert!(provenance.digest_matches_metadata.is_none());
+        // The bytes are still described even when identity is not.
+        assert!(provenance.sha256.is_some());
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn provenance_detects_a_sidecar_that_no_longer_matches_its_archive() {
+        let directory = temp_directory("provenance-drift");
+        let compiler_built = directory.join("build/libdoria_rt.a");
+        write_archive(&compiler_built, &[]);
+        // The sidecar keeps claiming the original digest while the archive
+        // changes underneath it.
+        fs::write(&compiler_built, b"different bytes entirely")
+            .expect("archive should be rewritten");
+        let resolved = resolve_in(&directory, None, Some(&compiler_built), "release")
+            .expect("runtime should resolve");
+        assert_eq!(resolved.provenance().digest_matches_metadata, Some(false));
         let _ = fs::remove_dir_all(directory);
     }
 

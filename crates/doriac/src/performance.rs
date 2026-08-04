@@ -64,10 +64,12 @@ pub fn compile_native(
     };
     let ast_item_count = ast.items.len();
     let output_size = bytes.len();
-    let runtime_artifact_path = native.runtime_artifact.display().to_string();
     let runtime_artifact_bytes = fs::metadata(&native.runtime_artifact)
         .ok()
         .map(|metadata| metadata.len());
+    // Hashing happens here rather than during selection so ordinary
+    // compilation pays nothing for it; a report was explicitly asked for.
+    let runtime = native.runtime.provenance();
     let backend = match options.native_profile {
         crate::backend::NativeProfile::Fast => "cranelift",
         crate::backend::NativeProfile::Release => "llvm",
@@ -92,7 +94,22 @@ pub fn compile_native(
         "totalDurationNs": duration_ns(total),
         "artifacts": {
             "output": {"bytes": output_size},
-            "runtime": {"path": runtime_artifact_path, "bytes": runtime_artifact_bytes}
+            // Identity of the archive actually linked. A timing result that
+            // cannot name its runtime describes an unknown program, which is
+            // how a published finding once had to be withdrawn.
+            "runtime": {
+                "path": runtime.path,
+                "origin": runtime.origin,
+                "metadataPath": runtime.metadata_path,
+                "bytes": runtime.bytes,
+                "sha256": runtime.sha256,
+                "abiVersion": runtime.abi_version,
+                "runtimeRevision": runtime.runtime_revision,
+                "targetTriple": runtime.target_triple,
+                "profile": runtime.profile,
+                "digestMatchesMetadata": runtime.digest_matches_metadata,
+                "identified": runtime.abi_version.is_some()
+            }
         },
         "phases": {
             "sourceLoad": available(source_load),

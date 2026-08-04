@@ -16,6 +16,7 @@ pub struct NativePerformance {
     pub code_generation: Duration,
     pub runtime_selection: Duration,
     pub runtime_artifact: PathBuf,
+    pub runtime: crate::runtime_artifact::RuntimeArtifact,
     pub linking: Duration,
 }
 
@@ -49,7 +50,7 @@ pub(crate) fn generate_executable_with_performance(
 
     let started = Instant::now();
     let runtime = runtime_artifact::locate(profile)?;
-    let runtime_path = runtime.path;
+    let runtime_path = runtime.path.clone();
     let runtime_selection = started.elapsed();
 
     let started = Instant::now();
@@ -62,6 +63,7 @@ pub(crate) fn generate_executable_with_performance(
             code_generation,
             runtime_selection,
             runtime_artifact: runtime_path,
+            runtime,
             linking,
         },
     ))
