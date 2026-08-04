@@ -121,12 +121,16 @@ Documentation role: working note. This file prevents duplicated in-flight work. 
   initialization. Interpreter, Cranelift, LLVM, and PHP compatibility agree;
   grouping creates no runtime object.
 - Stage 26b — Performance Baseline Foundation — In Progress. Decision 0112 is
-  accepted and Slice 1 is complete: the manifest/report/provenance foundation,
-  opt-in compiler phase report, and three matched Doria diagnostic pairs are in
-  place. Slice 2, the controlled baseline matrix, is next.
+  accepted and Slices 1 and 2 are complete: the manifest/provenance foundation,
+  opt-in compiler phase and structural report, compiler scaling generators,
+  compiler/generated/runtime/diagnostic matrix, process resource counters,
+  separate Callgrind/DHAT adapters, candidate evidence, and exact structural
+  baseline are in place. Slice 3 adds peer sources and accepts controlled timing
+  thresholds; Slice 2 makes no optimization claim.
 - Stage 26b — In Progress.
 - Stage 26b Slice 1 — Complete.
-- Stage 26b Slice 2 — Next.
+- Stage 26b Slice 2 — Complete.
+- Stage 26b Slice 3 — Next.
 - Stage 27 — Blocked Until Stage 26b Completes.
 - Stage 35a — Optimizer Contracts, Dispatch, And Escape Audit — Scheduled.
 - Stage 36a — Scheduled, Not Implemented.

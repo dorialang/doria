@@ -62,8 +62,11 @@ identities.
 `doriac compile --performance-report <file>` is the opt-in compiler measurement
 surface. The report records source loading, parsing, semantic analysis, HIR and
 MIR lowering, MIR validation, the selected Cranelift or LLVM code-generation
-phase, runtime-artifact selection, linking, total duration, output size, program
-counts, and generic callable/class specialization counts. An integrated phase,
+phase, runtime-artifact selection, linking, total duration, output size,
+source/AST/MIR structure, runtime artifact size when known, program counts, and
+generic callable/class specialization counts. The structural counts come from
+the AST and MIR already produced by the opt-in compile; no counting pass is
+added. An integrated phase,
 such as current borrow checking within semantic analysis, is explicitly marked
 unavailable as a separate duration rather than double-counted.
 
@@ -100,8 +103,11 @@ cases and record their performance impact under the master-plan rule.
 
 Stage 26b Slice 1 establishes this measurement foundation, compiler reports,
 initial paired diagnostics, provenance, and deterministic checks. Slice 2 records
-the initial controlled compiler/program/runtime baseline matrix. Slice 3 adds the
-accepted deterministic regression baselines and stage-completion workflow.
+the initial compiler/program/runtime matrix, process-resource adapters, optional
+separate Callgrind and DHAT executions, compiler scaling generators, candidate
+evidence, and an accepted exact structural baseline. Slice 3 adds peer sources
+for the new runtime cases, controlled timing thresholds, and the
+stage-completion workflow.
 Stage 27 remains blocked until all Stage 26b slices complete.
 
 ## Explicit Non-Goals
@@ -116,12 +122,37 @@ Stage 27 remains blocked until all Stage 26b slices complete.
 
 - The pre-existing comparative source layouts and historical evidence remain;
   new evidence gains exact correctness authority and reproducible provenance.
-- Stage 26b is in progress with Slice 1 complete and Slice 2 next.
+- Stage 26b is in progress with Slices 1 and 2 complete and Slice 3 next.
 - Stage 27 remains blocked until Stage 26b completes.
 - The compiler pins the benchmark repository revision used by its coordinated
   checks in `benchmarks-revision.json` without requiring network access. The
   optional sibling checkout is validated when present and absence remains valid
   in isolated compiler CI.
+
+## Slice 2 Structural Contract
+
+Report schema version 2 is required because the schema is strict and the new
+matrix, metric, resource, compiler-structure, artifact, and profiler fields
+would be rejected as unknown by version 1. Version 1 remains readable; unknown
+future versions are rejected.
+
+The compiler performance report remains version 1: its `metrics` object is an
+extensible opt-in compiler contract, so adding derived counters is additive for
+consumers that follow the record's unknown-metric rule. The benchmark report is
+different because its committed JSON Schema rejects unknown fields.
+
+Numeric metrics are either available with a numeric value, canonical unit,
+source, exactness, and baseline eligibility, or unavailable with a reason.
+Unavailable never means zero. Process accounting uses GNU time on Linux and BSD
+time on macOS when present; Windows records an explicit unavailable reason until
+a repository-supported adapter exists. Callgrind and DHAT run separately from
+timed samples and remove temporary output afterward.
+
+The accepted structural baseline contains exact output hashes and status plus
+stable compiler/MIR/specialization counts for the minimum Slice 2
+matrix. It contains no wall-time, RSS, Callgrind, DHAT, or cross-platform size
+threshold. Capture defaults to candidate; acceptance is explicit. Comparison
+results are Pass, Fail, Not Comparable, or Unavailable.
 
 ## Invalidated Elsewhere
 
