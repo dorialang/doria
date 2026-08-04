@@ -3,6 +3,13 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+// One SHA-256 implementation shared with the compiler, so the digest recorded
+// in the sidecar here and the digest verified at compile time cannot diverge.
+include!("src/runtime_digest.rs");
+
+/// Version of the sidecar document itself, independent of the runtime ABI.
+const RUNTIME_METADATA_SCHEMA_VERSION: u32 = 1;
+
 fn main() {
     let package_version = env::var("CARGO_PKG_VERSION").expect("Cargo package version");
     let toolchain_version = canonical_toolchain_version(&package_version);
@@ -26,11 +33,34 @@ fn main() {
     println!("cargo:rerun-if-changed={}", runtime_source_dir.display());
     println!("cargo:rerun-if-changed={}", runtime_manifest.display());
 
+    // The ABI version is a single plain-text authority read here rather than a
+    // constant duplicated between the runtime and the compiler. It is emitted
+    // before the bundled-runtime early return so the compiler always knows
+    // which ABI it expects, even in builds that carry no bundled archive.
+    let abi_path = runtime_dir.join("RUNTIME_ABI_VERSION");
+    println!("cargo:rerun-if-changed={}", abi_path.display());
+    let runtime_abi_version = std::fs::read_to_string(&abi_path)
+        .unwrap_or_else(|error| panic!("runtime ABI version at {}: {error}", abi_path.display()));
+    let runtime_abi_version = runtime_abi_version.trim().to_string();
+    assert!(
+        !runtime_abi_version.is_empty()
+            && runtime_abi_version
+                .bytes()
+                .all(|byte| byte.is_ascii_digit()),
+        "runtime ABI version must be a non-empty decimal number"
+    );
+    println!("cargo:rustc-env=DORIA_RT_ABI_VERSION={runtime_abi_version}");
+
+    let target = env::var("TARGET").expect("Cargo target triple");
+    let profile = env::var("PROFILE").unwrap_or_else(|_| "unknown".to_string());
+    println!("cargo:rustc-env=DORIA_RT_EXPECTED_TARGET={target}");
+    println!("cargo:rustc-env=DORIA_RT_EXPECTED_PROFILE={profile}");
+    println!("cargo:rustc-env=DORIA_RT_EXPECTED_REVISION={build_commit}");
+
     if env::var_os("CARGO_FEATURE_BUNDLED_RUNTIME").is_none() {
         return;
     }
 
-    let target = env::var("TARGET").expect("Cargo target triple");
     let filename = if target.ends_with("windows-msvc") {
         "doria_rt.lib"
     } else {
@@ -96,6 +126,93 @@ fn main() {
     assert!(status.success(), "failed to build doria-rt static library");
 
     println!("cargo:rustc-env=DORIA_RT_BUILT_PATH={}", output.display());
+
+    // Identity for the archive just produced. Without this the compiler can
+    // only compare paths and modification times, which is how a stale archive
+    // from an unrelated build previously shadowed the correct runtime and
+    // failed the link with an unexplained missing symbol.
+    let archive = std::fs::read(&output)
+        .unwrap_or_else(|error| panic!("runtime archive at {}: {error}", output.display()));
+    let metadata_path = runtime_metadata_path(&output);
+    let document = runtime_metadata_document(
+        &runtime_abi_version,
+        &build_commit,
+        &target,
+        &profile,
+        archive.len(),
+        &sha256_hex(&archive),
+    );
+    std::fs::write(&metadata_path, document).unwrap_or_else(|error| {
+        panic!(
+            "runtime metadata sidecar at {}: {error}",
+            metadata_path.display()
+        )
+    });
+    println!(
+        "cargo:rustc-env=DORIA_RT_BUILT_METADATA_PATH={}",
+        metadata_path.display()
+    );
+}
+
+/// Sidecar path for a runtime archive: the archive path plus a fixed suffix, so
+/// the two travel together and an archive copied without its metadata is
+/// detectably unidentified rather than silently trusted.
+fn runtime_metadata_path(archive: &Path) -> PathBuf {
+    let mut name = archive.file_name().unwrap_or_default().to_os_string();
+    name.push(".doria-runtime.json");
+    archive.with_file_name(name)
+}
+
+fn runtime_metadata_document(
+    abi_version: &str,
+    runtime_revision: &str,
+    target_triple: &str,
+    profile: &str,
+    bytes: usize,
+    sha256: &str,
+) -> String {
+    format!(
+        concat!(
+            "{{\n",
+            "  \"schemaVersion\": {},\n",
+            "  \"abiVersion\": \"{}\",\n",
+            "  \"runtimeRevision\": \"{}\",\n",
+            "  \"targetTriple\": \"{}\",\n",
+            "  \"profile\": \"{}\",\n",
+            "  \"featureSet\": [\"standalone-windows-support\"],\n",
+            "  \"bytes\": {},\n",
+            "  \"sha256\": \"{}\"\n",
+            "}}\n"
+        ),
+        RUNTIME_METADATA_SCHEMA_VERSION,
+        escape_json(abi_version),
+        escape_json(runtime_revision),
+        escape_json(target_triple),
+        escape_json(profile),
+        bytes,
+        escape_json(sha256),
+    )
+}
+
+/// The values written here are commit ids, target triples, profile names, and
+/// hex digests, but they arrive from the environment and are escaped rather
+/// than trusted to stay well behaved.
+fn escape_json(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '"' => escaped.push_str("\\\""),
+            '\\' => escaped.push_str("\\\\"),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            character if (character as u32) < 0x20 => {
+                escaped.push_str(&format!("\\u{:04x}", character as u32));
+            }
+            character => escaped.push(character),
+        }
+    }
+    escaped
 }
 
 fn find_rlib(dependency_dir: &Path, crate_name: &str) -> PathBuf {
