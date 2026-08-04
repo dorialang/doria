@@ -110,6 +110,12 @@ for the new runtime cases, controlled timing thresholds, and the
 stage-completion workflow.
 Stage 27 remains blocked until all Stage 26b slices complete.
 
+Slice 3 is split. Part 1 delivers the peer matrix, peer fairness and
+semantic-equivalence records, controlled candidate measurement, and a timing
+threshold proposal, together with the controlled-runner and baseline-promotion
+workflows. Part 1 does not accept a threshold or promote a baseline. The timing
+threshold review is a separate step that consumes Part 1's proposal.
+
 ## Explicit Non-Goals
 
 - Optimizing compiler output or runtime implementations.
@@ -122,7 +128,8 @@ Stage 27 remains blocked until all Stage 26b slices complete.
 
 - The pre-existing comparative source layouts and historical evidence remain;
   new evidence gains exact correctness authority and reproducible provenance.
-- Stage 26b is in progress with Slices 1 and 2 complete and Slice 3 next.
+- Stage 26b is in progress with Slices 1 and 2 complete and Slice 3 in progress.
+  Slice 3 Part 1 is delivered; the timing threshold review is next.
 - Stage 27 remains blocked until Stage 26b completes.
 - The compiler pins the benchmark repository revision used by its coordinated
   checks in `benchmarks-revision.json` without requiring network access. The
@@ -153,6 +160,52 @@ stable compiler/MIR/specialization counts for the minimum Slice 2
 matrix. It contains no wall-time, RSS, Callgrind, DHAT, or cross-platform size
 threshold. Capture defaults to candidate; acceptance is explicit. Comparison
 results are Pass, Fail, Not Comparable, or Unavailable.
+
+## Slice 3 Peer Fairness Contract
+
+Every comparative case that ranks Doria against another language carries a peer
+equivalence record, enforced when the manifest loads rather than left to review.
+The record states the workload, the observable result, any optimisation
+sensitivity, the Doria construct, and one entry per peer naming that peer's
+construct and its known semantic differences. Each difference declares whether it
+favours Doria, the peer, or neither, so an advantage cannot be recorded without
+saying who holds it. A declared peer target must have a committed source, that
+source must appear in `inputFiles`, and the target must have a runner entry.
+
+Peers use each language's idiomatic construct for the same requirement. Where
+Doria is stricter than idiomatic peer code, the peer is not handicapped to match
+and the resulting advantage is recorded against the peer. Where a case exists to
+measure a discipline, the discipline is preserved in every peer rather than
+removed to improve the peer's number. Neither rule may be relaxed to make a
+comparison more favourable.
+
+A case whose workload an optimiser can fold, hoist, or eliminate is flagged, so a
+result that mostly measures optimisation is not read as a runtime comparison.
+
+## Slice 3 Threshold Contract
+
+A timing threshold is proposed only for a case and target whose measured median
+clearly exceeds that target's process-startup floor, established by the `startup`
+case. A pair dominated by process startup carries no threshold at any tolerance,
+because a tolerance loose enough to survive the measurement noise cannot detect a
+regression. The remedy for such a pair is a larger workload, not a looser bound.
+
+A proposal is not an acceptance. A threshold document records `status:
+proposal` and `accepted: false`, states the limitations of the sessions it came
+from, and is reviewed separately before any threshold binds. Evidence from a
+session that did not achieve its controls remains valid candidate evidence and is
+published with its reasons rather than withheld or presented as eligible.
+
+Controlled sessions run on a curated runner through a manual workflow. Baseline
+promotion is a separate manual, confirmation-gated workflow that accepts the
+deterministic structural baseline only and cannot install a timing threshold.
+Shared CI runs structural checks and peer correctness qualification, never
+wall-clock gates.
+
+Controlled-runner controls are platform-specific. Where a platform cannot supply
+a control -- affinity verification, CPU model, memory size, or power mode -- the
+session records the control as unachieved with a reason and is not timing
+baseline eligible. The harness never infers that a control was achieved.
 
 ## Invalidated Elsewhere
 

@@ -42,8 +42,27 @@ evidence without changing the ordinary compile path. Slice 2 records the initial
 compiler/generated/runtime/diagnostic matrix, deterministic source scaling,
 process resource counters, separate optional Callgrind/DHAT evidence, candidate
 evidence, and an exact structural baseline without timing thresholds. Slice 3
-adds peers for the new cases and accepts controlled timing thresholds. This is not an
-unlimited optimization campaign and does not displace Stage 36a's stream gate.
+adds peers for the new cases and proposes controlled timing thresholds for a
+separate review. This is not an unlimited optimization campaign and does not
+displace Stage 36a's stream gate.
+
+Slice 3 Part 1 is delivered. C, Rust, and PHP peers cover the seventeen
+generated-program and runtime-subsystem cases, and every comparative case that
+ranks Doria against another language now carries a peer equivalence record that
+the manifest loader enforces: what each peer does, every known semantic
+difference, and which side it favours. Peers use idiomatic constructs and are not
+handicapped to match stricter Doria defaults, so differences favouring the peer
+stay visible.
+
+Two controlled candidate sessions produced a timing threshold proposal that
+accepts nothing. Its finding is that sixty-three of sixty-four case and target
+pairs are dominated by process startup rather than by their workload, so those
+cases cannot carry a timing threshold until their workloads are scaled. The one
+pair with measurable work, `string_search` on the Cranelift target, is recorded
+as an observation about loop-invariant code motion rather than an established
+cause, because the C and Rust peers appear to eliminate the loop entirely.
+Neither session is timing baseline eligible: CPU affinity cannot be verified on
+macOS, and the LLVM backend was unavailable, so the release path is unmeasured.
 
 The runner has three separate tracks:
 

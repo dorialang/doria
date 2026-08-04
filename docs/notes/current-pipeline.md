@@ -125,12 +125,23 @@ Documentation role: working note. This file prevents duplicated in-flight work. 
   opt-in compiler phase and structural report, compiler scaling generators,
   compiler/generated/runtime/diagnostic matrix, process resource counters,
   separate Callgrind/DHAT adapters, candidate evidence, and exact structural
-  baseline are in place. Slice 3 adds peer sources and accepts controlled timing
-  thresholds; Slice 2 makes no optimization claim.
+  baseline are in place. Slice 3 adds peer sources and proposes controlled timing
+  thresholds for a separate review; Slice 2 makes no optimization claim.
+  Slice 3 Part 1 is delivered: C, Rust, and PHP peers for the seventeen
+  generated-program and runtime-subsystem cases, peer fairness and
+  semantic-equivalence records enforced when the manifest loads, two controlled
+  candidate sessions, and a timing threshold proposal. It accepts no threshold
+  and promotes no baseline. The proposal's finding is that sixty-three of
+  sixty-four case and target pairs are dominated by process startup rather than
+  by their workload, so those cases cannot carry a timing threshold until their
+  workloads are scaled. The single pair with measurable work, `string_search` on
+  the Cranelift target, is recorded as an observation about loop-invariant code
+  motion and not as an established cause.
 - Stage 26b — In Progress.
 - Stage 26b Slice 1 — Complete.
 - Stage 26b Slice 2 — Complete.
-- Stage 26b Slice 3 — Next.
+- Stage 26b Slice 3 — In Progress. Part 1 delivered.
+- Stage 26b Timing Threshold Review — Next.
 - Stage 27 — Blocked Until Stage 26b Completes.
 - Stage 35a — Optimizer Contracts, Dispatch, And Escape Audit — Scheduled.
 - Stage 36a — Scheduled, Not Implemented.
