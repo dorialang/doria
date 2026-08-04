@@ -230,6 +230,15 @@ jobs:
           php scripts/check_docs_authority.php
           php scripts/check_stage25a_completion.php
 
+      # Reachability needs the network, so it is a separate step from the
+      # offline documentation guards. --require-remote makes an unverifiable pin
+      # a failure here: a pin that cannot be resolved from a published ref is a
+      # promise this repository cannot keep for anyone else.
+      - name: Check cross-repository revision pins
+        run: |
+          php scripts/test_cross_repo_pins.php
+          php scripts/check_cross_repo_pins.php --require-remote
+
       - name: Check diagnostic and runtime-outcome architecture
         run: |
           php scripts/check_diagnostic_style.php
