@@ -4,7 +4,7 @@
 //! This module deliberately owns a separate path so measurement cannot become a
 //! hidden cost paid by every compilation.
 
-use std::collections::HashSet;
+use std::fs;
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
@@ -36,27 +36,10 @@ pub fn compile_native(
     let started = Instant::now();
     let ast = crate::parse_source_file(&source)?;
     let parse = started.elapsed();
-    let ast_item_count = ast.items.len();
 
     let started = Instant::now();
     let semantic_info = semantics::analyze_program(&ast)?;
     let semantic = started.elapsed();
-    let callable_specializations = semantic_info
-        .generic_call_specializations
-        .iter()
-        .filter_map(|(span, specialization)| {
-            semantic_info
-                .call_targets
-                .get(span)
-                .map(|target| (target.clone(), specialization.clone()))
-        })
-        .collect::<HashSet<_>>()
-        .len();
-    let class_specializations = semantic_info
-        .classes
-        .iter()
-        .filter(|class| !class.arguments.is_empty())
-        .count();
 
     let started = Instant::now();
     let mut hir = lowering::lower_program_with_semantics(&ast, semantic_info)?;
@@ -65,26 +48,26 @@ pub fn compile_native(
     let hir_lowering = started.elapsed();
 
     let started = Instant::now();
-    let mir = mir_lowering::lower_program(&hir)?;
+    let (mir, structure) = mir_lowering::lower_program_with_metrics(&hir)?;
     let mir_lowering = started.elapsed();
-    let mir_basic_block_count = mir
-        .functions
-        .iter()
-        .map(|function| function.blocks.len())
-        .sum::<usize>();
-    let mir_statement_count = mir
-        .functions
-        .iter()
-        .flat_map(|function| &function.blocks)
-        .map(|block| block.statements.len())
-        .sum::<usize>();
-    let mir_terminator_count = mir_basic_block_count;
 
     let (bytes, native) =
         codegen_native::generate_executable_with_performance(&mir, options.native_profile)
             .map_err(backend_diagnostics)?;
-    let output_size = bytes.len();
     let total = source_load + total_started.elapsed();
+    let source_line_count = if text.is_empty() {
+        0
+    } else {
+        source
+            .line_count()
+            .saturating_sub(usize::from(text.ends_with('\n')))
+    };
+    let ast_item_count = ast.items.len();
+    let output_size = bytes.len();
+    let runtime_artifact_path = native.runtime_artifact.display().to_string();
+    let runtime_artifact_bytes = fs::metadata(&native.runtime_artifact)
+        .ok()
+        .map(|metadata| metadata.len());
     let backend = match options.native_profile {
         crate::backend::NativeProfile::Fast => "cranelift",
         crate::backend::NativeProfile::Release => "llvm",
@@ -100,7 +83,7 @@ pub fn compile_native(
         "source": {
             "path": path,
             "bytes": text.len(),
-            "lines": if text.is_empty() { 0 } else { text.lines().count() }
+            "lines": source_line_count
         },
         "target": options.target.name(),
         "profile": options.native_profile.name(),
@@ -109,7 +92,7 @@ pub fn compile_native(
         "totalDurationNs": duration_ns(total),
         "artifacts": {
             "output": {"bytes": output_size},
-            "runtime": {"path": native.runtime_artifact_path, "bytes": native.runtime_artifact_bytes}
+            "runtime": {"path": runtime_artifact_path, "bytes": runtime_artifact_bytes}
         },
         "phases": {
             "sourceLoad": available(source_load),
@@ -129,20 +112,20 @@ pub fn compile_native(
             "link": available(native.linking)
         },
         "metrics": {
-            "sourceLineCount": if text.is_empty() { 0 } else { text.lines().count() },
+            "sourceLineCount": source_line_count,
             "astItemCount": ast_item_count,
             "outputBytes": output_size,
             "functionCount": mir.functions.len(),
             "classCount": mir.classes.len(),
             "collectionTypeCount": mir.collection_types.len(),
             "mirFunctionCount": mir.functions.len(),
-            "mirBasicBlockCount": mir_basic_block_count,
-            "mirStatementCount": mir_statement_count,
-            "mirTerminatorCount": mir_terminator_count,
-            "callableSpecializationCount": callable_specializations,
-            "classSpecializationCount": class_specializations,
-            "totalGenericSpecializationCount": callable_specializations + class_specializations,
-            "runtimeArtifactBytes": native.runtime_artifact_bytes,
+            "mirBasicBlockCount": structure.basic_block_count,
+            "mirStatementCount": structure.statement_count,
+            "mirTerminatorCount": structure.terminator_count,
+            "callableSpecializationCount": structure.callable_specialization_count,
+            "classSpecializationCount": structure.class_specialization_count,
+            "totalGenericSpecializationCount": structure.callable_specialization_count + structure.class_specialization_count,
+            "runtimeArtifactBytes": runtime_artifact_bytes,
             "peakRssBytes": {"available": false, "reason": "portable in-process peak RSS collection is unavailable"}
         }
     });

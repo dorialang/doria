@@ -474,7 +474,33 @@ fn substitute_resolved_type(
     }
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+/// Opt-in counters accumulated while MIR nodes are already being materialized.
+/// Ordinary lowering passes no collector and allocates no report state.
+pub(crate) struct StructuralMetrics {
+    pub(crate) callable_specialization_count: usize,
+    pub(crate) class_specialization_count: usize,
+    pub(crate) basic_block_count: usize,
+    pub(crate) statement_count: usize,
+    pub(crate) terminator_count: usize,
+}
+
 pub fn lower_program(program: &hir::Program) -> DiagnosticResult<mir::Program> {
+    lower_program_impl(program, None)
+}
+
+pub(crate) fn lower_program_with_metrics(
+    program: &hir::Program,
+) -> DiagnosticResult<(mir::Program, StructuralMetrics)> {
+    let mut metrics = StructuralMetrics::default();
+    let program = lower_program_impl(program, Some(&mut metrics))?;
+    Ok((program, metrics))
+}
+
+fn lower_program_impl(
+    program: &hir::Program,
+    mut metrics: Option<&mut StructuralMetrics>,
+) -> DiagnosticResult<mir::Program> {
     let class_ids = program
         .semantic_info
         .classes
@@ -760,37 +786,48 @@ pub fn lower_program(program: &hir::Program) -> DiagnosticResult<mir::Program> {
         })
         .expect("exactly one collected main signature")
         .id;
-    let functions = instances
+    let mut functions = Vec::with_capacity(instances.len());
+    for ((instance, signature), substitutions) in instances
         .iter()
         .zip(callable_signatures)
         .zip(instance_substitutions)
-        .map(|((instance, signature), substitutions)| {
-            let declaration = declarations[instance.declaration];
-            let inputs = FunctionLoweringInputs {
-                signatures: &signatures,
-                method_signatures: &method_signatures,
-                semantic_info: &program.semantic_info,
-                property_initializers: &property_initializers,
-                constructor_body_initializers: &constructor_body_initializers,
-                static_ids: &static_ids,
-                collection_registry: &collection_registry,
-                type_substitutions: &substitutions,
-            };
-            lower_function(
-                declaration.function,
-                signature,
-                inputs,
-                declaration.class,
-                declaration.receiver,
-            )
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    {
+        if !instance.arguments.is_empty() {
+            if let Some(metrics) = metrics.as_deref_mut() {
+                metrics.callable_specialization_count += 1;
+            }
+        }
+        let declaration = declarations[instance.declaration];
+        let inputs = FunctionLoweringInputs {
+            signatures: &signatures,
+            method_signatures: &method_signatures,
+            semantic_info: &program.semantic_info,
+            property_initializers: &property_initializers,
+            constructor_body_initializers: &constructor_body_initializers,
+            static_ids: &static_ids,
+            collection_registry: &collection_registry,
+            type_substitutions: &substitutions,
+        };
+        functions.push(lower_function(
+            declaration.function,
+            signature,
+            inputs,
+            declaration.class,
+            declaration.receiver,
+            metrics.as_deref_mut(),
+        )?);
+    }
 
     let classes = program
         .semantic_info
         .classes
         .iter()
         .map(|class| {
+            if !class.arguments.is_empty() {
+                if let Some(metrics) = metrics.as_deref_mut() {
+                    metrics.class_specialization_count += 1;
+                }
+            }
             let properties = class
                 .properties
                 .iter()
@@ -1509,6 +1546,7 @@ fn lower_function(
     inputs: FunctionLoweringInputs<'_>,
     class: Option<ClassId>,
     receiver: Option<ClassId>,
+    metrics: Option<&mut StructuralMetrics>,
 ) -> DiagnosticResult<mir::Function> {
     let mut context = LoweringContext::new(&inputs);
     context.current_class = class;
@@ -1541,7 +1579,7 @@ fn lower_function(
         signature.return_type,
         &mut context,
     )?;
-    let (locals, blocks) = context.finish();
+    let (locals, blocks) = context.finish(metrics);
 
     Ok(mir::Function {
         id: signature.id,
@@ -2753,14 +2791,25 @@ impl<'semantic> LoweringContext<'semantic> {
         }
     }
 
-    fn finish(self) -> (Vec<mir::Local>, Vec<mir::BasicBlock>) {
+    fn finish(
+        self,
+        metrics: Option<&mut StructuralMetrics>,
+    ) -> (Vec<mir::Local>, Vec<mir::BasicBlock>) {
+        let mut metrics = metrics;
         let blocks = self
             .blocks
             .into_iter()
-            .map(|block| mir::BasicBlock {
-                id: block.id,
-                statements: block.statements,
-                terminator: block.terminator.unwrap_or(mir::Terminator::Unreachable),
+            .map(|block| {
+                if let Some(metrics) = metrics.as_deref_mut() {
+                    metrics.basic_block_count += 1;
+                    metrics.statement_count += block.statements.len();
+                    metrics.terminator_count += 1;
+                }
+                mir::BasicBlock {
+                    id: block.id,
+                    statements: block.statements,
+                    terminator: block.terminator.unwrap_or(mir::Terminator::Unreachable),
+                }
             })
             .collect();
         (self.locals, blocks)

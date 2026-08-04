@@ -77,7 +77,7 @@ function check_performance_foundation(string $root): array
             'B2601',
         ],
         'crates/doriac/src/codegen_native.rs' => [
-            'runtime_artifact_bytes',
+            'runtime_artifact: PathBuf',
             'generate_executable_with_performance',
         ],
         'benchmarks-revision.json' => [
