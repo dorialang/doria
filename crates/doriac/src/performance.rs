@@ -36,6 +36,7 @@ pub fn compile_native(
     let started = Instant::now();
     let ast = crate::parse_source_file(&source)?;
     let parse = started.elapsed();
+    let ast_item_count = ast.items.len();
 
     let started = Instant::now();
     let semantic_info = semantics::analyze_program(&ast)?;
@@ -66,6 +67,18 @@ pub fn compile_native(
     let started = Instant::now();
     let mir = mir_lowering::lower_program(&hir)?;
     let mir_lowering = started.elapsed();
+    let mir_basic_block_count = mir
+        .functions
+        .iter()
+        .map(|function| function.blocks.len())
+        .sum::<usize>();
+    let mir_statement_count = mir
+        .functions
+        .iter()
+        .flat_map(|function| &function.blocks)
+        .map(|block| block.statements.len())
+        .sum::<usize>();
+    let mir_terminator_count = mir_basic_block_count;
 
     let (bytes, native) =
         codegen_native::generate_executable_with_performance(&mir, options.native_profile)
@@ -94,6 +107,10 @@ pub fn compile_native(
         "backend": backend,
         "success": true,
         "totalDurationNs": duration_ns(total),
+        "artifacts": {
+            "output": {"bytes": output_size},
+            "runtime": {"path": native.runtime_artifact_path, "bytes": native.runtime_artifact_bytes}
+        },
         "phases": {
             "sourceLoad": available(source_load),
             "lexing": unavailable("integrated into parse"),
@@ -112,13 +129,20 @@ pub fn compile_native(
             "link": available(native.linking)
         },
         "metrics": {
+            "sourceLineCount": if text.is_empty() { 0 } else { text.lines().count() },
+            "astItemCount": ast_item_count,
             "outputBytes": output_size,
             "functionCount": mir.functions.len(),
             "classCount": mir.classes.len(),
             "collectionTypeCount": mir.collection_types.len(),
+            "mirFunctionCount": mir.functions.len(),
+            "mirBasicBlockCount": mir_basic_block_count,
+            "mirStatementCount": mir_statement_count,
+            "mirTerminatorCount": mir_terminator_count,
             "callableSpecializationCount": callable_specializations,
             "classSpecializationCount": class_specializations,
             "totalGenericSpecializationCount": callable_specializations + class_specializations,
+            "runtimeArtifactBytes": native.runtime_artifact_bytes,
             "peakRssBytes": {"available": false, "reason": "portable in-process peak RSS collection is unavailable"}
         }
     });

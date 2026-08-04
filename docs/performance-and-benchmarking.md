@@ -33,13 +33,16 @@ eligible for ordinary optimization; no group value survives in generated code.
 ## Stage 26b performance baseline foundation
 
 Stage 26b is in progress. Decision 0112 accepts the repository-owned measurement,
-provenance, and regression contract. Slice 1 is complete: the sibling benchmark
+provenance, and regression contract. Slices 1 and 2 are complete: the sibling benchmark
 repository has a strict manifest, versioned JSON schema, committed correctness
 fixtures, round-robin sampling, explicit toolchain selection, complete available
 provenance, and the first three diagnostic pairs. `doriac compile
---performance-report <file>` produces opt-in compiler phase evidence without
-changing the ordinary compile path. Slice 2 records the controlled baseline
-matrix; Slice 3 adds accepted deterministic regression baselines. This is not an
+--performance-report <file>` produces opt-in compiler phase and structural
+evidence without changing the ordinary compile path. Slice 2 records the initial
+compiler/generated/runtime/diagnostic matrix, deterministic source scaling,
+process resource counters, separate optional Callgrind/DHAT evidence, candidate
+evidence, and an exact structural baseline without timing thresholds. Slice 3
+adds peers for the new cases and accepts controlled timing thresholds. This is not an
 unlimited optimization campaign and does not displace Stage 36a's stream gate.
 
 The runner has three separate tracks:

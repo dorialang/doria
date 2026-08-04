@@ -114,6 +114,10 @@ records the compiler, build driver, toolchain, commands, and host used for each
 report. Public comparisons are workload-specific and reproducible rather than
 broad language rankings.
 
+The benchmark matrix includes deterministic compiler scaling, runtime-subsystem
+cases, process resources, artifact sizes, and optional profiler evidence. Shared CI
+compares deterministic structure; controlled runners alone own timing thresholds.
+
 Runtime panics use the same structured diagnostic model and format selection.
 Built-in panics have stable `P` codes, a precise Doria source label, an
 explanation, a Doria-only `Call Path`, and status 101. `doriac run` receives

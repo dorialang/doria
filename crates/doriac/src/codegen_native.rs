@@ -10,11 +10,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::backend::{BackendError, NativeProfile};
 use crate::{codegen_cranelift, mir, runtime_artifact};
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct NativePerformance {
     pub mir_validation: Duration,
     pub code_generation: Duration,
     pub runtime_selection: Duration,
+    pub runtime_artifact_path: String,
+    pub runtime_artifact_bytes: Option<u64>,
     pub linking: Duration,
 }
 
@@ -47,6 +49,10 @@ pub(crate) fn generate_executable_with_performance(
 
     let started = Instant::now();
     let runtime_path = runtime_artifact::locate(profile)?;
+    let runtime_artifact_path = runtime_path.display().to_string();
+    let runtime_artifact_bytes = fs::metadata(&runtime_path)
+        .ok()
+        .map(|metadata| metadata.len());
     let runtime_selection = started.elapsed();
 
     let started = Instant::now();
@@ -58,6 +64,8 @@ pub(crate) fn generate_executable_with_performance(
             mir_validation,
             code_generation,
             runtime_selection,
+            runtime_artifact_path,
+            runtime_artifact_bytes,
             linking,
         },
     ))

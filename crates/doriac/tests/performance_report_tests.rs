@@ -79,6 +79,33 @@ fn opt_in_native_compile_writes_a_versioned_phase_report() {
         .as_u64()
         .is_some_and(|value| value > 0));
     assert!(report["metrics"]["functionCount"].as_u64().is_some());
+    assert_eq!(report["metrics"]["sourceLineCount"], 1);
+    assert_eq!(report["metrics"]["astItemCount"], 1);
+    assert_eq!(
+        report["metrics"]["mirFunctionCount"],
+        report["metrics"]["functionCount"]
+    );
+    for field in [
+        "mirBasicBlockCount",
+        "mirStatementCount",
+        "mirTerminatorCount",
+    ] {
+        assert!(report["metrics"][field].as_u64().is_some(), "{field}");
+    }
+    assert_eq!(
+        report["metrics"]["mirBasicBlockCount"],
+        report["metrics"]["mirTerminatorCount"]
+    );
+    assert!(report["metrics"]["runtimeArtifactBytes"]
+        .as_u64()
+        .is_some_and(|value| value > 0));
+    assert!(report["artifacts"]["runtime"]["path"]
+        .as_str()
+        .is_some_and(|path| !path.is_empty()));
+    assert_eq!(
+        report["artifacts"]["runtime"]["bytes"],
+        report["metrics"]["runtimeArtifactBytes"]
+    );
     let _ = fs::remove_dir_all(directory);
 }
 
@@ -362,6 +389,54 @@ fn specialization_count_distinguishes_callables_with_the_same_type_arguments() {
     assert_eq!(report["metrics"]["callableSpecializationCount"], 2);
     assert_eq!(report["metrics"]["classSpecializationCount"], 0);
     assert_eq!(report["metrics"]["totalGenericSpecializationCount"], 2);
+    let _ = fs::remove_dir_all(directory);
+}
+
+#[test]
+fn generic_class_fixture_reports_structural_and_class_specialization_counts() {
+    if !host_linker_is_available() {
+        return;
+    }
+    let directory = fixture_directory("generic-class-structure");
+    fs::create_dir_all(&directory).expect("fixture directory");
+    fs::write(
+        directory.join("main.doria"),
+        concat!(
+            "class Box<T> { function __construct(take T $value) {} }\n",
+            "function main(): void {\n",
+            "    let $number = new Box<int>(42);\n",
+            "    let $text = new Box<string>(\"doria\");\n",
+            "    echo \"{$number->value}:{$text->value}\\n\";\n",
+            "}\n",
+        ),
+    )
+    .expect("source");
+    let output = Command::new(doriac_bin())
+        .current_dir(&directory)
+        .args([
+            "compile",
+            "main.doria",
+            "--out",
+            executable_name(),
+            "--performance-report",
+            "performance.json",
+        ])
+        .output()
+        .expect("doriac");
+    assert!(
+        output.status.success(),
+        "compile failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value =
+        serde_json::from_slice(&fs::read(directory.join("performance.json")).expect("report"))
+            .expect("JSON");
+    assert_eq!(report["metrics"]["classSpecializationCount"], 2);
+    assert_eq!(report["metrics"]["totalGenericSpecializationCount"], 2);
+    assert!(report["metrics"]["mirBasicBlockCount"]
+        .as_u64()
+        .is_some_and(|value| value >= 3));
+    assert!(report["metrics"]["mirStatementCount"].as_u64().is_some());
     let _ = fs::remove_dir_all(directory);
 }
 

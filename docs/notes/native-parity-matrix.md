@@ -11,6 +11,14 @@ separate `dorialang/benchmarks` manifest owns timed evidence, treats the
 interpreter as an oracle rather than a native competitor, and records Cranelift
 and LLVM as distinct targets built by one explicitly selected compiler commit.
 
+Stage 26b Slice 2 extends that separate evidence with compiler scaling and
+runtime-subsystem cases. Exact output remains the bridge between the systems;
+this parity matrix does not acquire timing, RSS, profiler, or baseline policy.
+
+Stage 26b Slice 2 extends that separate evidence with compiler scaling and
+runtime-subsystem cases. Exact output remains the bridge between the systems;
+this parity matrix does not acquire timing, RSS, profiler, or baseline policy.
+
 | Feature / example | MIR interpreter | Cranelift fast | LLVM release | Status | Notes |
 | --- | --- | --- | --- | --- | --- |
 | `main(): int` literal return | Covered | Covered | Covered | Covered | All three produce the same explicit status. |
