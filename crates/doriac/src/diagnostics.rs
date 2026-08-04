@@ -355,12 +355,19 @@ impl Diagnostic {
                         message.clone()
                     },
                 }],
-                explanation: match kind {
-                    DiagnosticKind::InternalCompiler => Some(
+                explanation: match (code, kind) {
+                    // A runtime mismatch is not a code-generation failure, and
+                    // saying so sends the reader hunting for a compiler bug
+                    // instead of at the archive that was selected.
+                    ("B0003", _) => Some(
+                        "The program compiled, but the runtime library selected for linking was not built for this compiler. Linking it would produce an executable this compiler cannot vouch for."
+                            .to_string(),
+                    ),
+                    (_, DiagnosticKind::InternalCompiler) => Some(
                         "The compiler reached an unexpected internal state. This is a compiler defect, not a problem with your program."
                             .to_string(),
                     ),
-                    DiagnosticKind::Backend | DiagnosticKind::ExternalTool => Some(
+                    (_, DiagnosticKind::Backend | DiagnosticKind::ExternalTool) => Some(
                         "The program passed language checking, but a code-generation or external tool step could not complete."
                             .to_string(),
                     ),
@@ -1432,15 +1439,22 @@ pub fn catalogue_metadata(code: &str) -> DiagnosticMetadata {
     DiagnosticMetadata {
         severity: DiagnosticSeverity::Error,
         kind,
-        title_family: match code.as_bytes().first().copied() {
-            Some(b'L') => "Lexical Error",
-            Some(b'P') if runtime => "Runtime Panic",
-            Some(b'P') => "Syntax Error",
-            Some(b'E') => "Language Error",
-            Some(b'M') => "MIR Error",
-            Some(b'B') => "Backend Error",
-            Some(b'I') => "Internal Compiler Error",
-            _ => "Compiler Diagnostic",
+        // A few diagnostics name a specific failure the family title cannot
+        // convey. A runtime artifact mismatch reported as "Backend Error" sends
+        // the reader looking for a code-generation bug instead of at the
+        // archive that was selected, which is the one fact that explains it.
+        title_family: match code {
+            "B0003" => "Runtime Artifact Is Incompatible With This Compiler",
+            _ => match code.as_bytes().first().copied() {
+                Some(b'L') => "Lexical Error",
+                Some(b'P') if runtime => "Runtime Panic",
+                Some(b'P') => "Syntax Error",
+                Some(b'E') => "Language Error",
+                Some(b'M') => "MIR Error",
+                Some(b'B') => "Backend Error",
+                Some(b'I') => "Internal Compiler Error",
+                _ => "Compiler Diagnostic",
+            },
         },
         development_only: false,
     }

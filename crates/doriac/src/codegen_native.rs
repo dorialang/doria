@@ -27,7 +27,8 @@ pub fn generate_executable(
         NativeProfile::Fast => codegen_cranelift::lower_mir_to_object(program)?,
         NativeProfile::Release => lower_release_object(program)?,
     };
-    let runtime_path = runtime_artifact::locate(profile)?;
+    let runtime = runtime_artifact::locate(profile)?;
+    let runtime_path = runtime.path;
     link_object(&object_bytes, &runtime_path)
 }
 
@@ -47,7 +48,8 @@ pub(crate) fn generate_executable_with_performance(
     let code_generation = started.elapsed();
 
     let started = Instant::now();
-    let runtime_path = runtime_artifact::locate(profile)?;
+    let runtime = runtime_artifact::locate(profile)?;
+    let runtime_path = runtime.path;
     let runtime_selection = started.elapsed();
 
     let started = Instant::now();
